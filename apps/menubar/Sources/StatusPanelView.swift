@@ -216,7 +216,8 @@ struct StatusPanelView: View {
             Divider().padding(.horizontal, 14)
             if let faultBanner = StatusPanelFormat.daemonFaultBanner(keychainLocked: store.keychainLocked,
                                                                      scrub: store.canonicalScrub,
-                                                                     systemicRefreshFailure: store.systemicRefreshFailure) {
+                                                                     systemicRefreshFailure: store.systemicRefreshFailure,
+                                                                     canary: store.canary) {
                 // The single daemon-level fault banner (worst-first): a fleet-wide lockout or mechanism
                 // failure NO per-row `auth` reflects (rows can read healthy while the shared item sits locked
                 // or emptied, and while the refresh mechanism is down every account is still alive), so it
@@ -225,7 +226,8 @@ struct StatusPanelView: View {
                 // the `next_swap` line (R-2: footer = next_swap; degraded daemon-level signals → honest
                 // banner). The panel shows ONE banner, ranked worst-first over (fault, VARIANT) — never over
                 // fault identity, so a calm self-healing state can never outrank one that cannot self-heal.
-                // See `daemonFaultBanner` for the four ranks and why `recovering` sits last of them.
+                // See `daemonFaultBanner` for the seven ranks (over four faults) and why `recovering` sits
+                // last of them.
                 //
                 // This banner is what makes the menu-bar glance honest rather than cryptic: the locked glyph
                 // taxonomy collapses every fault to one silhouette on the promise that "the *which* is one

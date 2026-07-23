@@ -601,6 +601,19 @@ struct HonestStateMachine {
     /// email (issue #15).
     private(set) var systemicRefreshFailure: UInt32?
 
+    /// The behavioral-canary verdict (#714, wire since schema 1.9), carried from the last applied snapshot
+    /// exactly as `canonicalScrub` / `keychainLocked` / `systemicRefreshFailure` are: the keychain-derivation
+    /// identity check's LAST result. Its ALARM verdicts (`drift`, `ambiguous`) surface through
+    /// `StatusPanelFormat.daemonFaultBanner` at the cross-surface ranks the CLI pins; the quiet verdicts
+    /// render nothing. RETAINED across a drop (shown under the dimmed last-known render, like its siblings)
+    /// and REFUSED with the other numbers on an unsupported-major frame. `nil` when there is no verdict — a
+    /// pre-#714 daemon omits the key, or the canary has not concluded a run (`decodeIfPresent`), so a
+    /// healthy/legacy daemon never alarms. Deliberately NOT fed to `PresentationState.make`: this issue (#728)
+    /// establishes the PANEL banner only — the menu-bar glyph stays silent on canary state, honoring the
+    /// glyph/banner pairing invariant (if the glyph is ever made to shout canary state, the banner must exist
+    /// FIRST — banner-without-glyph is the safe direction; glyph-without-banner is the forbidden one, #575).
+    private(set) var canary: CanaryStatus?
+
     /// The honest connection state — a PURE function of `(liveness, snapshotClass)`. This is where the
     /// never-healthy-when-dead invariant lives: `.connected` is returned on exactly one combination.
     var connectionState: ConnectionState {
@@ -903,6 +916,7 @@ struct HonestStateMachine {
             canonicalScrub = nil
             keychainLocked = false
             systemicRefreshFailure = nil
+            canary = nil
             return .unsupportedSchema
         }
         snapshotClass = status.accounts.isEmpty ? .empty : .healthy
@@ -913,6 +927,7 @@ struct HonestStateMachine {
         canonicalScrub = status.canonicalScrub
         keychainLocked = status.keychainLocked
         systemicRefreshFailure = status.systemicRefreshFailure
+        canary = status.canary
         return .appliedSnapshot
     }
 
@@ -927,6 +942,7 @@ struct HonestStateMachine {
             canonicalScrub = nil
             keychainLocked = false
             systemicRefreshFailure = nil
+            canary = nil
             return .unsupportedSchema
         }
         // Liveness/keepalive ONLY — a heartbeat carries no roster, so it must NOT be treated as a
