@@ -22,13 +22,19 @@ import SwiftUI
 
 struct SettingsView: View {
     @ObservedObject var model: SettingsModel
+    /// The launch-at-login model (issue #170) — app-local (`SMAppService.mainApp`, no daemon dependency, no
+    /// credential), so it drives the always-visible "General" section above the daemon-config gate. The SAME
+    /// instance the not-running panel card observes (app-retained, shared via `main.swift`), so the Settings
+    /// toggle and the panel's Start affordance never disagree about registration state.
+    @ObservedObject var loginItem: LoginItemModel
 
     var body: some View {
         VStack(spacing: 0) {
-            // ONE always-present grouped Form: the app-local Notifications section on top (daemon-independent,
-            // so it renders in every load phase — issue #573), then the daemon-config surface conditionally
-            // below it (loading / honest-disconnected / loaded).
+            // ONE always-present grouped Form: the app-local General (launch-at-login) + Notifications sections
+            // on top (daemon-independent, so they render in every load phase — issue #573), then the daemon-
+            // config surface conditionally below them (loading / honest-disconnected / loaded).
             Form {
+                launchAtLoginSection
                 notificationsSection
                 daemonConfig
             }
@@ -39,6 +45,43 @@ struct SettingsView: View {
         .frame(minWidth: 440, idealWidth: 460, minHeight: 420, idealHeight: 560)
         // No `.task { load() }` here: loads are driven SOLELY by SettingsWindowController.show() (first open
         // AND reopens), so the form never races two config-get fetches on first open.
+    }
+
+    // MARK: - General: launch at login (app-local, always visible — independent of the daemon load phase)
+
+    /// The app login-item toggle (issue #170). Like Notifications it is app-local — `SMAppService.mainApp`
+    /// registration carries no daemon dependency and no credential (issue #15) — so it sits ABOVE the load-phase
+    /// gate and renders in EVERY phase, reachable even with the daemon stopped. Turning it on registers the app
+    /// as a login item; `.requiresApproval` (the user must still approve it in System Settings) reads ON with an
+    /// inline hint + a deep-link, never a silent failure. This governs the menu-bar APP only — starting the
+    /// daemon at login is the separate Start affordance on the not-running panel card (the #170 keystone
+    /// decouples the two owners).
+    private var launchAtLoginSection: some View {
+        Section {
+            Toggle("Launch Sessiometer at login", isOn: launchAtLoginBinding)
+            if loginItem.needsApproval {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Approve Sessiometer in System Settings › General › Login Items to finish enabling this.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("Open Login Items settings") { loginItem.openLoginItemsSettings() }
+                        .font(.caption)
+                }
+            }
+        } header: {
+            Text("General")
+        } footer: {
+            Text("Start Sessiometer automatically when you log in. This launches the menu-bar app only — "
+                + "the background daemon is started separately.")
+        }
+    }
+
+    /// The launch-at-login toggle's binding: reads the model's derived on-state, and writes the register/
+    /// unregister INTENT (`setLaunchAtLogin`, idempotent + status-refreshing in the model). A hand-built
+    /// `Binding` rather than `$loginItem.x` because the set is an intent that re-reads the true OS status, not
+    /// a stored-property write.
+    private var launchAtLoginBinding: Binding<Bool> {
+        Binding(get: { loginItem.launchAtLoginEnabled }, set: { loginItem.setLaunchAtLogin($0) })
     }
 
     // MARK: - Notifications (app-local, always visible — independent of the daemon load phase)

@@ -22,10 +22,14 @@ import SwiftUI
 @MainActor
 final class SettingsWindowController: NSObject, NSWindowDelegate {
     private let model: SettingsModel
+    /// The launch-at-login model (issue #170) — passed straight to `SettingsView` for the General toggle and
+    /// refreshed on every open (below), the SAME app-retained instance the not-running panel card observes.
+    private let loginItem: LoginItemModel
     private var window: NSWindow?
 
-    init(model: SettingsModel) {
+    init(model: SettingsModel, loginItem: LoginItemModel) {
         self.model = model
+        self.loginItem = loginItem
         super.init()
     }
 
@@ -41,6 +45,11 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
 
+        // Re-read the login-item status on every open (issue #170) so a change the user made directly in
+        // System Settings › General › Login Items is reflected without a relaunch — the same open-time
+        // freshness contract the daemon `config-get` below gives the tunables. Synchronous (no socket).
+        loginItem.refreshStatus()
+
         // Re-fetch config on every open — the SINGLE load trigger (first open AND reopens); the view has no
         // competing `.task`, so first open never fires config-get twice. The model discards stale drafts.
         Task { await model.load() }
@@ -49,7 +58,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private func existingOrNewWindow() -> NSWindow {
         if let window { return window }
 
-        let hosting = NSHostingController(rootView: SettingsView(model: model))
+        let hosting = NSHostingController(rootView: SettingsView(model: model, loginItem: loginItem))
         let window = NSWindow(contentViewController: hosting)
         window.title = "Sessiometer Settings"
         // No `.miniaturizable`: minimizing does not fire `windowWillClose`, so a minimized window would strand

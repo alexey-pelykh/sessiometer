@@ -34,6 +34,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// opened from the status item's secondary-click menu. Held here so it (and its `SettingsModel`) outlive
     /// each open/close cycle.
     private var settingsWindowController: SettingsWindowController?
+    /// The launch-at-login / Start-daemon model (issue #170), app-retained so the ONE shared instance outlives
+    /// each panel open and Settings open/close cycle — see `applicationDidFinishLaunching`.
+    private var loginItemModel: LoginItemModel?
     #if DEBUG
     /// Retains the debug glyph-gallery status items (the issue #437 `SESSIOMETER_GLYPH_GALLERY` harness) so
     /// they are not deallocated while the gallery-only app runs; empty in normal operation.
@@ -147,10 +150,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             configClient = nil
         }
 
+        // The launch-at-login / Start-daemon model (issue #170): the ONE app-retained `LoginItemModel` over the
+        // real `SMAppService` seam, SHARED by the panel's not-running Start affordance (through the controller
+        // below) and the Settings "General" toggle (through the window controller further down) so the two never
+        // disagree about registration state. No daemon dependency and no credential (issue #15), so it is built
+        // unconditionally — independent of the control-socket clients above. Register the APP login item on this
+        // launch (idempotent — a no-op when already enabled; touches ONLY the app login item, never the daemon
+        // agent, which stays user-initiated via the Start affordance — the #170 keystone).
+        let loginItemModel = LoginItemModel(service: SMAppServiceLoginItemService())
+        self.loginItemModel = loginItemModel
+        loginItemModel.registerAppLoginItemOnLaunch()
+
         let controller = StatusItemController(store: store,
                                               captureClient: captureClient,
                                               swapClient: swapClient,
-                                              statsClient: statsClient)
+                                              statsClient: statsClient,
+                                              loginItemModel: loginItemModel)
         controller.start()
         statusItemController = controller
 
@@ -167,7 +182,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             client: configClient,
             preferences: notificationPreferences,
             onRequestAuthorization: { notificationPresenter.requestAuthorization() })
-        let settingsController = SettingsWindowController(model: settingsModel)
+        let settingsController = SettingsWindowController(model: settingsModel, loginItem: loginItemModel)
         self.settingsWindowController = settingsController
         controller.onOpenSettings = { [weak settingsController] in settingsController?.show() }
 

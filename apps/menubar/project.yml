@@ -17,6 +17,19 @@ targets:
     platform: macOS
     sources:
       - Sources
+      # Launch-at-login daemon agent (issue #170 / #171) — GATED, intentionally commented out.
+      # When #171 embeds the daemon binary AND authors the LaunchAgent plist (with the REAL BundleProgram —
+      # deferred here per the #170 keystone: never a launchd job pointing at a program that isn't embedded
+      # yet), ship that plist into the app bundle's Contents/Library/LaunchAgents/ so
+      # `SMAppService.agent(plistName: "org.sessiometer.agent.plist")` can find and register it. Until then
+      # `daemonAgentStatus` stays `.notFound`, `LoginItemModel.canStartDaemon` is false, and the not-running
+      # panel's Start affordance degrades honestly to the inert banner. Uncomment (and author the plist) as
+      # part of #171 — NOT before.
+      # - path: LaunchAgents/org.sessiometer.agent.plist
+      #   buildPhase:
+      #     copyFiles:
+      #       destination: wrapper
+      #       subpath: Contents/Library/LaunchAgents
     settings:
       base:
         # Bundle identity — FROZEN (ADR-0027). `org.sessiometer` is the product-FAMILY namespace
@@ -94,6 +107,13 @@ targets:
       # only-dirty keys, client-side format validation, and the notification-toggle write-through are exercised
       # against the same fake connector as AccountSwapModel — no socket, no live daemon, never a real config write.
       - path: Sources/SettingsModel.swift
+      # Launch-at-login (#170) model: the pure @MainActor decision layer over SMAppService — toggle-state
+      # derivation, idempotent first-launch register, requiresApproval, the Start-daemon phase machine, and
+      # the CLI two-owner guard. Compiled here (NOT SMAppServiceLoginItem.swift — that imports
+      # ServiceManagement — nor SettingsView/StartDaemonCard/main.swift, the SwiftUI/AppKit surfaces) so every
+      # decision is driven by a fake LoginItemService — no real SMAppService, never a login item or LaunchAgent
+      # written by a test run.
+      - path: Sources/LoginItemModel.swift
       - path: Sources/HonestStateMachine.swift
       - path: Sources/WatchStatusStore.swift
       # Native swap / all-accounts-exhausted notifications (#267): the pure event deriver + neutral

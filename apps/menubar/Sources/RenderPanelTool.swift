@@ -134,7 +134,9 @@ enum RenderPanelTool {
                     rows: rows, nextSwap: nil, generatedAt: now - 240),
             Fixture(name: "connecting", state: .connecting, rows: [], nextSwap: nil, generatedAt: nil),
             // #499: the cold-refused daemon-absent states (no reading ever held) — a forming card for
-            // starting, and the not-running card whose Start-daemon button degrades to an inert line (#170).
+            // starting, and the not-running card. #170 adds the Start-daemon affordance to the not-running
+            // card: the harness seeds `canStartDaemon` true (see the render loop) so this fixture shows the
+            // mock's Start button; the shipped app gates it off until #171 bundles the agent plist.
             Fixture(name: "starting", state: .starting, rows: [], nextSwap: nil, generatedAt: nil),
             Fixture(name: "not-running", state: .notRunning, rows: [], nextSwap: nil, generatedAt: nil),
             Fixture(name: "crash-looping", state: .crashLooping, rows: [], nextSwap: nil, generatedAt: nil),
@@ -190,11 +192,18 @@ enum RenderPanelTool {
                 //     directly rather than loading — so `--render-panel` stays as offline as the rest.
                 let stats = fixture.statsWire.map { PanelStatsModel.loadedPreview($0) }
                     ?? PanelStatsModel(client: nil)
+                // #170: a hermetic login-item model seeded so `canStartDaemon` is TRUE — the not-running
+                // fixture then renders the mock's Start-daemon button (the DESIGN-TARGET state). The shipped
+                // #170 app gates that button OFF until #171 bundles the agent plist; this render is a design
+                // oracle against the mock (which shows the button), NOT a capture of the #170 runtime's inert-
+                // banner state. Every other fixture carries the model inert (its state renders no Start card).
+                let loginItem = LoginItemModel(service: PreviewLoginItemService())
                 let view = StatusPanelView()
                     .statusPanelEnvironment(store: store,
                                             capture: AccountCaptureModel(client: nil),
                                             swap: AccountSwapModel(client: nil),
-                                            stats: stats)
+                                            stats: stats,
+                                            loginItem: loginItem)
                     .environment(\.colorScheme, scheme)
                 let renderer = ImageRenderer(content: view)
                 renderer.scale = 2
@@ -264,5 +273,22 @@ enum RenderPanelTool {
             FileHandle.standardError.write(Data("write failed \(path): \(error)\n".utf8))
         }
     }
+}
+
+/// A hermetic `LoginItemService` for the render harness (#170) — NO `SMAppService`, no OS calls. Seeded so
+/// `canStartDaemon` is TRUE (a registrable daemon agent — `.notRegistered`, NOT `.notFound` — and no
+/// CLI-owned agent), so the `not-running` fixture renders the mock's Start-daemon affordance. Only that
+/// fixture reads it; the model rides inert in every other fixture's environment. Register/unregister are
+/// no-ops — a design render never mutates real login-item state. Tooling-only (DEBUG, app target), so it
+/// never reaches `MenubarTests` (whose own `FakeLoginItemService` drives `LoginItemModelTests`).
+private final class PreviewLoginItemService: LoginItemService {
+    let appStatus: LoginItemStatus = .enabled
+    let daemonAgentStatus: LoginItemStatus = .notRegistered
+    let cliManagedAgentPresent: Bool = false
+    func registerApp() throws {}
+    func unregisterApp() throws {}
+    func registerDaemonAgent() throws {}
+    func unregisterDaemonAgent() throws {}
+    func openLoginItemsSettings() {}
 }
 #endif
