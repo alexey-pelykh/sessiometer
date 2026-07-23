@@ -31,18 +31,21 @@ accounts is permitted under them.
   place through the `/usr/bin/security` CLI; it never uses the
   Security.framework SDK (a CI guard enforces this, so the original silent-read
   access is preserved).
-- A **supported Claude Code version**. `sessiometer` depends on reverse-engineered
-  Claude Code internals (the keychain-service derivation and credential-refresh
-  behaviour) that were verified against a specific range — currently
-  **`2.1.181`–`2.1.217`** on macOS `26.5.1`–`26.5.2` / Darwin `25.x`. A `claude` outside
-  this range may have changed those internals and is unverified: `sessiometer`
-  could target the wrong keychain item with no other signal. The authoritative
-  range lives in [`build/version-compat.md`](build/version-compat.md).
-  `sessiometer` checks your installed `claude` against that range itself — once at
-  daemon startup and on each `sessiometer status` — and prints a one-line advisory
-  when it falls outside. The check is advisory only: it never blocks anything, and
-  stays silent when your `claude` is in range. `scripts/check-cc-version.sh` runs
-  the same comparison as a pre-release gate for maintainers.
+- A Claude Code version the internals were **verified against**. `sessiometer`
+  depends on reverse-engineered Claude Code internals (the keychain-service
+  derivation and credential-refresh behaviour); the range they were last verified
+  against is currently **`2.1.181`–`2.1.217`** on macOS `26.5.1`–`26.5.2` / Darwin
+  `25.x`. This is provenance, not a compatibility gate: a `claude` outside the
+  range is unverified and handled best-effort, never refused on version alone.
+  `sessiometer` itself compares your installed `claude` against the range — once
+  at daemon startup and on each `sessiometer status` — and prints a one-line
+  advisory when it falls outside; the check never blocks anything and stays
+  silent in range. The riskiest drift — a changed keychain derivation — is caught
+  separately at runtime by the behavioral canary (see "Edge cases & resilience"),
+  which refuses credential writes rather than let them land on the wrong item. The
+  authoritative range lives in [`build/version-compat.md`](build/version-compat.md);
+  `scripts/check-cc-version.sh` runs the same comparison for maintainers at
+  release time as an advisory provenance check.
 
 ## Quickstart
 

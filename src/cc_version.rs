@@ -10,7 +10,8 @@
 //! range recorded in `build/version-compat.md`. A CC release outside that range may have
 //! silently changed them, and sessiometer would then target the wrong keychain item with no
 //! other signal. Until #715 that check existed ONLY in the maintainer's pre-release process
-//! (`scripts/check-cc-version.sh`, run as a gate by `build/release-checklist.md`), so a
+//! (`scripts/check-cc-version.sh`, then run as a release gate by `build/release-checklist.md`;
+//! demoted to an advisory provenance check in #716 once the #714 runtime canary landed), so a
 //! user who upgraded `claude` AFTER installing a release got no signal at all. This module
 //! moves that informed consent onto the user's machine, where the risk actually lands.
 //!
