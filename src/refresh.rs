@@ -275,6 +275,38 @@ pub(crate) fn refresh_token(blob: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
     Some(Zeroizing::new(rt.as_bytes().to_vec()))
 }
 
+/// Whether `blob` is a well-formed Claude Code credential (issue #730) — the OFFLINE
+/// shape-check behind the canary's `NoStashMatch` write-gate. "Well-formed" is the
+/// exact CC shape `{"claudeAiOauth":{ accessToken: <string>, refreshToken: <string>,
+/// expiresAt: <number> }}`, with all THREE fields present and correctly typed.
+///
+/// Built on the SAME `claudeAiOauth` decoding the [`expires_at`] / [`refresh_token`]
+/// extractors already perform — one shape definition, never a second, drift-prone JSON
+/// schema. `accessToken` has no dedicated extractor, so its presence/type is checked
+/// with the same `serde_json::Value` navigation, then the other two fields defer to the
+/// audited extractors.
+///
+/// SECRET-FREE and OFFLINE by construction: a pure local parse of the in-hand `blob` —
+/// no network, no `claude` spawn, no keychain re-read — inspecting only field PRESENCE
+/// and TYPE, never copying a token value to an output channel (issue #15). An
+/// EMPTY-string `refreshToken` (CC's #101 in-place DEAD signal) still counts as
+/// well-formed: a dead CC item is unmistakably CC's OWN item, so the gate must NOT
+/// refuse — and clobber — it. Only a blob that is not CC's shape at all (a foreign
+/// secret, a truncated / re-encoded item) fails here — which is exactly the residual
+/// #730 hardens against (a future CC storage-format change leaving an unrelated secret
+/// under the derived service).
+pub(crate) fn is_well_formed_credential(blob: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<Value>(blob) else {
+        return false;
+    };
+    let access_token_ok = value
+        .get("claudeAiOauth")
+        .and_then(|oauth| oauth.get("accessToken"))
+        .and_then(Value::as_str)
+        .is_some();
+    access_token_ok && refresh_token(blob).is_some() && expires_at(blob).is_some()
+}
+
 /// Re-serialize `blob` with `claudeAiOauth.expiresAt` set to `now_ms` — a back-dated
 /// expiry (`<= now`) that makes Claude Code's 5-minute pre-expiry refresh predicate
 /// unconditionally true, forcing a deterministic on-demand refresh when the spawned
@@ -1060,6 +1092,66 @@ mod tests {
             refresh_token(br#"{"claudeAiOauth":{"accessToken":"x"}}"#),
             None
         );
+    }
+
+    #[test]
+    fn is_well_formed_credential_accepts_the_full_cc_shape() {
+        // All three fields present and correctly typed → the #730 shape-check passes
+        // (the benign fail-OPEN branch: a CC token simply not restashed yet).
+        assert!(is_well_formed_credential(&blob(NOW_MS, "sk-ant-ort-RT")));
+    }
+
+    #[test]
+    fn is_well_formed_credential_accepts_an_empty_refresh_token() {
+        // CC's #101 in-place DEAD signal (empty RT) is STILL CC's own item — an empty
+        // string is a string, so this stays well-formed and the gate must NOT refuse it.
+        assert!(is_well_formed_credential(
+            br#"{"claudeAiOauth":{"accessToken":"at","refreshToken":"","expiresAt":123}}"#
+        ));
+    }
+
+    #[test]
+    fn is_well_formed_credential_rejects_each_missing_field() {
+        // Any of the three fields absent → not CC's shape → fail-CLOSED branch.
+        assert!(!is_well_formed_credential(
+            br#"{"claudeAiOauth":{"refreshToken":"rt","expiresAt":123}}"#
+        )); // no accessToken
+        assert!(!is_well_formed_credential(
+            br#"{"claudeAiOauth":{"accessToken":"at","expiresAt":123}}"#
+        )); // no refreshToken
+        assert!(!is_well_formed_credential(
+            br#"{"claudeAiOauth":{"accessToken":"at","refreshToken":"rt"}}"#
+        )); // no expiresAt
+    }
+
+    #[test]
+    fn is_well_formed_credential_rejects_a_mistyped_field() {
+        // "Correctly typed" is enforced per field, not just presence — a wrong type on
+        // ANY of the three fails the shape-check (fail-CLOSED). Pinned symmetrically with
+        // `rejects_each_missing_field` so dropping a type-guard (e.g. `accessToken`'s
+        // `as_str`) would fail a test rather than silently accept a mistyped blob.
+        assert!(!is_well_formed_credential(
+            br#"{"claudeAiOauth":{"accessToken":123,"refreshToken":"rt","expiresAt":123}}"#
+        )); // accessToken a number, not a string
+        assert!(!is_well_formed_credential(
+            br#"{"claudeAiOauth":{"accessToken":"at","refreshToken":123,"expiresAt":123}}"#
+        )); // refreshToken a number, not a string
+        assert!(!is_well_formed_credential(
+            br#"{"claudeAiOauth":{"accessToken":"at","refreshToken":"rt","expiresAt":"123"}}"#
+        )); // expiresAt a string, not a number
+    }
+
+    #[test]
+    fn is_well_formed_credential_rejects_a_non_cc_blob() {
+        // A foreign secret / non-JSON bytes / a right-typed blob under the WRONG wrapper
+        // — overwhelmingly NOT Claude Code's item. This is the #730 residual: a future
+        // CC storage-format change leaves an unrelated secret the `-U` upsert must not
+        // clobber. OFFLINE by construction — a pure parse of the in-hand bytes.
+        assert!(!is_well_formed_credential(b"an-unrelated-keychain-secret"));
+        assert!(!is_well_formed_credential(b"{not json"));
+        assert!(!is_well_formed_credential(
+            br#"{"someOtherApp":{"accessToken":"at","refreshToken":"rt","expiresAt":123}}"#
+        ));
     }
 
     #[test]

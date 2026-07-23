@@ -489,6 +489,18 @@ pub(crate) struct Tunables {
     /// the derived service) have no false-positive story and stay fail-closed. `false` (refuse on
     /// drift) is the default and the safe posture.
     pub(crate) canary_drift_override: bool,
+    /// The documented operator override for the issue #730 `NoStashMatch` shape-gate — a
+    /// DEDICATED switch, separate from `canary_drift_override` (never widened to cover both).
+    /// The canary refuses a credential write when the resolved canonical matches no stash AND
+    /// does not parse as a Claude Code credential (overwhelmingly an unrelated secret an atomic
+    /// `-U` upsert would clobber unrecoverably); `true` restores the pre-#730 fail-OPEN for THAT
+    /// case — the recovery lever once the operator has vetted the canonical as safe (e.g. a
+    /// legitimate NEW Claude Code credential format they will re-stash). Overrides ONLY the
+    /// unparseable-`NoStashMatch` refusal: DRIFT (its own `canary_drift_override`) and the
+    /// Layer-1 zero/ambiguous refusals are untouched, and a WELL-FORMED unmatched canonical fails
+    /// OPEN regardless (nothing to override). `false` (the shape-gate ARMED) is the default and
+    /// the safe posture.
+    pub(crate) canary_nostashmatch_override: bool,
     /// Poll-interval timing strategy (issue #38): base = `poll_secs` (seconds),
     /// normal jitter by default. The daemon draws + clamps to `5..=3600` each
     /// cycle instead of sleeping a fixed interval.
@@ -529,6 +541,9 @@ impl Default for Tunables {
             fleet_runway_warn_secs: DEFAULT_FLEET_RUNWAY_WARN_SECS,
             // The #714 canary-drift override: OFF (refuse on drift) — the safe posture.
             canary_drift_override: false,
+            // The #730 NoStashMatch shape-gate override: OFF (refuse an unparseable orphan
+            // canonical) — the safe posture.
+            canary_nostashmatch_override: false,
             poll_strategy: Strategy {
                 base: DEFAULT_POLL_SECS as f64,
                 jitter: default_poll_jitter(),
@@ -1067,6 +1082,11 @@ pub(crate) struct SetTunables {
     /// bool; there is no range to validate, so the overlay writes it straight through).
     #[serde(default)]
     pub(crate) canary_drift_override: Option<bool>,
+    /// Issue #730: the canary NoStashMatch shape-gate override switch — a DEDICATED bool,
+    /// separate from `canary_drift_override`. Like it, no range to validate; the overlay
+    /// writes it straight through.
+    #[serde(default)]
+    pub(crate) canary_nostashmatch_override: Option<bool>,
 }
 
 /// Which classes of edit a [`Config::apply_settings`] actually changed (issue #268), so the
@@ -1112,6 +1132,11 @@ pub(crate) struct TunablesView {
     /// so a pre-#714 daemon's view decodes to `false` — refuse on drift).
     #[serde(default)]
     pub(crate) canary_drift_override: bool,
+    /// Issue #730: whether the canary NoStashMatch shape-gate override is set (a plain bool;
+    /// `#[serde(default)]` so a pre-#730 daemon's view decodes to `false` — refuse an
+    /// unparseable orphan canonical).
+    #[serde(default)]
+    pub(crate) canary_nostashmatch_override: bool,
 }
 
 impl From<&Tunables> for TunablesView {
@@ -1133,6 +1158,7 @@ impl From<&Tunables> for TunablesView {
             monitor_recovery_m: t.monitor_recovery_m,
             fleet_runway_warn_secs: t.fleet_runway_warn_secs,
             canary_drift_override: t.canary_drift_override,
+            canary_nostashmatch_override: t.canary_nostashmatch_override,
         }
     }
 }
@@ -1243,6 +1269,11 @@ struct RawTunables {
     // (not an integer knob): it is a switch with no range to validate.
     #[serde(default)]
     canary_drift_override: bool,
+    // Issue #730: the documented canary NoStashMatch shape-gate override — an absent key
+    // resolves to `false` (refuse an unparseable orphan canonical), the safe posture. A plain
+    // bool, separate from `canary_drift_override`, with no range to validate.
+    #[serde(default)]
+    canary_nostashmatch_override: bool,
 }
 
 impl Default for RawTunables {
@@ -1264,6 +1295,7 @@ impl Default for RawTunables {
             monitor_recovery_m: default_monitor_recovery_m(),
             fleet_runway_warn_secs: default_fleet_runway_warn_secs(),
             canary_drift_override: false,
+            canary_nostashmatch_override: false,
         }
     }
 }
