@@ -2,17 +2,22 @@
 
 Steps to run before tagging a `sessiometer` release.
 
-Its reason for existing is the **Claude Code compatibility gate** (step 1). Because `sessiometer`
-depends on reverse-engineered Claude Code internals recorded in
-[`build/version-compat.md`](version-compat.md), each release must re-verify the Claude Code version
-range it was validated against — so a CC drift becomes a *visible* release-time signal instead of
-silent breakage. CI cannot cover this: it runs hermetically and never execs a real `claude`.
+It began as the home of the **Claude Code compatibility gate** (step 1). That step is now an
+**advisory provenance check** (demoted in #716): since #714 the daemon carries a behavioral canary
+that refuses credential writes at runtime when the reverse-engineered keychain derivation drifts —
+so drift is caught on the user's machine, where the risk actually lands, instead of being policed at
+release time. (There is no runtime version advisory: the version string was never a control, so the
+#715 startup/`status` advisory was removed in #716; the range now records provenance only, surfaced
+in `sessiometer --version`.) Step 1 keeps the *published* "verified against" range honest; it no
+longer blocks a release. CI still cannot cover it: CI runs hermetically and never execs a real
+`claude`.
 
-## 1. Re-verify Claude Code compatibility (required)
+## 1. Record Claude Code provenance (advisory)
 
-The supported range is the authoritative declaration in
+The verified range is the authoritative provenance in
 [`build/version-compat.md`](version-compat.md) § *Supported Claude Code range*
-(the `CC_SUPPORTED_MIN` / `CC_SUPPORTED_MAX` lines).
+(the `CC_SUPPORTED_MIN` / `CC_SUPPORTED_MAX` lines) — the record of which CC builds the
+reverse-engineered internals were last verified against.
 
 - [ ] Run the check against the `claude` you are releasing against:
 
@@ -22,20 +27,26 @@ The supported range is the authoritative declaration in
   CLAUDE_BIN=/path/to/claude ./scripts/check-cc-version.sh
   ```
 
-- [ ] **In range** (`ok:` / exit 0) → proceed.
-- [ ] **Above range** (a newer `claude` shipped; `warning:` / exit 1) → do **not** release blind.
-  Re-verify the version-sensitive findings in [`build/version-compat.md`](version-compat.md) — at
+- [ ] **In range** (`ok:` / exit 0) → provenance is current; nothing to record.
+- [ ] **Above range** (a newer `claude` shipped; `warning:` / exit 1) → **advisory, not a
+  blocker**: the release may ship as-is — its provenance then honestly states the older verified
+  range, and the #714 canary refuses credential writes on derivation drift. Prefer refreshing the
+  provenance when practical:
+  re-verify the version-sensitive findings in [`build/version-compat.md`](version-compat.md) — at
   minimum **H3** (fresh-start adoption) and the **#100** keychain-service derivation (`n1()`) —
-  against the new CC. If they still hold, widen `CC_SUPPORTED_MAX` in the ledger, update the range
+  against the new CC; if they hold, widen `CC_SUPPORTED_MAX` in the ledger, update the range
   stated in the [README](../README.md#prerequisites) to match, then re-run the check.
-- [ ] **Below range** (`warning:` / exit 1) → the `claude` you tested is older than the verified
-  floor; install a supported `claude`, or (if releasing for that older CC) verify it and lower
-  `CC_SUPPORTED_MIN`.
+- [ ] **Below range** (`warning:` / exit 1) → same advisory footing: the `claude` you tested is
+  older than the verified floor. If releasing for that older CC matters, verify it and lower
+  `CC_SUPPORTED_MIN`; otherwise ship with the provenance as recorded.
 - [ ] **Could not determine** (`error:` / exit 2) → no `claude` resolved (set `$CLAUDE_BIN` or add it
-  to `$PATH`) or its `--version` was unparseable. Fix and re-run — exit 2 is **not** a pass.
-- [ ] The script also fails (exit 1) if `README.md` no longer states the ledger range, so the
-  user-facing range (AC1) cannot silently drift — keep the README `## Prerequisites` range in sync
-  with `CC_SUPPORTED_MIN`–`CC_SUPPORTED_MAX`.
+  to `$PATH`) or its `--version` was unparseable. Fix and re-run — exit 2 means the provenance was
+  not checked at all this release, which is worth one retry even for an advisory.
+- [ ] The script also reports (exit 1) when `README.md` no longer states the ledger range. Unlike
+  the version arms above, fix this one before tagging: it means the *published* provenance is
+  wrong — the README misstates what was verified — not merely that a newer `claude` exists. Keep
+  the README `## Prerequisites` range in sync with `CC_SUPPORTED_MIN`–`CC_SUPPORTED_MAX` (the
+  range-as-a-unit assertion from #712/#722 catches a partially-updated README too).
 
 ## 2. Rollback/downgrade procedure current (required)
 
