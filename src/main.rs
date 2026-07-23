@@ -11,6 +11,7 @@
 
 mod active;
 mod capture;
+mod cc_version;
 mod claude_state;
 mod cli;
 mod config;
