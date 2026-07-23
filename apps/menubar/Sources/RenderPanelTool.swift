@@ -45,10 +45,13 @@ enum RenderPanelTool {
         let now = Int64(Date().timeIntervalSince1970)
         let day: Int64 = 86_400
 
-        // The mock's "Healthy · Status" example rows (same labels + percents, so the render is directly
-        // comparable): Work active 42/88, Personal 31/71, Scratch 4/18 — next swap → Scratch. The
-        // provider secondary line (#173) and the "Last swap …" footer (#88) are the documented Wave-1
-        // reconciliations and correctly do NOT appear.
+        // The mock's "Healthy · Status" example rows — same percents + layout, so the render is directly
+        // comparable: Work active 42/88, Personal 31/71, Temp 4/18 — next swap → Temp. The third account is
+        // "Temp" where the mock illustrates "Scratch": re-picked so all three labels hash to DISTINCT #445
+        // palette slots (the mock's "Personal" + "Scratch" both land on slot 5 / ochre under the shared 8-slot
+        // label hash), so the committed oracle shows three visibly-distinct identity colours — violet / ochre /
+        // teal (#709). The provider secondary line (#173) and the "Last swap …" footer (#88) are the documented
+        // Wave-1 reconciliations and correctly do NOT appear.
         let rows = [
             AccountRow(label: "Work", isActive: true, isEnabled: true, isQuarantined: false,
                        isRecovering: false, auth: .healthy, sessionPct: 42, weeklyPct: 88,
@@ -58,7 +61,7 @@ enum RenderPanelTool {
                        isRecovering: false, auth: .healthy, sessionPct: 31, weeklyPct: 71,
                        sessionResetsAt: now + 3600 + 2 * 60, weeklyResetsAt: now + 3 * day,
                        weeklyExhausted: false, isNextSwapTarget: false, blindActive: nil),
-            AccountRow(label: "Scratch", isActive: false, isEnabled: true, isQuarantined: false,
+            AccountRow(label: "Temp", isActive: false, isEnabled: true, isQuarantined: false,
                        isRecovering: false, auth: .healthy, sessionPct: 4, weeklyPct: 18,
                        sessionResetsAt: now + 5 * 3600 + 20 * 60, weeklyResetsAt: now + 3 * day,
                        weeklyExhausted: false, isNextSwapTarget: true, blindActive: nil),
@@ -97,14 +100,14 @@ enum RenderPanelTool {
                                            sessionPct: 14, weeklyPct: 100, sessionResetsAt: now + 2 * 3600,
                                            weeklyResetsAt: now + 2 * day + 4 * 3600, weeklyExhausted: true,
                                            isNextSwapTarget: false, blindActive: nil)
-        let exhaustedScratch = AccountRow(label: "Scratch", isActive: false, isEnabled: true,
-                                          isQuarantined: false, isRecovering: false, auth: .healthy,
-                                          sessionPct: 6, weeklyPct: 97, sessionResetsAt: now + 4 * 3600 + 50 * 60,
-                                          weeklyResetsAt: now + 3 * day + 3600, weeklyExhausted: true,
-                                          isNextSwapTarget: false, blindActive: nil)
+        let exhaustedTemp = AccountRow(label: "Temp", isActive: false, isEnabled: true,
+                                       isQuarantined: false, isRecovering: false, auth: .healthy,
+                                       sessionPct: 6, weeklyPct: 97, sessionResetsAt: now + 4 * 3600 + 50 * 60,
+                                       weeklyResetsAt: now + 3 * day + 3600, weeklyExhausted: true,
+                                       isNextSwapTarget: false, blindActive: nil)
         let blindCorneredRows = [blindWork(BlindActive(blindSecs: 1080, lastKnownSessionPct: 92,
                                                        autoProtectionDegraded: true)),
-                                 exhaustedPersonal, exhaustedScratch]
+                                 exhaustedPersonal, exhaustedTemp]
 
         // The panel-rendered states (the fuller 9-state fidelity's remaining facets are #169 siblings).
         // `stale` and `disconnected` retain the last-good roster (disconnected dims it); the account-less
@@ -113,19 +116,19 @@ enum RenderPanelTool {
         // stale as intended.
         let fixtures = [
             Fixture(name: "healthy", state: .connected, rows: rows,
-                    nextSwap: .target(to: "Scratch", reason: .soonestReset(resetsAt: now + 3 * day)),
+                    nextSwap: .target(to: "Temp", reason: .soonestReset(resetsAt: now + 3 * day)),
                     generatedAt: now - 12),
             // #704: the healthy roster's STATS tab — the ONE fixture seeded to `.stats`/`.loaded` (every other
             // renders the Status glance). Reuses the healthy roster so the Stats rows join the same
-            // Work/Personal/Scratch identities (active = Work) the mock's `healthy-stats-*` frames show; the
+            // Work/Personal/Temp identities (active = Work) the mock's `healthy-stats-*` frames show; the
             // loaded series rides `statsWire`. State stays `.connected` because `StatusPanelView` offers the
             // Stats seg only over a live roster (`.connected`/`.stale`) — a Stats tab on a degraded daemon
             // could only fail. `next_swap` is inert here (the Stats tab renders no footer).
             Fixture(name: "stats", state: .connected, rows: rows,
-                    nextSwap: .target(to: "Scratch", reason: .soonestReset(resetsAt: now + 3 * day)),
+                    nextSwap: .target(to: "Temp", reason: .soonestReset(resetsAt: now + 3 * day)),
                     generatedAt: now - 12, statsWire: PanelStatsModel.loadedPreviewFixture),
             Fixture(name: "stale", state: .stale, rows: rows,
-                    nextSwap: .target(to: "Scratch", reason: .soonestReset(resetsAt: now + 3 * day)),
+                    nextSwap: .target(to: "Temp", reason: .soonestReset(resetsAt: now + 3 * day)),
                     generatedAt: now - 5400),
             Fixture(name: "disconnected", state: .disconnected(reason: "the daemon is not responding"),
                     rows: rows, nextSwap: nil, generatedAt: now - 240),
@@ -140,10 +143,10 @@ enum RenderPanelTool {
             // #571: the active-account blind row, OK + DEGRADED — a per-row modifier on a `.connected`
             // snapshot (fresh header/footer), rendered as the held session bar + auto-protection verdict.
             Fixture(name: "blind-ok", state: .connected, rows: blindOKRows,
-                    nextSwap: .target(to: "Scratch", reason: .soonestReset(resetsAt: now + 3 * day)),
+                    nextSwap: .target(to: "Temp", reason: .soonestReset(resetsAt: now + 3 * day)),
                     generatedAt: now - 12),
             Fixture(name: "blind-degraded", state: .connected, rows: blindDegradedRows,
-                    nextSwap: .target(to: "Scratch", reason: .soonestReset(resetsAt: now + 3 * day)),
+                    nextSwap: .target(to: "Temp", reason: .soonestReset(resetsAt: now + 3 * day)),
                     generatedAt: now - 12),
             // #572: the CORNERED blind row — blind + DEGRADED + no viable target. `next_swap` is
             // `.noViableTarget` (every spare weekly-exhausted, capacity back in 2d 4h), the signal the panel
@@ -223,7 +226,7 @@ enum RenderPanelTool {
     private static func faultFixtures(rows: [AccountRow], now: Int64, day: Int64) -> [Fixture] {
         // The healthy next-swap the roster would carry regardless — ranks 3-4 leave swapping alive, and even
         // where the daemon is blocked the panel still states its recommendation.
-        let nextSwap = NextSwap.target(to: "Scratch", reason: .soonestReset(resetsAt: now + 3 * day))
+        let nextSwap = NextSwap.target(to: "Temp", reason: .soonestReset(resetsAt: now + 3 * day))
         func fault(_ name: String, _ apply: (inout Fixture) -> Void) -> Fixture {
             var fixture = Fixture(name: name, state: .connected, rows: rows,
                                   nextSwap: nextSwap, generatedAt: now - 12)

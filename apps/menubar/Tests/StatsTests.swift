@@ -511,12 +511,12 @@ final class StatsTests: XCTestCase {
             return XCTFail("the stats preview fixture did not decode to a StatsWire")
         }
         // The three cards, keyed by the CAPITALISED roster labels RenderPanelTool's rows carry — so the
-        // case-sensitive `orderedStatHandles` join lands them in Work / Personal / Scratch order.
-        XCTAssertEqual(Set(wire.summary.accounts.keys), ["Work", "Personal", "Scratch"])
+        // case-sensitive `orderedStatHandles` join lands them in Work / Personal / Temp order.
+        XCTAssertEqual(Set(wire.summary.accounts.keys), ["Work", "Personal", "Temp"])
         // Bands → the mock's three signal pills.
         XCTAssertEqual(StatusPanelFormat.statsSignal(try XCTUnwrap(wire.summary.accounts["Work"]).band), .saturated)
         XCTAssertEqual(StatusPanelFormat.statsSignal(try XCTUnwrap(wire.summary.accounts["Personal"]).band), .balanced)
-        XCTAssertEqual(StatusPanelFormat.statsSignal(try XCTUnwrap(wire.summary.accounts["Scratch"]).band), .underused)
+        XCTAssertEqual(StatusPanelFormat.statsSignal(try XCTUnwrap(wire.summary.accounts["Temp"]).band), .underused)
         // The displayed numeric body matches the mock's active Work card verbatim.
         let work = try XCTUnwrap(wire.summary.accounts["Work"])
         XCTAssertEqual(StatusPanelFormat.statsSessionMeanPeak(work), "42 / 100%")
