@@ -1576,9 +1576,13 @@ mod tests {
         // an in-place token refresh — so the canary is INCONCLUSIVE and fails
         // OPEN (never block on "couldn't verify"): the swap runs, and the engine's
         // own re-stash captures the refreshed token (the drift guard #6 exists
-        // for), composing exactly with the #211 allow-neither rule.
+        // for), composing exactly with the #211 allow-neither rule. Issue #730: the
+        // refreshed canonical is a WELL-FORMED CC credential (`canonical_well_formed:
+        // true`), so the shape-gate leaves this fail-OPEN untouched — and the spares'
+        // raw stashes never gate it (the gate is scoped to the ACTIVE canonical).
         let roster = vec![account("u-A", "work"), account("u-B", "spare")];
-        let store = store_holding(b"A-token-refreshed").await;
+        let refreshed = cc_blob("sk-ant-oat-REFRESHED");
+        let store = store_holding(&refreshed).await;
         let stash = stash_with(&[
             ("Sessiometer/u-A", b"A-token", "u-A"),
             ("Sessiometer/u-B", b"B-token", "u-B"),
@@ -1617,8 +1621,132 @@ mod tests {
             .await
             .unwrap()
             .credential
-            .matches(&cred(b"A-token-refreshed")));
+            .matches(&cred(&refreshed)));
         // …and rerouted the canonical to the incoming account.
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"B-token")));
+    }
+
+    #[tokio::test]
+    async fn an_unparseable_canonical_with_no_stash_match_refuses_the_swap() {
+        // Issue #730: a swap is decided (the display-resolved active is over its
+        // trigger), but the resolved canonical matches NO stash AND does not parse as
+        // a Claude Code credential — overwhelmingly an unrelated secret. The pre-swap
+        // gate refuses the atomic `-U` clobber (ZERO writes) and logs the redaction-
+        // safe refusal; the wire verdict stays genuinely INCONCLUSIVE (no schema bump).
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        // A non-CC canonical no stash holds → the active resolves via the display (u-A).
+        let store = store_holding(b"an-unrelated-keychain-secret").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.97, 0.40)
+            .ok("u-B", 0.10, 0.10);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+
+        let first = warmed_tick(&mut daemon).await;
+
+        assert_eq!(first.action, TickAction::SwapFailed);
+        assert_eq!(
+            first.events,
+            vec![Event::CanaryUnparseableCanonical { overridden: false }]
+        );
+        // Reads stayed live — the refusing tick still polled the roster.
+        assert!(first.snapshot.accounts.iter().all(|a| a.usage.is_some()));
+        // The wire stays Inconclusive: the refuse is a daemon-internal policy (#730),
+        // not a new verdict — no schema bump, no menubar perturbation.
+        assert_eq!(first.snapshot.canary, Some(CanaryStatus::Inconclusive));
+        // ZERO writes: the canonical still holds the unrelated secret, stashes intact.
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"an-unrelated-keychain-secret")));
+        assert!(daemon
+            .stash
+            .read("Sessiometer/u-A")
+            .await
+            .unwrap()
+            .credential
+            .matches(&cred(b"A-token")));
+        assert!(daemon
+            .stash
+            .read("Sessiometer/u-B")
+            .await
+            .unwrap()
+            .credential
+            .matches(&cred(b"B-token")));
+    }
+
+    #[tokio::test]
+    async fn the_nostashmatch_override_swaps_through_an_unparseable_canonical() {
+        // Issue #730 override: `canary_nostashmatch_override = true` restores fail-OPEN
+        // for the unparseable case — the operator has vetted the canonical (e.g. a
+        // legitimate NEW CC credential format they will re-stash). The swap proceeds;
+        // the ride is logged with `overridden=true`, never silenced. DEDICATED switch:
+        // `canary_drift_override` is left at its default and does not gate this case.
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"a-vetted-new-cc-format").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.97, 0.40)
+            .ok("u-B", 0.10, 0.10);
+        let mut tun = tunables(95, 80, 0);
+        tun.canary_nostashmatch_override = true;
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+
+        let outcome = warmed_tick(&mut daemon).await;
+
+        // The swap RAN: work (display-resolved active, 0) → spare (1).
+        assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 1 });
+        // The refusal was logged as overridden, never silenced…
+        assert!(
+            outcome
+                .events
+                .contains(&Event::CanaryUnparseableCanonical { overridden: true }),
+            "the overridden refusal is logged: {:?}",
+            outcome.events
+        );
+        // …alongside the normal swap event.
+        assert!(
+            outcome.events.iter().any(
+                |e| matches!(e, Event::Swap { from, to, .. } if from == "work" && to == "spare")
+            ),
+            "the overridden swap still logs: {:?}",
+            outcome.events
+        );
+        // The canonical was rerouted to the incoming account's token.
         assert!(daemon
             .store
             .read()

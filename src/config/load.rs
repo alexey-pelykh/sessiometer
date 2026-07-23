@@ -142,6 +142,9 @@ mod tests {
                 // VALID omits canary_drift_override → the compiled-in default (issue #714):
                 // false, the canary's drift refusal ARMED (the override is opt-in).
                 canary_drift_override: false,
+                // VALID omits canary_nostashmatch_override → the compiled-in default (issue
+                // #730): false, the NoStashMatch shape-gate ARMED (the override is opt-in).
+                canary_nostashmatch_override: false,
                 // No [jitter] table in VALID → default strategies: poll jitters
                 // normally (base from poll_secs), session_ceiling/weekly_ceiling/cooldown
                 // are fixed at their respective bases.
