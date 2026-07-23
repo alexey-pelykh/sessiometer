@@ -19,13 +19,14 @@ targets:
       - Sources
     settings:
       base:
-        # Bundle identity per /council 2026-07-06: `org.sessiometer` is the product-FAMILY
-        # namespace — never itself a concrete bundle id; every artifact is a peer child (the app
-        # here; the embedded daemon LaunchAgent → org.sessiometer.agent, #329). PROVISIONAL,
-        # #170-spike-gated: falls back to bare `org.sessiometer` ONLY if the SMAppService spike
-        # (#170) shows the agent Label must be prefixed by the app's CFBundleIdentifier. The id
-        # needn't freeze until the first Sparkle release (#171). Supersedes the #311 scaffold's
-        # com-prefixed id and `Menubar` product name.
+        # Bundle identity — FROZEN (ADR-0027). `org.sessiometer` is the product-FAMILY namespace
+        # (never itself a concrete bundle id); every artifact is a peer child on the `<surface>`
+        # axis (the app `.menubar` here; the embedded daemon LaunchAgent → org.sessiometer.agent,
+        # #329). The #170 SMAppService spike (2026-07-23) empirically proved NO prefix-coupling — a
+        # *peer* app id registers the agent fine, no ancestor requirement — and a /council ratified
+        # freezing `org.sessiometer.menubar` (not bare `org.sessiometer`, not `.app`) before the
+        # first signed release (#171); Sparkle refuses a changed CFBundleIdentifier thereafter.
+        # Supersedes the #311 scaffold's com-prefixed id and `Menubar` product name.
         PRODUCT_NAME: Sessiometer
         PRODUCT_BUNDLE_IDENTIFIER: org.sessiometer.menubar
         MARKETING_VERSION: "0.1.0"
