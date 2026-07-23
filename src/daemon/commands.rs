@@ -87,11 +87,13 @@ where
     /// #108, the same transition invariant [`adopt_manual_swap`](Self::adopt_manual_swap) upholds
     /// for the standalone-`use` path), and returns the SAME `Event::Swap` (`Manual` / `Forced`) the
     /// standalone `use` emits — so the cooldown derived from the durable log agrees whichever path
-    /// wrote.
+    /// wrote. The returned events also carry any edge-triggered pre-swap canary alarm (#714) the
+    /// gated [`locked_swap`](Self::locked_swap) raised — including on a REFUSED swap, where the
+    /// wire ack stays a redacted rejection but the durable log names the drift.
     pub(super) async fn perform_socket_swap(
         &mut self,
         command: &SwapCommand,
-    ) -> (SwapAck, Option<Event>) {
+    ) -> (SwapAck, Vec<Event>) {
         // 1. Resolve the target handle (label OR uuid) against the CURRENT roster — the daemon's
         //    OWN resolution, never a client-provided index; it never guesses (issue #17).
         let target_idx = match crate::use_account::resolve_target(&self.roster, &command.target) {
@@ -101,7 +103,7 @@ where
                     SwapAck::Rejected {
                         reason: SwapRejection::AmbiguousTarget,
                     },
-                    None,
+                    Vec::new(),
                 )
             }
             // Not found (or any other resolve failure) → unknown target.
@@ -110,7 +112,7 @@ where
                     SwapAck::Rejected {
                         reason: SwapRejection::UnknownTarget,
                     },
-                    None,
+                    Vec::new(),
                 )
             }
         };
@@ -152,9 +154,9 @@ where
                 SwapAck::AlreadyActive {
                     to: self.roster[target_idx].label.clone(),
                 },
-                None,
+                Vec::new(),
             ),
-            SwapVerdict::Reject(reason) => (SwapAck::Rejected { reason }, None),
+            SwapVerdict::Reject(reason) => (SwapAck::Rejected { reason }, Vec::new()),
             // The verdict returns `Swap` only when an active account exists (it rejects
             // `NoActiveAccount` otherwise); re-match defensively rather than `expect` on the
             // long-running daemon path.
@@ -163,7 +165,7 @@ where
                     SwapAck::Rejected {
                         reason: SwapRejection::NoActiveAccount,
                     },
-                    None,
+                    Vec::new(),
                 ),
                 Some(active_idx) => {
                     let outgoing = self.roster[active_idx].stash();
@@ -171,8 +173,13 @@ where
                     // The SAME lock-wrapped engine (#64) the auto-swaps use: #6 is no-half-swap, so
                     // an error (a contended lock that fails closed, a locked keychain) leaves the
                     // canonical item and both stashes coherent — ZERO writes — and becomes a
-                    // redacted rejection.
-                    match self.locked_swap(&outgoing, &incoming).await {
+                    // redacted rejection. The pre-swap canary (#714) gates it identically to the
+                    // auto-swaps — a canary refusal surfaces as the same redacted rejection
+                    // (`classify_swap_failure` keeps the wire enum closed for old clients), while
+                    // `events` carries the durable edge-triggered canary alarm alongside any
+                    // `Event::Swap`.
+                    let mut events = Vec::new();
+                    match self.locked_swap(&outgoing, &incoming, &mut events).await {
                         Ok(_report) => {
                             let prev_active = self.state.active;
                             // Mirror the auto-swap tail: cache active, arm the cooldown, prime the
@@ -193,21 +200,24 @@ where
                             // so the log-derived cooldown agrees whichever path wrote. `session_pct`
                             // = 0: a manual/forced swap is not session-triggered (the reason
                             // distinguishes it). Non-secret handles only (issue #15).
-                            let event = Event::Swap {
+                            events.push(Event::Swap {
                                 from: from.clone(),
                                 to: to.clone(),
                                 reason,
                                 session_pct: 0,
                                 // Manual / forced swap: operator-driven, not a projection (#634).
                                 projection: None,
-                            };
-                            (SwapAck::Accepted { from, to }, Some(event))
+                            });
+                            (SwapAck::Accepted { from, to }, events)
                         }
                         Err(err) => (
                             SwapAck::Rejected {
                                 reason: classify_swap_failure(&err),
                             },
-                            None,
+                            // A canary-refused swap still carries its edge-triggered alarm
+                            // event (#714) — the rejection is redacted on the wire, but the
+                            // durable log names the drift/ambiguity once per episode.
+                            events,
                         ),
                     }
                 }
@@ -1058,16 +1068,18 @@ mod tests {
             daemon.state.last_swap.is_some(),
             "a completed swap arms the post-swap cooldown",
         );
-        // The durable event is the MANUAL (operator-driven) swap, session_pct 0 (not session-driven).
+        // The durable event is the MANUAL (operator-driven) swap, session_pct 0 (not
+        // session-driven) — and nothing else: the pre-swap canary concluded Ok on this
+        // healthy fixture, so no alarm event rides along (#714).
         assert_eq!(
             event,
-            Some(Event::Swap {
+            vec![Event::Swap {
                 from: "work".to_owned(),
                 to: "spare".to_owned(),
                 reason: SwapReason::Manual,
                 session_pct: 0,
                 projection: None,
-            })
+            }]
         );
     }
 
@@ -1116,7 +1128,7 @@ mod tests {
                 reason: SwapRejection::WeeklyExhausted,
             }
         );
-        assert!(no_event.is_none(), "a refused swap emits no event");
+        assert!(no_event.is_empty(), "a refused swap emits no event");
         assert!(
             daemon
                 .store
@@ -1152,13 +1164,13 @@ mod tests {
         // A forced swap records the FORCED reason (distinct from Manual), still session_pct 0.
         assert_eq!(
             event,
-            Some(Event::Swap {
+            vec![Event::Swap {
                 from: "work".to_owned(),
                 to: "spare".to_owned(),
                 reason: SwapReason::Forced,
                 session_pct: 0,
                 projection: None,
-            })
+            }]
         );
     }
 
@@ -1208,7 +1220,7 @@ mod tests {
                 reason: SwapRejection::KeychainLocked,
             }
         );
-        assert!(event.is_none(), "a refused swap emits no event");
+        assert!(event.is_empty(), "a refused swap emits no event");
         // ZERO writes: once unlocked the canonical still holds A's token, the display still shows A,
         // in-memory active never advanced, and no cooldown was armed. `force` forged no torn write.
         daemon.store.set_locked(false);
@@ -1266,7 +1278,7 @@ mod tests {
                 reason: SwapRejection::UnknownTarget,
             }
         );
-        assert!(event.is_none());
+        assert!(event.is_empty());
         assert!(
             daemon
                 .store
@@ -1319,7 +1331,7 @@ mod tests {
                 to: "work".to_owned(),
             }
         );
-        assert!(event.is_none());
+        assert!(event.is_empty());
         assert!(
             daemon
                 .store
@@ -1330,6 +1342,91 @@ mod tests {
             "an already-active no-op writes nothing",
         );
         assert!(daemon.state.last_swap.is_none(), "a no-op arms no cooldown");
+    }
+
+    #[tokio::test]
+    async fn perform_socket_swap_carries_the_canary_drift_alarm_on_a_refused_swap() {
+        // Issue #714 on the daemon-routed path: a drifted canary refuses the socket swap with the
+        // EXISTING redacted `Failed` rejection (the wire enum stays closed — an old Swift decoder
+        // must keep decoding it), while the returned events STILL carry the edge-triggered
+        // `canary_drift` alarm — the durable record of WHY, which the ack deliberately does not
+        // spell out. Zero writes. This pins the `Option<Event> → Vec<Event>` plumbing: dropping
+        // the events on the `Err` arm would silently lose the drift record while every ack
+        // assertion stayed green.
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        // The DRIFT fixture: the canonical holds spare's stashed token while the (soon frozen)
+        // display still names work — the canary's positive `A ≠ B` divergence.
+        let store = store_holding(b"B-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (dir, json) = claude_json("u-A");
+        // Both under the trigger: warm-up HOLDS (no auto-swap fires first) and resolves active
+        // token-first to spare(1).
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10);
+        let tun = tunables(95, 80, 100);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json.clone(),
+            &tun,
+        );
+        warmed_tick(&mut daemon).await;
+        assert_eq!(
+            daemon.state.active,
+            Some(1),
+            "warm-up resolved active token-first = spare"
+        );
+
+        // Freeze the display so the canary's best-effort heal cannot land (the persistent-
+        // divergence posture every drift fixture models), then drive the operator's swap.
+        let mut perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o500);
+        std::fs::set_permissions(dir.path(), perms.clone()).unwrap();
+        let (ack, events) = daemon
+            .perform_socket_swap(&SwapCommand {
+                target: "work".to_owned(),
+                force: false,
+            })
+            .await;
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o700);
+        std::fs::set_permissions(dir.path(), perms).unwrap();
+
+        // The ack is the CLOSED wire enum's opaque `Failed` — never a new variant an old client
+        // would fail to decode…
+        assert_eq!(
+            ack,
+            SwapAck::Rejected {
+                reason: SwapRejection::Failed,
+            }
+        );
+        // …while the durable alarm rides the returned events (labels only, #15).
+        assert_eq!(
+            events,
+            vec![Event::CanaryDrift {
+                displayed: "work".to_owned(),
+                matched: "spare".to_owned(),
+                overridden: false,
+            }]
+        );
+        // Zero writes: the canonical still holds the drifted token, untouched.
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"B-token")));
+        assert!(
+            daemon.state.last_swap.is_none(),
+            "a refusal arms no cooldown"
+        );
     }
 
     // --- perform_socket_capture (daemon capture-apply, issue #359) -----------

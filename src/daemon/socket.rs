@@ -1341,6 +1341,9 @@ pub(crate) fn encode_heartbeat_frame(generated_at: i64) -> String {
 /// but no in-tree client CONSUMES yet, so a non-test build would see it unused.
 #[cfg(test)]
 #[derive(Debug)]
+// Test-scoped, one transient frame decoded and asserted at a time — the snapshot/heartbeat size
+// gap is irrelevant, and boxing would only obscure the assertions.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum WatchFrame {
     /// A full status snapshot (the frozen #164 envelope).
     Snapshot(VersionedStatus),

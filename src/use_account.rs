@@ -69,6 +69,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::active;
+use crate::canary::{self, CanaryOutcome};
 use crate::config::{Account, Config};
 use crate::daemon::{
     AccountStatusLine, RealRosterPoller, RosterPoller, StatusResponse, SwapAck, SwapRejection,
@@ -744,6 +745,41 @@ where
                 }
             }
         };
+
+        // Pre-swap behavioral canary (issue #714): the SAME fresh Layer-1 resolution
+        // probe → display reconcile → Layer-2 stash-token cross-check the daemon runs
+        // in `locked_swap`, so the daemon-DOWN write path is gated identically to the
+        // daemon-routed one. SAFETY, not policy — `--force` does NOT bypass it (it sits
+        // with the locked-keychain abort, not the cooldown/viability gates); only the
+        // documented `canary_drift_override` tunable lets a diagnosed-false DRIFT
+        // proceed, and an overridden run is still logged. Layer-1 refusals (gone /
+        // ambiguous resolution) have no override — an atomic in-place write has no
+        // unique, safe target. INCONCLUSIVE proceeds (never block on "couldn't
+        // verify"). Refusal events are best-effort like the daemon's: the typed error
+        // must surface even if the log write fails. The adopt branch above is exempt by
+        // construction: it runs only when the canonical is CONFIRMED-gone / the
+        // outgoing unresolvable, so there is no resolved credential to cross-check.
+        match canary::run(seams.store, seams.stash, &config.roster, seams.claude_json).await? {
+            CanaryOutcome::NotFound => return Err(Error::CredentialNotFound),
+            CanaryOutcome::Ambiguous { count } => {
+                let _ = log.emit(&Event::CanaryAmbiguous { count });
+                return Err(Error::CredentialAmbiguous { count });
+            }
+            CanaryOutcome::Drift { displayed, matched } => {
+                let displayed = config.roster[displayed].label.clone();
+                let matched = config.roster[matched].label.clone();
+                let overridden = config.tunables.canary_drift_override;
+                let _ = log.emit(&Event::CanaryDrift {
+                    displayed: displayed.clone(),
+                    matched: matched.clone(),
+                    overridden,
+                });
+                if !overridden {
+                    return Err(Error::CanaryDrift { displayed, matched });
+                }
+            }
+            CanaryOutcome::Ok | CanaryOutcome::Inconclusive(_) => {}
+        }
 
         // Reuse the swap engine UNCHANGED, wrapped in the single-writer swap lock
         // (#64): acquired (blocking, bounded) BEFORE the swap reads anything and held
@@ -1478,6 +1514,7 @@ mod tests {
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -1500,6 +1537,7 @@ mod tests {
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -1819,6 +1857,7 @@ mod tests {
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -2312,6 +2351,133 @@ mod tests {
         // Unlock and confirm ZERO writes: the canonical still holds work's token.
         store.set_locked(false);
         assert_eq!(canonical(&store).await, b"A-token", "ZERO writes");
+    }
+
+    // --- acceptance: behavioral canary on the standalone path (issue #714) ---
+
+    /// Freeze / thaw the `~/.claude.json` directory (0o500 ⇄ 0o700) so the
+    /// canary's best-effort display heal — a temp-file + rename in that same
+    /// directory — cannot land, pinning the stale display the drift fixtures need.
+    fn set_dir_mode(dir: &Path, mode: u32) {
+        let mut perms = std::fs::metadata(dir).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, mode);
+        std::fs::set_permissions(dir, perms).unwrap();
+    }
+
+    #[tokio::test]
+    async fn use_refuses_a_drifted_canary_even_with_force() {
+        // Issue #714 AC on the daemon-DOWN path: the canonical byte-matches
+        // spare's stash while the (heal-frozen) display names work — positive
+        // identity drift. The standalone `use` refuses the credential write with
+        // ZERO writes, and `--force` does NOT bypass it: the canary is SAFETY
+        // (like the locked-keychain abort), not policy.
+        let store = FakeCredentialStore::empty();
+        store.write(&cred(b"B-token")).await.unwrap();
+        let stash = FakeAccountStash::empty();
+        stash
+            .write("Sessiometer/u-A", &stashed(b"A-token", "u-A"))
+            .await
+            .unwrap();
+        stash
+            .write("Sessiometer/u-B", &stashed(b"B-token", "u-B"))
+            .await
+            .unwrap();
+        let (json_dir, json) = claude_json_for("u-A");
+
+        set_dir_mode(json_dir.path(), 0o500);
+        let (result, log) = run_use_over(
+            &store,
+            &stash,
+            &json,
+            "work",
+            true,
+            Probe::Live { weekly: 0.10 },
+        )
+        .await;
+        set_dir_mode(json_dir.path(), 0o700);
+
+        assert!(
+            matches!(
+                &result,
+                Err(Error::CanaryDrift { displayed, matched })
+                    if displayed == "work" && matched == "spare"
+            ),
+            "got {result:?}"
+        );
+        assert_eq!(canonical(&store).await, b"B-token", "ZERO writes");
+        // The refusal is on the durable record (labels only), with no swap line.
+        assert!(
+            log.contains("event=canary_drift displayed=work matched=spare"),
+            "the refused drift is logged: {log}"
+        );
+        assert!(!log.contains("overridden=true"), "no override rode: {log}");
+        assert!(!log.contains("event=swap"), "no swap was written: {log}");
+    }
+
+    #[tokio::test]
+    async fn use_with_the_override_swaps_through_a_drift_and_logs_it() {
+        // Issue #714 AC: `canary_drift_override = true` lets the standalone `use`
+        // proceed despite a standing Layer-2 drift — and the ride is on the
+        // durable record (`overridden=true`) alongside the normal swap event.
+        let store = FakeCredentialStore::empty();
+        store.write(&cred(b"B-token")).await.unwrap();
+        let stash = FakeAccountStash::empty();
+        stash
+            .write("Sessiometer/u-A", &stashed(b"A-token", "u-A"))
+            .await
+            .unwrap();
+        stash
+            .write("Sessiometer/u-B", &stashed(b"B-token", "u-B"))
+            .await
+            .unwrap();
+        let (json_dir, json) = claude_json_for("u-A");
+        let mut config = config_ab();
+        config.tunables.canary_drift_override = true;
+
+        let log_dir = tempfile::tempdir().unwrap();
+        let log_path = log_dir.path().join("sessiometer.log");
+        let mut log = EventLog::at(&log_path).unwrap();
+        let poller = FakePoller::new(Probe::Live { weekly: 0.10 });
+        let lock_dir = tempfile::tempdir().unwrap();
+        let lock_path = lock_dir.path().join("swap.lock");
+        let notifier = FakeNotifier::ok();
+        let cache = FakeCache::miss();
+
+        set_dir_mode(json_dir.path(), 0o500);
+        let result = run_use(
+            &config,
+            "work",
+            false,
+            false,
+            Seams {
+                cache: &cache,
+                poller: &poller,
+                store: &store,
+                stash: &stash,
+                claude_json: &json,
+                lock_path: &lock_path,
+                notifier: &notifier,
+            },
+            &mut log,
+        )
+        .await;
+        set_dir_mode(json_dir.path(), 0o700);
+
+        assert!(result.is_ok(), "the override lets the swap run: {result:?}");
+        assert_eq!(
+            canonical(&store).await,
+            b"A-token",
+            "the canonical rerouted to work (u-A) despite the standing drift"
+        );
+        let log_text = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            log_text.contains("event=canary_drift displayed=work matched=spare overridden=true"),
+            "the overridden ride is on the record: {log_text}"
+        );
+        assert!(
+            log_text.contains("event=swap from=spare to=work reason=manual"),
+            "the swap itself logs normally: {log_text}"
+        );
     }
 
     // --- acceptance: adopt-target recovery (issue #212) ----------------------

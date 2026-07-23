@@ -120,6 +120,11 @@ impl Config {
                     t.fleet_runway_warn_secs.to_string(),
                     present("tunables", "fleet_runway_warn_secs"),
                 ),
+                entry(
+                    "canary_drift_override",
+                    t.canary_drift_override.to_string(),
+                    present("tunables", "canary_drift_override"),
+                ),
             ],
         };
 
@@ -464,6 +469,18 @@ impl Config {
         out.push_str(&format!(
             "fleet_runway_warn_secs = {}\n",
             t.fleet_runway_warn_secs
+        ));
+        out.push_str(
+            "# Keychain-identity canary override (issue #714): when the pre-swap canary\n\
+             # detects DRIFT (the resolved keychain credential byte-matches a DIFFERENT\n\
+             # account's stash than the one Claude Code's state names active), the daemon\n\
+             # refuses the credential write. Set true ONLY to clear a diagnosed false\n\
+             # alarm: swaps proceed despite drift, each logged with overridden=true.\n\
+             # Never bypasses the zero/ambiguous resolution guards. Default false.\n",
+        );
+        out.push_str(&format!(
+            "canary_drift_override = {}\n",
+            t.canary_drift_override
         ));
 
         // Per-cycle timing jitter (issue #38): drawn each cycle and clamped to the

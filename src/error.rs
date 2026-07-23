@@ -514,6 +514,31 @@ pub(crate) enum Error {
     )]
     SwapWrongIdentityRestash,
 
+    /// The behavioral canary's pre-swap identity cross-check found DRIFT (issue
+    /// #714): the resolved canonical credential byte-matches a DIFFERENT roster
+    /// account's stash (`matched`) than the one Claude Code's own state names
+    /// active (`displayed`) — evidence the #100 keychain derivation no longer
+    /// points at the credential Claude Code is actually using. The credential
+    /// WRITE is refused pre-mutation (ZERO writes; an atomic in-place `-U`
+    /// overwrite of a drifted target would clobber an unrelated secret
+    /// unrecoverably); reads / poll / `status` stay live. A generic exit `1`,
+    /// like its engine-guard sibling [`Error::SwapWrongIdentityRestash`] — not a
+    /// "retry shortly" (`4`) condition, since drift does not clear on its own.
+    /// Carries only operator LABELS (issue #15), never a token, email, or
+    /// account-uuid.
+    #[error(
+        "refusing the credential write: the keychain-identity canary detected drift — the \
+         resolved credential belongs to `{matched}`, but Claude Code's state names `{displayed}` \
+         active. Investigate with `sessiometer status`; if this is a false alarm, set \
+         `canary_drift_override = true` under `[tunables]` in config.toml and restart the daemon"
+    )]
+    CanaryDrift {
+        /// Label of the account `~/.claude.json` names active.
+        displayed: String,
+        /// Label of the account whose stashed token the canonical actually matches.
+        matched: String,
+    },
+
     // --- Daemon-routed swap (issue #167) -------------------------------------
     /// The running daemon performed a `use` swap on our behalf (issue #167 — `use`
     /// routes THROUGH the daemon when one is up) and its swap engine aborted for a

@@ -91,6 +91,7 @@ use std::time::{Duration, Instant};
 
 use tokio::signal::unix::{signal, Signal, SignalKind};
 
+use crate::canary::CanaryOutcome;
 use crate::claude_state;
 use crate::config::{Account, Config, Tunables, DEFAULT_REFRESH_SYSTEMIC_FAILURE_N};
 // The daemon↔refresh_tick boundary contract (issue #202) lives in its own leaf module so
@@ -139,7 +140,7 @@ mod snapshot;
 
 pub(crate) use snapshot::{
     credential_health, refresh_health_view, to_pct, to_pct_exact, versioned_status_response,
-    AccountReading, AccountStatusLine, BlindActive, BlindPreemptSwap, CanonicalScrub,
+    AccountReading, AccountStatusLine, BlindActive, BlindPreemptSwap, CanaryStatus, CanonicalScrub,
     LandingOvershoot, NextSwap, NextSwapReason, NoTargetCause, SchemaVersion, StatusResponse,
     StatusSnapshot, VersionedStatus, STATUS_SCHEMA_VERSION,
 };
@@ -1474,6 +1475,14 @@ struct DecisionState {
     /// mechanism-down signal distinct from the per-account `at_risk` rollup. `Default` (healthy,
     /// no streak) is the fresh-daemon state. See [`SystemicRefreshHealth`].
     systemic_refresh: SystemicRefreshHealth,
+    /// The behavioral canary's LAST concluded verdict (issue #714), with labels resolved at
+    /// detection time — `None` until the first canary run concludes (a canary that could not run,
+    /// e.g. under a locked keychain, HOLDS the previous value: no evidence is not a verdict, the
+    /// same discipline as the #464 canonical-liveness edge). Refreshed by
+    /// [`Daemon::refresh_canary`] at boot and before every swap; the value equality against a
+    /// fresh verdict IS the edge trigger for the durable `canary_drift` / `canary_ambiguous` /
+    /// `canary_cleared` events, and [`Daemon::snapshot`] copies it onto the `status` wire.
+    canary: Option<CanaryStatus>,
 }
 
 #[cfg(test)]
@@ -1646,6 +1655,16 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// Consecutive successful recovery probes before a quarantined account is
     /// restored to the rotation (issue #42; config `monitor_recovery_m`, `1..=20`).
     monitor_recovery_m: u8,
+    /// The documented operator override for a FALSE canary drift (issue #714,
+    /// `canary_drift_override` in `[tunables]`): when `true`, a positive Layer-2
+    /// DRIFT verdict is logged (`overridden=true` on the durable event, `overridden`
+    /// on the `status` wire) but the credential write PROCEEDS — the recovery lever
+    /// for an unattended daemon stuck refusing swaps on a drift the operator has
+    /// investigated and judged false. Layer-1 refusals (zero / ambiguous) are NOT
+    /// overridable — they have no false-positive story, and the atomic in-place
+    /// write has no unique, safe target under them. `false` (refuse on drift) is
+    /// the default and the safe posture.
+    canary_drift_override: bool,
     /// The single-writer swap lock path (issue #64), or `None` to swap WITHOUT the
     /// cross-process lock. `None` is the hermetic-test default — a single-process
     /// test has no second writer to serialize against, so taking a real `flock`
@@ -1823,6 +1842,9 @@ where
             tiebreak_seed: None,
             monitor_401_n: tunables.monitor_401_n,
             monitor_recovery_m: tunables.monitor_recovery_m,
+            // The #714 canary-drift override — `false` (refuse on drift) by default;
+            // the operator's documented false-positive recovery lever.
+            canary_drift_override: tunables.canary_drift_override,
             // No cross-process swap lock by default; production opts in via
             // `with_swap_lock`. See the field's docs for why tests stay lock-free.
             swap_lock_path: None,
@@ -3353,7 +3375,7 @@ where
         // next cycle.
         let outgoing = self.roster[active_idx].stash();
         let incoming = self.roster[target_idx].stash();
-        match self.locked_swap(&outgoing, &incoming).await {
+        match self.locked_swap(&outgoing, &incoming, events).await {
             Ok(_report) => {
                 self.record_swap(target_idx, &incoming, at).await;
                 // Log the swap (issue #9). `swap::decide` returns only a binary
@@ -3453,7 +3475,49 @@ where
     /// any other swap failure ([`TickAction::SwapFailed`]) and retries next cycle,
     /// never a torn write. With no lock configured (hermetic tests) the swap runs
     /// unlocked — there is no second writer in-process to serialize against.
-    async fn locked_swap(&self, outgoing: &str, incoming: &str) -> Result<swap::SwapReport> {
+    ///
+    /// EVERY daemon swap passes through here, which makes it the single pre-swap
+    /// slot for the behavioral canary (issue #714): a FRESH
+    /// [`refresh_canary`](Self::refresh_canary) run gates the credential WRITE
+    /// before any mutation. A `Drift` verdict refuses with
+    /// [`Error::CanaryDrift`] unless the operator set `canary_drift_override`; an
+    /// `Ambiguous` / `NotFound` verdict refuses with the matching resolution
+    /// error (no override — an atomic in-place write has no unique, safe target);
+    /// `Ok` / `Inconclusive` proceed (never block on "couldn't verify"). A canary
+    /// that cannot RUN (`Err` — locked keychain) aborts exactly as the engine's
+    /// own up-front read would, holding the last verdict. The canary runs OUTSIDE
+    /// the swap lock (keychain enumeration + stash reads are slow; the lock's
+    /// bounded wait must stay short); inside the lock the engine's #211
+    /// [`SwapWrongIdentityRestash`](Error::SwapWrongIdentityRestash) guard remains
+    /// as the inner net for the verdict→lock window — covering a canonical moved
+    /// to the INCOMING account's token (the wrong-identity staple it was built
+    /// for). A move to a THIRD account's token inside that window still passes it
+    /// as a legitimate in-place refresh — the whole pre-#714 exposure, which this
+    /// gate shrinks to the milliseconds between verdict and lock rather than
+    /// closes outright.
+    async fn locked_swap(
+        &mut self,
+        outgoing: &str,
+        incoming: &str,
+        events: &mut Vec<Event>,
+    ) -> Result<swap::SwapReport> {
+        match self.refresh_canary(events).await? {
+            CanaryOutcome::NotFound => return Err(Error::CredentialNotFound),
+            CanaryOutcome::Ambiguous { count } => return Err(Error::CredentialAmbiguous { count }),
+            CanaryOutcome::Drift { displayed, matched } => {
+                if !self.canary_drift_override {
+                    return Err(Error::CanaryDrift {
+                        displayed: self.roster[displayed].label.clone(),
+                        matched: self.roster[matched].label.clone(),
+                    });
+                }
+                // Override set: proceed despite drift. `refresh_canary` above logged
+                // the episode's ENTRY with `overridden=true` (edge-triggered — later
+                // rides in the same episode log only their `Event::Swap`), and the
+                // status wire carries the standing `overridden: true` the whole time.
+            }
+            CanaryOutcome::Ok | CanaryOutcome::Inconclusive(_) => {}
+        }
         swap::swap_locked(
             self.swap_lock_path
                 .as_deref()
@@ -3635,7 +3699,7 @@ where
         // stays quarantined and the emergency swap retries next cycle.
         let outgoing = self.roster[active_idx].stash();
         let incoming = self.roster[target_idx].stash();
-        match self.locked_swap(&outgoing, &incoming).await {
+        match self.locked_swap(&outgoing, &incoming, events).await {
             Ok(_report) => {
                 self.record_swap(target_idx, &incoming, at).await;
                 events.push(Event::EmergencySwap {
@@ -3867,7 +3931,7 @@ where
         // (`record_swap` drops it only on success), so the gate re-arms and retries next cycle.
         let outgoing = self.roster[active_idx].stash();
         let incoming = self.roster[target_idx].stash();
-        match self.locked_swap(&outgoing, &incoming).await {
+        match self.locked_swap(&outgoing, &incoming, events).await {
             Ok(_report) => {
                 let from_label = self.roster[active_idx].label.clone();
                 let to_label = self.roster[target_idx].label.clone();
@@ -4205,7 +4269,7 @@ where
         // the canonical + both stashes coherent, so we retry next cycle.
         let outgoing = self.roster[active_idx].stash();
         let incoming = self.roster[target_idx].stash();
-        match self.locked_swap(&outgoing, &incoming).await {
+        match self.locked_swap(&outgoing, &incoming, events).await {
             Ok(_report) => {
                 self.record_swap(target_idx, &incoming, at).await;
                 events.push(Event::Swap {
@@ -5309,6 +5373,12 @@ mod tests {
         async fn write(&self, credential: &Credential) -> Result<()> {
             (**self).write(credential).await
         }
+        async fn probe_resolution(&self) -> Result<()> {
+            // Delegate rather than inherit the trait's clean-probe default, so a
+            // test scripting `set_ambiguous` / `set_not_found` on the shared fake
+            // reaches the canary probe through this handle too (issue #714).
+            (**self).probe_resolution().await
+        }
     }
 
     /// An [`ExternalLoginWatch`] that becomes due exactly ONCE — simulating a manual
@@ -5691,6 +5761,9 @@ mod tests {
             // the shipped default) so baseline daemon tests never arm the runway check; the #650
             // edge-trigger tests drive the pure core / a probed daemon explicitly.
             fleet_runway_warn_secs: 0,
+            // Issue #714 canary drift override: OFF (the shipped default) so the pre-swap canary
+            // refuses on drift; the canary tests that exercise the override set it explicitly.
+            canary_drift_override: false,
             // Existing daemon tests exercise the fixed (no-jitter) path: each
             // strategy draws its base verbatim, identical to the pre-#38 scalars.
             poll_strategy: Strategy::fixed(60.0),
@@ -6962,7 +7035,7 @@ mod tests {
             },
             "a band target is not rotatable, so `use` must refuse it up front",
         );
-        assert!(no_event.is_none(), "a refused swap emits no event");
+        assert!(no_event.is_empty(), "a refused swap emits no event");
         assert!(
             daemon
                 .store

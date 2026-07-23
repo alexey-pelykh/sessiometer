@@ -784,6 +784,38 @@ pub(crate) enum Event {
     /// churn window resets and recovery resumes. `account` is the last-known active HANDLE the scrub
     /// emptied, or absent when none was resolved — never a token or email (issue #15).
     CanonicalRecoveryExhausted { account: Option<String> },
+    /// The behavioral canary (issue #714) detected keychain-identity DRIFT: the resolved canonical
+    /// credential byte-matches `matched`'s stash while Claude Code's own state (`~/.claude.json`)
+    /// names `displayed` active — evidence the #100 derivation no longer points at the credential
+    /// Claude Code is actually using. Unless `overridden` (the documented `canary_drift_override`
+    /// tunable let the write proceed), the daemon REFUSES credential writes while this holds
+    /// (pre-mutation, zero writes); reads / poll / `status` stay live. DAEMON-side this is
+    /// edge-triggered: emitted exactly ONCE on entering the drift state (boot canary or a
+    /// pre-swap re-check), never per refused swap while it persists, with
+    /// [`Event::CanaryCleared`] marking the leave edge. The STANDALONE daemon-down `use` path
+    /// has no carried state to edge off, so it emits one line per refused/overridden
+    /// invocation instead — each line there IS one operator action. Both fields are HANDLES
+    /// (operator labels), never a token, email, or account-uuid (issue #15).
+    CanaryDrift {
+        displayed: String,
+        matched: String,
+        overridden: bool,
+    },
+    /// The behavioral canary's FRESH Layer-1 resolution probe (issue #714) found MORE THAN ONE
+    /// item under the derived canonical service — the #100 uniqueness rule fails, so the
+    /// derivation no longer addresses a single credential and the atomic in-place write has no
+    /// unique, safe target. Credential writes are refused while this holds (no override — unlike
+    /// drift, ambiguity has no false-positive story); reads keep answering from the boot-pinned
+    /// item. Edge-triggered like [`Event::CanaryDrift`]; [`Event::CanaryCleared`] marks the leave
+    /// edge. Carries only the item COUNT (issue #15).
+    CanaryAmbiguous { count: usize },
+    /// The behavioral canary (issue #714) returned to a NON-ALARM verdict (ok / inconclusive /
+    /// not-found) after a [`Event::CanaryDrift`] or [`Event::CanaryAmbiguous`] episode — the
+    /// closing bracket of the alarm edge, mirroring the [`Event::CanonicalScrubbed`] /
+    /// [`Event::CanonicalRestored`] durable-pair idiom (an OVERRIDDEN drift still counts as an
+    /// episode: the alarm was real even though the write proceeded). Edge-triggered: exactly ONCE
+    /// per episode. No fields — the fresh verdict is on the `status` surface (issue #15).
+    CanaryCleared,
     /// `account`'s refresh token is confirmed DEAD and UNRECOVERABLE by automation: a
     /// quarantined account's isolated #106-sweep refresh returned `outcome=dead` (the
     /// stored refresh token is revoked/empty), so no daemon path can revive it — only
@@ -1435,6 +1467,25 @@ impl Event {
                     None => String::new(),
                 };
                 format!("ts={ts} event=canonical_recovery_exhausted{account}")
+            }
+            Event::CanaryDrift {
+                displayed,
+                matched,
+                overridden,
+            } => {
+                // `overridden` trails conditionally (the `late=true` idiom): a refused
+                // drift line stays minimal, and the token appears exactly when the
+                // `canary_drift_override` tunable let the write proceed anyway.
+                let overridden = if *overridden { " overridden=true" } else { "" };
+                format!(
+                    "ts={ts} event=canary_drift displayed={displayed} matched={matched}{overridden}"
+                )
+            }
+            Event::CanaryAmbiguous { count } => {
+                format!("ts={ts} event=canary_ambiguous count={count}")
+            }
+            Event::CanaryCleared => {
+                format!("ts={ts} event=canary_cleared")
             }
             Event::CredentialUnrecoverable { account } => {
                 format!("ts={ts} event=credential_unrecoverable account={account}")
