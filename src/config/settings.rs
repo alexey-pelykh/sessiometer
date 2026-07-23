@@ -136,6 +136,9 @@ fn overlay_tunables(raw: &mut RawTunables, edits: &SetTunables) {
     if let Some(v) = edits.fleet_runway_warn_secs {
         raw.fleet_runway_warn_secs = v;
     }
+    if let Some(v) = edits.canary_drift_override {
+        raw.canary_drift_override = v;
+    }
 }
 
 /// Overlay a `config-set`'s label edits (issue #268): each `account_uuid` → new label is
@@ -358,6 +361,48 @@ mod tests {
         assert_eq!(parsed.fleet_runway_warn_secs, Some(7200));
         let empty: SetTunables = serde_json::from_str("{}").unwrap();
         assert_eq!(empty.fleet_runway_warn_secs, None);
+    }
+
+    #[test]
+    fn apply_settings_overlays_the_canary_drift_override_and_it_round_trips() {
+        // Issue #714: the operator's documented false-drift recovery lever rides the SAME #268
+        // config-set overlay + config-get view + render persistence as every other tunable — the
+        // one plumbing chain the `Error::CanaryDrift` remedy text depends on ("set
+        // `canary_drift_override = true` … and restart"), pinned end-to-end with the NON-default
+        // value so a dropped overlay arm, a typo'd render key, or a miskeyed view field fails
+        // here rather than stranding an unattended daemon on a refused swap.
+        let (after, change) = Config::apply_settings(
+            VALID,
+            &SetTunables {
+                canary_drift_override: Some(true),
+                ..SetTunables::default()
+            },
+            &labels(&[]),
+        )
+        .unwrap();
+        assert!(after.tunables.canary_drift_override);
+        assert!(change.tunables_changed);
+        assert!(after.view().tunables.canary_drift_override);
+        // The overlaid value renders and re-parses verbatim (config-set persists via `render`).
+        let reparsed = Config::parse(&after.render()).unwrap();
+        assert!(reparsed.tunables.canary_drift_override);
+
+        // The hand-edit path the error message actually names: a bare TOML line under
+        // `[tunables]` parses to the armed override.
+        assert!(
+            Config::parse(&with_tunables("canary_drift_override = true"))
+                .unwrap()
+                .tunables
+                .canary_drift_override,
+            "the documented hand-edit arms the override"
+        );
+
+        // The key is a representable scalar edit (serde round-trip), unset stays None.
+        let parsed: SetTunables =
+            serde_json::from_str(r#"{"canary_drift_override":true}"#).unwrap();
+        assert_eq!(parsed.canary_drift_override, Some(true));
+        let empty: SetTunables = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.canary_drift_override, None);
     }
 
     #[test]

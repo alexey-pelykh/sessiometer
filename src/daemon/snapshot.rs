@@ -77,6 +77,12 @@ pub(crate) struct StatusSnapshot {
     /// record, projected `Some` only within the `LANDING_OVERSHOOT_NOTICE_SECS` window;
     /// [`status_response`] copies it straight onto the wire. `None` by `Default`.
     pub(crate) recent_landing_overshoot: Option<LandingOvershoot>,
+    /// The behavioral canary's LAST verdict (issue #714), or `None` until the first canary run
+    /// concludes (and on a canary that could not run at all — e.g. a boot under a locked
+    /// keychain: no evidence is not a verdict). Copied from the daemon's carried canary state in
+    /// [`Daemon::snapshot`]; [`status_response`] copies it straight onto the wire. `None` by
+    /// `Default`. Labels only — never a token or email (the #15 discipline).
+    pub(crate) canary: Option<CanaryStatus>,
 }
 
 /// The non-secret refresh-health inputs `status` surfaces in `--json` (issue #119): the
@@ -218,6 +224,52 @@ pub(crate) enum CanonicalScrub {
     Exhausted,
 }
 
+/// The behavioral canary's LAST verdict (issue #714) — did the reverse-engineered #100 keychain
+/// derivation still point at the credential Claude Code is actually using, the last time the
+/// canary ran (daemon boot + every pre-swap re-check)? Layer 1 is the fresh service-resolution
+/// uniqueness probe; Layer 2 is the offline stash-token identity cross-check (the decided
+/// option-C oracle — see [`crate::canary`]).
+///
+/// Internally tagged on `verdict` (mirroring [`CanonicalScrub`]'s `state`), so future per-variant
+/// fields are ADDITIVE rather than a breaking `string → object` reshape. Doubles as the daemon's
+/// own carried canary state (`DecisionState`) — one type, resolved to operator LABELS at
+/// detection time, so no surface downstream of it can leak a token, email, or account-uuid
+/// (issue #15).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "verdict")]
+pub(crate) enum CanaryStatus {
+    /// Positive Layer-2 pass: the resolved canonical token byte-matches the displayed active
+    /// account's own stash.
+    Ok,
+    /// No positive identity evidence either way (the canonical matches no stash — overwhelmingly
+    /// an in-place token refresh — or `~/.claude.json` names no roster account): the canary
+    /// FAILS OPEN to Layer-1-only protection. The honest surface of the offline oracle's
+    /// documented residual (see [`crate::canary`] Layer 3): identity is UNVERIFIED, not verified.
+    Inconclusive,
+    /// Layer 1: ZERO items under the derived service — a service-name derivation change, or a
+    /// scrubbed keychain (the [`CanonicalScrub`] machinery carries the scrub remedy; this verdict
+    /// records that the canary saw it too).
+    NotFound,
+    /// Layer 1: MORE THAN ONE item under the derived service — the #100 uniqueness rule fails,
+    /// so credential writes are refused (no unique, safe target for the atomic in-place write).
+    Ambiguous {
+        /// How many service-matching items the fresh enumeration found.
+        count: usize,
+    },
+    /// Layer 2 DRIFT: the resolved canonical token byte-matches a DIFFERENT account's stash than
+    /// the one Claude Code's own state names active. Credential writes are refused pre-mutation
+    /// (zero writes) unless `overridden`.
+    Drift {
+        /// Label of the account `~/.claude.json` names active.
+        displayed: String,
+        /// Label of the account whose stashed token the canonical actually matches.
+        matched: String,
+        /// Whether the documented `canary_drift_override` tunable was set, letting credential
+        /// writes proceed despite the drift.
+        overridden: bool,
+    },
+}
+
 /// One account's latest reading.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AccountReading {
@@ -319,7 +371,15 @@ pub(crate) struct SchemaVersion {
 /// likewise optional and (via `skip_serializing_if`) omitted entirely except in the bounded window
 /// after such an overshoot, so an unaffected frame's bytes are unchanged. Takes
 /// `recent_blind_preempt_swap`'s omit-when-absent pattern; a pre-#613 client ignores the unknown key.
-pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion { major: 1, minor: 8 };
+/// `1.9` ADDED the daemon-level [`StatusResponse::canary`] behavioral-canary verdict
+/// ([`CanaryStatus`], issue #714): whether the reverse-engineered #100 keychain derivation still
+/// points at the credential Claude Code is actually using (the fresh Layer-1 uniqueness probe + the
+/// offline Layer-2 stash-token identity cross-check, run at boot and pre-swap) — likewise optional
+/// and (via `skip_serializing_if`) omitted only until the first canary run concludes, so a pre-#714
+/// client ignores the unknown key. UNLIKE the omit-when-healthy siblings, a healthy verdict is
+/// still carried once known: "verified ok" and "unverified" are different operator facts (the
+/// canary's Layer-3 residual surface).
+pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion { major: 1, minor: 9 };
 
 /// The control socket's `status` reply PAYLOAD — handles + percentages + the forward-looking
 /// `next_swap` candidate, and nothing else (issue #15: never a token or email).
@@ -410,6 +470,23 @@ pub(crate) struct StatusResponse {
     /// never a token or email (issue #15).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) recent_landing_overshoot: Option<LandingOvershoot>,
+    /// The behavioral canary's LAST verdict (issue #714): did the reverse-engineered #100
+    /// keychain derivation still point at the credential Claude Code is actually using, the last
+    /// time the canary ran (boot + every pre-swap re-check)? `Some(Drift { .. })` /
+    /// `Some(Ambiguous { .. })` are the refusing states (`sessiometer status` renders a fault
+    /// banner: credential writes are refused while they hold); `Some(Ok)` is the positive
+    /// identity pass; `Some(Inconclusive)` is the honest fail-open Layer-1-only state; `None`
+    /// means the canary has not concluded a run (pre-#714 daemon, or it could not run — e.g. a
+    /// locked keychain at boot). `Option` + `#[serde(default, skip_serializing_if =
+    /// "Option::is_none")]` per the added-field convention (the MINOR [`STATUS_SCHEMA_VERSION`]
+    /// bump 1.8 → 1.9, mirroring `canonical_scrub`): a pre-#714 daemon omits the field → `None`
+    /// (a pre-#714 client ignores the unknown key, the minor-bump tolerate-by-ignoring
+    /// convention). Unlike the omit-when-healthy siblings this is omitted only when NEVER RUN —
+    /// a healthy verdict is still carried, because "verified ok" and "unverified" are different
+    /// operator facts (the Layer-3 residual surface). Labels only — never a token, email, or
+    /// account-uuid (issue #15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) canary: Option<CanaryStatus>,
 }
 
 /// The FROZEN status-snapshot wire contract (issue #164): the [`StatusResponse`] payload plus the
@@ -700,6 +777,7 @@ pub(crate) fn status_response(snapshot: &StatusSnapshot) -> StatusResponse {
         // in `Daemon::snapshot` (windowed): `Some` for a bounded window after a local landing overshoot,
         // `None` otherwise (and then omitted via `skip_serializing_if`).
         recent_landing_overshoot: snapshot.recent_landing_overshoot.clone(),
+        canary: snapshot.canary.clone(),
     }
 }
 

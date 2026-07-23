@@ -1029,6 +1029,25 @@ long-running rotation hits:
   display, and the daemon reconciles the two on its next start — so a process
   death partway through a swap leaves the keychain authoritative and is repaired
   automatically when you run it again.
+- **A drifted keychain derivation refuses writes (behavioral canary).** Before
+  every swap — the daemon before its own swaps, and `use` itself on the
+  daemon-down path, `--force` included — sessiometer re-verifies, fresh rather
+  than from a boot-time cache, that the keychain item it
+  resolves still points at the credential Claude Code is actually using: the
+  resolution must be **unique** (exactly one matching item), and the resolved
+  credential must not byte-match a **different** account's stash than the account
+  Claude Code's own state names active. On such **drift**, credential writes
+  (swaps and auto-protection) are refused *before any mutation* — an in-place
+  overwrite of a wrong target would clobber an unrelated secret unrecoverably —
+  while reads, polling, and `status` stay live; `status` names both accounts in a
+  dedicated line. If you diagnose a **false alarm**, set
+  `canary_drift_override = true` under `[tunables]` in `config.toml` and restart
+  the daemon: swaps then proceed despite the standing drift, and every overridden
+  write is logged with `overridden=true`. Zero or multiple matching keychain
+  items refuse the same way (there is no unique, safe write target) — with no
+  override, since ambiguity has no false-positive story. (The `use --force`
+  adopt-target recovery is deliberately outside this gate: it runs only when the
+  credential is confirmed gone, so there is no resolved item to cross-check.)
 - **Concurrent swap + re-login race (known limitation).** If you run
   `claude /login` at the exact moment the daemon is mid-swap, the two writers race
   on the canonical credential. Last-writer-wins, and the daemon reconciles on its

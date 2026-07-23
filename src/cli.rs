@@ -22,10 +22,10 @@ use unicode_width::UnicodeWidthStr;
 use crate::claude_state::OauthAccount;
 use crate::config::{Account, Config, ConflictPolicy, Origin, OriginReport};
 use crate::daemon::{
-    run_loop, AccountStatusLine, BlindActive, CanonicalScrub, Daemon, ExternalLoginWatcher,
-    InstanceLock, NextSwap, NextSwapReason, NoTargetCause, RealClock, RealKeepWarmEngine,
-    RealRosterPoller, RealShutdown, SchemaVersion, StatusResponse, UnixControl, VersionedStatus,
-    STATUS_SCHEMA_VERSION,
+    run_loop, AccountStatusLine, BlindActive, CanaryStatus, CanonicalScrub, Daemon,
+    ExternalLoginWatcher, InstanceLock, NextSwap, NextSwapReason, NoTargetCause, RealClock,
+    RealKeepWarmEngine, RealRosterPoller, RealShutdown, SchemaVersion, StatusResponse, UnixControl,
+    VersionedStatus, STATUS_SCHEMA_VERSION,
 };
 use crate::error::{Error, Result};
 use crate::keychain::{Credential, RealCredentialStore};
@@ -1482,6 +1482,9 @@ struct SchemaProbe {
 
 /// The reference `status` client's view of a reply after the issue-#164 MAJOR gate: either the
 /// compatible envelope to render, or a mismatch to report visibly.
+// One transient value per `status` invocation, immediately consumed — the payload/mismatch size
+// gap is irrelevant here, and boxing would only add indirection to a render-once path.
+#[allow(clippy::large_enum_variant)]
 enum StatusView {
     /// The daemon's contract major matches — render its payload.
     Render(VersionedStatus),
@@ -2096,21 +2099,43 @@ pub(crate) fn render_status(
     }
     // Worst-first (ADR-0026), so the CLI's print order agrees with its colour rank AND with the
     // menubar panel's `daemonFaultBanner`: keychain unreadable (rank 1, act-now `Red`), then canonical
-    // scrubbed-`exhausted` (rank 2, act-now `Red`), then the landing-overshoot SLO breach (#613, `Red`),
-    // then the pre-death systemic mechanism-down (rank 3, `Yellow`, act-at-your-next-break), and LAST the
-    // calm canonical `recovering` (rank 4, plain — may self-heal). `canonical_scrub` is
-    // exhausted-XOR-recovering, so its two variants emit at their OWN ranks: the guards keeping the calm
-    // `recovering` line BELOW `systemic` mirror the panel resolver's `if case .exhausted` at rank 2 vs its
-    // fall-through at rank 4 — severity ranks by (fault, VARIANT), never fault identity (the panel's
-    // load-bearing invariant, applied to print order too, so a `recovering` scrub co-occurring with a down
-    // refresh mechanism can't sit its "no action needed" ABOVE the `Yellow` warning). Before #575
-    // `systemic` sat first AND wore the only red, ranking the least-blocking fault the loudest.
+    // scrubbed-`exhausted` (rank 2, act-now `Red`), then the #714 canary REFUSAL pair (drift-refusing /
+    // ambiguous, act-now `Red` — credential writes are blocked), then the landing-overshoot SLO breach
+    // (#613, `Red`), then the pre-death systemic mechanism-down (rank 3, `Yellow`,
+    // act-at-your-next-break), then the OVERRIDDEN canary drift (`Yellow` — writes proceed under a
+    // standing operator override; an acknowledged alarm ranks below the unacknowledged systemic
+    // warning), and LAST the calm canonical `recovering` (rank 4, plain — may self-heal).
+    // `canonical_scrub` is exhausted-XOR-recovering and the canary verdict refusing-XOR-overridden, so
+    // each variant emits at its OWN rank: the guards mirror the panel resolver's `if case .exhausted`
+    // at rank 2 vs its fall-through at rank 4 — severity ranks by (fault, VARIANT), never fault
+    // identity (the panel's load-bearing invariant, applied to print order too, so a `recovering`
+    // scrub co-occurring with a down refresh mechanism can't sit its "no action needed" ABOVE the
+    // `Yellow` warning). Before #575 `systemic` sat first AND wore the only red, ranking the
+    // least-blocking fault the loudest.
     out.push_str(&render_keychain_locked(response, color));
     if matches!(response.canonical_scrub, Some(CanonicalScrub::Exhausted)) {
         out.push_str(&render_canonical_scrub(response, color));
     }
+    if matches!(
+        response.canary,
+        Some(CanaryStatus::Drift {
+            overridden: false,
+            ..
+        }) | Some(CanaryStatus::Ambiguous { .. })
+    ) {
+        out.push_str(&render_canary(response, color));
+    }
     out.push_str(&render_landing_overshoot(response, color));
     out.push_str(&render_systemic_refresh_failure(response, color));
+    if matches!(
+        response.canary,
+        Some(CanaryStatus::Drift {
+            overridden: true,
+            ..
+        })
+    ) {
+        out.push_str(&render_canary(response, color));
+    }
     if matches!(response.canonical_scrub, Some(CanonicalScrub::Recovering)) {
         out.push_str(&render_canonical_scrub(response, color));
     }
@@ -2303,8 +2328,18 @@ enum DaemonPayloadFault {
     KeychainLocked,
     /// #469 — the shared credential is readable but EMPTIED and auto-recovery gave up.
     CanonicalScrubExhausted,
+    /// #714 — the behavioral canary found identity DRIFT (the resolved credential
+    /// byte-matches a DIFFERENT account's stash than the displayed active) and the
+    /// override is off: credential writes are REFUSED until cleared.
+    CanaryDriftRefusing,
+    /// #714 — the canary's fresh resolution probe found MORE THAN ONE matching
+    /// keychain item: no unique write target, credential writes REFUSED (no override).
+    CanaryAmbiguous,
     /// #378 — the refresh MECHANISM is down (N consecutive all-error sweeps).
     SystemicRefreshFailure,
+    /// #714 — identity DRIFT stands but `canary_drift_override` lets writes proceed
+    /// (each logged): a standing, operator-acknowledged alarm, not a block.
+    CanaryDriftOverridden,
     /// #469 — scrubbed, but the daemon is adopting a live account back; may self-heal.
     CanonicalScrubRecovering,
 }
@@ -2322,8 +2357,15 @@ impl DaemonPayloadFault {
     /// contradicted the CLI's own vocabulary — the inversion #575 fixes.
     fn severity(self) -> Option<Severity> {
         match self {
-            Self::KeychainLocked | Self::CanonicalScrubExhausted => Some(Severity::Red),
-            Self::SystemicRefreshFailure => Some(Severity::Yellow),
+            // The #714 canary REFUSAL pair joins the act-now band: credential writes are
+            // blocked NOW (auto-protection cannot swap), the same operator urgency as the
+            // vault pair. An OVERRIDDEN drift is next-break `Yellow` — writes proceed, but a
+            // standing identity alarm rides an operator override that deserves re-checking.
+            Self::KeychainLocked
+            | Self::CanonicalScrubExhausted
+            | Self::CanaryDriftRefusing
+            | Self::CanaryAmbiguous => Some(Severity::Red),
+            Self::SystemicRefreshFailure | Self::CanaryDriftOverridden => Some(Severity::Yellow),
             Self::CanonicalScrubRecovering => None,
         }
     }
@@ -2625,6 +2667,61 @@ fn render_canonical_scrub(response: &StatusResponse, color: bool) -> String {
             color,
         ),
         None => String::new(),
+    }
+}
+
+/// The behavioral-canary verdict line (issue #714): rendered as DATA (unconditional — like the
+/// `canonical_scrub` footer, an operator's piped health check must see a refused-writes state),
+/// only for the ALARM verdicts. A REFUSING drift and an AMBIGUOUS resolution are act-now `Red`
+/// (credential writes — swaps AND auto-protection — are refused until cleared); an OVERRIDDEN
+/// drift is next-break `Yellow` (writes proceed under the operator's `canary_drift_override`,
+/// each logged). The healthy / no-verdict states print NOTHING: `ok` and `inconclusive` are the
+/// quiet normal, `not_found` is already voiced by the `canonical_scrub` / `keychain_locked`
+/// machinery (a second line would double-report the same absent credential), and `None` is a
+/// pre-#714 daemon that omits the field. Wording parity with [`Error::CanaryDrift`] /
+/// [`Error::CredentialAmbiguous`] so the refused swap's stderr and this durable surface tell one
+/// story. Operator LABELS and a COUNT only — never a token, email, or account-uuid (issue #15).
+fn render_canary(response: &StatusResponse, color: bool) -> String {
+    match &response.canary {
+        Some(CanaryStatus::Drift {
+            displayed,
+            matched,
+            overridden,
+        }) => {
+            if *overridden {
+                daemon_fault_line(
+                    &format!(
+                        "keychain canary: drift — the resolved credential belongs to {matched}, \
+                         but {displayed} is named active; canary_drift_override is set, swaps \
+                         proceed and are logged"
+                    ),
+                    DaemonPayloadFault::CanaryDriftOverridden,
+                    color,
+                )
+            } else {
+                daemon_fault_line(
+                    &format!(
+                        "keychain canary: drift — the resolved credential belongs to {matched}, \
+                         but {displayed} is named active; credential writes are refused (false \
+                         alarm? set canary_drift_override = true and restart the daemon)"
+                    ),
+                    DaemonPayloadFault::CanaryDriftRefusing,
+                    color,
+                )
+            }
+        }
+        Some(CanaryStatus::Ambiguous { count }) => daemon_fault_line(
+            &format!(
+                "keychain canary: ambiguous — {count} Claude Code-credentials items found \
+                 (expected exactly one); credential writes are refused until the duplicates \
+                 are removed"
+            ),
+            DaemonPayloadFault::CanaryAmbiguous,
+            color,
+        ),
+        Some(CanaryStatus::Ok | CanaryStatus::Inconclusive | CanaryStatus::NotFound) | None => {
+            String::new()
+        }
     }
 }
 
@@ -4572,6 +4669,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -4602,6 +4700,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: systemic,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: Some(true),
@@ -4667,6 +4766,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: scrub,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: Some(true),
@@ -4767,6 +4867,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: locked,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: Some(true),
@@ -4826,6 +4927,130 @@ spare  22222222-2222\n\
     }
 
     #[test]
+    fn render_status_surfaces_the_canary_alarms_and_keeps_the_quiet_verdicts_silent() {
+        // Issue #714: the behavioral-canary ALARM verdicts get a dedicated DATA line — a refusing
+        // drift names both accounts + the override remedy at act-now `Red`; an overridden drift
+        // names the standing alarm + that writes proceed, at next-break `Yellow`; an ambiguous
+        // resolution names the count at `Red` with no override. The quiet verdicts (`ok`,
+        // `inconclusive`, `not_found`) and a pre-#714 `None` print NOTHING — `ok` is the quiet
+        // normal, and `not_found` is already voiced by the scrub/locked machinery. #15-clean:
+        // labels + a count only.
+        let response = |canary| StatusResponse {
+            systemic_refresh_failure: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            canary,
+            recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
+            refresh_enabled: Some(true),
+            accounts: vec![status_line("work", true, Some(60), Some(25))],
+            next_swap: None,
+        };
+        let drift = |overridden| {
+            Some(CanaryStatus::Drift {
+                displayed: "work".to_owned(),
+                matched: "spare".to_owned(),
+                overridden,
+            })
+        };
+
+        // REFUSING drift → both labels + the refusal + the documented override remedy.
+        let refusing = render_status(&response(drift(false)), NOW, None, false);
+        let line = refusing
+            .lines()
+            .find(|l| l.contains("keychain canary: drift"))
+            .expect("the refusing drift line is present");
+        assert!(
+            line.contains("belongs to spare")
+                && line.contains("work is named active")
+                && line.contains("credential writes are refused")
+                && line.contains("canary_drift_override"),
+            "the refusing drift names accounts, refusal, and remedy: {line}"
+        );
+
+        // OVERRIDDEN drift → the standing alarm, and that writes proceed logged.
+        let overridden = render_status(&response(drift(true)), NOW, None, false);
+        let line = overridden
+            .lines()
+            .find(|l| l.contains("keychain canary: drift"))
+            .expect("the overridden drift line is present");
+        assert!(
+            line.contains("canary_drift_override is set") && line.contains("swaps proceed"),
+            "the overridden drift says writes proceed under the override: {line}"
+        );
+        assert!(
+            !line.contains("refused"),
+            "an overridden drift does not claim refusal: {line}"
+        );
+
+        // AMBIGUOUS → the count + the refusal, no override remedy (there is none).
+        let ambiguous = render_status(
+            &response(Some(CanaryStatus::Ambiguous { count: 2 })),
+            NOW,
+            None,
+            false,
+        );
+        let line = ambiguous
+            .lines()
+            .find(|l| l.contains("keychain canary: ambiguous"))
+            .expect("the ambiguous line is present");
+        assert!(
+            line.contains("2 Claude Code-credentials items")
+                && line.contains("credential writes are refused"),
+            "ambiguous names the count and the refusal: {line}"
+        );
+        assert!(
+            !line.contains("canary_drift_override"),
+            "ambiguity has no override: {line}"
+        );
+
+        // The QUIET verdicts (and a pre-#714 daemon omitting the field) print nothing.
+        for quiet in [
+            Some(CanaryStatus::Ok),
+            Some(CanaryStatus::Inconclusive),
+            Some(CanaryStatus::NotFound),
+            None,
+        ] {
+            assert!(
+                !render_status(&response(quiet.clone()), NOW, None, false)
+                    .contains("keychain canary"),
+                "the quiet verdict {quiet:?} prints no canary line"
+            );
+        }
+
+        // ADR-0026 colour bands: refusing drift + ambiguous wear act-now `Red`; the overridden
+        // drift wears next-break `Yellow`. All three plain texts are DATA (asserted above with the
+        // gate closed).
+        for (canary, sgr) in [
+            (drift(false), Severity::Red.sgr()),
+            (
+                Some(CanaryStatus::Ambiguous { count: 2 }),
+                Severity::Red.sgr(),
+            ),
+            (drift(true), Severity::Yellow.sgr()),
+        ] {
+            let colored = render_status(&response(canary), NOW, None, true)
+                .lines()
+                .find(|l| l.contains("keychain canary"))
+                .expect("the canary line is present under --color")
+                .to_owned();
+            assert!(
+                colored.contains(&format!("\x1b[{sgr}m")),
+                "the canary line carries its rank band: {colored:?}"
+            );
+        }
+
+        // #15/#444: no secret reaches any rendered canary surface.
+        for out in [&refusing, &overridden, &ambiguous] {
+            assert!(
+                crate::redaction::meter::unauthored_emails(out, &[]).is_empty()
+                    && !out.to_lowercase().contains("token"),
+                "no secret reaches the canary surface (#15/#444): {out:?}"
+            );
+        }
+    }
+
+    #[test]
     fn daemon_fault_severity_ranks_the_vault_pair_above_systemic_cross_surface() {
         // #575 — the acceptance test: the three daemon-level payload faults must rank the SAME way on
         // the `status` CLI as on the menubar panel (R-2). The vault pair blocks NOW (act-now `Red`,
@@ -4853,6 +5078,24 @@ spare  22222222-2222\n\
             None,
             "recovering is calm — no colour (rank 4)"
         );
+        // #714: the canary REFUSAL pair joins the act-now band (credential writes are blocked
+        // NOW), while an operator-OVERRIDDEN drift drops to the next-break band (writes proceed,
+        // the standing alarm deserves a re-check, not an act-now claim).
+        assert_eq!(
+            DaemonPayloadFault::CanaryDriftRefusing.severity(),
+            Some(Severity::Red),
+            "a refusing canary drift is act-now Red"
+        );
+        assert_eq!(
+            DaemonPayloadFault::CanaryAmbiguous.severity(),
+            Some(Severity::Red),
+            "an ambiguous canary resolution is act-now Red"
+        );
+        assert_eq!(
+            DaemonPayloadFault::CanaryDriftOverridden.severity(),
+            Some(Severity::Yellow),
+            "an overridden canary drift is next-break Yellow"
+        );
 
         // Rendered together (a locked keychain makes the refresh mechanism fail too, so they CO-OCCUR):
         // the operator reading the colour sees the vault pair Red ABOVE the systemic Yellow — no longer
@@ -4861,6 +5104,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: Some(5),
             canonical_scrub: None,
             keychain_locked: true,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: Some(true),
@@ -4915,6 +5159,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: Some(3),
             canonical_scrub: Some(CanonicalScrub::Recovering),
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: Some(true),
@@ -4971,6 +5216,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -5009,6 +5255,7 @@ spare  22222222-2222\n\
                 systemic_refresh_failure: None,
                 canonical_scrub: None,
                 keychain_locked: false,
+                canary: None,
                 recent_blind_preempt_swap: None,
                 recent_landing_overshoot: None,
                 refresh_enabled: None,
@@ -5030,6 +5277,7 @@ spare  22222222-2222\n\
                 systemic_refresh_failure: None,
                 canonical_scrub: None,
                 keychain_locked: false,
+                canary: None,
                 recent_blind_preempt_swap: None,
                 recent_landing_overshoot: None,
                 refresh_enabled: None,
@@ -5055,6 +5303,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -5089,6 +5338,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -5250,6 +5500,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: Some(BlindPreemptSwap {
                 from_label: "spare".to_owned(),
                 to_label: "work".to_owned(),
@@ -5295,6 +5546,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: Some(LandingOvershoot {
                 from_label: "spare".to_owned(),
@@ -5320,6 +5572,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: Some(LandingOvershoot {
                 from_label: "spare".to_owned(),
@@ -5364,6 +5617,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -5404,6 +5658,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -5507,6 +5762,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -5552,6 +5808,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -5584,6 +5841,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -5654,6 +5912,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -5716,6 +5975,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -5911,6 +6171,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -5955,6 +6216,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -6012,6 +6274,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -6102,6 +6365,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -6131,6 +6395,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -6222,6 +6487,7 @@ spare  22222222-2222\n\
                 systemic_refresh_failure: None,
                 canonical_scrub: None,
                 keychain_locked: false,
+                canary: None,
                 recent_blind_preempt_swap: None,
                 recent_landing_overshoot: None,
                 refresh_enabled: None,
@@ -6355,6 +6621,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -6395,6 +6662,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: Some(false),
@@ -6432,6 +6700,7 @@ spare  22222222-2222\n\
                 systemic_refresh_failure: None,
                 canonical_scrub: None,
                 keychain_locked: false,
+                canary: None,
                 recent_blind_preempt_swap: None,
                 recent_landing_overshoot: None,
                 refresh_enabled: Some(false),
@@ -6457,6 +6726,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: Some(true),
@@ -6480,6 +6750,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: Some(false),
@@ -6506,6 +6777,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: Some(false),
@@ -6532,6 +6804,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: Some(false),
@@ -6561,6 +6834,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -6587,6 +6861,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: Some(false),
@@ -6615,6 +6890,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -6931,6 +7207,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -6957,6 +7234,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -7021,6 +7299,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -7062,6 +7341,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -7109,6 +7389,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -7148,6 +7429,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -7206,6 +7488,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -7296,6 +7579,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -7333,6 +7617,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -7440,6 +7725,7 @@ spare  22222222-2222\n\
             systemic_refresh_failure: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -7648,6 +7934,7 @@ spare  22222222-2222\n\
                 systemic_refresh_failure: None,
                 canonical_scrub: None,
                 keychain_locked: false,
+                canary: None,
                 recent_blind_preempt_swap: None,
                 recent_landing_overshoot: None,
                 refresh_enabled: None,
@@ -7712,6 +7999,7 @@ spare  22222222-2222\n\
                 systemic_refresh_failure: None,
                 canonical_scrub: None,
                 keychain_locked: false,
+                canary: None,
                 recent_blind_preempt_swap: None,
                 recent_landing_overshoot: None,
                 refresh_enabled: None,
