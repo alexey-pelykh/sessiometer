@@ -40,6 +40,7 @@ issue threads is consolidated here in a stable, discoverable place.
 | [0025](0025-weekly-trigger-ceiling-semantics.md) | `weekly_trigger` is a settled ceiling too, with an independently calibrated tail margin | Accepted |
 | [0026](0026-daemon-fault-severity-rank-is-cross-surface.md) | Daemon-payload-fault severity is a cross-surface rank, not a per-surface colour register | Accepted |
 | [0027](0027-macos-app-bundle-identity.md) | macOS app bundle identity — freeze `org.sessiometer.menubar` on the `<surface>` axis | Accepted |
+| [0028](0028-version-range-provenance-canary-runtime-guard.md) | CC version range is provenance, not a runtime gate; the #714 behavioral canary is the runtime compatibility guard | Accepted |
 
 ## Conventions
 
