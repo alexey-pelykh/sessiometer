@@ -72,6 +72,15 @@ final class WatchStatusStore: ObservableObject {
     /// (see `StatusPanelFormat.daemonFaultBanner`). `nil` when the mechanism is healthy (or a pre-#378
     /// daemon omits the wire key). A COUNT only, never a token or path (issue #15).
     @Published private(set) var systemicRefreshFailure: UInt32?
+    /// The behavioral-canary verdict (#714, wire since schema 1.9) — the keychain-derivation identity check's
+    /// LAST result. The panel renders its ALARM verdicts (`drift`, `ambiguous`) through the honest banner above
+    /// the roster (worst-first via `StatusPanelFormat.daemonFaultBanner`, at the cross-surface ranks the CLI
+    /// pins): a refusing drift and an ambiguous resolution rank with the "act now" vault pair, an OVERRIDDEN
+    /// drift ranks with the "next break" mechanism fault — severity by (fault, VARIANT), never fault identity
+    /// (#575). The quiet verdicts (`ok` / `inconclusive` / `not_found`) render nothing. `nil` when there is no
+    /// verdict (a pre-#714 daemon, or the canary has not concluded a run). Operator LABELS and a COUNT only,
+    /// never a token or email (issue #15).
+    @Published private(set) var canary: CanaryStatus?
 
     /// The `nextSwap` the SWITCHABLE roster composes its blind verdicts from — the panel-side honest-state
     /// gate (#137, #572). A retained `noViableTarget` must NOT raise the cornered RED "cannot act" alarm off
@@ -246,6 +255,7 @@ final class WatchStatusStore: ObservableObject {
         canonicalScrub = machine.canonicalScrub
         keychainLocked = machine.keychainLocked
         systemicRefreshFailure = machine.systemicRefreshFailure
+        canary = machine.canary
         presentationsContinuation.yield(machine.presentation)
     }
 
@@ -438,7 +448,8 @@ extension WatchStatusStore {
                         nextSwap: NextSwap?, generatedAt: Int64?,
                         canonicalScrub: CanonicalScrub? = nil,
                         keychainLocked: Bool = false,
-                        systemicRefreshFailure: UInt32? = nil) -> WatchStatusStore {
+                        systemicRefreshFailure: UInt32? = nil,
+                        canary: CanaryStatus? = nil) -> WatchStatusStore {
         let store = WatchStatusStore()
         store.connectionState = state
         store.rows = rows
@@ -447,6 +458,7 @@ extension WatchStatusStore {
         store.canonicalScrub = canonicalScrub
         store.keychainLocked = keychainLocked
         store.systemicRefreshFailure = systemicRefreshFailure
+        store.canary = canary
         return store
     }
 }
