@@ -8,12 +8,12 @@
 # provenance in build/version-compat.md. A CC release outside that range may have
 # silently changed the internals — but that drift is caught at RUNTIME, where the
 # risk actually lands: the #714 behavioral canary refuses credential writes when
-# the keychain derivation drifts, and the #715 in-binary advisory names an
-# out-of-range `claude` to the operator. This check is therefore ADVISORY
-# provenance for the maintainer — it keeps the recorded "verified against" range
-# honest — not a release-blocking gate (demoted in #716; see
-# build/release-checklist.md). It is still not a hermetic CI check: CI never
-# execs a real `claude`.
+# the keychain derivation drifts. The version string was never a control, so there
+# is no runtime version advisory — the #715 startup/`status` advisory was removed
+# in #716. This check is therefore ADVISORY provenance for the maintainer — it
+# keeps the recorded "verified against" range honest — not a release-blocking gate
+# (demoted in #716; see build/release-checklist.md). It is still not a hermetic CI
+# check: CI never execs a real `claude`.
 #
 # This script reads the range from build/version-compat.md (the single source of
 # truth) and compares the installed `claude --version` against it.

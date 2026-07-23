@@ -700,11 +700,18 @@ fn parse_subcommand(name: &OsStr, parser: &mut lexopt::Parser) -> Result<Command
     }
 }
 
-/// The `--version` line (issue #175): the crate name plus `CARGO_PKG_VERSION`, the sole
-/// version source (`Cargo.toml`). Extracted so the parser test can assert its content
-/// without capturing stdout.
-fn version_line() -> &'static str {
-    concat!("sessiometer ", env!("CARGO_PKG_VERSION"))
+/// The `--version` output (issue #175): the crate name plus `CARGO_PKG_VERSION` (the sole
+/// version source, `Cargo.toml`), followed by a neutral provenance line naming the Claude Code
+/// range the reverse-engineered internals were verified against (issue #716). The provenance
+/// line is UNCONDITIONAL — it prints the baked `CC_SUPPORTED_MIN`/`MAX` constants and never
+/// probes `claude`, so it is a record, not an alarm. Extracted so the parser test can assert
+/// both lines without capturing stdout.
+fn version_line() -> String {
+    format!(
+        "{}\n{}",
+        concat!("sessiometer ", env!("CARGO_PKG_VERSION")),
+        crate::cc_version::supported_range_provenance(),
+    )
 }
 
 /// Run a parsed [`Command`]. The inverse of `parse`: this half owns the I/O (keychain,
@@ -1181,21 +1188,6 @@ async fn run(verbosity: Verbosity) -> Result<()> {
         config.tunables.poll_secs,
     );
 
-    // The once-per-boot supported-Claude-Code-range advisory (issue #715), stated right under
-    // the startup banner so the caveat travels with the "daemon started" line an operator
-    // actually reads. Deliberately NOT a `Diagnostic`: those are gated behind `-v`, and an
-    // advisory nobody sees by default is not informed consent. Deliberately NOT an `Event`
-    // either — this is a boot-time caveat about the ENVIRONMENT, not an observation about the
-    // rotation the durable log records. `None` (in range, or undeterminable) stays silent, and
-    // the probe is bounded, so a missing or wedged `claude` can neither speak nor stall the
-    // boot. The override is threaded so the daemon advises about the very binary its refresh
-    // engine spawns (`[refresh].claude_bin`, issue #105).
-    if let Some(advisory) =
-        crate::cc_version::range_advisory(config.refresh.claude_bin.as_deref()).await
-    {
-        eprintln!("sessiometer: {advisory}");
-    }
-
     // The operator-facing diagnostic channel (issue #77): stderr, gated by the
     // verbosity selected from `-v`/`--verbose` (default quiet — no console spam).
     // The lifecycle markers bracket the loop HERE because `cli` owns the process
@@ -1417,18 +1409,6 @@ async fn status(json: bool, no_color: bool, verbose: bool) -> Result<()> {
                 print!("{}", render_access_token_expiry(&versioned.status, now));
             }
         }
-    }
-    // The supported-Claude-Code-range advisory (issue #715), trailing BOTH arms above: an
-    // out-of-range `claude` is if anything more worth stating next to a schema-mismatch
-    // banner than next to a healthy table. Client-LOCAL — it reads the installed
-    // `claude --version` on this machine, never the wire — so it deliberately stays outside
-    // `render_status` (whose sole input is the daemon's `StatusResponse`, the exact surface the
-    // issue-#15 redaction meter scans). Nothing here can leak: the line carries two version
-    // numbers and no handle. Confined to the human render path — `--json` returned above, and a
-    // frozen machine contract must not grow a prose side-channel. Silent when in range or
-    // undeterminable; the probe is bounded, so it cannot stall the command.
-    if let Some(advisory) = crate::cc_version::range_advisory(None).await {
-        println!("\n{advisory}");
     }
     Ok(())
 }
@@ -8832,6 +8812,13 @@ spare  22222222-2222\n\
         assert!(
             version_line().contains(env!("CARGO_PKG_VERSION")),
             "the --version line must print CARGO_PKG_VERSION: {}",
+            version_line()
+        );
+        // Issue #716: the output also carries the UNCONDITIONAL Claude Code range provenance
+        // line — a record printed always, never a probe of the installed `claude`.
+        assert!(
+            version_line().contains("verified against Claude Code "),
+            "the --version output must carry the CC-range provenance line: {}",
             version_line()
         );
     }

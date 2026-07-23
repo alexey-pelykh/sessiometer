@@ -4,11 +4,13 @@ Steps to run before tagging a `sessiometer` release.
 
 It began as the home of the **Claude Code compatibility gate** (step 1). That step is now an
 **advisory provenance check** (demoted in #716): since #714 the daemon carries a behavioral canary
-that refuses credential writes at runtime when the reverse-engineered keychain derivation drifts,
-and #715 advises the operator when their installed `claude` sits outside the verified range — so
-drift is caught on the user's machine, where the risk actually lands, instead of being policed at
-release time. Step 1 keeps the *published* "verified against" range honest; it no longer blocks a
-release. CI still cannot cover it: CI runs hermetically and never execs a real `claude`.
+that refuses credential writes at runtime when the reverse-engineered keychain derivation drifts —
+so drift is caught on the user's machine, where the risk actually lands, instead of being policed at
+release time. (There is no runtime version advisory: the version string was never a control, so the
+#715 startup/`status` advisory was removed in #716; the range now records provenance only, surfaced
+in `sessiometer --version`.) Step 1 keeps the *published* "verified against" range honest; it no
+longer blocks a release. CI still cannot cover it: CI runs hermetically and never execs a real
+`claude`.
 
 ## 1. Record Claude Code provenance (advisory)
 
@@ -28,8 +30,8 @@ reverse-engineered internals were last verified against.
 - [ ] **In range** (`ok:` / exit 0) → provenance is current; nothing to record.
 - [ ] **Above range** (a newer `claude` shipped; `warning:` / exit 1) → **advisory, not a
   blocker**: the release may ship as-is — its provenance then honestly states the older verified
-  range, the #714 canary refuses credential writes on derivation drift, and #715 advises
-  the user their `claude` is unverified. Prefer refreshing the provenance when practical:
+  range, and the #714 canary refuses credential writes on derivation drift. Prefer refreshing the
+  provenance when practical:
   re-verify the version-sensitive findings in [`build/version-compat.md`](version-compat.md) — at
   minimum **H3** (fresh-start adoption) and the **#100** keychain-service derivation (`n1()`) —
   against the new CC; if they hold, widen `CC_SUPPORTED_MAX` in the ledger, update the range
