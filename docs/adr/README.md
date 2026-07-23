@@ -38,6 +38,8 @@ issue threads is consolidated here in a stable, discoverable place.
 | [0023](0023-session-trigger-ceiling-semantics.md) | `session_trigger` is a settled ceiling both swap arms derive their fire point backward from | Accepted (amended by [0024](0024-reactive-lookahead-gap-percentile-max-window-coverage.md), extended by [0025](0025-weekly-trigger-ceiling-semantics.md)) |
 | [0024](0024-reactive-lookahead-gap-percentile-max-window-coverage.md) | The reactive swap arm looks ahead over the measured re-observation gap (max-window coverage) | Accepted |
 | [0025](0025-weekly-trigger-ceiling-semantics.md) | `weekly_trigger` is a settled ceiling too, with an independently calibrated tail margin | Accepted |
+| [0026](0026-daemon-fault-severity-rank-is-cross-surface.md) | Daemon-payload-fault severity is a cross-surface rank, not a per-surface colour register | Accepted |
+| [0027](0027-macos-app-bundle-identity.md) | macOS app bundle identity — freeze `org.sessiometer.menubar` on the `<surface>` axis | Accepted |
 
 ## Conventions
 
