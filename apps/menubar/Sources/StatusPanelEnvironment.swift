@@ -32,11 +32,13 @@ extension View {
     func statusPanelEnvironment(store: WatchStatusStore,
                                 capture: AccountCaptureModel,
                                 swap: AccountSwapModel,
-                                stats: PanelStatsModel) -> some View {
+                                stats: PanelStatsModel,
+                                loginItem: LoginItemModel) -> some View {
         self
             .environmentObject(store)
             .environmentObject(capture)
             .environmentObject(swap)
             .environmentObject(stats)
+            .environmentObject(loginItem)
     }
 }
