@@ -30,10 +30,19 @@ Consumers of this range:
   against the two lines above, and also asserts the README still states this range (so the
   user-facing copy can't silently drift); the pre-release
   [`build/release-checklist.md`](release-checklist.md) runs it as a gate.
+- [`src/cc_version.rs`](../src/cc_version.rs) bakes the two values in as constants and advises the
+  USER — once at daemon startup, and on each `sessiometer status` — when their installed `claude`
+  falls outside them (issue #715). A shipped binary cannot read this ledger, so the range must be
+  compiled in; its `the_baked_range_matches_the_ledger` test makes this file a compile-time input
+  and fails if the constants drift from the two lines above. **Widening the range here therefore
+  requires updating `CC_SUPPORTED_MIN` / `CC_SUPPORTED_MAX` in that module in the same change.**
 
 When a CC bump moves the installed version **above** `CC_SUPPORTED_MAX`, re-verify the
 version-sensitive findings below — at minimum **H3** (fresh-start adoption) and the **#100**
-keychain-service derivation (`n1()`) — then widen the range here and update the README to match.
+keychain-service derivation (`n1()`) — then widen the range here and update the two consumers
+that copy it: the README's `## Prerequisites` range, and the `CC_SUPPORTED_MIN` /
+`CC_SUPPORTED_MAX` constants in `src/cc_version.rs`. `scripts/check-cc-version.sh` catches a
+stale README; `cargo test` catches stale constants.
 
 The acceptance record for issue [#16](https://github.com/alexey-pelykh/sessiometer/issues/16): a
 one-time empirical verification of the macOS credential mechanism, run **before** the swap engine
