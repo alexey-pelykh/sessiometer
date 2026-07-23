@@ -479,6 +479,16 @@ pub(crate) struct Tunables {
     /// `60..=2_592_000` (1 min..30 d — a warn line above 30 days is always-on noise, not a
     /// warning). Purely an operator-visibility signal: no swap decision reads it.
     pub(crate) fleet_runway_warn_secs: u64,
+    /// The documented operator override for a FALSE behavioral-canary drift (issue #714). The
+    /// canary refuses credential writes on a positive Layer-2 DRIFT (the resolved canonical
+    /// credential byte-matches a DIFFERENT account's stash than the one Claude Code's own state
+    /// names active); `true` lets those writes PROCEED — logged (`overridden=true` on the durable
+    /// `canary_drift` event) and surfaced on `status` — so a false drift on an unattended daemon
+    /// is recoverable in minutes (set the key, restart the daemon; re-clear it once the cause is
+    /// understood). Overrides Layer-2 DRIFT ONLY: Layer-1 refusals (zero / ambiguous items under
+    /// the derived service) have no false-positive story and stay fail-closed. `false` (refuse on
+    /// drift) is the default and the safe posture.
+    pub(crate) canary_drift_override: bool,
     /// Poll-interval timing strategy (issue #38): base = `poll_secs` (seconds),
     /// normal jitter by default. The daemon draws + clamps to `5..=3600` each
     /// cycle instead of sleeping a fixed interval.
@@ -517,6 +527,8 @@ impl Default for Tunables {
             monitor_401_n: DEFAULT_MONITOR_401_N,
             monitor_recovery_m: DEFAULT_MONITOR_RECOVERY_M,
             fleet_runway_warn_secs: DEFAULT_FLEET_RUNWAY_WARN_SECS,
+            // The #714 canary-drift override: OFF (refuse on drift) — the safe posture.
+            canary_drift_override: false,
             poll_strategy: Strategy {
                 base: DEFAULT_POLL_SECS as f64,
                 jitter: default_poll_jitter(),
@@ -1051,6 +1063,10 @@ pub(crate) struct SetTunables {
     pub(crate) monitor_recovery_m: Option<i64>,
     #[serde(default)]
     pub(crate) fleet_runway_warn_secs: Option<i64>,
+    /// Issue #714: the canary-drift override switch — the one non-integer settable (a plain
+    /// bool; there is no range to validate, so the overlay writes it straight through).
+    #[serde(default)]
+    pub(crate) canary_drift_override: Option<bool>,
 }
 
 /// Which classes of edit a [`Config::apply_settings`] actually changed (issue #268), so the
@@ -1092,6 +1108,10 @@ pub(crate) struct TunablesView {
     pub(crate) monitor_401_n: u8,
     pub(crate) monitor_recovery_m: u8,
     pub(crate) fleet_runway_warn_secs: u64,
+    /// Issue #714: whether the canary-drift override is set (a plain bool; `#[serde(default)]`
+    /// so a pre-#714 daemon's view decodes to `false` — refuse on drift).
+    #[serde(default)]
+    pub(crate) canary_drift_override: bool,
 }
 
 impl From<&Tunables> for TunablesView {
@@ -1112,6 +1132,7 @@ impl From<&Tunables> for TunablesView {
             monitor_401_n: t.monitor_401_n,
             monitor_recovery_m: t.monitor_recovery_m,
             fleet_runway_warn_secs: t.fleet_runway_warn_secs,
+            canary_drift_override: t.canary_drift_override,
         }
     }
 }
@@ -1217,6 +1238,11 @@ struct RawTunables {
     // opt-in default.
     #[serde(default = "default_fleet_runway_warn_secs")]
     fleet_runway_warn_secs: i64,
+    // Issue #714: the documented canary-drift override — an absent key resolves to `false`
+    // (refuse credential writes on a positive Layer-2 drift), the safe posture. A plain bool
+    // (not an integer knob): it is a switch with no range to validate.
+    #[serde(default)]
+    canary_drift_override: bool,
 }
 
 impl Default for RawTunables {
@@ -1237,6 +1263,7 @@ impl Default for RawTunables {
             monitor_401_n: default_monitor_401_n(),
             monitor_recovery_m: default_monitor_recovery_m(),
             fleet_runway_warn_secs: default_fleet_runway_warn_secs(),
+            canary_drift_override: false,
         }
     }
 }

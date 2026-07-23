@@ -339,6 +339,20 @@ mod tests {
             classify_swap_failure(&Error::SwapWrongIdentityRestash),
             SwapRejection::Failed
         );
+        // The #714 canary refusals ride the SAME opaque `Failed` — deliberately, so the closed
+        // wire enum never grows a variant an old Swift decoder would throw on (the detail lives
+        // in the event log + the `status` canary field, not the ack).
+        assert_eq!(
+            classify_swap_failure(&Error::CanaryDrift {
+                displayed: "work".to_owned(),
+                matched: "spare".to_owned(),
+            }),
+            SwapRejection::Failed
+        );
+        assert_eq!(
+            classify_swap_failure(&Error::CredentialAmbiguous { count: 2 }),
+            SwapRejection::Failed
+        );
     }
 
     // --- classify_capture_failure (engine error → redacted reason, issue #359) ---

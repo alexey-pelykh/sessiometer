@@ -235,6 +235,16 @@ where
             // duration of a lock episode — set in `locked_tick` before this snapshot is built, cleared
             // on the first readable cycle — so a direct read is a faithful "currently locked" indicator.
             keychain_locked: self.state.signaled_keychain_locked,
+            // The daemon-level keychain-identity canary verdict (issue #714): project the
+            // retained last-CONCLUDED canary outcome onto the wire so `status` / the menubar
+            // can surface drift / ambiguity (the states that refuse the pre-swap credential
+            // write) and the healthy "verified ok" fact alike. Mirrors `canonical_scrub`
+            // above: a direct read of daemon state decided elsewhere (`refresh_canary`), so
+            // `render_status` stays a pure function of the wire (#169). `None` only until the
+            // first canary run concludes; a no-verdict run (probe/read `Err` — locked
+            // keychain, transient) HOLDS the last state rather than fabricating one (the #464
+            // no-evidence discipline), so this is always the most recent concluded verdict.
+            canary: self.state.canary.clone(),
             // The daemon-level narrated preemptive-swap notice (issue #479): project the retained
             // `last_blind_preempt_swap` record onto the wire, but only while STILL-CURRENT (the swap's
             // target is still the active account) AND RECENT (within `BLIND_PREEMPT_NOTICE_SECS`) — both
@@ -273,6 +283,7 @@ mod tests {
             systemic_refresh: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             // Issue #613: a runtime landing overshoot rides the wire as one operator handle + two
             // small percents — populated here so the secret-free assertion below covers its bytes.
@@ -699,6 +710,7 @@ mod tests {
             systemic_refresh: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             generated_at: 0,
@@ -789,6 +801,7 @@ mod tests {
             systemic_refresh: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             generated_at: 0,
@@ -966,6 +979,7 @@ mod tests {
             systemic_refresh: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             generated_at,
@@ -1807,6 +1821,7 @@ mod tests {
         // but-scrubbed one.
         let snapshot = StatusSnapshot {
             keychain_locked: true,
+            canary: None,
             accounts: vec![AccountReading {
                 label: "work".to_owned(),
                 active: true,
@@ -1858,6 +1873,84 @@ mod tests {
     }
 
     #[test]
+    fn the_canary_verdict_rides_the_wire_additively_and_an_unconcluded_snapshot_omits_it() {
+        // Issue #714 / schema 1.8 → 1.9: the daemon-level behavioral-canary verdict rides the wire
+        // as an additive OPTIONAL tagged enum — present once the first canary run concludes (the
+        // HEALTHY `ok` verdict included: "verified ok" and "unverified" are different operator
+        // facts), OMITTED (`skip_serializing_if`) only while no run has concluded, so a pre-#714
+        // frame's bytes stay unchanged (the property the goldens pin). Round-trips back to the same
+        // verdict, and carries operator LABELS and a COUNT only — never a token or email (#15).
+        for (canary, wire) in [
+            (CanaryStatus::Ok, r#""canary":{"verdict":"ok"}"#),
+            (
+                CanaryStatus::Inconclusive,
+                r#""canary":{"verdict":"inconclusive"}"#,
+            ),
+            (
+                CanaryStatus::NotFound,
+                r#""canary":{"verdict":"not_found"}"#,
+            ),
+            (
+                CanaryStatus::Ambiguous { count: 2 },
+                r#""canary":{"verdict":"ambiguous","count":2}"#,
+            ),
+            (
+                CanaryStatus::Drift {
+                    displayed: "work".to_owned(),
+                    matched: "spare".to_owned(),
+                    overridden: true,
+                },
+                r#""canary":{"verdict":"drift","displayed":"work","matched":"spare","overridden":true}"#,
+            ),
+        ] {
+            let snapshot = StatusSnapshot {
+                canary: Some(canary.clone()),
+                accounts: vec![AccountReading {
+                    label: "work".to_owned(),
+                    active: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let json = serde_json::to_string(&status_response(&snapshot)).unwrap();
+            assert!(
+                json.contains(wire),
+                "the canary verdict rides the wire: {json}"
+            );
+            // #15: labels + counts only. Non-vacuous: a real handle rode the wire.
+            assert!(json.contains("\"label\":\"work\""), "got {json}");
+            assert!(crate::redaction::meter::unauthored_emails(&json, &[]).is_empty());
+            assert!(!json.to_lowercase().contains("token"));
+            // Round-trip: the verdict decodes back unchanged (a current client reads it).
+            let parsed: StatusResponse = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.canary, Some(canary));
+        }
+
+        // An UNCONCLUDED snapshot omits the field ENTIRELY, keeping pre-canary bytes unchanged
+        // across the additive minor bump.
+        let unconcluded = StatusSnapshot {
+            accounts: vec![AccountReading {
+                label: "work".to_owned(),
+                active: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&status_response(&unconcluded)).unwrap();
+        assert!(
+            !json.contains("canary"),
+            "an unconcluded snapshot omits the field: {json}"
+        );
+        // …and a pre-#714 (schema ≤ 1.8) frame that never carried the key decodes to `None` — the
+        // `#[serde(default)]` tolerate-by-ignoring contract.
+        let parsed: StatusResponse = serde_json::from_str(&json).unwrap();
+        assert!(parsed.canary.is_none());
+        let pre_714 = r#"{"accounts":[],"next_swap":null,"refresh_enabled":true,"systemic_refresh_failure":null}"#;
+        let parsed: StatusResponse = serde_json::from_str(pre_714).unwrap();
+        assert!(parsed.canary.is_none());
+    }
+
+    #[test]
     fn the_status_wire_is_flat_and_carries_the_frozen_meta() {
         // AC-1: the snapshot carries `schema_version` + `generated_at`, and the payload stays
         // FLAT at the top level (the settled #137–#143 shape, only prefixed with the two meta
@@ -1872,7 +1965,7 @@ mod tests {
         };
         let json = serde_json::to_string(&versioned_status_response(&snapshot)).unwrap();
         assert!(
-            json.contains(r#""schema_version":{"major":1,"minor":8}"#),
+            json.contains(r#""schema_version":{"major":1,"minor":9}"#),
             "got {json}"
         );
         assert!(json.contains(r#""generated_at":1782777600"#), "got {json}");
@@ -1911,6 +2004,7 @@ mod tests {
             systemic_refresh: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             generated_at: 1_782_777_600,
@@ -2206,6 +2300,7 @@ mod tests {
             systemic_refresh: None,
             canonical_scrub: None,
             keychain_locked: false,
+            canary: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             generated_at: 0,

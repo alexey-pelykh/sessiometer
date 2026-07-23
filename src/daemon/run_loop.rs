@@ -572,6 +572,23 @@ where
         eprintln!("sessiometer: reconcile-on-start skipped: {err}");
     }
 
+    // Boot-time behavioral canary (issue #714), AFTER the reconcile above (its display
+    // heal is the decided false-positive guard — a lagging post-swap co-write must not
+    // read as drift). Proactive surfacing only: the verdict lands on the `status` wire
+    // and the durable log NOW, so the operator learns of a drifted / ambiguous / gone
+    // derivation without waiting for the first swap to refuse. Best-effort like the
+    // reconcile — a canary that cannot run (locked keychain) holds no verdict, and the
+    // pre-swap gate in `locked_swap` re-runs it fresh before any write anyway.
+    {
+        let mut events = Vec::new();
+        if let Err(err) = daemon.refresh_canary(&mut events).await {
+            eprintln!("sessiometer: boot canary skipped: {err}");
+        }
+        for event in &events {
+            emit_best_effort(log, event);
+        }
+    }
+
     // De-burst start-up (issue #76), shutdown-responsive: a SIGINT / SIGTERM during the delay
     // exits cleanly rather than being deferred for up to STARTUP_DELAY_CAP.
     if await_startup_delay(daemon, shutdown).await {
@@ -663,9 +680,9 @@ where
             // (`SWAP_ACK_WRITE_TIMEOUT`): the ack carries nothing secret, so a disconnected /
             // wedged client just drops it and can never stall the loop (issue #15/#167).
             Idle::SwapRequested(stream, command) => {
-                let (ack, event) = daemon.perform_socket_swap(&command).await;
-                if let Some(event) = event {
-                    emit_best_effort(log, &event);
+                let (ack, events) = daemon.perform_socket_swap(&command).await;
+                for event in &events {
+                    emit_best_effort(log, event);
                 }
                 let _ = tokio::time::timeout(SWAP_ACK_WRITE_TIMEOUT, write_swap_ack(stream, &ack))
                     .await;

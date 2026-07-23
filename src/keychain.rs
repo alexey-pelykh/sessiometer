@@ -274,6 +274,31 @@ impl CanonicalWatch {
 pub(crate) trait CredentialStore {
     async fn read(&self) -> Result<Credential>;
     async fn write(&self, credential: &Credential) -> Result<()>;
+    /// FRESH canonical-service resolution probe (issue #714, canary Layer 1):
+    /// re-run the #100 enumeration + uniqueness rule NOW — `Ok(())` when exactly
+    /// one item sits under the derived service, [`Error::CredentialNotFound`] on
+    /// zero (a service-name derivation change, or a scrubbed keychain),
+    /// [`Error::CredentialAmbiguous`] on more than one.
+    ///
+    /// DELIBERATELY bypasses the resolve-once caches ([`RealCredentialStore`]'s
+    /// `acct`/`service` `OnceLock`s): those pin the boot-time resolution, so an
+    /// item that APPEARS after boot (Claude Code re-keying its storage into a
+    /// second item under the same service) would never re-trip the uniqueness
+    /// rule through the cached [`read`](Self::read) path — the pre-swap canary
+    /// must re-enumerate to see it. The probe never reads secret data
+    /// (`dump-keychain` is metadata-only, prompt-free, and works on a locked
+    /// keychain), and it does NOT update the pinned caches — a probe/read
+    /// divergence (fresh-unique item under a NEW `acct` while the pinned one is
+    /// gone) surfaces as [`Error::CredentialNotFound`] from the very next cached
+    /// `read`, which is the loud Layer-1 abort the canary wants.
+    ///
+    /// Defaulted to `Ok(())` (a clean probe): the canary is the only caller, and
+    /// only the daemon's REAL canonical store (plus the scripted test fake) has an
+    /// enumeration to re-run — the narrow test doubles and the stash-backed
+    /// adapter ([`crate::daemon`]'s seams) have no service namespace to probe.
+    async fn probe_resolution(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Real keychain-backed store, driving `/usr/bin/security`.
@@ -597,6 +622,13 @@ impl CredentialStore for RealCredentialStore {
         let output = run_interactive_write(&line).await?;
         finish_write(output.status.success(), output.status.code().unwrap_or(-1))
     }
+
+    async fn probe_resolution(&self) -> Result<()> {
+        // A fresh enumeration pass, discarding the resolved `acct` on purpose: the
+        // probe asserts the uniqueness rule still holds NOW; addressing stays with
+        // the pinned caches (see the trait docs for why a divergence is safe).
+        self.resolve().await.map(drop)
+    }
 }
 
 #[cfg(test)]
@@ -623,6 +655,14 @@ pub(crate) struct FakeCredentialStore {
     /// precedence over the `slot` value (the item is present but its secret is
     /// unreadable), NOT cleared by a write.
     unreadable: Cell<bool>,
+    /// When `Some(n)`, [`probe_resolution`](CredentialStore::probe_resolution) returns
+    /// [`Error::CredentialAmbiguous`] with that count — the in-memory analog of a SECOND
+    /// item appearing under the derived service AFTER boot (issue #714 canary Layer 1).
+    /// Deliberately affects ONLY the fresh probe, never [`read`](CredentialStore::read):
+    /// the real store's cached `acct` keeps addressing the boot-time item, so its reads
+    /// keep succeeding while the enumeration has gone ambiguous — exactly the
+    /// masked-by-the-cache state the pre-swap probe exists to catch.
+    ambiguous: Cell<Option<usize>>,
 }
 
 #[cfg(test)]
@@ -633,6 +673,7 @@ impl FakeCredentialStore {
             locked: Cell::new(false),
             not_found: Cell::new(false),
             unreadable: Cell::new(false),
+            ambiguous: Cell::new(None),
         }
     }
 
@@ -656,6 +697,15 @@ impl FakeCredentialStore {
     /// writes rather than clobber a canonical it could not read.
     pub(crate) fn set_unreadable(&self, unreadable: bool) {
         self.unreadable.set(unreadable);
+    }
+
+    /// Simulate a SECOND item appearing under the derived service (issue #714 canary
+    /// Layer 1): while `Some(n)`, a fresh [`probe_resolution`](CredentialStore::probe_resolution)
+    /// reports [`Error::CredentialAmbiguous`] with that count, while `read` keeps
+    /// answering from the pinned boot-time item — the exact cache-masked ambiguity
+    /// the pre-swap canary re-enumerates to catch. `None` restores a clean probe.
+    pub(crate) fn set_ambiguous(&self, count: Option<usize>) {
+        self.ambiguous.set(count);
     }
 }
 
@@ -690,6 +740,20 @@ impl CredentialStore for FakeCredentialStore {
         // An `add-generic-password -U` creates the item if it was absent, so a write
         // clears the gone-canonical signal — a post-write re-read now finds it.
         self.not_found.set(false);
+        Ok(())
+    }
+
+    async fn probe_resolution(&self) -> Result<()> {
+        // Mirrors the real probe's semantics, NOT `read`'s: `dump-keychain` is
+        // metadata-only, so a LOCKED keychain and an unreadable SECRET both still
+        // enumerate — only the item being gone (zero) or duplicated (ambiguous)
+        // fails the fresh uniqueness rule (issue #714 canary Layer 1).
+        if let Some(count) = self.ambiguous.get() {
+            return Err(Error::CredentialAmbiguous { count });
+        }
+        if self.not_found.get() {
+            return Err(Error::CredentialNotFound);
+        }
         Ok(())
     }
 }

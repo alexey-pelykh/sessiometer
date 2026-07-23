@@ -12,6 +12,8 @@
 
 use super::*;
 
+use crate::canary::CanaryOutcome;
+
 impl<P, C, S, K> super::Daemon<P, C, S, K>
 where
     P: RosterPoller,
@@ -37,26 +39,91 @@ where
     /// leaves the keychain authoritative and the display stale — exactly the
     /// mismatch healed here on the next start. No separate mechanism is needed; the
     /// keychain-first ordering plus this reconcile make a torn swap self-healing.
+    ///
+    /// The heal core is [`crate::canary::reconcile_display`] (extracted for issue
+    /// #714): the behavioral canary runs the SAME reconcile before its pre-swap
+    /// identity cross-check, so a lagging self-co-write can never false-positive
+    /// as drift — one core, two wirings.
     pub(crate) async fn reconcile_on_start(&self) -> Result<()> {
         let canonical = self.store.read().await?;
-        for account in &self.roster {
-            let Ok(stashed) = self.stash.read(&account.stash()).await else {
-                continue;
-            };
-            if !stashed.credential.matches(&canonical) {
-                continue;
+        crate::canary::reconcile_display(&self.roster, &self.stash, &self.claude_json, &canonical)
+            .await
+    }
+
+    /// Run one behavioral-canary pass (issue #714) and fold its verdict into
+    /// daemon state: retain it for the `status` wire ([`Daemon::snapshot`] copies
+    /// `state.canary`) and emit the durable edge-triggered event pairs.
+    ///
+    /// Wired at BOOT (right after [`reconcile_on_start`](Self::reconcile_on_start),
+    /// so the operator sees a drifted derivation without waiting for a swap) and
+    /// PRE-SWAP inside [`locked_swap`](Self::locked_swap) (the refuse slot — a
+    /// fresh verdict every swap, never the boot-pinned one, because the `OnceLock`
+    /// resolution cache and CC's own state both move under a running daemon).
+    ///
+    /// Edge semantics, mirroring the [`Event::CanonicalScrubbed`] /
+    /// [`Event::CanonicalRestored`] durable-pair idiom: an event fires only when
+    /// the verdict CHANGES. A new / re-shaped alarm (drift with different labels,
+    /// ambiguity with a different count) re-fires its event; an alarm → non-alarm
+    /// transition fires [`Event::CanaryCleared`] exactly once; alarm → different
+    /// alarm fires only the new alarm's event (the episode continues, re-labeled).
+    /// A run that could not conclude (`Err` — locked keychain, transient
+    /// `security` failure) HOLDS the last verdict untouched: no evidence is not a
+    /// verdict (the #464 no-evidence discipline).
+    pub(crate) async fn refresh_canary(
+        &mut self,
+        events: &mut Vec<Event>,
+    ) -> Result<CanaryOutcome> {
+        let outcome =
+            crate::canary::run(&self.store, &self.stash, &self.roster, &self.claude_json).await?;
+        let status = self.canary_status_of(outcome);
+        if self.state.canary.as_ref() != Some(&status) {
+            match &status {
+                CanaryStatus::Drift {
+                    displayed,
+                    matched,
+                    overridden,
+                } => events.push(Event::CanaryDrift {
+                    displayed: displayed.clone(),
+                    matched: matched.clone(),
+                    overridden: *overridden,
+                }),
+                CanaryStatus::Ambiguous { count } => {
+                    events.push(Event::CanaryAmbiguous { count: *count });
+                }
+                CanaryStatus::Ok | CanaryStatus::Inconclusive | CanaryStatus::NotFound => {
+                    // Close the alarm bracket exactly once: only if the verdict we are
+                    // REPLACING was an alarm (an overridden drift included — its alarm
+                    // was real even though the write proceeded).
+                    if matches!(
+                        self.state.canary,
+                        Some(CanaryStatus::Drift { .. } | CanaryStatus::Ambiguous { .. })
+                    ) {
+                        events.push(Event::CanaryCleared);
+                    }
+                }
             }
-            // The canonical belongs to this account; ensure the display agrees.
-            let displayed = claude_state::read_oauth_account_from(&self.claude_json)
-                .ok()
-                .map(|o| o.account_uuid().to_owned());
-            if displayed.as_deref() != Some(stashed.oauth_account.account_uuid()) {
-                claude_state::write_oauth_account(&self.claude_json, &stashed.oauth_account)?;
-            }
-            return Ok(());
+            self.state.canary = Some(status);
         }
-        // No stash matched the canonical token — leave ~/.claude.json untouched.
-        Ok(())
+        Ok(outcome)
+    }
+
+    /// Project a typed [`CanaryOutcome`] (roster indices) onto the wire-shaped
+    /// [`CanaryStatus`] (operator labels — the #15-safe handles — plus the
+    /// [`canary_drift_override`](crate::config::Tunables::canary_drift_override)
+    /// stamp, so `status` shows WHETHER a standing drift is currently refusing
+    /// writes or riding the override).
+    fn canary_status_of(&self, outcome: CanaryOutcome) -> CanaryStatus {
+        match outcome {
+            CanaryOutcome::Ok => CanaryStatus::Ok,
+            CanaryOutcome::NotFound => CanaryStatus::NotFound,
+            CanaryOutcome::Ambiguous { count } => CanaryStatus::Ambiguous { count },
+            CanaryOutcome::Drift { displayed, matched } => CanaryStatus::Drift {
+                displayed: self.roster[displayed].label.clone(),
+                matched: self.roster[matched].label.clone(),
+                overridden: self.canary_drift_override,
+            },
+            CanaryOutcome::Inconclusive(_) => CanaryStatus::Inconclusive,
+        }
     }
 
     /// Identify the active account: the roster index whose credential the
@@ -1276,6 +1343,416 @@ mod tests {
         assert!(corpus.contains(&format!("fingerprint={fingerprint}")));
         // …and the raw refresh token never rode alongside it.
         assert!(!corpus.contains(std::str::from_utf8(&rt).unwrap()));
+        assert_clean(&corpus, &secrets, &[]);
+    }
+
+    // --- behavioral canary (issue #714) --------------------------------------
+
+    /// Freeze `dir` read-only (0o500) so `reconcile_display`'s best-effort heal —
+    /// a temp-file + rename in the SAME directory — cannot land, pinning a stale
+    /// display for the drift fixtures. Restore with [`thaw_dir`] before the
+    /// tempdir drops.
+    fn freeze_dir(dir: &std::path::Path) {
+        let mut perms = std::fs::metadata(dir).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o500);
+        std::fs::set_permissions(dir, perms).unwrap();
+    }
+
+    fn thaw_dir(dir: &std::path::Path) {
+        let mut perms = std::fs::metadata(dir).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o700);
+        std::fs::set_permissions(dir, perms).unwrap();
+    }
+
+    /// The daemon-level DRIFT fixture: the canonical holds `spare`'s stashed token
+    /// while the FROZEN `~/.claude.json` still names `work` — the display heal
+    /// cannot land, so the canary's Layer-2 cross-check sees the positive `A ≠ B`
+    /// divergence. `spare` (the token-resolved active) is over the session trigger
+    /// so every tick WANTS to swap; whether the write happens is then exactly the
+    /// canary's call.
+    async fn drift_daemon(tun: &Tunables) -> (tempfile::TempDir, FakeDaemon) {
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"B-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.97, 0.40);
+        let daemon: FakeDaemon =
+            Daemon::new(roster, poller, store, stash, FakeClock::frozen(), json, tun);
+        (dir, daemon)
+    }
+
+    #[tokio::test]
+    async fn a_drifted_canary_refuses_the_swap_with_zero_writes_and_one_edge_event() {
+        // Issue #714 AC: identity mismatch (the resolved canonical byte-matches
+        // `stash[X≠A]`) → the credential WRITE is refused pre-mutation — ZERO
+        // writes to the canonical and both stashes — while reads/poll/status stay
+        // live. The durable `canary_drift` event fires exactly ONCE (edge), and
+        // the `status` wire carries the verdict with labels.
+        let tun = tunables(95, 80, 0);
+        let (dir, mut daemon) = drift_daemon(&tun).await;
+
+        freeze_dir(dir.path());
+        let first = warmed_tick(&mut daemon).await;
+        let second = daemon.tick().await;
+        thaw_dir(dir.path());
+
+        // The swap was decided (spare is over the trigger) but the write refused.
+        assert_eq!(first.action, TickAction::SwapFailed);
+        assert_eq!(
+            first.events,
+            vec![Event::CanaryDrift {
+                displayed: "work".to_owned(),
+                matched: "spare".to_owned(),
+                overridden: false,
+            }]
+        );
+        // Reads stayed live: the refusing tick still polled the whole roster.
+        assert!(first.snapshot.accounts.iter().all(|a| a.usage.is_some()));
+        // The second refusing tick is SILENT (edge-triggered), still refusing.
+        assert_eq!(second.action, TickAction::SwapFailed);
+        assert!(
+            second.events.is_empty(),
+            "the drift alarm is edge-triggered: {:?}",
+            second.events
+        );
+        // The verdict rides the status wire, labels only.
+        assert_eq!(
+            second.snapshot.canary,
+            Some(CanaryStatus::Drift {
+                displayed: "work".to_owned(),
+                matched: "spare".to_owned(),
+                overridden: false,
+            })
+        );
+        // ZERO writes: the canonical and BOTH stashes hold their original bytes.
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"B-token")));
+        assert!(daemon
+            .stash
+            .read("Sessiometer/u-A")
+            .await
+            .unwrap()
+            .credential
+            .matches(&cred(b"A-token")));
+        assert!(daemon
+            .stash
+            .read("Sessiometer/u-B")
+            .await
+            .unwrap()
+            .credential
+            .matches(&cred(b"B-token")));
+    }
+
+    #[tokio::test]
+    async fn an_overridden_drift_swaps_anyway_and_logs_overridden_true() {
+        // Issue #714 AC: the documented operator override (`canary_drift_override`)
+        // clears a diagnosed FALSE drift — the swap proceeds despite the standing
+        // Layer-2 alarm, and the durable record marks the ride with
+        // `overridden=true` (status mirrors it).
+        let mut tun = tunables(95, 80, 0);
+        tun.canary_drift_override = true;
+        let (dir, mut daemon) = drift_daemon(&tun).await;
+
+        freeze_dir(dir.path());
+        let outcome = warmed_tick(&mut daemon).await;
+        thaw_dir(dir.path());
+
+        // The swap RAN: spare (token-resolved active, index 1) → work (index 0).
+        assert_eq!(outcome.action, TickAction::Swapped { from: 1, to: 0 });
+        // The drift alarm still fired — overridden, never silenced…
+        assert_eq!(
+            outcome.events.first(),
+            Some(&Event::CanaryDrift {
+                displayed: "work".to_owned(),
+                matched: "spare".to_owned(),
+                overridden: true,
+            })
+        );
+        // …alongside the normal swap event.
+        assert!(
+            outcome.events.iter().any(
+                |e| matches!(e, Event::Swap { from, to, .. } if from == "spare" && to == "work")
+            ),
+            "the overridden swap still logs: {:?}",
+            outcome.events
+        );
+        // The canonical was rerouted to the incoming account's token.
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"A-token")));
+        assert_eq!(
+            outcome.snapshot.canary,
+            Some(CanaryStatus::Drift {
+                displayed: "work".to_owned(),
+                matched: "spare".to_owned(),
+                overridden: true,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_resolution_refuses_the_swap_then_clears_on_the_edge() {
+        // Issue #714 AC: >1 item under the derived service → the uniqueness rule
+        // fails, the write refuses (NO override — an atomic in-place write has no
+        // unique, safe target), edge-triggered `canary_ambiguous` once; when the
+        // duplicate clears, `canary_cleared` closes the episode and the swap runs.
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.97, 0.40)
+            .ok("u-B", 0.10, 0.10);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+        daemon.store.set_ambiguous(Some(2));
+
+        let first = warmed_tick(&mut daemon).await;
+        assert_eq!(first.action, TickAction::SwapFailed);
+        assert_eq!(first.events, vec![Event::CanaryAmbiguous { count: 2 }]);
+        assert_eq!(
+            first.snapshot.canary,
+            Some(CanaryStatus::Ambiguous { count: 2 })
+        );
+        // Zero writes while ambiguous.
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"A-token")));
+
+        let second = daemon.tick().await;
+        assert_eq!(second.action, TickAction::SwapFailed);
+        assert!(
+            second.events.is_empty(),
+            "the ambiguity alarm is edge-triggered: {:?}",
+            second.events
+        );
+
+        // The duplicate item is removed → the very next swap attempt re-probes
+        // FRESH (never the boot-pinned verdict), sees a unique item, closes the
+        // episode with `canary_cleared`, and the held swap finally lands.
+        daemon.store.set_ambiguous(None);
+        let third = daemon.tick().await;
+        assert_eq!(third.action, TickAction::Swapped { from: 0, to: 1 });
+        assert_eq!(
+            third.events.first(),
+            Some(&Event::CanaryCleared),
+            "the alarm closes exactly once: {:?}",
+            third.events
+        );
+        assert_eq!(third.snapshot.canary, Some(CanaryStatus::Ok));
+    }
+
+    #[tokio::test]
+    async fn an_unmatched_canonical_is_inconclusive_and_the_swap_proceeds() {
+        // Issue #714 AC: the resolved canonical matches NO stash — overwhelmingly
+        // an in-place token refresh — so the canary is INCONCLUSIVE and fails
+        // OPEN (never block on "couldn't verify"): the swap runs, and the engine's
+        // own re-stash captures the refreshed token (the drift guard #6 exists
+        // for), composing exactly with the #211 allow-neither rule.
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token-refreshed").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.97, 0.40)
+            .ok("u-B", 0.10, 0.10);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+
+        let outcome = warmed_tick(&mut daemon).await;
+        assert_eq!(outcome.action, TickAction::Swapped { from: 0, to: 1 });
+        assert!(
+            !outcome
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::CanaryDrift { .. } | Event::CanaryAmbiguous { .. })),
+            "inconclusive raises no alarm: {:?}",
+            outcome.events
+        );
+        assert_eq!(outcome.snapshot.canary, Some(CanaryStatus::Inconclusive));
+        // The engine captured the refreshed token into the outgoing stash (#6)…
+        assert!(daemon
+            .stash
+            .read("Sessiometer/u-A")
+            .await
+            .unwrap()
+            .credential
+            .matches(&cred(b"A-token-refreshed")));
+        // …and rerouted the canonical to the incoming account.
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"B-token")));
+    }
+
+    #[tokio::test]
+    async fn a_lagging_display_cowrite_is_healed_not_reported_as_drift() {
+        // Issue #714 decided invariant: reconcile-BEFORE-cross-check. The fixture
+        // is a lagging self-co-write (a prior swap put spare's token in the
+        // canonical; the display still says work) with a WRITABLE `~/.claude.json`
+        // — the canary's embedded reconcile heals the display first, so the swap
+        // proceeds with NO false drift alarm.
+        let tun = tunables(95, 80, 0);
+        let (_dir, mut daemon) = drift_daemon(&tun).await;
+
+        // Same divergent fixture as the drift tests — but the display is writable.
+        let outcome = warmed_tick(&mut daemon).await;
+
+        assert_eq!(outcome.action, TickAction::Swapped { from: 1, to: 0 });
+        assert!(
+            !outcome
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::CanaryDrift { .. })),
+            "a healable display is never drift: {:?}",
+            outcome.events
+        );
+        assert_eq!(outcome.snapshot.canary, Some(CanaryStatus::Ok));
+    }
+
+    #[tokio::test]
+    async fn refresh_canary_holds_state_and_edges_through_drift_and_clear() {
+        // The boot-path entry (issue #714): `refresh_canary` concludes a verdict,
+        // retains it for the wire, and edge-triggers the durable pair — silent on
+        // a repeat verdict, `canary_cleared` exactly once when the drift resolves.
+        // A gone canonical concludes NOT_FOUND with NO canary event of its own
+        // (the scrub machinery voices that state).
+        let tun = tunables(95, 80, 0);
+        let (dir, mut daemon) = drift_daemon(&tun).await;
+
+        freeze_dir(dir.path());
+        let mut events = Vec::new();
+        let first = daemon.refresh_canary(&mut events).await.unwrap();
+        assert_eq!(
+            first,
+            crate::canary::CanaryOutcome::Drift {
+                displayed: 0,
+                matched: 1
+            }
+        );
+        assert_eq!(
+            events,
+            vec![Event::CanaryDrift {
+                displayed: "work".to_owned(),
+                matched: "spare".to_owned(),
+                overridden: false,
+            }]
+        );
+
+        // Re-running under the SAME verdict is silent (edge-triggered).
+        let mut repeat = Vec::new();
+        daemon.refresh_canary(&mut repeat).await.unwrap();
+        assert!(
+            repeat.is_empty(),
+            "no re-fire on a held verdict: {repeat:?}"
+        );
+        thaw_dir(dir.path());
+
+        // The drift resolves (the canonical returns to the DISPLAYED account's
+        // token) → one `canary_cleared` closes the episode…
+        daemon.store.write(&cred(b"A-token")).await.unwrap();
+        let mut cleared = Vec::new();
+        let verdict = daemon.refresh_canary(&mut cleared).await.unwrap();
+        assert_eq!(verdict, crate::canary::CanaryOutcome::Ok);
+        assert_eq!(cleared, vec![Event::CanaryCleared]);
+
+        // …and NOT_FOUND is a verdict with no canary event (scrub owns the voice).
+        daemon.store.set_not_found(true);
+        let mut gone = Vec::new();
+        let verdict = daemon.refresh_canary(&mut gone).await.unwrap();
+        assert_eq!(verdict, crate::canary::CanaryOutcome::NotFound);
+        assert!(gone.is_empty(), "not-found emits no canary event: {gone:?}");
+    }
+
+    #[test]
+    fn redaction_meter_covers_the_canary_lines_and_status() {
+        use crate::redaction::meter::{assert_clean, Secrets};
+        // Issue #714 / #15: every canary surface — the three durable event lines
+        // and the wire-serialized `CanaryStatus` — must carry operator LABELS and
+        // COUNTS only, never a token, blob, email, or account-uuid. Build the
+        // corpus from the meter fixture's REAL secret material context (the labels
+        // are authored, the secrets exist in the fixture) and prove the
+        // value-based meter reads clean.
+        let secrets = Secrets::meter_fixture();
+        let mut corpus = String::new();
+        for event in [
+            Event::CanaryDrift {
+                displayed: "work".to_owned(),
+                matched: "spare".to_owned(),
+                overridden: false,
+            },
+            Event::CanaryDrift {
+                displayed: "work".to_owned(),
+                matched: "spare".to_owned(),
+                overridden: true,
+            },
+            Event::CanaryAmbiguous { count: 3 },
+            Event::CanaryCleared,
+        ] {
+            corpus.push_str(&event.to_log_line(std::time::SystemTime::UNIX_EPOCH));
+            corpus.push('\n');
+        }
+        for status in [
+            CanaryStatus::Ok,
+            CanaryStatus::Inconclusive,
+            CanaryStatus::NotFound,
+            CanaryStatus::Ambiguous { count: 3 },
+            CanaryStatus::Drift {
+                displayed: "work".to_owned(),
+                matched: "spare".to_owned(),
+                overridden: true,
+            },
+        ] {
+            corpus.push_str(&serde_json::to_string(&status).unwrap());
+            corpus.push('\n');
+        }
+        // The corpus is substantive (no vacuous pass on a degraded build)…
+        assert!(corpus.contains("event=canary_drift"));
+        assert!(corpus.contains("overridden=true"));
+        assert!(corpus.contains(r#""verdict":"drift""#));
+        // …and carries nothing the meter knows as secret.
         assert_clean(&corpus, &secrets, &[]);
     }
 }

@@ -10,6 +10,7 @@
 //! the `0.1.0` milestone issues).
 
 mod active;
+mod canary;
 mod capture;
 mod cc_version;
 mod claude_state;
