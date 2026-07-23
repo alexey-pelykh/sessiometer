@@ -129,5 +129,15 @@ printf -- '- supported **`2.1.181`** on macOS\n' > "$work/README.md"
 fake_claude 2.1.181
 check "degenerate min==max range accepts a single-version README" 0 "$(run)"
 
+# Case 7 (#721): MAX bound trailing-edge anchor. A malformed README states a drifted MAX
+# with a trailing digit -- `2.1.181`-`2.1.2179` while the ledger MAX is 2.1.217. Before the
+# anchor, MAX (2.1.217) matched as a PREFIX of 2.1.2179 and the guard PASSED despite the
+# wrong range; the `([^0-9]|$)` trailing-edge anchor makes it RED. (MIN's trailing edge was
+# already protected, so this is MAX-specific.)
+write_ledger 2.1.181 2.1.217
+printf -- '- supported **`2.1.181`–`2.1.2179`** on macOS\n' > "$work/README.md"
+fake_claude 2.1.190
+check "MAX with a trailing digit (prefix-match) is REJECTED" 1 "$(run)"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
