@@ -7,9 +7,12 @@
 # closes), and GREEN on a correctly-stated adjacent range. Run locally:
 #   ./scripts/check-cc-version.test.sh
 #
-# check-cc-version.sh is a pre-release gate (build/release-checklist.md), not a CI
-# job — CI never execs a real `claude`. This peer is the same: a local falsifier,
+# check-cc-version.sh is an advisory pre-release provenance check
+# (build/release-checklist.md; demoted from a release gate in #716), not a CI job —
+# CI never execs a real `claude`. This peer is the same: a local falsifier,
 # runnable by hand, like scripts/check-formula.test.sh and check-gate-change-ack.test.sh.
+# The #716 demotion changed how a non-zero exit is TREATED, not the exit codes —
+# every expected-exit assertion below is unchanged and still binding.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"

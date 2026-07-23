@@ -8,19 +8,30 @@
 - CC_SUPPORTED_MIN: 2.1.181
 - CC_SUPPORTED_MAX: 2.1.217
 
-This range is the **authoritative source of truth** for sessiometer's Claude Code compatibility.
-Every reverse-engineered assumption recorded in this ledger — the keychain-service derivation
-(#100), the credential-refresh lifecycle (#101), the `oauthAccount`/token orthogonality (H2) — was
-verified against Claude Code in `2.1.181`–`2.1.217` on macOS `26.5.1`–`26.5.2` / Darwin `25.x`.
-Because these are reverse-engineered CC internals, a CC release outside this range may silently
-change them, and `sessiometer` would then target the wrong keychain item with no other signal.
+This range is the **authoritative provenance record** of sessiometer's Claude Code verification —
+it states which CC builds the findings were **last verified against**; it does not gate anything
+(demoted from a release gate in #716). Every reverse-engineered assumption recorded in this
+ledger — the keychain-service derivation (#100), the credential-refresh lifecycle (#101), the
+`oauthAccount`/token orthogonality (H2) — was verified against Claude Code in `2.1.181`–`2.1.217`
+on macOS `26.5.1`–`26.5.2` / Darwin `25.x`. A CC release outside this range may silently change
+those internals, but "silently" no longer means "with no other signal": the most dangerous drift —
+a changed keychain-service derivation, which would make `sessiometer` target the wrong item — is
+caught at **runtime** by the #714 behavioral canary (the daemon re-verifies the derivation at boot
+and before every credential-swap write — its own swaps and `use`, `--force` included — and refuses
+the write on drift). Detection therefore lands where the risk lands — the user's machine — and this
+range records what was verified rather than blocking a release. There is **no runtime version
+advisory**: the installed `claude`'s version was never a control (a matching version number does not
+prove the reverse-engineered internals are unchanged, nor a mismatched one prove they changed), so
+the #715 startup/`status` advisory was removed in #716. The residual findings the canary does not
+re-check (the refresh lifecycle, H2/H3 adoption semantics) are covered by this **provenance
+record** — surfaced in `sessiometer --version`, this ledger, and ADR #717 — not by a runtime check.
 
-The range is **spot-verified, not exhaustive**: the range-gating findings were established on
+The range is **spot-verified, not exhaustive**: the range-underwriting findings were established on
 `2.1.181` and re-verified on `2.1.195` (#145), `2.1.197` (#130) and `2.1.217` (#552). Builds between
 those points are covered by the range but were not individually walked. (The `2.1.207` work —
 #470's scrub observation and #466's knob-absence spike — is deliberately **not** in that list:
 per #470's own "Does NOT widen the supported range" section, it characterizes an auth
-failure-mode and does not re-verify the findings the range gates.)
+failure-mode and does not re-verify the findings the range records.)
 
 Consumers of this range:
 
@@ -29,13 +40,17 @@ Consumers of this range:
 - [`scripts/check-cc-version.sh`](../scripts/check-cc-version.sh) re-verifies the installed `claude`
   against the two lines above, and also asserts the README still states this range (so the
   user-facing copy can't silently drift); the pre-release
-  [`build/release-checklist.md`](release-checklist.md) runs it as a gate.
-- [`src/cc_version.rs`](../src/cc_version.rs) bakes the two values in as constants and advises the
-  USER — once at daemon startup, and on each `sessiometer status` — when their installed `claude`
-  falls outside them (issue #715). A shipped binary cannot read this ledger, so the range must be
-  compiled in; its `the_baked_range_matches_the_ledger` test makes this file a compile-time input
-  and fails if the constants drift from the two lines above. **Widening the range here therefore
-  requires updating `CC_SUPPORTED_MIN` / `CC_SUPPORTED_MAX` in that module in the same change.**
+  [`build/release-checklist.md`](release-checklist.md) runs it as an **advisory provenance
+  check** — an out-of-range `claude` informs the release rather than blocking it (#716; the
+  stale-README arm is the one exit-1 cause the checklist still says to fix before tagging,
+  since that means the *published* provenance is wrong).
+- [`src/cc_version.rs`](../src/cc_version.rs) bakes the two values in as constants and surfaces them
+  as a neutral provenance line in `sessiometer --version` (issue #716) — a record printed always,
+  with no `claude` probe (the #715 runtime advisory was removed in #716). A shipped binary cannot
+  read this ledger, so the range must be compiled in; its `the_baked_range_matches_the_ledger` test
+  makes this file a compile-time input and fails if the constants drift from the two lines above.
+  **Widening the range here therefore requires updating `CC_SUPPORTED_MIN` / `CC_SUPPORTED_MAX` in
+  that module in the same change.**
 
 When a CC bump moves the installed version **above** `CC_SUPPORTED_MAX`, re-verify the
 version-sensitive findings below — at minimum **H3** (fresh-start adoption) and the **#100**

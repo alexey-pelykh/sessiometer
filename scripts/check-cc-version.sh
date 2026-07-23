@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
-# Re-verify the installed Claude Code against sessiometer's supported CC range.
+# Advisory provenance check: compare the installed Claude Code against the range
+# sessiometer's reverse-engineered internals were last verified against.
 #
 # `sessiometer` depends on reverse-engineered Claude Code internals (the
 # keychain-service derivation #100, the credential-refresh lifecycle #101). Those
-# were verified against a specific CC range, recorded as the authoritative source
-# of truth in build/version-compat.md. A CC release outside that range may have
-# silently changed the internals, and sessiometer would then target the wrong
-# keychain item with no other signal — so the supported range is a pre-release
-# gate (see build/release-checklist.md), not a hermetic CI check (CI never execs
-# a real `claude`).
+# were verified against a specific CC range, recorded as the authoritative
+# provenance in build/version-compat.md. A CC release outside that range may have
+# silently changed the internals — but that drift is caught at RUNTIME, where the
+# risk actually lands: the #714 behavioral canary refuses credential writes when
+# the keychain derivation drifts. The version string was never a control, so there
+# is no runtime version advisory — the #715 startup/`status` advisory was removed
+# in #716. This check is therefore ADVISORY provenance for the maintainer — it
+# keeps the recorded "verified against" range honest — not a release-blocking gate
+# (demoted in #716; see build/release-checklist.md). It is still not a hermetic CI
+# check: CI never execs a real `claude`.
 #
 # This script reads the range from build/version-compat.md (the single source of
 # truth) and compares the installed `claude --version` against it.
@@ -17,9 +22,10 @@
 # (mirroring the tool's own $CLAUDE_BIN/$PATH layer; the config `claude_bin`
 # override is not consulted here).
 #
-# Exit codes:
-#   0  installed CC is within the supported range and the README states it
-#   1  installed CC is OUTSIDE the supported range, or the README no longer states the range
+# Exit codes (unchanged by the #716 demotion — advisory status lives in how the
+# release checklist treats a non-zero exit, not in the codes themselves):
+#   0  installed CC is within the verified range and the README states it
+#   1  installed CC is OUTSIDE the verified range, or the README no longer states the range
 #   2  could not determine (no `claude`, unparseable version, or no range in the ledger)
 set -euo pipefail
 
@@ -46,9 +52,11 @@ if [[ -z "$min" || -z "$max" ]]; then
     exit 2
 fi
 
-# README drift guard: AC1 requires the range in a user-facing location, so a stale
-# README is a release failure, not a silent regression. Assert the README states the
-# current ledger range (checked at the end so `claude` findings print first).
+# README drift guard: the range must live in a user-facing location, so a stale
+# README means the PUBLISHED provenance is wrong — reported here (exit 1) so the
+# maintainer fixes the README rather than shipping copy that misstates what was
+# verified. Assert the README states the current ledger range (checked at the end
+# so `claude` findings print first).
 #
 # #712: check the range as a UNIT, not two independent substrings. Two loose
 # `grep -qF` (MIN present AND MAX present, anywhere) pass on a README that states a
@@ -74,7 +82,7 @@ fi
 claude_bin="${CLAUDE_BIN:-claude}"
 if ! command -v "$claude_bin" >/dev/null 2>&1; then
     echo "error: no \`claude\` found (looked for '${claude_bin}'; set \$CLAUDE_BIN or add it to \$PATH)." >&2
-    echo "       cannot re-verify against the supported range ${min}-${max}." >&2
+    echo "       cannot re-verify against the verified range ${min}-${max}." >&2
     exit 2
 fi
 
@@ -95,25 +103,26 @@ ver_le() { [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" == "$1" ]]; 
 
 status=0
 if ver_le "$min" "$cur" && ver_le "$cur" "$max"; then
-    echo "ok: Claude Code ${cur} is within the supported range ${min}-${max} (build/version-compat.md)."
+    echo "ok: Claude Code ${cur} is within the verified range ${min}-${max} (build/version-compat.md)."
 else
     status=1
-    echo "warning: Claude Code ${cur} is OUTSIDE the supported range ${min}-${max}." >&2
-    echo "         sessiometer's reverse-engineered CC internals are unverified on this version." >&2
+    echo "warning: Claude Code ${cur} is OUTSIDE the verified range ${min}-${max} (advisory — see #716)." >&2
+    echo "         sessiometer's reverse-engineered CC internals are unverified on this version;" >&2
+    echo "         runtime drift protection: the #714 canary refuses drifted credential writes." >&2
     if ver_le "$cur" "$min"; then
-        echo "         ${cur} is BELOW the range — install a supported \`claude\`, or verify the older CC." >&2
+        echo "         ${cur} is BELOW the range — install a verified \`claude\`, or verify the older CC." >&2
     else
-        echo "         ${cur} is ABOVE the range — re-verify H3 (fresh-start adoption) and the #100" >&2
-        echo "         keychain-service derivation in build/version-compat.md, then widen the range there" >&2
-        echo "         and update the README." >&2
+        echo "         ${cur} is ABOVE the range — to refresh the provenance, re-verify H3 (fresh-start" >&2
+        echo "         adoption) and the #100 keychain-service derivation in build/version-compat.md," >&2
+        echo "         then widen the range there and update the README." >&2
     fi
 fi
 
 if [[ "$readme_ok" -eq 0 ]]; then
     status=1
-    echo "warning: README.md does not state the supported range ${min}-${max}." >&2
+    echo "warning: README.md does not state the verified range ${min}-${max}." >&2
     echo "         the user-facing range has drifted from build/version-compat.md — update" >&2
-    echo "         the README \`## Prerequisites\` range to match." >&2
+    echo "         the README \`## Prerequisites\` range so the published provenance is accurate." >&2
 fi
 
 exit "$status"
