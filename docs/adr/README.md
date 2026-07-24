@@ -14,7 +14,7 @@ issue threads is consolidated here in a stable, discoverable place.
 | ADR | Title | Status |
 |-----|-------|--------|
 | [0001](0001-current-thread-tokio-runtime.md) | Single-threaded (`current_thread`) Tokio runtime | Accepted |
-| [0002](0002-keychain-via-security-cli-zero-ffi.md) | Keychain access via `/usr/bin/security` CLI (zero FFI) | Accepted |
+| [0002](0002-keychain-via-security-cli-zero-ffi.md) | Keychain access via `/usr/bin/security` CLI (zero FFI) | Accepted (amended by [0028](0028-version-range-provenance-canary-runtime-guard.md)) |
 | [0003](0003-no-torn-swap-invariant.md) | No-torn-swap invariant | Accepted |
 | [0004](0004-incidental-libc-ffi-kept-raw.md) | Incidental `libc` FFI kept raw (no wrapper crate) | Accepted |
 | [0005](0005-config-parsed-by-crate-emitted-by-hand.md) | Config parsed with the `toml` crate, emitted by hand | Accepted |
@@ -40,7 +40,7 @@ issue threads is consolidated here in a stable, discoverable place.
 | [0025](0025-weekly-trigger-ceiling-semantics.md) | `weekly_trigger` is a settled ceiling too, with an independently calibrated tail margin | Accepted |
 | [0026](0026-daemon-fault-severity-rank-is-cross-surface.md) | Daemon-payload-fault severity is a cross-surface rank, not a per-surface colour register | Accepted |
 | [0027](0027-macos-app-bundle-identity.md) | macOS app bundle identity — freeze `org.sessiometer.menubar` on the `<surface>` axis | Accepted |
-| [0028](0028-version-range-provenance-canary-runtime-guard.md) | CC version range is provenance, not a runtime gate; the #714 behavioral canary is the runtime compatibility guard | Accepted |
+| [0028](0028-version-range-provenance-canary-runtime-guard.md) | CC version range is provenance, not a runtime gate; the #714 behavioral canary is the runtime compatibility guard | Accepted (#730 hardening has since landed) |
 
 ## Conventions
 
