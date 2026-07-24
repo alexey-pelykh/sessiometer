@@ -17,19 +17,17 @@ targets:
     platform: macOS
     sources:
       - Sources
-      # Launch-at-login daemon agent (issue #170 / #171) — GATED, intentionally commented out.
-      # When #171 embeds the daemon binary AND authors the LaunchAgent plist (with the REAL BundleProgram —
-      # deferred here per the #170 keystone: never a launchd job pointing at a program that isn't embedded
-      # yet), ship that plist into the app bundle's Contents/Library/LaunchAgents/ so
-      # `SMAppService.agent(plistName: "org.sessiometer.agent.plist")` can find and register it. Until then
-      # `daemonAgentStatus` stays `.notFound`, `LoginItemModel.canStartDaemon` is false, and the not-running
-      # panel's Start affordance degrades honestly to the inert banner. Uncomment (and author the plist) as
-      # part of #171 — NOT before.
-      # - path: LaunchAgents/org.sessiometer.agent.plist
-      #   buildPhase:
-      #     copyFiles:
-      #       destination: wrapper
-      #       subpath: Contents/Library/LaunchAgents
+      # Launch-at-login daemon agent (#170/#171) — the bundled LaunchAgent plist. Shipped into
+      # Contents/Library/LaunchAgents/ so `SMAppService.agent(plistName: "org.sessiometer.agent.plist")`
+      # resolves and registers it. Its presence flips `daemonAgentStatus` .notFound → .notRegistered,
+      # which makes `LoginItemModel.canStartDaemon` true (the not-running panel's Start affordance goes
+      # live). A static bundle resource — sealed into the app signature (no independent signing); its
+      # BundleProgram points at the embedded daemon staged by the postBuildScript below.
+      - path: LaunchAgents/org.sessiometer.agent.plist
+        buildPhase:
+          copyFiles:
+            destination: wrapper
+            subpath: Contents/Library/LaunchAgents
     settings:
       base:
         # Bundle identity — FROZEN (ADR-0027). `org.sessiometer` is the product-FAMILY namespace
@@ -54,6 +52,16 @@ targets:
         # `CFBundleIconName`, so the app shows the Cycle-Gauge icon in Dock / Finder / About. Full color is
         # correct on these surfaces — unlike the monochrome menu-bar status-item template glyphs (#325/#437).
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    # Embed the universal `sessiometer` daemon at Contents/Helpers/sessiometer (#171 WS1).
+    # postBuildScripts run AFTER the .app wrapper is assembled; the external release script
+    # (scripts/release-macos.sh) then signs inside-out (daemon first, app last). The script is
+    # RELEASE-ONLY (no-ops for Debug), so `xcodebuild test CODE_SIGNING_ALLOWED=NO` never builds Rust.
+    postBuildScripts:
+      - name: "Embed universal sessiometer daemon (Release only)"
+        script: '"${SRCROOT}/scripts/embed-daemon.sh"'
+        shell: /bin/bash
+        # Cargo owns incrementality; force the phase to run every build so a src/** change re-embeds.
+        basedOnDependencyAnalysis: false
   # Wire-decoder (#322) + socket-transport (#323) + status-store (#324) unit tests. A STANDALONE
   # logic-test bundle: no TEST_HOST, so it never launches the app — it compiles the pure production
   # sources directly alongside the tests (NOT the whole Sources dir: main.swift is the app's

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Non-sandboxed (ADR-0011): the app reaches ~/Library/LaunchAgents (two-owner guard,
+         #170) and drives the daemon over an AF_UNIX socket — neither is reachable under App
+         Sandbox, so there is no app-sandbox key. Pure IPC client with zero network egress
+         (enforced by the CI no-Network.framework guard) → no network entitlement is needed
+         under Hardened Runtime. No JIT / unsigned executable memory / third-party plug-ins →
+         no cs.* runtime exceptions; library validation stays ON. get-task-allow MUST be
+         false for a distributed (Dev-ID, notarized) build. -->
+    <key>com.apple.security.get-task-allow</key>
+    <false/>
+</dict>
+</plist>
