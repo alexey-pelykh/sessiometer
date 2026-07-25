@@ -18,21 +18,25 @@
 //!
 //! A LaunchAgent (not a system-wide LaunchDaemon) because the swap loop needs the
 //! user's **login keychain**, which only exists inside the per-user GUI session.
-//! The agent is `RunAtLoad` + `KeepAlive`, so it starts at login and stays up
-//! across the whole session — the poll loop runs continuously and does not
-//! idle-exit. That is what an always-present UI attaches to, and why swaps keep
-//! happening with no terminal open.
+//! The agent is `RunAtLoad` + conditional `KeepAlive` (`{SuccessfulExit: false}`,
+//! issue #742), so it starts at login and — because the poll loop runs continuously
+//! and does not idle-exit — stays up across the whole session; only a NON-clean exit
+//! (a crash) is respawned. That is what an always-present UI attaches to, and why
+//! swaps keep happening with no terminal open.
 //!
 //! **The single-owner guard is upheld here by construction, not re-implemented.**
-//! The plist's `ProgramArguments` is exactly `[<binary>, "run"]`, and `run`
-//! acquires the single-instance [`InstanceLock`](crate::daemon::InstanceLock) on
-//! `daemon.lock` FIRST — before the roster load, the socket bind, or any swap. So
+//! The plist's `ProgramArguments` is exactly `[<binary>, "run", "--managed"]`, and
+//! `run` acquires the single-instance [`InstanceLock`](crate::daemon::InstanceLock)
+//! on `daemon.lock` FIRST — before the roster load, the socket bind, or any swap. So
 //! whatever launchd invokes is the lock-guarded run-loop (never a path that enters
 //! the loop without the lock), and a foreground `run` and the background agent can
-//! never both drive the swap loop: whichever starts second gets
-//! [`Error::AlreadyRunning`] (process exit
-//! `3`) and performs no swap. This is a **safety** guard — there is deliberately
-//! no `--force`-style bypass on `run`.
+//! never both drive the swap loop: whichever starts second loses the lock and
+//! performs no swap. The two owners differ only in how they REPORT that loss — a
+//! launchd-managed `run --managed` exits `0` (a clean stand-down, so the conditional
+//! `KeepAlive` does not respawn it into a throttled loop; issue #742), while a human
+//! foreground `sessiometer run` gets [`Error::AlreadyRunning`] (process exit `3`,
+//! issue #7) so a supervisor can tell "already running" apart. This is a **safety**
+//! guard — there is deliberately no `--force`-style bypass on `run`.
 //!
 //! Following the CONTRIBUTING "transport rule", the launchd control plane is driven
 //! through the system CLI at an absolute path (`/bin/launchctl`) rather than a
@@ -88,7 +92,7 @@ pub(crate) async fn install() -> Result<()> {
     let contents = render_plist(
         AGENT_LABEL,
         &program,
-        &["run"],
+        &["run", "--managed"],
         &stdout_log,
         &stderr_log,
         &environment,
@@ -147,8 +151,8 @@ pub(crate) async fn uninstall() -> Result<()> {
 /// Restart a LOADED managed daemon (issue #397's `daemon restart`, supervised branch; re-homed
 /// from issue #376's `service restart`): the headline recovery verb for a stuck/stale daemon
 /// (#375) or an applied config change. `kickstart -k` kills the running agent and relaunches
-/// it atomically — a bare kill would just be respawned by `KeepAlive`, so `-k` is what makes
-/// "restart" mean restart.
+/// it in one atomic launchd operation — the primitive that makes "restart" a single reliable
+/// step rather than a stop-then-start with a relaunch race.
 ///
 /// PRECONDITION: the agent's job is in the domain ([`AgentSupervision::Supervising`] or
 /// [`AgentSupervision::RegisteredIdle`] with nothing else running). The caller ([`crate::cli`]'s
@@ -170,8 +174,10 @@ pub(crate) async fn kickstart_managed() -> Result<()> {
 ///
 /// PRECONDITION: a plist is installed ([`is_managed`]), the agent is NOT loaded, and no
 /// unmanaged daemon is running. Bootstrapping over a live foreground `run` would hand launchd a
-/// process that loses the single-instance lock, exits `3`, and is respawned by `KeepAlive` into
-/// a throttled crash loop — so the caller refuses that state rather than reaching this.
+/// `run --managed` that loses the single-instance lock and cleanly stands down (exit `0`, not
+/// respawned under the conditional `KeepAlive`; issue #742) — so the managed agent would never
+/// actually take over while the foreground daemon holds the lock. The caller refuses that state
+/// rather than bootstrapping an agent that immediately stands down.
 pub(crate) async fn bootstrap_managed() -> Result<()> {
     let plist = agent_plist()?;
     launchctl(&["bootstrap", &domain_target(), &plist.to_string_lossy()]).await?;
@@ -216,17 +222,17 @@ pub(crate) async fn status() -> Result<()> {
 }
 
 /// Stop a MANAGED daemon (issue #397's `daemon stop`, managed branch; re-homed from issue
-/// #376's `service stop`): boot the installed agent out of the per-user domain, which stops
-/// the process AND suppresses the `KeepAlive` respawn (a control-socket shutdown would just be
-/// respawned — that is why the managed case must `bootout`, not signal the process). This stops
-/// it for the CURRENT login session; `RunAtLoad` brings it back at the next login
-/// (`sessiometer service uninstall` removes it for good).
+/// #376's `service stop`): boot the installed agent out of the per-user domain, which terminates
+/// the process AND removes its job, so nothing relaunches it. This stops it for the CURRENT login
+/// session; `RunAtLoad` brings it back at the next login (`sessiometer service uninstall` removes
+/// it for good).
 ///
 /// PRECONDITION: launchd is supervising the daemon ([`AgentSupervision::Supervising`]), so booting
 /// the agent out stops the running daemon itself. The caller ([`crate::cli`]'s `daemon stop`)
-/// dispatches on exactly that. For a merely-[`AgentSupervision::RegisteredIdle`] job the bootout is
-/// still REQUIRED — it disarms the `KeepAlive` respawn — but is NOT the whole stop, so the caller
-/// uses the quiet [`bootout_agent`] there and narrates the compound stop itself.
+/// dispatches on exactly that. For a merely-[`AgentSupervision::RegisteredIdle`] job the bootout
+/// removes the idle registered agent but is NOT the whole stop (a foreground `run` owns the
+/// daemon), so the caller uses the quiet [`bootout_agent`] there and narrates the compound stop
+/// itself.
 pub(crate) async fn stop_managed() -> Result<()> {
     bootout_agent().await?;
     eprintln!(
@@ -238,9 +244,10 @@ pub(crate) async fn stop_managed() -> Result<()> {
 
 /// Boot the agent out of the per-user domain WITHOUT printing — the bare launchctl primitive under
 /// [`stop_managed`]. `daemon stop` uses this directly for the [`AgentSupervision::RegisteredIdle`]
-/// case, where the bootout only disarms `KeepAlive` and the real stop is a control-socket shutdown;
-/// emitting `stop_managed`'s "daemon stopped, managed by launchd" there would contradict the
-/// unmanaged-shutdown line that follows. The caller owns the message for that compound path.
+/// case, where the bootout only removes the idle registered agent and the real stop is a
+/// control-socket shutdown; emitting `stop_managed`'s "daemon stopped, managed by launchd" there
+/// would contradict the unmanaged-shutdown line that follows. The caller owns the message for that
+/// compound path.
 pub(crate) async fn bootout_agent() -> Result<()> {
     launchctl(&["bootout", &service_target(AGENT_LABEL)]).await
 }
@@ -302,9 +309,10 @@ pub(crate) enum AgentSupervision {
     /// the agent out but leaves it registered for next login) — so this is NOT [`is_managed`].
     Unregistered,
     /// The job is in the domain, but launchd has no running process for it: it was bootstrapped
-    /// while a foreground `run` already held the single-instance lock (so the agent's own `run`
-    /// exits `3` and `KeepAlive` throttles it into a crash loop), or it is simply between
-    /// respawns. Whatever daemon is running here, launchd is NOT supervising it.
+    /// while a foreground `run` already held the single-instance lock (so the agent's own
+    /// `run --managed` lost the lock and cleanly stood down — exit `0`, not respawned under the
+    /// conditional `KeepAlive`; issue #742), or it is simply between respawns. Whatever daemon is
+    /// running here, launchd is NOT supervising it.
     RegisteredIdle,
     /// The job is in the domain WITH a running process — launchd is supervising the daemon, and
     /// since that process holds the single-instance lock no foreground `run` can coexist.
@@ -344,7 +352,7 @@ pub(crate) async fn agent_supervision() -> Result<AgentSupervision> {
 /// line (launchd prints a PID only while the process lives). Requiring only one of the two keeps a
 /// future `launchctl` output tweak from silently flipping the answer. If BOTH ever disappear this
 /// degrades to "not running", which is the SAFE direction: `daemon restart` then refuses rather than
-/// bootstrapping a second daemon into a `KeepAlive` crash loop.
+/// bootstrapping a second managed agent that would just lose the lock and cleanly stand down (#742).
 fn job_is_running(dump: &str) -> bool {
     dump.lines()
         .map(str::trim)
@@ -460,11 +468,13 @@ fn xml_escape(s: &str) -> String {
 /// Render the LaunchAgent plist — the module's pure, fully-tested core.
 ///
 /// `program` is the absolute `sessiometer` binary path; `args` follow it in
-/// `ProgramArguments` (always `["run"]` — the lock-guarded verb, issue #166's
-/// "whatever launchd invokes is the lock-guarded run-loop"). `RunAtLoad` +
-/// `KeepAlive` are both `true` so the agent starts at login and is kept up across
-/// the session. `environment` is baked into an `EnvironmentVariables` dict (omitted
-/// entirely when empty).
+/// `ProgramArguments` (the installed agent passes `["run", "--managed"]` — the
+/// lock-guarded verb plus the launchd-managed marker that turns a lost-lock
+/// contention into a clean exit-`0` stand-down rather than exit-`3`; issues #166,
+/// #742). `RunAtLoad` is `true` and `KeepAlive` is conditional
+/// (`{SuccessfulExit: false}`) so the agent starts at login and is kept up across
+/// the session, respawned only on a non-clean exit. `environment` is baked into an
+/// `EnvironmentVariables` dict (omitted entirely when empty).
 fn render_plist(
     label: &str,
     program: &Path,
@@ -511,7 +521,10 @@ fn render_plist(
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
-  <true/>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
   <key>StandardOutPath</key>
   <string>{stdout}</string>
   <key>StandardErrorPath</key>
@@ -626,10 +639,10 @@ org.sessiometer.agent = {
     #[test]
     fn job_is_running_reads_launchd_state_not_mere_domain_membership() {
         // Issue #397: `launchctl print` exits 0 for BOTH of these, so the exit status alone cannot
-        // tell "launchd is supervising the daemon" from "launchd registered a job that keeps
-        // dying". Dispatching `daemon stop` / `daemon restart` on the exit status would bootout an
-        // agent that supervises nothing, or kickstart one whose `run` loses the single-instance
-        // lock to a live foreground daemon and crash-loops under `KeepAlive`.
+        // tell "launchd is supervising the daemon" from "launchd registered a job with no running
+        // process". Dispatching `daemon stop` / `daemon restart` on the exit status would bootout an
+        // agent that supervises nothing, or kickstart one whose `run --managed` loses the
+        // single-instance lock to a live foreground daemon and cleanly stands down (exit 0; #742).
         assert!(job_is_running(DUMP_RUNNING));
         assert!(!job_is_running(DUMP_REGISTERED_IDLE));
     }
@@ -652,7 +665,8 @@ org.sessiometer.agent = {
         assert!(!job_is_running("\tlast exit code = 3"), "no marker");
         assert!(!job_is_running(""), "empty dump");
         // Degrading to "not running" when BOTH markers vanish is the SAFE direction: `daemon
-        // restart` refuses rather than bootstrapping a second daemon into a crash loop.
+        // restart` refuses rather than bootstrapping a second managed agent that would just lose
+        // the lock and cleanly stand down (issue #742).
         assert!(!job_is_running(
             "org.sessiometer.agent = {\n\tprogram = /x\n}"
         ));
@@ -682,15 +696,21 @@ org.sessiometer.agent = {
     }
 
     #[test]
-    fn the_launch_agent_invokes_the_lock_guarded_run_verb() {
-        // AC4: "whatever launchd invokes is the lock-guarded run-loop, not a path
-        // that enters the loop without the lock." The plist must exec the binary
-        // with exactly `run` — the verb that acquires the single-instance lock FIRST
-        // (cli::run) — and NOTHING that could bypass it (no `--force`, no other verb).
+    fn the_launch_agent_invokes_the_lock_guarded_run_verb_as_a_managed_agent() {
+        // AC4 (issues #166, #742): "whatever launchd invokes is the lock-guarded
+        // run-loop, not a path that enters the loop without the lock." The plist must
+        // exec the binary with the lock-guarded `run` verb (cli::run acquires the
+        // single-instance lock FIRST) plus the `--managed` marker, and NOTHING that
+        // could BYPASS the lock (no `--force`, no other verb). `--managed` is not a
+        // bypass — it only changes the lost-lock EXIT (a clean 0 stand-down vs the
+        // human exit-3), so the lock is still taken before any swap. This is the Rust
+        // half of the two-owner parity the bundled plist mirrors
+        // (`apps/menubar/LaunchAgents/org.sessiometer.agent.plist`, pinned by
+        // BundledAgentPlistTests).
         let plist = render_plist(
             AGENT_LABEL,
             Path::new("/opt/sessiometer/bin/sessiometer"),
-            &["run"],
+            &["run", "--managed"],
             Path::new("/logs/out"),
             Path::new("/logs/err"),
             &[],
@@ -700,8 +720,9 @@ org.sessiometer.agent = {
             vec![
                 "/opt/sessiometer/bin/sessiometer".to_owned(),
                 "run".to_owned(),
+                "--managed".to_owned(),
             ],
-            "launchd invokes the binary with the lock-guarded `run` verb and nothing else",
+            "launchd invokes the binary with the lock-guarded `run` verb + the --managed marker, nothing else",
         );
     }
 
@@ -738,12 +759,16 @@ org.sessiometer.agent = {
 
     #[test]
     fn keep_alive_and_run_at_load_persist_the_agent_across_the_session() {
-        // AC1: installed as a LaunchAgent that persists across the session — it starts
-        // at login (RunAtLoad) and is kept up (KeepAlive, the continuously-polling loop).
+        // AC1 + issue #742: installed as a LaunchAgent that persists across the session —
+        // it starts at login (RunAtLoad) and is kept up by a CONDITIONAL KeepAlive
+        // (SuccessfulExit: false). The continuously-polling loop never idle-exits; a
+        // genuine crash (non-zero exit) is respawned, while a CLEAN stand-down (exit 0 — a
+        // `--managed` agent that lost the single-instance lock) is NOT respawned, so it
+        // never throttle-loops against a live daemon.
         let plist = render_plist(
             AGENT_LABEL,
             Path::new("/bin/sessiometer"),
-            &["run"],
+            &["run", "--managed"],
             Path::new("/logs/out"),
             Path::new("/logs/err"),
             &[],
@@ -753,8 +778,10 @@ org.sessiometer.agent = {
             "RunAtLoad is true so the agent starts at login",
         );
         assert!(
-            plist.contains("<key>KeepAlive</key>\n  <true/>"),
-            "KeepAlive is true so the poll loop is kept up across the session",
+            plist.contains(
+                "<key>KeepAlive</key>\n  <dict>\n    <key>SuccessfulExit</key>\n    <false/>\n  </dict>"
+            ),
+            "KeepAlive is conditional (SuccessfulExit false): respawn on crash, not on a clean stand-down",
         );
         assert!(plist.contains(&format!("<string>{AGENT_LABEL}</string>")));
     }

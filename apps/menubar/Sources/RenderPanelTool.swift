@@ -294,6 +294,9 @@ private final class PreviewLoginItemService: LoginItemService {
     let appStatus: LoginItemStatus = .enabled
     let daemonAgentStatus: LoginItemStatus = .notRegistered
     let cliManagedAgentPresent: Bool = false
+    // No daemon running in a design render → the lock is free, so the liveness gate (issue #742)
+    // stays open and the not-running fixture keeps rendering the Start-daemon affordance.
+    let daemonLockHeld: Bool = false
     func registerApp() throws {}
     func unregisterApp() throws {}
     func registerDaemonAgent() throws {}

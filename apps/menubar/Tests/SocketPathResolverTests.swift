@@ -45,6 +45,44 @@ final class SocketPathResolverTests: XCTestCase {
         XCTAssertFalse(path.contains("should-be-ignored"))
     }
 
+    // MARK: - Lock path (issue #742) — same paths.rs contract, `daemon.lock` leaf
+
+    // The lock path mirrors `src/paths.rs::daemon_lock()` = support_dir().join("daemon.lock"),
+    // i.e. `<home>/Library/Application Support/sessiometer/daemon.lock` for any home.
+    func testLockPathMatchesPathsRsContractForFixedHome() {
+        XCTAssertEqual(
+            SocketPathResolver.lockPath(home: "/Users/example"),
+            "/Users/example/Library/Application Support/sessiometer/daemon.lock")
+    }
+
+    func testLockTailIsThePathsRsContract() {
+        XCTAssertEqual(
+            SocketPathResolver.lockTail,
+            "Library/Application Support/sessiometer/daemon.lock")
+    }
+
+    // The lock and the socket share the SAME native-local support dir — they differ only in the
+    // leaf, so the app's liveness probe and its control-socket client resolve into one directory.
+    func testLockAndSocketShareTheSupportDir() {
+        let home = "/Users/example"
+        XCTAssertEqual(
+            (SocketPathResolver.lockPath(home: home) as NSString).deletingLastPathComponent,
+            (SocketPathResolver.socketPath(home: home) as NSString).deletingLastPathComponent)
+    }
+
+    // `resolveLock()` applies the SAME passwd-DB home + sandbox tripwire as `resolve()`; on the
+    // non-sandboxed test process it yields exactly the derived lock path.
+    func testResolveLockSucceedsOnNonSandboxedProcessAndMatchesDerivation() throws {
+        let passwd = try XCTUnwrap(SocketPathResolver.passwdHome(), "passwd-DB home must resolve")
+        switch SocketPathResolver.resolveLock() {
+        case .success(let path):
+            XCTAssertEqual(path, SocketPathResolver.lockPath(home: passwd))
+            XCTAssertTrue(path.hasSuffix("/Library/Application Support/sessiometer/daemon.lock"))
+        case .failure(let error):
+            XCTFail("non-sandboxed process should resolve the lock, got \(error)")
+        }
+    }
+
     // MARK: - Sandbox tripwire (ADR-0011)
 
     // Non-sandboxed: the passwd-DB home and `NSHomeDirectory()` agree → `.ok`.
