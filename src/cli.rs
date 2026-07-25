@@ -81,8 +81,12 @@ enum Command {
     Capture { label: Option<String> },
     /// `login [<label>]` — `claude /login` in isolation, then land it in the rotation.
     Login { label: Option<String> },
-    /// `run [-v|--verbose]` — the foreground poll+swap daemon.
-    Run { verbose: bool },
+    /// `run [-v|--verbose] [--managed]` — the foreground poll+swap daemon. `--managed`
+    /// marks a launchd-invoked agent (the bundled `org.sessiometer.agent` / `service install`
+    /// plist): on single-instance-lock contention it stands down cleanly (exit `0`) rather
+    /// than returning the human-CLI exit-`3` `AlreadyRunning`, so the generated plist's
+    /// conditional `KeepAlive` does not respawn it into a throttled loop (issue #742).
+    Run { verbose: bool, managed: bool },
     /// `service install|uninstall|status` — the PERSISTENCE noun (issue #397): manage the
     /// background launchd LaunchAgent (install/uninstall) and report whether one is installed.
     Service { action: ServiceAction },
@@ -331,18 +335,21 @@ fn parse_list(parser: &mut lexopt::Parser) -> Result<Command> {
     Ok(Command::List)
 }
 
-/// Parse `run [-v|--verbose]` (issue #77) — the verbosity flag, position-independent.
+/// Parse `run [-v|--verbose] [--managed]` (issues #77, #742) — the verbosity flag and the
+/// launchd-managed marker, both position-independent.
 fn parse_run(parser: &mut lexopt::Parser) -> Result<Command> {
     let mut verbose = false;
+    let mut managed = false;
     while let Some(arg) = parser.next()? {
         match arg {
             Short('h') | Long("help") => return Ok(Command::Help(HelpTopic::Run)),
             Short('v') | Long("verbose") => verbose = true,
+            Long("managed") => managed = true,
             Value(_) => {}
             other => return Err(unexpected(other, HelpTopic::Run)),
         }
     }
-    Ok(Command::Run { verbose })
+    Ok(Command::Run { verbose, managed })
 }
 
 /// Parse `service <install|uninstall|status>` (issues #166, #376, #397): the first positional
@@ -720,13 +727,13 @@ async fn execute(command: Command) -> Result<()> {
     match command {
         Command::Capture { label } => crate::capture::capture(label).await,
         Command::Login { label } => crate::capture::login(label).await,
-        Command::Run { verbose } => {
+        Command::Run { verbose, managed } => {
             let verbosity = if verbose {
                 Verbosity::Verbose
             } else {
                 Verbosity::Quiet
             };
-            run(verbosity).await
+            run(verbosity, managed).await
         }
         Command::Service { action } => match action {
             ServiceAction::Install => crate::service::install().await,
@@ -867,9 +874,14 @@ and a revived quarantined account is un-quarantined at once. Switch to it with
 const RUN_USAGE: &str = "sessiometer run — run the foreground daemon (poll every account's usage and swap before exhaustion)
 
 USAGE:
-    sessiometer run [-v|--verbose]
+    sessiometer run [-v|--verbose] [--managed]
 
     -v, --verbose  emit per-tick run diagnostics on stderr
+        --managed  mark a launchd-invoked agent: on single-instance-lock contention exit 0
+                   (stand down cleanly) instead of the exit-3 `already running` a bare `run`
+                   returns, so the generated LaunchAgent's conditional KeepAlive does not
+                   respawn it while another daemon holds the lock. Set by the generated plist;
+                   not meant for interactive use.
     -h, --help     print this help
 ";
 
@@ -890,7 +902,7 @@ managed service installed?\", while `daemon status` answers \"is a daemon runnin
 
 The agent invokes the lock-guarded `sessiometer run`, so the background agent and a
 foreground `run` can never both drive the swap loop: whichever starts second refuses
-with a clear message and exits 3, performing no swap. This single-owner guard is a
+with a clear message and performs no swap. This single-owner guard is a
 safety guard — nothing bypasses it.
 ";
 
@@ -1077,15 +1089,15 @@ USAGE:
 ///
 /// Wires the **real** seams into the generic [`Daemon`] and drives [`run_loop`]
 /// until SIGINT / SIGTERM. Lifecycle order is load-bearing: take the
-/// single-instance lock FIRST (a second `run` exits `3` without disturbing the
-/// first), then bind the control socket, then run.
+/// single-instance lock FIRST (a second `run` fails to take it and returns
+/// without disturbing the first), then bind the control socket, then run.
 ///
 /// `verbosity` (issue #77) gates the operator-facing diagnostic channel: this
 /// function owns the process lifecycle, so it brackets the loop with the
 /// `diag=start` / `diag=stop` markers, and the per-tick diagnostics are emitted
 /// inside [`run_loop`]. Default [`Verbosity::Quiet`] keeps `run` silent on that
 /// channel; `-v`/`--verbose` opts in.
-async fn run(verbosity: Verbosity) -> Result<()> {
+async fn run(verbosity: Verbosity, managed: bool) -> Result<()> {
     // The native-local support dir holds both the lock and the socket; ensure it
     // (0700) before either touches it.
     paths::ensure_private_dir(&paths::support_dir()?)?;
@@ -1093,7 +1105,26 @@ async fn run(verbosity: Verbosity) -> Result<()> {
     // Single-instance lock FIRST: held for the process lifetime, released by the
     // kernel on exit (`_lock` drop). A second `run` cannot acquire it and exits
     // `3` (issue #7), without disturbing the running daemon.
-    let _lock = InstanceLock::acquire(&paths::daemon_lock()?)?;
+    let _lock = match InstanceLock::acquire(&paths::daemon_lock()?) {
+        Ok(lock) => lock,
+        // A launchd-managed agent (`run --managed`) that loses the lock stands down
+        // CLEANLY (issue #742): another daemon already owns the instance, the collision
+        // is non-destructive (the loser never reached the socket or any state/keychain
+        // write — the lock is acquired BEFORE all of that), and exiting `0` keeps the
+        // generated plist's conditional `KeepAlive: {SuccessfulExit: false}` from
+        // respawning it into a throttled ~10s loop that can never win while the holder
+        // is alive. A human `sessiometer run` (unmanaged) still gets the exit-`3`
+        // `AlreadyRunning` contract (issue #7), so an operator/supervisor can tell
+        // "already running" apart from a generic failure.
+        Err(Error::AlreadyRunning) if managed => {
+            eprintln!(
+                "sessiometer: another daemon already holds the single-instance lock; \
+                 this managed agent is standing down (nothing was started)"
+            );
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
 
     // Load the real config (roster + tunables). A malformed or absent config FILE
     // is fatal — never silently replaced wholesale by defaults (issue #3). That
@@ -1595,14 +1626,14 @@ async fn daemon_status() -> Result<()> {
 /// which is not supervision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StopPlan {
-    /// launchd is supervising the daemon ⇒ `launchctl bootout` alone. REQUIRED, not merely
-    /// sufficient: the agent is `KeepAlive`, so a socket shutdown would just be respawned. Only
-    /// leaving the domain makes "stopped" stick, and the process it stops IS the running daemon.
+    /// launchd is supervising the daemon ⇒ `launchctl bootout` alone. Booting the agent out of the
+    /// domain terminates the supervised daemon (SIGTERM ⇒ graceful exit) and removes its job, so
+    /// nothing is left to relaunch it — the process it stops IS the running daemon.
     BootOut,
     /// The job is in the domain but launchd runs no process for it, so a foreground `run` may own
-    /// the daemon ⇒ do BOTH, in order. The bootout is what stops `KeepAlive` from respawning a
-    /// replacement the instant the real daemon exits; the socket shutdown is what actually stops
-    /// that daemon. Either alone leaves a daemon running.
+    /// the daemon ⇒ do BOTH. The bootout removes the idle registered agent from the domain; the
+    /// socket shutdown stops the foreground `run` that actually holds the lock. Bootout alone
+    /// leaves that daemon running; socket shutdown alone leaves the idle agent registered.
     BootOutThenSocketShutdown,
     /// No job in the domain ⇒ nothing supervises anything: a same-user-gated `{"cmd":"shutdown"}`
     /// control request, driving the daemon's graceful exit (an in-flight swap completes first).
@@ -1640,8 +1671,9 @@ enum RestartPlan {
 /// [`AgentSupervision::Supervising`] settles it: that process holds the single-instance lock, so no
 /// foreground daemon can coexist and a kickstart restarts the daemon the operator meant. Otherwise a
 /// RUNNING daemon is one launchd does not supervise, and must be refused — kickstarting or
-/// bootstrapping beside it hands launchd a `run` that loses the lock, exits `3`, and is respawned
-/// into a throttled crash loop. Only with nothing running does registration mean "bring it up".
+/// bootstrapping beside it only hands launchd a managed `run` that loses the lock and cleanly stands
+/// down (exit `0`), never touching the foreground daemon the operator meant to restart. Only with
+/// nothing running does registration mean "bring it up".
 fn plan_restart(
     agent: AgentSupervision,
     daemon_running: bool,
@@ -1665,13 +1697,13 @@ fn plan_restart(
 /// holder PID, and `kill(2)` is PID-reuse-racy.
 async fn daemon_stop() -> Result<()> {
     match plan_stop(crate::service::agent_supervision().await?) {
-        // launchd supervises the daemon: booting the agent out IS the stop, and it disarms the
-        // `KeepAlive` respawn in the same step.
+        // launchd supervises the daemon: booting the agent out of the domain IS the stop — it
+        // terminates the daemon and removes its job, so nothing relaunches it.
         StopPlan::BootOut => crate::service::stop_managed().await,
-        // The registered agent is idle while a foreground `run` may own the daemon. Bootout FIRST,
-        // to disarm `KeepAlive` so it cannot respawn a replacement, THEN stop the running daemon
-        // over the socket. Neither half alone is the whole story, so narrate the compound stop with
-        // one coherent message rather than stacking two primitive ones.
+        // The registered agent is idle while a foreground `run` may own the daemon. Bootout removes
+        // the idle registered agent, then stop the running daemon over the socket. Neither half
+        // alone is the whole story, so narrate the compound stop with one coherent message rather
+        // than stacking two primitive ones.
         StopPlan::BootOutThenSocketShutdown => {
             crate::service::bootout_agent().await?;
             socket_shutdown(
@@ -7750,14 +7782,14 @@ spare  22222222-2222\n\
     fn plan_stop_covers_every_supervision_state() {
         use AgentSupervision::{RegisteredIdle, Supervising, Unregistered};
 
-        // launchd owns the process: bootout stops the daemon AND suppresses the `KeepAlive`
-        // respawn. It is the daemon, so nothing else needs stopping.
+        // launchd owns the process: bootout terminates the daemon and removes its job, so nothing
+        // relaunches it. It is the daemon, so nothing else needs stopping.
         assert_eq!(plan_stop(Supervising), StopPlan::BootOut);
 
         // The regression state (issue #397 review): the job sits in the domain with NO process
         // behind it — `launchctl print` still exits 0 — while a foreground `run` owns the lock and
-        // the socket. Bootout alone would report a stop that did not happen; a socket shutdown alone
-        // would be undone the instant `KeepAlive` respawned the agent. Both, in order.
+        // the socket. Bootout alone would report a stop that did not happen (the foreground daemon
+        // keeps running); a socket shutdown alone would leave the idle agent registered. Both.
         assert_eq!(
             plan_stop(RegisteredIdle),
             StopPlan::BootOutThenSocketShutdown
@@ -7786,7 +7818,8 @@ spare  22222222-2222\n\
         }
 
         // Registered but idle: whatever is running, launchd is not supervising it. Kickstarting
-        // would hand launchd a `run` that loses the lock, exits 3, and crash-loops under KeepAlive.
+        // would only hand launchd a managed `run` that loses the lock and cleanly stands down
+        // (exit 0), never restarting the foreground daemon — so refuse.
         assert_eq!(
             plan_restart(RegisteredIdle, true, true),
             RestartPlan::RefuseUnmanaged
@@ -7796,7 +7829,8 @@ spare  22222222-2222\n\
             RestartPlan::RefuseUnmanaged
         );
         // Registered, idle, and nothing running: `kickstart` starts a job that is not running, so
-        // no bootstrap is needed and none of the crash-loop hazard applies.
+        // no bootstrap is needed and — with nothing holding the lock — the managed `run` comes up
+        // and keeps the lock.
         assert_eq!(
             plan_restart(RegisteredIdle, false, true),
             RestartPlan::Kickstart
@@ -9456,18 +9490,45 @@ spare  22222222-2222\n\
     }
 
     #[test]
-    fn run_parses_verbose_and_now_rejects_a_bogus_flag() {
+    fn run_parses_verbose_and_managed_and_rejects_a_bogus_flag() {
         assert_eq!(
             parse_argv(&["run", "--verbose"]).unwrap(),
-            Command::Run { verbose: true }
+            Command::Run {
+                verbose: true,
+                managed: false
+            }
         );
         assert_eq!(
             parse_argv(&["run", "-v"]).unwrap(),
-            Command::Run { verbose: true }
+            Command::Run {
+                verbose: true,
+                managed: false
+            }
         );
         assert_eq!(
             parse_argv(&["run"]).unwrap(),
-            Command::Run { verbose: false }
+            Command::Run {
+                verbose: false,
+                managed: false
+            }
+        );
+        // `--managed` (issue #742): the launchd-agent marker, position-independent and
+        // orthogonal to `-v`. A BARE `run` is NOT managed — that is exactly what preserves
+        // the human-CLI exit-3 `AlreadyRunning` contract: only `--managed` flips a lost-lock
+        // exit to 0, so an interactive `sessiometer run` still reports "already running".
+        assert_eq!(
+            parse_argv(&["run", "--managed"]).unwrap(),
+            Command::Run {
+                verbose: false,
+                managed: true
+            }
+        );
+        assert_eq!(
+            parse_argv(&["run", "-v", "--managed"]).unwrap(),
+            Command::Run {
+                verbose: true,
+                managed: true
+            }
         );
         // Previously a bogus `run` flag was silently ignored; now it errors (issue #175).
         assert!(matches!(

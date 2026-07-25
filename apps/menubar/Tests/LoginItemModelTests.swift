@@ -165,13 +165,34 @@ final class LoginItemModelTests: XCTestCase {
         XCTAssertEqual(fake.registerDaemonCount, 0, "the app never registers a second owner for the label")
     }
 
-    /// `canStartDaemon` is the conjunction: registrable (not `.notFound`) AND no CLI owner.
+    // MARK: - Liveness gate (issue #742: the app yields to ANY live daemon, even a manual one)
+
+    /// When ANY daemon holds the single-instance lock — including a manually-run `sessiometer run`
+    /// with no LaunchAgent plist (so `cliManagedAgentPresent` is false, and the two-owner guard
+    /// alone would NOT catch it) — the app stands down: `canStartDaemon` is false and a Start attempt
+    /// registers nothing, so the app never registers an agent that would just lose the lock and
+    /// silently stand down.
+    func testLivenessGateBlocksStartWhenADaemonHoldsTheLock() async {
+        let (model, fake) = makeModel(daemonAgentStatus: .notRegistered, daemonLockHeld: true)
+        XCTAssertFalse(model.canStartDaemon,
+                       "a live daemon (lock held) means the app stands down, even with no CLI plist")
+        await model.startDaemon()
+        XCTAssertEqual(fake.registerDaemonCount, 0,
+                       "the app never registers an agent that would just lose the lock")
+    }
+
+    /// `canStartDaemon` is the three-way conjunction: registrable (not `.notFound`) AND no CLI owner
+    /// (two-owner guard) AND no daemon holding the lock (liveness gate, issue #742).
     func testCanStartDaemonDerivation() {
         XCTAssertFalse(makeModel(daemonAgentStatus: .notFound).model.canStartDaemon)
         XCTAssertTrue(makeModel(daemonAgentStatus: .notRegistered).model.canStartDaemon)
         XCTAssertTrue(makeModel(daemonAgentStatus: .enabled).model.canStartDaemon)
         XCTAssertFalse(
             makeModel(daemonAgentStatus: .notRegistered, cliManagedAgentPresent: true).model.canStartDaemon)
+        // The liveness gate is independent of the two-owner gate: a registrable agent + no CLI plist,
+        // but a daemon holds the lock ⇒ still blocked (the manual-daemon case).
+        XCTAssertFalse(
+            makeModel(daemonAgentStatus: .notRegistered, daemonLockHeld: true).model.canStartDaemon)
     }
 
     // MARK: - Helpers
@@ -180,12 +201,14 @@ final class LoginItemModelTests: XCTestCase {
     private func makeModel(
         appStatus: LoginItemStatus = .notRegistered,
         daemonAgentStatus: LoginItemStatus = .notFound,
-        cliManagedAgentPresent: Bool = false
+        cliManagedAgentPresent: Bool = false,
+        daemonLockHeld: Bool = false
     ) -> (model: LoginItemModel, fake: FakeLoginItemService) {
         let fake = FakeLoginItemService(
             appStatus: appStatus,
             daemonAgentStatus: daemonAgentStatus,
-            cliManagedAgentPresent: cliManagedAgentPresent)
+            cliManagedAgentPresent: cliManagedAgentPresent,
+            daemonLockHeld: daemonLockHeld)
         return (LoginItemModel(service: fake), fake)
     }
 }
@@ -199,6 +222,7 @@ private final class FakeLoginItemService: LoginItemService {
     var appStatus: LoginItemStatus
     var daemonAgentStatus: LoginItemStatus
     var cliManagedAgentPresent: Bool
+    var daemonLockHeld: Bool
 
     /// The status `registerApp()` lands on when it does not throw (default `.enabled`; set `.requiresApproval`).
     var appRegisterResult: LoginItemStatus = .enabled
@@ -214,10 +238,16 @@ private final class FakeLoginItemService: LoginItemService {
     private(set) var registerDaemonCount = 0
     private(set) var openSettingsCount = 0
 
-    init(appStatus: LoginItemStatus, daemonAgentStatus: LoginItemStatus, cliManagedAgentPresent: Bool) {
+    init(
+        appStatus: LoginItemStatus,
+        daemonAgentStatus: LoginItemStatus,
+        cliManagedAgentPresent: Bool,
+        daemonLockHeld: Bool = false
+    ) {
         self.appStatus = appStatus
         self.daemonAgentStatus = daemonAgentStatus
         self.cliManagedAgentPresent = cliManagedAgentPresent
+        self.daemonLockHeld = daemonLockHeld
     }
 
     func registerApp() throws {

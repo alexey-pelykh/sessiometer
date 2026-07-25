@@ -25,10 +25,23 @@ enum SocketPathResolver {
     /// that property holds by construction.
     static let socketTail = "Library/Application Support/sessiometer/daemon.sock"
 
+    /// The fixed tail under the user's home the daemon's single-instance lock lives at:
+    /// `Library/Application Support/sessiometer/daemon.lock`. Mirrors `src/paths.rs` exactly —
+    /// `support_dir()` + `daemon_lock()` appends `daemon.lock`. NATIVE-LOCAL like `socketTail`
+    /// (ignores `$XDG_CONFIG_HOME`; the lock must be machine-global — paths.rs issue #7). Used by
+    /// the app-side daemon-liveness probe (issue #742).
+    static let lockTail = "Library/Application Support/sessiometer/daemon.lock"
+
     /// The daemon's control-socket path for a given home directory — a pure string derivation, so a
     /// test can assert it against the `paths.rs` contract for any home without process state.
     static func socketPath(home: String) -> String {
         (home as NSString).appendingPathComponent(socketTail)
+    }
+
+    /// The daemon's single-instance-lock path for a given home — a pure derivation, testable against
+    /// the `paths.rs` `daemon_lock()` contract for any home without process state (issue #742).
+    static func lockPath(home: String) -> String {
+        (home as NSString).appendingPathComponent(lockTail)
     }
 
     /// The outcome of the non-sandbox tripwire (pure). The passwd-DB home and `NSHomeDirectory()`
@@ -57,11 +70,23 @@ enum SocketPathResolver {
     /// Resolve the daemon socket path from live process state, applying the sandbox tripwire. The
     /// home is read from the password database (`getpwuid(getuid())->pw_dir`) — the SAME source
     /// `src/paths.rs::home_dir()` uses (never `$HOME`, never XDG, never a sandbox container).
-    static func resolve() -> Result<String, ResolveError> {
+    static func resolve() -> Result<String, ResolveError> { resolve(tail: socketTail) }
+
+    /// Resolve the daemon's single-instance-LOCK path (`daemon.lock`) from live process state,
+    /// applying the SAME sandbox tripwire as `resolve()`. The app-side liveness probe (issue #742)
+    /// uses this so `LoginItemModel.canStartDaemon` can detect a running daemon (manual or managed)
+    /// without a daemon command — the app stays a pure IPC client.
+    static func resolveLock() -> Result<String, ResolveError> { resolve(tail: lockTail) }
+
+    /// Shared resolution for a native-local support-dir tail (socket or lock): read the passwd-DB
+    /// home (never `$HOME` / XDG / a sandbox container — matches `src/paths.rs::home_dir()`) and
+    /// apply the ADR-0011 non-sandbox tripwire. Both `resolve()` and `resolveLock()` funnel here so
+    /// the home source and the sandbox guard stay identical for the socket and the lock.
+    private static func resolve(tail: String) -> Result<String, ResolveError> {
         guard let passwd = passwdHome() else { return .failure(.homeUnresolved) }
         switch sandboxCheck(passwdHome: passwd, nsHome: NSHomeDirectory()) {
         case .ok:
-            return .success(socketPath(home: passwd))
+            return .success((passwd as NSString).appendingPathComponent(tail))
         case .sandboxed(let passwd, let container):
             return .failure(.sandboxed(passwdHome: passwd, containerHome: container))
         }
