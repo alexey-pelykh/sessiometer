@@ -56,6 +56,22 @@ final class SMAppServiceLoginItemService: LoginItemService {
         FileManager.default.fileExists(atPath: Self.cliAgentPlistPath.path)
     }
 
+    /// Whether a LIVE daemon currently holds the single-instance lock (`daemon.lock`) — the app-side
+    /// liveness gate (issue #742). A fresh non-blocking `flock` probe (`DaemonLockProbe`) over the
+    /// resolved native-local lock path; the app is non-sandboxed (ADR-0011) so it reaches the support
+    /// dir. A resolve failure (home unresolved, or the sandbox tripwire) is logged and treated as NOT
+    /// held — permissive, so a probe that cannot run never newly suppresses the Start affordance.
+    var daemonLockHeld: Bool {
+        switch SocketPathResolver.resolveLock() {
+        case .success(let path):
+            return DaemonLockProbe.isHeld(path: path)
+        case .failure(let error):
+            loginItemServiceLog.error(
+                "daemon-lock liveness probe skipped (path unresolved): \(String(describing: error), privacy: .public)")
+            return false
+        }
+    }
+
     func registerDaemonAgent() throws { try daemonAgent.register() }
 
     func unregisterDaemonAgent() throws { try daemonAgent.unregister() }

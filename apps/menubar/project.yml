@@ -78,6 +78,12 @@ targets:
       - path: Sources/TransportEvent.swift
       - path: Sources/WatchStateMachine.swift
       - path: Sources/SocketPathResolver.swift
+      # Daemon-lock liveness probe (#742): the pure `flock`-over-a-fresh-open helper the app-side
+      # Start-daemon liveness gate uses — the Swift mirror of `InstanceLock::is_held` (src/daemon/
+      # seams.rs). Foundation + Darwin only (no ServiceManagement/AppKit), so it compiles into this
+      # headless bundle and `DaemonLockProbeTests` exercises absent/held/freed against a temp file,
+      # exactly like the Rust seam test.
+      - path: Sources/DaemonLockProbe.swift
       - path: Sources/WatchConnection.swift
       - path: Sources/WatchTransport.swift
       # Control-command transport (#358): the short-lived client→daemon write path + its redacted-ack

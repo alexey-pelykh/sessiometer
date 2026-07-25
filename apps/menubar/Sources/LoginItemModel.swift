@@ -65,6 +65,13 @@ protocol LoginItemService: AnyObject {
     /// Whether the Rust CLI already owns the `org.sessiometer.agent` LaunchAgent (a plist at the CLI's
     /// `~/Library/LaunchAgents` path). When true, the app defers — the two-owner guard (issue #170 / #329).
     var cliManagedAgentPresent: Bool { get }
+    /// Whether ANY daemon currently holds the single-instance lock (`daemon.lock`) — a fresh
+    /// client-side `flock` liveness probe (issue #742). Unlike `cliManagedAgentPresent` (which only
+    /// checks whether the CLI's LaunchAgent PLIST FILE exists), this detects a LIVE daemon of any
+    /// provenance — including a developer's manually-run `sessiometer run` that has no LaunchAgent —
+    /// so the Start affordance can stand down honestly rather than register an agent that would just
+    /// lose the lock.
+    var daemonLockHeld: Bool { get }
     /// Register (and, via the plist's `RunAtLoad`, start) the embedded daemon LaunchAgent. Throws on failure.
     func registerDaemonAgent() throws
     /// Unregister the bundled daemon LaunchAgent. Throws on failure.
@@ -163,11 +170,17 @@ final class LoginItemModel: ObservableObject {
 
     // MARK: Daemon agent (Start affordance; #171 activates the bundled plist)
 
-    /// Whether the Start-daemon affordance can act: the bundled agent is registrable (NOT `.notFound` — i.e.
-    /// #171 has shipped the plist + embedded binary) AND the Rust CLI is not already the LaunchAgent owner (the
-    /// two-owner guard). While either fails — the #170 state, where no plist is bundled, or a CLI-managed
-    /// daemon — the button degrades honestly to an inert explanatory banner rather than a broken action.
-    var canStartDaemon: Bool { daemonStatus != .notFound && !service.cliManagedAgentPresent }
+    /// Whether the Start-daemon affordance can act, as the conjunction of three gates: the bundled
+    /// agent is registrable (NOT `.notFound` — i.e. #171 has shipped the plist + embedded binary),
+    /// the Rust CLI is not already the LaunchAgent owner (the two-owner guard), AND no daemon
+    /// currently holds the single-instance lock (the liveness gate, issue #742). The liveness gate
+    /// catches what the two-owner check cannot: a manually-run `sessiometer run` has no LaunchAgent
+    /// plist, but it DOES hold `daemon.lock`. While any gate fails — the #170 no-plist state, a
+    /// CLI-managed daemon, or ANY live daemon — the Start affordance is withheld rather than
+    /// offering a misleading action that would register an agent and silently win nothing.
+    var canStartDaemon: Bool {
+        daemonStatus != .notFound && !service.cliManagedAgentPresent && !service.daemonLockHeld
+    }
 
     /// The "Start daemon" action: register (and, via `RunAtLoad`, start) the embedded daemon LaunchAgent. A
     /// no-op when `canStartDaemon` is false (the button is only offered when it is) or a start is already in

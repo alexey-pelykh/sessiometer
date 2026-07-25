@@ -31,17 +31,30 @@ final class BundledAgentPlistTests: XCTestCase {
                        "Label must equal AGENT_LABEL (service.rs) and the plist filename stem")
     }
 
-    func testProgramArgumentsInvokeTheLockGuardedRunVerb() throws {
+    func testProgramArgumentsInvokeTheLockGuardedManagedRunVerb() throws {
         let plist = try loadAgentPlist()
         let argv = try XCTUnwrap(plist["ProgramArguments"] as? [String], "ProgramArguments missing")
-        XCTAssertEqual(argv.last, "run",
-                       "the daemon must be launched via the single-instance-lock-guarded `run` verb")
+        // Full-array pin (issue #742): the daemon is launched via the single-instance-lock-guarded
+        // `run` verb plus the `--managed` marker that turns a lost-lock contention into a clean
+        // exit-0 stand-down (not the human exit-3). Assert the WHOLE argv, not just `.last` — a
+        // `.last`-only pin would miss an inserted arg (`[…, "--x", "run"]`) or a wrong argv[0]. This
+        // is the two-owner parity anchor with `src/service.rs render_plist` (which passes the same
+        // `["run", "--managed"]` after its own absolute-`Program` argv[0]).
+        XCTAssertEqual(argv, ["sessiometer", "run", "--managed"],
+                       "argv must be exactly [sessiometer, run, --managed] — parity with render_plist")
     }
 
-    func testRunAtLoadAndKeepAliveAreEnabled() throws {
+    func testRunAtLoadIsEnabledAndKeepAliveIsConditionalOnUnsuccessfulExit() throws {
         let plist = try loadAgentPlist()
         XCTAssertEqual(plist["RunAtLoad"] as? Bool, true, "RunAtLoad must be true (parity with service.rs)")
-        XCTAssertEqual(plist["KeepAlive"] as? Bool, true, "KeepAlive must be true (parity with service.rs)")
+        // KeepAlive is a CONDITIONAL dict, not a bare Bool (issue #742): {SuccessfulExit: false}
+        // respawns only on a NON-clean exit, so a `--managed` agent that cleanly stands down on lock
+        // contention (exit 0) is NOT relaunched into a throttled loop. Parity with service.rs.
+        let keepAlive = try XCTUnwrap(plist["KeepAlive"] as? [String: Any],
+                                      "KeepAlive must be a conditional dict, not a Bool (issue #742)")
+        XCTAssertEqual(keepAlive["SuccessfulExit"] as? Bool, false,
+                       "KeepAlive.SuccessfulExit=false: respawn on crash, not on a clean stand-down")
+        XCTAssertEqual(keepAlive.count, 1, "SuccessfulExit is the only KeepAlive condition")
     }
 
     func testUsesBundleRelativeProgramNotAbsoluteProgram() throws {
