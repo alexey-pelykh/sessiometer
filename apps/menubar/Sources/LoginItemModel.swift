@@ -87,11 +87,12 @@ protocol LoginItemService: AnyObject {
 @MainActor
 final class LoginItemModel: ObservableObject {
 
-    /// The Start-daemon affordance's interaction phase. `registering` is a brief transient (a spinner beat)
-    /// between the button press and the `SMAppService.agent().register()` result; `failed` carries a REDACTED
-    /// registration reason (no credential surface — issue #15) the card renders. `idle` is both the resting
-    /// state and success — on success the daemon comes up (the plist's `RunAtLoad`) and the panel leaves
-    /// `.notRunning` on its own via the next `watch` snapshot, exactly as a swap's new active row arrives.
+    /// The Start-daemon affordance's interaction phase. `registering` is the transient beat that persists from
+    /// the button press THROUGH the register AND the post-register liveness wait (issue #745). `failed` carries a
+    /// card-rendered reason — either a REDACTED register error (no credential surface — issue #15) OR the
+    /// "registered but never started" liveness timeout. `idle` is the resting state and TRUE success: register
+    /// succeeded AND a daemon took the single-instance lock, so the panel will leave `.notRunning` on the next
+    /// `watch` snapshot, exactly as a swap's new active row arrives.
     enum StartPhase: Equatable {
         case idle
         case registering
@@ -110,8 +111,19 @@ final class LoginItemModel: ObservableObject {
 
     private let service: LoginItemService
 
-    init(service: LoginItemService) {
+    /// The post-register liveness wait (issue #745): how often to re-probe the single-instance lock, and how
+    /// long to wait for a daemon to take it, before declaring the start failed. Injectable so tests drive the
+    /// poll deterministically without real-time sleeps; the production defaults give a slow launchd `RunAtLoad`
+    /// spawn ample room while still surfacing a dead start within a few seconds.
+    private let livenessPollInterval: Duration
+    private let livenessTimeout: Duration
+
+    init(service: LoginItemService,
+         livenessPollInterval: Duration = .milliseconds(500),
+         livenessTimeout: Duration = .seconds(8)) {
         self.service = service
+        self.livenessPollInterval = livenessPollInterval
+        self.livenessTimeout = livenessTimeout
         self.appStatus = service.appStatus
         self.daemonStatus = service.daemonAgentStatus
     }
@@ -184,9 +196,11 @@ final class LoginItemModel: ObservableObject {
 
     /// The "Start daemon" action: register (and, via `RunAtLoad`, start) the embedded daemon LaunchAgent. A
     /// no-op when `canStartDaemon` is false (the button is only offered when it is) or a start is already in
-    /// flight. On success the daemon comes up and the panel leaves `.notRunning` via the next `watch` snapshot;
-    /// a failure surfaces a redacted reason inline. The brief `registering` beat is painted before the
-    /// synchronous framework call (the `Task.yield()`), mirroring the swap/capture affordances' pending state.
+    /// flight. After register succeeds it WAITS for a daemon to actually take the single-instance lock
+    /// (issue #745) — landing `.idle` (the panel then leaves `.notRunning` on the next `watch` snapshot) only if
+    /// one comes up, else `.failed`, so a dead start is never silent; a register throw surfaces a redacted reason
+    /// inline. The `registering` beat is painted before the synchronous register (the `Task.yield()`) and HELD
+    /// across the liveness wait, mirroring the swap/capture affordances' pending state.
     func startDaemon() async {
         guard canStartDaemon else { return }
         if case .registering = startPhase { return }
@@ -196,11 +210,37 @@ final class LoginItemModel: ObservableObject {
         do {
             try service.registerDaemonAgent()
             daemonStatus = service.daemonAgentStatus
-            startPhase = .idle
+            // register() SUCCEEDING only means launchd accepted the plist — the plist's `RunAtLoad` still has to
+            // SPAWN the daemon, and that spawn can fail (a bad launchd config, a crash-loop, a sandbox denial)
+            // while register() reports success (issue #745). So don't assume `.idle`: wait for a daemon to
+            // actually take the single-instance lock, and surface a failure if none does — otherwise the card
+            // sits silent forever, since the panel only leaves `.notRunning` on a `watch` snapshot that, with no
+            // daemon, never arrives.
+            startPhase = await daemonBecameLive()
+                ? .idle
+                : .failed(reason: Self.notStartedReason)
         } catch {
             loginItemLog.error("daemon agent register failed: \(String(describing: error), privacy: .public)")
             startPhase = .failed(reason: Self.startFailureReason(error))
         }
+    }
+
+    /// Poll for a daemon to take the single-instance lock after a successful register (issue #745). Reuses the
+    /// same `daemonLockHeld` flock probe `canStartDaemon` gates on (issue #742): `canStartDaemon` guaranteed the
+    /// lock was FREE at the button press, so a lock that becomes held within the window is the daemon our
+    /// register just started (via `RunAtLoad`). Returns `true` as soon as the lock is held, `false` if the
+    /// bounded window elapses with no daemon — the honest "registered but never started" signal. Bounded and
+    /// cancellation-aware so it never spins the UI.
+    private func daemonBecameLive() async -> Bool {
+        if service.daemonLockHeld { return true }
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: livenessTimeout)
+        while clock.now < deadline {
+            do { try await Task.sleep(for: livenessPollInterval) }
+            catch { return service.daemonLockHeld }  // cancelled — report last-known state, stop polling
+            if service.daemonLockHeld { return true }
+        }
+        return false
     }
 
     /// Re-read both statuses from the OS — called when the Settings window (re)opens and when the app becomes
@@ -209,6 +249,12 @@ final class LoginItemModel: ObservableObject {
         appStatus = service.appStatus
         daemonStatus = service.daemonAgentStatus
     }
+
+    /// The #745 silent-failure copy: register succeeded but no daemon took the lock within the liveness window.
+    /// There is no OS error to surface (register did NOT throw), so this is a plain, actionable statement rather
+    /// than a redacted message — and, like every `.failed` reason, it carries no credential (issue #15).
+    private static let notStartedReason =
+        "The daemon was registered but didn’t start. Check Console for details."
 
     /// A redacted, non-secret reason for a failed daemon start (issue #15) — a registration error carries no
     /// credential, so the OS message is safe to surface, with a plain fallback when it is empty.
