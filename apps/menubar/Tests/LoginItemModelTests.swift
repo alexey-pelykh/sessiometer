@@ -122,15 +122,34 @@ final class LoginItemModelTests: XCTestCase {
 
     // MARK: - Start-daemon phase machine
 
-    /// A successful start registers the daemon agent once and lands `.idle`, with the daemon status reflecting
-    /// the registration (the panel then leaves `.notRunning` via the next watch snapshot).
-    func testStartDaemonSuccess() async {
-        let (model, fake) = makeModel(daemonAgentStatus: .notRegistered)  // registrable (plist present, #171)
+    /// A TRUE success: the register lands AND the daemon comes up and takes the single-instance lock within the
+    /// liveness window (issue #745), so the phase lands `.idle` and the panel then leaves `.notRunning` via the
+    /// next watch snapshot.
+    func testStartDaemonSuccessWhenDaemonComesUp() async {
+        let (model, fake) = makeModel(daemonAgentStatus: .notRegistered,  // registrable (plist present, #171)
+                                      daemonComesUpOnRegister: true)
         XCTAssertTrue(model.canStartDaemon)
         await model.startDaemon()
         XCTAssertEqual(fake.registerDaemonCount, 1)
         XCTAssertEqual(model.daemonStatus, .enabled)
         XCTAssertEqual(model.startPhase, .idle)
+    }
+
+    /// The #745 fix: register SUCCEEDS but the daemon never takes the lock (a bad launchd config / crash-loop /
+    /// sandbox denial — register does NOT throw). The old code landed `.idle` and the card sat silent; now the
+    /// bounded liveness wait elapses with the lock still free and the phase lands `.failed` with the actionable
+    /// "registered but didn't start" reason, so the click is never a silent no-op.
+    func testStartDaemonRegistersButDaemonNeverComesUpSurfacesFailure() async {
+        let (model, fake) = makeModel(daemonAgentStatus: .notRegistered,
+                                      daemonComesUpOnRegister: false)  // register succeeds, daemon never starts
+        XCTAssertTrue(model.canStartDaemon)
+        await model.startDaemon()
+        XCTAssertEqual(fake.registerDaemonCount, 1, "register was attempted and SUCCEEDED (no throw)")
+        guard case .failed(let reason) = model.startPhase else {
+            return XCTFail("expected .failed (registered but never started), got \(model.startPhase)")
+        }
+        XCTAssertTrue(reason.contains("registered but"),
+                      "the failure names the not-started condition, not a register error")
     }
 
     /// A daemon register that throws lands `.failed` with a redacted reason (never a crash, never a silent no-op).
@@ -202,14 +221,21 @@ final class LoginItemModelTests: XCTestCase {
         appStatus: LoginItemStatus = .notRegistered,
         daemonAgentStatus: LoginItemStatus = .notFound,
         cliManagedAgentPresent: Bool = false,
-        daemonLockHeld: Bool = false
+        daemonLockHeld: Bool = false,
+        daemonComesUpOnRegister: Bool = false
     ) -> (model: LoginItemModel, fake: FakeLoginItemService) {
         let fake = FakeLoginItemService(
             appStatus: appStatus,
             daemonAgentStatus: daemonAgentStatus,
             cliManagedAgentPresent: cliManagedAgentPresent,
             daemonLockHeld: daemonLockHeld)
-        return (LoginItemModel(service: fake), fake)
+        fake.daemonComesUpOnRegister = daemonComesUpOnRegister
+        // Tiny liveness timings (issue #745) so the post-register lock poll runs in ~ms: the timeout-path test
+        // (no daemon comes up) resolves fast instead of stalling the suite on the 8s production window.
+        return (LoginItemModel(service: fake,
+                               livenessPollInterval: .milliseconds(1),
+                               livenessTimeout: .milliseconds(20)),
+                fake)
     }
 }
 
@@ -228,6 +254,10 @@ private final class FakeLoginItemService: LoginItemService {
     var appRegisterResult: LoginItemStatus = .enabled
     /// The status `registerDaemonAgent()` lands on when it does not throw.
     var daemonRegisterResult: LoginItemStatus = .enabled
+    /// Whether a successful `registerDaemonAgent()` simulates the plist's `RunAtLoad` bringing the daemon up (it
+    /// then holds the single-instance lock, so `daemonLockHeld` flips true). False models the #745 case: register
+    /// succeeds but the daemon never starts, so `daemonLockHeld` stays false and the liveness wait times out.
+    var daemonComesUpOnRegister = false
 
     var appRegisterError: Error?
     var appUnregisterError: Error?
@@ -266,6 +296,9 @@ private final class FakeLoginItemService: LoginItemService {
         registerDaemonCount += 1
         if let daemonRegisterError { throw daemonRegisterError }
         daemonAgentStatus = daemonRegisterResult
+        // Simulate the plist's `RunAtLoad`: a register that "takes" brings the daemon up, which then holds the
+        // single-instance lock. When false, the daemon never appears — the #745 silent-start failure mode.
+        if daemonComesUpOnRegister { daemonLockHeld = true }
     }
 
     func unregisterDaemonAgent() throws {
