@@ -214,7 +214,459 @@ final class LoginItemModelTests: XCTestCase {
             makeModel(daemonAgentStatus: .notRegistered, daemonLockHeld: true).model.canStartDaemon)
     }
 
+    // MARK: - Stale-registration repair after an app update (issue #788)
+
+    /// T4 / AC3 — the header's explicit recommendation: on a changed executable, unregister BEFORE
+    /// re-registering. Asserted on the ORDERED call log, not on counts, because "both were called" is exactly
+    /// what a wrong order also satisfies. T1 rides here too: this is the unregister path's first live exercise.
+    func testChangedExecutableUnregistersBeforeReRegistering() async {
+        let (model, fake, store) = makeReconcileModel(
+            daemonAgentStatus: .enabled, lastRegisteredIdentity: "build-1", agentIdentity: "build-2")
+
+        await model.reconcileDaemonAgentRegistration()
+
+        XCTAssertEqual(fake.daemonCalls, [.unregister, .register],
+                       "the SDK header requires unregister BEFORE re-register when the executable changed")
+        XCTAssertEqual(store.lastRegisteredIdentity, "build-2",
+                       "a successful re-registration records WHAT was registered")
+    }
+
+    /// T5 (positive) / AC2 — a changed executable is detected and repaired, so launchd ends up holding a
+    /// registration for the NEW binary.
+    func testDetectorFiresOnAChangedExecutable() async {
+        let (model, fake, _) = makeReconcileModel(
+            daemonAgentStatus: .enabled, lastRegisteredIdentity: "build-1", agentIdentity: "build-2")
+
+        await model.reconcileDaemonAgentRegistration()
+
+        XCTAssertEqual(fake.registerDaemonCount, 1)
+        XCTAssertEqual(fake.unregisterDaemonCount, 1)
+    }
+
+    /// T5 (negative) — a detector that always fires is as wrong as one that never does. An UNCHANGED identity
+    /// must touch nothing: no unregister (which would kill the daemon), no register.
+    func testDetectorDoesNotFireOnAnUnchangedExecutable() async {
+        let (model, fake, store) = makeReconcileModel(
+            daemonAgentStatus: .enabled, lastRegisteredIdentity: "build-1", agentIdentity: "build-1")
+
+        await model.reconcileDaemonAgentRegistration()
+
+        XCTAssertEqual(fake.daemonCalls, [], "an unchanged executable is a no-op — nothing to repair")
+        XCTAssertEqual(store.lastRegisteredIdentity, "build-1", "the recorded identity is left untouched")
+        XCTAssertEqual(model.startPhase, .idle, "a no-op reconcile paints no beat at all")
+    }
+
+    /// T6 — no re-register storm: once a change is repaired, every subsequent launch at that same identity is
+    /// inert. Three reconciles, one registration.
+    func testRepeatedLaunchesAtTheSameVersionRegisterAtMostOnce() async {
+        let (model, fake, _) = makeReconcileModel(
+            daemonAgentStatus: .enabled, lastRegisteredIdentity: "build-1", agentIdentity: "build-2")
+
+        await model.reconcileDaemonAgentRegistration()
+        await model.reconcileDaemonAgentRegistration()
+        await model.reconcileDaemonAgentRegistration()
+
+        XCTAssertEqual(fake.registerDaemonCount, 1, "the repair happens once, not once per launch")
+        XCTAssertEqual(fake.unregisterDaemonCount, 1)
+    }
+
+    /// T6 (at the source) — `startDaemon()` records what it registered, so the NEXT launch's reconcile sees an
+    /// unchanged identity. Without this the app would unregister→re-register an agent registered seconds ago:
+    /// the storm, seeded by the very act of starting.
+    func testStartDaemonRecordsTheRegisteredIdentitySoTheNextLaunchIsInert() async {
+        let (model, fake, store) = makeReconcileModel(
+            daemonAgentStatus: .notRegistered, lastRegisteredIdentity: nil, agentIdentity: "build-2",
+            daemonComesUpOnRegister: true)
+
+        await model.startDaemon()
+        XCTAssertEqual(store.lastRegisteredIdentity, "build-2")
+
+        fake.daemonLockHeld = false  // simulate the next launch finding the lock free
+        await model.reconcileDaemonAgentRegistration()
+        XCTAssertEqual(fake.unregisterDaemonCount, 0, "a freshly-registered agent is never churned")
+        XCTAssertEqual(fake.registerDaemonCount, 1)
+    }
+
+    /// T9 / AC4 — the two-owner guard OUTRANKS the SDK's "must be re-registered". When the Rust CLI owns
+    /// `org.sessiometer.agent`, the app performs NO re-registration at all, even with a detected change:
+    /// asserted in the affirmative on BOTH halves (no unregister, no register).
+    func testNoReRegistrationAtAllWhenTheAgentIsCLIManaged() async {
+        let (model, fake, store) = makeReconcileModel(
+            daemonAgentStatus: .enabled, cliManagedAgentPresent: true,
+            lastRegisteredIdentity: "build-1", agentIdentity: "build-2")
+
+        await model.reconcileDaemonAgentRegistration()
+
+        XCTAssertEqual(fake.daemonCalls, [],
+                       "a CLI-managed LaunchAgent is not the app's to unregister or re-register")
+        XCTAssertEqual(store.lastRegisteredIdentity, "build-1",
+                       "no registration happened, so nothing is recorded as registered")
+    }
+
+    /// T2 / AC4 — the unregister half of the two-owner guard, stated on its own: the app never unregisters a
+    /// CLI-managed agent, whatever the detector says.
+    func testCLIManagedAgentIsNeverUnregisteredByTheApp() async {
+        let (model, fake, _) = makeReconcileModel(
+            daemonAgentStatus: .enabled, cliManagedAgentPresent: true,
+            lastRegisteredIdentity: nil, agentIdentity: "build-2")
+
+        await model.reconcileDaemonAgentRegistration()
+
+        XCTAssertEqual(fake.unregisterDaemonCount, 0)
+    }
+
+    /// T7 / AC5 — a re-registration that would displace a LIVE daemon running the old executable is DEFERRED,
+    /// never silently performed: `unregister()` unloads the launchd job and terminates that daemon. The
+    /// deferral leaves the recorded identity stale ON PURPOSE, so the next launch retries.
+    func testLiveDaemonIsDeferredToNextLaunchNeverSilentlyKilled() async {
+        let (model, fake, store) = makeReconcileModel(
+            daemonAgentStatus: .enabled, daemonLockHeld: true,
+            lastRegisteredIdentity: "build-1", agentIdentity: "build-2")
+
+        await model.reconcileDaemonAgentRegistration()
+
+        XCTAssertEqual(fake.daemonCalls, [], "a live daemon is never displaced mid-launch")
+        XCTAssertEqual(store.lastRegisteredIdentity, "build-1",
+                       "a deferral is not a repair — the stale identity stands so the next launch retries")
+        XCTAssertEqual(model.startPhase, .idle,
+                       "a deferral is a healthy postponement, not a failure — it paints no error card")
+    }
+
+    /// T7 (the retry half) — the deferral above is genuinely self-healing: the same model, on a later launch
+    /// that finds the lock free, performs the repair it postponed.
+    func testDeferredRepairIsPerformedOnTheNextLaunchWithAFreeLock() async {
+        let (model, fake, store) = makeReconcileModel(
+            daemonAgentStatus: .enabled, daemonLockHeld: true,
+            lastRegisteredIdentity: "build-1", agentIdentity: "build-2")
+
+        await model.reconcileDaemonAgentRegistration()
+        XCTAssertEqual(fake.daemonCalls, [])
+
+        fake.daemonLockHeld = false
+        await model.reconcileDaemonAgentRegistration()
+
+        XCTAssertEqual(fake.daemonCalls, [.unregister, .register])
+        XCTAssertEqual(store.lastRegisteredIdentity, "build-2")
+    }
+
+    /// T3 / AC6 — an unregister that THROWS surfaces a reason on the existing not-running card rather than
+    /// being swallowed, and never proceeds to register on top of a failed unregister.
+    func testUnregisterFailureSurfacesAReasonInsteadOfBeingSwallowed() async {
+        let (model, fake, store) = makeReconcileModel(
+            daemonAgentStatus: .enabled, lastRegisteredIdentity: "build-1", agentIdentity: "build-2")
+        fake.daemonUnregisterError = FakeLoginItemError.denied
+
+        await model.reconcileDaemonAgentRegistration()
+
+        guard case .failed(let reason) = model.startPhase else {
+            return XCTFail("an unregister throw must surface, not vanish; got \(model.startPhase)")
+        }
+        XCTAssertFalse(reason.isEmpty, "the card needs something to say")
+        XCTAssertEqual(fake.registerDaemonCount, 0, "a failed unregister does not proceed to register")
+        XCTAssertEqual(store.lastRegisteredIdentity, "build-1",
+                       "a failed repair is never recorded as done — the next launch retries")
+    }
+
+    /// AC6 — the other failure half: unregister lands, register throws. The agent is left honestly
+    /// unregistered with a reason shown AND the Start affordance available, so the operator can recover —
+    /// never a silent half-state.
+    func testRegisterFailureAfterUnregisterLeavesAnHonestRecoverableState() async {
+        let (model, fake, store) = makeReconcileModel(
+            daemonAgentStatus: .enabled, lastRegisteredIdentity: "build-1", agentIdentity: "build-2")
+        fake.daemonRegisterError = FakeLoginItemError.denied
+
+        await model.reconcileDaemonAgentRegistration()
+
+        XCTAssertEqual(fake.daemonCalls, [.unregister, .register])
+        guard case .failed = model.startPhase else {
+            return XCTFail("a register throw must surface; got \(model.startPhase)")
+        }
+        XCTAssertEqual(model.daemonStatus, .notRegistered, "the honest post-unregister status")
+        XCTAssertTrue(model.canStartDaemon, "the operator can recover via the existing Start affordance")
+        XCTAssertEqual(store.lastRegisteredIdentity, "build-1",
+                       "a failed register records nothing new — the identity of the registration that is now "
+                       + "gone stands, and it is inert: the next launch finds `.notRegistered` and repairs "
+                       + "nothing, because first registration is the Start affordance's job")
+    }
+
+    /// AC6 / issue #745 parity — a re-registration launchd ACCEPTS still has to be spawned by `RunAtLoad`, and
+    /// that spawn can fail silently. No daemon within the liveness window ⇒ the same honest "registered but
+    /// didn't start" reason the Start affordance uses, not a card that sits quietly forever.
+    func testReRegisterThatNeverStartsADaemonSurfacesTheSilentStartFailure() async {
+        let (model, _, store) = makeReconcileModel(
+            daemonAgentStatus: .enabled, lastRegisteredIdentity: "build-1", agentIdentity: "build-2",
+            daemonComesUpOnRegister: false)
+
+        await model.reconcileDaemonAgentRegistration()
+
+        guard case .failed(let reason) = model.startPhase else {
+            return XCTFail("a re-register whose daemon never came up must surface; got \(model.startPhase)")
+        }
+        XCTAssertTrue(reason.contains("didn’t start"), "the #745 silent-start copy, reused verbatim")
+        XCTAssertEqual(store.lastRegisteredIdentity, "build-2",
+                       "the REGISTRATION succeeded — the spawn is a separate, separately-surfaced failure")
+    }
+
+    /// A successful repair whose daemon DOES come up lands `.idle` — true success, no residual error card.
+    func testSuccessfulReRegistrationWhoseDaemonComesUpLandsIdle() async {
+        let (model, _, _) = makeReconcileModel(
+            daemonAgentStatus: .enabled, lastRegisteredIdentity: "build-1", agentIdentity: "build-2",
+            daemonComesUpOnRegister: true)
+
+        await model.reconcileDaemonAgentRegistration()
+
+        XCTAssertEqual(model.startPhase, .idle)
+    }
+
+    /// The reconcile REPAIRS, it never INITIATES (the #170 keystone: the app does not enroll a daemon nobody
+    /// asked for). With nothing of ours registered — `.notRegistered` (never started) or `.notFound` (no
+    /// bundled plist) — a detected change registers nothing.
+    func testReconcileNeverInitiatesARegistrationTheOperatorNeverAskedFor() async {
+        for status in [LoginItemStatus.notRegistered, .notFound] {
+            let (model, fake, store) = makeReconcileModel(
+                daemonAgentStatus: status, lastRegisteredIdentity: nil, agentIdentity: "build-2")
+
+            await model.reconcileDaemonAgentRegistration()
+
+            XCTAssertEqual(fake.daemonCalls, [], "nothing of ours is registered, so nothing is repaired (\(status))")
+            XCTAssertNil(store.lastRegisteredIdentity)
+        }
+    }
+
+    /// A `.requiresApproval` agent IS a live registration (issue #170 treats it as success everywhere else), so
+    /// it is repairable too — the reconcile must not mistake the pending approval gate for "not registered".
+    func testRequiresApprovalAgentIsRepairedLikeAnEnabledOne() async {
+        let (model, fake, _) = makeReconcileModel(
+            daemonAgentStatus: .requiresApproval, lastRegisteredIdentity: "build-1", agentIdentity: "build-2")
+
+        await model.reconcileDaemonAgentRegistration()
+
+        XCTAssertEqual(fake.daemonCalls, [.unregister, .register])
+    }
+
+    /// An agent registered by a build that PREDATES this bookkeeping has no recorded identity. Nil reads as
+    /// CHANGED — that unknown executable is exactly the stale registration issue #788 exists to repair — and
+    /// the repair then records, so it happens once rather than on every launch.
+    func testNoRecordedIdentityCountsAsChangedAndIsRepairedExactlyOnce() async {
+        let (model, fake, store) = makeReconcileModel(
+            daemonAgentStatus: .enabled, lastRegisteredIdentity: nil, agentIdentity: "build-2")
+
+        await model.reconcileDaemonAgentRegistration()
+        await model.reconcileDaemonAgentRegistration()
+
+        XCTAssertEqual(fake.registerDaemonCount, 1)
+        XCTAssertEqual(store.lastRegisteredIdentity, "build-2")
+    }
+
+    /// Two reconciles running CONCURRENTLY repair once, not twice. Today there is a single call site, and the
+    /// reverse direction is already safe (`startDaemon()` records before its liveness wait, so a concurrent
+    /// reconcile no-ops at the identity gate). This pins the guard so that adding a second call site — an
+    /// `applicationDidBecomeActive` refresh being the obvious one — cannot silently introduce a double
+    /// unregister→register.
+    func testConcurrentReconcilesRepairOnce() async {
+        let (model, fake, _) = makeReconcileModel(
+            daemonAgentStatus: .enabled, lastRegisteredIdentity: "build-1", agentIdentity: "build-2",
+            daemonComesUpOnRegister: false)  // the liveness wait holds `.registering` open across the overlap
+
+        async let first: Void = model.reconcileDaemonAgentRegistration()
+        async let second: Void = model.reconcileDaemonAgentRegistration()
+        _ = await (first, second)
+
+        XCTAssertEqual(fake.daemonCalls, [.unregister, .register],
+                       "the second reconcile must find one in flight and stand down, not repeat the repair")
+    }
+
+    /// The two deferral paths — the gate before the yield and the re-probe after it — must both leave
+    /// `startPhase` exactly as they found it. The re-probe path is the one that can regress: it has already
+    /// painted `.registering`, so putting back a literal `.idle` rather than the ENTRY phase would erase a
+    /// pre-existing `.failed` reason. Unreachable from the single launch-time call site (the phase is always
+    /// `.idle` there), so this pins the symmetry for the second call site the guard above anticipates.
+    func testDeferralRestoresTheEntryPhaseRatherThanForcingIdle() async {
+        let (model, fake, _) = makeReconcileModel(
+            daemonAgentStatus: .enabled, lastRegisteredIdentity: "build-1", agentIdentity: "build-2")
+
+        // Land a real `.failed` first: a register that throws, with the lock free.
+        fake.daemonRegisterError = FakeLoginItemError.denied
+        await model.reconcileDaemonAgentRegistration()
+        guard case .failed(let reason) = model.startPhase else {
+            return XCTFail("setup: expected a failed repair, got \(model.startPhase)")
+        }
+
+        // Re-arm so the NEXT reconcile actually reaches the re-probe. Without these two lines the SUCCESSFUL
+        // unregister above has left the agent `.notRegistered`, so the second call bails at gate 2 long before
+        // the re-probe and the assertion below passes no matter what the deferral does to the phase — vacuous,
+        // not passing.
+        fake.daemonRegisterError = nil
+        fake.daemonAgentStatus = .enabled
+        // A daemon takes the lock DURING the next repair — free at gate 4, held by the time of the re-probe.
+        fake.takeLockOnNextProbe = true
+        await model.reconcileDaemonAgentRegistration()
+
+        XCTAssertEqual(fake.daemonCalls.count, 2,
+                       "the repair must have DEFERRED at the re-probe — no second unregister/register pair")
+
+        guard case .failed(let preserved) = model.startPhase else {
+            return XCTFail("the deferral erased the prior reason; got \(model.startPhase)")
+        }
+        XCTAssertEqual(preserved, reason, "a deferral reports nothing of its own — it restores what it found")
+    }
+
+    // MARK: - The identity the detector compares (issue #788)
+
+    /// The detector is only as good as the identity feeding it. Driving the model with hand-written strings
+    /// proves the BRANCHING; this proves the SIGNAL — that rewriting the embedded daemon (what
+    /// `embed-daemon.sh` does on every Release build) actually produces a different identity.
+    func testIdentityChangesWhenTheEmbeddedDaemonIsRewritten() throws {
+        let bundle = try makeTemporaryBundle(helperContents: "old-daemon")
+        let before = DaemonAgentIdentity.current(bundleURL: bundle, infoDictionary: ["CFBundleVersion": "7"])
+
+        // A re-`lipo` of a different-sized universal binary, with a moved mtime.
+        let helper = bundle.appendingPathComponent(DaemonAgentIdentity.helperRelativePath)
+        try "a-much-longer-new-daemon-binary".write(to: helper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(600)], ofItemAtPath: helper.path)
+
+        let after = DaemonAgentIdentity.current(bundleURL: bundle, infoDictionary: ["CFBundleVersion": "7"])
+        XCTAssertNotEqual(before, after, "a rewritten executable must change the identity, same version or not")
+    }
+
+    /// The negative direction at the identity layer: an untouched bundle reads the same identity on every
+    /// launch, so the detector stays quiet.
+    func testIdentityIsStableForAnUntouchedBundle() throws {
+        let bundle = try makeTemporaryBundle(helperContents: "daemon")
+        let info: [String: Any] = ["CFBundleShortVersionString": "0.2.0", "CFBundleVersion": "7"]
+        XCTAssertEqual(DaemonAgentIdentity.current(bundleURL: bundle, infoDictionary: info),
+                       DaemonAgentIdentity.current(bundleURL: bundle, infoDictionary: info))
+    }
+
+    /// The SEAM, not the halves. Both halves of the detector are covered above — `DaemonAgentIdentity.current`
+    /// by the temp-bundle tests, the branching by injected strings — but every one of those injects
+    /// `agentIdentity` explicitly, so NOTHING pinned the wire between them: replacing the production default
+    /// with a constant left the whole suite green while making the repair fire once and go inert forever.
+    /// This is the only test that builds a model WITHOUT injecting an identity, so it is the only one that
+    /// fails if that default is ever unwired.
+    func testProductionIdentityProviderIsTheOneTheModelActuallyUses() async {
+        let fake = FakeLoginItemService(
+            appStatus: .enabled, daemonAgentStatus: .notRegistered,
+            cliManagedAgentPresent: false, daemonLockHeld: false)
+        fake.daemonComesUpOnRegister = true
+        let store = ephemeralRegistrationStore()
+
+        // No `agentIdentity:` argument — the production default is under test.
+        let model = LoginItemModel(service: fake,
+                                   registrationStore: store,
+                                   livenessPollInterval: .milliseconds(1),
+                                   livenessTimeout: .milliseconds(20))
+        await model.startDaemon()
+
+        XCTAssertEqual(store.lastRegisteredIdentity, DaemonAgentIdentity.current(),
+                       "the model must record the identity of the REAL running bundle — a default wired to a "
+                       + "constant would make every later launch see no change and never repair anything")
+    }
+
+    /// A version bump alone changes the identity — the shipped-update signal, which holds even where the
+    /// helper is absent (a bundle predating issue #171, or a Debug build whose embed step no-ops). Degrading
+    /// to the version half is deliberate: coarser, never broken.
+    func testIdentityFallsBackToTheVersionWhenTheHelperIsAbsent() throws {
+        let bundle = try makeTemporaryBundle(helperContents: nil)
+        let before = DaemonAgentIdentity.current(bundleURL: bundle, infoDictionary: ["CFBundleVersion": "7"])
+        let after = DaemonAgentIdentity.current(bundleURL: bundle, infoDictionary: ["CFBundleVersion": "8"])
+        XCTAssertNotEqual(before, after)
+    }
+
+    // MARK: - Render-harness seed behaviour (T8)
+
+    // SCOPE — what these two do NOT prove. `PanelRenderHarness`'s `PanelRenderLoginItemService` is `private`
+    // to the app target, so no test here can reach it: both drive a REPLICA of its seed, hand-copied, and
+    // editing the harness's own seed would fail neither. T8's other half — "the stub stays in sync with the
+    // protocol" — is structurally unfailable here: this change adds no protocol member (all three conformances
+    // are byte-unchanged), so no conformance CAN drift, and one that did would simply not compile. The real
+    // guard against the harness rendering something unexpected is `PanelGoldenParityTests`, which re-renders
+    // every panel state and diffs it against the committed goldens. What these two DO pin is the model-side
+    // contract that seed depends on.
+
+    /// The replica seed still yields the Start affordance and the resting `.idle` phase — no spinner or error
+    /// text leaking into a golden. If a model change makes that seed derive something else, this names the
+    /// cause here rather than surfacing as an unexplained golden diff.
+    func testRenderHarnessSeedStillYieldsTheStartAffordance() {
+        let (model, _, _) = makeReconcileModel(
+            appStatus: .enabled, daemonAgentStatus: .notRegistered,
+            cliManagedAgentPresent: false, daemonLockHeld: false)
+
+        XCTAssertTrue(model.canStartDaemon, "the not-running fixture renders the Start-daemon affordance")
+        XCTAssertEqual(model.startPhase, .idle, "no pending or failed beat bleeds into a design render")
+    }
+
+    /// The mutation half: a design render must never mutate registration state. The seed is `.notRegistered`,
+    /// so even if a render path reached the reconcile it would register nothing — both register and unregister
+    /// stay untouched.
+    func testRenderHarnessSeedMakesReconcileInert() async {
+        let (model, fake, _) = makeReconcileModel(
+            appStatus: .enabled, daemonAgentStatus: .notRegistered, agentIdentity: "build-2")
+
+        await model.reconcileDaemonAgentRegistration()
+
+        XCTAssertEqual(fake.daemonCalls, [], "a design render never mutates login-item state")
+    }
+
     // MARK: - Helpers
+
+    /// A model + fake + store wired for the issue #788 reconcile tests: the identity the bundle reports now
+    /// (`agentIdentity`) and the one last recorded as registered (`lastRegisteredIdentity`) are both injected,
+    /// so a test states the change it is exercising instead of simulating a build.
+    private func makeReconcileModel(
+        appStatus: LoginItemStatus = .enabled,
+        daemonAgentStatus: LoginItemStatus = .enabled,
+        cliManagedAgentPresent: Bool = false,
+        daemonLockHeld: Bool = false,
+        lastRegisteredIdentity: String? = nil,
+        agentIdentity: String = "build-1",
+        daemonComesUpOnRegister: Bool = true
+    ) -> (model: LoginItemModel, fake: FakeLoginItemService, store: DaemonAgentRegistrationStore) {
+        let fake = FakeLoginItemService(
+            appStatus: appStatus,
+            daemonAgentStatus: daemonAgentStatus,
+            cliManagedAgentPresent: cliManagedAgentPresent,
+            daemonLockHeld: daemonLockHeld)
+        fake.daemonComesUpOnRegister = daemonComesUpOnRegister
+
+        let store = ephemeralRegistrationStore()
+        store.lastRegisteredIdentity = lastRegisteredIdentity
+
+        // Tiny liveness timings (issue #745) so the post-register lock poll runs in ~ms rather than stalling
+        // the suite on the 8 s production window.
+        let model = LoginItemModel(service: fake,
+                                   registrationStore: store,
+                                   agentIdentity: { agentIdentity },
+                                   livenessPollInterval: .milliseconds(1),
+                                   livenessTimeout: .milliseconds(20))
+        return (model, fake, store)
+    }
+
+    /// A per-test volatile `UserDefaults` domain, so a recorded identity never touches the operator's real
+    /// defaults or leaks into another test.
+    private func ephemeralRegistrationStore() -> DaemonAgentRegistrationStore {
+        let suite = "org.sessiometer.menubar.login-item-tests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defaults.removePersistentDomain(forName: suite)
+        addTeardownBlock { UserDefaults().removePersistentDomain(forName: suite) }
+        return DaemonAgentRegistrationStore(defaults: defaults)
+    }
+
+    /// A throwaway `.app`-shaped directory, optionally holding an embedded daemon at the real
+    /// `Contents/Helpers/sessiometer` path, for the identity-composition tests. Removed on teardown.
+    private func makeTemporaryBundle(helperContents: String?) throws -> URL {
+        let bundle = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("Sessiometer-\(UUID().uuidString).app")
+        let helper = bundle.appendingPathComponent(DaemonAgentIdentity.helperRelativePath)
+        try FileManager.default.createDirectory(
+            at: helper.deletingLastPathComponent(), withIntermediateDirectories: true)
+        if let helperContents {
+            try helperContents.write(to: helper, atomically: true, encoding: .utf8)
+        }
+        addTeardownBlock { try? FileManager.default.removeItem(at: bundle) }
+        return bundle
+    }
 
     @discardableResult
     private func makeModel(
@@ -248,7 +700,27 @@ private final class FakeLoginItemService: LoginItemService {
     var appStatus: LoginItemStatus
     var daemonAgentStatus: LoginItemStatus
     var cliManagedAgentPresent: Bool
-    var daemonLockHeld: Bool
+
+    /// Whether a daemon holds the single-instance lock. A COMPUTED probe rather than a plain stored flag, so a
+    /// test can stage the check-then-act window issue #788's re-probe narrows: with `takeLockOnNextProbe` set,
+    /// the first read reports the lock FREE and every read after reports it HELD — exactly how a `RunAtLoad`
+    /// spawn arriving between two probes looks to the app. Reading it is therefore NOT side-effect-free while
+    /// armed; that one-shot transition is the whole point.
+    var daemonLockHeld: Bool {
+        get {
+            guard takeLockOnNextProbe else { return lockHeldStorage }
+            // The spawn lands between this probe and the next: report free, then hold from here on.
+            takeLockOnNextProbe = false
+            lockHeldStorage = true
+            return false
+        }
+        set { lockHeldStorage = newValue }
+    }
+
+    /// Arms the one-shot spawn-mid-window race `daemonLockHeld` describes; disarms itself on the next read.
+    var takeLockOnNextProbe = false
+
+    private var lockHeldStorage: Bool
 
     /// The status `registerApp()` lands on when it does not throw (default `.enabled`; set `.requiresApproval`).
     var appRegisterResult: LoginItemStatus = .enabled
@@ -262,11 +734,18 @@ private final class FakeLoginItemService: LoginItemService {
     var appRegisterError: Error?
     var appUnregisterError: Error?
     var daemonRegisterError: Error?
+    var daemonUnregisterError: Error?
 
     private(set) var registerAppCount = 0
     private(set) var unregisterAppCount = 0
     private(set) var registerDaemonCount = 0
+    private(set) var unregisterDaemonCount = 0
     private(set) var openSettingsCount = 0
+
+    /// Every daemon-agent registration call, in the order it arrived — the order-sensitive evidence the
+    /// unregister-before-register requirement needs (issue #788 / AC3), which call counts alone cannot express:
+    /// "both were called" is exactly what the WRONG order also satisfies.
+    private(set) var daemonCalls: [DaemonAgentCall] = []
 
     init(
         appStatus: LoginItemStatus,
@@ -277,7 +756,7 @@ private final class FakeLoginItemService: LoginItemService {
         self.appStatus = appStatus
         self.daemonAgentStatus = daemonAgentStatus
         self.cliManagedAgentPresent = cliManagedAgentPresent
-        self.daemonLockHeld = daemonLockHeld
+        self.lockHeldStorage = daemonLockHeld
     }
 
     func registerApp() throws {
@@ -294,6 +773,7 @@ private final class FakeLoginItemService: LoginItemService {
 
     func registerDaemonAgent() throws {
         registerDaemonCount += 1
+        daemonCalls.append(.register)
         if let daemonRegisterError { throw daemonRegisterError }
         daemonAgentStatus = daemonRegisterResult
         // Simulate the plist's `RunAtLoad`: a register that "takes" brings the daemon up, which then holds the
@@ -302,10 +782,22 @@ private final class FakeLoginItemService: LoginItemService {
     }
 
     func unregisterDaemonAgent() throws {
+        unregisterDaemonCount += 1
+        daemonCalls.append(.unregister)
+        if let daemonUnregisterError { throw daemonUnregisterError }
         daemonAgentStatus = .notRegistered
+        // Unloading the launchd job stops whatever daemon that registration was running, so the
+        // single-instance lock it held is released.
+        daemonLockHeld = false
     }
 
     func openLoginItemsSettings() { openSettingsCount += 1 }
+}
+
+/// One daemon-agent registration call, recorded in order by `FakeLoginItemService` (issue #788).
+private enum DaemonAgentCall: String, Equatable {
+    case unregister
+    case register
 }
 
 /// A stand-in for an `SMAppService` registration error (denied / not permitted) — its exact reason is irrelevant

@@ -279,12 +279,19 @@ struct SwapCalloutCard: View {
 /// yet, so `canStartDaemon` is false and the card is exactly the inert banner it was before — never a dead
 /// button over a daemon it can't start. On success the daemon comes up and the panel leaves `.notRunning`
 /// on the next `watch` snapshot (like a swap's new active row); a failure surfaces its reason inline.
+///
+/// TWO WRITERS, not one (issue #788): `startPhase` is not driven only by a press of the button below.
+/// `LoginItemModel.reconcileDaemonAgentRegistration()` repairs a registration an app update left stale, and it
+/// paints the SAME `.registering` beat and `.failed` reason on this card, with no press behind it. So the
+/// spinner can appear on its own at launch, and a reason shown here may belong to that repair rather than to
+/// anything the operator just did — this card is the sole surface for both.
 struct StartDaemonCard: View {
     /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
     @Environment(\.panelScale) private var scale
     @EnvironmentObject private var loginItem: LoginItemModel
 
-    /// The Start registration is in flight (the transient spinner beat).
+    /// A registration is in flight (the transient spinner beat) — either the button below, or the launch-time
+    /// re-registration (issue #788).
     private var isRegistering: Bool {
         if case .registering = loginItem.startPhase { return true }
         return false
