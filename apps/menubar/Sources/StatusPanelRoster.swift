@@ -532,9 +532,18 @@ private struct UsageMeter: View {
     }
 
     /// Bar fill = the green/amber/red usage band; a failed poll (`nil`) is muted, never a false green (#137).
-    /// The FILL deliberately keeps the system-bright colors (≈ the mock's `--u-*` fill family): a bar is a
-    /// non-text fill (WCAG 3:1), so — unlike the small `pctColor` TEXT, which took the darker `--ut-*` tokens
-    /// in #388 — it does NOT need the contrast-safe tint (leaving it here is intentional, not an oversight).
+    /// The FILL deliberately keeps the system-bright colors (≈ the mock's `--u-*` fill family) while the
+    /// small `pctColor` TEXT took the darker `--ut-*` tokens in #388 — leaving it here is intentional, not
+    /// an oversight, and `StatusPanelFormatTests` now asserts that split as a relation rather than trusting
+    /// this comment for it (#759).
+    ///
+    /// CORRECTED (#759, measured): this used to claim the fill was fine because "a bar is a non-text fill,
+    /// WCAG 3:1". The split is real but that justification is NOT — the fills do not clear 3:1 either. In
+    /// light, against the `--track` they sit on: `.green` 1.61, `.orange` 1.67, `.red` 2.59 (the mock's own
+    /// `--u-*` values fail identically, so this is a design property, not a drift). What actually makes the
+    /// bar defensible is that it never carries its value alone: it is `.accessibilityHidden(true)` and the
+    /// exact percent is printed beside it as AA-clearing text. Do NOT generalise "fills only need 3:1, and
+    /// these clear it" to a fill with no adjacent text — that one would be a real violation. Issue #831.
     private var barColor: Color {
         switch severity {
         case .red:    return .red
@@ -671,8 +680,9 @@ private struct BlindMeter: View {
         }
     }
 
-    /// The held bar's fill hue — the SAME bright severity family `UsageMeter.barColor` uses (a bar is a
-    /// non-text fill, WCAG 3:1), keyed off the last-known session band.
+    /// The held bar's fill hue — the SAME bright severity family `UsageMeter.barColor` uses, keyed off the
+    /// last-known session band. It inherits that fill's measured contrast position and its compensating
+    /// control (see `UsageMeter.barColor`; issue #831) — the held percent is likewise printed beside it.
     private func barColor(_ severity: StatusPanelFormat.UsageSeverity) -> Color {
         switch severity {
         case .red:    return .red
