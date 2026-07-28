@@ -237,12 +237,195 @@ final class StartDaemonCardTests: XCTestCase {
         XCTAssertNotNil(real.firstContaining(StatusPanelFormat.startDaemonRepairAttribution))
     }
 
+    // MARK: - issue #779 — the failed state OFFERS the log instead of sending the operator to find it
+    //
+    // Issue #745 shipped "The daemon was registered but didn’t start. Check Console for details." That second
+    // sentence was correct only for as long as the app had no path of its own; issue #776 built one. These
+    // pin the replacement AND its honest-affordance gate, on the RENDERED surface, for the same reason the
+    // rest of this file works there: a model that holds the right state and a card that draws nothing is the
+    // defect class this suite exists for.
+
+    /// AC-1 + AC-2. With a log to open, the manual instruction is GONE and a live `View log` stands in its
+    /// place — while the diagnostic sentence, which is issue #745's honest statement of what happened, stays.
+    ///
+    /// Both halves are asserted together deliberately: "the button appeared" would pass while the stale
+    /// instruction sat right beside it (the exact staleness issue #779 exists to remove), and "the
+    /// instruction is gone" would pass on a card that dropped the whole line and offered nothing.
+    func testTheNotStartedFailureOffersViewLogInPlaceOfTheConsoleInstruction() async {
+        let model = await notStartedFailure()
+        let nodes = tree(for: model, logPath: Self.seededLogPath)
+        assertKnownPresent(nodes, Self.anchor, "the #779 affordance check")
+
+        let button = nodes.interactiveNodes.first { $0.text == Self.viewLog }
+        XCTAssertNotNil(button, """
+            the not-started failure offers no `View log` action even with a log to open. Tree:
+            \(nodes.map(\.description).joined(separator: "\n"))
+            """)
+        XCTAssertEqual(button?.enabled, true, "a visible action that cannot be activated is R10's dead button")
+
+        XCTAssertNotNil(nodes.firstContaining(Self.diagnostic),
+                        "issue #745's honest statement of WHAT happened must survive — the affordance "
+                        + "replaces the navigation instruction, never the diagnosis")
+        XCTAssertNil(nodes.firstContaining(Self.manualInstruction), """
+            the card still tells the operator to go find the log by hand while ALSO offering to open it. \
+            That instruction is what issue #779 replaces. Tree:
+            \(nodes.map(\.description).joined(separator: "\n"))
+            """)
+    }
+
+    /// AC-4 — the honest-affordance rule (issue #169) in the state most likely to trip it. "Registered but
+    /// never started" is precisely the case where the daemon may have written nothing at all, so the no-log
+    /// arm here is the common one, not a theoretical edge.
+    ///
+    /// And the fall-back is the SHIPPED sentence, byte-for-byte: the rule withholds the button, never the
+    /// information, so an operator on a machine with no log is exactly as well-informed as before issue #779.
+    func testTheNotStartedFailureFallsBackToTheInstructionWhenThereIsNoLog() async {
+        let model = await notStartedFailure()
+        let nodes = tree(for: model, logPath: nil)
+        assertKnownPresent(nodes, Self.anchor, "the #779 no-log fallback check")
+
+        XCTAssertNil(nodes.interactiveNodes.first { $0.text == Self.viewLog }, """
+            a `View log` button was offered with NO log to open — a click would open nothing, which is the \
+            dead affordance issue #169 forbids. Tree:
+            \(nodes.map(\.description).joined(separator: "\n"))
+            """)
+        XCTAssertNotNil(nodes.firstContaining("\(Self.diagnostic) \(Self.manualInstruction)"),
+                        "with no button to offer, the card owes the operator the manual route — the whole "
+                        + "issue #745 sentence, unchanged")
+    }
+
+    /// The affordance is gated on the FAILURE, not merely on the log's existence. A register that THREW never
+    /// spawned anything, so the daemon's log cannot mention it — offering to open it would be a dead button
+    /// of a subtler kind: live and clickable, pointing at a file with nothing to say.
+    ///
+    /// The log is forced AVAILABLE here, so an absent button can only be the card's own gating. Seeded `nil`
+    /// this test would pass on a card that offered the action unconditionally.
+    func testARegisterErrorIsNotOfferedTheLogEvenWhenOneExists() async {
+        let (model, _) = await failedLaunchRepair()
+        let nodes = tree(for: model, logPath: Self.seededLogPath)
+        assertKnownPresent(nodes, Self.anchor, "the #779 register-error gating check")
+
+        XCTAssertNil(nodes.interactiveNodes.first { $0.text == Self.viewLog }, """
+            a register error was offered `View log`. Nothing was spawned, so the daemon wrote no line about \
+            this failure and the OS message is already on the card. Note the log was forced AVAILABLE, so \
+            this is the card's state gating, not a seeding accident. Tree:
+            \(nodes.map(\.description).joined(separator: "\n"))
+            """)
+    }
+
+    /// AC-3 — "reuse whatever handler issue #776 establishes; do not fork a second Console-opening path."
+    ///
+    /// Asserted as IDENTITY between the two surfaces rather than as a property of this one: a check that the
+    /// button here merely *has* the right label would pass on a hand-rolled copy that drifts the moment the
+    /// mock's label, glyph or help text changes. Every user-visible attribute the tree can see must match the
+    /// starting card's, because both render the one `ViewLogButton`.
+    func testTheOfferedActionIsTheSameAffordanceTheStartingCardRenders() async {
+        let model = await notStartedFailure()
+        let mine = tree(for: model, logPath: Self.seededLogPath)
+            .interactiveNodes.first { $0.text == Self.viewLog }
+        XCTAssertNotNil(mine, "setup: the not-running card published no `View log` button")
+
+        // Issue #776's own surface, same seeded path, hosted the same way.
+        let starting = PanelA11y.tree(
+            for: DaemonLogCard(state: .starting, actionStyle: .link)
+                .environmentObject(WatchStatusStore.preview(state: .starting, rows: [],
+                                                            nextSwap: nil, generatedAt: nil))
+                .environment(\.daemonLogProbe, .fixed(Self.seededLogPath)),
+            size: Self.cardSize)
+            .interactiveNodes.first { $0.text == Self.viewLog }
+        XCTAssertNotNil(starting, "setup: issue #776's starting card published no `View log` button")
+
+        XCTAssertEqual(mine?.role, starting?.role, "the two must publish the same role")
+        XCTAssertEqual(mine?.help, starting?.help,
+                       "the help text carries the D3 destination (Console.app) — a second definition that "
+                       + "drifted here would be exactly the fork issue #779 forbids")
+        XCTAssertEqual(mine?.enabled, starting?.enabled)
+    }
+
+    /// AC-5 — redaction (issue #15). The not-started reason is a FIXED pair of literals that interpolates
+    /// nothing, so there is no seam through which a credential could reach the card. Asserted as exact
+    /// equality rather than a "does not contain a secret" scan: a containment check can only rule out the
+    /// secrets it thinks to name, whereas equality rules out anything at all having been added.
+    func testTheNotStartedFailureLineIsExactlyItsFixedCopyAndNothingElse() async {
+        let model = await notStartedFailure()
+
+        let offered = tree(for: model, logPath: Self.seededLogPath)
+        assertKnownPresent(offered, Self.anchor, "the #779 redaction check (log offered)")
+        XCTAssertNotNil(offered.first { $0.text == Self.diagnostic },
+                        "the offered-affordance line must be the diagnostic and nothing more")
+
+        let bare = tree(for: model, logPath: nil)
+        assertKnownPresent(bare, Self.anchor, "the #779 redaction check (no log)")
+        XCTAssertNotNil(bare.first { $0.text == "\(Self.diagnostic) \(Self.manualInstruction)" },
+                        "and the fallback line must be the two fixed sentences and nothing more")
+    }
+
+    /// CANARY for the two absence assertions above. A replica that renders `View log` with NO regard for the
+    /// probe — the shape a careless implementation takes — fed through the SAME query
+    /// `testTheNotStartedFailureFallsBackToTheInstructionWhenThereIsNoLog` uses. It must be caught, or that
+    /// test's "no button was offered" verdict proves nothing about the gate it claims to defend.
+    func testTheNoLogAssertionCatchesAnUngatedButton() async {
+        let model = await notStartedFailure()
+        let ungated = PanelA11y.tree(for: UngatedViewLogCardReplica().environmentObject(model),
+                                     size: Self.cardSize)
+        assertKnownPresent(ungated, Self.anchor, "the ungated-button canary")
+        XCTAssertNotNil(ungated.interactiveNodes.first { $0.text == Self.viewLog },
+                        "the canary is not mutated: an ungated `View log` must be VISIBLE to this suite's "
+                        + "query, or the no-log absence assertion is vacuous")
+
+        // …and the real card, same model, same query, same absent probe, withholds it. The pair is the gate.
+        XCTAssertNil(tree(for: model, logPath: nil).interactiveNodes.first { $0.text == Self.viewLog })
+    }
+
     // MARK: - Helpers
+
+    /// The `View log` label, the two halves of the #745 copy, and a stand-in log path — all DERIVED from the
+    /// shipped constants rather than transcribed, so a reworded sentence reddens these tests instead of
+    /// silently making them assert about a string the product no longer shows.
+    private static let viewLog = StatusPanelFormat.viewLogButtonTitle
+    private static let diagnostic = LoginItemModel.StartFailureReason.notStartedDiagnostic
+    private static let manualInstruction = LoginItemModel.StartFailureReason.manualLogInstruction
+
+    /// A FIXED stand-in log path, never a resolved one — same reasoning as `PanelRenderHarness.fixtureLogPath`
+    /// (#776): nothing renders the path, only the button's presence, so a literal is a complete stand-in and
+    /// it keeps the suite independent of whether the machine running it has ever started the daemon.
+    private static let seededLogPath = "/Users/sessiometer/Library/Logs/sessiometer/sessiometer.log"
+
+    /// A model driven into a genuine `.notStarted` failure through the real Start action: a registrable agent
+    /// and a free lock (so `canStartDaemon` is true and the press is not a no-op), a register that SUCCEEDS,
+    /// and a daemon that never comes up — so the bounded liveness wait elapses. Never a hand-set phase: the
+    /// state has to be one the product can actually reach.
+    private func notStartedFailure() async -> LoginItemModel {
+        let fake = FakeLoginItemService(appStatus: .enabled, daemonAgentStatus: .notRegistered,
+                                        cliManagedAgentPresent: false, daemonLockHeld: false)
+        fake.daemonComesUpOnRegister = false  // the #745 case: register takes, nothing spawns
+        let model = LoginItemModel(service: fake,
+                                   registrationStore: ephemeralRegistrationStore(),
+                                   agentIdentity: { "build-1" },
+                                   livenessPollInterval: .milliseconds(1),
+                                   livenessTimeout: .milliseconds(20))
+        await model.startDaemon()
+        guard case .failed(.notStarted, .operatorStart) = model.startPhase else {
+            XCTFail("setup: expected an operator-attributed not-started failure, got \(model.startPhase)")
+            return model
+        }
+        return model
+    }
 
     /// The real card, hosted with `model` as its `@EnvironmentObject`. `panelScale` is left at its default
     /// (1.0, the `.large` Dynamic Type class) — the same factor the committed goldens render at.
     private func tree(for model: LoginItemModel) -> [A11yNode] {
         PanelA11y.tree(for: StartDaemonCard().environmentObject(model), size: Self.cardSize)
+    }
+
+    /// The same card with issue #776's availability seam pinned (issue #779). Separate from `tree(for:)` above
+    /// so the pre-#779 tests keep hosting the card exactly as they did — with the environment default,
+    /// `.unavailable`, which is what the shipped app falls back to and what renders no button.
+    private func tree(for model: LoginItemModel, logPath: String?) -> [A11yNode] {
+        PanelA11y.tree(for: StartDaemonCard()
+                            .environmentObject(model)
+                            .environment(\.daemonLogProbe, .fixed(logPath)),
+                       size: Self.cardSize)
     }
 
     /// A model driven into a genuinely-failed LAUNCH REPAIR through the real reconcile: a changed identity
@@ -307,9 +490,34 @@ private struct CoupledStartDaemonCardReplica: View {
             if loginItem.canStartDaemon {
                 Text(StatusPanelFormat.startDaemonButtonTitle)
                 if case .failed(let reason, let origin) = loginItem.startPhase {
-                    Text(StatusPanelFormat.startDaemonFailureText(reason: reason, origin: origin))
+                    // `offeringLogAffordance: false` — the pre-#820 shape this replica models predates issue
+                    // #779's affordance entirely, so it renders the reason's un-degraded copy. What the
+                    // canary watches is whether the reason is DRAWN, which that argument cannot affect.
+                    Text(StatusPanelFormat.startDaemonFailureText(
+                        reason: reason.text(offeringLogAffordance: false), origin: origin))
                 }
                 Text(StatusPanelFormat.startDaemonHint)
+            }
+        }
+    }
+}
+
+/// The not-running card with issue #779's affordance UNGATED — a `View log` offered on any failure, with no
+/// regard for whether there is a log to open. This is the shape a careless implementation takes, and it is
+/// what `testTheNoLogAssertionCatchesAnUngatedButton` requires this suite's absence query to catch.
+///
+/// A copy rather than a flag on the real card, for the same reason as the replica above: a production toggle
+/// for "render the dead-button way" would be a code path shipping to operators for no product reason.
+private struct UngatedViewLogCardReplica: View {
+    @EnvironmentObject private var loginItem: LoginItemModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            BannerView(banner: StatusPanelFormat.banner(for: .notRunning, accountCount: 0))
+            if case .failed(let reason, let origin) = loginItem.startPhase {
+                Text(StatusPanelFormat.startDaemonFailureText(
+                    reason: reason.text(offeringLogAffordance: true), origin: origin))
+                Button(StatusPanelFormat.viewLogButtonTitle) {}
             }
         }
     }

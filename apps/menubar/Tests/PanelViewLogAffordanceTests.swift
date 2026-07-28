@@ -222,6 +222,16 @@ final class PanelViewLogAffordanceTests: XCTestCase {
     /// The mock's entire action inventory is three labels across three frames; `View log` belongs to two
     /// states and no more. Sweeping EVERY fixture is what makes that a contract rather than a spot check.
     ///
+    /// WHAT THIS SWEEP DOES AND DOES NOT CLAIM SINCE ISSUE #779. The affordance now has a second home the
+    /// MOCK does not author: the not-running card's `.failed` line, where issue #745's "Check Console for
+    /// details" instruction used to send the operator off to find the log by hand (`StartDaemonCard`, gated by
+    /// `StartDaemonCardTests`). The sweep below stays green — and is not weakened — because it is gated on the
+    /// FIXTURE's state, and `PanelRenderHarness`'s `not-running` fixture seeds a `LoginItemModel` that sits at
+    /// `.idle`: the failure branch is never entered, so there is no button to find. What this sweep therefore
+    /// attests is the MOCK's contract over the mock's own states, which is exactly its job. If you later seed
+    /// a `.failed` phase into the `not-running` fixture, expect this to go red for a LEGITIMATE reason —
+    /// exclude that fixture deliberately rather than reading the red as a regression in the panel's gating.
+    ///
     /// TWO SEPARATE VACUITIES, and the second is the one that nearly got through. The first is the familiar
     /// empty-tree void — an activation failure yields no nodes, which satisfies any absence check
     /// perfectly; `assertKnownPresent`-style anchoring is what closes it. The second is subtler and

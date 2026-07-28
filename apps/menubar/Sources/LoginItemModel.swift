@@ -226,13 +226,92 @@ final class LoginItemModel: ObservableObject {
     /// `watch` snapshot, exactly as a swap's new active row arrives.
     ///
     /// Both non-resting beats carry their `StartOrigin` (issue #820). The reason ALONE cannot identify its
-    /// writer — `notStartedReason` is emitted byte-identically by `startDaemon()` and by the launch-time
+    /// writer — `.notStarted` is emitted byte-identically by `startDaemon()` and by the launch-time
     /// repair — so the attribution has to be recorded HERE, where the writer is known, rather than
     /// reconstructed downstream from copy that does not distinguish them.
     enum StartPhase: Equatable {
         case idle
         case registering(StartOrigin)
-        case failed(reason: String, origin: StartOrigin)
+        case failed(reason: StartFailureReason, origin: StartOrigin)
+    }
+
+    /// WHY a `.failed` beat happened — and, with it, WHERE the evidence for it lives (issue #779).
+    ///
+    /// This used to be a bare `String`, which was enough while the card's only job was to print it. It is not
+    /// enough now that the card offers a `View log` affordance, because the daemon's own event log is evidence
+    /// for exactly ONE of the two failures:
+    ///
+    ///  • `.notStarted` — register SUCCEEDED and launchd was asked to spawn; no daemon took the lock. Whatever
+    ///    went wrong happened inside a process this app cannot see, and the log is the only place that says
+    ///    what. So this is the arm that gets the affordance.
+    ///  • `.registerFailed` — the register/unregister call itself THREW. Nothing was ever spawned, so the
+    ///    daemon wrote no line about it, and the OS error is already in hand and printed verbatim. Offering to
+    ///    open a log that cannot mention this failure would be a dead affordance of a subtler kind than the one
+    ///    issue #169 forbids: live, clickable, and pointing at the wrong file.
+    ///
+    /// A TYPE rather than a text comparison, deliberately. The card could have asked "is this reason string the
+    /// not-started one?", but that compares against operator-facing COPY — it would go quietly wrong the first
+    /// time someone rewords the sentence, and nothing would fail. The writer already knows which failure it is
+    /// raising; recording it here is the same argument issue #820 made for `StartOrigin`, one axis over.
+    ///
+    /// The ARITY of `.failed` is deliberately unchanged: every `case .failed(let reason, let origin)` in the
+    /// app and its tests still compiles, and only the handful of sites that used the reason AS a string moved.
+    enum StartFailureReason: Equatable {
+        /// Register succeeded, but no daemon took the single-instance lock inside the liveness window (#745).
+        case notStarted
+        /// The register / unregister call threw — a REDACTED, non-secret OS message (issue #15).
+        case registerFailed(String)
+
+        /// The #745 silent-failure copy: register succeeded but no daemon took the lock within the liveness
+        /// window. There is no OS error to surface (register did NOT throw), so this is a plain, actionable
+        /// statement rather than a redacted message — and, like every `.failed` reason, it carries no
+        /// credential (issue #15).
+        ///
+        /// WHAT happened, and nothing else. Issue #745 authored this sentence deliberately as the honest
+        /// statement of the condition, and it is shown unconditionally: a log the app can open for you does
+        /// not make the diagnosis less owed.
+        static let notStartedDiagnostic = "The daemon was registered but didn’t start."
+
+        /// The manual-navigation half issue #745 shipped alongside the diagnostic above, now shown ONLY where
+        /// the app cannot do it for the operator (issue #779).
+        ///
+        /// It was correct advice for exactly as long as the app offered no path of its own. Issue #776 built
+        /// one — `View log` opens this very file in Console — so on any machine where the daemon HAS written a
+        /// line, this sentence names an action the app now performs on request, which is the staleness issue
+        /// #779 exists to remove. Where there is no log it is still the only thing to say, so it is kept
+        /// rather than dropped: the honest-affordance rule (issue #169) withholds the BUTTON, never the
+        /// information. It names a fixed, non-secret location and interpolates nothing (issue #15).
+        static let manualLogInstruction = "Check Console for details."
+
+        /// Whether the daemon's own event log is evidence for this failure, and so whether the card offers
+        /// `View log` beside it (issue #779). See the type's docs for why only one arm qualifies.
+        var evidenceIsInTheDaemonLog: Bool {
+            switch self {
+            case .notStarted: return true
+            case .registerFailed: return false
+            }
+        }
+
+        /// The failure line's text, given whether a live `View log` affordance is being rendered beside it.
+        ///
+        /// The DIAGNOSTIC half never degrades — "what happened" is issue #745's honest statement and is owed to
+        /// the operator either way. Only the REMEDY half moves: with a log to open, the affordance IS the
+        /// remedy and the manual "go find it yourself" instruction would be redundant advice for a thing the
+        /// app just did; with no log to open, the instruction is all there is, so it stays and the output is
+        /// byte-identical to what issue #745 shipped.
+        ///
+        /// A register error has no remedy half at all, so `offeringLogAffordance` cannot change it — which is
+        /// what keeps that card byte-unchanged by construction rather than by remembering.
+        func text(offeringLogAffordance: Bool) -> String {
+            switch self {
+            case .notStarted:
+                return offeringLogAffordance
+                    ? Self.notStartedDiagnostic
+                    : "\(Self.notStartedDiagnostic) \(Self.manualLogInstruction)"
+            case .registerFailed(let message):
+                return message
+            }
+        }
     }
 
     // MARK: Published state
@@ -377,10 +456,11 @@ final class LoginItemModel: ObservableObject {
             // daemon, never arrives.
             startPhase = await daemonBecameLive()
                 ? .idle
-                : .failed(reason: Self.notStartedReason, origin: .operatorStart)
+                : .failed(reason: .notStarted, origin: .operatorStart)
         } catch {
             loginItemLog.error("daemon agent register failed: \(String(describing: error), privacy: .public)")
-            startPhase = .failed(reason: Self.startFailureReason(error), origin: .operatorStart)
+            startPhase = .failed(reason: .registerFailed(Self.startFailureReason(error)),
+                                 origin: .operatorStart)
         }
     }
 
@@ -507,13 +587,14 @@ final class LoginItemModel: ObservableObject {
                 // so a lock taken within the window is the daemon this re-registration started.
                 startPhase = await daemonBecameLive()
                     ? .idle
-                    : .failed(reason: Self.notStartedReason, origin: .launchRepair)
+                    : .failed(reason: .notStarted, origin: .launchRepair)
             }
         } catch {
             loginItemLog.error(
                 "daemon agent re-registration failed: \(String(describing: error), privacy: .public)")
             daemonStatus = service.daemonAgentStatus
-            startPhase = .failed(reason: Self.reregisterFailureReason(error), origin: .launchRepair)
+            startPhase = .failed(reason: .registerFailed(Self.reregisterFailureReason(error)),
+                                 origin: .launchRepair)
         }
     }
 
@@ -619,12 +700,6 @@ final class LoginItemModel: ObservableObject {
     private static let foreignHolderLivenessNote =
         "another daemon holds the single-instance lock, so this registration's own startup is not observable "
         + "from here; it will start at the next login"
-
-    /// The #745 silent-failure copy: register succeeded but no daemon took the lock within the liveness window.
-    /// There is no OS error to surface (register did NOT throw), so this is a plain, actionable statement rather
-    /// than a redacted message — and, like every `.failed` reason, it carries no credential (issue #15).
-    private static let notStartedReason =
-        "The daemon was registered but didn’t start. Check Console for details."
 
     /// A redacted, non-secret reason for a failed daemon start (issue #15) — a registration error carries no
     /// credential, so the OS message is safe to surface, with a plain fallback when it is empty.

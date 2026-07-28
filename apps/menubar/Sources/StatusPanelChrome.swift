@@ -313,6 +313,10 @@ struct SwapCalloutCard: View {
 struct StartDaemonCard: View {
     /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
     @Environment(\.panelScale) private var scale
+    /// Is there a log to view (issue #779)? The SAME injected seam `DaemonLogCard` reads — see `DaemonLog.swift`
+    /// for why availability is injected rather than probed from `body`, and note the default is `.unavailable`,
+    /// so a host that forgets to inject renders no button rather than a dead one.
+    @Environment(\.daemonLogProbe) private var daemonLogProbe
     @EnvironmentObject private var loginItem: LoginItemModel
 
     /// The in-flight beat's writer (issue #788/#820), or nil when no registration is in flight — either the
@@ -329,13 +333,10 @@ struct StartDaemonCard: View {
                 startButton
             }
             // OUTSIDE the gate above — see (1) in this view's header. The three branches keep the resting
-            // `canStartDaemon` order (button → reason → hint) byte-identical to what issue #170 shipped.
+            // `canStartDaemon` order (button → reason → hint) byte-identical to what issue #170 shipped;
+            // issue #779's affordance is nested INSIDE the reason branch, so that ordering is untouched.
             if case .failed(let reason, let origin) = loginItem.startPhase {
-                Label(StatusPanelFormat.startDaemonFailureText(reason: reason, origin: origin),
-                      systemImage: "exclamationmark.triangle.fill")
-                    .font(.panel(11, scale: scale))
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
+                failureLine(reason: reason, origin: origin)
             }
             if loginItem.canStartDaemon {
                 Text(StatusPanelFormat.startDaemonHint)
@@ -343,6 +344,46 @@ struct StartDaemonCard: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+        }
+    }
+
+    /// The failure line, plus issue #779's `View log` affordance where the daemon's own log is both the
+    /// evidence AND actually there to open.
+    ///
+    /// TWO GATES, AND-ed, in this order:
+    ///
+    ///  1. `evidenceIsInTheDaemonLog` — is this failure one the log can speak to at all? Only the #745
+    ///     liveness timeout is; a register that threw never spawned anything to write a line (see
+    ///     `StartFailureReason`). This gate is asked FIRST so the probe is not even consulted for a failure
+    ///     the log is irrelevant to.
+    ///  2. `existingLogPath()` — is there a log? This is the honest-affordance rule (issue #169) at the seam
+    ///     issue #776 built for it: nil when the home is unresolvable, the app is sandboxed, or the daemon has
+    ///     never written a line. "Registered but never started" is EXACTLY the state where a daemon may well
+    ///     have written nothing, so this is not a theoretical arm — it is the common one.
+    ///
+    /// And the copy moves with the gate rather than beside it: `text(offeringLogAffordance:)` drops the
+    /// "Check Console for details" instruction precisely when the button replaces it, and keeps it — restoring
+    /// issue #745's shipped sentence byte-for-byte — when it cannot. What is never dropped either way is the
+    /// diagnostic itself, which is issue #745's honest statement of what happened.
+    @ViewBuilder
+    private func failureLine(reason: LoginItemModel.StartFailureReason, origin: StartOrigin) -> some View {
+        let logPath = reason.evidenceIsInTheDaemonLog ? daemonLogProbe.existingLogPath() : nil
+        let text = StatusPanelFormat.startDaemonFailureText(
+            reason: reason.text(offeringLogAffordance: logPath != nil), origin: origin)
+
+        Label(text, systemImage: "exclamationmark.triangle.fill")
+            .font(.panel(11, scale: scale))
+            .foregroundStyle(.red)
+            .fixedSize(horizontal: false, vertical: true)
+        if let logPath {
+            // `.link`, not `.bordered`, and this card is why the style is a PARAMETER rather than derived
+            // (`DaemonLogCard.ActionStyle`). No mock frame governs this state — issue #779 ships with
+            // `Build Reference: None` — so the mock's own rule is applied rather than copied: it reserves the
+            // bordered `.btn` for an action that shares a row as a peer, and this one does not. The primary
+            // remedy here is `Start daemon` (`.borderedProminent`, directly above); a neutral-chrome button
+            // beneath a red failure line would read as a second co-equal action and outweigh the hint below
+            // it. Reading a log is diagnosis, not the remedy — `.link` is what says so.
+            ViewLogButton(logPath: logPath, actionStyle: .link)
         }
     }
 
@@ -434,13 +475,30 @@ struct DaemonLogCard: View {
         VStack(alignment: .leading, spacing: 8 * scale) {
             BannerView(banner: StatusPanelFormat.banner(for: state, accountCount: store.rows.count))
             if let logPath = daemonLogProbe.existingLogPath() {
-                viewLogButton(logPath: logPath)
+                ViewLogButton(logPath: logPath, actionStyle: actionStyle)
             }
         }
     }
+}
 
-    @ViewBuilder
-    private func viewLogButton(logPath: String) -> some View {
+/// The ONE `View log` button (issue #776) — every surface that offers the action renders THIS, so the
+/// affordance cannot fork.
+///
+/// Extracted from `DaemonLogCard` when issue #779 gave the action a second home (the not-running card's
+/// `.failed` line, `StartDaemonCard` above). "Reuse whatever handler issue #776 establishes; do not fork a
+/// second Console-opening path" is that issue's explicit constraint, and a copied button is how a fork starts
+/// — two call sites of `DaemonLogOpen.perform` is not a fork, but two DEFINITIONS of the label, the glyph,
+/// the VoiceOver name and the help text would drift into one. Everything below is issue #776's code moved
+/// verbatim, not re-derived: the committed panel goldens for `starting` / `crash-looping` are the proof, and
+/// they must not move by so much as a pixel over this extraction.
+private struct ViewLogButton: View {
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
+
+    let logPath: String
+    let actionStyle: DaemonLogCard.ActionStyle
+
+    var body: some View {
         // `doc.text` is the SF Symbol counterpart of the mock's document glyph (a rounded rect over three
         // text rules, the last one short). `Label` pairs it with the title exactly as `StartDaemonCard` pairs
         // `play.fill` with "Start daemon", so both cards' actions read as one family.
