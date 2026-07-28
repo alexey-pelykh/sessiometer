@@ -90,10 +90,24 @@ frame. As of #448 the per-row manual-switch chip is PERSISTENT, so a render capt
 committed `panel-healthy-*.png` show it on every switchable row. What a single resting frame still
 can't show is the ARMED state — the hover/focus brighten to `.secondary`, the row wash, the
 `pointingHand` cursor — nor the in-flight `Switching…` spinner; those are interaction states, so they
-stay a manual operator check (#380) — as does the real-popover swap round-trip. **Note:** regenerating
-the committed PNGs runs the built app's `ImageRenderer` path, which needs a GUI / windowserver session
-— so it stays a **manual pre-release step** (run the command above on a workstation), not something
-headless CI can do.
+stay a manual operator check (#380) — as does the real-popover swap round-trip.
+
+**Correction (issue #749): `ImageRenderer` rasterizes headlessly.** This note previously said
+regenerating the committed PNGs "needs a GUI / windowserver session — not something headless CI can
+do", and that belief (echoed in `BarGlyphParityTests`) was the stated reason the panel had no automated
+visual gate while the bar glyph did. It was never tested, and it is wrong:
+`ImageRendererHeadlessProbeTests` rasterizes SwiftUI inside the standalone `MenubarTests` bundle
+(`TEST_HOST: ""` — no host app, no `NSApplication`, no window) under `xcodebuild test`, across a bare
+view, an SF Symbol, and the `@EnvironmentObject` / `@Published` environment-injection path that issue
+#749 flagged as the likelier failure point. So an in-bundle panel golden gate IS reachable — that is
+issue #754's work. (The stronger no-*windowserver* claim was confirmed separately under `sandbox-exec`
+denying `com.apple.windowserver*` — `CGSession` nil, `NSScreen.count` 0, identical output bytes — but
+only the in-bundle claim above is what CI re-runs.)
+
+What stays a **manual pre-release step** is regenerating these committed PNGs through the built
+**app**'s `--render-panel` tool, for the ordinary reason that it needs a local Debug build of the app
+(`RenderPanelTool` is `#if DEBUG`) and a human eye on the comparison — not because of any headless
+limitation.
 
 ### Design vs. capture, screen by screen
 
@@ -226,9 +240,10 @@ Three tint **contexts** × four glyphs × {@1x, @2x} = **24** references under `
 <img src="renders/bar-glyphs/bar-healthy-light@2x.png" width="48"> <img src="renders/bar-glyphs/bar-healthy-dark@2x.png" width="48"> <img src="renders/bar-glyphs/bar-healthy-menuOpen@2x.png" width="48"> — healthy, the three contexts @2x (the other three glyphs mirror this).
 
 Regenerate the references with a DEBUG-only tool (`RenderBarGlyphTool`, wired in `AppDelegate` beside
-`--render-panel`). Unlike the panel renderer it needs no windowserver — `NSBitmapImageRep` + `NSImage.draw`
-rasterize a custom symbol headless — but it runs inside the app so `Bundle.main` carries the compiled
-catalog:
+`--render-panel`). It rasterizes headless via `NSBitmapImageRep` + `NSImage.draw`, and it runs inside
+the app so `Bundle.main` carries the compiled catalog. (This previously read "unlike the panel renderer
+it needs no windowserver" — a false contrast, corrected above per issue #749: the panel's `ImageRenderer`
+rasterizes headless too. What actually sets this path apart is the template tinting named above.)
 
 ```sh
 # from apps/menubar, after a Debug build (xcodegen generate && xcodebuild build -scheme Menubar …)
