@@ -1005,8 +1005,34 @@ pub(crate) enum Event {
     /// ONCE, on the first working sweep that clears the episode — the closing bracket of the
     /// systemic-failure edge, mirroring the [`Event::CredentialDead`] / [`Event::CredentialRestored`]
     /// two-edge idiom at the refresh-MECHANISM scope. No fields — a daemon-global recovery with
-    /// nothing account-specific to carry (#15).
+    /// nothing account-specific to carry (#15). The CLOSING bracket of a systemic episode however
+    /// it was opened — by the streak crossing above, or by the startup preflight below.
     RefreshSystemicRecovered,
+    /// The daemon's STARTUP PREFLIGHT could not resolve the `claude` binary (issue #787): before a
+    /// single refresh sweep ran, the mechanism's precondition was already broken, so every eligible
+    /// account's cycle is guaranteed to fail (`reason=unresolved`, issue #786) until an operator
+    /// intervenes.
+    ///
+    /// The SECOND opening bracket of a systemic-failure episode. Until #787 the state behind
+    /// [`Event::RefreshSystemicFailure`] was pure in-memory, so a daemon restart ERASED an open
+    /// episode and the board went green over an unfixed fault for another N sweeps — with launchd's
+    /// `KeepAlive { SuccessfulExit: false }` re-opening that window on every abnormal exit. The
+    /// preflight re-establishes the fault AT startup instead of re-deriving it N sweeps later.
+    ///
+    /// Deliberately DISTINCT from [`Event::RefreshSystemicFailure`] rather than a synthesized
+    /// `consecutive=1` of it: an episode opened by a startup probe and one opened by a genuine
+    /// N-sweep crossing are different facts, and a DIAGNOSABILITY fix must not make them
+    /// indistinguishable on the log. The same call issue #786 made in splitting
+    /// [`Event::RefreshBinaryResolved`] out of `reason=` rather than overloading it. So an episode
+    /// has TWO possible opening brackets — this one or `refresh_systemic_failure` — and exactly one
+    /// closing bracket, [`Event::RefreshSystemicRecovered`]: the log-balance audit that found #787
+    /// in the first place (one `failure`, zero `recovered`) still works, on a two-token alternation.
+    ///
+    /// NO fields at all, so it is #15-clean by construction with nothing to redact: a preflight is
+    /// one daemon-global observation with no count to carry, and the resolved path deliberately
+    /// stays off it — a SUCCESSFUL resolution has its own [`Event::RefreshBinaryResolved`] line,
+    /// and a failed one has no path to name.
+    RefreshPreflightUnresolved,
     /// The absolute path of the `claude` binary the refresh sweep RESOLVED and is spawning
     /// (issue #786) — the "WHICH `claude` did the daemon pick?" question the log previously could
     /// not answer at all. With three resolution tiers (`[refresh].claude_bin`, `$CLAUDE_BIN`, the
@@ -1718,6 +1744,12 @@ impl Event {
                 // The closing edge of the #378 systemic-failure episode — a daemon-global recovery
                 // with nothing account-specific to carry.
                 format!("ts={ts} event=refresh_systemic_recovered")
+            }
+            Event::RefreshPreflightUnresolved => {
+                // The preflight-established OPENING edge of a #378 episode (issue #787). No fields
+                // at all: one daemon-global observation with no count to carry and, by
+                // construction, no path — so it is #15-clean with nothing to redact.
+                format!("ts={ts} event=refresh_preflight_unresolved")
             }
             Event::RefreshBinaryResolved { path } => {
                 // Percent-encoded (see `path_value`) so the value can never split into a second
@@ -3181,6 +3213,36 @@ mod tests {
         // Issue #378: the recovery edge is a bare daemon-global line — nothing to leak.
         let line = Event::RefreshSystemicRecovered.to_log_line(at_epoch(0));
         assert_eq!(line, format!("{TS0} event=refresh_systemic_recovered"));
+    }
+
+    #[test]
+    fn refresh_preflight_unresolved_carries_no_fields_at_all() {
+        // Issue #787 / AC6: the preflight-established opening edge is a bare daemon-global line —
+        // no count (one observation, nothing to count) and NO PATH. The unresolvable location is
+        // exactly what a #15 review would object to, and it is absent by construction: a
+        // SUCCESSFUL resolution has its own `refresh_binary_resolved` line (#786), and a failed one
+        // has no path to name.
+        let line = Event::RefreshPreflightUnresolved.to_log_line(at_epoch(0));
+        assert_eq!(line, format!("{TS0} event=refresh_preflight_unresolved"));
+    }
+
+    #[test]
+    fn an_episode_has_two_opening_brackets_and_one_closing_bracket() {
+        // Issue #787: the log-balance forensics that FOUND #787 (one `refresh_systemic_failure`,
+        // zero `refresh_systemic_recovered` ⇒ an episode that was erased, not closed) must survive
+        // the fix. It does, as a two-token alternation: an episode opens with EITHER the sweep
+        // crossing OR the preflight, and closes with the one recovery event. Pinned here so a
+        // future event rename cannot silently break an operator's grep vocabulary.
+        let sweep_open = Event::RefreshSystemicFailure { consecutive: 3 }.to_log_line(at_epoch(0));
+        let preflight_open = Event::RefreshPreflightUnresolved.to_log_line(at_epoch(0));
+        let close = Event::RefreshSystemicRecovered.to_log_line(at_epoch(0));
+
+        assert!(sweep_open.contains(" event=refresh_systemic_failure "));
+        assert!(preflight_open.ends_with(" event=refresh_preflight_unresolved"));
+        assert!(close.ends_with(" event=refresh_systemic_recovered"));
+        // The two openers are distinguishable — the whole reason the preflight got its own event
+        // rather than a synthesized `consecutive=1` of the sweep one.
+        assert_ne!(sweep_open, preflight_open);
     }
 
     #[test]
