@@ -236,6 +236,8 @@ impl Config {
             fleet_runway_warn_secs: t.fleet_runway_warn_secs as u64,
             canary_drift_override: t.canary_drift_override,
             canary_nostashmatch_override: t.canary_nostashmatch_override,
+            canary_online_probe: t.canary_online_probe,
+            canary_online_probe_strict: t.canary_online_probe_strict,
             poll_strategy: Strategy {
                 base: t.poll_secs as f64,
                 jitter: poll_jitter,

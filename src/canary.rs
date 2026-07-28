@@ -59,11 +59,12 @@
 //! agree (an unwritable `~/.claude.json`, or a write racing the check) — the
 //! decided fail-closed posture on a positive mismatch the heal could not clear;
 //! on a writable display the protection is Layer 1 plus the honest INCONCLUSIVE
-//! surface, not this refuse. Closing Layer 3
-//! needs an online liveness signal (`/oauth/usage` currency of the resolved
-//! token), deliberately out of scope for the offline canary — the INCONCLUSIVE
-//! (`Layer-1-only`) verdict on the status wire is the honest surface of this
-//! limit. Non-swap canonical writes (the #467 scrubbed-canonical adopt, `use
+//! surface, not this refuse. Narrowing Layer 3 needs an ONLINE liveness signal
+//! (`/oauth/usage` currency of the resolved token) — out of scope for the
+//! OFFLINE layers above, and since issue #736 available as the opt-in
+//! [`probe_liveness`] described below. With that probe disarmed (the default) the
+//! INCONCLUSIVE (`Layer-1-only`) verdict on the status wire remains the honest
+//! surface of this limit. Non-swap canonical writes (the #467 scrubbed-canonical adopt, `use
 //! --force` adopt-target, the #282 keep-warm promotion, `capture`) are likewise
 //! outside the canary's refuse slot: adopt targets a CONFIRMED-absent/vetted
 //! item (nothing coherent to protect), and promotion/capture write the resolved
@@ -103,15 +104,75 @@
 //! `inconclusive` #730 originally reused — collapsing back to `inconclusive`
 //! exactly when the override has restored the fail-OPEN and nothing is refused.
 //!
+//! ## The opt-in ONLINE liveness probe (issue #736)
+//!
+//! [`probe_liveness`] is the canary's only NETWORKED check and the partial answer
+//! to the Layer-3 residual above. It runs on the same pre-`-U` decision path as the
+//! offline layers, AFTER the canonical is resolved, and asks the one question an
+//! offline check cannot: *does this bearer still authenticate?* It reuses the
+//! existing `/oauth/usage` client ([`crate::usage`], reached through the
+//! [`RosterPoller`] seam both pre-swap callers already hold) — no new transport, no
+//! new auth flow, and the client's own bounded `max-time` means a hung network
+//! cannot stall a swap.
+//!
+//! Two properties bound what it can claim, and both are deliberate:
+//!
+//! 1. **LIVENESS, never IDENTITY.** The `/oauth/usage` response carries no account
+//!    field, so a pass says the token works — never WHOSE session it is. Resolving
+//!    identity online is the separate, gated issue #737 (`/api/oauth/profile`);
+//!    nothing here may claim it.
+//! 2. **It NARROWS Layer 3 rather than closing it.** The residual's shape is a
+//!    same-account canonical silently relocated in place. Where the stale copy has
+//!    also gone DEAD, the probe sees it; where it is stale-but-VALID — the residual
+//!    as originally stated — the probe passes just as the offline layers do. That
+//!    sub-case stays open.
+//!
+//! It is therefore DOUBLE-gated, and off at both gates by default. `canary_online_probe`
+//! arms it — while `false`, no request is issued at all, so the default swap path is
+//! byte-identical to the pre-#736 one. `canary_online_probe_strict` decides whether a
+//! probe that does not confirm liveness REFUSES the write; while `false` (the decided
+//! graceful-degrade posture) the verdict is logged and the swap PROCEEDS, so a network
+//! outage can never become a swap outage. Strict refuses on INCONCLUSIVE as well as on
+//! a positive rejection, because opting into strict IS opting into the network failure
+//! mode the non-strict default forbids. Refusing by default would additionally be
+//! wrong on the evidence: Claude Code refreshes its `accessToken` in place, so a
+//! momentarily expired-but-refreshable token answers `401` while the credential is
+//! perfectly healthy.
+//!
+//! One asymmetry with the offline layers is load-bearing: **an armed probe stands down
+//! when the caller has no current reading for the outgoing bearer**
+//! ([`ProbeGate::Uninformative`]). Every tick-driven swap arm that fires off a FAILING
+//! active does so on exactly that precondition — the emergency swap off a dead active
+//! (issue #42), the bounded-blindness preemptive swap off a blind one (#452 / ADR-0017)
+//! — so probing there would re-derive the known failure and, under strict, refuse the
+//! very swap that exists to escape it, on every tick and forever. The daemon reads its
+//! own last poll of the account for this. The daemon-DOWN `use` path has no such state,
+//! and neither path can foresee a canonical that dies between the last poll and the
+//! swap, so `--force` is the operator's escape at BOTH ([`ProbeGate::Overridden`]); it
+//! bypasses THIS layer only — see [`Error::CanaryProbeNotLive`] and the `use` call site
+//! for why Layer 3's much milder failure consequence earns an override the
+//! unrecoverable-clobber layers do not.
+//!
+//! Unlike the offline layers the probe yields no STANDING verdict — it runs per swap
+//! ATTEMPT, not per tick — so it adds nothing to the `status` wire (no
+//! [`CanaryStatus`](crate::daemon::CanaryStatus) variant, no schema bump). Its durable
+//! surface is [`Event::CanaryOnlineProbe`](crate::observability::Event::CanaryOnlineProbe),
+//! emitted at the refuse sites in the alarm-only idiom its `canary_drift` /
+//! `canary_unparseable_canonical` siblings use: a probe that confirms liveness is
+//! silent.
+//!
 //! Every surface derived from these types is secret-free by construction (issue
 //! #15): outcomes carry roster INDICES (resolved to operator labels at the event /
-//! status boundary), never a token, email, or account-uuid.
+//! status boundary), never a token, email, or account-uuid. The probe holds to the
+//! same line — its verdict is a three-way class, never a status code, a response
+//! body, or a bearer.
 
 use std::path::Path;
 
 use crate::active;
 use crate::claude_state;
 use crate::config::Account;
+use crate::daemon::RosterPoller;
 use crate::error::{Error, Result};
 use crate::keychain::{Credential, CredentialStore};
 use crate::stash::AccountStash;
@@ -314,6 +375,199 @@ where
             canonical_well_formed,
         },
     ))
+}
+
+/// The Layer-3 ONLINE liveness verdict (issue #736) — a closed class, never an HTTP
+/// status, a response body, or a bearer (issue #15).
+///
+/// Deliberately NOT an identity verdict: `/oauth/usage` names no account, so
+/// [`Live`](Liveness::Live) means "this bearer still authenticates", never "this
+/// bearer is account A's".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Liveness {
+    /// [`ProbeGate::Disarmed`]: `canary_online_probe` is off, so NO request was issued.
+    /// Distinct from [`Inconclusive`](Liveness::Inconclusive), which means the probe RAN
+    /// and learned nothing — that one strict mode may refuse on, this one never can
+    /// (see [`probe_refuses`]).
+    Skipped,
+    /// [`ProbeGate::Uninformative`]: armed, but the caller has no CURRENT reading for this
+    /// bearer, so NO request was issued. See that variant for why asking anyway would be
+    /// both redundant and actively harmful. Never refuses.
+    Uninformative,
+    /// [`ProbeGate::Overridden`]: armed, but the operator passed `--force`, so NO request
+    /// was issued and the swap proceeds. Logged rather than silent — a forced bypass of an
+    /// armed strict gate is exactly the kind of thing an operator later needs to find in
+    /// the log. Never refuses.
+    Overridden,
+    /// The endpoint accepted the bearer (`2xx`): the resolved canonical still
+    /// authenticates.
+    Live,
+    /// The endpoint positively REJECTED the bearer (`401`). Suggestive, not proof:
+    /// Claude Code refreshes its `accessToken` in place, so a momentarily expired
+    /// but perfectly refreshable token answers `401` too — which is why this only
+    /// refuses under the opt-in strict mode.
+    Rejected,
+    /// The probe ran but established nothing either way — no HTTP response at all
+    /// (DNS / connection / TLS / timeout), a `429`, a `5xx`, the `403` missing-scope
+    /// case (a non-interactive setup token: a statement about the token's SCOPES,
+    /// not its validity), or a `2xx` whose body did not parse. A keychain that could
+    /// not be read for the bearer lands here too: unreadable is not rejected.
+    Inconclusive,
+}
+
+impl Liveness {
+    /// The stable, secret-free label for the durable event line (issue #15).
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Liveness::Skipped => "skipped",
+            Liveness::Uninformative => "uninformative",
+            Liveness::Overridden => "overridden",
+            Liveness::Live => "live",
+            Liveness::Rejected => "rejected",
+            Liveness::Inconclusive => "inconclusive",
+        }
+    }
+}
+
+/// Whether — and why — [`probe_liveness`] should issue its request (issue #736).
+///
+/// The caller supplies FACTS about the swap it is about to perform; the decision to put
+/// a request on the wire stays inside `probe_liveness`, so "disarmed means no request at
+/// all" is enforced in one place rather than replicated at each call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeGate {
+    /// `canary_online_probe` is off. → [`Liveness::Skipped`].
+    Disarmed,
+    /// Armed, and the caller has no independent reason to expect this poll to fail.
+    Armed,
+    /// Armed, but the caller has NO CURRENT READING for this bearer — its own last poll of
+    /// it did not return one (it failed, or it has not polled it yet), or it is inside a
+    /// server-directed `Retry-After` / rate-limit hold. → [`Liveness::Uninformative`], no
+    /// request.
+    ///
+    /// This is not an optimization; omitting it is a self-DoS. Every tick-driven swap arm
+    /// that fires off a FAILING active does so on exactly this precondition — the emergency
+    /// swap off a quarantined one (issue #42) and the bounded-blindness preemptive swap off
+    /// a blind one (issue #452 / ADR-0017) both require the active's current reading to be
+    /// absent. On those arms a failing probe is the REASON to swap, and a strict gate that
+    /// read it as a reason to refuse would block, every tick and forever, the exact swap
+    /// that exists to escape the failure.
+    ///
+    /// The condition is deliberately the DIRECT fact — "no current reading" — and not the
+    /// narrower proxies it is tempting to substitute. `quarantined` alone under-covers it:
+    /// blindness caused by a `403` missing scope or a non-401 `4xx` neither quarantines the
+    /// account nor arms its back-off (it resets the 401 streak and CLEARS `poll_backoff_until`),
+    /// yet still blinds it into the preemptive-swap arm. It slightly OVER-covers in one
+    /// direction — an account this daemon has not polled YET (a fresh start, a just-`capture`d
+    /// account) reads the same — which is the fail-OPEN direction and the honest one: a bearer
+    /// the daemon has never reached is one it cannot vouch for either.
+    ///
+    /// The back-off half is kept as a separate term because it covers the converse case — a
+    /// held account can still carry a stale-but-present reading — and because it keeps the
+    /// probe from firing an extra request into a hold the server just directed, which the tick
+    /// loop's own poll would have skipped (issue #293). That is the whole extent of the claim:
+    /// the probe respects an ALREADY-ARMED hold, but its own outcome is never folded back into
+    /// [`note_account_backoff`](crate::daemon::Daemon::note_account_backoff), so a probe that
+    /// is itself throttled neither advances the account's streak nor arms a window. Under
+    /// strict + an intermittently-`429`ing endpoint that leaves one extra request per refused
+    /// tick; the refusal loop itself is strict mode's documented cost, not new.
+    ///
+    /// Nothing is lost by not asking. The probe's question is "has this canonical gone
+    /// dead behind our back?" — and when the caller cannot even get a routine reading out
+    /// of the bearer, the reply carries no Layer-3 information: a relocated-and-dead
+    /// canonical and a plainly unreachable one are indistinguishable to it.
+    Uninformative,
+    /// Armed, but the operator passed `--force`. → [`Liveness::Overridden`], no request.
+    ///
+    /// Layer 3's failure consequence is milder than Layers 1–2's — a swap that may not take
+    /// effect, versus unrecoverably clobbering an unrelated account's secret — so unlike
+    /// those layers it yields to an explicit operator override. That is what makes strict
+    /// mode escapable without editing config and restarting: see
+    /// [`Error::CanaryProbeNotLive`].
+    Overridden,
+}
+
+/// Run the Layer-3 online liveness probe (issue #736) against the RESOLVED CANONICAL
+/// credential, immediately before a swap's `-U` write.
+///
+/// `gate` decides whether a request is issued at all, and both no-request cases return
+/// without touching `poller` — so the "off means no request" invariant is a property of
+/// this function rather than a convention the call sites must each remember.
+///
+/// `account` is the account Claude Code's own state names active, i.e. the one the
+/// canonical is BELIEVED to belong to. It selects nothing on the production path: the
+/// `active = true` argument routes [`RosterPoller::poll`] through the canonical
+/// credential store, which is precisely the bearer under test. Passing the believed
+/// owner keeps the call honest for a fake poller and reads correctly at the call site.
+///
+/// FRESH by construction. The daemon polls the active account every tick, so a recent
+/// reading is usually at hand — but it can be a whole `poll_secs` old, and a relocation
+/// can land inside that window. Layer 1 already re-resolves fresh at swap time rather
+/// than trusting its boot-pinned cache for the same reason; this holds the same line.
+///
+/// Never returns `Err`: a probe is evidence-gathering, and its FAILURE modes are
+/// verdicts (`Rejected` / `Inconclusive`), not errors. Whether a verdict refuses the
+/// swap is [`probe_refuses`]'s decision, kept separate so the policy is unit-testable
+/// without a poller.
+pub(crate) async fn probe_liveness<P>(poller: &P, account: &Account, gate: ProbeGate) -> Liveness
+where
+    P: RosterPoller,
+{
+    match gate {
+        ProbeGate::Disarmed => return Liveness::Skipped,
+        ProbeGate::Uninformative => return Liveness::Uninformative,
+        ProbeGate::Overridden => return Liveness::Overridden,
+        ProbeGate::Armed => {}
+    }
+    match poller.poll(account, true).await {
+        Ok(_) => Liveness::Live,
+        Err(Error::UsageUnauthorized) => Liveness::Rejected,
+        // Everything else is an absence of evidence, NOT evidence of absence: transient
+        // transport failures, throttling, a 5xx, a missing scope, an unparseable body, a
+        // locked keychain. Collapsed to one verdict on purpose — the swap decision below
+        // treats them identically, and a finer taxonomy on the log line would only invite
+        // reading proof of relocation into a network blip.
+        Err(_) => Liveness::Inconclusive,
+    }
+}
+
+/// Whether a Layer-3 probe verdict REFUSES the credential write (issue #736).
+///
+/// `strict` is the `canary_online_probe_strict` tunable. Non-strict — the default —
+/// never refuses: the decided graceful-degrade posture, so a network outage cannot
+/// become a swap outage. Strict refuses on anything that is not a confirmed-live
+/// bearer, [`Liveness::Inconclusive`] included: the issue's constraint is "no MANDATORY
+/// network failure mode … unless the operator opts into a strict mode", so opting in IS
+/// opting into that failure mode.
+///
+/// Only a verdict the probe actually WENT AND GOT can refuse. [`Liveness::Skipped`]
+/// cannot, which keeps `canary_online_probe_strict` inert while `canary_online_probe`
+/// is off — the documented "only meaningful when the probe is armed" contract, enforced
+/// rather than merely stated. Neither can [`Liveness::Uninformative`], which is what
+/// keeps strict mode from deadlocking the swap arms that fire BECAUSE the outgoing
+/// bearer is failing (see [`ProbeGate::Uninformative`]), nor [`Liveness::Overridden`],
+/// which is the operator's own `--force` escape out of a strict refusal.
+pub(crate) fn probe_refuses(liveness: Liveness, strict: bool) -> bool {
+    strict && matches!(liveness, Liveness::Rejected | Liveness::Inconclusive)
+}
+
+/// Whether a Layer-3 probe verdict earns a durable
+/// [`Event::CanaryOnlineProbe`](crate::observability::Event::CanaryOnlineProbe) line
+/// (issue #736) — the ALARM-ONLY rule the two pre-swap sites share.
+///
+/// Silent on exactly two verdicts, for opposite reasons. [`Liveness::Live`] is the
+/// healthy answer, and logging it would make every swap on an armed daemon noisy.
+/// [`Liveness::Skipped`] never ran, so a DISARMED probe must leave the log exactly as it
+/// was pre-#736. Everything else speaks — including the two stand-downs and the
+/// non-strict degrade, where this line is the ONLY trace that the gate did not do what an
+/// operator armed it to do.
+///
+/// A predicate beside [`probe_refuses`] rather than a `matches!` at each call site: the
+/// two are this layer's whole policy, they are the pair a new [`Liveness`] variant must be
+/// weighed against, and keeping them together is what stops the daemon's copy and the
+/// standalone `use` copy from drifting apart.
+pub(crate) fn probe_alarms(liveness: Liveness) -> bool {
+    !matches!(liveness, Liveness::Skipped | Liveness::Live)
 }
 
 #[cfg(test)]
@@ -631,5 +885,233 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(displayed_uuid(&json).as_deref(), Some("u-A"));
+    }
+
+    // --- Layer 3: the opt-in online liveness probe (issue #736) ---------------
+
+    /// A [`RosterPoller`] that answers one scripted outcome and COUNTS its calls, so a
+    /// test can assert not merely the verdict but whether the network was touched at
+    /// all — the load-bearing claim for the disarmed default. No real HTTP: the probe
+    /// reaches the network only through this seam.
+    struct ScriptedPoller {
+        outcome: std::cell::RefCell<Option<Result<()>>>,
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl ScriptedPoller {
+        fn ok() -> Self {
+            Self::scripted(Ok(()))
+        }
+
+        fn failing(err: Error) -> Self {
+            Self::scripted(Err(err))
+        }
+
+        fn scripted(outcome: Result<()>) -> Self {
+            Self {
+                outcome: std::cell::RefCell::new(Some(outcome)),
+                calls: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl RosterPoller for ScriptedPoller {
+        async fn poll(
+            &self,
+            _account: &Account,
+            active: bool,
+        ) -> Result<crate::usage::PolledReading> {
+            // The probe must ride the CANONICAL credential, not a stash — the whole point
+            // is testing the item the `-U` write is about to overwrite.
+            assert!(active, "the liveness probe must poll `active = true`");
+            self.calls.set(self.calls.get() + 1);
+            match self
+                .outcome
+                .borrow_mut()
+                .take()
+                .expect("one poll per probe")
+            {
+                Ok(()) => Ok(crate::usage::PolledReading {
+                    usage: crate::usage::Usage {
+                        session: 0.10,
+                        weekly: 0.10,
+                        weekly_resets_at: None,
+                        session_resets_at: None,
+                    },
+                    severity: None,
+                }),
+                Err(err) => Err(err),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_disarmed_probe_issues_no_request_at_all() {
+        // Issue #736's first hard constraint: `canary_online_probe = false` (the default)
+        // must not merely ignore the probe's answer — it must never ASK. Asserted on the
+        // poller's call count, since a verdict alone cannot tell "not asked" from "asked
+        // and passed".
+        let poller = ScriptedPoller::ok();
+        let verdict = probe_liveness(&poller, &acct("work", "u-A"), ProbeGate::Disarmed).await;
+        assert_eq!(verdict, Liveness::Skipped);
+        assert_eq!(poller.calls.get(), 0, "a disarmed probe must not poll");
+    }
+
+    #[tokio::test]
+    async fn an_uninformative_gate_stands_down_without_asking() {
+        // The self-DoS guard. When the caller has no current reading for this bearer, the
+        // probe must not ask — both because the answer carries no Layer-3 information and
+        // because the swap arms that reach here fire BECAUSE of that failure. Call count
+        // pins "did not ask"; the distinct verdict pins that it is told apart from a
+        // disarmed probe on the durable line.
+        let poller = ScriptedPoller::ok();
+        let verdict = probe_liveness(&poller, &acct("work", "u-A"), ProbeGate::Uninformative).await;
+        assert_eq!(verdict, Liveness::Uninformative);
+        assert_eq!(poller.calls.get(), 0, "an uninformative gate must not poll");
+        // …and it can never refuse, whatever strict says — the property that keeps the
+        // emergency / blind-preempt escape swaps from deadlocking.
+        assert!(!probe_refuses(verdict, true));
+    }
+
+    #[tokio::test]
+    async fn an_overridden_gate_stands_down_without_asking_but_is_not_silent() {
+        // `--force`: the operator's escape out of a strict refusal, at BOTH pre-swap sites.
+        // It stands down like the other two no-request gates, and it is deliberately its OWN
+        // verdict rather than folded into `Skipped` — `Skipped` is silent by design, and a
+        // bypass of a gate the operator ARMED is exactly the event that must survive in the
+        // log (the offline layers record their overrides the same way).
+        let poller = ScriptedPoller::failing(Error::UsageUnauthorized);
+        let verdict = probe_liveness(&poller, &acct("work", "u-A"), ProbeGate::Overridden).await;
+        assert_eq!(verdict, Liveness::Overridden);
+        assert_eq!(poller.calls.get(), 0, "an overridden gate must not poll");
+        assert!(!probe_refuses(verdict, true));
+        assert_ne!(verdict.as_str(), Liveness::Skipped.as_str());
+    }
+
+    #[tokio::test]
+    async fn an_armed_probe_that_authenticates_is_live() {
+        let poller = ScriptedPoller::ok();
+        let verdict = probe_liveness(&poller, &acct("work", "u-A"), ProbeGate::Armed).await;
+        assert_eq!(verdict, Liveness::Live);
+        assert_eq!(poller.calls.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_401_is_rejected_not_inconclusive() {
+        // The one outcome that is positive evidence the bearer no longer authenticates —
+        // kept distinct from the no-evidence class so the durable log line says which.
+        let poller = ScriptedPoller::failing(Error::UsageUnauthorized);
+        let verdict = probe_liveness(&poller, &acct("work", "u-A"), ProbeGate::Armed).await;
+        assert_eq!(verdict, Liveness::Rejected);
+    }
+
+    #[tokio::test]
+    async fn every_other_failure_is_inconclusive_never_rejected() {
+        // Absence of evidence, not evidence of absence: a throttle, a 5xx, an unreachable
+        // endpoint, a missing scope, and a locked keychain must NOT masquerade as proof
+        // that the canonical went dead.
+        for err in [
+            Error::UsageRateLimited {
+                status: 429,
+                retry_after: None,
+            },
+            Error::UsageTransient {
+                status: 503,
+                retry_after: None,
+            },
+            Error::UsageTransient {
+                status: 0,
+                retry_after: None,
+            },
+            Error::UsageScopeMissing,
+            Error::UsageRejected { status: 418 },
+            Error::KeychainLocked { op: "read" },
+        ] {
+            let label = format!("{err}");
+            let poller = ScriptedPoller::failing(err);
+            assert_eq!(
+                probe_liveness(&poller, &acct("work", "u-A"), ProbeGate::Armed).await,
+                Liveness::Inconclusive,
+                "{label} must be inconclusive"
+            );
+        }
+    }
+
+    #[test]
+    fn non_strict_never_refuses_whatever_the_probe_said() {
+        // Issue #736's second hard constraint: probe failure != refuse. A network outage
+        // must not become a swap outage under the default posture.
+        for verdict in [
+            Liveness::Skipped,
+            Liveness::Uninformative,
+            Liveness::Overridden,
+            Liveness::Live,
+            Liveness::Rejected,
+            Liveness::Inconclusive,
+        ] {
+            assert!(!probe_refuses(verdict, false), "{verdict:?} refused");
+        }
+    }
+
+    #[test]
+    fn only_a_verdict_the_probe_went_and_got_can_refuse() {
+        // The three no-request verdicts are structurally unable to refuse, which is what
+        // makes every stand-down safe: `Skipped` keeps strict inert while the probe is
+        // disarmed, `Uninformative` keeps it from deadlocking the escape swaps, `Overridden`
+        // is the operator's own `--force`. Asserted together so a future variant added to
+        // `Liveness` has to face this question.
+        assert!(!probe_refuses(Liveness::Skipped, true));
+        assert!(!probe_refuses(Liveness::Uninformative, true));
+        assert!(!probe_refuses(Liveness::Overridden, true));
+    }
+
+    #[test]
+    fn strict_refuses_on_inconclusive_as_well_as_rejected() {
+        // Strict mode IS the opt-in to the network failure mode the default forbids, so it
+        // refuses on "could not confirm", not only on a positive rejection.
+        assert!(probe_refuses(Liveness::Rejected, true));
+        assert!(probe_refuses(Liveness::Inconclusive, true));
+        assert!(!probe_refuses(Liveness::Live, true));
+    }
+
+    #[test]
+    fn strict_is_inert_while_the_probe_is_disarmed() {
+        // `canary_online_probe_strict` is documented as meaningful only with the probe
+        // armed. `Skipped` never refusing is what ENFORCES that, rather than leaving the
+        // pairing to the call sites: a lone `strict = true` cannot block a swap.
+        assert!(!probe_refuses(Liveness::Skipped, true));
+    }
+
+    #[test]
+    fn only_the_healthy_and_the_never_ran_verdicts_are_silent() {
+        // The alarm-only rule, pinned as a set rather than left implicit in two call-site
+        // `matches!`es. `Live` is silent so an armed daemon's swaps stay quiet; `Skipped` is
+        // silent so a DISARMED probe leaves the log byte-identical to pre-#736. The other
+        // four MUST speak — under the non-strict default that line is the only trace the
+        // gate failed and the swap went ahead anyway. Enumerated so a future `Liveness`
+        // variant has to face this question, exactly as
+        // `only_a_verdict_the_probe_went_and_got_can_refuse` does for the refusal policy.
+        assert!(!probe_alarms(Liveness::Live));
+        assert!(!probe_alarms(Liveness::Skipped));
+        for verdict in [
+            Liveness::Uninformative,
+            Liveness::Overridden,
+            Liveness::Rejected,
+            Liveness::Inconclusive,
+        ] {
+            assert!(probe_alarms(verdict), "{verdict:?} must be on the record");
+        }
+    }
+
+    #[test]
+    fn verdict_labels_are_stable_and_secret_free() {
+        // These strings reach the durable log line and the typed error's message, so they
+        // are contract. Each is a verdict CLASS — never a status code, body, or bearer.
+        assert_eq!(Liveness::Skipped.as_str(), "skipped");
+        assert_eq!(Liveness::Uninformative.as_str(), "uninformative");
+        assert_eq!(Liveness::Overridden.as_str(), "overridden");
+        assert_eq!(Liveness::Live.as_str(), "live");
+        assert_eq!(Liveness::Rejected.as_str(), "rejected");
+        assert_eq!(Liveness::Inconclusive.as_str(), "inconclusive");
     }
 }

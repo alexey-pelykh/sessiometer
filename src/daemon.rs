@@ -91,7 +91,7 @@ use std::time::{Duration, Instant};
 
 use tokio::signal::unix::{signal, Signal, SignalKind};
 
-use crate::canary::{CanaryOutcome, InconclusiveReason};
+use crate::canary::{self, CanaryOutcome, InconclusiveReason, Liveness, ProbeGate};
 use crate::claude_state;
 use crate::config::{Account, Config, Tunables, DEFAULT_REFRESH_SYSTEMIC_FAILURE_N};
 // The daemon↔refresh_tick boundary contract (issue #202) lives in its own leaf module so
@@ -1676,6 +1676,21 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// refusals are untouched by this switch. `false` (the shape-gate ARMED) is the
     /// default and the safe posture.
     canary_nostashmatch_override: bool,
+    /// Master enable for the canary's opt-in Layer-3 ONLINE liveness probe (issue #736,
+    /// `canary_online_probe` in `[tunables]`): when `true`, one bounded `/oauth/usage`
+    /// GET runs on the resolved canonical in [`locked_swap`](Self::locked_swap) before
+    /// the credential write, asking only whether that bearer still authenticates. When
+    /// `false` (the default) NO request is issued at all, so the swap path is
+    /// byte-identical to the pre-#736 one. LIVENESS, never IDENTITY — the endpoint names
+    /// no account (issue #737 is the separate, gated identity fetch).
+    canary_online_probe: bool,
+    /// Whether a Layer-3 probe that did NOT confirm liveness refuses the credential write
+    /// (issue #736, `canary_online_probe_strict` in `[tunables]`). `false` (the default)
+    /// is the decided graceful-degrade posture — the verdict is logged on the durable
+    /// `canary_online_probe` event and the swap PROCEEDS, so a network outage never
+    /// becomes a swap outage. `true` opts INTO that network failure mode. Inert while
+    /// `canary_online_probe` is off (see [`crate::canary::probe_refuses`]).
+    canary_online_probe_strict: bool,
     /// The single-writer swap lock path (issue #64), or `None` to swap WITHOUT the
     /// cross-process lock. `None` is the hermetic-test default — a single-process
     /// test has no second writer to serialize against, so taking a real `flock`
@@ -1859,6 +1874,11 @@ where
             // The #730 NoStashMatch shape-gate override — `false` (refuse an unparseable
             // orphan canonical) by default; the operator's documented recovery lever.
             canary_nostashmatch_override: tunables.canary_nostashmatch_override,
+            // The #736 Layer-3 online liveness probe — `false` (no probe, and therefore no
+            // network call on the swap path) by default; the operator opts in. Its strict
+            // mode is a second, independent opt-in and likewise `false`.
+            canary_online_probe: tunables.canary_online_probe,
+            canary_online_probe_strict: tunables.canary_online_probe_strict,
             // No cross-process swap lock by default; production opts in via
             // `with_swap_lock`. See the field's docs for why tests stay lock-free.
             swap_lock_path: None,
@@ -3389,7 +3409,7 @@ where
         // next cycle.
         let outgoing = self.roster[active_idx].stash();
         let incoming = self.roster[target_idx].stash();
-        match self.locked_swap(&outgoing, &incoming, events).await {
+        match self.locked_swap(&outgoing, &incoming, false, events).await {
             Ok(_report) => {
                 self.record_swap(target_idx, &incoming, at).await;
                 // Log the swap (issue #9). `swap::decide` returns only a binary
@@ -3503,7 +3523,17 @@ where
     /// [`Error::CanaryUnparseableCanonical`] unless `canary_nostashmatch_override` is
     /// set, protecting an unrelated secret from the atomic `-U` clobber. A canary
     /// that cannot RUN (`Err` — locked keychain) aborts exactly as the engine's
-    /// own up-front read would, holding the last verdict. The canary runs OUTSIDE
+    /// own up-front read would, holding the last verdict.
+    ///
+    /// Once those OFFLINE layers clear, the opt-in Layer-3 ONLINE liveness probe
+    /// (issue #736) runs here too, still pre-mutation: one bounded `/oauth/usage`
+    /// GET on the resolved canonical, asking only whether that bearer still
+    /// authenticates. Disarmed by default (`canary_online_probe`), in which case NO
+    /// request is issued and this gate is a no-op; armed, a probe that does not
+    /// confirm liveness refuses with [`Error::CanaryProbeNotLive`] ONLY under the
+    /// second opt-in `canary_online_probe_strict`, and otherwise logs
+    /// [`Event::CanaryOnlineProbe`] and proceeds — the decided graceful-degrade
+    /// posture, so a network outage never becomes a swap outage. The canary runs OUTSIDE
     /// the swap lock (keychain enumeration + stash reads are slow; the lock's
     /// bounded wait must stay short); inside the lock the engine's #211
     /// [`SwapWrongIdentityRestash`](Error::SwapWrongIdentityRestash) guard remains
@@ -3517,6 +3547,7 @@ where
         &mut self,
         outgoing: &str,
         incoming: &str,
+        force: bool,
         events: &mut Vec<Event>,
     ) -> Result<swap::SwapReport> {
         match self.refresh_canary(events).await? {
@@ -3554,6 +3585,58 @@ where
                 // credential format the operator will re-stash) — the ride is logged above.
             }
             CanaryOutcome::Ok | CanaryOutcome::Inconclusive(_) => {}
+        }
+        // Layer 3 (issue #736): the opt-in ONLINE liveness probe, AFTER the offline layers
+        // have cleared the canonical and still BEFORE any mutation. Disarmed by default —
+        // `probe_liveness` returns `Skipped` without issuing a request — so the default swap
+        // path is unchanged. When armed, it asks only whether the resolved canonical's bearer
+        // still authenticates; it can never say WHOSE session that is (`/oauth/usage` carries
+        // no identity field — issue #737 is the separate, gated identity fetch). It probes
+        // the OUTGOING account, polled `active = true` so the request rides the CANONICAL
+        // credential rather than a stash — and `probe_gate` stands it down when this daemon
+        // has no current reading for that bearer, which is what keeps a strict gate from
+        // deadlocking the escape swaps that fire for exactly that reason, or when the
+        // operator passed `--force` (issue #167's daemon-routed `use`), which is what makes
+        // the documented escape out of a strict refusal work while the daemon is up. `force`
+        // is `false` at every AUTO-swap caller: nothing but an operator can set it.
+        //
+        // Alarm-only and per-ATTEMPT: a confirmed-live probe is silent, and every other
+        // asked-or-stood-down outcome logs here whether or not it refused — under the
+        // default graceful-degrade posture that line is the ONLY trace that the probe
+        // failed and the swap went ahead anyway. The probe yields no standing verdict (it
+        // runs per swap, not per tick), so unlike the offline layers it adds nothing to the
+        // `status` wire — which is why `Error::CanaryProbeNotLive` points the operator at
+        // the event log rather than at `sessiometer status`.
+        let outgoing_idx = self
+            .roster
+            .iter()
+            .position(|account| account.stash() == outgoing);
+        let liveness = match outgoing_idx {
+            Some(idx) => {
+                canary::probe_liveness(&self.poller, &self.roster[idx], self.probe_gate(idx, force))
+                    .await
+            }
+            // The outgoing stash names no roster account — unreachable on the live paths (all
+            // five callers derive `outgoing` FROM the roster), but if it ever happens with the
+            // probe ARMED the probe could not run, which is INCONCLUSIVE, never a pass: a gate
+            // the operator armed must not fall silently open. Disarmed it stays `Skipped`, so a
+            // default daemon's behaviour is untouched either way, and `--force` overrides it on
+            // the same terms as the nameable case rather than stranding the escape here.
+            None if !self.canary_online_probe => Liveness::Skipped,
+            None if force => Liveness::Overridden,
+            None => Liveness::Inconclusive,
+        };
+        let refused = canary::probe_refuses(liveness, self.canary_online_probe_strict);
+        if canary::probe_alarms(liveness) {
+            events.push(Event::CanaryOnlineProbe {
+                verdict: liveness.as_str(),
+                refused,
+            });
+        }
+        if refused {
+            return Err(Error::CanaryProbeNotLive {
+                verdict: liveness.as_str(),
+            });
         }
         swap::swap_locked(
             self.swap_lock_path
@@ -3736,7 +3819,7 @@ where
         // stays quarantined and the emergency swap retries next cycle.
         let outgoing = self.roster[active_idx].stash();
         let incoming = self.roster[target_idx].stash();
-        match self.locked_swap(&outgoing, &incoming, events).await {
+        match self.locked_swap(&outgoing, &incoming, false, events).await {
             Ok(_report) => {
                 self.record_swap(target_idx, &incoming, at).await;
                 events.push(Event::EmergencySwap {
@@ -3968,7 +4051,7 @@ where
         // (`record_swap` drops it only on success), so the gate re-arms and retries next cycle.
         let outgoing = self.roster[active_idx].stash();
         let incoming = self.roster[target_idx].stash();
-        match self.locked_swap(&outgoing, &incoming, events).await {
+        match self.locked_swap(&outgoing, &incoming, false, events).await {
             Ok(_report) => {
                 let from_label = self.roster[active_idx].label.clone();
                 let to_label = self.roster[target_idx].label.clone();
@@ -4306,7 +4389,7 @@ where
         // the canonical + both stashes coherent, so we retry next cycle.
         let outgoing = self.roster[active_idx].stash();
         let incoming = self.roster[target_idx].stash();
-        match self.locked_swap(&outgoing, &incoming, events).await {
+        match self.locked_swap(&outgoing, &incoming, false, events).await {
             Ok(_report) => {
                 self.record_swap(target_idx, &incoming, at).await;
                 events.push(Event::Swap {
@@ -4605,6 +4688,37 @@ where
             .health
             .poll_backoff_until
             .is_some_and(|until| self.clock.now() < until)
+    }
+
+    /// Whether the Layer-3 online liveness probe (issue #736) should put a request on the
+    /// wire before swapping AWAY from account `i` — and if not, which of the three silences
+    /// it is. Each [`ProbeGate`] variant carries its own WHY; this is where the daemon's
+    /// state answers them.
+    ///
+    /// Disarmed unless `canary_online_probe` is set, and yielded outright to an operator
+    /// `--force` (issue #167's daemon-routed `use`), which is what keeps the escape out of
+    /// a strict refusal reachable while the daemon is up.
+    ///
+    /// Armed, it stands DOWN on [`ProbeGate::Uninformative`] — see that variant for why
+    /// asking anyway would deadlock the very swap arms that fire because the outgoing bearer
+    /// is failing. What is daemon-specific is HOW that condition is read: the account's
+    /// `last_reading` DIRECTLY, never the `quarantined` proxy. Quarantine tracks a 401 streak
+    /// only, so blindness caused by a `403` missing scope or any other non-401 `4xx` — which
+    /// RESETS that streak and CLEARS `poll_backoff_until` — reaches
+    /// [`blind_swap`](Self::blind_swap) with both proxies reading healthy. The back-off term
+    /// is kept alongside because it covers the converse (a held account can still carry a
+    /// stale-but-present reading) and keeps the probe inside the same per-account back-off
+    /// discipline `tick` applies to every other usage request (issue #293).
+    fn probe_gate(&self, i: usize, force: bool) -> ProbeGate {
+        if !self.canary_online_probe {
+            ProbeGate::Disarmed
+        } else if force {
+            ProbeGate::Overridden
+        } else if self.state.accounts[i].last_reading.is_none() || self.account_backing_off(i) {
+            ProbeGate::Uninformative
+        } else {
+            ProbeGate::Armed
+        }
     }
 
     /// Whether NON-active account `i` is being SLOW-POLLED because it is out of rotation —
@@ -5805,6 +5919,11 @@ mod tests {
             // pre-swap canary refuses an unparseable orphan canonical; the #730 tests that
             // exercise the override set it explicitly.
             canary_nostashmatch_override: false,
+            // Issue #736 Layer-3 online liveness probe: DISARMED (the shipped default), so
+            // baseline daemon tests issue no probe at all and their swap paths are unchanged;
+            // the #736 tests arm it explicitly. Its strict mode is likewise off.
+            canary_online_probe: false,
+            canary_online_probe_strict: false,
             // Existing daemon tests exercise the fixed (no-jitter) path: each
             // strategy draws its base verbatim, identical to the pre-#38 scalars.
             poll_strategy: Strategy::fixed(60.0),

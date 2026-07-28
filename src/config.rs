@@ -501,6 +501,37 @@ pub(crate) struct Tunables {
     /// OPEN regardless (nothing to override). `false` (the shape-gate ARMED) is the default and
     /// the safe posture.
     pub(crate) canary_nostashmatch_override: bool,
+    /// Master enable for the canary's Layer-3 ONLINE liveness probe (issue #736) — the one
+    /// canary layer that touches the NETWORK, and therefore the one that is opt-in.
+    ///
+    /// `false` (the default) means the current swap path is byte-identical to the pre-#736
+    /// one: the probe is not merely ignored, NO request is issued at all. `true` arms one
+    /// bounded `/oauth/usage` GET on the resolved canonical, immediately before the swap's
+    /// `-U` credential write, asking only "does this bearer still authenticate?".
+    ///
+    /// It is a LIVENESS signal, never an IDENTITY one: the endpoint carries no account field,
+    /// so a pass says the token works, NOT whose session it is (that is the separate, gated
+    /// issue #737). On its own it does not close the Layer-3 residual — it narrows it, catching
+    /// the sub-case where a silently-relocated canonical has gone dead while leaving the
+    /// stale-but-VALID sub-case open. Arming it alone changes no swap outcome; refusing on a
+    /// failed probe additionally needs `canary_online_probe_strict`.
+    pub(crate) canary_online_probe: bool,
+    /// Whether a Layer-3 online probe that does NOT confirm liveness REFUSES the credential
+    /// write (issue #736). Only meaningful with `canary_online_probe = true`.
+    ///
+    /// `false` (the default) is the decided graceful-degrade posture: a probe that comes back
+    /// rejected or inconclusive is LOGGED and the swap PROCEEDS, so a network outage can never
+    /// become a swap outage. `true` is the operator opting INTO that network failure mode —
+    /// anything short of a confirmed-live bearer refuses the write pre-mutation (ZERO writes).
+    ///
+    /// Strict deliberately refuses on an INCONCLUSIVE probe (DNS / TLS / timeout / 429 / 5xx),
+    /// not only on a positive `401`: the issue's constraint is "no MANDATORY network failure
+    /// mode … unless the operator opts into a strict mode", so opting in IS opting into the
+    /// network failure mode. Note that `401` alone is weak evidence of relocation — Claude Code
+    /// refreshes its `accessToken` in place, so a momentarily expired-but-refreshable token
+    /// answers `401` while the credential is perfectly healthy. That false-positive story is
+    /// exactly why refusing is opt-in and `false` is the safe posture.
+    pub(crate) canary_online_probe_strict: bool,
     /// Poll-interval timing strategy (issue #38): base = `poll_secs` (seconds),
     /// normal jitter by default. The daemon draws + clamps to `5..=3600` each
     /// cycle instead of sleeping a fixed interval.
@@ -544,6 +575,12 @@ impl Default for Tunables {
             // The #730 NoStashMatch shape-gate override: OFF (refuse an unparseable orphan
             // canonical) — the safe posture.
             canary_nostashmatch_override: false,
+            // The #736 Layer-3 online liveness probe: OFF — no network call on the swap path
+            // at all, so the default swap path is byte-identical to the pre-#736 one.
+            canary_online_probe: false,
+            // The #736 strict mode: OFF — a probe that fails degrades gracefully (log, then
+            // proceed), so a network outage never becomes a swap outage.
+            canary_online_probe_strict: false,
             poll_strategy: Strategy {
                 base: DEFAULT_POLL_SECS as f64,
                 jitter: default_poll_jitter(),
@@ -1087,6 +1124,16 @@ pub(crate) struct SetTunables {
     /// writes it straight through.
     #[serde(default)]
     pub(crate) canary_nostashmatch_override: Option<bool>,
+    /// Issue #736: the Layer-3 online liveness probe's master enable. Like its canary
+    /// siblings a plain bool with no range to validate; the overlay writes it straight
+    /// through.
+    #[serde(default)]
+    pub(crate) canary_online_probe: Option<bool>,
+    /// Issue #736: the Layer-3 online liveness probe's strict mode. A SEPARATE bool from
+    /// `canary_online_probe` — arming the probe and refusing on it are independent operator
+    /// decisions — with no range to validate.
+    #[serde(default)]
+    pub(crate) canary_online_probe_strict: Option<bool>,
 }
 
 /// Which classes of edit a [`Config::apply_settings`] actually changed (issue #268), so the
@@ -1137,6 +1184,16 @@ pub(crate) struct TunablesView {
     /// unparseable orphan canonical).
     #[serde(default)]
     pub(crate) canary_nostashmatch_override: bool,
+    /// Issue #736: whether the Layer-3 online liveness probe is armed (a plain bool;
+    /// `#[serde(default)]` so a pre-#736 daemon's view decodes to `false` — no probe, no
+    /// network call on the swap path).
+    #[serde(default)]
+    pub(crate) canary_online_probe: bool,
+    /// Issue #736: whether a non-live Layer-3 probe REFUSES the swap (a plain bool;
+    /// `#[serde(default)]` so a pre-#736 daemon's view decodes to `false` — degrade
+    /// gracefully). Inert unless `canary_online_probe` is also set.
+    #[serde(default)]
+    pub(crate) canary_online_probe_strict: bool,
 }
 
 impl From<&Tunables> for TunablesView {
@@ -1159,6 +1216,8 @@ impl From<&Tunables> for TunablesView {
             fleet_runway_warn_secs: t.fleet_runway_warn_secs,
             canary_drift_override: t.canary_drift_override,
             canary_nostashmatch_override: t.canary_nostashmatch_override,
+            canary_online_probe: t.canary_online_probe,
+            canary_online_probe_strict: t.canary_online_probe_strict,
         }
     }
 }
@@ -1274,6 +1333,16 @@ struct RawTunables {
     // bool, separate from `canary_drift_override`, with no range to validate.
     #[serde(default)]
     canary_nostashmatch_override: bool,
+    // Issue #736: the Layer-3 online liveness probe's master enable — an absent key resolves
+    // to `false` (no probe, and therefore no network call on the swap path), the opt-in
+    // default. A plain bool with no range to validate.
+    #[serde(default)]
+    canary_online_probe: bool,
+    // Issue #736: the Layer-3 probe's strict mode — an absent key resolves to `false` (a
+    // failed probe degrades gracefully and the swap proceeds), the safe posture. A plain
+    // bool, separate from `canary_online_probe`, with no range to validate.
+    #[serde(default)]
+    canary_online_probe_strict: bool,
 }
 
 impl Default for RawTunables {
@@ -1296,6 +1365,8 @@ impl Default for RawTunables {
             fleet_runway_warn_secs: default_fleet_runway_warn_secs(),
             canary_drift_override: false,
             canary_nostashmatch_override: false,
+            canary_online_probe: false,
+            canary_online_probe_strict: false,
         }
     }
 }
