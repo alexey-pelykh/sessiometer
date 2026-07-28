@@ -93,7 +93,10 @@ use tokio::signal::unix::{signal, Signal, SignalKind};
 
 use crate::canary::{self, CanaryOutcome, InconclusiveReason, Liveness, ProbeGate};
 use crate::claude_state;
-use crate::config::{Account, Config, Tunables, DEFAULT_REFRESH_SYSTEMIC_FAILURE_N};
+use crate::config::{
+    Account, Config, Tunables, DEFAULT_CREDENTIAL_EXPIRY_HORIZON_SECS,
+    DEFAULT_REFRESH_SYSTEMIC_FAILURE_N,
+};
 // The daemon↔refresh_tick boundary contract (issue #202) lives in its own leaf module so
 // `refresh_tick` can depend on it without depending on the whole daemon. Re-exported under
 // `crate::daemon::*` so every existing `daemon::Clock` / `daemon::RealClock` caller is unchanged.
@@ -107,10 +110,10 @@ use crate::keychain::{
 use crate::landing;
 use crate::observability::{
     BackoffClass, BlindVelocity, CanonicalLiveness, CaptureEventOutcome, CredentialHealth,
-    DecisionClass, Diagnostic, DiagnosticLog, Event, EventLog, KeepWarmTrigger, PollClass,
-    RefreshEventOutcome, SwapProjection, SwapReason,
+    DecisionClass, Diagnostic, DiagnosticLog, Event, EventLog, ExpiryHorizon, KeepWarmTrigger,
+    PollClass, RefreshEventOutcome, SwapProjection, SwapReason,
 };
-use crate::refresh::{RefreshOutcome, RefreshReport};
+use crate::refresh::{CredentialClocks, RefreshOutcome, RefreshReport};
 use crate::refresh_tick::{refresh_event_outcome, RealRefreshEngine, RefreshEngine};
 use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
 use crate::stats::FleetRunway;
@@ -139,17 +142,23 @@ pub(crate) use peer_auth::{is_same_user, peer_euid};
 mod snapshot;
 
 pub(crate) use snapshot::{
-    credential_health, refresh_health_view, to_pct, to_pct_exact, versioned_status_response,
-    AccountReading, AccountStatusLine, BlindActive, BlindPreemptSwap, CanaryStatus, CanonicalScrub,
-    LandingOvershoot, NextSwap, NextSwapReason, NoTargetCause, SchemaVersion, StatusResponse,
-    StatusSnapshot, SystemicRefreshSource, VersionedStatus, STATUS_SCHEMA_VERSION,
+    account_expiry, credential_health, refresh_health_view, to_pct, to_pct_exact,
+    versioned_status_response, AccountReading, AccountStatusLine, BlindActive, BlindPreemptSwap,
+    CanaryStatus, CanonicalScrub, LandingOvershoot, NextSwap, NextSwapReason, NoTargetCause,
+    SchemaVersion, StatusResponse, StatusSnapshot, SystemicRefreshSource, VersionedStatus,
+    STATUS_SCHEMA_VERSION,
 };
 // `status_response` (the payload projection) and `RefreshHealth` are named only by the in-module
 // tests — production reaches the wire through `versioned_status_response` (issue #164) and builds
 // the health view through `refresh_health_view` without naming the type. Re-export test-scoped so
 // `use super::*` resolves them while a non-test build sees no unused re-export.
+//
+// `AccountExpiry` (issue #878) joins them for the same reason with a different cause: production
+// CONSTRUCTS it via `account_expiry` and stores it on `AccountReading` without ever naming the type,
+// and nothing reads it back until issue #882 projects it onto the wire. Only the tests that pin its
+// classification name it today.
 #[cfg(test)]
-pub(crate) use snapshot::{status_response, RefreshHealth};
+pub(crate) use snapshot::{status_response, AccountExpiry, RefreshHealth};
 
 mod socket;
 
@@ -1056,6 +1065,22 @@ pub(crate) struct AccountHealth {
     /// rollup gains a positive-liveness signal and consumes the poll clock under #137. The
     /// wire prefers the refresh-sourced value and falls back to this (see [`Daemon::snapshot`]).
     poll_expires_at: Option<i64>,
+    /// The REFRESH token's own `refreshTokenExpiresAt` deadline as epoch SECONDS (issue #878),
+    /// read on the POLL path from the SAME credential the usage poll used (the canonical item for
+    /// the active account, the per-account stash for any other) and converted MS→s at that
+    /// boundary by [`millis_to_secs`]. `None` until this account has been polled, OR when the
+    /// credential carried no such field.
+    ///
+    /// A DIFFERENT KIND of clock from both access-token ones above
+    /// ([`access_expires_at`](Self::access_expires_at), [`poll_expires_at`](Self::poll_expires_at))
+    /// and never to be folded in with them — see [`crate::refresh::refresh_token_expires_at`] for
+    /// the distinction.
+    ///
+    /// Feeds [`account_expiry`] ONLY, never [`credential_health`]: an account whose refresh token
+    /// expires next week is `Healthy` *right now*, and routing a foresight signal into a
+    /// current-validity ramp would both mis-rank it and force a genuinely healthy account to render
+    /// non-healthy. Surfaced, never acted upon — no swap or poll decision reads it (issue #878).
+    refresh_token_expires_at: Option<i64>,
     /// The last-observed refresh classification (issue #119): drives the rollup's `Dead`
     /// (a cleared refresh token) check and the `--json` `last_ok` projection. `None` until
     /// a refresh has been observed. Stored as the full enum (not the reduced `last_ok`)
@@ -1795,6 +1820,16 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// default (an inert placeholder for hermetic tests, which drive the detector directly). Read
     /// only by [`note_systemic_refresh`](Self::note_systemic_refresh).
     systemic_failure_n: u32,
+    /// The REFRESH-token foresight horizon in seconds (issue #878): how far ahead
+    /// [`account_expiry`] looks when classifying each account's `refreshTokenExpiresAt` deadline.
+    /// Sourced from `[credential].expiry_horizon_secs` via
+    /// [`with_credential_expiry_horizon`](Self::with_credential_expiry_horizon); `new`'s default is
+    /// the config default ([`DEFAULT_CREDENTIAL_EXPIRY_HORIZON_SECS`], seven days), so a hermetic
+    /// test daemon classifies at the shipped horizon without extra wiring.
+    ///
+    /// A CLASSIFICATION bound only. Nothing on the swap or poll path reads it — expiry is
+    /// surfaced, not acted upon (issue #878).
+    credential_expiry_horizon_secs: u64,
     state: DecisionState,
 }
 
@@ -1923,6 +1958,12 @@ where
             // threshold directly to `SystemicRefreshHealth::note`, so this placeholder only sets
             // the value for a `note_systemic_refresh` call an integration test drives at defaults.
             systemic_failure_n: DEFAULT_REFRESH_SYSTEMIC_FAILURE_N,
+            // Issue #878: the refresh-token foresight horizon defaults to the config default
+            // (production overrides via `with_credential_expiry_horizon` from
+            // `[credential].expiry_horizon_secs`). Unlike the placeholders above this is a REAL
+            // default rather than an inert one — the classification runs unconditionally, so a
+            // hermetic daemon classifies at the shipped seven-day horizon.
+            credential_expiry_horizon_secs: DEFAULT_CREDENTIAL_EXPIRY_HORIZON_SECS,
             state: DecisionState {
                 accounts,
                 ..DecisionState::default()
@@ -2168,6 +2209,17 @@ where
     /// Builder-style to mirror [`with_keep_warm_engine`](Self::with_keep_warm_engine).
     pub(crate) fn with_proactive_keep_warm(mut self, enabled: bool) -> Self {
         self.proactive_keep_warm = enabled;
+        self
+    }
+
+    /// Set the REFRESH-token foresight horizon (issue #878) from `[credential].expiry_horizon_secs`.
+    /// See [`credential_expiry_horizon_secs`](Self::credential_expiry_horizon_secs); builder-style to
+    /// mirror [`with_systemic_failure_n`](Self::with_systemic_failure_n) and keep `new`'s args stable.
+    ///
+    /// Callers wire this UNCONDITIONALLY, never inside the `[refresh].enabled` block the keep-warm
+    /// builders sit inside — see [`CredentialConfig`](crate::config::CredentialConfig) for why.
+    pub(crate) fn with_credential_expiry_horizon(mut self, horizon_secs: u64) -> Self {
+        self.credential_expiry_horizon_secs = horizon_secs;
         self
     }
 
@@ -2540,10 +2592,15 @@ where
             // rollup reads, so `status --json` surfaces the access-token expiry with
             // `[refresh]` off without firing a false-🟠 Stale for an idle lapsed token (the
             // rollup's positive-liveness consumption of this clock lands under #137).
-            let poll_expiry = self
-                .read_poll_expires_at(&self.roster[i], active == Some(i))
+            // Issue #878: the SAME read also yields the REFRESH token's own fixed deadline, which
+            // feeds the orthogonal expiry modifier (never `credential_health`) — one credential
+            // read, two clocks, no extra `security` subprocess per cycle.
+            let clocks = self
+                .read_poll_clocks(&self.roster[i], active == Some(i))
                 .await;
-            self.state.accounts[i].health.poll_expires_at = poll_expiry;
+            self.state.accounts[i].health.poll_expires_at = clocks.access_expires_at;
+            self.state.accounts[i].health.refresh_token_expires_at =
+                clocks.refresh_token_expires_at;
             self.note_polled(i);
         }
 

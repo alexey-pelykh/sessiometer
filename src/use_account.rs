@@ -1255,6 +1255,7 @@ mod tests {
             login: crate::config::LoginConfig::default(),
             stats: crate::config::StatsConfig::default(),
             migration: crate::config::MigrationConfig::default(),
+            credential: crate::config::CredentialConfig::default(),
         }
     }
 

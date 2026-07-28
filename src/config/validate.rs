@@ -397,6 +397,22 @@ impl Config {
             conflict_policy,
         };
 
+        // The credential-continuity settings (issue #878). The foresight horizon is bounds-checked
+        // like the tunables. The ONE DAY floor is deliberate: unlike `fleet_runway_warn_secs` this
+        // knob has no zero opt-out (see `CredentialConfig::expiry_horizon_secs` for why) — and the
+        // ninety-day ceiling is a sanity bound comfortably past any observed refresh-token lifetime.
+        // No cross-field rules: the horizon is independent of `[refresh].cadence_secs`.
+        let c = raw.credential;
+        range(
+            "credential.expiry_horizon_secs",
+            c.expiry_horizon_secs,
+            86_400,
+            7_776_000,
+        )?;
+        let credential = CredentialConfig {
+            expiry_horizon_secs: c.expiry_horizon_secs as u64,
+        };
+
         Ok(Config {
             roster,
             tunables,
@@ -404,6 +420,7 @@ impl Config {
             login,
             stats,
             migration,
+            credential,
         })
     }
 }
@@ -1241,6 +1258,80 @@ mod tests {
         // A stray `claude_bin = ""` defers to $CLAUDE_BIN/the harvested PATH (None), like omitting it.
         let toml = format!("{VALID}\n[refresh]\nclaude_bin = \"   \"\n");
         assert_eq!(Config::parse(&toml).unwrap().refresh.claude_bin, None);
+    }
+
+    // --- [credential] settings (issue #878) ---------------------------------
+
+    /// AC: the foresight horizon defaults to a value STRICTLY GREATER than three days.
+    ///
+    /// Three days is the upstream Claude Code client's own warning window — the floor to BEAT, not
+    /// the target — so the default is asserted against that floor explicitly rather than merely
+    /// pinned to a number. The stated goal is ≥ 7 d, which is asserted too; a future tightening of
+    /// the default below either bar fails here with the reason spelled out.
+    #[test]
+    fn credential_expiry_horizon_defaults_above_the_upstream_three_day_window() {
+        let config = Config::parse(VALID).unwrap();
+        assert_eq!(config.credential, CredentialConfig::default());
+
+        let horizon = config.credential.expiry_horizon_secs;
+        assert!(
+            horizon > 3 * 86_400,
+            "the default horizon must BEAT the upstream client's own 3d window, got {horizon}s"
+        );
+        assert!(
+            horizon >= 7 * 86_400,
+            "the issue's goal is a horizon of at least 7d, got {horizon}s"
+        );
+        assert_eq!(horizon, DEFAULT_CREDENTIAL_EXPIRY_HORIZON_SECS);
+        assert_eq!(
+            config.credential.expiry_horizon(),
+            Duration::from_secs(7 * 86_400)
+        );
+    }
+
+    /// AC: the horizon is CONFIGURABLE — an operator value overrides the default.
+    #[test]
+    fn parses_a_custom_credential_table() {
+        let toml = format!("{VALID}\n[credential]\nexpiry_horizon_secs = 1209600\n");
+        let config = Config::parse(&toml).unwrap();
+        assert_eq!(
+            config.credential,
+            CredentialConfig {
+                expiry_horizon_secs: 1_209_600,
+            }
+        );
+        assert_eq!(
+            config.credential.expiry_horizon(),
+            Duration::from_secs(14 * 86_400)
+        );
+    }
+
+    #[test]
+    fn credential_expiry_horizon_out_of_range_is_rejected() {
+        // Below the 1d floor and above the 90d ceiling both fail, naming the field. Note `0` is
+        // rejected rather than treated as an opt-out: a zero horizon would silently reduce the
+        // axis to reporting only ALREADY-lapsed credentials — the after-the-fact signal this
+        // feature exists to get ahead of — so the knob has no "off".
+        for bad in [
+            "expiry_horizon_secs = 0",
+            "expiry_horizon_secs = 86399",
+            "expiry_horizon_secs = 7776001",
+        ] {
+            let toml = format!("{VALID}\n[credential]\n{bad}\n");
+            let err = Config::parse(&toml).unwrap_err();
+            assert!(
+                matches!(&err, Error::ConfigInvalid(msg)
+                    if msg.contains("credential.expiry_horizon_secs")),
+                "expected a credential.expiry_horizon_secs range error for {bad:?}, got {err:?}"
+            );
+        }
+        // The inclusive bounds themselves are accepted.
+        for edge in [86_400, 7_776_000] {
+            let toml = format!("{VALID}\n[credential]\nexpiry_horizon_secs = {edge}\n");
+            let config = Config::parse(&toml)
+                .unwrap_or_else(|e| panic!("expiry_horizon_secs = {edge} is a valid edge: {e:?}"));
+            assert_eq!(config.credential.expiry_horizon_secs, edge);
+        }
     }
 
     // --- [login] settings (issue #135) --------------------------------------
