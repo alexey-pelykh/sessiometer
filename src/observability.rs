@@ -816,6 +816,27 @@ pub(crate) enum Event {
     /// idiom of [`Event::CanaryDrift`]. Secret-free (issue #15): only the `overridden` flag, never
     /// a token or the canonical's bytes.
     CanaryUnparseableCanonical { overridden: bool },
+    /// The behavioral canary's opt-in Layer-3 ONLINE liveness probe (issue #736) did not
+    /// confirm that the resolved canonical credential still authenticates. `verdict` is the
+    /// probe class — `rejected` (the endpoint answered `401`) or `inconclusive` (no HTTP
+    /// response, a `429`/`5xx`, a missing scope, an unparseable body, an unreadable
+    /// keychain). `refused` says whether that cost the swap: `true` only under the opt-in
+    /// `canary_online_probe_strict`, where the write is refused pre-mutation (ZERO writes);
+    /// `false` is the default graceful-degrade posture, where the swap PROCEEDED and this
+    /// line is the only trace of the failed probe — which is exactly why it is emitted even
+    /// then.
+    ///
+    /// ALARM-ONLY, like its `canary_drift` / `canary_unparseable_canonical` siblings: a probe
+    /// that confirms liveness emits nothing, and a DISARMED probe emits nothing (it never ran).
+    /// Emitted at the pre-swap gates — the daemon's and the standalone daemon-down `use`
+    /// path's — one line per probed ATTEMPT rather than per verdict edge, since the probe
+    /// yields no standing verdict to edge off (it runs per swap, not per tick). Secret-free
+    /// (issue #15): a verdict CLASS and a flag, never a status code, a response body, or a
+    /// bearer.
+    CanaryOnlineProbe {
+        verdict: &'static str,
+        refused: bool,
+    },
     /// The behavioral canary's FRESH Layer-1 resolution probe (issue #714) found MORE THAN ONE
     /// item under the derived canonical service — the #100 uniqueness rule fails, so the
     /// derivation no longer addresses a single credential and the atomic in-place write has no
@@ -1503,6 +1524,13 @@ impl Event {
                 // appearing exactly when `canary_nostashmatch_override` let the write proceed.
                 let overridden = if *overridden { " overridden=true" } else { "" };
                 format!("ts={ts} event=canary_unparseable_canonical{overridden}")
+            }
+            Event::CanaryOnlineProbe { verdict, refused } => {
+                // `refused` trails conditionally (the same idiom as the `overridden` flag on
+                // the two canary siblings above): the graceful-degrade default keeps the line
+                // minimal, and the token appears exactly when strict mode cost the swap.
+                let refused = if *refused { " refused=true" } else { "" };
+                format!("ts={ts} event=canary_online_probe verdict={verdict}{refused}")
             }
             Event::CanaryAmbiguous { count } => {
                 format!("ts={ts} event=canary_ambiguous count={count}")
@@ -2841,6 +2869,38 @@ mod tests {
         assert_eq!(
             overridden,
             format!("{TS0} event=canary_unparseable_canonical overridden=true")
+        );
+    }
+
+    #[test]
+    fn canary_online_probe_carries_the_verdict_and_trails_refused_only_when_it_fired() {
+        // Issue #736: the Layer-3 probe's only durable surface. `verdict` always rides the
+        // line (the operator needs to tell a dead bearer apart from a network blip — the two
+        // demand different responses); `refused` trails EXACTLY when strict mode cost the
+        // swap, mirroring the `overridden` idiom of its two canary siblings above. So the
+        // graceful-degrade ride — probe failed, swap proceeded — is a minimal line an
+        // operator can grep for as `event=canary_online_probe` without `refused=true`.
+        // Redaction-clean (#15): a verdict CLASS and a flag, never a status code, a response
+        // body, or a bearer. Pinned byte-exact — an integration `log.contains(...)` cannot
+        // catch malformed spacing or a stray `refused=false` leaking into the degrade branch.
+        let degraded = Event::CanaryOnlineProbe {
+            verdict: "inconclusive",
+            refused: false,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            degraded,
+            format!("{TS0} event=canary_online_probe verdict=inconclusive")
+        );
+
+        let refused = Event::CanaryOnlineProbe {
+            verdict: "rejected",
+            refused: true,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            refused,
+            format!("{TS0} event=canary_online_probe verdict=rejected refused=true")
         );
     }
 

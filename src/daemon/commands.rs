@@ -177,9 +177,16 @@ where
                     // auto-swaps — a canary refusal surfaces as the same redacted rejection
                     // (`classify_swap_failure` keeps the wire enum closed for old clients), while
                     // `events` carries the durable edge-triggered canary alarm alongside any
-                    // `Event::Swap`.
+                    // `Event::Swap`. `command.force` rides along so the Layer-3 online probe
+                    // (issue #736) honours `use --force` the same way the standalone path does —
+                    // otherwise the escape out of a strict refusal would exist only while the
+                    // daemon is DOWN, which is the opposite of when an operator needs it. It
+                    // bypasses that layer ONLY: Layers 1–2 still fail closed under `--force`.
                     let mut events = Vec::new();
-                    match self.locked_swap(&outgoing, &incoming, &mut events).await {
+                    match self
+                        .locked_swap(&outgoing, &incoming, command.force, &mut events)
+                        .await
+                    {
                         Ok(_report) => {
                             let prev_active = self.state.active;
                             // Mirror the auto-swap tail: cache active, arm the cooldown, prime the
@@ -1236,6 +1243,116 @@ mod tests {
             daemon.state.last_swap.is_none(),
             "a refused swap arms no cooldown",
         );
+    }
+
+    #[tokio::test]
+    async fn perform_socket_swap_gates_on_the_online_probe_and_force_carries_past_it() {
+        // Issue #736, END TO END on the DAEMON-ROUTED path — the one `use` actually takes
+        // whenever a daemon is up (a reachable daemon's ack is authoritative, so `run_use`'s
+        // own copy of this gate never executes). Two halves, and both are load-bearing:
+        //
+        //   1. an armed STRICT probe refuses the operator's swap here too, with zero writes —
+        //      the gate is not daemon-down-only;
+        //   2. `--force` carries past it — which works ONLY because `command.force` is threaded
+        //      into `locked_swap`. Without that thread the escape `Error::CanaryProbeNotLive`
+        //      and the README both promise would exist only while the daemon is DOWN, i.e.
+        //      never in the case that motivates it. Asserting the gate through `locked_swap`
+        //      directly cannot catch that: the flag would simply never arrive.
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10);
+        let tun = Tunables {
+            canary_online_probe: true,
+            canary_online_probe_strict: true,
+            ..tunables(95, 80, 0)
+        };
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json.clone(),
+            &tun,
+        );
+        warmed_tick(&mut daemon).await;
+        assert_eq!(daemon.state.active, Some(0));
+        // Both accounts carry a live reading from the warm-up, so `probe_gate` is ARMED — the
+        // stand-down keys off a MISSING one, and standing down here would make the test vacuous.
+        assert!(daemon.state.accounts[0].last_reading.is_some());
+
+        // The canonical dies AFTER the last poll — precisely the Layer-3 window an offline
+        // check cannot see, and the only state in which this gate has anything to say.
+        daemon.poller = FakeRosterPoller::new()
+            .unauthorized("u-A")
+            .ok("u-B", 0.10, 0.10);
+
+        let (ack, events) = daemon
+            .perform_socket_swap(&SwapCommand {
+                target: "spare".to_owned(),
+                force: false,
+            })
+            .await;
+
+        // Refused — as the opaque `Failed`, because the wire enum stays CLOSED (#167/#714: an
+        // old Swift decoder must never meet a new variant). The DETAIL rides the event log.
+        assert_eq!(
+            ack,
+            SwapAck::Rejected {
+                reason: SwapRejection::Failed,
+            }
+        );
+        assert!(events.contains(&Event::CanaryOnlineProbe {
+            verdict: "rejected",
+            refused: true,
+        }));
+        assert!(
+            !events.iter().any(|e| matches!(e, Event::Swap { .. })),
+            "a refused swap emits no swap event: {events:?}"
+        );
+        // ZERO writes: canonical, display, in-memory active and cooldown all untouched.
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"A-token")));
+        assert_eq!(displayed_uuid(&json).as_deref(), Some("u-A"));
+        assert_eq!(daemon.state.active, Some(0));
+        assert!(daemon.state.last_swap.is_none());
+
+        // Same daemon, same dead bearer, same armed strict gate — but forced.
+        let (ack, events) = daemon
+            .perform_socket_swap(&SwapCommand {
+                target: "spare".to_owned(),
+                force: true,
+            })
+            .await;
+
+        assert!(
+            matches!(ack, SwapAck::Accepted { .. }),
+            "--force must carry the swap past an armed strict probe, got {ack:?}"
+        );
+        // Not silent: bypassing a gate the operator armed is exactly what they later need to find.
+        assert!(events.contains(&Event::CanaryOnlineProbe {
+            verdict: "overridden",
+            refused: false,
+        }));
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"B-token")));
+        assert_eq!(daemon.state.active, Some(1));
     }
 
     #[tokio::test]

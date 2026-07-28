@@ -566,16 +566,67 @@ pub(crate) enum Error {
     )]
     CanaryUnparseableCanonical,
 
+    /// The behavioral canary's opt-in Layer-3 ONLINE liveness probe (issue #736) did
+    /// not confirm the resolved canonical credential still authenticates, and the
+    /// operator had armed `canary_online_probe_strict`. The credential WRITE is
+    /// refused pre-mutation (ZERO writes). Reachable ONLY with BOTH `[tunables]`
+    /// switches on — with the default `canary_online_probe = false` no probe runs at
+    /// all, and with the default `canary_online_probe_strict = false` a failed probe
+    /// is logged and the swap proceeds.
+    ///
+    /// A generic exit `1` via the `exit_code` catch-all, like its siblings
+    /// [`Error::CanaryDrift`] / [`Error::CanaryUnparseableCanonical`]. Deliberately
+    /// NOT the "retry shortly" `4`: a `rejected` verdict does not clear on its own,
+    /// and one exit code for both verdicts keeps a caller from having to tell a
+    /// dead token apart from a network blip by exit status — the log line and the
+    /// message carry that distinction. Secret-free (issue #15): the verdict CLASS
+    /// only, never a status code, a response body, or a token.
+    // The remedy deliberately does NOT say "investigate with `sessiometer status`" the way
+    // its two offline siblings above do. For them that is true — a standing canary verdict
+    // is on the status wire. This probe adds nothing there by design (it is per-attempt, not
+    // a standing verdict), and on the STANDALONE path it fires precisely when no daemon is
+    // reachable, so `status` would answer "daemon not running". Naming the wrong surface
+    // would send the operator to a screen that shows a healthy canary and read the refusal
+    // as spurious. The event log is where the probe's durable line actually is.
+    #[error(
+        "refusing the credential write: the keychain-identity canary's online liveness probe \
+         did not confirm the active canonical credential still authenticates (probe: {verdict}), \
+         and `canary_online_probe_strict` is set. The probe's verdict is logged as \
+         `event=canary_online_probe` in ~/Library/Logs/sessiometer/sessiometer.log; \
+         `verdict=rejected` means the endpoint refused the credential, `verdict=inconclusive` \
+         means it could not be reached. Use `sessiometer use --force <account>` for a one-off \
+         swap past this check, or set `canary_online_probe_strict = false` under `[tunables]` \
+         in config.toml and restart the daemon to stop refusing on unconfirmed probes"
+    )]
+    CanaryProbeNotLive {
+        /// The probe's verdict class — `rejected` or `inconclusive`.
+        verdict: &'static str,
+    },
+
     // --- Daemon-routed swap (issue #167) -------------------------------------
     /// The running daemon performed a `use` swap on our behalf (issue #167 — `use`
     /// routes THROUGH the daemon when one is up) and its swap engine aborted for a
     /// reason other than the redacted-and-remapped ones (a locked keychain → exit
     /// `4`, a contended swap lock → exit `4`, a gone canonical → the recovery
-    /// signal): a wrong-identity re-stash guard (#211), an absent stash, or an I/O
-    /// error. The daemon aborted with ZERO writes. A generic exit `1`, like its
-    /// sibling engine aborts. Secret-free: the daemon's ack is redacted to a machine
-    /// reason code, never a token or email (issue #15).
-    #[error("the daemon could not complete the swap; check `sessiometer status` and retry")]
+    /// signal): a wrong-identity re-stash guard (#211), an absent stash, an I/O
+    /// error, or a canary refusal ([`Error::CanaryDrift`],
+    /// [`Error::CanaryUnparseableCanonical`], [`Error::CanaryProbeNotLive`]). The
+    /// daemon aborted with ZERO writes. A generic exit `1`, like its sibling engine
+    /// aborts. Secret-free: the daemon's ack is redacted to a machine reason code,
+    /// never a token or email (issue #15).
+    //
+    // The message names the event LOG beside `status`, and does not promise a retry will
+    // help. Since issue #736 not every cause of this rejection has a `status` surface: the
+    // standing canary verdicts do, but the Layer-3 online probe is per-ATTEMPT and adds
+    // nothing to the wire by design, so an operator sent to `status` alone would find a
+    // healthy canary and read a real refusal as spurious. The log carries the reason for
+    // EVERY cause that lands here, which is why it is named unconditionally rather than
+    // per-cause — the wire enum stays closed (`classify_swap_failure`), so this message
+    // cannot know which one it is.
+    #[error(
+        "the daemon could not complete the swap (it made no changes); check `sessiometer status` \
+         and the daemon's log at ~/Library/Logs/sessiometer/sessiometer.log for the reason"
+    )]
     DaemonSwapFailed,
 
     // --- One-shot `poke` (issue #104) ----------------------------------------

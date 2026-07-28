@@ -130,6 +130,16 @@ impl Config {
                     t.canary_nostashmatch_override.to_string(),
                     present("tunables", "canary_nostashmatch_override"),
                 ),
+                entry(
+                    "canary_online_probe",
+                    t.canary_online_probe.to_string(),
+                    present("tunables", "canary_online_probe"),
+                ),
+                entry(
+                    "canary_online_probe_strict",
+                    t.canary_online_probe_strict.to_string(),
+                    present("tunables", "canary_online_probe_strict"),
+                ),
             ],
         };
 
@@ -501,6 +511,33 @@ impl Config {
         out.push_str(&format!(
             "canary_nostashmatch_override = {}\n",
             t.canary_nostashmatch_override
+        ));
+        out.push_str(
+            "# Keychain-identity canary ONLINE liveness probe (issue #736), the canary's only\n\
+             # networked layer and therefore opt-in. When true, one bounded /oauth/usage GET\n\
+             # runs on the resolved canonical immediately before the swap's credential write,\n\
+             # asking only whether that bearer still authenticates. LIVENESS, not identity:\n\
+             # the endpoint names no account, so a pass never says WHOSE session it is. It\n\
+             # narrows — does not close — the Layer-3 same-account silent-relocation residual,\n\
+             # catching a relocated canonical that has gone dead but not one still valid.\n\
+             # When false NO request is issued at all. Default false.\n",
+        );
+        out.push_str(&format!(
+            "canary_online_probe = {}\n",
+            t.canary_online_probe
+        ));
+        out.push_str(
+            "# Strict mode for that probe (issue #736); only meaningful with\n\
+             # canary_online_probe = true. Default false: a probe that comes back rejected or\n\
+             # inconclusive is logged and the swap PROCEEDS, so a network outage never becomes\n\
+             # a swap outage. Set true to opt INTO that network failure mode — anything short\n\
+             # of a confirmed-live bearer then refuses the write before any mutation. Note a\n\
+             # 401 alone is weak evidence: Claude Code refreshes its accessToken in place, so a\n\
+             # momentarily expired-but-refreshable token answers 401 while it is healthy.\n",
+        );
+        out.push_str(&format!(
+            "canary_online_probe_strict = {}\n",
+            t.canary_online_probe_strict
         ));
 
         // Per-cycle timing jitter (issue #38): drawn each cycle and clamped to the
