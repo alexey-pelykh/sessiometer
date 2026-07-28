@@ -45,34 +45,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         #if DEBUG
-        // Design-parity tooling (not a product path): `--render-panel <dir>` renders the panel to PNGs
-        // for diffing against the mock, then exits — never wires the status item. Runs here so the full
-        // AppKit environment (fonts, system colors) is up before `ImageRenderer` draws.
-        if let idx = CommandLine.arguments.firstIndex(of: "--render-panel"),
-           idx + 1 < CommandLine.arguments.count {
-            RenderPanelTool.run(outputDir: CommandLine.arguments[idx + 1])
+        // Design-parity / debug TOOL modes — not product paths, and DEBUG-only by construction, so a
+        // release build has exactly one reachable mode. Which mode this process launched in is a pure
+        // argv+env decision (issue #764): `AppLaunchPlan.mode` owns it — including the precedence between
+        // the three, and the exact-`"1"` gallery opt-in — and `AppLaunchPlanTests` covers it headlessly.
+        // This shell only ACTS on the resolved mode. Dispatch runs here so the full AppKit environment
+        // (fonts, system colors) is up before either renderer draws.
+        switch AppLaunchPlan.mode(arguments: CommandLine.arguments,
+                                  environment: ProcessInfo.processInfo.environment,
+                                  toolModesAvailable: AppLaunchPlan.toolModesAvailableInThisBuild) {
+        case .renderPanel(let outputDirectory):
+            // Renders the panel to PNGs for diffing against the mock, then exits — never wires the status item.
+            RenderPanelTool.run(outputDir: outputDirectory)
             exit(0)
-        }
 
-        // Bar-glyph render-parity tooling (issue #525): `--render-bar-glyphs <dir>` renders every status-
-        // item glyph — template-tinted, per appearance, @1x + @2x, plus the menu-open inverted state — to
-        // committable PNGs the parity gate diffs against, then exits. Like `--render-panel` it never wires
-        // the status item; unlike the panel it exists because `NSStatusItem` template tinting is applied by
-        // the system and is invisible to SwiftUI `ImageRenderer`.
-        if let idx = CommandLine.arguments.firstIndex(of: "--render-bar-glyphs"),
-           idx + 1 < CommandLine.arguments.count {
-            RenderBarGlyphTool.run(outputDir: CommandLine.arguments[idx + 1])
+        case .renderBarGlyphs(let outputDirectory):
+            // Issue #525: renders every status-item glyph — template-tinted, per appearance, @1x + @2x, plus
+            // the menu-open inverted state — to committable PNGs the parity gate diffs against, then exits.
+            // Like `--render-panel` it never wires the status item; unlike the panel it exists because
+            // `NSStatusItem` template tinting is applied by the system and is invisible to `ImageRenderer`.
+            RenderBarGlyphTool.run(outputDir: outputDirectory)
             exit(0)
-        }
 
-        // Glyph-gallery harness (issue #437): `SESSIOMETER_GLYPH_GALLERY=1` installs one real menu-bar
-        // status item per StatusGlyph — the four bespoke template gauges side by side — and wires nothing
-        // else (no daemon, no transport). It exists so #437's PRIORITY-1 falsifier — shape-distinctness at
-        // real bar size (light + dark, Increase Contrast, over a bright wallpaper, beside system icons) —
-        // can be captured from ACTUAL NSStatusItems, which a headless raster proxy cannot settle. Opt-in and
-        // inert in normal operation; it never JUDGES distinctness, it only makes the on-device capture
-        // possible. The app keeps running afterwards (no exit) so the items stay live to screenshot.
-        if ProcessInfo.processInfo.environment["SESSIOMETER_GLYPH_GALLERY"] == "1" {
+        case .glyphGallery:
+            // Issue #437: installs one real menu-bar status item per StatusGlyph — the four bespoke template
+            // gauges side by side — and wires nothing else (no daemon, no transport). It exists so #437's
+            // PRIORITY-1 falsifier — shape-distinctness at real bar size (light + dark, Increase Contrast,
+            // over a bright wallpaper, beside system icons) — can be captured from ACTUAL NSStatusItems,
+            // which a headless raster proxy cannot settle. It never JUDGES distinctness, it only makes the
+            // on-device capture possible. The app keeps RUNNING afterwards (no exit) so the items stay live
+            // to screenshot.
             galleryItems = StatusGlyph.allCases.map { glyph in
                 let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
                 item.button?.image = StatusGauge.image(for: glyph)
@@ -82,6 +84,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             appLog.info("glyph gallery installed: \(self.galleryItems.count, privacy: .public) items (SESSIOMETER_GLYPH_GALLERY)")
             return
+
+        case .normal:
+            break
         }
         #endif
 
@@ -90,13 +95,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.store = store
 
         // The in-app capture affordance's write path (issue #360): the short-lived control-command client
-        // over the SAME daemon control socket the watch transport uses. Built via `.production()` (the
-        // ADR-0011 non-sandbox tripwire); a resolve failure (sandboxed / home unresolved) degrades to a nil
-        // client so a capture attempt surfaces an honest "unreachable" rather than a dead button — and in
-        // that case the watch transport ALSO fails, so the panel shows disconnected and never renders the
-        // affordance anyway.
+        // over the SAME daemon control socket the watch transport uses, on `AppLaunchPlan.captureTimeout`.
+        // Built via `.production()` (the ADR-0011 non-sandbox tripwire); a resolve failure (sandboxed /
+        // home unresolved) degrades to a nil client so a capture attempt surfaces an honest "unreachable"
+        // rather than a dead button — and in that case the watch transport ALSO fails, so the panel shows
+        // disconnected and never renders the affordance anyway.
         let captureClient: ControlCommandClient?
-        switch ControlCommandClient.production() {
+        switch ControlCommandClient.production(timeout: AppLaunchPlan.captureTimeout) {
         case .success(let client):
             captureClient = client
         case .failure(let error):
@@ -105,15 +110,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // The swap affordance's write path (issue #169): the SAME short-lived control-command transport,
-        // but with its OWN, larger budget — exactly the per-call-site timeout `ControlCommandClient`
-        // earmarks for this exchange. A `swap` ack is written only AFTER the swap runs, and the swap may
-        // wait on the cross-process single-writer lock for up to `SWAP_LOCK_MAX_WAIT` (10 s, `src/swap.rs`)
-        // before failing closed. The capture default (2 s) would therefore time out a swap that is merely
-        // QUEUED and about to succeed — reporting a false failure for a write that then commits. 15 s
-        // clears the lock's own bound with headroom for the keychain read/write beneath it. The bound is
-        // what makes a lost ack recover instead of sticking the spinner (issue #169).
+        // but with its OWN, larger budget. `AppLaunchPlan.swapTimeout` owns the value AND its derivation
+        // (it must clear the cross-process single-writer lock a `swap` can wait behind — a Rust bound
+        // `AppLaunchPlanTests` re-reads from `src/swap.rs`, so the two cannot drift apart silently). That
+        // it is BOUNDED at all is what makes a lost ack recover instead of sticking the spinner.
         let swapClient: ControlCommandClient?
-        switch ControlCommandClient.production(timeout: .seconds(15)) {
+        switch ControlCommandClient.production(timeout: AppLaunchPlan.swapTimeout) {
         case .success(let client):
             swapClient = client
         case .failure(let error):
@@ -122,13 +124,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // The Stats-tab read path (issue #446): the SAME short-lived control-command transport, for the
-        // one-shot `stats` query (#356) the panel runs when the operator opens the Stats tab. A bounded READ
-        // answered off the daemon's run loop (no lock, unlike `swap`), so a modest 5 s budget clears a slower
-        // store aggregation without the swap path's 15 s lock headroom. A resolve failure degrades to a nil
-        // client → the tab shows an honest "unavailable" (and the watch transport ALSO fails, so the panel is
-        // disconnected and never offers the seg anyway).
+        // one-shot `stats` query (#356) the panel runs when the operator opens the Stats tab — on
+        // `AppLaunchPlan.statsTimeout`, which owns the budget and why a lock-free READ needs no swap-sized
+        // headroom. A resolve failure degrades to a nil client → the tab shows an honest "unavailable" (and
+        // the watch transport ALSO fails, so the panel is disconnected and never offers the seg anyway).
         let statsClient: ControlCommandClient?
-        switch ControlCommandClient.production(timeout: .seconds(5)) {
+        switch ControlCommandClient.production(timeout: AppLaunchPlan.statsTimeout) {
         case .success(let client):
             statsClient = client
         case .failure(let error):
@@ -137,12 +138,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         // The Settings window's config read/write path (issue #268): the SAME short-lived control-command
-        // transport for the one-shot config-get / config-set exchanges. A 5 s budget — config-set validates
-        // + atomically writes config.toml off the daemon's run loop (no swap.lock), clearing a slower disk
-        // write without the swap path's 15 s lock headroom. A resolve failure degrades to a nil client → the
-        // Settings window shows an honest "not connected" and never writes config locally (AC 7).
+        // transport for the one-shot config-get / config-set exchanges, on `AppLaunchPlan.configTimeout`
+        // (which owns the budget and why an off-run-loop validate + atomic write needs no swap-sized
+        // headroom). A resolve failure degrades to a nil client → the Settings window shows an honest
+        // "not connected" and never writes config locally (AC 7).
         let configClient: ControlCommandClient?
-        switch ControlCommandClient.production(timeout: .seconds(5)) {
+        switch ControlCommandClient.production(timeout: AppLaunchPlan.configTimeout) {
         case .success(let client):
             configClient = client
         case .failure(let error):
@@ -216,7 +217,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { await transport.start() }
         case .failure(let error):
             appLog.error("watch transport unavailable: \(String(describing: error), privacy: .public)")
-            store.start(consuming: Self.disconnectedStream(reason: Self.reason(for: error)))
+            store.start(consuming: AppLaunchPlan.disconnectedStream(reason: AppLaunchPlan.degradeReason(for: error)))
         }
 
         // Sleep/wake gating of the warm-dwell escalation (issue #526): suspend the store's warm-dwell timer
@@ -242,25 +243,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         guard let transport else { return }
         Task { await transport.stop() }
-    }
-
-    /// A one-shot event stream that yields a single `.disconnected` then finishes — the honest feed for
-    /// an unresolvable socket path, so the glance renders the "disconnected" glyph (the reason is logged
-    /// above and carried on the event) instead of a perpetual "connecting".
-    private static func disconnectedStream(reason: String) -> AsyncStream<TransportEvent> {
-        AsyncStream { continuation in
-            continuation.yield(.disconnected(reason: reason))
-            continuation.finish()
-        }
-    }
-
-    private static func reason(for error: SocketPathResolver.ResolveError) -> String {
-        switch error {
-        case .homeUnresolved:
-            return "home directory unresolved"
-        case .sandboxed:
-            return "app is sandboxed — the daemon socket is unreachable"
-        }
     }
 }
 
