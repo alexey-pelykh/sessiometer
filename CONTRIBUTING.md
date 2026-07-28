@@ -2,14 +2,41 @@
 
 Thanks for your interest in improving `sessiometer`. For building and running the
 tool see the [README](README.md); for the *why* behind load-bearing technical
-decisions see the [ADRs](docs/adr/). This guide covers the one thing most likely
-to surprise a new contributor: the project holds a deliberate **minimal-dependency
-line**, and several primitives you might expect to be crates are hand-rolled on
-purpose.
+decisions see the [ADRs](docs/adr/). This guide covers the two things most likely
+to surprise a new contributor: **macOS is the only supported build target**, and the
+project holds a deliberate **minimal-dependency line** under which several primitives
+you might expect to be crates are hand-rolled on purpose.
 
 If you are about to add a dependency, or "helpfully" swap a hand-rolled primitive
 for a well-known crate (`clap`, `hex`, `reqwest`, …), please read this first — the
 omission is intentional, not an oversight.
+
+## Supported platform: macOS only
+
+**`sessiometer` builds and runs on macOS only.** The crate does not compile for a Linux
+or Windows target today, and **no CI job attempts it** — every job that runs `cargo
+build` / `test` / `clippy` / `doc` uses a `macos-latest` runner. The `ubuntu-latest` jobs
+(`changes`, `deny`, `ci-ok-needs-complete`, `gate-change-ack`, `ci-ok`) are gates and
+routers; none of them compiles the crate.
+
+Two things follow, and both matter when you write or review a change:
+
+- **A green CI run says nothing about portability.** Introduce a macOS-only call and every
+  gate still passes. The most concrete instance is already on `main`:
+  [`src/daemon/peer_auth.rs`](src/daemon/peer_auth.rs) calls `libc::getpeereid` with no
+  `cfg(target_os)` gate, and `getpeereid(3)` is not in glibc — so a Linux `cargo check`
+  exits 101. That is a known, accepted consequence, not a defect to fix in passing.
+- **Do not write an acceptance criterion asserting that the Linux build works.** Nothing
+  verifies it, so the claim cannot fail — which is worse than not making it. Where a test
+  carries a platform assumption (a live `/bin/sh -l` spawn, an absolute passwd entry), say
+  so in a comment beside it, as the login-shell harvest tests in
+  [`src/paths.rs`](src/paths.rs) do.
+
+None of this closes the door. Cross-platform support is tracked, sequenced future work:
+recon first (#40), then the backend-neutral credential-store seam (#25) and the per-OS
+mechanisms (#26 Linux, #27 Windows, #28 at-rest hygiene), then productionization including
+a per-OS CI matrix (#29). The full rationale — and the alternative that was weighed and
+deferred — is in [ADR-0029](docs/adr/0029-macos-is-the-only-supported-build-target.md).
 
 ## The minimal-dependency line
 
