@@ -71,9 +71,10 @@ fn label_at(snapshot: &StatusSnapshot, index: usize) -> &str {
 
 /// Emit one event to the event log, best-effort: a write failure is logged to stderr and
 /// swallowed (issue #9). The daemon must never die on a logging failure, and one failed event
-/// must not drop the rest — so this never returns an error. The single home for the four
-/// tick / idle / post-idle emit sites, so the fail-open path and its message live in one place.
-fn emit_best_effort(log: &mut EventLog, event: &Event) {
+/// must not drop the rest — so this never returns an error. The single home for the tick / idle /
+/// post-idle emit sites AND `cli`'s pre-loop startup-preflight site (issue #787), so the fail-open
+/// path and its message live in one place.
+pub(crate) fn emit_best_effort(log: &mut EventLog, event: &Event) {
     if let Err(err) = log.emit(event) {
         eprintln!("sessiometer: event log write failed: {err}");
     }

@@ -592,6 +592,22 @@ where
             .systemic_refresh
             .note(health, self.systemic_failure_n)
     }
+
+    /// Fold the daemon's STARTUP PREFLIGHT into the same systemic-refresh detector (issue #787),
+    /// returning [`Event::RefreshPreflightUnresolved`] when it opens an episode.
+    ///
+    /// The restart-time sibling of [`note_systemic_refresh`](Self::note_systemic_refresh), and
+    /// deliberately NOT threaded through `systemic_failure_n`: the threshold filters a flaky sweep,
+    /// while an unresolvable `claude` is a deterministic fleet-wide precondition failure that would
+    /// make every eligible cycle error by construction. See
+    /// [`SystemicRefreshHealth::note_preflight`](crate::systemic_refresh::SystemicRefreshHealth::note_preflight).
+    ///
+    /// `pub(crate)`, unlike its `pub(super)` sibling, because its ONE caller is the process
+    /// lifecycle owner ([`crate::cli`]) rather than the run loop: the preflight runs once at
+    /// startup, before the loop exists, on the fresh state a restart just produced.
+    pub(crate) fn note_refresh_preflight(&mut self, health: PreflightHealth) -> Option<Event> {
+        self.state.systemic_refresh.note_preflight(health)
+    }
 }
 
 #[cfg(test)]
@@ -942,6 +958,87 @@ mod tests {
             indicator(&daemon),
             None,
             "recovery clears the status indicator"
+        );
+    }
+
+    /// The #787 daemon-side wiring the pure `SystemicRefreshHealth` unit tests can't reach: a
+    /// startup preflight failure must reach the SAME `snapshot`'s `systemic_refresh` projection the
+    /// sweep path feeds — the field the `status` board and the menu-bar panel banner both render.
+    /// This is the difference between "the fault is in memory" and "the operator sees the fault":
+    /// the defect #787 fixes was precisely a board that read healthy over a broken daemon.
+    ///
+    /// Also pins the projection's shape at the seam the wire cares about. `status` renders that
+    /// count as "N consecutive sweep(s) failed", so a preflight-opened episode must project a
+    /// non-degenerate `>= 1` rather than a zero that would render "0 consecutive sweeps failed" on
+    /// both surfaces.
+    #[tokio::test]
+    async fn note_refresh_preflight_projects_a_restart_established_fault_into_snapshot() {
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        const NOW: i64 = 1_782_777_600;
+        let no_readings: [Option<Usage>; 3] = [None, None, None];
+        let indicator = |d: &FakeDaemon| d.snapshot(None, &no_readings, NOW).systemic_refresh;
+
+        // A freshly-restarted daemon reads healthy — the false-green the preflight closes.
+        assert_eq!(indicator(&daemon), None, "a fresh daemon starts healthy");
+
+        // The preflight finds the mechanism already broken: one signal, and the board goes DOWN
+        // immediately — WITHOUT the three all-error sweeps the threshold would otherwise demand.
+        assert_eq!(
+            daemon.note_refresh_preflight(PreflightHealth::Unresolved),
+            Some(Event::RefreshPreflightUnresolved)
+        );
+        assert_eq!(
+            indicator(&daemon),
+            Some(1),
+            "a restart-established fault is status-visible at once, with a renderable count"
+        );
+
+        // Sweeps that keep failing climb the count for `status` without re-emitting — the
+        // once-per-episode contract holds across the two openers, at the daemon seam too.
+        assert_eq!(daemon.note_systemic_refresh(SweepHealth::AllError), None);
+        assert_eq!(indicator(&daemon), Some(2));
+
+        // …and the first working sweep still closes it. The episode is re-derived at each startup
+        // rather than persisted precisely so it can never go stale in the false-POSITIVE direction:
+        // an operator who fixed the fault and restarted to apply the fix sees a clean board again.
+        assert_eq!(
+            daemon.note_systemic_refresh(SweepHealth::Working),
+            Some(Event::RefreshSystemicRecovered)
+        );
+        assert_eq!(indicator(&daemon), None, "recovery clears it");
+    }
+
+    /// The preflight is inert when the operator has `[refresh]` OFF (issue #787). Not a
+    /// convenience gate — a correctness one, and the asymmetry is the reason: with the proactive
+    /// sweep disabled no `SweepHealth::Working` is ever folded, so the CLEARING edge does not
+    /// exist. An ungated preflight would therefore latch a mechanism-down signal that nothing could
+    /// ever clear, trading the false-GREEN this issue fixes for a permanent false-RED.
+    ///
+    /// The gate itself is [`crate::refresh_tick::mechanism_is_observable`], which owns the
+    /// `[refresh].enabled` leg alongside the roster and allowlist ones; what is pinned HERE is the
+    /// property that makes it necessary: an active episode is clearable ONLY by a working sweep,
+    /// never by anything the disabled path could produce.
+    #[tokio::test]
+    async fn a_preflight_opened_episode_is_clearable_only_by_a_working_sweep() {
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        const NOW: i64 = 1_782_777_600;
+        let no_readings: [Option<Usage>; 3] = [None, None, None];
+        let indicator = |d: &FakeDaemon| d.snapshot(None, &no_readings, NOW).systemic_refresh;
+
+        daemon.note_refresh_preflight(PreflightHealth::Unresolved);
+        assert_eq!(indicator(&daemon), Some(1));
+
+        // Neither an idle sweep nor a second preflight — the only things a `[refresh]`-off daemon
+        // could ever fold — releases the latch.
+        assert_eq!(daemon.note_systemic_refresh(SweepHealth::NoSignal), None);
+        assert_eq!(
+            daemon.note_refresh_preflight(PreflightHealth::Resolved),
+            None
+        );
+        assert_eq!(
+            indicator(&daemon),
+            Some(1),
+            "nothing but a working sweep clears it — hence the observability gate on the preflight"
         );
     }
 
