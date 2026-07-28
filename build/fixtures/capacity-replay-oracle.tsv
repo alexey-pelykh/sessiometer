@@ -1,0 +1,95 @@
+# Frozen ORACLE — issue #806. DO NOT REGENERATE. See the same warning in
+# capacity-replay-corpus.tsv: these two files are ONE cut of one 48 h, and they
+# move together or not at all. Re-cutting either alone leaves the differential
+# comparing two unrelated windows while still passing every parse check.
+#
+# Every `event=all_exhausted` ENTER the running daemon logged over the SAME window
+# as capacity-replay-corpus.tsv, from the SAME 48 h of wall-clock — but produced by
+# a wholly different surface: the daemon's live tick decisions, written as it ran,
+# versus an offline aggregate folded from the sample store. Two surfaces, two
+# independent premises, one physical condition. That independence is the entire
+# point: an aggregate fixture derived from the aggregator's own premise cannot
+# refute the aggregator.
+#
+# Same redaction as the corpus: `hold` is the a1..a6 alias, `ts_off` is a signed
+# offset from CORPUS_START.
+#
+# The daemon RE-ARMS its ENTER guard on any non-NoViableTarget tick, so these
+# ENTERs over-count episodes by design. `count(ENTER) >= count(holds)` is therefore
+# NOT an invariant in either direction and is NEVER gated on — the ratio is only
+# ever reported as a diagnostic. What IS asserted is DETECTION and CAUSE COVERAGE:
+# over a window the daemon spent cornered, the aggregate must see a hold AT ALL
+# rather than print UNKNOWN, and must name BOTH of the causes the oracle names.
+# Per-ENTER containment — "at each instant below there is a hold covering it" — is
+# deliberately NOT asserted: these rows are ENTER EDGES, not episode spans, so the
+# oracle carries no span to contain, and a coverage gap around any single edge
+# would fail a containment gate for a reason that says nothing about the metric.
+#
+# Columns, tab-separated:  ts_off  hold  cause
+21258	a1	session
+25148	a2	session
+25541	a2	session
+27855	a2	session
+28167	a2	session
+28447	a2	session
+28748	a2	session
+29348	a2	session
+30311	a2	session
+31737	a2	session
+32844	a2	session
+34116	a2	session
+68328	a3	weekly
+69191	a3	weekly
+69799	a3	weekly
+70787	a3	weekly
+71572	a3	weekly
+72650	a3	weekly
+73769	a3	weekly
+75117	a3	weekly
+76495	a3	weekly
+77380	a3	weekly
+82161	a3	weekly
+82534	a3	weekly
+82845	a3	weekly
+83245	a3	weekly
+84301	a3	weekly
+85398	a3	weekly
+86042	a3	weekly
+86831	a3	weekly
+87822	a3	weekly
+88620	a3	weekly
+90197	a3	weekly
+91513	a3	weekly
+92731	a3	weekly
+93654	a3	weekly
+95299	a3	weekly
+96270	a3	weekly
+97531	a3	weekly
+98577	a3	weekly
+99535	a3	weekly
+101079	a3	weekly
+102139	a3	weekly
+102960	a3	weekly
+103865	a3	weekly
+105193	a3	weekly
+105810	a3	weekly
+106834	a3	weekly
+110884	a3	weekly
+111194	a3	weekly
+111458	a3	weekly
+111699	a3	weekly
+112259	a3	weekly
+113071	a3	weekly
+114092	a3	weekly
+115504	a3	weekly
+116697	a3	weekly
+118265	a3	weekly
+119362	a3	weekly
+120784	a3	weekly
+121788	a3	weekly
+122575	a3	weekly
+123558	a3	weekly
+125218	a3	weekly
+126539	a3	weekly
+127490	a3	weekly
+128486	a3	weekly
