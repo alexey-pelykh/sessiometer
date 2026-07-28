@@ -648,6 +648,7 @@ private final class A11yProbeLoginItemService: LoginItemService {
     let daemonAgentStatus: LoginItemStatus = .notRegistered
     let cliManagedAgentPresent: Bool = false
     let daemonLockHeld: Bool = false
+    let daemonAgentRunState: DaemonAgentRunState = .notRunning
     func registerApp() throws {}
     func unregisterApp() throws {}
     func registerDaemonAgent() throws {}
