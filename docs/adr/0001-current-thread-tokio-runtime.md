@@ -48,15 +48,15 @@ work-stealing runtime.
      single-threaded interior mutability (`Rc<Cell<…>>`, `Rc<RefCell<…>>` in the
      `daemon` test module), which is `!Send`; a `Send` bound would force
      `Arc<Mutex<…>>` and cross-thread synchronization the real workload never needs.
-   - **Cons (soundness, not just ergonomics)**: the crate resolves the user's home and
-     login name through `getpwuid` (`src/paths.rs`) — a non-reentrant `libc` call that
-     returns a pointer into a process-wide **static buffer**. Its `// SAFETY:` argument
-     rests on this runtime being single-threaded, with `paths.rs` the crate's *only*
-     `getpw*` caller, so no concurrent `getpw*` can race that buffer. A work-stealing
-     runtime could poll that FFI from multiple worker threads, racing the shared buffer
-     into **undefined behavior** — a strictly graver failure than the `Send`-bound
-     friction above, and one the `Send` bound does **not** catch (the calls are
-     synchronous, so nothing is held across an `.await` for the bound to reject).
+   - **Cons (soundness, not just ergonomics)**: the crate resolves the user's home,
+     login name, and login shell through `getpwuid` (`src/paths.rs`) — a non-reentrant
+     `libc` call that returns a pointer into a process-wide **static buffer**. Its
+     `// SAFETY:` argument rests on this runtime being single-threaded, with `paths.rs`
+     the crate's *only* `getpw*` caller, so no concurrent `getpw*` can race that buffer.
+     A work-stealing runtime could poll that FFI from multiple worker threads, racing
+     the shared buffer into **undefined behavior** — a strictly graver failure than the
+     `Send`-bound friction above, and one the `Send` bound does **not** catch (the calls
+     are synchronous, so nothing is held across an `.await` for the bound to reject).
      Multi-threading would first require moving these sites to the reentrant `getpwuid_r`.
    - **Why rejected**: it buys parallelism the workload has none of, taxes the seam/test
      architecture that is this module's main quality lever, and would void the

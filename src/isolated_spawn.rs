@@ -58,10 +58,12 @@ const SPAWN_TIMEOUT: Duration = Duration::from_secs(40);
 ///     keychain service-name derivation (#100, [`crate::keychain`]), so an inherited one would
 ///     mis-target the read away from the item we seeded.
 ///
-/// Kept as a named list (not inline `env_remove` calls), applied by [`SpawnPlan::build_command`],
-/// so the `both_parametrizations_apply_the_full_scrub_set` test can assert the set is applied for
-/// EVERY parametrization — a dropped entry is a silent isolation regression on whichever caller
-/// drops it.
+/// Kept as a named list (not inline `env_remove` calls), applied by [`SpawnPlan::build_command`]
+/// — and, for the issue #783 login-shell PATH harvest, by
+/// [`crate::paths::build_login_shell_env_command`] — so the
+/// `all_parametrizations_apply_the_full_scrub_set` test can assert the set is applied for EVERY
+/// parametrization — a dropped entry is a silent isolation regression on whichever caller drops
+/// it.
 pub(crate) const SPAWN_ENV_REMOVE: &[&str] = &[
     "CLAUDE_CODE_OAUTH_TOKEN",
     "ANTHROPIC_API_KEY",
@@ -398,11 +400,29 @@ mod tests {
             .collect()
     }
 
-    /// AC3 (issue #131): the security-critical env scrub is applied to the built command for BOTH
-    /// parametrizations — a caller silently dropping a scrub entry (an isolation regression) fails
+    /// The set of vars an arbitrary built command REMOVES — the [`scrubbed_vars`] projection for a
+    /// spawn that is not a [`SpawnPlan`] (the issue #783 login-shell harvest).
+    fn scrubbed_vars_of(command: &Command) -> BTreeSet<OsString> {
+        command
+            .as_std()
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_os_string())
+            .collect()
+    }
+
+    /// AC3 (issue #131): the security-critical env scrub is applied to the built command for EVERY
+    /// parametrization — a caller silently dropping a scrub entry (an isolation regression) fails
     /// here regardless of which path drops it.
+    ///
+    /// Extended by issue #783 to a THIRD parametrization, the login-shell PATH harvest
+    /// ([`crate::paths::build_login_shell_env_command`]). It is the only one that is not a `claude`
+    /// spawn, and the one with the sharpest need: it runs the user's login shell, which sources
+    /// ARBITRARY rc files. Renamed from `both_parametrizations_…` at the same time — with three
+    /// callers the old name asserted something no longer true, and a test name that has quietly
+    /// become false is exactly the class of stale documentation this suite exists to prevent.
     #[test]
-    fn both_parametrizations_apply_the_full_scrub_set() {
+    fn all_parametrizations_apply_the_full_scrub_set() {
         let expected: BTreeSet<OsString> = SPAWN_ENV_REMOVE
             .iter()
             .map(|s| OsString::from(*s))
@@ -418,6 +438,15 @@ mod tests {
             expected,
             "the login spawn must scrub the full credential/config-override set — a dropped entry \
              is a silent isolation regression on the login path"
+        );
+        assert_eq!(
+            scrubbed_vars_of(&crate::paths::build_login_shell_env_command(Path::new(
+                "/bin/zsh"
+            ))),
+            expected,
+            "the login-shell PATH harvest (issue #783) must scrub the full \
+             credential/config-override set — it runs the user's login shell, which sources \
+             arbitrary rc files, so a dropped entry leaks a live credential into them"
         );
     }
 
