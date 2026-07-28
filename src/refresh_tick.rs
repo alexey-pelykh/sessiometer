@@ -45,12 +45,13 @@
 //! `PokeEngine`) and a [`Clock`] seam, so the whole tick runs hermetically against in-memory
 //! fakes in tests; production wires [`RealRefreshEngine`] + [`crate::contract::RealClock`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::{Account, RefreshConfig};
 use crate::contract::{Clock, RefreshDelta, RefreshObservation, RefreshTicker, SweepOutcome};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::observability::{Event, RefreshEventOutcome, RefreshEventReason};
 use crate::paths;
 use crate::refresh::{self, RefreshErrorReason, RefreshOutcome, RefreshReport};
@@ -123,6 +124,85 @@ pub(crate) trait RefreshEngine {
     async fn stored_expires_at(&self, account: &Account) -> Option<i64>;
     /// Run one isolated-refresh cycle for `account` (the #102 engine).
     async fn refresh(&self, account: &Account) -> Result<RefreshReport>;
+    /// TAKE the `claude`-binary resolution worth putting on the log, if the cycle just run
+    /// produced one (issue #786) — the path when it was the FIRST resolution or a CHANGE,
+    /// `None` when it merely repeated the last one already surfaced.
+    ///
+    /// A drain, not a getter: [`run_sweep`](RefreshTick::run_sweep) calls it once per cycle and
+    /// emits an [`Event::RefreshBinaryResolved`] for whatever it hands back, so a path taken is
+    /// a path logged. The edge-triggering itself lives in the engine, next to the resolution it
+    /// observes ([`ResolvedBinaryObserver`]); the sweep only ferries the result onto the channel.
+    ///
+    /// REQUIRED, not defaulted: an engine that resolves a binary and forgets to override would
+    /// silently drop the line — and a silent drop is what this module's classification discipline
+    /// exists to prevent ([`refresh_event_reason`] has no `_` arm, so a new variant is a COMPILE
+    /// error rather than a dropped `reason=`). An engine with nothing to report answers `None`,
+    /// but it has to answer.
+    fn take_resolved_binary(&self) -> Option<PathBuf>;
+}
+
+/// The edge-trigger behind the `claude`-binary resolution line (issue #786).
+///
+/// [`RealRefreshEngine::resolve_binary`] runs PER ACCOUNT, PER CYCLE — #375 moved it to the spawn
+/// site precisely so a mid-run change is picked up — so logging every SUCCESSFUL resolution would
+/// put one identical line per account on the channel every sweep, forever. That buries the signal
+/// it was added to give and works against issue #15's "carry only what is needed". This holds the
+/// last path already SURFACED and yields a line only when a resolution is NEW: the first one, or a
+/// change (a `claude` that MOVED is the diagnostically interesting event; one that stayed put is
+/// noise).
+///
+/// Two consequences fall out of judging "new" against the last SURFACED path rather than the last
+/// observed one. The N accounts of a single sweep resolving the same binary yield ONE line, not N.
+/// And a resolution FAILURE clears the memory, so the success that follows re-emits — a `claude`
+/// that came BACK is exactly as worth seeing as one that moved, and a recovery must never be
+/// silent just because it restored the previous path.
+///
+/// `std::sync::Mutex`, not the `tokio` one `paths`' harvest memo uses: nothing here is held across
+/// an `await` (the observe and the drain are both synchronous), so an async mutex would buy
+/// nothing. Lock poisoning is absorbed rather than unwrapped — the daemon must not die on a
+/// diagnostic, and the worst a recovered-from-poison state can do is emit one redundant line.
+#[derive(Debug, Default)]
+struct ResolvedBinaryObserver {
+    state: Mutex<ObserverState>,
+}
+
+/// [`ResolvedBinaryObserver`]'s two slots: what has been surfaced, and what is waiting to be.
+#[derive(Debug, Default)]
+struct ObserverState {
+    /// The last path SURFACED on the log — the value "changed?" is judged against. `None` before
+    /// the first success, and again after any resolution failure (so a recovery re-emits).
+    surfaced: Option<PathBuf>,
+    /// A path observed as new and not yet drained by [`RefreshEngine::take_resolved_binary`].
+    pending: Option<PathBuf>,
+}
+
+impl ResolvedBinaryObserver {
+    /// Record one cycle's resolution outcome: `Some(path)` for a success, `None` for a failure.
+    fn note(&self, resolved: Option<&Path>) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        match resolved {
+            // Unchanged from the last surfaced path ⇒ nothing to say.
+            Some(path) if state.surfaced.as_deref() == Some(path) => {}
+            // News (the first resolution, or a change) ⇒ arm the line.
+            Some(path) => {
+                state.surfaced = Some(path.to_path_buf());
+                state.pending = Some(path.to_path_buf());
+            }
+            // A failure forgets the surfaced path, so the next success is a CHANGE and re-emits.
+            // `pending` is deliberately left alone: a resolution armed but not yet drained is
+            // still true and still unlogged.
+            None => state.surfaced = None,
+        }
+    }
+
+    /// Take the armed path, if any — see [`RefreshEngine::take_resolved_binary`].
+    fn take(&self) -> Option<PathBuf> {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pending
+            .take()
+    }
 }
 
 /// The production [`RefreshEngine`]: the real keychain-backed stash plus the
@@ -139,11 +219,20 @@ pub(crate) trait RefreshEngine {
 pub(crate) struct RealRefreshEngine {
     stash: RealAccountStash,
     claude_bin: Option<PathBuf>,
+    /// The edge-trigger for the resolved-binary log line (issue #786), sited HERE because this
+    /// is where resolution happens. Per-engine, not process-wide: `cli` builds one engine for the
+    /// #105 sweep and a second for the #162 poll path, and only the sweep drains — a process-wide
+    /// memo would let one path's resolution silence the other's first line.
+    binary_observer: ResolvedBinaryObserver,
 }
 
 impl RealRefreshEngine {
     pub(crate) fn new(stash: RealAccountStash, claude_bin: Option<PathBuf>) -> Self {
-        Self { stash, claude_bin }
+        Self {
+            stash,
+            claude_bin,
+            binary_observer: ResolvedBinaryObserver::default(),
+        }
     }
 
     /// Resolve the `claude` binary to spawn THIS cycle (issue #375) via the shared resolution
@@ -162,8 +251,14 @@ impl RealRefreshEngine {
     /// sweep regardless of roster size: the harvested PATH is memoized process-wide under
     /// [`paths::HARVESTED_PATH_TTL`], while the directory scan — the part #375 cares about —
     /// still runs on every single call.
+    ///
+    /// Every outcome — success AND failure — is handed to the [`ResolvedBinaryObserver`] (issue
+    /// #786), which decides whether it is worth a line. Noting the FAILURES matters as much as the
+    /// successes: it is what makes the recovery afterwards visible instead of silently identical.
     async fn resolve_binary(&self) -> Result<PathBuf> {
-        paths::claude_binary_with_override(self.claude_bin.as_deref()).await
+        let resolved = paths::claude_binary_with_override(self.claude_bin.as_deref()).await;
+        self.binary_observer.note(resolved.as_deref().ok());
+        resolved
     }
 }
 
@@ -183,6 +278,10 @@ impl RefreshEngine for RealRefreshEngine {
             claude_binary,
         )
         .await
+    }
+
+    fn take_resolved_binary(&self) -> Option<PathBuf> {
+        self.binary_observer.take()
     }
 }
 
@@ -392,16 +491,35 @@ impl<E: RefreshEngine, K: Clock> RefreshTick<E, K> {
             // the refresh-health delta (classification + token-rotation) the rollup keys off.
             let cycle =
                 tokio::time::timeout(self.config.timeout(), self.engine.refresh(account)).await;
-            // The OUTER `Err` is the whole-cycle timeout bound firing → `reason=timeout` (#377);
-            // a hard engine `Err` (`Ok(Err)`) has no secret-free sub-class → no `reason=`.
-            // Computed before the match consumes `cycle`.
-            let timeout_reason = cycle.is_err().then_some(RefreshEventReason::Timeout);
+            // WHICH `claude` this cycle resolved, but only when that is NEWS (issue #786): the
+            // first resolution, or a change. Drained BEFORE the refresh event is pushed, so the
+            // path an operator needs reads immediately ahead of the outcome it explains — and
+            // drained per cycle rather than per sweep so the recovery inside a sweep is not held
+            // back to the next one. The engine owns the edge-trigger; this only ferries it.
+            if let Some(path) = self.engine.take_resolved_binary() {
+                outcome.events.push(Event::RefreshBinaryResolved { path });
+            }
             // Classify ONCE — drives the event, the #119 observation, AND the #408 back-off fold.
             // A completed cycle keeps its report (for the expiry slide + rotation); a hard `Err` /
             // timeout has no report and is an `Error` outcome with the expiry held at the before.
-            let (event_outcome, report) = match cycle {
-                Ok(Ok(report)) => (refresh_event_outcome(&report), Some(report)),
-                Ok(Err(_)) | Err(_) => (RefreshEventOutcome::Error, None),
+            //
+            // `error_reason` is the non-secret `reason=` sub-class for a cycle that produced no
+            // report. The OUTER `Err` is the whole-cycle timeout bound firing → `reason=timeout`
+            // (#377). An `Ok(Err)` is a hard engine `Err` — a variant this arm used to discard
+            // outright (`Ok(Err(_))`) and now hands to `engine_error_reason`, which classifies the
+            // unresolved binary and leaves every other hard `Err` bare (issue #786).
+            let (event_outcome, report, error_reason) = match cycle {
+                Ok(Ok(report)) => (refresh_event_outcome(&report), Some(report), None),
+                Ok(Err(error)) => (
+                    RefreshEventOutcome::Error,
+                    None,
+                    engine_error_reason(&error),
+                ),
+                Err(_) => (
+                    RefreshEventOutcome::Error,
+                    None,
+                    Some(RefreshEventReason::Timeout),
+                ),
             };
             // RESTORE a quarantined account ONLY when THIS cycle persisted the fresh token
             // (`Refreshed` AND `re_stashed`): then the canonical demonstrably holds a token we know
@@ -463,7 +581,7 @@ impl<E: RefreshEngine, K: Clock> RefreshTick<E, K> {
                 // `Err` carries no secret-free reason. The stash is untouched, so the rollup sees
                 // a refresh failure (→ at-risk) with the expiry held at the before, never a slide.
                 None => (
-                    error_refresh_event(&account.label, before_ms, timeout_reason, backoff_secs),
+                    error_refresh_event(&account.label, before_ms, error_reason, backoff_secs),
                     RefreshObservation {
                         account_uuid: account.account_uuid.clone(),
                         expires_at_ms: before_ms,
@@ -602,10 +720,10 @@ pub(crate) fn refresh_event(
 /// error Display is deliberately NOT folded in — the structured event carries only the
 /// non-secret class, and that field discipline is what keeps the channel #15-clean.
 ///
-/// `reason` is the non-secret `reason=` sub-class (issue #377): `Some(Timeout)` when the
-/// whole-cycle timeout bound fired, `None` for a hard engine `Err` (a locked keychain, a
-/// contended lock, an FS error, an unresolved binary) — that carries no secret-free class, so
-/// it renders a bare `outcome=error`.
+/// `reason` is the non-secret `reason=` sub-class: `Some(Timeout)` when the whole-cycle timeout
+/// bound fired (#377), `Some(Unresolved)` when the `claude` binary could not be located at all
+/// (#786), and `None` for every hard engine `Err` that still carries no secret-free class — a
+/// locked keychain, a contended lock, an FS error — which renders a bare `outcome=error`.
 ///
 /// `backoff_secs` (issue #408) is the per-account refresh back-off THIS error armed, in seconds
 /// — always an error path here, so it is `Some` whenever the sweep advanced the streak. Passed by
@@ -653,9 +771,11 @@ pub(crate) fn refresh_event_outcome(report: &RefreshReport) -> RefreshEventOutco
 /// or `None` for any non-error outcome — the event-level [`RefreshEventReason`] mirror of the
 /// engine's [`RefreshErrorReason`]. Every arm is explicit (no `_`), exactly like
 /// [`refresh_event_outcome`]: a future engine [`RefreshOutcome`] or [`RefreshErrorReason`] variant
-/// is then a COMPILE error here, never a silently dropped `reason=`. [`RefreshEventReason::Timeout`]
-/// has no arm — it is NOT reachable from a completed report (it is the tick's `timeout` bound,
-/// supplied directly at the error arm of the sweep).
+/// is then a COMPILE error here, never a silently dropped `reason=`. The two EVENT-level-only
+/// reasons have no arm, because neither is reachable from a completed report:
+/// [`RefreshEventReason::Timeout`] is the tick's `timeout` bound and
+/// [`RefreshEventReason::Unresolved`] is a resolution failure that precedes any cycle (issue
+/// #786) — both supplied directly at the error arm of the sweep.
 fn refresh_event_reason(report: &RefreshReport) -> Option<RefreshEventReason> {
     let reason = match report.outcome {
         RefreshOutcome::Error(reason) => reason,
@@ -668,6 +788,27 @@ fn refresh_event_reason(report: &RefreshReport) -> Option<RefreshEventReason> {
         RefreshErrorReason::ReadbackUnreadable => RefreshEventReason::ReadbackUnreadable,
         RefreshErrorReason::Malformed => RefreshEventReason::Malformed,
     })
+}
+
+/// Map a HARD engine `Err` — a cycle that produced no [`RefreshReport`] at all — to its non-secret
+/// `reason=` sub-class, or `None` when it has none (issue #786).
+///
+/// Exactly ONE variant classifies: [`Error::ClaudeBinaryNotFound`] → `reason=unresolved`. That is
+/// the whole of #786's widening, and the narrowness is the point. The other hard `Err`s a cycle
+/// can raise — a locked keychain, a contended lock, an FS error — each need their own issue #15
+/// analysis before they earn a token, and #786 scoped itself to the one cause it had 24 h of field
+/// evidence for. Until then they keep rendering a bare `outcome=error`, exactly as before.
+///
+/// Deliberately NOT an exhaustive match, and this is the one place in this module where that is
+/// right. [`refresh_event_reason`] and [`refresh_event_outcome`] enumerate every arm of the small,
+/// closed, purpose-built refresh classification enums so a new variant is a COMPILE error rather
+/// than a silent drop. [`Error`] is neither small nor closed nor purpose-built: it spans the whole
+/// crate's failure surface, and the CORRECT default for a new variant of it is precisely to stay
+/// unclassified. Forcing every future CLI / config / keychain error to declare a refresh `reason=`
+/// would be noise that answers itself `None`. The classification enums keep the discipline; the
+/// narrowing predicate does not pretend to it.
+fn engine_error_reason(error: &Error) -> Option<RefreshEventReason> {
+    matches!(error, Error::ClaudeBinaryNotFound).then_some(RefreshEventReason::Unresolved)
 }
 
 /// The stored token's `expiresAt` AFTER the cycle (epoch ms). ONLY a re-stashed refresh
@@ -770,6 +911,13 @@ mod tests {
         Report(RefreshReport),
         /// A hard cycle error (the engine's `Err` channel — e.g. a contended lock).
         HardError,
+        /// A hard cycle error from a LOCKED KEYCHAIN specifically (issue #786): the hard `Err`
+        /// that must STAY unclassified, so the narrowness of the `reason=unresolved` widening is
+        /// asserted rather than assumed.
+        KeychainLocked,
+        /// The `claude` binary could not be located (issue #786) — the hard `Err` the sweep now
+        /// classifies as `reason=unresolved`.
+        Unresolved,
         /// Sleeps past any sane timeout, to exercise the whole-cycle timeout bound.
         Hang,
     }
@@ -788,6 +936,14 @@ mod tests {
         scripts: RefCell<HashMap<String, Vec<FakeRefresh>>>,
         refreshed: RefCell<Vec<String>>,
         expiry_reads: RefCell<Vec<String>>,
+        /// Scripted `claude`-binary RESOLUTIONS (issue #786), consumed one per `refresh` call in
+        /// call order — engine-wide, not per-account, because that is how the real one behaves:
+        /// `RealRefreshEngine::resolve_binary` takes no account and re-runs the same three-tier
+        /// policy every cycle. `Some(path)` resolves; `None` fails.
+        resolutions: RefCell<Vec<Option<PathBuf>>>,
+        /// The REAL edge-trigger under test — the same [`ResolvedBinaryObserver`] production runs,
+        /// so these tests exercise the shipped state machine rather than a mirror of it.
+        binary_observer: ResolvedBinaryObserver,
     }
 
     impl FakeEngine {
@@ -798,7 +954,18 @@ mod tests {
                 scripts: RefCell::new(HashMap::new()),
                 refreshed: RefCell::new(Vec::new()),
                 expiry_reads: RefCell::new(Vec::new()),
+                resolutions: RefCell::new(Vec::new()),
+                binary_observer: ResolvedBinaryObserver::default(),
             }
+        }
+        /// Script the per-cycle binary resolutions (issue #786), consumed front-to-back across
+        /// every `refresh` call the engine serves — within one sweep AND across sweeps.
+        fn with_resolutions(self, resolutions: &[Option<&str>]) -> Self {
+            *self.resolutions.borrow_mut() = resolutions
+                .iter()
+                .map(|r| r.map(PathBuf::from))
+                .collect::<Vec<_>>();
+            self
         }
         fn with_expiry(mut self, uuid: &str, expires_at: Option<i64>) -> Self {
             self.expiries.insert(uuid.to_owned(), expires_at);
@@ -834,6 +1001,20 @@ mod tests {
             self.refreshed
                 .borrow_mut()
                 .push(account.account_uuid.clone());
+            // Model the real engine's per-cycle resolution (issue #786) when one is scripted:
+            // observe the outcome, then short-circuit on failure exactly as
+            // `RealRefreshEngine::refresh`'s `?` does. Engines with no script resolve nothing and
+            // report nothing, which is why every pre-#786 test is untouched.
+            let resolution = {
+                let mut resolutions = self.resolutions.borrow_mut();
+                (!resolutions.is_empty()).then(|| resolutions.remove(0))
+            };
+            if let Some(resolution) = resolution {
+                self.binary_observer.note(resolution.as_deref());
+                if resolution.is_none() {
+                    return Err(crate::error::Error::ClaudeBinaryNotFound);
+                }
+            }
             // Pick the result — a scripted step (if any remain), else the fixed per-account result,
             // else the `NoChange` default — and DROP the `scripts` borrow before any `await`.
             let scripted = self
@@ -846,12 +1027,20 @@ mod tests {
             match fake {
                 Some(FakeRefresh::Report(r)) => Ok(r),
                 Some(FakeRefresh::HardError) => Err(crate::error::Error::SwapLockBusy),
+                Some(FakeRefresh::KeychainLocked) => {
+                    Err(crate::error::Error::KeychainLocked { op: "read" })
+                }
+                Some(FakeRefresh::Unresolved) => Err(crate::error::Error::ClaudeBinaryNotFound),
                 Some(FakeRefresh::Hang) => {
                     tokio::time::sleep(Duration::from_secs(10_000)).await;
                     Ok(report(RefreshOutcome::Refreshed, true))
                 }
                 None => Ok(report(RefreshOutcome::NoChange, false)),
             }
+        }
+
+        fn take_resolved_binary(&self) -> Option<PathBuf> {
+            self.binary_observer.take()
         }
     }
 
@@ -1383,9 +1572,10 @@ mod tests {
     #[tokio::test]
     async fn sweep_records_an_error_event_for_a_hard_failure() {
         // A hard engine `Err` is an `error` event with the stored expiry unchanged — the
-        // error Display never reaches the structured event (only the class does). A hard
-        // `Err` has NO secret-free sub-class among the fixed #377 set, so it renders a bare
-        // `outcome=error` with `reason: None` — distinct from a timeout (which is `Timeout`).
+        // error Display never reaches the structured event (only the class does). An
+        // UNCLASSIFIED hard `Err` (here a contended swap lock) has no secret-free sub-class, so
+        // it renders a bare `outcome=error` with `reason: None` — distinct from a timeout
+        // (`Timeout`) and from an unresolvable binary (`Unresolved`, issue #786).
         let now_ms = now_ms();
         let soon = now_ms + 60_000;
         let roster = vec![acct("work", "u-A")];
@@ -1403,7 +1593,7 @@ mod tests {
                 expires_after: Some(soon),
                 // A hard `Err` has no report to source a rotation from → `false` (#279).
                 refresh_token_rotated: false,
-                reason: None, // hard `Err`: no secret-free sub-class → no `reason=` (#377)
+                reason: None, // unclassified hard `Err`: no sub-class → no `reason=` (#377)
                 // This FIRST error arms the #408 per-account back-off: streak 1, base = idle_after
                 // (60 s) × 2^1 = 120 s (below the 3600 s cap), surfaced on the error event.
                 backoff_secs: Some(120),
@@ -1413,10 +1603,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn sweep_records_a_timeout_reason_on_a_hung_cycle() {
-        // Issue #377: a whole-cycle TIMEOUT is the one error sub-cause detected OUTSIDE a
-        // completed engine cycle — the tick's `tokio::time::timeout` bound firing — so it is
-        // event-level only and renders `reason=timeout`, distinct from a hard `Err`'s bare
-        // `outcome=error`. `start_paused` auto-advances the virtual clock past the 5 s bound.
+        // Issue #377: a whole-cycle TIMEOUT is detected OUTSIDE a completed engine cycle — the
+        // tick's `tokio::time::timeout` bound firing — so it is event-level only and renders
+        // `reason=timeout`, distinct from an unclassified hard `Err`'s bare `outcome=error`.
+        // `start_paused` auto-advances the virtual clock past the 5 s bound.
         let now_ms = now_ms();
         let soon = now_ms + 60_000;
         let roster = vec![acct("work", "u-A")];
@@ -1440,6 +1630,290 @@ mod tests {
                 backoff_secs: Some(120),
             }]
         );
+    }
+
+    // --- the unresolved-binary classification (issue #786) ------------------
+
+    #[tokio::test]
+    async fn sweep_classifies_an_unresolvable_claude_binary_as_reason_unresolved() {
+        // T2 — the whole point of #786. A `ClaudeBinaryNotFound` arrives as a hard engine `Err`,
+        // and the sweep used to throw the variant away (`Ok(Err(_)) => (Error, None)`), leaving
+        // the #375-class outage the `reason=` vocabulary was built for as the one outage it
+        // could not name: 83 identical bare `error` lines over 24 h, with `status` pointing the
+        // operator at a `reason=` field no refresh event had ever populated.
+        let now_ms = now_ms();
+        let soon = now_ms + 60_000;
+        let roster = vec![acct("work", "u-A")];
+        let engine = FakeEngine::new()
+            .with_expiry("u-A", Some(soon))
+            .with_result("u-A", FakeRefresh::Unresolved);
+        let mut t = tick(roster, cfg(3600, 60, &[]), engine);
+        let outcome = t.sweep(&[], &[]).await;
+        assert_eq!(
+            outcome.events,
+            vec![Event::Refresh {
+                account: "work".to_owned(),
+                outcome: RefreshEventOutcome::Error,
+                expires_before: Some(soon),
+                expires_after: Some(soon),
+                refresh_token_rotated: false,
+                reason: Some(RefreshEventReason::Unresolved),
+                // An unresolved binary is an `error` too → the #408 back-off arms unchanged.
+                backoff_secs: Some(120),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_leaves_a_locked_keychain_error_unclassified() {
+        // T3 — the GUARD on #786's narrowness. The widening classified exactly one hard `Err`;
+        // a locked keychain is a different failure needing its own issue #15 analysis, so it
+        // must still render a bare `outcome=error`. Without this, a later blanket
+        // `Ok(Err(_)) => Some(Unresolved)` would pass every other test in this module.
+        let now_ms = now_ms();
+        let soon = now_ms + 60_000;
+        let roster = vec![acct("work", "u-A")];
+        let engine = FakeEngine::new()
+            .with_expiry("u-A", Some(soon))
+            .with_result("u-A", FakeRefresh::KeychainLocked);
+        let mut t = tick(roster, cfg(3600, 60, &[]), engine);
+        let outcome = t.sweep(&[], &[]).await;
+        assert_eq!(
+            outcome.events,
+            vec![Event::Refresh {
+                account: "work".to_owned(),
+                outcome: RefreshEventOutcome::Error,
+                expires_before: Some(soon),
+                expires_after: Some(soon),
+                refresh_token_rotated: false,
+                reason: None, // STILL unclassified — #786 did not widen to this cause
+                backoff_secs: Some(120),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_still_maps_a_completed_cycles_spawn_failure_to_reason_spawn_failed() {
+        // T4 — the pre-existing completed-cycle mapping is untouched by #786. A spawn failure is
+        // a report the engine PRODUCED (the binary resolved, then would not exec), so it still
+        // routes through `refresh_event_reason`, not the new hard-`Err` narrowing — the very
+        // distinction `unresolved` (could not FIND it) draws against `spawn_failed`.
+        let now_ms = now_ms();
+        let soon = now_ms + 60_000;
+        let roster = vec![acct("work", "u-A")];
+        let engine = FakeEngine::new()
+            .with_expiry("u-A", Some(soon))
+            .with_result(
+                "u-A",
+                FakeRefresh::Report(report(
+                    RefreshOutcome::Error(RefreshErrorReason::SpawnFailed),
+                    false,
+                )),
+            );
+        let mut t = tick(roster, cfg(3600, 60, &[]), engine);
+        let outcome = t.sweep(&[], &[]).await;
+        assert_eq!(
+            outcome.events,
+            vec![Event::Refresh {
+                account: "work".to_owned(),
+                outcome: RefreshEventOutcome::Error,
+                expires_before: Some(soon),
+                expires_after: Some(soon),
+                refresh_token_rotated: false,
+                reason: Some(RefreshEventReason::SpawnFailed),
+                backoff_secs: Some(120),
+            }]
+        );
+    }
+
+    // --- the resolved-binary line, edge-triggered (issue #786) --------------
+
+    /// The `path` of every [`Event::RefreshBinaryResolved`] in `events`, in order — the surface
+    /// the AC9 / AC10 edge-trigger is asserted against.
+    fn resolved_paths(events: &[Event]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::RefreshBinaryResolved { path } => Some(path.display().to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn repeated_cycles_resolving_the_same_binary_log_the_path_once() {
+        // T11 — the anti-spam property. Resolution runs per account per cycle, so an
+        // unconditional line would be one per account per sweep, forever. Two sweeps here, both
+        // resolving the same `claude`: the first is news, the second is not.
+        let now_ms = now_ms();
+        let soon = now_ms + 60_000;
+        let roster = vec![acct("work", "u-A")];
+        let engine = FakeEngine::new()
+            .with_expiry("u-A", Some(soon))
+            .with_resolutions(&[
+                Some("/opt/homebrew/bin/claude"),
+                Some("/opt/homebrew/bin/claude"),
+            ]);
+        let mut t = tick(roster, cfg(3600, 60, &[]), engine);
+        let first = t.sweep(&[], &[]).await;
+        let second = t.sweep(&[], &[]).await;
+        assert_eq!(
+            resolved_paths(&first.events),
+            vec!["/opt/homebrew/bin/claude".to_owned()],
+            "the FIRST resolution is news"
+        );
+        assert!(
+            resolved_paths(&second.events).is_empty(),
+            "an unchanged re-resolution is noise: {:?}",
+            second.events
+        );
+    }
+
+    #[tokio::test]
+    async fn a_changed_binary_path_logs_a_new_line() {
+        // T12 — the case actually worth seeing: a `claude` that MOVED between cycles (an
+        // auto-update, a version-dir swap, a newly-shadowing entry earlier on the PATH). Without
+        // this the edge-trigger could degenerate into "log once, ever" and hide the change.
+        let now_ms = now_ms();
+        let soon = now_ms + 60_000;
+        let roster = vec![acct("work", "u-A")];
+        let engine = FakeEngine::new()
+            .with_expiry("u-A", Some(soon))
+            .with_resolutions(&[
+                Some("/opt/homebrew/bin/claude"),
+                Some("/Users/o/.local/bin/claude"),
+            ]);
+        let mut t = tick(roster, cfg(3600, 60, &[]), engine);
+        let first = t.sweep(&[], &[]).await;
+        let second = t.sweep(&[], &[]).await;
+        assert_eq!(
+            resolved_paths(&first.events),
+            vec!["/opt/homebrew/bin/claude".to_owned()]
+        );
+        assert_eq!(
+            resolved_paths(&second.events),
+            vec!["/Users/o/.local/bin/claude".to_owned()],
+            "a path that changed is the diagnostically interesting event"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_sweep_over_many_accounts_logs_the_shared_binary_once() {
+        // T13 — the within-sweep dedup (AC10). Every account resolves the same binary because
+        // resolution does not depend on the account, so a three-account roster must yield ONE
+        // line, not three. This falls out of judging "changed?" against the last SURFACED path.
+        let now_ms = now_ms();
+        let soon = now_ms + 60_000;
+        let roster = vec![acct("a", "u-A"), acct("b", "u-B"), acct("c", "u-C")];
+        let engine = FakeEngine::new()
+            .with_expiry("u-A", Some(soon))
+            .with_expiry("u-B", Some(soon))
+            .with_expiry("u-C", Some(soon))
+            .with_resolutions(&[
+                Some("/opt/homebrew/bin/claude"),
+                Some("/opt/homebrew/bin/claude"),
+                Some("/opt/homebrew/bin/claude"),
+            ]);
+        let mut t = tick(roster, cfg(3600, 60, &[]), engine);
+        let outcome = t.sweep(&[], &[]).await;
+        assert_eq!(t.engine.refreshed(), vec!["u-A", "u-B", "u-C"]);
+        assert_eq!(
+            resolved_paths(&outcome.events),
+            vec!["/opt/homebrew/bin/claude".to_owned()],
+            "one sweep, one shared binary, one line: {:?}",
+            outcome.events
+        );
+    }
+
+    #[tokio::test]
+    async fn a_recovered_resolution_logs_the_path_again() {
+        // T14 — a RECOVERY must be visible. Naively, "log only on change" silences the success
+        // that follows a failure whenever the binary came back at the SAME path — the single
+        // most reassuring line an operator staring at a refresh outage can get. The failure
+        // therefore CLEARS the surfaced path, so the next success counts as new again.
+        //
+        // Staged within one sweep (b's resolution fails between a's and c's) so no clock has to
+        // advance past the #408 back-off window the failure arms.
+        let now_ms = now_ms();
+        let soon = now_ms + 60_000;
+        let roster = vec![acct("a", "u-A"), acct("b", "u-B"), acct("c", "u-C")];
+        let engine = FakeEngine::new()
+            .with_expiry("u-A", Some(soon))
+            .with_expiry("u-B", Some(soon))
+            .with_expiry("u-C", Some(soon))
+            .with_resolutions(&[
+                Some("/opt/homebrew/bin/claude"),
+                None,                             // the binary vanished mid-sweep
+                Some("/opt/homebrew/bin/claude"), // …and came back, at the SAME path
+            ]);
+        let mut t = tick(roster, cfg(3600, 60, &[]), engine);
+        let outcome = t.sweep(&[], &[]).await;
+        assert_eq!(
+            resolved_paths(&outcome.events),
+            vec![
+                "/opt/homebrew/bin/claude".to_owned(),
+                "/opt/homebrew/bin/claude".to_owned(),
+            ],
+            "the failure→success transition re-emits: {:?}",
+            outcome.events
+        );
+        // And the failed cycle itself is classified — the two halves of #786 on one line each.
+        let reasons: Vec<_> = outcome
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Refresh {
+                    account, reason, ..
+                } => Some((account.as_str(), *reason)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reasons,
+            vec![
+                ("a", None),
+                ("b", Some(RefreshEventReason::Unresolved)),
+                ("c", None),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_resolved_binary_line_precedes_the_refresh_event_it_explains() {
+        // Ordering, so the log READS as an explanation: the path an operator needs sits
+        // immediately ahead of the outcome it accounts for, not after it or at the sweep's end.
+        let now_ms = now_ms();
+        let soon = now_ms + 60_000;
+        let roster = vec![acct("work", "u-A")];
+        let engine = FakeEngine::new()
+            .with_expiry("u-A", Some(soon))
+            .with_resolutions(&[Some("/opt/homebrew/bin/claude")]);
+        let mut t = tick(roster, cfg(3600, 60, &[]), engine);
+        let outcome = t.sweep(&[], &[]).await;
+        assert!(
+            matches!(
+                outcome.events.as_slice(),
+                [Event::RefreshBinaryResolved { .. }, Event::Refresh { .. }]
+            ),
+            "resolution first, then the cycle it explains: {:?}",
+            outcome.events
+        );
+    }
+
+    #[test]
+    fn a_failed_resolution_never_arms_a_path_line() {
+        // The observer's own contract, asserted directly: a failure has no path to surface, and
+        // must not resurrect a previously surfaced one. (The `reason=unresolved` line is where a
+        // failure becomes visible; this line is only ever about a path that EXISTS.)
+        let observer = ResolvedBinaryObserver::default();
+        observer.note(None);
+        assert_eq!(observer.take(), None);
+        observer.note(Some(Path::new("/opt/homebrew/bin/claude")));
+        assert_eq!(
+            observer.take(),
+            Some(PathBuf::from("/opt/homebrew/bin/claude"))
+        );
+        assert_eq!(observer.take(), None, "a drained path is not re-served");
     }
 
     // --- credential-clock observations (issue #119) ------------------------
