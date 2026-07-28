@@ -128,7 +128,10 @@ Two measured facts from building that gate, recorded because they are easy to re
 - The card's single-line strings use at most **43 %** of the card at every Dynamic Type class, so the
   "scaled font in an unscaled cell" mutation that falsifies `PanelTextMetricsTests`' sweep cannot trip
   that half of this one. Its falsifier is an over-wide fixture instead; the wrapping half keeps the
-  scale mutation, where it trips decisively (2 lines → 4).
+  scale mutation, where it trips decisively (2 lines → 4). Neither number is left to this paragraph:
+  the sweep re-derives the worst ratio every run and reddens if copy growth closes the margin, and
+  `testTheScaleMutationIsProvablyInertOnTheSingleLineLane` re-measures the mutated case (~92 % of an
+  unscaled card) that makes the over-wide fixture the honest falsifier here.
 
 **Harness limitation — ARMED / in-flight states are NOT captured.** `ImageRenderer` draws one resting
 frame. As of #448 the per-row manual-switch chip is PERSISTENT, so a render captures its resting glyph

@@ -45,8 +45,9 @@ import Foundation
 ///
 /// Read the property list as a CONTRACT, not as a convenience struct: it is the complete set of values
 /// `UserNotificationPresenter` is allowed to populate, and the source pin in `NotificationDeliveryTests`
-/// enforces that. Adding a field here is how you widen the delivery surface; adding one to the presenter
-/// without adding it here reddens the gate.
+/// is the tripwire holding it there — a tripwire against the realistic regression, not a proof (this
+/// file's header states exactly what it cannot see). Adding a field here is how you widen the delivery
+/// surface; adding one to the presenter without adding it here reddens the gate.
 ///
 /// Every field is a NON-SECRET by construction, and the construction is the point: `plan(for:)` takes an
 /// `AccountEvent`, which carries no associated value (issue #267), so there is no account-specific value

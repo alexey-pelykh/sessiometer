@@ -50,7 +50,6 @@
 
 #if DEBUG
 import AppKit
-import CoreText
 import SwiftUI
 import XCTest
 
@@ -100,7 +99,7 @@ final class PanelCaptureCardTests: XCTestCase {
         [("explainer", StatusPanelFormat.captureCardExplainer, explainerFont(k)),
          ("scope hint", StatusPanelFormat.captureScopeHint, hintFont(k))]
             + captureFailures.map {
-                ("error status (\($0.0))", StatusPanelFormat.captureErrorText($0.1), statusFont(k))
+                ("error status (\($0.name))", StatusPanelFormat.captureErrorText($0.failure), statusFont(k))
             }
     }
 
@@ -116,7 +115,7 @@ final class PanelCaptureCardTests: XCTestCase {
     /// Every `CaptureFailure` the affordance can render, enumerated by hand because the type carries
     /// associated values and cannot be `CaseIterable`. `testEveryCaptureFailureIsEnumerated` is the guard
     /// that this list has not fallen behind the enum.
-    private let captureFailures: [(String, CaptureFailure)] = [
+    private let captureFailures: [(name: String, failure: CaptureFailure)] = [
         ("rejected/noActiveAccount", .rejected(.noActiveAccount)),
         ("rejected/keychainLocked", .rejected(.keychainLocked)),
         ("rejected/swapLockBusy", .rejected(.swapLockBusy)),
@@ -138,7 +137,8 @@ final class PanelCaptureCardTests: XCTestCase {
     /// silently moves every measurement below it. Pinning the arithmetic means a geometry change reddens
     /// HERE, with the derivation named, instead of quietly re-scaling the whole gate underneath itself.
     func testTheDerivedCaptureCardBudgetMatchesTheShippedGeometry() {
-        XCTAssertEqual(StatusPanelFormat.panelContentWidth, 380, accuracy: 0.001)
+        XCTAssertEqual(StatusPanelFormat.panelContentWidth, 380, accuracy: 0.001,
+                       "the panel's fixed content width — every budget below is derived from it")
         XCTAssertEqual(StatusPanelFormat.captureCardHorizontalInset, 12, accuracy: 0.001,
                        "the `.padding(.horizontal,)` both StatusPanelView call sites apply to the card")
         XCTAssertEqual(StatusPanelFormat.captureCardPadding, 12, accuracy: 0.001,
@@ -191,7 +191,7 @@ final class PanelCaptureCardTests: XCTestCase {
     func testTheDoneStatusLineElidesALongHandleUnderTheShippedPolicy() {
         let budget = StatusPanelFormat.captureCardTextBudget
         let font = statusFont()
-        let mode: CTLineTruncationType = StatusPanelFormat.identityElision == .middle ? .middle : .end
+        let mode = TextMetrics.truncationType(for: StatusPanelFormat.identityElision)
 
         let realistic = StatusPanelFormat.captureDoneText(label: "oleksii@company-one.com")
         assertFits(realistic, font, budget: budget, "capture done line (realistic handle)")
@@ -216,12 +216,15 @@ final class PanelCaptureCardTests: XCTestCase {
             .appendingPathComponent("Sources/StatusPanelFormat.swift")
         let source = try XCTUnwrap(try? String(contentsOf: url, encoding: .utf8),
                                    "could not read StatusPanelFormat.swift")
+        // The ORDER check is load-bearing, not defensive noise: an inverted range traps, and a trap takes
+        // the whole bundle down with a stack trace instead of this one actionable line.
         guard let start = source.range(of: "static func captureErrorText"),
-              let end = source.range(of: "// MARK: - Capture CARD copy") else {
+              let end = source.range(of: "// MARK: - Capture CARD copy"),
+              start.lowerBound < end.lowerBound else {
             return XCTFail("could not bound captureErrorText — re-point this assertion")
         }
         let body = source[start.lowerBound..<end.lowerBound]
-        let rendered = Set(captureFailures.map { StatusPanelFormat.captureErrorText($0.1) })
+        let rendered = Set(captureFailures.map { StatusPanelFormat.captureErrorText($0.failure) })
 
         // Every `return "…"` in the mapper must be reachable from the fixture list, so a NEW failure copy
         // that nothing above renders reddens here instead of going unmeasured.
@@ -283,12 +286,15 @@ final class PanelCaptureCardTests: XCTestCase {
 
     func testEveryCaptureStringStillFitsAtEveryDynamicTypeSizeClass() {
         var checked = 0
+        var widest = (name: "none", size: "", ratio: 0.0)
         for size in DynamicTypeSize.allCases {
             let k = PanelTypeScale.factor(for: size)
             let budget = StatusPanelFormat.captureCardTextBudget * k
             for cell in singleLineStrings(k) {
                 assertFits(cell.text, cell.font, budget: budget,
                            "capture card \(cell.name) at \(size) (k=\(String(format: "%.4f", k)))")
+                let ratio = TextMetrics.width(cell.text, cell.font) / budget
+                if ratio > widest.ratio { widest = (cell.name, "\(size)", ratio) }
                 checked += 1
             }
             for cell in wrappingStrings(k) {
@@ -306,6 +312,17 @@ final class PanelCaptureCardTests: XCTestCase {
         let perClass = 5 + 2 + captureFailures.count
         XCTAssertEqual(checked, DynamicTypeSize.allCases.count * perClass,
                        "expected \(DynamicTypeSize.allCases.count * perClass) measurements, ran \(checked)")
+
+        // The headroom the note below the next MARK reasons from, re-derived here instead of hand-copied
+        // into a comment that nothing reddens when copy grows. Half the card is the loosest bound that
+        // still makes the point: at this margin the scale mutation cannot reach the edge, which is why the
+        // single-line lane's canary is an over-wide fixture rather than that mutation.
+        XCTAssertLessThan(widest.ratio, 0.5, """
+            the widest shipped single-line string now reaches \
+            \(String(format: "%.0f", widest.ratio * 100)) % of the card (\(widest.name) at \(widest.size)). \
+            The "cannot be tripped by scaling alone" reasoning above this suite's canaries assumed a wide \
+            margin — re-read it, and consider promoting the scale mutation into the single-line lane.
+            """)
     }
 
     // MARK: - CONSTRAINT-A: the metrics lane PROVES it can fail, in the same run it passes
@@ -321,7 +338,9 @@ final class PanelCaptureCardTests: XCTestCase {
     //     fuse into one wrong sentence, so both are stated. (1) In the SHIPPED configuration the widest
     //     single-line string uses at most ~43 % of its budget — the classes are not equally tight, because
     //     glyph advance is not linear in point size, so the maximum ratio sits at a SMALL class, not the
-    //     largest one. (2) Under the MUTATION the tightest case is the onboarding title at
+    //     largest one. That bound is asserted, not narrated:
+    //     `testEveryCaptureStringStillFitsAtEveryDynamicTypeSizeClass` re-derives the worst ratio each run
+    //     and reddens if copy growth closes the margin this reasoning depends on. (2) Under the MUTATION the tightest case is the onboarding title at
     //     .accessibility3 — 305.50 pt measured against the UNSCALED 332 pt card, about 92 % of it, still
     //     inside. The remaining margin is small, which is exactly why (2) is not left as a hand-copied
     //     number: `testTheScaleMutationIsProvablyInertOnTheSingleLineLane` re-measures it every run.
@@ -574,7 +593,10 @@ final class PanelCaptureCardTests: XCTestCase {
         assertReachable(live, "CARD_ANCHOR", "the enablement canary (live)")
         assertReachable(dead, "CARD_ANCHOR", "the enablement canary (disabled)")
 
-        XCTAssertTrue(try XCTUnwrap(live.firstContaining("CANARY_FIELD")).enabled)
+        XCTAssertTrue(try XCTUnwrap(live.firstContaining("CANARY_FIELD")).enabled, """
+            an UNdisabled field already reports disabled, so the contrast below proves nothing — the flag \
+            would read "correctly disabled" for a field the operator can still type into.
+            """)
         XCTAssertFalse(try XCTUnwrap(dead.firstContaining("CANARY_FIELD")).enabled, """
             `.disabled(true)` did not change what the tree reports, so the in-flight assertion above \
             cannot fail — it would report a still-editable field as correctly disabled.

@@ -290,9 +290,7 @@ final class NotificationDeliveryTests: XCTestCase {
             again puts the delivered content back outside all of them.
             """)
 
-        let planFields = Set(NotificationLeakScan.fields(of: NotificationDelivery.plan(for: .swapped,
-                                                                                       requestIdentifier: "r"))
-            .map(\.name))
+        let planFields = Self.planFieldNames
         let writes = Self.assignedContentWrites(in: source)
         let assigned = Set(writes.keys)
         XCTAssertFalse(assigned.isEmpty,
@@ -387,10 +385,19 @@ final class NotificationDeliveryTests: XCTestCase {
                        "the provenance check must still ACCEPT the shipped form, or it fires on everything")
     }
 
-    /// The plan's field names, as the pin's canaries assert against them. Kept next to the canaries rather
-    /// than re-derived per test; the REAL pin reads them off the live plan by reflection instead.
-    private static let planFieldNames: Set<String> = ["title", "body", "threadIdentifier",
-                                                      "requestIdentifier"]
+    /// The shipped plan's field names, read off a LIVE plan by the same reflection the leak scan uses —
+    /// what the real pin above and both of its canaries assert against.
+    ///
+    /// Deliberately NOT a hand-listed copy sitting beside the canaries: a canary judged against a parallel
+    /// list would keep passing against yesterday's surface the day the plan widens, which is precisely the
+    /// failure `testTheLeakScanReachesAFieldThePlanDoesNotYetHave` exists to rule out one layer up. The set
+    /// is spelled out in exactly ONE place — `testTheScanReadsEveryFieldOfTheShippedPlan` — where recording
+    /// a new field is a deliberate act rather than a silent widening.
+    private static var planFieldNames: Set<String> {
+        Set(NotificationLeakScan.fields(of: NotificationDelivery.plan(for: .swapped,
+                                                                      requestIdentifier: "req-1"))
+            .map(\.name))
+    }
 
     // MARK: - AC-3: grouping / threading behaviour
 
@@ -417,7 +424,10 @@ final class NotificationDeliveryTests: XCTestCase {
         }
         // And the plan actually threads the caller's identity through rather than minting its own.
         XCTAssertEqual(NotificationDelivery.plan(for: .swapped, requestIdentifier: "req-7").requestIdentifier,
-                       "req-7")
+                       "req-7", """
+            the planner minted its own identity instead of threading the caller's, so the uniqueness \
+            asserted above is a property of freshRequestIdentifier() and not of what a post carries.
+            """)
     }
 
     /// The shipped grouping decision: no explicit thread, so macOS groups these under the app itself.
