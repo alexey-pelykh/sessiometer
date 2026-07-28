@@ -10,6 +10,23 @@
 
 import SwiftUI
 
+// MARK: - Identity elision (issue #445 policy → SwiftUI)
+
+extension StatusPanelFormat.IdentityElision {
+    /// The SwiftUI truncation mode this policy selects.
+    ///
+    /// The policy VALUE lives in `StatusPanelFormat` (Foundation-only) so `PanelTextMetricsTests` can
+    /// assert it; this is the one place it becomes a SwiftUI type. Kept to a bare two-case map on purpose —
+    /// it is the only step in the chain the headless bundle cannot reach, so it is deliberately small
+    /// enough to verify by reading.
+    var truncationMode: Text.TruncationMode {
+        switch self {
+        case .middle: return .middle
+        case .tail:   return .tail
+        }
+    }
+}
+
 // MARK: - Honest-state banner
 
 /// The always-present honest-state header. A shape-and-color status dot plus a plain title/detail,
@@ -68,7 +85,8 @@ struct MonogramBadge: View {
             // Per-account identity color (issue #445), seeded from `label` — the deliberate deviation from the
             // mock's neutral `--badge-bg` monochrome badge. A low-chroma muted hue, never provider branding.
             .fill(Color.accountBadge(label, dark: dark))
-            .frame(width: 30, height: 30)
+            .frame(width: StatusPanelFormat.monogramBadgeWidth,
+                   height: StatusPanelFormat.monogramBadgeWidth)
             .overlay(
                 Text(monogram)
                     .font(.system(size: 13, weight: .bold))
@@ -104,7 +122,8 @@ struct StatusDot: View {
                 // rendered ≈half the mock's neutral (the #388 washout).
                 Circle().strokeBorder(Color(nsColor: .tertiaryLabelColor), lineWidth: isActive ? 0 : 1.5)
             )
-            .frame(width: 8, height: 8)
+            .frame(width: StatusPanelFormat.statusDotWidth,
+                   height: StatusPanelFormat.statusDotWidth)
             // The design reference rings the active disc with a soft accent halo (`box-shadow 0 0 0 3px`) —
             // a redundant emphasis behind the fill-vs-ring shape difference, never the sole active cue. Its
             // opacity is theme-aware (#388, mock `--accent-halo`): .20 light / .30 dark.

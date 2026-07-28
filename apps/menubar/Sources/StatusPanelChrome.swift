@@ -200,7 +200,7 @@ struct SwapCalloutCard: View {
                     Text("→ ").fixedSize()
                     Text(target).fontWeight(.semibold)
                         .lineLimit(1)
-                        .truncationMode(.middle)
+                        .truncationMode(StatusPanelFormat.identityElision.truncationMode)
                 }
                 .font(.system(size: 12))
                 if let reason {
@@ -337,7 +337,7 @@ struct SwapStatusLine: View {
             line(StatusPanelFormat.swapDoneText(success),
                  symbol: "checkmark.circle.fill", tint: .green)
                 .lineLimit(1)
-                .truncationMode(.middle)
+                .truncationMode(StatusPanelFormat.identityElision.truncationMode)
         case .failed(let failure):
             line(StatusPanelFormat.swapErrorText(failure),
                  symbol: "exclamationmark.triangle.fill", tint: .red)
