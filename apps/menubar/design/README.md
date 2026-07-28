@@ -91,14 +91,44 @@ Light shown here:
 no capture bar — capture is **empty-roster / first-run only**, and Add account lives off-panel in the
 status-item right-click menu (#394). So `panel-healthy-*.png` correctly shows no capture bar.)
 
-**Harness limitation — the capture field is NOT verified by the tool.** SwiftUI `ImageRenderer`
-cannot rasterize the AppKit-backed `TextField` in the #360 capture affordance (the operator-label
-input on the empty-roster / first-run onboarding card): it draws a blank placeholder box, not the
-real field. So `--render-panel` faithfully captures every state's layout, color, and typography
-**except** that one label field — it needs a manual check against the mock in a real popover (first
-run). The status-item "Add account…" capture surface (#394) is a menu-triggered panel mode this tool
-does not render at all, so it is likewise a manual real-popover check. Treat a blank/placeholder
-capture-field box in the PNGs as a known tool artifact, not a panel defect.
+**Harness limitation — the capture field is NOT RASTERIZED by the tool (but it IS verified elsewhere,
+#765).** SwiftUI `ImageRenderer` cannot rasterize the AppKit-backed `TextField` in the #360 capture
+affordance (the operator-label input on the empty-roster / first-run onboarding card): it draws a blank
+placeholder box, not the real field. So `--render-panel` faithfully captures every state's layout,
+color, and typography **except** that one label field. Treat a blank/placeholder capture-field box in
+the PNGs as a known tool artifact, not a panel defect.
+
+What issue #765 changed is the sentence that used to follow. This note previously concluded that the
+field therefore "needs a manual check against the mock in a real popover", and listed the #394 "Add
+account…" surface as a second manual check. That conflated two different limitations: `ImageRenderer`
+cannot RASTERIZE the field, which is still true, but rasterizing is one way to observe a view and not
+the only one. `Tests/PanelCaptureCardTests` now verifies the card through two lanes that never need a
+pixel, both inside the required `swift` CI job:
+
+- **the accessibility tree** (#758's in-process walker) — the field's reachability, `AXTextField` role
+  and enablement, at **every** capture phase: idle, in-flight, done, failed. Those phases are new
+  coverage even against #758, which sees the one `empty-roster` render fixture at its resting phase. The
+  disabled-while-pending state is a property a raster cannot express at all. Both entry points publish
+  the same affordance and both are covered, so the #394 surface's *content* is no longer a manual check
+  — its live-panel presentation still is (step 1 below).
+- **CoreText metrics** (#750/#762 `TextMetrics`) — every shipped capture string measured against the
+  card's derived text budget, across all 12 Dynamic Type classes.
+
+What is still manual is the **live-panel interaction**: focus, keystroke routing, Return-to-submit and
+Esc-to-cancel need a real `FloatingPanel` (the borderless non-activating `NSPanel` the status item hosts
+— not an `NSPopover`, see issue #808), and the fidelity comparison against the mock's onboarding frames
+is still a human eye. Those are steps 1–2 of the *Capture + notification pre-release checklist* below.
+
+Two measured facts from building that gate, recorded because they are easy to re-lose:
+
+- The button's **rendered** title ("Capture active account") never reaches the accessibility tree — its
+  `.accessibilityLabel` ("Capture **the** active account") replaces it. A query keyed on the rendered
+  string returns nothing and reads as "the button is absent". This is why every absence claim in that
+  suite pins a known-present anchor first.
+- The card's single-line strings use at most **43 %** of the card at every Dynamic Type class, so the
+  "scaled font in an unscaled cell" mutation that falsifies `PanelTextMetricsTests`' sweep cannot trip
+  that half of this one. Its falsifier is an over-wide fixture instead; the wrapping half keeps the
+  scale mutation, where it trips decisively (2 lines → 4).
 
 **Harness limitation — ARMED / in-flight states are NOT captured.** `ImageRenderer` draws one resting
 frame. As of #448 the per-row manual-switch chip is PERSISTENT, so a render captures its resting glyph
@@ -466,6 +496,66 @@ Run these against a real build with the daemon RUNNING unless a step says otherw
 
 Not on this list on purpose: the panel's own contents. Those are covered by the panel golden gate, the
 accessibility-tree gate (#758) and the VoiceOver checklist above.
+
+### Capture + notification pre-release checklist (manual)
+
+Issue #765 put the two surfaces the render harness structurally cannot see under automated gates —
+`Tests/PanelCaptureCardTests` for the capture card (see the *Harness limitation* note above for what each
+lane proves) and `Tests/NotificationDeliveryTests` for delivered notification content. What is left is
+the part that is genuinely not a decision: a live `NSPanel`'s focus and key routing, and
+`UNUserNotificationCenter`'s own prompting and rendering. Neither is observable from a headless bundle at
+any effort, so they are listed here rather than left silent.
+
+Here is where every surface of those two went. **13 rows: 8 covered by this item, 1 already covered
+elsewhere, 4 routed to the checklist below.** Nothing is left silent.
+
+| Surface | Disposition |
+|---|---|
+| Capture field reachable, `AXTextField`, enabled at rest | `PanelCaptureCardTests` (tree lane) |
+| Field + button DISABLED while a capture is in flight | `PanelCaptureCardTests` (tree lane) |
+| Done / failed status copy reaches the tree | `PanelCaptureCardTests` (tree lane) |
+| Both entry points (#360 onboarding, #394 Add account) publish the same affordance | `PanelCaptureCardTests` (tree lane) |
+| Card tree SHAPE (no decorative leak into the card) | `PanelCaptureCardTests` (tree lane) |
+| Every capture string fits / wraps within the card, at every Dynamic Type class | `PanelCaptureCardTests` (metrics lane) |
+| Delivered notification content carries no account label or email | `NotificationDeliveryTests` (end-to-end, past the seam) |
+| Delivery identity is fresh per post (no coalescing) + the app-level grouping decision | `NotificationDeliveryTests` |
+| Swap / exhaustion detection, redaction at the model layer, toggle gating | Already: `AccountEventNotifierTests` (#267) |
+| Live-panel focus, keystroke routing, Return / Esc | Manual, step 1 |
+| Capture-card fidelity against the mock's onboarding frames | Manual, step 2 |
+| The OS authorization prompt, and a denial | Manual, step 3 |
+| How Notification Center actually renders and stacks a delivered notification | Manual, step 4 |
+
+Run these against a real build:
+
+- [ ] **Capture in a live panel.** With an EMPTY roster, open the panel: the onboarding card appears
+      with a real, focusable label field (not the blank box the PNGs show). Click into it and type — the
+      keystrokes must land, which is the whole point of `AccountCaptureModel.panelKeyRequest` re-asserting
+      the panel key. Press Return to submit, and on a second attempt press Esc to cancel: Esc must resign
+      focus and return the card to idle so an outside click can dismiss the panel again. Then repeat the
+      whole step through the status item's right-click **Add account…** surface (#394). (Every phase's
+      tree is gated automatically; that a live `FloatingPanel` routes keys into it is not — it overrides
+      `canBecomeKey` precisely so this works.)
+- [ ] **Capture-card fidelity.** Compare that same first-run card against the mock's onboarding frames in
+      `menubar-preview.html`. The gate measures that the copy FITS and that the controls are reachable;
+      whether the card LOOKS like the ratified design is a human judgement, and the field is the one
+      element `build-comparison.py` cannot show you.
+- [ ] **Notification authorization.** On a fresh install, confirm the OS permission prompt appears once.
+      Then DENY it and confirm the app stays usable and silent — no in-app re-prompt, no error banner.
+      Finally, with notifications toggled off at launch, turn them on in Settings (`⌘,`) and confirm the
+      prompt fires at that point (the toggle drives `onRequestAuthorization`).
+- [ ] **Notification rendering.** Force a swap (`sessiometer swap`) and confirm a notification appears
+      reading "Active account switched" / "Sessiometer rotated to a different account", and **that it
+      names no account** — this is the manual half of the redaction guarantee, on the lock screen, which
+      is where the exposure actually is. Then trigger a second swap and confirm you now have TWO
+      notifications stacked under Sessiometer rather than one replacing the other (the per-post identity),
+      and that they group under the app rather than into sub-threads.
+
+Not on this list on purpose: what the notification SAYS, and whether a label could leak into it. Both are
+measured in `NotificationDeliveryTests` against the `NotificationDeliveryPlan` the presenter copies onto
+the notification, with a source pin holding the presenter to that plan — so neither needs a human. Read
+the pin for what it does and does not cover: it catches an added field, a KVC or `userInfo` write, and a
+substituted value on `title`/`body`; it cannot see an assignment made through a local alias or a helper in
+another file, because `UNUserNotificationCenter` keeps the presenter out of the test bundle.
 
 ## It's a mock, not code
 

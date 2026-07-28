@@ -76,6 +76,84 @@ enum StatusPanelFormat {
         }
     }
 
+    // MARK: - Capture CARD copy + geometry (issue #765 — the first thing a new operator ever sees)
+
+    // WHY THESE MOVED HERE. Every string and number below was a bare literal inside `StatusPanelCapture`
+    // / `StatusPanelView`. Both files now compile into `MenubarTests` (#754), so the strings were
+    // *reachable* — but reachable is not the same as PINNED: a gate that re-types the copy it measures is
+    // measuring its own copy, and the two drift apart the first time someone edits one of them. This is the
+    // same hoist `capturePendingText` above already made for the affordance's in-flight copy, and the same
+    // one issue #750 made for the meter-cell widths. Nothing here changed a rendered byte — the panel
+    // goldens are untouched by the move.
+    //
+    // WHAT NEEDED PINNING, and why this card specifically. SwiftUI `ImageRenderer` cannot rasterize the
+    // AppKit-backed `TextField` this card hosts — it draws a blank placeholder box — so the panel golden
+    // gate (#754) is structurally blind to exactly the surface a first-run operator meets. Issue #765
+    // closes that with two lanes that need no raster at all: the accessibility tree (#758) proves the field
+    // is REACHABLE and correctly typed, and CoreText metrics (#750/#762 `TextMetrics`) prove the copy FITS.
+    // Both need the shipped string and the shipped budget, from one place, which is here.
+
+    /// The empty-roster / first-run onboarding card's title (#326/#360) — the visually distinct "you have
+    /// no accounts yet" state, deliberately not the daemon-down banner.
+    static let captureCardOnboardingTitle = "Capture your first account"
+
+    /// The status-item "Add account…" surface's title (#394) — the populated-panel capture path, reached
+    /// from the right-click menu now that the persistent capture bar is gone. Same card, same mechanics;
+    /// the title is the ONLY difference between the two entry points.
+    static let captureCardAddAccountTitle = "Add account"
+
+    /// The card's explanatory line, under the title.
+    static let captureCardExplainer =
+        "Capture the account you\u{2019}re signed into — the daemon adds it to the roster and starts "
+        + "tracking it here."
+
+    /// The affordance's secondary hint — the honest scope boundary: capture snapshots the account
+    /// currently logged into Claude Code, so adding a DIFFERENT one is a `claude /login` first.
+    static let captureScopeHint = "To add a different account, run claude /login first, then capture."
+
+    /// The label field's placeholder. It invites an OPTIONAL label — blank means the daemon derives the
+    /// handle from the account UUID, never from the email (#15).
+    static let captureFieldPlaceholder = "e.g. Work, Personal"
+
+    /// The primary button's title at rest. (`capturePendingText` above is its in-flight replacement.)
+    static let captureButtonTitle = "Capture active account"
+
+    /// The label field's accessibility label — what VoiceOver announces, and what the #758 tree walk finds
+    /// the field by. Pinned here so the a11y gate and the view read ONE string.
+    static let captureFieldAccessibilityLabel = "Account label, optional"
+
+    /// The primary button's accessibility label, which differs in flight so a VoiceOver user hears that the
+    /// action is running rather than that it is still offered.
+    static func captureButtonAccessibilityLabel(pending: Bool) -> String {
+        pending ? "Capturing the active account" : "Capture the active account"
+    }
+
+    /// The capture card's own internal padding, in points — LINKED (`CaptureCard` lays out with this exact
+    /// constant on all four edges).
+    static let captureCardPadding: Double = 12
+
+    /// The horizontal inset between the panel edge and the capture card, in points — LINKED (both call
+    /// sites in `StatusPanelView` apply this exact `.padding(.horizontal,)`).
+    static let captureCardHorizontalInset: Double = 12
+
+    /// The vertical spacing between the card's stacked elements, in points — LINKED (`CaptureCard` and
+    /// `CaptureAffordance` both use this exact `VStack` spacing).
+    static let captureCardSpacing: Double = 9
+
+    /// The width available to the capture card's TEXT, in points.
+    ///
+    /// Derived, never hand-tuned: the panel's fixed width less the card's horizontal inset on each side,
+    /// less the card's own padding on each side. A LINKED budget — every input is a constant a view lays
+    /// out with — so unlike `rosterLabelBudget` (which folds in two ALLOWANCES) this one is exact rather
+    /// than ±10 pt, and `PanelCaptureCardTests` measures against it directly.
+    ///
+    /// The card's own children are full-width: the title, explainer and hint are plain `Text` with no
+    /// trailing element, and the field spans the card. So there is no column arithmetic to subtract, which
+    /// is why this is a two-term derivation and not a six-term one.
+    static var captureCardTextBudget: Double {
+        panelContentWidth - 2 * captureCardHorizontalInset - 2 * captureCardPadding
+    }
+
     // MARK: - Manual switch affordance (issue #169 — the per-row swap-on-click)
 
     /// Why a roster row cannot be manually switched to. These are exactly the CLIENT-VISIBLE subset of

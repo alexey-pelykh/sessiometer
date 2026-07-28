@@ -175,8 +175,8 @@ struct StatusPanelView: View {
                 // header above stays, so its honest state sub-line still governs; a capture attempt over a
                 // degraded daemon surfaces its own honest error through the affordance, never a false ok.
                 Divider().padding(.horizontal, 14 * scale)
-                CaptureCard(title: "Add account")
-                    .padding(.horizontal, 12 * scale)
+                CaptureCard(title: StatusPanelFormat.captureCardAddAccountTitle)
+                    .padding(.horizontal, StatusPanelFormat.captureCardHorizontalInset * scale)
                     .padding(.top, 10 * scale).padding(.bottom, 10 * scale)
             } else if onStatsTab {
                 // The Stats tab (issue #446): the mock's per-account 7-day sparklines + numeric body,
@@ -202,8 +202,8 @@ struct StatusPanelView: View {
         case .emptyRoster:
             // A live onboarding state, not stale data — distinct from daemon-down.
             Divider().padding(.horizontal, 14 * scale)
-            CaptureCard(title: "Capture your first account")
-                .padding(.horizontal, 12 * scale)
+            CaptureCard(title: StatusPanelFormat.captureCardOnboardingTitle)
+                .padding(.horizontal, StatusPanelFormat.captureCardHorizontalInset * scale)
                 .padding(.top, 10 * scale).padding(.bottom, 10 * scale)
 
         case .connecting, .starting, .unsupported, .crashLooping:
