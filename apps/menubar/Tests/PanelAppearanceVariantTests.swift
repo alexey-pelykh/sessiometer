@@ -23,7 +23,11 @@
 //      property", while `.environment(\.key, value)` gives "cannot convert value of type
 //      'KeyPath<EnvironmentValues, Bool>' to expected argument type 'WritableKeyPath<…>'". `\.colorScheme`
 //      is writable, which is precisely why the light/dark axis that #749 unblocked works and these three
-//      do not — they are not the same mechanism.
+//      do not — they are not the same mechanism. And the unreachability is DOUBLE: measured on the CI
+//      runner (which has Reduce Transparency and Reduce Motion ON), an `ImageRenderer` render reports
+//      `false` for both anyway — so the renderer does not inherit the system setting either, and changing
+//      the system would not reach it even if a test could. See
+//      `testThePanelRenderReadsTheAccessibilityDefaultsRegardlessOfTheSystem`.
 //   2. The one remaining lever, `NSAppearance`, does not reach an `ImageRenderer` render at all — and the
 //      precise form of that matters, because the obvious reading of it is wrong.
 //      `performAsCurrentDrawingAppearance` IS live in this process (it changes an AppKit colour
@@ -308,47 +312,81 @@ final class PanelAppearanceVariantTests: XCTestCase {
                        + "it there rather than widening this predicate")
     }
 
-    // MARK: - AXIS 2 + 3 (reduce transparency / reduce motion) — PIN: the render inherits the SYSTEM setting
+    // MARK: - AXIS 2 + 3 (reduce transparency / reduce motion) — PIN: the render is pinned to the DEFAULTS
 
-    /// The environment keys cannot be OVERRIDDEN (get-only — a compile error, so no test can attempt it);
-    /// what a test CAN establish is the consequence: what SwiftUI hands the panel during a render is the
-    /// SYSTEM's value, with no seam in between. Asserted as equality against `NSWorkspace` rather than
-    /// against a hardcoded `false`, deliberately — a hardcoded expectation would encode THIS machine's
-    /// accessibility settings and redden on a developer or runner that has any of them switched on, which
-    /// is a false alarm about the machine rather than a finding about the panel. Equality holds on every
-    /// machine and says the load-bearing thing: the render tracks the system, so a test process that cannot
-    /// change the system cannot change the render.
+    /// The environment keys cannot be OVERRIDDEN (get-only — a compile error, so no test can attempt it).
+    /// What a test CAN establish is the consequence, and the consequence is stronger than "you cannot
+    /// change it": what SwiftUI hands a view during an `ImageRenderer` render is the DEFAULT value for all
+    /// three, regardless of what the system is actually set to.
     ///
-    /// WHEN THIS REDDENS: SwiftUI stopped sourcing these from the system — most likely because an override
-    /// seam appeared. Check whether the keys became writable on `EnvironmentValues`; if so, the reduce-
-    /// transparency axis is gateable and #760's fixtures should be built for it.
-    func testTheAccessibilitySettingsReachThePanelRenderOnlyFromTheSystem() throws {
+    /// MEASURED, and this pin's first draft got it wrong in a way only CI could catch. The draft asserted
+    /// equality against `NSWorkspace`, on the model "the render tracks the system, so a process that cannot
+    /// change the system cannot change the render" — which passes on any machine where the settings are
+    /// OFF, including this one. The GitHub `macos-latest` runner has Reduce Transparency and Reduce Motion
+    /// **ON**, and there the two diverge:
+    ///
+    ///   NSWorkspace.accessibilityDisplayShouldReduceTransparency = true   SwiftUI = false
+    ///   NSWorkspace.accessibilityDisplayShouldReduceMotion       = true   SwiftUI = false
+    ///
+    /// So the renderer does not inherit the system setting either. That is the decisive observation, and it
+    /// is only available on a machine where a setting is on — which is exactly why the equality form looked
+    /// correct locally and was not. Recorded because the lesson generalises: a pin whose two sides agree by
+    /// coincidence on the authoring machine is not evidence, and the cheapest falsifier for it is a machine
+    /// configured differently.
+    ///
+    /// The consequence for #760 is a DOUBLE unreachability, and it makes the verdict firmer rather than
+    /// weaker: the axis cannot be driven by injection (get-only), and it could not be driven by changing
+    /// the system setting either, because the render does not read it. Nothing a test process can do
+    /// reaches it.
+    ///
+    /// A side effect worth knowing, for the golden gate: this is *why* the committed panel goldens are
+    /// portable across machines with different accessibility settings. `PanelGoldenParityTests` never had
+    /// to think about it; this is the measurement that says it did not need to.
+    ///
+    /// WHEN THIS REDDENS: the renderer started sourcing these from somewhere — the system, or a new
+    /// override seam. Check whether the keys became writable on `EnvironmentValues`; if so, the
+    /// reduce-transparency axis is gateable and #760's fixtures should be built for it. Either way the
+    /// panel goldens need re-examining for a new machine dependence.
+    func testThePanelRenderReadsTheAccessibilityDefaultsRegardlessOfTheSystem() throws {
         let sink = AccessibilityEnvironmentSink()
         let renderer = ImageRenderer(content: AccessibilityEnvironmentProbe(sink: sink)
             .frame(width: 24, height: 24))
         renderer.scale = 1
         XCTAssertNotNil(renderer.cgImage, "the probe view did not rasterize, so it never read the environment")
 
-        // Degenerate-subject guard: an unrendered probe leaves every field nil, and `nil == nil` comparisons
-        // below would then pass having measured nothing.
+        // Degenerate-subject guard: an unrendered probe leaves every field nil, so the assertions below
+        // would be comparing against nothing. `testAnInjectedEnvironmentValueReachesTheProbe` is the
+        // companion proof that a value which CAN be injected does arrive — together they rule out "the
+        // probe reports a constant" as the explanation for the defaults below.
         let reduceTransparency = try XCTUnwrap(sink.reduceTransparency,
                                                "the probe never evaluated its body — nothing was measured")
         let reduceMotion = try XCTUnwrap(sink.reduceMotion, "the probe never evaluated its body")
         let contrast = try XCTUnwrap(sink.contrast, "the probe never evaluated its body")
 
+        // The system's values are NOT the expectation — they are context for the failure message, so a
+        // reddening reads as "the render started following the system" rather than as a bare mismatch.
         let workspace = NSWorkspace.shared
-        XCTAssertEqual(reduceTransparency, workspace.accessibilityDisplayShouldReduceTransparency,
-                       "SwiftUI's `accessibilityReduceTransparency` no longer tracks the system setting — "
-                       + "something now sits between them. If that something is a writable environment key, "
-                       + "the reduce-transparency axis has become gateable: build issue #760's fixtures.")
-        XCTAssertEqual(reduceMotion, workspace.accessibilityDisplayShouldReduceMotion,
-                       "SwiftUI's `accessibilityReduceMotion` no longer tracks the system setting — see the "
-                       + "note on the transparency assertion above. Note that reduce MOTION stays outside a "
-                       + "still-render gate regardless (a raster encodes no motion); it would need an "
-                       + "animation-aware harness, not a fixture.")
-        XCTAssertEqual(contrast == .increased, workspace.accessibilityDisplayShouldIncreaseContrast,
-                       "SwiftUI's `colorSchemeContrast` no longer tracks the system Increase-Contrast "
-                       + "setting. That is the seam issue #832 looked for and did not find — re-open it.")
+        let systemState = "system reports reduceTransparency="
+            + "\(workspace.accessibilityDisplayShouldReduceTransparency), reduceMotion="
+            + "\(workspace.accessibilityDisplayShouldReduceMotion), increaseContrast="
+            + "\(workspace.accessibilityDisplayShouldIncreaseContrast)"
+
+        XCTAssertFalse(reduceTransparency,
+                       "SwiftUI reported `accessibilityReduceTransparency` TRUE during an ImageRenderer "
+                       + "render (\(systemState)). The renderer now sources this from somewhere — the "
+                       + "system, or a new override seam. If the key also became writable, the "
+                       + "reduce-transparency axis is gateable: build issue #760's fixtures. Either way, "
+                       + "the committed panel goldens have acquired a dependence on the operator's "
+                       + "accessibility settings and are no longer machine-portable.")
+        XCTAssertFalse(reduceMotion,
+                       "SwiftUI reported `accessibilityReduceMotion` TRUE during an ImageRenderer render "
+                       + "(\(systemState)) — see the note on the transparency assertion above. Reduce "
+                       + "MOTION stays outside a still-render gate regardless (a raster encodes no motion); "
+                       + "it would need an animation-aware harness, not a fixture.")
+        XCTAssertEqual(contrast, .standard,
+                       "SwiftUI reported `colorSchemeContrast` .increased during an ImageRenderer render "
+                       + "(\(systemState)). That is the seam issue #832 looked for and did not find — "
+                       + "re-open it, and build issue #760's increased-contrast fixtures.")
     }
 
     /// CANARY for the pin above: is the environment -> sink path the pin depends on actually LIVE?

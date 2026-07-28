@@ -357,8 +357,8 @@ the three can be driven from a test process**, so no such fixture exists and non
 | Axis | Reachable in-bundle? | Evidence |
 |---|---|---|
 | Increased contrast | **No** | `\.colorSchemeContrast` is get-only; and `NSAppearance` — the only other lever — does not reach an `ImageRenderer` render for *any* appearance (see blocker 2) |
-| Reduce transparency | **No** | `\.accessibilityReduceTransparency` is get-only; SwiftUI sources it from the system, and `NSWorkspace`'s property is read-only |
-| Reduce motion | **No**, and never fixture-shaped | Same get-only key — *and* a still raster encodes no motion at all, so no golden-style gate can ever cover it |
+| Reduce transparency | **No**, doubly | `\.accessibilityReduceTransparency` is get-only — *and* the renderer reports `false` even where the system says `true` (measured on CI), so changing the system would not reach it either |
+| Reduce motion | **No**, and never fixture-shaped | Same get-only key, same defaults-regardless-of-system behaviour — *and* a still raster encodes no motion at all, so no golden-style gate can ever cover it |
 
 Two independent blockers, either of which alone would be decisive:
 
@@ -368,6 +368,13 @@ Two independent blockers, either of which alone would be decisive:
    **compile error**, not a runtime no-op. `\.colorScheme` *is* writable, which is exactly why the
    light/dark axis issue #749 unblocked works and these do not — they are not the same mechanism, and the
    assumption that they were is what #760 was scoped on.
+
+   The unreachability is **double**, and only CI could show it. The GitHub runner has Reduce Transparency
+   and Reduce Motion **ON**; an `ImageRenderer` render there still reports `false` for both. So the
+   renderer does not inherit the system setting either — changing the system would not reach it even if a
+   test could. (An earlier draft asserted the render *tracks* the system; that passes on any machine with
+   the settings off, including the authoring one, and CI falsified it. Useful side effect: this is why the
+   committed panel goldens are portable across machines with different accessibility settings.)
 2. **`NSAppearance` does not reach an `ImageRenderer` render** — and the precise shape of this matters,
    because the obvious reading of it is wrong. `performAsCurrentDrawingAppearance` **is** live in this
    process: it changes an AppKit colour resolution (`NSColor.textColor` → near-black under `.aqua`,
