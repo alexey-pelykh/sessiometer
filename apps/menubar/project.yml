@@ -144,6 +144,16 @@ targets:
       # swap/exhausted detection, content redaction, and toggle gating are tested against a spy
       # presenter with no OS notification surface.
       - path: Sources/AccountEventNotifier.swift
+      # The notification DELIVERY decision (issue #765) — what is actually populated on the object handed
+      # to `UNUserNotificationCenter`: the two content fields, the grouping thread, and the per-post
+      # request identity that keeps distinct events from coalescing. `UserNotificationPresenter` itself
+      # stays EXCLUDED above and always will be (it imports `UserNotifications`), so the DECISION moved
+      # out instead — the same move #764 made for `StatusItemController`/`main.swift` and #762 for
+      # `SettingsView`. #267's redaction proof stopped at the `AccountEventPresenter` seam, one layer
+      # above where the exposure happens; this file is what lets `NotificationDeliveryTests` assert it on
+      # the values the OS receives. Foundation-only — no `UserNotifications` import — so it compiles into
+      # this headless bundle unchanged.
+      - path: Sources/NotificationDelivery.swift
       # Status-item gauge (#325): the pure, shape-encoded template `NSImage` factory. Added here (NOT
       # StatusItemController/main.swift — those touch the NSStatusBar / app-entry surface a headless
       # logic-test bundle can't drive) so the shape-per-state contract is tested in isolation.

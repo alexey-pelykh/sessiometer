@@ -135,12 +135,11 @@ final class PanelTextMetricsTests: XCTestCase {
 
     /// The CoreText truncation type the panel's own elision POLICY selects. Everything below elides through
     /// this rather than through a hardcoded `.middle`, so these are assertions about the panel's policy, not
-    /// about CoreText's repertoire.
+    /// about CoreText's repertoire. A thin forward like `overflows` / `visibleSubstring` above: the map
+    /// itself moved to `TextMetrics` when a second suite (`PanelCaptureCardTests`) needed it, so the two
+    /// cannot disagree about what the shipped policy means.
     private func coreTextType(_ policy: StatusPanelFormat.IdentityElision) -> CTLineTruncationType {
-        switch policy {
-        case .middle: return .middle
-        case .tail:   return .end
-        }
+        TextMetrics.truncationType(for: policy)
     }
 
     /// Elide under the SHIPPED policy.

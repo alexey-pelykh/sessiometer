@@ -85,6 +85,19 @@ enum TextMetrics {
         return (ranges.map { ns.substring(with: $0) }.joined(), true)
     }
 
+    /// The CoreText truncation type the panel's own elision POLICY selects — so a suite elides under what
+    /// the panel actually ships rather than under a hardcoded `.middle`.
+    ///
+    /// Shared for the same reason `overflows` is, and with one extra edge: a suite that re-derives this
+    /// inline as a `policy == .middle ? .middle : .end` ternary silently routes a THIRD policy case to tail
+    /// elision, while this exhaustive `switch` refuses to compile until someone decides what it should be.
+    static func truncationType(for policy: StatusPanelFormat.IdentityElision) -> CTLineTruncationType {
+        switch policy {
+        case .middle: return .middle
+        case .tail:   return .end
+        }
+    }
+
     // MARK: - Wrapping (the model for a `Text` with NO `.lineLimit`)
 
     /// How many LINES `text` occupies when wrapped to `budget`, and the height that costs.
