@@ -149,9 +149,14 @@ STATES = [
               "diverges only in its count — the mock’s clock-based “Restarted 5× in the last minute.” becomes "
               "the panel’s clock-free “Restarting repeatedly”, both closing on “holding status until it stays "
               "up.” — because the client counts consecutive unstable reconnects, not wall-clock restarts, and "
-              "will not quote a number it cannot source. The mock’s <b>View log</b> / <b>Restart…</b> "
-              "affordances (Restart behind a confirm) are #169 siblings, so the panel’s card carries the "
-              "message alone. Light-only: the mock has no <code>crash-looping-dark</code> frame."),
+              "will not quote a number it cannot source. The mock’s <b>View log</b> is BUILT (#776) and "
+              "should pair; its <b>Restart…</b> sibling never will — #777 measured that a manual kickstart "
+              "mid-throttle costs an EXTRA respawn cycle and blocks the caller for seconds, lengthening the "
+              "outage launchd is already ending, so it is dropped rather than deferred and #856 removes it "
+              "from the mock. Until then this is the one frame where the mock is knowingly ahead of the "
+              "panel by a button that should not exist. Light-only here: #778 has since added a "
+              "<code>crash-looping-dark</code> frame, so a dark row is now possible — pairing it is that "
+              "issue’s follow-through, not this row’s."),
     dict(title="5 · Disconnected (UDS drop)", theme="light", design="disconnected-light", capture="panel-disconnected-light.png",
          note="Dropped connection: a loud strip over the <b>dimmed last-known</b> roster — retained, "
               "never frozen-as-live (#137) — and an amber “updated Nm ago” footer."),

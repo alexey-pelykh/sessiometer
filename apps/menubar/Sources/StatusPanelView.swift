@@ -208,15 +208,30 @@ struct StatusPanelView: View {
                 .padding(.horizontal, StatusPanelFormat.captureCardHorizontalInset * scale)
                 .padding(.top, 10 * scale).padding(.bottom, 10 * scale)
 
-        case .connecting, .starting, .unsupported, .crashLooping:
-            // No trustworthy reading to show — a plain honest message card. `.crashLooping` (#169) holds
-            // here too: the daemon served a snapshot but keeps dropping before it stabilizes, so its
-            // numbers are refused ("holding status until it stays up") rather than flickered as live —
-            // the crown-jewel anti-#137 debounce. `.starting` (#499) is the cold-refused daemon-absent
-            // state that never held a reading, so it renders the honest banner card. (`.notRunning` is its
-            // sibling but now carries the #170 Start affordance — see the dedicated branch below.)
+        case .connecting, .unsupported:
+            // No trustworthy reading to show — a plain honest message card, and no action: the design mock
+            // gives these two states no affordance at all, and its whole action inventory is only three
+            // labels, so an extra button here would be invention rather than conformance.
             Divider().padding(.horizontal, 14 * scale)
             BannerView(banner: StatusPanelFormat.banner(for: state, accountCount: store.rows.count))
+                .padding(.horizontal, 14 * scale).padding(.vertical, 14 * scale)
+
+        case .starting, .crashLooping:
+            // The two cold states the mock gives a `View log` action (issue #776) — the same honest message
+            // card as their `.connecting` / `.unsupported` siblings above, plus the affordance, which appears
+            // only where there is a log to open (`DaemonLogCard`). `.crashLooping` (#169): the daemon served a
+            // snapshot but keeps dropping before it stabilizes, so its numbers are refused ("holding status
+            // until it stays up") rather than flickered as live — the crown-jewel anti-#137 debounce.
+            // `.starting` (#499) is the cold-refused daemon-absent state that never held a reading.
+            // (`.notRunning` is their third sibling, but carries the #170 Start affordance instead — see
+            // the dedicated branch below; the mock gives it no `View log`.)
+            //
+            // The two take DIFFERENT action styles because the mock renders the same action differently in
+            // each. That mapping is `ActionStyle.forState` — a pure function rather than a literal here, so
+            // it can be asserted directly; a render check can only show the two treatments differ, never
+            // that the right state got the right one.
+            Divider().padding(.horizontal, 14 * scale)
+            DaemonLogCard(state: state, actionStyle: .forState(state))
                 .padding(.horizontal, 14 * scale).padding(.vertical, 14 * scale)
 
         case .notRunning:
@@ -227,8 +242,13 @@ struct StatusPanelView: View {
             // button that registers + launches the agent via `SMAppService`. In the #170 shipped state no
             // plist is bundled yet (that co-lands with #171), so `canStartDaemon` is false and — with nothing
             // able to have registered, hence no `.failed` reason to carry (issue #820) — the card is exactly
-            // the inert banner it was before, never a dead button. (View log / Restart remain #169/#171
-            // siblings.)
+            // the inert banner it was before, never a dead button.
+            //
+            // The mock's two other actions, once deferred from here as "#169/#171 siblings", are both settled
+            // and neither belongs in THIS state: `View log` is BUILT (issue #776) and the mock scopes it to
+            // `.starting` / `.crashLooping` only — see the branch above; `Restart…` is DROPPED on measured
+            // evidence (issue #777, `docs/findings/0777-manual-restart-under-conditional-keepalive.md`) and
+            // issue #856 removes it from the mock. Nothing here is pending.
             Divider().padding(.horizontal, 14 * scale)
             StartDaemonCard()
                 .padding(.horizontal, 14 * scale).padding(.vertical, 14 * scale)

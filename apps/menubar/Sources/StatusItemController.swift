@@ -74,12 +74,16 @@ final class StatusItemController {
         // #326's status panel reads its dependencies via `@EnvironmentObject`: the store (a thin view over the
         // `src/cli.rs`-mirroring `StatusPanelFormat`), the #360 capture affordance's `AccountCaptureModel`, the
         // #169 swap affordance's `AccountSwapModel`, the #446 Stats tab's `PanelStatsModel`, and the #170
-        // launch-at-login / Start-daemon `LoginItemModel`. Inject the COMPLETE set here through the shared
-        // `statusPanelEnvironment` modifier — the SAME wiring the DEBUG `--render-panel` harness uses, so the
-        // app and the harness cannot drift (issue #504).
+        // launch-at-login / Start-daemon `LoginItemModel`; plus the #776 `View log` availability probe, a plain
+        // value rather than an object. Inject the COMPLETE set here through the shared `statusPanelEnvironment`
+        // modifier — the SAME wiring the DEBUG `--render-panel` harness uses, so the app and the harness cannot
+        // drift (issue #504).
+        //
+        // `.live` is the only place the real filesystem is consulted: it re-probes per render, so a `View log`
+        // button appears as soon as the daemon writes its first line rather than only after an app restart.
         let hosting = NSHostingView(rootView: StatusPanelView()
             .statusPanelEnvironment(store: store, capture: captureModel, swap: swapModel, stats: statsModel,
-                                    loginItem: loginItemModel))
+                                    loginItem: loginItemModel, daemonLog: .live))
         hosting.translatesAutoresizingMaskIntoConstraints = false
         self.hostingView = hosting
 
