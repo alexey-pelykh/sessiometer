@@ -18,4 +18,4 @@ beta    ┤x──────────────────────�
 delta   ┤x───────────────────────────────────────├  0% · 0% · 0%
 ガンマ  ┤x───────────────────────────────────────├  0% · 0% · 0%
 
-roster: 4 swaps (2 session, 1 weekly, 1 manual, 0 forced, 0 emergency) · all-accounts-high: 0 episodes (0s)
+roster: 4 swaps (2 session, 1 weekly, 1 manual, 0 forced, 0 emergency) · all-accounts-high (≥95%): —
