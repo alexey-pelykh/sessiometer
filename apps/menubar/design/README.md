@@ -20,14 +20,30 @@ blacks out the vibrancy). Run from this directory:
 
 ```sh
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
-  --headless=new --hide-scrollbars --force-device-scale-factor=1.5 \
-  --window-size=1200,9600 --screenshot=renders/all-states.png \
+  --headless=new --hide-scrollbars --force-device-scale-factor=1.25 \
+  --window-size=1200,12500 --screenshot=renders/all-states.png \
   menubar-preview.html
 ```
 
-(Bump the `--window-size` height if the page ever grows past it — the committed render is
-1800×14400 at this `9600` height × the `1.5` device scale; a shorter height clips the notes. The
-mock ends at ~9280 CSS px as of #703, so `9600` leaves ~320 px of headroom.)
+(Bump the `--window-size` height if the page ever grows past it — but **not past the per-scale cap
+below**. The committed render is 1500×15625 at this `12500` height × the `1.25` device scale; a
+shorter height clips the notes. The mock ends at ~11050 CSS px as of #778, so `12500` leaves
+~1450 px before the notes clip — of which only ~600 px is actually bumpable, per the cap.)
+
+**Why `1.25` and not `1.5`** — the render height in *device* pixels (CSS height × scale) must stay
+under the GPU's 16384 px max texture dimension. Past it the GPU process dies mid-render
+(`Restarting GPU process due to unrecoverable error`) and no PNG is written. At `1.5` the 34-frame
+mock needs 16536 device px, which is over; `1.25` needs 13776 and fits. Measured empirically at
+#778 (at `1.5`): 16350 device px renders, 17100 fails.
+
+In the units of the knob you actually turn — the maximum `--window-size` height is **13107** at
+`1.25`, **10922** at `1.5`, **16384** at `1.0` (16384 ÷ scale). Past that the bump *itself* kills
+the render, so growing the page eventually means lowering the scale, not just raising the height.
+`1.5` is already unreachable: its 10922 cap is below the mock's own ~11050.
+
+If another Chrome is already running, add `--user-data-dir=<a scratch dir>` — without it the render
+can block on the profile lock instead of exiting. Chrome also tends to write the screenshot and then
+hang rather than exit, so run it under `timeout 180` and check the output file, not the exit code.
 
 ## Rendering the BUILT panel (design-parity check)
 
