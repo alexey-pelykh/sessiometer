@@ -4243,4 +4243,248 @@ ts=2026-07-10T00:00:00Z event=swap from=work to=spare reason=session session_pct
             assert!(ceiling < 1.0);
         }
     }
+
+    // --- issue #767: FULL-OUTPUT goldens for the `reliability` human render -----------
+    //
+    // The SLI tests above assert individual numbers and individual lines. None sees the
+    // readout as a whole, so a block that silently stopped printing, printed twice, or moved
+    // above the block it is supposed to qualify would pass every one of them. This pins the
+    // ENTIRE readout, byte for byte.
+    //
+    // AXES. `render_human` takes only a `Report` — this surface has no terminal-width
+    // degradation, no glyph ramp and no colour gate (its `[ok]` / `[OVER]` markers are ASCII
+    // precisely so it needs none; `src/reliability.rs` `ok_flag`). So the matrix here is over
+    // the axes it DOES have: a populated report, its degenerate empty-log counterpart, and the
+    // `--since` windowed variant that adds the cutoff banner. Claiming a width or colour cell
+    // for this surface would be a golden of an axis that does not exist.
+    //
+    // Determinism: pure over the `Report`, which is derived from a FIXED log and a FIXED sample
+    // list at fixed epochs. No wall clock reaches the render — `Window` carries an absolute
+    // `cutoff_epoch`, so even the windowed banner is fixed bytes.
+    mod goldens {
+        use super::*;
+        use crate::render_golden::{self, Case};
+
+        /// The golden event log — self-contained rather than shared with `FIXTURE_LOG` above,
+        /// so these goldens document their own input and an unrelated edit to that fixture
+        /// cannot silently re-baseline them.
+        ///
+        /// Covers one event of each family the readout reports on: `reason=session` swaps (the
+        /// #363 reaction-latency gate), a `reason=velocity_preempt` swap (#539's projective
+        /// SLI), an `all_exhausted` hold and the swap that relieves it (#719's capacity-held
+        /// partition — the discriminator is `hold == to`, so the OUTGOING account is the
+        /// capacity casualty), `blind_window` reconciliations both near-limit and not, an
+        /// uncensored `blind_enter`/`blind_exit` pair (#591), usage backoffs of both classes
+        /// plus a clear, and a `usage_velocity` observation (#608).
+        const GOLDEN_LOG: &str = "\
+ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct=94
+ts=2026-07-11T00:05:00Z event=swap from=spare to=work reason=weekly session_pct=42
+ts=2026-07-11T00:06:00Z event=swap from=work to=spare reason=session session_pct=98 late=true
+ts=2026-07-11T00:07:00Z event=swap from=spare to=work reason=velocity_preempt session_pct=88
+ts=2026-07-11T00:08:00Z event=all_exhausted hold=third cause=all_accounts_exhausted resets_at=2026-07-11T05:00:00Z
+ts=2026-07-11T00:09:00Z event=swap from=work to=third reason=session session_pct=100
+ts=2026-07-11T00:10:00Z event=blind_window acct=u-A duration_secs=300 session_pct=97 session_at_recovery=99 near_limit=true
+ts=2026-07-11T00:20:00Z event=blind_window acct=u-B duration_secs=600 session_pct=96 session_at_recovery=40 near_limit=true
+ts=2026-07-11T00:30:00Z event=blind_window acct=u-C duration_secs=120 session_pct=50 session_at_recovery=51 near_limit=false
+ts=2026-07-11T00:31:00Z event=blind_enter acct=u-D session_pct=95 weekly_pct=40 was_active=true near_limit=true
+ts=2026-07-11T00:32:00Z event=blind_exit acct=u-D duration_secs=480 session_burn_pct=3 weekly_burn_pct=2 session_pct=95 session_at_recovery=98 weekly_pct=40 weekly_at_recovery=42 was_active=true swapped_away=false near_limit=true
+ts=2026-07-11T00:40:00Z event=usage_backoff acct=u-A class=rate_limited consecutive=1 backoff_secs=60
+ts=2026-07-11T00:41:00Z event=usage_backoff acct=u-B class=transient consecutive=1 backoff_secs=30
+ts=2026-07-11T00:45:00Z event=usage_backoff_cleared acct=u-A
+ts=2026-07-11T00:50:00Z event=usage_velocity acct=u-A session_pct_per_min=0.20 weekly_pct_per_min=0.01 elapsed_secs=120 session_delta_pct=1 weekly_delta_pct=0
+";
+
+        /// The usage samples the #595 landing SLI joins against the swap anchors above: for
+        /// each `reason=session` swap, the outgoing account's post-swap readings. `work` keeps
+        /// climbing after being parked at 94 (a post-swap TAIL breach) and again after 98; the
+        /// capacity-held swap at 100 is excluded from the SLO by #719 and counted separately.
+        fn golden_samples() -> Vec<Sample> {
+            vec![
+                Sample::new(epoch("2026-07-11T00:01:00Z"), "claude", "work", 0.97, 0.10),
+                Sample::new(epoch("2026-07-11T00:02:00Z"), "claude", "work", 0.99, 0.10),
+                Sample::new(epoch("2026-07-11T00:06:30Z"), "claude", "work", 0.98, 0.10),
+                Sample::new(epoch("2026-07-11T00:09:30Z"), "claude", "work", 1.00, 0.10),
+            ]
+        }
+
+        /// The populated report — the whole-log aggregate, no `--since` bound.
+        fn golden_report() -> Report {
+            aggregate(&parse_events(GOLDEN_LOG, None), &golden_samples(), None)
+        }
+
+        /// The `--since` windowed report. The cutoff is an ABSOLUTE epoch (not `now − d`), so
+        /// the banner it adds is fixed bytes; it sits between the two blind_window events, so
+        /// the window demonstrably BOUNDS the aggregate rather than merely decorating it.
+        fn windowed_report() -> Report {
+            let window = Window {
+                since_arg: "6h".to_owned(),
+                cutoff_epoch: epoch("2026-07-11T00:25:00Z"),
+            };
+            aggregate(
+                &parse_events(GOLDEN_LOG, Some(window.cutoff_epoch)),
+                &golden_samples(),
+                Some(window),
+            )
+        }
+
+        /// The degenerate case: an empty log. Every percentile is `None` — cardinality-zero is
+        /// reported as "no swaps observed", never as a passing `0`.
+        fn empty_report() -> Report {
+            aggregate(&parse_events("", None), &[], None)
+        }
+
+        /// Every goldened `reliability` case, freshly rendered. The single source of truth for
+        /// the case list: the comparison, the canary, and the emitter all consume THIS.
+        fn cases() -> Vec<Case> {
+            vec![
+                Case::new("reliability-full", render_human(&golden_report())),
+                Case::new("reliability-windowed", render_human(&windowed_report())),
+                Case::new("reliability-empty-log", render_human(&empty_report())),
+            ]
+        }
+
+        /// The committed goldens, named by case. The macro derives each path from the name, so an
+        /// entry cannot pair a case with someone else's bytes, and `include_str!` keeps every
+        /// file a COMPILE-TIME input — a missing golden is a build error, not a silent skip.
+        const GOLDENS: &[(&str, &str)] = render_golden::cli_render_goldens![
+            "reliability-full",
+            "reliability-windowed",
+            "reliability-empty-log",
+        ];
+
+        /// One-time emitter for the committed `reliability` render goldens (issue #767).
+        /// `#[ignore]` — NOT part of the suite. Run it ONLY alongside a DELIBERATE change to
+        /// the `reliability` readout:
+        ///   `cargo test -- --ignored emit_cli_render_goldens`
+        /// then look at the regenerated files and record why in a `CLI-Goldens-Rebaselined:`
+        /// commit trailer (CI requires it — `scripts/check-cli-golden-rebaseline.sh`).
+        #[test]
+        #[ignore = "one-time cli-render-golden emitter — run ONLY alongside a deliberate render change"]
+        fn emit_cli_render_goldens_reliability() {
+            render_golden::emit(&cases());
+        }
+
+        #[test]
+        fn the_committed_reliability_goldens_still_match_the_render() {
+            render_golden::assert_matches_goldens("reliability", &cases(), GOLDENS);
+        }
+
+        /// CONSTRAINT-A: the gate can FAIL, demonstrated by MUTATION through the SAME
+        /// predicate the assertion above uses — not by inspection.
+        ///
+        /// `strip-ansi` is declared INAPPLICABLE: this readout has no colour gate at all — its
+        /// `[ok]` / `[OVER]` markers are ASCII precisely so it needs none ([`ok_flag`]) — so
+        /// there is no escape to strip. The declaration is checked both ways, so if a colour
+        /// overlay is ever added here this exemption goes red rather than silently exempting
+        /// the new bytes from the canary.
+        #[test]
+        fn the_reliability_golden_gate_rejects_a_corrupted_render() {
+            render_golden::assert_canary("reliability", &cases(), &["strip-ansi"]);
+        }
+
+        /// The input-side half of the canary: a log whose readings actually changed must not
+        /// match the unperturbed golden.
+        #[test]
+        fn a_perturbed_log_does_not_match_the_reliability_golden() {
+            let perturbed = GOLDEN_LOG.replace("session_pct=94", "session_pct=93");
+            assert_ne!(
+                perturbed, GOLDEN_LOG,
+                "the perturbation did not alter the log, so it cannot alter the render"
+            );
+            render_golden::assert_perturbed_input_is_rejected(
+                "reliability",
+                "reliability-full",
+                &render_human(&golden_report()),
+                &render_human(&aggregate(
+                    &parse_events(&perturbed, None),
+                    &golden_samples(),
+                    None,
+                )),
+            );
+        }
+
+        /// Each case must exercise the axis it claims, or its golden is a duplicate that
+        /// asserts nothing. Stated as properties, so it survives a re-baseline.
+        #[test]
+        fn each_reliability_case_exercises_the_axis_it_claims() {
+            let all = cases();
+            let case = |name: &str| render_golden::rendered(&all, name);
+            let (full, windowed, empty) = (
+                case("reliability-full"),
+                case("reliability-windowed"),
+                case("reliability-empty-log"),
+            );
+
+            // The WINDOW axis: the banner appears, names the cutoff, and the bound actually
+            // reaches the SLIs (an unbounded readout must not equal a bounded one).
+            assert!(
+                windowed.contains("window: since"),
+                "the windowed case carries no cutoff banner, so it is not exercising `--since`"
+            );
+            assert!(
+                !full.contains("window: since"),
+                "the unbounded case carries a cutoff banner it should omit — the whole-log \
+                 readout is byte-for-byte window-free by design"
+            );
+            assert_ne!(
+                windowed, full,
+                "the `--since` window changed nothing, so it is decorating the readout rather \
+                 than bounding it"
+            );
+
+            // The DEGENERATE axis: cardinality-zero reports "no swaps observed", never a
+            // passing `0` — a gate that scores an empty subject is not evidence.
+            assert!(
+                empty.contains("no swaps observed"),
+                "the empty-log case does not report cardinality-zero honestly"
+            );
+            assert!(
+                !empty.contains("[ok]") && !empty.contains("[OVER]"),
+                "the empty-log readout asserts a target verdict over ZERO observations — an \
+                 unmeasurable period is not a passing one:\n{empty}"
+            );
+            assert!(
+                full.contains("[ok]") || full.contains("[OVER]"),
+                "the populated case asserts no target verdict at all, so the flag rendering is \
+                 unexercised"
+            );
+        }
+
+        /// The #719 capacity-held partition must be VISIBLE and SEGREGATED: the all-exhausted
+        /// swap is excluded from the #363 reaction-latency gate and reported in its own block.
+        /// Pinned as a property because it is the readout's most load-bearing distinction — a
+        /// re-baseline that quietly folded the two populations back together would otherwise
+        /// look like an ordinary byte change.
+        #[test]
+        fn the_capacity_held_partition_stays_segregated_from_the_reaction_latency_gate() {
+            let report = golden_report();
+            assert_eq!(
+                report.capacity_held.n, 1,
+                "the golden log's `all_exhausted`-relieving swap was not classified as \
+                 capacity-held, so this case does not exercise the #719 partition"
+            );
+            // GOLDEN_LOG holds THREE `reason=session` swaps (94, 98, 100). Exactly one — the
+            // 100 that relieved the hold — is capacity-held, so the reaction-latency gate must
+            // see the other two and no more. Asserting the count rather than "n > 0" is what
+            // catches a leak in EITHER direction.
+            assert_eq!(
+                report.swap_overshoot.n, 2,
+                "the #363 reaction-latency gate counted {} swaps, not the 2 non-held ones — a \
+                 capacity-held swap leaked in (or a reaction-latency swap leaked out)",
+                report.swap_overshoot.n
+            );
+            assert_eq!(
+                report.swap_overshoot.p100,
+                Some(98),
+                "the gate's P100 is not the worst NON-HELD swap — the 100 that resolved the \
+                 all-exhausted hold is dragging a capacity limit into a latency SLO"
+            );
+            let rendered = render_human(&report);
+            assert!(
+                rendered.contains("capacity-held (reason=session, all_exhausted"),
+                "the capacity-held block is absent from the readout, so the excluded population \
+                 is invisible:\n{rendered}"
+            );
+        }
+    }
 }

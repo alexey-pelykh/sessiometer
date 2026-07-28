@@ -1,0 +1,4 @@
+ACCOUNT  SESSION% RESET  WEEKLY% RESET  AUTH
+* work   97%      12m    40%     5d     🟢
+
+next swap: 世界 (only viable target)

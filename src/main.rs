@@ -33,6 +33,10 @@ mod redaction;
 mod refresh;
 mod refresh_tick;
 mod reliability;
+/// Shared full-output render-golden machinery (issue #767) — test-only: nothing in the
+/// shipping binary reads a golden, so it is not compiled into one.
+#[cfg(test)]
+mod render_golden;
 mod service;
 mod sha256;
 mod stash;

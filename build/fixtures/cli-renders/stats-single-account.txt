@@ -1,0 +1,17 @@
+usage — last 24h (Jun 30–Jul 1)
+
+account  signal     session  weekly  runway  velocity  trend
+alpha    saturated    62/99     48%     ~2h  0.9%/min  ▃▆▇█
+
+contribution share
+alpha  ██████████████████████░░░░░░░░░░░░░░░░░░   55%
+
+session pattern — hourly mean
+alpha  ▒▓▓█
+
+session distribution — mean · p95 · peak
+alpha  ┤────────────────────────m────────────P─x├  62% · 94% · 99%
+
+  lowest utilisation: alpha (session mean 62%)
+  accounts last ~1 day at the current combined rate (1 of 1 counted)
+roster: 4 swaps (2 session, 1 weekly, 1 manual, 0 forced, 0 emergency) · all-accounts-high: 0 episodes (0s)
