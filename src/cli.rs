@@ -588,17 +588,21 @@ fn parse_reliability(parser: &mut lexopt::Parser) -> Result<Command> {
     }))
 }
 
-/// Parse `log [--since <duration>] [--event <name>] [--json]` (issue #773) — the offline reader
-/// for the event log's lines themselves. Flags only: there is no positional form, because the
-/// thing one would filter by is an event name, and that is `--event`.
+/// Parse `log [--since <duration>] [--event <name>] [--json] [-f|--follow]` (issues #773, #774) —
+/// the offline reader for the event log's lines themselves. Flags only: there is no positional
+/// form, because the thing one would filter by is an event name, and that is `--event`.
 fn parse_log(parser: &mut lexopt::Parser) -> Result<Command> {
     let mut json = false;
     let mut since = None;
     let mut event = None;
+    let mut follow = false;
     while let Some(arg) = parser.next()? {
         match arg {
             Short('h') | Long("help") => return Ok(Command::Help(HelpTopic::Log)),
             Long("json") => json = true,
+            // `-f` is the short form every tailer has had since `tail(1)`; spelling it out costs
+            // nothing and not having it would surprise.
+            Short('f') | Long("follow") => follow = true,
             Long("since") => {
                 since = Some(
                     required_value(parser, "since", HelpTopic::Log)?
@@ -616,7 +620,12 @@ fn parse_log(parser: &mut lexopt::Parser) -> Result<Command> {
             other => return Err(unexpected(other, HelpTopic::Log)),
         }
     }
-    Ok(Command::Log(crate::log::LogArgs { since, event, json }))
+    Ok(Command::Log(crate::log::LogArgs {
+        since,
+        event,
+        json,
+        follow,
+    }))
 }
 
 /// Parse `export [PATH] [--plaintext] [--no-secrets] [--passphrase-file <path> |
@@ -865,7 +874,7 @@ COMMANDS:
     poke [<account>]     Run Claude Code once in an isolated config dir so it refreshes a parked account's credential (all near-expiry if omitted)
     stats [<account>...] [--period day|week|month|lifetime] [--since <when>] [--json]  Show usage over a period, offline (reads the sample store directly)
     reliability [--json]  Swap-out overshoot SLO readout, offline (reads the event log): swap-out session_pct P50/P95/P100 vs targets, time-blind, false-preempt proxy, 429 counts
-    log [--since <duration>] [--event <name>] [--json]  Show the daemon's event log itself, offline (reads the log file directly) — the raw-lines counterpart to reliability
+    log [--since <duration>] [--event <name>] [--json] [-f|--follow]  Show the daemon's event log itself, offline (reads the log file directly) — the raw-lines counterpart to reliability; --follow keeps printing new lines as they arrive
     export [PATH] [--plaintext] [--no-secrets] [--passphrase-stdin]  Serialize state to an (encrypted by default) migration artifact — a file (0600) or stdout
     import <PATH> [--overwrite] [--passphrase-stdin]  Rehydrate accounts from a migration artifact — skips accounts already present unless --overwrite
 
@@ -1104,20 +1113,32 @@ const LOG_USAGE: &str =
     "sessiometer log — show the daemon's event log, offline (reads the log file directly)
 
 USAGE:
-    sessiometer log [--since <duration>] [--event <name>] [--json]
+    sessiometer log [--since <duration>] [--event <name>] [--json] [-f|--follow]
 
-    --since <d>  show only events at/after now - <duration>. <duration> is a non-negative
-                 integer with a unit: s, m, h, d, w (e.g. 30m, 24h, 7d, 2w) — the same
-                 grammar as `reliability --since`. Omit for the whole log (the default).
-    --event <n>  show only lines whose `event=` token is EXACTLY <n> (e.g. swap, restash,
-                 all_exhausted). Omit for every event.
-    --json       print the matched lines as JSON records (schema:1, for scripts) instead of
-                 the text view
-    -h, --help   print this help
+    --since <d>   show only events at/after now - <duration>. <duration> is a non-negative
+                  integer with a unit: s, m, h, d, w (e.g. 30m, 24h, 7d, 2w) — the same
+                  grammar as `reliability --since`. Omit for the whole log (the default).
+    --event <n>   show only lines whose `event=` token is EXACTLY <n> (e.g. swap, restash,
+                  all_exhausted). Omit for every event.
+    --json        print the matched lines as JSON records (schema:1, for scripts) instead of
+                  the text view
+    -f, --follow  keep printing newly appended lines until interrupted (Ctrl-C)
+    -h, --help    print this help
 
 READ-ONLY: it reads ~/Library/Logs/sessiometer/sessiometer.log and makes no live call, so it
 works when the daemon is down. This is the raw-lines counterpart to `reliability`, which reads
 the same file but only to fold it into SLIs.
+
+FOLLOWING (-f, --follow): the log is printed as usual, then newly appended lines are printed as
+they arrive. The two filters do NOT behave the same way here, and the difference is deliberate:
+--since bounds the initial catch-up only, because a line that arrives while you are watching is
+recent by definition; --event keeps filtering every streamed line. If the log is truncated, or
+rotated away and replaced, the follower says so on stderr and resumes from the new file's start
+instead of stalling or reprinting what it already showed you. If the log does not exist yet, it
+waits for the daemon to create it rather than exiting — a follow started before the daemon's
+first write is a normal cold start. With --json the stream is JSON Lines (one complete record
+per line, each carrying its own schema), NOT the single document the one-shot form prints: a
+stream has no last record, so its array could never be closed.
 
 The text view writes the matched lines to stdout VERBATIM and nothing else, so a piped
 `sessiometer log` stays a clean line stream (`| grep`, `| wc -l` stay honest). The resolved
@@ -10060,13 +10081,14 @@ spare  22222222-2222\n\
 
     #[test]
     fn log_parses_bare_and_each_flag() {
-        // Bare defaults to the whole log, every event, the text view.
+        // Bare defaults to the whole log, every event, the text view, one shot.
         assert_eq!(
             parse_argv(&["log"]).unwrap(),
             Command::Log(crate::log::LogArgs {
                 since: None,
                 event: None,
                 json: false,
+                follow: false,
             })
         );
         // `--since` / `--event` capture their RAW values (space- or `=`-separated); duration
@@ -10081,17 +10103,48 @@ spare  22222222-2222\n\
                     since: Some("7d".to_string()),
                     event: Some("swap".to_string()),
                     json: false,
+                    follow: false,
                 }),
                 "argv {argv:?} must carry the raw flag values",
             );
         }
-        // All three compose.
+        // All four compose.
         assert_eq!(
-            parse_argv(&["log", "--since", "24h", "--event", "restash", "--json"]).unwrap(),
+            parse_argv(&["log", "--since", "24h", "--event", "restash", "--json", "--follow"])
+                .unwrap(),
             Command::Log(crate::log::LogArgs {
                 since: Some("24h".to_string()),
                 event: Some("restash".to_string()),
                 json: true,
+                follow: true,
+            })
+        );
+    }
+
+    #[test]
+    fn log_follow_has_a_short_form_and_defaults_off() {
+        // `-f` and `--follow` are the SAME flag (issue #774) — a tailer without `-f` would
+        // surprise, and a short form that silently diverged from the long one would be worse.
+        let long = parse_argv(&["log", "--follow"]).unwrap();
+        assert_eq!(parse_argv(&["log", "-f"]).unwrap(), long);
+        assert_eq!(
+            long,
+            Command::Log(crate::log::LogArgs {
+                since: None,
+                event: None,
+                json: false,
+                follow: true,
+            })
+        );
+        // Non-degeneracy: the default is genuinely `false`, so the assertions above are not
+        // comparing two copies of the same default value.
+        assert_eq!(
+            parse_argv(&["log"]).unwrap(),
+            Command::Log(crate::log::LogArgs {
+                since: None,
+                event: None,
+                json: false,
+                follow: false,
             })
         );
     }
@@ -10127,26 +10180,35 @@ spare  22222222-2222\n\
     fn log_usage_lists_exactly_the_flags_the_parser_accepts() {
         // The issue #175 help/parser lockstep, both directions.
         //
-        // Forward: every flag the parser accepts is documented.
-        for flag in ["--since", "--event", "--json"] {
+        // Forward: every flag the parser accepts is documented. `--follow` joined this set in
+        // issue #774, moved out of the `foreign` reservation below — which is exactly the trip
+        // wire that reservation existed to be.
+        for flag in ["--since", "--event", "--json", "--follow"] {
             assert!(LOG_USAGE.contains(flag), "LOG_USAGE must document {flag}");
             assert!(
                 parse_argv(&["log", flag, "x"]).is_ok() || parse_argv(&["log", flag]).is_ok(),
                 "{flag} must be accepted by the parser"
             );
         }
-        assert!(LOG_USAGE.contains("-h, --help"));
+        // The short forms, which the loop above cannot express: each must be documented in the
+        // pair spelling the usage block uses, and accepted.
+        for (short, long) in [("-h, --help", "-h"), ("-f, --follow", "-f")] {
+            assert!(LOG_USAGE.contains(short), "LOG_USAGE must document {short}");
+            assert!(
+                parse_argv(&["log", long]).is_ok(),
+                "{long} must be accepted by the parser"
+            );
+        }
 
         // Backward: no flag the parser REJECTS may be documented — the drift a copy-pasted
-        // usage block actually produces. Includes the two flags deferred to the sibling issues
-        // (#774 `--follow`, #775 `--channel`), so shipping one without its help text trips here.
+        // usage block actually produces. Still includes the flag deferred to the sibling issue
+        // (#775 `--channel`), so shipping it without its help text trips here.
         for foreign in [
             "--period",
             "--no-color",
             "--ascii",
             "--plaintext",
             "--overwrite",
-            "--follow",
             "--channel",
             "--verbose",
         ] {
@@ -10160,13 +10222,20 @@ spare  22222222-2222\n\
             );
         }
 
-        // And the verb is reachable from the top-level overview.
-        assert!(
-            ROOT_USAGE
-                .lines()
-                .any(|line| line.trim_start().starts_with("log ")),
-            "ROOT_USAGE must carry a `log` line"
-        );
+        // And the verb is reachable from the top-level overview — carrying the SAME flags, not
+        // merely present. Asserting only that the line exists let the root synopsis go stale
+        // when `--follow` landed: the overview kept advertising the issue #773 flag set while
+        // the parser had grown past it, and every other assertion here still passed.
+        let root_line = ROOT_USAGE
+            .lines()
+            .find(|line| line.trim_start().starts_with("log "))
+            .expect("ROOT_USAGE must carry a `log` line");
+        for flag in ["--since", "--event", "--json", "--follow"] {
+            assert!(
+                root_line.contains(flag),
+                "the ROOT_USAGE `log` synopsis must carry {flag}, got {root_line:?}"
+            );
+        }
     }
 
     #[test]
