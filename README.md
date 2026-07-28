@@ -1145,6 +1145,15 @@ raise [`poll_secs`](#configuration) or keep the roster smaller by choice.
 
 ## Build from source
 
+**macOS is the only supported build target.** The crate does not compile for Linux or
+Windows today, and no CI job attempts it — every job that builds, tests, or lints the
+crate runs on a macOS runner. That is a stated position, not an oversight: the daemon is
+built on `launchd`, the login keychain, and the passwd database, and the menu-bar app on
+SwiftUI, TCC, and Developer ID notarization. Cross-platform support is tracked future
+work — recon (#40) first, then the credential-store seam (#25), the per-OS mechanisms
+(#26/#27/#28), and packaging plus CI (#29). See
+[ADR-0029](docs/adr/0029-macos-is-the-only-supported-build-target.md).
+
 ```sh
 cargo build --release
 ./target/release/sessiometer --help

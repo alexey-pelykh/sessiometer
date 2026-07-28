@@ -2607,6 +2607,17 @@ mod tests {
     /// assertion above rather than replacing it — this half proves the scrub survives an
     /// actual spawn, and its subject is verified non-degenerate (the child really did
     /// emit a populated environment) before the absence claim is made.
+    ///
+    /// **macOS-only assumption — documented, not `cfg`-gated (issue #797, ADR-0029).**
+    /// This spawns the real `/bin/sh -l -c /usr/bin/env` and asserts it succeeded, which
+    /// assumes `/bin/sh` accepts `-l` and still emits an environment. macOS's `/bin/sh`
+    /// (bash in `sh` mode) does; `dash` — the Debian/Ubuntu `/bin/sh` — does not treat
+    /// `-l` the same, so the success assertion could fail there for a reason unrelated to
+    /// the scrub under test. It stays a comment rather than a `#[cfg(target_os = "macos")]`
+    /// because macOS is the only supported build target: the crate does not compile for
+    /// Linux at all, so the gate would be inert today AND would falsely imply the rest of
+    /// this suite is portable. A future porter (#26 / #29) re-verifies it against the
+    /// target's real `/bin/sh`.
     #[tokio::test]
     async fn a_live_harvest_child_emits_no_scrubbed_variable() {
         // The real shape — `/bin/sh -l -c /usr/bin/env` — so the child's own `env`
@@ -2701,6 +2712,16 @@ mod tests {
     /// the reverse order returns identical values. Each copies out of the same
     /// libc-owned static buffer, so a borrow left dangling by one would be clobbered by
     /// the next `getpwuid` — this is the test that would catch it.
+    ///
+    /// **macOS-only assumption — documented, not `cfg`-gated (issue #797, ADR-0029; same
+    /// reasoning as `a_live_harvest_child_emits_no_scrubbed_variable`).** The absoluteness
+    /// assertions below read the HOST's live passwd entry and require it to be populated:
+    /// an absolute `pw_dir`, an absolute `pw_shell`, a non-empty name. Every macOS account
+    /// satisfies that; a minimal Linux container image need not — a uid with no passwd
+    /// entry makes `login_shell()` return `LoginShellUnresolved`, and a `nologin`-class
+    /// empty `pw_shell` does the same, so the `unwrap()` panics before the absoluteness
+    /// claim is even reached. A future porter (#26 / #29) re-verifies it against the
+    /// target's passwd database.
     #[test]
     fn every_passwd_accessor_returns_its_own_field() {
         let home_first = home_dir().unwrap();
@@ -2744,6 +2765,13 @@ mod tests {
     /// without touching the ambient environment: `login_shell` takes no input and reads
     /// no env var, so whatever `$SHELL` says cannot reach it — and the value it does
     /// return is a real executable, which a spoofed `$SHELL` need not be.
+    ///
+    /// **macOS-only assumption — documented, not `cfg`-gated (issue #797, ADR-0029; same
+    /// reasoning as `every_passwd_accessor_returns_its_own_field`).** This reads the HOST's
+    /// live passwd entry, and it is the STRICTER of the two: `is_file()` demands the named
+    /// shell exist on disk, where the sibling only demands `is_absolute()`. A minimal Linux
+    /// container image naming an absent `/usr/sbin/nologin` would pass the sibling and fail
+    /// here. A future porter (#26 / #29) re-verifies it against the target's passwd database.
     #[test]
     fn the_login_shell_comes_from_the_password_database() {
         let shell = login_shell().unwrap();
@@ -2899,8 +2927,9 @@ mod tests {
     // we hand it — `HOME` is genuinely ABSENT rather than merely overwritten, which is the
     // one thing an in-process approach cannot safely arrange.
     //
-    // Nothing here introduces a platform conditional (issue #797's premise correction): no
-    // `cfg(target_os)`, and no claim — implicit or explicit — about Linux.
+    // Nothing here introduces a platform conditional (issue #797's premise correction, now
+    // recorded as ADR-0029): no `cfg(target_os)`, and no claim — implicit or explicit —
+    // about Linux.
     //
     // Cases carry their issue-#785 T-number, exactly as the tier-3 tests above carry their
     // #784 ones. The two numberings are independent: a bare "T2" in this section is #785's.
