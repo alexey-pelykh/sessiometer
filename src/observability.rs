@@ -5390,8 +5390,10 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
 
     #[test]
     fn no_diagnostic_line_carries_an_email_or_token_sigil() {
-        // #15: every diagnostic field is a handle / enum / number / timestamp, so a
-        // token or email can never reach a rendered line. Mirrors the event-log guard.
+        // #15: every diagnostic field is a handle / enum / number / timestamp / hash
+        // prefix, so a token or email can never reach a rendered line. The handles here
+        // are plain (non-email) labels; an operator's own email label would be
+        // permitted. Mirrors the event-log guard.
         let diags = [
             Diagnostic::Start {
                 accounts: 2,
@@ -5412,6 +5414,17 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
                 backoff_secs: Some(16),
                 // Exercise the #295 source-label field through the #15 redaction scan too.
                 retry_after_secs: Some(3600),
+            },
+            // Issue #464: the identifier-shaped variant — a hash-prefix fingerprint, an
+            // operator handle, a timestamp. All four optional fields are populated (a live
+            // `Present` read), so the issue #475 rotation-yank marker's trailing
+            // `prev=<prior-fingerprint>` — a second fingerprint — rides the scan too.
+            Diagnostic::Canonical {
+                state: CanonicalLiveness::Present,
+                fingerprint: Some("0123456789abcdef".to_owned()),
+                account: Some("work".to_owned()),
+                expires_at: Some(1_782_777_600),
+                rotated_from: Some("fedcba9876543210".to_owned()),
             },
         ];
         for diag in &diags {
