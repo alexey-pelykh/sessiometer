@@ -12,4 +12,4 @@ retired  underused   33%         11/19/18           2/3/3     0     0s     0%   
 
   lowest utilisation: ガンマ (session mean 8%)
   accounts last ~3 days at the current combined rate (2 of 3 counted)
-roster: 4 swaps (2 session, 1 weekly, 1 manual, 0 forced, 0 emergency) · all-accounts-high: 0 episodes (0s)
+roster: 4 swaps (2 session, 1 weekly, 1 manual, 0 forced, 0 emergency) · all-accounts-high (≥95%): 0 episodes (0s)
