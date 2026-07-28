@@ -250,6 +250,86 @@ success; the countable signal is the `PANEL_GOLDEN_GATE_RESULT=green|red` line t
 alongside the `max drift` figure the promotion decision needs. **The promotion decision — the tally, the
 re-calibration question it must answer first, and the mechanics — is recorded in issue #790.**
 
+## Accessibility (#758)
+
+Accessibility *labels* have long been deliberate and unit-tested as **strings**
+(`StatusPanelFormatTests`). What issue #758 added is a gate over everything about a11y that is **not** a
+string — reachability, role, enabled state, element order, and whether `accessibilityHidden(true)`
+decorations genuinely *leave* the tree. A correct label on an unreachable or mis-typed element is not
+accessible.
+
+### The tooling question, answered
+
+Issue #758 was written around "`performAccessibilityAudit` needs a macOS 14 host, but the app targets
+13.0 — can we audit at all?" Measured 2026-07-28, that framing names the wrong blocker three times:
+
+1. **The host was never it.** Dev machine macOS 26.5.2 / Xcode 26.6; CI's `macos-latest` resolved to
+   macOS 26.4 on the #749 and #761 runs.
+2. **The test bundle can outrank the app.** Adding `deploymentTarget: "14.0"` to the `MenubarTests`
+   target yields `MACOSX_DEPLOYMENT_TARGET = 14.0` for it while the `Menubar` app target still reads
+   `13.0` — XcodeGen's per-target key overrides `options.deploymentTarget` for that target only. So the
+   app's shipping floor never had to move.
+3. **…and it is not needed.** `performAccessibilityAudit` hangs off `XCUIApplication`, i.e. a UI-test
+   bundle, with all of issue #761's costs (own scheme, dead on a locked session, prose-coupled queries).
+   The accessibility tree turns out to be reachable **in-process** from the existing headless bundle.
+
+So the automated branch is a **GO**, by a cheaper route than the issue anticipated, and `project.yml`'s
+`macOS: "13.0"` is untouched.
+
+### The automated gate
+
+`Tests/PanelAccessibilityTreeTests` hosts the panel in an `NSHostingView` and walks the live AppKit
+accessibility tree across all 17 render fixtures — no XCUITest, no scheme risk, no TCC grant
+(`AXIsProcessTrusted()` is **false** in that bundle), ~0.6 s, inside the required `swift` job. It asserts
+interactive elements publish `AXButton`, blocked rows publish `enabled=false`, decorative elements are
+**absent** from the tree, no focusable element is silent, navigation order runs header → tabs → roster →
+footer, and each fixture's role histogram is unchanged.
+
+Two constraints make its green trustworthy, both learned the hard way locally:
+
+- **Every absence claim pins a known-present anchor in the same dump.** An empty tree satisfies "nothing
+  leaked" perfectly, so absence is evidence only against a populated tree — the trap issue #761's spike
+  fell into when it read a filtered tree as a complete one.
+- **Every predicate has a mutation canary.** Each is fed a deliberately-broken view through the *same*
+  function the real assertion calls, because a gate authored against passing code can be one that cannot
+  fail — issue #437's three render bugs are the local precedent for what that costs.
+
+Two known defects are pinned as set **equality**, so fixing either turns the suite red and says so:
+issue #838 (a decorative Stats icon reaching the tree) and issue #839 (non-interactive rows publishing
+`AXUnknown`). The Settings window is **not** covered — see issue #840.
+
+### VoiceOver pre-release checklist (manual)
+
+The tree walk cannot see VoiceOver's own behaviour: the rotor, real focus traversal, and speech are
+runtime features of the screen reader, not attributes of the tree. Those stay manual. Run this before a
+release, with VoiceOver on (`⌘F5`):
+
+**Status panel** — open it from the menu bar, then:
+
+- [ ] `VO`+arrow traverses header → Status tab → Stats tab → each roster row → next-swap callout → switch
+      chip → footer, with nothing skipped and nothing announced twice.
+- [ ] Each roster row speaks its whole sentence (label, active/auth state, both percents and resets).
+- [ ] The switch chip announces as a **button**, not as text, and speaks its target account.
+- [ ] On the `blind-cornered`-shaped state, a weekly-exhausted row announces as **dimmed / unavailable**,
+      not merely with "Can't switch" buried in its sentence.
+- [ ] No glyph, meter, sparkline, capsule or signal pill is ever focused — VoiceOver should never say
+      "image" inside the panel. (Issue #838 is a known live exception in the Stats tab until fixed.)
+- [ ] Rotor (`VO`+U): the roster is navigable by control type; note which rows are missing from the
+      button/text lists (this is the observation issue #839 is tracking — confirm or correct it here).
+- [ ] Switching Status ↔ Stats moves focus somewhere sensible rather than dumping it at the panel root.
+
+**Settings window** — `⌘,`:
+
+- [ ] The window announces its title and is fully reachable by `Tab` and by `VO`+arrow.
+- [ ] Every `Toggle`, `TextField` and `Button` announces its role and current value.
+- [ ] The per-field help text is spoken (it maps to `accessibilityHelp`).
+- [ ] The decorative icon in the load-failure state is never focused.
+
+Not on this list on purpose: the **armed / hover** states. Hovering drives only the row wash, the chip
+tint step and the cursor — none of which is an accessibility attribute, so an armed row and a resting row
+are byte-identical in the tree and VoiceOver cannot distinguish them either. That surface belongs to
+issue #766's interaction-state checklist, not here.
+
 ## It's a mock, not code
 
 The mock approximates native treatments in HTML/CSS. When building the SwiftUI panel, translate
