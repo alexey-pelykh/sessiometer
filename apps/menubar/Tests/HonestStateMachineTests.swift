@@ -256,6 +256,48 @@ final class HonestStateMachineTests: XCTestCase {
                        "Sessiometer: refresh mechanism down — 1 consecutive sweep failed for every eligible account")
     }
 
+    // AC1/AC2 (#813): the a11y label — the third render site — phrases the episode's evidence from its
+    // PROVENANCE. A VoiceOver user hearing "1 consecutive sweep failed" over an episode in which zero
+    // sweeps ran is told a fabricated observation aloud; this pins that it no longer is. End-to-end from
+    // the wire, so the decode → retain → project path is exercised, not just `make`.
+    func testPreflightOpenedEpisodeLabelDoesNotInventASweep() {
+        let m = machine([.connected, .line(Fixtures.snapshotSystemicRefreshPreflight)])
+        XCTAssertEqual(m.systemicRefreshSource, .preflight, "the provenance reaches the projection")
+        XCTAssertEqual(m.systemicRefreshFailure, 1, "the seeded floor, carried but not cited")
+        XCTAssertEqual(m.presentation.glyph, .attention,
+                       "the GLYPH is unchanged — a down mechanism is the same next-break ! either way")
+        XCTAssertEqual(m.presentation.accessibilityLabel,
+                       "Sessiometer: refresh mechanism down — the startup preflight could not resolve the claude binary")
+        XCTAssertFalse(m.presentation.accessibilityLabel.contains("sweep"), "#813 AC1: no sweep is asserted")
+
+        // AC2 — the sweep arm is unchanged, and so is a pre-#813 daemon's provenance-free frame: both keep
+        // the historical phrasing exactly.
+        let swept = machine([.connected, .line(Fixtures.snapshotSystemicRefreshFailure)])
+        XCTAssertEqual(swept.systemicRefreshSource, .sweep)
+        let legacy = machine([.connected, .line(Fixtures.snapshotSystemicRefreshNoSource)])
+        XCTAssertNil(legacy.systemicRefreshSource, "a pre-#813 daemon sends none")
+        XCTAssertEqual(legacy.presentation.accessibilityLabel, swept.presentation.accessibilityLabel,
+                       "#813 AC2/AC3: absent provenance renders exactly as the sweep arm did before")
+        XCTAssertEqual(swept.presentation.accessibilityLabel,
+                       "Sessiometer: refresh mechanism down — 3 consecutive sweeps failed for every eligible account")
+    }
+
+    // #813: the provenance is REFUSED with the rest of the payload on an unsupported-major frame, and
+    // cleared on a drop — it must never outlive the count it qualifies, or a later episode would be
+    // narrated with a stale bracket.
+    func testSystemicRefreshProvenanceIsRefusedAndClearedWithItsCount() {
+        let unsupported = machine([.connected, .line(Fixtures.snapshotSystemicRefreshPreflight),
+                                   .line(Fixtures.snapshotUnsupportedMajor)])
+        XCTAssertNil(unsupported.systemicRefreshFailure, "refused with the unsupported-major payload")
+        XCTAssertNil(unsupported.systemicRefreshSource, "and so is its provenance — never one without the other")
+
+        // A later healthy frame clears both together.
+        let recovered = machine([.connected, .line(Fixtures.snapshotSystemicRefreshPreflight),
+                                 .line(Fixtures.snapshotBasic)])
+        XCTAssertNil(recovered.systemicRefreshFailure)
+        XCTAssertNil(recovered.systemicRefreshSource, "no stale bracket survives into the next episode")
+    }
+
     // The vouched-only GATE, extended to the third payload fault: the count is RETAINED across a drop /
     // stale (like the vault bits and the roster), but `make` reads it ONLY in the `.connected` arm. Under a
     // dropped socket the actionable problem is the SOCKET — the label must say so, not the retained
@@ -285,6 +327,17 @@ final class HonestStateMachineTests: XCTestCase {
                          .line(Fixtures.heartbeatPreFreeze)])
         XCTAssertEqual(m.connectionState, .unsupported)
         XCTAssertNil(m.systemicRefreshFailure, "refused on a skewed beat, as on a skewed snapshot")
+        // #813: the PROVENANCE is refused on the beat leg too. Asserted explicitly because the
+        // snapshot leg's refusal does not imply this one — `applyHeartbeat` carries its own reset
+        // list, and a field added to the snapshot leg alone would be retained here, outliving the
+        // contract it was read through. (Pre-#813 this leg was guarded for the count only.)
+        XCTAssertNil(m.systemicRefreshSource, "the bracket is refused with its count, never one alone")
+
+        // The same on the PREFLIGHT bracket — the arm whose provenance actually changes a render.
+        let pre = machine([.connected, .line(Fixtures.snapshotSystemicRefreshPreflight),
+                           .line(Fixtures.heartbeatPreFreeze)])
+        XCTAssertNil(pre.systemicRefreshFailure)
+        XCTAssertNil(pre.systemicRefreshSource)
     }
 
     // MARK: - AC: empty accounts → empty-roster (DISTINCT from daemon-down)

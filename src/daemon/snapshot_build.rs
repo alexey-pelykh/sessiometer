@@ -207,6 +207,11 @@ where
             // when healthy — surfaced by `status` so the mechanism-down state is visible without
             // waiting for an account to die. A COUNT only (#15).
             systemic_refresh: self.state.systemic_refresh.status(),
+            // WHICH bracket opened that episode (issue #813) — read from the SAME latch as the
+            // count above, so an episode snapshot always carries both or neither. Lets each
+            // surface phrase a preflight-opened episode without inventing the sweep that would
+            // have had to run for the count to mean what it says.
+            systemic_refresh_source: self.state.systemic_refresh.source(),
             // The daemon-level canonical-scrub rollup (issue #516): project the two edge-latched scrub
             // signals into the wire discriminant so `status` / the menubar (#469) can surface the
             // fleet-wide scrubbed lockout. GATE on `signaled_canonical_scrubbed` FIRST (the master "is
@@ -281,6 +286,7 @@ mod tests {
     fn status_response_carries_handles_and_percentages_and_never_a_secret() {
         let snapshot = StatusSnapshot {
             systemic_refresh: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -708,6 +714,7 @@ mod tests {
         let secrets = Secrets::meter_fixture();
         let snapshot = StatusSnapshot {
             systemic_refresh: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -799,6 +806,7 @@ mod tests {
 
         let snapshot = StatusSnapshot {
             systemic_refresh: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -977,6 +985,7 @@ mod tests {
     fn watch_snapshot(label: &str, generated_at: i64, session: f64) -> StatusSnapshot {
         StatusSnapshot {
             systemic_refresh: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -1972,12 +1981,72 @@ mod tests {
         };
         let json = serde_json::to_string(&versioned_status_response(&snapshot)).unwrap();
         assert!(
-            json.contains(r#""schema_version":{"major":1,"minor":10}"#),
+            json.contains(r#""schema_version":{"major":1,"minor":11}"#),
             "got {json}"
         );
         assert!(json.contains(r#""generated_at":1782777600"#), "got {json}");
         // Flat: the payload's `accounts` sits at the top level, not nested under a wrapper key.
         assert!(json.contains(r#""accounts":[{"#), "got {json}");
+    }
+
+    #[test]
+    fn the_systemic_episode_carries_its_provenance_as_a_fixed_token() {
+        // Issue #813: the episode's opening bracket reaches the wire beside the count it qualifies,
+        // so a client can phrase a preflight-opened episode without inventing the sweep the count
+        // implies. Both arms of the discriminant, plus the healthy frame.
+        let framed = |systemic, source| {
+            serde_json::to_string(&versioned_status_response(&StatusSnapshot {
+                systemic_refresh: systemic,
+                systemic_refresh_source: source,
+                ..Default::default()
+            }))
+            .unwrap()
+        };
+
+        // AC3 / the omit-when-healthy contract: a healthy frame does not carry the key AT ALL, so
+        // its bytes are unchanged for every client, old or new.
+        let healthy = framed(None, None);
+        assert!(
+            !healthy.contains("systemic_refresh_source"),
+            "healthy omits the key entirely: {healthy}"
+        );
+
+        // An episode frame carries BOTH, and the count is untouched by the addition — which is what
+        // keeps a pre-#813 client rendering exactly what it renders today.
+        let sweep = framed(Some(3), Some(SystemicRefreshSource::Sweep));
+        assert!(
+            sweep.contains(r#""systemic_refresh_failure":3"#)
+                && sweep.contains(r#""systemic_refresh_source":"sweep""#),
+            "the sweep arm carries count + provenance: {sweep}"
+        );
+        let preflight = framed(Some(1), Some(SystemicRefreshSource::Preflight));
+        assert!(
+            preflight.contains(r#""systemic_refresh_failure":1"#)
+                && preflight.contains(r#""systemic_refresh_source":"preflight""#),
+            "the preflight arm carries count + provenance: {preflight}"
+        );
+
+        // AC4 / issue #15: a CLASS from a closed two-value set, never the evidence behind it. The
+        // preflight's subject is a binary location, so this is the arm where a path would leak —
+        // assert the whole frame is free of one rather than trusting the type to stay fieldless.
+        for frame in [&sweep, &preflight] {
+            assert!(
+                !frame.contains('/') && !frame.to_lowercase().contains("token"),
+                "the provenance is a fixed token, never a path or secret: {frame}"
+            );
+        }
+
+        // And it round-trips: a client decoding these bytes recovers the same discriminant.
+        let decoded: VersionedStatus = serde_json::from_str(&preflight).unwrap();
+        assert_eq!(
+            decoded.status.systemic_refresh_source,
+            Some(SystemicRefreshSource::Preflight)
+        );
+        let decoded_healthy: VersionedStatus = serde_json::from_str(&healthy).unwrap();
+        assert_eq!(
+            decoded_healthy.status.systemic_refresh_source, None,
+            "an absent key decodes to None, so a pre-#813 daemon reads as healthy provenance"
+        );
     }
 
     #[test]
@@ -2009,6 +2078,7 @@ mod tests {
         // backward-compat guarantee the flatten design rests on.
         let snapshot = StatusSnapshot {
             systemic_refresh: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -2320,6 +2390,7 @@ mod tests {
     fn swap_report_renders_only_for_a_swap_outcome() {
         let snapshot = StatusSnapshot {
             systemic_refresh: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,

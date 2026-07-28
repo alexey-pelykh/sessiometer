@@ -59,6 +59,14 @@ struct PanelRenderFixture {
     var keychainLocked: Bool = false
     var canonicalScrub: CanonicalScrub?
     var systemicRefreshFailure: UInt32?
+    // The systemic episode's opening bracket (#813) — it selects the banner's EVIDENCE clause, so each arm
+    // is a distinct render (three of them: sweep/absent, preflight, and the newer-daemon `.unrecognized`
+    // fallback that cites no evidence). Plumbed through to `WatchStatusStore.preview` so the preflight arm is
+    // renderable, but no fixture below sets it yet: a `fault-systemic-refresh-preflight` capture needs a
+    // matching `.pop` state in the mock to pair against, the same design-SSOT prerequisite that keeps the
+    // canary faults unmodeled here (#571). The rendered fixture is therefore the `.sweep`/absent arm, which
+    // is what shipped before #813.
+    var systemicRefreshSource: SystemicRefreshSource?
     // The loaded Stats-tab series (#704). Non-nil ONLY on the `stats` fixture: it seeds a `PanelStatsModel`
     // to `.stats`/`.loaded` so the render shows the account cards, not the Status glance. `var` with a
     // default for the same memberwise-init reason as the payload faults above.
@@ -389,7 +397,8 @@ enum PanelRenderHarness {
                                              nextSwap: fixture.nextSwap, generatedAt: fixture.generatedAt,
                                              canonicalScrub: fixture.canonicalScrub,
                                              keychainLocked: fixture.keychainLocked,
-                                             systemicRefreshFailure: fixture.systemicRefreshFailure)
+                                             systemicRefreshFailure: fixture.systemicRefreshFailure,
+                                             systemicRefreshSource: fixture.systemicRefreshSource)
         let stats = fixture.statsWire.map { PanelStatsModel.loadedPreview($0) }
             ?? PanelStatsModel(client: nil)
         let loginItem = LoginItemModel(service: PanelRenderLoginItemService())

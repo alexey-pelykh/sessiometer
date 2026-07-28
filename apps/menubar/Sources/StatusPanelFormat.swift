@@ -1249,13 +1249,53 @@ enum StatusPanelFormat {
     /// STATE-parity, as ADR-0016 did for `ActiveDeadNoTarget` / `nextSwapFooter`) — the CLI spells the
     /// remedy out for a terminal reader; the panel keeps it to the one line a popover affords. The noun
     /// agreement matches the CLI's at the `n=1` floor (a threshold of 1 fires on the first all-error sweep
-    /// → "1 consecutive sweep"). Carries only the COUNT — never a token, path, or email (issue #15).
-    static func systemicRefreshFailureBanner(_ consecutive: UInt32?) -> Banner? {
+    /// → "1 consecutive sweep"). Carries only the COUNT and a FIXED-TOKEN provenance class — never a
+    /// token, path, or email (issue #15).
+    ///
+    /// The DOWN verdict is one state, but its EVIDENCE has three shapes, and issue #813 stopped this banner
+    /// from citing the wrong one. `source` says which of the episode's opening brackets opened it — what
+    /// each arm SAYS is below; the posture behind the split lives with `SystemicRefreshSource`:
+    ///
+    /// - `.sweep` — and `nil`, a pre-#813 daemon that sends no provenance at all: nothing better is
+    ///   available there, it is what that daemon's own client always showed, and changing it would regress
+    ///   an old daemon for no gain. The count IS a sweep count and reads exactly as before.
+    /// - `.preflight` — ZERO sweeps have run; the count is a seeded floor of one kept only for pre-#813
+    ///   grammar, so it is not cited at all and the preflight is named instead.
+    /// - `.unrecognized` — a NEWER daemon opened the episode with a bracket this build has never heard of,
+    ///   so the banner claims NO evidence: verdict and remedy only. Reusing the sweep phrasing there would
+    ///   re-create #813's defect in a build too old to know better.
+    ///
+    /// The `.preflight` and `.unrecognized` arms make NO claim about sweeps having or not having run since
+    /// — such an episode still clears only on a working sweep, so all-error sweeps may have run meanwhile;
+    /// "no sweep has run" would swap one fabrication for another. The CLI's line splits on the same seam
+    /// for the two arms a daemon of this vintage can send, so the two surfaces stay parallel.
+    ///
+    /// The CLI has no `.unrecognized` counterpart, and NOT because it cannot be older than the daemon it
+    /// reads — it can (`status` dials a fixed, version-agnostic socket, and since #171/#269 the daemon
+    /// ships embedded in the app while the CLI can come from Homebrew, so an updated app beside an older
+    /// `brew` CLI is a real topology). It is a deliberate POSTURE split: serde rejects an unknown variant,
+    /// so an unreadable bracket costs the Rust reader the whole frame — the refuse-don't-mis-render stance
+    /// every wire enum there takes (`canonical_scrub`, `next_swap.state`, `auth`; none carry
+    /// `#[serde(other)]`). A terminal reader gets an error and re-runs; a menu-bar panel would just go
+    /// blank, which is why this client tolerates and degrades instead. Same goal, opposite mechanism.
+    static func systemicRefreshFailureBanner(_ consecutive: UInt32?,
+                                             source: SystemicRefreshSource? = nil) -> Banner? {
         guard let consecutive else { return nil }
-        let sweeps = consecutive == 1 ? "sweep" : "sweeps"
-        return Banner(title: "Refresh mechanism down",
-                      detail: "\(consecutive) consecutive \(sweeps) failed for every eligible account — check the daemon log.",
-                      kind: .warning)
+        let detail: String
+        switch source {
+        case .preflight:
+            detail = "The startup preflight could not resolve the claude binary — check the daemon log."
+        case .unrecognized:
+            // "cannot read the cause", NOT "this app is older than the daemon": the skew is the
+            // overwhelmingly likely cause but it is an INFERENCE, and the a11y label states the
+            // weaker claim — two surfaces documented as reading off one seam must not assert
+            // different-strength things. The likely cause lives in the type's doc, not the string.
+            detail = "This app cannot read the cause — check the daemon log."
+        case .sweep, nil:
+            let sweeps = consecutive == 1 ? "sweep" : "sweeps"
+            detail = "\(consecutive) consecutive \(sweeps) failed for every eligible account — check the daemon log."
+        }
+        return Banner(title: "Refresh mechanism down", detail: detail, kind: .warning)
     }
 
     // MARK: - `canary` banner (issue #714 — the behavioral-canary identity-drift signal)
@@ -1369,6 +1409,7 @@ enum StatusPanelFormat {
     static func daemonFaultBanner(keychainLocked: Bool,
                                   scrub: CanonicalScrub?,
                                   systemicRefreshFailure: UInt32? = nil,
+                                  systemicRefreshSource: SystemicRefreshSource? = nil,
                                   canary: CanaryStatus? = nil) -> Banner? {
         // Ranks 1-2 — the "act now" vault pair.
         if let locked = keychainLockedBanner(keychainLocked) { return locked }
@@ -1386,7 +1427,12 @@ enum StatusPanelFormat {
         // operator's canary_nostashmatch_override makes the daemon send `inconclusive`, reaching no arm.
         if case .refusedUnparseableCanonical = canary { return canaryBanner(canary) }
         // Rank 6 — the "next break" mechanism fault, ABOVE the overridden-drift and calm-scrub arms below.
-        if let systemic = systemicRefreshFailureBanner(systemicRefreshFailure) { return systemic }
+        // The provenance (issue #813) only picks the banner's EVIDENCE clause — it never moves this
+        // rank. A down mechanism is the same next-break fault however its episode opened.
+        if let systemic = systemicRefreshFailureBanner(systemicRefreshFailure,
+                                                       source: systemicRefreshSource) {
+            return systemic
+        }
         // Rank 7 — an OVERRIDDEN drift (next-break `.warning`): the identity alarm stands, but the operator's
         // canary_drift_override lets writes proceed (each logged), so it ranks BELOW systemic and ABOVE the
         // calm recovering scrub. Only the overridden variant moved down — the refusal trio stays at ranks 3-5.

@@ -193,7 +193,8 @@ enum PanelA11y {
                                              nextSwap: fixture.nextSwap, generatedAt: fixture.generatedAt,
                                              canonicalScrub: fixture.canonicalScrub,
                                              keychainLocked: fixture.keychainLocked,
-                                             systemicRefreshFailure: fixture.systemicRefreshFailure)
+                                             systemicRefreshFailure: fixture.systemicRefreshFailure,
+                                             systemicRefreshSource: fixture.systemicRefreshSource)
         let stats = fixture.statsWire.map { PanelStatsModel.loadedPreview($0) } ?? PanelStatsModel(client: nil)
         let view = StatusPanelView()
             .statusPanelEnvironment(store: store,
@@ -595,6 +596,48 @@ final class PanelAccessibilityTreeTests: XCTestCase {
                 label nor a value — VoiceOver would land on them and say nothing: \(silent)
                 """)
         }
+    }
+
+    // MARK: - #813 — the episode's provenance survives the machine → store → VIEW chain
+
+    /// AC1's PANEL leg, guarded where it is actually reachable: through the real `StatusPanelView`.
+    ///
+    /// `StatusPanelFormatTests` pins the banner FUNCTION and `HonestStateMachineTests` pins the machine's
+    /// projection, but neither sees the `StatusPanelView` → `daemonFaultBanner` argument list in between.
+    /// Dropping `systemicRefreshSource:` at that call site leaves both suites green while the panel renders
+    /// "1 consecutive sweep failed" over an episode in which zero sweeps ran — the exact defect #813
+    /// exists to remove. This walks the rendered tree, so that line is load-bearing for a passing suite.
+    ///
+    /// The fixture is built HERE rather than added to `PanelRenderHarness.fixtures`: a shipped
+    /// `fault-systemic-refresh-preflight` capture needs a matching `.pop` state in the mock to pair
+    /// against (the design-SSOT prerequisite that also defers the canary faults, #571), and this guard
+    /// needs no capture — only the tree.
+    func testPreflightProvenanceReachesTheRenderedPanelBanner() throws {
+        let swept = try XCTUnwrap(PanelA11y.allFixtures.first { $0.name == "fault-systemic-refresh" })
+        var preflight = swept
+        // The count a preflight-opened episode actually carries: the seeded floor of one, kept only so a
+        // pre-#813 client stays grammatical. If the provenance is lost anywhere in the chain, THIS is what
+        // gets rendered as "1 consecutive sweep failed".
+        preflight.systemicRefreshFailure = 1
+        preflight.systemicRefreshSource = .preflight
+
+        let nodes = PanelA11y.panelTree(fixture: preflight)
+        assertKnownPresent(nodes, "Sessiometer.", "the #813 provenance check")
+
+        XCTAssertNotNil(nodes.firstContaining("startup preflight could not resolve"), """
+            the preflight banner never reached the rendered panel — the provenance is dropped somewhere in \
+            machine → store → StatusPanelView. Tree: \(nodes)
+            """)
+        XCTAssertNil(nodes.firstContaining("consecutive sweep"), """
+            the panel still asserts a sweep for a PREFLIGHT-opened episode (zero sweeps ran) — issue #813's \
+            defect, reachable again. Tree: \(nodes)
+            """)
+
+        // AC2's panel leg, through the same rendered chain: the sweep arm is untouched.
+        let sweptNodes = PanelA11y.panelTree(fixture: swept)
+        assertKnownPresent(sweptNodes, "Sessiometer.", "the #813 sweep-arm regression check")
+        XCTAssertNotNil(sweptNodes.firstContaining("3 consecutive sweeps failed"),
+                        "the #378 sweep phrasing regressed in the rendered panel: \(sweptNodes)")
     }
 }
 

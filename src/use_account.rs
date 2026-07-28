@@ -1573,6 +1573,7 @@ mod tests {
         // A unique handle match → its verdict.
         let unique = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -1596,6 +1597,7 @@ mod tests {
         // fallback, never a guess.
         let duped = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -1916,6 +1918,7 @@ mod tests {
 
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,

@@ -307,6 +307,79 @@ extension CanonicalScrub: Decodable {
     }
 }
 
+/// WHICH of a systemic-refresh episode's two opening brackets opened it (`src/daemon/snapshot.rs`
+/// `SystemicRefreshSource`, issue #813) — the wire's half of a distinction the daemon's event log has
+/// drawn since issue #787 but the snapshot could not.
+///
+/// THE CANONICAL HOME for the three-way rendering contract below: the two render sites
+/// (`StatusPanelFormat.systemicRefreshFailureBanner`, `PresentationState.make`) carry their own
+/// strings and point here for the WHY.
+///
+/// An episode opens EITHER on the #378 sweep crossing or on the #787 startup preflight failing to
+/// resolve the `claude` binary; it closes one way, on the first working sweep. The
+/// `systemicRefreshFailure` COUNT cannot carry that distinction: the preflight path seeds the count at
+/// one so a pre-#813 client stays grammatical, which is byte-identical to a genuine one-sweep crossing
+/// under `systemic_failure_n = 1`. Without this discriminant both the panel banner and the menu-bar
+/// a11y label asserted "1 consecutive sweep failed" for an episode in which ZERO sweeps had run.
+///
+/// A bare STRING (`"sweep"` / `"preflight"`), not internally tagged like `CanonicalScrub`: the two
+/// variants are fieldless classifications with no per-variant payload to grow into.
+///
+/// An UNRECOGNISED token does NOT fail the frame — the TOLERATED-DECORATION posture of an unknown
+/// `next_swap.reason.kind`, deliberately NOT the hard-reject posture of an unknown `canonical_scrub`
+/// state or `next_swap.state`. The split is about WHERE the alarm lives, not about house style: for
+/// those two the unknown value IS the fault, so a frame that cannot be read faithfully must be refused
+/// rather than mis-rendered. Here the fault rides in a SEPARATE field (`systemic_refresh_failure`)
+/// that decodes fine, and this one only picks which evidence clause the banner cites. Rejecting would
+/// throw away the whole frame — roster, vault pair, canary alarm and the mechanism-down count itself —
+/// over a phrasing selector. It would also be unrecoverable rather than gateable: `WireContract`
+/// `isSupported` keys on the MAJOR only, so a future 1.12 daemon adding a third bracket is a version
+/// this client reports as SUPPORTED while blanking every frame it sends.
+///
+/// It degrades to [`unrecognized`](Self/unrecognized) rather than to `nil`, because those two states
+/// are NOT the same and must not render the same. `nil` means "no provenance on this wire" — a
+/// pre-#813 daemon — where the historical sweep phrasing is the best available reading and is what
+/// that daemon's own client always showed. An unrecognised token means "this episode was opened by a
+/// bracket this build has never heard of", and a third bracket is far likelier to be another
+/// NON-sweep opener than a sweep one — so reusing the sweep phrasing there would assert a sweep that
+/// never ran, re-creating the exact defect #813 exists to remove, in a build too old to know better.
+/// The renderers therefore give it a provenance-NEUTRAL clause: the DOWN verdict and the remedy, with
+/// no evidence claimed.
+///
+/// Deliberately NOT `String`-raw-valued: [`unrecognized`](Self/unrecognized) is a CLIENT-side decode
+/// outcome, never a wire token, and a raw-value mapping would let some future daemon token collide
+/// with it. `init(wireToken:)` is the only way in, which also keeps the mapping total.
+///
+/// The whole key is optional (ABSENT when healthy, and absent from every pre-#813 daemon), handled at
+/// `VersionedStatus` via `decodeIfPresent`. Non-secret — a FIXED TOKEN from a closed set, never a path,
+/// binary location, token, or email (issue #15).
+enum SystemicRefreshSource: Equatable {
+    /// The #378 SWEEP crossing: `systemic_failure_n` consecutive sweeps in a row failed with
+    /// `outcome=error` across every eligible account. The count IS a sweep count here, so a renderer
+    /// may cite it as one.
+    case sweep
+    /// The #787 startup PREFLIGHT: the `claude` binary could not be resolved, so every eligible
+    /// account's refresh is guaranteed to fail before a single cycle runs. No sweep produced this
+    /// verdict, so a renderer must NOT cite the count as a sweep count (issue #813).
+    case preflight
+    /// A bracket this build does not know — a NEWER daemon (the wire's forward direction). Never sent
+    /// by any daemon; produced only here, by `init(wireToken:)`. The episode is real and the DOWN
+    /// verdict stands, but this build cannot say what opened it, so renderers must claim no evidence
+    /// at all rather than guess `sweep` and risk asserting a sweep that never ran.
+    case unrecognized
+
+    /// Map a wire token to a case, TOTALLY — an unrecognised token becomes
+    /// [`unrecognized`](Self/unrecognized) rather than a decode failure. The only constructor from the
+    /// wire, so the tolerate-don't-reject posture cannot be bypassed at a call site.
+    init(wireToken: String) {
+        switch wireToken {
+        case "sweep": self = .sweep
+        case "preflight": self = .preflight
+        default: self = .unrecognized
+        }
+    }
+}
+
 // MARK: - The behavioral-canary verdict (issue #714 — the keychain-derivation identity check)
 
 /// The behavioral canary's LAST verdict (`src/daemon/snapshot.rs` `CanaryStatus`, issue #714): did the
@@ -527,6 +600,19 @@ struct VersionedStatus: Decodable, Equatable {
     /// visible without waiting for an account to die; `nil` for a pre-#378 daemon (rendered as
     /// healthy). Added by the MINOR `1.0 → 1.1` bump — an older client tolerates it by ignoring.
     let systemicRefreshFailure: UInt32?
+    /// WHICH opening bracket opened the active systemic-refresh episode (`src/daemon/snapshot.rs`
+    /// `StatusResponse.systemic_refresh_source`, issue #813): `.sweep` / `.preflight` alongside a non-nil
+    /// `systemicRefreshFailure`, else `nil` (ABSENT) when the mechanism is healthy. Lets the panel banner
+    /// and the menu-bar a11y label phrase a preflight-opened episode without asserting a sweep that never
+    /// ran — the count alone cannot, because the preflight path seeds it at one for pre-#813 grammar.
+    ///
+    /// `nil` for a pre-#813 daemon, for a healthy one (`skip_serializing_if` omits it there, so a healthy
+    /// frame is byte-unchanged), AND for a future token this build does not know. Added by the MINOR
+    /// `1.10 → 1.11` bump — an older client tolerates it by ignoring, and THIS client tolerates both its
+    /// absence and its un-decodability: a `nil` source beside a non-nil count keeps the historical sweep
+    /// phrasing, which is the best a frame carrying no readable provenance supports. A fixed-token
+    /// classification, never a path or secret (issue #15).
+    let systemicRefreshSource: SystemicRefreshSource?
     /// The daemon-level CANONICAL-SCRUB rollup (`src/daemon/snapshot.rs` `StatusResponse.canonical_scrub`,
     /// issue #516): `.recovering` / `.exhausted` while the shared canonical item is scrubbed, else `nil`
     /// (ABSENT) when healthy — the fleet-wide scrubbed / un-recoverable lockout no per-account `auth`
@@ -561,6 +647,7 @@ struct VersionedStatus: Decodable, Equatable {
         case nextSwap = "next_swap"
         case refreshEnabled = "refresh_enabled"
         case systemicRefreshFailure = "systemic_refresh_failure"
+        case systemicRefreshSource = "systemic_refresh_source"
         case canonicalScrub = "canonical_scrub"
         case keychainLocked = "keychain_locked"
         case canary
@@ -576,6 +663,13 @@ struct VersionedStatus: Decodable, Equatable {
         nextSwap = try c.decodeIfPresent(NextSwap.self, forKey: .nextSwap)
         refreshEnabled = try c.decodeIfPresent(Bool.self, forKey: .refreshEnabled)
         systemicRefreshFailure = try c.decodeIfPresent(UInt32.self, forKey: .systemicRefreshFailure)
+        // Decoded as a raw STRING then mapped TOTALLY, so an unrecognised token becomes `.unrecognized`
+        // rather than failing the whole frame (the `reason.kind` tolerated-decoration posture). Note the
+        // two nil-ish outcomes stay DISTINCT: an absent key is `nil` (a pre-#813 daemon, which renders
+        // the historical sweep phrasing), an unreadable token is `.unrecognized` (a newer daemon, which
+        // renders no evidence at all) — see the type's doc.
+        systemicRefreshSource = try c.decodeIfPresent(String.self, forKey: .systemicRefreshSource)
+            .map(SystemicRefreshSource.init(wireToken:))
         canonicalScrub = try c.decodeIfPresent(CanonicalScrub.self, forKey: .canonicalScrub)
         keychainLocked = try c.decodeIfPresent(Bool.self, forKey: .keychainLocked) ?? false
         canary = try c.decodeIfPresent(CanaryStatus.self, forKey: .canary)

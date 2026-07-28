@@ -24,8 +24,8 @@ use crate::config::{Account, Config, ConflictPolicy, Origin, OriginReport};
 use crate::daemon::{
     emit_best_effort, run_loop, AccountStatusLine, BlindActive, CanaryStatus, CanonicalScrub,
     Daemon, ExternalLoginWatcher, InstanceLock, NextSwap, NextSwapReason, NoTargetCause, RealClock,
-    RealKeepWarmEngine, RealRosterPoller, RealShutdown, SchemaVersion, StatusResponse, UnixControl,
-    VersionedStatus, STATUS_SCHEMA_VERSION,
+    RealKeepWarmEngine, RealRosterPoller, RealShutdown, SchemaVersion, StatusResponse,
+    SystemicRefreshSource, UnixControl, VersionedStatus, STATUS_SCHEMA_VERSION,
 };
 use crate::error::{Error, Result};
 use crate::keychain::{Credential, RealCredentialStore};
@@ -2677,34 +2677,84 @@ fn render_next_swap(next_swap: Option<&NextSwap>, now: i64) -> String {
 }
 
 /// The systemic refresh-failure indicator (issue #378): the daemon reports the refresh MECHANISM is
-/// down — `consecutive` sweeps in a row failed with error across EVERY eligible account (a stale
-/// `claude` path #375, a wedged spawn), not one account's creds. Surfaced as DATA (not advisory
+/// down — not one account's creds, but the thing that renews them all (a stale `claude` path #375, a
+/// wedged spawn). It opens on either of two brackets, which is what the whole provenance split below
+/// is about: `consecutive` sweeps in a row failing with error across EVERY eligible account (#378),
+/// or the startup preflight failing to resolve the binary at all (#787). Surfaced as DATA (not advisory
 /// chrome like the #138 line): printed UNCONDITIONALLY so it survives a pipe / redirect /
 /// `status | grep` — an operator's health check must be able to see it — tinted `Yellow` (its "act
 /// at your next break" rank, ADR-0026: pre-death — every account still alive — so it sits BELOW the
 /// vault pair's act-now `Red`) only when the colour gate is open. Distinct from the per-account
-/// `AUTH` column: it is the whole
-/// mechanism failing, visible before any account dies. Carries only the COUNT (issue #15). Mutually
-/// exclusive with the #138 advisory (that needs `[refresh]` OFF; this needs sweeps running, i.e.
-/// ON), so their ordering never matters.
+/// `AUTH` column: it is the whole mechanism failing, visible before any account dies. Carries only
+/// the COUNT and a FIXED-TOKEN provenance class (issue #15). Mutually exclusive with the #138
+/// advisory (that needs `[refresh]` OFF; this needs sweeps running, i.e. ON), so their ordering
+/// never matters.
+///
+/// The DOWN verdict is one state, but its EVIDENCE has two shapes, and issue #813 stopped this line
+/// from citing the wrong one. An episode opens either on the #378 sweep crossing or on the #787
+/// startup preflight failing to resolve the binary, and the count alone cannot tell them apart —
+/// the preflight path seeds it at one for pre-#813 clients' grammar, which reads identically to a
+/// genuine one-sweep crossing under `systemic_failure_n = 1`. So this line branches on
+/// [`SystemicRefreshSource`] and cites the count ONLY where it genuinely counts sweeps; the
+/// preflight arm names the preflight instead. The `None` arm (a pre-#813 daemon, which sends no
+/// discriminant) keeps the historical sweep phrasing verbatim — with no provenance on the wire
+/// there is nothing better to say, and changing it would regress an old daemon's rendering for no
+/// gain.
+///
+/// The preflight arm deliberately makes NO claim about sweeps having or not having run. A
+/// preflight-opened episode clears only on a working sweep, so all-error sweeps may well have run
+/// and climbed the count meanwhile; "no sweep has run" would be a fresh fabrication in place of the
+/// one being removed. It reports only what was actually observed — the startup resolution failed.
+///
+/// DECIDED, not overlooked: that arm drops the DURATION signal the count otherwise carries, so a
+/// boot-opened episode reads the same after one second as after fifty failed sweeps. The count is
+/// not junk there — the preflight seeds a floor of one and only all-error sweeps climb it, so
+/// `count - 1` IS the all-error sweeps since the seed. But reading it that way requires knowing the
+/// seed convention, and pushing that onto every renderer is precisely the daemon-internals coupling
+/// this discriminant exists to break: the wire would then carry a number whose meaning silently
+/// depends on a sibling field, which is how this line came to fabricate a sweep in the first place.
+/// The duration an operator actually needs is on the event log, bracketed by
+/// `refresh_preflight_unresolved`. If a "how long has it been down" readout is wanted on the
+/// preflight arm later, it should come from a separate, honestly-named field carrying that number
+/// directly — never by asking a renderer to subtract a seed it has to know about.
 fn render_systemic_refresh_failure(response: &StatusResponse, color: bool) -> String {
     let Some(consecutive) = response.systemic_refresh_failure else {
         return String::new();
     };
-    // `consecutive` is always `>= 1` while an episode is active, so keep the noun agreement right
-    // at that floor. TWO routes reach exactly 1: a `systemic_failure_n` of 1 fires on the first
-    // all-error sweep, and since issue #787 a startup preflight that could not resolve the `claude`
-    // binary opens an episode with no sweep at all.
-    let sweeps = if consecutive == 1 { "sweep" } else { "sweeps" };
-    // The log pointer stays PROVENANCE-NEUTRAL for that reason (issue #787): a preflight-opened
+    // The log pointer stays PROVENANCE-NEUTRAL on both arms (issue #787): a preflight-opened
     // episode has no `reason=` line to read — its evidence is the `refresh_preflight_unresolved`
     // line — so naming `reason=` specifically would send an operator after evidence that may not
     // exist. "the daemon log" covers both, and matches how the menu-bar panel already phrases it.
-    let body = format!(
-        "refresh mechanism: DOWN — {consecutive} consecutive {sweeps} failed for every eligible \
-         account; the mechanism is failing, not one account (check the daemon log and the \
-         [refresh] claude binary)"
-    );
+    //
+    // TOTAL `match`, no `_` arm — deliberately, and this is the structural half of the fix. A
+    // THIRD opening bracket must not be able to reach the sweep phrasing by falling through: that
+    // is precisely how #787 became #813 (a second bracket was added and this renderer silently
+    // kept asserting sweeps). Written as `if let … else`, adding a variant compiles clean and
+    // re-fabricates the count; written as a total `match`, the compiler makes the next author
+    // decide what that bracket's evidence reads as. Keep it exhaustive.
+    let body = match response.systemic_refresh_source {
+        Some(SystemicRefreshSource::Preflight) => {
+            // The count is the seeded floor here, not a sweep count, so it is not cited at all.
+            // The tail matches the sweep arm's verbatim: the same state, the same remedy, only
+            // the evidence clause differs.
+            "refresh mechanism: DOWN — the startup preflight could not resolve the claude binary; \
+             the mechanism is failing, not one account (check the daemon log and the [refresh] \
+             claude binary)"
+                .to_owned()
+        }
+        // `None` is a pre-#813 daemon, which sends no discriminant — the historical phrasing is
+        // the best available reading there, and it is what that daemon's own CLI always printed.
+        Some(SystemicRefreshSource::Sweep) | None => {
+            // `consecutive` is always `>= 1` while an episode is active, so keep the noun agreement
+            // right at that floor — a `systemic_failure_n` of 1 fires on the first all-error sweep.
+            let sweeps = if consecutive == 1 { "sweep" } else { "sweeps" };
+            format!(
+                "refresh mechanism: DOWN — {consecutive} consecutive {sweeps} failed for every eligible \
+                 account; the mechanism is failing, not one account (check the daemon log and the \
+                 [refresh] claude binary)"
+            )
+        }
+    };
     daemon_fault_line(&body, DaemonPayloadFault::SystemicRefreshFailure, color)
 }
 
@@ -4839,6 +4889,7 @@ spare  22222222-2222\n\
         spare.enabled = false;
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -4868,8 +4919,9 @@ spare  22222222-2222\n\
         // Issue #378: when the daemon reports the refresh MECHANISM is down, `status` shows a
         // dedicated DOWN line carrying the count — visible without waiting for an account to die,
         // and distinct from the per-account `needs re-login`. #15-clean: a count only, no token/email.
-        let response = |systemic| StatusResponse {
+        let sourced = |systemic, source| StatusResponse {
             systemic_refresh_failure: systemic,
+            systemic_refresh_source: source,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -4879,6 +4931,9 @@ spare  22222222-2222\n\
             accounts: vec![status_line("work", true, Some(50), Some(25))],
             next_swap: None,
         };
+        // A pre-#813 daemon sends no discriminant; the count-only frames below are exactly what it
+        // puts on the wire, so they double as this render's legacy-compat case.
+        let response = |systemic| sourced(systemic, None);
 
         let out = render_status(&response(Some(3)), NOW, None, false);
         let down = out
@@ -4925,6 +4980,74 @@ spare  22222222-2222\n\
             !down_colored.contains(&format!("\x1b[{}m", Severity::Red.sgr())),
             "systemic is NOT Red — it must not outrank the act-now vault pair (#575): {down_colored:?}"
         );
+
+        // Issue #813 AC2 — a SWEEP-opened episode renders exactly as it did before the discriminant
+        // existed. TWO legs, because they prove different things. The FROZEN literal is the line
+        // this renderer printed at `9cb9248`, so it catches a re-wrap of the `\`-continued format
+        // string (which strips the newline AND the leading indent — re-indenting is safe, re-wrapping
+        // is not); a self-comparison could not. The equality after it pins the other half: an
+        // explicit `sweep` source and a pre-#813 count-only frame stay indistinguishable.
+        let swept = render_status(
+            &sourced(Some(3), Some(SystemicRefreshSource::Sweep)),
+            NOW,
+            None,
+            false,
+        );
+        assert_eq!(
+            swept.lines().find(|l| l.contains("refresh mechanism: DOWN")),
+            Some(
+                "refresh mechanism: DOWN — 3 consecutive sweeps failed for every eligible account; \
+                 the mechanism is failing, not one account (check the daemon log and the [refresh] \
+                 claude binary)"
+            ),
+            "#813 AC2: the sweep line is byte-identical to the pre-#813 one"
+        );
+        assert_eq!(
+            swept,
+            render_status(&response(Some(3)), NOW, None, false),
+            "#813 AC2: an explicit `sweep` source renders as a pre-#813 count-only frame does"
+        );
+
+        // Issue #813 AC1 — a PREFLIGHT-opened episode must not claim a sweep ran. Zero sweeps have
+        // run when the startup preflight opens the episode; the count is a seeded floor of 1 kept
+        // only so a pre-#813 client stays grammatical, so this arm cites the preflight instead.
+        let pre = render_status(
+            &sourced(Some(1), Some(SystemicRefreshSource::Preflight)),
+            NOW,
+            None,
+            false,
+        );
+        let pre_line = pre
+            .lines()
+            .find(|l| l.contains("refresh mechanism: DOWN"))
+            .expect("the mechanism-down verdict still fires on a preflight-opened episode");
+        assert!(
+            !pre_line.contains("sweep"),
+            "#813 AC1: no sweep is asserted on the preflight arm: {pre_line}"
+        );
+        assert!(
+            !pre_line.contains('1'),
+            "#813 AC1: the seeded count is not cited as evidence either: {pre_line}"
+        );
+        assert!(
+            pre_line.contains("startup preflight could not resolve the claude binary"),
+            "#813 AC1: it names what was actually observed: {pre_line}"
+        );
+        // The verdict and the remedy are unchanged — only the evidence clause differs, so the two
+        // arms stay content-parallel (and the menu-bar surfaces can mirror the same split).
+        assert!(
+            pre_line.contains("the mechanism is failing, not one account")
+                && pre_line.contains("[refresh] claude binary"),
+            "the DOWN verdict and remedy survive the rephrasing: {pre_line}"
+        );
+        // #15/#444: the provenance is a fixed token, so the preflight arm leaks no path or secret
+        // even though its subject IS a binary location.
+        assert!(
+            crate::redaction::meter::unauthored_emails(&pre, &[]).is_empty()
+                && !pre.to_lowercase().contains("token")
+                && !pre_line.contains('/'),
+            "#813 AC4: a class, never a resolved path or secret: {pre:?}"
+        );
     }
 
     #[test]
@@ -4936,6 +5059,7 @@ spare  22222222-2222\n\
         // #15-clean: a bare state discriminant, never a token or email.
         let response = |scrub| StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: scrub,
             keychain_locked: false,
             canary: None,
@@ -5037,6 +5161,7 @@ spare  22222222-2222\n\
         // email.
         let response = |locked| StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: locked,
             canary: None,
@@ -5109,6 +5234,7 @@ spare  22222222-2222\n\
         // labels + a count only.
         let response = |canary| StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary,
@@ -5312,6 +5438,7 @@ spare  22222222-2222\n\
         // the pre-#575 inversion.
         let response = StatusResponse {
             systemic_refresh_failure: Some(5),
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: true,
             canary: None,
@@ -5367,6 +5494,7 @@ spare  22222222-2222\n\
         // regression to a single fixed canonical-scrub slot.
         let response = StatusResponse {
             systemic_refresh_failure: Some(3),
+            systemic_refresh_source: None,
             canonical_scrub: Some(CanonicalScrub::Recovering),
             keychain_locked: false,
             canary: None,
@@ -5424,6 +5552,7 @@ spare  22222222-2222\n\
         };
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -5463,6 +5592,7 @@ spare  22222222-2222\n\
         let out = render_status(
             &StatusResponse {
                 systemic_refresh_failure: None,
+                systemic_refresh_source: None,
                 canonical_scrub: None,
                 keychain_locked: false,
                 canary: None,
@@ -5485,6 +5615,7 @@ spare  22222222-2222\n\
         let normal = render_status(
             &StatusResponse {
                 systemic_refresh_failure: None,
+                systemic_refresh_source: None,
                 canonical_scrub: None,
                 keychain_locked: false,
                 canary: None,
@@ -5511,6 +5642,7 @@ spare  22222222-2222\n\
         // uses) while the OK line stays PLAIN — an OK line is never emphasized even with color on.
         let blind = |degraded: bool| StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -5546,6 +5678,7 @@ spare  22222222-2222\n\
     fn cornered_response(cause: Option<NoTargetCause>, resets_at: Option<i64>) -> StatusResponse {
         StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -5708,6 +5841,7 @@ spare  22222222-2222\n\
         // line holds). Absent from the wire → no line.
         let narrated = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -5754,6 +5888,7 @@ spare  22222222-2222\n\
         // line.
         let breached = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -5780,6 +5915,7 @@ spare  22222222-2222\n\
         // parked account did not climb after the swap — the banner must NOT call it a post-swap tail.
         let gap_crossing = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -5825,6 +5961,7 @@ spare  22222222-2222\n\
         spare.quarantined = true;
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -5866,6 +6003,7 @@ spare  22222222-2222\n\
         dead.quarantined = true; // quarantined but NOT recovering — still dead
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -5970,6 +6108,7 @@ spare  22222222-2222\n\
         };
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -6016,6 +6155,7 @@ spare  22222222-2222\n\
         // columns). Any glyph rollup materializes the column and its label.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -6049,6 +6189,7 @@ spare  22222222-2222\n\
         };
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -6120,6 +6261,7 @@ spare  22222222-2222\n\
         // expiry reads an honest `unknown`. The DEFAULT table stays compact — no raw clock.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -6183,6 +6325,7 @@ spare  22222222-2222\n\
         // `status --verbose` on an empty roster adds nothing.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -6379,6 +6522,7 @@ spare  22222222-2222\n\
         work.active = true;
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -6424,6 +6568,7 @@ spare  22222222-2222\n\
         // these display labels.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -6482,6 +6627,7 @@ spare  22222222-2222\n\
         // only the weekly reset; now it shows the session reset too.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -6573,6 +6719,7 @@ spare  22222222-2222\n\
         quarantined.quarantined = true;
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -6603,6 +6750,7 @@ spare  22222222-2222\n\
         // takes its label with it.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -6695,6 +6843,7 @@ spare  22222222-2222\n\
         let footer = |next_swap| {
             let response = StatusResponse {
                 systemic_refresh_failure: None,
+                systemic_refresh_source: None,
                 canonical_scrub: None,
                 keychain_locked: false,
                 canary: None,
@@ -6829,6 +6978,7 @@ spare  22222222-2222\n\
         // per-cell health coloring is #84, orthogonal; the footer stays uncolored.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -6870,6 +7020,7 @@ spare  22222222-2222\n\
         // interactive TTY).
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -6908,6 +7059,7 @@ spare  22222222-2222\n\
         for health in [Unknown, Stale, AtRisk, Degraded, Dead] {
             let response = StatusResponse {
                 systemic_refresh_failure: None,
+                systemic_refresh_source: None,
                 canonical_scrub: None,
                 keychain_locked: false,
                 canary: None,
@@ -6934,6 +7086,7 @@ spare  22222222-2222\n\
         // non-active account — the maintenance mechanism is already on.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -6958,6 +7111,7 @@ spare  22222222-2222\n\
         // AC-2: refresh off, but every NON-ACTIVE account is 🟢 Healthy → nothing to advise.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -6985,6 +7139,7 @@ spare  22222222-2222\n\
         // non-active accounts healthy does NOT arm the advisory.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -7012,6 +7167,7 @@ spare  22222222-2222\n\
         // ANSI overlay. Same response as AC-1, only the gate differs.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -7042,6 +7198,7 @@ spare  22222222-2222\n\
         // it cannot know.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -7069,6 +7226,7 @@ spare  22222222-2222\n\
         // (cli.rs:951-953), so the advisory can never reach a `--json | jq` consumer as data.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -7098,6 +7256,7 @@ spare  22222222-2222\n\
         // next-swap candidate label, so a token / email can never reach the printed surface.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -7415,6 +7574,7 @@ spare  22222222-2222\n\
         // a pipe / redirect / log never carries an escape (the gate's promise).
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -7442,6 +7602,7 @@ spare  22222222-2222\n\
     fn color_on_tints_each_row_and_strips_back_to_the_exact_plain_table() {
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -7507,6 +7668,7 @@ spare  22222222-2222\n\
         // per-cell color, not one row-wide tint.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -7549,6 +7711,7 @@ spare  22222222-2222\n\
         // utilization (both `%` here are a calm green).
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -7597,6 +7760,7 @@ spare  22222222-2222\n\
         // while its colored siblings prove the overlay is active.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -7637,6 +7801,7 @@ spare  22222222-2222\n\
         // misalign it — and keeps the `SESSION%` header (issue #99) over its data too.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -7696,6 +7861,7 @@ spare  22222222-2222\n\
         // now-correct `display_width` (2 cells for the coalesced glyph), not char count.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -7787,6 +7953,7 @@ spare  22222222-2222\n\
         };
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -7825,6 +7992,7 @@ spare  22222222-2222\n\
         // never an `@`-email or a token sigil.
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -7933,6 +8101,7 @@ spare  22222222-2222\n\
         // serializes this exact response verbatim, the same surface scripts consume.)
         let response = StatusResponse {
             systemic_refresh_failure: None,
+            systemic_refresh_source: None,
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
@@ -8144,6 +8313,7 @@ spare  22222222-2222\n\
             generated_at: 1_782_777_600,
             status: StatusResponse {
                 systemic_refresh_failure: None,
+                systemic_refresh_source: None,
                 canonical_scrub: None,
                 keychain_locked: false,
                 canary: None,
@@ -8209,6 +8379,7 @@ spare  22222222-2222\n\
             generated_at,
             status: StatusResponse {
                 systemic_refresh_failure: None,
+                systemic_refresh_source: None,
                 canonical_scrub: None,
                 keychain_locked: false,
                 canary: None,
@@ -10140,6 +10311,7 @@ spare  22222222-2222\n\
         ) -> StatusResponse {
             StatusResponse {
                 systemic_refresh_failure: None,
+                systemic_refresh_source: None,
                 canonical_scrub: None,
                 keychain_locked: false,
                 canary: None,
