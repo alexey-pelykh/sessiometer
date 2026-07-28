@@ -603,7 +603,8 @@ struct HonestStateMachine {
 
     /// The behavioral-canary verdict (#714, wire since schema 1.9), carried from the last applied snapshot
     /// exactly as `canonicalScrub` / `keychainLocked` / `systemicRefreshFailure` are: the keychain-derivation
-    /// identity check's LAST result. Its ALARM verdicts (`drift`, `ambiguous`) surface through
+    /// identity check's LAST result. Its ALARM verdicts (`drift`, `ambiguous`, and since schema 1.10 the
+    /// #730/#738 `refusedUnparseableCanonical`) surface through
     /// `StatusPanelFormat.daemonFaultBanner` at the cross-surface ranks the CLI pins; the quiet verdicts
     /// render nothing. RETAINED across a drop (shown under the dimmed last-known render, like its siblings)
     /// and REFUSED with the other numbers on an unsupported-major frame. `nil` when there is no verdict — a

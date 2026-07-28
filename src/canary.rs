@@ -96,9 +96,12 @@
 //! via the SAME fail-closed slot as DRIFT, protecting an unrelated secret from the
 //! atomic `-U` clobber, unless the dedicated `canary_nostashmatch_override` tunable
 //! (separate from `canary_drift_override`) is set. A well-formed orphan canonical
-//! (a benign in-place refresh) still fails OPEN, exactly as before. The identity
-//! verdict on the wire stays `inconclusive` (the refuse is a daemon-internal
-//! policy, not a new verdict — no schema bump).
+//! (a benign in-place refresh) still fails OPEN, exactly as before. The IDENTITY
+//! answer is inconclusive either way, but the refusal is an operator-visible
+//! consequence, so since issue #738 the wire carries its own
+//! `refused_unparseable_canonical` verdict (schema 1.10) rather than the quiet
+//! `inconclusive` #730 originally reused — collapsing back to `inconclusive`
+//! exactly when the override has restored the fail-OPEN and nothing is refused.
 //!
 //! Every surface derived from these types is secret-free by construction (issue
 //! #15): outcomes carry roster INDICES (resolved to operator labels at the event /
@@ -175,8 +178,11 @@ pub(crate) enum InconclusiveReason {
     ///
     /// The identity verdict is genuinely INCONCLUSIVE either way (the token matched
     /// nothing, so identity is unverified); the refuse is a daemon-internal POLICY
-    /// layered on top, and the wire verdict stays `inconclusive` (issue #730 — no
-    /// schema bump).
+    /// layered on top. #730 therefore left the wire verdict at `inconclusive` — which
+    /// issue #738 corrected: the POLICY is what the operator experiences, so the
+    /// refusing sub-case now projects to
+    /// [`CanaryStatus::RefusedUnparseableCanonical`](crate::daemon::CanaryStatus::RefusedUnparseableCanonical)
+    /// (schema 1.10), while the overridden and well-formed cases stay `inconclusive`.
     NoStashMatch {
         /// Whether the orphan canonical parses as a well-formed Claude Code
         /// credential (issue #730). `false` drives the caller's fail-CLOSED refuse

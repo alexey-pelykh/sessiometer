@@ -268,6 +268,20 @@ pub(crate) enum CanaryStatus {
         /// writes proceed despite the drift.
         overridden: bool,
     },
+    /// Layer 2 REFUSE (issue #730, surfaced by issue #738): the resolved canonical token matches
+    /// NO account's stash AND does not parse as a Claude Code credential — overwhelmingly an
+    /// UNRELATED secret sitting under the derived service, which the atomic `-U` upsert would
+    /// clobber unrecoverably. Credential writes are refused pre-mutation (zero writes).
+    ///
+    /// A distinct verdict rather than the quiet [`Inconclusive`](Self::Inconclusive) it reused
+    /// before #738: the *identity* answer is genuinely inconclusive either way, but the daemon's
+    /// fail-CLOSED policy makes this case a REFUSAL an operator must see — the wire carries the
+    /// operator-visible consequence, not just the identity verdict. Emitted ONLY while the refuse
+    /// is live: with `canary_nostashmatch_override` set, the gate restores the pre-#730 fail-OPEN
+    /// and the verdict is `Inconclusive` again, because nothing is being refused. Carries no
+    /// fields — an unparseable canonical has no #15-safe detail to name (the bytes are the
+    /// unrelated secret itself); the remedy rides the render text, not the wire.
+    RefusedUnparseableCanonical,
 }
 
 /// One account's latest reading.
@@ -378,8 +392,19 @@ pub(crate) struct SchemaVersion {
 /// and (via `skip_serializing_if`) omitted only until the first canary run concludes, so a pre-#714
 /// client ignores the unknown key. UNLIKE the omit-when-healthy siblings, a healthy verdict is
 /// still carried once known: "verified ok" and "unverified" are different operator facts (the
-/// canary's Layer-3 residual surface).
-pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion { major: 1, minor: 9 };
+/// canary's Layer-3 residual surface). `1.10` ADDED the
+/// [`CanaryStatus::RefusedUnparseableCanonical`] VARIANT (issue #738) — the #730 fail-CLOSED
+/// refuse (an orphan canonical that parses as no Claude Code credential) had been reusing the
+/// quiet `inconclusive` verdict, so the daemon refused the swap while every surface rendered
+/// "nothing to see". Additive by construction: the enum is internally tagged on `verdict`, so a
+/// new variant adds no key to any EXISTING frame — a healthy or drifted snapshot's bytes are
+/// unchanged. Forward-compat is asymmetric BY DESIGN here: a pre-#738 client that meets the new
+/// verdict rejects the frame rather than mis-decoding it (an alarm state must never silently
+/// degrade to "all clear"), which is exactly why this earns a minor bump the client can gate on.
+pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion {
+    major: 1,
+    minor: 10,
+};
 
 /// The control socket's `status` reply PAYLOAD — handles + percentages + the forward-looking
 /// `next_swap` candidate, and nothing else (issue #15: never a token or email).

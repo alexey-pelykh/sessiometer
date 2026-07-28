@@ -226,7 +226,7 @@ struct StatusPanelView: View {
                 // the `next_swap` line (R-2: footer = next_swap; degraded daemon-level signals → honest
                 // banner). The panel shows ONE banner, ranked worst-first over (fault, VARIANT) — never over
                 // fault identity, so a calm self-healing state can never outrank one that cannot self-heal.
-                // See `daemonFaultBanner` for the seven ranks (over four faults) and why `recovering` sits
+                // See `daemonFaultBanner` for the eight ranks (over four faults) and why `recovering` sits
                 // last of them.
                 //
                 // This banner is what makes the menu-bar glance honest rather than cryptic: the locked glyph

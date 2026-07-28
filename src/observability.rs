@@ -807,12 +807,14 @@ pub(crate) enum Event {
     /// Unless `overridden` (the dedicated `canary_nostashmatch_override` tunable let the write
     /// proceed), the write is refused (pre-mutation, zero writes); reads / poll / `status` stay
     /// live. Emitted at the REFUSAL site (the daemon pre-swap gate and the standalone daemon-down
-    /// `use` path) — one line per refused/overridden attempt. This is the COMPENSATING operator
-    /// signal for the deliberately-`inconclusive` status wire: the identity verdict IS genuinely
-    /// inconclusive, the refuse is a policy on top with no `status` surface of its own, so
-    /// (unlike edge-triggered [`Event::CanaryDrift`]) per-attempt logging is the honest "one line
-    /// = one blocked swap" record. Secret-free (issue #15): only the `overridden` flag, never a
-    /// token or the canonical's bytes.
+    /// `use` path) — one line per refused/overridden attempt. Issue #738 gave the refusal its own
+    /// `status` surface ([`CanaryStatus::RefusedUnparseableCanonical`](crate::daemon::CanaryStatus::RefusedUnparseableCanonical)),
+    /// which does NOT retire this per-attempt line: the two carry different facts. The wire is
+    /// LEVEL-triggered — it says the refusal stands right now — while this log COUNTS ATTEMPTS,
+    /// and a verdict edge cannot count the swaps that kept being blocked while the verdict held
+    /// steady. That is why this event stays per-attempt rather than adopting the edge-triggered
+    /// idiom of [`Event::CanaryDrift`]. Secret-free (issue #15): only the `overridden` flag, never
+    /// a token or the canonical's bytes.
     CanaryUnparseableCanonical { overridden: bool },
     /// The behavioral canary's FRESH Layer-1 resolution probe (issue #714) found MORE THAN ONE
     /// item under the derived canonical service — the #100 uniqueness rule fails, so the
@@ -822,9 +824,11 @@ pub(crate) enum Event {
     /// item. Edge-triggered like [`Event::CanaryDrift`]; [`Event::CanaryCleared`] marks the leave
     /// edge. Carries only the item COUNT (issue #15).
     CanaryAmbiguous { count: usize },
-    /// The behavioral canary (issue #714) returned to a NON-ALARM verdict (ok / inconclusive /
-    /// not-found) after a [`Event::CanaryDrift`] or [`Event::CanaryAmbiguous`] episode — the
-    /// closing bracket of the alarm edge, mirroring the [`Event::CanonicalScrubbed`] /
+    /// The behavioral canary (issue #714) left a [`Event::CanaryDrift`] or
+    /// [`Event::CanaryAmbiguous`] episode for a verdict that opens no alarm of its OWN — the quiet
+    /// `ok` / `inconclusive` / `not_found`, or (since issue #738) `refused_unparseable_canonical`,
+    /// whose durable line is per-attempt and owned by the refuse sites rather than the verdict
+    /// edge. The closing bracket of the alarm edge, mirroring the [`Event::CanonicalScrubbed`] /
     /// [`Event::CanonicalRestored`] durable-pair idiom (an OVERRIDDEN drift still counts as an
     /// episode: the alarm was real even though the write proceeded). Edge-triggered: exactly ONCE
     /// per episode. No fields — the fresh verdict is on the `status` surface (issue #15).

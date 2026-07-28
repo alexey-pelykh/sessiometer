@@ -72,10 +72,13 @@ final class WatchStatusStore: ObservableObject {
     /// (see `StatusPanelFormat.daemonFaultBanner`). `nil` when the mechanism is healthy (or a pre-#378
     /// daemon omits the wire key). A COUNT only, never a token or path (issue #15).
     @Published private(set) var systemicRefreshFailure: UInt32?
-    /// The behavioral-canary verdict (#714, wire since schema 1.9) — the keychain-derivation identity check's
-    /// LAST result. The panel renders its ALARM verdicts (`drift`, `ambiguous`) through the honest banner above
+    /// The behavioral-canary verdict (#714, wire since schema 1.9; its #730/#738
+    /// `refusedUnparseableCanonical` verdict since 1.10) — the keychain-derivation identity check's
+    /// LAST result. The panel renders its ALARM verdicts (`drift`, `ambiguous`, `refusedUnparseableCanonical`)
+    /// through the honest banner above
     /// the roster (worst-first via `StatusPanelFormat.daemonFaultBanner`, at the cross-surface ranks the CLI
-    /// pins): a refusing drift and an ambiguous resolution rank with the "act now" vault pair, an OVERRIDDEN
+    /// pins): a refusing drift, an ambiguous resolution and an unrecognized canonical all rank with the "act
+    /// now" vault pair, an OVERRIDDEN
     /// drift ranks with the "next break" mechanism fault — severity by (fault, VARIANT), never fault identity
     /// (#575). The quiet verdicts (`ok` / `inconclusive` / `not_found`) render nothing. `nil` when there is no
     /// verdict (a pre-#714 daemon, or the canary has not concluded a run). Operator LABELS and a COUNT only,
