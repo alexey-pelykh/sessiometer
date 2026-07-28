@@ -132,13 +132,15 @@ pub(crate) struct TickOutcome {
     pub(crate) action: TickAction,
     /// The structured log events this cycle generated (issue #9): the
     /// poll-outcome events (401 / keychain-locked / 403) in roster order, then the
-    /// decision event (swap / all-exhausted) if any. `run_loop` emits each to the
-    /// event log; a Hold or a skip generates none.
+    /// decision event (swap / all-exhausted) if any, then — on the edge — an
+    /// [`Event::AllExhaustedCleared`] when this cycle LEFT the all-exhausted state
+    /// (issue #800). `run_loop` emits each to the event log; a Hold or a skip that
+    /// crosses no edge generates none.
     pub(crate) events: Vec<Event>,
     /// The operator-facing diagnostics this cycle generated (issue #77), in the
     /// order they are emitted: one [`Diagnostic::Poll`] per polled account (in
-    /// roster order), then — on the edge — a [`Diagnostic::AllExhaustedCleared`]
-    /// when this cycle LEFT the all-exhausted state, and finally the per-tick
+    /// roster order), then — on the edge — a [`Diagnostic::ActiveDeadNoTargetCleared`]
+    /// when this cycle LEFT the active-dead-no-target strand, and finally the per-tick
     /// [`Diagnostic::Tick`] decision (with any back-off). Unlike `events`, EVERY
     /// tick produces some (a Hold still logs its poll outcomes + decision), so
     /// `run_loop`'s [`DiagnosticLog`] — not this vec — applies the verbosity gate.

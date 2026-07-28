@@ -700,6 +700,37 @@ pub(crate) enum Event {
         cause: SwapReason,
         resets_at: Option<i64>,
     },
+    /// The daemon LEFT the all-exhausted terminal state (issue #11): a viable swap target is
+    /// possible again. The edge-triggered EXIT partner of [`Self::AllExhausted`]'s ENTER, so an
+    /// exhaustion episode's SPAN is bracketed in the DURABLE log — the sibling idiom of
+    /// [`Self::UsageBackoffCleared`] / [`Self::ExhaustedSlowPollCleared`].
+    ///
+    /// Durable since issue #800 (REQ-STA-B-011): previously a stderr-bound
+    /// `Diagnostic::AllExhaustedCleared`, so the bracket closed in CODE but not in the LOG —
+    /// measured 2026-07-28, 155 `event=all_exhausted` lines against 0 `diag=` lines of any kind,
+    /// a `run -v` daemon's fd 2 being a TTY. A hold's END was therefore not reconstructable
+    /// offline, and the tightest bound the durable log alone allowed (`min(next ENTER, next
+    /// swap) − ENTER`) overstated duration ~25×.
+    ///
+    /// NOT sufficient on its own to recover true episode counts, and a consumer MUST NOT assume
+    /// every post-#800 ENTER has a matching END. Three distinct sources of an unclosed or
+    /// duplicated bracket survive this change:
+    ///
+    /// 1. The ENTER guard re-arms on ANY non-`NoViableTarget` tick, so ENTER edges OVER-count
+    ///    episodes — ENTER/LEAVE pairs still need debouncing (REQ-STA-B-010).
+    /// 2. `DecisionState::signaled_all_exhausted` is IN-MEMORY only, never persisted. A daemon
+    ///    restart while a hold is open therefore drops the pending LEAVE (an ENTER with no END)
+    ///    and, because the guard comes back clear, re-emits a DUPLICATE ENTER on the next
+    ///    `NoViableTarget` tick. Deriving duration from that second ENTER understates the hold.
+    /// 3. Historical windows predating #800 carry ENTERs with no END at all.
+    ///
+    /// Duration is not backfillable, and REQ-STA-B-010's "report as a bound, marked as such"
+    /// discipline still has to hold for any bracket left open by (2) or (3).
+    ///
+    /// Payload-free by design: the ENTER line already carries `hold` / `cause` / `resets_at`, and
+    /// the leave is just "the state ended". Secret-free by construction (issue #15) — the line is
+    /// a timestamp and a closed token, with no field that could hold a label, email, or token.
+    AllExhaustedCleared,
     /// The ACTIVE account's credential is DEAD *and* no live account is a viable emergency
     /// swap target — the strictly-WORSE sibling of [`Self::AllExhausted`] (issue #405). The
     /// emergency path (issue #42) drops the `target_max_session_usage` reserve AND the session gate, so
@@ -1504,6 +1535,9 @@ impl Event {
                     None => String::new(),
                 };
                 format!("ts={ts} event=all_exhausted hold={hold} cause={cause}{resets}")
+            }
+            Event::AllExhaustedCleared => {
+                format!("ts={ts} event=all_exhausted_cleared")
             }
             Event::ActiveDeadNoTarget {
                 hold,
@@ -2479,23 +2513,21 @@ pub(crate) enum Diagnostic {
         /// the same shape as `fingerprint` — never a token.
         rotated_from: Option<String>,
     },
-    /// The daemon LEFT the all-exhausted terminal state (issue #11): a viable swap
-    /// target is possible again. The edge-triggered LEAVE marker — the symmetric
-    /// partner of the event log's edge-triggered `all_exhausted` ENTER — so a stale
-    /// "all exhausted" reading from an earlier episode can be told from a current
-    /// one (the very confusion that motivated #77).
-    AllExhaustedCleared,
     /// The daemon LEFT the active-dead-no-target strand (issue #405): the dead active
     /// recovered (re-login / spontaneous revive) or a live target became reachable
     /// again. The edge-triggered LEAVE marker — the symmetric partner of the event
     /// log's edge-triggered `active_dead_no_target` ENTER, mirroring
-    /// [`Self::AllExhaustedCleared`] — so a stale strand reading is told from a current one.
+    /// [`Event::AllExhaustedCleared`] — so a stale strand reading is told from a current one.
+    /// Unlike that sibling — promoted to a durable event by issue #800 — this marker is still
+    /// stderr-bound, so the strand's END is not reconstructable offline (issue #827).
     ActiveDeadNoTargetCleared,
     /// The aggregate fleet runway recovered to at/over the operator's `fleet_runway_warn_secs`
     /// threshold (issue #650): the warning re-armed, so a LATER downward crossing will signal
     /// afresh. The edge-triggered LEAVE marker — the symmetric partner of the event log's
-    /// edge-triggered `fleet_runway_low` ENTER, mirroring [`Self::AllExhaustedCleared`] — so a
-    /// stale low-runway reading is told from a current one. Fires only on a KNOWN at/over-
+    /// edge-triggered `fleet_runway_low` ENTER, mirroring [`Event::AllExhaustedCleared`] — so a
+    /// stale low-runway reading is told from a current one. Like the sibling above (and unlike
+    /// that promoted marker) this one is still stderr-bound, so the low-runway episode's END is
+    /// not reconstructable offline (issue #827). Fires only on a KNOWN at/over-
     /// threshold reading: an UNKNOWN aggregate (store hiccup, degraded overlay) holds the
     /// armed state instead, so a flaky read never fabricates a recovery (the
     /// `signaled_canonical_scrubbed` discipline).
@@ -2592,7 +2624,6 @@ impl Diagnostic {
                     "ts={ts} diag=canonical state={state}{fingerprint}{account}{expires_at}{rotated}"
                 )
             }
-            Diagnostic::AllExhaustedCleared => format!("ts={ts} diag=all_exhausted_cleared"),
             Diagnostic::ActiveDeadNoTargetCleared => {
                 format!("ts={ts} diag=active_dead_no_target_cleared")
             }
@@ -2888,6 +2919,15 @@ mod tests {
                 "{TS0} event=all_exhausted hold=work cause=session resets_at=2026-06-30T00:00:00Z"
             )
         );
+    }
+
+    #[test]
+    fn all_exhausted_cleared_line_is_bare() {
+        // The edge-triggered EXIT partner (issue #800): a bare token — the episode's span is
+        // bracketed by pairing this with the last `all_exhausted` ENTER line, exactly as
+        // `usage_backoff_cleared` / `exhausted_slow_poll_cleared` bracket theirs.
+        let line = Event::AllExhaustedCleared.to_log_line(at_epoch(0));
+        assert_eq!(line, format!("{TS0} event=all_exhausted_cleared"));
     }
 
     #[test]
@@ -3905,6 +3945,9 @@ mod tests {
                 cause: SwapReason::Weekly,
                 resets_at: Some(1_782_777_600),
             },
+            // Issue #800: the durable LEAVE partner — a bare token with no field at all, so it
+            // rides the sweep trivially, but keeping it listed keeps the sweep exhaustive.
+            Event::AllExhaustedCleared,
             Event::ActiveDeadNoTarget {
                 hold: "work".to_owned(),
                 cause: SwapReason::Weekly,
@@ -4031,6 +4074,64 @@ mod tests {
     }
 
     #[test]
+    fn all_exhausted_cleared_survives_a_log_file_round_trip() {
+        // REQ-STA-B-011's whole point: the LEAVE edge must be reconstructable OFFLINE. Drive the
+        // real sink to a real file and read a full bracket back — emit → persist → parse, end to
+        // end. The readback re-implements the flat `key=val` tokenizer rather than calling a
+        // consumer, so it pins the LINE's own recoverability independently of any one consumer's
+        // folding; that each real consumer tolerates the new kind is pinned separately, in
+        // `reliability` and `usage_stats`' own test modules.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessiometer.log");
+        let mut log = EventLog::at(&path).unwrap();
+
+        // ENTER, the relief swap, then the LEAVE.
+        log.emit(&Event::AllExhausted {
+            hold: "spare".to_owned(),
+            cause: SwapReason::Session,
+            resets_at: Some(1_782_777_600),
+        })
+        .unwrap();
+        log.emit(&Event::Swap {
+            from: "work".to_owned(),
+            to: "spare".to_owned(),
+            reason: SwapReason::Session,
+            session_pct: 97,
+            projection: None,
+        })
+        .unwrap();
+        log.emit(&Event::AllExhaustedCleared).unwrap();
+
+        let logged = std::fs::read_to_string(&path).unwrap();
+        let parsed: Vec<std::collections::BTreeMap<&str, &str>> = logged
+            .lines()
+            .map(|line| {
+                line.split_whitespace()
+                    .filter_map(|token| token.split_once('='))
+                    .collect()
+            })
+            .collect();
+
+        // Each line recovers its own `event=` kind, in order — so the bracket is closed in the
+        // LOG, not merely in code.
+        assert_eq!(
+            parsed
+                .iter()
+                .map(|fields| fields.get("event").copied().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["all_exhausted", "swap", "all_exhausted_cleared"],
+            "got: {logged:?}"
+        );
+        // …and the LEAVE line's `ts=` is readable by the crate's one canonical RFC-3339 parser,
+        // so a hold's END is placeable in time — the offline reconstructability the requirement
+        // asks for.
+        assert!(
+            crate::usage::epoch_from_rfc3339(parsed[2].get("ts").copied().unwrap()).is_some(),
+            "the LEAVE edge must be placeable in time: {logged:?}"
+        );
+    }
+
+    #[test]
     fn the_log_file_is_created_private() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
@@ -4109,6 +4210,39 @@ ts=1970-01-01T00:00:40Z event=monitor_401 account=c consecutive=1\n";
         )
         .unwrap();
         assert_eq!(last_swap_at(&path), Some(at_epoch(60)));
+    }
+
+    #[test]
+    fn last_swap_at_ignores_the_all_exhausted_cleared_leave_edge() {
+        // Issue #800 put a NEW `event=` kind into the log, and this reader gates the one-shot
+        // `use` verb's swap cooldown (#63/#10) — a production path that would otherwise be
+        // covered only transitively. The daemon emits the clear on the relief swap's OWN tick,
+        // immediately AFTER the swap line, so the clear is the LAST line exactly when the
+        // cooldown is most load-bearing. `last_swap_at` scans from the end for a SPACE-ANCHORED
+        // ` event=swap ` / ` event=emergency_swap `, so it must walk past the clear and still
+        // return the swap's instant — never `None` (which would read as "cooldown inactive" and
+        // wrongly permit an immediate second swap).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessiometer.log");
+        std::fs::write(
+            &path,
+            "ts=1970-01-01T00:00:10Z event=all_exhausted hold=b cause=session\n\
+ts=1970-01-01T00:00:30Z event=swap from=a to=b reason=session session_pct=97\n\
+ts=1970-01-01T00:00:30Z event=all_exhausted_cleared\n",
+        )
+        .unwrap();
+        assert_eq!(last_swap_at(&path), Some(at_epoch(30)));
+
+        // And a log carrying ONLY the bracket (no swap — the daemon left the state because the
+        // active's usage fell, not because it swapped) still reports no swap, so neither edge can
+        // fabricate a cooldown floor out of nothing.
+        std::fs::write(
+            &path,
+            "ts=1970-01-01T00:00:10Z event=all_exhausted hold=b cause=session\n\
+ts=1970-01-01T00:00:20Z event=all_exhausted_cleared\n",
+        )
+        .unwrap();
+        assert_eq!(last_swap_at(&path), None);
     }
 
     #[test]
@@ -5070,16 +5204,9 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
     }
 
     #[test]
-    fn all_exhausted_cleared_line_is_bare() {
-        assert_eq!(
-            Diagnostic::AllExhaustedCleared.to_log_line(at_epoch(0)),
-            format!("{TS0} diag=all_exhausted_cleared")
-        );
-    }
-
-    #[test]
     fn active_dead_no_target_cleared_line_is_bare() {
-        // #405: the strand's LEAVE marker, mirroring `all_exhausted_cleared` — a bare edge token.
+        // #405: the strand's LEAVE marker, mirroring `event=all_exhausted_cleared` — a bare edge
+        // token. Still stderr-bound, unlike that sibling (promoted to a durable event by #800).
         assert_eq!(
             Diagnostic::ActiveDeadNoTargetCleared.to_log_line(at_epoch(0)),
             format!("{TS0} diag=active_dead_no_target_cleared")
@@ -5088,8 +5215,9 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
 
     #[test]
     fn fleet_runway_recovered_line_is_bare() {
-        // #650: the proactive warn's LEAVE marker, mirroring `all_exhausted_cleared` — a bare edge
-        // token, no payload (the ENTER event carried the reading; the recovery is just "back over").
+        // #650: the proactive warn's LEAVE marker, mirroring `event=all_exhausted_cleared` — a bare
+        // edge token, no payload (the ENTER event carried the reading; the recovery is just "back
+        // over"). Still stderr-bound, unlike that sibling (promoted to a durable event by #800).
         assert_eq!(
             Diagnostic::FleetRunwayRecovered.to_log_line(at_epoch(0)),
             format!("{TS0} diag=fleet_runway_recovered")
@@ -5121,7 +5249,6 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
                 // Exercise the #295 source-label field through the #15 redaction scan too.
                 retry_after_secs: Some(3600),
             },
-            Diagnostic::AllExhaustedCleared,
             Diagnostic::ActiveDeadNoTargetCleared,
             Diagnostic::FleetRunwayRecovered,
         ];

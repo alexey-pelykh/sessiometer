@@ -2590,14 +2590,14 @@ where
         // re-entry signals afresh. `decide_action` sets the guard (and emits once)
         // while in the state; this is the matching reset on the way out.
         if !matches!(action, TickAction::NoViableTarget) {
-            // Diagnostic LEAVE edge (issue #77): the guard is still set from the
-            // prior episode here (it has NOT been cleared yet), so a set guard on a
-            // non-exhausted cycle means we are LEAVING the state — emit the marker
-            // BEFORE the reset below. The symmetric partner of the event log's
-            // edge-triggered `all_exhausted` ENTER, so a stale reading is
-            // distinguishable from a current one.
+            // The LEAVE edge: the guard is still set from the prior episode here (it has NOT
+            // been cleared yet), so a set guard on a non-exhausted cycle means we are LEAVING
+            // the state — emit the marker BEFORE the reset below. Durable since issue #800; see
+            // [`Event::AllExhaustedCleared`] for why it is an event and not a diagnostic.
+            // Pushed AFTER `decide_action` returned, so a relief swap's `event=swap` precedes
+            // the clear on the same tick — the causal reading order.
             if self.state.signaled_all_exhausted {
-                diagnostics.push(Diagnostic::AllExhaustedCleared);
+                events.push(Event::AllExhaustedCleared);
             }
             self.state.signaled_all_exhausted = false;
         }
@@ -12724,6 +12724,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_relief_swap_emits_the_durable_leave_edge_after_its_own_swap_event() {
+        // Issue #800, the PRIMARY production shape: a hold most often ends because a spare came
+        // back and the daemon SWAPPED onto it. That tick must emit BOTH `Event::Swap` and
+        // `Event::AllExhaustedCleared`, in that order (the clear is pushed post-`decide_action`),
+        // so the durable log carries `event=swap` then `event=all_exhausted_cleared` and a hold's
+        // span is closable offline — the whole point of REQ-STA-B-011, and #803's principal
+        // duration input.
+        //
+        // The sibling test below covers the OTHER exit (a plain Hold). Without this one, the
+        // relief-swap shape is only ever hand-written as a fixture string in the consumer tests,
+        // never derived from the daemon — so a refactor that cleared the guard inside
+        // `decide_action`'s swap path would suppress the clear on exactly this tick and leave the
+        // whole suite green.
+        //
+        // The exhausted state is entered NATURALLY (both accounts over the session trigger), so
+        // the guard is set by the daemon's own ENTER path — never hand-poked.
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            // Active over the session trigger AND the only spare over it too → no viable target.
+            FakeRosterPoller::new()
+                .ok("u-A", 0.97, 0.40)
+                .ok("u-B", 0.97, 0.40),
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+
+        let entered = warmed_tick(&mut daemon).await;
+        assert_eq!(entered.action, TickAction::NoViableTarget);
+        assert!(
+            entered
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::AllExhausted { .. })),
+            "precondition: the daemon must ENTER the hold on its own, got {:?}",
+            entered.events,
+        );
+        assert!(daemon.state.signaled_all_exhausted, "the guard is armed");
+
+        // The spare's window frees up. Re-script the poller, then advance past the WIDENED
+        // slow-poll window (#537) the exhausted peer was put on — otherwise it is simply not
+        // re-polled and the fresh reading never lands. The staggered schedule then needs a tick
+        // or two to reach it, and every one of those is still NoViableTarget (the carried reading
+        // is stale-exhausted), so the guard stays armed until the relief swap itself.
+        daemon.poller = FakeRosterPoller::new()
+            .ok("u-A", 0.97, 0.40)
+            .ok("u-B", 0.05, 0.05);
+        // 2× the `exhausted_poll_secs: 3600` the `tunables` helper configures.
+        daemon.clock.advance(Duration::from_secs(2 * 3600));
+        // Schedule `[work, spare]`: the next tick re-observes the active (still 0.97, and
+        // `spare`'s CARRIED reading is stale-exhausted → still no viable target, guard still
+        // armed), then the one after re-polls the freed `spare` and swaps onto it.
+        let held = daemon.tick().await; // the active `work`
+        assert_eq!(
+            held.action,
+            TickAction::NoViableTarget,
+            "the carried reading is stale-exhausted, so the guard must not clear early",
+        );
+        let relief = daemon.tick().await; // the freed `spare` — relief
+        assert_eq!(relief.action, TickAction::Swapped { from: 0, to: 1 });
+
+        // THE ASSERTION: swap first, then the durable clear — one of each, in that order.
+        assert_eq!(
+            relief
+                .events
+                .iter()
+                .filter(|e| matches!(
+                    e,
+                    Event::Swap { .. } | Event::AllExhaustedCleared | Event::AllExhausted { .. }
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                &Event::Swap {
+                    from: "work".to_owned(),
+                    to: "spare".to_owned(),
+                    reason: SwapReason::Session,
+                    session_pct: 97,
+                    projection: None,
+                },
+                &Event::AllExhaustedCleared,
+            ],
+            "the relief tick must close the bracket in the DURABLE log, after its own swap",
+        );
+        assert!(!daemon.state.signaled_all_exhausted, "the guard re-armed");
+    }
+
+    #[tokio::test]
     async fn leaving_the_all_exhausted_state_clears_the_edge_guard() {
         // #11 edge re-fire: once the daemon leaves the all-exhausted state the
         // guard clears, so a later re-entry signals afresh. Here a Hold (active
@@ -12759,14 +12857,18 @@ mod tests {
             !daemon.state.signaled_all_exhausted,
             "leaving the all-exhausted state must clear the edge guard",
         );
+        // The LEAVE marker lands in `events` — the DURABLE file log — exactly ONCE (issue #800,
+        // REQ-STA-B-011). It is computed from the guard BEFORE the reset above, so a genuine
+        // leave is told apart from a never-entered hold (a stale "all exhausted" reading vs a
+        // current one). Asserting the whole vec — not just the marker count — pins that a plain
+        // Hold emits NOTHING else, so the bracket's closing line cannot be diluted.
+        assert_eq!(outcome.events, vec![Event::AllExhaustedCleared]);
         // And the full diagnostic vec (#77), in emission order: ONE per-poll line (the
-        // staggered loop polls a single account — the active `work` — this tick), then
-        // — exactly ONCE — the `AllExhaustedCleared` LEAVE marker (the symmetric
-        // partner of the edge-triggered ENTER), then the per-tick Hold decision. The
-        // marker is computed from the guard BEFORE the reset above, so a genuine leave
-        // is told apart from a never-entered hold (a stale "all exhausted" reading vs a
-        // current one — the #77 motivation). Asserting the whole vec — not just the
-        // marker count — pins the operator-visible ORDER against an accidental reorder.
+        // staggered loop polls a single account — the active `work` — this tick), then the
+        // per-tick Hold decision. The LEAVE marker is NO LONGER here: #800 moved it to the
+        // durable channel above, because stderr is ephemeral (a `run -v` daemon holds fd 2 on a
+        // TTY) and a hold's END has to survive offline. Pinning its ABSENCE here is what keeps a
+        // regression to the old sink visible.
         assert_eq!(
             outcome.diagnostics,
             vec![
@@ -12775,7 +12877,6 @@ mod tests {
                     account: "work".to_owned(),
                     outcome: PollClass::Live,
                 },
-                Diagnostic::AllExhaustedCleared,
                 Diagnostic::Tick {
                     decision: DecisionClass::Hold,
                     backoff_secs: None,
