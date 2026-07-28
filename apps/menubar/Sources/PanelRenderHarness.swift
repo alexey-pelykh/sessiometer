@@ -316,9 +316,15 @@ enum PanelRenderHarness {
     /// until #171 bundles the agent plist; this render is a design oracle against the mock (which shows the
     /// button), NOT a capture of the #170 runtime's inert-banner state. Every other fixture carries the
     /// model inert (its state renders no Start card).
-    static func render(_ fixture: PanelRenderFixture, scheme: ColorScheme) -> CGImage? {
+    /// `dynamicTypeSize` defaults to `.large` — the DEFAULT class, whose `PanelTypeScale` factor is exactly
+    /// 1.0 — so every existing consumer (the app's `--render-panel` tool, the committed golden gate) renders
+    /// byte-for-byte what it rendered before issue #756. It is a parameter at all because AC-3 asks what the
+    /// panel looks like "given each Dynamic Type size class", and that question needs a seam; issue #757's
+    /// gate is the intended consumer of it.
+    static func render(_ fixture: PanelRenderFixture, scheme: ColorScheme,
+                       dynamicTypeSize: DynamicTypeSize = .large) -> CGImage? {
         warmUpIfNeeded()
-        return rasterize(fixture, scheme: scheme)
+        return rasterize(fixture, scheme: scheme, dynamicTypeSize: dynamicTypeSize)
     }
 
     /// Discard-renders until the rasterizer reaches its steady state, once per process.
@@ -351,7 +357,8 @@ enum PanelRenderHarness {
         guard let probe else { return }
         var previous: [UInt8]?
         for _ in 0..<8 {
-            guard let cg = rasterize(probe, scheme: .light), let bytes = rawBytes(cg) else { return }
+            guard let cg = rasterize(probe, scheme: .light, dynamicTypeSize: .large),
+                  let bytes = rawBytes(cg) else { return }
             if let previous, previous == bytes { return }
             previous = bytes
         }
@@ -376,7 +383,8 @@ enum PanelRenderHarness {
         return ok ? bytes : nil
     }
 
-    private static func rasterize(_ fixture: PanelRenderFixture, scheme: ColorScheme) -> CGImage? {
+    private static func rasterize(_ fixture: PanelRenderFixture, scheme: ColorScheme,
+                                  dynamicTypeSize: DynamicTypeSize) -> CGImage? {
         let store = WatchStatusStore.preview(state: fixture.state, rows: fixture.rows,
                                              nextSwap: fixture.nextSwap, generatedAt: fixture.generatedAt,
                                              canonicalScrub: fixture.canonicalScrub,
@@ -400,6 +408,9 @@ enum PanelRenderHarness {
             // second machine. `.tint` pins it explicitly for the whole hierarchy, from the same asset, so
             // the app tool and the in-bundle gate rasterize identical pixels.
             .tint(Color.panelAccent)
+            // The Dynamic Type size class (issue #756). `StatusPanelView` clamps it to
+            // `PanelTypeScale.ceiling` and derives the panel's uniform scale factor from it.
+            .dynamicTypeSize(dynamicTypeSize)
         let renderer = ImageRenderer(content: view)
         renderer.scale = scale
         return renderer.cgImage

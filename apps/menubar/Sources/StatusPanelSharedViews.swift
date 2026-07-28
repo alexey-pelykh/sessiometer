@@ -32,19 +32,21 @@ extension StatusPanelFormat.IdentityElision {
 /// The always-present honest-state header. A shape-and-color status dot plus a plain title/detail,
 /// tinted by the banner's kind — the panel's promise that it never shows healthy on a degraded daemon.
 struct BannerView: View {
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
     let banner: StatusPanelFormat.Banner
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
+        HStack(alignment: .firstTextBaseline, spacing: 8 * scale) {
             Circle()
                 .fill(tint)
-                .frame(width: 8, height: 8)
+                .frame(width: 8 * scale, height: 8 * scale)
                 .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 2 * scale) {
                 Text(banner.title)
-                    .font(.headline)
+                    .font(.panel(style: .headline, .bold, scale: scale))
                 Text(banner.detail)
-                    .font(.subheadline)
+                    .font(.panel(style: .subheadline, scale: scale))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -73,6 +75,8 @@ struct BannerView: View {
 /// the parent (`RosterView` / `StatsContent`) so its collision-escalation sees every sibling label.
 /// Accessibility-hidden; the row's VoiceOver label already speaks the identity.
 struct MonogramBadge: View {
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
     let label: String
     /// The roster-resolved 2-char monogram (issue #445) — derived from the label's distinguishing token, so
     /// a same-local-part roster does not collapse to one letter. Computed once per roster by the parent.
@@ -81,16 +85,16 @@ struct MonogramBadge: View {
 
     var body: some View {
         let dark = colorScheme == .dark
-        RoundedRectangle(cornerRadius: 8)
+        RoundedRectangle(cornerRadius: 8 * scale)
             // Per-account identity color (issue #445), seeded from `label` — the deliberate deviation from the
             // mock's neutral `--badge-bg` monochrome badge. A low-chroma muted hue, never provider branding.
             .fill(Color.accountBadge(label, dark: dark))
-            .frame(width: StatusPanelFormat.monogramBadgeWidth,
-                   height: StatusPanelFormat.monogramBadgeWidth)
+            .frame(width: StatusPanelFormat.monogramBadgeWidth * scale,
+                   height: StatusPanelFormat.monogramBadgeWidth * scale)
             .overlay(
                 Text(monogram)
-                    .font(.system(size: 13, weight: .bold))
-                    .tracking(0.4)
+                    .font(.panel(13, .bold, scale: scale))
+                    .tracking(0.4 * scale)
                     // High-contrast neutral glyph ON the fill (asserted ≥ 4.5:1 per slot, both themes).
                     .foregroundStyle(Color.accountMonogram(dark: dark))
             )
@@ -107,6 +111,8 @@ struct MonogramBadge: View {
 /// label (`StatusPanelFormat.rowAccessibilityLabel`, ", active") and the panel header's plain-text
 /// subtitle (`headerSubtitle`, which names the active account — e.g. "3 accounts · Work active").
 struct StatusDot: View {
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
     let isActive: Bool
     /// The active halo opacity is theme-aware (#388, mock `--accent-halo`); the inactive ring takes the
     /// mock's `--text-3` (a tertiary-label neutral), not a washed `secondary.opacity`.
@@ -123,10 +129,11 @@ struct StatusDot: View {
                 // `.tertiaryLabelColor` is the label-family neutral the footer freshness line also uses for
                 // `--text-3` (one token, one impl); it REPLACES `Color.secondary.opacity(0.55)`, which
                 // rendered ≈half the mock's neutral (the #388 washout).
-                Circle().strokeBorder(Color(nsColor: .tertiaryLabelColor), lineWidth: isActive ? 0 : 1.5)
+                Circle().strokeBorder(Color(nsColor: .tertiaryLabelColor),
+                                      lineWidth: isActive ? 0 : 1.5 * scale)
             )
-            .frame(width: StatusPanelFormat.statusDotWidth,
-                   height: StatusPanelFormat.statusDotWidth)
+            .frame(width: StatusPanelFormat.statusDotWidth * scale,
+                   height: StatusPanelFormat.statusDotWidth * scale)
             // The design reference rings the active disc with a soft accent halo (`box-shadow 0 0 0 3px`) —
             // a redundant emphasis behind the fill-vs-ring shape difference, never the sole active cue. Its
             // opacity is theme-aware (#388, mock `--accent-halo`): .20 light / .30 dark.
@@ -134,7 +141,7 @@ struct StatusDot: View {
                 if isActive {
                     Circle()
                         .fill(Color.accentEmphasis(.activeDotHalo, dark: colorScheme == .dark))
-                        .frame(width: 14, height: 14)
+                        .frame(width: 14 * scale, height: 14 * scale)
                 }
             }
             .accessibilityHidden(true)

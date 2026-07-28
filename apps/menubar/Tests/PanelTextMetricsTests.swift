@@ -86,6 +86,9 @@
 #if DEBUG
 import AppKit
 import CoreText
+// `DynamicTypeSize` + `PanelTypeScale` — the AC-3 sweep (issue #756) reads the SAME factor the views
+// lay out with, never a second copy of the curve.
+import SwiftUI
 import XCTest
 
 final class PanelTextMetricsTests: XCTestCase {
@@ -605,6 +608,92 @@ final class PanelTextMetricsTests: XCTestCase {
         for (name, _, budget) in cells {
             XCTAssertGreaterThan(budget, 0, "\(name) budget is non-positive — every string would overflow")
         }
+    }
+
+    // MARK: - AC-3 (issue #756): every gated cell still fits at EVERY Dynamic Type size class
+
+    // The panel scales UNIFORMLY (`StatusPanelTypeScale`): one factor multiplies every font point size AND
+    // every layout constant, so a cell and the text inside it grow together. The obvious objection is that
+    // this makes the sweep below a tautology — if both sides are × k, of course it still fits.
+    //
+    // It is not, for one measured reason: GLYPH ADVANCE IS NOT LINEAR IN POINT SIZE. Hinting and device
+    // rounding mean `width(text, font(size: 11k)) != k · width(text, font(size: 11))`, so the two sides
+    // drift apart by fractions of a point at every step, and the sweep is what says the drift never
+    // crosses a cell edge. The same non-linearity shows up one level up: the panel's rendered HEIGHT
+    // tracks k only to within about −2.4 %…+1.2 % across the range (measured over the `healthy` and
+    // `stats` fixtures), while its WIDTH — a `.frame(width:)` on a constant — is exact.
+    //
+    // The fonts are rebuilt here from the SAME (points, weight) pairs the views pass to `Font.panel(_:_:
+    // scale:)`, at the SAME factor `PanelTypeScale.factor(for:)` returns, so this measures the shipped
+    // typography rather than a parallel model of it.
+
+    /// Every gated cell at factor `k`: its font, its budget, and the widest string it can actually reach.
+    ///
+    /// The three travel together in ONE row rather than through a name-keyed lookup, so a cell can never be
+    /// measured against another cell's fixture — a mistyped or newly-added name has nowhere to silently
+    /// fall through to. The strings are the same fixtures the default-size tests above justify, so the
+    /// sweep inherits their reachability reasoning rather than inventing new content.
+    private func scaledCells(_ k: Double) -> [(name: String, widest: String, font: NSFont, budget: Double)] {
+        [("meter label", "SESSION",
+          NSFont.systemFont(ofSize: 10 * k, weight: .semibold),
+          StatusPanelFormat.meterLabelCellWidth * k),
+         ("meter percent", StatusPanelFormat.pct(255),                   // bare UInt8 wire, no clamp
+          NSFont.monospacedDigitSystemFont(ofSize: 12 * k, weight: .semibold),
+          StatusPanelFormat.meterPercentCellWidth * k),
+         ("meter reset", StatusPanelFormat.humanizeUntil(999 * 86_400 + 23 * 3600),
+          NSFont.monospacedDigitSystemFont(ofSize: 11 * k, weight: .regular),
+          StatusPanelFormat.meterResetCellWidth * k),
+         ("roster label", "oleksii@company-one.com",                     // the realistic fleet shape
+          NSFont.systemFont(
+              ofSize: NSFont.preferredFont(forTextStyle: .body).pointSize * k, weight: .semibold),
+          StatusPanelFormat.rosterLabelBudget * k),
+         ("stats handle", "oleksii@company-one.com",
+          NSFont.systemFont(ofSize: 13 * k, weight: .semibold),
+          StatusPanelFormat.statsHandleBudget * k)]
+    }
+
+    func testEveryGatedCellFitsAtEveryDynamicTypeSizeClass() {
+        var checked = 0
+        for size in DynamicTypeSize.allCases {
+            let k = PanelTypeScale.factor(for: size)
+            for cell in scaledCells(k) {
+                assertFits(cell.widest, cell.font, budget: cell.budget,
+                           "\(cell.name) at \(size) (k=\(String(format: "%.4f", k)))")
+                checked += 1
+            }
+        }
+        // Degenerate-subject guard, exact rather than non-zero: 12 size classes × 5 gated cells. A sweep
+        // that silently evaluated one class would otherwise pass and prove nothing.
+        XCTAssertEqual(checked, 12 * 5,
+                       "expected \(12 * 5) (size class × cell) measurements, ran \(checked)")
+    }
+
+    // MARK: - CONSTRAINT-A for the AC-3 sweep: a scaled font in an UNSCALED cell must FAIL
+
+    // The sweep above passes because both sides scale. This proves the sweep can still FAIL, by mutating
+    // exactly the defect AC-2 names — "a scaled font in a fixed cell is a clipping bug, not a fix" — and
+    // pushing it through the SAME `overflows` predicate the sweep uses. That mutation is not hypothetical:
+    // it is what the panel would look like if someone scaled the fonts and forgot the `.frame(width:)`
+    // constants, which is the single most likely way this change regresses.
+    func testAScaledFontInAnUnscaledCellTripsTheGate() {
+        let k = PanelTypeScale.factor(for: .accessibility3)
+        XCTAssertGreaterThan(k, 1.0, "the ceiling factor is not an enlargement — the mutation below is inert")
+
+        var tripped = 0
+        for cell in scaledCells(k) {
+            // The MUTATION: keep the scaled font, revert the cell to its DEFAULT width.
+            let unscaledBudget = cell.budget / k
+            XCTAssertTrue(overflows(cell.widest, cell.font, budget: unscaledBudget),
+                          "\(cell.name): the .accessibility3 font still fits the UNSCALED "
+                          + "\(String(format: "%.2f", unscaledBudget)) pt cell, so the sweep would stay "
+                          + "green even if the frame constants were never scaled — this cell's half of "
+                          + "AC-3 is not actually gated (issue #748 CONSTRAINT-A)")
+            // Control, same run: with the cell scaled too, the identical string fits.
+            assertFits(cell.widest, cell.font, budget: cell.budget,
+                       "\(cell.name) control (scaled cell)")
+            tripped += 1
+        }
+        XCTAssertEqual(tripped, 5, "expected 5 gated cells in the mutation, ran \(tripped)")
     }
 
     // MARK: - Headless (issue #750 AC-6)
