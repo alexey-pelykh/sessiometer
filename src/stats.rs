@@ -2129,15 +2129,28 @@ fn render_sparkline(values: &[Option<f64>], ascii: bool) -> String {
     values.iter().map(|&v| spark_glyph(v, ascii)).collect()
 }
 
+/// Where a cell sits WITHIN its content-sized column: TEXT cells left-align, NUMERIC cells
+/// right-align, so magnitudes read down a column and their `%` / unit suffixes line up
+/// (design-stats.md §D-STA-5, as amended by issue #793). This is alignment inside a column —
+/// widths stay content-sized, NOT the fixed-width fields the #557 reflow retired. The gap
+/// sentinel `—` simply follows its own column's alignment.
+#[derive(Clone, Copy)]
+enum Align {
+    Left,
+    Right,
+}
+
 /// One droppable table column: a header, per-row cells, an optional per-row colour, the
-/// spaces rendered BEFORE it, and a drop priority (`None` = always keep; `Some(n)` =
-/// droppable, the LOWEST present `n` dropping first under a narrow terminal). Mirrors the
-/// `status` view's [`Column`](crate::cli) discipline but over already-rendered string cells.
+/// spaces rendered BEFORE it, its cell [`Align`]ment, and a drop priority (`None` = always
+/// keep; `Some(n)` = droppable, the LOWEST present `n` dropping first under a narrow
+/// terminal). Mirrors the `status` view's [`Column`](crate::cli) discipline but over
+/// already-rendered string cells.
 struct ChartCol {
     header: &'static str,
     cells: Vec<String>,
     colors: Vec<Option<&'static str>>,
     lead_gap: usize,
+    align: Align,
     priority: Option<u8>,
 }
 
@@ -2158,24 +2171,37 @@ fn table_width(columns: &[ChartCol]) -> usize {
     columns.iter().map(|c| c.lead_gap + c.width()).sum()
 }
 
-/// Render one table line: each cell preceded by its lead gap, LEFT-padded to its column
-/// width on DISPLAY width, colour wrapping the raw cell BEFORE the pad (so the escape bytes
-/// never enter the width math and stripping them recovers the exact plain table), trailing
-/// whitespace trimmed. The `status` view's `render_cells` discipline (issue #159 reuse).
+/// Render one table line: each cell preceded by its lead gap and padded to its column width on
+/// DISPLAY width, the pad going AFTER the cell for an [`Align::Left`] column and BEFORE it for
+/// an [`Align::Right`] one (text left, numeric right — issue #795), colour wrapping the raw cell
+/// BEFORE the pad either way (so the escape bytes never enter the width math, the SGR pair hugs
+/// the cell text and never the padding, and stripping the escapes recovers the exact plain
+/// table), trailing whitespace trimmed. A right-aligned column pads on the LEADING side, so the
+/// trim only ever reaches a left-aligned trailing column. The `status` view's `render_cells`
+/// discipline (issue #159 reuse).
 fn render_line(
     cells: &[&str],
     widths: &[usize],
     colors: &[Option<&str>],
     gaps: &[usize],
+    aligns: &[Align],
 ) -> String {
     let mut line = String::new();
-    for (((cell, &width), color), &gap) in cells.iter().zip(widths).zip(colors).zip(gaps) {
+    for ((((cell, &width), color), &gap), &align) in
+        cells.iter().zip(widths).zip(colors).zip(gaps).zip(aligns)
+    {
+        let pad = " ".repeat(width.saturating_sub(display_width(cell)));
+        let (lead, trail) = match align {
+            Align::Left => ("", pad.as_str()),
+            Align::Right => (pad.as_str(), ""),
+        };
         line.push_str(&" ".repeat(gap));
+        line.push_str(lead);
         match color {
             Some(sgr) => line.push_str(&format!("\x1b[{sgr}m{cell}\x1b[0m")),
             None => line.push_str(cell),
         }
-        line.push_str(&" ".repeat(width.saturating_sub(display_width(cell))));
+        line.push_str(trail);
     }
     format!("{}\n", line.trim_end())
 }
@@ -2193,9 +2219,10 @@ struct AccountRow<'a> {
 }
 
 /// One column of the per-account table catalog (issue #557), generalising the [`ChartCol`] idea to
-/// a reusable SPEC: a header, the spaces BEFORE it, the drop `priority` (`None` = the
-/// `account · signal · session` floor, `Some(n)` sheds lowest-first under a narrow terminal), and
-/// pure extractors for the cell string and its optional per-row colour SGR from an [`AccountRow`].
+/// a reusable SPEC: a header, the spaces BEFORE it, the cell [`Align`]ment (issue #795), the drop
+/// `priority` (`None` = the `account · signal · session` floor, `Some(n)` sheds lowest-first under
+/// a narrow terminal), and pure extractors for the cell string and its optional per-row colour SGR
+/// from an [`AccountRow`].
 /// There is ONE catalog; each surface renders its declared ordered subset ([`piped_columns`] /
 /// [`tty_columns`]). A new per-account metric is a single `Column` that appears on both surfaces by
 /// subset choice — the convergence that kills the latent shape-drift #556 left between the two
@@ -2203,6 +2230,7 @@ struct AccountRow<'a> {
 struct Column {
     header: &'static str,
     lead_gap: usize,
+    align: Align,
     priority: Option<u8>,
     cell: fn(&AccountRow) -> String,
     color: fn(&AccountRow) -> Option<&'static str>,
@@ -2214,12 +2242,18 @@ struct Column {
 // columns (`account` / `signal` / `velocity` / `runway`) are the SAME constructor on both
 // surfaces, so they cannot diverge; the surface-specific ones differ only in which subset lists
 // them. `account` leads with no gap; every other column is preceded by two spaces.
+//
+// ALIGNMENT (issue #795, §D-STA-5 as amended by issue #793) is declared per column here: the two
+// TEXT columns (`account` / `signal`) left-align, every NUMERIC one right-aligns. `trend` is
+// neither — a per-bucket sparkline read left-to-right in time, one glyph per series bucket and so
+// the same width on every row — and stays LEFT.
 
 /// The `account` handle — the floor's first column, sized on DISPLAY width by the renderer.
 fn col_account() -> Column {
     Column {
         header: "account",
         lead_gap: 0,
+        align: Align::Left,
         priority: None,
         cell: |r| r.handle.to_owned(),
         color: |_| None,
@@ -2231,6 +2265,7 @@ fn col_signal() -> Column {
     Column {
         header: "signal",
         lead_gap: 2,
+        align: Align::Left,
         priority: None,
         cell: |r| signal_cell(r.stats).to_owned(),
         color: |r| signal_sgr(r.stats),
@@ -2241,6 +2276,7 @@ fn col_cov() -> Column {
     Column {
         header: "cov",
         lead_gap: 2,
+        align: Align::Right,
         priority: None,
         cell: |r| format!("{}%", pct(r.stats.coverage)),
         color: |_| None,
@@ -2252,6 +2288,7 @@ fn col_session_triple() -> Column {
     Column {
         header: "session m/p/p95",
         lead_gap: 2,
+        align: Align::Right,
         priority: None,
         cell: |r| triple(&r.stats.session),
         color: |_| None,
@@ -2262,6 +2299,7 @@ fn col_session_compact() -> Column {
     Column {
         header: "session",
         lead_gap: 2,
+        align: Align::Right,
         priority: None,
         cell: |r| session_cell(r.stats),
         color: |r| Some(Band::of(r.stats.session.peak).sgr()),
@@ -2272,6 +2310,7 @@ fn col_weekly_triple() -> Column {
     Column {
         header: "weekly m/p/p95",
         lead_gap: 2,
+        align: Align::Right,
         priority: None,
         cell: |r| triple(&r.stats.weekly),
         color: |_| None,
@@ -2283,6 +2322,7 @@ fn col_weekly_peak() -> Column {
     Column {
         header: "weekly",
         lead_gap: 2,
+        align: Align::Right,
         priority: Some(4),
         cell: |r| format!("{}%", pct(r.stats.weekly.peak)),
         color: |r| Some(Band::of(r.stats.weekly.peak).sgr()),
@@ -2293,6 +2333,7 @@ fn col_caps() -> Column {
     Column {
         header: "caps",
         lead_gap: 2,
+        align: Align::Right,
         priority: None,
         cell: |r| r.stats.cap_hits.to_string(),
         color: |_| None,
@@ -2303,6 +2344,7 @@ fn col_time_at_cap() -> Column {
     Column {
         header: "t@cap",
         lead_gap: 2,
+        align: Align::Right,
         priority: None,
         cell: |r| fmt_dur(r.stats.time_at_cap_secs),
         color: |_| None,
@@ -2313,6 +2355,7 @@ fn col_share() -> Column {
     Column {
         header: "share",
         lead_gap: 2,
+        align: Align::Right,
         priority: None,
         cell: |r| format!("{}%", pct(r.stats.contribution_share)),
         color: |_| None,
@@ -2324,6 +2367,7 @@ fn col_velocity() -> Column {
     Column {
         header: "velocity",
         lead_gap: 2,
+        align: Align::Right,
         priority: Some(2),
         cell: |r| velocity_cell(r.velocity),
         color: |_| None,
@@ -2335,6 +2379,7 @@ fn col_runway() -> Column {
     Column {
         header: "runway",
         lead_gap: 2,
+        align: Align::Right,
         priority: Some(3),
         cell: |r| runway_cell(r.velocity),
         color: |_| None,
@@ -2346,6 +2391,7 @@ fn col_trend() -> Column {
     Column {
         header: "trend",
         lead_gap: 2,
+        align: Align::Left,
         priority: Some(1),
         cell: |r| r.trend.clone(),
         color: |_| None,
@@ -2449,6 +2495,7 @@ fn render_account_table(
             cells: all_rows.iter().map(|&r| (c.cell)(r)).collect(),
             colors: all_rows.iter().map(|&r| (c.color)(r)).collect(),
             lead_gap: c.lead_gap,
+            align: c.align,
             priority: c.priority,
         })
         .collect();
@@ -2465,8 +2512,15 @@ fn render_account_table(
         }
     }
 
+    // Every per-column layout slice is derived from the POST-DROP `cols` — widths, gaps, headers
+    // AND aligns alike — so they stay index-aligned with each other through both retains above.
+    // Deriving any one of them from the pre-drop `columns` catalog instead would desynchronise it
+    // the moment a column elides or sheds, silently padding cells on the wrong side under a narrow
+    // terminal — a wide-terminal golden cannot see it, but
+    // `alignment_survives_column_elision_and_the_priority_drop` can.
     let widths: Vec<usize> = cols.iter().map(ChartCol::width).collect();
     let gaps: Vec<usize> = cols.iter().map(|c| c.lead_gap).collect();
+    let aligns: Vec<Align> = cols.iter().map(|c| c.align).collect();
     let headers: Vec<&str> = cols.iter().map(|c| c.header).collect();
     let no_color: Vec<Option<&str>> = vec![None; cols.len()];
 
@@ -2479,14 +2533,15 @@ fn render_account_table(
             out.push_str(heading);
             out.push('\n');
         }
-        out.push_str(&render_line(&headers, &widths, &no_color, &gaps));
+        // A header follows its OWN column's alignment, so it sits over its data as one unit.
+        out.push_str(&render_line(&headers, &widths, &no_color, &gaps, &aligns));
         for r in span.clone() {
             let cells: Vec<&str> = cols.iter().map(|c| c.cells[r].as_str()).collect();
             let colors: Vec<Option<&str>> = cols
                 .iter()
                 .map(|c| if color { c.colors[r] } else { None })
                 .collect();
-            out.push_str(&render_line(&cells, &widths, &colors, &gaps));
+            out.push_str(&render_line(&cells, &widths, &colors, &gaps, &aligns));
         }
     }
     out
@@ -2869,12 +2924,15 @@ mod tests {
         // §D-STA-5 columns: `account · signal · session(mean/peak) · weekly · trend`. The fixture
         // carries no velocity overlay, so `velocity` / `runway` are uniformly `—` and elide before
         // the width fit — the sparse-fleet default. `session` is mean/peak (`50/99`) not peak-only.
+        // The text columns (`account` / `signal`) and the sparkline left-align; the NUMERIC
+        // `session` / `weekly` right-align inside their content-sized widths, so `40%` and `5%`
+        // land their `%` in one terminal cell (issue #795).
         let r = two_account_charts();
         assert_eq!(
             render_chart_table(&r, &keys(&r), 60, false, false),
             "account  signal     session  weekly  trend\n\
-             alpha    saturated  50/99    40%     ▃▅█\n\
-             beta     underused  10/20    5%      ▂ ▂\n",
+             alpha    saturated    50/99     40%  ▃▅█\n\
+             beta     underused    10/20      5%  ▂ ▂\n",
         );
     }
 
@@ -3035,9 +3093,9 @@ mod tests {
     #[test]
     fn render_text_label_column_aligns_on_display_width() {
         // render_text carried a DOUBLE bug: it sized the label column on `String::len()`
-        // (bytes) AND padded on char count. The coverage `%` is a fixed-offset marker after
-        // the label (a `{:>3}` field then a literal `%`), so it lands at one display column
-        // per row only when the label column is sized AND padded on display width.
+        // (bytes) AND padded on char count. The coverage `%` terminates `cov`, the first NUMERIC
+        // column after the label, so it lands at one display column per row only when the label
+        // column is sized AND padded on display width.
         let out = render_text(&wide_glyph_charts());
         let pct_col = |label: &str| {
             let line = out.lines().find(|l| l.contains(label)).unwrap();
@@ -3047,6 +3105,163 @@ mod tests {
         assert!(
             cols.iter().all(|&c| c == cols[0]),
             "text: the coverage `%` aligns across rows: {cols:?}\n{out}"
+        );
+    }
+
+    // --- issue #795 AC: numeric columns right-align within their content-sized width ----
+
+    /// A three-account chart report whose `weekly` peaks render at THREE different widths —
+    /// `7%` / `97%` / `100%`, the exact ragged trio issue #795 reports — under the given
+    /// `handles`. Every account is present and non-zero in the single series bucket, so
+    /// nothing elides; no velocity overlay, so `velocity` / `runway` elide as usual.
+    fn mixed_width_weekly_charts(handles: [&'static str; 3]) -> Report {
+        let row = |weekly: f64| stat(3, ds(0.30, 0.50, 0.40), weekly, 0.33);
+        let accts = [
+            (handles[0], row(0.07)),
+            (handles[1], row(0.97)),
+            (handles[2], row(1.00)),
+        ];
+        charts_report(&accts, &[&accts[..]])
+    }
+
+    /// The three `(handle, weekly cell)` pairs `mixed_width_weekly_charts` renders, for the
+    /// ASCII handles. Each cell string occurs exactly once in its own row.
+    const MIXED_WEEKLY: [(&str, &str); 3] = [("aa", "7%"), ("bbbb", "97%"), ("c", "100%")];
+
+    /// The display column at which `cell` ENDS in the row of `out` starting with `row` — where
+    /// that cell's right edge lands on screen. Equal across rows IFF the column right-aligns;
+    /// equal to the header's own right edge IFF the header aligns with its data (issue #795).
+    fn cell_right_edge(out: &str, row: &str, cell: &str) -> usize {
+        let line = out
+            .lines()
+            .find(|l| l.starts_with(row))
+            .unwrap_or_else(|| panic!("a row for `{row}`:\n{out}"));
+        let end = line
+            .find(cell)
+            .unwrap_or_else(|| panic!("`{cell}` in row `{row}`:\n{out}"))
+            + cell.len();
+        display_width(&line[..end])
+    }
+
+    #[test]
+    fn a_numeric_column_right_aligns_so_its_values_line_up_down_the_column() {
+        // THE reported defect: `weekly` rendered `7%` / `97%` / `100%` LEFT-aligned, so the `%`
+        // signs staggered and magnitudes could not be compared down the column. Right-aligned,
+        // every value's right edge lands in ONE terminal cell whatever its width — and so does
+        // the column's own header, so the header reads as part of the column it heads.
+        let r = mixed_width_weekly_charts(["aa", "bbbb", "c"]);
+        let out = render_chart_table(&r, &keys(&r), 80, false, false);
+        let edges: Vec<usize> = MIXED_WEEKLY
+            .iter()
+            .map(|&(row, cell)| cell_right_edge(&out, row, cell))
+            .collect();
+        assert!(
+            edges.iter().all(|&e| e == edges[0]),
+            "weekly's `%` signs land in one terminal cell: {edges:?}\n{out}"
+        );
+        // A numeric column's HEADER right-aligns with its own cells, so the header reads as part
+        // of the column it heads. `weekly` cannot witness that — its header is exactly as wide as
+        // its column, so it fills the column under EITHER alignment. The piped surface's `cov`
+        // can: a 3-cell header over 4-cell `100%` values, so a left-aligned header would sit one
+        // column left of the data it heads.
+        let piped = render_text(&r);
+        let cov_header = cell_right_edge(&piped, "account", "cov");
+        for (handle, _) in MIXED_WEEKLY {
+            assert_eq!(
+                cell_right_edge(&piped, handle, "100%"),
+                cov_header,
+                "`cov`'s header right-aligns with its own cells\n{piped}"
+            );
+        }
+        // The TEXT columns are untouched: every handle still starts flush at column 0, however
+        // short — right-aligning `account` would indent `c` under `bbbb`.
+        for (handle, _) in MIXED_WEEKLY {
+            assert!(
+                out.lines().any(|l| l.starts_with(handle)),
+                "`account` still left-aligns: `{handle}` starts its own row\n{out}"
+            );
+        }
+    }
+
+    /// The display column at which the row's LAST cell BEGINS. `trend` renders last on the TTY
+    /// surface and its cells are narrower than its 5-wide header, so this is where a
+    /// left-aligned `trend` sits — four columns left of where a right-aligned one would.
+    fn last_cell_left_edge(line: &str) -> usize {
+        let last = line.split_whitespace().next_back().unwrap();
+        display_width(&line[..line.rfind(last).unwrap()])
+    }
+
+    #[test]
+    fn alignment_survives_column_elision_and_the_priority_drop() {
+        // THE desync trap: the per-column alignment slice must go through the SAME elision and
+        // priority-drop retains as the widths and gaps. Derived from the pre-drop catalog
+        // instead, it would shift the moment a column vanishes and pad cells on the WRONG side —
+        // and the shed states are ones a wide-terminal golden never renders. Sweep the width
+        // down over a fixture that BOTH elides (no velocity overlay → `velocity` / `runway` go,
+        // from the MIDDLE of the catalog) and priority-drops, asserting at every width that
+        // `weekly` still lands its right edge on its header's and that `trend` still sits flush
+        // under the LEFT edge of its own.
+        let r = mixed_width_weekly_charts(["aa", "bbbb", "c"]);
+        let header_cols = |out: &str| out.lines().next().unwrap().split_whitespace().count();
+        let full = header_cols(&render_chart_table(&r, &keys(&r), 200, false, false));
+        let mut shed_states = 0;
+        for w in (10..90).rev() {
+            let out = render_chart_table(&r, &keys(&r), w, false, false);
+            let header = out.lines().next().unwrap();
+            shed_states += usize::from(header_cols(&out) < full);
+            if header.contains("weekly") {
+                let edge = cell_right_edge(&out, "account", "weekly");
+                for (row, cell) in MIXED_WEEKLY {
+                    assert_eq!(
+                        cell_right_edge(&out, row, cell),
+                        edge,
+                        "at w={w} `weekly` still right-aligns under its header\n{out}"
+                    );
+                }
+            }
+            if header.contains("trend") {
+                let edge = last_cell_left_edge(header);
+                for line in out.lines().skip(1) {
+                    assert_eq!(
+                        last_cell_left_edge(line),
+                        edge,
+                        "at w={w} `trend` still left-aligns under its header\n{out}"
+                    );
+                }
+            }
+        }
+        assert!(
+            shed_states > 0,
+            "the sweep must actually reach a shed state — otherwise this asserts nothing"
+        );
+    }
+
+    /// Handles that stress the table's own width math, unlike [`WIDE_LABELS`] (whose widest is
+    /// still narrower than the 7-cell `account` header, so the header sizes that column and a
+    /// cell-sizing bug hides): an ASCII label (5 cells / 5 chars), a CJK run WIDER than the
+    /// header (12 cells / 6 chars — so the CELLS size the column), and a ZWJ-family emoji (one
+    /// coalesced 2-cell glyph / 5 code points). Char count and display width disagree on all
+    /// three, and disagree DIFFERENTLY, so either a char-count SIZE or a char-count PAD
+    /// staggers the rows.
+    const WIDE_HANDLES: [&str; 3] = ["ascii", "日本語日本語", "👨\u{200D}👩\u{200D}👧"];
+
+    #[test]
+    fn a_right_aligned_numeric_column_lands_on_display_width() {
+        // The issue #249 guarantee holds across the new pad side too: the `account` column is
+        // sized and padded on DISPLAY width, so a CJK / ZWJ-emoji handle cannot stagger the
+        // right-aligned numeric columns downstream of it — the `%` column would tear apart.
+        let r = mixed_width_weekly_charts(WIDE_HANDLES);
+        let out = render_chart_table(&r, &keys(&r), 80, false, false);
+        let cells = ["7%", "97%", "100%"];
+        let edges: Vec<usize> = WIDE_HANDLES
+            .iter()
+            .zip(cells)
+            .map(|(&row, cell)| cell_right_edge(&out, row, cell))
+            .collect();
+        assert!(
+            edges.iter().all(|&e| e == edges[0]),
+            "weekly right-aligns at one display column behind wide-glyph handles: \
+             {edges:?}\n{out}"
         );
     }
 
@@ -3070,8 +3285,8 @@ mod tests {
         // run and carries no Unicode block glyph.
         let r = two_account_charts();
         let table = render_chart_table(&r, &keys(&r), 60, false, true);
-        assert!(table.contains("alpha    saturated  50/99    40%     -+@\n"));
-        assert!(table.contains("beta     underused  10/20    5%      : :\n"));
+        assert!(table.contains("alpha    saturated    50/99     40%  -+@\n"));
+        assert!(table.contains("beta     underused    10/20      5%  : :\n"));
         for glyph in ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█', '░', '▒', '▓'] {
             assert!(!table.contains(glyph), "no Unicode block survives --ascii");
         }
@@ -3089,16 +3304,16 @@ mod tests {
         assert_eq!(
             w40,
             "account  signal     session  weekly\n\
-             alpha    saturated  50/99    40%\n\
-             beta     underused  10/20    5%\n",
+             alpha    saturated    50/99     40%\n\
+             beta     underused    10/20      5%\n",
         );
         // Narrower still → weekly drops NEXT; the `account · signal · session` floor is always kept.
         let w30 = render_chart_table(&r, &keys(&r), 30, false, false);
         assert_eq!(
             w30,
             "account  signal     session\n\
-             alpha    saturated  50/99\n\
-             beta     underused  10/20\n",
+             alpha    saturated    50/99\n\
+             beta     underused    10/20\n",
         );
         // Below the floor width the floor OVERFLOWS rather than wrapping — nothing more drops, so
         // the render is byte-identical to the floor at any narrower width, one line per account.
@@ -3162,9 +3377,13 @@ mod tests {
         // (#159): the window echo, the per-account table, and the contiguous aggregate roster
         // block. `aa` carries a velocity overlay (populated cells); `bb` has none (`—`). Since
         // issue #557 the piped table is the shared render_account_table over piped_columns at
-        // w = usize::MAX / color = false, so this layout is CONTENT-SIZED and LEFT-ALIGNED (the
-        // §D-STA-5 impl style) — the deliberate, reviewed reflow from the former hand-built
-        // fixed-width right-aligned fields. The piped-contract risk was resolved before reflowing:
+        // w = usize::MAX / color = false, so this layout is CONTENT-SIZED — the deliberate,
+        // reviewed reflow from the former hand-built FIXED-WIDTH fields — with the text columns
+        // (`account` / `signal`) left-aligned and the numeric ones right-aligned WITHIN those
+        // content-sized widths (§D-STA-5 as amended by issue #793; landed by issue #795). The two
+        // halves are independent: sizing to content is not a licence to left-align, and aligning
+        // right is not a return to fixed-width fields.
+        // The piped-contract risk was resolved before reflowing:
         // no workflow parses piped column positions; `--json schema:1` is the machine contract. It
         // still pins the exact bytes so a future SILENT reflow (reordered / re-spaced columns) is
         // caught — the circular `piped == render_text` check cannot see a layout regression.
@@ -3186,9 +3405,9 @@ mod tests {
         assert_eq!(
             render_text(&r),
             "usage — last 24h (Jun 30–Jul 1)\n\n\
-             account  signal     cov   session m/p/p95  weekly m/p/p95  caps  t@cap  share  velocity  runway\n\
-             aa       saturated  100%  30/90/85         0/40/0          0     0s     60%    0.9%/min  ~2h\n\
-             bb       underused  100%  10/15/12         0/20/0          0     0s     40%    —         —\n\
+             account  signal      cov  session m/p/p95  weekly m/p/p95  caps  t@cap  share  velocity  runway\n\
+             aa       saturated  100%         30/90/85          0/40/0     0     0s    60%  0.9%/min     ~2h\n\
+             bb       underused  100%         10/15/12          0/20/0     0     0s    40%         —       —\n\
              \n  lowest utilisation: bb (session mean 10%)\n\
              roster: 0 swaps (0 session, 0 weekly, 0 manual, 0 forced, 0 emergency) · all-accounts-high: 0 episodes (0s)\n",
         );
@@ -3312,6 +3531,9 @@ mod tests {
     fn color_gate_governs_every_ansi_byte() {
         let r = two_account_charts();
         // Gate open → the utilisation bands tint the cells (alpha's hot 50/99 session reads red).
+        // Both tinted columns are RIGHT-aligned (issue #795), so these two literals also pin the
+        // SGR pair hugging the cell TEXT with the leading pad outside it — never weaken them to a
+        // bare `contains("\x1b[31m")`, or a pad drifting inside the escape stops being caught.
         let colored = render_chart_table(&r, &keys(&r), 60, true, false);
         assert!(
             colored.contains("\x1b[31m50/99\x1b[0m"),
