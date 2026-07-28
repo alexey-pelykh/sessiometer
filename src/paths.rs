@@ -83,10 +83,14 @@ fn home_dir() -> Result<PathBuf> {
 /// (`getpwuid(getuid())->pw_name`), resolved the same way as [`home_dir`] — never
 /// from `$USER`, which may be unset or spoofed.
 ///
-/// This is the `acct` attribute Claude Code stores its credential item under (CC's
-/// `vO()` == `whoami`; `build/version-compat.md`). The isolated-refresh engine
-/// (issue #102) seeds and reads its isolated keychain item under the SAME `acct`,
-/// so a `claude` it spawns locates the seeded item.
+/// This is the **fallback source** for the `acct` attribute Claude Code stores its
+/// credential item under — not the `acct` itself. CC's own derivation prefers `$USER`
+/// and only falls back to this passwd name (`keychain::claude_code_acct_from`, issue
+/// #711; `build/version-compat.md`), so the isolated-refresh engine (issue #102) seeds
+/// its item under CC's *derived* `acct` rather than calling this directly. The `$USER`
+/// preference is deliberately confined to that mirror: everything else this module
+/// resolves — the home directory above all — must key off the real user regardless of
+/// a spoofed environment, which is exactly what this function guarantees.
 pub(crate) fn username() -> Result<OsString> {
     let uid = current_uid();
     // SAFETY: `getpwuid` returns a pointer into a libc-owned static buffer. The crate
@@ -930,8 +934,10 @@ mod tests {
 
     #[test]
     fn username_resolves_a_non_empty_login_name() {
-        // The login name backs the isolated item's `acct` (#102); it must resolve
-        // to a non-empty value from the password database (never `$USER`).
+        // The login name is the FALLBACK source for the isolated item's `acct`
+        // (#102; CC's `$USER`-first derivation is pinned in `keychain`, issue #711).
+        // It must resolve to a non-empty value from the password database — never
+        // from `$USER`, which the rest of this module must not trust.
         let name = username().unwrap();
         assert!(!name.is_empty());
     }
