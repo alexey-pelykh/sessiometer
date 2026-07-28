@@ -115,7 +115,7 @@ use crate::refresh_tick::{refresh_event_outcome, RealRefreshEngine, RefreshEngin
 use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
 use crate::stats::FleetRunway;
 use crate::swap::{self, SwapDecision, SwapLock, SWAP_LOCK_MAX_WAIT};
-use crate::systemic_refresh::{SweepHealth, SystemicRefreshHealth};
+use crate::systemic_refresh::{PreflightHealth, SweepHealth, SystemicRefreshHealth};
 use crate::timing::{Jitter, Rng, SplitMix64, Strategy};
 use crate::usage::{CurlTransport, PolledReading, RealUsageSource, Usage, UsageSource};
 use crate::usage_store::{append_sample, compact_and_roll, RetentionPolicy, Sample};
@@ -175,6 +175,10 @@ pub(crate) use socket::{
 mod run_loop;
 
 pub(crate) use run_loop::run_loop;
+// The fail-open event-log write (issue #9). Re-exported because the #787 startup preflight emits
+// from `cli` — BEFORE the run loop exists — and the whole point of that helper is that the
+// swallow-and-warn path lives in exactly one place.
+pub(crate) use run_loop::emit_best_effort;
 // `swap_report` / `unrecoverable_report` are exercised only by the in-module run-loop tests
 // (production calls them inside `run_loop`); re-export test-scoped so `use super::*` resolves them
 // while a non-test build sees no unused re-export.

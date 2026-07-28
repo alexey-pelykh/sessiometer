@@ -406,11 +406,93 @@ impl<E, K> RefreshTick<E, K> {
     /// `account_uuid` (the resolution `poke`/`use` key on). Only consulted when the
     /// allowlist is non-empty.
     fn account_listed(&self, account: &Account) -> bool {
-        self.config
-            .accounts
-            .iter()
-            .any(|entry| entry == &account.label || entry == &account.account_uuid)
+        account_listed_in(&self.config.accounts, account)
     }
+}
+
+/// [`RefreshTick::account_listed`]'s rule, as a free function so the startup-time
+/// [`mechanism_is_observable`] check applies the SAME allowlist matching the sweep does. Extracted
+/// rather than duplicated deliberately: a drift between the two is exactly what would silently
+/// re-open the unclearable-signal hole #787 guards against.
+fn account_listed_in(allowlist: &[String], account: &Account) -> bool {
+    allowlist
+        .iter()
+        .any(|entry| entry == &account.label || entry == &account.account_uuid)
+}
+
+/// The most accounts a single sweep can ever have excluded from it — the ACTIVE account, plus at
+/// most ONE predicted imminent swap target ([`crate::daemon::Daemon::refresh_exclusions`] pushes
+/// exactly those two, the second only when a viable target exists).
+///
+/// The coupling to that function is enforced where the exclusions are BUILT, not here: the
+/// `refresh_exclusions_name_the_active_and_imminent_target_not_dead_accounts` test in
+/// `crate::daemon::snapshot_build` drives the maximal case and asserts the returned set fits inside
+/// this bound. A test here could only have compared this constant to itself.
+pub(crate) const MAX_SWEEP_EXCLUSIONS: usize = 2;
+
+/// Whether ANY sweep this daemon runs could EVER produce a verdict about the refresh mechanism —
+/// i.e. whether the mechanism is OBSERVABLE at all under this roster and `[refresh]` config
+/// (issue #787).
+///
+/// A sweep is judged only on the cycles that actually RAN, and [`RefreshTick::run_sweep`] `continue`s
+/// past an excluded or un-allowlisted account BEFORE producing any observation. So a config in which
+/// every account is skipped by those two legs yields ZERO observations on every sweep, forever —
+/// which [`crate::systemic_refresh::SweepHealth::classify`] reads as `NoSignal`, and `NoSignal`
+/// neither advances nor CLEARS an episode.
+///
+/// That asymmetry is why this check exists. The sweep path is self-consistent without it: opening an
+/// episode requires N consecutive ALL-ERROR sweeps, which requires an account that actually ran, so
+/// an episode could only ever be opened in a config where a clearing sweep is also possible. The
+/// #787 startup preflight does NOT inherit that guarantee — it can latch the mechanism-down signal
+/// with no sweep at all — so in a permanently-skipped config it would latch a signal nothing could
+/// ever clear, and the daemon would show a false-RED until the next restart. That is the SAME harm
+/// as the false-GREEN #787 fixes, merely inverted, so the preflight is gated on this.
+///
+/// Deliberately CONSERVATIVE, because the two errors are not symmetric: skipping a preflight that
+/// could have run costs a post-restart false-green window (the pre-#787 status quo, self-healing on
+/// the first all-error sweep), while running one that cannot be cleared costs a stuck false-red that
+/// only a restart clears. Hence the count against [`MAX_SWEEP_EXCLUSIONS`] rather than any attempt
+/// to predict which accounts today's exclusions will actually name. A two-account roster is the case
+/// that trade rejects: its non-active account is usually also the predicted swap target, so both can
+/// be excluded from every sweep. (For such a roster the #378 sweep detector is inert for the same
+/// reason — this check does not create that, it declines to build on top of it.)
+///
+/// **What this does and does NOT prove — the bound matters, so state it exactly.** `run_sweep` has
+/// four pre-observation skip legs; this covers the two that are CONFIG-shaped and therefore
+/// PERMANENT — exclusions (via the roster-size floor) and the allowlist — plus `[refresh].enabled`.
+/// It does not cover the two RUNTIME legs: the #408 per-account error back-off, and the near-expiry
+/// filter (which also swallows an account whose stored expiry is simply unreadable — a locked login
+/// keychain, an absent stash). Those can still leave a stretch of sweeps classifying `NoSignal`, so
+/// a latched episode can be slow to clear.
+///
+/// That residual is deliberately accepted, because it is NOT specific to the preflight: a #378
+/// sweep-opened episode has exactly the same exposure — fix the mechanism while every account sits
+/// far from expiry and the DOWN signal persists until one comes due. Both runtime legs are
+/// self-limiting (a back-off window expires, tokens drift toward expiry, a keychain gets unlocked),
+/// so they DELAY the clearing sweep rather than making it unreachable. What this gate removes is the
+/// one class that is neither self-limiting nor pre-existing: a config where the clearing sweep can
+/// never run at all.
+///
+/// The whole gate is ONE predicate, `[refresh].enabled` included, rather than a leg of it left
+/// inline at the call site: the three ways to be permanently unobservable — the tick never wired,
+/// the roster too small, the allowlist too narrow — are one condition wearing three hats, and
+/// splitting them across a call-site `&&` invites a future edit to drop one and re-open the hole
+/// with the test suite still green.
+pub(crate) fn mechanism_is_observable(roster: &[Account], config: &RefreshConfig) -> bool {
+    // `[refresh]` OFF: the PROACTIVE tick is never wired (`cli`), so no sweep runs at all and
+    // nothing can ever clear. The reactive #162 engine still resolves per cycle when a 401 fires,
+    // but it feeds no `SweepHealth` — it is not the periodic mechanism this detector reports on.
+    if !config.enabled {
+        return false;
+    }
+    let sweepable = roster
+        .iter()
+        .filter(|account| {
+            // An empty allowlist means "all parked accounts" — the same reading `run_sweep` uses.
+            config.accounts.is_empty() || account_listed_in(&config.accounts, account)
+        })
+        .count();
+    sweepable > MAX_SWEEP_EXCLUSIONS
 }
 
 impl<E: RefreshEngine, K: Clock> RefreshTick<E, K> {
@@ -1059,6 +1141,119 @@ mod tests {
             },
         )
     }
+
+    // --- mechanism_is_observable: the #787 preflight's clearability gate ----
+    //
+    // The property under test is an ASYMMETRY, so every case below is really the same question:
+    // "if the startup preflight latched a mechanism-down signal here, could any future sweep ever
+    // release it?" `NoSignal` (the classification an all-skipped sweep produces) never clears an
+    // episode — only `Working` does — so the answer must be a provable yes before the preflight is
+    // allowed to latch anything.
+
+    /// An ENABLED refresh config with the allowlist set (empty = "all parked accounts", the common
+    /// case) — the shape in which the preflight is even a question.
+    fn refresh_config_with_allowlist(allowlist: &[&str]) -> RefreshConfig {
+        RefreshConfig {
+            enabled: true,
+            accounts: allowlist.iter().map(|entry| (*entry).to_owned()).collect(),
+            ..RefreshConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_disabled_refresh_tick_is_not_observable_however_large_the_roster() {
+        // The `[refresh]` OFF door into the same permanent-blindness hole: with the proactive tick
+        // unwired no sweep runs at all, so a preflight would latch a signal nothing could clear —
+        // and a big, perfectly healthy roster does not change that. Folded into this ONE predicate
+        // so the call site cannot drop half the gate.
+        let roster = [
+            acct("work", "u-w"),
+            acct("spare", "u-s"),
+            acct("third", "u-t"),
+        ];
+        let mut off = refresh_config_with_allowlist(&[]);
+        off.enabled = false;
+        assert!(!mechanism_is_observable(&roster, &off));
+
+        // The same roster with the tick ON is observable — isolating `enabled` as the only
+        // difference, so the assertion above cannot pass for the wrong reason.
+        assert!(mechanism_is_observable(
+            &roster,
+            &refresh_config_with_allowlist(&[])
+        ));
+    }
+
+    #[test]
+    fn a_roster_too_small_to_outlast_the_sweep_exclusions_is_not_observable() {
+        let all = refresh_config_with_allowlist(&[]);
+
+        // ONE account: it is always the ACTIVE one, and the daemon excludes the active account from
+        // every sweep — so `run_sweep` skips it before producing any observation, forever. A
+        // preflight here would latch a signal only a restart could clear.
+        assert!(!mechanism_is_observable(&[acct("solo", "u-solo")], &all));
+
+        // TWO accounts: the non-active one is usually also the PREDICTED imminent swap target, and
+        // `refresh_exclusions` excludes that too — so both can be skipped on every sweep. Rejected
+        // deliberately: the gate answers "can I prove a clearing sweep is possible?", and for a
+        // two-account roster the honest answer is no.
+        assert!(!mechanism_is_observable(
+            &[acct("work", "u-w"), acct("spare", "u-s")],
+            &all
+        ));
+
+        // THREE is the floor: the exclusions name at most two accounts (active + one target), so a
+        // third is always left for the sweep to run — and therefore always able to clear.
+        assert!(mechanism_is_observable(
+            &[
+                acct("work", "u-w"),
+                acct("spare", "u-s"),
+                acct("third", "u-t")
+            ],
+            &all
+        ));
+    }
+
+    #[test]
+    fn an_allowlist_is_counted_the_same_way_the_sweep_applies_it() {
+        let roster = [
+            acct("work", "u-w"),
+            acct("spare", "u-s"),
+            acct("third", "u-t"),
+            acct("fourth", "u-f"),
+        ];
+
+        // An allowlist naming NO roster account skips every account on every sweep — the same
+        // permanent blindness as a too-small roster, reached through a different door. It is
+        // reachable by a plain typo, and the allowlist is not validated against the roster.
+        assert!(!mechanism_is_observable(
+            &roster,
+            &refresh_config_with_allowlist(&["typo"])
+        ));
+
+        // An allowlist that narrows the roster BELOW the exclusion floor is equally blind: only
+        // allowlisted accounts are ever swept, so it is the allowlisted count that has to outlast
+        // the exclusions, not the roster count.
+        assert!(!mechanism_is_observable(
+            &roster,
+            &refresh_config_with_allowlist(&["work", "spare"])
+        ));
+        assert!(mechanism_is_observable(
+            &roster,
+            &refresh_config_with_allowlist(&["work", "spare", "third"])
+        ));
+
+        // Matched by uuid as well as by label — the same either/or rule `account_listed` applies,
+        // via the one shared `account_listed_in` helper (a drift between them would silently
+        // re-open the hole this gate closes).
+        assert!(mechanism_is_observable(
+            &roster,
+            &refresh_config_with_allowlist(&["u-w", "spare", "u-t"])
+        ));
+    }
+
+    // No `MAX_SWEEP_EXCLUSIONS` test here by design — the coupling is pinned where the exclusions
+    // are BUILT, in `daemon::snapshot_build`. See the constant's own doc for why a test at this end
+    // could only have compared it to itself.
 
     // --- RealRefreshEngine per-cycle binary resolution (issue #375) ---------
 

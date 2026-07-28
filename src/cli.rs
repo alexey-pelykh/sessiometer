@@ -22,8 +22,8 @@ use unicode_width::UnicodeWidthStr;
 use crate::claude_state::OauthAccount;
 use crate::config::{Account, Config, ConflictPolicy, Origin, OriginReport};
 use crate::daemon::{
-    run_loop, AccountStatusLine, BlindActive, CanaryStatus, CanonicalScrub, Daemon,
-    ExternalLoginWatcher, InstanceLock, NextSwap, NextSwapReason, NoTargetCause, RealClock,
+    emit_best_effort, run_loop, AccountStatusLine, BlindActive, CanaryStatus, CanonicalScrub,
+    Daemon, ExternalLoginWatcher, InstanceLock, NextSwap, NextSwapReason, NoTargetCause, RealClock,
     RealKeepWarmEngine, RealRosterPoller, RealShutdown, SchemaVersion, StatusResponse, UnixControl,
     VersionedStatus, STATUS_SCHEMA_VERSION,
 };
@@ -36,11 +36,12 @@ use crate::observability::{
 };
 use crate::paths;
 use crate::refresh;
-use crate::refresh_tick::{RealRefreshEngine, RefreshTick};
+use crate::refresh_tick::{self, RealRefreshEngine, RefreshTick};
 use crate::service::AgentSupervision;
 use crate::sha256::sha256_hex;
 use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
 use crate::swap::{SwapLock, SWAP_LOCK_MAX_WAIT};
+use crate::systemic_refresh;
 
 /// Parse `argv`, then run the requested subcommand.
 ///
@@ -1320,6 +1321,45 @@ async fn run(verbosity: Verbosity, managed: bool) -> Result<()> {
         RealRefreshEngine::new(RealAccountStash::new(), config.refresh.claude_bin.clone()),
         RealClock::new(),
     );
+    // The STARTUP PREFLIGHT (issue #787): probe the refresh mechanism's PRECONDITION exactly once,
+    // here, so a fault that was already present survives the restart that erased the detector's
+    // state. `SystemicRefreshHealth` is pure in-memory, so every restart reset an open episode and
+    // the board went green over an unfixed fault for another `systemic_failure_n` sweeps — and the
+    // bundled launchd job's `KeepAlive { SuccessfulExit: false }` re-opened that window on each
+    // abnormal exit. Resolving once here re-establishes the episode immediately instead.
+    //
+    // A SIGNAL, NEVER A GATE: `preflight` returns a classification, not a `Result`, so an
+    // unresolvable binary cannot `?` out of this function and the daemon still starts (the tick
+    // then retries per cycle and self-heals, exactly as issue #375 requires). The resolved path is
+    // DROPPED inside `preflight` and nothing here holds it — the engines above still resolve at
+    // their own spawn sites, per cycle. Best-effort on the log for the same reason `run_loop` is:
+    // a failed diagnostic write must not take the daemon down with it (issue #9).
+    //
+    // Gated on the mechanism being OBSERVABLE, because the asymmetry is in the CLEARING edge: only
+    // a `SweepHealth::Working` releases the latch, so a config in which no sweep can ever run would
+    // latch a mechanism-down signal nothing could clear — trading the false-GREEN this fixes for a
+    // stuck false-RED, which is the same harm inverted. `refresh_tick::mechanism_is_observable`
+    // owns that whole rule (the `[refresh].enabled` leg included), next to the sweep skip chain it
+    // mirrors, so the three ways to be permanently blind stay one tested condition rather than a
+    // call-site `&&` a later edit can half-delete.
+    //
+    // One bounded startup cost, deliberate: this awaits the shared resolver, whose tier-3 harvest
+    // spawns the login shell under a 5 s timeout (#783/#784) — so under launchd's minimal `PATH`, a
+    // `status` issued in the first seconds of a restart can wait on it. Accepted because it is
+    // BOUNDED and the same shape as the `reap_orphans` / `reap_login_orphan` spawns already above.
+    // Note it is NOT amortized by the harvest memo: that TTL equals the default `idle_after_secs`,
+    // which is also the floor the first sweep waits, so at stock settings the memo has expired by
+    // the time a cycle resolves and this genuinely is an extra harvest rather than a shared one.
+    if refresh_tick::mechanism_is_observable(&config.roster, &config.refresh) {
+        let preflight = systemic_refresh::preflight(|| {
+            paths::claude_binary_with_override(config.refresh.claude_bin.as_deref())
+        })
+        .await;
+        if let Some(event) = daemon.note_refresh_preflight(preflight) {
+            emit_best_effort(&mut log, &event);
+        }
+    }
+
     // The external-login watch (issue #140): a short-cadence LOCAL probe of the canonical item
     // over its OWN `RealCredentialStore`, driven from `run_loop`'s idle path, so a manual
     // `claude /login` on the active account is reflected within `EXTERNAL_LOGIN_WATCH_SECS`
@@ -2580,13 +2620,19 @@ fn render_systemic_refresh_failure(response: &StatusResponse, color: bool) -> St
     let Some(consecutive) = response.systemic_refresh_failure else {
         return String::new();
     };
-    // `consecutive` is a valid `1..=100` count, so keep the noun agreement right at the `n=1`
-    // floor (a threshold of 1 fires on the first all-error sweep → "1 consecutive sweep").
+    // `consecutive` is always `>= 1` while an episode is active, so keep the noun agreement right
+    // at that floor. TWO routes reach exactly 1: a `systemic_failure_n` of 1 fires on the first
+    // all-error sweep, and since issue #787 a startup preflight that could not resolve the `claude`
+    // binary opens an episode with no sweep at all.
     let sweeps = if consecutive == 1 { "sweep" } else { "sweeps" };
+    // The log pointer stays PROVENANCE-NEUTRAL for that reason (issue #787): a preflight-opened
+    // episode has no `reason=` line to read — its evidence is the `refresh_preflight_unresolved`
+    // line — so naming `reason=` specifically would send an operator after evidence that may not
+    // exist. "the daemon log" covers both, and matches how the menu-bar panel already phrases it.
     let body = format!(
         "refresh mechanism: DOWN — {consecutive} consecutive {sweeps} failed for every eligible \
-         account; the mechanism is failing, not one account (check the daemon log 'reason=' \
-         and the [refresh] claude binary)"
+         account; the mechanism is failing, not one account (check the daemon log and the \
+         [refresh] claude binary)"
     );
     daemon_fault_line(&body, DaemonPayloadFault::SystemicRefreshFailure, color)
 }

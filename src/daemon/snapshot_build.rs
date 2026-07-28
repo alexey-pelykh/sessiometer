@@ -2189,6 +2189,21 @@ mod tests {
         // Excluded = active (u-A) + the imminent target (u-B) ONLY — NOT the dead `backup`
         // (u-C, now a restore candidate) and NOT the healthy parked `reserve` (u-D).
         assert_eq!(excluded, vec!["u-A".to_owned(), "u-B".to_owned()]);
+        // Issue #787: this is the MAXIMAL exclusion set — an active account plus one imminent
+        // target — and the startup preflight's `mechanism_is_observable` gate sizes its roster
+        // floor against exactly that bound (a roster it cannot prove outlasts the exclusions gets
+        // no preflight, because a signal no sweep can clear is a stuck false-RED). Pinned HERE,
+        // where the exclusions are actually BUILT, so growing a third one fails a test that names
+        // the coupling — the three content assertions around it would fail too, but an author who
+        // updates them still ships the gate's constant stale.
+        assert!(
+            excluded.len() <= crate::refresh_tick::MAX_SWEEP_EXCLUSIONS,
+            "refresh_exclusions returned {} entries, above the \
+             refresh_tick::MAX_SWEEP_EXCLUSIONS = {} that the #787 preflight gate assumes — \
+             raise that constant in lockstep: {excluded:?}",
+            excluded.len(),
+            crate::refresh_tick::MAX_SWEEP_EXCLUSIONS,
+        );
         assert!(
             !excluded.contains(&"u-C".to_owned()),
             "dead account is no longer excluded"
