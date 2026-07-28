@@ -50,6 +50,15 @@ pub(crate) struct StatusSnapshot {
     /// `Default` (an all-defaults snapshot reads as healthy). A COUNT only — never a token,
     /// path, or email (the #15 discipline).
     pub(crate) systemic_refresh: Option<u32>,
+    /// WHICH opening bracket opened the active systemic-refresh episode (issue #813): `Some(Sweep |
+    /// Preflight)` exactly when [`Self::systemic_refresh`] is `Some`, else `None`. Copied from
+    /// [`SystemicRefreshHealth::source`](crate::systemic_refresh::SystemicRefreshHealth::source) at
+    /// build, in lockstep with the count — both read the SAME latch, so they cannot disagree about
+    /// whether an episode is active. Lets each surface phrase a preflight-opened episode without
+    /// asserting a sweep that never ran. `None` by `Default` (an all-defaults snapshot reads as
+    /// healthy). A FIXED-TOKEN classification only — never a path, token, or email (the #15
+    /// discipline).
+    pub(crate) systemic_refresh_source: Option<SystemicRefreshSource>,
     /// The daemon-level CANONICAL-SCRUB rollup (issue #516): `Some(Recovering | Exhausted)` while the
     /// shared canonical item is scrubbed, else `None` when healthy. Computed in [`Daemon::snapshot`]
     /// from the edge-latched scrub signals (`signaled_canonical_scrubbed` / `signaled_scrub_adopt_exhausted`);
@@ -222,6 +231,47 @@ pub(crate) enum CanonicalScrub {
     /// stays empty until a `claude /login` re-authenticates it. The residual UN-RECOVERABLE state
     /// #469 renders with that remedy. Ranks above [`Self::Recovering`] (most-severe wins).
     Exhausted,
+}
+
+/// WHICH of a systemic-refresh episode's two opening brackets opened the ACTIVE episode (issue
+/// #813) — the wire's half of a distinction the event log has drawn since issue #787 but the
+/// snapshot could not.
+///
+/// An episode opens EITHER by the #378 sweep crossing (`refresh_systemic_failure`) or by the #787
+/// startup preflight failing to resolve the `claude` binary (`refresh_preflight_unresolved`); it
+/// closes one way, on the first working sweep. Without this discriminant a client holding only the
+/// [`StatusResponse::systemic_refresh_failure`] count cannot tell them apart, and the count alone
+/// does not carry it: the preflight path SEEDS the count at one (see
+/// [`SystemicRefreshHealth::note_preflight`](crate::systemic_refresh::SystemicRefreshHealth::note_preflight))
+/// so pre-#813 renderers stay grammatical, which is indistinguishable on the wire from a genuine
+/// one-sweep crossing under `systemic_failure_n = 1`. Every renderer therefore asserted "1
+/// consecutive sweep failed" for an episode in which ZERO sweeps had run — a fabricated
+/// observation in a signal whose entire purpose is diagnosability.
+///
+/// The count STAYS alongside this field rather than being re-derived: an older client keeps
+/// decoding exactly the bytes it decodes today (the field it knows is unchanged, the one it does
+/// not know it ignores), so the accuracy fix costs no compatibility. What changes is that a
+/// #813-aware renderer now branches on PROVENANCE and stops citing the count as a sweep count on
+/// the preflight arm.
+///
+/// Externally tagged as a bare string (`"sweep"` / `"preflight"`) rather than internally tagged
+/// like [`CanonicalScrub`]: the two variants are fieldless CLASSIFICATIONS with no per-variant
+/// payload to grow into — deliberately so, per issue #15. A FIXED TOKEN from a closed two-value
+/// set, never a path, a binary location, a token, or an email; in particular the preflight's
+/// unresolvable-binary evidence stays on the daemon log, and only the fact of its class reaches
+/// the wire.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SystemicRefreshSource {
+    /// The episode opened on the #378 SWEEP crossing: `systemic_failure_n` consecutive sweeps in a
+    /// row failed with `outcome=error` across every eligible account. The count is then a true
+    /// sweep count, and a renderer may cite it as one.
+    Sweep,
+    /// The episode opened on the #787 startup PREFLIGHT: the `claude` binary could not be resolved,
+    /// so every eligible account's refresh cycle is guaranteed to fail before a single one runs. No
+    /// sweep produced this verdict, so a renderer must NOT cite the count as a sweep count — that
+    /// is the entire point of this discriminant (issue #813).
+    Preflight,
 }
 
 /// The behavioral canary's LAST verdict (issue #714) — did the reverse-engineered #100 keychain
@@ -401,9 +451,17 @@ pub(crate) struct SchemaVersion {
 /// unchanged. Forward-compat is asymmetric BY DESIGN here: a pre-#738 client that meets the new
 /// verdict rejects the frame rather than mis-decoding it (an alarm state must never silently
 /// degrade to "all clear"), which is exactly why this earns a minor bump the client can gate on.
+/// `1.11` ADDED the daemon-level [`StatusResponse::systemic_refresh_source`] episode-provenance
+/// discriminant ([`SystemicRefreshSource`], issue #813) — WHICH of the two opening brackets opened
+/// the active systemic-refresh episode (the #378 sweep crossing or the #787 startup preflight), a
+/// distinction the event log has drawn since #787 while the wire could not. Additive alongside the
+/// existing `systemic_refresh_failure` count rather than a reshape of it, and (via
+/// `skip_serializing_if`) omitted entirely while the mechanism is healthy — so a healthy frame's
+/// bytes are unchanged AND an episode frame keeps the exact count an older client already renders.
+/// A pre-#813 client ignores the unknown key (the minor-bump tolerate-by-ignoring convention).
 pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion {
     major: 1,
-    minor: 10,
+    minor: 11,
 };
 
 /// The control socket's `status` reply PAYLOAD — handles + percentages + the forward-looking
@@ -439,6 +497,26 @@ pub(crate) struct StatusResponse {
     /// path, or email (issue #15).
     #[serde(default)]
     pub(crate) systemic_refresh_failure: Option<u32>,
+    /// WHICH opening bracket opened the active systemic-refresh episode (issue #813):
+    /// `Some(Sweep | Preflight)` alongside a `Some` [`Self::systemic_refresh_failure`], else absent.
+    /// Lets each surface phrase what actually happened instead of asserting a sweep that never ran —
+    /// the preflight path seeds the count at one (issue #787) purely for renderer grammar, which is
+    /// indistinguishable on the wire from a genuine one-sweep crossing.
+    ///
+    /// `Option` + `#[serde(default, skip_serializing_if = "Option::is_none")]` per the added-field
+    /// convention (the MINOR [`STATUS_SCHEMA_VERSION`] bump 1.10 → 1.11, taking `canonical_scrub`'s
+    /// omit-when-healthy pattern rather than `systemic_refresh_failure`'s always-emitted `null`):
+    /// a pre-#813 daemon omits the field → `None`, AND a healthy snapshot omits it entirely, so a
+    /// healthy frame's bytes are byte-for-byte unchanged. ADDITIVE alongside the count, never a
+    /// reshape of it — an older client keeps decoding the exact bytes it decodes today and ignores
+    /// this unknown key (the minor-bump tolerate-by-ignoring convention).
+    ///
+    /// Set in lockstep with the count from the SAME latch
+    /// ([`crate::systemic_refresh::SystemicRefreshHealth`], whose latch IS
+    /// the source), so the two can never disagree about whether an episode is active. A FIXED-TOKEN
+    /// classification only — never a path, binary location, token, or email (issue #15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) systemic_refresh_source: Option<SystemicRefreshSource>,
     /// The daemon-level CANONICAL-SCRUB rollup (issue #516): `Some(Recovering | Exhausted)` while the
     /// shared canonical item is scrubbed (recovering vs recovery-exhausted / un-recoverable), else
     /// absent when healthy. Lets `sessiometer status` + the menubar (#469) surface the fleet-wide
@@ -787,6 +865,11 @@ pub(crate) fn status_response(snapshot: &StatusSnapshot) -> StatusResponse {
         // The daemon-level systemic refresh-failure indicator (issue #378), copied straight to the
         // wire: `Some(n)` while the mechanism is down, `None` when healthy.
         systemic_refresh_failure: snapshot.systemic_refresh,
+        // WHICH opening bracket opened that episode (issue #813), copied straight to the wire
+        // beside the count it qualifies: `Some(Sweep | Preflight)` while the mechanism is down,
+        // `None` when healthy (and then omitted entirely via `skip_serializing_if`). Both come
+        // from the one latch, so an episode frame always carries both or neither.
+        systemic_refresh_source: snapshot.systemic_refresh_source,
         // The daemon-level canonical-scrub rollup (issue #516), copied straight to the wire:
         // `Some(Recovering | Exhausted)` while the shared canonical is scrubbed, `None` when healthy.
         canonical_scrub: snapshot.canonical_scrub,

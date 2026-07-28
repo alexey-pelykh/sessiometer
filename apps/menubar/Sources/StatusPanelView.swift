@@ -254,6 +254,7 @@ struct StatusPanelView: View {
             if let faultBanner = StatusPanelFormat.daemonFaultBanner(keychainLocked: store.keychainLocked,
                                                                      scrub: store.canonicalScrub,
                                                                      systemicRefreshFailure: store.systemicRefreshFailure,
+                                                                     systemicRefreshSource: store.systemicRefreshSource,
                                                                      canary: store.canary) {
                 // The single daemon-level fault banner (worst-first): a fleet-wide lockout or mechanism
                 // failure NO per-row `auth` reflects (rows can read healthy while the shared item sits locked

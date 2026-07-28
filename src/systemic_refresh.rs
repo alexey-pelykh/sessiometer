@@ -26,6 +26,12 @@
 //! gives "it's everyone, not one account") and stays #15-clean by construction — it carries only
 //! COUNTS + the `error`/non-`error` classification, never a token, path, or email.
 //!
+//! An episode therefore has TWO opening brackets and one closing bracket, and since issue #813 the
+//! `status` snapshot says WHICH one opened it ([`SystemicRefreshHealth::source`] →
+//! [`SystemicRefreshSource`]) instead of leaving every surface to read the count and assume a
+//! sweep. The count is seeded to one on the preflight arm for pre-#813 clients' grammar, so it
+//! cannot carry that distinction itself.
+//!
 //! The type is a pure state machine ([`SystemicRefreshHealth`]) fed one classified sweep at a time
 //! ([`SweepHealth`]), so its edge-trigger behavior is unit-tested here directly, independent of the
 //! daemon's async run loop. The daemon owns the live instance in its `DecisionState`, classifies
@@ -80,6 +86,7 @@
 use std::future::Future;
 use std::path::PathBuf;
 
+use crate::daemon::SystemicRefreshSource;
 use crate::error::Result;
 use crate::observability::{Event, RefreshEventOutcome};
 
@@ -195,19 +202,29 @@ pub(crate) struct SystemicRefreshHealth {
     /// Consecutive fleet-wide mechanism-failure OBSERVATIONS so far; reset to 0 by any working
     /// sweep. Usually all-error sweeps — but a failed startup preflight (issue #787) is the same
     /// class of evidence and floors it at one, so a restart-established episode still projects a
-    /// non-degenerate count. Kept climbing while a systemic episode is active so
-    /// [`status`](Self::status) can surface how long the mechanism has been down.
+    /// non-degenerate count to a PRE-#813 client. Kept climbing while a systemic episode is active
+    /// so [`status`](Self::status) can surface how long the mechanism has been down.
+    ///
+    /// Because of that floor the count alone is NOT a sweep count on the preflight arm, which is
+    /// why a current renderer reads [`source`](Self::source) first and cites this only where it
+    /// genuinely counts sweeps (issue #813).
     consecutive_error_sweeps: u32,
-    /// Whether a systemic-failure episode is currently active — the streak has crossed the
-    /// threshold (or a startup preflight found the mechanism already broken, issue #787) and no
-    /// working sweep has cleared it yet. The edge latch that makes the failure signal fire once on
-    /// the crossing (not per subsequent all-error sweep) and the recovery signal fire once when it
-    /// clears. Both entry points — [`note`](Self::note) and
-    /// [`note_preflight`](Self::note_preflight) — gate on this same latch, so the once-per-episode
-    /// contract is a property of the latch rather than of either caller. Mirrors the daemon's
-    /// `signaled_all_exhausted` / `signaled_keychain_locked` once-per-episode idiom, at the
-    /// refresh-MECHANISM scope.
-    active: bool,
+    /// Whether a systemic-failure episode is currently active — and, when it is, WHICH opening
+    /// bracket opened it (issue #813). `Some` once the streak has crossed the threshold
+    /// ([`SystemicRefreshSource::Sweep`]) or a startup preflight found the mechanism already broken
+    /// ([`SystemicRefreshSource::Preflight`], issue #787), back to `None` when a working sweep
+    /// clears it. The edge latch that makes the failure signal fire once on the crossing (not per
+    /// subsequent all-error sweep) and the recovery signal fire once when it clears. Both entry
+    /// points — [`note`](Self::note) and [`note_preflight`](Self::note_preflight) — gate on this
+    /// same latch, so the once-per-episode contract is a property of the latch rather than of
+    /// either caller. Mirrors the daemon's `signaled_all_exhausted` / `signaled_keychain_locked`
+    /// once-per-episode idiom, at the refresh-MECHANISM scope.
+    ///
+    /// The provenance rides IN the latch rather than beside it so the two facts cannot drift apart:
+    /// "an episode is active" and "this is how it opened" are one fact, and [`status`](Self::status)
+    /// and [`source`](Self::source) both read it — so the wire can never carry a count without its
+    /// discriminant, nor a discriminant without its count.
+    active: Option<SystemicRefreshSource>,
 }
 
 impl SystemicRefreshHealth {
@@ -232,8 +249,8 @@ impl SystemicRefreshHealth {
             SweepHealth::NoSignal => None,
             SweepHealth::AllError => {
                 self.consecutive_error_sweeps = self.consecutive_error_sweeps.saturating_add(1);
-                if !self.active && self.consecutive_error_sweeps >= threshold {
-                    self.active = true;
+                if self.active.is_none() && self.consecutive_error_sweeps >= threshold {
+                    self.active = Some(SystemicRefreshSource::Sweep);
                     Some(Event::RefreshSystemicFailure {
                         consecutive: self.consecutive_error_sweeps,
                     })
@@ -243,8 +260,7 @@ impl SystemicRefreshHealth {
             }
             SweepHealth::Working => {
                 self.consecutive_error_sweeps = 0;
-                if self.active {
-                    self.active = false;
+                if self.active.take().is_some() {
                     Some(Event::RefreshSystemicRecovered)
                 } else {
                     None
@@ -270,13 +286,23 @@ impl SystemicRefreshHealth {
     ///   once-per-episode contract holds across both entry points.
     ///
     /// The streak is raised to at least ONE rather than left at zero. It is the value
-    /// [`status`](Self::status) projects onto the wire, and both renderers of that field — the
-    /// CLI's `refresh mechanism: DOWN` line and the menu-bar panel's banner — phrase it as
-    /// "N consecutive sweep(s) failed", so a zero would render a degenerate "0 consecutive sweeps
-    /// failed" on both surfaces. Read the counter as *consecutive fleet-wide mechanism-failure
-    /// OBSERVATIONS*: an all-error sweep is the usual one, a failed preflight is the restart-time
-    /// one, and a later all-error sweep climbs from there. `max` rather than assignment so this can
-    /// only ever raise a streak, never discard evidence a caller had already accumulated.
+    /// [`status`](Self::status) projects onto the wire, and a PRE-#813 renderer of that field — the
+    /// CLI's `refresh mechanism: DOWN` line, the menu-bar panel's banner, the menu-bar a11y label —
+    /// phrases it unconditionally as "N consecutive sweep(s) failed", so a zero would render a
+    /// degenerate "0 consecutive sweeps failed" on all three surfaces. Read the counter as
+    /// *consecutive fleet-wide mechanism-failure OBSERVATIONS*: an all-error sweep is the usual one,
+    /// a failed preflight is the restart-time one, and a later all-error sweep climbs from there.
+    /// `max` rather than assignment so this can only ever raise a streak, never discard evidence a
+    /// caller had already accumulated.
+    ///
+    /// The seed is kept, but it is no longer what the renderers read. It bought GRAMMAR at the cost
+    /// of ACCURACY — one is not a sweep count here, because no sweep has run — so issue #813 put the
+    /// episode's PROVENANCE on the wire beside it ([`source`](Self::source),
+    /// [`SystemicRefreshSource`]) and every current renderer now branches on that instead of citing
+    /// the count on this arm. The seed survives purely for the clients that cannot: a pre-#813
+    /// menu-bar build decodes the count and ignores the unknown discriminant, and a zero would
+    /// regress it to the degenerate line. Accuracy for current clients, unchanged bytes for old
+    /// ones.
     ///
     /// The event is DISTINCT from [`Event::RefreshSystemicFailure`] on purpose: a preflight-opened
     /// episode and a genuine N-sweep crossing must stay tellable apart on the log, which is the
@@ -286,9 +312,9 @@ impl SystemicRefreshHealth {
     pub(crate) fn note_preflight(&mut self, health: PreflightHealth) -> Option<Event> {
         match health {
             PreflightHealth::Resolved => None,
-            PreflightHealth::Unresolved if self.active => None,
+            PreflightHealth::Unresolved if self.active.is_some() => None,
             PreflightHealth::Unresolved => {
-                self.active = true;
+                self.active = Some(SystemicRefreshSource::Preflight);
                 self.consecutive_error_sweeps = self.consecutive_error_sweeps.max(1);
                 Some(Event::RefreshPreflightUnresolved)
             }
@@ -304,7 +330,28 @@ impl SystemicRefreshHealth {
     /// FLOOR is guaranteed — the count keeps climbing for as long as the episode lasts, so it is
     /// not bounded above by `systemic_failure_n`'s validated `1..=100` range.
     pub(crate) fn status(&self) -> Option<u32> {
-        self.active.then_some(self.consecutive_error_sweeps)
+        self.active.map(|_| self.consecutive_error_sweeps)
+    }
+
+    /// WHICH opening bracket opened the active episode, for the `status` snapshot (issue #813):
+    /// `Some(Sweep)` for a #378 threshold crossing, `Some(Preflight)` for a #787 startup preflight
+    /// that could not resolve the binary, `None` when the mechanism is healthy. The wire half of a
+    /// distinction the event log has drawn since #787 — without it a client holding only
+    /// [`status`](Self::status)'s count cannot tell a preflight-opened episode (in which ZERO sweeps
+    /// have run, the count being the seeded floor of one) from a genuine one-sweep crossing under
+    /// `systemic_failure_n = 1`, so every surface asserted a sweep that never ran.
+    ///
+    /// Reports the episode's OPENING bracket, held for the episode's whole life: an episode is a
+    /// single span between one opening and one closing (a working sweep), so all-error sweeps that
+    /// climb the count MID-episode do not re-open it and do not restamp its provenance. A renderer
+    /// on the `Preflight` arm must therefore not claim that no sweep has run SINCE either — only
+    /// that no sweep opened the episode.
+    ///
+    /// Reads the same latch as [`status`](Self::status), which is what makes "both or neither" a
+    /// structural property of this type rather than a convention its callers must keep. A
+    /// FIXED-TOKEN classification only — never a path, token, or email (#15).
+    pub(crate) fn source(&self) -> Option<SystemicRefreshSource> {
+        self.active
     }
 }
 
@@ -607,6 +654,116 @@ mod tests {
         // daemon runs exactly one per process, but the latch — not the caller — owns the contract).
         assert_eq!(detector.note_preflight(preflight_unresolved().await), None);
         assert_eq!(detector.status(), Some(4));
+    }
+
+    #[tokio::test]
+    async fn the_episode_projects_which_bracket_opened_it() {
+        // Issue #813 — the wire half of the distinction the event log has drawn since #787. The
+        // count cannot carry it: the preflight arm SEEDS the count at one, which is byte-identical
+        // to a genuine one-sweep crossing under `systemic_failure_n = 1`. Both shapes below reach
+        // `status() == Some(1)`; only `source()` tells them apart.
+        let mut swept = SystemicRefreshHealth::default();
+        assert_eq!(swept.source(), None, "healthy carries no provenance");
+        assert!(swept.note(all_error(2), 1).is_some(), "n=1 fires at once");
+        assert_eq!(swept.status(), Some(1));
+        assert_eq!(swept.source(), Some(SystemicRefreshSource::Sweep));
+
+        let mut preflighted = SystemicRefreshHealth::default();
+        assert_eq!(
+            preflighted.note_preflight(preflight_unresolved().await),
+            Some(Event::RefreshPreflightUnresolved)
+        );
+        assert_eq!(
+            preflighted.status(),
+            Some(1),
+            "the seeded floor — no sweep ran"
+        );
+        assert_eq!(preflighted.source(), Some(SystemicRefreshSource::Preflight));
+
+        // The two are INDISTINGUISHABLE on the count and distinguishable only on the source. This
+        // equality IS the bug #813 fixes; the assertion below is what makes the fix load-bearing.
+        assert_eq!(swept.status(), preflighted.status());
+        assert_ne!(swept.source(), preflighted.source());
+    }
+
+    #[tokio::test]
+    async fn the_provenance_is_the_opening_bracket_and_clears_with_the_episode() {
+        // Issue #813 — an episode is ONE span between one opening and one closing, so mid-episode
+        // all-error sweeps must not restamp its provenance: they did not open it. (This is why a
+        // renderer on the preflight arm may not claim no sweep has run SINCE — only that no sweep
+        // opened the episode.)
+        let mut detector = SystemicRefreshHealth::default();
+        detector.note_preflight(preflight_unresolved().await);
+        for _ in 0..4 {
+            detector.note(all_error(2), 3);
+        }
+        assert_eq!(detector.status(), Some(5), "the count climbed");
+        assert_eq!(
+            detector.source(),
+            Some(SystemicRefreshSource::Preflight),
+            "the opening bracket is held for the episode's whole life"
+        );
+
+        // A working sweep closes the episode: count and provenance clear TOGETHER, because they
+        // are the same latch. Neither can outlive the other and leave the wire self-contradicting.
+        assert_eq!(
+            detector.note(SweepHealth::Working, 3),
+            Some(Event::RefreshSystemicRecovered)
+        );
+        assert_eq!(detector.status(), None);
+        assert_eq!(detector.source(), None);
+
+        // The NEXT episode is stamped by whatever opens it — a sweep crossing here, so the stale
+        // `Preflight` must not survive the recovery.
+        for _ in 0..3 {
+            detector.note(all_error(2), 3);
+        }
+        assert_eq!(detector.source(), Some(SystemicRefreshSource::Sweep));
+    }
+
+    #[tokio::test]
+    async fn the_count_and_the_provenance_are_never_one_without_the_other() {
+        // Issue #813 — the wire carries two fields, so the invariant that matters to every
+        // renderer is that they travel together: a count with no provenance would silently fall
+        // back to the sweep phrasing (the bug), and a provenance with no count would render a
+        // verdict with no evidence. Both read the SAME latch, which is what makes this structural
+        // rather than a convention the daemon's projection has to remember.
+        //
+        // HONESTLY LABELLED: against the CURRENT representation this cannot fail — `status()` is
+        // `active.map(…)` and `source()` is `active`, so the two `is_some()`s are the same read.
+        // It is kept deliberately as a DRIFT guard, and it is the moment the latch is split (a
+        // separate count field, a provenance cached across episodes) that it stops being
+        // tautological and starts earning its place — which is exactly when the invariant would
+        // otherwise break silently. Not evidence that the coupling is enforced today; the
+        // single-latch representation is.
+        let mut detector = SystemicRefreshHealth::default();
+        // Drive the detector through a long mixed run of both entry points — opens, mid-episode
+        // climbs, recoveries, redundant preflights against an active episode — asserting the
+        // invariant after EVERY fold. Deliberately no "n steps ran" counter: the step count is
+        // fixed by the loop bounds, so asserting it would hold no matter how the detector behaved.
+        for step in [
+            None,
+            Some(PreflightHealth::Unresolved),
+            None,
+            Some(PreflightHealth::Resolved),
+            Some(PreflightHealth::Unresolved),
+        ] {
+            for sweep in [
+                SweepHealth::NoSignal,
+                SweepHealth::AllError,
+                SweepHealth::Working,
+            ] {
+                if let Some(health) = step {
+                    detector.note_preflight(health);
+                }
+                detector.note(sweep, 2);
+                assert_eq!(
+                    detector.status().is_some(),
+                    detector.source().is_some(),
+                    "both or neither, always"
+                );
+            }
+        }
     }
 
     #[tokio::test]

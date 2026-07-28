@@ -15,12 +15,13 @@ final class WireDecoderTests: XCTestCase {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotBasic) else {
             return XCTFail("expected a snapshot frame")
         }
-        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 10))
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 11))
         XCTAssertEqual(v.generatedAt, 42)
         XCTAssertTrue(v.isSchemaSupported)
         XCTAssertNil(v.nextSwap, "next_swap null decodes to nil")
         XCTAssertEqual(v.refreshEnabled, false)
         XCTAssertNil(v.systemicRefreshFailure, "systemic_refresh_failure null decodes to nil")
+        XCTAssertNil(v.systemicRefreshSource, "systemic_refresh_source absent (healthy) decodes to nil")
         XCTAssertNil(v.canonicalScrub, "canonical_scrub absent (healthy) decodes to nil")
         XCTAssertFalse(v.keychainLocked, "keychain_locked absent (unlocked) decodes to false")
         XCTAssertNil(v.canary, "canary absent (no verdict yet) decodes to nil")
@@ -45,8 +46,8 @@ final class WireDecoderTests: XCTestCase {
     // AC: "Decodes real … `heartbeat` frames." + heartbeat carries the freshness envelope.
     func testDecodesRealHeartbeatFrame() throws {
         let frame = try parseWatchFrame(Fixtures.heartbeatBasic)
-        XCTAssertEqual(frame, .heartbeat(generatedAt: 42, schemaVersion: SchemaVersion(major: 1, minor: 10)))
-        XCTAssertEqual(frame.schemaVersion, SchemaVersion(major: 1, minor: 10))
+        XCTAssertEqual(frame, .heartbeat(generatedAt: 42, schemaVersion: SchemaVersion(major: 1, minor: 11)))
+        XCTAssertEqual(frame.schemaVersion, SchemaVersion(major: 1, minor: 11))
         XCTAssertTrue(WireContract.isSupported(try XCTUnwrap(frame.schemaVersion)))
     }
 
@@ -162,7 +163,7 @@ final class WireDecoderTests: XCTestCase {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotBlindActiveDegraded) else {
             return XCTFail("expected a snapshot frame")
         }
-        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 10))
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 11))
         let work = v.accounts[0]
         XCTAssertTrue(work.active)
         XCTAssertNil(work.sessionPct)
@@ -189,7 +190,7 @@ final class WireDecoderTests: XCTestCase {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotCanonicalScrubExhausted) else {
             return XCTFail("expected a snapshot frame")
         }
-        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 10))
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 11))
         XCTAssertEqual(v.canonicalScrub, .exhausted)
         // The rest of the frame still decodes normally alongside the added rollup.
         XCTAssertEqual(v.accounts.count, 1)
@@ -217,7 +218,7 @@ final class WireDecoderTests: XCTestCase {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotKeychainLocked) else {
             return XCTFail("expected a snapshot frame")
         }
-        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 10))
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 11))
         XCTAssertTrue(v.keychainLocked)
         // The flag is independent of `canonical_scrub` (a locked keychain can't be read to know
         // scrubbed-ness), and the rest of the frame still decodes normally alongside it.
@@ -235,13 +236,81 @@ final class WireDecoderTests: XCTestCase {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotSystemicRefreshFailure) else {
             return XCTFail("expected a snapshot frame")
         }
-        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 10))
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 11))
         XCTAssertEqual(v.systemicRefreshFailure, 3)
+        XCTAssertEqual(v.systemicRefreshSource, .sweep, "#813: the episode's opening bracket")
         // Independent of the vault pair — the mechanism can be down while the shared item is fine.
         XCTAssertNil(v.canonicalScrub)
         XCTAssertFalse(v.keychainLocked)
         XCTAssertEqual(v.accounts.count, 1)
         XCTAssertEqual(v.accounts[0].auth, .healthy)
+    }
+
+    // AC1/AC3 (#813): the episode's PROVENANCE decodes on both arms, and its ABSENCE is tolerated. The
+    // count cannot carry this distinction — a preflight-opened episode seeds the count at 1 for pre-#813
+    // grammar, so on the wire it is byte-indistinguishable from a genuine one-sweep crossing. This is the
+    // decode-level pin that the surfaces' phrasing split rests on.
+    func testDecodesSystemicRefreshProvenanceOnBothArmsAndToleratesItsAbsence() throws {
+        guard case .snapshot(let pre) = try parseWatchFrame(Fixtures.snapshotSystemicRefreshPreflight) else {
+            return XCTFail("expected a snapshot frame")
+        }
+        XCTAssertEqual(pre.schemaVersion, SchemaVersion(major: 1, minor: 11))
+        XCTAssertEqual(pre.systemicRefreshSource, .preflight)
+        XCTAssertEqual(pre.systemicRefreshFailure, 1, "the seeded floor, not a sweep count")
+
+        // AC3 — a PRE-#813 daemon (minor 10) sends the bare count. The additive key's absence must decode
+        // to nil, never a decode error: this frame is exactly what an older daemon puts on the wire, and
+        // refusing it would break a supported-major client over an additive minor.
+        guard case .snapshot(let legacy) = try parseWatchFrame(Fixtures.snapshotSystemicRefreshNoSource) else {
+            return XCTFail("a pre-#813 frame must still decode, not throw")
+        }
+        XCTAssertEqual(legacy.schemaVersion, SchemaVersion(major: 1, minor: 10))
+        XCTAssertTrue(legacy.isSchemaSupported, "an additive minor stays supported — major gates, minor does not")
+        XCTAssertEqual(legacy.systemicRefreshFailure, 3, "the count it does send is unchanged")
+        XCTAssertNil(legacy.systemicRefreshSource, "absent provenance decodes to nil")
+
+        // The two #813-era arms differ ONLY in provenance at the same count-carrying position — which is
+        // precisely why the count alone could never tell them apart.
+        XCTAssertNotEqual(pre.systemicRefreshSource, legacy.systemicRefreshSource)
+    }
+
+    // #813: an UNKNOWN provenance token from a FUTURE daemon degrades to nil — it must NOT fail the frame.
+    // The tolerated-decoration posture of an unknown `reason.kind`, not the hard-reject posture of an
+    // unknown `canonical_scrub` state, because the alarm rides in a SEPARATE field here: the count still
+    // decodes, so rejecting would throw away the roster, the vault pair, the canary AND the mechanism-down
+    // signal itself over a phrasing selector. It would also be unrecoverable — `isSupported` keys on the
+    // MAJOR (pinned two tests above), so a 1.12 daemon is a version this client calls supported while
+    // blanking every frame it sends.
+    func testUnknownSystemicRefreshSourceIsReadableAsUnrecognizedRatherThanFailingTheFrame() throws {
+        let frame = #"""
+        {"type":"snapshot","schema_version":{"major":1,"minor":12},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":true,"systemic_refresh_failure":3,"systemic_refresh_source":"future_bracket"}
+        """#
+        guard case .snapshot(let v) = try parseWatchFrame(frame) else {
+            return XCTFail("an unknown provenance token must not cost us the frame")
+        }
+        XCTAssertEqual(v.systemicRefreshSource, .unrecognized,
+                       "an unreadable token is present-but-unreadable — NOT nil, which means a pre-#813 daemon")
+        XCTAssertEqual(v.systemicRefreshFailure, 3, "the DOWN verdict itself still decodes — that is the point")
+        XCTAssertEqual(v.accounts.count, 1, "and so does the roster")
+        XCTAssertTrue(v.isSchemaSupported, "a future MINOR is still a supported contract")
+
+        // AC1's spirit one version further out: with the bracket unreadable, both surfaces claim NO
+        // evidence rather than falling back to the sweep phrasing. A third bracket is far likelier to be
+        // another non-sweep opener, so guessing "3 consecutive sweeps failed" would re-create exactly the
+        // fabrication #813 removes — in a build too old to know better.
+        let detail = StatusPanelFormat.systemicRefreshFailureBanner(v.systemicRefreshFailure,
+                                                                    source: v.systemicRefreshSource)?.detail
+        XCTAssertEqual(detail,
+                       "This app cannot read the cause — check the daemon log.")
+        XCTAssertFalse(detail?.contains("sweep") ?? true, "must not invent a sweep it cannot know about")
+
+        let label = PresentationState.make(for: .connected,
+                                           accountCount: 1,
+                                           systemicRefreshFailure: v.systemicRefreshFailure,
+                                           systemicRefreshSource: v.systemicRefreshSource).accessibilityLabel
+        XCTAssertEqual(label,
+                       "Sessiometer: refresh mechanism down — this app cannot read the cause; check the daemon log")
+        XCTAssertFalse(label.contains("sweep"), "nor read a fabricated sweep aloud to a VoiceOver user")
     }
 
     // AC (#728): the behavioral-canary `drift` verdict decodes with its labels + `overridden` flag — the
@@ -252,7 +321,7 @@ final class WireDecoderTests: XCTestCase {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotCanaryDriftRefusing) else {
             return XCTFail("expected a snapshot frame")
         }
-        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 10))
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 11))
         XCTAssertEqual(v.canary, .drift(displayed: "work", matched: "personal", overridden: false))
         // Independent of its sibling faults — the identity can drift while the vault reads fine.
         XCTAssertNil(v.canonicalScrub)
@@ -292,7 +361,7 @@ final class WireDecoderTests: XCTestCase {
             try parseWatchFrame(Fixtures.snapshotCanaryRefusedUnparseableCanonical) else {
             return XCTFail("expected a snapshot frame")
         }
-        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 10))
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 11))
         XCTAssertEqual(v.canary, .refusedUnparseableCanonical)
         // Independent of its sibling faults — an unrecognized canonical can sit under a vault that
         // reads fine and a roster that is entirely healthy.

@@ -647,13 +647,45 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertEqual(one.detail, "1 consecutive sweep failed for every eligible account — check the daemon log.")
     }
 
+    // AC1/AC2 (#813): the banner phrases the episode's EVIDENCE from its provenance instead of always
+    // asserting a sweep. On the `.preflight` arm ZERO sweeps have run — the count is a seeded floor of 1
+    // kept only so a pre-#813 client stays grammatical — so citing it would state a fabricated observation
+    // in the one signal whose whole purpose is diagnosability.
+    func testSystemicRefreshFailureBannerDoesNotInventASweepOnThePreflightArm() throws {
+        let pre = try XCTUnwrap(StatusPanelFormat.systemicRefreshFailureBanner(1, source: .preflight))
+        XCTAssertEqual(pre.title, "Refresh mechanism down", "the VERDICT is unchanged — only its evidence")
+        XCTAssertEqual(pre.detail,
+                       "The startup preflight could not resolve the claude binary — check the daemon log.")
+        XCTAssertFalse(pre.detail.contains("sweep"), "#813 AC1: no sweep is asserted")
+        XCTAssertFalse(pre.detail.contains("1"), "#813 AC1: the seeded count is not cited as evidence")
+        XCTAssertEqual(pre.kind, .warning, "provenance picks the evidence clause, never the severity")
+
+        // AC2 — the SWEEP arm is unchanged from the pre-#813 render, byte for byte. An explicit `.sweep`
+        // and an absent provenance (a pre-#813 daemon) must both produce exactly what shipped before.
+        let legacy = try XCTUnwrap(StatusPanelFormat.systemicRefreshFailureBanner(3))
+        let swept = try XCTUnwrap(StatusPanelFormat.systemicRefreshFailureBanner(3, source: .sweep))
+        XCTAssertEqual(swept.detail, legacy.detail, "#813 AC2: the sweep arm did not move")
+        XCTAssertEqual(swept.detail,
+                       "3 consecutive sweeps failed for every eligible account — check the daemon log.")
+
+        // The CLI's line splits on the SAME seam and names the same observation, each medium phrasing it
+        // its own way (R-2 STATE-parity). That parity is asserted where BOTH strings are reachable —
+        // `src/cli.rs` `render_status_surfaces_the_systemic_refresh_failure_when_the_mechanism_is_down`;
+        // from here it could only be re-read off the literal already pinned above.
+    }
+
     // Issue #15: the banner carries only the COUNT — never a token, path, or email. The CLI line names the
     // `[refresh] claude binary` because a terminal reader can act on it; the panel keeps to the daemon log.
     func testSystemicRefreshFailureBannerCarriesNoSecret() throws {
-        let banner = try XCTUnwrap(StatusPanelFormat.systemicRefreshFailureBanner(7))
-        let text = banner.title + " " + banner.detail
-        for forbidden in ["@", "sk-", "token", "Bearer", "/Users/", ".json"] {
-            XCTAssertFalse(text.contains(forbidden), "#15: the banner must not carry \(forbidden): \(text)")
+        // #813 AC4: swept across EVERY arm. The preflight arm is where a path would leak — its subject IS a
+        // binary location — so it is asserted here rather than trusted to the discriminant's fixed shape.
+        for banner in [try XCTUnwrap(StatusPanelFormat.systemicRefreshFailureBanner(7)),
+                       try XCTUnwrap(StatusPanelFormat.systemicRefreshFailureBanner(1, source: .preflight)),
+                       try XCTUnwrap(StatusPanelFormat.systemicRefreshFailureBanner(2, source: .unrecognized))] {
+            let text = banner.title + " " + banner.detail
+            for forbidden in ["@", "sk-", "token", "Bearer", "/Users/", ".json", "/"] {
+                XCTAssertFalse(text.contains(forbidden), "#15: the banner must not carry \(forbidden): \(text)")
+            }
         }
     }
 

@@ -245,7 +245,8 @@ struct PresentationState: Equatable, Sendable {
                      keychainLocked: Bool = false,
                      canonicalScrub: CanonicalScrub? = nil,
                      activeBlindDegraded: Bool = false,
-                     systemicRefreshFailure: UInt32? = nil) -> PresentationState {
+                     systemicRefreshFailure: UInt32? = nil,
+                     systemicRefreshSource: SystemicRefreshSource? = nil) -> PresentationState {
         switch state {
         case .connected:
             // TIER 1 — vouched: the fleet/vault speaks. Every `⊘` no-runway path first (worst-first:
@@ -274,9 +275,23 @@ struct PresentationState: Equatable, Sendable {
             // only picks which root cause the a11y label names. Why a down refresh mechanism belongs on `!`
             // rather than the `⊘` above or the `…` of a self-resolving state: see `StatusGlyph.attention`.
             if let consecutive = systemicRefreshFailure {
-                let sweeps = consecutive == 1 ? "sweep" : "sweeps"
+                // Issue #813: the glyph is `!` however the episode opened — the provenance picks only
+                // the EVIDENCE this label cites. The three-way split is the one the panel banner
+                // takes, so both menu-bar surfaces read off one seam; why each arm reads as it does
+                // lives with the type (`SystemicRefreshSource`). Same defect, one register louder
+                // here: an invented sweep is not merely shown, it is READ ALOUD to a VoiceOver user.
+                let evidence: String
+                switch systemicRefreshSource {
+                case .preflight:
+                    evidence = "the startup preflight could not resolve the claude binary"
+                case .unrecognized:
+                    evidence = "this app cannot read the cause; check the daemon log"
+                case .sweep, nil:
+                    let sweeps = consecutive == 1 ? "sweep" : "sweeps"
+                    evidence = "\(consecutive) consecutive \(sweeps) failed for every eligible account"
+                }
                 return PresentationState(glyph: .attention,
-                                         accessibilityLabel: "Sessiometer: refresh mechanism down — \(consecutive) consecutive \(sweeps) failed for every eligible account")
+                                         accessibilityLabel: "Sessiometer: refresh mechanism down — \(evidence)")
             }
             // #485: a blind ACTIVE account whose ADR-0017 auto-protection is DEGRADED (armed but acting on a
             // STALE anchor) is a next-break the operator should see — ratified 2026-07-16 as the honest "!"
@@ -601,6 +616,19 @@ struct HonestStateMachine {
     /// email (issue #15).
     private(set) var systemicRefreshFailure: UInt32?
 
+    /// WHICH opening bracket opened that episode (#813, wire since schema 1.11), carried from the last
+    /// applied snapshot in lockstep with the count it qualifies — the daemon sets both from one latch, so
+    /// they arrive and clear together. Picks the EVIDENCE the panel banner and the menu-bar a11y label
+    /// cite, never the severity: a down mechanism is the same next-break fault however its episode opened.
+    /// RETAINED across a drop and REFUSED with the rest on an unsupported-major frame — on the SNAPSHOT and
+    /// the HEARTBEAT leg alike, each of which carries its own reset list, so both are asserted rather than
+    /// inferred from the other. `nil` when the mechanism is healthy — or a pre-#813 daemon omits the key
+    /// (`decodeIfPresent`), in which case both surfaces keep the historical sweep phrasing. `.unrecognized`
+    /// is the third readable value: a NEWER daemon opened the episode with a bracket this build does not
+    /// know, and both surfaces then cite no evidence at all rather than guessing the sweep phrasing (see
+    /// `SystemicRefreshSource`). A fixed-token class, never a path or secret (issue #15).
+    private(set) var systemicRefreshSource: SystemicRefreshSource?
+
     /// The behavioral-canary verdict (#714, wire since schema 1.9), carried from the last applied snapshot
     /// exactly as `canonicalScrub` / `keychainLocked` / `systemicRefreshFailure` are: the keychain-derivation
     /// identity check's LAST result. Its ALARM verdicts (`drift`, `ambiguous`, and since schema 1.10 the
@@ -662,7 +690,8 @@ struct HonestStateMachine {
                                keychainLocked: keychainLocked,
                                canonicalScrub: canonicalScrub,
                                activeBlindDegraded: activeBlindDegraded,
-                               systemicRefreshFailure: systemicRefreshFailure)
+                               systemicRefreshFailure: systemicRefreshFailure,
+                               systemicRefreshSource: systemicRefreshSource)
     }
 
     /// Whether the retained `nextSwap` reports the fleet has no viable swap target left — the
@@ -917,6 +946,7 @@ struct HonestStateMachine {
             canonicalScrub = nil
             keychainLocked = false
             systemicRefreshFailure = nil
+            systemicRefreshSource = nil
             canary = nil
             return .unsupportedSchema
         }
@@ -928,6 +958,7 @@ struct HonestStateMachine {
         canonicalScrub = status.canonicalScrub
         keychainLocked = status.keychainLocked
         systemicRefreshFailure = status.systemicRefreshFailure
+        systemicRefreshSource = status.systemicRefreshSource
         canary = status.canary
         return .appliedSnapshot
     }
@@ -943,6 +974,7 @@ struct HonestStateMachine {
             canonicalScrub = nil
             keychainLocked = false
             systemicRefreshFailure = nil
+            systemicRefreshSource = nil
             canary = nil
             return .unsupportedSchema
         }
