@@ -25,20 +25,43 @@
 
 import SwiftUI
 
+// MARK: - The daemon-log availability seam (issue #776)
+
+/// How `DaemonLogCard` learns whether there is a log to view. A plain environment VALUE rather than an
+/// `@EnvironmentObject` because nothing observes it — it is answered on demand during `body` (see
+/// `DaemonLogProbe`). The default is `.unavailable`, so an un-injected host renders no `View log` button
+/// rather than a dead one.
+private struct DaemonLogProbeKey: EnvironmentKey {
+    static let defaultValue = DaemonLogProbe.unavailable
+}
+
+extension EnvironmentValues {
+    var daemonLogProbe: DaemonLogProbe {
+        get { self[DaemonLogProbeKey.self] }
+        set { self[DaemonLogProbeKey.self] = newValue }
+    }
+}
+
 extension View {
-    /// Inject the COMPLETE set of environment objects `StatusPanelView` (and its subviews) require. Every
+    /// Inject the COMPLETE set of environment dependencies `StatusPanelView` (and its subviews) require. Every
     /// panel host must route through this modifier rather than calling `.environmentObject` directly — see this
     /// file's header for the #504 drift it exists to make a build error rather than a silent render-time crash.
+    ///
+    /// `daemonLog` is a plain value rather than an object, but it is carried HERE for exactly the same reason:
+    /// it is a dependency the panel reads, so adding it to this one signature is what forces every host to
+    /// supply it at BUILD time instead of leaving the rarely-run harness silently un-wired.
     func statusPanelEnvironment(store: WatchStatusStore,
                                 capture: AccountCaptureModel,
                                 swap: AccountSwapModel,
                                 stats: PanelStatsModel,
-                                loginItem: LoginItemModel) -> some View {
+                                loginItem: LoginItemModel,
+                                daemonLog: DaemonLogProbe) -> some View {
         self
             .environmentObject(store)
             .environmentObject(capture)
             .environmentObject(swap)
             .environmentObject(stats)
             .environmentObject(loginItem)
+            .environment(\.daemonLogProbe, daemonLog)
     }
 }

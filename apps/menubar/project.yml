@@ -90,6 +90,14 @@ targets:
       # `not running`/`running` substring trap included — with no subprocess spawned in the suite. Foundation
       # + os only, like its sibling, so it compiles into this headless bundle.
       - path: Sources/LaunchdJobProbe.swift
+      # Daemon event-log location + the Console.app open decision (#776) — the third member of the
+      # pure-path-derivation family above. `logPath(home:)` mirrors `src/paths.rs::logs_dir()`'s macOS branch
+      # so a test can assert the contract for any home; `existingLogPath(home:fileExists:)` takes the
+      # existence predicate as a parameter, so BOTH arms of the honest-affordance gate are drivable without
+      # creating or deleting a real file; and `DaemonLogOpen.plan` is the open decision split out of its
+      # `NSWorkspace` shell, exactly as #764 split `StatusItemChrome` out of the status-item controller.
+      # Foundation + AppKit only, so it compiles into this headless bundle.
+      - path: Sources/DaemonLog.swift
       - path: Sources/WatchConnection.swift
       - path: Sources/WatchTransport.swift
       # Control-command transport (#358): the short-lived client→daemon write path + its redacted-ack

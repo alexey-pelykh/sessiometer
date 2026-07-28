@@ -1146,6 +1146,19 @@ enum StatusPanelFormat {
         }
     }
 
+    // MARK: - View-log affordance copy (issue #776, beside the starting / crash-looping banners)
+
+    /// The `View log` button title — VERBATIM from the design mock, which is the oracle for this string. It
+    /// doubles as the button's accessibility label: keeping the spoken and the rendered text identical is what
+    /// lets one accessibility-tree read attest BOTH the mock's label and the VoiceOver requirement, and it
+    /// removes the drift surface a second, prettier spoken string would add.
+    static let viewLogButtonTitle = "View log"
+
+    /// The button's tooltip / accessibility help — where the label says WHAT, this says WHERE it lands, which
+    /// is umbrella decision D3 (Console.app) and not something the mock authors. Help is supplementary by
+    /// design: nothing depends on it being read.
+    static let viewLogHelp = "Open the daemon’s event log in Console"
+
     // MARK: - Snapshot age (issue #326 / council — the CLI's parity render of the wire `generated_at`)
 
     /// The age (in seconds) past which a snapshot's data is UNAMBIGUOUSLY stale — the maximum possible

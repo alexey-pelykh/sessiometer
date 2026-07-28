@@ -369,6 +369,121 @@ struct StartDaemonCard: View {
     }
 }
 
+/// The cold states that offer a `View log` action (issue #776) — the design mock's daemon-starting and
+/// crash-looping message cards, and NO other state. It reuses the honest-state `BannerView` for the message
+/// (exactly as `StartDaemonCard` does for its own state) and adds the mock's document-glyph action beneath it.
+///
+/// TWO STATES, TWO STYLES, ON PURPOSE. The mock renders this same action differently in each: a borderless
+/// `.btn.link` where it is the SOLE action (daemon-starting) and a bordered `.btn` where it shares the row
+/// (crash-looping). That divergence is the reference's intent, not an inconsistency to normalize, so the style
+/// is an explicit parameter rather than something derived here — the call sites in `StatusPanelView` name it,
+/// which is what makes a future change to either state a visible diff.
+///
+/// Honest degradation (the crown-jewel rule, and the same shape as `StartDaemonCard`'s `canStartDaemon` gate):
+/// the button appears ONLY where it can act. `DaemonLogProbe` answers "is there a log to view?" and returns
+/// `nil` when the home is unresolvable, the app is sandboxed, or the daemon has not written a line yet — in
+/// all three the card degrades to exactly the inert banner it was before, never a button whose click does
+/// nothing. See `DaemonLog.swift` for why that answer is INJECTED rather than read from the filesystem here.
+///
+/// What the mock does NOT author is what a click DOES; that is umbrella decision D3 (open the log in
+/// Console.app via `NSWorkspace`), and it lives in `DaemonLogOpen`.
+///
+/// The mock's OTHER crash-looping action, `Restart…`, is deliberately absent: measured evidence
+/// (`docs/findings/0777-manual-restart-under-conditional-keepalive.md`) showed a manual kickstart mid-throttle
+/// LENGTHENS the outage launchd is already ending on its own, so it is dropped rather than deferred, and the
+/// mock is stale on that one button until issue #856 removes it.
+struct DaemonLogCard: View {
+    /// Which of the mock's two treatments this state's action takes.
+    enum ActionStyle {
+        /// `.btn.link` — borderless over the message card, secondary-tinted (daemon-starting).
+        case link
+        /// `.btn` — the mock's bordered default (crash-looping).
+        case bordered
+
+        /// The mock's state→treatment mapping, as a pure function of the state.
+        ///
+        /// A FUNCTION rather than a literal at each call site, so the mapping itself is directly testable:
+        /// a render-level check can only prove the two cases LOOK different, never that the right state
+        /// gets the right one — crash-looping wrongly styled `.link` would sail past a
+        /// "the styles diverge" assertion while violating the reference outright.
+        ///
+        /// `.link` is the default because it is the mock's treatment for a lone action; only crash-looping
+        /// takes the bordered `.btn`. NOTE for whoever lands issue #856 (which removes `Restart…` from the
+        /// mock): the reference's own logic for that divergence is sole-action vs shares-the-row, so once
+        /// `Restart…` is gone crash-looping becomes a lone action too and the mock's rationale would argue
+        /// for `.link` in BOTH. That is a design decision to take deliberately at #856 — not a drift to
+        /// silently absorb, and not something to pre-empt here.
+        static func forState(_ state: ConnectionState) -> ActionStyle {
+            state == .crashLooping ? .bordered : .link
+        }
+    }
+
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
+    /// Is there a log to view? See the type's docs for why this is a seam and not a filesystem call.
+    @Environment(\.daemonLogProbe) private var daemonLogProbe
+    @EnvironmentObject private var store: WatchStatusStore
+
+    /// The cold state whose banner copy this card carries — `.starting` or `.crashLooping`.
+    let state: ConnectionState
+    let actionStyle: ActionStyle
+
+    var body: some View {
+        // Same 8 pt banner→action gap `StartDaemonCard` settled on for the mock's `.msg-actions{margin-top}`,
+        // so the panel's two message cards space their actions identically.
+        VStack(alignment: .leading, spacing: 8 * scale) {
+            BannerView(banner: StatusPanelFormat.banner(for: state, accountCount: store.rows.count))
+            if let logPath = daemonLogProbe.existingLogPath() {
+                viewLogButton(logPath: logPath)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func viewLogButton(logPath: String) -> some View {
+        // `doc.text` is the SF Symbol counterpart of the mock's document glyph (a rounded rect over three
+        // text rules, the last one short). `Label` pairs it with the title exactly as `StartDaemonCard` pairs
+        // `play.fill` with "Start daemon", so both cards' actions read as one family.
+        let button = Button { DaemonLogOpen.perform(logPath: logPath) } label: {
+            Label(StatusPanelFormat.viewLogButtonTitle, systemImage: "doc.text")
+        }
+        .font(.panel(12, scale: scale))
+        .controlSize(PanelTypeScale.controlSize(for: scale))
+        // The label is already the spoken text, but state it explicitly: the button's rendered content is a
+        // `Label`, and pinning the string here is what keeps the VoiceOver name from following a future
+        // change to the glyph or the layout. Help carries the D3 destination the label does not say.
+        .accessibilityLabel(StatusPanelFormat.viewLogButtonTitle)
+        .help(StatusPanelFormat.viewLogHelp)
+
+        switch actionStyle {
+        case .link:
+            // `.btn.link`: no border, no fill, `--text-2` — a secondary-weight action, still a real button
+            // (and so still keyboard-focusable and still `AXButton`), never colour-only.
+            button.buttonStyle(.plain).foregroundStyle(.secondary)
+        case .bordered:
+            // `.btn`: the mock's hairline-bordered default — a NEUTRAL chrome button (`--btn-bg` fill,
+            // `--btn-border` hairline, `color: var(--text)`), which is why the tint is reset to `.primary`
+            // here. The panel pins `.tint(Color.panelAccent)` for the whole hierarchy (#391/#754), and a
+            // `.bordered` button inherits it — which would paint this action in the brand blue the mock
+            // reserves for `.btn.primary` (Start daemon, `.borderedProminent`). Two different actions must
+            // not read as the same weight: viewing a log is not the primary thing to do here.
+            //
+            // MEASURED RECONCILIATION (a deliberate divergence, in the sense design/README.md § Expected
+            // reconciliations means). Against the light golden the platform's `.bordered` renders a fill of
+            // (231,231,231) — 8/255 DARKER than the (239,239,239) card behind it — where the mock's
+            // `--btn-bg: rgba(255,255,255,.72)` composites LIGHTER, and its `.5px solid rgba(0,0,0,.14)`
+            // hairline is not separately discernible in the raster. The direction is inverted and the border
+            // is implicit. Taking the native style anyway is the considered call: it is what the mock's CSS
+            // is itself approximating, and it inherits control sizing, Dynamic Type (#756), vibrancy and the
+            // accessibility appearance settings that a hand-rolled rounded-rect background would all have to
+            // re-implement and would then drift from. What the panel must preserve is the SEMANTIC contrast
+            // the mock encodes — neutral-chrome `.btn` vs accent `.btn.primary` vs borderless `.btn.link` —
+            // and that is intact and asserted.
+            button.buttonStyle(.bordered).tint(.primary)
+        }
+    }
+}
+
 /// The settled swap's inline outcome (issue #169) — one line beneath the swap-callout card, shared by
 /// BOTH swap paths (the footer recommendation and a per-row manual switch), because the daemon holds a
 /// single-writer swap lock: at most one swap is ever in flight, so at most one outcome needs a home.
