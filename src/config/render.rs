@@ -620,8 +620,8 @@ impl Config {
             r.proactive_keep_warm
         ));
         out.push_str(
-            "# The `claude` binary to spawn, overriding $CLAUDE_BIN/$PATH. Omit (or leave\n\
-             # empty) to resolve from $CLAUDE_BIN then $PATH.\n",
+            "# The `claude` binary to spawn, overriding $CLAUDE_BIN and your login shell's\n\
+             # PATH. Omit (or leave empty) to resolve from $CLAUDE_BIN then that PATH.\n",
         );
         match &r.claude_bin {
             Some(bin) => out.push_str(&format!(
@@ -647,8 +647,8 @@ impl Config {
         );
         out.push_str(&format!("timeout_secs = {}\n", l.timeout_secs));
         out.push_str(
-            "# The `claude` binary to spawn, overriding $CLAUDE_BIN/$PATH. Omit (or leave empty)\n\
-             # to resolve from $CLAUDE_BIN then $PATH.\n",
+            "# The `claude` binary to spawn, overriding $CLAUDE_BIN and your login shell's PATH.\n\
+             # Omit (or leave empty) to resolve from $CLAUDE_BIN then that PATH.\n",
         );
         match &l.claude_bin {
             Some(bin) => out.push_str(&format!(
@@ -762,8 +762,8 @@ fn render_jitter(jitter: &Jitter) -> String {
 
 /// Render an optional `claude_bin` override for the `config show` origin view
 /// (issue #401): the quoted path when set, or a `(unset)` sentinel when it defers
-/// to `$CLAUDE_BIN` / `$PATH`. Diagnostic-only — this view never round-trips to a
-/// file, so an absent override reads as a clear sentinel rather than a blank.
+/// to `$CLAUDE_BIN` / the harvested login-shell PATH. Diagnostic-only — this view never
+/// round-trips to a file, so an absent override reads as a clear sentinel rather than a blank.
 fn render_optional_bin(bin: &Option<PathBuf>) -> String {
     match bin {
         Some(path) => basic_string(&path.to_string_lossy()),

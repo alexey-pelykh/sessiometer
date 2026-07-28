@@ -280,14 +280,20 @@ impl RealKeepWarmEngine {
         Self { claude_bin }
     }
 
-    /// Resolve the `claude` binary to spawn THIS keep-warm cycle (issue #375) via the UNCHANGED
+    /// Resolve the `claude` binary to spawn THIS keep-warm cycle (issue #375) via the shared
     /// policy ([`crate::paths::claude_binary_with_override`]: `[refresh].claude_bin` →
-    /// `$CLAUDE_BIN` → `$PATH`) — only the timing moved to per-cycle; which binary is chosen is
-    /// identical to before (no canonicalization, no validation — a wrapper symlink spawns as-is).
-    /// A failure surfaces as the mint's `Err`, which the daemon treats non-fatally: the canonical
-    /// item is left untouched and the mint is retried next cycle.
-    fn resolve_binary(&self) -> Result<PathBuf> {
-        crate::paths::claude_binary_with_override(self.claude_bin.as_deref())
+    /// `$CLAUDE_BIN` → the harvested user `PATH`). #375 moved the timing to per-cycle; #784
+    /// changed only tier 3's PATH source (the login-shell harvest, so a launchd-started daemon
+    /// resolves what the user's terminal would). Which binary a given `PATH` yields is unchanged
+    /// — first match in the user's own order, no canonicalization, no validation (a wrapper
+    /// symlink spawns as-is). A failure surfaces as the mint's `Err`, which the daemon treats
+    /// non-fatally: the canonical item is left untouched and the mint is retried next cycle.
+    ///
+    /// `async` since #784 (tier 3's harvest spawns the login shell); the harvested PATH is
+    /// memoized process-wide, so this shares one harvest with the periodic tick rather than
+    /// paying its own.
+    async fn resolve_binary(&self) -> Result<PathBuf> {
+        crate::paths::claude_binary_with_override(self.claude_bin.as_deref()).await
     }
 }
 
@@ -297,13 +303,14 @@ impl KeepWarm for RealKeepWarmEngine {
         account: &'a Account,
         canonical: &'a Credential,
     ) -> Pin<Box<dyn Future<Output = Result<KeepWarmMint>> + 'a>> {
-        // Resolve THIS cycle (issue #375), not from a frozen field, then own the non-borrowed
-        // inputs so the future needs only `canonical`'s lifetime. A resolution failure is carried
-        // into the future as the `Err` the daemon handles fail-safe (canonical left untouched).
-        let resolved = self.resolve_binary();
+        // Own the non-borrowed inputs so the future needs only the `'a` borrows. The resolve
+        // itself moved INSIDE the future with #784 — it is `async` now (tier 3 harvests the login
+        // shell), and `&'a self` is already captured, so awaiting it here is free of any bridge.
+        // Still per-cycle (issue #375), and a resolution failure is still carried as the `Err`
+        // the daemon handles fail-safe (canonical left untouched).
         let uuid = account.account_uuid.clone();
         Box::pin(async move {
-            let binary = resolved?;
+            let binary = self.resolve_binary().await?;
             crate::refresh::keep_warm_account(canonical.expose(), &uuid, binary).await
         })
     }
@@ -407,8 +414,8 @@ impl InstanceLock {
 mod tests {
     use super::*;
 
-    #[test]
-    fn real_keep_warm_engine_resolves_the_binary_per_cycle_not_frozen_at_construction() {
+    #[tokio::test]
+    async fn real_keep_warm_engine_resolves_the_binary_per_cycle_not_frozen_at_construction() {
         // Issue #375, the #282 keep-warm engine's half of the fix (sibling to `refresh_tick`'s
         // `RealRefreshEngine` test). `RealKeepWarmEngine` holds the `[refresh].claude_bin` OVERRIDE
         // and resolves the spawn binary PER CYCLE, so a mid-run symlink re-point is picked up on the
@@ -424,14 +431,14 @@ mod tests {
 
         // Cycle 1: link → installed (exists) → Ok, returning the symlink path UNCANONICALIZED
         // (issue constraint [C1]: a wrapper symlink is spawned as-is, never resolved to its target).
-        assert_eq!(engine.resolve_binary().unwrap(), link);
+        assert_eq!(engine.resolve_binary().await.unwrap(), link);
 
         // The updater removes the pointed-at binary: the SAME engine resolves to a NON-FATAL error
         // on its next cycle (the daemon leaves the canonical item untouched, retried next cycle),
         // never a reuse of a stale frozen path.
         std::fs::remove_file(&installed).unwrap();
         assert!(matches!(
-            engine.resolve_binary(),
+            engine.resolve_binary().await,
             Err(crate::error::Error::ClaudeBinaryNotFound)
         ));
     }

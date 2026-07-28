@@ -616,17 +616,31 @@ timeout_secs = 90         # whole-cycle bound for one account's refresh (10..=60
 proactive_keep_warm = false  # pre-emptively refresh the ACTIVE token before expiry; off by default
                              # (it rotates the live shared credential each cadence) — the active
                              # account is instead kept warm reactively on a 401. See below.
-# claude_bin = "/absolute/path/to/claude"   # overrides $CLAUDE_BIN/$PATH; omit to resolve normally
+# claude_bin = "/absolute/path/to/claude"   # overrides $CLAUDE_BIN + your login shell's PATH;
+                                            # omit (or leave empty) to resolve normally
 ```
 
 An account is **due** when its stored token would expire within one `cadence_secs`
 of now — i.e. it would not survive until the next tick — so the cadence doubles as
 the near-expiry horizon (no second knob). `[refresh]` config changes take effect at
 the next daemon start. The `claude` binary, however, is resolved **per refresh cycle**
-(honoring `claude_bin` → `$CLAUDE_BIN` → `$PATH`), not frozen at start-up — so a Claude
-Code auto-update that re-points the binary is picked up on the next cycle with no daemon
-restart. A cycle that cannot resolve `claude` records a non-fatal error and retries next
-cycle; it never disables the tick.
+(honoring `claude_bin` → `$CLAUDE_BIN` → your **login shell's** `PATH`), not frozen at
+start-up — so a Claude Code auto-update that re-points the binary is picked up on the next
+cycle with no daemon restart. A cycle that cannot resolve `claude` records a non-fatal
+error and retries next cycle; it never disables the tick.
+
+That third tier is the user-level `PATH`, not the daemon's own. Started by `launchd` the
+daemon inherits a bare `PATH=/usr/bin:/bin:/usr/sbin:/sbin` — no `~/.local/bin`, and so no
+`claude` at all — so it reconstructs the PATH your terminal would have by running your
+login shell once and reading its environment. That PATH is scanned **in your own order**
+and the **first** `claude` wins, so a binary you deliberately shadow earlier on your `PATH`
+is the one the daemon spawns, exactly as your shell would resolve it. The harvested value
+is reused for 60 s (so a sweep runs one login shell, not one per account) while the
+directory scan still runs every cycle. If the harvest fails, resolution falls back to the
+daemon's own `$PATH` rather than erroring — a failure is never cached, so a shell that is
+persistently broken is retried per account rather than reused, which costs time but keeps a
+transient hiccup from turning into a minute-long outage. Setting `claude_bin` or
+`$CLAUDE_BIN` skips the harvest entirely.
 
 `idle_after_secs` sets how long the daemon must idle before the **first** refresh
 sweep after start-up. Since issue #260 the idle floor is anchored to an absolute
@@ -736,7 +750,7 @@ Settings for `sessiometer login`, the interactive re-auth verb.
 | Key | Meaning | Range | Default |
 |-----|---------|-------|---------|
 | `timeout_secs` | Seconds bounding one whole interactive login capture — longer than a refresh, since it waits on a human completing a browser OAuth handoff. | `60..=600` | `180` |
-| `claude_bin` | Absolute path to the `claude` binary to spawn, overriding `$CLAUDE_BIN`/`$PATH`. Omit (or leave empty) to resolve normally. | — | unset |
+| `claude_bin` | Absolute path to the `claude` binary to spawn, overriding `$CLAUDE_BIN` and your login shell's `PATH`. Omit (or leave empty) to resolve normally. | — | unset |
 
 ### Other blocks
 
