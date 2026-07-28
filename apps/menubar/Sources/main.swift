@@ -161,6 +161,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.loginItemModel = loginItemModel
         loginItemModel.registerAppLoginItemOnLaunch()
 
+        // Repair a daemon-agent registration this app update left stale (issue #788): every Release build
+        // re-embeds the daemon (#171), and `SMAppService.h` is explicit that a changed executable "must be
+        // re-registered or it may not launch" — unregistering first. Nothing else does it; the Start affordance
+        // stands down once a daemon holds the lock (#742). Async and unawaited so a re-register (and its #745
+        // liveness wait) never delays the status item coming up; a no-op on the overwhelmingly common
+        // unchanged-version launch, and it never registers an agent the operator never started.
+        Task { await loginItemModel.reconcileDaemonAgentRegistration() }
+
         let controller = StatusItemController(store: store,
                                               captureClient: captureClient,
                                               swapClient: swapClient,
