@@ -347,6 +347,117 @@ Two known defects are pinned as set **equality**, so fixing either turns the sui
 issue #838 (a decorative Stats icon reaching the tree) and issue #839 (non-interactive rows publishing
 `AXUnknown`). The Settings window is **not** covered — see issue #840.
 
+### Appearance variants: increased contrast, reduce transparency, reduce motion (#760)
+
+Issue #760 asked for render fixtures under the three system accessibility *display* settings, each
+asserted to **differ** from its baseline on the reasoning that an identical render means the setting is
+being ignored. The reasoning is right; the premise underneath it is not. Measured 2026-07-28, **none of
+the three can be driven from a test process**, so no such fixture exists and none was faked.
+
+| Axis | Reachable in-bundle? | Evidence |
+|---|---|---|
+| Increased contrast | **No** | `\.colorSchemeContrast` is get-only; and `NSAppearance` — the only other lever — does not reach an `ImageRenderer` render for *any* appearance (see blocker 2) |
+| Reduce transparency | **No**, doubly | `\.accessibilityReduceTransparency` is get-only — *and* the renderer reports `false` even where the system says `true` (measured on CI), so changing the system would not reach it either |
+| Reduce motion | **No**, and never fixture-shaped | Same get-only key, same defaults-regardless-of-system behaviour — *and* a still raster encodes no motion at all, so no golden-style gate can ever cover it |
+
+Two independent blockers, either of which alone would be decisive:
+
+1. **All four accessibility environment keys are get-only** on `EnvironmentValues` —
+   `colorSchemeContrast`, `accessibilityReduceTransparency`, `accessibilityReduceMotion`,
+   `accessibilityDifferentiateWithoutColor`. `.environment(\.accessibilityReduceTransparency, true)` is a
+   **compile error**, not a runtime no-op. `\.colorScheme` *is* writable, which is exactly why the
+   light/dark axis issue #749 unblocked works and these do not — they are not the same mechanism, and the
+   assumption that they were is what #760 was scoped on.
+
+   The unreachability is **double**, and only CI could show it. The GitHub runner has Reduce Transparency
+   and Reduce Motion **ON**; an `ImageRenderer` render there still reports `false` for both. So the
+   renderer does not inherit the system setting either — changing the system would not reach it even if a
+   test could. (An earlier draft asserted the render *tracks* the system; that passes on any machine with
+   the settings off, including the authoring one, and CI falsified it. Useful side effect: this is why the
+   committed panel goldens are portable across machines with different accessibility settings.)
+2. **`NSAppearance` does not reach an `ImageRenderer` render** — and the precise shape of this matters,
+   because the obvious reading of it is wrong. `performAsCurrentDrawingAppearance` **is** live in this
+   process: it changes an AppKit colour resolution (`NSColor.textColor` → near-black under `.aqua`,
+   near-white under `.darkAqua`). It just never reaches the SwiftUI renderer, for *any* appearance — even
+   `.aqua` vs `.darkAqua` at a pinned `\.colorScheme` renders byte-identically. So the high-contrast null
+   is **not** a fact about the high-contrast names; it is the general fact, and it would look identical
+   even if the high-contrast assets resolved perfectly.
+
+   **Do not read these as the same measurement as issue #832's.** #832's pin resolves colours through the
+   AppKit path, where the lever *is* live, so its zero is a genuine finding about asset lookup honouring
+   the name. These pins use a path where the lever is dead. The two do **not** move together: if AppKit
+   ever starts honouring the high-contrast name, #832's pin reddens and these stay green.
+
+`Tests/PanelAppearanceVariantTests` pins all of that, so it reddens the day a macOS or SwiftUI revision
+changes it rather than decaying into an unchecked assumption. A sameness-pin needs *two* things proven
+before it is evidence — that the comparison can see a difference, and that the **lever** being driven is
+live — because a lever that does nothing yields a passing measurement about nothing. Both are pinned, the
+second by an explicit liveness control. Verified by mutation, not inspection: feeding the contrast pin a
+genuinely different raster reddens it at 2 042 964 bytes / worst channel 217.
+
+**What is covered instead, for reduce transparency.** The panel is heavily backdrop-dependent — its
+`.regularMaterial` scrim composites what is behind it *inside* the SwiftUI pass, so the same panel over
+different opaque backdrops rasterizes differently (healthy/light, 760×898 @2×):
+
+```
+over white .......... 0.000000 vs bare      over 0.1 white ...... 0.909323
+over 0.9 white ...... 0.000000              over black .......... 0.933727  (worst channel 90)
+over 0.5 gray ....... 0.000000              over rgb(.9,.2,.6) .. 0.929223
+```
+
+The light rows read 0.000000 because `.regularMaterial` in the light scheme resolves near-white, landing
+within the metric's 64/255 channel threshold of its own unbacked fallback — not because nothing happened.
+Worth stating plainly: the bare render is **100 % opaque** at the alpha level (682 480/682 480 px at alpha
+255, zero partial), so "the panel is opaque" and "the panel is backdrop-dependent" are both true and not
+in tension — the blending happens before the raster gets its alpha.
+
+That establishes the axis is **consequential** (removing vibrancy moves most of the frame), so it must not
+be closed as "no visible effect".
+
+**AC-3 is not starting from zero.** `StatusPanelFormatTests` (#759) already measures every panel text tint
+at 4.5:1 and every glyph tint at 3:1 against an **opaque** popover base — `lightBase = RGB(247, 247, 250)`
+/ `darkBase = RGB(38, 38, 43)`, described there as the agreed stand-in precisely because "the live panel
+floats on vibrancy, which is not headlessly measurable". That opaque-base sweep **is** the token-level half
+of "does not go opaque-on-opaque", and it is already gated. What is missing is the **panel-level** half:
+whether the composed surface still reads once the material stops contributing.
+
+That half deliberately stops short of a legibility *threshold*: the mock defines the default appearance
+only, so what the panel should look like once the OS removes vibrancy is an **unratified design question**,
+and a threshold here would settle it by assertion. Routed to issue #868 with the product gap below.
+
+**The product gap.** The panel's own code consults none of the three settings — a grep over `Sources/`
+for the environment keys and `NSWorkspace.accessibilityDisplayShould*` returns nothing. Note what that
+does and does not establish: the panel's translucency comes from **framework-provided** surfaces
+(`.regularMaterial` in `StatusPanelView`, and the host `NSVisualEffectView` with `material = .popover` in
+`StatusItemController`), whose Reduce-Transparency response lives in AppKit/SwiftUI rather than in app
+code. So the OS very likely *does* change the panel under these settings — the measurement above says such
+a change would be large — while nothing in the panel *deliberately* responds to it, and nobody has looked
+at the result. Honouring them intentionally is product work needing a ratified visual target, tracked as
+issue #868; the contrast half stays with issue #832.
+
+### Appearance-settings pre-release checklist (manual)
+
+The three axes above have no automated coverage and cannot get any, so they are checked by hand. Toggle
+each in **System Settings → Accessibility → Display**, then open the panel:
+
+Nothing in the panel *deliberately* responds to any of these (issue #868), so the expected outcome is
+"whatever AppKit/SwiftUI does on our behalf". **Record what you see — that observation is issue #868's
+evidence, not a new defect to file.**
+
+- [ ] **Increase contrast** on — walk `healthy`, `blind-degraded`, `blind-cornered`, `fault-keychain-locked`
+      and `empty-roster`. Borders and separators should strengthen; every meter, health glyph and percent
+      stays readable; nothing turns into a flat block. Compare each against the same state with it off.
+- [ ] **Reduce transparency** on — the popover goes opaque. Confirm no chrome *vanishes* (a border, strip
+      tint or leading rule that was carrying vibrancy) and nothing lands opaque-on-opaque (a label matching
+      its own field). Check over both a light and a dark desktop wallpaper — the measurement above shows the
+      panel's appearance depends heavily on what is behind it.
+- [ ] **Reduce motion** on — the panel has **four** in-flight spinners and nothing automated covers any of
+      them. Trigger each: the per-row **switch chip** (click a non-active row), the **Swap** button, the
+      **Start daemon** button (with the daemon stopped), and **Capture active account** (empty-roster/
+      first-run card). None should whirl or bounce; a static or cross-fade indicator is correct.
+- [ ] Repeat the first two in **both** Light and Dark mode — the colour sets ship separate
+      high-contrast variants per scheme (issue #832), and nothing automated reads them.
+
 ### VoiceOver pre-release checklist (manual)
 
 The tree walk cannot see VoiceOver's own behaviour: the rotor, real focus traversal, and speech are
