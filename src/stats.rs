@@ -727,14 +727,25 @@ fn is_ymd(s: &str) -> bool {
 /// config-derived "hot" line, PINNED as the census threshold by issue #804 and carried out
 /// on [`RosterStats::high_threshold`] so no surface has to hardcode a literal.
 fn params_from(config: Option<&Config>) -> AggregateParams {
-    let (poll_secs, cap) = match config {
-        Some(c) => (c.tunables.poll_secs as i64, c.swap_threshold()),
-        None => {
-            let t = Tunables::default();
-            (t.poll_secs as i64, f64::from(t.session_ceiling) / 100.0)
-        }
+    // ONE resolved tunables source for every knob below — the config's when there is a config, the
+    // shipping defaults otherwise — so no knob is read through two different paths.
+    let defaults = Tunables::default();
+    let (tunables, cap) = match config {
+        Some(c) => (&c.tunables, c.swap_threshold()),
+        None => (&defaults, f64::from(defaults.session_ceiling) / 100.0),
     };
-    AggregateParams::new(poll_secs.max(1), cap, cap)
+    // The daemon's OWN viability boundary (issue #803), so the capacity-holds census measures the
+    // lines the daemon actually enforced rather than a water chosen here. Sourced through
+    // `swap::viability_boundary` — the same helper the daemon's decision path calls — so the two
+    // surfaces cannot drift; in particular the weekly arm is `weekly_ceiling − WEEKLY_TAIL_MARGIN`
+    // (0.97 at defaults), NOT the raw ceiling, and a census taken against the raw value would miss
+    // exactly the accounts resting on the line.
+    let viability = crate::swap::viability_boundary(
+        f64::from(tunables.session_ceiling) / 100.0,
+        f64::from(tunables.target_max_session_usage) / 100.0,
+        f64::from(tunables.weekly_ceiling) / 100.0,
+    );
+    AggregateParams::new((tunables.poll_secs as i64).max(1), cap, cap).with_viability(viability)
 }
 
 /// The live-roster handle set for the orphan partition (issue #314): every account's
@@ -1362,7 +1373,7 @@ fn roster_line(report: &UsageReport) -> String {
     };
     format!(
         "roster: {} swap{} ({} session, {} weekly, {} manual, {} forced, {} emergency) · \
-         all-accounts-high (≥{}%): {}\n",
+         all-accounts-high (≥{}%): {} · {}\n",
         r.swap_count,
         plural(r.swap_count),
         r.swaps.session,
@@ -1372,6 +1383,44 @@ fn roster_line(report: &UsageReport) -> String {
         r.swaps.emergency,
         pct(r.high_threshold),
         census,
+        capacity_holds_cell(r),
+    )
+}
+
+/// The capacity-holds cell of the roster line (§D-STA-5, issue #803): `capacity holds (session
+/// ≥80%, weekly ≥97%): 7 (2 session / 5 weekly) · ≥29h28m`.
+///
+/// Answers a DIFFERENT operator question from the census beside it — "could the daemon still
+/// swap?" rather than "was the roster running hot?" — which is why it is a second cell and not a
+/// re-rendering of the first. The two disagreed on the week that motivated it: the daemon was
+/// cornered 95 times while the census read calm.
+///
+/// It STATES THE BOUNDARY it measured against, for the same reason the census beside it states its
+/// water (issue #804): both lines are operator-configurable, so without them the figure's meaning
+/// moves with the config while the render looks identical. The two are named per dimension rather
+/// than positionally — a bare `≥80%/≥97%` pair would re-introduce, in the render, exactly the
+/// silent transposition [`crate::swap::ViabilityBoundary`] is a named struct to prevent.
+///
+/// The duration carries a `≥` because it is a LOWER BOUND and never an exact figure
+/// (REQ-STA-B-011): a coverage gap inside a hold truncates it, a hold still running at the
+/// window's end is clipped to it, and the closing instant is anchored to the blocking window's
+/// carried reset rather than observed. Under no joint coverage the whole cell degrades to the
+/// view's own gap sentinel `—`, never `0 holds` — an unmeasurable period is not a calm one, the
+/// same contract the census beside it keeps. The boundary is omitted from THAT branch on purpose:
+/// with the census untaken the carried lines are `0.0`, and printing `≥0%` would state a line no
+/// reading was ever measured against.
+fn capacity_holds_cell(r: &crate::usage_stats::RosterStats) -> String {
+    if r.capacity_hold_covered_secs == 0 {
+        return "capacity holds: —".to_owned();
+    }
+    format!(
+        "capacity holds (session ≥{}%, weekly ≥{}%): {} ({} session / {} weekly) · ≥{}",
+        pct(r.capacity_session_line),
+        pct(r.capacity_weekly_line),
+        r.capacity_holds,
+        r.capacity_holds_session,
+        r.capacity_holds_weekly,
+        fmt_dur(r.capacity_hold_secs_lower_bound),
     )
 }
 
@@ -1873,12 +1922,15 @@ struct DimWire {
 
 /// The roster-wide block of the `--json` / socket wire.
 ///
-/// `all_high_threshold` and `all_high_covered_secs` are ADDITIVE (issue #804) — no existing
-/// field changed type or meaning, so `JSON_SCHEMA_VERSION` does not move and a reader that
-/// ignores them decodes exactly as before. Both are ALWAYS present rather than
-/// `skip_serializing_if`-elided: they are always known, and a surface that found the
-/// threshold absent would fall back to a hardcoded literal — precisely what carrying it is
-/// meant to end.
+/// `all_high_threshold` and `all_high_covered_secs` are ADDITIVE (issue #804), as are the seven
+/// `capacity_*` fields (issue #803) — no existing field changed type or meaning, so
+/// `JSON_SCHEMA_VERSION` does not move and a reader that ignores them decodes exactly as before
+/// (the Swift `StatsRoster` names its keys explicitly and ignores the rest). All are ALWAYS
+/// present rather than `skip_serializing_if`-elided, following #804's rationale: they are always
+/// known, and a surface that found a threshold or a denominator ABSENT would fall back to a
+/// hardcoded literal or to reading a bare count as calm — precisely what carrying them is meant to
+/// end. Eliding them would make "not measurable" and "field not sent" indistinguishable, which is
+/// the one distinction the capacity readout must preserve.
 ///
 /// Read `all_high_episodes` ONLY against `all_high_covered_secs`. Zero jointly-covered
 /// seconds means the census was never measurable, and the accompanying `0` is UNKNOWN, not
@@ -1896,6 +1948,33 @@ struct RosterWire {
     /// Seconds of the window during which EVERY rostered account was simultaneously
     /// covered — the denominator the two figures above were measured over.
     all_high_covered_secs: i64,
+    /// Maximal intervals in which EVERY rostered account was simultaneously non-viable at the
+    /// daemon's own boundary, so swapping could not have restored capacity (issue #803).
+    ///
+    /// A DIFFERENT fact from `all_high_episodes`, not a stricter version of it: that one is the
+    /// utilisation census ("was the roster running hot?"), this is the capacity fact ("could the
+    /// daemon still swap?"). Read it ONLY against `capacity_hold_covered_secs`.
+    capacity_holds: u32,
+    /// The `capacity_holds` gated by a SESSION window reopening.
+    capacity_holds_session: u32,
+    /// The `capacity_holds` gated by a WEEKLY window reopening. Together with the field above
+    /// these split `capacity_holds` exactly.
+    capacity_holds_weekly: u32,
+    /// Total held seconds — a LOWER BOUND (REQ-STA-B-011), which is why the name says so and why
+    /// a consumer must render it as `≥`, never as an exact figure. A coverage gap inside a hold
+    /// truncates it and a hold still running at the window's end is clipped to that end.
+    capacity_hold_secs_lower_bound: i64,
+    /// Seconds during which EVERY rostered account was simultaneously covered under the
+    /// reset-anchored windows — the denominator the four figures above were measured over. `0`
+    /// means the census was never taken or never measurable, so the accompanying `0` holds is
+    /// UNKNOWN, not calm; a consumer MUST render its own gap sentinel there.
+    capacity_hold_covered_secs: i64,
+    /// The SESSION line an account had to be at/above to count as non-viable, as a FRACTION
+    /// (`min(session_ceiling, target_max_session_usage)` — 0.80 at defaults).
+    capacity_session_line: f64,
+    /// The WEEKLY line, as a FRACTION (`weekly_ceiling − WEEKLY_TAIL_MARGIN` — 0.97 at defaults,
+    /// NOT the raw 0.98 ceiling).
+    capacity_weekly_line: f64,
 }
 
 #[derive(Serialize)]
@@ -2119,6 +2198,13 @@ fn roster_wire(r: &RosterStats) -> RosterWire {
         all_high_secs: r.all_high_secs,
         all_high_threshold: r.high_threshold,
         all_high_covered_secs: r.all_high_covered_secs,
+        capacity_holds: r.capacity_holds,
+        capacity_holds_session: r.capacity_holds_session,
+        capacity_holds_weekly: r.capacity_holds_weekly,
+        capacity_hold_secs_lower_bound: r.capacity_hold_secs_lower_bound,
+        capacity_hold_covered_secs: r.capacity_hold_covered_secs,
+        capacity_session_line: r.capacity_session_line,
+        capacity_weekly_line: r.capacity_weekly_line,
     }
 }
 
@@ -3383,7 +3469,7 @@ mod tests {
         assert!(out.contains("session distribution — mean · p95 · peak\n"));
         assert!(out
             .trim_end()
-            .ends_with("all-accounts-high (≥95%): 0 episodes (0s)"));
+            .contains("all-accounts-high (≥95%): 0 episodes (0s) ·"));
     }
 
     #[test]
@@ -3516,7 +3602,7 @@ mod tests {
              aa       saturated  100%         30/90/85          0/40/0     0     0s    60%  0.9%/min     ~2h\n\
              bb       underused  100%         10/15/12          0/20/0     0     0s    40%         —       —\n\
              \n  lowest utilisation: bb (session mean 10%)\n\
-             roster: 0 swaps (0 session, 0 weekly, 0 manual, 0 forced, 0 emergency) · all-accounts-high (≥95%): 0 episodes (0s)\n",
+             roster: 0 swaps (0 session, 0 weekly, 0 manual, 0 forced, 0 emergency) · all-accounts-high (≥95%): 0 episodes (0s) · capacity holds: —\n",
         );
     }
 
@@ -4456,6 +4542,156 @@ mod tests {
         })
     }
 
+    // --- issue #803: the capacity-holds cell ------------------------------------------
+
+    /// A roster line from a capacity-holds census with the given figures, over a
+    /// [`CENSUS_WINDOW`] period at the shipping-default boundary (0.80 session / 0.97 weekly).
+    fn capacity_line(holds: u32, session: u32, weekly: u32, secs: i64, covered: i64) -> String {
+        roster_line(&UsageReport {
+            period: Period::new(0, CENSUS_WINDOW),
+            per_account: BTreeMap::new(),
+            roster: RosterStats {
+                capacity_holds: holds,
+                capacity_holds_session: session,
+                capacity_holds_weekly: weekly,
+                capacity_hold_secs_lower_bound: secs,
+                capacity_hold_covered_secs: covered,
+                capacity_session_line: 0.80,
+                capacity_weekly_line: 0.97,
+                ..Default::default()
+            },
+        })
+    }
+
+    #[test]
+    fn a_measured_capacity_census_renders_its_counts_boundary_and_bound_marker() {
+        // The MEASURED branch, pinned as an exact string. Every other render assertion and all
+        // eleven goldens exercise only the `—` branch, so without this the whole cell was
+        // ungated: a mutation transposing the session/weekly counts AND dropping the `≥` marker
+        // passed the entire suite. Both of those are exactly what this asserts.
+        let line = capacity_line(7, 2, 5, 106_080, CENSUS_WINDOW);
+        assert!(
+            line.ends_with(
+                "capacity holds (session ≥80%, weekly ≥97%): 7 (2 session / 5 weekly) · ≥29h28m\n"
+            ),
+            "measured capacity cell renders counts, boundary and the bound marker: {line}"
+        );
+    }
+
+    #[test]
+    fn a_measured_capacity_census_with_no_holds_is_calm_and_not_the_gap_sentinel() {
+        // The branch a healthy fleet sees every day, and the one nothing else pins: the goldens
+        // and every other assertion here exercise either `—` or a NONZERO hold count, so a
+        // regression that collapsed measured-calm into the `—` branch would erase the distinction
+        // between "the daemon was never cornered" and "we could not tell" — the very distinction
+        // this readout exists to make — and still pass the suite.
+        let calm = capacity_line(0, 0, 0, 0, CENSUS_WINDOW);
+        assert!(
+            calm.ends_with(
+                "capacity holds (session ≥80%, weekly ≥97%): 0 (0 session / 0 weekly) · ≥0s\n"
+            ),
+            "a MEASURED zero states its boundary and stays marked as a bound: {calm}"
+        );
+        assert!(
+            !calm.contains("capacity holds: —"),
+            "measured calm is NOT the gap sentinel: {calm}"
+        );
+    }
+
+    #[test]
+    fn the_capacity_cell_marks_its_duration_as_a_bound_and_never_states_an_exact_figure() {
+        // REQ-STA-B-011: until a hold's END is reconstructable offline, the duration is a BOUND
+        // and must be marked as one. The `≥` is that marking — a render that dropped it would
+        // state an exact figure the aggregate cannot support, which is the one thing the
+        // requirement forbids. Asserted separately from the shape above so a future re-layout
+        // of the cell cannot quietly take the marker with it.
+        let line = capacity_line(1, 1, 0, 3_600, CENSUS_WINDOW);
+        assert!(line.contains("· ≥1h\n"), "the duration is marked: {line}");
+        assert!(
+            !line.contains(": 1h\n") && !line.contains(" 1h\n"),
+            "an UNMARKED duration would read as exact: {line}"
+        );
+    }
+
+    #[test]
+    fn the_capacity_cell_names_each_boundary_by_its_own_dimension() {
+        // The two lines are independent (issue #41) and both operator-configurable, so a
+        // positional `≥80%/≥97%` pair would re-introduce in the render the silent transposition
+        // `ViabilityBoundary` is a named struct to prevent. A non-default, ASYMMETRIC boundary
+        // proves each number is bound to its own dimension rather than to its position.
+        let line = roster_line(&UsageReport {
+            period: Period::new(0, CENSUS_WINDOW),
+            per_account: BTreeMap::new(),
+            roster: RosterStats {
+                capacity_holds: 1,
+                capacity_holds_session: 1,
+                capacity_hold_secs_lower_bound: 60,
+                capacity_hold_covered_secs: CENSUS_WINDOW,
+                capacity_session_line: 0.55,
+                capacity_weekly_line: 0.91,
+                ..Default::default()
+            },
+        });
+        assert!(
+            line.contains("capacity holds (session ≥55%, weekly ≥91%):"),
+            "each line is named by its own dimension: {line}"
+        );
+    }
+
+    #[test]
+    fn an_untaken_capacity_census_renders_the_gap_sentinel_and_states_no_boundary() {
+        // Zero jointly-covered seconds means the census was never taken or never measurable, so
+        // the count is UNKNOWN — the same contract the census beside it keeps, and the reason a
+        // bare `0 holds` is forbidden here too. The boundary is withheld in this branch because
+        // the carried lines are `0.0` when the census was not taken: printing `≥0%` would state
+        // a line no reading was ever measured against.
+        let unmeasurable = capacity_line(0, 0, 0, 0, 0);
+        assert!(
+            unmeasurable.ends_with("capacity holds: —\n"),
+            "an unmeasurable capacity census renders `—`: {unmeasurable}"
+        );
+        // Scoped to the capacity cell's own label: the census cell to its left legitimately
+        // states ITS water, so a bare `≥0%` search over the whole line would match that instead
+        // — which is precisely what this assertion caught on its first run.
+        assert!(
+            !unmeasurable.contains("0 holds") && !unmeasurable.contains("capacity holds ("),
+            "never a fabricated calm, and never a boundary it did not measure against: \
+             {unmeasurable}"
+        );
+    }
+
+    #[test]
+    fn the_two_roster_cells_answer_their_two_questions_independently() {
+        // The motivating contrast, pinned: the utilisation census can read UNKNOWN while the
+        // capacity fact beside it reads a measured hold. They are separate facts over separate
+        // denominators (issue #803 vs #804), and merging or substituting one for the other is
+        // exactly the defect that left a 95-hold week reading as calm.
+        let line = roster_line(&UsageReport {
+            period: Period::new(0, CENSUS_WINDOW),
+            per_account: BTreeMap::new(),
+            roster: RosterStats {
+                all_high_covered_secs: 0, // census unmeasurable
+                high_threshold: 0.95,
+                capacity_holds: 5,
+                capacity_holds_session: 4,
+                capacity_holds_weekly: 1,
+                capacity_hold_secs_lower_bound: 99_435,
+                capacity_hold_covered_secs: CENSUS_WINDOW, // capacity measured
+                capacity_session_line: 0.80,
+                capacity_weekly_line: 0.97,
+                ..Default::default()
+            },
+        });
+        assert!(
+            line.contains("all-accounts-high (≥95%): — ·"),
+            "census UNKNOWN: {line}"
+        );
+        assert!(
+            line.contains("capacity holds (session ≥80%, weekly ≥97%): 5 "),
+            "capacity measured: {line}"
+        );
+    }
+
     #[test]
     fn an_unmeasurable_census_renders_the_gap_sentinel_never_a_bare_zero() {
         // THE reported defect: `stats` printed `all-accounts-high: 0 episodes (0s)` for a week
@@ -4463,7 +4699,7 @@ mod tests {
         // With no jointly-covered second, the count is UNKNOWN and must say so.
         let unmeasurable = census_line(0, 0, 0, 0.95);
         assert!(
-            unmeasurable.ends_with("all-accounts-high (≥95%): —\n"),
+            unmeasurable.contains("all-accounts-high (≥95%): — ·"),
             "unmeasurable census renders `—`: {unmeasurable}"
         );
         assert!(
@@ -4475,7 +4711,7 @@ mod tests {
         // so the sentinel marks unmeasurability rather than merely "nothing happened".
         assert!(
             census_line(0, 0, CENSUS_WINDOW, 0.95)
-                .ends_with("all-accounts-high (≥95%): 0 episodes (0s)\n"),
+                .contains("all-accounts-high (≥95%): 0 episodes (0s) ·"),
             "a MEASURED zero still renders as zero"
         );
     }
@@ -4489,7 +4725,7 @@ mod tests {
         // period says so (REQ-STA-B-008's annotation clause).
         let sliver = census_line(0, 0, 7_200, 0.95); // 2 h of a day
         assert!(
-            sliver.ends_with("all-accounts-high (≥95%): 0 episodes (0s, 8% covered)\n"),
+            sliver.contains("all-accounts-high (≥95%): 0 episodes (0s, 8% covered) ·"),
             "a partly-covered census annotates its measured share: {sliver}"
         );
 
@@ -4497,14 +4733,14 @@ mod tests {
         // these windows are strictly partly covered, and a `0%` or a `100%` would deny it.
         let trace = census_line(0, 0, 60, 0.95); // 1 min of a day ≈ 0.07%
         assert!(
-            trace.ends_with("all-accounts-high (≥95%): 0 episodes (0s, <1% covered)\n"),
+            trace.contains("all-accounts-high (≥95%): 0 episodes (0s, <1% covered) ·"),
             "a trace of coverage renders `<1%`, never a false `0%`: {trace}"
         );
         // A day covered but for its last 5 min rounds to 100 — reachable whenever one account
         // joins the roster (or its daemon restarts) a sliver into the window.
         let nearly = census_line(0, 0, CENSUS_WINDOW - 300, 0.95); // ≈ 99.65%
         assert!(
-            nearly.ends_with("all-accounts-high (≥95%): 0 episodes (0s, >99% covered)\n"),
+            nearly.contains("all-accounts-high (≥95%): 0 episodes (0s, >99% covered) ·"),
             "near-total coverage renders `>99%`, never a false `100%`: {nearly}"
         );
 
@@ -4520,7 +4756,7 @@ mod tests {
         // both what was seen and how much of the window it was seen over.
         let partial = census_line(2, 600, CENSUS_WINDOW / 2, 0.95);
         assert!(
-            partial.ends_with("all-accounts-high (≥95%): 2 episodes (10m, 50% covered)\n"),
+            partial.contains("all-accounts-high (≥95%): 2 episodes (10m, 50% covered) ·"),
             "a measured episode over half a window reports both: {partial}"
         );
 
@@ -4528,7 +4764,7 @@ mod tests {
         // takes the UNKNOWN branch and the share is never computed — which is why the division
         // above needs no zero guard, not because one is applied.
         let degenerate = census_line_over(0, 0, 0, 0.95, 0);
-        assert!(degenerate.ends_with("all-accounts-high (≥95%): —\n"));
+        assert!(degenerate.contains("all-accounts-high (≥95%): — ·"));
     }
 
     #[test]
@@ -4753,6 +4989,11 @@ mod tests {
             // reading — the wire's `all_high_covered_secs` is what says so (issue #804).
             all_high_covered_secs: 21_600,
             high_threshold: 0.95,
+            // The capacity-holds census is left at its unmeasurable default (issue #803), so
+            // these buckets pin the census cell's UNKNOWN branch. That is the honest reading for
+            // a hand-authored roster block: nothing here was measured against a viability
+            // boundary, so a hand-set hold count would assert a fact no input supports.
+            ..RosterStats::default()
         };
         let bucket = |start, end| UsageReport {
             period: Period::new(start, end),
@@ -5571,7 +5812,14 @@ mod tests {
         "all_high_episodes": 0,
         "all_high_secs": 0,
         "all_high_threshold": 0.95,
-        "all_high_covered_secs": 21600
+        "all_high_covered_secs": 21600,
+        "capacity_holds": 0,
+        "capacity_holds_session": 0,
+        "capacity_holds_weekly": 0,
+        "capacity_hold_secs_lower_bound": 0,
+        "capacity_hold_covered_secs": 0,
+        "capacity_session_line": 0.0,
+        "capacity_weekly_line": 0.0
       },
       "accounts": {
         "work": {
@@ -5609,7 +5857,14 @@ mod tests {
       "all_high_episodes": 0,
       "all_high_secs": 0,
       "all_high_threshold": 0.95,
-      "all_high_covered_secs": 21600
+      "all_high_covered_secs": 21600,
+      "capacity_holds": 0,
+      "capacity_holds_session": 0,
+      "capacity_holds_weekly": 0,
+      "capacity_hold_secs_lower_bound": 0,
+      "capacity_hold_covered_secs": 0,
+      "capacity_session_line": 0.0,
+      "capacity_weekly_line": 0.0
     },
     "accounts": {
       "work": {
@@ -6635,6 +6890,12 @@ mod tests {
                         // `0` so the UNKNOWN branch is goldened too (issue #804).
                         all_high_covered_secs: 86_400,
                         high_threshold: 0.95,
+                        // Capacity holds (issue #803) stay at the unmeasurable default for the
+                        // same reason the note above gives: this block is authored FOR THE
+                        // RENDER, so goldening a hand-set hold count would pin a fact no input
+                        // supports. What the goldens below pin is that the renderer prints the
+                        // census cell's UNKNOWN branch here.
+                        ..RosterStats::default()
                     },
                 },
                 series: vec![

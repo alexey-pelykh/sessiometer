@@ -81,10 +81,12 @@
 // See the "Not-yet-wired seam" note above: #158 wires the CLI caller.
 #![allow(dead_code)]
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
+use crate::swap::ViabilityBoundary;
 use crate::usage::epoch_from_rfc3339;
 use crate::usage_store::Sample;
 
@@ -183,18 +185,38 @@ pub(crate) struct AggregateParams {
     /// ts + stale_after_secs))`; a gap wider than this leaves genuinely unknown time.
     /// Defaults to `poll_interval_secs` in [`AggregateParams::new`].
     pub(crate) stale_after_secs: i64,
+    /// The daemon's viability boundary (issue #803), when the caller knows it — the pair of
+    /// lines at/above which an account cannot be swapped TO. Supplied by the caller from
+    /// [`crate::config`], exactly as the other knobs here are.
+    ///
+    /// `None` means the capacity-holds census is NOT TAKEN: without the daemon's own boundary
+    /// there is no honest predicate for it, and inventing one would report a fact about a daemon
+    /// that does not exist. The aggregate then yields zero jointly-covered seconds, which every
+    /// surface must read as UNKNOWN rather than as a calm `0 holds` (REQ-STA-B-010, refining
+    /// REQ-STA-B-008). It is deliberately NOT defaulted to a plausible-looking pair.
+    pub(crate) viability: Option<ViabilityBoundary>,
 }
 
 impl AggregateParams {
     /// Params with `stale_after_secs` defaulted to the poll cadence — a reading covers
-    /// exactly one nominal poll interval forward unless a newer reading supersedes it.
+    /// exactly one nominal poll interval forward unless a newer reading supersedes it — and
+    /// NO viability boundary (the capacity-holds census is not taken; chain
+    /// [`with_viability`](AggregateParams::with_viability) to take it).
     pub(crate) fn new(poll_interval_secs: i64, session_cap: f64, high_threshold: f64) -> Self {
         Self {
             poll_interval_secs,
             session_cap,
             high_threshold,
             stale_after_secs: poll_interval_secs,
+            viability: None,
         }
+    }
+
+    /// Supply the daemon's viability boundary, enabling the capacity-holds census. Mirrors
+    /// [`Sample::with_resets`]'s builder idiom.
+    pub(crate) fn with_viability(mut self, viability: ViabilityBoundary) -> Self {
+        self.viability = Some(viability);
+        self
     }
 }
 
@@ -282,6 +304,51 @@ pub(crate) struct RosterStats {
     /// episode — [`AggregateParams::high_threshold`], carried through so every surface can
     /// state the value it ACTUALLY used instead of hardcoding a literal (issue #804).
     pub(crate) high_threshold: f64,
+    /// Number of maximal CAPACITY HOLDS in the period (issue #803, REQ-STA-B-010): intervals
+    /// during which EVERY rostered account was simultaneously non-viable at the daemon's own
+    /// viability boundary, so swapping could not have restored capacity.
+    ///
+    /// A distinct fact from `all_high_episodes`, not a variant of it. That one is the
+    /// UTILISATION census ("was the roster running hot?"); this is the CAPACITY fact ("could the
+    /// daemon still swap?"). A roster can run hot for a week without ever cornering the daemon,
+    /// and — the case this metric exists for — it can corner the daemon while the census reads
+    /// calm. Do not merge or substitute the two.
+    ///
+    /// Read ONLY against `capacity_hold_covered_secs`, which is `0` when the census could not be
+    /// taken at all; the accompanying `0` is then UNKNOWN, never calm.
+    pub(crate) capacity_holds: u32,
+    /// The `capacity_holds` whose relief was gated by a SESSION window.
+    pub(crate) capacity_holds_session: u32,
+    /// The `capacity_holds` whose relief was gated by a WEEKLY window. Splits `capacity_holds`
+    /// exactly (`session + weekly == capacity_holds`) — this census names every hold one or the
+    /// other, in the daemon's own `cause=` vocabulary so the split reconciles against its
+    /// `all_exhausted` events (which are the ORACLE for these figures, never their source).
+    pub(crate) capacity_holds_weekly: u32,
+    /// Total held seconds — a LOWER BOUND, never an exact figure (REQ-STA-B-011), which is why
+    /// the name says so and why surfaces render it with a `≥`.
+    ///
+    /// Two independent reasons it can only bound the truth, both structural rather than
+    /// provisional: a coverage gap inside a hold truncates it (unknown time is never assumed
+    /// held), and a hold still running at the period's end is clipped to that end. The
+    /// closing instant is likewise ANCHORED to the blocking window's own carried reset rather
+    /// than observed — the account is known to stay blocked at least that long, not to un-block
+    /// exactly then.
+    pub(crate) capacity_hold_secs_lower_bound: i64,
+    /// Seconds during which EVERY account in the census set was SIMULTANEOUSLY covered under the
+    /// reset-anchored windows — the denominator the four figures above were measured over.
+    ///
+    /// `0` means the census was never taken or never measurable, so `capacity_holds: 0` is
+    /// UNKNOWN rather than calm. Surfaces MUST consult it and render their own gap sentinel,
+    /// exactly as REQ-STA-B-008 already requires of the utilisation census.
+    pub(crate) capacity_hold_covered_secs: i64,
+    /// The SESSION line an account had to be at/above to count as non-viable
+    /// ([`ViabilityBoundary::session`]), carried out so every surface states the value actually
+    /// used — the same lesson `high_threshold` encodes for the census (issue #804). Meaningful
+    /// only when `capacity_hold_covered_secs > 0`.
+    pub(crate) capacity_session_line: f64,
+    /// The WEEKLY line, likewise ([`ViabilityBoundary::weekly`]) — `0.97` at defaults, NOT the
+    /// raw `0.98` ceiling. Meaningful only when `capacity_hold_covered_secs > 0`.
+    pub(crate) capacity_weekly_line: f64,
 }
 
 /// The full aggregation result for one period.
@@ -475,6 +542,7 @@ pub(crate) fn aggregate_with_roster(
 
     let (all_high_episodes, all_high_secs, all_high_covered_secs) =
         all_high(&by_acct, roster, period, params);
+    let holds = capacity_holds(&by_acct, roster, period, params);
     let roster = RosterStats {
         // Excludes #452 preemptive swaps (`SwapKind::Preempt`) so the count stays the SUM of the
         // itemized `swap_breakdown` reasons (which likewise omits them — see there). Preemptive
@@ -489,6 +557,13 @@ pub(crate) fn aggregate_with_roster(
         all_high_secs,
         all_high_covered_secs,
         high_threshold: params.high_threshold,
+        capacity_holds: holds.count,
+        capacity_holds_session: holds.session,
+        capacity_holds_weekly: holds.weekly,
+        capacity_hold_secs_lower_bound: holds.secs,
+        capacity_hold_covered_secs: holds.covered_secs,
+        capacity_session_line: params.viability.map_or(0.0, |b| b.session),
+        capacity_weekly_line: params.viability.map_or(0.0, |b| b.weekly),
     };
 
     UsageReport {
@@ -654,6 +729,286 @@ fn all_high(
         episodes.iter().map(|(lo, hi)| hi - lo).sum(),
         covered.iter().map(|(lo, hi)| hi - lo).sum(),
     )
+}
+
+/// Which window's reset gates a hold's relief — the daemon's own `cause=` vocabulary, so a
+/// reported split is directly reconcilable against its `all_exhausted` event stream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HoldCause {
+    /// Relief waits on a SESSION window reopening.
+    Session,
+    /// Relief waits on a WEEKLY window reopening.
+    Weekly,
+}
+
+/// A cause-tagged half-open interval `[lo, hi)`: a span during which the relevant account (or,
+/// after intersection, the whole roster) was non-viable, plus the dimension gating its end.
+type HoldSpan = (i64, i64, HoldCause);
+
+/// The capacity-holds census over one period — see [`RosterStats::capacity_holds`] for what each
+/// figure means and the UNKNOWN contract `covered_secs == 0` carries.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct CapacityHoldCensus {
+    count: u32,
+    session: u32,
+    weekly: u32,
+    secs: i64,
+    covered_secs: i64,
+}
+
+/// Count + cause split + bounded duration of the intervals during which EVERY account in the
+/// census set was simultaneously NON-VIABLE at the daemon's own viability boundary — the capacity
+/// fact "could the daemon still swap?" (issue #803, REQ-STA-B-010).
+///
+/// Structurally the sibling of [`all_high`], and deliberately a SEPARATE function measuring a
+/// SEPARATE fact rather than a parameterisation of it: that one asks whether the roster was
+/// running hot, this one whether the daemon still had anywhere to land. They answer differently on
+/// the same week, which is the whole reason both exist.
+///
+/// # Why the validity window is RESET-anchored, not cadence-anchored
+///
+/// This is the part that makes the metric measurable at all. A blocked account is polled at
+/// `exhausted_poll_secs` (3600 s at defaults) against a `poll_secs` (300 s) staleness horizon, so a
+/// window that expired after one nominal cadence would go blind EXACTLY while the condition it is
+/// meant to detect holds — detector sensitivity inversely coupled to the thing detected. Measured
+/// on the live corpus, a cadence-anchored predicate swings 0 → 84 episodes as `stale_after` moves
+/// between those two values, which is a reading of the poll schedule, not of the fleet.
+///
+/// A blocked reading sidesteps this because it already STATES its own expiry: the
+/// `session_resets_at` / `weekly_resets_at` the poll recorded. So a blocked reading covers
+/// `[ts, min(next_ts, max(ts + stale_after, blocking_dimension_reset)))` — it is counted as blocked
+/// on the account's own last assertion of when its block ends, never by assumption. Over the live
+/// 7 d corpus, 2036 / 2036 blocked→next transitions honoured that carried reset and none un-blocked
+/// early. A blocked reading carrying NO usable expiry falls back to the cadence horizon and the
+/// time beyond it stays UNKNOWN — this REFINES REQ-STA-B-008's UNKNOWN (from "no sample" to "no
+/// sample AND no carried expiry"), it does not repeal it.
+///
+/// # Why the event log is the ORACLE and not the source
+///
+/// The daemon emits `all_exhausted` on ENTERING this state, but re-arms that guard on any
+/// non-`NoViableTarget` tick, so its ENTERs over-count episodes (95 ENTERs over one measured week
+/// against ~7 true holds). The events reconcile this figure; they cannot produce it.
+///
+/// # What this census does NOT see — stated, not papered over
+///
+/// Three known gaps, all in the direction of UNDER-reporting the daemon's own experience:
+///
+/// - `enabled` / quarantine state is invisible here (it is not in the sample stream), so a PARKED
+///   account — which the daemon excludes from viability outright — still has to be independently
+///   blocked before it can contribute to a hold. Closing this fully needs the store to carry
+///   roster state, a separate and larger change.
+/// - The census intersects over the whole CONFIGURED roster, which includes the ACTIVE account;
+///   the daemon's own target scan excludes it (it is looking for somewhere to swap TO). A daemon
+///   cornered while its active account still reads viable is therefore not counted here.
+/// - The COUNT, not only the duration, is affected by coverage: a gap INSIDE a real hold splits it
+///   into two, so an under-covered window can report more, shorter holds. The duration stays a
+///   lower bound throughout (the split loses the gap's seconds), but the count is not a bound in
+///   either direction — read it against `covered_secs`, which is what says how much was seen.
+fn capacity_holds(
+    by_acct: &BTreeMap<&str, Vec<&Sample>>,
+    roster: Option<&BTreeSet<String>>,
+    period: Period,
+    params: &AggregateParams,
+) -> CapacityHoldCensus {
+    // No boundary supplied ⇒ the census is not taken at all. Zero covered seconds says so, and
+    // every surface must render UNKNOWN rather than the calm `0 holds` that zero would otherwise
+    // read as.
+    let Some(boundary) = params.viability else {
+        return CapacityHoldCensus::default();
+    };
+    let census: Vec<&str> = match roster {
+        Some(r) => r.iter().map(String::as_str).collect(),
+        None => by_acct.keys().copied().collect(),
+    };
+    if census.is_empty() {
+        return CapacityHoldCensus::default();
+    }
+
+    let mut hold_acc: Option<Vec<HoldSpan>> = None;
+    let mut cov_acc: Option<Vec<(i64, i64)>> = None;
+    for handle in census {
+        // A rostered account absent from the period's samples covers NOTHING — it stays in the
+        // intersection and empties it, rather than silently leaving and letting the remaining
+        // accounts corner a daemon that in fact had this one to land on.
+        let group: &[&Sample] = by_acct.get(handle).map_or(&[], Vec::as_slice);
+        let (blocked, covering) = blocked_windows(group, period, params.stale_after_secs, boundary);
+
+        hold_acc = Some(match hold_acc {
+            None => blocked,
+            Some(prev) => intersect_tagged(&prev, &blocked),
+        });
+        cov_acc = Some(match cov_acc {
+            None => covering,
+            Some(prev) => intersect(&prev, &covering),
+        });
+        // Same short-circuit (and same deliberate restraint) as [`all_high`]: `blocked ⊆ covering`
+        // per account by construction, so an emptied COVERING intersection has already emptied the
+        // hold one. `hold_acc` is NOT force-emptied here — doing so would pre-satisfy the very ⊆
+        // invariant `prop_capacity_hold_time_never_exceeds_the_jointly_covered_time` exists to
+        // gate, repairing a broken relation instead of failing on it.
+        if cov_acc.as_ref().is_some_and(Vec::is_empty) {
+            break;
+        }
+    }
+
+    let episodes = hold_acc.unwrap_or_default();
+    let covered = cov_acc.unwrap_or_default();
+    CapacityHoldCensus {
+        count: episodes.len() as u32,
+        session: cause_count(&episodes, HoldCause::Session),
+        weekly: cause_count(&episodes, HoldCause::Weekly),
+        secs: episodes.iter().map(|(lo, hi, _)| hi - lo).sum(),
+        covered_secs: covered.iter().map(|(lo, hi)| hi - lo).sum(),
+    }
+}
+
+/// How many episodes carry `cause`.
+fn cause_count(episodes: &[HoldSpan], cause: HoldCause) -> u32 {
+    episodes.iter().filter(|&&(.., c)| c == cause).count() as u32
+}
+
+/// One account's RESET-ANCHORED blocked windows (each tagged with the dimension gating its end)
+/// and its covering windows, both merged into sorted disjoint lists.
+///
+/// A reading covers `[ts, min(next_ts, max(ts + stale_after, relief)))`, clamped into the period
+/// exactly as [`validity_windows`] clamps its own, where `relief` is the reading's own carried
+/// expiry for whichever dimensions block it (see [`relief_of`]); an unblocked reading, or a
+/// blocked one whose gating reset is unknown, has no `relief` and keeps the plain cadence horizon
+/// [`validity_windows`] uses. The period clamp is why a hold still running at the period's end is
+/// reported clipped to that end rather than out to its reset.
+///
+/// The covering list extends over the SAME anchored windows, because "blocked until its stated
+/// reset" is knowledge about the account's state over that span, not a gap in it. That also makes
+/// `blocked ⊆ covering` true by construction, which the census's short-circuit relies on.
+fn blocked_windows(
+    group: &[&Sample],
+    period: Period,
+    stale_after: i64,
+    boundary: ViabilityBoundary,
+) -> (Vec<HoldSpan>, Vec<(i64, i64)>) {
+    let mut blocked: Vec<HoldSpan> = Vec::new();
+    let mut covering: Vec<(i64, i64)> = Vec::with_capacity(group.len());
+    for (i, s) in group.iter().enumerate() {
+        let session_blocked = boundary.session_blocked(s.session);
+        let weekly_blocked = boundary.weekly_blocked(s.weekly);
+        let relief = relief_of(s, session_blocked, weekly_blocked);
+
+        let next = group.get(i + 1).map_or(period.end, |n| n.ts);
+        let cadence_hi = s.ts + stale_after.max(0);
+        let anchored_hi = relief.map_or(cadence_hi, |(at, _)| cadence_hi.max(at));
+        let hi = next.min(anchored_hi).min(period.end).max(s.ts);
+
+        covering.push((s.ts, hi));
+        if session_blocked || weekly_blocked {
+            // With no usable expiry the window is cadence-bounded, but the hold still has a
+            // gating dimension to name — the same weekly-preferring default the daemon's own
+            // classification falls back to when a blocked spare reports no reset.
+            let cause = relief.map_or_else(
+                || {
+                    if weekly_blocked {
+                        HoldCause::Weekly
+                    } else {
+                        HoldCause::Session
+                    }
+                },
+                |(_, c)| c,
+            );
+            blocked.push((s.ts, hi, cause));
+        }
+    }
+    (merge_tagged(blocked), merge_intervals(covering))
+}
+
+/// When a blocked reading's own carried expiry says capacity returns, and which dimension gates
+/// it — the per-account inner half of the daemon's relief rule, over a stored [`Sample`] rather
+/// than a live reading.
+///
+/// Deliberately mirrors `crate::daemon`'s `spare_relief` exactly, including both of its judgements:
+/// an account blocked on BOTH dimensions returns only once the LATER window clears (so the reset
+/// is a `max`, not a `min`), and an exact tie names WEEKLY — the scarcer window. A reading missing
+/// the reset for ANY dimension that blocks it yields `None`: its return time is genuinely unknown,
+/// and guessing it is what reset-anchoring exists to avoid.
+fn relief_of(s: &Sample, session_blocked: bool, weekly_blocked: bool) -> Option<(i64, HoldCause)> {
+    let session = if session_blocked {
+        Some((s.session_resets_at?, HoldCause::Session))
+    } else {
+        None
+    };
+    let weekly = if weekly_blocked {
+        Some((s.weekly_resets_at?, HoldCause::Weekly))
+    } else {
+        None
+    };
+    match (session, weekly) {
+        (Some(s), Some(w)) => Some(if w.0 >= s.0 { w } else { s }),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
+    }
+}
+
+/// The cause to carry when two tagged intervals end at the SAME instant, so neither one's cause
+/// wins on its own — WEEKLY when either says so, the same tie rule [`relief_of`] and the daemon's
+/// classification apply. Not a rare branch: every hold still running at the period's end has each
+/// account's span clipped to that same instant, so an ongoing hold ties by construction.
+fn tie_cause(a: HoldCause, b: HoldCause) -> HoldCause {
+    if a == HoldCause::Weekly || b == HoldCause::Weekly {
+        HoldCause::Weekly
+    } else {
+        HoldCause::Session
+    }
+}
+
+/// [`merge_intervals`] for cause-tagged intervals: the merged span keeps the cause of whichever
+/// window ends LAST, since that is the one whose reset the merged hold is waiting on.
+fn merge_tagged(mut ivs: Vec<HoldSpan>) -> Vec<HoldSpan> {
+    ivs.retain(|(lo, hi, _)| hi > lo);
+    ivs.sort_by_key(|(lo, _, _)| *lo);
+    let mut out: Vec<HoldSpan> = Vec::with_capacity(ivs.len());
+    for (lo, hi, cause) in ivs {
+        match out.last_mut() {
+            Some(last) if lo <= last.1 => match hi.cmp(&last.1) {
+                Ordering::Greater => {
+                    last.1 = hi;
+                    last.2 = cause;
+                }
+                Ordering::Equal => last.2 = tie_cause(last.2, cause),
+                Ordering::Less => {}
+            },
+            _ => out.push((lo, hi, cause)),
+        }
+    }
+    out
+}
+
+/// [`intersect`] for cause-tagged intervals: the overlap keeps the cause of whichever side ends
+/// FIRST, because that is the account whose relief ends the joint hold — the outer `min` of the
+/// daemon's relief rule, expressed over intervals.
+///
+/// The output needs no re-merge: both inputs are merged (so each has a real gap between
+/// consecutive intervals), and an overlap can only end where one input's interval ends, so two
+/// outputs can never abut.
+fn intersect_tagged(a: &[HoldSpan], b: &[HoldSpan]) -> Vec<HoldSpan> {
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        let lo = a[i].0.max(b[j].0);
+        let hi = a[i].1.min(b[j].1);
+        if lo < hi {
+            let cause = match a[i].1.cmp(&b[j].1) {
+                Ordering::Less => a[i].2,
+                Ordering::Greater => b[j].2,
+                Ordering::Equal => tie_cause(a[i].2, b[j].2),
+            };
+            out.push((lo, hi, cause));
+        }
+        // Advance the interval that ends first; the other may still overlap the next.
+        if a[i].1 <= b[j].1 {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    out
 }
 
 /// The forward-coverage window of each sample in the sorted `group`, clamped into the
@@ -1623,6 +1978,390 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
         assert!(
             covered_positive_iters > 0,
             "every iteration was unmeasurable — a `return (0, 0, 0)` stub would pass 300/300"
+        );
+    }
+
+    // --- #803 capacity holds ---------------------------------------------------
+
+    /// The shipping-default viability boundary: session 0.80 (the #398 reserve binding below the
+    /// #597 ceiling 0.95), weekly 0.97 (the #607 effective ceiling below the raw 0.98).
+    fn boundary() -> ViabilityBoundary {
+        crate::swap::viability_boundary(0.95, 0.80, 0.98)
+    }
+
+    /// [`params`] with the capacity-holds census enabled at the default boundary.
+    fn hold_params() -> AggregateParams {
+        params().with_viability(boundary())
+    }
+
+    /// A reading carrying both window resets — what every real poll records.
+    fn dated(
+        ts: i64,
+        acct: &str,
+        session: f64,
+        weekly: f64,
+        session_reset: i64,
+        weekly_reset: i64,
+    ) -> Sample {
+        Sample::new(ts, "claude", acct, session, weekly)
+            .with_resets(Some(session_reset), Some(weekly_reset))
+    }
+
+    #[test]
+    fn capacity_holds_are_not_taken_without_a_viability_boundary() {
+        // Without the daemon's own boundary there is no honest predicate, so the census is not
+        // taken — and it says so with zero covered seconds rather than reporting a calm `0 holds`
+        // that a reader cannot tell from a genuinely uncornered week.
+        let samples = vec![dated(0, "a", 0.99, 0.99, 9_000, 9_000)];
+        let report = aggregate_with_roster(
+            &samples,
+            &[],
+            Period::new(0, 10_000),
+            &params(), // no `.with_viability(..)`
+            Some(&roster(&["a"])),
+        );
+        assert_eq!(report.roster.capacity_hold_covered_secs, 0, "UNKNOWN");
+        assert_eq!(report.roster.capacity_holds, 0);
+    }
+
+    #[test]
+    fn a_blocked_reading_is_held_to_its_carried_reset_not_to_the_poll_cadence() {
+        // The load-bearing behaviour (REQ-STA-B-010). One account, blocked, polled ONCE and then
+        // not again for hours — exactly what `exhausted_poll_secs` (3600) does to a cornered
+        // account against a 300 s staleness horizon. A cadence-anchored window would expire after
+        // 300 s and report a 5-minute hold; the reading's OWN carried expiry says it stays blocked
+        // until 7200.
+        let period = Period::new(0, 10_000);
+        let samples = vec![dated(0, "a", 0.85, 0.10, 7_200, 999_999)];
+        let report =
+            aggregate_with_roster(&samples, &[], period, &hold_params(), Some(&roster(&["a"])));
+        let r = &report.roster;
+        assert_eq!(r.capacity_holds, 1);
+        assert_eq!(
+            r.capacity_hold_secs_lower_bound, 7_200,
+            "the hold runs to the carried session reset, not to ts + stale_after (300)"
+        );
+        assert_eq!(r.capacity_holds_session, 1, "session gated the relief");
+        assert_eq!(r.capacity_holds_weekly, 0);
+    }
+
+    #[test]
+    fn capacity_holds_are_insensitive_to_the_staleness_horizon() {
+        // The signature property that separates a reset-anchored implementation from a
+        // cadence-anchored one, and the falsifier for the whole approach: moving `stale_after`
+        // between the two real cadences (poll_secs 300 and exhausted_poll_secs 3600) must not move
+        // the answer, because a blocked reading's validity comes from its own carried expiry. On
+        // the live corpus the reset-anchored figure held at 7 episodes across both while a
+        // cadence-anchored one swung 0 → 84 — a reading of the poll schedule, not of the fleet.
+        let period = Period::new(0, 40_000);
+        let samples = vec![
+            dated(0, "a", 0.85, 0.10, 20_000, 999_999),
+            dated(0, "b", 0.10, 0.98, 999_999, 20_000),
+            // Both return at 20_000 and the fleet is viable again from there.
+            dated(20_000, "a", 0.10, 0.10, 999_999, 999_999),
+            dated(20_000, "b", 0.10, 0.10, 999_999, 999_999),
+        ];
+        let at = |stale: i64| {
+            let mut p = hold_params();
+            p.stale_after_secs = stale;
+            let report =
+                aggregate_with_roster(&samples, &[], period, &p, Some(&roster(&["a", "b"])));
+            (
+                report.roster.capacity_holds,
+                report.roster.capacity_hold_secs_lower_bound,
+            )
+        };
+        assert_eq!(at(300), (1, 20_000));
+        assert_eq!(
+            at(300),
+            at(3_600),
+            "a stale_after-SENSITIVE answer is cadence-anchored, and so is wrong"
+        );
+    }
+
+    #[test]
+    fn the_weekly_line_is_the_effective_ceiling_not_the_raw_one() {
+        // The undercount this metric was specified to avoid: an account resting at exactly 0.97 is
+        // blocked FOR THE DAEMON (whose weekly line is `0.98 − WEEKLY_TAIL_MARGIN`) while a
+        // predicate written against the raw 0.98 sees it as viable. One live roster account sat at
+        // exactly 0.97 across both peak days, so this is the difference between measuring the drain
+        // and missing it.
+        let period = Period::new(0, 10_000);
+        let samples = vec![dated(0, "a", 0.10, 0.97, 999_999, 8_000)];
+        let report =
+            aggregate_with_roster(&samples, &[], period, &hold_params(), Some(&roster(&["a"])));
+        assert_eq!(
+            report.roster.capacity_holds, 1,
+            "0.97 blocks at the 0.97 line"
+        );
+        assert_eq!(report.roster.capacity_holds_weekly, 1);
+        // Sanity in the other direction: the boundary itself says the raw ceiling is not the line.
+        assert!(boundary().weekly < 0.98);
+    }
+
+    #[test]
+    fn a_hold_needs_every_rostered_account_blocked_at_once() {
+        // The capacity question is about the FLEET: one viable spare means the daemon could still
+        // swap, so there is no hold however hot the others are. This is what makes the metric a
+        // capacity fact rather than a utilisation one.
+        let period = Period::new(0, 10_000);
+        let samples = vec![
+            dated(0, "a", 0.99, 0.99, 8_000, 8_000),
+            dated(0, "b", 0.99, 0.99, 8_000, 8_000),
+            dated(0, "c", 0.10, 0.10, 999_999, 999_999), // somewhere to land
+        ];
+        let report = aggregate_with_roster(
+            &samples,
+            &[],
+            period,
+            &hold_params(),
+            Some(&roster(&["a", "b", "c"])),
+        );
+        assert_eq!(report.roster.capacity_holds, 0, "c was viable throughout");
+        assert!(
+            report.roster.capacity_hold_covered_secs > 0,
+            "measured, and it genuinely did not happen — NOT unmeasurable"
+        );
+    }
+
+    #[test]
+    fn a_rostered_account_with_no_samples_makes_the_census_unmeasurable() {
+        // A rostered account that contributed nothing cannot silently leave the intersection and
+        // let the remaining accounts corner a daemon that in fact had this one to land on. The
+        // honest answer is UNKNOWN, which zero covered seconds says.
+        let period = Period::new(0, 10_000);
+        let samples = vec![dated(0, "a", 0.99, 0.99, 8_000, 8_000)];
+        let report = aggregate_with_roster(
+            &samples,
+            &[],
+            period,
+            &hold_params(),
+            Some(&roster(&["a", "absent"])),
+        );
+        assert_eq!(report.roster.capacity_hold_covered_secs, 0, "UNKNOWN");
+    }
+
+    #[test]
+    fn a_blocked_reading_without_a_carried_expiry_falls_back_to_the_cadence_horizon() {
+        // REQ-STA-B-010 refines REQ-STA-B-008's UNKNOWN rather than repealing it: an instant is
+        // counted as held on the account's own last assertion of when its block ends, never by
+        // assumption. With no assertion to lean on, the window is the plain cadence horizon and
+        // everything past it stays unknown.
+        let period = Period::new(0, 10_000);
+        let samples = vec![Sample::new(0, "claude", "a", 0.85, 0.10)]; // no resets carried
+        let report =
+            aggregate_with_roster(&samples, &[], period, &hold_params(), Some(&roster(&["a"])));
+        assert_eq!(
+            report.roster.capacity_hold_secs_lower_bound, 300,
+            "one staleness horizon, not an invented extension"
+        );
+    }
+
+    #[test]
+    fn a_hold_blocked_on_both_dimensions_waits_for_the_later_window() {
+        // Mirrors the daemon's own relief rule (`spare_relief`): an account blocked on BOTH
+        // dimensions returns only once the LATER window clears, and the cause names THAT window —
+        // because a window's LENGTH is not its time REMAINING (issue #665).
+        let period = Period::new(0, 40_000);
+        let samples = vec![dated(0, "a", 0.85, 0.98, 5_000, 30_000)];
+        let report =
+            aggregate_with_roster(&samples, &[], period, &hold_params(), Some(&roster(&["a"])));
+        let r = &report.roster;
+        assert_eq!(r.capacity_hold_secs_lower_bound, 30_000, "the LATER reset");
+        assert_eq!(r.capacity_holds_weekly, 1, "named by the gating window");
+        assert_eq!(r.capacity_holds_session, 0);
+    }
+
+    #[test]
+    fn the_cause_split_partitions_the_holds_exactly() {
+        // Two separated holds gated by different windows: the split is a partition, never an
+        // overlapping tally, so a surface can print `N (a session / b weekly)` without the parts
+        // contradicting the whole.
+        let period = Period::new(0, 100_000);
+        let samples = vec![
+            dated(0, "a", 0.85, 0.10, 10_000, 999_999), // session-gated hold
+            dated(10_000, "a", 0.10, 0.10, 999_999, 999_999), // relief
+            dated(50_000, "a", 0.10, 0.98, 999_999, 60_000), // weekly-gated hold
+            dated(60_000, "a", 0.10, 0.10, 999_999, 999_999), // relief
+        ];
+        let report =
+            aggregate_with_roster(&samples, &[], period, &hold_params(), Some(&roster(&["a"])));
+        let r = &report.roster;
+        assert_eq!(r.capacity_holds, 2);
+        assert_eq!(r.capacity_holds_session, 1);
+        assert_eq!(r.capacity_holds_weekly, 1);
+        assert_eq!(
+            r.capacity_holds_session + r.capacity_holds_weekly,
+            r.capacity_holds,
+            "the cause split must partition the count"
+        );
+    }
+
+    #[test]
+    fn a_joint_hold_whose_accounts_end_together_is_named_by_the_weekly_window() {
+        // The tie rule, whose VERDICT nothing else asserts — only that a tie is reached. And it
+        // is not an edge case: every hold still RUNNING at the period's end has each account's
+        // span clipped to that same instant, so an ongoing hold ties by construction and
+        // something must break it. It breaks WEEKLY — the scarcer window, the same tie
+        // `spare_relief` takes in the daemon.
+        //
+        // Both accounts here reset well past the period, so neither one's relief ends the joint
+        // hold first: `a` is session-blocked, `b` weekly-blocked, and the answer must not depend
+        // on which of the two the roster happens to intersect first.
+        let period = Period::new(0, 10_000);
+        let samples = vec![
+            dated(0, "a", 0.85, 0.10, 999_999, 999_999),
+            dated(0, "b", 0.10, 0.98, 999_999, 999_999),
+        ];
+        let report = aggregate_with_roster(
+            &samples,
+            &[],
+            period,
+            &hold_params(),
+            Some(&roster(&["a", "b"])),
+        );
+        let r = &report.roster;
+        assert_eq!(r.capacity_holds, 1);
+        assert_eq!(
+            r.capacity_hold_secs_lower_bound, 10_000,
+            "clipped to the end"
+        );
+        assert_eq!(r.capacity_holds_weekly, 1, "a tie names the scarcer window");
+        assert_eq!(r.capacity_holds_session, 0);
+    }
+
+    #[test]
+    fn the_carried_boundary_lines_are_the_ones_actually_measured() {
+        // Carried out for the same reason #804 carries `high_threshold`: every surface states the
+        // value it ACTUALLY used instead of hardcoding a literal that can drift from the config.
+        let report = aggregate_with_roster(
+            &[dated(0, "a", 0.10, 0.10, 9_000, 9_000)],
+            &[],
+            Period::new(0, 10_000),
+            &hold_params(),
+            Some(&roster(&["a"])),
+        );
+        assert!((report.roster.capacity_session_line - 0.80).abs() < 1e-9);
+        assert!((report.roster.capacity_weekly_line - 0.97).abs() < 1e-9);
+    }
+
+    #[test]
+    fn prop_reset_anchoring_never_unblocks_a_reading_before_its_carried_expiry() {
+        // The anchor-fidelity invariant, encoded so a provider-side change in reset semantics
+        // fails LOUDLY rather than silently shortening every hold. Measured over the live 7 d
+        // corpus at 2036/2036 blocked→next transitions honouring their carried reset, with none
+        // un-blocking early; this pins the property the measurement observed.
+        //
+        // Stated over a single account, where the roster intersection is the identity, so the
+        // assertion is about anchoring alone and not about interval algebra.
+        let mut rng = Lcg::new(0x803_2026);
+        let mut blocked_iters = 0_u32;
+        let mut extended_beyond_cadence_iters = 0_u32;
+        for _ in 0..300 {
+            let period = Period::new(0, 200_000);
+            let ts = rng.below(50_000) as i64;
+            // A reset strictly after the cadence horizon is where anchoring can be observed at all.
+            let reset = ts + 301 + rng.below(100_000) as i64;
+            let session = rng.frac();
+            let weekly = rng.frac();
+            let samples = vec![dated(ts, "a", session, weekly, reset, reset)];
+            let report =
+                aggregate_with_roster(&samples, &[], period, &hold_params(), Some(&roster(&["a"])));
+            let held = report.roster.capacity_hold_secs_lower_bound;
+            let b = boundary();
+            if b.session_blocked(session) || b.weekly_blocked(weekly) {
+                blocked_iters += 1;
+                let expected = (reset.min(period.end) - ts).max(0);
+                assert_eq!(
+                    held, expected,
+                    "a blocked reading must stay held to its carried expiry (ts={ts}, \
+                     reset={reset}, session={session}, weekly={weekly})"
+                );
+                if expected > 300 {
+                    extended_beyond_cadence_iters += 1;
+                }
+            } else {
+                assert_eq!(held, 0, "an unblocked reading holds nothing");
+            }
+        }
+        // Positive witnesses: without them a corpus that never blocks — or one whose every reset
+        // lands inside the cadence horizon — would pass while proving nothing about anchoring.
+        assert!(
+            blocked_iters > 0,
+            "no iteration produced a blocked reading (expect ~60) — the anchoring arm is never \
+             exercised"
+        );
+        assert!(
+            extended_beyond_cadence_iters > 0,
+            "no hold ever ran past the 300 s cadence horizon — a cadence-anchored implementation \
+             would pass this test unchanged"
+        );
+    }
+
+    #[test]
+    fn prop_capacity_hold_time_never_exceeds_the_jointly_covered_time() {
+        // The invariant the UNKNOWN render rests on, the capacity-side twin of
+        // `prop_all_high_time_never_exceeds_the_jointly_covered_time`: holds are a SUBSET of the
+        // jointly-covered time, so `covered == 0` implies `holds == 0`. Were it violable, `—`
+        // would be printed over a real hold — an UNKNOWN hiding the very fact the readout exists
+        // to surface.
+        let mut rng = Lcg::new(0x803_0804);
+        let accounts = ["work", "play", "spare"];
+        let mut covered_zero_iters = 0_u32;
+        let mut nonzero_hold_iters = 0_u32;
+        for _ in 0..300 {
+            let period = Period::new(0, 50_000);
+            let n = 1 + rng.below(40);
+            let samples: Vec<Sample> = (0..n)
+                .map(|_| {
+                    let acct = accounts[rng.below(3) as usize];
+                    let ts = rng.below(50_000) as i64;
+                    // Blocked readings are over-represented on purpose: a uniformly random corpus
+                    // almost never corners a three-account fleet, so the hold arm would be vacuous.
+                    dated(
+                        ts,
+                        acct,
+                        0.70 + rng.frac() * 0.35,
+                        0.90 + rng.frac() * 0.12,
+                        ts + rng.below(20_000) as i64,
+                        ts + rng.below(20_000) as i64,
+                    )
+                })
+                .collect();
+            let set: BTreeSet<String> = accounts.iter().map(|a| (*a).to_owned()).collect();
+            let report = aggregate_with_roster(&samples, &[], period, &hold_params(), Some(&set));
+            let r = &report.roster;
+            assert!(
+                r.capacity_hold_secs_lower_bound <= r.capacity_hold_covered_secs,
+                "held time {} exceeded jointly-covered time {}",
+                r.capacity_hold_secs_lower_bound,
+                r.capacity_hold_covered_secs
+            );
+            assert!(
+                r.capacity_hold_covered_secs >= 0
+                    && r.capacity_hold_covered_secs <= period.duration(),
+                "jointly-covered time is within [0, period]"
+            );
+            assert_eq!(
+                r.capacity_holds_session + r.capacity_holds_weekly,
+                r.capacity_holds,
+                "the cause split must partition the count on every corpus"
+            );
+            if r.capacity_hold_covered_secs == 0 {
+                covered_zero_iters += 1;
+                assert_eq!(r.capacity_holds, 0, "no covered second can hold a hold");
+            }
+            if r.capacity_hold_secs_lower_bound > 0 {
+                nonzero_hold_iters += 1;
+            }
+        }
+        assert!(
+            covered_zero_iters > 0,
+            "no iteration was unmeasurable — the `covered == 0 ⇒ holds == 0` arm is never exercised"
+        );
+        assert!(
+            nonzero_hold_iters > 0,
+            "no iteration produced a hold — a zero stub would pass 300/300"
         );
     }
 
