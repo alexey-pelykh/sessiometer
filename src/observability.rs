@@ -754,11 +754,25 @@ pub(crate) enum Event {
     /// [`Self::UsageBackoffCleared`] / [`Self::ExhaustedSlowPollCleared`].
     ///
     /// Durable since issue #800 (REQ-STA-B-011): previously a stderr-bound
-    /// `Diagnostic::AllExhaustedCleared`, so the bracket closed in CODE but not in the LOG —
-    /// measured 2026-07-28, 155 `event=all_exhausted` lines against 0 `diag=` lines of any kind,
-    /// a `run -v` daemon's fd 2 being a TTY. A hold's END was therefore not reconstructable
-    /// offline, and the tightest bound the durable log alone allowed (`min(next ENTER, next
-    /// swap) − ENTER`) overstated duration ~25×.
+    /// `Diagnostic::AllExhaustedCleared`, so the bracket closed in CODE but not in the LOG.
+    /// Issue #775 later made the diagnostic channel *reachable* for a background daemon
+    /// (`[tunables] verbose` honored under `--managed`, plus `sessiometer log --channel diag`),
+    /// which is why the promotion no longer rests on reachability — it rests on being always-on
+    /// and on GOVERNANCE. Diagnostics are opt-in and default OFF (the reader defaults to the event
+    /// channel), so on a default install the LEAVE edge is simply absent; and `daemon.err.log` is
+    /// an ungoverned channel that can carry panic payloads which passed no redaction meter,
+    /// whereas every field of this log is a handle, enum, number or timestamp by type-level
+    /// construction and passes the issue #15 meter. A LEAVE marker whose ENTER partner is a
+    /// durable, governed event belongs on the same sink as it. This variant is the family's
+    /// canonical statement of that argument: [`Self::ActiveDeadNoTargetCleared`] and
+    /// [`Self::FleetRunwayRecovered`] were promoted for the same reason and point here.
+    ///
+    /// What the original defect looked like, measured when issue #800 was filed: 2026-07-28, 155
+    /// `event=all_exhausted` lines against 0 `diag=` lines of any kind, a `run -v` daemon's fd 2
+    /// being a TTY. A hold's END was therefore not reconstructable offline, and the tightest bound
+    /// the durable log alone allowed (`min(next ENTER, next swap) − ENTER`) overstated duration
+    /// ~25×. That measurement is the empirical record of why the bracket was unreconstructable —
+    /// history, not the standing justification.
     ///
     /// NOT sufficient on its own to recover true episode counts, and a consumer MUST NOT assume
     /// every post-#800 ENTER has a matching END. Three distinct sources of an unclosed or
@@ -807,16 +821,10 @@ pub(crate) enum Event {
     /// EXIT partner of [`Self::ActiveDeadNoTarget`]'s ENTER, so the strand's SPAN is bracketed in
     /// the DURABLE log — the sibling idiom of [`Self::AllExhaustedCleared`].
     ///
-    /// Durable since issue #827: previously a stderr-bound `Diagnostic::ActiveDeadNoTargetCleared`,
-    /// so the bracket closed in CODE but not in the LOG. Issue #775 later made the diagnostic
-    /// channel *reachable* for a background daemon (`[tunables] verbose` plus
-    /// `sessiometer log --channel diag`), which is why the promotion no longer rests on
-    /// reachability — it rests on GOVERNANCE and on being always-on. Diagnostics are opt-in and
-    /// default OFF (the reader defaults to the event channel), so on a default install the LEAVE
-    /// edge was simply absent; and `daemon.err.log` is an ungoverned channel that can carry panic
-    /// payloads which passed no redaction meter, whereas every field of this log is a handle, enum,
-    /// number or timestamp by type-level construction and passes the issue #15 meter. A LEAVE
-    /// marker whose ENTER partner is a durable, governed event belongs on the same sink as it.
+    /// Durable since issue #827, for the same reason as [`Self::AllExhaustedCleared`]: the
+    /// diagnostic channel is opt-in, default OFF, and ungoverned, while this log is always-on and
+    /// passes the issue #15 redaction meter by type-level construction. See that variant for the
+    /// full governance argument.
     ///
     /// A consumer MUST NOT assume every ENTER has a matching END, nor that ENTER edges count
     /// episodes. Three sources of an unclosed or duplicated bracket survive this change, mirroring
@@ -861,13 +869,13 @@ pub(crate) enum Event {
     /// episode's SPAN is bracketed in the DURABLE log — the sibling idiom of
     /// [`Self::AllExhaustedCleared`].
     ///
-    /// Durable since issue #827, for the same reason as [`Self::ActiveDeadNoTargetCleared`]: the
+    /// Durable since issue #827, for the same reason as [`Self::AllExhaustedCleared`]: the
     /// diagnostic channel is opt-in, default OFF, and ungoverned, while this log is always-on and
     /// passes the issue #15 redaction meter by type-level construction. See that variant for the
     /// full governance argument.
     ///
-    /// Its bracket caveats apply here too, with one difference in the first. A consumer MUST NOT
-    /// assume every ENTER has a matching END, nor that ENTER edges count episodes:
+    /// Its bracket caveats apply here too, with differences in the first and third. A consumer
+    /// MUST NOT assume every ENTER has a matching END, nor that ENTER edges count episodes:
     ///
     /// 1. A runway OSCILLATING around the threshold across successive cadence windows emits one
     ///    ENTER/LEAVE pair per crossing, so ENTER edges OVER-count what an operator would call one
@@ -4671,7 +4679,7 @@ mod tests {
         }
         // Neither promoted line adds an email/token surface to the file the operator ships
         // around — the #15 guarantee that is half of why the two moved onto this channel
-        // (`Event::ActiveDeadNoTargetCleared` carries the argument).
+        // (`Event::AllExhaustedCleared` carries the argument).
         assert!(crate::redaction::meter::unauthored_emails(&logged, &[]).is_empty());
     }
 
