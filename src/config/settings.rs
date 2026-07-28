@@ -142,6 +142,12 @@ fn overlay_tunables(raw: &mut RawTunables, edits: &SetTunables) {
     if let Some(v) = edits.canary_nostashmatch_override {
         raw.canary_nostashmatch_override = v;
     }
+    if let Some(v) = edits.canary_online_probe {
+        raw.canary_online_probe = v;
+    }
+    if let Some(v) = edits.canary_online_probe_strict {
+        raw.canary_online_probe_strict = v;
+    }
 }
 
 /// Overlay a `config-set`'s label edits (issue #268): each `account_uuid` → new label is
@@ -451,6 +457,85 @@ mod tests {
         assert_eq!(parsed.canary_nostashmatch_override, Some(true));
         let empty: SetTunables = serde_json::from_str("{}").unwrap();
         assert_eq!(empty.canary_nostashmatch_override, None);
+    }
+
+    #[test]
+    fn apply_settings_overlays_the_online_probe_switches_and_they_round_trip() {
+        // Issue #736: the Layer-3 probe's two switches ride the SAME #268 overlay +
+        // config-get view + render persistence chain as their #714 / #730 canary siblings —
+        // the plumbing the `Error::CanaryProbeNotLive` remedy text depends on ("set
+        // `canary_online_probe_strict = false` … and restart"). Pinned end-to-end at their
+        // NON-default values so a dropped overlay arm, a typo'd render key, or a miskeyed
+        // view field fails here rather than at 3am on an unattended daemon.
+        //
+        // Both are set in ONE call on purpose: they are INDEPENDENT keys that operators
+        // will set together (arming the probe strictly), and the assertions below are
+        // per-key, so a plumbing regression on either still fails distinctly.
+        let (after, change) = Config::apply_settings(
+            VALID,
+            &SetTunables {
+                canary_online_probe: Some(true),
+                canary_online_probe_strict: Some(true),
+                ..SetTunables::default()
+            },
+            &labels(&[]),
+        )
+        .unwrap();
+        assert!(after.tunables.canary_online_probe);
+        assert!(after.tunables.canary_online_probe_strict);
+        assert!(change.tunables_changed);
+        assert!(after.view().tunables.canary_online_probe);
+        assert!(after.view().tunables.canary_online_probe_strict);
+        // The overlaid values render and re-parse verbatim (config-set persists via `render`).
+        let reparsed = Config::parse(&after.render()).unwrap();
+        assert!(reparsed.tunables.canary_online_probe);
+        assert!(reparsed.tunables.canary_online_probe_strict);
+
+        // Independence, both ways: arming the probe must not silently arm strict (that
+        // would turn an opt-in diagnostic into a swap-blocking gate), and arming strict
+        // alone must not arm the probe.
+        let (probe_only, _) = Config::apply_settings(
+            VALID,
+            &SetTunables {
+                canary_online_probe: Some(true),
+                ..SetTunables::default()
+            },
+            &labels(&[]),
+        )
+        .unwrap();
+        assert!(probe_only.tunables.canary_online_probe);
+        assert!(!probe_only.tunables.canary_online_probe_strict);
+        let (strict_only, _) = Config::apply_settings(
+            VALID,
+            &SetTunables {
+                canary_online_probe_strict: Some(true),
+                ..SetTunables::default()
+            },
+            &labels(&[]),
+        )
+        .unwrap();
+        assert!(!strict_only.tunables.canary_online_probe);
+        assert!(strict_only.tunables.canary_online_probe_strict);
+
+        // The hand-edit path the error message actually names: bare TOML lines under
+        // `[tunables]` parse to the armed switches.
+        let hand_edited = Config::parse(&with_tunables(
+            "canary_online_probe = true\ncanary_online_probe_strict = true",
+        ))
+        .unwrap();
+        assert!(hand_edited.tunables.canary_online_probe);
+        assert!(hand_edited.tunables.canary_online_probe_strict);
+
+        // Both keys are representable scalar edits (serde round-trip); unset stays None.
+        let parsed: SetTunables = serde_json::from_str(
+            r#"{"canary_online_probe":true,"canary_online_probe_strict":true}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.canary_online_probe, Some(true));
+        assert_eq!(parsed.canary_online_probe_strict, Some(true));
+        let empty: SetTunables = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.canary_online_probe, None);
+        assert_eq!(empty.canary_online_probe_strict, None);
     }
 
     #[test]

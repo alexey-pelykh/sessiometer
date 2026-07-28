@@ -1067,6 +1067,45 @@ long-running rotation hits:
   the other. An item that matches no stash but *does* parse as a Claude Code
   credential is the ordinary case of a token refreshed in place since it was last
   stashed, so it is never refused and needs no override.
+
+  Both of those checks are **offline**, which leaves one case they cannot see: the
+  same account, with Claude Code having quietly moved its credential elsewhere and
+  the item sessiometer manages left behind. Everything still lines up — right
+  account, right format, matching stash — while the two have gone their separate
+  ways. Setting `canary_online_probe = true` under `[tunables]` adds one short
+  online check right before a swap writes: it asks the usage endpoint whether the
+  credential it is about to overwrite *still works*. Off by default, and while it
+  is off no request is made at all. Note what it can and cannot tell you: the
+  endpoint does not say **which** account a credential belongs to, only that it
+  works — so this catches a left-behind credential that has since **stopped**
+  working, and not one that still works. It narrows the gap rather than closing it.
+
+  By default a check that fails — no answer, a timeout, a rejection — is written to
+  the log and the swap goes ahead anyway, so a patchy network never turns into a
+  stuck rotation. Setting `canary_online_probe_strict = true` instead **refuses** the
+  swap (before any write) unless the check comes back clean, **including** when it
+  simply could not reach the endpoint — that is the point of the setting. Understand
+  what you are buying: this is not a short delay, it is a refusal that repeats for as
+  long as the check keeps failing. Weigh it knowing a rejection on its own is weak
+  evidence — Claude Code refreshes its access token in place, so a token that has
+  merely gone briefly stale is rejected too while being perfectly healthy. That is
+  why refusing is something you opt into rather than the default.
+
+  Two escapes keep strict mode from trapping you on a credential that has genuinely
+  died. The daemon **skips the check** whenever it has no current reading for the
+  account it is swapping away from — its last poll came back empty, or it has not
+  polled that account yet (right after a restart, say). The first case is precisely
+  the condition its automatic escape swaps fire on, so a check that fails for the same
+  reason must not block them; the second is a state it simply cannot vouch for. It
+  likewise skips while that account is inside a rate-limit hold
+  (`verdict=uninformative` in the log records any of these). And
+  `sessiometer use --force <account>` skips the check outright, whether or not the
+  daemon is running (`verdict=overridden` in the log records that you did). The
+  forced escape is the one that always applies: the skip above cannot help when the
+  daemon's last poll *succeeded* and the credential died in the window since. Note
+  that `--force` skips **only** this online check: the offline checks above still
+  refuse, with or without it, because those protect against destroying an unrelated
+  secret.
 - **Concurrent swap + re-login race (known limitation).** If you run
   `claude /login` at the exact moment the daemon is mid-swap, the two writers race
   on the canonical credential. Last-writer-wins, and the daemon reconciles on its

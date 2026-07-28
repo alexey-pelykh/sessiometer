@@ -145,6 +145,11 @@ mod tests {
                 // VALID omits canary_nostashmatch_override → the compiled-in default (issue
                 // #730): false, the NoStashMatch shape-gate ARMED (the override is opt-in).
                 canary_nostashmatch_override: false,
+                // VALID omits both #736 keys → the compiled-in defaults: the Layer-3 online
+                // liveness probe DISARMED (no network call on the swap path at all) and its
+                // strict mode OFF (a failed probe would degrade gracefully).
+                canary_online_probe: false,
+                canary_online_probe_strict: false,
                 // No [jitter] table in VALID → default strategies: poll jitters
                 // normally (base from poll_secs), session_ceiling/weekly_ceiling/cooldown
                 // are fixed at their respective bases.

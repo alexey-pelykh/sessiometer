@@ -2018,12 +2018,18 @@ mod tests {
     #[test]
     fn redaction_meter_covers_the_canary_lines_and_status() {
         use crate::redaction::meter::{assert_clean, Secrets};
-        // Issue #714 / #15: every canary surface — the three durable event lines
-        // and the wire-serialized `CanaryStatus` — must carry operator LABELS and
-        // COUNTS only, never a token, blob, email, or account-uuid. Build the
+        // Issue #714 / #15: EVERY canary surface — each durable event line and the
+        // wire-serialized `CanaryStatus` — must carry operator LABELS and COUNTS
+        // only, never a token, blob, email, or account-uuid. Build the
         // corpus from the meter fixture's REAL secret material context (the labels
         // are authored, the secrets exist in the fixture) and prove the
         // value-based meter reads clean.
+        //
+        // The enumeration below is the falsifier for the module's "every surface derived
+        // from these types is secret-free by construction" claim (`src/canary.rs`), so a
+        // canary event added without a row here silently un-falsifies it. #730's
+        // `CanaryUnparseableCanonical` and #736's `CanaryOnlineProbe` are therefore
+        // enumerated alongside #714's originals.
         let secrets = Secrets::meter_fixture();
         let mut corpus = String::new();
         for event in [
@@ -2039,6 +2045,27 @@ mod tests {
             },
             Event::CanaryAmbiguous { count: 3 },
             Event::CanaryCleared,
+            Event::CanaryUnparseableCanonical { overridden: false },
+            Event::CanaryUnparseableCanonical { overridden: true },
+            // Issue #736 — every `Liveness` label that can reach a line, at both
+            // `refused` settings, so a future verdict carrying a status code or a
+            // response fragment fails HERE rather than shipping.
+            Event::CanaryOnlineProbe {
+                verdict: crate::canary::Liveness::Uninformative.as_str(),
+                refused: false,
+            },
+            Event::CanaryOnlineProbe {
+                verdict: crate::canary::Liveness::Overridden.as_str(),
+                refused: false,
+            },
+            Event::CanaryOnlineProbe {
+                verdict: crate::canary::Liveness::Inconclusive.as_str(),
+                refused: false,
+            },
+            Event::CanaryOnlineProbe {
+                verdict: crate::canary::Liveness::Rejected.as_str(),
+                refused: true,
+            },
         ] {
             corpus.push_str(&event.to_log_line(std::time::SystemTime::UNIX_EPOCH));
             corpus.push('\n');
@@ -2062,7 +2089,469 @@ mod tests {
         assert!(corpus.contains("event=canary_drift"));
         assert!(corpus.contains("overridden=true"));
         assert!(corpus.contains(r#""verdict":"drift""#));
+        assert!(corpus.contains("event=canary_unparseable_canonical"));
+        assert!(corpus.contains("event=canary_online_probe verdict=rejected refused=true"));
         // …and carries nothing the meter knows as secret.
         assert_clean(&corpus, &secrets, &[]);
+    }
+
+    // --- Layer 3: the opt-in online liveness probe (issue #736) --------------
+
+    /// A daemon whose OFFLINE canary layers all pass — canonical holds `work`'s token,
+    /// `work`'s stash matches it, and the display names `work` active — so a
+    /// `locked_swap` reaches the Layer-3 probe. `poller` and `tun` script the probe's
+    /// answer and the two `[tunables]` switches.
+    ///
+    /// Both accounts are seeded with a CURRENT reading, which is what leaves `probe_gate`
+    /// ARMED: the stand-down keys off a missing one. The blind cases seed `None` explicitly
+    /// so the state under test is visible at the test rather than inherited from here.
+    async fn probe_daemon(
+        poller: FakeRosterPoller,
+        tun: Tunables,
+    ) -> (tempfile::TempDir, FakeDaemon) {
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (dir, json) = claude_json("u-A");
+        let mut daemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+        daemon
+            .state
+            .seed_readings([Some(reading(0.10, 0.10)), Some(reading(0.10, 0.10))]);
+        (dir, daemon)
+    }
+
+    /// `tunables(95, 80, 0)` with the two #736 switches set — the only thing these tests
+    /// vary.
+    fn probe_tunables(probe: bool, strict: bool) -> Tunables {
+        Tunables {
+            canary_online_probe: probe,
+            canary_online_probe_strict: strict,
+            ..tunables(95, 80, 0)
+        }
+    }
+
+    #[tokio::test]
+    async fn the_disarmed_probe_neither_refuses_nor_logs_even_on_a_dead_bearer() {
+        // Issue #736's first hard constraint at the integration level: with
+        // `canary_online_probe = false` (the shipped default) the swap path is the
+        // pre-#736 one. Scripted so the probe WOULD come back rejected if it ran — a
+        // `401` on the very account it would poll — so a pass here is the disarm
+        // working, not a vacuously healthy fixture.
+        let poller = FakeRosterPoller::new().unauthorized("u-A");
+        let (_dir, mut daemon) = probe_daemon(poller, probe_tunables(false, false)).await;
+        let mut events = Vec::new();
+
+        // Driven through `locked_swap` directly rather than a full tick: the probe gate is
+        // the unit under test, and a tick's own poll of the outgoing account would have to
+        // succeed for a swap to be decided at all — which is precisely the answer these
+        // tests need to script as a FAILURE. (Same reason the #738 bracket test above
+        // drives `refresh_canary` directly.)
+        let report = daemon
+            .locked_swap("Sessiometer/u-A", "Sessiometer/u-B", false, &mut events)
+            .await
+            .expect("a disarmed probe must not block the swap");
+
+        assert!(report.canonical_confirmed);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::CanaryOnlineProbe { .. })),
+            "a disarmed probe must emit nothing: {events:?}"
+        );
+        // The swap really happened — the canonical now holds the incoming token.
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"B-token")));
+    }
+
+    #[tokio::test]
+    async fn an_armed_probe_that_confirms_liveness_is_silent_and_swaps() {
+        // The healthy armed case: alarm-only emission means a confirmed-live probe leaves
+        // no line at all, so arming the probe does not turn every swap into log noise.
+        let poller = FakeRosterPoller::new().ok("u-A", 0.10, 0.10);
+        let (_dir, mut daemon) = probe_daemon(poller, probe_tunables(true, true)).await;
+        let mut events = Vec::new();
+
+        daemon
+            .locked_swap("Sessiometer/u-A", "Sessiometer/u-B", false, &mut events)
+            .await
+            .expect("a live probe must not block the swap");
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::CanaryOnlineProbe { .. })),
+            "a live probe must be silent: {events:?}"
+        );
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"B-token")));
+    }
+
+    #[tokio::test]
+    async fn an_armed_non_strict_probe_that_fails_logs_and_still_swaps() {
+        // Issue #736's second hard constraint: probe failure != refuse. An unreachable
+        // endpoint must not become a swap outage. The durable line is the ONLY trace that
+        // the probe failed and the swap went ahead regardless, which is why it is emitted
+        // even though nothing was refused — and why `refused` must NOT trail it.
+        let poller = FakeRosterPoller::new().failing("u-A");
+        let (_dir, mut daemon) = probe_daemon(poller, probe_tunables(true, false)).await;
+        let mut events = Vec::new();
+
+        daemon
+            .locked_swap("Sessiometer/u-A", "Sessiometer/u-B", false, &mut events)
+            .await
+            .expect("a non-strict probe failure must not block the swap");
+
+        assert!(events.contains(&Event::CanaryOnlineProbe {
+            verdict: "inconclusive",
+            refused: false,
+        }));
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"B-token")));
+    }
+
+    #[tokio::test]
+    async fn an_armed_strict_probe_that_is_rejected_refuses_with_zero_writes() {
+        // Both switches armed — the one configuration in which the probe can cost a swap.
+        // A `401` says the resolved canonical no longer authenticates, so the write is
+        // refused BEFORE any mutation, exactly like the offline layers' refusals.
+        let poller = FakeRosterPoller::new().unauthorized("u-A");
+        let (_dir, mut daemon) = probe_daemon(poller, probe_tunables(true, true)).await;
+        let mut events = Vec::new();
+
+        let result = daemon
+            .locked_swap("Sessiometer/u-A", "Sessiometer/u-B", false, &mut events)
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(Error::CanaryProbeNotLive {
+                    verdict: "rejected"
+                })
+            ),
+            "expected a rejected-probe refusal, got {result:?}"
+        );
+        assert!(events.contains(&Event::CanaryOnlineProbe {
+            verdict: "rejected",
+            refused: true,
+        }));
+        // ZERO writes: the canonical still holds the OUTGOING token and both stashes are
+        // untouched — the refusal is pre-mutation, not a rollback.
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"A-token")));
+        assert!(daemon
+            .stash
+            .read("Sessiometer/u-A")
+            .await
+            .unwrap()
+            .credential
+            .matches(&cred(b"A-token")));
+        assert!(daemon
+            .stash
+            .read("Sessiometer/u-B")
+            .await
+            .unwrap()
+            .credential
+            .matches(&cred(b"B-token")));
+    }
+
+    #[tokio::test]
+    async fn a_strict_probe_never_blocks_the_emergency_swap_off_a_dead_active() {
+        // THE self-DoS guard, and the reason `ProbeGate::Uninformative` exists.
+        //
+        // `emergency_swap` fires exactly when the active account is QUARANTINED on a 401
+        // streak and still failing to poll (`src/daemon.rs`) — the escape hatch off a dead
+        // credential. Probing that same bearer necessarily returns `Rejected`, because it
+        // IS dead; that is the reason to swap, not a reason to refuse. Without the stand-down
+        // a strict operator would deadlock here on EVERY tick, forever, with no recovery but
+        // a config edit + restart — reintroducing precisely the `ActiveDeadNoTarget` self-DoS
+        // the surrounding code drops the target reserve to avoid.
+        let poller = FakeRosterPoller::new().unauthorized("u-A");
+        let (_dir, mut daemon) = probe_daemon(poller, probe_tunables(true, true)).await;
+        // The state `emergency_swap` runs in, BOTH halves of it: quarantined AND with this
+        // cycle's reading absent. The second half is what `probe_gate` actually reads — the
+        // quarantine flag is set here so the fixture is the real precondition rather than a
+        // convenient subset of it.
+        daemon.state.accounts[0].health.quarantined = true;
+        daemon
+            .state
+            .seed_readings([None, Some(reading(0.10, 0.10))]);
+        let mut events = Vec::new();
+
+        daemon
+            .locked_swap("Sessiometer/u-A", "Sessiometer/u-B", false, &mut events)
+            .await
+            .expect("the escape swap off a dead active must not be blocked by the probe");
+
+        // The swap landed — the fleet is off the dead credential.
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"B-token")));
+        // The stand-down is on the record: an operator who armed strict is entitled to see
+        // that the gate did not run, and why — but it must NOT read as a refusal.
+        assert!(events.contains(&Event::CanaryOnlineProbe {
+            verdict: "uninformative",
+            refused: false,
+        }));
+    }
+
+    #[tokio::test]
+    async fn a_strict_probe_never_blocks_the_preemptive_swap_off_a_blind_active() {
+        // The arm the `quarantined` proxy MISSES, and the reason `probe_gate` reads the
+        // reading directly instead.
+        //
+        // `blind_swap` (#452 / ADR-0017) runs in the NON-quarantined branch: its precondition
+        // is only that the active's current reading is absent. Blindness caused by a `403`
+        // missing scope or any other non-401 `4xx` gets there while BOTH proxies read healthy
+        // — such an outcome RESETS the 401 streak (so never quarantines) and takes the
+        // `backoff_signal → None` branch that CLEARS `poll_backoff_until`. A gate keyed on
+        // `quarantined || backing_off` would arm here, probe the same unreachable endpoint,
+        // score `Inconclusive`, and under strict refuse the preemptive escape on every tick
+        // forever — the identical deadlock the emergency arm above is guarded against.
+        let poller = FakeRosterPoller::new().scope_missing("u-A");
+        let (_dir, mut daemon) = probe_daemon(poller, probe_tunables(true, true)).await;
+        // Blind, but by neither proxy's definition: not quarantined, not backing off.
+        daemon
+            .state
+            .seed_readings([None, Some(reading(0.10, 0.10))]);
+        assert!(!daemon.state.accounts[0].health.quarantined);
+        assert!(daemon.state.accounts[0].health.poll_backoff_until.is_none());
+        let mut events = Vec::new();
+
+        daemon
+            .locked_swap("Sessiometer/u-A", "Sessiometer/u-B", false, &mut events)
+            .await
+            .expect("the preemptive swap off a blind active must not be blocked by the probe");
+
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"B-token")));
+        assert!(events.contains(&Event::CanaryOnlineProbe {
+            verdict: "uninformative",
+            refused: false,
+        }));
+    }
+
+    #[tokio::test]
+    async fn a_quarantined_account_that_polls_again_is_still_worth_probing() {
+        // The converse of the two stand-downs, and the reason the condition is the reading
+        // rather than `quarantined || …`: a quarantined account MID-RECOVERY (issue #42 —
+        // its own token started answering again) has a live reading, so its bearer
+        // demonstrably works and a probe of it is genuinely informative. Standing down there
+        // would silently disarm the gate on an account an operator can still `use` away from.
+        let poller = FakeRosterPoller::new().unauthorized("u-A");
+        let (_dir, mut daemon) = probe_daemon(poller, probe_tunables(true, true)).await;
+        daemon.state.accounts[0].health.quarantined = true;
+        // …but with THIS cycle's poll live: the recovery probe is landing.
+        daemon
+            .state
+            .seed_readings([Some(reading(0.10, 0.10)), Some(reading(0.10, 0.10))]);
+        let mut events = Vec::new();
+
+        let result = daemon
+            .locked_swap("Sessiometer/u-A", "Sessiometer/u-B", false, &mut events)
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(Error::CanaryProbeNotLive {
+                    verdict: "rejected"
+                })
+            ),
+            "the gate must stay ARMED on a recovering account, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_forced_swap_bypasses_an_armed_strict_probe_and_says_so() {
+        // The escape `Error::CanaryProbeNotLive` and the README both promise, on the
+        // DAEMON-ROUTED `use` path (issue #167) — where `run_use`'s own gate never executes,
+        // because a reachable daemon's ack is authoritative. Without `force` threaded through
+        // `locked_swap` the documented remedy would work only while the daemon is DOWN, i.e.
+        // never in the case that motivates it.
+        //
+        // It bypasses LAYER 3 ONLY, and it is not silent: `verdict=overridden` is the durable
+        // trace that a swap skipped a gate the operator had armed, mirroring how the offline
+        // layers record `overridden=true`.
+        let poller = FakeRosterPoller::new().unauthorized("u-A");
+        let (_dir, mut daemon) = probe_daemon(poller, probe_tunables(true, true)).await;
+        let mut events = Vec::new();
+
+        daemon
+            .locked_swap("Sessiometer/u-A", "Sessiometer/u-B", true, &mut events)
+            .await
+            .expect("--force must carry the swap past an armed strict probe");
+
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"B-token")));
+        assert!(events.contains(&Event::CanaryOnlineProbe {
+            verdict: "overridden",
+            refused: false,
+        }));
+    }
+
+    #[tokio::test]
+    async fn a_strict_probe_never_blocks_a_swap_off_a_backing_off_active() {
+        // The OTHER term of the stand-down, isolated: this account still carries a reading
+        // (seeded by `probe_daemon`), so only `account_backing_off` can stand the gate down
+        // here. That term exists for the #293 per-account back-off discipline — the tick loop
+        // skips a held account's poll, and a probe that ignored the hold would fire an extra
+        // request into a window the server just directed, on top of failing for that reason
+        // and refusing the swap under strict.
+        let poller = FakeRosterPoller::new().rate_limited("u-A", None);
+        let (_dir, mut daemon) = probe_daemon(poller, probe_tunables(true, true)).await;
+        // Inside a rate-limit back-off window on the monotonic clock.
+        daemon.state.accounts[0].health.poll_backoff_until =
+            Some(daemon.clock.now() + Duration::from_secs(60));
+        assert!(daemon.state.accounts[0].last_reading.is_some());
+        let mut events = Vec::new();
+
+        daemon
+            .locked_swap("Sessiometer/u-A", "Sessiometer/u-B", false, &mut events)
+            .await
+            .expect("a swap off a throttled active must not be blocked by the probe");
+
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"B-token")));
+        assert!(events.contains(&Event::CanaryOnlineProbe {
+            verdict: "uninformative",
+            refused: false,
+        }));
+    }
+
+    #[tokio::test]
+    async fn an_armed_probe_that_cannot_name_the_outgoing_account_refuses_rather_than_falls_open() {
+        // The one arm with non-obvious semantics. `outgoing` naming no roster account is
+        // unreachable in production (every caller derives it FROM the roster), but if it
+        // ever became reachable an ARMED gate must not fall silently open — "could not
+        // probe" is INCONCLUSIVE, which strict refuses on, not a pass.
+        let poller = FakeRosterPoller::new().ok("u-A", 0.10, 0.10);
+        let (_dir, mut daemon) = probe_daemon(poller, probe_tunables(true, true)).await;
+        let mut events = Vec::new();
+
+        let result = daemon
+            .locked_swap("Sessiometer/absent", "Sessiometer/u-B", false, &mut events)
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(Error::CanaryProbeNotLive {
+                    verdict: "inconclusive"
+                })
+            ),
+            "an armed gate must not fall open, got {result:?}"
+        );
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"A-token")));
+    }
+
+    #[tokio::test]
+    async fn a_disarmed_probe_stays_a_no_op_even_when_the_outgoing_is_unnameable() {
+        // The complement of the test above: on the same unreachable arm, a DISARMED gate
+        // must leave a default daemon's behaviour byte-identical to the pre-#736 one —
+        // `Skipped`, no refusal, no log line. A gate nobody armed must never be able to
+        // block a swap.
+        //
+        // The swap still fails, but on the ENGINE's own terms — there is no outgoing stash
+        // to re-stash into (`StashIncomplete`), which is the pre-existing behaviour for a
+        // bogus outgoing and further evidence this arm is unreachable in production. What
+        // this test pins is the DISCRIMINATOR: the failure is not `CanaryProbeNotLive`.
+        let poller = FakeRosterPoller::new().ok("u-A", 0.10, 0.10);
+        let (_dir, mut daemon) = probe_daemon(poller, probe_tunables(false, true)).await;
+        let mut events = Vec::new();
+
+        let result = daemon
+            .locked_swap("Sessiometer/absent", "Sessiometer/u-B", false, &mut events)
+            .await;
+
+        assert!(
+            !matches!(result, Err(Error::CanaryProbeNotLive { .. })),
+            "a disarmed gate must never refuse, got {result:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::CanaryOnlineProbe { .. })),
+            "a disarmed probe must emit nothing: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_armed_strict_probe_refuses_on_inconclusive_too() {
+        // Strict mode IS the opt-in to the network failure mode the default forbids, so
+        // "could not confirm" refuses just as a positive rejection does — and the verdict
+        // on the wire says WHICH, so the operator can tell a dead bearer (investigate the
+        // credential) from an unreachable endpoint (investigate the network).
+        let poller = FakeRosterPoller::new().rate_limited("u-A", None);
+        let (_dir, mut daemon) = probe_daemon(poller, probe_tunables(true, true)).await;
+        let mut events = Vec::new();
+
+        let result = daemon
+            .locked_swap("Sessiometer/u-A", "Sessiometer/u-B", false, &mut events)
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(Error::CanaryProbeNotLive {
+                    verdict: "inconclusive"
+                })
+            ),
+            "expected an inconclusive-probe refusal, got {result:?}"
+        );
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"A-token")));
     }
 }

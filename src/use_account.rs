@@ -69,7 +69,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::active;
-use crate::canary::{self, CanaryOutcome, InconclusiveReason};
+use crate::canary::{self, CanaryOutcome, InconclusiveReason, ProbeGate};
 use crate::config::{Account, Config};
 use crate::daemon::{
     AccountStatusLine, RealRosterPoller, RosterPoller, StatusResponse, SwapAck, SwapRejection,
@@ -793,6 +793,53 @@ where
                 }
             }
             CanaryOutcome::Ok | CanaryOutcome::Inconclusive(_) => {}
+        }
+
+        // Layer 3 (issue #736): the opt-in ONLINE liveness probe, the standalone mirror of
+        // the daemon's — same slot (offline layers cleared, still pre-mutation), same double
+        // opt-in, same graceful-degrade default. Disarmed by default, in which case
+        // `probe_liveness` issues no request at all and this is a no-op; armed, it asks only
+        // whether the resolved canonical's bearer still authenticates, never WHOSE session it
+        // is (`/oauth/usage` carries no identity field — issue #737 is the separate, gated
+        // identity fetch). `active` is the account the display names active, polled with
+        // `active = true` so the request rides the CANONICAL credential rather than a stash.
+        //
+        // Like its offline siblings on THIS path the emission is per invocation — the `use`
+        // path carries no state to edge off, and each line here IS one operator action.
+        // Alarm-only: a confirmed-live probe stays silent, and a failed one logs whether or
+        // not it refused, so the graceful-degrade ride is never invisible.
+        //
+        // `--force` DOES bypass this layer, unlike the offline ones above — the one place
+        // the layers are treated differently, and deliberately. Layers 1 and 2 refuse
+        // because the write would clobber an unrelated secret UNRECOVERABLY, which no
+        // operator intent can make safe. Layer 3 refuses on much weaker evidence and a far
+        // milder consequence: a dead canonical does not endanger another secret, it only
+        // means the swap may not take effect. So `--force` stays what it is — the operator's
+        // explicit "I have looked, do it anyway" — and remains the manual escape hatch when
+        // a strict probe is wrongly blocking a swap the operator needs. The daemon-routed
+        // path honours it identically (`Daemon::probe_gate`), so the escape does not depend
+        // on whether the daemon happens to be up.
+        //
+        // A forced bypass of an ARMED probe is `Overridden`, not `Disarmed`: it LOGS. That
+        // matches how the offline layers record their overrides (`overridden=true`), and it
+        // is the only durable trace that a swap skipped a gate the operator had armed.
+        let gate = match (config.tunables.canary_online_probe, force) {
+            (true, false) => ProbeGate::Armed,
+            (true, true) => ProbeGate::Overridden,
+            (false, _) => ProbeGate::Disarmed,
+        };
+        let liveness = canary::probe_liveness(seams.poller, active, gate).await;
+        let refused = canary::probe_refuses(liveness, config.tunables.canary_online_probe_strict);
+        if canary::probe_alarms(liveness) {
+            let _ = log.emit(&Event::CanaryOnlineProbe {
+                verdict: liveness.as_str(),
+                refused,
+            });
+        }
+        if refused {
+            return Err(Error::CanaryProbeNotLive {
+                verdict: liveness.as_str(),
+            });
         }
 
         // Reuse the swap engine UNCHANGED, wrapped in the single-writer swap lock
@@ -2989,8 +3036,209 @@ mod tests {
             .to_string(),
             Error::ActiveAccountUnresolved.to_string(),
             Error::KeychainLocked { op: "read" }.to_string(),
+            // Issue #736: the Layer-3 probe's strict refusal carries a verdict CLASS only.
+            Error::CanaryProbeNotLive {
+                verdict: "rejected",
+            }
+            .to_string(),
+            Error::CanaryProbeNotLive {
+                verdict: "inconclusive",
+            }
+            .to_string(),
         ]
         .join("\n");
         meter::assert_clean(&corpus, &secrets, &[]);
+    }
+
+    // --- Layer 3: the opt-in online liveness probe (issue #736) --------------
+
+    /// Run `use spare` with the two #736 switches set and a scripted probe answer.
+    ///
+    /// The target-viability gate is satisfied from a cache HIT so the ONLY poll the run
+    /// makes is the Layer-3 probe itself — which both keeps `probe` unambiguous (the
+    /// shared [`FakePoller`] answers every account identically) and pins that the probe
+    /// is a genuinely NEW call rather than a reuse of the gate's viability poll.
+    /// Returns the result, the canonical's bytes afterwards, the poll count, and the log.
+    async fn run_use_with_probe(
+        probe: Probe,
+        online_probe: bool,
+        strict: bool,
+    ) -> (Result<()>, Vec<u8>, u32, String) {
+        run_use_with_probe_forced(probe, online_probe, strict, false).await
+    }
+
+    /// [`run_use_with_probe`] with `--force` under the caller's control, for the one test
+    /// that pins Layer 3's deliberate `--force` bypass.
+    async fn run_use_with_probe_forced(
+        probe: Probe,
+        online_probe: bool,
+        strict: bool,
+        force: bool,
+    ) -> (Result<()>, Vec<u8>, u32, String) {
+        let mut config = config_ab();
+        config.tunables.canary_online_probe = online_probe;
+        config.tunables.canary_online_probe_strict = strict;
+        let (store, stash) = seeded_store_and_stash().await;
+        let (_json_dir, json) = claude_json_for("u-A");
+        let log_dir = tempfile::tempdir().unwrap();
+        let log_path = log_dir.path().join("sessiometer.log");
+        let mut log = EventLog::at(&log_path).unwrap();
+        let poller = FakePoller::new(probe);
+        let lock_dir = tempfile::tempdir().unwrap();
+        let lock_path = lock_dir.path().join("swap.lock");
+        let notifier = FakeNotifier::ok();
+        let cache = FakeCache::hit(Viability::Viable);
+
+        let result = run_use(
+            &config,
+            "spare",
+            force,
+            false,
+            Seams {
+                cache: &cache,
+                poller: &poller,
+                store: &store,
+                stash: &stash,
+                claude_json: &json,
+                lock_path: &lock_path,
+                notifier: &notifier,
+            },
+            &mut log,
+        )
+        .await;
+
+        let log_text = std::fs::read_to_string(&log_path).unwrap_or_default();
+        (
+            result,
+            canonical(&store).await,
+            poller.calls.get(),
+            log_text,
+        )
+    }
+
+    #[tokio::test]
+    async fn use_with_a_disarmed_probe_issues_no_poll_and_swaps() {
+        // Issue #736's first hard constraint on the standalone path: `canary_online_probe
+        // = false` (the default) must not merely ignore the probe — it must never ASK.
+        // With the viability gate served from cache, a poll count of ZERO is direct
+        // evidence no request was issued. Scripted `Dead` so the probe WOULD have refused
+        // had it run: this passes because the probe is disarmed, not because it was happy.
+        let (result, canonical, polls, log) = run_use_with_probe(Probe::Dead, false, true).await;
+
+        assert!(result.is_ok(), "got {result:?}");
+        assert_eq!(polls, 0, "a disarmed probe must issue no request: {log}");
+        assert_eq!(canonical, b"B-token", "the swap wrote the incoming token");
+        assert!(!log.contains("event=canary_online_probe"), "logged: {log}");
+    }
+
+    #[tokio::test]
+    async fn use_with_an_armed_live_probe_polls_once_and_stays_silent() {
+        // The healthy armed case. The poll count pins that the probe is its OWN call —
+        // the viability gate was served from cache and made none — while the empty log
+        // pins the alarm-only idiom: arming the probe must not make every swap noisy.
+        let (result, canonical, polls, log) =
+            run_use_with_probe(Probe::Live { weekly: 0.10 }, true, true).await;
+
+        assert!(result.is_ok(), "got {result:?}");
+        assert_eq!(polls, 1, "the probe is a call of its own");
+        assert_eq!(canonical, b"B-token");
+        assert!(!log.contains("event=canary_online_probe"), "logged: {log}");
+    }
+
+    #[tokio::test]
+    async fn use_with_an_armed_non_strict_probe_logs_the_failure_and_swaps_anyway() {
+        // Issue #736's second hard constraint on the standalone path: probe failure !=
+        // refuse. The swap completes, and the durable line is the only trace that the
+        // probe failed — which is exactly why it is emitted with nothing refused.
+        let (result, canonical, _polls, log) =
+            run_use_with_probe(Probe::Transient, true, false).await;
+
+        assert!(result.is_ok(), "got {result:?}");
+        assert_eq!(canonical, b"B-token", "the swap still wrote");
+        assert!(
+            log.contains("event=canary_online_probe verdict=inconclusive"),
+            "the degraded probe is on the record: {log}"
+        );
+        assert!(!log.contains("refused=true"), "nothing was refused: {log}");
+        assert!(log.contains("event=swap"), "the swap is logged: {log}");
+    }
+
+    #[tokio::test]
+    async fn use_with_an_armed_strict_probe_refuses_a_dead_bearer_with_zero_writes() {
+        // Both switches armed — the one configuration where the probe can cost a swap.
+        // Refused pre-mutation, like the offline layers' refusals: the canonical still
+        // holds the OUTGOING token and no swap event was written.
+        let (result, canonical, _polls, log) = run_use_with_probe(Probe::Dead, true, true).await;
+
+        assert!(
+            matches!(
+                &result,
+                Err(Error::CanaryProbeNotLive {
+                    verdict: "rejected"
+                })
+            ),
+            "got {result:?}"
+        );
+        assert_eq!(canonical, b"A-token", "ZERO writes");
+        assert!(
+            log.contains("event=canary_online_probe verdict=rejected refused=true"),
+            "the refusal is on the record: {log}"
+        );
+        assert!(!log.contains("event=swap"), "no swap was written: {log}");
+    }
+
+    #[tokio::test]
+    async fn use_force_bypasses_the_online_probe_so_recovery_is_always_possible() {
+        // Layer 3 is the ONE layer `--force` bypasses, and the asymmetry is the point: the
+        // offline layers refuse because the write would clobber an unrelated secret
+        // UNRECOVERABLY, which no operator intent can make safe, while a failed probe means
+        // only that the swap may not take effect. Without this, a strict operator whose
+        // active credential has genuinely died would have no way to swap off it — and the
+        // daemon-routed path honours `--force` identically (`Daemon::probe_gate`), so the
+        // escape does not blink out whenever the daemon happens to be up.
+        // The poll count pins that `--force` does not merely ignore the verdict: it never asks.
+        // The log line pins that it is not SILENT either — bypassing a gate the operator armed
+        // is exactly what an operator later needs to find, so it is `overridden`, not skipped.
+        //
+        // Contrast `use_refuses_a_drifted_canary_even_with_force` above, which pins that
+        // `--force` does NOT bypass Layer 2 — the two tests together fix the boundary.
+        let (result, canonical, polls, log) =
+            run_use_with_probe_forced(Probe::Dead, true, true, true).await;
+
+        assert!(
+            result.is_ok(),
+            "--force must clear the online probe: {result:?}"
+        );
+        assert_eq!(polls, 0, "--force must not even ask: {log}");
+        assert_eq!(canonical, b"B-token", "the forced swap wrote");
+        assert!(
+            log.contains("event=canary_online_probe verdict=overridden"),
+            "the bypass must leave a durable trace: {log}"
+        );
+        assert!(!log.contains("refused=true"), "not a refusal: {log}");
+    }
+
+    #[tokio::test]
+    async fn use_with_an_armed_strict_probe_refuses_an_unreachable_endpoint_too() {
+        // Strict IS the opt-in to the network failure mode the default forbids, so it
+        // refuses on "could not confirm" as well — with the verdict naming WHICH, so an
+        // operator can tell a dead bearer from an unreachable endpoint without guessing.
+        let (result, canonical, _polls, log) =
+            run_use_with_probe(Probe::RateLimited, true, true).await;
+
+        assert!(
+            matches!(
+                &result,
+                Err(Error::CanaryProbeNotLive {
+                    verdict: "inconclusive"
+                })
+            ),
+            "got {result:?}"
+        );
+        assert_eq!(canonical, b"A-token", "ZERO writes");
+        assert!(
+            log.contains("event=canary_online_probe verdict=inconclusive refused=true"),
+            "the refusal is on the record: {log}"
+        );
     }
 }
