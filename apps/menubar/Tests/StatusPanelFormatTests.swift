@@ -914,7 +914,15 @@ final class StatusPanelFormatTests: XCTestCase {
     /// both writers emit byte-identically (`notStartedReason`'s wording), because that is the case where the
     /// reason itself carries no signal and the attribution is doing all the work.
     func testFailureTextAttributesOnlyTheUnpromptedLaunchRepair() {
-        let shared = "The daemon was registered but didn’t start. Check Console for details."
+        // DERIVED, not transcribed (issue #779). This used to be a hand-copied literal, which silently stops
+        // testing the shipped sentence the moment the model's copy changes. It is now composed by the model —
+        // and pinned against the literal issue #745 shipped, so the equality below is doing two jobs: it keeps
+        // this attribution test honest, AND it is the assertion that issue #779 did not disturb the no-log
+        // rendering. `offeringLogAffordance: false` is that no-log arm.
+        let shared = LoginItemModel.StartFailureReason.notStarted.text(offeringLogAffordance: false)
+        XCTAssertEqual(shared, "The daemon was registered but didn’t start. Check Console for details.",
+                       "with no log to open, the card must still say exactly what issue #745 shipped — the "
+                       + "issue #169 honest-affordance rule withholds the BUTTON, never the information")
 
         XCTAssertEqual(StatusPanelFormat.startDaemonFailureText(reason: shared, origin: .operatorStart),
                        shared,

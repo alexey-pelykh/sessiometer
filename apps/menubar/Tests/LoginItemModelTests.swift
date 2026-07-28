@@ -149,8 +149,11 @@ final class LoginItemModelTests: XCTestCase {
             return XCTFail("expected .failed (registered but never started), got \(model.startPhase)")
         }
         XCTAssertEqual(origin, .operatorStart, "a press is what stands behind this one (issue #820)")
-        XCTAssertTrue(reason.contains("registered but"),
-                      "the failure names the not-started condition, not a register error")
+        XCTAssertEqual(reason, .notStarted,
+                       "the failure names the not-started condition, not a register error — asserted on the "
+                       + "CASE since issue #779, because that is what the card's `View log` gate reads")
+        XCTAssertTrue(reason.text(offeringLogAffordance: false).contains("registered but"),
+                      "and the #745 copy still says so — the type carries the distinction, not replaces it")
     }
 
     /// A daemon register that throws lands `.failed` with a redacted reason (never a crash, never a silent no-op).
@@ -372,7 +375,10 @@ final class LoginItemModelTests: XCTestCase {
         guard case .failed(let reason, let origin) = model.startPhase else {
             return XCTFail("an unregister throw must surface, not vanish; got \(model.startPhase)")
         }
-        XCTAssertFalse(reason.isEmpty, "the card needs something to say")
+        XCTAssertFalse(reason.text(offeringLogAffordance: false).isEmpty, "the card needs something to say")
+        XCTAssertFalse(reason.evidenceIsInTheDaemonLog,
+                       "an unregister that THREW spawned nothing, so the daemon's log cannot speak to it — "
+                       + "issue #779 withholds `View log` here rather than pointing at an unrelated file")
         XCTAssertEqual(origin, .launchRepair, "no press stands behind a launch-time repair (issue #820)")
         XCTAssertEqual(fake.registerDaemonCount, 0, "a failed unregister does not proceed to register")
         XCTAssertEqual(store.lastRegisteredIdentity, "build-1",
@@ -414,7 +420,9 @@ final class LoginItemModelTests: XCTestCase {
         guard case .failed(let reason, let origin) = model.startPhase else {
             return XCTFail("a re-register whose daemon never came up must surface; got \(model.startPhase)")
         }
-        XCTAssertTrue(reason.contains("didn’t start"), "the #745 silent-start copy, reused verbatim")
+        XCTAssertEqual(reason, .notStarted, "the #745 silent-start condition, reused verbatim")
+        XCTAssertTrue(reason.text(offeringLogAffordance: false).contains("didn’t start"),
+                      "and its copy is the same sentence the Start affordance emits")
         // The sharpest place to pin the origin (issue #820): this reason is emitted BYTE-IDENTICALLY by
         // `startDaemon()`, so the phase's origin is the only thing that can tell the two writers apart —
         // exactly what the card's attribution has to read.
@@ -746,7 +754,8 @@ final class LoginItemModelTests: XCTestCase {
         guard case .failed(let reason, .launchRepair) = model.startPhase else {
             return XCTFail("the only recovery signal must not be erased; got \(model.startPhase)")
         }
-        XCTAssertTrue(reason.contains("didn’t start"))
+        XCTAssertEqual(reason, .notStarted)
+        XCTAssertTrue(reason.text(offeringLogAffordance: false).contains("didn’t start"))
 
         // And a LATER launch still repairs nothing, so nothing re-raises it. This is the compounding the
         // issue names, asserted rather than asserted-about.
