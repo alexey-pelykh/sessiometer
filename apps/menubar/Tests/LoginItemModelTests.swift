@@ -145,9 +145,10 @@ final class LoginItemModelTests: XCTestCase {
         XCTAssertTrue(model.canStartDaemon)
         await model.startDaemon()
         XCTAssertEqual(fake.registerDaemonCount, 1, "register was attempted and SUCCEEDED (no throw)")
-        guard case .failed(let reason) = model.startPhase else {
+        guard case .failed(let reason, let origin) = model.startPhase else {
             return XCTFail("expected .failed (registered but never started), got \(model.startPhase)")
         }
+        XCTAssertEqual(origin, .operatorStart, "a press is what stands behind this one (issue #820)")
         XCTAssertTrue(reason.contains("registered but"),
                       "the failure names the not-started condition, not a register error")
     }
@@ -368,10 +369,11 @@ final class LoginItemModelTests: XCTestCase {
 
         await model.reconcileDaemonAgentRegistration()
 
-        guard case .failed(let reason) = model.startPhase else {
+        guard case .failed(let reason, let origin) = model.startPhase else {
             return XCTFail("an unregister throw must surface, not vanish; got \(model.startPhase)")
         }
         XCTAssertFalse(reason.isEmpty, "the card needs something to say")
+        XCTAssertEqual(origin, .launchRepair, "no press stands behind a launch-time repair (issue #820)")
         XCTAssertEqual(fake.registerDaemonCount, 0, "a failed unregister does not proceed to register")
         XCTAssertEqual(store.lastRegisteredIdentity, "build-1",
                        "a failed repair is never recorded as done — the next launch retries")
@@ -409,10 +411,15 @@ final class LoginItemModelTests: XCTestCase {
 
         await model.reconcileDaemonAgentRegistration()
 
-        guard case .failed(let reason) = model.startPhase else {
+        guard case .failed(let reason, let origin) = model.startPhase else {
             return XCTFail("a re-register whose daemon never came up must surface; got \(model.startPhase)")
         }
         XCTAssertTrue(reason.contains("didn’t start"), "the #745 silent-start copy, reused verbatim")
+        // The sharpest place to pin the origin (issue #820): this reason is emitted BYTE-IDENTICALLY by
+        // `startDaemon()`, so the phase's origin is the only thing that can tell the two writers apart —
+        // exactly what the card's attribution has to read.
+        XCTAssertEqual(origin, .launchRepair,
+                       "the reason alone cannot distinguish this from a failed press; the origin must")
         XCTAssertEqual(store.lastRegisteredIdentity, "build-2",
                        "the REGISTRATION succeeded — the spawn is a separate, separately-surfaced failure")
     }
@@ -498,7 +505,7 @@ final class LoginItemModelTests: XCTestCase {
         // Land a real `.failed` first: a register that throws, with the lock free.
         fake.daemonRegisterError = FakeLoginItemError.denied
         await model.reconcileDaemonAgentRegistration()
-        guard case .failed(let reason) = model.startPhase else {
+        guard case .failed(let reason, _) = model.startPhase else {
             return XCTFail("setup: expected a failed repair, got \(model.startPhase)")
         }
 
@@ -517,7 +524,7 @@ final class LoginItemModelTests: XCTestCase {
         XCTAssertEqual(fake.daemonCalls.count, 2,
                        "the repair must have DEFERRED at the re-probe — no second unregister/register pair")
 
-        guard case .failed(let preserved) = model.startPhase else {
+        guard case .failed(let preserved, _) = model.startPhase else {
             return XCTFail("the deferral erased the prior reason; got \(model.startPhase)")
         }
         XCTAssertEqual(preserved, reason, "a deferral reports nothing of its own — it restores what it found")
@@ -674,6 +681,77 @@ final class LoginItemModelTests: XCTestCase {
                        + "thing that dies when launchd unloads the job")
         XCTAssertEqual(store.lastRegisteredIdentity, "build-1",
                        "a deferral is not a repair — the next launch retries")
+    }
+
+    // MARK: - A failed repair's reason outlives the Start affordance (issue #820)
+
+    /// AC1 / AC4 — THE ORDERING, which is the whole regression. A launch-time repair FAILS, and only THEN
+    /// does a daemon take the single-instance lock (a hand-run `sessiometer run`, or our own `RunAtLoad`
+    /// spawn arriving past the liveness window). That flips `canStartDaemon` false — and the card used to
+    /// nest its reason inside exactly that gate, so the reason silently vanished.
+    ///
+    /// STAGED IN THAT ORDER ON PURPOSE. Both halves already pass on their own today: a repair that fails
+    /// with the lock free renders its reason fine, and a held lock withholds the button correctly. It is the
+    /// SEQUENCE — fail, and only afterwards lose the affordance — that nothing pinned. A test asserting
+    /// merely "a failure lands `.failed`" passes with the render still coupled.
+    ///
+    /// This is the MODEL half of the pin: the reason is still there to be read. `StartDaemonCardTests` holds
+    /// the other half — that the card actually renders it in this exact state — because a phase nobody draws
+    /// is not a reason the operator can reach, and the model alone cannot say whether it is drawn.
+    func testAFailedRepairKeepsItsReasonOnceADaemonTakesTheLock() async {
+        let (model, fake, _) = makeReconcileModel(
+            daemonAgentStatus: .enabled, lastRegisteredIdentity: "build-1", agentIdentity: "build-2")
+        fake.daemonRegisterError = FakeLoginItemError.denied
+
+        await model.reconcileDaemonAgentRegistration()
+
+        // Precondition: the repair genuinely failed, and at this instant the affordance IS still offered.
+        XCTAssertTrue(model.canStartDaemon, "setup: the lock is free, so Start is offered — for now")
+        guard case .failed(let reason, let origin) = model.startPhase else {
+            return XCTFail("setup: expected a failed repair, got \(model.startPhase)")
+        }
+        XCTAssertEqual(origin, .launchRepair)
+
+        // NOW some daemon takes the lock. Nothing about the failure changed; the affordance's gate did.
+        fake.daemonLockHeld = true
+
+        XCTAssertFalse(model.canStartDaemon,
+                       "a held lock withholds the Start affordance — that part is correct and stays")
+        guard case .failed(let stillThere, let stillLaunchRepair) = model.startPhase else {
+            return XCTFail("the reason must OUTLIVE the affordance; got \(model.startPhase)")
+        }
+        XCTAssertEqual(stillThere, reason, "the reason is unchanged — only the button's gate moved")
+        XCTAssertEqual(stillLaunchRepair, .launchRepair, "and it is still attributable to the repair")
+    }
+
+    /// The sibling ordering for the OTHER failure the repair can raise, and the one the issue calls the bad
+    /// case: register SUCCEEDS but no daemon spawns. The identity is recorded (before the liveness wait, at
+    /// parity with `startDaemon()`), so the identity gate short-circuits every later launch and the repair is
+    /// never retried — which is precisely why the reason has to survive: it is the SOLE recovery signal, and
+    /// nothing else will raise it again.
+    func testTheNeverRetriedRepairsReasonSurvivesALockTakenAfterwards() async {
+        let (model, fake, store) = makeReconcileModel(
+            daemonAgentStatus: .enabled, lastRegisteredIdentity: "build-1", agentIdentity: "build-2",
+            daemonComesUpOnRegister: false)
+
+        await model.reconcileDaemonAgentRegistration()
+        XCTAssertEqual(store.lastRegisteredIdentity, "build-2",
+                       "setup: the registration succeeded, so the identity is recorded and gate 3 will "
+                       + "short-circuit every later launch — there is no automatic retry behind this reason")
+
+        // A daemon appears afterwards — our own late `RunAtLoad` spawn, or somebody's `sessiometer run`.
+        fake.daemonLockHeld = true
+
+        XCTAssertFalse(model.canStartDaemon)
+        guard case .failed(let reason, .launchRepair) = model.startPhase else {
+            return XCTFail("the only recovery signal must not be erased; got \(model.startPhase)")
+        }
+        XCTAssertTrue(reason.contains("didn’t start"))
+
+        // And a LATER launch still repairs nothing, so nothing re-raises it. This is the compounding the
+        // issue names, asserted rather than asserted-about.
+        await model.reconcileDaemonAgentRegistration()
+        XCTAssertEqual(fake.registerDaemonCount, 1, "the identity gate short-circuits — no second repair")
     }
 
     // MARK: - The identity the detector compares (issue #788)
@@ -863,7 +941,12 @@ final class LoginItemModelTests: XCTestCase {
 /// A hermetic `LoginItemService`: no `SMAppService`, so a test never writes a login item or a LaunchAgent. It
 /// records call counts, lets a test script the status a register LANDS on (`appRegisterResult` /
 /// `daemonRegisterResult` — e.g. `.requiresApproval`), and lets a test make any register/unregister THROW.
-private final class FakeLoginItemService: LoginItemService {
+///
+/// Module-internal rather than file-private since issue #820: `StartDaemonCardTests` drives the card's render
+/// from a model in a REAL failed-repair state, and reaching that state means running the real
+/// `reconcileDaemonAgentRegistration()` against this same seam. A second, hand-copied fake there would be a
+/// second thing to keep in step with the protocol — the drift issue #504 already paid for once.
+final class FakeLoginItemService: LoginItemService {
     var appStatus: LoginItemStatus
     var daemonAgentStatus: LoginItemStatus
     var cliManagedAgentPresent: Bool
@@ -1017,14 +1100,15 @@ private final class FakeLoginItemService: LoginItemService {
     func openLoginItemsSettings() { openSettingsCount += 1 }
 }
 
-/// One daemon-agent registration call, recorded in order by `FakeLoginItemService` (issue #788).
-private enum DaemonAgentCall: String, Equatable {
+/// One daemon-agent registration call, recorded in order by `FakeLoginItemService` (issue #788). Internal for
+/// the same reason the fake above is.
+enum DaemonAgentCall: String, Equatable {
     case unregister
     case register
 }
 
 /// A stand-in for an `SMAppService` registration error (denied / not permitted) — its exact reason is irrelevant
 /// to the model, which only routes a throw into `.failed` with a redacted message.
-private enum FakeLoginItemError: Error {
+enum FakeLoginItemError: Error {
     case denied
 }

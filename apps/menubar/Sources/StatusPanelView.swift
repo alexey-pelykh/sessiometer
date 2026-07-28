@@ -83,7 +83,9 @@ struct StatusPanelView: View {
     @EnvironmentObject private var stats: PanelStatsModel
     /// The launch-at-login / Start-daemon model (issue #170): observed here so the `.notRunning` body can
     /// render `StartDaemonCard` — the honest Start affordance that appears only where it can act
-    /// (`canStartDaemon`) and otherwise degrades to the same inert banner the other cold states show.
+    /// (`canStartDaemon`) and otherwise degrades to the same inert banner the other cold states show. Since
+    /// issue #820 that degraded card still carries a `.failed` REASON when one exists: the affordance is
+    /// withheld, the explanation is not.
     @EnvironmentObject private var loginItem: LoginItemModel
 
     /// The operator's Dynamic Type size class (issue #756) — the panel's ONE reader of it. Every subview
@@ -223,9 +225,10 @@ struct StatusPanelView: View {
             // #170 Start affordance: `StartDaemonCard` reuses that banner and, ONLY where a bundled agent is
             // registrable and no CLI owns the label (`loginItem.canStartDaemon`), offers a "Start daemon"
             // button that registers + launches the agent via `SMAppService`. In the #170 shipped state no
-            // plist is bundled yet (that co-lands with #171), so `canStartDaemon` is false and the card is
-            // exactly the inert banner it was before — never a dead button. (View log / Restart remain
-            // #169/#171 siblings.)
+            // plist is bundled yet (that co-lands with #171), so `canStartDaemon` is false and — with nothing
+            // able to have registered, hence no `.failed` reason to carry (issue #820) — the card is exactly
+            // the inert banner it was before, never a dead button. (View log / Restart remain #169/#171
+            // siblings.)
             Divider().padding(.horizontal, 14 * scale)
             StartDaemonCard()
                 .padding(.horizontal, 14 * scale).padding(.vertical, 14 * scale)

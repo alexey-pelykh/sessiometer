@@ -131,9 +131,13 @@ targets:
       # Launch-at-login (#170) model: the pure @MainActor decision layer over SMAppService — toggle-state
       # derivation, idempotent first-launch register, requiresApproval, the Start-daemon phase machine, and
       # the CLI two-owner guard. Compiled here (NOT SMAppServiceLoginItem.swift — that imports
-      # ServiceManagement — nor SettingsView/StartDaemonCard/main.swift, the SwiftUI/AppKit surfaces) so every
-      # decision is driven by a fake LoginItemService — no real SMAppService, never a login item or LaunchAgent
-      # written by a test run.
+      # ServiceManagement — nor SettingsView/main.swift) so every decision is driven by a fake
+      # LoginItemService — no real SMAppService, never a login item or LaunchAgent written by a test run.
+      # `StartDaemonCard` was in that exclusion list until #754 widened this bundle to the panel's view
+      # hierarchy; it now compiles here via StatusPanelChrome.swift below, and `StartDaemonCardTests` (#820)
+      # DEPENDS on that — it hosts the real card to prove a failed launch repair's reason is still RENDERED
+      # once a daemon takes the lock, which the model alone cannot say. Corrected in place rather than left
+      # to contradict that block, matching how #754 handled the same drift.
       - path: Sources/LoginItemModel.swift
       - path: Sources/HonestStateMachine.swift
       - path: Sources/WatchStatusStore.swift
