@@ -248,6 +248,71 @@ pub(crate) fn weekly_effective_ceiling(ceiling: f64) -> f64 {
     (ceiling - WEEKLY_TAIL_MARGIN).max(0.0)
 }
 
+/// The daemon's VIABILITY BOUNDARY: the pair of utilisation lines at/above which an account can
+/// no longer be swapped TO, so a fleet whose every account is over one of them has nowhere to
+/// land — the terminal no-viable-target state ([`crate::daemon::TickAction::NoViableTarget`]).
+///
+/// This is a CAPACITY fact ("could the daemon still swap?"), NOT a utilisation water ("was the
+/// roster running hot?"). The two are deliberately distinct (issue #803 / #804): a roster can sit
+/// hot for a week without ever cornering the daemon, and — the case that motivated this type — it
+/// can corner the daemon while a utilisation census reads calm.
+///
+/// Produced by [`viability_boundary`] and consumed by BOTH surfaces that must agree on it: the
+/// daemon's own decision path ([`crate::daemon`]) and the offline capacity-holds aggregate
+/// ([`crate::usage_stats`]). A single origin is the point — the aggregate exists to report the
+/// boundary the daemon ACTUALLY enforced, so an independently-chosen line would make it report a
+/// fact about a daemon that does not exist (REQ-STA-B-010).
+///
+/// A named struct rather than a bare `(f64, f64)`: both fields are utilisation FRACTIONS in the
+/// same units and the same range, so a positional pair is silently transposable at a call site —
+/// a transposition that type-checks, runs, and mis-measures. The field names make it not compile.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ViabilityBoundary {
+    /// The SESSION line: `min(session_ceiling, target_max_session_usage)` — 0.80 at defaults,
+    /// where the #398 default-on target reserve (80) binds below the #597 ceiling (95).
+    pub(crate) session: f64,
+    /// The WEEKLY line: [`weekly_effective_ceiling`]`(weekly_ceiling)` — 0.97 at defaults, NOT the
+    /// raw 0.98. The [`WEEKLY_TAIL_MARGIN`] pp is load-bearing here and not a rounding detail: an
+    /// account resting at exactly 0.97 is blocked FOR THE DAEMON while a predicate written against
+    /// the raw ceiling sees it as viable, so an aggregate that took the raw value would undercount
+    /// precisely the accounts sitting on the line.
+    pub(crate) weekly: f64,
+}
+
+/// Build the [`ViabilityBoundary`] from the three configured lines, in usage FRACTIONS.
+///
+/// Both arms are derived exactly as [`crate::daemon`]'s own target filter derives them, and the
+/// weekly arm routes through [`weekly_effective_ceiling`] — the same function the daemon's release
+/// and acquire predicates call — so the three surfaces share one origin and cannot drift apart.
+pub(crate) fn viability_boundary(
+    session_ceiling: f64,
+    target_max_session_usage: f64,
+    weekly_ceiling: f64,
+) -> ViabilityBoundary {
+    ViabilityBoundary {
+        session: session_ceiling.min(target_max_session_usage),
+        weekly: weekly_effective_ceiling(weekly_ceiling),
+    }
+}
+
+impl ViabilityBoundary {
+    /// Whether a reading's SESSION dimension is at/above the session line (inclusive — the line is
+    /// a not-cross line, so landing exactly on it already blocks, matching the daemon's `>=`).
+    pub(crate) fn session_blocked(self, session: f64) -> bool {
+        session >= self.session
+    }
+
+    /// Whether a reading's WEEKLY dimension is at/above the weekly line (inclusive, as above).
+    ///
+    /// Kept a SEPARATE predicate from [`session_blocked`](Self::session_blocked) rather than
+    /// folded into one `blocks(session, weekly)` disjunction: the two dimensions are independent
+    /// (issue #41), and every caller so far needs to know WHICH one blocked in order to name the
+    /// window relief waits on, so a combined predicate would discard the very fact they came for.
+    pub(crate) fn weekly_blocked(self, weekly: f64) -> bool {
+        weekly >= self.weekly
+    }
+}
+
 /// The reactive arm's re-observation-gap lookahead, in seconds: how long the active account can
 /// climb UNSEEN between the daemon's successive observations of it. The measured **p90** of the
 /// active-account re-observation gap.
@@ -1159,6 +1224,57 @@ mod tests {
                 "weekly ceiling {ceiling_pct}: fire point must sit exactly one margin below",
             );
         }
+    }
+
+    // --- #803 shared viability boundary ---------------------------------
+
+    #[test]
+    fn viability_boundary_takes_the_binding_session_line_and_the_effective_weekly_one() {
+        // At the shipping defaults (session_ceiling 95, target_max_session_usage 80,
+        // weekly_ceiling 98) the boundary is 0.80 / 0.97: the #398 target reserve binds BELOW the
+        // #597 session ceiling, and the weekly arm is one WEEKLY_TAIL_MARGIN below the raw
+        // ceiling. The weekly 0.97 is the load-bearing digit — a census written against the raw
+        // 0.98 would see an account resting at exactly 0.97 as viable while the daemon,
+        // enforcing this line, could not swap to it.
+        let b = viability_boundary(0.95, 0.80, 0.98);
+        assert!((b.session - 0.80).abs() < 1e-9);
+        assert!((b.weekly - 0.97).abs() < 1e-9);
+        assert!(b.weekly < 0.98, "the weekly line is NOT the raw ceiling");
+
+        // The session arm takes whichever line binds — a reserve raised above the ceiling cannot
+        // loosen the boundary past the ceiling itself.
+        assert!((viability_boundary(0.90, 0.95, 0.98).session - 0.90).abs() < 1e-9);
+    }
+
+    #[test]
+    fn viability_boundary_weekly_arm_tracks_weekly_effective_ceiling_exactly() {
+        // The anti-drift property this type exists for (issue #803): the boundary's weekly arm is
+        // not a re-derivation but the SAME function the daemon's release and acquire predicates
+        // call, so no future edit can move one without moving the other. Asserted across the
+        // operator-settable range rather than at one point, so a divergence anywhere fails.
+        for ceiling_pct in 50..=99u8 {
+            let ceiling = f64::from(ceiling_pct) / 100.0;
+            assert_eq!(
+                viability_boundary(0.95, 0.80, ceiling).weekly,
+                weekly_effective_ceiling(ceiling),
+                "weekly ceiling {ceiling_pct}: boundary must not re-derive the weekly line",
+            );
+        }
+    }
+
+    #[test]
+    fn viability_boundary_blocks_at_the_line_inclusively_and_per_dimension() {
+        let b = viability_boundary(0.95, 0.80, 0.98);
+        // AT the line already blocks — a ceiling is a not-cross line, matching the daemon's `>=`.
+        assert!(b.session_blocked(0.80));
+        assert!(b.weekly_blocked(0.97));
+        // Just below does not.
+        assert!(!b.session_blocked(0.7999));
+        assert!(!b.weekly_blocked(0.9699));
+        // The dimensions are independent (issue #41): neither subsumes the other, so an account
+        // can be blocked on weekly while its session dimension is idle, and vice versa.
+        assert!(b.weekly_blocked(0.98) && !b.session_blocked(0.10));
+        assert!(b.session_blocked(0.95) && !b.weekly_blocked(0.10));
     }
 
     #[test]

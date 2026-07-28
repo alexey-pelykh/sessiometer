@@ -3275,7 +3275,18 @@ where
         // next cycle, the exact ping-pong that exclusion exists to prevent. The session dimension
         // closes the same gap with the `target_max_session_usage` reserve (#398), which has no weekly
         // counterpart, so weekly closes it by moving both predicates together.
-        let weekly_threshold = swap::weekly_effective_ceiling(weekly_ceiling);
+        //
+        // Both this weekly line and the SESSION block line the all-exhausted classification uses
+        // below come from ONE shared origin — `swap::viability_boundary` (issue #803) — so the
+        // daemon's enforced boundary and the offline capacity-holds aggregate that reports it
+        // cannot drift apart. The weekly arm is unchanged by that routing: the boundary derives it
+        // through the very `weekly_effective_ceiling` this line called directly before.
+        let boundary = swap::viability_boundary(
+            session_ceiling,
+            self.target_max_session_usage,
+            weekly_ceiling,
+        );
+        let weekly_threshold = boundary.weekly;
         if swap::decide(&active_usage, session_threshold, weekly_threshold) == SwapDecision::Hold {
             // Reactive says HOLD — the observed reading is below both fire points (the #597
             // velocity-derived session threshold + the #607 effective weekly ceiling). Before
@@ -3387,12 +3398,14 @@ where
             // edge-triggered: emit only on ENTERING the state, so the payload is computed
             // once per episode, not every poll while it holds.
             if !self.state.signaled_all_exhausted {
-                let session_block_line = session_ceiling.min(self.target_max_session_usage);
                 let (cause, hold_idx, resets_at) = all_exhausted_relief(
                     active_idx,
                     readings,
                     &self.enabled_mask(),
-                    session_block_line,
+                    // The shared viability boundary (issue #803), so `sessiometer stats`' offline
+                    // capacity-holds readout measures the SAME session line this state was entered
+                    // under rather than an independently-chosen water.
+                    boundary.session,
                     // The same #607 effective weekly ceiling the viability filter just used, so the
                     // relief hint EXPLAINS the verdict it accompanies rather than reasoning against a
                     // different weekly line.
@@ -4523,15 +4536,22 @@ where
             // and the active-DEAD-and-stranded cases: a dead active leaves every live spare
             // weekly-exhausted, so relief classifies `Weekly` here while the dead active's 🔴 health
             // rides its own account row (the composite an operator needs — issue #405).
-            let session_block_line = self.session_ceiling_base.min(self.target_max_session_usage);
+            // The shared viability boundary (issue #803) over the BASE ceilings, so this preview,
+            // the durable-event classification, and `stats`' offline capacity-holds readout all
+            // derive their block lines from one origin. Its weekly arm is exactly
+            // `weekly_rotation_line()` — both route through `swap::weekly_effective_ceiling` over
+            // `weekly_ceiling_base` — so the #607 agreement this call already relied on is kept.
+            let boundary = swap::viability_boundary(
+                self.session_ceiling_base,
+                self.target_max_session_usage,
+                self.weekly_ceiling_base,
+            );
             let (cause, _hold, resets_at) = all_exhausted_relief(
                 active_idx,
                 readings,
                 &enabled,
-                session_block_line,
-                // Issue #607: the same rotation line the viability filter above used, so the relief
-                // hint explains the verdict it accompanies rather than a different weekly line.
-                self.weekly_rotation_line(),
+                boundary.session,
+                boundary.weekly,
             );
             let cause = match cause {
                 SwapReason::Session => Some(NoTargetCause::Session),
