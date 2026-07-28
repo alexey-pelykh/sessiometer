@@ -658,6 +658,31 @@ pub(crate) async fn claude_binary() -> Result<PathBuf> {
 /// there is no bridge to build. The PURE policy below ([`claude_binary_from`]) stays sync and
 /// argument-threaded; only this composing entry point awaits.
 pub(crate) async fn claude_binary_with_override(config_bin: Option<&Path>) -> Result<PathBuf> {
+    claude_binary_ambient(config_bin, harvest_login_shell_path).await
+}
+
+/// [`claude_binary_with_override`]'s body with the harvest — and ONLY the harvest —
+/// injected. The ambient-read seam, added by issue #785.
+///
+/// Every other input stays genuinely ambient: `$CLAUDE_BIN`, `$PATH` and `cwd` are read
+/// from the REAL process environment and the memo is the REAL process-wide static. That is
+/// the whole point. The #784 seam below ([`claude_binary_tiered`]) threads those in as
+/// arguments, which is right for testing the POLICY but is exactly why the launchd outage
+/// was invisible to the suite: every test proved "the resolver works when HANDED a good
+/// `PATH`", and none proved "the daemon, running in the environment launchd actually gives
+/// it, resolves the binary". A test that re-execs itself under
+/// `PATH=/usr/bin:/bin:/usr/sbin:/sbin` needs to drive the daemon's OWN reads rather than a
+/// hand-rolled mirror of them, and this is the entry point that lets it.
+///
+/// `harvest` is the one input that cannot stay ambient, because it is the one a test cannot
+/// stage: [`harvest_login_shell_path`] resolves the shell from the PASSWORD DATABASE, so
+/// leaving it fixed would make the guard depend on whichever shell the running user happens
+/// to have — and, through it, on whether their real `~/.local/bin/claude` exists.
+async fn claude_binary_ambient<F, Fut>(config_bin: Option<&Path>, harvest: F) -> Result<PathBuf>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<OsString>>,
+{
     claude_binary_tiered(
         config_bin,
         std::env::var_os("CLAUDE_BIN"),
@@ -665,7 +690,7 @@ pub(crate) async fn claude_binary_with_override(config_bin: Option<&Path>) -> Re
         &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         &HARVESTED_PATH,
         Instant::now(),
-        harvest_login_shell_path,
+        harvest,
     )
     .await
 }
@@ -2847,5 +2872,448 @@ mod tests {
         // And it is generous against the measured ~38 ms cost the comment cites: two
         // orders of magnitude of headroom for a slow rc file.
         assert!(LOGIN_SHELL_HARVEST_TIMEOUT >= Duration::from_secs(1));
+    }
+
+    // --- The literal launchd environment, reproduced (issue #785) -----------
+    //
+    // Every test above threads the environment in as an ARGUMENT — the right shape for
+    // testing the POLICY, and exactly the gap the outage lived in (`claude_binary_ambient`
+    // states it in full): the resolver was always correct when GIVEN a good PATH; the daemon
+    // was never given one.
+    //
+    // This section closes it by reproducing the environment for real, in a CHILD PROCESS:
+    // the test binary re-execs itself with its environment cleared to the single literal
+    // variable
+    //
+    //     PATH=/usr/bin:/bin:/usr/sbin:/sbin
+    //
+    // which is the environment measured on the affected machine — no `CLAUDE_BIN`, no
+    // `HOME`, nothing else. `apps/menubar/LaunchAgents/org.sessiometer.agent.plist` carries
+    // NO `EnvironmentVariables` key, which is *why* the daemon inherits that bare set; the
+    // reproduction matches the job's actual (absent-key) shape rather than an invented one.
+    //
+    // A child process rather than `std::env::set_var`: mutating this process's environment
+    // would race the rest of the suite sharing it (other tests read `$PATH` and `$TMPDIR`
+    // concurrently), no internal mutex can serialize readers it does not own, and the call
+    // is `unsafe` from edition 2024 on. A child's environment, by contrast, is exactly what
+    // we hand it — `HOME` is genuinely ABSENT rather than merely overwritten, which is the
+    // one thing an in-process approach cannot safely arrange.
+    //
+    // Nothing here introduces a platform conditional (issue #797's premise correction): no
+    // `cfg(target_os)`, and no claim — implicit or explicit — about Linux.
+    //
+    // Cases carry their issue-#785 T-number, exactly as the tier-3 tests above carry their
+    // #784 ones. The two numberings are independent: a bare "T2" in this section is #785's.
+
+    /// The interpreter every staged login shell in this section is written against — and the
+    /// one host property the skip gate keys on, since without it no staged shell can run.
+    const POSIX_SH: &str = "/bin/sh";
+
+    /// Marks a child invocation AND names the case it must run; absent means "not a child".
+    const LAUNCHD_CASE_VAR: &str = "SESSIOMETER_TEST_LAUNCHD_CASE";
+
+    /// Carries the parent's staged fixture root into the child.
+    const LAUNCHD_FIXTURE_VAR: &str = "SESSIOMETER_TEST_LAUNCHD_FIXTURE";
+
+    /// The `#[ignore]`d child payload, named once so the re-exec filter and the function it
+    /// selects cannot drift apart silently.
+    const LAUNCHD_CHILD_FN: &str = "launchd_env_child_payload";
+
+    /// Printed by the child once a case's assertions have all run, and asserted by the
+    /// parent — see [`run_launchd_case`] for why an exit code alone is not evidence.
+    const LAUNCHD_CASE_OK: &str = "launchd-case-ok:";
+
+    /// Printed instead of running, when the mechanism cannot apply.
+    const LAUNCHD_SKIP: &str = "launchd-case-skipped:";
+
+    /// The fixture's stand-in for `~/.local/bin`: the ONLY directory holding a `claude`, and
+    /// reachable only through the harvest.
+    const FIXTURE_HARVESTED_DIR: &str = "user-local-bin";
+    /// The fixture login shell whose harvest SUCCEEDS, yielding [`FIXTURE_HARVESTED_DIR`].
+    const FIXTURE_LOGIN_SHELL: &str = "login-shell";
+    /// The fixture login shell whose harvest FAILS — the negative control's mechanism.
+    const FIXTURE_BROKEN_LOGIN_SHELL: &str = "broken-login-shell";
+    /// The environment dump the fixture login shell prints, staged as a FILE so a tempdir
+    /// path never has to be interpolated into shell source.
+    const FIXTURE_HARVESTED_ENV: &str = "harvested-env";
+
+    /// Stage the launchd fixture and return its (parent-owned) root.
+    ///
+    /// The `claude` staged here exists ONLY under [`FIXTURE_HARVESTED_DIR`] — never on
+    /// `/usr/bin:/bin:/usr/sbin:/sbin`, and never the developer's real
+    /// `~/.local/bin/claude`. That is what makes the guard deterministic on CI and on any
+    /// contributor's machine.
+    ///
+    /// The login shell prints a staged FILE rather than an interpolated string, so no
+    /// tempdir path ever needs shell-quoting: `${0%/*}` is POSIX parameter expansion (the
+    /// script's own directory) and `/bin/cat` is absolute, per the transport rule.
+    fn stage_launchd_fixture() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let harvested = dir_with_claude(tmp.path(), FIXTURE_HARVESTED_DIR);
+        // Shaped like a real `env` dump — other variables around the `PATH=` line, including
+        // a `HOME` the harvest must ignore — so the real parser does real work.
+        let mut dump = OsString::from("SHELL=/bin/zsh\nHOME=/harvest/must/ignore/this\nPATH=");
+        dump.push(harvested.as_os_str());
+        dump.push("\nTERM=xterm\n");
+        fs::write(tmp.path().join(FIXTURE_HARVESTED_ENV), dump.into_vec()).unwrap();
+        fake_shell(
+            tmp.path(),
+            FIXTURE_LOGIN_SHELL,
+            &format!("/bin/cat \"${{0%/*}}/{FIXTURE_HARVESTED_ENV}\""),
+        );
+        fake_shell(tmp.path(), FIXTURE_BROKEN_LOGIN_SHELL, "exit 1");
+        tmp
+    }
+
+    /// The child payload's libtest name. libtest names a test by its module path with the
+    /// CRATE ROOT stripped, so this strips it too.
+    ///
+    /// A drifted name would make the re-exec filter select NOTHING — and libtest exits 0 on
+    /// an empty selection, which is a silently green, entirely degenerate gate. That is why
+    /// [`run_launchd_case`] asserts the child's completion marker and not merely its status.
+    fn launchd_child_test_name() -> String {
+        let module = module_path!();
+        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+        format!("{module}::{LAUNCHD_CHILD_FN}")
+    }
+
+    /// Emit a skip reason that libtest's default output capture cannot swallow.
+    ///
+    /// `println!` and `eprintln!` route through the thread-local capture libtest installs, so
+    /// on a PASSING test their output is discarded unless `--nocapture` is passed — which
+    /// would make a skip indistinguishable from a real pass, the exact "a silently-skipped
+    /// test is a degenerate gate" outcome the skip requirement exists to prevent. A write
+    /// straight to the `stderr` HANDLE goes to fd 2 and is always seen. (Measured both ways:
+    /// the macro output vanishes on a passing test, the handle write does not.)
+    fn announce_skip(reason: &str) {
+        let _ = writeln!(std::io::stderr(), "{LAUNCHD_SKIP} {reason}");
+    }
+
+    /// Run one launchd case: re-exec THIS test binary, with its environment cleared to
+    /// exactly the launchd set, running only the `#[ignore]`d child payload.
+    ///
+    /// `with_claude_bin` additionally exports `$CLAUDE_BIN` pointing at the fixture binary —
+    /// the tier-2 escape hatch, which only one case exercises.
+    fn run_launchd_case(case: &str, with_claude_bin: bool) {
+        // A parent test running INSIDE a child invocation would re-exec again, forever.
+        // `--exact` plus `--ignored` already makes that unreachable; failing loudly here
+        // means a future drift in either flag surfaces as one clear panic, not a fork bomb.
+        assert!(
+            std::env::var_os(LAUNCHD_CASE_VAR).is_none(),
+            "{LAUNCHD_CASE_VAR} is set — a parent test is running inside a child invocation"
+        );
+        if !Path::new(POSIX_SH).is_file() {
+            // SKIPPED, never failed: a host with no POSIX shell cannot run the staged login
+            // shell, which is a property of the host rather than of the resolver.
+            announce_skip(&format!(
+                "{case}: no POSIX shell at {POSIX_SH}, so the staged login shell cannot run \
+                 on this host"
+            ));
+            return;
+        }
+        let fixture = stage_launchd_fixture();
+        let mut command = std::process::Command::new(
+            std::env::current_exe().expect("the test binary must know its own path"),
+        );
+        command
+            .arg(launchd_child_test_name())
+            .arg("--exact")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            // THE reproduction. After `env_clear` the child's ENTIRE environment is what
+            // follows: the literal launchd `PATH`, plus the two variables telling the payload
+            // which case to run and where its fixture lives. No `HOME`, no `CLAUDE_BIN`
+            // unless the case asks for one, nothing else.
+            .env_clear()
+            .env("PATH", LAUNCHD_PATH)
+            .env(LAUNCHD_CASE_VAR, case)
+            .env(LAUNCHD_FIXTURE_VAR, fixture.path())
+            // `cwd` is the other genuinely-ambient input [`claude_binary_ambient`] reads, so
+            // it is reproduced too rather than inherited from cargo. The plist carries no
+            // `WorkingDirectory` key either, so a launchd-started daemon runs at `/`.
+            .current_dir("/");
+        if with_claude_bin {
+            command.env(
+                "CLAUDE_BIN",
+                fixture.path().join(FIXTURE_HARVESTED_DIR).join("claude"),
+            );
+        }
+        let output = command
+            .output()
+            .unwrap_or_else(|err| panic!("could not re-exec the test binary for {case}: {err}"));
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "the launchd child failed for {case} ({}):\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+            output.status
+        );
+        // Non-degenerate subject: libtest exits 0 when its filter selects NOTHING, so a
+        // renamed payload or a drifted module path would otherwise read as a pass. The marker
+        // is printed by the case body itself, only after every assertion in it has run.
+        assert!(
+            stdout.contains(&format!("{LAUNCHD_CASE_OK} {case}")),
+            "the launchd child exited 0 for {case} without completing the case — the filter \
+             `{}` may have selected no test:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+            launchd_child_test_name()
+        );
+    }
+
+    /// The fixture root the parent staged (child side).
+    fn launchd_fixture_root() -> PathBuf {
+        PathBuf::from(
+            std::env::var_os(LAUNCHD_FIXTURE_VAR).expect("the parent must pass the fixture root"),
+        )
+    }
+
+    /// Assert the child really is running under the reproduced environment. Every case runs
+    /// this FIRST, so no case can assert against an environment that was not actually reduced
+    /// to `PATH=/usr/bin:/bin:/usr/sbin:/sbin`.
+    fn assert_launchd_environment() {
+        assert_eq!(
+            std::env::var_os("PATH").as_deref(),
+            Some(OsStr::new(LAUNCHD_PATH)),
+            "the child must run under the literal launchd PATH"
+        );
+        assert!(
+            std::env::var_os("HOME").is_none(),
+            "the launchd environment carries no HOME — the passwd discipline in `home_dir` \
+             exists for exactly this"
+        );
+    }
+
+    /// Resolve exactly as the daemon does — ambient `$CLAUDE_BIN`, `$PATH` and `cwd`, and the
+    /// real process-wide memo — with only the login shell staged, because that one input
+    /// comes from the password database and cannot be staged any other way.
+    async fn resolve_under_launchd(config_bin: Option<&Path>, shell: &Path) -> Result<PathBuf> {
+        claude_binary_ambient(config_bin, || {
+            harvest_path_from(shell, LOGIN_SHELL_HARVEST_TIMEOUT)
+        })
+        .await
+    }
+
+    /// The child half of the launchd guard, `#[ignore]`d because it is meaningless outside a
+    /// re-exec: the PARENT is what supplies the reduced environment, so an ordinary
+    /// `cargo test` run must not select it.
+    ///
+    /// One payload dispatching on the case rather than one `#[ignore]`d test per case: a
+    /// hand-run `cargo test -- --ignored` would otherwise execute several tests with no
+    /// parent environment behind them, and the "not a child" branch would have to be
+    /// repeated in each.
+    #[tokio::test]
+    #[ignore = "child half of the launchd-environment guard — driven by run_launchd_case"]
+    async fn launchd_env_child_payload() {
+        let Some(case) = std::env::var_os(LAUNCHD_CASE_VAR) else {
+            // Reachable only by running the ignored set by hand — which means WITHOUT the
+            // `--nocapture` the parent passes, so this has to go through [`announce_skip`]'s
+            // handle write for the reason documented there. There is nothing to assert
+            // without the parent's environment, so say so rather than pass silently.
+            announce_skip(&format!(
+                "(no case): {LAUNCHD_CASE_VAR} is unset — this payload is driven by the \
+                 launchd parent tests, never run directly"
+            ));
+            return;
+        };
+        let case = case.to_str().expect("case names are ASCII").to_owned();
+        assert_launchd_environment();
+
+        let fixture = launchd_fixture_root();
+        let harvested_dir = fixture.join(FIXTURE_HARVESTED_DIR);
+        let fixture_claude = harvested_dir.join("claude");
+        let good_shell = fixture.join(FIXTURE_LOGIN_SHELL);
+        let broken_shell = fixture.join(FIXTURE_BROKEN_LOGIN_SHELL);
+
+        match case.as_str() {
+            // T1: the fix under the real environment. `PATH=/usr/bin:/bin:/usr/sbin:/sbin`
+            // holds no `claude` at all, yet the one reachable via the harvested user PATH
+            // resolves. This is the assertion that fails on pre-#784 `main`.
+            "t1" => {
+                assert!(
+                    std::env::var_os("CLAUDE_BIN").is_none(),
+                    "t1 must resolve through the harvest, never through an override"
+                );
+                let got = resolve_under_launchd(None, &good_shell)
+                    .await
+                    .expect("a harvested `claude` must resolve under the launchd environment");
+                assert_eq!(got, fixture_claude);
+            }
+            // T2: the negative control, and the reason a green result here MEANS something.
+            // The only difference from T1 is that the harvest FAILS: the same fixture
+            // `claude` is on disk, simply unreachable from the launchd PATH, so resolution
+            // reports `ClaudeBinaryNotFound` — the current-`main` behavior, pinned as the
+            // regression baseline. Stub the harvest out and T1 collapses into this outcome
+            // and fails; without this case a no-op harvest would leave the suite green.
+            "t2" => {
+                assert!(
+                    fixture_claude.is_file(),
+                    "the fixture `claude` must exist, or T2 proves nothing about the harvest"
+                );
+                for dir in std::env::split_paths(LAUNCHD_PATH) {
+                    let candidate = dir.join("claude");
+                    assert!(
+                        !candidate.is_file(),
+                        "this host has a `claude` at {candidate:?}, on the literal launchd \
+                         PATH — the negative control cannot hold here"
+                    );
+                }
+                let err = resolve_under_launchd(None, &broken_shell)
+                    .await
+                    .expect_err("a failed harvest under the launchd PATH must not resolve");
+                assert!(matches!(err, Error::ClaudeBinaryNotFound), "got {err:?}");
+            }
+            // T3: the documented escape hatch, through the REAL production entry point —
+            // `claude_binary_with_override`, harvest and all. With `$CLAUDE_BIN` set, tier 2
+            // decides and `tier3_path` short-circuits before any login shell is spawned, so
+            // this case never touches the running user's shell. It is what an operator would
+            // be told to do when the harvest cannot work for them.
+            "t3" => {
+                let claude_bin =
+                    std::env::var_os("CLAUDE_BIN").expect("the parent must set $CLAUDE_BIN");
+                let got = claude_binary_with_override(None)
+                    .await
+                    .expect("$CLAUDE_BIN must resolve under the launchd environment");
+                assert_eq!(got, PathBuf::from(&claude_bin));
+                assert_eq!(got, fixture_claude);
+            }
+            // T4: the tier-1 `[refresh].claude_bin` pin, likewise through the REAL entry
+            // point and likewise harvest-free.
+            "t4" => {
+                assert!(
+                    std::env::var_os("CLAUDE_BIN").is_none(),
+                    "t4 exercises tier 1; a `$CLAUDE_BIN` would confuse which tier answered"
+                );
+                let got = claude_binary_with_override(Some(&fixture_claude))
+                    .await
+                    .expect("a config pin must resolve under the launchd environment");
+                assert_eq!(got, fixture_claude);
+            }
+            // T5: `HOME` is genuinely ABSENT (asserted above, and true by construction — the
+            // child's environment is `env_clear()` plus what the parent set). The
+            // password-database discipline this module is built on must hold anyway, and
+            // resolution must still work.
+            "t5" => {
+                let home =
+                    home_dir().expect("getpwuid must resolve the home dir with $HOME absent");
+                assert!(home.is_absolute(), "got {home:?}");
+                let name = username().expect("getpwuid must resolve the user with $USER absent");
+                assert!(!name.is_empty());
+                let got = resolve_under_launchd(None, &good_shell)
+                    .await
+                    .expect("resolution must survive an absent $HOME");
+                assert_eq!(got, fixture_claude);
+            }
+            // T6: the harvest genuinely produced a DIFFERENT `PATH` than the launchd one.
+            // Without this, T1 could pass by accident — a harvest that silently echoed the
+            // inherited value would still "resolve", just never through the user's own PATH.
+            "t6" => {
+                let harvested = harvest_path_from(&good_shell, LOGIN_SHELL_HARVEST_TIMEOUT)
+                    .await
+                    .expect("the staged login shell must harvest");
+                assert_eq!(harvested, OsString::from(harvested_dir.as_os_str()));
+                assert_ne!(
+                    harvested,
+                    OsString::from(LAUNCHD_PATH),
+                    "the harvested PATH must DIFFER from the launchd PATH, or T1 could pass \
+                     by accident"
+                );
+                assert_ne!(
+                    std::env::var_os("PATH"),
+                    Some(harvested),
+                    "the harvest must not merely echo the inherited environment"
+                );
+            }
+            other => panic!("unknown launchd case {other:?}"),
+        }
+
+        println!("{LAUNCHD_CASE_OK} {case}");
+    }
+
+    /// T1 — under `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, with no `CLAUDE_BIN` and no `HOME`, a
+    /// `claude` reachable only via the harvested user PATH RESOLVES. The launchd outage,
+    /// inverted: this is what pre-#784 `main` could not do.
+    ///
+    /// The name spells the `PATH` out instead of naming it, which is deliberate (AC5): ONE
+    /// test here has to carry the literal environment, so that a `cargo test` line on its own
+    /// tells a reader what is being reproduced. Don't shorten it to match its siblings.
+    #[test]
+    fn launchd_env_usr_bin_bin_usr_sbin_sbin_resolves_a_harvested_claude() {
+        run_launchd_case("t1", false);
+    }
+
+    /// T2 — the negative control. Same environment, same fixture, harvest FAILING: no
+    /// `claude` is reachable from `/usr/bin:/bin:/usr/sbin:/sbin`, so resolution is
+    /// `ClaudeBinaryNotFound`. This is the current-`main` behavior pinned as the baseline, and
+    /// it is what makes T1's green non-degenerate.
+    #[test]
+    fn launchd_env_without_a_working_harvest_is_claude_binary_not_found() {
+        run_launchd_case("t2", false);
+    }
+
+    /// T3 — `$CLAUDE_BIN` resolves through the real production entry point under
+    /// `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, without needing a harvest at all: the documented
+    /// escape hatch actually works under launchd.
+    #[test]
+    fn launchd_env_with_claude_bin_resolves_via_tier_2() {
+        run_launchd_case("t3", true);
+    }
+
+    /// T4 — a `[refresh].claude_bin` pin resolves through the real production entry point
+    /// under `PATH=/usr/bin:/bin:/usr/sbin:/sbin`.
+    #[test]
+    fn launchd_env_with_a_config_pin_resolves_via_tier_1() {
+        run_launchd_case("t4", false);
+    }
+
+    /// T5 — with `HOME` entirely ABSENT (as under launchd), the passwd-database accessors
+    /// still answer and resolution still succeeds.
+    #[test]
+    fn launchd_env_without_home_still_resolves_from_the_password_database() {
+        run_launchd_case("t5", false);
+    }
+
+    /// T6 — the harvested PATH is genuinely different from
+    /// `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, so T1 cannot pass by accident if the harvest
+    /// silently no-ops.
+    #[test]
+    fn launchd_env_harvested_path_differs_from_the_launchd_path() {
+        run_launchd_case("t6", false);
+    }
+
+    /// The production entry point must actually WIRE the real harvest into the ambient seam.
+    ///
+    /// [`claude_binary_ambient`] exists so the cases above can drive the daemon's own env
+    /// reads against a STAGED login shell. That seam opens a new gap one level up — and it is
+    /// the very shape of bug this section exists to guard, recursed: every launchd case either
+    /// injects its own harvest (T1/T2/T5/T6) or is decided at tier 1/2 before the harvest is
+    /// ever reached (T3/T4), so replacing `harvest_login_shell_path` at the call site below
+    /// leaves ALL of them green. Confirmed by mutation, which is why this guard exists.
+    ///
+    /// A source assertion rather than a behavioral one, for the same reason
+    /// `t19_the_resolver_introduces_no_platform_conditional` is: the only behavioral
+    /// difference is whether the RUNNING USER's login shell gets spawned, and a test keyed on
+    /// that would depend on the machine-specific state these cases deliberately stage away.
+    /// An equivalence test would be actively misleading here — the process-wide
+    /// [`HARVESTED_PATH`] memo would serve the second call from the first call's result and
+    /// agree no matter what the wiring said.
+    #[test]
+    fn the_production_entry_point_wires_the_real_harvest() {
+        let source = include_str!("paths.rs");
+        // The definition precedes this test, so `find` reaches it rather than the literal in
+        // this assertion — the same anchoring trick T19 uses.
+        let start = source
+            .find("pub(crate) async fn claude_binary_with_override(")
+            .expect("the entry point moved — re-anchor this guard");
+        let end = source[start..]
+            .find("\n}")
+            .map(|offset| start + offset)
+            .expect("the entry point's body is unterminated");
+        let body = &source[start..end];
+        assert!(
+            body.contains("claude_binary_ambient(config_bin, harvest_login_shell_path)"),
+            "`claude_binary_with_override` must hand the REAL harvest to the ambient seam — \
+             every launchd case injects or bypasses it, so nothing else here would catch a \
+             stub. Body was:\n{body}"
+        );
     }
 }
