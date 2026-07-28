@@ -12,7 +12,36 @@
 
 use super::*;
 
-use crate::canary::CanaryOutcome;
+use crate::canary::{CanaryOutcome, InconclusiveReason};
+
+/// Close a canary ALARM episode's durable bracket exactly once (issue #714, generalized by #738):
+/// push [`Event::CanaryCleared`] iff the verdict being REPLACED was an alarm this module opened —
+/// a drift (an OVERRIDDEN one included: its alarm was real even though the write proceeded) or an
+/// ambiguous resolution.
+///
+/// Called by every NON-OPENING transition, so they all close identically. The alarm arms
+/// (`Drift`, `Ambiguous`) deliberately do NOT call it: an alarm → different alarm transition
+/// RE-LABELS the episode rather than ending it, firing only the new alarm's event. So the rule has
+/// two halves — a verdict that opens its own alarm re-labels; a verdict that opens nothing closes
+/// whatever it replaces.
+///
+/// Extracted because inlining the check at each arm is what let issue #738's new verdict silently
+/// skip it: that arm fires no event of its own, so the missing close looked like "nothing to do"
+/// rather than a dropped bracket, and a drift alarm raised before an unrelated secret appeared
+/// would have stayed open in the log forever.
+///
+/// Deliberately does NOT list [`CanaryStatus::RefusedUnparseableCanonical`] among the closable
+/// alarms: `refresh_canary` never OPENS a bracket for it (its durable line is per-attempt and owned
+/// by the refuse sites), and closing a bracket that was never opened would emit an unpaired
+/// `canary_cleared`.
+fn close_canary_alarm_bracket(replacing: Option<&CanaryStatus>, events: &mut Vec<Event>) {
+    if matches!(
+        replacing,
+        Some(CanaryStatus::Drift { .. } | CanaryStatus::Ambiguous { .. })
+    ) {
+        events.push(Event::CanaryCleared);
+    }
+}
 
 impl<P, C, S, K> super::Daemon<P, C, S, K>
 where
@@ -69,6 +98,14 @@ where
     /// A run that could not conclude (`Err` — locked keychain, transient
     /// `security` failure) HOLDS the last verdict untouched: no evidence is not a
     /// verdict (the #464 no-evidence discipline).
+    ///
+    /// [`CanaryStatus::RefusedUnparseableCanonical`] (issue #738) is the one alarm
+    /// this method does not OPEN: its durable line is per-ATTEMPT and belongs to the
+    /// refuse sites, so edge-firing it here would double-log. It still CLOSES a prior
+    /// bracket exactly as the quiet verdicts do — it opens nothing, so it has no
+    /// episode of its own to continue (an alarm → alarm transition re-labels instead,
+    /// per the paragraph above). The asymmetry is the point: a bracket that is never
+    /// closed is an alarm the operator can never see end.
     pub(crate) async fn refresh_canary(
         &mut self,
         events: &mut Vec<Event>,
@@ -90,16 +127,24 @@ where
                 CanaryStatus::Ambiguous { count } => {
                     events.push(Event::CanaryAmbiguous { count: *count });
                 }
+                CanaryStatus::RefusedUnparseableCanonical => {
+                    // Issue #738: no event OPENS here. The durable `canary_unparseable_canonical`
+                    // line is owned by the REFUSE sites (`locked_swap` here, `use_account`'s `use`
+                    // path), which log one line per refused/overridden ATTEMPT; firing it again on
+                    // the verdict edge would double-log the same episode. The wire verdict is this
+                    // transition's own surface — strictly MORE than before, since a boot-time run
+                    // now shows the refusal without waiting for a swap to be attempted.
+                    //
+                    // But a prior alarm's bracket MUST still be closed. This verdict replaced the
+                    // `Inconclusive` that #730 mapped the case to, and that verdict DID close the
+                    // bracket — so omitting it here would leave a `canary_drift` open forever once
+                    // a drifted canonical is replaced by an unrelated secret. The drift/ambiguity
+                    // genuinely ENDED (the canary no longer sees it), which is exactly what
+                    // `CanaryCleared` asserts, so the close is honest and not merely bookkeeping.
+                    close_canary_alarm_bracket(self.state.canary.as_ref(), events);
+                }
                 CanaryStatus::Ok | CanaryStatus::Inconclusive | CanaryStatus::NotFound => {
-                    // Close the alarm bracket exactly once: only if the verdict we are
-                    // REPLACING was an alarm (an overridden drift included — its alarm
-                    // was real even though the write proceeded).
-                    if matches!(
-                        self.state.canary,
-                        Some(CanaryStatus::Drift { .. } | CanaryStatus::Ambiguous { .. })
-                    ) {
-                        events.push(Event::CanaryCleared);
-                    }
+                    close_canary_alarm_bracket(self.state.canary.as_ref(), events);
                 }
             }
             self.state.canary = Some(status);
@@ -112,6 +157,16 @@ where
     /// [`canary_drift_override`](crate::config::Tunables::canary_drift_override)
     /// stamp, so `status` shows WHETHER a standing drift is currently refusing
     /// writes or riding the override).
+    ///
+    /// Both override tunables are read HERE rather than left to the render sites,
+    /// because each decides which VERDICT the wire carries, not merely how it is
+    /// drawn: a drift carries its `overridden` stamp, and the #730 unparseable-
+    /// canonical case collapses back to the quiet
+    /// [`Inconclusive`](CanaryStatus::Inconclusive) when
+    /// [`canary_nostashmatch_override`](crate::config::Tunables::canary_nostashmatch_override)
+    /// has restored the pre-#730 fail-OPEN. Severity is therefore a property of
+    /// the (fault, VARIANT) pair the wire already names (#575), never something a
+    /// surface re-derives.
     fn canary_status_of(&self, outcome: CanaryOutcome) -> CanaryStatus {
         match outcome {
             CanaryOutcome::Ok => CanaryStatus::Ok,
@@ -122,6 +177,17 @@ where
                 matched: self.roster[matched].label.clone(),
                 overridden: self.canary_drift_override,
             },
+            // Issue #738: the #730 fail-CLOSED sub-case earns its OWN verdict — the identity
+            // answer is inconclusive, but the operator-visible consequence is a REFUSAL, and
+            // rendering that as the quiet `inconclusive` is what #738 fixes. Gated on the
+            // override precisely so the verdict never outlives the refusal it names: with the
+            // override set the write proceeds, so there is nothing to refuse and the honest
+            // verdict is `Inconclusive` again (the pre-#730 fail-OPEN `canary_nostashmatch_override`
+            // is documented to restore). A WELL-FORMED unmatched canonical is untouched — it
+            // fails OPEN regardless, exactly as in #714.
+            CanaryOutcome::Inconclusive(InconclusiveReason::NoStashMatch {
+                canonical_well_formed: false,
+            }) if !self.canary_nostashmatch_override => CanaryStatus::RefusedUnparseableCanonical,
             CanaryOutcome::Inconclusive(_) => CanaryStatus::Inconclusive,
         }
     }
@@ -1637,7 +1703,9 @@ mod tests {
         // trigger), but the resolved canonical matches NO stash AND does not parse as
         // a Claude Code credential — overwhelmingly an unrelated secret. The pre-swap
         // gate refuses the atomic `-U` clobber (ZERO writes) and logs the redaction-
-        // safe refusal; the wire verdict stays genuinely INCONCLUSIVE (no schema bump).
+        // safe refusal. Issue #738: the wire now SAYS SO — the identity answer is still
+        // inconclusive, but the refusal is the operator-visible fact, so it gets its own
+        // verdict instead of the quiet `inconclusive` #730 reused.
         let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         // A non-CC canonical no stash holds → the active resolves via the display (u-A).
         let store = store_holding(b"an-unrelated-keychain-secret").await;
@@ -1670,9 +1738,14 @@ mod tests {
         );
         // Reads stayed live — the refusing tick still polled the roster.
         assert!(first.snapshot.accounts.iter().all(|a| a.usage.is_some()));
-        // The wire stays Inconclusive: the refuse is a daemon-internal policy (#730),
-        // not a new verdict — no schema bump, no menubar perturbation.
-        assert_eq!(first.snapshot.canary, Some(CanaryStatus::Inconclusive));
+        // Issue #738 — the whole point: the wire carries the REFUSAL, so the CLI's
+        // `render_canary` and the menubar banner can both voice it. The durable event still
+        // fires exactly once from the refuse site (asserted above), NOT a second time from
+        // the verdict edge.
+        assert_eq!(
+            first.snapshot.canary,
+            Some(CanaryStatus::RefusedUnparseableCanonical)
+        );
         // ZERO writes: the canonical still holds the unrelated secret, stashes intact.
         assert!(daemon
             .store
@@ -1694,6 +1767,108 @@ mod tests {
             .unwrap()
             .credential
             .matches(&cred(b"B-token")));
+    }
+
+    #[tokio::test]
+    async fn refresh_canary_closes_the_drift_bracket_when_entering_the_unparseable_refusal() {
+        // Issue #738 regression guard. The `canary_drift` / `canary_cleared` pair is a durable
+        // BRACKET (`src/observability.rs`): every opened episode must close exactly once, or the
+        // operator's log shows an identity alarm raised and never resolved.
+        //
+        // #738 introduced a verdict that opens no bracket of its own (its durable line is
+        // per-ATTEMPT, owned by the refuse sites). The trap is that "opens nothing" reads as
+        // "nothing to do" on the INCOMING edge too — but this verdict REPLACED the `Inconclusive`
+        // that #730 mapped the case to, and `Inconclusive` closed the bracket. So a drift followed
+        // by an unrelated secret appearing under the derived service would have left
+        // `canary_drift` open forever.
+        //
+        // Driven through `refresh_canary` directly: the edge contract is the unit under test, and
+        // routing it through a full tick would additionally depend on swap-decision plumbing that
+        // has nothing to do with bracketing.
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        // Canonical holds `spare`'s token while `~/.claude.json` names `work` active → DRIFT.
+        let store = store_holding(b"B-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+        // The canary reconciles the display before cross-checking, which would HEAL this drift
+        // into agreement (the #714 anti-false-positive step). Freezing the directory makes
+        // `~/.claude.json` unwritable so the divergence survives — the same device the sibling
+        // drift tests use.
+        freeze_dir(dir.path());
+
+        // Edge 1 — the drift alarm OPENS its bracket.
+        let mut opened = Vec::new();
+        daemon.refresh_canary(&mut opened).await.unwrap();
+        assert_eq!(
+            opened,
+            vec![Event::CanaryDrift {
+                displayed: "work".to_owned(),
+                matched: "spare".to_owned(),
+                overridden: false,
+            }],
+            "the drift episode opens exactly once"
+        );
+        assert_eq!(
+            daemon.state.canary,
+            Some(CanaryStatus::Drift {
+                displayed: "work".to_owned(),
+                matched: "spare".to_owned(),
+                overridden: false,
+            })
+        );
+
+        // An unrelated secret replaces the canonical — no stash matches it, and it does not parse
+        // as a Claude Code credential, so the #730 shape-gate refuses.
+        daemon
+            .store
+            .write(&cred(b"an-unrelated-keychain-secret"))
+            .await
+            .unwrap();
+
+        // Edge 2 — the verdict moves to the refusal, and the drift bracket CLOSES.
+        let mut closed = Vec::new();
+        daemon.refresh_canary(&mut closed).await.unwrap();
+        assert_eq!(
+            daemon.state.canary,
+            Some(CanaryStatus::RefusedUnparseableCanonical)
+        );
+        assert_eq!(
+            closed,
+            vec![Event::CanaryCleared],
+            "the drift bracket closes on the way INTO the refusal — and the refusal itself opens \
+             no bracket here (its durable line is per-attempt, from the refuse sites)"
+        );
+
+        // Edge 3 — leaving the refusal for a quiet verdict emits NOTHING: `refresh_canary` closes
+        // only brackets it opened, and it opened none for the refusal. An unpaired `canary_cleared`
+        // would be as dishonest as the unclosed bracket this test exists to prevent.
+        daemon.store.write(&cred(b"A-token")).await.unwrap();
+        let mut quiet = Vec::new();
+        daemon.refresh_canary(&mut quiet).await.unwrap();
+        assert_eq!(daemon.state.canary, Some(CanaryStatus::Ok));
+        assert!(
+            quiet.is_empty(),
+            "no unpaired close on the way out of the refusal: {quiet:?}"
+        );
+
+        thaw_dir(dir.path());
     }
 
     #[tokio::test]
@@ -1746,6 +1921,12 @@ mod tests {
             "the overridden swap still logs: {:?}",
             outcome.events
         );
+        // Issue #738, the complement of the refusing case: with the override set NOTHING is
+        // refused, so the honest verdict is the quiet `Inconclusive` (the pre-#730 fail-OPEN
+        // this tunable is documented to restore) — NOT `RefusedUnparseableCanonical`, whose
+        // name would then describe a refusal that did not happen and would raise an act-now
+        // `.error` banner over a swap that succeeded.
+        assert_eq!(outcome.snapshot.canary, Some(CanaryStatus::Inconclusive));
         // The canonical was rerouted to the incoming account's token.
         assert!(daemon
             .store
@@ -1872,6 +2053,7 @@ mod tests {
                 matched: "spare".to_owned(),
                 overridden: true,
             },
+            CanaryStatus::RefusedUnparseableCanonical,
         ] {
             corpus.push_str(&serde_json::to_string(&status).unwrap());
             corpus.push('\n');

@@ -338,6 +338,13 @@ enum CanaryStatus: Equatable {
     case notFound
     case ambiguous(count: Int)
     case drift(displayed: String, matched: String, overridden: Bool)
+    /// Layer 2 REFUSE (issues #730/#738, wire since schema 1.10): the resolved canonical matches no
+    /// account's stash AND parses as no Claude Code credential — overwhelmingly an UNRELATED secret,
+    /// which the daemon refuses to clobber, so credential writes (swaps AND auto-protection) are
+    /// blocked. Carries no payload: the item's bytes are somebody else's secret, so there is nothing
+    /// #15-safe to name. A pre-#738 daemon never sends it; a daemon whose `canary_nostashmatch_override`
+    /// is set sends `inconclusive` instead, because with the override nothing is being refused.
+    case refusedUnparseableCanonical
 }
 
 extension CanaryStatus: Decodable {
@@ -367,6 +374,8 @@ extension CanaryStatus: Decodable {
                 matched: try container.decode(String.self, forKey: .matched),
                 overridden: try container.decode(Bool.self, forKey: .overridden)
             )
+        case "refused_unparseable_canonical":
+            self = .refusedUnparseableCanonical
         default:
             throw DecodingError.dataCorruptedError(
                 forKey: .verdict,

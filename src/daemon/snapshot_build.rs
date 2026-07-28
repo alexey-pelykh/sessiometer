@@ -1902,6 +1902,13 @@ mod tests {
                 },
                 r#""canary":{"verdict":"drift","displayed":"work","matched":"spare","overridden":true}"#,
             ),
+            // Issue #738 / schema 1.9 → 1.10: the #730 fail-CLOSED refuse gets its OWN verdict
+            // instead of the quiet `inconclusive` it reused. A bare tag — the unparseable
+            // canonical has no #15-safe detail to carry (its bytes ARE the unrelated secret).
+            (
+                CanaryStatus::RefusedUnparseableCanonical,
+                r#""canary":{"verdict":"refused_unparseable_canonical"}"#,
+            ),
         ] {
             let snapshot = StatusSnapshot {
                 canary: Some(canary.clone()),
@@ -1965,7 +1972,7 @@ mod tests {
         };
         let json = serde_json::to_string(&versioned_status_response(&snapshot)).unwrap();
         assert!(
-            json.contains(r#""schema_version":{"major":1,"minor":9}"#),
+            json.contains(r#""schema_version":{"major":1,"minor":10}"#),
             "got {json}"
         );
         assert!(json.contains(r#""generated_at":1782777600"#), "got {json}");

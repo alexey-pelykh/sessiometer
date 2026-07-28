@@ -744,6 +744,22 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertEqual(banner.kind, .error, "no unique write target → writes refused NOW → act-now .error")
     }
 
+    // The `refused_unparseable_canonical` verdict (#730/#738) → an act-now `.error` banner naming the
+    // EVIDENCE (matches no stash, not Claude Code's format), the REFUSAL, and its OWN override. Content-parity
+    // with the CLI's `keychain canary: unrecognized credential — …` line. The remedy must name
+    // `canary_nostashmatch_override` and NOT `canary_drift_override`: they are deliberately separate switches
+    // (`src/config.rs`), so quoting the drift one would send the operator to a lever that cannot clear this.
+    func testCanaryBannerNamesTheUnparseableCanonicalRefusalAndItsOwnOverride() throws {
+        let banner = try XCTUnwrap(StatusPanelFormat.canaryBanner(.refusedUnparseableCanonical))
+        XCTAssertEqual(banner.title, "Unrecognized keychain credential")
+        XCTAssertEqual(banner.detail,
+                       "The keychain item matches no stashed account and is not in Claude Code's own format — it is probably an unrelated secret, so credential writes are refused rather than overwrite it (vetted it as safe? set canary_nostashmatch_override and restart the daemon).")
+        XCTAssertEqual(banner.kind, .error,
+                       "writes refused NOW → act-now .error, the same rank as a refusing drift")
+        XCTAssertFalse(banner.detail.contains("canary_drift_override"),
+                       "the unparseable refusal must not quote the DRIFT override — a separate switch that cannot clear it")
+    }
+
     // The quiet verdicts (and no verdict) → NO banner: `ok` / `inconclusive` are the quiet normal, and
     // `not_found` is already voiced by the scrub / keychain machinery (a second banner would double-report
     // the same absent credential — the same reason the CLI's render_canary prints nothing for it).
@@ -760,6 +776,7 @@ final class StatusPanelFormatTests: XCTestCase {
             try XCTUnwrap(StatusPanelFormat.canaryBanner(.drift(displayed: "work", matched: "personal", overridden: false))),
             try XCTUnwrap(StatusPanelFormat.canaryBanner(.drift(displayed: "work", matched: "personal", overridden: true))),
             try XCTUnwrap(StatusPanelFormat.canaryBanner(.ambiguous(count: 2))),
+            try XCTUnwrap(StatusPanelFormat.canaryBanner(.refusedUnparseableCanonical)),
         ]
         for banner in banners {
             let text = banner.title + " " + banner.detail
@@ -769,11 +786,11 @@ final class StatusPanelFormatTests: XCTestCase {
         }
     }
 
-    // The 7-rank worst-first order (pinned to the CLI's `DaemonPayloadFault`): the #714 canary REFUSAL pair
-    // joins the ACT-NOW band (ranks 3-4, under the vault pair, OVER systemic), while an OVERRIDDEN drift is
-    // NEXT-BREAK (rank 6, UNDER systemic, OVER the calm recovering scrub). Severity by (fault, VARIANT), never
+    // The 8-rank worst-first order (pinned to the CLI's `DaemonPayloadFault`): the canary REFUSAL TRIO
+    // joins the ACT-NOW band (ranks 3-5, under the vault pair, OVER systemic), while an OVERRIDDEN drift is
+    // NEXT-BREAK (rank 7, UNDER systemic, OVER the calm recovering scrub). Severity by (fault, VARIANT), never
     // fault identity (#575) — the same split the scrub's exhausted/recovering pair already proved load-bearing.
-    func testDaemonFaultBannerRanksTheCanaryRefusalPairInTheActNowBand() throws {
+    func testDaemonFaultBannerRanksTheCanaryRefusalTrioInTheActNowBand() throws {
         let refusing = CanaryStatus.drift(displayed: "work", matched: "personal", overridden: false)
         let overridden = CanaryStatus.drift(displayed: "work", matched: "personal", overridden: true)
 
@@ -788,23 +805,48 @@ final class StatusPanelFormatTests: XCTestCase {
         // A refusing drift and an ambiguous resolution BOTH outrank systemic-refresh (act-now over next-break).
         let refusingVsSystemic = try XCTUnwrap(
             StatusPanelFormat.daemonFaultBanner(keychainLocked: false, scrub: nil, systemicRefreshFailure: 3, canary: refusing))
-        XCTAssertEqual(refusingVsSystemic.title, "Keychain identity drift", "a refusing drift (rank 3) outranks systemic (rank 5)")
+        XCTAssertEqual(refusingVsSystemic.title, "Keychain identity drift", "a refusing drift (rank 3) outranks systemic (rank 6)")
         XCTAssertEqual(refusingVsSystemic.kind, .error)
         let ambiguousVsSystemic = try XCTUnwrap(
             StatusPanelFormat.daemonFaultBanner(keychainLocked: false, scrub: nil, systemicRefreshFailure: 3, canary: .ambiguous(count: 2)))
-        XCTAssertEqual(ambiguousVsSystemic.title, "Keychain identity ambiguous", "ambiguous (rank 4) outranks systemic (rank 5)")
+        XCTAssertEqual(ambiguousVsSystemic.title, "Keychain identity ambiguous", "ambiguous (rank 4) outranks systemic (rank 6)")
 
-        // But an OVERRIDDEN drift ranks UNDER systemic (rank 6 < rank 5) — the writes-proceed variant is
+        // #738 — the third act-now refusal completes the band. It outranks systemic (it BLOCKS writes now,
+        // systemic only foreshadows), and it is outranked by the vault pair and by its two #714 siblings.
+        let unparseableVsSystemic = try XCTUnwrap(
+            StatusPanelFormat.daemonFaultBanner(keychainLocked: false, scrub: nil, systemicRefreshFailure: 3,
+                                                canary: .refusedUnparseableCanonical))
+        XCTAssertEqual(unparseableVsSystemic.title, "Unrecognized keychain credential",
+                       "an unparseable-canonical refusal (rank 5) outranks systemic (rank 6)")
+        XCTAssertEqual(unparseableVsSystemic.kind, .error)
+        let scrubVsUnparseable = try XCTUnwrap(
+            StatusPanelFormat.daemonFaultBanner(keychainLocked: false, scrub: .exhausted, systemicRefreshFailure: nil,
+                                                canary: .refusedUnparseableCanonical))
+        XCTAssertEqual(scrubVsUnparseable.title, "Shared login scrubbed",
+                       "scrub-exhausted (rank 2) outranks an unparseable-canonical refusal (rank 5)")
+        // No assertion for "refusing drift (rank 3) beats this (rank 5)" — deliberately. `canary` is ONE
+        // optional verdict, so a drift and an unparseable refusal can never co-occur; such a test would
+        // pass without exercising anything and would keep passing if the arms were reordered. The canary's
+        // intra-band order is a reading-order convention (mirroring `DaemonPayloadFault`), and only the
+        // cross-FAULT edges below/above are real arbitration.
+        // It does beat the calm recovering scrub (rank 5 > rank 8) — a genuinely independent field.
+        let unparseableVsRecovering = try XCTUnwrap(
+            StatusPanelFormat.daemonFaultBanner(keychainLocked: false, scrub: .recovering, systemicRefreshFailure: nil,
+                                                canary: .refusedUnparseableCanonical))
+        XCTAssertEqual(unparseableVsRecovering.title, "Unrecognized keychain credential",
+                       "an unparseable-canonical refusal (rank 5) outranks recovering scrub (rank 8)")
+
+        // But an OVERRIDDEN drift ranks UNDER systemic (rank 7 > rank 6) — the writes-proceed variant is
         // next-break, so a coincident down mechanism (the harder-to-recover fault) must surface first.
         let overriddenVsSystemic = try XCTUnwrap(
             StatusPanelFormat.daemonFaultBanner(keychainLocked: false, scrub: nil, systemicRefreshFailure: 3, canary: overridden))
-        XCTAssertEqual(overriddenVsSystemic.title, "Refresh mechanism down", "systemic (rank 5) outranks an overridden drift (rank 6)")
+        XCTAssertEqual(overriddenVsSystemic.title, "Refresh mechanism down", "systemic (rank 6) outranks an overridden drift (rank 7)")
 
-        // And an OVERRIDDEN drift ranks OVER the calm recovering scrub (rank 6 > rank 7): an acknowledged
+        // And an OVERRIDDEN drift ranks OVER the calm recovering scrub (rank 7 > rank 8): an acknowledged
         // identity alarm still beats a self-healing state.
         let overriddenVsRecovering = try XCTUnwrap(
             StatusPanelFormat.daemonFaultBanner(keychainLocked: false, scrub: .recovering, systemicRefreshFailure: nil, canary: overridden))
-        XCTAssertEqual(overriddenVsRecovering.title, "Keychain identity drift", "an overridden drift (rank 6) outranks recovering scrub (rank 7)")
+        XCTAssertEqual(overriddenVsRecovering.title, "Keychain identity drift", "an overridden drift (rank 7) outranks recovering scrub (rank 8)")
         XCTAssertEqual(overriddenVsRecovering.kind, .warning)
 
         // A quiet verdict alongside a healthy fleet → no banner (canary never fabricates one).
