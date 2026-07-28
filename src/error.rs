@@ -75,6 +75,21 @@ pub(crate) enum Error {
     )]
     ReliabilitySinceInvalid(String),
 
+    /// `log --since` got a value that is not a relative duration — a non-negative integer with
+    /// a unit `s`/`m`/`h`/`d`/`w` (e.g. `30m`, `24h`, `7d`, `2w`). Duration-only, exactly like
+    /// `reliability --since` (both resolve through [`crate::duration::parse_duration_secs`]);
+    /// an absolute date is not accepted here. Distinct from the `reliability` variant so the
+    /// message names the verb whose flag the operator actually mistyped (issue #773).
+    #[error(
+        "invalid --since `{0}`: expected a relative duration (e.g. 30m, 24h, 7d, 2w — units s/m/h/d/w)"
+    )]
+    LogSinceInvalid(String),
+
+    /// The `log --json` view could not be serialized. Unreachable — the wire is the durable
+    /// lines plus bare integers and strings (issue #773); mapped, never panicked.
+    #[error("could not render the log view as JSON: {0}")]
+    LogSerialize(&'static str),
+
     /// The current user's home directory could not be resolved — from the
     /// password database on Unix, or from the Windows user-profile ladder
     /// (`%USERPROFILE%`, then the `FOLDERID_Profile` Known Folder); see
@@ -911,6 +926,12 @@ mod tests {
             Error::UnknownCommand("frobnicate".to_owned()).exit_code(),
             1
         );
+        // The `log` reader's two variants (issue #773) reach the generic arm via the `_ => 1`
+        // catch-all, so the compiler never forced a decision about them — pinned here instead.
+        // A malformed `--since` must be non-zero (never a silent whole-log fallback), and both
+        // match their `reliability` counterparts rather than entering the swap/lock taxonomy.
+        assert_eq!(Error::LogSinceInvalid("7x".to_owned()).exit_code(), 1);
+        assert_eq!(Error::LogSerialize("boom").exit_code(), 1);
     }
 
     #[test]
