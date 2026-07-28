@@ -450,6 +450,10 @@ sessiometer log --event swap
 
 # Both, as JSON records (schema:1) for a script.
 sessiometer log --since 7d --event swap --json
+
+# Watch a running daemon: print the log, then keep printing what arrives.
+sessiometer log --follow
+sessiometer log -f --event swap
 ```
 
 `--since` takes a non-negative integer and a unit — `s`, `m`, `h`, `d`, `w` (e.g.
@@ -465,7 +469,8 @@ The two streams are split, so a pipe stays clean:
   `sessiometer log | grep …`, `| wc -l` and `| head` stay honest, and with no flags
   stdout reproduces the log byte for byte. With `--json` it is instead a single JSON
   document, which is what a script parses — there `| wc -l` counts lines of JSON, not
-  events, so read `n_matched`.
+  events, so read `n_matched`. (Under `--follow` the `--json` shape differs; see
+  [below](#following-a-running-daemon--f---follow).)
 - **stderr** carries the operator notice: the resolved window, the active filter, the
   match count, and — when nothing came back — *which* empty state it was. An empty
   stdout is never an ambiguous silence: it tells you whether there is no log file yet,
@@ -483,6 +488,47 @@ file but only to fold it into SLIs. Run `sessiometer log --help` for the full us
 > above, identifies accounts by the label you chose — which may be your email.
 > `sessiometer log` does not redact (that is the point: what it prints is what the file
 > says), so treat what you pipe, paste, or attach accordingly.
+
+#### Following a running daemon (`-f`, `--follow`)
+
+Watching a daemon that is *currently running* is the case a reader exists for, and a
+one-shot render does not serve it. `--follow` prints the log as usual and then keeps
+printing lines as they are appended, until you interrupt it with Ctrl-C:
+
+```sh
+sessiometer log --follow
+```
+
+The two filters deliberately do **not** behave the same way here:
+
+- **`--since` bounds the initial catch-up only.** It is a statement about the log's
+  *history*, and a line that arrives while you are watching is recent by definition.
+  So `--follow --since 1h` backfills the last hour and then streams everything that
+  follows.
+- **`--event` keeps filtering every streamed line**, because it is a content filter with
+  no time in it. `--follow --event swap` shows you swaps and only swaps, live.
+
+The log has no rotation of its own, but an operator or an external tool (`newsyslog`)
+can still rotate it — and the follower survives that, a truncation, and a rewrite in
+place. If the file is truncated, rewritten, or moved aside and replaced, it says which
+one happened on stderr and resumes from the new content's start rather than stalling or
+reprinting what it already showed you. If the log does not exist yet, it waits for the
+daemon to create it instead of exiting: a follow started before the first write is a
+normal cold start, not an error.
+
+One caveat on rotation: a running daemon holds its own log open for its whole run, so it
+keeps appending to the **moved-aside** file until it restarts. The follower reattaches to
+the *path* — which is where the events will be once the daemon does restart — so expect
+the stream to go quiet until then.
+
+With `--json`, a follow is **JSON Lines** — one complete record per line, each carrying
+its own `schema` — rather than the single document the one-shot form prints. A stream has
+no last record, so its `records` array could never be closed; reading it line by line is
+what lets a consumer act on an event the moment it arrives:
+
+```sh
+sessiometer log --follow --json | jq --unbuffered -r .line
+```
 
 ## Switching the active account
 
