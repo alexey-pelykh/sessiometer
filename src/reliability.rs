@@ -279,11 +279,15 @@ struct Window {
 }
 
 impl Window {
-    /// Resolve a raw `--since` value against `now` (epoch seconds) into a [`Window`]. Malformed
-    /// input is [`Error::ReliabilitySinceInvalid`]. Saturating throughout: an absurd span can
-    /// never overflow into a future cutoff, and a span reaching past the epoch clamps to `0`.
+    /// Resolve a raw `--since` value against `now` (epoch seconds) into a [`Window`]. The span
+    /// grammar is [`crate::duration::parse_duration_secs`] — shared with `log` (issue #773) so
+    /// the two offline readers cannot drift — and its rejection is mapped HERE, so an operator
+    /// mistyping this verb's flag still reads [`Error::ReliabilitySinceInvalid`]. Saturating
+    /// throughout: an absurd span can never overflow into a future cutoff, and a span reaching
+    /// past the epoch clamps to `0`.
     fn resolve(raw: &str, now: i64) -> Result<Window> {
-        let secs = parse_duration_secs(raw)?;
+        let secs = crate::duration::parse_duration_secs(raw)
+            .ok_or_else(|| Error::ReliabilitySinceInvalid(raw.trim().to_owned()))?;
         // i64 `now` − u64 `secs` → `saturating_sub_unsigned`; `.max(0)` then floors a
         // past-the-epoch result at 0 (the saturating rationale is on the doc comment above).
         let cutoff_epoch = now.saturating_sub_unsigned(secs).max(0);
@@ -301,32 +305,6 @@ impl Window {
         // cutoff_epoch is clamped `>= 0`, so the `as u64` cast is lossless (no wraparound).
         crate::observability::rfc3339(UNIX_EPOCH + Duration::from_secs(self.cutoff_epoch as u64))
     }
-}
-
-/// Parse a relative-duration `<non-negative int><unit>` into whole seconds (issue #494). Units:
-/// `s`/`m`/`h`/`d`/`w` (seconds/minutes/hours/days/weeks) — the same vocabulary as the relative
-/// branch of `stats --since`, minus its absolute-date forms (an absolute date is out of this
-/// window's scope; the issue asks a duration). Rejected as [`Error::ReliabilitySinceInvalid`]:
-/// an empty string, a missing or unknown unit, and a non-integer, negative, or empty count.
-/// Saturating multiply, so an absurd count yields `u64::MAX` (→ a clamped cutoff) rather than
-/// overflow. Hand-rolled per the minimal-dependency line — no date crate.
-fn parse_duration_secs(raw: &str) -> Result<u64> {
-    let s = raw.trim();
-    let invalid = || Error::ReliabilitySinceInvalid(s.to_owned());
-    let unit = s.chars().last().ok_or_else(invalid)?;
-    let per_unit: u64 = match unit {
-        's' => 1,
-        'm' => 60,
-        'h' => 3_600,
-        'd' => 86_400,
-        'w' => 7 * 86_400,
-        _ => return Err(invalid()),
-    };
-    // The count is everything before the unit char. `parse::<u64>` inherently rejects a
-    // negative sign, an empty string, and any non-digit — no separate sign/empty guard needed.
-    let digits = &s[..s.len() - unit.len_utf8()];
-    let n: u64 = digits.parse().map_err(|_| invalid())?;
-    Ok(n.saturating_mul(per_unit))
 }
 
 /// The event-log text, tolerating an absent file (no daemon has ever run) as empty — the
@@ -3351,25 +3329,41 @@ ts=2026-07-10T02:00:00Z event=usage_backoff acct=u-B class=transient
     }
 
     #[test]
-    fn parse_duration_secs_accepts_each_unit() {
-        assert_eq!(parse_duration_secs("45s").unwrap(), 45);
-        assert_eq!(parse_duration_secs("30m").unwrap(), 1_800);
-        assert_eq!(parse_duration_secs("24h").unwrap(), 86_400);
-        assert_eq!(parse_duration_secs("7d").unwrap(), 604_800);
-        assert_eq!(parse_duration_secs("2w").unwrap(), 1_209_600);
-        assert_eq!(parse_duration_secs("0d").unwrap(), 0);
-        // Surrounding whitespace is trimmed (lexopt hands the value through verbatim).
-        assert_eq!(parse_duration_secs("  7d  ").unwrap(), 604_800);
-        // Saturating multiply: a u64-representable count whose ×unit overflows yields u64::MAX
-        // (→ a clamped cutoff), never a wrapped value.
-        assert_eq!(
-            parse_duration_secs(&format!("{}w", u64::MAX)).unwrap(),
-            u64::MAX
-        );
+    fn window_resolve_accepts_each_unit_of_the_shared_grammar() {
+        // The span grammar itself moved to `crate::duration` (issue #773) and is unit-tested
+        // there. What THIS verb still owns — and what these assertions pin — is that its
+        // `--since` resolves each unit to the same cutoff it always did.
+        let now = epoch("2026-07-12T00:00:00Z");
+        for (raw, secs) in [
+            ("45s", 45),
+            ("30m", 1_800),
+            ("24h", 86_400),
+            ("7d", 604_800),
+            ("2w", 1_209_600),
+            ("0d", 0),
+            // Surrounding whitespace is trimmed (lexopt hands the value through verbatim).
+            ("  7d  ", 604_800),
+        ] {
+            let w = Window::resolve(raw, now).expect("valid duration");
+            assert_eq!(
+                now - w.cutoff_epoch,
+                secs,
+                "{raw:?} must resolve to now − {secs}s"
+            );
+        }
+        // Saturating multiply, then clamp: a count whose ×unit overflows u64 yields `u64::MAX`
+        // seconds, which floors the cutoff at 0 ("the whole log") — never a wrapped, and so
+        // future-dated, cutoff that would silently empty the window.
+        let w = Window::resolve(&format!("{}w", u64::MAX), now).expect("valid duration");
+        assert_eq!(w.cutoff_epoch, 0);
     }
 
     #[test]
-    fn parse_duration_secs_rejects_malformed() {
+    fn window_resolve_rejects_malformed_as_this_verbs_error() {
+        // The shared grammar rejects each of these (see `crate::duration`); what THIS verb owns
+        // is that the rejection surfaces as ReliabilitySinceInvalid — naming the flag the
+        // operator actually mistyped, not `log`'s.
+        let now = epoch("2026-07-12T00:00:00Z");
         for bad in [
             "",                      // empty
             "   ",                   // whitespace only (trims to empty)
@@ -3384,7 +3378,7 @@ ts=2026-07-10T02:00:00Z event=usage_backoff acct=u-B class=transient
             "7 d",                   // internal whitespace
             "99999999999999999999s", // count overflows u64 → rejected, not silently saturated
         ] {
-            let err = parse_duration_secs(bad).unwrap_err();
+            let err = Window::resolve(bad, now).unwrap_err();
             assert!(
                 matches!(err, Error::ReliabilitySinceInvalid(_)),
                 "{bad:?} must be rejected as ReliabilitySinceInvalid, got {err:?}"
