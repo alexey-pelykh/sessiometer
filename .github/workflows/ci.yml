@@ -184,6 +184,119 @@ jobs:
             -destination 'platform=macOS' \
             CODE_SIGNING_ALLOWED=NO
 
+  # Panel golden drift gate (issue #754) — DELIBERATELY NON-REQUIRED for now. `PanelGoldenParityTests`
+  # re-renders every panel state in-process and diffs it against the committed goldens under
+  # apps/menubar/design/renders/panel-goldens/. That comparison is the ONE cross-machine-sensitive
+  # assertion in the suite (goldens rasterized on one machine, re-rendered on an unpinned macos-latest),
+  # so it is env-gated OFF by default and runs only here: the rest of the suite — renders succeed, carry
+  # ink, are deterministic, stay pairwise distinct, and every canary trips its predicate — are same-run
+  # comparisons that already run in the required `swift` job above.
+  #
+  # WHY A SEPARATE JOB rather than one more step in `swift` (which would reuse that build): the issue's
+  # promotion criterion is "N consecutive green runs", and counting those needs a named, queryable status
+  # context. A soft step buried in `swift` would only be countable by grepping logs, which is not a
+  # mechanism. The cost is one extra macOS build; it is gated on the same `swift` path filter, so it runs
+  # only when the app changes.
+  #
+  # HOW "non-required" is achieved, and why it is done THIS way: EVERY step carries
+  # `continue-on-error: true`, so the job's conclusion is always success and the `ci-ok` rollup can never
+  # be blocked by it. The job still appears in `ci-ok.needs` — it must, or `ci-ok-needs-complete`
+  # (issue #318) fails — but structurally cannot fail the gate.
+  #
+  # EVERY step, not just the gate step, and that distinction is the whole point. `ci-ok` fails on
+  # `contains(needs.*.result, 'failure')`, and a job's result is failure if ANY un-guarded step fails —
+  # so marking only the gate step soft would still let `brew install xcodegen` (a network operation, on
+  # every apps/menubar/** PR) or a checkout blip block a merge. That is precisely the RISK-2 failure this
+  # job's non-required landing exists to avoid, arriving through the setup steps instead of the assertion.
+  # A setup failure surfaces as a RED soft verdict below, which is the honest reading: the gate did not
+  # produce a measurement.
+  #
+  # Note this is NOT done by putting `continue-on-error` on the JOB: whether a continue-on-error job
+  # reports `success` or `failure` in `needs.*.result` is not something this repo's merge gate should
+  # depend on, so the soft-ness is placed at the steps, where the semantics are unambiguous.
+  #
+  # PROMOTION (making it required) is: drop every `continue-on-error` below and drop the reporting step.
+  # The criterion, the counting command, and the re-calibration question that must be answered first are
+  # recorded in apps/menubar/design/README.md § Panel golden drift gate.
+  panel-goldens:
+    name: panel-goldens
+    needs: changes
+    if: needs.changes.outputs.swift == 'true'
+    runs-on: macos-latest
+    steps:
+      # Every step is soft — see the job comment. A setup failure must report a red VERDICT, never block a
+      # merge; `ci-ok` fails on any un-guarded step in a needed job, setup steps included.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        continue-on-error: true
+      - name: Install XcodeGen
+        continue-on-error: true
+        run: brew install xcodegen
+      - name: Generate Xcode project
+        continue-on-error: true
+        working-directory: apps/menubar
+        run: xcodegen generate
+      - name: Panel golden drift gate (SOFT — cannot fail the build; see the job comment)
+        id: gate
+        continue-on-error: true
+        working-directory: apps/menubar
+        # `TEST_RUNNER_`-prefixed variables are forwarded to the xctest process with the prefix stripped —
+        # a plain env var would NOT reach it, which is exactly how a "green" run could be a silently
+        # skipped one. The two tests below `XCTSkipUnless` on the un-prefixed name, so a forwarding
+        # regression shows up as `2 skipped` in the reporting step rather than as a false pass.
+        env:
+          TEST_RUNNER_SESSIOMETER_PANEL_GOLDEN_GATE: "1"
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project Menubar.xcodeproj \
+            -scheme Menubar \
+            -configuration Debug \
+            -destination 'platform=macOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            -only-testing:MenubarTests/PanelGoldenParityTests/testEveryRenderMatchesItsCommittedGolden \
+            -only-testing:MenubarTests/PanelGoldenParityTests/testEachFreshRenderIsNearestToItsOwnGolden \
+            2>&1 | tee panel-goldens.log
+          # Degenerate-pass guard: a run where both tests SKIPPED would exit 0 and read as green while
+          # asserting nothing (cardinality zero is an automatic fail, not a pass). Require two executed
+          # tests and no skips.
+          grep -qE 'Executed 2 tests, with 0 failures' panel-goldens.log
+      - name: Report the soft-gate verdict
+        if: always()
+        # Soft too: if checkout failed there is no apps/menubar to run in, and this step would otherwise be
+        # the un-guarded one that fails the job.
+        continue-on-error: true
+        run: |
+          # The verdict line is the countable signal the promotion criterion reads, and the max-drift
+          # figure is the measurement that criterion needs: `driftCeiling` was calibrated on ONE machine,
+          # and only a run here can say what cross-machine antialiasing actually costs.
+          log=apps/menubar/panel-goldens.log
+          drift="$(grep -o '\[panel-goldens\] max drift .*' "$log" 2>/dev/null | tail -1)"
+          # The relative gate's own coverage: how many cells have no same-size cross-state rival and so
+          # rest on the absolute ceiling alone. Measured per run because a layout change moves it.
+          margin="$(grep -o '\[panel-goldens\] weakest cross-state margin .*' "$log" 2>/dev/null | tail -1)"
+          if [ "${{ steps.gate.outcome }}" = "success" ]; then
+            echo "PANEL_GOLDEN_GATE_RESULT=green"
+            {
+              echo "### Panel golden drift gate: ✅ green (non-required)"
+              echo
+              echo "\`${drift:-no max-drift line found}\`"
+              echo
+              echo "\`${margin:-no margin line found}\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "PANEL_GOLDEN_GATE_RESULT=red"
+            # One line by necessity: a `::warning` workflow command is not parsed across newlines.
+            echo "::warning title=Panel golden drift gate::The gate did not report a clean measurement. This check is NON-REQUIRED and did not fail the build (issue #754). ${drift:-}"
+            {
+              echo "### Panel golden drift gate: ❌ red (non-required — did not fail the build)"
+              echo
+              echo "\`${drift:-no max-drift line found}\`"
+              echo
+              # Also one line by necessity: GFM renders a newline inside a paragraph as a line break.
+              echo "Three things land here, and the max-drift line above distinguishes them: the panel changed (re-bless per apps/menubar/design/README.md § Panel golden drift gate); cross-machine antialiasing exceeds the ceiling (see that section's re-calibration note); or a SETUP step failed and no measurement was taken at all (no max-drift line)."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   # Canonical Homebrew formula (issue #567). `Formula/sessiometer.rb` is the source the
   # published tap mirrors (ADR-0021), and until now nothing here checked it — the gap ADR-0021
   # records as "No CI covers the formula — on either side", and the root cause of #566: a
@@ -243,6 +356,18 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: ./scripts/check-gate-change-ack.sh
+      # Panel-golden re-baseline discipline (issue #754). Sibling trailer guard, hosted in this job
+      # because it needs the identical fetch-depth-0 PR range and must be un-skippable for the same
+      # reason. Distinct trailer (`Panel-Goldens-Rebaselined:`) and distinct question — "what changed in
+      # the panel's appearance, and was it intended?" rather than "is this gate weakening safe?" — so the
+      # two audit trails stay separately greppable. REQUIRED from day one even though the drift
+      # comparison it protects lands non-required: this check is pure git and cannot be flaky, and a
+      # re-baseline discipline that waits is worth nothing.
+      - name: Require a justification when a PR re-baselines the panel goldens
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: ./scripts/check-panel-golden-rebaseline.sh
 
   # Single always-running summary gate. This is the ONE check branch protection should
   # require: it runs on every PR/push regardless of path filters, and passes only when every
@@ -253,7 +378,11 @@ jobs:
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [changes, test, msrv, deny, swift, formula, ci-ok-needs-complete, gate-change-ack]
+    # `panel-goldens` is listed because `ci-ok-needs-complete` requires every job to be — but its own
+    # gate step is `continue-on-error`, so the job's conclusion is always success and it cannot block a
+    # merge while it is soft-landing (issue #754). Promoting it to a real gate is a change in THAT job,
+    # not here.
+    needs: [changes, test, msrv, deny, swift, formula, panel-goldens, ci-ok-needs-complete, gate-change-ack]
     runs-on: ubuntu-latest
     steps:
       # `needs.*.result` auto-covers every job in `needs:` above — and the `ci-ok-needs-complete`

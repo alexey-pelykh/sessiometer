@@ -129,6 +129,18 @@ Before adding a dependency, weigh:
   on one of its commits, so a change to the merge gate's own definition lands
   deliberately and auditably rather than slipping through green in this solo repo
   (issue #317).
+- [`scripts/check-panel-golden-rebaseline.sh`](scripts/check-panel-golden-rebaseline.sh)
+  — a CI guard (the `gate-change-ack` job in
+  [`.github/workflows/ci.yml`](.github/workflows/ci.yml)) that fails the build when a
+  PR adds, changes, or deletes a committed panel golden under
+  `apps/menubar/design/renders/panel-goldens/` without a
+  `Panel-Goldens-Rebaselined: <reason>` trailer on one of its commits. Those PNGs are
+  the reference the panel drift gate compares against, so re-blessing them is the one
+  edit that can make the gate agree with a regression — it has to be a deliberate,
+  recorded act rather than a side effect of regenerating (issue #754). Deliberately a
+  SEPARATE trailer from `Gate-Change-Acknowledged:` above: that one acknowledges
+  changing a gate's *definition*, this one acknowledges moving a gate's *baseline*.
+  Falsifier peer: [`scripts/check-panel-golden-rebaseline.test.sh`](scripts/check-panel-golden-rebaseline.test.sh).
 - [`scripts/check-ci-ok-needs.sh`](scripts/check-ci-ok-needs.sh)
   — a CI guard (the `ci-ok-needs-complete` job in
   [`.github/workflows/ci.yml`](.github/workflows/ci.yml)) that parses the workflow

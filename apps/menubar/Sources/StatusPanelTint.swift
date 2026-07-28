@@ -8,14 +8,51 @@
 
 import SwiftUI
 
+/// Anchors `Color.panelAssets` to whichever bundle the panel's code was compiled into — see that property.
+private final class PanelAssetAnchor {}
+
 extension Color {
+    /// The bundle the panel's asset-catalog colour sets resolve from (issue #754).
+    ///
+    /// `Bundle(for:)` rather than `.main`, for one reason: the panel is compiled into TWO bundles. In the
+    /// app this resolves to the app bundle, which IS `.main` — no behaviour change. In `MenubarTests`
+    /// (`TEST_HOST: ""`) `Bundle.main` is the `xctest` runner, which carries no `Assets.car`, so
+    /// `Color("HealthOK", bundle: .main)` would silently fail to resolve and the panel golden gate would
+    /// bake a wrong-coloured reference — the BASELINE TRAP (#437), where the gate then defends the defect.
+    /// The test bundle compiles `Sources/Assets.xcassets` (project.yml), so `Bundle(for:)` finds the real
+    /// colour sets there. Same idiom, same reason as `StatusGauge.image(for:in:)`'s explicit bundle
+    /// parameter, which `BarGlyphParityTests` needs for exactly this.
+    static var panelAssets: Bundle { Bundle(for: PanelAssetAnchor.self) }
+
+    /// The brand accent (#391), resolved EXPLICITLY from the `AccentColor` asset rather than through
+    /// `Color.accentColor` (issue #754).
+    ///
+    /// In the app the two name the same colour — `ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME` pins
+    /// `Color.accentColor` to this very asset so a non-blue macOS system accent cannot drift the panel hue
+    /// off the design mock. But that is a build setting on the APP target: anywhere else the panel is
+    /// compiled, `Color.accentColor` falls back to the OPERATOR'S system accent. Naming the asset directly
+    /// makes the #391 pin a property of the code rather than of one target's build settings, which is what
+    /// lets the panel golden gate produce machine-independent references.
+    ///
+    /// SAME COLOUR IS NOT SAME PIXELS, and the difference was measured rather than assumed. Switching the
+    /// three use sites to this property changes the app's own render on 22 of the 34 golden cells, by up to
+    /// 21/255 on a single channel over ~30 % of pixels (A/B against a build-level control that confirmed the
+    /// render is otherwise byte-deterministic across independent builds). `AccentColor.colorset` is sRGB
+    /// #007AFF / #0A84FF — nominally the macOS default accent — so this is a dynamic-vs-static colour
+    /// RESOLUTION shift, not a hue change: visually imperceptible, and invisible to the golden gate, whose
+    /// metric ignores channel deltas under 64/255. Recorded because "changes nothing" would have been the
+    /// convenient claim and it is false; what this actually does is pin the panel accent to the brand asset
+    /// instead of to a dynamic system colour that happens to match it.
+    static var panelAccent: Color { Color("AccentColor", bundle: panelAssets) }
+
     /// Resolve a Foundation-only `StatusPanelFormat.PanelTint` to a concrete `Color` (#388): an
-    /// asset-catalog color set (theme-adaptive Any/Dark + Increased-Contrast) from the app's main bundle,
-    /// or a system semantic color. This is the ONE SwiftUI-side seam; the role→token table stays in
-    /// `StatusPanelFormat` (Foundation-only, unit-tested), which cannot name a `Color` itself.
+    /// asset-catalog color set (theme-adaptive Any/Dark + Increased-Contrast) from the bundle the panel
+    /// was compiled into, or a system semantic color. This is the ONE SwiftUI-side seam; the role→token
+    /// table stays in `StatusPanelFormat` (Foundation-only, unit-tested), which cannot name a `Color`
+    /// itself.
     static func panel(_ tint: StatusPanelFormat.PanelTint) -> Color {
         switch tint {
-        case .asset(let name): return Color(name, bundle: .main)
+        case .asset(let name): return Color(name, bundle: panelAssets)
         case .secondary:       return .secondary
         case .primary:         return .primary
         }
@@ -37,7 +74,7 @@ extension Color {
     /// composition so each call site names the emphasis SURFACE, not the mechanism. The accent HUE stays the
     /// brand-blue `AccentColor` asset (#391); only the theme-variant alpha comes from the token.
     static func accentEmphasis(_ emphasis: StatusPanelFormat.AccentEmphasis, dark: Bool) -> Color {
-        Color.accentColor.opacity(StatusPanelFormat.accentOpacity(emphasis, dark: dark))
+        Color.panelAccent.opacity(StatusPanelFormat.accentOpacity(emphasis, dark: dark))
     }
 
     /// The Stats sparkline stroke / area / dot color (#446) — mock `--spark`, from the testable

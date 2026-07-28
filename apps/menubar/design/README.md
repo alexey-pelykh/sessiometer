@@ -99,15 +99,16 @@ visual gate while the bar glyph did. It was never tested, and it is wrong:
 `ImageRendererHeadlessProbeTests` rasterizes SwiftUI inside the standalone `MenubarTests` bundle
 (`TEST_HOST: ""` — no host app, no `NSApplication`, no window) under `xcodebuild test`, across a bare
 view, an SF Symbol, and the `@EnvironmentObject` / `@Published` environment-injection path that issue
-#749 flagged as the likelier failure point. So an in-bundle panel golden gate IS reachable — that is
-issue #754's work. (The stronger no-*windowserver* claim was confirmed separately under `sandbox-exec`
-denying `com.apple.windowserver*` — `CGSession` nil, `NSScreen.count` 0, identical output bytes — but
-only the in-bundle claim above is what CI re-runs.)
+#749 flagged as the likelier failure point. So an in-bundle panel golden gate IS reachable — and issue
+#754 built it (see *Panel golden drift gate* below). (The stronger no-*windowserver* claim was confirmed
+separately under `sandbox-exec` denying `com.apple.windowserver*` — `CGSession` nil, `NSScreen.count` 0,
+identical output bytes — but only the in-bundle claim above is what CI re-runs.)
 
-What stays a **manual pre-release step** is regenerating these committed PNGs through the built
-**app**'s `--render-panel` tool, for the ordinary reason that it needs a local Debug build of the app
-(`RenderPanelTool` is `#if DEBUG`) and a human eye on the comparison — not because of any headless
-limitation.
+What stays a **manual pre-release step** is this `--render-panel` pass and the eyeball comparison it
+feeds, for the ordinary reason that it needs a local Debug build of the app (`RenderPanelTool` is
+`#if DEBUG`) and a human judging fidelity against the mock — not because of any headless limitation. The
+automated half (drift against committed goldens) does run headless in CI, and it is a different question:
+*has the panel changed?*, not *does the panel match the design?*
 
 ### Design vs. capture, screen by screen
 
@@ -128,6 +129,13 @@ python3 design/build-comparison.py /tmp/panelcaps /tmp/design-vs-capture.html
 open /tmp/design-vs-capture.html
 ```
 
+**This harness re-baselines itself, by design — which is why the golden gate below exists.**
+`build-comparison.py` slices the mock's `.pop` blocks **live** at comparison time, so editing
+`menubar-preview.html` silently changes what the built panel is compared against. That is correct for
+this tool (the mock is the reference; it *should* always read the current mock), but it means the tool
+cannot detect PANEL drift — nothing here is committed, so nothing here shows in a diff. The panel
+golden gate is the other half.
+
 Frames are paired **by name**, never by position: every `.pop` block carries a `data-frame` (e.g.
 `blind-ok-light`), and each `STATES` entry names the frame it pairs with. So add, remove, or reorder
 frames freely — a mock frame and its Swift fixture no longer have to land in one commit (#581).
@@ -138,6 +146,109 @@ state, then variant — and always suffix the theme (`Active blind · OK · Ligh
 nothing enforces the convention. What the script *does* enforce is presence and uniqueness: it exits
 non-zero on an untagged block, a duplicate name, or a `STATES` entry pointing at a name the mock no
 longer carries — naming the frame, or the line for an untagged block.
+
+### Panel golden drift gate (#754)
+
+The harness above is the **fidelity** path (a human eye, against the live mock). This is the **drift**
+path: `Tests/PanelGoldenParityTests` re-renders every panel state in-process — SwiftUI `ImageRenderer`
+inside the headless `MenubarTests` bundle, which issue #749 measured as viable — and diffs the fresh
+renders against committed goldens under `renders/panel-goldens/`. **34 goldens** (17 fixtures × light/dark,
+`panel-<state>-<theme>.png`, @2x), rendered through the same `PanelRenderHarness` the app's
+`--render-panel` tool uses, so the automated gate and the human oracle can never render different states.
+
+Read a green as "the panel's appearance has not changed since it was last blessed" — **never** as "the
+panel matches the mock". The built panel intentionally differs from the mock on the axes listed under
+*Expected reconciliations* above, and those differences are baked into the goldens.
+
+**Regenerating (re-baselining) the goldens** — an explicit command, never a side effect:
+
+```sh
+# from apps/menubar
+xcodegen generate
+TEST_RUNNER_SESSIOMETER_PANEL_GOLDENS=update xcodebuild test \
+  -project Menubar.xcodeproj -scheme Menubar -configuration Debug \
+  -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO \
+  -only-testing:MenubarTests/PanelGoldenParityTests/testRegenerateGoldensWhenExplicitlyRequested
+```
+
+The `TEST_RUNNER_` prefix is required: `xcodebuild` forwards only prefixed variables into the test
+process (stripping the prefix). A bare `SESSIOMETER_PANEL_GOLDENS=update` reaches `xcodebuild` and not the
+test, which then **skips** — writing nothing while exiting 0.
+
+Then **look at the new renders** (a reference you have not looked at is not a reference) and record why
+they changed:
+
+```sh
+git commit --trailer 'Panel-Goldens-Rebaselined: <what changed in the panel and why>'
+```
+
+`scripts/check-panel-golden-rebaseline.sh` enforces that trailer in CI on any PR touching
+`renders/panel-goldens/**` — add, modify, or delete. Its falsifier peer
+(`scripts/check-panel-golden-rebaseline.test.sh`) proves the guard goes red without it.
+
+**Re-deriving the thresholds** (the measurement table in the suite's header):
+
+```sh
+TEST_RUNNER_SESSIOMETER_PANEL_MEASURE=1 xcodebuild test \
+  -project Menubar.xcodeproj -scheme Menubar -configuration Debug \
+  -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO \
+  -only-testing:MenubarTests/PanelGoldenParityTests/testMeasureSeparations
+```
+
+Two of the header's rows are asserted by always-on tests rather than printed by that command (the
+aqua-vs-darkAqua row, and the app-tool-vs-goldens row measured out of band by running `--render-panel`
+into a scratch directory and `diff -rq`-ing it against `renders/panel-goldens/`), so re-deriving the
+whole table means running the default suite too.
+
+**What the relative gate does and does not cover.** The primary check —
+`testEachFreshRenderIsNearestToItsOwnGolden` — asks that a fresh render's closest same-size golden be
+itself, which needs no cross-machine calibration and catches one state morphing into another. It only has
+power where a same-size golden of a *different* fixture exists to lose to, and goldens are sized by
+content: 5 of the 17 fixtures (`stats`, `disconnected`, `not-running`, `empty-roster`, `blind-cornered`)
+own a unique height, so their size group holds only their own two themes, ~0.97 apart. For those **10 of
+34 cells the relative check is trivially satisfied** and the absolute ceiling — the cross-machine
+*unvalidated* half — is the only thing defending them. The suite asserts that count rather than merely
+noting it, and prints it on every run alongside the weakest real margin (measured **0.002513**), so the
+promotion decision in issue #790 has the number in front of it.
+
+**What runs where.** Only the two committed-golden comparisons are cross-machine sensitive (goldens
+rasterized on one machine, re-rendered on an unpinned `macos-latest`), so they are env-gated off by
+default and run only in the **non-required** `panel-goldens` CI job:
+
+| Assertion class | Where | Required? |
+|---|---|---|
+| renders succeed · non-blank · deterministic · clock-drift window · host-appearance independent · pairwise distinct · health-tint assets resolve · both canaries · PNG round-trip | `swift` job (default suite) | **yes** — all same-run comparisons, cross-machine immune |
+| `testEveryRenderMatchesItsCommittedGolden` · `testEachFreshRenderIsNearestToItsOwnGolden` | `panel-goldens` job (`SESSIOMETER_PANEL_GOLDEN_GATE=1`) | **no** — soft-landing |
+| `Panel-Goldens-Rebaselined:` trailer | `gate-change-ack` job | **yes** — pure git, cannot be flaky |
+
+**A golden can change bytes without changing pixels.** The gate compares decoded PIXELS, never file
+bytes — which is why the suite normalizes both sides into one sRGB/RGBA8 buffer. `NSBitmapImageRep`'s PNG
+encoder is byte-stable for a given OS + Xcode but not across versions, so re-blessing on a newer machine
+can produce a diff with no visible change. Measured instance: the committed `renders/panel-healthy-*.png`
+oracle (rendered on an older toolchain) has different bytes from a fresh render and **0.000000** pixel
+drift. Do not read "the PNG changed" as "the panel changed"; the gate's own verdict is the answer.
+
+**On THIS toolchain the goldens are byte-reproducible, and that is deliberate.** Two independent
+`SESSIOMETER_PANEL_GOLDENS=update` runs produce byte-identical files, and the app's own `--render-panel`
+output is byte-identical to all 34 goldens. It did not start out that way: the first renders in a process
+disagree with the steady state by ±1/255 on ~0.03 % of bytes — a rasterization warm-up artifact, found by
+rendering one fixture six times (renders 0–1 agree with each other, renders 2–5 agree with each other,
+the two groups differ) and ruled out as a clock effect because renders seeded seconds apart are
+byte-identical. `PanelRenderHarness` now discards renders until two consecutive ones agree, so both the
+app tool and the in-bundle gate rasterize from the steady state. None of this changes a VERDICT — the
+gate metric ignores channel deltas under 64/255 either way — it protects the AUDIT TRAIL: without it a
+re-bless rewrites files that did not change, and the real change hides among the churn in exactly the
+diff `Panel-Goldens-Rebaselined:` exists to make readable. `PanelGoldenParityTests` asserts the
+byte-exactness directly, so a regression here fails loudly rather than quietly returning the churn.
+
+**Promotion to required: N = 10 consecutive green `panel-goldens` runs on `main`.** Ten rather than three
+because the risk under measurement is antialiasing drift on an *unpinned* runner image, and the sample
+must span at least one image roll. EVERY step in the job is `continue-on-error` — not just the gate step,
+because `ci-ok` fails on any un-guarded step in a job it needs, so a `brew install xcodegen` network blip
+would otherwise block a merge through the very job whose whole point is not to. The job's conclusion is always
+success; the countable signal is the `PANEL_GOLDEN_GATE_RESULT=green|red` line the reporting step prints,
+alongside the `max drift` figure the promotion decision needs. **The promotion decision — the tally, the
+re-calibration question it must answer first, and the mechanics — is recorded in issue #790.**
 
 ## It's a mock, not code
 

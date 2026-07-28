@@ -13,3 +13,7 @@ DerivedData/
 
 # Per-user Xcode state (schemes, breakpoints, window layout)
 xcuserdata/
+
+# `tee` target of the panel golden drift gate's CI step (issue #754) — anyone reproducing that job's
+# command locally gets one here; it is a log, never an input.
+panel-goldens.log
