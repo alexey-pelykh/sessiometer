@@ -1120,8 +1120,19 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
                 .wrapping_add(1_442_695_040_888_963_407);
             self.0
         }
+        /// A value in `[0, n)`, drawn from the HIGH bits (issue #801).
+        ///
+        /// `next_u64() % n` would be wrong here: in an LCG mod 2^64 the low `k` bits
+        /// have period only 2^k, so bit 0 simply alternates `1,0,1,0,…`. For any EVEN
+        /// `n` the remainder inherits that bit, so a caller drawing at an even stride
+        /// gets a pinned parity forever. Both shapes bite the tests below:
+        /// `below(2)` at the stride-4 per-sample loops returned a CONSTANT, collapsing
+        /// a two-account corpus to one account and so never exercising the `all_high`
+        /// intersection with N > 1; `1 + below(50)` was odd in 200/200 iterations,
+        /// leaving half its sample counts unreachable. Shifting first discards the
+        /// short-period bits — the lowest one kept is bit 33, of period 2^34.
         fn below(&mut self, n: u64) -> u64 {
-            self.next_u64() % n
+            (self.next_u64() >> 33) % n
         }
         fn frac(&mut self) -> f64 {
             (self.next_u64() >> 11) as f64 / (1u64 << 53) as f64
@@ -1180,6 +1191,9 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
     fn prop_splitting_a_period_loses_no_sample_and_doubles_none() {
         let mut rng = Lcg::new(0xD57_9001);
         let accounts = ["work", "play"];
+        // Splitting is only interesting when the samples span more than one account —
+        // otherwise the per-account half of the assertion repeats the aggregate half.
+        let mut multi_account_iters = 0_u32;
         for _ in 0..400 {
             let start = 0i64;
             let end = 100_000i64;
@@ -1212,13 +1226,29 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
                 let seen = |rep: &UsageReport| rep.per_account.get(acct).map_or(0, |a| a.seen);
                 assert_eq!(seen(&l) + seen(&r), seen(&whole), "{acct}: partitioned");
             }
+            if whole.per_account.len() > 1 {
+                multi_account_iters += 1;
+            }
         }
+        // Non-degeneracy. This also carries the positive witness: reaching two accounts
+        // requires at least two samples, so `0 + 0 == 0` cannot satisfy the conservation
+        // assertions above vacuously.
+        assert!(
+            multi_account_iters > 0,
+            "corpus is single-account in all 400 iterations — the per-account split is \
+             never distinct from the aggregate one (expect ~388); is `Lcg::below` \
+             drawing from the low bits?"
+        );
     }
 
     #[test]
     fn prop_cap_hits_are_monotone_in_the_threshold() {
         let mut rng = Lcg::new(0xCAF_E157);
         let period = Period::new(0, 100_000);
+        // `lo >= hi` holds for ANY constant function, `cap_hits = 0` included. Count the
+        // iterations where the two thresholds actually disagree, so the ordering is
+        // witnessed rather than merely not-contradicted.
+        let mut strict_drop_iters = 0_u32;
         for _ in 0..200 {
             let n = 1 + rng.below(50);
             let samples: Vec<Sample> = (0..n)
@@ -1232,13 +1262,26 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
                 lo >= hi,
                 "a lower cap can only admit MORE hits ({lo} >= {hi})"
             );
+            if lo > hi {
+                strict_drop_iters += 1;
+            }
         }
+        // Positive witness. `lo > hi` implies `lo > 0`, so this subsumes the plain
+        // "some iteration produced a hit" check and additionally proves the threshold
+        // is what separates the two counts.
+        assert!(
+            strict_drop_iters > 0,
+            "raising the cap never dropped a single hit in any of 200 iterations \
+             (expect ~192) — `lo >= hi` above is holding as `lo == hi`, i.e. vacuously"
+        );
     }
 
     #[test]
     fn prop_all_high_never_exceeds_period_duration() {
         let mut rng = Lcg::new(0x8118_2026);
         let accounts = ["work", "play"];
+        let mut multi_account_iters = 0_u32;
+        let mut nonzero_all_high_iters = 0_u32;
         for _ in 0..200 {
             let period = Period::new(0, 50_000);
             let n = 1 + rng.below(40);
@@ -1254,7 +1297,27 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
                     && report.roster.all_high_secs <= period.duration(),
                 "all-high time is within [0, period]"
             );
+            if report.per_account.len() > 1 {
+                multi_account_iters += 1;
+            }
+            if report.roster.all_high_secs > 0 {
+                nonzero_all_high_iters += 1;
+            }
         }
+        // Non-degeneracy: the corpus must actually reach the N-fold intersection with
+        // N > 1. A single-account corpus (what a low-bit `Lcg::below` produced) passes
+        // every assertion above while never executing the intersection at all.
+        assert!(
+            multi_account_iters > 0,
+            "corpus is single-account in all 200 iterations — the N>1 intersection is \
+             never exercised (expect ~191); is `Lcg::below` drawing from the low bits?"
+        );
+        // Positive witness: without this a `return (0, 0)` stub passes 200/200.
+        assert!(
+            nonzero_all_high_iters > 0,
+            "no iteration produced a non-zero all-high span (expect ~20) — the range \
+             bound alone cannot tell a working implementation from a zero stub"
+        );
     }
 
     // --- test constructors ----------------------------------------------------
