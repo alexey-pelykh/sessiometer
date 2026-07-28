@@ -258,7 +258,7 @@ private struct AccountRowView: View {
     /// branches cannot drift.
     private var rowContent: some View {
         VStack(alignment: .leading, spacing: 9) {
-            HStack(spacing: 9) {
+            HStack(spacing: StatusPanelFormat.rowInterElementSpacing) {
                 StatusDot(isActive: row.isActive)
                 MonogramBadge(label: row.label, monogram: monogram)
 
@@ -268,7 +268,7 @@ private struct AccountRowView: View {
                     .lineLimit(1)
                     // MIDDLE-truncation (issue #445): a same-local-part label's distinguishing suffix /
                     // domain survives when it elides, where tail-truncation hid exactly that part.
-                    .truncationMode(.middle)
+                    .truncationMode(StatusPanelFormat.identityElision.truncationMode)
 
                 // #699: the trailing identity slot carries NO "active" text. Active is encoded twice over
                 // — the leading dot's FILL-vs-ring treatment (a SHAPE cue, so WCAG 1.4.1 / R-2 holds under
@@ -277,7 +277,7 @@ private struct AccountRowView: View {
                 // of the account label's width — pushing near-identical fleet emails into truncation. The
                 // row's spoken label is unaffected: `rowAccessibilityLabel` derives ", active" from
                 // `isActive` independently, and the capsule was `accessibilityHidden` anyway (#325).
-                Spacer(minLength: 6)
+                Spacer(minLength: StatusPanelFormat.rowSpacerMinLength)
 
                 authView
                 switchSlot
@@ -299,7 +299,7 @@ private struct AccountRowView: View {
                 }
             }
         }
-        .padding(.horizontal, 8)
+        .padding(.horizontal, StatusPanelFormat.rowHorizontalPadding)
         .padding(.top, 9)
         .padding(.bottom, 10)
         // Active emphasis follows the design reference: an accent-tint fill ONLY. The accent ring was
@@ -482,19 +482,21 @@ private struct UsageMeter: View {
             Text(label.uppercased())
                 .font(.system(size: 10, weight: .semibold))
                 .foregroundStyle(.secondary)
-                .frame(width: 52, alignment: .leading)
+                // The three cell widths come from `StatusPanelFormat` (#750) rather than sitting inline, so
+                // `PanelTextMetricsTests` measures text against the SAME number this lays out with.
+                .frame(width: StatusPanelFormat.meterLabelCellWidth, alignment: .leading)
 
             UsageBar(fraction: fraction, color: barColor)
 
             Text(StatusPanelFormat.pct(pct))
                 .font(.system(size: 12, weight: .semibold)).monospacedDigit()
                 .foregroundStyle(pctColor)
-                .frame(width: 40, alignment: .trailing)
+                .frame(width: StatusPanelFormat.meterPercentCellWidth, alignment: .trailing)
 
             Text(reset)
                 .font(.system(size: 11)).monospacedDigit()
                 .foregroundStyle(.secondary)
-                .frame(width: 52, alignment: .trailing)
+                .frame(width: StatusPanelFormat.meterResetCellWidth, alignment: .trailing)
                 .lineLimit(1)
         }
     }
@@ -542,18 +544,15 @@ private struct UsageBar: View {
                 // Track = mock `--track` neutral fill (#388) — replaces a washed `Color.secondary.opacity(0.20)`.
                 Capsule().fill(Color.panelFill(.track, dark: colorScheme == .dark))
                 Capsule().fill(color)
-                    .frame(width: fillWidth(geo.size.width))
+                    // The clamp + minimum sliver live in `StatusPanelFormat.meterFillWidth` (#750) so they
+                    // are assertable — nothing upstream clamps the percent (the wire decodes a bare
+                    // `UInt8`), so this bound is what stops a 255 % reading painting 2.55× its own track.
+                    // The rationale lives with the function.
+                    .frame(width: StatusPanelFormat.meterFillWidth(fraction: fraction, full: geo.size.width))
             }
         }
         .frame(height: 6)
         .accessibilityHidden(true)
-    }
-
-    private func fillWidth(_ full: CGFloat) -> CGFloat {
-        let clamped = min(1, max(0, fraction))
-        guard clamped > 0 else { return 0 }
-        // Mock `.m-fill { min-width: 5px }` — a live-but-tiny percent keeps a visible sliver.
-        return max(5, full * clamped)
     }
 }
 
@@ -587,14 +586,17 @@ private struct BlindMeter: View {
                 Text("SESSION")
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(.secondary)
-                    .frame(width: 52, alignment: .leading)
+                    // The SAME constants the live `UsageMeter` lays out with (#750), so the type comment
+                    // above — "reuses UsageMeter's SESSION-label (52) and percent (40) columns" — is now
+                    // structurally true rather than two literals that happen to agree today.
+                    .frame(width: StatusPanelFormat.meterLabelCellWidth, alignment: .leading)
 
                 HeldUsageBar(fraction: Double(blind.lastKnownSessionPct) / 100.0, color: barColor(lastKnownBand))
 
                 Text(StatusPanelFormat.pct(blind.lastKnownSessionPct))
                     .font(.system(size: 12, weight: .semibold)).monospacedDigit()
                     .foregroundStyle(Color.panel(StatusPanelFormat.usageTextTint(lastKnownBand)))
-                    .frame(width: 40, alignment: .trailing)
+                    .frame(width: StatusPanelFormat.meterPercentCellWidth, alignment: .trailing)
 
                 Text(StatusPanelFormat.blindDurationChip(blind.blindSecs))
                     .font(.system(size: 11, weight: .medium)).monospacedDigit()
@@ -664,8 +666,10 @@ private struct HeldUsageBar: View {
             ZStack(alignment: .leading) {
                 Capsule().fill(Color.panelFill(.track, dark: colorScheme == .dark))
                 // Muted fill (0.5α) — a held value reads dimmer than a live meter, never a bright false-now.
+                // Shares `UsageMeter`'s bound (#750): the held bar reads a LAST-KNOWN `UInt8` off the same
+                // unclamped wire field, so it needs the same clamp for the same reason.
                 Capsule().fill(color.opacity(0.5))
-                    .frame(width: fillWidth(geo.size.width))
+                    .frame(width: StatusPanelFormat.meterFillWidth(fraction: fraction, full: geo.size.width))
                 // Dashed outline over the whole track — the legible-at-6px "held" signal.
                 Capsule().strokeBorder(color.opacity(0.9),
                                        style: StrokeStyle(lineWidth: 1, dash: [2.5, 2]))
@@ -673,11 +677,5 @@ private struct HeldUsageBar: View {
         }
         .frame(height: 6)
         .accessibilityHidden(true)
-    }
-
-    private func fillWidth(_ full: CGFloat) -> CGFloat {
-        let clamped = min(1, max(0, fraction))
-        guard clamped > 0 else { return 0 }
-        return max(5, full * clamped)
     }
 }

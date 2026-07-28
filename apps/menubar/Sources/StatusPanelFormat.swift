@@ -238,6 +238,164 @@ enum StatusPanelFormat {
         panelContentWidth - 2 * rosterHorizontalInset - 2 * statsCardHorizontalPadding - statsChartLeadingInset
     }
 
+    // MARK: - Text-cell layout budgets (issue #750 — the widths the text-metrics gate measures against)
+
+    // WHY THESE MOVED HERE. Each was a bare literal in a view file the headless `MenubarTests` bundle
+    // deliberately excludes — so the truncation policy they enforce was unmeasurable, and
+    // `PanelTextMetricsTests` had nothing to assert against. Hoisting them into this Foundation-only layer
+    // is the SAME move `switchAffordanceSlotWidth` / `panelContentWidth` / `statsCardHorizontalPadding`
+    // already made, and for the same stated reason: a number the view lays out with must not be a second
+    // copy that can drift from the number a test checks.
+    //
+    // TWO KINDS LIVE HERE, and the difference is load-bearing — do not read the second kind as the first:
+    //
+    //   * LINKED (the view reads this exact constant, so there is no second copy):
+    //     `meterLabelCellWidth`, `meterPercentCellWidth`, `meterResetCellWidth` (the three `UsageMeter`
+    //     cells, also reused by `BlindMeter`), `rowHorizontalPadding`, `rowInterElementSpacing`,
+    //     `rowSpacerMinLength`, `statusDotWidth`, `monogramBadgeWidth`.
+    //
+    //   * ALLOWANCE (no view site exists to link — the element has no fixed frame and sizes to its own
+    //     content, so this is a RESERVED budget, not a pin): `authColumnAllowance`,
+    //     `statsSignalPillAllowance`. These are the two inputs `rosterLabelBudget` / `statsHandleBudget`
+    //     cannot verify, which is why both budgets are documented as ±10 pt and why the issue #445
+    //     invariant is asserted across a RANGE rather than at one derived number.
+    //
+    // NOTE these are BUDGETS, not measurements — what fits in them is a font-metric question the gate
+    // answers, and answers differently as the system font changes.
+
+    /// The usage meter's leading window-name cell (`SESSION` / `WEEKLY`), uppercased at 10 pt semibold.
+    /// Fixed-width so Session and Weekly rows align down the panel; `.leading`-aligned.
+    static let meterLabelCellWidth: Double = 52
+
+    /// The usage meter's percent cell (`N%` / `n/a`), 12 pt semibold with monospaced digits, `.trailing`.
+    /// The widest reachable content is `255%` — `WireModel` decodes `session_pct` / `weekly_pct` as a bare
+    /// `UInt8` with NO clamp, so a daemon sending 255 renders `255%` here (measured: 35.56 pt, fits).
+    static let meterPercentCellWidth: Double = 40
+
+    /// The usage meter's trailing reset-in cell (`humanizeUntil` output), 11 pt monospaced digits,
+    /// `.trailing`, `.lineLimit(1)`.
+    ///
+    /// MEASURED BOUNDARY (issue #750): the day form is the unbounded one — the hour form maxes at `23h59m`
+    /// (44.15 pt) because hours roll into days. Three-digit days still fit (`999d23h` = 48.32 pt); overflow
+    /// begins at FOUR digits (`1000d23h` = 55.32 pt). `Int64.max` seconds renders `106751991167300d15h`
+    /// (132.24 pt). So this cell is safe for every plausible reset instant and clips only on a wire value
+    /// that is already nonsense — which is exactly what the gate reports rather than assumes.
+    static let meterResetCellWidth: Double = 52
+
+    /// The leading status dot's diameter (`StatusDot`), on a roster row and on a Stats card's head row alike.
+    static let statusDotWidth: Double = 8
+
+    /// The monogram badge's side (`MonogramBadge`, a rounded square), on both row kinds.
+    static let monogramBadgeWidth: Double = 30
+
+    /// A roster row's inner horizontal padding per side (`AccountRowView`'s horizontal padding).
+    static let rowHorizontalPadding: Double = 8
+
+    /// The `HStack` spacing charged between each adjacent pair of children on BOTH identity-bearing rows —
+    /// `AccountRowView`'s six (so five gaps, the count `rosterLabelBudget` charges) and `StatStripRow`'s
+    /// four (three gaps, the count `statsHandleBudget` charges).
+    static let rowInterElementSpacing: Double = 9
+
+    /// The minimum width `AccountRowView`'s trailing `Spacer` collapses to once the label wants the slack.
+    static let rowSpacerMinLength: Double = 6
+
+    /// The auth column's reserved width allowance on a roster row, in points — the glyph plus its longest
+    /// action cue (`claude /login`, `recovering`, `disabled`).
+    ///
+    /// An ALLOWANCE, not a pin: the column has no `.frame(width:)`, and its true width depends on SF-Symbol
+    /// metrics this Foundation-only layer cannot measure. The 60 pt figure is not new — it is the number
+    /// `switchAffordanceMinRowWidth` above has always folded into its own published derivation ("60 (auth
+    /// glyph + its longest cue)"); naming it here just stops the two derivations owning separate copies.
+    static let authColumnAllowance: Double = 60
+
+    /// The width available to a roster row's ACCOUNT LABEL on the shipped fixed-width panel — the budget the
+    /// `.lineLimit(1)` + `.truncationMode(.middle)` policy (issue #445) actually elides against.
+    ///
+    /// Derived, never hand-tuned, from the row's fixed columns at the label's tightest: `defaultRowWidth`
+    /// minus both row paddings, the 8 pt status dot, the 30 pt monogram badge, the swap slot, the five
+    /// inter-element gaps the six-child `HStack` charges, the collapsed spacer, and the auth allowance. On the
+    /// shipped 380 pt panel that is 364 − 16 − 8 − 30 − 28 − 45 − 6 − 60 = **171 pt**.
+    ///
+    /// Its weakest input is `authColumnAllowance` (see there), so treat this as ±10 pt rather than exact —
+    /// `PanelTextMetricsTests` therefore asserts the issue #445 invariant across a RANGE of budgets, not only
+    /// at this one value, so the invariant does not rest on the allowance being precisely right.
+    static var rosterLabelBudget: Double {
+        defaultRowWidth
+            - 2 * rowHorizontalPadding
+            - statusDotWidth
+            - monogramBadgeWidth
+            - switchAffordanceSlotWidth
+            - 5 * rowInterElementSpacing
+            - rowSpacerMinLength
+            - authColumnAllowance
+    }
+
+    /// The Stats head row's trailing signal-pill allowance, in points — like `authColumnAllowance`, a
+    /// reserved budget rather than a `.frame(width:)` pin (the pill `.fixedSize()`s to its own label).
+    static let statsSignalPillAllowance: Double = 85
+
+    /// The width available to a Stats card's HANDLE label on the shipped fixed-width panel — the budget
+    /// issue #700 bought by moving the sparkline onto its own row, and the one its "enough for a
+    /// 28-character handle untruncated" claim is about.
+    ///
+    /// Derived from the card's own geometry: `panelContentWidth` minus both roster insets and both card
+    /// paddings gives the 348 pt card content width; the head row then spends the status dot, the monogram
+    /// badge, its three `HStack` gaps, and the trailing signal pill. 348 − 8 − 30 − 27 − 85 = **198 pt**,
+    /// matching the figure `StatStripRow`'s own comment records.
+    ///
+    /// MEASURED (issue #750): a realistic 23-character address (`oleksii@company-one.com`) needs 170.03 pt
+    /// and clears it; 28 characters of the WIDE glyph `x` needs 201.70 pt and does not. So #700's claim holds
+    /// for representative handles and is marginal at the wide-glyph extreme — recorded, not silently rounded.
+    static var statsHandleBudget: Double {
+        panelContentWidth
+            - 2 * rosterHorizontalInset
+            - 2 * statsCardHorizontalPadding
+            - statusDotWidth
+            - monogramBadgeWidth
+            - 3 * rowInterElementSpacing
+            - statsSignalPillAllowance
+    }
+
+    // MARK: - Identity elision policy (issue #445 — the truncation MODE, hoisted so it can be asserted)
+
+    /// Which end(s) of an over-long identity-bearing label the panel elides.
+    enum IdentityElision: Equatable {
+        /// Keep the head AND the tail, elide the middle — so a same-local-part address's distinguishing
+        /// DOMAIN survives.
+        case middle
+        /// Keep the head, elide the tail.
+        case tail
+    }
+
+    /// The elision policy for every label that CARRIES AN IDENTITY — the roster account label, the Stats
+    /// handle, the next-swap target, and the capture/swap result lines that name an account.
+    ///
+    /// Hoisted out of the views (issue #750) because it is the whole substance of issue #445 and was
+    /// previously five separate `.truncationMode(.middle)` literals in files the headless test bundle
+    /// excludes — so "the panel middle-truncates identities" was an ASSUMPTION no test could reach. It is
+    /// now one value, asserted by `PanelTextMetricsTests`, and a change to `.tail` reddens the gate instead
+    /// of silently undoing #445 across five sites.
+    ///
+    /// Deliberately NOT applied to non-identity text (the next-swap REASON line, the stats caveat strip):
+    /// those tail-truncate, because their information is front-loaded and they name no account.
+    static let identityElision: IdentityElision = .middle
+
+    // MARK: - Usage-bar fill (issue #750 — the clamp, hoisted so it can be locked)
+
+    /// The usage bar's fill width for `fraction` within a track of `full` points.
+    ///
+    /// Hoisted out of `UsageBar` so the CLAMP is assertable. It matters because nothing upstream clamps: the
+    /// wire decodes `session_pct` / `weekly_pct` as a bare `UInt8`, so a daemon sending 255 yields a fraction
+    /// of 2.55 — which without this `min(1,…)` would paint a capsule 2.55× its own track. A live-but-tiny
+    /// percent keeps a 5 pt sliver (mock `.m-fill { min-width: 5px }`) so it never reads as empty, and a zero
+    /// or failed reading shows a BARE track (#137: never a fabricated fill). The NUMBER beside the bar still
+    /// reports the real value — clamping is a drawing bound, not a truth edit.
+    static func meterFillWidth(fraction: Double, full: Double) -> Double {
+        let clamped = min(1, max(0, fraction))
+        guard clamped > 0 else { return 0 }
+        return max(5, full * clamped)
+    }
+
     // MARK: - Swap-chip emphasis (issue #448 — persistent-quiet, brightens when armed)
 
     /// The per-row swap chip's emphasis level. #169 revealed the trailing swap glyph ONLY on hover, so on a
