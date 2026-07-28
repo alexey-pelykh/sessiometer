@@ -65,29 +65,92 @@
 //! Caller-contract note below, spike #262); the flag remains the per-cycle new-token
 //! signal, and the sliding-window-vs-cap TTL question stays open.
 //!
-//! "The TTL question" is really TWO different TTLs — spike #281 separated them and settled
-//! what is knowable WITHOUT a live token:
+//! "The TTL question" is really TWO different TTLs — spike #281 separated them and ruled on
+//! what is knowable WITHOUT a live token. That separation still holds; its ruling on the
+//! SECOND one does not (issue #876 — see the bullet's own correction below):
 //!
 //!   - **Access-token TTL — readable AT REST.** The credential blob's `expiresAt` field IS
 //!     the access token's expiry (~8h; a zero-impact read measured 7h19m remaining). No
 //!     experiment needed for this one.
-//!   - **Refresh-token idle-expiry (`refresh_token_expires_in`) — NOT at rest, verified
-//!     (High).** A zero-impact enumeration of the live `Claude Code-credentials` blob found
-//!     SIX fields — `accessToken`, `refreshToken`, `expiresAt`, `scopes`,
-//!     `subscriptionType`, `rateLimitTier` — and NONE is a refresh-token expiry (the lone
-//!     `expiresAt` is the access token's). The refresh token is itself an opaque
-//!     `sk-ant-ort…` string, not a JWT, so it carries no decodable `exp` either. Claude
-//!     Code's own credential path does not even READ `refresh_token_expires_in` (the
-//!     OAuth-response field carrying the RT lifetime): a static RE of the client
-//!     (v2.1.198) shows its `claudeAiOauth` write destructures
-//!     `accessToken`/`refreshToken`/`expiresAt`/`scopes` off the response and stores the
-//!     six-field blob, never the RT lifetime. (The field DOES appear elsewhere in the
-//!     binary — but only inside the bundled `@azure/msal-node` library on a separate
-//!     Microsoft-auth path; a red herring, not the Anthropic flow.) So the number
-//!     survives only in that single live `/v1/oauth/token` response — an operator
-//!     one-shot on a throwaway account is the sole source (deferred, zero-impact mandate
-//!     #101; see the Deferred-live-check section). The sliding-window-vs-cap facet stays with the
-//!     engine's own `expires_at_delta_secs` telemetry (above).
+//!   - **Refresh-token idle-expiry (`refresh_token_expires_in`) — READABLE AT REST on CC
+//!     v2.1.218–220 (issue #876).** The refresh token is itself an opaque `sk-ant-ort…`
+//!     string, not a JWT, so it carries no decodable `exp` — but the client does not need
+//!     one: it persists the server's answer. A static RE of the installed client on
+//!     2026-07-28 shows the OAuth token-formatting path READ `refresh_token_expires_in`
+//!     and store it in the `claudeAiOauth` blob as `refreshTokenExpiresAt`:
+//!
+//!     ```text
+//!     accessToken:e.access_token, refreshToken:e.refresh_token,
+//!     expiresAt:Date.now()+e.expires_in*1000,
+//!     refreshTokenExpiresAt:ano(e.refresh_token_expires_in,!0),   // `ano` = v2.1.220 naming
+//!     scopes:…, subscriptionType:…, rateLimitTier:…
+//!     ```
+//!
+//!     The client also RENDERS it: a `daysLeft = Math.ceil((refreshTokenExpiresAt - now) /
+//!     86400000)` helper gates two surfaces — a persistent `oauth-expiry` warning inside a
+//!     3-day window, and an `oauth-expiry-warning` toast at 1 day or less.
+//!
+//!     **The deadline does NOT slide across refreshes — and the client cannot be silently
+//!     discarding a fresh one.** Read the helper carefully; the numeric test fires FIRST
+//!     and unconditionally:
+//!
+//!     ```text
+//!     function ano(e,t){ if(typeof e==="number") return Date.now()+e*1000;
+//!                        return t ? Date.now()+sxg : void 0 }   // sxg = 2592000000 = 30d
+//!     // login   :     refreshTokenExpiresAt: ano(e.refresh_token_expires_in, !0)  // 30d fallback
+//!     // refresh : f =                        ano(l.refresh_token_expires_in, !1)  // undefined
+//!     // merge   :     refreshTokenExpiresAt: new ?? old     // `f` reaches the blob here
+//!     ```
+//!
+//!     The `t` fallback flag is consulted ONLY when the value is absent or non-numeric.
+//!     A numeric `refresh_token_expires_in` on the refresh path therefore always becomes
+//!     a fresh absolute deadline, and since a number is not nullish the `??` merge STORES
+//!     it — the deadline WOULD move. So "the server sends a fresh lifetime that CC throws
+//!     away" is not available as an explanation for a numeric value.
+//!
+//!     At rest: across 6 accounts whose ACCESS tokens had all refreshed within hours, the
+//!     refresh-token deadlines sat unmoved at fixed absolute timestamps (4 of the 6 inside
+//!     one ~4-minute window, 30 days after a single onboarding sitting). Given the read
+//!     above, that is evidence the server does **not** send a numeric
+//!     `refresh_token_expires_in` on refresh — it omits it, or sends it non-numerically.
+//!
+//!     What remains UNKNOWABLE at rest is the server's own refresh-token lifetime policy.
+//!     A non-moving recorded deadline reports what CC was TOLD, not what the server would
+//!     grant, so it is **not by itself proof of a server-side fixed cap**.
+//!
+//!     **Operational consequence for THIS engine.** The deadline CC records does not slide,
+//!     so no amount of refreshing extends the refresh token's own life — whatever the
+//!     server's policy turns out to be. CC does not ENFORCE the deadline either: every
+//!     `refreshTokenExpiresAt` site is a write, the merge, or the render read — there is no
+//!     refresh-refusal predicate, and the refresh trigger stays the 5-minute pre-expiry
+//!     check on `expiresAt` (the ACCESS token). So past that deadline this engine keeps
+//!     attempting refreshes and the failure arrives server-side, surfacing through the
+//!     existing step-6 `Dead` classification — not as a new client-side refusal to handle.
+//!
+//!     **The divergence from the v2.1.198 record is UNRESOLVED — do not narrate a cause.**
+//!     The prior record here (PR #290, spike #281) reported a six-field blob carrying no
+//!     refresh-token expiry, no Anthropic-path read of `refresh_token_expires_in`, and the
+//!     field's presence attributed solely to the bundled `@azure/msal-node` library. That
+//!     MSAL copy IS still present in v2.1.218–220 — but so is the Anthropic-path use, so
+//!     the "only MSAL" half does not hold OF THESE BINARIES. The v2.1.198 binary is
+//!     **not installed**, so "CC changed after v2.1.198" and "the original RE was wrong"
+//!     cannot be told apart
+//!     from here; this module asserts NEITHER. Spike #281 stays CLOSED and is NOT reopened
+//!     — the divergence is tracked in #876.
+//!
+//!     **Version pin + re-verification trigger.** Everything in this bullet is RE-derived
+//!     from `~/.local/share/claude/versions/{2.1.218,2.1.219,2.1.220}` on 2026-07-28 —
+//!     which is **above** the `CC_SUPPORTED_MAX` recorded in `build/version-compat.md`
+//!     (that range is a provenance record, and this observation does not widen it).
+//!     Minified identifiers are BUILD-SPECIFIC — the same helper is `ano` in 2.1.220,
+//!     `sno` in 2.1.219, `jeo` in 2.1.218 — so re-verify SEMANTICALLY, never by minified
+//!     name: `grep -a` the stock binary (Bun-compiled; the embedded JS is plain text) for
+//!     `refresh_token_expires_in`, `refreshTokenExpiresAt` and `daysLeft:Math.ceil`.
+//!     **Re-verify on any CC bump touching the credential or OAuth path** — this claim
+//!     silently diverged from the binary once already, which is what #876 exists to fix.
+//!
+//!     The sliding-window-vs-cap facet of the ACCESS token stays with the engine's own
+//!     `expires_at_delta_secs` telemetry (above).
 //!
 //! ## Caller contract (the two thin callers must honor)
 //!
@@ -128,10 +191,15 @@
 //! rotate a real refresh token — the zero-impact mandate, #101). The hermetic tests
 //! drive the engine's logic with fakes; a real-CLI test ([`crate::keychain`]) covers the
 //! isolated keychain item mechanics on a throwaway keychain; the live refresh is the
-//! engine's own production telemetry (above). The one datum this can never surface at rest
-//! — the refresh token's own idle-expiry (`refresh_token_expires_in`, spike #281) — needs
-//! an operator one-shot interception of a single `/v1/oauth/token` exchange on a throwaway
-//! account (the recipe lives in issue #281, not in-tree).
+//! engine's own production telemetry (above). The refresh token's own idle-expiry
+//! (`refresh_token_expires_in`) was once listed here as the one datum unreachable at rest,
+//! needing an operator one-shot interception of a live `/v1/oauth/token` exchange; on CC
+//! v2.1.218–220 it is READABLE AT REST as the blob's `refreshTokenExpiresAt` (issue #876,
+//! see the TTL bullet above) — [`refresh_token_expires_at`] is the reader (issue #878) — so
+//! no interception is required for it. What a live exchange
+//! would still settle is the server's own refresh-token lifetime POLICY — the recorded
+//! deadline reports what CC was told, not what the server would grant, so an unmoving
+//! deadline does not by itself establish a server-side fixed cap.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
