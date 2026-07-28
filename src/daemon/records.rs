@@ -132,20 +132,28 @@ pub(crate) struct TickOutcome {
     pub(crate) action: TickAction,
     /// The structured log events this cycle generated (issue #9): the
     /// poll-outcome events (401 / keychain-locked / 403) in roster order, then the
-    /// decision event (swap / all-exhausted) if any, then — on the edge — an
-    /// [`Event::AllExhaustedCleared`] when this cycle LEFT the all-exhausted state
-    /// (issue #800). `run_loop` emits each to the event log; a Hold or a skip that
-    /// crosses no edge generates none.
+    /// decision event (swap / all-exhausted) if any, then — on the edge — the LEAVE
+    /// markers this cycle crossed: [`Event::AllExhaustedCleared`] (issue #800),
+    /// [`Event::ActiveDeadNoTargetCleared`] and [`Event::FleetRunwayRecovered`]
+    /// (both issue #827), each when this cycle LEFT the matching state. `run_loop`
+    /// emits each to the event log; a Hold or a skip that crosses no edge generates
+    /// none.
     pub(crate) events: Vec<Event>,
     /// The operator-facing diagnostics this cycle generated (issue #77), in the
-    /// order they are emitted: one [`Diagnostic::Poll`] per polled account (in
-    /// roster order), then — on the edge — a [`Diagnostic::ActiveDeadNoTargetCleared`]
-    /// when this cycle LEFT the active-dead-no-target strand, and finally the per-tick
-    /// [`Diagnostic::Tick`] decision (with any back-off). Unlike `events`, EVERY
-    /// tick produces some (a Hold still logs its poll outcomes + decision), so
+    /// order they are emitted: first the per-tick [`Diagnostic::Canonical`]
+    /// shared-item reading (issue #464), then — only if this tick's scheduled
+    /// account was actually polled (the issue #80 stagger polls at most ONE per
+    /// tick, and a back-off / slow-poll window skips even that) — its
+    /// [`Diagnostic::Poll`] outcome, and finally the per-tick
+    /// [`Diagnostic::Tick`] decision (with any back-off). A LOCKED tick is the one
+    /// exception: `locked_tick` short-circuits before the canonical read, so it
+    /// carries the decision line ALONE. No LEAVE marker rides this vec
+    /// any more — issue #827 moved the remaining two onto `events` above, because
+    /// the diagnostic channel is opt-in, default off, and ungoverned. Unlike
+    /// `events`, EVERY tick produces some — at minimum that decision line — so
     /// `run_loop`'s [`DiagnosticLog`] — not this vec — applies the verbosity gate.
-    /// Produced unconditionally so the #15 redaction meter scans them on every
-    /// cycle, in quiet mode too.
+    /// Produced regardless of verbosity so the #15 redaction meter scans them on
+    /// every cycle, in quiet mode too.
     pub(crate) diagnostics: Vec<Diagnostic>,
     /// The per-account readings this cycle, for the control socket (`status`).
     pub(crate) snapshot: StatusSnapshot,

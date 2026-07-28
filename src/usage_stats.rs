@@ -1193,6 +1193,44 @@ ts=2026-01-01T00:05:00Z event=all_exhausted_cleared
     }
 
     #[test]
+    fn parsing_skips_the_promoted_leave_edges() {
+        // Issue #827 promoted the OTHER two LEAVE edges — the active-dead-no-target strand's
+        // (issue #405) and the proactive fleet-runway warn's (issue #650) — from stderr
+        // `Diagnostic`s to durable `Event`s, so `event=active_dead_no_target_cleared` and
+        // `event=fleet_runway_recovered` lines now appear in the log this parser reads. Sibling of
+        // the issue #800 test above.
+        //
+        // Neither carries `from=`/`to=` NOR a `reason=`, so both must land on the `_ => continue`
+        // drop like any other non-swap event — never a malformed `SwapEvent` that would corrupt
+        // the contribution timeline. Pinned against the real production shape: each clear rides
+        // its own tick, immediately after any decision event, and the active-dead strand's real
+        // exit is an EMERGENCY swap — which this parser DOES fold (it bounds the timeline), so the
+        // drop has to be precise rather than "skip everything nearby".
+        let log = "\
+ts=2026-01-01T00:00:00Z event=active_dead_no_target hold=work cause=weekly resets_at=2026-01-01T05:00:00Z
+ts=2026-01-01T00:05:00Z event=emergency_swap from=work to=play
+ts=2026-01-01T00:05:00Z event=active_dead_no_target_cleared
+ts=2026-01-01T00:06:00Z event=fleet_runway_low runway_secs=1800 threshold_secs=3600 counted=2 observed=2
+ts=2026-01-01T00:07:00Z event=fleet_runway_recovered
+";
+        assert_eq!(
+            parse_swap_events(log).len(),
+            1,
+            "only the emergency swap parses; every ENTER and LEAVE edge is skipped"
+        );
+        // Equivalence with the same log minus the two new LEAVE lines — the new event kinds are
+        // inert here.
+        assert_eq!(
+            parse_swap_events(log),
+            parse_swap_events(
+                "ts=2026-01-01T00:00:00Z event=active_dead_no_target hold=work cause=weekly resets_at=2026-01-01T05:00:00Z\n\
+ts=2026-01-01T00:05:00Z event=emergency_swap from=work to=play\n\
+ts=2026-01-01T00:06:00Z event=fleet_runway_low runway_secs=1800 threshold_secs=3600 counted=2 observed=2\n"
+            )
+        );
+    }
+
+    #[test]
     fn velocity_preempt_swap_parses_as_preempt_bounds_the_timeline_and_is_excluded_from_count() {
         // Issue #539 regression, two halves. PARSER: a `reason=velocity_preempt` line must fold onto
         // SwapKind::Preempt (like #452's blind_preempt), NEVER the `_ => continue` drop — dropping it

@@ -1440,6 +1440,12 @@ mod tests {
         // clears (the dead active recovered, or a target became reachable), the daemon emits ONE
         // `active_dead_no_target_cleared` and resets the guard — so a stale strand reading is told
         // from a current one. A healthy active can never itself strand, so ANY tick here leaves it.
+        //
+        // The marker rides `events` — the DURABLE, always-on file log — since issue #827. It was
+        // stderr-bound before, so on a default install (the diagnostic channel is opt-in and
+        // defaults OFF) the line was never written at all and the strand's END was not
+        // reconstructable offline. Asserting the marker out of `events` is what keeps a regression
+        // to the old sink visible.
         let mut daemon = lifecycle_daemon().await;
         // Simulate having entered the strand on a prior episode.
         daemon.state.signaled_active_dead_no_target = true;
@@ -1451,11 +1457,9 @@ mod tests {
             "a healthy active never strands"
         );
         assert!(
-            first
-                .diagnostics
-                .contains(&Diagnostic::ActiveDeadNoTargetCleared),
-            "leaving the strand emits the cleared marker: {:?}",
-            first.diagnostics
+            first.events.contains(&Event::ActiveDeadNoTargetCleared),
+            "leaving the strand emits the cleared marker durably: {:?}",
+            first.events
         );
         assert!(
             !daemon.state.signaled_active_dead_no_target,
@@ -1465,11 +1469,124 @@ mod tests {
         // Edge-triggered: a subsequent non-strand tick does NOT re-emit the cleared marker.
         let second = daemon.tick().await;
         assert!(
-            !second
-                .diagnostics
-                .contains(&Diagnostic::ActiveDeadNoTargetCleared),
+            !second.events.contains(&Event::ActiveDeadNoTargetCleared),
             "the LEAVE edge fires once, not every non-strand tick: {:?}",
-            second.diagnostics
+            second.events
+        );
+    }
+
+    #[tokio::test]
+    async fn an_escape_swap_emits_the_durable_leave_edge_after_its_own_emergency_swap_event() {
+        // Issue #827, the PRIMARY production shape: the strand does not usually end because the
+        // dead active spontaneously revived — it ends because a weekly-exhausted spare came back
+        // and the daemon ESCAPE-SWAPPED onto it. That tick must emit BOTH `Event::EmergencySwap`
+        // and `Event::ActiveDeadNoTargetCleared`, in that order (the clear is pushed
+        // post-`decide_action`), so the durable log carries `event=emergency_swap` then
+        // `event=active_dead_no_target_cleared` and the strand's span is closable offline.
+        //
+        // The sibling test above covers the OTHER exit (the active itself recovers) and hand-pokes
+        // the guard. Without THIS one, the escape-swap shape is only ever hand-written as a
+        // fixture string in the consumer tests, never derived from the daemon — and guard-set and
+        // real-exit are two branches of ONE `let-else` in `emergency_swap`, so the plausible
+        // refactor "we escaped the strand, clear its guard right where it was set" would suppress
+        // the clear on exactly this tick and leave the whole suite green. Mirrors what issue #800
+        // shipped for the all-exhausted hold
+        // (`daemon::tests::a_relief_swap_emits_the_durable_leave_edge_after_its_own_swap_event`).
+        //
+        // The strand is entered NATURALLY — the daemon's own emergency path arms the guard, never
+        // a hand-poke — so a regression that stops ARMING it fails here too.
+        let mut daemon = lifecycle_daemon().await;
+        let at = daemon.clock.now();
+        daemon.state.active = Some(0);
+        daemon.state.accounts[0].health.quarantined = true;
+
+        // ENTER: the dead active has no reading (still 401ing) and the only spare is
+        // weekly-exhausted, so the emergency path — whose sole remaining filter IS weekly
+        // exhaustion — finds no viable target.
+        let stranded = vec![
+            None,
+            Some(Usage {
+                // Over the 98% weekly ceiling `tunables` configures → weekly-exhausted.
+                session: 0.10,
+                weekly: 0.99,
+                weekly_resets_at: None,
+                session_resets_at: None,
+            }),
+        ];
+        let mut entered = Vec::new();
+        assert_eq!(
+            daemon
+                .decide_action(at, Some(0), &stranded, &mut entered)
+                .await,
+            TickAction::ActiveDeadNoTarget,
+        );
+        assert!(
+            entered
+                .iter()
+                .any(|e| matches!(e, Event::ActiveDeadNoTarget { .. })),
+            "precondition: the daemon must ENTER the strand on its own, got {entered:?}",
+        );
+        assert!(
+            daemon.state.signaled_active_dead_no_target,
+            "the guard is armed"
+        );
+
+        // The spare's weekly window frees up. From here the test drives FULL ticks — the LEAVE
+        // edge lives in `tick`, after `decide_action` returns. `u-A` is deliberately left
+        // UNSCRIPTED: the dead active is still not answering, which is the strand's precondition.
+        daemon.poller = FakeRosterPoller::new().ok("u-B", 0.05, 0.05);
+
+        // The staggered schedule reaches the active first: that tick re-observes the still-dead
+        // `work` and is STILL stranded, so the guard must stay armed and — being edge-triggered —
+        // must NOT re-emit the ENTER.
+        let still_stranded = daemon.tick().await;
+        assert_eq!(still_stranded.action, TickAction::ActiveDeadNoTarget);
+        assert!(
+            !still_stranded
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::ActiveDeadNoTarget { .. })),
+            "a held strand re-signals nothing: {:?}",
+            still_stranded.events
+        );
+        assert!(
+            daemon.state.signaled_active_dead_no_target,
+            "the guard stays armed while the strand holds"
+        );
+
+        // The next tick reaches the freed spare and escapes onto it — the strand's real exit.
+        let relief = daemon.tick().await;
+        assert_eq!(
+            relief.action,
+            TickAction::EmergencySwapped { from: 0, to: 1 }
+        );
+
+        // THE ASSERTION: the escape swap first, then the durable clear — one of each, in that
+        // order. Filtering to the two strand-relevant kinds keeps the assertion stable against
+        // the poll-outcome events a real tick also produces, while still pinning ORDER.
+        assert_eq!(
+            relief
+                .events
+                .iter()
+                .filter(|e| matches!(
+                    e,
+                    Event::EmergencySwap { .. }
+                        | Event::ActiveDeadNoTargetCleared
+                        | Event::ActiveDeadNoTarget { .. }
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                &Event::EmergencySwap {
+                    from: "work".to_owned(),
+                    to: "spare".to_owned(),
+                },
+                &Event::ActiveDeadNoTargetCleared,
+            ],
+            "the escape tick must close the bracket in the DURABLE log, after its own swap",
+        );
+        assert!(
+            !daemon.state.signaled_active_dead_no_target,
+            "the guard re-armed"
         );
     }
 

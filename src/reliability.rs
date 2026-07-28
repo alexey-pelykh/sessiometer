@@ -2695,6 +2695,46 @@ ts=2026-07-11T00:03:00Z event=swap from=c to=a reason=session session_pct=98
     }
 
     #[test]
+    fn the_promoted_leave_edges_are_folded_transparently() {
+        // Issue #827 promoted the OTHER two LEAVE edges — the active-dead-no-target strand's
+        // (issue #405) and the proactive fleet-runway warn's (issue #650) — from stderr
+        // `Diagnostic`s to durable `Event`s, so `event=active_dead_no_target_cleared` and
+        // `event=fleet_runway_recovered` lines now appear in the log this parser reads.
+        //
+        // Unlike `all_exhausted_cleared` (which issue #828 gave its OWN arm, because a stale
+        // `hold=` corrupts the issue #719 capacity-held classification), these two must be fully
+        // INERT here: neither state feeds any reliability SLI. The parser is a tolerant field-map
+        // fold, so an unrecognised `event=` kind falls through every arm — pinned by parsing the
+        // SAME log with and without the two new lines and asserting the folds are IDENTICAL, a
+        // stronger claim than spot-checking one field since it also covers `horizon_ts` and every
+        // other ingredient.
+        //
+        // The two lines sit where the daemon emits them: each clear rides its own tick AFTER any
+        // decision event, and the active-dead strand's real exit is an EMERGENCY swap — which IS a
+        // re-activation edge for the issue #595 landing filter, so the surrounding swap here is a
+        // load-bearing part of the shape rather than decoration. Neither `ts` is the log's
+        // maximum, so the observation horizon is untouched too.
+        let without = "\
+ts=2026-07-11T00:01:00Z event=active_dead_no_target hold=a cause=weekly resets_at=2026-07-11T05:00:00Z
+ts=2026-07-11T00:02:00Z event=emergency_swap from=a to=b
+ts=2026-07-11T00:04:00Z event=swap from=b to=c reason=session session_pct=97
+";
+        let with = "\
+ts=2026-07-11T00:01:00Z event=active_dead_no_target hold=a cause=weekly resets_at=2026-07-11T05:00:00Z
+ts=2026-07-11T00:02:00Z event=emergency_swap from=a to=b
+ts=2026-07-11T00:02:00Z event=active_dead_no_target_cleared
+ts=2026-07-11T00:03:00Z event=fleet_runway_low runway_secs=1800 threshold_secs=3600 counted=2 observed=2
+ts=2026-07-11T00:03:30Z event=fleet_runway_recovered
+ts=2026-07-11T00:04:00Z event=swap from=b to=c reason=session session_pct=97
+";
+        assert_eq!(parse_events(with, None), parse_events(without, None));
+        // And the fold is non-degenerate — an equivalence between two EMPTY parses would pass
+        // vacuously, so pin that the surrounding swap really did land as a reaction-latency
+        // sample with the new lines present.
+        assert_eq!(parse_events(with, None).swap_out_pcts, vec![97.0]);
+    }
+
+    #[test]
     fn a_relief_swap_to_a_different_account_than_the_hold_is_not_capacity_held() {
         // The discriminator is precise: `all_exhausted hold=` names ONE awaited spare; a swap whose
         // `to=` is a DIFFERENT account did not land on that spare, so it did not resolve THAT hold and
