@@ -67,7 +67,8 @@ use crate::observability;
 use crate::paths;
 use crate::usage::epoch_from_rfc3339;
 use crate::usage_stats::{
-    aggregate, parse_swap_events, AccountStats, AggregateParams, Period, RosterStats, UsageReport,
+    aggregate_with_roster, parse_swap_events, AccountStats, AggregateParams, Period, RosterStats,
+    UsageReport,
 };
 use crate::usage_store::{self, Rollup, Sample};
 
@@ -721,8 +722,10 @@ fn is_ymd(s: &str) -> bool {
 ///
 /// Config triggers are integer PERCENTS; the aggregator wants FRACTIONS — the `stats`
 /// caller converts them here, once, so `crate::usage_stats` never reasons about the
-/// mismatch. Session cap and the all-accounts-high water are both the session swap
-/// threshold (a neutral, config-derived "hot" line).
+/// mismatch. Session cap and the all-accounts-high water are both `session_ceiling`
+/// (`Config::swap_threshold` is exactly that percent as a fraction) — a neutral,
+/// config-derived "hot" line, PINNED as the census threshold by issue #804 and carried out
+/// on [`RosterStats::high_threshold`] so no surface has to hardcode a literal.
 fn params_from(config: Option<&Config>) -> AggregateParams {
     let (poll_secs, cap) = match config {
         Some(c) => (c.tunables.poll_secs as i64, c.swap_threshold()),
@@ -737,9 +740,24 @@ fn params_from(config: Option<&Config>) -> AggregateParams {
 /// The live-roster handle set for the orphan partition (issue #314): every account's
 /// `label`, which is EXACTLY what the daemon freezes into each `Sample.acct`
 /// ([`crate::daemon`] writes the label verbatim), so set membership is a plain string
-/// compare against the [`aggregate`] output's `per_account` keys. DISABLED accounts are
-/// KEPT — a disabled account is still in the roster (its samples are legitimate); only
-/// removed / renamed / stray handles fall outside this set and become orphans.
+/// compare against the [`aggregate_with_roster`] output's `per_account` keys. DISABLED
+/// accounts are KEPT — a disabled account is still in the roster (its samples are
+/// legitimate); only removed / renamed / stray handles fall outside this set and become
+/// orphans.
+///
+/// Since issue #804 this same set is ALSO the all-accounts-high census set, which gives the
+/// disabled-account rule a second consequence worth stating: [`crate::daemon`]'s poll
+/// schedule skips a disabled (#36) or quarantined (#42) NON-ACTIVE account, so one of those
+/// contributes no samples and the census over a roster holding it reports UNKNOWN for the
+/// whole window. (Only non-active — the ACTIVE account is polled even while disabled or
+/// quarantined, since its swap-AWAY trigger must still fire, so a disabled ACTIVE account
+/// keeps contributing until the daemon rotates off it.) That UNKNOWN is the gap-honest
+/// reading — the roster genuinely was not wholly observable — and it is the reading
+/// REQ-STA-B-005's amendment pins ("the CONFIGURED roster … an account with zero samples
+/// SHALL NOT silently leave the intersection"). Narrowing the census to enabled accounts
+/// would be a fourth unstated parameter, and it is the very move the amendment forbids, so
+/// it is deliberately NOT made here; if the UNKNOWN proves too blunt in practice, the
+/// amendment is what should change.
 fn roster_handles(config: &Config) -> BTreeSet<String> {
     config.roster.iter().map(|a| a.label.clone()).collect()
 }
@@ -1087,7 +1105,10 @@ fn overlaid_report(
 /// The summary is one whole-window `aggregate`; the series is one `aggregate` per bucket.
 /// Roster-wide statistics (swap frequency, all-high) are computed over the FULL roster;
 /// the account filter then restricts only which per-account rows are displayed, so a
-/// filtered view never distorts the roster picture.
+/// filtered view never distorts the roster picture. `roster` reaches the aggregate itself
+/// (issue #804) — the all-accounts-high census intersects over the CONFIGURED handles, so a
+/// rostered account with no samples cannot silently leave the intersection and an orphan
+/// handle cannot silently join it.
 fn build_report(
     data: &StoreData,
     window: Window,
@@ -1098,11 +1119,12 @@ fn build_report(
 ) -> Report {
     let swaps = parse_swap_events(&data.events);
 
-    let mut summary = aggregate(
+    let mut summary = aggregate_with_roster(
         &data.samples,
         &swaps,
         Period::new(window.start, window.end),
         params,
+        roster,
     );
     apply_filter(&mut summary.per_account, &accounts);
     // Split non-roster handles out of the SUMMARY view — they render in their own section
@@ -1113,7 +1135,8 @@ fn build_report(
     let series = bucket_bounds(window.start, window.end, window.base_bucket())
         .into_iter()
         .map(|(lo, hi)| {
-            let mut bucket = aggregate(&data.samples, &swaps, Period::new(lo, hi), params);
+            let mut bucket =
+                aggregate_with_roster(&data.samples, &swaps, Period::new(lo, hi), params, roster);
             apply_filter(&mut bucket.per_account, &accounts);
             // Drop orphans from each series bucket too, so the charts' per-account series
             // (and the JSON `series`) only ever plot live-roster accounts.
@@ -1151,8 +1174,11 @@ fn apply_filter(per_account: &mut BTreeMap<String, AccountStats>, accounts: &[St
 /// mirrors [`apply_filter`]'s removal shape, so the three render surfaces keep iterating a
 /// live-accounts-only `per_account` UNCHANGED; orphans surface only through the returned map
 /// (and thence each view's dedicated "not in roster" section). Roster-wide statistics
-/// (`swap_count`, all-high) are computed by [`aggregate`] over the full sample set and are
-/// independent of this display subset, exactly as they already are under [`apply_filter`].
+/// (`swap_count`, all-high) are computed by [`aggregate_with_roster`] BEFORE this split and
+/// are independent of this display subset, exactly as they already are under
+/// [`apply_filter`]. They are not independent of `roster` itself, though: since issue #804
+/// the same set drives the all-accounts-high census, so an orphan is excluded from that
+/// census by the aggregate rather than merely hidden from the table by this split.
 ///
 /// When `roster` is `None` (no config / roster known) NOTHING is split — every handle stays
 /// and the caller gets an empty orphan map, so a pre-`capture` `stats` (or one whose config
@@ -1273,17 +1299,70 @@ fn render_text(report: &Report) -> String {
         out.push_str(&band);
         out.push('\n');
     }
-    out.push_str(&roster_line(&summary.roster));
+    out.push_str(&roster_line(summary));
     out
 }
 
 /// The roster summary line (issue #158): swap frequency broken out by reason and the
-/// all-accounts-high episodes. Extracted so the numeric [`render_text`] and the charts
+/// all-accounts-high census. Extracted so the numeric [`render_text`] and the charts
 /// [`render_charts`] (issue #159) foot the view with the IDENTICAL roster sentence.
-fn roster_line(r: &RosterStats) -> String {
+///
+/// The census states the water it used (issue #804) rather than leaving the reader to guess
+/// which threshold produced the number — the defect that had three surfaces quoting three
+/// different values. Under insufficient joint coverage it renders the view's own gap
+/// sentinel `—`, NEVER `0 episodes (0s)`: an unmeasurable period is not a calm one, and a
+/// bare `0` is indistinguishable from a genuinely quiet week (REQ-STA-B-008).
+///
+/// Takes the whole [`UsageReport`] rather than its `roster` alone so the coverage
+/// annotation's denominator — the window the census was measured over — is read from the
+/// SAME report as the numerator and cannot be mismatched by a caller. The wire needs no
+/// equivalent field: `all_high_covered_secs` rides on it alongside the window's own `start`
+/// / `end`, so every surface can derive the same share.
+fn roster_line(report: &UsageReport) -> String {
+    let r = &report.roster;
+    let period_secs = report.period.duration();
+    // "Insufficient" is taken at its most conservative: NO jointly-covered instant at all.
+    // A stricter CUTOFF (below X% of the window ⇒ UNKNOWN) would be a fourth unstated
+    // parameter, and pinning one is not this fix's job.
+    let census = if r.all_high_covered_secs > 0 {
+        let mut detail = fmt_dur(r.all_high_secs);
+        // A conservative bar alone would leave the reported defect reachable: one covered
+        // second in a week reads as a confident calm, which is the very thing "a bare 0 is
+        // indistinguishable from a genuinely quiet week" forbids. So a partly-covered period
+        // ANNOTATES itself, as REQ-STA-B-008 requires ("low-coverage periods SHALL be
+        // annotated") — the measured share, in its own percent. That is not a fourth
+        // parameter: the bar for annotating is wholly-covered-or-not, the module's own
+        // `Complete` / `Partial` line, and the number shown is measured, never chosen.
+        //
+        // No `period_secs > 0` guard is needed to keep the division safe: this branch already
+        // has `all_high_covered_secs >= 1`, so reaching the body forces `period_secs >= 2`.
+        if r.all_high_covered_secs < period_secs {
+            let share = r.all_high_covered_secs as f64 / period_secs as f64;
+            // Rounding must not manufacture a whole the share is NOT. Sub-1% would read `0%`
+            // and over-99% would read `100%` — and BOTH are false in here, where coverage is
+            // strictly between nothing and everything, which is the one thing this annotation
+            // exists to say. A render that states a falsehood is what this issue exists to
+            // end, at either end of the scale.
+            let shown = match pct(share) {
+                0 => "<1".to_owned(),
+                100 => ">99".to_owned(),
+                whole => whole.to_string(),
+            };
+            detail.push_str(&format!(", {shown}% covered"));
+        }
+        format!(
+            "{} episode{} ({detail})",
+            r.all_high_episodes,
+            plural(r.all_high_episodes),
+        )
+    } else {
+        // The view's own gap sentinel, the same glyph the `signal` / `velocity` / `runway`
+        // cells degrade to — one UNKNOWN vocabulary across the surface.
+        "—".to_owned()
+    };
     format!(
         "roster: {} swap{} ({} session, {} weekly, {} manual, {} forced, {} emergency) · \
-         all-accounts-high: {} episode{} ({})\n",
+         all-accounts-high (≥{}%): {}\n",
         r.swap_count,
         plural(r.swap_count),
         r.swaps.session,
@@ -1291,9 +1370,8 @@ fn roster_line(r: &RosterStats) -> String {
         r.swaps.manual,
         r.swaps.forced,
         r.swaps.emergency,
-        r.all_high_episodes,
-        plural(r.all_high_episodes),
-        fmt_dur(r.all_high_secs),
+        pct(r.high_threshold),
+        census,
     )
 }
 
@@ -1793,12 +1871,31 @@ struct DimWire {
     p95: f64,
 }
 
+/// The roster-wide block of the `--json` / socket wire.
+///
+/// `all_high_threshold` and `all_high_covered_secs` are ADDITIVE (issue #804) — no existing
+/// field changed type or meaning, so `JSON_SCHEMA_VERSION` does not move and a reader that
+/// ignores them decodes exactly as before. Both are ALWAYS present rather than
+/// `skip_serializing_if`-elided: they are always known, and a surface that found the
+/// threshold absent would fall back to a hardcoded literal — precisely what carrying it is
+/// meant to end.
+///
+/// Read `all_high_episodes` ONLY against `all_high_covered_secs`. Zero jointly-covered
+/// seconds means the census was never measurable, and the accompanying `0` is UNKNOWN, not
+/// calm — a consumer MUST render its own gap sentinel there, never a bare `0`
+/// (REQ-STA-B-008; the CLI does so in [`roster_line`]).
 #[derive(Serialize)]
 struct RosterWire {
     swap_count: u32,
     swaps: SwapsWire,
     all_high_episodes: u32,
     all_high_secs: i64,
+    /// The session-utilisation water each account had to be at/above, as a FRACTION —
+    /// the same units as every other utilisation on this wire (`session_ceiling` / 100).
+    all_high_threshold: f64,
+    /// Seconds of the window during which EVERY rostered account was simultaneously
+    /// covered — the denominator the two figures above were measured over.
+    all_high_covered_secs: i64,
 }
 
 #[derive(Serialize)]
@@ -2020,6 +2117,8 @@ fn roster_wire(r: &RosterStats) -> RosterWire {
         },
         all_high_episodes: r.all_high_episodes,
         all_high_secs: r.all_high_secs,
+        all_high_threshold: r.high_threshold,
+        all_high_covered_secs: r.all_high_covered_secs,
     }
 }
 
@@ -2741,7 +2840,7 @@ fn render_charts(report: &Report, w: usize, color: bool, ascii: bool) -> String 
         if let Some(line) = orphan_names_line(&report.orphans) {
             out.push_str(&line);
         }
-        out.push_str(&roster_line(&report.summary.roster));
+        out.push_str(&roster_line(&report.summary));
         return out;
     }
     out.push_str(&render_chart_table(report, &accounts, w, color, ascii));
@@ -2770,7 +2869,7 @@ fn render_charts(report: &Report, w: usize, color: bool, ascii: bool) -> String 
     if let Some(line) = orphan_names_line(&report.orphans) {
         out.push_str(&line);
     }
-    out.push_str(&roster_line(&report.summary.roster));
+    out.push_str(&roster_line(&report.summary));
     out
 }
 
@@ -2810,7 +2909,15 @@ mod tests {
         UsageReport {
             period: Period::new(0, HOUR_SECS),
             per_account: accts.iter().map(|(h, a)| (h.to_string(), *a)).collect(),
-            roster: RosterStats::default(),
+            roster: RosterStats {
+                // Spelled out rather than `Default`ed: this report FEEDS THE RENDER, and a
+                // defaulted roster would quietly foot every chart fixture with a 0% census
+                // water over zero measurable time (issue #804). The hour is fully jointly
+                // covered at the default 95% water — a measured, never-fired census.
+                all_high_covered_secs: HOUR_SECS,
+                high_threshold: 0.95,
+                ..Default::default()
+            },
         }
     }
 
@@ -3276,7 +3383,7 @@ mod tests {
         assert!(out.contains("session distribution — mean · p95 · peak\n"));
         assert!(out
             .trim_end()
-            .ends_with("all-accounts-high: 0 episodes (0s)"));
+            .ends_with("all-accounts-high (≥95%): 0 episodes (0s)"));
     }
 
     #[test]
@@ -3409,7 +3516,7 @@ mod tests {
              aa       saturated  100%         30/90/85          0/40/0     0     0s    60%  0.9%/min     ~2h\n\
              bb       underused  100%         10/15/12          0/20/0     0     0s    40%         —       —\n\
              \n  lowest utilisation: bb (session mean 10%)\n\
-             roster: 0 swaps (0 session, 0 weekly, 0 manual, 0 forced, 0 emergency) · all-accounts-high: 0 episodes (0s)\n",
+             roster: 0 swaps (0 session, 0 weekly, 0 manual, 0 forced, 0 emergency) · all-accounts-high (≥95%): 0 episodes (0s)\n",
         );
     }
 
@@ -4316,6 +4423,203 @@ mod tests {
         }
     }
 
+    // --- issue #804: the all-accounts-high census reads honestly -----------------------
+
+    /// A whole DAY, the window every census line below is measured against.
+    const CENSUS_WINDOW: i64 = 86_400;
+
+    /// A roster line from a census with the given `(episodes, secs, jointly-covered secs)` at
+    /// the given water, over a [`CENSUS_WINDOW`] period. Swap fields are irrelevant here and
+    /// stay zero; so is `per_account`, which the roster line never reads.
+    fn census_line(episodes: u32, secs: i64, covered: i64, water: f64) -> String {
+        census_line_over(episodes, secs, covered, water, CENSUS_WINDOW)
+    }
+
+    /// [`census_line`] over an explicit `period_secs` — the degenerate zero-length window.
+    fn census_line_over(
+        episodes: u32,
+        secs: i64,
+        covered: i64,
+        water: f64,
+        period_secs: i64,
+    ) -> String {
+        roster_line(&UsageReport {
+            period: Period::new(0, period_secs),
+            per_account: BTreeMap::new(),
+            roster: RosterStats {
+                all_high_episodes: episodes,
+                all_high_secs: secs,
+                all_high_covered_secs: covered,
+                high_threshold: water,
+                ..Default::default()
+            },
+        })
+    }
+
+    #[test]
+    fn an_unmeasurable_census_renders_the_gap_sentinel_never_a_bare_zero() {
+        // THE reported defect: `stats` printed `all-accounts-high: 0 episodes (0s)` for a week
+        // in which the metric could see nothing — indistinguishable from a genuinely quiet one.
+        // With no jointly-covered second, the count is UNKNOWN and must say so.
+        let unmeasurable = census_line(0, 0, 0, 0.95);
+        assert!(
+            unmeasurable.ends_with("all-accounts-high (≥95%): —\n"),
+            "unmeasurable census renders `—`: {unmeasurable}"
+        );
+        assert!(
+            !unmeasurable.contains("0 episodes"),
+            "a bare `0` is forbidden — it reads as a calm week: {unmeasurable}"
+        );
+
+        // And the other branch is NOT swallowed: a measured zero still reports itself as one,
+        // so the sentinel marks unmeasurability rather than merely "nothing happened".
+        assert!(
+            census_line(0, 0, CENSUS_WINDOW, 0.95)
+                .ends_with("all-accounts-high (≥95%): 0 episodes (0s)\n"),
+            "a MEASURED zero still renders as zero"
+        );
+    }
+
+    #[test]
+    fn a_barely_covered_census_annotates_its_share_instead_of_reading_as_calm() {
+        // The conservative "no covered second at all" bar is necessary but NOT sufficient: the
+        // reported defect's own field shape — an hourly-polled peer against a 300 s staleness
+        // horizon — leaves a sliver of joint coverage, not none, so `covered > 0` alone would
+        // still print a confident calm for a week the metric barely saw. A partly-covered
+        // period says so (REQ-STA-B-008's annotation clause).
+        let sliver = census_line(0, 0, 7_200, 0.95); // 2 h of a day
+        assert!(
+            sliver.ends_with("all-accounts-high (≥95%): 0 episodes (0s, 8% covered)\n"),
+            "a partly-covered census annotates its measured share: {sliver}"
+        );
+
+        // Rounding must not manufacture a whole the share is NOT, at EITHER end: both of
+        // these windows are strictly partly covered, and a `0%` or a `100%` would deny it.
+        let trace = census_line(0, 0, 60, 0.95); // 1 min of a day ≈ 0.07%
+        assert!(
+            trace.ends_with("all-accounts-high (≥95%): 0 episodes (0s, <1% covered)\n"),
+            "a trace of coverage renders `<1%`, never a false `0%`: {trace}"
+        );
+        // A day covered but for its last 5 min rounds to 100 — reachable whenever one account
+        // joins the roster (or its daemon restarts) a sliver into the window.
+        let nearly = census_line(0, 0, CENSUS_WINDOW - 300, 0.95); // ≈ 99.65%
+        assert!(
+            nearly.ends_with("all-accounts-high (≥95%): 0 episodes (0s, >99% covered)\n"),
+            "near-total coverage renders `>99%`, never a false `100%`: {nearly}"
+        );
+
+        // A WHOLLY covered period carries no annotation — the common case stays terse, and
+        // the annotation's presence is itself the low-coverage signal. That is the ONLY way
+        // to read `100%`, so the `>99%` above can never be mistaken for it.
+        assert!(
+            !census_line(2, 600, CENSUS_WINDOW, 0.95).contains("covered"),
+            "a fully-covered census is not annotated"
+        );
+
+        // Episodes and a partial window COMPOSE — the everyday shape, and the one that says
+        // both what was seen and how much of the window it was seen over.
+        let partial = census_line(2, 600, CENSUS_WINDOW / 2, 0.95);
+        assert!(
+            partial.ends_with("all-accounts-high (≥95%): 2 episodes (10m, 50% covered)\n"),
+            "a measured episode over half a window reports both: {partial}"
+        );
+
+        // A degenerate (zero-length) window: nothing can be jointly covered inside it, so it
+        // takes the UNKNOWN branch and the share is never computed — which is why the division
+        // above needs no zero guard, not because one is applied.
+        let degenerate = census_line_over(0, 0, 0, 0.95, 0);
+        assert!(degenerate.ends_with("all-accounts-high (≥95%): —\n"));
+    }
+
+    #[test]
+    fn the_roster_line_states_the_water_it_used_rather_than_a_literal() {
+        // Three surfaces once quoted three different thresholds because none stated its own.
+        // The rendered percent must track the census's carried water, not a constant.
+        for (water, shown) in [(0.95, "≥95%"), (0.80, "≥80%"), (0.90, "≥90%")] {
+            let line = census_line(3, 6_000, 86_400, water);
+            assert!(
+                line.contains(&format!("all-accounts-high ({shown}): 3 episodes (1h40m)")),
+                "water {water} renders as {shown}: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_report_takes_the_census_over_the_configured_roster() {
+        // The plumbing half, end to end through `build_report`: `beta` is configured but was
+        // never sampled in the window, so the census cannot be taken and the line renders `—`
+        // — where the sampled-set form would have degenerated to `alpha` alone and reported a
+        // confident episode.
+        let now = 1_000_000;
+        let samples = vec![
+            sample(now - 900, "alpha", 0.90, 0.1),
+            sample(now - 600, "alpha", 0.95, 0.1),
+            sample(now - 300, "alpha", 0.97, 0.1),
+        ];
+        let store = data(samples, "");
+        let window = plan_window(None, None, now, &store).unwrap();
+        let configured: BTreeSet<String> =
+            ["alpha", "beta"].iter().map(|h| (*h).to_owned()).collect();
+
+        let over_roster = build_report(
+            &store,
+            window.clone(),
+            vec![],
+            Some(&configured),
+            &params(),
+            0,
+        );
+        assert_eq!(over_roster.summary.roster.all_high_covered_secs, 0);
+        assert!(
+            render_text(&over_roster).contains("all-accounts-high (≥80%): —"),
+            "an unobserved rostered account leaves the census UNKNOWN"
+        );
+        // The SERIES buckets take the roster too, not just the summary. Asserted on
+        // `all_high_covered_secs`, which is roster-derived — a threshold assertion here would
+        // pass either way (it comes from `params`) and so would gate nothing.
+        assert!(
+            over_roster
+                .series
+                .iter()
+                .all(|b| b.roster.all_high_covered_secs == 0),
+            "every bucket's census is taken over the configured roster as well"
+        );
+
+        let no_roster = build_report(&store, window, vec![], None, &params(), 0);
+        assert!(
+            no_roster.summary.roster.all_high_episodes > 0,
+            "without a configured roster the census degrades to the sampled set — the \
+             pre-#804 reading, kept as the honest fallback when config is unreadable"
+        );
+        assert!(
+            no_roster
+                .series
+                .iter()
+                .any(|b| b.roster.all_high_covered_secs > 0),
+            "the fallback reaches the buckets too — so the assertion above is a real gate on \
+             the pass-through, not a summary-only one that a `None` bucket would still pass"
+        );
+    }
+
+    #[test]
+    fn the_wire_carries_the_census_water_and_its_coverage_denominator() {
+        // #805 (the menubar's hardcoded `≥90%` label) and any other surface read these two
+        // keys rather than re-deriving or hardcoding. Both are ALWAYS present: a surface that
+        // found the water absent would fall back to a literal, which is the defect.
+        let report = wire_golden_report();
+        let v: serde_json::Value = serde_json::from_str(&render_json(&report, None).unwrap())
+            .expect("the wire is valid JSON");
+        let roster = &v["summary"]["roster"];
+        assert_eq!(roster["all_high_threshold"], 0.95);
+        assert_eq!(roster["all_high_covered_secs"], 21_600);
+        assert_eq!(
+            v["schema"], 1,
+            "both keys are ADDITIVE — no existing field changed, so `schema` does not move"
+        );
+        // The series buckets carry them too, so a per-bucket reader is not left guessing.
+        assert_eq!(v["series"][0]["roster"]["all_high_threshold"], 0.95);
+    }
+
     #[test]
     fn empty_window_still_renders_an_echo_and_roster_line() {
         let now = 1_000_000;
@@ -4445,6 +4749,10 @@ mod tests {
             },
             all_high_episodes: 0,
             all_high_secs: 0,
+            // The whole 6 h bucket was jointly covered, so `0 episodes` here is a MEASURED
+            // reading — the wire's `all_high_covered_secs` is what says so (issue #804).
+            all_high_covered_secs: 21_600,
+            high_threshold: 0.95,
         };
         let bucket = |start, end| UsageReport {
             period: Period::new(start, end),
@@ -5233,7 +5541,11 @@ mod tests {
     // --- AC: --json schema:1 stays byte-stable vs #158/#159 --------------------------
 
     /// The frozen schema:1 wire. #160 is HUMAN-render only — it adds no field, no
-    /// recommendation, no glyph — so this is the #158/#159 contract verbatim.
+    /// recommendation, no glyph — so this is the #158/#159 contract plus, since issue #804,
+    /// the roster block's two ADDITIVE census fields (`all_high_threshold` +
+    /// `all_high_covered_secs`). Additive is why `schema` still reads `1`: no existing field
+    /// changed type, name, order or meaning, so every pre-#804 reader decodes these bytes
+    /// exactly as before.
     const WIRE_GOLDEN: &str = r#"{
   "schema": 1,
   "window": {
@@ -5257,7 +5569,9 @@ mod tests {
           "emergency": 0
         },
         "all_high_episodes": 0,
-        "all_high_secs": 0
+        "all_high_secs": 0,
+        "all_high_threshold": 0.95,
+        "all_high_covered_secs": 21600
       },
       "accounts": {
         "work": {
@@ -5293,7 +5607,9 @@ mod tests {
         "emergency": 0
       },
       "all_high_episodes": 0,
-      "all_high_secs": 0
+      "all_high_secs": 0,
+      "all_high_threshold": 0.95,
+      "all_high_covered_secs": 21600
     },
     "accounts": {
       "work": {
@@ -5325,7 +5641,8 @@ mod tests {
         assert_eq!(
             render_json(&wire_golden_report(), None).unwrap(),
             WIRE_GOLDEN,
-            "#160 must not perturb the schema:1 wire by a single byte"
+            "the schema:1 wire drifted — only an ADDITIVE change (a new key, as issue #804 \
+             made) may move these bytes without a `schema` bump"
         );
     }
 
@@ -6305,6 +6622,19 @@ mod tests {
                         },
                         all_high_episodes: 0,
                         all_high_secs: 0,
+                        // Set to the whole 24 h window so these goldens pin the census's
+                        // MEASURED branch, exactly as the hand-set `all_high_*` above have
+                        // always pinned a swap/episode count — this roster block is authored
+                        // FOR THE RENDER and was never derived from the `per_account` beside
+                        // it. (It is not self-consistent with it either: `delta` sits at
+                        // `seen: 0`, so a real aggregation over this fixture's accounts would
+                        // yield `covered == 0`. That is fine here and worth stating plainly —
+                        // the aggregator's own behaviour is pinned by the `usage_stats` tests;
+                        // what these goldens pin is that the RENDERER, handed a measured
+                        // census, prints one.) The degenerate goldens below override this to
+                        // `0` so the UNKNOWN branch is goldened too (issue #804).
+                        all_high_covered_secs: 86_400,
+                        high_threshold: 0.95,
                     },
                 },
                 series: vec![
@@ -6381,13 +6711,20 @@ mod tests {
         }
 
         /// A report with no per-account usage at all — the degenerate roster.
+        ///
+        /// Nothing was observed, so nothing was jointly covered: this golden pins the
+        /// all-accounts-high census rendering the gap sentinel `—` rather than the `0
+        /// episodes (0s)` that used to read as a genuinely calm window (issue #804).
         fn empty_report() -> Report {
             let base = golden_report();
             Report {
                 summary: UsageReport {
                     period: base.summary.period,
                     per_account: BTreeMap::new(),
-                    roster: base.summary.roster,
+                    roster: RosterStats {
+                        all_high_covered_secs: 0,
+                        ..base.summary.roster
+                    },
                 },
                 series: Vec::new(),
                 orphans: BTreeMap::new(),
@@ -6441,6 +6778,11 @@ mod tests {
         /// `signal` stays and renders a full column of the gap sentinel `—`. A keep-column is
         /// never elided even when every one of its cells is a gap — the roster is unmeasured,
         /// not absent, and the render must say so rather than quietly narrowing to look tidy.
+        ///
+        /// The footer says so too: with no account observed, no instant had the whole roster
+        /// covered, so the all-accounts-high census renders `—` rather than a fabricated `0
+        /// episodes` (issue #804). It is the exact shape of the reported defect — a window in
+        /// which the metric could see nothing reading as a calm one.
         fn all_unobserved_report() -> Report {
             let base = golden_report();
             let unobserved = |m: &BTreeMap<String, AccountStats>| {
@@ -6474,7 +6816,10 @@ mod tests {
                 summary: UsageReport {
                     period: base.summary.period,
                     per_account: unobserved(&base.summary.per_account),
-                    roster: base.summary.roster,
+                    roster: RosterStats {
+                        all_high_covered_secs: 0,
+                        ..base.summary.roster
+                    },
                 },
                 series: Vec::new(),
                 orphans: BTreeMap::new(),

@@ -29,8 +29,12 @@
 //! * `swap_count` + a per-reason [`SwapBreakdown`] — the swap frequency, INCLUDING the
 //!   manual `sessiometer use` verb (`reason=manual|forced`) and emergency swaps;
 //! * `all_high_episodes` + `all_high_secs` — the count and total duration of intervals
-//!   during which EVERY rostered account was simultaneously at/above a high-water
-//!   threshold (the danger state: no healthy account to rotate to).
+//!   during which EVERY rostered account was simultaneously at/above the session
+//!   high-water threshold: a UTILISATION CENSUS ("was the roster running hot?"), NOT a
+//!   capacity claim (issue #804 — "could the daemon still swap?" is its own fact);
+//! * `all_high_covered_secs` + `high_threshold` — the census's own denominator and water,
+//!   so a reader can tell "measured, and it never happened" from "never measurable"
+//!   (issue #804) and every surface can state the threshold it actually used.
 //!
 //! # Gap honesty — a missing sample is UNKNOWN, never zero
 //!
@@ -77,7 +81,7 @@
 // See the "Not-yet-wired seam" note above: #158 wires the CLI caller.
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
@@ -107,8 +111,11 @@ impl Period {
         ts >= self.start && ts < self.end
     }
 
-    /// The window's length in seconds (`0` for an empty/inverted window).
-    fn duration(&self) -> i64 {
+    /// The window's length in seconds (`0` for an empty/inverted window). Crate-visible since
+    /// issue #804: the roster line needs it as the denominator for the census's coverage
+    /// annotation, and re-deriving `end - start` at the render would be a second, driftable
+    /// definition of the same quantity.
+    pub(crate) fn duration(&self) -> i64 {
         (self.end - self.start).max(0)
     }
 }
@@ -253,9 +260,28 @@ pub(crate) struct RosterStats {
     pub(crate) swaps: SwapBreakdown,
     /// Number of maximal intervals during which every rostered account was
     /// simultaneously KNOWN-and-at/above [`AggregateParams::high_threshold`].
+    ///
+    /// Meaningful ONLY alongside `all_high_covered_secs`: with no jointly-covered instant
+    /// there is nothing to count, so this reads `0` for a window that was never
+    /// measurable. Surfaces MUST consult the denominator and render UNKNOWN rather than a
+    /// bare `0` — an unmeasurable period is not a calm one (issue #804, REQ-STA-B-008).
     pub(crate) all_high_episodes: u32,
-    /// Total duration (seconds) of those all-accounts-high intervals.
+    /// Total duration (seconds) of those all-accounts-high intervals. Same caveat as the
+    /// count above.
     pub(crate) all_high_secs: i64,
+    /// Seconds of the period during which EVERY account in the census set was
+    /// SIMULTANEOUSLY covered (each holding a non-gap reading) — the denominator the two
+    /// figures above were measured over, and the coverage figure REQ-STA-B-008 requires
+    /// this aggregate to carry.
+    ///
+    /// `0` means the census was never measurable at all: no instant existed at which the
+    /// whole roster was observable, so "0 episodes" is UNKNOWN, not calm. That zero is a
+    /// measured quantity, not a sentinel — jointly-covered time really was nil.
+    pub(crate) all_high_covered_secs: i64,
+    /// The session-utilisation water an account had to be at/above to count toward an
+    /// episode — [`AggregateParams::high_threshold`], carried through so every surface can
+    /// state the value it ACTUALLY used instead of hardcoding a literal (issue #804).
+    pub(crate) high_threshold: f64,
 }
 
 /// The full aggregation result for one period.
@@ -342,11 +368,40 @@ pub(crate) fn parse_swap_events(text: &str) -> Vec<SwapEvent> {
 /// may be in any order (both are used order-independently; swaps are sorted internally
 /// for the active-account timeline). Output is deterministic: per-account results are a
 /// [`BTreeMap`] keyed by handle, and every metric is a pure function of the inputs.
+///
+/// The all-accounts-high census is taken over the accounts that HOLD SAMPLES in the period,
+/// which fires more readily than over a known roster (an unsampled account cannot withhold
+/// it). A caller that knows the configured roster should pass it to
+/// [`aggregate_with_roster`] instead — this is exactly that call with `None` (issue #804).
 pub(crate) fn aggregate(
     samples: &[Sample],
     swaps: &[SwapEvent],
     period: Period,
     params: &AggregateParams,
+) -> UsageReport {
+    aggregate_with_roster(samples, swaps, period, params, None)
+}
+
+/// [`aggregate`], with the CONFIGURED roster supplied so the all-accounts-high census is
+/// taken over it rather than over whoever happens to hold samples (issue #804).
+///
+/// `roster` is the set of handles the census must cover. A rostered account with ZERO
+/// samples in the period stays IN the intersection and contributes no covering interval —
+/// so it cannot silently leave and make the metric fire more easily, and its absence is
+/// reported as UNKNOWN (`all_high_covered_secs == 0`) rather than as a calm `0 episodes`.
+/// It also keeps ORPHAN handles (samples from a removed/renamed account, issue #314) out
+/// of the census, which the sampled-accounts form wrongly admitted.
+///
+/// `None` means the caller does not know the roster (no readable config): the census then
+/// degrades to the accounts present in the period's samples — the pre-#804 behaviour, and
+/// the honest fallback when there is no configured set to intersect over. Everything else
+/// is identical to [`aggregate`], which is exactly this call with `None`.
+pub(crate) fn aggregate_with_roster(
+    samples: &[Sample],
+    swaps: &[SwapEvent],
+    period: Period,
+    params: &AggregateParams,
+    roster: Option<&BTreeSet<String>>,
 ) -> UsageReport {
     // Samples that fall in [start, end). References only — no copies of the readings.
     let in_period: Vec<&Sample> = samples.iter().filter(|s| period.contains(s.ts)).collect();
@@ -418,7 +473,8 @@ pub(crate) fn aggregate(
             });
     }
 
-    let (all_high_episodes, all_high_secs) = all_high(&by_acct, period, params);
+    let (all_high_episodes, all_high_secs, all_high_covered_secs) =
+        all_high(&by_acct, roster, period, params);
     let roster = RosterStats {
         // Excludes #452 preemptive swaps (`SwapKind::Preempt`) so the count stays the SUM of the
         // itemized `swap_breakdown` reasons (which likewise omits them — see there). Preemptive
@@ -431,6 +487,8 @@ pub(crate) fn aggregate(
         swaps: swap_breakdown(swaps, period),
         all_high_episodes,
         all_high_secs,
+        all_high_covered_secs,
+        high_threshold: params.high_threshold,
     };
 
     UsageReport {
@@ -513,46 +571,88 @@ fn swap_breakdown(swaps: &[SwapEvent], period: Period) -> SwapBreakdown {
     bd
 }
 
-/// Count + total duration of the intervals during which EVERY rostered account is
-/// simultaneously known-and-at/above `high_threshold` — the "no healthy account left"
-/// danger state.
+/// Count + total duration of the intervals during which EVERY account in the census set is
+/// simultaneously known-and-at/above `high_threshold` — the utilisation census ("was the
+/// roster running hot?"), plus the jointly-covered time it was measured over.
 ///
 /// Each account contributes the disjoint intervals over which its readings are BOTH
 /// covering (not a gap) AND high; the all-high intervals are the intersection of every
-/// account's high-interval set. An empty roster, or any account with no high interval,
-/// yields no episodes. Because a gap produces no covering interval, an instant where any
-/// account is unsampled cannot be part of an episode — gaps are UNKNOWN, never high.
+/// account's high-interval set. Any account with no high interval yields no episodes.
+/// Because a gap produces no covering interval, an instant where any account is unsampled
+/// cannot be part of an episode — gaps are UNKNOWN, never high.
 ///
-/// Returns `(episode_count, total_secs)`.
+/// The census set is `roster` when the caller knows it, else the sampled accounts (see
+/// [`aggregate_with_roster`]). A rostered account with NO samples therefore keeps its
+/// (empty) place in the intersection instead of vanishing from it. An EMPTY census set —
+/// an empty configured roster, or no samples at all under the fallback — has nothing to
+/// intersect over and yields `(0, 0, 0)`: unmeasurable, which the zero third return says.
+///
+/// The third return is the intersection of every census account's COVERING intervals — the
+/// time over which the census could be taken at all. It is `0` exactly when no instant had
+/// the whole set observable, which is what separates "measured, and it never happened" from
+/// "never measurable" for a caller that would otherwise print a fabricated `0 episodes`.
+/// Since high ⊆ covering per account, this bounds the episode total: zero jointly-covered
+/// time implies zero episodes, never the reverse.
+///
+/// Returns `(episode_count, total_secs, jointly_covered_secs)`.
 fn all_high(
     by_acct: &BTreeMap<&str, Vec<&Sample>>,
+    roster: Option<&BTreeSet<String>>,
     period: Period,
     params: &AggregateParams,
-) -> (u32, i64) {
-    let mut acc: Option<Vec<(i64, i64)>> = None;
-    for group in by_acct.values() {
+) -> (u32, i64, i64) {
+    let census: Vec<&str> = match roster {
+        Some(r) => r.iter().map(String::as_str).collect(),
+        None => by_acct.keys().copied().collect(),
+    };
+    // Nothing to intersect over: no account is observable, so the census is UNMEASURABLE
+    // (covered `0`), not a calm zero.
+    if census.is_empty() {
+        return (0, 0, 0);
+    }
+
+    let mut high_acc: Option<Vec<(i64, i64)>> = None;
+    let mut cov_acc: Option<Vec<(i64, i64)>> = None;
+    for handle in census {
+        // A rostered account absent from the period's samples covers NOTHING — it stays in
+        // the intersection and empties it, rather than silently leaving it.
+        let group: &[&Sample] = by_acct.get(handle).map_or(&[], Vec::as_slice);
         let windows = validity_windows(group, period, params.stale_after_secs);
-        let highs: Vec<(i64, i64)> = windows
-            .iter()
-            .zip(group.iter())
-            .filter(|(_, s)| s.session >= params.high_threshold)
-            .map(|(&w, _)| w)
-            .collect();
-        let highs = merge_intervals(highs);
-        acc = Some(match acc {
+        let highs = merge_intervals(
+            windows
+                .iter()
+                .zip(group.iter())
+                .filter(|(_, s)| s.session >= params.high_threshold)
+                .map(|(&w, _)| w)
+                .collect(),
+        );
+        let covering = merge_intervals(windows);
+
+        high_acc = Some(match high_acc {
             None => highs,
             Some(prev) => intersect(&prev, &highs),
         });
-        // Empty ∩ anything stays empty — nothing more can become all-high.
-        if acc.as_ref().is_some_and(Vec::is_empty) {
+        cov_acc = Some(match cov_acc {
+            None => covering,
+            Some(prev) => intersect(&prev, &covering),
+        });
+        // Empty ∩ anything stays empty, and `highs ⊆ covering` per account (the high list is
+        // a FILTERED subset of the very windows the covering one merges), so an emptied
+        // COVERING intersection has ALREADY emptied the high one — nothing more can change.
+        // `high_acc` is deliberately NOT forced empty here: doing so would pre-satisfy the
+        // very ⊆ invariant `prop_all_high_time_never_exceeds_the_jointly_covered_time` exists
+        // to gate, silently REPAIRING a broken subset relation instead of failing on it.
+        if cov_acc.as_ref().is_some_and(Vec::is_empty) {
             break;
         }
     }
 
-    let episodes = merge_intervals(acc.unwrap_or_default());
+    let episodes = merge_intervals(high_acc.unwrap_or_default());
+    let covered = merge_intervals(cov_acc.unwrap_or_default());
     (
         episodes.len() as u32,
         episodes.iter().map(|(lo, hi)| hi - lo).sum(),
+        covered.iter().map(|(lo, hi)| hi - lo).sum(),
     )
 }
 
@@ -1045,6 +1145,126 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
         assert_eq!(single.per_account.len(), 1);
     }
 
+    /// A handle set, for the census-over-the-configured-roster tests below.
+    fn roster(handles: &[&str]) -> BTreeSet<String> {
+        handles.iter().map(|h| (*h).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_rostered_account_with_no_samples_stays_in_the_census_instead_of_vanishing() {
+        // Issue #804's opposite-direction defect. `a` is high across the whole window; `b` is
+        // rostered but was never sampled in it. Intersecting over the SAMPLED accounts drops
+        // `b` and the census degenerates to `a` alone — so it fires MORE easily, on strictly
+        // less evidence. Over the CONFIGURED roster, `b` keeps its (empty) place.
+        let period = Period::new(0, 600);
+        let samples = vec![sample(0, "a", 0.90, 0.1), sample(300, "a", 0.95, 0.1)];
+
+        let sampled_only = aggregate(&samples, &[], period, &params());
+        assert_eq!(
+            sampled_only.roster.all_high_episodes, 1,
+            "the roster-less form still degenerates to the sampled set — the documented fallback"
+        );
+
+        let configured =
+            aggregate_with_roster(&samples, &[], period, &params(), Some(&roster(&["a", "b"])));
+        assert_eq!(
+            configured.roster.all_high_episodes, 0,
+            "`b` was never observed, so the roster was never known to be all-high"
+        );
+        assert_eq!(
+            configured.roster.all_high_covered_secs, 0,
+            "no instant had BOTH accounts covered — the census was unmeasurable, and this zero \
+             is what stops a surface printing that `0` as a calm window"
+        );
+    }
+
+    #[test]
+    fn the_census_excludes_an_orphan_handle_that_is_not_in_the_configured_roster() {
+        // The other half of intersecting over the CONFIGURED set: samples from a removed /
+        // renamed handle (issue #314's orphan partition) must not join the census. `retired`
+        // idles across the window, so admitting it would suppress a real episode.
+        let period = Period::new(0, 600);
+        let samples = vec![
+            sample(0, "a", 0.90, 0.1),
+            sample(300, "a", 0.95, 0.1),
+            sample(0, "retired", 0.05, 0.1),
+            sample(300, "retired", 0.05, 0.1),
+        ];
+
+        assert_eq!(
+            aggregate(&samples, &[], period, &params())
+                .roster
+                .all_high_episodes,
+            0,
+            "sampled-set census: the orphan's idle readings suppress the episode"
+        );
+
+        let configured =
+            aggregate_with_roster(&samples, &[], period, &params(), Some(&roster(&["a"])));
+        assert_eq!(
+            configured.roster.all_high_episodes, 1,
+            "the orphan is not in the roster, so it is not part of the census"
+        );
+        assert_eq!(configured.roster.all_high_secs, 600);
+    }
+
+    #[test]
+    fn jointly_covered_seconds_separate_a_measured_zero_from_an_unmeasurable_one() {
+        // The distinction the render rule turns on. Both windows report `0 episodes`; only one
+        // of them MEASURED that zero.
+        let period = Period::new(0, 600);
+        let set = roster(&["a", "b"]);
+
+        // Measured: both accounts covered the whole window, neither ever high.
+        let calm = vec![
+            sample(0, "a", 0.10, 0.1),
+            sample(300, "a", 0.10, 0.1),
+            sample(0, "b", 0.10, 0.1),
+            sample(300, "b", 0.10, 0.1),
+        ];
+        let calm = aggregate_with_roster(&calm, &[], period, &params(), Some(&set));
+        assert_eq!(calm.roster.all_high_episodes, 0);
+        assert_eq!(
+            calm.roster.all_high_covered_secs, 600,
+            "both were observable for the whole window, so the zero is a real reading"
+        );
+
+        // Unmeasurable: the two accounts' coverage never overlaps, so no instant had the
+        // roster observable — even though each was high while it WAS observed.
+        let disjoint = vec![sample(0, "a", 0.90, 0.1), sample(300, "b", 0.90, 0.1)];
+        let disjoint = aggregate_with_roster(&disjoint, &[], period, &params(), Some(&set));
+        assert_eq!(disjoint.roster.all_high_episodes, 0);
+        assert_eq!(
+            disjoint.roster.all_high_covered_secs, 0,
+            "a covers [0,300), b covers [300,600) — the intersection is empty"
+        );
+    }
+
+    #[test]
+    fn an_empty_configured_roster_is_unmeasurable_not_calm() {
+        // Degenerate set: nothing to intersect over. `0 episodes` here would claim a calm
+        // roster that does not exist.
+        let period = Period::new(0, 600);
+        let samples = vec![sample(0, "a", 0.90, 0.1)];
+        let empty = aggregate_with_roster(&samples, &[], period, &params(), Some(&BTreeSet::new()));
+        assert_eq!(empty.roster.all_high_episodes, 0);
+        assert_eq!(empty.roster.all_high_covered_secs, 0);
+    }
+
+    #[test]
+    fn the_census_carries_the_water_it_actually_used() {
+        // The threshold rides OUT of the aggregate (issue #804) so no downstream surface has to
+        // hardcode a literal. It is the param's value, not a constant: two runs at different
+        // waters report their own.
+        let period = Period::new(0, 600);
+        let samples = vec![sample(0, "a", 0.90, 0.1)];
+        for water in [0.80, 0.95] {
+            let params = AggregateParams::new(300, 0.80, water);
+            let report = aggregate(&samples, &[], period, &params);
+            assert_eq!(report.roster.high_threshold, water);
+        }
+    }
+
     // --- month-length / DST boundaries (UTC epoch discipline) -----------------
 
     #[test]
@@ -1344,6 +1564,65 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
             nonzero_all_high_iters > 0,
             "no iteration produced a non-zero all-high span (expect ~20) — the range \
              bound alone cannot tell a working implementation from a zero stub"
+        );
+    }
+
+    #[test]
+    fn prop_all_high_time_never_exceeds_the_jointly_covered_time() {
+        // The invariant the UNKNOWN render rests on (issue #804): episodes are a SUBSET of the
+        // jointly-covered time, so `covered == 0` implies `episodes == 0`. If it could ever be
+        // violated, `—` would be printed over a real episode — an UNKNOWN hiding a fact, which
+        // is worse than the fabricated calm it replaced. Held only by construction (high ⊆
+        // covering per account, and intersection preserves ⊆) until this pinned it.
+        let mut rng = Lcg::new(0x804_2026);
+        let accounts = ["work", "play", "spare"];
+        let mut covered_zero_iters = 0_u32;
+        let mut covered_positive_iters = 0_u32;
+        for _ in 0..300 {
+            let period = Period::new(0, 50_000);
+            let n = 1 + rng.below(40);
+            let samples: Vec<Sample> = (0..n)
+                .map(|_| {
+                    let acct = accounts[rng.below(3) as usize];
+                    sample(rng.below(50_000) as i64, acct, rng.frac(), rng.frac())
+                })
+                .collect();
+            // Over the FULL three-account roster, so a never-sampled account really can empty
+            // the intersection — the shape the render rule exists for.
+            let roster: BTreeSet<String> = accounts.iter().map(|a| (*a).to_owned()).collect();
+            let report = aggregate_with_roster(&samples, &[], period, &params(), Some(&roster));
+            let r = &report.roster;
+            assert!(
+                r.all_high_secs <= r.all_high_covered_secs,
+                "all-high time {} exceeded jointly-covered time {}",
+                r.all_high_secs,
+                r.all_high_covered_secs
+            );
+            assert!(
+                r.all_high_covered_secs >= 0 && r.all_high_covered_secs <= period.duration(),
+                "jointly-covered time is within [0, period]"
+            );
+            if r.all_high_covered_secs == 0 {
+                covered_zero_iters += 1;
+                assert_eq!(
+                    r.all_high_episodes, 0,
+                    "no jointly-covered second can hold an episode"
+                );
+            } else {
+                covered_positive_iters += 1;
+            }
+        }
+        // Both witnesses, so neither branch of the implication is vacuous: an all-zero corpus
+        // would satisfy `all_high_secs <= all_high_covered_secs` trivially, and an
+        // always-covered one would never exercise the `covered == 0` arm the render turns on.
+        assert!(
+            covered_zero_iters > 0,
+            "no iteration was unmeasurable — the `covered == 0 ⇒ episodes == 0` arm is never \
+             exercised"
+        );
+        assert!(
+            covered_positive_iters > 0,
+            "every iteration was unmeasurable — a `return (0, 0, 0)` stub would pass 300/300"
         );
     }
 
