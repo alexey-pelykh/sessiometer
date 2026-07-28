@@ -7,8 +7,28 @@
 // directly (via `BarGlyphRenderer`), re-rendering every glyph as it actually appears in the bar — template-
 // tinted, per appearance, @1x + @2x, plus the menu-open inverted state — and diffs the fresh renders
 // against the committed references under `design/renders/bar-glyphs/` (emitted by the app's
-// `--render-bar-glyphs` tool). It runs headless under `xcodebuild test`: unlike the panel's `ImageRenderer`
-// (which needs a windowserver), `NSBitmapImageRep` + `NSImage.draw` rasterize a custom symbol with no GUI.
+// `--render-bar-glyphs` tool). It runs headless under `xcodebuild test` — `NSBitmapImageRep` +
+// `NSImage.draw` rasterize a custom symbol with no GUI.
+//
+// CORRECTION (issue #749): this header previously asserted that the panel's `ImageRenderer` "needs a
+// windowserver", contrasting it with the AppKit path above. That claim was never executed, and it is
+// wrong. It mattered because it was the stated reason `RenderPanelTool` is an app-tool rather than a
+// test, and therefore the reason the PANEL had no automated visual gate while the bar glyph did.
+//
+// What the committed evidence proves: `ImageRendererHeadlessProbeTests` rasterizes SwiftUI in THIS
+// bundle — `TEST_HOST: ""`, no host app, no `NSApplication`, no window — across a bare view, an SF
+// Symbol, and the `@EnvironmentObject` / `@Published` environment-injection path. That is exactly the
+// environment CI runs, so an in-bundle panel golden gate is reachable (issue #754).
+//
+// The stronger claim — that no WINDOWSERVER is needed either — was confirmed separately under
+// `sandbox-exec` denying `com.apple.windowserver*`: with `CGSession` nil, `NSScreen.count` 0 and
+// `CGMainDisplayID` 0, the same view still rasterized to identical bytes. That probe is not committed
+// (it needs no repo surface), so treat this paragraph as the record of the measurement, not as
+// something these tests re-run. The in-bundle claim above is the one under CI.
+//
+// What remains TRUE is this suite's actual reason to exist, stated at the top: `ImageRenderer` draws a
+// SwiftUI view and so never exercises `NSStatusItem` TEMPLATE TINTING. That gap is orthogonal to
+// headlessness, and no amount of SwiftUI rasterization closes it.
 //
 // The catalog is compiled INTO this test bundle (project.yml adds `Sources/Assets.xcassets`), so the REAL
 // bespoke `.symbolset`s resolve via `StatusGauge.image(for:in:)` against `Bundle(for:)` — `NSImage(named:)`
