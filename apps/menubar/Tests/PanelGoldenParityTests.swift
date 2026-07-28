@@ -91,7 +91,13 @@
 // rendering one fixture six times (renders 0–1 agree, renders 2–5 agree, the groups differ) and ruled
 // clock-independent by the seed-lag rows above. `PanelRenderHarness` discards renders until two consecutive
 // ones agree, so both the app tool and this gate rasterize from the steady state; the byte assertions here
-// are what keep that honest.
+// are what keep that honest. HONEST LIMIT, measured for issue #821: that warm-up renders the `healthy`
+// fixture only, and its "two consecutive agree" rule cannot detect a cold group that agrees with ITSELF —
+// rendering `blind-cornered/dark` ten times as a process's first renders gives frames 0–1 identical and
+// frames 2+ differing from them by 1/255 on 728 bytes, at an IDENTICAL seed. So the steady state is reached
+// in practice by the volume of renders this suite does, not guaranteed by the warm-up, and a byte assertion
+// can still redden on a run that rasterizes a cell for the first time. Tracked as issue #824; do NOT
+// absorb it into a tolerance.
 //
 // The median is quoted only to be dismissed: of the 57 same-size pairs, 37 are cross-theme (light vs dark,
 // ~0.97), which drags the median to 0.971210 and so says nothing whatever about the gate's real margin. The
@@ -344,10 +350,10 @@ final class PanelGoldenParityTests: XCTestCase {
         let (differing, worst) = PanelRaster.byteDelta(a, b)
         print(String(format: "[panel-goldens] identical re-render: %d of %d bytes differ, worst delta %d",
                      differing, a.bytes.count, worst))
-        // BYTE-exact, not merely under the metric threshold. `ImageRenderer` is fully deterministic for a
-        // given seed, and asserting the strong form is what makes the WEAKER result next door (renders
-        // seconds apart agree only to ±1) attributable to the seed→raster latency rather than to the
-        // renderer — the distinction the golden churn note in design/README.md rests on.
+        // BYTE-exact, not merely under the metric threshold. `ImageRenderer` is deterministic for a given
+        // seed once the rasterizer is warm, and asserting the strong form here is what lets the seed-lag
+        // result next door (`testRendersSurviveTheClockDriftWindow`, also byte-exact) be attributed to the
+        // clock guard rather than to luck.
         XCTAssertEqual(worst, 0,
                        "two back-to-back renders of the same fixture differ by \(worst)/255 on some channel "
                        + "(\(differing) of \(a.bytes.count) bytes) — `ImageRenderer` is nondeterministic at "
@@ -382,13 +388,32 @@ final class PanelGoldenParityTests: XCTestCase {
     // MUTATION: re-seed as if the fixtures had been built 1 / 7 / 29 s ago (the real-world direction — a
     // render is always later than its seed) and require an unchanged render (drift 0, the gate metric).
     //
-    // The BYTE delta is measured here too, and it is the one place in this suite where it is NOT zero.
-    // Renders seeded seconds apart agree under the gate metric but differ by ±1/255 on a fraction of a
-    // percent of bytes — sub-pixel antialiasing that tracks the continuously-varying seed→raster latency,
-    // not a text change (a changed string moves thousands of pixels by hundreds of levels, which is what
-    // the metric assertion above catches). Two consequences, both recorded rather than discovered later:
-    // the gate metric's 64/255 threshold is what makes committed goldens viable at all, and a re-blessed
-    // golden will always show binary churn in `git diff --stat`, so the churn is not evidence of a change.
+    // The BYTE delta is measured here too, and it is ALSO zero — the seed lag moves no bytes at all, which
+    // is the strong form of the claim above (identical strings rasterize to identical bytes). An earlier
+    // revision of this comment asserted the opposite — that this was "the one place in this suite where it
+    // is NOT zero", ±1/255 tracking the seed→raster latency — while the assertion below demanded exactly 0.
+    // That prose was stale (issue #821): it predated `PanelRenderHarness.warmUpIfNeeded()`, whose own doc
+    // records the measurement that refutes it — "renders seeded seconds apart are byte-identical, which
+    // rules the clock out directly". Re-measured for #821: 11 consecutive runs (5 of this class alone, 6 of
+    // the whole suite under 14-core saturation, load average to 38) reported `worst delta 0 over up to 0
+    // bytes` every time. The assertion was right and the comment was wrong; do NOT re-loosen it to a
+    // tolerance on the strength of the deleted prose.
+    //
+    // WHAT DOES move bytes by ±1 is a COLD raster, not the clock — the header's HONEST LIMIT carries that
+    // measurement, and this test is where it surfaces, because `atSeed` lands in the cold group while the
+    // lagged renders land outside it. Worth knowing it is NOT a flake when it does: running this test ALONE
+    // (`-only-testing:…/testRendersSurviveTheClockDriftWindow`) is red 6 times out of 6, at exactly 882
+    // bytes and worst delta 1, on this commit and on the one before it alike — the observed #756 signature
+    // exactly, and a warm-up signature rather than a clock one. In the FULL suite the earlier tests have
+    // already rasterized the catalog, so the rasterizer is warm by the time this runs and the measurement is
+    // 0 — which is why the required job is green, and why a lone re-run is not a diagnosis. Closing the
+    // exposure is a change to the harness's warm-up, tracked as issue #824.
+    //
+    // `atSeed` is rendered UNCACHED below for the same reason `testAnIdenticalRerenderScoresExactlyZero`
+    // renders both of its sides uncached: the lagged renders already bypass the cache, so caching only this
+    // side would compare an arbitrarily-old entry — whatever the FIRST test to touch the cell rasterized —
+    // against a fresh render. Symmetry, not a fix; measured NOT to change the outcome in any of the three
+    // scenarios tried (isolated, full-class, cache-populated-while-cold).
     func testRendersSurviveTheClockDriftWindow() throws {
         var worstByteDelta = 0
         var worstByteCount = 0
@@ -396,7 +421,7 @@ final class PanelGoldenParityTests: XCTestCase {
                      Cell(fixture: "stale", scheme: .dark),
                      Cell(fixture: "disconnected", scheme: .light),
                      Cell(fixture: "blind-cornered", scheme: .dark)] {
-            let atSeed = try XCTUnwrap(render(cell))
+            let atSeed = try XCTUnwrap(render(cell, cached: false))
             for lag: Int64 in [1, 7, 29] {
                 let drifted = try XCTUnwrap(render(cell, seedLag: lag))
                 XCTAssertEqual(PanelRaster.diffFraction(atSeed, drifted), 0.0, accuracy: 0.0,
@@ -416,7 +441,14 @@ final class PanelGoldenParityTests: XCTestCase {
                        + "(up to \(worstByteCount) bytes) while scoring 0.000000 under the gate metric. "
                        + "Sub-threshold drift the metric is too coarse to see — the committed goldens stop "
                        + "being byte-reproducible, so a re-bless churns files that did not change and the "
-                       + "`Panel-Goldens-Rebaselined:` audit trail stops being readable")
+                       + "`Panel-Goldens-Rebaselined:` audit trail stops being readable. "
+                       + "DIAGNOSE, do not re-run (issue #821): a worst delta of exactly 1 over a few "
+                       + "hundred bytes is the COLD-RASTER signature, not a clock failure — the warm-up "
+                       + "covers the `healthy` fixture only (issue #824). A worst delta above 1, or a byte "
+                       + "count in the thousands, is the real subject of this test: a clock-relative string "
+                       + "crossed a `humanizeUntil` boundary inside the "
+                       + "\(PanelRenderHarness.boundaryGuardSecs)s guard window — move the offending "
+                       + "fixture offset off the boundary rather than relaxing this assertion")
     }
 
     // MARK: - Cross-machine robustness: the render ignores the HOST process's appearance
@@ -538,6 +570,56 @@ final class PanelGoldenParityTests: XCTestCase {
         XCTAssertNotEqual(nearest(to: substituted, in: references), claimed,
                           "a substituted render still resolved to \(claimed) — the nearest-reference gate "
                           + "cannot distinguish two different panel states, so it cannot catch drift")
+    }
+
+    // MARK: - CANARY: the byte-equality assertions can FAIL (mutation, same predicate)
+
+    // Proof that the `byteDelta(...).worst == 0` assertions are reachable — the ones in
+    // `testAnIdenticalRerenderScoresExactlyZero` and `testRendersSurviveTheClockDriftWindow`, which issue
+    // #821 questioned. They are equality-to-zero assertions over a same-run pair, so a renderer that is
+    // merely CONSISTENT rather than correct satisfies them for free, and an inspection-only argument for
+    // them is exactly the argument issue #437 taught this repo not to accept: a golden authored over a
+    // broken renderer DEFENDS the break and reports green.
+    //
+    // Both halves below are load-bearing, and they say opposite things about the same ±1 mutation:
+    //   • `byteDelta` MUST see it — the gate can fail; and
+    //   • `diffFraction` MUST NOT (0.000000) — which is why the byte assertions are not redundant with the
+    //     metric gates next door. If this half ever reddens, the metric grew sensitive enough to subsume
+    //     them and the byte assertions can be reconsidered; until then they are the only thing standing
+    //     between a ±1-everywhere raster and a green suite.
+    // Same-run comparison, no committed file → runs in the required job, like its sibling canaries.
+    func testANudgedRenderTripsTheByteEqualityGate() throws {
+        let clean = try XCTUnwrap(render(Cell(fixture: "healthy", scheme: .light)))
+
+        // Control: the mutator is exact — a zero-count nudge changes nothing, so the canary below measures
+        // the nudge rather than incidental rig noise.
+        let (unchanged, unchangedWorst) = PanelRaster.byteDelta(clean,
+                                                               PanelRaster.byteNudged(clean, count: 0))
+        XCTAssertEqual(unchangedWorst, 0,
+                       "a zero-count nudge changed \(unchanged) bytes — the mutator is not exact")
+
+        // 1 byte is the MINIMAL drift the predicate has to see; 728 is the measured cold-raster signature
+        // (see the header) — the failure this canary is shaped after.
+        for count in [1, 728] {
+            let nudged = PanelRaster.byteNudged(clean, count: count)
+            let (differing, worst) = PanelRaster.byteDelta(clean, nudged)
+
+            // The gate can FAIL: this is the same `byteDelta(...).worst` predicate the real assertions use.
+            XCTAssertGreaterThan(worst, 0,
+                                 "nudging \(count) byte(s) by 1 did NOT move `byteDelta`'s worst delta — the "
+                                 + "byte-equality assertions cannot fail, so their green is not evidence")
+            XCTAssertEqual(worst, 1, "expected a worst delta of exactly 1, got \(worst) — the mutator is not "
+                           + "producing the ±1/255 signature this canary claims to model")
+            XCTAssertEqual(differing, count,
+                           "expected exactly \(count) differing byte(s), got \(differing) — the nudge is not "
+                           + "landing on \(count) distinct byte(s), so the canary overstates itself")
+
+            // …and the METRIC cannot see it. This is the whole reason the byte assertions exist.
+            XCTAssertEqual(PanelRaster.diffFraction(clean, nudged), 0.0, accuracy: 0.0,
+                           "a \(count)-byte ±1 nudge was visible to the gate metric — `diffFraction`'s "
+                           + "64/255 threshold is meant to be blind to this, and the byte assertions exist "
+                           + "precisely to cover what it cannot see")
+        }
     }
 
     // MARK: - Pipeline integrity: a golden round-trips exactly
@@ -894,8 +976,9 @@ struct PanelRaster {
     ///
     /// `diffFraction` deliberately ignores channel deltas under 64/255, which is right for a drift gate and
     /// wrong for asking "is this renderer reproducible at all". That second question needs its own primitive
-    /// — see `testAnIdenticalRerenderScoresExactlyZero`, which measured that the answer is NO in the exact
-    /// sense: consecutive renders of one fixture agree to within ±1/255 but not to the byte.
+    /// — see `testAnIdenticalRerenderScoresExactlyZero`, which measures that the answer is YES once the
+    /// rasterizer is warm: consecutive renders of one fixture agree to the BYTE, not merely to ±1/255. What
+    /// still moves bytes by ±1 is a COLD raster (issue #824), not the seed or the clock.
     static func byteDelta(_ a: PanelRaster, _ b: PanelRaster) -> (differing: Int, worst: Int) {
         guard a.bytes.count == b.bytes.count else { return (max(a.bytes.count, b.bytes.count), 255) }
         var differing = 0
@@ -953,6 +1036,33 @@ struct PanelRaster {
                 bytes[i + 2] = 0    // B
                 bytes[i + 3] = 255  // A
             }
+        }
+        return PanelRaster(width: raster.width, height: raster.height, bytes: bytes)
+    }
+
+    /// A copy with `count` bytes nudged by exactly +1 (saturating) — the MINIMAL drift the byte assertions
+    /// exist to catch, and deliberately the one the gate metric is blind to.
+    ///
+    /// `perturbed` above is the canary for the METRIC (a red band, deltas of 255, whole pixels). It cannot
+    /// prove the byte predicate is reachable, because anything that trips `diffFraction` trips `byteDelta`
+    /// trivially. The interesting claim is the other direction: that `byteDelta` catches drift `diffFraction`
+    /// reports as 0.000000. So this mutates by exactly the ±1/255 signature the real cold-raster defect
+    /// produces (issue #824) — the canary is the same shape as the failure it guards against.
+    ///
+    /// Bytes are spread evenly across the buffer rather than taken from the front, so the mutation cannot be
+    /// satisfied by a transparent margin alone; the step is derived from `count`, so exactly `count` bytes
+    /// move (clamped to the buffer). `count == 0` returns an exact copy, which the canary asserts moves
+    /// nothing.
+    static func byteNudged(_ raster: PanelRaster, count: Int) -> PanelRaster {
+        guard count > 0, !raster.bytes.isEmpty else { return raster }
+        var bytes = raster.bytes
+        let touched = min(count, bytes.count)
+        // ≥ 1 because `touched` ≤ `bytes.count`, so the indices below are distinct and the last one,
+        // `(touched - 1) * step`, is inside the buffer.
+        let step = bytes.count / touched
+        for k in 0..<touched {
+            let i = k * step
+            bytes[i] = bytes[i] == 255 ? 254 : bytes[i] + 1
         }
         return PanelRaster(width: raster.width, height: raster.height, bytes: bytes)
     }
