@@ -2530,8 +2530,11 @@ fn render_bars(report: &Report, accounts: &[&String], w: usize, ascii: bool) -> 
     let summary = &report.summary;
     let (fill, track) = if ascii { BAR_ASCII } else { BAR_UNICODE };
     let label_w = accounts.iter().map(|h| display_width(h)).max().unwrap_or(0);
-    // line = label + "  " + bar + "  " + "NNN%"; reserve 4 for the percent field.
-    let bar_w = w.checked_sub(label_w + 2 + 2 + 4)?;
+    // line = label + "  " + bar + "  " + "NNN%"; reserve 4 for the percent field. `w` is a
+    // BUDGET, not a target: bound the bar at the same 40 cells `render_percentiles` bounds its
+    // gauge to (issue #794) — past that the extra cells add nothing, since the bar is a
+    // comparative shape on a fixed scale and the exact figure already sits beside it.
+    let bar_w = w.checked_sub(label_w + 2 + 2 + 4)?.min(40);
     if bar_w < 4 {
         return None;
     }
@@ -2881,8 +2884,9 @@ mod tests {
         assert_eq!(
             render_bars(&r, &keys(&r), 60, false).unwrap(),
             "contribution share\n\
-             alpha  ███████████████████████████████████░░░░░░░░░░░░   75%\n\
-             beta   ████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   25%\n",
+             alpha  ██████████████████████████████░░░░░░░░░░   75%\n\
+             beta   ██████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   25%\n",
+            "the bar is bounded at 40 cells, not the 47 this width allows (issue #794)",
         );
         assert_eq!(
             render_heatmap(&r, &keys(&r), 60, false, false).unwrap(),
@@ -2897,6 +2901,53 @@ mod tests {
              alpha  ┤─────────────────m────────P──────x├  50% · 80% · 99%\n\
              beta   ┤───m─P─x──────────────────────────├  10% · 15% · 20%\n",
             "distinct mean/p95/peak markers spread apart; clustered where they are close",
+        );
+    }
+
+    // --- issue #794 AC: the bar is bounded, not full-bleed ----------------------------
+
+    /// A bar row's fill + track glyphs.
+    const BAR_GLYPHS: [char; 2] = ['█', '░'];
+    /// A gauge row's track plus its three markers.
+    const GAUGE_GLYPHS: [char; 4] = ['─', 'm', 'P', 'x'];
+
+    /// How many of `glyphs` the row for `label` carries. None of them occurs in a label or in
+    /// the figures trailing the row, so the count over the whole line IS that row's rendered
+    /// bar or gauge width.
+    fn row_cells(out: &str, label: &str, glyphs: &[char]) -> usize {
+        out.lines()
+            .find(|l| l.starts_with(label))
+            .unwrap()
+            .chars()
+            .filter(|c| glyphs.contains(c))
+            .count()
+    }
+
+    #[test]
+    fn render_bars_bounds_the_bar_rather_than_filling_a_wide_terminal() {
+        let r = two_account_charts();
+
+        // Far past the bound the bar stops at 40 rather than tracking `w`. Unbounded it would
+        // be 187 cells, drawing beta's 25% share as 140 cells of empty track and dwarfing the
+        // account table it sits under.
+        let wide = render_bars(&r, &keys(&r), 200, false).unwrap();
+        assert_eq!(row_cells(&wide, "alpha", &BAR_GLYPHS), 40);
+        assert_eq!(row_cells(&wide, "beta", &BAR_GLYPHS), 40);
+
+        // The bound is a CEILING, not a fixed width: under it the bar still sizes to the
+        // terminal, so the block keeps degrading with the narrow-width contract (issue #159).
+        // The budget less the label column (`alpha`, 5), the two gaps and the percent field.
+        let snug = render_bars(&r, &keys(&r), 40, false).unwrap();
+        assert_eq!(row_cells(&snug, "alpha", &BAR_GLYPHS), 40 - (5 + 2 + 2 + 4));
+
+        // The bound is SHARED with the sibling gauge of this same view — that precedent is
+        // where the value comes from. Pin the pair so drifting one alone silently re-opens the
+        // asymmetry this issue closed.
+        let gauges = render_percentiles(&r, &keys(&r), 200, false).unwrap();
+        assert_eq!(
+            row_cells(&wide, "alpha", &BAR_GLYPHS),
+            row_cells(&gauges, "alpha", &GAUGE_GLYPHS),
+            "the contribution bar and the distribution gauge share one bound"
         );
     }
 
