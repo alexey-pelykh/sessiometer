@@ -211,7 +211,9 @@ struct ConfigSetCommand: Encodable {
 /// What a successful `config-set` requires for its edits to take effect (`src/daemon/socket.rs`
 /// `ConfigSetEffect`, issue #268) — the `effect` the UI renders. snake_case wire; an UNKNOWN value is a
 /// hard decode error (a drifted daemon degrades loudly, mirroring serde's unknown-variant rejection).
-enum ConfigSetEffect: String, Decodable, Equatable {
+/// `CaseIterable` for the same issue #762 coverage gate as `ConfigSetRejection` below — every effect the
+/// footer can land on has its own sentence, and the count is asserted. Purely additive.
+enum ConfigSetEffect: String, Decodable, Equatable, CaseIterable {
     /// Only label(s) changed — adopted LIVE (the daemon reconciled its roster in-process); no restart.
     case live
     /// A tunable changed — persisted, effective on the NEXT daemon start (no hot-reload). Restart hint.
@@ -222,7 +224,11 @@ enum ConfigSetEffect: String, Decodable, Equatable {
 
 /// Why the daemon refused a `config-set` (`src/daemon/socket.rs` `ConfigSetRejection`, issue #268) — a
 /// redacted, stable machine code. kebab-case wire; an UNKNOWN value is a hard decode error.
-enum ConfigSetRejection: String, Decodable, Equatable {
+///
+/// `CaseIterable` for the coverage gate (issue #762): `SettingsTextMetricsTests` renders EVERY case's
+/// operator copy and asserts the count, so adding a rejection reason without adding its sentence reddens
+/// the suite instead of silently shipping an unrendered outcome. Purely additive — decoding is unchanged.
+enum ConfigSetRejection: String, Decodable, Equatable, CaseIterable {
     /// A tunable was out of range, or a cross-field rule failed (e.g. `exhausted_poll_secs < poll_secs`).
     /// The ack's `detail` names the offending field.
     case invalid

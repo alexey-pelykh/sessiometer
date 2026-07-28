@@ -113,70 +113,24 @@ final class PanelTextMetricsTests: XCTestCase {
     /// `.font(.system(size: 13, weight: .semibold))` — `StatStripRow`'s handle.
     private let statsHandleFont = NSFont.systemFont(ofSize: 13, weight: .semibold)
 
-    // MARK: - The gate predicate (one definition, used by every assertion AND by the canary)
+    // MARK: - The gate predicate (ONE definition, used by every assertion AND by the canary)
 
-    /// Required width in points for `text` rendered in `font`.
-    ///
-    /// `visibleSubstring` below decides whether to truncate via `CTLineGetTypographicBounds` instead, and
-    /// several tests branch on THIS width then assert THAT verdict — so the two must not disagree at a
-    /// boundary. Measured across every fixture in this file, they agree to the last bit (delta 0.0000):
-    /// `NSString.size` for a single-line attributed run is the same typographic advance.
+    // The predicate itself lives in `TextMetrics` (issue #762) — shared with `SettingsTextMetricsTests`,
+    // because two metrics suites must not derive their own `overflows` and then disagree at a boundary.
+    // These forwards exist so the assertions below read exactly as issue #750 wrote them; `assertFits` is
+    // now an `XCTestCase` extension in the same file. Nothing about WHAT this suite measures moved.
+
     private func width(_ text: String, _ font: NSFont) -> Double {
-        Double((text as NSString).size(withAttributes: [.font: font]).width)
+        TextMetrics.width(text, font)
     }
 
-    /// THE predicate. `true` when `text` does not fit `budget`. The CONSTRAINT-A canary runs through this
-    /// same function so the thing proven falsifiable is the thing actually gating.
     private func overflows(_ text: String, _ font: NSFont, budget: Double) -> Bool {
-        width(text, font) > budget
+        TextMetrics.overflows(text, font, budget: budget)
     }
 
-    /// Assert one cell, reporting measured required-vs-available in points on failure (issue #748 R1: the
-    /// suite fails *reporting* the numbers, not merely reporting that something is wrong).
-    private func assertFits(_ text: String, _ font: NSFont, budget: Double, _ what: String,
-                            file: StaticString = #filePath, line: UInt = #line) {
-        let required = width(text, font)
-        XCTAssertFalse(overflows(text, font, budget: budget),
-                       "\(what): \"\(text)\" needs \(String(format: "%.2f", required)) pt "
-                       + "in a \(String(format: "%.2f", budget)) pt slot "
-                       + "(over by \(String(format: "%.2f", required - budget)) pt)",
-                       file: file, line: line)
-    }
-
-    // MARK: - Truncation model (the same CoreText primitive SwiftUI's `.truncationMode` selects)
-
-    private static let tokenKey = NSAttributedString.Key("sessiometer.truncationToken")
-
-    /// The substring that remains VISIBLE when `text` is truncated to `budget` under `mode`, plus whether
-    /// truncation happened at all.
-    ///
-    /// Ranges, not per-character indices: an emoji ZWJ sequence or a surrogate pair sliced by codepoint
-    /// would come back as lone surrogates and make every comparison below meaningless. Runs are collected by
-    /// `CTRunGetStringRange` and re-sorted into LOGICAL order, so a bidi (RTL) label reconstructs to what it
-    /// semantically contains rather than to its visual ordering. The ellipsis token carries a marker
-    /// attribute purely so its run can be excluded — it belongs to the token string, not to `text`.
     private func visibleSubstring(_ text: String, font: NSFont, budget: Double,
                                   mode: CTLineTruncationType) -> (text: String, truncated: Bool) {
-        let attrs: [NSAttributedString.Key: Any] = [.font: font]
-        let line = CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: attrs))
-        guard CTLineGetTypographicBounds(line, nil, nil, nil) > budget else { return (text, false) }
-
-        var tokenAttrs = attrs
-        tokenAttrs[Self.tokenKey] = true
-        let token = CTLineCreateWithAttributedString(
-            NSAttributedString(string: "\u{2026}", attributes: tokenAttrs))
-        guard let cut = CTLineCreateTruncatedLine(line, budget, mode, token) else { return (text, true) }
-
-        let ns = text as NSString
-        var ranges: [NSRange] = []
-        for run in CTLineGetGlyphRuns(cut) as? [CTRun] ?? [] {
-            if (CTRunGetAttributes(run) as NSDictionary)[Self.tokenKey] != nil { continue }
-            let r = CTRunGetStringRange(run)
-            guard r.location >= 0, r.length > 0, r.location + r.length <= ns.length else { continue }
-            ranges.append(NSRange(location: r.location, length: r.length))
-        }
-        ranges.sort { $0.location < $1.location }
-        return (ranges.map { ns.substring(with: $0) }.joined(), true)
+        TextMetrics.visibleSubstring(text, font: font, budget: budget, mode: mode)
     }
 
     /// The CoreText truncation type the panel's own elision POLICY selects. Everything below elides through

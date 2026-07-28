@@ -330,6 +330,40 @@ tint step and the cursor — none of which is an accessibility attribute, so an 
 are byte-identical in the tree and VoiceOver cannot distinguish them either. That surface belongs to
 issue #766's interaction-state checklist, not here.
 
+### Settings window pre-release checklist (manual, non-VoiceOver)
+
+Issue #762 put the Settings window's copy and its two hardcoded field widths under an automated gate
+(`Tests/SettingsTextMetricsTests`). Three surfaces stayed out of reach of that gate — window/activation
+lifecycle, the `⌘S` key event, and runtime affordances (spinner, focus ring, hover tooltip) — and they
+are listed here rather than left silent, since the issue's AC-4 is explicit that an untestable surface
+must be named as such. They expand to the five steps below because two of them have a stopped-daemon and
+a running-daemon half. Everything else the gate could not reach has a tracked owner instead: the
+accessibility tree is issue #840, the missing design reference is issue #763, and Dynamic Type is the
+pinned defect issue #845.
+
+Run these with the daemon RUNNING (so the form loads) unless a step says otherwise:
+
+- [ ] **Window lifecycle.** Open Settings (`⌘,`), close it, reopen it. The window reappears with the same
+      size and position, exactly one Settings window ever exists, and each open re-reads the daemon (edit a
+      tunable in `config.toml` externally, reopen, confirm the form shows the new value).
+- [ ] **Activation policy.** While Settings is open the app has a Dock icon and is `⌘`-Tab reachable; after
+      closing it the Dock icon goes away again. A lingering Dock icon means the app is stranded in
+      `.regular` — the failure `SettingsWindowController` deliberately avoids by omitting `.miniaturizable`.
+- [ ] **⌘S.** With a pending edit, `⌘S` saves without touching the Save button. With no pending edit — and
+      while a save is in flight — it does nothing. (The predicate behind the button is gated automatically;
+      that the *key event* reaches it is not.)
+- [ ] **Loading + focus.** With the daemon STOPPED, open Settings: the Notifications and General sections
+      are still usable, and the daemon section shows the honest failure rather than a blank or fabricated
+      form. Tab through the form and confirm every field shows a visible focus ring and the spinner
+      animates on a slow first load.
+- [ ] **Hover tooltips.** Hover each tunable field and confirm its `.help` text appears. This is the only
+      place a field's unit and meaning are explained, and hover is not an accessibility attribute — no
+      tree walk can see it. (VoiceOver users get the same copy via `accessibilityHelp`, which the
+      VoiceOver checklist above covers; this bullet is the sighted-mouse half.)
+
+Not on this list on purpose: the per-field COPY, the Save enable/disable rule, and whether a value or
+label fits its field. Those are measured in `SettingsTextMetricsTests` and do not need a human.
+
 ## It's a mock, not code
 
 The mock approximates native treatments in HTML/CSS. When building the SwiftUI panel, translate
