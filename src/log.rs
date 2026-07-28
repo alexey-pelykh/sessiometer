@@ -1,17 +1,18 @@
 // Copyright (c) 2026 Oleksii PELYKH
 // SPDX-License-Identifier: MIT
 
-//! The `log` verb (issue #773): a supported reader for the daemon's durable event log.
+//! The `log` verb (issue #773): a supported reader for the daemon's own log lines.
 //!
 //! The log has always been durable and structured, but the only way to *look at* it was to know
 //! `~/Library/Logs/sessiometer/sessiometer.log` and type `tail`. [`crate::reliability`] reads
 //! this exact file already — but only to fold it into SLIs, never to show the lines. This verb
-//! shows them, with a window ([`LogArgs::since`]) and an event filter ([`LogArgs::event`]).
+//! shows them, with a window ([`LogArgs::since`]), a kind filter ([`LogArgs::event`]), and — since
+//! issue #775 — a choice of which channel to read at all ([`LogArgs::channel`]).
 //!
 //! It is the third **offline** reader, in the shape the two shipped ones establish (`stats`,
 //! issue #158; `reliability`, issue #455): read the daemon's durable file directly, make no live
 //! control-socket / keychain / usage-API call, and render with the daemon down. The only impure
-//! steps are the one file read and — for `--since` alone — one wall-clock read; everything below
+//! steps are the file reads and — for `--since` alone — one wall-clock read; everything below
 //! them is a pure function of the text, so the whole reader is unit-testable from a `&str`.
 //!
 //! # Byte-faithfulness, and why the two streams are split
@@ -49,13 +50,56 @@
 //! reads `ts=` / `event=` only to *filter*, through the same whitespace/`key=val` tokenization
 //! the sibling reader folds through, so the two cannot disagree about what a line says.
 //!
-//! Diagnostics stay out of it. The `-v` OPERATOR channel is stderr-only and never reaches the
-//! durable log (see [`crate::reliability`]'s note); that invariant is untouched here, and this
-//! verb reads the durable channel alone. Reading `daemon.err.log` — raw stderr and panic payloads,
-//! an ungoverned channel that never passed the issue #15 redaction meter — is out of scope; the
-//! `--channel event|diag|all` selector that would reach it is issue #775's. Nothing here forecloses
-//! it: [`select`] filters a channel-agnostic line stream and takes its text as an argument, so a
-//! later channel adds a *source*, not a rewrite.
+//! Diagnostics are never ROUTED into it. The `-v` OPERATOR channel is stderr-only and never
+//! reaches the durable log (see [`crate::reliability`]'s note); that invariant is untouched.
+//!
+//! # The second channel (`--channel`, issue #775)
+//!
+//! The daemon writes two files, and the reader can now show either or both. They are not the same
+//! kind of thing, and the whole design of the selector follows from that:
+//!
+//! - The **event log** is GOVERNED. Every field is a handle, an enum, a number or a timestamp by
+//!   type-level construction ([`crate::observability::Event`]), and the channel passes the issue
+//!   #15 redaction meter in CI.
+//! - **`daemon.err.log`** ([`crate::paths::daemon_stderr_log`]) is the launchd agent's raw stderr —
+//!   where the diagnostic channel LANDS, but also everything else the process printed there,
+//!   including PANIC PAYLOADS that passed no meter at all.
+//!
+//! So [`Channel::Event`] is the default and `all` is not: a bare `sessiometer log` must never
+//! widen onto an ungoverned channel on behalf of an operator who did not ask. When one IS asked
+//! for, the stderr notice says the channel is not redaction-checked, because the exposure travels
+//! with wherever those bytes are piped next. The meter is extended over the read path in tests —
+//! `a_poisoned_diagnostic_channel_never_reaches_the_default_view` proves a planted token stays out
+//! of the default view, and canaries the scan so the guarantee is not vacuous.
+//!
+//! Adding the channel added a *source*, not a rewrite, exactly as issue #773 intended: [`select`]
+//! still filters ONE text handed to it as an argument, and the channel merely supplies the key its
+//! lines name their kind with ([`Channel::name_key`] — `event=` there, `diag=` here). Two extra
+//! pure functions compose the rest: [`merge`] interleaves two selected views, [`view_of`] picks
+//! between one and two.
+//!
+//! Two ordering questions had to be ANSWERED rather than left implicit, because the two files have
+//! independent line formats:
+//!
+//! - **What orders a line with no `ts=`.** Raw stderr has plenty — a panic payload, the startup
+//!   notice. It CARRIES FORWARD the timestamp of the nearest preceding line of its own source, so
+//!   it is placed where it actually happened; a line with no timestamped predecessor still has no
+//!   placement. The carry is scoped to the diagnostic channel: on the durable log, whose grammar
+//!   always writes `ts=`, an untimestamped line is malformed and issue #773's tolerant-drop is
+//!   right and unchanged.
+//! - **What interleaves the two.** A two-pointer [`merge`], not a sort of the concatenation — a
+//!   merge preserves each source's own file order STRUCTURALLY, so a panic backtrace (a run of
+//!   lines all sharing one inherited timestamp) stays contiguous and in order. Ties put the event
+//!   line first.
+//!
+//! `--channel all` is refused under `--follow`, not approximated: ordering a live merge would mean
+//! holding each new line back until the other channel produced one at least as late, and on a
+//! quiet channel that is never.
+//!
+//! CONSTRAINT-A holds across both. In text mode nothing is interpolated to mark the channel — it
+//! does not need to be, since each line already names its own kind (`event=` / `diag=`). The
+//! `--json` view carries `channel` as STRUCTURE beside the verbatim `line`, which is what bumped
+//! its schema to 2.
 //!
 //! # Following (`--follow`, issue #774)
 //!
@@ -115,7 +159,76 @@ use std::path::{Path, PathBuf};
 /// The stable `--json` schema version. Owned by this reader, independent of
 /// [`crate::stats`]' and [`crate::reliability`]'s own `JSON_SCHEMA_VERSION` — the three readers
 /// version their wires separately, so one can change without forcing a bump on the others.
-const JSON_SCHEMA_VERSION: u32 = 1;
+/// Bumped 1 → 2 by issue #775: every record and the document itself gained a `channel` field, in
+/// EVERY view including the default one. `stats`' precedent for adding a field without a bump
+/// rests on `skip_serializing_if` — the key is simply absent when it does not apply — which is
+/// not this case, so the honest signal is the bump. Independent of the sibling readers' versions,
+/// so this costs them nothing.
+const JSON_SCHEMA_VERSION: u32 = 2;
+
+/// Which of the daemon's two output channels a view reads (issue #775).
+///
+/// They are different files with different guarantees, which is why this is a selector rather
+/// than a merged default. The durable event log is GOVERNED — every field is a handle, an enum, a
+/// number or a timestamp by type-level construction ([`crate::observability::Event`]) and the
+/// whole channel passes the issue #15 redaction meter. `daemon.err.log` is the managed agent's raw
+/// stderr: it carries the diagnostic channel, but also anything else the process writes there,
+/// including PANIC PAYLOADS that passed no meter at all.
+///
+/// So [`Channel::Event`] is the default and `all` is not: widening a bare `sessiometer log` to
+/// include an ungoverned channel would move that exposure onto every operator who never asked
+/// for it.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum Channel {
+    /// The durable event log — the default, and the only channel a bare `sessiometer log` reads.
+    Event,
+    /// The managed daemon's stderr file: the issue #77 diagnostic channel, ungoverned.
+    Diag,
+    /// Both, merged in timestamp order (see [`merge`]).
+    All,
+}
+
+impl Channel {
+    /// The `key=` a line of this channel names its KIND with: `event=` on the durable log,
+    /// `diag=` on the diagnostic channel.
+    ///
+    /// This is the whole reason `--event` keeps working across the selector without a second
+    /// flag. Both channels are written in the same whitespace-delimited `key=val` grammar and
+    /// both spell "which kind of line is this" in one token — they just spell it with a different
+    /// key, because they are different taxonomies (`event=swap` is a durable fact,
+    /// `diag=tick` is a per-cycle observation). Filtering by the channel's OWN key is what makes
+    /// `--event tick --channel diag` mean what an operator expects.
+    fn name_key(self) -> &'static str {
+        match self {
+            Channel::Event => "event",
+            // `All` reads both sources, but each SOURCE is selected under its own channel, so
+            // this arm is only ever reached through `Channel::Diag`.
+            Channel::Diag | Channel::All => "diag",
+        }
+    }
+
+    /// Parse a `--channel` value, or `None` for anything outside the closed set.
+    ///
+    /// The tokens are exactly what [`Channel::as_str`] emits, so the flag an operator types and
+    /// the value `--json` reports back are provably the same vocabulary.
+    pub(crate) fn parse(raw: &str) -> Option<Channel> {
+        match raw.trim() {
+            "event" => Some(Channel::Event),
+            "diag" => Some(Channel::Diag),
+            "all" => Some(Channel::All),
+            _ => None,
+        }
+    }
+
+    /// The channel token for the `--json` view and for the notice.
+    fn as_str(self) -> &'static str {
+        match self {
+            Channel::Event => "event",
+            Channel::Diag => "diag",
+            Channel::All => "all",
+        }
+    }
+}
 
 /// Parsed `log` options (issue #773). A plain comparable value so the CLI parser is
 /// unit-testable by value, like `StatsArgs` and `ReliabilityArgs`.
@@ -134,6 +247,9 @@ pub(crate) struct LogArgs {
     /// `-f` / `--follow` (issue #774) — after the initial render, keep reading newly appended
     /// lines until the process is interrupted or the downstream pipe closes.
     pub(crate) follow: bool,
+    /// `--channel <event|diag|all>` (issue #775) — which output channel to read.
+    /// [`Channel::Event`] is the default, and a bare `sessiometer log` never widens past it.
+    pub(crate) channel: Channel,
 }
 
 /// How long the follower waits between cycles.
@@ -160,10 +276,10 @@ pub(crate) fn run(args: LogArgs) -> Result<()> {
 /// and exits `0`. So does a log with no matching line — the notice distinguishes *no file*, *an
 /// empty file*, and *no match*, so a silent exit never has to be guessed at.
 fn run_once(args: LogArgs) -> Result<()> {
-    let text = read_event_log()?;
+    let sources = read_channels(args.channel)?;
     // Resolved BEFORE selecting, so the cutoff is a plain integer the pure path filters by.
     let window = resolve_window(args.since.as_deref())?;
-    let view = select(text.as_deref(), window, args.event.as_deref());
+    let view = view_of(&sources, args.channel, window, args.event.as_deref());
     let rendered = if args.json {
         render_json(&view)?
     } else {
@@ -229,6 +345,37 @@ fn write_stream(sink: &mut impl Write, text: &str) -> Result<Pipe> {
     }
 }
 
+/// One channel's text as read, or `None` when that channel's file does not exist.
+#[derive(Debug, PartialEq)]
+struct Source {
+    /// Which channel this text came from — carried so a merged view can say, per line, which
+    /// file it was read out of without inspecting the line itself.
+    channel: Channel,
+    /// The whole file, or `None` when there is none.
+    text: Option<String>,
+}
+
+/// Read the file(s) the selector asks for, in merge order.
+///
+/// [`Channel::All`] reads BOTH, and reads the event log first — the tie-break order the merge
+/// documents, fixed here rather than at the merge so the two cannot disagree.
+fn read_channels(channel: Channel) -> Result<Vec<Source>> {
+    let mut sources = Vec::new();
+    if matches!(channel, Channel::Event | Channel::All) {
+        sources.push(Source {
+            channel: Channel::Event,
+            text: read_event_log()?,
+        });
+    }
+    if matches!(channel, Channel::Diag | Channel::All) {
+        sources.push(Source {
+            channel: Channel::Diag,
+            text: read_channel_at(&crate::paths::daemon_stderr_log()?)?,
+        });
+    }
+    Ok(sources)
+}
+
 /// The event-log text, or `None` when there is no log file at all.
 ///
 /// Unlike [`crate::reliability`]'s read — which folds an absent file into an empty aggregate,
@@ -236,14 +383,16 @@ fn write_stream(sink: &mut impl Write, text: &str) -> Result<Pipe> {
 /// "the daemon has never run" and "the daemon ran and recorded nothing" are different answers to
 /// the operator's question, and issue #773 asks for the first to be said plainly.
 fn read_event_log() -> Result<Option<String>> {
-    read_event_log_at(&crate::observability::log_path()?)
+    read_channel_at(&crate::observability::log_path()?)
 }
 
-/// [`read_event_log`] against an explicit path — the seam that makes the absent-file arm
-/// testable. The production path is not injectable (it resolves through `getpwuid`, deliberately,
-/// so it cannot be spoofed by an environment variable), so without this split the `NotFound`
+/// Read a channel's file at an explicit path — the seam that makes the absent-file arm testable,
+/// and (since issue #775) the one read shared by both channels.
+///
+/// The production paths are not injectable (they resolve through `getpwuid`, deliberately, so
+/// they cannot be spoofed by an environment variable), so without this split the `NotFound`
 /// branch could only be reached by interposing on `open`.
-fn read_event_log_at(path: &Path) -> Result<Option<String>> {
+fn read_channel_at(path: &Path) -> Result<Option<String>> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(Some(text)),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -271,7 +420,10 @@ fn now_epoch() -> i64 {
 /// which error a rejection maps to, which is per-verb by design — that module returning `Option`
 /// rather than `Result` IS this split. Folding the type itself would save ~20 lines at the cost of
 /// a shared surface neither verb has yet asked to evolve together.
-#[derive(Debug, PartialEq)]
+/// `Clone` since issue #775: a `--channel all` view resolves the window ONCE and hands a copy to
+/// each source's [`select`], so its two halves are provably bounded by the same cutoff rather
+/// than by two independent clock reads.
+#[derive(Debug, PartialEq, Clone)]
 struct Window {
     /// The raw `--since` value, trimmed, echoed verbatim in the notice (e.g. `"7d"`).
     since_arg: String,
@@ -333,8 +485,20 @@ struct Selected<'a> {
     line: &'a str,
     /// The `ts=` value, or `None` when the line carries none.
     ts: Option<&'a str>,
-    /// The `event=` value, or `None` when the line carries none.
+    /// The line's KIND token — its `event=` value on the durable log, its `diag=` value on the
+    /// diagnostic channel ([`Channel::name_key`]). `None` when the line carries none, which on
+    /// the diagnostic channel is ordinary: raw stderr and panic payloads name no kind.
     event: Option<&'a str>,
+    /// Which channel this line was read from (issue #775).
+    channel: Channel,
+    /// Where this line sits in time, as epoch seconds — its own `ts=` when that parses, else the
+    /// value CARRIED FORWARD from the nearest preceding line of the same source that had one.
+    /// `None` only for a line with no `ts=` and no timestamped predecessor.
+    ///
+    /// Carrying rather than re-deriving is what places an untimestamped line — a panic payload,
+    /// the startup `eprintln!` — where it actually happened relative to its own channel. See
+    /// [`select`] for why the carry is scoped to the diagnostic channel.
+    at: Option<i64>,
 }
 
 /// Everything the reader was asked for and everything it found — the single value both renderers
@@ -345,12 +509,31 @@ struct LogView<'a> {
     window: Option<Window>,
     /// The `--event` token; `None` when the flag was absent.
     event: Option<&'a str>,
-    /// `false` when there is no log file at all — distinct from a file with zero lines.
-    log_present: bool,
-    /// Every line that passed both filters, in file order.
+    /// The `--channel` selector as the operator gave it (issue #775) — `All` for a merged view,
+    /// NOT the channel of any one line (that rides on each [`Selected`]).
+    channel: Channel,
+    /// Whether each source's file exists, in merge order. A `Vec` rather than a bool because
+    /// [`Channel::All`] can find one channel and not the other, and the notice has to be able to
+    /// say WHICH — "no diagnostics" and "no daemon has ever run" are different answers.
+    present: Vec<(Channel, bool)>,
+    /// Every line that passed both filters, in file order (or merged order for `All`).
     matched: Vec<Selected<'a>>,
-    /// Every line the log held, filters aside — the denominator of the match count.
+    /// Every line the sources held, filters aside — the denominator of the match count.
     n_scanned: usize,
+}
+
+impl LogView<'_> {
+    /// Whether at least one of the read channels has a file on disk.
+    fn any_present(&self) -> bool {
+        self.present.iter().any(|(_, present)| *present)
+    }
+
+    /// Whether the named channel was read AND its file exists.
+    fn channel_present(&self, channel: Channel) -> bool {
+        self.present
+            .iter()
+            .any(|(read, present)| *read == channel && *present)
+    }
 }
 
 /// The value of `key=` in `line`, or `None` when the key is absent.
@@ -370,56 +553,171 @@ fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
         .next_back()
 }
 
-/// Select the lines matching both filters, in file order. Pure — the whole reader below the file
-/// and clock reads, so every behaviour here is testable from a `&str`.
+/// Select ONE source's lines matching both filters, in file order. Pure — the whole reader below
+/// the file and clock reads, so every behaviour here is testable from a `&str`.
+///
+/// Channel-agnostic by construction: the text arrives as an argument and the channel supplies its
+/// own KIND key ([`Channel::name_key`]), so issue #775 added a *source* here rather than a second
+/// filter. `--event tick --channel diag` therefore selects `diag=tick`, because "which kind of
+/// line is this" is the same question on both channels — spelled with a different key.
+///
+/// # Placing a line in time, and why the two channels differ
 ///
 /// A line whose `ts=` is missing or unparseable is dropped from a WINDOWED view: it cannot be
 /// placed in time, so it is not provably in-window. That is the tolerant-drop precedent
-/// [`crate::reliability`]'s fold already sets. Without `--since` no timestamp is consulted at
-/// all, so such a line is emitted like any other.
+/// [`crate::reliability`]'s fold already sets, and issue #773's behaviour, unchanged.
+///
+/// On the DIAGNOSTIC channel a line is first given the chance to inherit one. The difference is
+/// not a preference, it is the two grammars: every durable line is written by
+/// [`crate::observability::Event::to_log_line`] as `ts=… event=…`, so an untimestamped one there
+/// is MALFORMED and dropping it is right. `daemon.err.log` is raw process stderr, where an
+/// untimestamped line is ORDINARY — a panic payload, the startup notice — and dropping it would
+/// silently discard exactly what an operator opened the ungoverned channel to see. Inheriting the
+/// nearest preceding timestamp places such a line where it actually happened, and a line with no
+/// timestamped predecessor at all still has no placement and still drops under a window.
+///
+/// Without `--since` no timestamp bounds anything, so every line is emitted regardless; the
+/// carried value is still recorded, because [`merge`] orders by it.
 fn select<'a>(
     text: Option<&'a str>,
     window: Option<Window>,
     event: Option<&'a str>,
+    channel: Channel,
 ) -> LogView<'a> {
     // `None` IS the absent-file state, so the two cannot disagree — there is no way to ask for
     // "present, but here is no text" or "absent, but here is some".
-    let log_present = text.is_some();
+    let present = vec![(channel, text.is_some())];
     let cutoff = window.as_ref().map(|w| w.cutoff_epoch);
+    let carries = channel == Channel::Diag;
     let mut matched = Vec::new();
     let mut n_scanned = 0usize;
+    // The running carry, advanced by every timestamped line — INCLUDING one a filter later
+    // drops, so a filtered-out line can never break the chain for the lines after it.
+    let mut carried: Option<i64> = None;
     for line in text.unwrap_or("").lines() {
         n_scanned += 1;
         let ts = field(line, "ts");
-        let line_event = field(line, "event");
+        // ONE lookup, keyed by the channel — not a branch that special-cases the event channel
+        // back to a hard-coded `"event"`. `name_key` is the single place that mapping lives, so
+        // it cannot drift out of step with itself.
+        let line_name = field(line, channel.name_key());
+        let own = ts.and_then(epoch_from_rfc3339);
+        if own.is_some() {
+            carried = own;
+        }
+        let at = if carries { own.or(carried) } else { own };
         if let Some(cutoff) = cutoff {
-            // A line with no parseable `ts=` cannot be placed in time, so it is not provably
-            // in-window and drops alongside the genuinely older lines — the tolerant-drop
-            // precedent, stated as the drop condition it is.
-            let out_of_window = ts.and_then(epoch_from_rfc3339).is_none_or(|at| at < cutoff);
-            if out_of_window {
+            // Not provably in-window ⇒ dropped: either no placement at all, or one that is
+            // genuinely older than the cutoff.
+            if at.is_none_or(|at| at < cutoff) {
                 continue;
             }
         }
         // Exact token equality, not a prefix or substring: `--event swap` must not also match a
         // hypothetical `swap_failed`.
         if let Some(wanted) = event {
-            if line_event != Some(wanted) {
+            if line_name != Some(wanted) {
                 continue;
             }
         }
         matched.push(Selected {
             line,
             ts,
-            event: line_event,
+            event: line_name,
+            channel,
+            at,
         });
     }
     LogView {
         window,
         event,
-        log_present,
+        channel,
+        present,
         matched,
         n_scanned,
+    }
+}
+
+/// Interleave two single-source views into one, in timestamp order (issue #775).
+///
+/// A two-pointer MERGE, not a sort of the concatenation, and the difference is the whole point:
+/// a merge takes lines off the front of each already-in-order source, so **each source's own file
+/// order is preserved structurally** — it cannot be violated even if a file turns out not to be
+/// internally monotone (a clock step, an interleaved writer). That matters most for the thing the
+/// diagnostic channel exists to show: a panic backtrace is a run of untimestamped lines that all
+/// carry the same inherited timestamp, and it must stay contiguous and in order. A sort with any
+/// tie-break over a key they all share could shuffle it; this cannot.
+///
+/// Ties resolve EVENT-first, matching the read order [`read_channels`] fixes. A line with no
+/// placement at all (`at == None`) sorts before every placed line of its own source, which is
+/// where it is in its file — nothing preceded it there.
+fn merge<'a>(events: LogView<'a>, diags: LogView<'a>) -> LogView<'a> {
+    let mut matched = Vec::with_capacity(events.matched.len() + diags.matched.len());
+    let mut left = events.matched.into_iter().peekable();
+    let mut right = diags.matched.into_iter().peekable();
+    loop {
+        // `None` (unplaceable) sorts first, which is what `Option`'s own ordering already says.
+        let take_left = match (left.peek(), right.peek()) {
+            (Some(l), Some(r)) => l.at <= r.at,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => break,
+        };
+        // `expect` over `unwrap`: the peek above proved the side is non-empty.
+        if take_left {
+            matched.push(left.next().expect("peeked"));
+        } else {
+            matched.push(right.next().expect("peeked"));
+        }
+    }
+    let mut present = events.present;
+    present.extend(diags.present);
+    LogView {
+        window: events.window,
+        event: events.event,
+        channel: Channel::All,
+        present,
+        matched,
+        n_scanned: events.n_scanned + diags.n_scanned,
+    }
+}
+
+/// Compose the view for whichever channel(s) were read — one [`select`], or two and a [`merge`].
+///
+/// The `window` is cloned into each source rather than resolved twice: one clock read, one
+/// cutoff, so a merged view's two halves are provably bounded by the SAME window.
+fn view_of<'a>(
+    sources: &'a [Source],
+    channel: Channel,
+    window: Option<Window>,
+    event: Option<&'a str>,
+) -> LogView<'a> {
+    let mut views: Vec<LogView<'a>> = sources
+        .iter()
+        .map(|source| {
+            select(
+                source.text.as_deref(),
+                window.clone(),
+                event,
+                source.channel,
+            )
+        })
+        .collect();
+    // Right-to-left, so the two pops come off in read order (event, then diag).
+    match (views.pop(), views.pop()) {
+        (Some(diags), Some(events)) => merge(events, diags),
+        (Some(single), None) => single,
+        // Unreachable in practice: `read_channels` yields at least one source for every
+        // `Channel`. Rendered as an empty view rather than a panic — a reader has no business
+        // aborting over an internally-impossible state.
+        _ => LogView {
+            window,
+            event,
+            channel,
+            present: Vec::new(),
+            matched: Vec::new(),
+            n_scanned: 0,
+        },
     }
 }
 
@@ -454,7 +752,16 @@ fn render_text(view: &LogView) -> Rendered {
 fn render_json(view: &LogView) -> Result<Rendered> {
     let wire = LogWire {
         schema: JSON_SCHEMA_VERSION,
-        log_present: view.log_present,
+        channel: view.channel.as_str(),
+        log_present: view.any_present(),
+        present: view
+            .present
+            .iter()
+            .map(|(channel, present)| ChannelPresenceWire {
+                channel: channel.as_str(),
+                present: *present,
+            })
+            .collect(),
         window: view.window.as_ref().map(|w| WindowWire {
             since: w.since_arg.as_str(),
             cutoff: w.cutoff_rfc3339(),
@@ -468,6 +775,7 @@ fn render_json(view: &LogView) -> Result<Rendered> {
             .map(|s| RecordWire {
                 ts: s.ts,
                 event: s.event,
+                channel: s.channel.as_str(),
                 line: s.line,
             })
             .collect(),
@@ -488,8 +796,31 @@ fn render_json(view: &LogView) -> Result<Rendered> {
 /// the lines do not already say, and silence keeps the common case clean.
 fn notice(view: &LogView) -> String {
     let mut notice = String::new();
-    if !view.log_present {
-        notice.push_str("no event log yet — the daemon has not run\n");
+    // The diagnostic channel is UNGOVERNED (issue #775): unlike the event log, whose every field
+    // is a handle / enum / number / timestamp by construction and which passes the issue #15
+    // redaction meter, this is raw process stderr and can carry anything the daemon printed —
+    // including a panic payload that passed no meter. Said once, up front, whenever the operator
+    // opted in, because the exposure travels with wherever these bytes are piped or pasted next.
+    if matches!(view.channel, Channel::Diag | Channel::All) {
+        notice.push_str(
+            "note: the diagnostic channel is the daemon's raw stderr — unlike the event log it \
+             is not redaction-checked, and can carry panic output\n",
+        );
+    }
+    // An absent diagnostic file is not a cold install, it is a knob that is off — so it gets the
+    // instruction that resolves it rather than the event log's "the daemon has not run".
+    if matches!(view.channel, Channel::Diag | Channel::All) && !view.channel_present(Channel::Diag)
+    {
+        notice.push_str(
+            "no diagnostics yet — a managed daemon writes them only with `verbose = true` under \
+             [tunables] in the config (`sessiometer config path`), effective at the next daemon \
+             start (`sessiometer daemon restart`)\n",
+        );
+    }
+    if !view.any_present() {
+        if view.channel != Channel::Diag {
+            notice.push_str("no event log yet — the daemon has not run\n");
+        }
         return notice;
     }
     if let Some(window) = &view.window {
@@ -503,7 +834,19 @@ fn notice(view: &LogView) -> String {
         notice.push_str(&format!("filter: event={event}\n"));
     }
     if view.n_scanned == 0 {
-        notice.push_str("the event log is empty — no events recorded yet\n");
+        // Named for the channel actually read: "the event log is empty" would be a false
+        // statement about a different file when the operator asked for `--channel diag`.
+        match view.channel {
+            Channel::Event => {
+                notice.push_str("the event log is empty — no events recorded yet\n");
+            }
+            Channel::Diag => {
+                notice.push_str("the diagnostic channel is empty — nothing recorded yet\n");
+            }
+            Channel::All => {
+                notice.push_str("both channels are empty — nothing recorded yet\n");
+            }
+        }
     } else if view.matched.is_empty() {
         notice.push_str("no matching events\n");
     } else if view.window.is_some() || view.event.is_some() {
@@ -516,25 +859,38 @@ fn notice(view: &LogView) -> String {
     notice
 }
 
-/// The `--json` document (schema 1). Named for its verb, like `StatsWire` and
+/// The `--json` document (schema 2). Named for its verb, like `StatsWire` and
 /// `ReliabilityWire`.
 #[derive(Serialize)]
 struct LogWire<'a> {
     /// The schema version — bumped on any change a consumer could not ignore.
     schema: u32,
-    /// `false` when there is no log file at all, so a script can tell a cold install from a
-    /// quiet one without parsing prose.
+    /// The `--channel` selector this document answers: `event`, `diag`, or `all`.
+    channel: &'static str,
+    /// `false` when NO read channel has a file, so a script can tell a cold install from a quiet
+    /// one without parsing prose. Under `--channel all` it is the disjunction; `present` below
+    /// carries the per-channel detail.
     log_present: bool,
+    /// Per-channel presence, one entry per channel read — the field that distinguishes "no
+    /// diagnostics because the knob is off" from "no daemon has ever run".
+    present: Vec<ChannelPresenceWire>,
     /// The resolved `--since` window, or `null` when the whole log was read.
     window: Option<WindowWire<'a>>,
     /// The `--event` filter, or `null` when every event was read.
     event: Option<&'a str>,
-    /// Lines the log held, filters aside.
+    /// Lines the sources held, filters aside.
     n_scanned: usize,
     /// Lines that matched — always `records.len()`.
     n_matched: usize,
-    /// One record per matched line, in file order.
+    /// One record per matched line, in file order (merged order under `--channel all`).
     records: Vec<RecordWire<'a>>,
+}
+
+/// Whether one read channel has a file on disk.
+#[derive(Serialize)]
+struct ChannelPresenceWire {
+    channel: &'static str,
+    present: bool,
 }
 
 /// The resolved window, on the wire.
@@ -548,10 +904,17 @@ struct WindowWire<'a> {
 
 /// One matched line, on the wire. `ts` and `event` are the line's own tokens; `line` is the
 /// durable line itself, verbatim.
+///
+/// `channel` is the one field here that is READER-authored rather than read out of the line, and
+/// it is why `--channel all` needs no marker interpolated into `line`: the JSON view can say
+/// which file a record came from as structure, leaving the line itself byte-faithful
+/// (CONSTRAINT-A). In the TEXT view the line says it itself — the durable log spells its kind
+/// `event=`, the diagnostic channel spells it `diag=`.
 #[derive(Serialize)]
 struct RecordWire<'a> {
     ts: Option<&'a str>,
     event: Option<&'a str>,
+    channel: &'static str,
     line: &'a str,
 }
 
@@ -568,6 +931,9 @@ struct FollowRecordWire<'a> {
     schema: u32,
     ts: Option<&'a str>,
     event: Option<&'a str>,
+    /// Which channel the record came from — carried per record for the same reason `schema` is:
+    /// a follow stream has no header a late-attaching consumer could have read.
+    channel: &'static str,
     line: &'a str,
 }
 
@@ -829,8 +1195,16 @@ fn read_forward(path: &Path, offset: u64) -> Result<(String, u64)> {
 ///
 /// The window is described as bounding the BACKFILL specifically, because that is the only thing
 /// it can bound — see the module docs.
-fn follow_header(window: Option<&Window>, event: Option<&str>) -> String {
+fn follow_header(window: Option<&Window>, event: Option<&str>, channel: Channel) -> String {
     let mut header = String::new();
+    // Said before the first line, for the same reason the one-shot notice says it (issue #775):
+    // this channel is raw stderr and is not redaction-checked.
+    if channel == Channel::Diag {
+        header.push_str(
+            "note: the diagnostic channel is the daemon's raw stderr — unlike the event log it \
+             is not redaction-checked, and can carry panic output\n",
+        );
+    }
     if let Some(window) = window {
         header.push_str(&format!(
             "window: backfilling events at/after {} (--since {}); newer lines stream as they arrive\n",
@@ -841,7 +1215,11 @@ fn follow_header(window: Option<&Window>, event: Option<&str>) -> String {
     if let Some(event) = event {
         header.push_str(&format!("filter: event={event}\n"));
     }
-    header.push_str("following the event log — press Ctrl-C to stop\n");
+    header.push_str(match channel {
+        Channel::Event => "following the event log — press Ctrl-C to stop\n",
+        // `All` cannot reach here: `run_follow` rejects it before a follower is built.
+        Channel::Diag | Channel::All => "following the diagnostic channel — press Ctrl-C to stop\n",
+    });
     header
 }
 
@@ -894,6 +1272,7 @@ fn render_follow(view: &LogView, json: bool) -> Result<String> {
             schema: JSON_SCHEMA_VERSION,
             ts: selected.ts,
             event: selected.event,
+            channel: selected.channel.as_str(),
             line: selected.line,
         };
         out.push_str(
@@ -903,6 +1282,24 @@ fn render_follow(view: &LogView, json: bool) -> Result<String> {
         out.push('\n');
     }
     Ok(out)
+}
+
+/// What a follow was asked for — the filters and the view shape, as one value.
+///
+/// Grouped rather than passed as four parameters because they ARE one thing (what the operator
+/// typed), and because `window` is CONSUMED by the first batch: keeping it beside the filters
+/// that outlive it makes the asymmetry visible at the call site instead of hiding it in an
+/// argument list long enough to have to be counted.
+struct FollowAsk<'a> {
+    /// The resolved `--since` window, `take()`n by the first attached batch (see [`follow_loop`]).
+    window: Option<Window>,
+    /// The `--event` kind filter, applied to every streamed line.
+    event: Option<&'a str>,
+    /// `--json` — render JSON Lines instead of the text view.
+    json: bool,
+    /// The single channel being followed. Never [`Channel::All`]: [`run_follow`] refuses that
+    /// before a follower is built.
+    channel: Channel,
 }
 
 /// Poll, render, emit — until the downstream closes or `tick` says to stop.
@@ -921,14 +1318,15 @@ fn render_follow(view: &LogView, json: bool) -> Result<String> {
 /// drive. A header emitted by the wiring above would be a line no test could observe.
 fn follow_loop(
     follower: &mut Follower,
-    mut window: Option<Window>,
-    event: Option<&str>,
-    json: bool,
+    mut ask: FollowAsk<'_>,
     data: &mut impl Write,
     notice: &mut impl Write,
     mut tick: impl FnMut() -> Flow,
 ) -> Result<()> {
-    write_stream(notice, &follow_header(window.as_ref(), event))?;
+    write_stream(
+        notice,
+        &follow_header(ask.window.as_ref(), ask.event, ask.channel),
+    )?;
     let mut previous = None;
     loop {
         let polled = follower.poll()?;
@@ -939,12 +1337,12 @@ fn follow_loop(
         previous = Some(polled.transition);
         if !polled.text.is_empty() {
             let backfill = if polled.transition == Transition::Attached {
-                window.take()
+                ask.window.take()
             } else {
                 None
             };
-            let view = select(Some(&polled.text), backfill, event);
-            rendered.out = render_follow(&view, json)?;
+            let view = select(Some(&polled.text), backfill, ask.event, ask.channel);
+            rendered.out = render_follow(&view, ask.json)?;
         }
         // A closed `| head` is the ordinary end of a follow, not a failure — but it must END it,
         // or the loop would re-render into a pipe nobody reads for as long as the daemon runs.
@@ -1000,15 +1398,30 @@ fn hung_up(fd: std::os::unix::io::RawFd) -> bool {
 /// The window is resolved before the first read ([`resolve_window`]), so a malformed `--since` is
 /// rejected before any output — exactly as on the one-shot path.
 fn run_follow(args: LogArgs) -> Result<()> {
+    // `--follow --channel all` is refused rather than approximated (issue #775). A one-shot merge
+    // can order two COMPLETE files; a live one cannot, because ordering the next line means
+    // holding it back until the other channel has produced something at least as late — which on
+    // a quiet channel is never. The choice would be between stalling one stream indefinitely and
+    // emitting out of order, and both are worse than saying so.
+    if args.channel == Channel::All {
+        return Err(Error::LogFollowAllUnsupported);
+    }
     let window = resolve_window(args.since.as_deref())?;
-    let mut follower = Follower::new(crate::observability::log_path()?);
+    let path = match args.channel {
+        Channel::Diag => crate::paths::daemon_stderr_log()?,
+        Channel::Event | Channel::All => crate::observability::log_path()?,
+    };
+    let mut follower = Follower::new(path);
     let mut data = std::io::stdout().lock();
     let mut notice = std::io::stderr().lock();
     follow_loop(
         &mut follower,
-        window,
-        args.event.as_deref(),
-        args.json,
+        FollowAsk {
+            window,
+            event: args.event.as_deref(),
+            json: args.json,
+            channel: args.channel,
+        },
         &mut data,
         &mut notice,
         || {
@@ -1067,7 +1480,7 @@ ts=2026-07-11T03:00:00Z event=swap from=spare to=oleksii@pelykh.com reason=sessi
 
     #[test]
     fn no_flags_emits_every_line_in_file_order_byte_identical() {
-        let view = select(Some(FIXTURE_LOG), None, None);
+        let view = select(Some(FIXTURE_LOG), None, None, Channel::Event);
         assert_eq!(view.n_scanned, 4);
         assert_eq!(view.matched.len(), 4);
         let rendered = render_text(&view);
@@ -1085,6 +1498,7 @@ ts=2026-07-11T03:00:00Z event=swap from=spare to=oleksii@pelykh.com reason=sessi
             Some(FIXTURE_LOG),
             Some(window("1h", "2026-07-11T03:00:00Z")),
             None,
+            Channel::Event,
         );
         assert_eq!(view.matched.len(), 2);
         assert_eq!(
@@ -1110,11 +1524,16 @@ ts=2026-07-11T03:00:00Z event=swap from=spare to=oleksii@pelykh.com reason=sessi
         // Tolerant-drop, mirroring the sibling reader: unplaceable ⇒ not provably in-window.
         let log =
             "ts=nonsense event=swap from=a to=b\nts=2026-07-11T03:00:00Z event=swap from=b to=a\n";
-        let windowed = select(Some(log), Some(window("1h", "2026-07-11T03:00:00Z")), None);
+        let windowed = select(
+            Some(log),
+            Some(window("1h", "2026-07-11T03:00:00Z")),
+            None,
+            Channel::Event,
+        );
         assert_eq!(windowed.matched.len(), 1);
         assert_eq!(windowed.matched[0].ts, Some("2026-07-11T03:00:00Z"));
         // But with no window, no timestamp is consulted, so the same line is emitted like any other.
-        let whole = select(Some(log), None, None);
+        let whole = select(Some(log), None, None, Channel::Event);
         assert_eq!(whole.matched.len(), 2);
     }
 
@@ -1138,7 +1557,7 @@ ts=2026-07-11T03:00:00Z event=swap from=spare to=oleksii@pelykh.com reason=sessi
 
     #[test]
     fn event_filter_matches_the_token_exactly() {
-        let view = select(Some(FIXTURE_LOG), None, Some("swap"));
+        let view = select(Some(FIXTURE_LOG), None, Some("swap"), Channel::Event);
         assert_eq!(view.matched.len(), 2);
         assert!(view.matched.iter().all(|s| s.event == Some("swap")));
         let rendered = render_text(&view);
@@ -1149,9 +1568,16 @@ ts=2026-07-11T03:00:00Z event=swap from=spare to=oleksii@pelykh.com reason=sessi
         // EXACT, not a prefix or substring: a longer token that merely starts with the filter
         // must not match, or `--event swap` would silently widen as new events are added.
         let log = "ts=2026-07-11T00:00:00Z event=swap_failed acct=u-A\n";
-        assert_eq!(select(Some(log), None, Some("swap")).matched.len(), 0);
         assert_eq!(
-            select(Some(log), None, Some("swap_failed")).matched.len(),
+            select(Some(log), None, Some("swap"), Channel::Event)
+                .matched
+                .len(),
+            0
+        );
+        assert_eq!(
+            select(Some(log), None, Some("swap_failed"), Channel::Event)
+                .matched
+                .len(),
             1
         );
     }
@@ -1165,6 +1591,7 @@ ts=2026-07-11T03:00:00Z event=swap from=spare to=oleksii@pelykh.com reason=sessi
             Some(FIXTURE_LOG),
             Some(window("1h", "2026-07-11T03:00:00Z")),
             Some("swap"),
+            Channel::Event,
         );
         assert_eq!(view.matched.len(), 1);
         assert_eq!(view.matched[0].ts, Some("2026-07-11T03:00:00Z"));
@@ -1176,7 +1603,12 @@ ts=2026-07-11T03:00:00Z event=swap from=spare to=oleksii@pelykh.com reason=sessi
 
     #[test]
     fn an_absent_event_token_says_no_matching_events_in_both_views() {
-        let view = select(Some(FIXTURE_LOG), None, Some("no_such_event"));
+        let view = select(
+            Some(FIXTURE_LOG),
+            None,
+            Some("no_such_event"),
+            Channel::Event,
+        );
         assert!(view.matched.is_empty());
 
         // Text view: empty stdout, but never an ambiguous silence.
@@ -1207,17 +1639,22 @@ ts=2026-07-11T03:00:00Z event=swap from=spare to=oleksii@pelykh.com reason=sessi
     #[test]
     fn the_three_empty_states_are_distinguishable() {
         // 1. No log file at all — a fresh install. A normal cold state, said plainly.
-        let absent = render_text(&select(None, None, None));
+        let absent = render_text(&select(None, None, None, Channel::Event));
         assert_eq!(absent.out, "");
         assert!(absent.notice.contains("no event log yet"));
 
         // 2. A log file with no lines — the daemon ran but recorded nothing.
-        let empty = render_text(&select(Some(""), None, None));
+        let empty = render_text(&select(Some(""), None, None, Channel::Event));
         assert_eq!(empty.out, "");
         assert!(empty.notice.contains("the event log is empty"));
 
         // 3. Lines, but none matching the filter.
-        let unmatched = render_text(&select(Some(FIXTURE_LOG), None, Some("nope")));
+        let unmatched = render_text(&select(
+            Some(FIXTURE_LOG),
+            None,
+            Some("nope"),
+            Channel::Event,
+        ));
         assert_eq!(unmatched.out, "");
         assert!(unmatched.notice.contains("no matching events"));
 
@@ -1228,7 +1665,7 @@ ts=2026-07-11T03:00:00Z event=swap from=spare to=oleksii@pelykh.com reason=sessi
 
     #[test]
     fn json_parses_and_carries_a_schema_and_one_record_per_matched_line() {
-        let view = select(Some(FIXTURE_LOG), None, Some("swap"));
+        let view = select(Some(FIXTURE_LOG), None, Some("swap"), Channel::Event);
         let rendered = render_json(&view).expect("serializes");
         let parsed: serde_json::Value =
             serde_json::from_str(&rendered.out).expect("output parses as JSON");
@@ -1259,6 +1696,7 @@ ts=2026-07-11T03:00:00Z event=swap from=spare to=oleksii@pelykh.com reason=sessi
             Some(FIXTURE_LOG),
             Some(window("1h", "2026-07-11T03:00:00Z")),
             None,
+            Channel::Event,
         ))
         .expect("serializes");
         let parsed: serde_json::Value = serde_json::from_str(&windowed.out).expect("parses");
@@ -1266,7 +1704,7 @@ ts=2026-07-11T03:00:00Z event=swap from=spare to=oleksii@pelykh.com reason=sessi
         assert_eq!(parsed["window"]["cutoff"], "2026-07-11T02:00:00Z");
 
         // A cold install still yields a valid, parseable document — never a bare notice.
-        let cold = render_json(&select(None, None, None)).expect("serializes");
+        let cold = render_json(&select(None, None, None, Channel::Event)).expect("serializes");
         let parsed: serde_json::Value = serde_json::from_str(&cold.out).expect("parses");
         assert_eq!(parsed["log_present"], false);
         assert_eq!(parsed["n_matched"], 0);
@@ -1293,12 +1731,13 @@ ts=2026-07-11T03:00:00Z event=swap from=spare to=oleksii@pelykh.com reason=sessi
         );
 
         for view in [
-            select(Some(FIXTURE_LOG), None, None),
-            select(Some(FIXTURE_LOG), None, Some("swap")),
+            select(Some(FIXTURE_LOG), None, None, Channel::Event),
+            select(Some(FIXTURE_LOG), None, Some("swap"), Channel::Event),
             select(
                 Some(FIXTURE_LOG),
                 Some(window("1h", "2026-07-11T03:00:00Z")),
                 None,
+                Channel::Event,
             ),
         ] {
             // Non-degeneracy per view: an empty selection satisfies containment vacuously.
@@ -1353,7 +1792,7 @@ ts=2026-07-11T03:00:00Z event=swap from=spare to=oleksii@pelykh.com reason=sessi
         // how a real interpolation regression would actually look.
         let poisoned = format!(
             "{}{smuggled}",
-            render_text(&select(Some(FIXTURE_LOG), None, None)).out
+            render_text(&select(Some(FIXTURE_LOG), None, None, Channel::Event)).out
         );
         assert!(
             !every_line_is_in(&poisoned, FIXTURE_LOG),
@@ -1375,9 +1814,12 @@ ts=2026-07-11T03:00:00Z event=swap from=spare to=oleksii@pelykh.com reason=sessi
     fn a_line_without_the_filtered_keys_is_handled_not_crashed() {
         let log = "a bare line with no key=val at all\nts=2026-07-11T00:00:00Z event=swap\n";
         // No window, no filter: everything is emitted, including the bare line.
-        assert_eq!(select(Some(log), None, None).matched.len(), 2);
+        assert_eq!(
+            select(Some(log), None, None, Channel::Event).matched.len(),
+            2
+        );
         // With an `--event` filter, the bare line has no `event=` and so cannot match.
-        let filtered = select(Some(log), None, Some("swap"));
+        let filtered = select(Some(log), None, Some("swap"), Channel::Event);
         assert_eq!(filtered.matched.len(), 1);
         assert_eq!(filtered.matched[0].ts, Some("2026-07-11T00:00:00Z"));
     }
@@ -1388,7 +1830,7 @@ ts=2026-07-11T03:00:00Z event=swap from=spare to=oleksii@pelykh.com reason=sessi
     /// here rather than silently shipping.
     #[test]
     fn emit_routes_the_data_to_stdout_and_the_notice_to_stderr() {
-        let view = select(Some(FIXTURE_LOG), None, Some("swap"));
+        let view = select(Some(FIXTURE_LOG), None, Some("swap"), Channel::Event);
         let rendered = render_text(&view);
         // Non-degeneracy: both streams must be non-empty, else the routing assertions below
         // would hold vacuously.
@@ -1419,7 +1861,7 @@ ts=2026-07-11T03:00:00Z event=swap from=spare to=oleksii@pelykh.com reason=sessi
     #[test]
     fn emit_writes_nothing_to_the_notice_stream_when_there_is_nothing_to_say() {
         // A plain `sessiometer log` over a non-empty log: stdout is the log, stderr untouched.
-        let rendered = render_text(&select(Some(FIXTURE_LOG), None, None));
+        let rendered = render_text(&select(Some(FIXTURE_LOG), None, None, Channel::Event));
         let (mut data, mut notice) = (Vec::new(), Vec::new());
         emit(&rendered, &mut data, &mut notice).expect("writes");
         assert_eq!(data, FIXTURE_LOG.as_bytes());
@@ -1441,7 +1883,7 @@ ts=2026-07-11T03:00:00Z event=swap from=spare to=oleksii@pelykh.com reason=sessi
 
     #[test]
     fn a_closed_downstream_is_success_but_a_real_io_error_is_not() {
-        let rendered = render_text(&select(Some(FIXTURE_LOG), None, None));
+        let rendered = render_text(&select(Some(FIXTURE_LOG), None, None, Channel::Event));
         // `sessiometer log | head -3` closes the pipe after three lines. For a reader that
         // advertises piping, that is the ordinary end of a stream, not a failure — and it must
         // not be the panic the crate's `print!`-based verbs produce.
@@ -1474,7 +1916,7 @@ ts=2026-07-11T03:00:00Z event=swap from=spare to=oleksii@pelykh.com reason=sessi
         // No file at all → `None`, and NOT an error.
         let missing = dir.path().join("sessiometer.log");
         assert_eq!(
-            read_event_log_at(&missing).expect("absent is not an error"),
+            read_channel_at(&missing).expect("absent is not an error"),
             None
         );
 
@@ -1482,7 +1924,7 @@ ts=2026-07-11T03:00:00Z event=swap from=spare to=oleksii@pelykh.com reason=sessi
         let empty = dir.path().join("empty.log");
         std::fs::write(&empty, "").expect("write");
         assert_eq!(
-            read_event_log_at(&empty).expect("readable"),
+            read_channel_at(&empty).expect("readable"),
             Some(String::new())
         );
 
@@ -1490,13 +1932,13 @@ ts=2026-07-11T03:00:00Z event=swap from=spare to=oleksii@pelykh.com reason=sessi
         let full = dir.path().join("full.log");
         std::fs::write(&full, FIXTURE_LOG).expect("write");
         assert_eq!(
-            read_event_log_at(&full).expect("readable"),
+            read_channel_at(&full).expect("readable"),
             Some(FIXTURE_LOG.to_string())
         );
 
         // The two cold states drive different notices end-to-end.
-        let absent = render_text(&select(None, None, None));
-        let empty = render_text(&select(Some(""), None, None));
+        let absent = render_text(&select(None, None, None, Channel::Event));
+        let empty = render_text(&select(Some(""), None, None, Channel::Event));
         assert!(absent.notice.contains("no event log yet"));
         assert!(empty.notice.contains("the event log is empty"));
     }
@@ -1571,9 +2013,12 @@ ts=2026-07-11T03:00:00Z event=swap from=spare to=oleksii@pelykh.com reason=sessi
         let mut steps = script.iter();
         follow_loop(
             &mut follower,
-            window,
-            event,
-            json,
+            FollowAsk {
+                window,
+                event,
+                json,
+                channel: Channel::Event,
+            },
             &mut data,
             &mut notice,
             || match steps.next() {
@@ -1946,9 +2391,12 @@ ts=2026-07-11T03:00:00Z event=swap from=spare to=oleksii@pelykh.com reason=sessi
         let mut cycles = 0usize;
         follow_loop(
             &mut follower,
-            None,
-            None,
-            false,
+            FollowAsk {
+                window: None,
+                event: None,
+                json: false,
+                channel: Channel::Event,
+            },
             &mut FailingSink(std::io::ErrorKind::BrokenPipe),
             &mut Vec::new(),
             || {
@@ -2013,10 +2461,14 @@ ts=2026-07-11T03:00:00Z event=swap from=spare to=oleksii@pelykh.com reason=sessi
     /// The header states what the follow was asked for — and that the window bounds the backfill.
     #[test]
     fn follow_header_states_the_window_the_filter_and_the_follow() {
-        let bare = follow_header(None, None);
+        let bare = follow_header(None, None, Channel::Event);
         assert_eq!(bare, "following the event log — press Ctrl-C to stop\n");
 
-        let full = follow_header(Some(&window("1h", "2026-07-11T03:00:00Z")), Some("swap"));
+        let full = follow_header(
+            Some(&window("1h", "2026-07-11T03:00:00Z")),
+            Some("swap"),
+            Channel::Event,
+        );
         assert!(full.contains("backfilling events at/after 2026-07-11T02:00:00Z (--since 1h)"));
         assert!(full.contains("newer lines stream as they arrive"));
         assert!(full.contains("filter: event=swap"));
@@ -2147,5 +2599,576 @@ ts=2026-07-11T03:00:00Z event=swap from=spare to=oleksii@pelykh.com reason=sessi
             .poll()
             .expect_err("invalid utf-8 must not be rendered lossily");
         assert!(matches!(err, Error::Io(_)), "got {err:?}");
+    }
+
+    // ---- `--channel` (issue #775) ------------------------------------------------------------
+
+    /// A representative diagnostic slice, in the shape [`crate::observability::Diagnostic`]
+    /// actually writes: the same `ts=` RFC 3339 the durable log uses, and the kind spelled
+    /// `diag=` rather than `event=`. Its timestamps deliberately fall BETWEEN [`FIXTURE_LOG`]'s,
+    /// so a merge that simply concatenated would be visibly wrong.
+    const FIXTURE_DIAG: &str = "\
+ts=2026-07-11T00:30:00Z diag=start accounts=2 poll_secs=60
+ts=2026-07-11T01:30:00Z diag=poll account=u-A outcome=live
+ts=2026-07-11T02:30:00Z diag=tick decision=hold
+";
+
+    /// The diagnostic channel as it really is: a timestamped line, then a run of raw stderr with
+    /// no `ts=` at all — the panic payload this channel exists to surface — then a further
+    /// timestamped line.
+    const FIXTURE_DIAG_PANIC: &str = "\
+ts=2026-07-11T01:30:00Z diag=tick decision=hold
+thread 'main' panicked at src/daemon.rs:1:1:
+called `Option::unwrap()` on a `None` value
+ts=2026-07-11T02:30:00Z diag=stop
+";
+
+    /// Build the `Source` list a `--channel` selector would produce, from fixture text rather
+    /// than the real files (which resolve through `getpwuid` and are not injectable).
+    fn sources(event: Option<&str>, diag: Option<&str>) -> Vec<Source> {
+        let mut sources = Vec::new();
+        if let Some(text) = event {
+            sources.push(Source {
+                channel: Channel::Event,
+                text: Some(text.to_owned()),
+            });
+        }
+        if let Some(text) = diag {
+            sources.push(Source {
+                channel: Channel::Diag,
+                text: Some(text.to_owned()),
+            });
+        }
+        sources
+    }
+
+    /// The `--channel` value set is closed, and its tokens are exactly the ones the JSON view
+    /// reports back — so what an operator types and what a script reads are one vocabulary.
+    #[test]
+    fn channel_parses_the_closed_set_and_rejects_everything_else() {
+        for (raw, expected) in [
+            ("event", Channel::Event),
+            ("diag", Channel::Diag),
+            ("all", Channel::All),
+        ] {
+            assert_eq!(Channel::parse(raw), Some(expected));
+            // Round-trip: the token parsed IS the token rendered.
+            assert_eq!(expected.as_str(), raw);
+        }
+        for bad in ["", "  ", "Event", "diagnostic", "both", "stderr", "events"] {
+            assert_eq!(Channel::parse(bad), None, "{bad:?} must be rejected");
+        }
+    }
+
+    /// **CONSTRAINT-C, the opt-in guarantee.** A bare `sessiometer log` reads the event log and
+    /// ONLY the event log, so the ungoverned channel is never widened into the default view.
+    ///
+    /// Asserted at the READ, not at the render: a view that read the diagnostic file and then
+    /// filtered every line out would satisfy an output-only check while having already loaded
+    /// the bytes. What must be true is that the file is not opened at all.
+    #[test]
+    fn the_default_channel_reads_the_event_log_and_nothing_else() {
+        // The parser's default — the value a bare `sessiometer log` carries — is `Event`.
+        // (`cli::tests::log_channel_defaults_to_event_and_parses_each_value` pins the argv side.)
+        let read = |channel: Channel| {
+            let mut asked = Vec::new();
+            if matches!(channel, Channel::Event | Channel::All) {
+                asked.push(Channel::Event);
+            }
+            if matches!(channel, Channel::Diag | Channel::All) {
+                asked.push(Channel::Diag);
+            }
+            asked
+        };
+        // This mirrors `read_channels`' selection exactly; the assertion below pins that the
+        // production function agrees, so the mirror cannot drift into a comfortable fiction.
+        assert_eq!(read(Channel::Event), vec![Channel::Event]);
+        assert_eq!(read(Channel::Diag), vec![Channel::Diag]);
+        assert_eq!(read(Channel::All), vec![Channel::Event, Channel::Diag]);
+
+        // The production selector, over the real `read_channels`: which channels it names.
+        for (asked, expected) in [
+            (Channel::Event, vec![Channel::Event]),
+            (Channel::Diag, vec![Channel::Diag]),
+            (Channel::All, vec![Channel::Event, Channel::Diag]),
+        ] {
+            let named: Vec<Channel> = read_channels(asked)
+                .expect("reading absent files is not an error")
+                .iter()
+                .map(|source| source.channel)
+                .collect();
+            assert_eq!(
+                named,
+                expected,
+                "--channel {} read {named:?}",
+                asked.as_str()
+            );
+        }
+    }
+
+    /// **CONSTRAINT-C, the redaction meter extended over the diagnostic read path** — with the
+    /// canary that proves the extension can actually fail.
+    ///
+    /// The diagnostic channel is raw process stderr: it never passed the issue #15 meter, and a
+    /// byte-faithful reader cannot scrub it. So the guarantee this reader can make is not "diag
+    /// output is clean" — it is that **the poison does not cross into the default view**, and
+    /// that the meter is genuinely watching. Both halves are here, and the second is what makes
+    /// the first non-vacuous: a guard that cannot be shown to fail proves nothing.
+    #[test]
+    fn a_poisoned_diagnostic_channel_never_reaches_the_default_view() {
+        use crate::redaction::meter;
+
+        // A token-shaped string, deliberately injected — the thing an ungoverned channel can
+        // carry that the event log's type-level construction makes impossible.
+        let poisoned = "\
+ts=2026-07-11T01:30:00Z diag=tick decision=hold
+thread 'main' panicked at src/keychain.rs:1:1: sk-ant-oat-LEAK0abc0def0ghi0jkl0mno0pqr0stu0vwx
+";
+        let secrets = meter::Secrets::meter_fixture();
+        // `FIXTURE_LOG` carries the operator's OWN label as an authored email (#444's permitted
+        // value), so it is passed as the allow-set rather than pretended away.
+        let authored = ["oleksii@pelykh.com"];
+
+        // The DEFAULT view, with the poisoned diagnostic file sitting right there on disk: the
+        // event channel alone, and it is meter-clean.
+        let default_sources = sources(Some(FIXTURE_LOG), Some(poisoned));
+        let default_view = view_of(&default_sources[..1], Channel::Event, None, None);
+        let default_out = render_text(&default_view).out;
+        assert!(
+            !default_out.is_empty(),
+            "the default view must select lines, else the meter passes vacuously"
+        );
+        meter::assert_clean(&default_out, &secrets, &authored);
+        assert!(
+            !default_out.contains("sk-ant-"),
+            "the default view must not carry a diagnostic-channel token"
+        );
+
+        // THE CANARY. The same meter, run over the same reader's DIAGNOSTIC view, finds the
+        // planted token — so the assertion above is a real gate and not a tautology about a
+        // scan that never fires.
+        let diag_view = view_of(&default_sources[1..], Channel::Diag, None, None);
+        let diag_out = render_text(&diag_view).out;
+        let findings = meter::scan(&diag_out, &secrets, &authored);
+        assert!(
+            findings
+                .iter()
+                .any(|f| matches!(f, meter::Finding::TokenPrefix { .. })),
+            "the meter must catch a token planted in the diagnostic channel, got {findings:?}"
+        );
+
+        // And `--channel all` DOES carry it — stated, not hidden. That is the whole reason the
+        // channel is opt-in and the notice says the channel is not redaction-checked.
+        let all_view = view_of(&default_sources, Channel::All, None, None);
+        let all = render_text(&all_view);
+        assert!(all.out.contains("sk-ant-"));
+        assert!(
+            all.notice.contains("not redaction-checked"),
+            "an opted-in view must say the channel is ungoverned, got {:?}",
+            all.notice
+        );
+    }
+
+    /// `--channel all` interleaves the two files by timestamp, and each source keeps its own
+    /// order. The fixtures' timestamps alternate, so a concatenation would be visibly wrong.
+    #[test]
+    fn all_merges_the_two_channels_in_timestamp_order() {
+        let sources = sources(Some(FIXTURE_LOG), Some(FIXTURE_DIAG));
+        let view = view_of(&sources, Channel::All, None, None);
+        assert_eq!(view.n_scanned, 7, "4 event lines + 3 diagnostic lines");
+
+        let timestamps: Vec<&str> = view.matched.iter().map(|s| s.ts.expect("ts")).collect();
+        assert_eq!(
+            timestamps,
+            vec![
+                "2026-07-11T00:00:00Z",
+                "2026-07-11T00:30:00Z",
+                "2026-07-11T01:00:00Z",
+                "2026-07-11T01:30:00Z",
+                "2026-07-11T02:00:00Z",
+                "2026-07-11T02:30:00Z",
+                "2026-07-11T03:00:00Z",
+            ],
+            "the merge must alternate, not concatenate"
+        );
+        // Each line's channel alternates with it — and comes from the SOURCE, not from guessing
+        // at the line's content.
+        let channels: Vec<Channel> = view.matched.iter().map(|s| s.channel).collect();
+        assert_eq!(
+            channels,
+            vec![
+                Channel::Event,
+                Channel::Diag,
+                Channel::Event,
+                Channel::Diag,
+                Channel::Event,
+                Channel::Diag,
+                Channel::Event,
+            ]
+        );
+
+        // Within each source, file order is preserved exactly.
+        for (channel, expected) in [(Channel::Event, FIXTURE_LOG), (Channel::Diag, FIXTURE_DIAG)] {
+            let kept: Vec<&str> = view
+                .matched
+                .iter()
+                .filter(|s| s.channel == channel)
+                .map(|s| s.line)
+                .collect();
+            assert_eq!(kept, expected.lines().collect::<Vec<_>>());
+        }
+    }
+
+    /// An untimestamped diagnostic line — a panic payload — is placed at the timestamp of the
+    /// line before it, so it lands where it happened instead of being dropped or floated to the
+    /// front. And the run stays CONTIGUOUS: a backtrace split across an event line would be
+    /// unreadable exactly when it matters most.
+    #[test]
+    fn an_untimestamped_diagnostic_line_inherits_its_predecessors_place() {
+        let sources = sources(Some(FIXTURE_LOG), Some(FIXTURE_DIAG_PANIC));
+        let view = view_of(&sources, Channel::All, None, None);
+
+        let lines: Vec<&str> = view.matched.iter().map(|s| s.line).collect();
+        let panicked = lines
+            .iter()
+            .position(|l| l.starts_with("thread 'main' panicked"))
+            .expect("the panic line must survive the merge");
+        // Contiguous with the diagnostic line it followed, and in its own order.
+        assert!(lines[panicked - 1].contains("diag=tick"));
+        assert!(lines[panicked + 1].contains("Option::unwrap()"));
+        // Placed at 01:30 (inherited), so it sits after the 01:00 event line and before 02:00.
+        assert!(lines[..panicked]
+            .iter()
+            .any(|l| l.contains("ts=2026-07-11T01:00:00Z")));
+        assert!(lines[panicked..]
+            .iter()
+            .any(|l| l.contains("ts=2026-07-11T02:00:00Z")));
+
+        // The inheritance is recorded, not merely implied by position.
+        let inherited = view.matched[panicked].at;
+        assert_eq!(inherited, view.matched[panicked - 1].at);
+        assert!(
+            view.matched[panicked].ts.is_none(),
+            "it carries no ts= of its own"
+        );
+    }
+
+    /// A window keeps an inherited placement — which is the point of inheriting one. Under
+    /// `--since` the panic payload survives with the diagnostic line it belongs to, rather than
+    /// being dropped as unplaceable and leaving a truncated crash.
+    ///
+    /// The EVENT channel keeps issue #773's tolerant-drop unchanged: there, an untimestamped line
+    /// is malformed (the log's grammar always writes `ts=`), not ordinary.
+    #[test]
+    fn a_window_keeps_an_inherited_placement_on_diag_and_still_drops_a_malformed_event_line() {
+        // 01:00 window at 03:00 admits the 01:30 tick — and the panic lines that inherit 01:30.
+        let diag = select(
+            Some(FIXTURE_DIAG_PANIC),
+            Some(window("2h", "2026-07-11T03:00:00Z")),
+            None,
+            Channel::Diag,
+        );
+        let lines: Vec<&str> = diag.matched.iter().map(|s| s.line).collect();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("thread 'main' panicked")),
+            "a windowed diagnostic view must keep the panic payload, got {lines:?}"
+        );
+        assert_eq!(lines.len(), 4, "all four lines are at/after the cutoff");
+
+        // A cutoff ABOVE the inherited timestamp drops the run with the line it belongs to —
+        // the inheritance places a line, it does not exempt it.
+        let later = select(
+            Some(FIXTURE_DIAG_PANIC),
+            Some(window("45m", "2026-07-11T03:00:00Z")),
+            None,
+            Channel::Diag,
+        );
+        assert_eq!(
+            later.matched.iter().map(|s| s.line).collect::<Vec<_>>(),
+            vec!["ts=2026-07-11T02:30:00Z diag=stop"]
+        );
+
+        // The event channel is UNCHANGED: an unplaceable line still drops, even after a
+        // well-formed one (no inheritance there).
+        let log = "ts=2026-07-11T03:00:00Z event=swap from=a to=b\nts=nonsense event=swap\n";
+        let events = select(
+            Some(log),
+            Some(window("1h", "2026-07-11T03:00:00Z")),
+            None,
+            Channel::Event,
+        );
+        assert_eq!(events.matched.len(), 1);
+        assert_eq!(events.matched[0].ts, Some("2026-07-11T03:00:00Z"));
+    }
+
+    /// `--event` filters by the channel's OWN kind key: `event=` on the durable log, `diag=` on
+    /// the diagnostic channel. Without this the flag would silently match nothing on `diag`.
+    #[test]
+    fn the_event_filter_uses_each_channels_own_kind_key() {
+        let diag = select(Some(FIXTURE_DIAG), None, Some("tick"), Channel::Diag);
+        assert_eq!(diag.matched.len(), 1);
+        assert_eq!(diag.matched[0].event, Some("tick"));
+        assert!(diag.matched[0].line.contains("diag=tick"));
+
+        // Still EXACT, not a prefix: `--event poll` must not also match `poll_failed`.
+        let log = "ts=2026-07-11T00:00:00Z diag=poll_failed account=u-A\n";
+        assert_eq!(
+            select(Some(log), None, Some("poll"), Channel::Diag)
+                .matched
+                .len(),
+            0
+        );
+
+        // And an `event=` token is NOT what the diagnostic channel matches on — a durable line
+        // that somehow landed there would not be selected by its `event=` name.
+        assert_eq!(
+            select(Some(FIXTURE_LOG), None, Some("swap"), Channel::Diag)
+                .matched
+                .len(),
+            0
+        );
+
+        // Under `--channel all` each half filters by its own key, in one pass.
+        let both = sources(Some(FIXTURE_LOG), Some(FIXTURE_DIAG));
+        let all = view_of(&both, Channel::All, None, Some("start"));
+        assert_eq!(all.matched.len(), 1);
+        assert_eq!(all.matched[0].channel, Channel::Diag);
+    }
+
+    /// An absent diagnostic file is not a cold install — it is a knob that is off. So it gets the
+    /// instruction that resolves it, rather than an empty view that reads as "nothing happened".
+    #[test]
+    fn an_absent_diagnostic_file_says_how_to_turn_diagnostics_on() {
+        let absent = vec![Source {
+            channel: Channel::Diag,
+            text: None,
+        }];
+        let view = view_of(&absent, Channel::Diag, None, None);
+        let rendered = render_text(&view);
+        assert_eq!(rendered.out, "", "nothing to show");
+        for expected in [
+            "no diagnostics yet",
+            "verbose = true",
+            "[tunables]",
+            "daemon restart",
+        ] {
+            assert!(
+                rendered.notice.contains(expected),
+                "the notice must carry {expected:?}, got {:?}",
+                rendered.notice
+            );
+        }
+        // NOT the event log's cold-start line: that would name the wrong file and the wrong fix.
+        assert!(
+            !rendered.notice.contains("the daemon has not run"),
+            "an absent diag file is not an absent event log, got {:?}",
+            rendered.notice
+        );
+
+        // `--channel all` with only the diagnostics missing still renders the event lines, and
+        // says which half was missing rather than going quiet about it.
+        let partial = vec![
+            Source {
+                channel: Channel::Event,
+                text: Some(FIXTURE_LOG.to_owned()),
+            },
+            Source {
+                channel: Channel::Diag,
+                text: None,
+            },
+        ];
+        let mixed = render_text(&view_of(&partial, Channel::All, None, None));
+        assert_eq!(mixed.out, FIXTURE_LOG);
+        assert!(mixed.notice.contains("no diagnostics yet"));
+        assert!(!mixed.notice.contains("the daemon has not run"));
+    }
+
+    /// The empty-state notices name the CHANNEL that was read. "The event log is empty" would be
+    /// a true-sounding statement about a file the operator did not ask about.
+    #[test]
+    fn the_empty_notice_names_the_channel_that_was_read() {
+        for (channel, expected) in [
+            (Channel::Event, "the event log is empty"),
+            (Channel::Diag, "the diagnostic channel is empty"),
+        ] {
+            let source = vec![Source {
+                channel,
+                text: Some(String::new()),
+            }];
+            let rendered = render_text(&view_of(&source, channel, None, None));
+            assert!(
+                rendered.notice.contains(expected),
+                "--channel {} must say {expected:?}, got {:?}",
+                channel.as_str(),
+                rendered.notice
+            );
+        }
+        let both = vec![
+            Source {
+                channel: Channel::Event,
+                text: Some(String::new()),
+            },
+            Source {
+                channel: Channel::Diag,
+                text: Some(String::new()),
+            },
+        ];
+        let rendered = render_text(&view_of(&both, Channel::All, None, None));
+        assert!(rendered.notice.contains("both channels are empty"));
+    }
+
+    /// **CONSTRAINT-A over the new channels.** Every byte the reader writes to stdout already
+    /// existed in one of the sources — the reader interpolates nothing, including no channel
+    /// marker, which is why the text view leans on `event=`/`diag=` being in the lines already.
+    #[test]
+    fn stdout_bytes_all_exist_in_their_source_on_every_channel() {
+        let both = sources(Some(FIXTURE_LOG), Some(FIXTURE_DIAG));
+        let corpus = format!("{FIXTURE_LOG}{FIXTURE_DIAG}");
+        for (asked, slice) in [
+            (Channel::Event, &both[..1]),
+            (Channel::Diag, &both[1..]),
+            (Channel::All, &both[..]),
+        ] {
+            let view = view_of(slice, asked, None, None);
+            assert!(
+                !view.matched.is_empty(),
+                "--channel {} must select lines, else its guard proves nothing",
+                asked.as_str()
+            );
+            let text = render_text(&view);
+            assert!(
+                every_line_is_in(&text.out, &corpus),
+                "--channel {} carried a line absent from both sources: {:?}",
+                asked.as_str(),
+                text.out
+            );
+            // Exact stream, not mere membership: each selected line once, in merged order.
+            let expected: String = view
+                .matched
+                .iter()
+                .map(|s| format!("{}\n", s.line))
+                .collect();
+            assert_eq!(text.out, expected);
+        }
+
+        // The distinguishability the text view relies on (CONSTRAINT-A forbids adding a marker):
+        // every durable line names its kind with `event=`, every diagnostic one with `diag=`.
+        let merged = view_of(&both, Channel::All, None, None);
+        for selected in &merged.matched {
+            let key = match selected.channel {
+                Channel::Event => "event=",
+                Channel::Diag | Channel::All => "diag=",
+            };
+            assert!(
+                selected.line.contains(key),
+                "a {} line must name its kind with {key}: {:?}",
+                selected.channel.as_str(),
+                selected.line
+            );
+        }
+    }
+
+    /// The JSON view carries the channel as STRUCTURE — per document and per record — so a script
+    /// never has to infer it from the line, and per-channel presence stays distinguishable.
+    #[test]
+    fn json_carries_the_channel_and_per_channel_presence() {
+        let both = sources(Some(FIXTURE_LOG), Some(FIXTURE_DIAG));
+        let json = render_json(&view_of(&both, Channel::All, None, None)).expect("serializes");
+        let parsed: serde_json::Value = serde_json::from_str(&json.out).expect("parses");
+        assert_eq!(parsed["schema"], 2, "the channel field bumped the schema");
+        assert_eq!(parsed["channel"], "all");
+        assert_eq!(parsed["log_present"], true);
+        assert_eq!(
+            parsed["present"],
+            serde_json::json!([
+                {"channel": "event", "present": true},
+                {"channel": "diag", "present": true},
+            ])
+        );
+        let records = parsed["records"].as_array().expect("array");
+        assert_eq!(records.len(), 7);
+        assert_eq!(records[0]["channel"], "event");
+        assert_eq!(records[1]["channel"], "diag");
+        // `line` stays verbatim — the channel rides beside it, never inside it.
+        assert_eq!(
+            records[1]["line"],
+            FIXTURE_DIAG.lines().next().expect("line")
+        );
+
+        // A missing diagnostic file is distinguishable from a missing daemon, in the wire.
+        let partial = vec![
+            Source {
+                channel: Channel::Event,
+                text: Some(FIXTURE_LOG.to_owned()),
+            },
+            Source {
+                channel: Channel::Diag,
+                text: None,
+            },
+        ];
+        let json = render_json(&view_of(&partial, Channel::All, None, None)).expect("serializes");
+        let parsed: serde_json::Value = serde_json::from_str(&json.out).expect("parses");
+        assert_eq!(parsed["log_present"], true, "one of the two exists");
+        assert_eq!(parsed["present"][1]["channel"], "diag");
+        assert_eq!(parsed["present"][1]["present"], false);
+    }
+
+    /// `--follow --channel all` is refused rather than approximated, and the message says why and
+    /// what to do instead. The two single-channel follows are accepted.
+    #[test]
+    fn follow_refuses_to_merge_both_channels_and_says_why() {
+        let args = |channel| LogArgs {
+            since: None,
+            event: None,
+            json: false,
+            follow: true,
+            channel,
+        };
+        let err = run_follow(args(Channel::All)).expect_err("a live merge must be refused");
+        assert!(matches!(err, Error::LogFollowAllUnsupported), "got {err:?}");
+        let shown = err.to_string();
+        assert!(
+            shown.contains("--channel event") && shown.contains("--channel diag"),
+            "the refusal must name the followable alternatives, got {shown:?}"
+        );
+
+        // And the follow header names the channel being followed, so a `--follow --channel diag`
+        // stream is not mistakable for the event log — plus the ungoverned-channel warning.
+        let diag = follow_header(None, None, Channel::Diag);
+        assert!(diag.contains("following the diagnostic channel"));
+        assert!(diag.contains("not redaction-checked"));
+        let event = follow_header(None, None, Channel::Event);
+        assert!(event.contains("following the event log"));
+        assert!(
+            !event.contains("not redaction-checked"),
+            "the governed channel must not carry the warning, got {event:?}"
+        );
+    }
+
+    /// The merge is a two-pointer MERGE, not a sort — so each source's own order survives even
+    /// when a file is NOT internally monotone (a clock step, an interleaved writer). A sort over
+    /// a shared key could reorder those lines; this cannot.
+    #[test]
+    fn a_non_monotone_source_keeps_its_own_order_through_the_merge() {
+        // The second diagnostic line is EARLIER than the first — the file is out of order.
+        let jumbled = "ts=2026-07-11T02:30:00Z diag=tick decision=hold\n\
+                       ts=2026-07-11T00:30:00Z diag=poll account=u-A outcome=live\n";
+        let sources = sources(Some(FIXTURE_LOG), Some(jumbled));
+        let view = view_of(&sources, Channel::All, None, None);
+        let diag_order: Vec<&str> = view
+            .matched
+            .iter()
+            .filter(|s| s.channel == Channel::Diag)
+            .map(|s| s.ts.expect("ts"))
+            .collect();
+        assert_eq!(
+            diag_order,
+            vec!["2026-07-11T02:30:00Z", "2026-07-11T00:30:00Z"],
+            "the source's own order must survive, however odd it looks"
+        );
+        // Nothing is lost or duplicated by the merge, whatever the ordering.
+        assert_eq!(view.matched.len(), 6);
     }
 }

@@ -5948,6 +5948,9 @@ mod tests {
             // the #736 tests arm it explicitly. Its strict mode is likewise off.
             canary_online_probe: false,
             canary_online_probe_strict: false,
+            // The managed-daemon diagnostic channel (issue #775) is a CLI-layer concern — the
+            // daemon core never reads it — so the harness pins the default.
+            verbose: false,
             // Existing daemon tests exercise the fixed (no-jitter) path: each
             // strategy draws its base verbatim, identical to the pre-#38 scalars.
             poll_strategy: Strategy::fixed(60.0),

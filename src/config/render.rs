@@ -140,6 +140,11 @@ impl Config {
                     t.canary_online_probe_strict.to_string(),
                     present("tunables", "canary_online_probe_strict"),
                 ),
+                entry(
+                    "verbose",
+                    t.verbose.to_string(),
+                    present("tunables", "verbose"),
+                ),
             ],
         };
 
@@ -539,6 +544,19 @@ impl Config {
             "canary_online_probe_strict = {}\n",
             t.canary_online_probe_strict
         ));
+        out.push_str(
+            "# Diagnostic channel for a LAUNCHD-MANAGED daemon (issue #775). The per-poll,\n\
+             # per-tick and lifecycle diagnostics (issue #77) are reachable interactively with\n\
+             # `sessiometer run -v`, but the installed agent runs `run --managed` with no -v, so\n\
+             # a background daemon emits nothing. Set true to turn them on there WITHOUT editing\n\
+             # the plist (`service install` would overwrite it). They land on the agent's stderr\n\
+             # file and are read back with `sessiometer log --channel diag`. Scoped to --managed:\n\
+             # an interactive `run` is unchanged, and -v still wins on either. Takes effect at the\n\
+             # NEXT daemon start (no hot reload) — `sessiometer daemon restart`. That channel is\n\
+             # raw stderr, so it can also carry panic output: unlike the event log it is NOT\n\
+             # redaction-metered. Default false.\n",
+        );
+        out.push_str(&format!("verbose = {}\n", t.verbose));
 
         // Per-cycle timing jitter (issue #38): drawn each cycle and clamped to the
         // tunable's valid range, to decorrelate polling/swaps across cycles.

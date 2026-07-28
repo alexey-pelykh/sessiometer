@@ -471,6 +471,25 @@ pub(crate) fn config_file() -> Result<PathBuf> {
     Ok(config_dir()?.join("config.toml"))
 }
 
+/// The launchd agent's `StandardErrorPath`: `<logs_dir>/daemon.err.log` — where a
+/// MANAGED daemon's stderr lands, and therefore where its diagnostic channel
+/// (issue #77) lands once `[tunables].verbose` arms it.
+///
+/// Lifted here by issue #775 because it now has TWO consumers that must agree: the
+/// installer renders it into the plist ([`crate::service::install`]) and the reader
+/// reads it back (`log --channel diag`). Computed independently in each, a rename in
+/// one would leave the other reading a file nothing writes — silently, since an
+/// absent diagnostic file is a legitimate state (the knob is off). One function
+/// makes that drift unrepresentable.
+///
+/// Unlike [`crate::observability::log_path`]'s event log, this file is written by
+/// LAUNCHD, not by this crate: it is raw process stderr, so it also carries panic
+/// payloads and anything else the process writes there. That is why the reader
+/// treats it as an UNGOVERNED channel and keeps it strictly opt-in.
+pub(crate) fn daemon_stderr_log() -> Result<PathBuf> {
+    Ok(logs_dir()?.join("daemon.err.log"))
+}
+
 /// The log directory:
 ///
 /// - **macOS**: `~/Library/Logs/sessiometer` (Console.app reads here) — fixed,
@@ -1307,6 +1326,25 @@ mod tests {
             dir.ends_with("Library/Logs/sessiometer"),
             "macOS logs_dir must be ~/Library/Logs/sessiometer, got {dir:?}"
         );
+    }
+
+    /// The launchd stderr path is ONE function with two callers (issue #775): the installer
+    /// renders it into the plist, the `log --channel diag` reader reads it back. Computed
+    /// separately they could drift, and the drift would be SILENT — an absent diagnostic file is
+    /// a legitimate state (the knob is off), so the reader would simply say "no diagnostics yet"
+    /// about a file the daemon was busily writing somewhere else.
+    #[test]
+    fn the_daemon_stderr_log_sits_in_the_log_dir_beside_the_event_log() {
+        let path = daemon_stderr_log().unwrap();
+        assert_eq!(path.file_name().unwrap(), "daemon.err.log");
+        assert_eq!(
+            path.parent().unwrap(),
+            logs_dir().unwrap(),
+            "the reader and the installer must resolve the same directory"
+        );
+        // Beside, not the same as: the durable event log is a different file with different
+        // guarantees, and conflating them would route ungoverned stderr into a metered channel.
+        assert_ne!(path, crate::observability::log_path().unwrap());
     }
 
     // --- Cross-platform strategies (issue #24) ------------------------------
