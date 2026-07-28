@@ -110,10 +110,12 @@ final class PosixSocketConnectionTests: XCTestCase {
 
     // MARK: - Teardown
 
-    // `close()` shuts the fd, which unblocks the blocked `read()` so the reader thread exits and the
-    // stream finishes (ADR-0011 §4 teardown mechanism). It is idempotent: a second call is a safe
-    // no-op. The 5 s timeout in `nextLine` converts a teardown HANG into a clear failure rather than a
-    // stuck suite.
+    // `close()` disconnects the socket, which unblocks the blocked `read()` so the reader thread
+    // exits and the stream finishes (ADR-0011 §4 teardown mechanism; since issue #859 the wake is a
+    // `shutdown()` and the descriptor is retired by the reader — see
+    // `testTeardownDoesNotStrandAReaderOnAReusedDescriptor`). It is idempotent: a second call is a
+    // safe no-op. The 5 s timeout in `nextLine` converts a teardown HANG into a clear failure rather
+    // than a stuck suite.
     func testCloseFinishesStreamAndIsIdempotent() async throws {
         let pair = try makeSocketPair()
         let connection = PosixSocketConnection(fd: pair.conn)
@@ -128,15 +130,76 @@ final class PosixSocketConnectionTests: XCTestCase {
         Darwin.close(pair.peer)
     }
 
+    // MARK: - Descriptor ownership (issue #859)
+
+    // Teardown must not release the descriptor NUMBER while the reader thread can still `read()` it.
+    // When it does, a connection torn down without awaiting its stream leaves behind a reader that
+    // issues its first `read()` against whatever the process allocated that number to NEXT —
+    // consuming a LATER connection's bytes, and leaving that connection to observe EOF on an empty
+    // buffer. `socket()` returns the lowest free descriptor, so the number handed back is precisely
+    // the one just released.
+    //
+    // This is the production reconnect shape (`WatchTransport` closes the connection, then calls
+    // `connector.connect()`), and it is what made `testTrailingUnterminatedBytesAreDeliveredAtEof`
+    // flake under full-suite load: the test preceding it leaves exactly such a reader behind, and a
+    // loaded machine is what delays that reader's first `read()` past the next test's write. The
+    // victim test was CORRECT — it was reporting this defect, not suffering a bad assertion.
+    //
+    // Measured against the pre-fix reader, out of process: the payload was lost in 342–391 of 400
+    // iterations of this shape (the rate is load-dependent; two independent runs bracket it), and 0
+    // of 400 WITHOUT the abandoned connection — which is also what refutes the originally suspected
+    // mechanism, a `close()` overtaking its own unread bytes, something AF_UNIX stream semantics do
+    // not permit.
+    //
+    // The loop is what turns that race into a gate. Per-iteration the pre-fix failure rate measures
+    // ~70–100%, so a single iteration would be a coin-flip in the other direction, while 20 makes a
+    // spurious pass vanishingly unlikely; observed pre-fix failures were 12–20 of 20 across runs.
+    func testTeardownDoesNotStrandAReaderOnAReusedDescriptor() async throws {
+        for iteration in 1...20 {
+            // Torn down WITHOUT awaiting its stream — the shape every non-EOF test here leaves
+            // behind, and the shape `WatchTransport` reconnects through.
+            let abandoned = try makeSocketPair()
+            let abandonedConnection = PosixSocketConnection(fd: abandoned.conn)
+            abandonedConnection.close()
+            Darwin.close(abandoned.peer)
+
+            // A fresh connection, on the descriptor number that teardown may just have released.
+            let pair = try makeSocketPair()
+            let connection = PosixSocketConnection(fd: pair.conn)
+            let collector = LineCollector(); collector.consume(connection.lines)
+
+            writeBytes(pair.peer, "not-stolen")
+            Darwin.close(pair.peer)
+
+            try await XCTAssertNextLine(
+                collector, "not-stolen",
+                "iteration \(iteration): a torn-down connection's reader consumed these bytes")
+
+            connection.close()
+        }
+    }
+
     // MARK: - Fixtures
 
     private struct SocketPairError: Error { let errnoValue: Int32 }
 
     /// A connected AF_UNIX stream fd pair (no filesystem socket, no daemon). `conn` is wrapped by the
     /// production `PosixSocketConnection`; `peer` is the test's end to write / close directly.
+    ///
+    /// `SO_NOSIGPIPE` is set on both ends because `PosixSocketConnector.connect()` sets it on every
+    /// socket production ever hands to a `PosixSocketConnection` — a fixture without it is not the
+    /// production object. It also matters more since issue #859: teardown now SHUTS DOWN the socket
+    /// instead of closing it, so a write after `close()` reaches a live-but-disconnected peer and
+    /// raises SIGPIPE (killing the whole test process) where it previously returned EBADF. No test
+    /// writes after closing today; this keeps the first one that does from taking down the run
+    /// instead of failing one assertion.
     private func makeSocketPair() throws -> (conn: Int32, peer: Int32) {
         var fds: [Int32] = [-1, -1]
         guard socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0 else { throw SocketPairError(errnoValue: errno) }
+        var noSigPipe: Int32 = 1
+        for fd in fds {
+            _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+        }
         return (fds[0], fds[1])
     }
 
