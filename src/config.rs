@@ -206,7 +206,11 @@ const DEFAULT_REFRESH_CADENCE_SECS: u64 = 3600;
 /// Default seconds the daemon must idle before a refresh sweep fires (issue #105). One minute lets
 /// the idle floor — anchored absolutely since #260, so it accumulates rather than resetting on each
 /// idle re-arm — elapse soon after start-up without waiting out a whole poll interval.
-const DEFAULT_REFRESH_IDLE_AFTER_SECS: u64 = 60;
+///
+/// `pub(crate)` so [`crate::paths::HARVESTED_PATH_TTL`] pins the login-shell PATH memo (issue #784)
+/// to this SAME source of truth rather than an invented constant — the same "one definition, two
+/// readers" promotion [`DEFAULT_REFRESH_SYSTEMIC_FAILURE_N`] already carries.
+pub(crate) const DEFAULT_REFRESH_IDLE_AFTER_SECS: u64 = 60;
 /// Default seconds bounding ONE account's whole isolated-refresh cycle (issue #105). The
 /// engine's internal `claude -p` spawn budget is ~40 s (#102); ninety seconds leaves
 /// comfortable headroom for the seed, read-back and CAS re-stash around it, so a healthy
@@ -645,10 +649,10 @@ pub(crate) struct RefreshConfig {
     /// error. Default ([`DEFAULT_REFRESH_TIMEOUT_SECS`]) leaves headroom over the engine's
     /// ~40 s `claude -p` spawn budget.
     pub(crate) timeout_secs: u64,
-    /// The `claude` binary the engine spawns, overriding the `$CLAUDE_BIN` / `$PATH`
-    /// resolution (issue #105) — `None` (the default) defers to that resolution. Resolved
-    /// (absolutized, validated to exist) before any spawn by
-    /// [`crate::paths::claude_binary_with_override`].
+    /// The `claude` binary the engine spawns, overriding the `$CLAUDE_BIN` / harvested
+    /// login-shell-PATH resolution (issue #105, tier 3 re-sourced by #784) — `None` (the
+    /// default) defers to that resolution. Resolved (absolutized, validated to exist) before
+    /// any spawn by [`crate::paths::claude_binary_with_override`].
     pub(crate) claude_bin: Option<PathBuf>,
     /// Consecutive refresh sweeps that must fail with `outcome=error` across EVERY eligible
     /// account before the daemon surfaces a SYSTEMIC refresh-mechanism failure (issue #378) — the
@@ -721,9 +725,9 @@ pub(crate) struct LoginConfig {
     /// outcome). Default [`DEFAULT_LOGIN_TIMEOUT_SECS`] (180), operator-tunable within `60..=600`
     /// — low enough to abandon an unattended login, high enough for a deliberate browser handoff.
     pub(crate) timeout_secs: u64,
-    /// The `claude` binary the login engine spawns, overriding the `$CLAUDE_BIN` / `$PATH`
-    /// resolution — `None` (the default) defers to that resolution. Resolved (absolutized,
-    /// validated to exist) before the spawn by the SAME resolver the refresh path uses,
+    /// The `claude` binary the login engine spawns, overriding the `$CLAUDE_BIN` / harvested
+    /// login-shell-PATH resolution — `None` (the default) defers to that resolution. Resolved
+    /// (absolutized, validated to exist) before the spawn by the SAME resolver the refresh path uses,
     /// [`crate::paths::claude_binary_with_override`] (issue #135 AC: "reusing the existing
     /// binary-override resolver; no new config mechanism").
     pub(crate) claude_bin: Option<PathBuf>,
