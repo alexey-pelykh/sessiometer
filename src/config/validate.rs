@@ -238,6 +238,7 @@ impl Config {
             canary_nostashmatch_override: t.canary_nostashmatch_override,
             canary_online_probe: t.canary_online_probe,
             canary_online_probe_strict: t.canary_online_probe_strict,
+            verbose: t.verbose,
             poll_strategy: Strategy {
                 base: t.poll_secs as f64,
                 jitter: poll_jitter,

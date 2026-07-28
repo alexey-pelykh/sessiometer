@@ -150,6 +150,9 @@ mod tests {
                 // strict mode OFF (a failed probe would degrade gracefully).
                 canary_online_probe: false,
                 canary_online_probe_strict: false,
+                // VALID omits verbose → the compiled-in default (issue #775): a managed daemon
+                // stays silent on the diagnostic channel.
+                verbose: false,
                 // No [jitter] table in VALID → default strategies: poll jitters
                 // normally (base from poll_secs), session_ceiling/weekly_ceiling/cooldown
                 // are fixed at their respective bases.
@@ -455,5 +458,70 @@ mod tests {
         // particular there is deliberately no `kdf_parallelism` key (lanes are fixed).
         let toml = format!("{VALID}\n[migration]\nkdf_parallelism = 2\n");
         assert!(matches!(Config::parse(&toml), Err(Error::ConfigParse(_))));
+    }
+
+    /// **The issue #775 backward-compatibility guard.** `RawTunables` is `deny_unknown_fields`,
+    /// so adding `verbose` is a deliberate schema change — and the direction that matters is the
+    /// other one: no `config.toml` on any operator's disk carries the new key, so it MUST be
+    /// `#[serde(default)]`. A regression here does not degrade a feature, it stops every
+    /// existing daemon from starting.
+    #[test]
+    fn a_config_written_before_the_verbose_knob_still_loads() {
+        // A realistic pre-#775 file: a `[tunables]` table with real values and no `verbose`.
+        let legacy = with_tunables(
+            "poll_secs = 45\n\
+             session_ceiling = 92\n\
+             canary_drift_override = true",
+        );
+        let config = Config::parse(&legacy).expect("a pre-#775 config must still load");
+        assert_eq!(config.tunables.poll_secs, 45, "the old keys still apply");
+        assert!(config.tunables.canary_drift_override);
+        assert!(
+            !config.tunables.verbose,
+            "an absent key must take the documented default (silent), not fail the parse"
+        );
+
+        // The same for a file with NO `[tunables]` table at all — the older shape still in the
+        // wild — and for the `VALID` fixture the rest of this module parses.
+        assert!(!Config::parse(VALID).expect("VALID parses").tunables.verbose);
+    }
+
+    /// The knob itself: the hand-edit the help text and `config.toml` comment both name arms it,
+    /// and it survives a render → re-parse round trip (so `config-set`/`capture` rewriting the
+    /// file cannot silently drop an operator's setting).
+    #[test]
+    fn the_verbose_knob_parses_and_survives_a_render_round_trip() {
+        let armed = Config::parse(&with_tunables("verbose = true")).expect("parses");
+        assert!(armed.tunables.verbose, "the documented hand-edit arms it");
+
+        let reparsed = Config::parse(&armed.render()).expect("the rendered config re-parses");
+        assert!(
+            reparsed.tunables.verbose,
+            "a render must not drop the operator's setting"
+        );
+        // The emitted file names the key and explains the restart semantics, since the knob is
+        // useless to an operator who does not know it needs one.
+        let rendered = armed.render();
+        assert!(rendered.contains("verbose = true"));
+        assert!(
+            rendered.contains("NEXT daemon start"),
+            "the emitted comment must state the no-hot-reload semantics"
+        );
+
+        // Default-off round-trips too, so a config written by a daemon that never armed it does
+        // not come back armed.
+        let off = Config::parse(VALID).expect("parses");
+        assert!(
+            !Config::parse(&off.render())
+                .expect("re-parses")
+                .tunables
+                .verbose
+        );
+
+        // A non-bool is a parse error, not a coerced truthy value.
+        assert!(matches!(
+            Config::parse(&with_tunables("verbose = \"yes\"")),
+            Err(Error::ConfigParse(_))
+        ));
     }
 }
