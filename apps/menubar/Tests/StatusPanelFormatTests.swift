@@ -21,6 +21,8 @@
 // + `AccountRow.rows(from:)`, proving the panel formatting is fed by the real store projection (and
 // that `recovering` survives it — the field #326 added to `AccountRow`).
 
+import AppKit
+import SwiftUI
 import XCTest
 
 final class StatusPanelFormatTests: XCTestCase {
@@ -1260,8 +1262,8 @@ final class StatusPanelFormatTests: XCTestCase {
         // The panel floats on live vibrancy — NOT headlessly measurable (the owner-eyeball residual, same class
         // as #326/#388/#446/#504). We assert against the mock's OPAQUE popover reference base, the same
         // convention the #388 `--text-2` comment uses ("4.53:1 over #f5f5f7"): light #f7f7fa / dark #26262b.
-        let lightBase = RGB(247, 247, 250)
-        let darkBase = RGB(38, 38, 43)
+        let lightBase = Self.lightBase
+        let darkBase = Self.darkBase
         let lightText = StatusPanelFormat.accountMonogramColor(dark: false)
         let darkText = StatusPanelFormat.accountMonogramColor(dark: true)
         for slot in 0..<StatusPanelFormat.accountColorCount {
@@ -1341,7 +1343,441 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertEqual(StatusPanelFormat.accountMonograms(["  "])["  "], "?")        // whitespace → sentinel
     }
 
+    // MARK: - #388 tint-token CONTRAST (issue #759 — the token VALUES, not just the role→token mapping)
+    //
+    // The tests at :123-152 guard WHICH token each role maps to. These guard what the tokens ARE: the
+    // shipped `Assets.xcassets` colour sets, resolved through the REAL `Color.panelAssets` seam under each
+    // of the four appearances the panel can be drawn in (aqua / darkAqua × normal / Increase-Contrast), and
+    // measured with the same sRGB helper the #445 palette test uses (:1414).
+    //
+    // TWO DIFFERENT BARS, and getting them backwards would manufacture a false failure. A token's bar is set
+    // by the SURFACE it paints, which was established by censusing every consumer site rather than assumed:
+    //
+    //   TEXT (WCAG 1.4.3 → 4.5:1)
+    //     UtilGreen/Amber/Red  `usageTextTint`      → the percent text        (Roster :556, :628)
+    //     UtilOrange/Red       `healthTint`         → the auth cue text       (Roster :462-463)
+    //     UtilOrange/Red       `healthTint`         → blind verdict + remedy  (Roster :655, :666)
+    //     UtilAmber            `healthTint(.yellow)`→ footer stale-age text   (Chrome :404)
+    //   NON-TEXT (WCAG 1.4.11 → 3:1)
+    //     HealthOK + the above `healthTint`         → the health SF Symbol    (Roster :472)
+    //                                               → blind leading rule      (Roster :338)
+    //                                               → verdict shield glyph    (Roster :652)
+    //
+    // `HealthOK` is the one GLYPH-ONLY token — it never paints text, so holding it to 4.5:1 would be a false
+    // failure (it measures 3.08:1 in light). What keeps it off text is `blindVerdict` emitting `.neutral`
+    // rather than `.green` for the OK verdict; that is load-bearing, so it is pinned below rather than left
+    // to a reader's goodwill.
+
+    /// The panel reference base — the mock's OPAQUE popover colour. Same convention, and the same two
+    /// values, the #445 palette test uses at :1263 (the live panel floats on vibrancy, which is not
+    /// headlessly measurable; this is the agreed stand-in).
+    private static let lightBase = RGB(247, 247, 250)
+    private static let darkBase = RGB(38, 38, 43)
+
+    /// The surfaces the panel can be drawn on — light and dark, each with the base it sits on.
+    ///
+    /// The Increase-Contrast variants are deliberately ABSENT, and that is a measured decision rather than
+    /// an oversight. Each colour set ships four variants (Any / Dark / high-contrast / dark high-contrast),
+    /// so a four-surface sweep looks obviously right — but AppKit selects the `contrast: high` variant from
+    /// the SYSTEM Increase-Contrast setting, not from the `NSAppearance` name, so
+    /// `.accessibilityHighContrastAqua` resolves BYTE-IDENTICALLY to `.aqua` here. A four-surface sweep
+    /// would therefore be two real measurements and two duplicates presenting as four — a degenerate gate
+    /// that reports broader coverage than it has. `testTheHighContrastVariantsAreNotReachableByAppearance`
+    /// pins that so the gap stays visible; closing it is issue #832.
+    private static let surfaces: [(name: String, appearance: NSAppearance.Name, base: RGB)] = [
+        ("light", .aqua, lightBase),
+        ("dark", .darkAqua, darkBase),
+    ]
+
+    /// The #388 tokens that paint TEXT somewhere in the panel (censused above) — the 4.5:1 set.
+    private static let textTintAssets = ["UtilGreen", "UtilAmber", "UtilOrange", "UtilRed"]
+    /// Every #388 token reachable through `healthTint`, i.e. every token that paints a GLYPH — the 3:1 set.
+    private static let nonTextTintAssets = ["HealthOK", "UtilAmber", "UtilOrange", "UtilRed"]
+
+    /// Max-channel separation (0…1) at or under which two deuteranope-simulated tints count as NOT told
+    /// apart by colour, so the SHAPE channel has to carry the distinction. A judgment threshold rather than
+    /// a standard, set with headroom: every collapse this palette actually exhibits measures ≤ 5.65/255
+    /// (quoted in `testSeverityPairsThatCollapseUnderDeuteranopiaAreSeparatedByShape`), so a small
+    /// platform drift in the simulated values cannot quietly walk a pair across the line.
+    private static let deuteranopeCollapse = 12 / 255.0
+
+    /// The ONE contrast predicate every assertion in this section runs through, so the canary
+    /// (`testTheContrastGateCanFail`) proves THE GATE can fail rather than proving some parallel arithmetic
+    /// can. Mutation-driven, never inspection — the #437 lesson `BarGlyphParityTests` records.
+    private func clearsBar(_ foreground: RGB, on background: RGB, bar: Double) -> Bool {
+        contrast(foreground, background) >= bar
+    }
+
+    /// Every (token, surface) cell that does NOT clear `bar`, named `token@surface`. `resolve` is injected
+    /// so the canary can feed the SAME audit a deliberately degraded token and watch the cell appear.
+    private func failingCells(
+        _ assets: [String],
+        bar: Double,
+        resolve: (String, NSAppearance.Name) throws -> RGB
+    ) rethrows -> Set<String> {
+        var failures: Set<String> = []
+        for asset in assets {
+            for surface in Self.surfaces {
+                let resolved = try resolve(asset, surface.appearance)
+                if !clearsBar(resolved, on: surface.base, bar: bar) {
+                    failures.insert("\(asset)@\(surface.name)")
+                }
+            }
+        }
+        return failures
+    }
+
+    /// Every pair of `assets` that resolves to the SAME colour on some surface, named `a~b@surface`. The
+    /// distinctness counterpart of `failingCells`, carrying the same injected `resolve` for the same reason:
+    /// it lets the canary drive THIS sweep by mutation instead of re-doing its arithmetic on itself.
+    private func collapsedPairs(
+        _ assets: [String],
+        resolve: (String, NSAppearance.Name) throws -> RGB
+    ) rethrows -> Set<String> {
+        var collapsed: Set<String> = []
+        for surface in Self.surfaces {
+            let resolved = try assets.map { try resolve($0, surface.appearance) }
+            for i in resolved.indices {
+                for j in resolved.indices where j > i && channelDistance(resolved[i], resolved[j]) == 0 {
+                    collapsed.insert("\(assets[i])~\(assets[j])@\(surface.name)")
+                }
+            }
+        }
+        return collapsed
+    }
+
+    // MARK: AC-1 — every TEXT tint token clears WCAG AA (4.5:1), in both themes
+
+    func testEveryTextTintTokenClearsWcagAAExceptTheOneDocumentedMiss() throws {
+        // MEASURED, not assumed — and the measurement contradicted the issue's premise, so this gates at the
+        // measured boundary rather than fabricating a pass. 7 of the 8 (token × surface) cells clear 4.5:1.
+        // One does not:
+        //
+        //   UtilGreen (mock `--ut-g` #268a3f) in LIGHT measures 4.10:1 — a REAL WCAG 1.4.3 miss on the
+        //   healthy percent text. It is base-insensitive: 4.10 over the #f7f7fa panel base, 4.03 over the
+        //   mock page #f5f5f7, 4.38 even over pure white. The high-contrast variant (#1f7134) clears at 5.66.
+        //
+        // NOT fixed here, deliberately. Per #388 the panel tokens are DERIVED from the mock's CSS custom
+        // properties, so the fix belongs in `design/menubar-preview.html` — the ratified visual build
+        // reference — and darkening `--ut-g` reddens the 34 byte-compared panel goldens (#754), whose
+        // re-baseline is gated on a `Panel-Goldens-Rebaselined:` trailer. That is a palette change the
+        // operator has not approved, so this pins CURRENT behaviour and tracks the fix in issue #830.
+        //
+        // The assertion is set EQUALITY, not "ignore the known one": a second token dropping below AA grows
+        // the set and fails loudly, and FIXING `--ut-g` shrinks it and also fails loudly — telling whoever
+        // fixed it to drop the exception and close the issue. A one-sided allowlist would silently swallow
+        // both.
+        let documentedMisses: Set<String> = ["UtilGreen@light"]
+        let measured = try failingCells(Self.textTintAssets, bar: 4.5, resolve: assetRGB)
+        XCTAssertEqual(measured, documentedMisses,
+                       "the set of text tints below WCAG AA 4.5:1 changed. Grew → a token regressed below "
+                       + "AA. Shrank → the palette was fixed: delete the stale entry and close issue "
+                       + "#830. Measured failures: \(measured.sorted())")
+
+        // Pin the miss's MAGNITUDE too, so a drift that keeps it failing but moves it materially still trips.
+        let green = try assetRGB("UtilGreen", .aqua)
+        XCTAssertEqual(contrast(green, Self.lightBase), 4.10, accuracy: 0.05,
+                       "UtilGreen/light drifted from its pinned 4.10:1 — re-derive the exception in issue "
+                       + "#830 before adjusting this number")
+    }
+
+    func testTheHighContrastVariantsAreNotReachableByAppearance() throws {
+        // Discovered by measurement while building the sweep above, and pinned here because the NEXT person
+        // to read those colour sets will reach the same obvious-looking conclusion I did: four variants ship,
+        // therefore sweep four appearances. They do not resolve. Every asset returns its NORMAL-contrast
+        // value under the high-contrast appearance name, so adding those surfaces would silently double the
+        // apparent coverage without measuring anything new — the degenerate-gate failure mode.
+        //
+        // This asserts the CURRENT platform behaviour, so if a future macOS starts honouring the appearance
+        // name this test goes red and points at issue #832 — which is the wanted outcome: that is the
+        // day the high-contrast variants become guardable and the surface list should grow.
+        for asset in Self.nonTextTintAssets + Self.textTintAssets {
+            XCTAssertEqual(try assetRGB(asset, .accessibilityHighContrastAqua),
+                           try assetRGB(asset, .aqua),
+                           "\(asset) now differs under the high-contrast appearance — AppKit began honouring "
+                           + "it. Add the contrast surfaces to `surfaces` and close issue #832.")
+            XCTAssertEqual(try assetRGB(asset, .accessibilityHighContrastDarkAqua),
+                           try assetRGB(asset, .darkAqua),
+                           "\(asset) now differs under the dark high-contrast appearance — see issue #832.")
+        }
+        // The colour sets DO ship distinct high-contrast variants; this is a resolution gap, not a design
+        // gap. Left un-asserted here on purpose — reading the .colorset JSON off disk from a test bundle
+        // would guard the file rather than the seam the panel actually draws through.
+    }
+
+    // MARK: AC-2 — non-text fills take the DIFFERENT, lower bar (3:1), and text took the darker family
+
+    func testEveryGlyphTintClearsTheWcagNonTextBar() throws {
+        // The 3:1 bar — the "correct, different bar" the `StatusPanelRoster` exemption comment describes.
+        // Every token that paints a health glyph / leading rule / shield clears it on all four surfaces
+        // (the tightest cell is HealthOK in light at 3.08:1).
+        let failures = try failingCells(Self.nonTextTintAssets, bar: 3.0, resolve: assetRGB)
+        XCTAssertEqual(failures, [],
+                       "glyph tints below the WCAG 1.4.11 non-text bar of 3:1: \(failures.sorted())")
+    }
+
+    func testTheGlyphOnlyTintNeverReachesATextSite() {
+        // HealthOK sits at 3.08:1 in light — fine for a glyph, BELOW AA for text. The only TINT-ROLE path
+        // that could put it on a text run is the blind verdict, whose calm case is `.neutral`, not
+        // `.green`. Flipping that one enum (an easy, plausible "make OK look positive" edit) would silently
+        // paint sub-AA text, and no other test in this file would notice. So pin it at the source of truth.
+        //
+        // This is NOT a total guarantee, and the gap is worth naming: converting any of the `healthColor`
+        // call sites (Roster :417 / :424 / :433) from `Image` to `Text` would also put HealthOK on text,
+        // and nothing here would catch that. Those are structurally glyph sites, so the risk is low — but
+        // "low" is the honest word, not "impossible".
+        for severity in [StatusPanelFormat.BlindSeverity.ok, .degraded, .cornered] {
+            let tint = StatusPanelFormat.blindVerdict(severity, nextSwap: nil, now: 0).tint
+            XCTAssertNotEqual(tint, .green,
+                              "blindVerdict(\(severity)) resolves to .green → HealthOK (3.08:1 in light) "
+                              + "would paint the verdict TEXT at Roster :655, below WCAG AA. Keep OK "
+                              + "`.neutral`, or move HealthOK to a 4.5:1-clearing value first.")
+        }
+    }
+
+    func testTextTintsAreStrictlyDarkerThanTheBrightFillFamilyTheyReplaced() throws {
+        // This is the #388 distinction the `StatusPanelRoster` comment (`barColor`) has carried in prose:
+        // the small percent TEXT took the darker `--ut-*` tokens while the BAR kept the bright system fills.
+        // Encoding it as a relation — text contrast strictly greater than the fill it sits beside — makes
+        // the exemption a gate instead of a claim, and it holds regardless of the exact system-colour values
+        // (which Apple revises between macOS releases, so pinning their hexes would be brittle).
+        let bands: [(StatusPanelFormat.UsageSeverity, NSColor)] = [
+            (.green, .systemGreen), (.yellow, .systemOrange), (.red, .systemRed),
+        ]
+        for (band, fill) in bands {
+            guard case .asset(let tokenName) = StatusPanelFormat.usageTextTint(band) else {
+                return XCTFail("usageTextTint(\(band)) is no longer an asset token")
+            }
+            for surface in Self.surfaces {
+                let text = try assetRGB(tokenName, surface.appearance)
+                let bar = try systemRGB(fill, surface.appearance)
+                XCTAssertGreaterThan(contrast(text, surface.base), contrast(bar, surface.base),
+                                     "\(band) on \(surface.name): the TEXT tint \(tokenName) "
+                                     + "(\(contrast(text, surface.base))) is not higher-contrast than the "
+                                     + "bright bar fill (\(contrast(bar, surface.base))) — the two families "
+                                     + "collapsed, so #388's darker-text split is gone")
+            }
+        }
+    }
+
+    func testTheMeterBarFillIsCarriedByTheAdjacentPercentTextNotByItsOwnContrast() throws {
+        // The issue's AC-2 premise — that the meter-bar fills clear 3:1 — is FALSE when measured, and the
+        // MOCK'S OWN `--u-*` values fail the same way, so this is a design property rather than a Swift
+        // defect. Against the `--track` neutral the fill sits on (and against the panel base), in LIGHT:
+        //
+        //     systemGreen  1.61 vs track / 2.08 vs base       (mock --u-g #34c759: 1.61 / 2.08)
+        //     systemOrange 1.67 vs track / 2.16 vs base       (mock --u-a #ff9f0a: 1.49 / 1.92)
+        //     systemRed    2.59 vs track / 3.34 vs base       (mock --u-r #ff3b30: 2.57 / 3.32)
+        //
+        // (The Swift bar takes AppKit's system colours, which are NOT byte-identical to the mock's `--u-*`
+        // — systemOrange is #FF8D28 vs `--u-a` #ff9f0a, systemRed #FF383C vs `--u-r` #ff3b30. Hence the
+        // "≈" in the `barColor` comment. Both families fail 3:1, so the drift changes no verdict here.)
+        //
+        // Asserting >= 3:1 here would redden the build against the ratified build reference to satisfy a
+        // premise that measurement refutes — the #437 failure mode in reverse. Tracked as issue #831.
+        //
+        // What IS assertable is the compensating control, and it is the reason the bar is defensible under
+        // WCAG 1.4.11 at all: the bar is `.accessibilityHidden(true)` (Roster :583) and the exact value sits
+        // beside it as TEXT. The bar reinforces a number; it never carries it alone.
+        //
+        // SCOPE OF THIS TEST, stated precisely because the obvious reading overclaims it. It pins the
+        // FORMATTER — that a percent still renders as a percent string — and the tint's contrast. It does
+        // NOT pin that the view still draws that string: deleting `Text(StatusPanelFormat.pct(...))` from
+        // `UsageMeter` leaves this green. What would catch that is `PanelGoldenParityTests`' raster
+        // goldens, which is a different gate in a different file.
+        for pct in [UInt8(0), 7, 60, 95, 100] {
+            XCTAssertEqual(StatusPanelFormat.pct(pct), "\(pct)%",
+                           "the percent value must stay renderable as text beside the bar — it is the bar's "
+                           + "non-colour channel (issue #831)")
+        }
+        // …and that text's tint clears AA. `UtilGreen` is NOT in this list, and the omission is the whole
+        // problem rather than a convenience: on the HEALTHY band neither channel clears its bar — the fill
+        // is 2.08 (issue #831) and the text is 4.10 (issue #830). Each issue documents one half, so the
+        // green band is the one place the compensating-control argument does not actually hold. Add
+        // "UtilGreen" here the moment #830 lands; that is the assertion proving the hole closed.
+        XCTAssertEqual(try failingCells(["UtilAmber", "UtilRed"], bar: 4.5, resolve: assetRGB), [],
+                       "the amber/red percent text no longer clears AA, so the meter bar's compensating "
+                       + "control is gone on those bands too (issues #830, #831)")
+    }
+
+    // MARK: AC-3 — the severity families stay mutually distinguishable
+
+    func testEverySeverityRoleResolvesToADistinctTokenWithinItsFamily() throws {
+        // `testStaleAndAtRiskGlyphTintsStayDistinct` (:133) checks ONE pair. This extends that bar to the
+        // whole tint set — within each family, because the two families deliberately SHARE tokens across
+        // families (`testWarningTextAndGlyphShareOneTokenSource`, :148), so a cross-family sweep would fail
+        // by design.
+        // `PanelTint` is Equatable, not Hashable (it names a role, and is never a dictionary key), so the
+        // sweep is pairwise — the same shape `testStaleAndAtRiskGlyphTintsStayDistinct` uses for its one pair.
+        let glyphRoles: [StatusPanelFormat.HealthTint] = [.green, .yellow, .orange, .red]
+        for i in glyphRoles.indices {
+            for j in glyphRoles.indices where j > i {
+                XCTAssertNotEqual(StatusPanelFormat.healthTint(glyphRoles[i]),
+                                  StatusPanelFormat.healthTint(glyphRoles[j]),
+                                  "glyph severity roles \(glyphRoles[i]) and \(glyphRoles[j]) collapsed "
+                                  + "onto one token")
+            }
+        }
+        let textRoles: [StatusPanelFormat.UsageSeverity] = [.green, .yellow, .red]
+        for i in textRoles.indices {
+            for j in textRoles.indices where j > i {
+                XCTAssertNotEqual(StatusPanelFormat.usageTextTint(textRoles[i]),
+                                  StatusPanelFormat.usageTextTint(textRoles[j]),
+                                  "percent-text severity bands \(textRoles[i]) and \(textRoles[j]) "
+                                  + "collapsed onto one token")
+            }
+        }
+
+        // Distinct token NAMES could still resolve to one colour (the failure `PanelGoldenParityTests`
+        // :290 guards for the asset lookup). Assert the resolved sRGB values are pairwise distinct too, on
+        // every surface — a numeric bar, not just an enum-identity one. Routed through the same injected-
+        // resolver audit shape AC-1 and AC-2 use, so the canary can drive this sweep by mutation as well.
+        let collapsed = try collapsedPairs(Self.nonTextTintAssets, resolve: assetRGB)
+        XCTAssertEqual(collapsed, [],
+                       "tint tokens that resolved to the SAME colour on some surface: \(collapsed.sorted())")
+    }
+
+    func testSeverityPairsThatCollapseUnderDeuteranopiaAreSeparatedByShape() throws {
+        // The governing principle from the (locked) brand record is WCAG 1.4.1: colour is never the SOLE
+        // differentiator; state is carried by SHAPE with colour redundant on top. The art-direction record
+        // flags a green↔red colour-blind risk specifically, so this asserts the redundancy where it is
+        // actually needed rather than trusting the hue numbers.
+        //
+        // MEASURED (Viénot-Brettel-Mollon 1999 deuteranopia simulation, max-channel separation of the
+        // simulated colours, quoted on a 0-255 scale) — the warm family collapses almost completely in
+        // LIGHT. Six of the ten state pairs land under the 12/255 threshold and therefore execute the
+        // inner assertion:
+        //
+        //     stale↔atRisk 5.65   stale↔degraded 5.65   stale↔dead 1.20
+        //     atRisk↔degraded 0.00   atRisk↔dead 4.45   degraded↔dead 4.45
+        //
+        // So hue does essentially NO work separating stale / at-risk / dead for a deuteranope. That is
+        // acceptable ONLY because every one of those states carries a distinct SF Symbol — and this test is
+        // what keeps that true, driven by the measured collapse rather than by a standing assumption.
+        //
+        // The test cannot go vacuously green: atRisk and degraded share ONE token (`UtilOrange`, the #427
+        // decision that degraded is a recoverable warning distinguished by SHAPE), so their separation is
+        // exactly 0 by construction on every platform and the assertion always fires. Note also that the
+        // simulation must run in LINEAR light — the widespread gamma-encoded variants of this matrix report
+        // stale↔dead as ≈29 rather than 1.20, which would drop every pair above the threshold and quietly
+        // turn this whole test into a no-op.
+        let states: [CredentialHealth] = [.healthy, .stale, .atRisk, .degraded, .dead]
+        for surface in Self.surfaces {
+            var simulated: [(state: CredentialHealth, symbol: String, colour: RGB)] = []
+            for state in states {
+                let symbol = StatusPanelFormat.healthSymbol(state)
+                guard case .asset(let token) = StatusPanelFormat.healthTint(symbol.tint) else { continue }
+                simulated.append((state, symbol.name, deuteranope(try assetRGB(token, surface.appearance))))
+            }
+            for i in simulated.indices {
+                for j in simulated.indices where j > i {
+                    let separation = channelDistance(simulated[i].colour, simulated[j].colour)
+                    guard separation <= Self.deuteranopeCollapse else { continue }
+                    XCTAssertNotEqual(simulated[i].symbol, simulated[j].symbol,
+                                      "\(simulated[i].state) and \(simulated[j].state) are indistinguishable "
+                                      + "by colour under deuteranopia on \(surface.name) AND share the "
+                                      + "symbol '\(simulated[i].symbol)' — colour is then the sole "
+                                      + "differentiator, which WCAG 1.4.1 forbids")
+                }
+            }
+        }
+    }
+
+    // MARK: AC-4 — CONSTRAINT-A canary: the gate PROVES it can fail
+
+    func testTheContrastGateCanFail() throws {
+        // The gate above is only evidence if it can go red. Proven by MUTATION through the SAME `clearsBar`
+        // predicate and the SAME `failingCells` audit the real assertions use — never by inspecting the
+        // arithmetic. (The #437 precedent: three real render bugs were misread five times as a DESIGN
+        // failure, and a golden authored then would have defended them. `BarGlyphParityTests`
+        // :250 is this repo's working pattern; this is its colour-space analogue.)
+
+        // 1. A real token, unmutated, clears its bar — so a green canary is not vacuous.
+        let amber = try assetRGB("UtilAmber", .aqua)
+        XCTAssertTrue(clearsBar(amber, on: Self.lightBase, bar: 4.5),
+                      "UtilAmber no longer clears AA unmutated — the canary's control is broken")
+
+        // 2. Mutate that SAME token 90 % of the way toward the background it is measured against. Nothing
+        //    else changes: same asset, same surface, same predicate.
+        let washedOut = blend(amber, toward: Self.lightBase, 0.9)
+        XCTAssertFalse(clearsBar(washedOut, on: Self.lightBase, bar: 4.5),
+                       "a token washed 90 % into the panel base still cleared 4.5:1 — the text bar cannot "
+                       + "fail, so it is not evidence")
+        XCTAssertFalse(clearsBar(washedOut, on: Self.lightBase, bar: 3.0),
+                       "the same washed-out token cleared even the 3:1 non-text bar — neither bar can fail")
+
+        // 3. Drive it through the real audit: injecting the mutation as the resolver must make the cell
+        //    surface in exactly the place AC-1 and AC-2 read their verdicts from.
+        let mutatingResolve: (String, NSAppearance.Name) throws -> RGB = { asset, appearance in
+            let real = try self.assetRGB(asset, appearance)
+            return asset == "UtilAmber" ? blend(real, toward: Self.lightBase, 0.9) : real
+        }
+        let textFailures = try failingCells(Self.textTintAssets, bar: 4.5, resolve: mutatingResolve)
+        XCTAssertTrue(textFailures.contains("UtilAmber@light"),
+                      "the mutated token did not surface in the AC-1 audit — the audit is blind to it, so a "
+                      + "real regression would pass too. Saw: \(textFailures.sorted())")
+        let glyphFailures = try failingCells(Self.nonTextTintAssets, bar: 3.0, resolve: mutatingResolve)
+        XCTAssertTrue(glyphFailures.contains("UtilAmber@light"),
+                      "the mutated token did not surface in the AC-2 non-text audit. Saw: \(glyphFailures.sorted())")
+
+        // 4. The distinctness bar (AC-3) must be able to fail too, and that needs its own mutation —
+        //    comparing a colour with ITSELF would be 0 by construction and would prove nothing about the
+        //    sweep. Force UtilRed to resolve to UtilAmber's value and require `collapsedPairs` — the audit
+        //    AC-3 reads its verdict from — to report the pair.
+        let red = try assetRGB("UtilRed", .aqua)
+        XCTAssertGreaterThan(channelDistance(amber, red), 0,
+                             "UtilAmber and UtilRed are already identical — the canary's control is broken")
+        let collapsingResolve: (String, NSAppearance.Name) throws -> RGB = { asset, appearance in
+            try self.assetRGB(asset == "UtilRed" ? "UtilAmber" : asset, appearance)
+        }
+        let collapsed = try collapsedPairs(Self.nonTextTintAssets, resolve: collapsingResolve)
+        XCTAssertTrue(collapsed.contains("UtilAmber~UtilRed@light"),
+                      "two tokens forced onto one colour did not surface in the AC-3 distinctness sweep, so "
+                      + "testEverySeverityRoleResolvesToADistinctTokenWithinItsFamily cannot fail. Saw: "
+                      + "\(collapsed.sorted())")
+
+        // 5. And the deuteranopia bar (AC-3's second half): a pair that collapses under simulation must be
+        //    detected as collapsing. `UtilOrange` and `UtilRed` are visibly different in sRGB yet land
+        //    4.45/255 apart once simulated — under `deuteranopeCollapse`, so the shape assertion fires.
+        let orange = try assetRGB("UtilOrange", .aqua)
+        XCTAssertGreaterThan(channelDistance(orange, red), Self.deuteranopeCollapse,
+                             "UtilOrange and UtilRed are NOT distinguishable in plain sRGB — the "
+                             + "deuteranopia canary has nothing to demonstrate")
+        XCTAssertLessThanOrEqual(channelDistance(deuteranope(orange), deuteranope(red)), Self.deuteranopeCollapse,
+                                 "UtilOrange and UtilRed no longer collapse under deuteranopia, so the "
+                                 + "collapse-detection branch may never execute — re-check that "
+                                 + "testSeverityPairsThatCollapseUnderDeuteranopiaAreSeparatedByShape "
+                                 + "still asserts anything")
+    }
+
     // MARK: - Helpers
+
+    /// A shipped asset colour set, resolved through the REAL panel seam (`Color.panelAssets`, the bundle
+    /// fix #754 made) under `appearance`, as sRGB components. Resolution happens INSIDE
+    /// `performAsCurrentDrawingAppearance` because an asset colour is dynamic — read outside it, every
+    /// surface would silently return the host process's appearance and the four-surface sweep would be
+    /// four copies of one measurement (a degenerate pass).
+    private func assetRGB(_ name: String, _ appearance: NSAppearance.Name) throws -> RGB {
+        let bundle = Color.panelAssets
+        let dynamic = try XCTUnwrap(NSColor(named: name, bundle: bundle),
+                                    "colour set \(name) did not resolve from "
+                                    + "\(bundle.bundleURL.lastPathComponent) — the compiled Assets.xcassets "
+                                    + "is missing from the MenubarTests bundle (project.yml)")
+        return try resolve(dynamic, appearance, label: name)
+    }
+
+    /// An AppKit system colour under `appearance` — the bright `--u-*`-family fills the bar keeps (#388).
+    private func systemRGB(_ colour: NSColor, _ appearance: NSAppearance.Name) throws -> RGB {
+        try resolve(colour, appearance, label: "\(colour)")
+    }
+
+    private func resolve(_ colour: NSColor, _ appearance: NSAppearance.Name, label: String) throws -> RGB {
+        var resolved: NSColor?
+        try XCTUnwrap(NSAppearance(named: appearance), "appearance \(appearance.rawValue) is unavailable")
+            .performAsCurrentDrawingAppearance { resolved = colour.usingColorSpace(.sRGB) }
+        let srgb = try XCTUnwrap(resolved, "\(label) did not convert to sRGB under \(appearance.rawValue)")
+        return RGB(srgb.redComponent, srgb.greenComponent, srgb.blueComponent)
+    }
 
     private func cell(_ auth: CredentialHealth, recovering: Bool = false, enabled: Bool = true) -> String {
         StatusPanelFormat.authCell(auth: auth, recovering: recovering, enabled: enabled, quarantined: false)
@@ -1393,7 +1829,7 @@ final class StatusPanelFormatTests: XCTestCase {
 // vocabulary; the assertions do the verification. The palette fills are opaque (alpha 1), so a fill's own
 // color IS its rendered color — no compositing needed here.
 
-private struct RGB {
+private struct RGB: Equatable {
     let red, green, blue: Double
     init(_ r: Int, _ g: Int, _ b: Int) {
         red = Double(r) / 255; green = Double(g) / 255; blue = Double(b) / 255
@@ -1420,6 +1856,49 @@ private func contrast(_ a: RGB, _ b: RGB) -> Double {
 private func contrast(_ a: StatusPanelFormat.FillRGBA, _ b: RGB) -> Double { contrast(RGB(a), b) }
 private func contrast(_ a: StatusPanelFormat.FillRGBA, _ b: StatusPanelFormat.FillRGBA) -> Double {
     contrast(RGB(a), RGB(b))
+}
+
+// MARK: - #759 tint-contrast helpers: channel distance, alpha blend, deuteranopia simulation
+
+/// The largest per-channel difference between two colors, in 0…1. The separation metric for "did these two
+/// tokens collapse onto one color" — deliberately a max-channel delta, the same shape as the drift metric
+/// `BarGlyphRenderer.diffFraction` / `PanelRaster.diffFraction` threshold on, so the numbers read alike.
+private func channelDistance(_ a: RGB, _ b: RGB) -> Double {
+    max(abs(a.red - b.red), max(abs(a.green - b.green), abs(a.blue - b.blue)))
+}
+
+/// `color` composited `amount` (0…1) of the way toward `background` — source-over with `1 - amount` alpha.
+/// The canary's mutation: it degrades a REAL token along the one axis contrast measures, so the perturbed
+/// value is a plausible token rather than an arbitrary constant.
+private func blend(_ color: RGB, toward background: RGB, _ amount: Double) -> RGB {
+    RGB(color.red + (background.red - color.red) * amount,
+        color.green + (background.green - color.green) * amount,
+        color.blue + (background.blue - color.blue) * amount)
+}
+
+/// A deuteranope's view of `color` — Viénot, Brettel & Mollon (1999): convert to LMS, discard the M cone by
+/// reconstructing it from L and S, convert back. Operates in LINEAR light (the same `srgbToLinear` the
+/// contrast math uses), because the cone transform is only valid on linear intensities.
+///
+/// Used to answer one question with a measurement instead of an assumption: for a viewer with the most
+/// common form of colour-blindness, do two severity tints still differ? For this palette the warm family
+/// does NOT (see `testSeverityPairsThatCollapseUnderDeuteranopiaAreSeparatedByShape`), which is precisely
+/// why the shape channel is load-bearing rather than decorative.
+private func deuteranope(_ color: RGB) -> RGB {
+    let r = srgbToLinear(color.red), g = srgbToLinear(color.green), b = srgbToLinear(color.blue)
+    let l = 17.8824 * r + 43.5161 * g + 4.11935 * b
+    let m = 3.45565 * r + 27.1554 * g + 3.86714 * b
+    let s = 0.0299566 * r + 0.184309 * g + 1.46709 * b
+    let simulatedM = 0.494207 * l + 1.24827 * s        // the deuteranope's reconstructed M response
+    let outR = 0.0809444479 * l - 0.130504409 * simulatedM + 0.116721066 * s
+    let outG = -0.0102485335 * l + 0.0540193266 * simulatedM - 0.113614708 * s
+    let outB = -0.000365296938 * l - 0.00412161469 * simulatedM + 0.693511405 * s
+    return RGB(linearToSrgb(outR), linearToSrgb(outG), linearToSrgb(outB))
+}
+
+private func linearToSrgb(_ c: Double) -> Double {
+    let clamped = min(max(c, 0), 1)
+    return clamped <= 0.0031308 ? 12.92 * clamped : 1.055 * pow(clamped, 1 / 2.4) - 0.055
 }
 
 /// The HSV hue in degrees (0…360); 0 for an achromatic color (never expected in the palette).
