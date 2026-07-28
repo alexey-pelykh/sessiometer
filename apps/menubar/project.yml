@@ -196,6 +196,17 @@ targets:
       # duplicated between the app tool and the test bundle would rot exactly the way #504's injection sites
       # did. (`RenderPanelTool.swift` itself stays app-only: it is the CommandLine/exit tool surface.)
       - path: Sources/PanelRenderHarness.swift
+      # The two imperative shells' pure decision layers (issue #764). `StatusItemController` and
+      # `main.swift` themselves remain EXCLUDED and always will be — the controller owns NSStatusBar /
+      # NSPanel / a global event monitor, and `main.swift` is top-level AppKit entry code that cannot live
+      # in a unit-test bundle at all. So the DECISIONS moved out instead, exactly as #325 did for the glyph
+      # artwork (`StatusGauge`), #324 for the honest state (`HonestStateMachine`), and #170 for the login
+      # item (`LoginItemModel`): panel geometry, click routing, the lifecycle-menu spec and the
+      # outside-click retain here; launch-mode dispatch, the degrade wording and the per-call-site
+      # control-command budgets in `AppLaunchPlan`. Both are Foundation/AppKit-value-only — no view, no
+      # window, no status bar — so they compile into this headless bundle unchanged.
+      - path: Sources/StatusItemChrome.swift
+      - path: Sources/AppLaunchPlan.swift
       - path: Tests
     settings:
       base:

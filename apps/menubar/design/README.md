@@ -380,6 +380,93 @@ Run these with the daemon RUNNING (so the form loads) unless a step says otherwi
 Not on this list on purpose: the per-field COPY, the Save enable/disable rule, and whether a value or
 label fits its field. Those are measured in `SettingsTextMetricsTests` and do not need a human.
 
+### Status item + app entry pre-release checklist (manual)
+
+Issue #764 put the status item's and the app entry point's pure DECISIONS under automated gates
+(`Tests/StatusItemChromeTests`, `Tests/AppLaunchPlanTests`). What is left is the imperative shell those
+decisions drive — `NSStatusBar`, `NSPanel`, the global event monitor, and the top-level `NSApplication`
+bootstrap — none of which a headless logic bundle can stand up. `StatusItemController.swift` and
+`main.swift` therefore remain excluded from `MenubarTests` and always will be: the controller owns real
+menu-bar chrome, and `main.swift` is top-level entry code that cannot live in a unit-test bundle at all.
+
+Here is where every surface of those two files went. **25 rows: 9 covered by this item, 6 already covered
+elsewhere (one of those with an OS-wiring half that only a human can see, so it also appears below), 8
+routed to the 8-step manual checklist below, and 2 filed as defects.** Nothing is left silent.
+
+| Surface | Disposition |
+|---|---|
+| Panel placement (centering, both-axis clamp, #446 bottom floor) | `StatusItemChromeTests` |
+| Degenerate `fittingSize` fallback | `StatusItemChromeTests` |
+| Primary vs secondary click classification | `StatusItemChromeTests` |
+| Lifecycle-menu rows, order, copy, shortcuts | `StatusItemChromeTests` |
+| Outside-click disposition (own-icon, in-flight retain) | `StatusItemChromeTests` |
+| Open-panel precondition | `StatusItemChromeTests` |
+| Launch-mode dispatch + precedence + gallery opt-in | `AppLaunchPlanTests` |
+| Degrade wording + per-call-site timeout budgets | `AppLaunchPlanTests` |
+| Degrade FEED shape (exactly one `.disconnected`, then finish) | `AppLaunchPlanTests` |
+| `ConnectionState` → glyph projection | Already: `HonestStateMachineTests` (exhaustive 10-row table) |
+| One distinct silhouette per state (the brand lock) | Already: `StatusGaugeTests` + `BarGlyphParityTests` |
+| First-launch login-item registration, `canStartDaemon` | Already: `LoginItemModelTests` (#170) |
+| Daemon-agent re-registration after an app update | Already: `LoginItemModelTests` (#788) |
+| Sleep/wake dwell suspension logic | Already: `WatchStatusStoreTests` (#526) — the OS wiring is step 6 below |
+| Socket-path resolution + its failure taxonomy | Already: `SocketPathResolverTests` (ADR-0011 tripwire) |
+| Status-item creation, button target/action, panel + vibrancy chrome | Manual, step 1 |
+| Panel show/hide, key focus, `FloatingPanel.canBecomeKey` | Manual, steps 2 + 8 |
+| Transient-menu presentation mechanism | Manual, step 3 |
+| Global outside-click monitor install/remove | Manual, step 2 |
+| Stats re-size observer (`objectWillChange` → re-fit while open, #446) | Manual, step 4 |
+| `start()` presentation-stream consumption + its idempotence guard | Manual, step 1 |
+| Activation policy (`.accessory`), `applicationWillTerminate` | Manual, step 7 |
+| Notifier-before-`store.start` ordering | Manual, step 5 |
+| Tool flag with no output directory falls through to a normal launch | Filed: issue #850 |
+| Control-client `.failure → nil` degrade mapping (×4 call sites) | Filed: issue #853 |
+
+Two rows deserve their reasoning stated, because both were originally mis-filed here and the correction
+is the useful part. The **socket-path** row covers `resolve()` returning the right `ResolveError` — NOT
+what the four call sites do with it; that `.failure → nil` branch is a genuinely uncovered honesty path
+(issue #853), and the obvious manual step does not reach it, because a merely *stopped* daemon still
+resolves its socket path and the client is constructed and then times out. And the **state → glyph** row
+is this item's entire answer to AC-1, so `StatusItemChromeTests.testTheUpstreamStateToGlyphTableStill`
+`Exists` reads that suite's source and reddens if the table is deleted or narrowed — a link, not a note.
+
+Run these against a real build with the daemon RUNNING unless a step says otherwise:
+
+- [ ] **The item appears, and tracks state.** Launch the app: exactly one status item appears, showing a
+      monochrome gauge that tints correctly in a light AND a dark menu bar. Stop the daemon and confirm the
+      glyph changes, then restart it and confirm the glyph follows — the item must keep tracking, and must
+      never end up with two subscriptions double-applying. (Which glyph each state selects is gated
+      automatically; that the item exists at all, that the image is applied as a template, and that the
+      presentation stream is consumed exactly once, are not.)
+- [ ] **Click to toggle, and click away.** Primary-click the icon: the panel opens below it with a visible
+      gap, and the icon stays visible and clickable. Primary-click the icon again: it closes. Open it, then
+      click elsewhere on screen: it closes. Start a swap and click away mid-flight: it must NOT close.
+      (The decision is gated; that the global monitor is actually installed and removed is not.)
+- [ ] **Secondary-click menu.** Right-click and control-click the icon: the lifecycle menu appears
+      positioned under the item, and the panel closes first if it was open. Pick each row and confirm it
+      acts. Then primary-click the icon: the panel must still toggle — a menu left permanently assigned to
+      the status item would hijack the primary click (#325/#326).
+- [ ] **Stats tab re-size.** With the panel open on Status, switch to Stats: the panel must GROW to fit
+      the taller content rather than clipping it, and must stay fully on screen. Switch back to Status: it
+      must shrink to the original size. Then close the panel, switch nothing, and reopen — it opens on
+      Status at the small size. (The arithmetic is gated automatically; that the observer fires and defers
+      the re-fit to the next run-loop turn is only observable here — #446.)
+- [ ] **Cold start with the daemon stopped.** Launch with no daemon: the item shows the disconnected
+      glyph, the panel opens and reads honestly, and no notification is missed on the first snapshot when
+      the daemon comes up (the notifier is installed BEFORE the store starts consuming — an ordering the
+      wiring, not a model, guarantees).
+- [ ] **Sleep/wake.** Close the lid overnight (or `pmset sleepnow`) with the daemon running, and check the
+      item on wake: a benign long disconnect must NOT have escalated to Attention. The dwell logic itself
+      is unit-tested; that the `NSWorkspace` notifications reach it is only observable here (#526).
+- [ ] **Agent shape.** Confirm no Dock icon and no app-switcher entry while only the status item is up,
+      and that Quit terminates the app while `sessiometer status` still answers — Quit is a pure-client
+      control and must never stop the daemon.
+- [ ] **VoiceOver on the item.** With VoiceOver on, navigate to the status item and confirm it speaks the
+      current state sentence, and that focus moves INTO the panel when it opens. (`FloatingPanel` overrides
+      `canBecomeKey` precisely so this works; a plain borderless window would leave the panel unreachable.)
+
+Not on this list on purpose: the panel's own contents. Those are covered by the panel golden gate, the
+accessibility-tree gate (#758) and the VoiceOver checklist above.
+
 ## It's a mock, not code
 
 The mock approximates native treatments in HTML/CSS. When building the SwiftUI panel, translate
