@@ -17,6 +17,8 @@ import SwiftUI
 /// connection state, so a degraded daemon reads "last-known" / "· stale", never a false "active".
 /// Provider-neutral (issue #173): a generic gauge, no brand mark or color.
 struct PanelHeader: View {
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
     let subtitle: String
     /// Whether to show the Status|Stats seg control (issue #446). Only where the Stats tab can deliver (a
     /// live roster, not the capture surface; gated in `content`). Defaults off, so every degraded-state
@@ -26,26 +28,26 @@ struct PanelHeader: View {
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 10 * scale) {
             // The identity block (glyph + name + sub-line) combines into ONE accessibility element; the seg
             // control keeps its own button traits alongside it, so VoiceOver reads "Sessiometer, …" then the
             // two tab buttons rather than one merged blob.
-            HStack(spacing: 10) {
-                RoundedRectangle(cornerRadius: 7)
+            HStack(spacing: 10 * scale) {
+                RoundedRectangle(cornerRadius: 7 * scale)
                     // Mock `--badge-bg` neutral fill (#388) — replaces a washed `Color.secondary.opacity(0.16)`.
                     .fill(Color.panelFill(.badge, dark: colorScheme == .dark))
-                    .frame(width: 27, height: 27)
+                    .frame(width: 27 * scale, height: 27 * scale)
                     .overlay(
                         Image(systemName: "gauge.medium")
-                            .font(.system(size: 14, weight: .semibold))
+                            .font(.panel(14, .semibold, scale: scale))
                             .foregroundStyle(.primary)
                     )
                     .accessibilityHidden(true)
-                VStack(alignment: .leading, spacing: 1) {
+                VStack(alignment: .leading, spacing: 1 * scale) {
                     Text("Sessiometer")
-                        .font(.system(size: 13.5, weight: .semibold))
+                        .font(.panel(13.5, .semibold, scale: scale))
                     Text(subtitle)
-                        .font(.system(size: 11))
+                        .font(.panel(11, scale: scale))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.tail)
@@ -62,7 +64,7 @@ struct PanelHeader: View {
                 PanelTabSwitcher(tab: stats.tab) { stats.select($0) }
             }
         }
-        .padding(.horizontal, 14).padding(.top, 12).padding(.bottom, 11)
+        .padding(.horizontal, 14 * scale).padding(.top, 12 * scale).padding(.bottom, 11 * scale)
     }
 }
 
@@ -72,20 +74,22 @@ struct PanelHeader: View {
 /// mock's exact `--seg-*` chrome values inline (decorative control chrome, not a data-bearing tint — the
 /// data colors, `--spark` / `--sig-*`, live in the testable `StatusPanelFormat` layer).
 private struct PanelTabSwitcher: View {
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
     let tab: PanelStatsModel.Tab
     let select: (PanelStatsModel.Tab) -> Void
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        HStack(spacing: 2) {
+        HStack(spacing: 2 * scale) {
             segButton("Status", target: .status)
             segButton("Stats", target: .stats)
         }
-        .padding(2)
+        .padding(2 * scale)
         .background(
-            RoundedRectangle(cornerRadius: 7)
+            RoundedRectangle(cornerRadius: 7 * scale)
                 .fill(segBackground)
-                .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(segBorder, lineWidth: 0.5))
+                .overlay(RoundedRectangle(cornerRadius: 7 * scale).strokeBorder(segBorder, lineWidth: 0.5 * scale))
         )
     }
 
@@ -93,14 +97,15 @@ private struct PanelTabSwitcher: View {
         let on = tab == target
         return Button { select(target) } label: {
             Text(title)
-                .font(.system(size: 11, weight: on ? .semibold : .medium))
+                .font(.panel(11, on ? .semibold : .medium, scale: scale))
                 .foregroundStyle(on ? Color.primary : Color.secondary)
-                .padding(.horizontal, 9)
-                .padding(.vertical, 2.5)
+                .padding(.horizontal, 9 * scale)
+                .padding(.vertical, 2.5 * scale)
                 .background(
-                    RoundedRectangle(cornerRadius: 5)
+                    RoundedRectangle(cornerRadius: 5 * scale)
                         .fill(on ? segOnFill : Color.clear)
-                        .shadow(color: on ? Color.black.opacity(0.18) : .clear, radius: 0.75, y: 0.5)
+                        .shadow(color: on ? Color.black.opacity(0.18) : .clear,
+                                radius: 0.75 * scale, y: 0.5 * scale)
                 )
                 .contentShape(Rectangle())
         }
@@ -128,24 +133,26 @@ private struct PanelTabSwitcher: View {
 /// below are never mistaken for live (#137). Richer per-state strips (keychain-locked "paused", a
 /// Reconnect action) are #169.
 struct HonestStrip: View {
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
     let banner: StatusPanelFormat.Banner
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 8 * scale) {
             Image(systemName: "bolt.horizontal.circle")
-                .font(.caption)
+                .font(.panel(style: .caption1, scale: scale))
                 .accessibilityHidden(true)
             Text(banner.title)
-                .font(.system(size: 11.5, weight: .semibold))
+                .font(.panel(11.5, .semibold, scale: scale))
             Text(banner.detail)
-                .font(.system(size: 11.5))
+                .font(.panel(11.5, scale: scale))
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .truncationMode(.tail)
             Spacer(minLength: 0)
         }
         .foregroundStyle(stripTint)
-        .padding(.horizontal, 14).padding(.vertical, 9)
+        .padding(.horizontal, 14 * scale).padding(.vertical, 9 * scale)
         .background(stripTint.opacity(0.12))
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(banner.title). \(banner.detail)")
@@ -170,6 +177,8 @@ struct HonestStrip: View {
 /// never a targetless "swap to whatever you'd choose" verb. It is the same `swap` command a per-row
 /// switch sends; the daemon re-validates it either way.
 struct SwapCalloutCard: View {
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
     let target: String
     /// The daemon's selection rationale for `target`, already rendered from the wire
     /// `NextSwap.target` reason (issue #393); `nil` for a pre-#393 daemon that sent no reason, in
@@ -184,11 +193,11 @@ struct SwapCalloutCard: View {
     private var isSwitchingToTarget: Bool { swap.phase.pendingTarget == target }
 
     var body: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 10 * scale) {
             // The card's TEXT is one combined VoiceOver element; the button below is a SEPARATE one.
             // (Combining the whole card, as this did while the button was dead, would now swallow a live
             // control and leave it unreachable.)
-            VStack(alignment: .leading, spacing: 1) {
+            VStack(alignment: .leading, spacing: 1 * scale) {
                 // MIDDLE-truncate the TARGET label (issue #445), keeping the "→" prefix whole, so a
                 // same-local-part target's distinguishing suffix survives the elision (the earlier "clunky"
                 // read was a tail-truncated target). The prefix is `.fixedSize`d; the target absorbs the
@@ -202,10 +211,10 @@ struct SwapCalloutCard: View {
                         .lineLimit(1)
                         .truncationMode(StatusPanelFormat.identityElision.truncationMode)
                 }
-                .font(.system(size: 12))
+                .font(.panel(12, scale: scale))
                 if let reason {
                     Text(reason)
-                        .font(.system(size: 10.5))
+                        .font(.panel(10.5, scale: scale))
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.tail)
@@ -214,21 +223,21 @@ struct SwapCalloutCard: View {
             .accessibilityElement(children: .combine)
             .accessibilityLabel(accessibilityText)
 
-            Spacer(minLength: 6)
+            Spacer(minLength: 6 * scale)
 
             Button(action: { Task { await swap.swap(to: target) } }) {
                 if isSwitchingToTarget {
-                    HStack(spacing: 5) {
-                        ProgressView().controlSize(.small)
+                    HStack(spacing: 5 * scale) {
+                        ProgressView().controlSize(PanelTypeScale.controlSize(for: scale))
                         Text(StatusPanelFormat.swapPendingText)
                     }
                 } else {
                     Text("Swap")
                 }
             }
-            .font(.system(size: 12, weight: .semibold))
+            .font(.panel(12, .semibold, scale: scale))
             .buttonStyle(.borderedProminent)
-            .controlSize(.small)
+            .controlSize(PanelTypeScale.controlSize(for: scale))
             // Any in-flight swap disables this button too — the footer and the rows are siblings on the
             // one `swap` verb, and the daemon holds a single-writer lock behind it.
             .disabled(swap.phase.isPending)
@@ -237,16 +246,16 @@ struct SwapCalloutCard: View {
                                 ? "Switching to \(target)"
                                 : StatusPanelFormat.switchHelpText(label: target))
         }
-        .padding(.leading, 11).padding(.trailing, 8).padding(.vertical, 9)
+        .padding(.leading, 11 * scale).padding(.trailing, 8 * scale).padding(.vertical, 9 * scale)
         // Fill + border opacities are theme-aware (#388, mock `--accent-tint` / `--accent-tint-border`):
         // .10/.20 light, .16/.30 dark — the dark callout was too faint hardcoded to the light values.
         .background(
-            RoundedRectangle(cornerRadius: 9)
+            RoundedRectangle(cornerRadius: 9 * scale)
                 .fill(Color.accentEmphasis(.swapCalloutFill, dark: colorScheme == .dark))
-                .overlay(RoundedRectangle(cornerRadius: 9)
-                    .strokeBorder(Color.accentEmphasis(.swapCalloutBorder, dark: colorScheme == .dark), lineWidth: 0.5))
+                .overlay(RoundedRectangle(cornerRadius: 9 * scale)
+                    .strokeBorder(Color.accentEmphasis(.swapCalloutBorder, dark: colorScheme == .dark), lineWidth: 0.5 * scale))
         )
-        .padding(.horizontal, 8).padding(.top, 9).padding(.bottom, 4)
+        .padding(.horizontal, 8 * scale).padding(.top, 9 * scale).padding(.bottom, 4 * scale)
     }
 
     /// The spoken label for the card's text — delegated to `StatusPanelFormat.swapCalloutAccessibilityLabel`
@@ -271,6 +280,8 @@ struct SwapCalloutCard: View {
 /// button over a daemon it can't start. On success the daemon comes up and the panel leaves `.notRunning`
 /// on the next `watch` snapshot (like a swap's new active row); a failure surfaces its reason inline.
 struct StartDaemonCard: View {
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
     @EnvironmentObject private var loginItem: LoginItemModel
 
     /// The Start registration is in flight (the transient spinner beat).
@@ -280,18 +291,18 @@ struct StartDaemonCard: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 8 * scale) {
             BannerView(banner: StatusPanelFormat.banner(for: .notRunning, accountCount: 0))
             if loginItem.canStartDaemon {
                 startButton
                 if case .failed(let reason) = loginItem.startPhase {
                     Label(reason, systemImage: "exclamationmark.triangle.fill")
-                        .font(.system(size: 11))
+                        .font(.panel(11, scale: scale))
                         .foregroundStyle(.red)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Text(StatusPanelFormat.startDaemonHint)
-                    .font(.system(size: 10.5))
+                    .font(.panel(10.5, scale: scale))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -301,17 +312,17 @@ struct StartDaemonCard: View {
     private var startButton: some View {
         Button(action: { Task { await loginItem.startDaemon() } }) {
             if isRegistering {
-                HStack(spacing: 5) {
-                    ProgressView().controlSize(.small)
+                HStack(spacing: 5 * scale) {
+                    ProgressView().controlSize(PanelTypeScale.controlSize(for: scale))
                     Text(StatusPanelFormat.startDaemonPendingText)
                 }
             } else {
                 Label(StatusPanelFormat.startDaemonButtonTitle, systemImage: "play.fill")
             }
         }
-        .font(.system(size: 12, weight: .semibold))
+        .font(.panel(12, .semibold, scale: scale))
         .buttonStyle(.borderedProminent)
-        .controlSize(.small)
+        .controlSize(PanelTypeScale.controlSize(for: scale))
         .disabled(isRegistering)
         .accessibilityLabel(isRegistering
                             ? StatusPanelFormat.startDaemonPendingText
@@ -327,6 +338,8 @@ struct StartDaemonCard: View {
 /// is already looking; a second spinner would be noise. `done` clears itself after a short beat; a
 /// `failed` persists until the next swap attempt, so an error the operator has not read cannot vanish.
 struct SwapStatusLine: View {
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
     @EnvironmentObject private var swap: AccountSwapModel
 
     var body: some View {
@@ -347,9 +360,9 @@ struct SwapStatusLine: View {
 
     private func line(_ text: String, symbol: String, tint: Color) -> some View {
         Label(text, systemImage: symbol)
-            .font(.system(size: 11))
+            .font(.panel(11, scale: scale))
             .foregroundStyle(tint)
-            .padding(.horizontal, 12).padding(.vertical, 2)
+            .padding(.horizontal, 12 * scale).padding(.vertical, 2 * scale)
     }
 }
 
@@ -360,18 +373,20 @@ struct SwapStatusLine: View {
 /// no card, so the two never collide). Amber when the reading should be distrusted (a wedged poll loop,
 /// or a stale/disconnected connection), never frozen-as-fresh (#137).
 struct FooterView: View {
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
     let text: String
     let stale: Bool
 
     var body: some View {
         VStack(spacing: 0) {
             Divider()
-            HStack(spacing: 5) {
+            HStack(spacing: 5 * scale) {
                 Image(systemName: "clock")
-                    .font(.caption2)
+                    .font(.panel(style: .caption2, .medium, scale: scale))
                     .accessibilityHidden(true)
                 Text(text)
-                    .font(.system(size: 11))
+                    .font(.panel(11, scale: scale))
                     .monospacedDigit()
                 Spacer(minLength: 0)
             }
@@ -380,9 +395,9 @@ struct FooterView: View {
             // (wedged poll loop / stale / disconnected). That amber is the SAME contrast-safe `--ut-a` token
             // as the stale auth glyph (#388) — small text on the vibrancy, so never raw system orange (< 4.5:1).
             .foregroundStyle(stale ? .panel(StatusPanelFormat.healthTint(.yellow)) : Color(nsColor: .tertiaryLabelColor))
-            .padding(.horizontal, 14).padding(.top, 9).padding(.bottom, 11)
+            .padding(.horizontal, 14 * scale).padding(.top, 9 * scale).padding(.bottom, 11 * scale)
         }
-        .padding(.top, 5)
+        .padding(.top, 5 * scale)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(stale ? "\(text), stale" : text)
     }
