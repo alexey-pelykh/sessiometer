@@ -893,6 +893,62 @@ final class StatusPanelFormatTests: XCTestCase {
         XCTAssertEqual(StatusPanelFormat.captureCommand, "sessiometer capture")
     }
 
+    // MARK: - Start-daemon card copy, attributed to its writer (issue #820)
+    //
+    // `startPhase` has had TWO writers since issue #788 — the Start button and the launch-time registration
+    // repair — and until now both rendered identical copy, so a repair no press stood behind was
+    // indistinguishable from a press that failed. These pin the distinction ON THE STRINGS. Whether the
+    // strings actually reach the screen is `StartDaemonCardTests`' job.
+
+    /// The pending beat says WHICH writer is running. The operator's wording is unchanged from issue #170.
+    func testPendingTextNamesTheWriterThatPaintedTheBeat() {
+        XCTAssertEqual(StatusPanelFormat.startDaemonPendingText(for: .operatorStart), "Starting…")
+        XCTAssertEqual(StatusPanelFormat.startDaemonPendingText(for: .launchRepair), "Repairing…")
+        XCTAssertNotEqual(StatusPanelFormat.startDaemonPendingText(for: .operatorStart),
+                          StatusPanelFormat.startDaemonPendingText(for: .launchRepair),
+                          "identical copy is exactly the defect issue #820 fixes — assert they DIFFER, not "
+                          + "merely that each has some value")
+    }
+
+    /// The failure line: verbatim for a press, attributed for the launch repair. Driven with the ONE reason
+    /// both writers emit byte-identically (`notStartedReason`'s wording), because that is the case where the
+    /// reason itself carries no signal and the attribution is doing all the work.
+    func testFailureTextAttributesOnlyTheUnpromptedLaunchRepair() {
+        let shared = "The daemon was registered but didn’t start. Check Console for details."
+
+        XCTAssertEqual(StatusPanelFormat.startDaemonFailureText(reason: shared, origin: .operatorStart),
+                       shared,
+                       "the operator pressed the button a moment ago — a prefix telling them so is noise, "
+                       + "and issue #170/#745's shipped copy stays byte-unchanged on that path")
+
+        let repaired = StatusPanelFormat.startDaemonFailureText(reason: shared, origin: .launchRepair)
+        XCTAssertNotEqual(repaired, shared, "the same reason must not read the same from both writers")
+        XCTAssertTrue(repaired.hasPrefix(StatusPanelFormat.startDaemonRepairAttribution),
+                      "the attribution LEADS — the operator's first question about a card they never "
+                      + "summoned is who did this, not what went wrong")
+        XCTAssertTrue(repaired.hasSuffix(shared), "and the reason itself survives the prefix intact")
+    }
+
+    /// The attribution says both halves out loud — that it was automatic (so: not you) and what triggered
+    /// it. A prefix that named only one would leave the operator to guess the other.
+    func testTheRepairAttributionSaysAutomaticAndWhy() {
+        let attribution = StatusPanelFormat.startDaemonRepairAttribution
+        XCTAssertTrue(attribution.lowercased().contains("automatic"),
+                      "no press stands behind this; the copy has to say so")
+        XCTAssertTrue(attribution.lowercased().contains("update"), "and name what triggered it")
+    }
+
+    /// Redaction (issue #15) is not weakened by the prefix: the attribution is a fixed literal that
+    /// interpolates nothing, so whatever redaction the reason arrived with is what the card shows.
+    func testAttributionAddsNothingBeyondTheReasonItWasGiven() {
+        let reason = "Operation not permitted"
+        let attributed = StatusPanelFormat.startDaemonFailureText(reason: reason, origin: .launchRepair)
+        XCTAssertEqual(attributed,
+                       "\(StatusPanelFormat.startDaemonRepairAttribution) — \(reason)",
+                       "the whole output is the fixed attribution plus the reason as given — no second "
+                       + "source of text that could smuggle in something un-redacted")
+    }
+
     // MARK: - rowAccessibilityLabel (issue #326 AC: VoiceOver-navigable rows)
 
     func testRowAccessibilityLabelSpeaksTheRow() {

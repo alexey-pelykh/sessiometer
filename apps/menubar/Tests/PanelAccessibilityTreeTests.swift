@@ -246,22 +246,21 @@ extension Array where Element == A11yNode {
     }
 }
 
-// MARK: - Tests
+// MARK: - The absence-trap guard every absence assertion routes through
+//
+// Every absence assertion in this bundle calls this against the SAME dump it is judging. An activation
+// failure yields an empty tree, which would satisfy "no decorative element leaked" — or "the reason is
+// gone" — perfectly; this is what makes those claims evidence rather than vacuity (file header).
+//
+// On `XCTestCase` rather than private to one suite, because it has more than one: `StartDaemonCardTests`
+// (issue #820) hosts the not-running card through the same `PanelA11y` harness and carries the same trap,
+// and issue #840's Settings gate will be the third. A hand-copied guard is a second failure message to keep
+// in step with the first — the drift issue #504 already paid for once.
 
-@MainActor
-final class PanelAccessibilityTreeTests: XCTestCase {
-
-    private static let panelSize = CGSize(width: 380, height: 420)
-
-    // MARK: Absence-trap guard
-    //
-    // Every absence assertion below calls this against the SAME dump it is judging. An activation failure
-    // yields an empty tree, which would satisfy "no decorative element leaked" perfectly — this is what
-    // makes the absence claims evidence rather than vacuity (file header).
-
-    private func assertKnownPresent(_ nodes: [A11yNode], _ needle: String,
-                                    _ context: String,
-                                    file: StaticString = #filePath, line: UInt = #line) {
+extension XCTestCase {
+    func assertKnownPresent(_ nodes: [A11yNode], _ needle: String,
+                            _ context: String,
+                            file: StaticString = #filePath, line: UInt = #line) {
         XCTAssertNotNil(
             nodes.firstContaining(needle), """
             ABSENCE EVIDENCE VOID for \(context): the known-present anchor '\(needle)' is missing from a \
@@ -269,6 +268,17 @@ final class PanelAccessibilityTreeTests: XCTestCase {
             the tree is empty or filtered, not clean. Check PanelA11y.activate() first.
             """, file: file, line: line)
     }
+}
+
+// MARK: - Tests
+
+@MainActor
+final class PanelAccessibilityTreeTests: XCTestCase {
+
+    private static let panelSize = CGSize(width: 380, height: 420)
+
+    // The absence-trap guard every check below pairs with is `assertKnownPresent`, defined above this class
+    // so the suites that share this harness share the guard too.
 
     // MARK: - Rig canaries — every predicate proven able to FAIL, by mutation
     //
