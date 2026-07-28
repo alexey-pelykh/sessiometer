@@ -76,8 +76,15 @@ data-path:
    `event=active_dead_no_target hold=… cause=… [resets_at=…]` — the same `key=val`
    grammar as `AllExhausted`. Fired once on entry under a
    `signaled_active_dead_no_target` latch (mirroring `signaled_all_exhausted`),
-   cleared on exit with a `Diagnostic::ActiveDeadNoTargetCleared` leave-marker. The
+   cleared on exit with an `Event::ActiveDeadNoTargetCleared` leave-marker. The
    stranded state is now diagnosable from `sessiometer.log` alone (**#399**).
+
+   > **Amended by #827.** The leave-marker shipped as a stderr-bound
+   > `Diagnostic::ActiveDeadNoTargetCleared`, so the bracket closed in code but not
+   > in the log and the strand's END was not reconstructable offline. **#827**
+   > promoted it to the durable `Event` named above — both edges now land on the
+   > same governed, always-on sink. The decision this ADR records (surface the
+   > strand, do not relax the filter) is unchanged.
 
 3. **Render (`src/cli.rs` + menubar).** The `next swap:` footer and the menubar
    `nextSwapFooter` show the composite: the dead active's `🔴 claude /login` row
@@ -158,7 +165,8 @@ a token or email. User-visible strings carry **no** issue numbers.
   or email).
 - Code: `src/daemon/snapshot.rs` — `NextSwap::NoViableTarget { cause, resets_at }`,
   `NoTargetCause`, `STATUS_SCHEMA_VERSION` 1.3. `src/observability.rs` —
-  `Event::ActiveDeadNoTarget`, `Diagnostic::ActiveDeadNoTargetCleared`,
+  `Event::ActiveDeadNoTarget`, `Event::ActiveDeadNoTargetCleared` (a
+  `Diagnostic` until **#827** promoted it),
   `DecisionClass::ActiveDeadNoTarget` (pre-existing). `src/daemon.rs` —
   `signaled_active_dead_no_target` latch (edge-triggered set at the emergency
   no-target branch, cleared on exit), `all_exhausted_relief()` (the reused relief

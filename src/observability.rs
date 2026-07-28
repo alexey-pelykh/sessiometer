@@ -747,13 +747,46 @@ pub(crate) enum Event {
     /// `all_exhausted_relief`, naming WHEN a spare's weekly window frees capacity; `resets_at` is
     /// that reset as epoch seconds (RFC 3339 in [`Event::to_log_line`], present whenever a spare
     /// reported a parseable weekly reset, omitted otherwise). Edge-triggered like `all_exhausted`:
-    /// emitted exactly ONCE on entering the strand, cleared by [`Diagnostic::ActiveDeadNoTargetCleared`].
+    /// emitted exactly ONCE on entering the strand, cleared by [`Self::ActiveDeadNoTargetCleared`].
     /// Secret-free by construction (#15): a closed enum + a label + a timestamp, never a token or email.
     ActiveDeadNoTarget {
         hold: String,
         cause: SwapReason,
         resets_at: Option<i64>,
     },
+    /// The daemon LEFT the active-dead-no-target strand (issue #405): the dead active recovered
+    /// (re-login / spontaneous revive) or a live target became reachable again. The edge-triggered
+    /// EXIT partner of [`Self::ActiveDeadNoTarget`]'s ENTER, so the strand's SPAN is bracketed in
+    /// the DURABLE log — the sibling idiom of [`Self::AllExhaustedCleared`].
+    ///
+    /// Durable since issue #827: previously a stderr-bound `Diagnostic::ActiveDeadNoTargetCleared`,
+    /// so the bracket closed in CODE but not in the LOG. Issue #775 later made the diagnostic
+    /// channel *reachable* for a background daemon (`[tunables] verbose` plus
+    /// `sessiometer log --channel diag`), which is why the promotion no longer rests on
+    /// reachability — it rests on GOVERNANCE and on being always-on. Diagnostics are opt-in and
+    /// default OFF (the reader defaults to the event channel), so on a default install the LEAVE
+    /// edge was simply absent; and `daemon.err.log` is an ungoverned channel that can carry panic
+    /// payloads which passed no redaction meter, whereas every field of this log is a handle, enum,
+    /// number or timestamp by type-level construction and passes the issue #15 meter. A LEAVE
+    /// marker whose ENTER partner is a durable, governed event belongs on the same sink as it.
+    ///
+    /// A consumer MUST NOT assume every ENTER has a matching END, nor that ENTER edges count
+    /// episodes. Three sources of an unclosed or duplicated bracket survive this change, mirroring
+    /// [`Self::AllExhaustedCleared`]'s:
+    ///
+    /// 1. The ENTER guard re-arms on ANY non-strand tick, so a strand that flickers — stranded,
+    ///    one non-strand tick, stranded again — emits two ENTER/LEAVE pairs for what an operator
+    ///    would call one episode. ENTER edges therefore OVER-count, and pairs still need debouncing.
+    /// 2. `DecisionState::signaled_active_dead_no_target` is IN-MEMORY only, never persisted, so a
+    ///    daemon restart mid-strand drops the pending LEAVE (an ENTER with no END) and, because
+    ///    the guard comes back clear, re-emits a DUPLICATE ENTER on the next strand tick —
+    ///    deriving duration from that second ENTER understates the strand.
+    /// 3. Windows predating issue #827 carry ENTERs with no END at all, and are not backfillable.
+    ///
+    /// Payload-free by design: the ENTER line already carries `hold` / `cause` / `resets_at`, and
+    /// the leave is just "the strand ended". Secret-free by construction (issue #15) — the line is
+    /// a timestamp and a closed token, with no field that could hold a label, email, or token.
+    ActiveDeadNoTargetCleared,
     /// The aggregate fleet runway (issue #544 — the roster's combined weekly head-room over its
     /// combined observed burn) dropped BELOW the operator's `fleet_runway_warn_secs` threshold —
     /// the PROACTIVE lead-time warning (issue #650) ahead of the all-exhausted terminal state
@@ -762,7 +795,7 @@ pub(crate) enum Event {
     ///
     /// Edge-triggered like `all_exhausted`: emitted exactly ONCE on the downward crossing, held
     /// silent while the runway stays below, re-armed by the daemon once a KNOWN reading is back
-    /// at/over the threshold ([`Diagnostic::FleetRunwayRecovered`] marks that leave edge).
+    /// at/over the threshold ([`Self::FleetRunwayRecovered`] marks that leave edge).
     /// `runway_secs` is the crossing reading, `threshold_secs` the configured warn line, and
     /// `counted`/`observed` the aggregate's `n of m` honesty cardinality (how many accounts
     /// backed the figure vs were seen — #544's honest-degradation surface, carried so the line
@@ -774,6 +807,36 @@ pub(crate) enum Event {
         counted: usize,
         observed: usize,
     },
+    /// The aggregate fleet runway recovered to at/over the operator's `fleet_runway_warn_secs`
+    /// threshold (issue #650): the warning re-armed, so a LATER downward crossing signals afresh.
+    /// The edge-triggered EXIT partner of [`Self::FleetRunwayLow`]'s ENTER, so a low-runway
+    /// episode's SPAN is bracketed in the DURABLE log — the sibling idiom of
+    /// [`Self::AllExhaustedCleared`].
+    ///
+    /// Durable since issue #827, for the same reason as [`Self::ActiveDeadNoTargetCleared`]: the
+    /// diagnostic channel is opt-in, default OFF, and ungoverned, while this log is always-on and
+    /// passes the issue #15 redaction meter by type-level construction. See that variant for the
+    /// full governance argument.
+    ///
+    /// Its bracket caveats apply here too, with one difference in the first. A consumer MUST NOT
+    /// assume every ENTER has a matching END, nor that ENTER edges count episodes:
+    ///
+    /// 1. A runway OSCILLATING around the threshold across successive cadence windows emits one
+    ///    ENTER/LEAVE pair per crossing, so ENTER edges OVER-count what an operator would call one
+    ///    low-runway episode. Unlike the sibling guards, though, this one re-arms ONLY on a KNOWN
+    ///    at/over reading — an UNKNOWN aggregate holds it — so a merely-unreadable window cannot
+    ///    split an episode.
+    /// 2. `DecisionState::signaled_fleet_runway_low` is IN-MEMORY only, so a daemon restart
+    ///    mid-episode drops the pending LEAVE and re-emits a duplicate ENTER on the next downward
+    ///    crossing.
+    /// 3. Windows predating issue #827 carry ENTERs with no END at all, and are not backfillable.
+    ///
+    /// Fires only on a KNOWN at/over-threshold reading: an UNKNOWN aggregate (store hiccup,
+    /// degraded overlay, or a counted-but-FLAT fleet) HOLDS the armed state instead, so a flaky
+    /// read never fabricates a recovery. Payload-free by design — the ENTER line carried the
+    /// reading, and the recovery is just "back over". Secret-free by construction (issue #15): a
+    /// timestamp and a closed token, never an account handle, email, or token.
+    FleetRunwayRecovered,
     /// `account`'s stored token was rejected with HTTP 401 `consecutive` times in a
     /// row — the climbing streak toward the dead-credential threshold (issue #42).
     /// Emitted per 401 while the account is still healthy; once it crosses
@@ -1554,6 +1617,9 @@ impl Event {
                 };
                 format!("ts={ts} event=active_dead_no_target hold={hold} cause={cause}{resets}")
             }
+            Event::ActiveDeadNoTargetCleared => {
+                format!("ts={ts} event=active_dead_no_target_cleared")
+            }
             Event::FleetRunwayLow {
                 runway_secs,
                 threshold_secs,
@@ -1566,6 +1632,9 @@ impl Event {
                     "ts={ts} event=fleet_runway_low runway_secs={runway_secs} \
                      threshold_secs={threshold_secs} counted={counted} observed={observed}"
                 )
+            }
+            Event::FleetRunwayRecovered => {
+                format!("ts={ts} event=fleet_runway_recovered")
             }
             Event::Monitor401 {
                 account,
@@ -2513,25 +2582,6 @@ pub(crate) enum Diagnostic {
         /// the same shape as `fingerprint` — never a token.
         rotated_from: Option<String>,
     },
-    /// The daemon LEFT the active-dead-no-target strand (issue #405): the dead active
-    /// recovered (re-login / spontaneous revive) or a live target became reachable
-    /// again. The edge-triggered LEAVE marker — the symmetric partner of the event
-    /// log's edge-triggered `active_dead_no_target` ENTER, mirroring
-    /// [`Event::AllExhaustedCleared`] — so a stale strand reading is told from a current one.
-    /// Unlike that sibling — promoted to a durable event by issue #800 — this marker is still
-    /// stderr-bound, so the strand's END is not reconstructable offline (issue #827).
-    ActiveDeadNoTargetCleared,
-    /// The aggregate fleet runway recovered to at/over the operator's `fleet_runway_warn_secs`
-    /// threshold (issue #650): the warning re-armed, so a LATER downward crossing will signal
-    /// afresh. The edge-triggered LEAVE marker — the symmetric partner of the event log's
-    /// edge-triggered `fleet_runway_low` ENTER, mirroring [`Event::AllExhaustedCleared`] — so a
-    /// stale low-runway reading is told from a current one. Like the sibling above (and unlike
-    /// that promoted marker) this one is still stderr-bound, so the low-runway episode's END is
-    /// not reconstructable offline (issue #827). Fires only on a KNOWN at/over-
-    /// threshold reading: an UNKNOWN aggregate (store hiccup, degraded overlay) holds the
-    /// armed state instead, so a flaky read never fabricates a recovery (the
-    /// `signaled_canonical_scrubbed` discipline).
-    FleetRunwayRecovered,
 }
 
 impl Diagnostic {
@@ -2624,10 +2674,6 @@ impl Diagnostic {
                     "ts={ts} diag=canonical state={state}{fingerprint}{account}{expires_at}{rotated}"
                 )
             }
-            Diagnostic::ActiveDeadNoTargetCleared => {
-                format!("ts={ts} diag=active_dead_no_target_cleared")
-            }
-            Diagnostic::FleetRunwayRecovered => format!("ts={ts} diag=fleet_runway_recovered"),
         }
     }
 }
@@ -2963,6 +3009,15 @@ mod tests {
     }
 
     #[test]
+    fn active_dead_no_target_cleared_line_is_bare() {
+        // Issue #827: the strand's edge-triggered EXIT partner — a bare token, mirroring
+        // `event=all_exhausted_cleared`. The strand's span is bracketed by pairing this with the
+        // last `active_dead_no_target` ENTER line, so the payload lives on the ENTER alone.
+        let line = Event::ActiveDeadNoTargetCleared.to_log_line(at_epoch(0));
+        assert_eq!(line, format!("{TS0} event=active_dead_no_target_cleared"));
+    }
+
+    #[test]
     fn fleet_runway_low_renders_the_crossing_the_threshold_and_the_cardinality() {
         // #650: the proactive warn line carries four plain integers — the crossing reading, the
         // configured line it dropped below, and the `n of m` honesty cardinality (how many
@@ -2981,6 +3036,15 @@ mod tests {
                 "{TS0} event=fleet_runway_low runway_secs=1800 threshold_secs=3600 counted=2 observed=3"
             )
         );
+    }
+
+    #[test]
+    fn fleet_runway_recovered_line_is_bare() {
+        // Issue #827: the proactive warn's edge-triggered EXIT partner — a bare token, mirroring
+        // `event=all_exhausted_cleared`. No payload: the ENTER line carried the reading, and the
+        // recovery is just "back over", so the episode's span comes from pairing the two lines.
+        let line = Event::FleetRunwayRecovered.to_log_line(at_epoch(0));
+        assert_eq!(line, format!("{TS0} event=fleet_runway_recovered"));
     }
 
     #[test]
@@ -3953,6 +4017,13 @@ mod tests {
                 cause: SwapReason::Weekly,
                 resets_at: Some(1_782_777_600),
             },
+            // Issue #827: the two durable LEAVE partners promoted off the diagnostic channel —
+            // bare tokens with no field at all, so they ride the sweep trivially, and the sweep
+            // that covers them is now THIS one rather than the diagnostic one below. Listing them
+            // is a deliberate act: this array is a CURATED subset of `Event`, not an
+            // enforced-exhaustive one — nothing makes adding a variant add a row here, so a
+            // payload-carrying variant still needs listing by hand.
+            Event::ActiveDeadNoTargetCleared,
             // Issue #650: the proactive fleet-runway warn line — four bare integers, no handle.
             Event::FleetRunwayLow {
                 runway_secs: 1800,
@@ -3960,6 +4031,7 @@ mod tests {
                 counted: 2,
                 observed: 3,
             },
+            Event::FleetRunwayRecovered,
             Event::ReStash {
                 account: "work".to_owned(),
             },
@@ -4132,6 +4204,80 @@ mod tests {
     }
 
     #[test]
+    fn the_promoted_leave_edges_survive_a_log_file_round_trip() {
+        // Issue #827's whole point, for BOTH promoted edges: each must be reconstructable
+        // OFFLINE, so drive the real sink to a real file and read both full brackets back —
+        // emit → persist → parse, end to end. Sibling of
+        // `all_exhausted_cleared_survives_a_log_file_round_trip`; the readback re-implements the
+        // flat `key=val` tokenizer rather than calling a consumer, so it pins each LINE's own
+        // recoverability independently of any one consumer's folding. That the real consumers
+        // tolerate the new kinds is pinned separately, in `reliability` and `usage_stats`' own
+        // test modules.
+        //
+        // Both brackets go into ONE file, interleaved, because that is the production shape: the
+        // two episodes are independent and can be open at the same time, so a reader has to pair
+        // each LEAVE with its OWN ENTER by kind rather than by adjacency.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessiometer.log");
+        let mut log = EventLog::at(&path).unwrap();
+
+        log.emit(&Event::ActiveDeadNoTarget {
+            hold: "work".to_owned(),
+            cause: SwapReason::Weekly,
+            resets_at: Some(1_782_777_600),
+        })
+        .unwrap();
+        log.emit(&Event::FleetRunwayLow {
+            runway_secs: 1800,
+            threshold_secs: 3600,
+            counted: 2,
+            observed: 2,
+        })
+        .unwrap();
+        log.emit(&Event::ActiveDeadNoTargetCleared).unwrap();
+        log.emit(&Event::FleetRunwayRecovered).unwrap();
+
+        let logged = std::fs::read_to_string(&path).unwrap();
+        let parsed: Vec<std::collections::BTreeMap<&str, &str>> = logged
+            .lines()
+            .map(|line| {
+                line.split_whitespace()
+                    .filter_map(|token| token.split_once('='))
+                    .collect()
+            })
+            .collect();
+
+        // Each line recovers its own `event=` kind, in order — so both brackets close in the LOG,
+        // not merely in code.
+        assert_eq!(
+            parsed
+                .iter()
+                .map(|fields| fields.get("event").copied().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "active_dead_no_target",
+                "fleet_runway_low",
+                "active_dead_no_target_cleared",
+                "fleet_runway_recovered",
+            ],
+            "got: {logged:?}"
+        );
+        // …and each LEAVE line's `ts=` is readable by the crate's one canonical RFC-3339 parser,
+        // so each episode's END is placeable in time — the offline reconstructability the issue
+        // asks for. A bare token that could not be timestamped would close nothing.
+        for fields in &parsed[2..] {
+            assert!(
+                crate::usage::epoch_from_rfc3339(fields.get("ts").copied().unwrap()).is_some(),
+                "every LEAVE edge must be placeable in time: {logged:?}"
+            );
+        }
+        // Neither promoted line adds an email/token surface to the file the operator ships
+        // around — the #15 guarantee that is half of why the two moved onto this channel
+        // (`Event::ActiveDeadNoTargetCleared` carries the argument).
+        assert!(crate::redaction::meter::unauthored_emails(&logged, &[]).is_empty());
+    }
+
+    #[test]
     fn the_log_file_is_created_private() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
@@ -4240,6 +4386,45 @@ ts=1970-01-01T00:00:30Z event=all_exhausted_cleared\n",
             &path,
             "ts=1970-01-01T00:00:10Z event=all_exhausted hold=b cause=session\n\
 ts=1970-01-01T00:00:20Z event=all_exhausted_cleared\n",
+        )
+        .unwrap();
+        assert_eq!(last_swap_at(&path), None);
+    }
+
+    #[test]
+    fn last_swap_at_ignores_the_promoted_leave_edges() {
+        // Issue #827 put two MORE `event=` kinds into the log, and this reader gates the one-shot
+        // `use` verb's swap cooldown (#63/#10) — the same production path issue #800's sibling
+        // test guards. Both new kinds land AFTER the swap on their own tick (the daemon pushes
+        // each clear post-`decide_action`), so they are the last lines exactly when the cooldown
+        // matters most. `last_swap_at` scans from the end for a SPACE-ANCHORED ` event=swap ` /
+        // ` event=emergency_swap `, so it must walk past both and still return the swap's instant
+        // — never `None`, which would read as "cooldown inactive" and wrongly permit an immediate
+        // second swap.
+        //
+        // The active-dead strand's real exit is an EMERGENCY swap (#42/#405), so that arm of the
+        // reader — not just the plain-swap one — is what this pins.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessiometer.log");
+        std::fs::write(
+            &path,
+            "ts=1970-01-01T00:00:10Z event=active_dead_no_target hold=a cause=weekly\n\
+ts=1970-01-01T00:00:30Z event=emergency_swap from=a to=b\n\
+ts=1970-01-01T00:00:30Z event=active_dead_no_target_cleared\n\
+ts=1970-01-01T00:00:40Z event=fleet_runway_recovered\n",
+        )
+        .unwrap();
+        assert_eq!(last_swap_at(&path), Some(at_epoch(30)));
+
+        // And a log carrying ONLY the two brackets (no swap at all — the strand ended because the
+        // dead active recovered, and the runway rose on its own) still reports no swap, so no new
+        // edge can fabricate a cooldown floor out of nothing.
+        std::fs::write(
+            &path,
+            "ts=1970-01-01T00:00:10Z event=active_dead_no_target hold=a cause=weekly\n\
+ts=1970-01-01T00:00:20Z event=active_dead_no_target_cleared\n\
+ts=1970-01-01T00:00:30Z event=fleet_runway_low runway_secs=1800 threshold_secs=3600 counted=2 observed=2\n\
+ts=1970-01-01T00:00:40Z event=fleet_runway_recovered\n",
         )
         .unwrap();
         assert_eq!(last_swap_at(&path), None);
@@ -5204,27 +5389,6 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
     }
 
     #[test]
-    fn active_dead_no_target_cleared_line_is_bare() {
-        // #405: the strand's LEAVE marker, mirroring `event=all_exhausted_cleared` — a bare edge
-        // token. Still stderr-bound, unlike that sibling (promoted to a durable event by #800).
-        assert_eq!(
-            Diagnostic::ActiveDeadNoTargetCleared.to_log_line(at_epoch(0)),
-            format!("{TS0} diag=active_dead_no_target_cleared")
-        );
-    }
-
-    #[test]
-    fn fleet_runway_recovered_line_is_bare() {
-        // #650: the proactive warn's LEAVE marker, mirroring `event=all_exhausted_cleared` — a bare
-        // edge token, no payload (the ENTER event carried the reading; the recovery is just "back
-        // over"). Still stderr-bound, unlike that sibling (promoted to a durable event by #800).
-        assert_eq!(
-            Diagnostic::FleetRunwayRecovered.to_log_line(at_epoch(0)),
-            format!("{TS0} diag=fleet_runway_recovered")
-        );
-    }
-
-    #[test]
     fn no_diagnostic_line_carries_an_email_or_token_sigil() {
         // #15: every diagnostic field is a handle / enum / number / timestamp, so a
         // token or email can never reach a rendered line. Mirrors the event-log guard.
@@ -5249,8 +5413,6 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
                 // Exercise the #295 source-label field through the #15 redaction scan too.
                 retry_after_secs: Some(3600),
             },
-            Diagnostic::ActiveDeadNoTargetCleared,
-            Diagnostic::FleetRunwayRecovered,
         ];
         for diag in &diags {
             let line = diag.to_log_line(at_epoch(0));
