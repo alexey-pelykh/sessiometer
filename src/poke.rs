@@ -167,7 +167,7 @@ pub(crate) async fn poke(target: Option<String>) -> Result<()> {
         resolve_active_uuid(&config.roster, &store, &stash, &paths::claude_json()?).await?;
     let engine = RealPokeEngine {
         stash,
-        claude_binary: paths::claude_binary()?,
+        claude_binary: paths::claude_binary().await?,
     };
     // The daemon's current per-account verdict (#163), read best-effort BEFORE the
     // cycle so a refreshed-but-still-quarantined account is reported honestly rather

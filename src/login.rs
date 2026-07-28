@@ -309,13 +309,13 @@ where
 
 /// Capture a fresh interactive login in isolation — the production entry point (issue #132).
 ///
-/// Resolves the `claude` binary (config override → `$CLAUDE_BIN` → `$PATH`), derives the isolated
-/// login dir + its suffixed keychain item (#100), builds the onboarding seed for the current
-/// working dir (#130), and runs [`login_capture`] over the REAL seams: the shared
-/// `Claude Code-credentials` store (baseline-hashed for AC5), the suffixed isolated item, and the
-/// interactive `claude /login` spawner. `config_bin` is the operator's `[…].claude_bin` override
-/// (`None` defers to `$CLAUDE_BIN`/`$PATH`); `timeout` the tunable login budget
-/// ([`DEFAULT_LOGIN_TIMEOUT`] by default).
+/// Resolves the `claude` binary (config override → `$CLAUDE_BIN` → the harvested login-shell
+/// `PATH`, issue #784), derives the isolated login dir + its suffixed keychain item (#100),
+/// builds the onboarding seed for the current working dir (#130), and runs [`login_capture`]
+/// over the REAL seams: the shared `Claude Code-credentials` store (baseline-hashed for AC5),
+/// the suffixed isolated item, and the interactive `claude /login` spawner. `config_bin` is
+/// the operator's `[…].claude_bin` override (`None` defers to `$CLAUDE_BIN` / the harvested
+/// `PATH`); `timeout` the tunable login budget ([`DEFAULT_LOGIN_TIMEOUT`] by default).
 ///
 /// Wired into a CLI verb by the stash/roster write path (#134); until then reachable only from
 /// tests (which keep its production-only callees live), hence `allow(dead_code)` off-test. The
@@ -338,7 +338,7 @@ pub(crate) async fn login_account(
     crate::refresh::reap_login_orphan().await;
 
     let iso_dir = paths::isolated_login_dir()?;
-    let binary = paths::claude_binary_with_override(config_bin)?;
+    let binary = paths::claude_binary_with_override(config_bin).await?;
     let shared_store = RealCredentialStore::new();
     let keychain = crate::keychain::IsolatedKeychainItem::new(iso_dir.as_os_str())?;
     let login = SpawnClaudeLogin::new(binary);

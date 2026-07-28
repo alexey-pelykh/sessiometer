@@ -676,11 +676,15 @@ pub(crate) enum Error {
 
     /// The `claude` binary the isolated refresh spawns (issue #102 step 4) could
     /// not be located: `$CLAUDE_BIN` is unset (or not an existing file) and no
-    /// `claude` is on `$PATH`. Secret-free — a missing executable, never a
-    /// credential.
+    /// `claude` is on the PATH scanned. Since issue #784 that PATH is the user's
+    /// LOGIN-SHELL PATH, not the daemon's own — which is why the message names it:
+    /// under launchd the daemon's inherited `$PATH` is a bare
+    /// `/usr/bin:/bin:/usr/sbin:/sbin`, so "on your PATH" would have sent an
+    /// operator looking in the wrong environment. Secret-free — a missing
+    /// executable, never a credential.
     #[error(
         "could not locate the `claude` binary — install Claude Code so `claude` is on \
-         your PATH, or set `$CLAUDE_BIN` to its absolute path"
+         your login shell's PATH, or set `$CLAUDE_BIN` to its absolute path"
     )]
     ClaudeBinaryNotFound,
 

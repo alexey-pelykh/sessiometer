@@ -146,17 +146,24 @@ impl RealRefreshEngine {
         Self { stash, claude_bin }
     }
 
-    /// Resolve the `claude` binary to spawn THIS cycle (issue #375). Reuses the UNCHANGED
-    /// resolution policy ([`paths::claude_binary_with_override`]: `[refresh].claude_bin` →
-    /// `$CLAUDE_BIN` → `$PATH`); only the TIMING moved from once-at-startup to per-cycle, and
-    /// WHICH binary is chosen is identical to before — no symlink canonicalization, no
-    /// prefer-the-"real"-binary, no validation that the target is the genuine CLI (a wrapper
-    /// symlink is spawned as-is). A resolution failure is returned as `Err` for the caller to
-    /// treat non-fatally: [`run_sweep`](RefreshTick::run_sweep) records an `error` refresh event
-    /// and the #162 poll path lets the 401 stand — both retry next cycle, and the tick is never
-    /// permanently disabled.
-    fn resolve_binary(&self) -> Result<PathBuf> {
-        paths::claude_binary_with_override(self.claude_bin.as_deref())
+    /// Resolve the `claude` binary to spawn THIS cycle (issue #375) via the shared resolution
+    /// policy ([`paths::claude_binary_with_override`]: `[refresh].claude_bin` → `$CLAUDE_BIN` →
+    /// the harvested user `PATH`). #375 moved the TIMING from once-at-startup to per-cycle; #784
+    /// changed only tier 3's PATH SOURCE (the login-shell harvest, so the daemon resolves what
+    /// the user's terminal would rather than launchd's bare `/usr/bin:/bin:/usr/sbin:/sbin`).
+    /// WHICH binary a given `PATH` yields is unchanged — first match in the user's own order, no
+    /// symlink canonicalization, no prefer-the-"real"-binary, no validation that the target is
+    /// the genuine CLI (a wrapper symlink is spawned as-is). A resolution failure is returned as
+    /// `Err` for the caller to treat non-fatally: [`run_sweep`](RefreshTick::run_sweep) records an
+    /// `error` refresh event and the #162 poll path lets the 401 stand — both retry next cycle,
+    /// and the tick is never permanently disabled.
+    ///
+    /// `async` because tier 3's harvest spawns the login shell. Per-account cost stays O(1) per
+    /// sweep regardless of roster size: the harvested PATH is memoized process-wide under
+    /// [`paths::HARVESTED_PATH_TTL`], while the directory scan — the part #375 cares about —
+    /// still runs on every single call.
+    async fn resolve_binary(&self) -> Result<PathBuf> {
+        paths::claude_binary_with_override(self.claude_bin.as_deref()).await
     }
 }
 
@@ -168,7 +175,7 @@ impl RefreshEngine for RealRefreshEngine {
     async fn refresh(&self, account: &Account) -> Result<RefreshReport> {
         // Resolve per cycle at the spawn site (issue #375), not from a frozen field — the `?` is
         // the non-fatal path `run_sweep` (and the #162 poll) already handle fail-safe.
-        let claude_binary = self.resolve_binary()?;
+        let claude_binary = self.resolve_binary().await?;
         refresh::refresh_account(
             &self.stash,
             &account.stash(),
@@ -866,8 +873,8 @@ mod tests {
 
     // --- RealRefreshEngine per-cycle binary resolution (issue #375) ---------
 
-    #[test]
-    fn real_refresh_engine_resolves_the_binary_per_cycle_not_frozen_at_construction() {
+    #[tokio::test]
+    async fn real_refresh_engine_resolves_the_binary_per_cycle_not_frozen_at_construction() {
         // Issue #375 regression, at the engine that backs BOTH the #105 periodic sweep and the
         // #162 poll-refresh (it impls `RefreshEngine` and, through it, `PollRefresh`). The engine
         // holds the `[refresh].claude_bin` OVERRIDE and resolves the spawn binary PER CYCLE, so a
@@ -890,14 +897,14 @@ mod tests {
         // Cycle 1: link → A (exists) → Ok. The resolver returns the SYMLINK path UNCANONICALIZED
         // (AC4 / issue constraint [C1]: a wrapper symlink is spawned as-is, never resolved to its
         // target), so the fix changes only the timing of resolution, never which binary is chosen.
-        assert_eq!(engine.resolve_binary().unwrap(), link);
+        assert_eq!(engine.resolve_binary().await.unwrap(), link);
 
         // A Claude Code auto-update removes the target the symlink pointed at (the "resolved
         // version directory deleted by an updater" failure): the SAME engine now resolves to a
         // NON-FATAL error on its next cycle (AC2), rather than reusing a stale frozen path.
         std::fs::remove_file(&version_a).unwrap();
         assert!(matches!(
-            engine.resolve_binary(),
+            engine.resolve_binary().await,
             Err(crate::error::Error::ClaudeBinaryNotFound)
         ));
 
@@ -906,7 +913,7 @@ mod tests {
         // #375). Under the frozen design this stays broken until a manual restart.
         std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(&version_b, &link).unwrap();
-        assert_eq!(engine.resolve_binary().unwrap(), link);
+        assert_eq!(engine.resolve_binary().await.unwrap(), link);
     }
 
     // --- is_near_expiry / account_listed (pure) -----------------------------

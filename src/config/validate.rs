@@ -302,7 +302,7 @@ impl Config {
         // tunables; `enabled` / `accounts` / `claude_bin` are free-form (a bad `claude_bin`
         // surfaces at spawn-resolution time, an unmatched `accounts` entry at selection).
         // An empty/whitespace `claude_bin` collapses to `None` — same as omitting it — so a
-        // stray `claude_bin = ""` defers to `$CLAUDE_BIN`/`$PATH` rather than erroring.
+        // stray `claude_bin = ""` defers to `$CLAUDE_BIN`/the harvested PATH rather than erroring.
         let r = raw.refresh;
         range("refresh.cadence_secs", r.cadence_secs, 60, 86_400)?;
         range("refresh.idle_after_secs", r.idle_after_secs, 0, 3_600)?;
@@ -1237,7 +1237,7 @@ mod tests {
 
     #[test]
     fn empty_claude_bin_collapses_to_none() {
-        // A stray `claude_bin = ""` defers to $CLAUDE_BIN/$PATH (None), like omitting it.
+        // A stray `claude_bin = ""` defers to $CLAUDE_BIN/the harvested PATH (None), like omitting it.
         let toml = format!("{VALID}\n[refresh]\nclaude_bin = \"   \"\n");
         assert_eq!(Config::parse(&toml).unwrap().refresh.claude_bin, None);
     }
@@ -1303,7 +1303,7 @@ mod tests {
 
     #[test]
     fn login_empty_claude_bin_collapses_to_none() {
-        // A stray `claude_bin = ""` defers to $CLAUDE_BIN/$PATH (None), like omitting it —
+        // A stray `claude_bin = ""` defers to $CLAUDE_BIN/the harvested PATH (None), like omitting it —
         // the same override-resolver contract as [refresh].claude_bin (issue #135 AC).
         let toml = format!("{VALID}\n[login]\nclaude_bin = \"   \"\n");
         assert_eq!(Config::parse(&toml).unwrap().login.claude_bin, None);

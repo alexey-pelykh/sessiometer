@@ -34,16 +34,18 @@
 //! Directories are created `0700` and files `0600`, and every directory we
 //! create is asserted to be owned by the current uid before use.
 
-use std::ffi::{CStr, OsString};
+use std::ffi::{CStr, OsStr, OsString};
 use std::fs::{self, File, OpenOptions, Permissions};
+use std::future::Future;
 use std::io::{ErrorKind, Write};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::process::Command;
+use tokio::sync::Mutex;
 
 use crate::error::{Error, Result};
 use crate::isolated_spawn::SPAWN_ENV_REMOVE;
@@ -620,49 +622,110 @@ pub(crate) fn login_keychain() -> Result<PathBuf> {
 }
 
 /// Resolve the `claude` binary to spawn for an isolated refresh (issue #102 step 4):
-/// `$CLAUDE_BIN` if it names an existing file, else the first `claude` found on
-/// `$PATH`. The result is absolute (the spawn pins an absolute binary — a PATH entry
-/// may be a wrapper that execs a patched copy, the #101 provenance note), so a caller
-/// can validate it once before spawning. [`Error::ClaudeBinaryNotFound`] if neither
-/// yields an existing file. Used by the one-shot `poke` (issue #104) and, later, the
-/// periodic refresh tick (#105).
-pub(crate) fn claude_binary() -> Result<PathBuf> {
-    claude_binary_from(
-        std::env::var_os("CLAUDE_BIN"),
-        std::env::var_os("PATH"),
-        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    )
+/// `$CLAUDE_BIN` if it names an existing file, else the first `claude` found on the
+/// **harvested user-level `PATH`** (issue #784 — see [`tier3_path`]). The result is
+/// absolute (the spawn pins an absolute binary — a PATH entry may be a wrapper that execs
+/// a patched copy, the #101 provenance note), so a caller can validate it once before
+/// spawning. [`Error::ClaudeBinaryNotFound`] if neither yields an existing file. Used by
+/// the one-shot `poke` (issue #104) and the periodic refresh tick (#105).
+pub(crate) async fn claude_binary() -> Result<PathBuf> {
+    claude_binary_with_override(None).await
 }
 
-/// The pure resolution policy for [`claude_binary`], taking the `$CLAUDE_BIN` /
-/// `$PATH` values + `cwd` as arguments so the override / PATH-scan / not-found
-/// branches are testable without mutating process-global env. An empty / unset
-/// `$CLAUDE_BIN` falls through to the PATH scan; a `$CLAUDE_BIN` that is set but does
-/// NOT name an existing file is an error (the operator pointed us at a specific
-/// binary — don't silently substitute a different one).
 /// Resolve the `claude` binary the isolated-refresh engine spawns, honoring the
-/// `[refresh].claude_bin` config override (issue #105) ahead of the `$CLAUDE_BIN` / `$PATH`
-/// resolution [`claude_binary`] performs.
+/// `[refresh].claude_bin` config override (issue #105) ahead of the `$CLAUDE_BIN` /
+/// harvested-`PATH` resolution.
+///
+/// The three tiers, in order — only tier 3 changed in #784:
+///
+/// 1. `[refresh].claude_bin` — the explicit operator pin (`config_bin`)
+/// 2. `$CLAUDE_BIN` — the explicit env override
+/// 3. the **harvested user-level `PATH`**, scanned in the user's own order
 ///
 /// `config_bin` is `Some` only when the operator set `[refresh].claude_bin` (an empty value
 /// is collapsed to `None` at config-load). When set it WINS and is validated exactly like a
 /// `$CLAUDE_BIN` override — absolutized against the current dir, then required to name an
 /// existing file — so a configured-but-missing binary is [`Error::ClaudeBinaryNotFound`],
-/// never a silent fall-through to a different `claude` on `$PATH` (the operator named a
-/// specific binary; honor it or fail). When `None`, defers to [`claude_binary`].
-pub(crate) fn claude_binary_with_override(config_bin: Option<&Path>) -> Result<PathBuf> {
-    match config_bin {
-        // A configured override is the sole candidate: pass no `$PATH`, so a missing one is
-        // an error rather than a scan that substitutes a different binary.
-        Some(bin) => claude_binary_from(
-            Some(bin.as_os_str().to_owned()),
-            None,
-            &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        ),
-        None => claude_binary(),
-    }
+/// never a silent fall-through to a different `claude` (the operator named a specific
+/// binary; honor it or fail). A pin also suppresses the harvest entirely: [`tier3_path`]
+/// returns `None` before any login shell is spawned.
+///
+/// **`async` because tier 3 now genuinely does I/O.** The harvest ([`harvest_login_shell_path`])
+/// spawns the user's login shell, and the daemon runs on a `current_thread` runtime (ADR-0001)
+/// where a `block_on` from inside the runtime panics. Rather than bridge, the resolver itself
+/// became `async` — every caller (`refresh_tick`'s `RealRefreshEngine::refresh`, `seams`'
+/// `RealKeepWarmEngine::keep_warm`, `poke`, `login`) was already inside an async context, so
+/// there is no bridge to build. The PURE policy below ([`claude_binary_from`]) stays sync and
+/// argument-threaded; only this composing entry point awaits.
+pub(crate) async fn claude_binary_with_override(config_bin: Option<&Path>) -> Result<PathBuf> {
+    claude_binary_tiered(
+        config_bin,
+        std::env::var_os("CLAUDE_BIN"),
+        std::env::var_os("PATH"),
+        &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        &HARVESTED_PATH,
+        Instant::now(),
+        harvest_login_shell_path,
+    )
+    .await
 }
 
+/// The three-tier composition behind [`claude_binary_with_override`], with every ambient
+/// input threaded in as an argument — the process env, `cwd`, the memo, the clock and the
+/// harvest itself.
+///
+/// This is the composition seam, and it exists so the tests drive the REAL tier ordering
+/// rather than a hand-rolled mirror of it: precedence, the "a pin suppresses the harvest"
+/// short-circuit, the harvest-replaces-inherited rule and the degrade-on-failure path are
+/// all observable here without mutating process-global env or spawning a login shell.
+async fn claude_binary_tiered<F, Fut>(
+    config_bin: Option<&Path>,
+    claude_bin_env: Option<OsString>,
+    inherited: Option<OsString>,
+    cwd: &Path,
+    memo: &HarvestedPathMemo,
+    now: Instant,
+    harvest: F,
+) -> Result<PathBuf>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<OsString>>,
+{
+    // Tiers 1 and 2 collapse into one "explicit override" value because they are validated
+    // IDENTICALLY (absolutize, then require an existing file); only their precedence differs,
+    // and tier 1 winning is expressed by it shadowing the env read here.
+    //
+    // "Omit OR LEAVE EMPTY to resolve normally": an empty override is NOT an override. The
+    // emptiness is filtered at BOTH tiers and BEFORE tier 3 is consulted, so an empty value
+    // falls through to the tier below *and* leaves tier 3 reachable — rather than merely
+    // failing an existence check with the lower tiers already suppressed. (Config-load
+    // collapses an empty `claude_bin` to `None` too; filtering here keeps the resolver's own
+    // contract from drifting from it.)
+    let explicit = match config_bin.filter(|bin| !bin.as_os_str().is_empty()) {
+        Some(bin) => Some(bin.as_os_str().to_owned()),
+        None => claude_bin_env,
+    }
+    .filter(|bin| !bin.is_empty());
+    // Tier 3 is consulted only when NO explicit override decided — gated on the EFFECTIVE
+    // override rather than on `config_bin` alone. An operator who sets `$CLAUDE_BIN` has named
+    // a specific binary just as surely as one who pins `[refresh].claude_bin`, and often does
+    // so *because* their login shell is slow, prompts, or is broken — running it anyway would
+    // execute their rc files in the daemon's process tree on a timer for a value that is then
+    // discarded 100% of the time.
+    let path = tier3_path(explicit.as_deref(), memo, now, inherited, harvest).await;
+    claude_binary_from(explicit, path, cwd)
+}
+
+/// The pure resolution policy, taking the tier-1/2 override, the tier-3 scan `PATH` and
+/// `cwd` as arguments so the override / PATH-scan / not-found branches are testable without
+/// mutating process-global env. An empty / unset override falls through to the PATH scan; an
+/// override that is set but does NOT name an existing file is an error (the operator pointed
+/// us at a specific binary — don't silently substitute a different one).
+///
+/// The scan honors `path`'s ORDER and returns the FIRST match — no re-ranking, no preference
+/// among several `claude` binaries. That is the binding #784 constraint: a `claude` the user
+/// deliberately shadows earlier on their `PATH` must be the one the daemon spawns, exactly as
+/// their own shell would resolve it.
 fn claude_binary_from(
     claude_bin: Option<OsString>,
     path: Option<OsString>,
@@ -714,9 +777,9 @@ fn absolutize(path: PathBuf, cwd: &Path) -> PathBuf {
 // spawn the SAME binary the user's terminal would, which means reconstructing the
 // user-level PATH that launchd never handed it.
 //
-// This section provides the harvest capability only; feeding its result into
-// [`claude_binary_from`] is issue #784, so nothing here has a production caller yet
-// (hence the `allow(dead_code)` off the test path, as elsewhere in this module).
+// Issue #783 built the harvest capability (`harvest_login_shell_path` and its seams);
+// issue #784 feeds it into the resolution chain as tier 3 (`tier3_path`, memoized by
+// `HarvestedPathMemo`), which is what gave every function here a production caller.
 
 /// The absolute `env(1)` run inside the login shell to read its environment.
 ///
@@ -837,8 +900,8 @@ fn path_from_env_output(shell: &Path, output: &[u8]) -> Result<OsString> {
 ///
 /// The production entry point: resolves the shell from the password database via
 /// [`login_shell`] and hands it to [`harvest_path_from`] under
-/// [`LOGIN_SHELL_HARVEST_TIMEOUT`]. Wired into the resolution chain by issue #784.
-#[cfg_attr(not(test), allow(dead_code))]
+/// [`LOGIN_SHELL_HARVEST_TIMEOUT`]. Wired into the resolution chain as tier 3 by issue
+/// #784 — it reaches production through [`tier3_path`], never called directly.
 pub(crate) async fn harvest_login_shell_path() -> Result<OsString> {
     harvest_path_from(&login_shell()?, LOGIN_SHELL_HARVEST_TIMEOUT).await
 }
@@ -897,6 +960,146 @@ async fn harvest_path_from(shell: &Path, bound: Duration) -> Result<OsString> {
         });
     }
     path_from_env_output(shell, &output.stdout)
+}
+
+// --- Tier-3 PATH memoization (issue #784) --------------------------------------
+//
+// The harvest above is tier 3's EXPENSIVE half (~38 ms of login shell); scanning its
+// result for a `claude` is the cheap half. Only the former is memoized, which is what
+// lets tier 3 run per-cycle (issue #375) without paying one login shell per account.
+
+/// How long one harvested `PATH` is reused before the login shell is re-run (issue #784).
+///
+/// **60 s**, pinned to [`crate::config::DEFAULT_REFRESH_IDLE_AFTER_SECS`] rather than an
+/// invented constant: an interval this daemon already treats as meaningful.
+///
+/// **What is memoized is the PATH STRING — never the resolution.** Cache the stable,
+/// expensive thing (running a login shell, measured at ~38 ms); never the volatile, cheap
+/// thing (a directory scan for `claude`). That split is exactly what preserves issue #375:
+/// the scan still runs EVERY cycle, against the memoized PATH, so a `claude` that appears,
+/// moves, or disappears inside an already-known directory is picked up on the very next
+/// cycle with no daemon restart. Only the login-shell spawn is amortized, and the TTL
+/// bounds even that — a later cycle re-harvests, so a `PATH` the user themselves changes
+/// is observed within 60 s, again with no restart. A memo that outlived the process would
+/// be a start-up freeze by another name, which is the thing #375 removed.
+///
+/// **Why a TTL rather than a per-sweep memo.** [`claude_binary_with_override`] serves TWO
+/// callers that share one engine — the periodic sweep (issue #105) and the #162 poll-refresh
+/// — so a memo scoped to "one sweep" would leave the poll path unbounded. The lifetime is
+/// therefore keyed on wall-clock, process-wide, covering both.
+///
+/// **Cost, for the record.** The sweep resolves once per ACCOUNT, so on the reference
+/// 6-account roster the naive wiring would be 6 login-shell spawns per sweep (~230 ms).
+/// Memoized it is one (~38 ms) — on the SUCCESS path. A persistently FAILING harvest is
+/// still one attempt per account, because a failure is deliberately not cached (below); the
+/// worst case is bounded by [`LOGIN_SHELL_HARVEST_TIMEOUT`] × accounts (~30 s on the
+/// reference roster) and is accepted, since the alternative — caching the failure — is the
+/// self-inflicted outage that tradeoff exists to avoid. Resolution stays CORRECT throughout
+/// (it degrades to the inherited `$PATH`); only the cost regresses. At the default 3600 s
+/// cadence either number is negligible (~228 ms/hour unmemoized) — this is NOT a hot-path
+/// optimization. The TTL exists to bound the POLL path and to keep the cost independent of
+/// roster size.
+///
+/// `pub(crate)` for the doc link alone (`refresh_tick` cites the bound its per-cycle resolve
+/// inherits); no code outside this module reads it.
+pub(crate) const HARVESTED_PATH_TTL: Duration =
+    Duration::from_secs(crate::config::DEFAULT_REFRESH_IDLE_AFTER_SECS);
+
+/// A time-bounded memo of one harvested `PATH`, with failure EXCLUDED from the cache.
+///
+/// The `Mutex` is `tokio`'s (not `std`'s) because the harvest is awaited while the slot is
+/// held: holding it across the await is deliberate, so N concurrent callers perform ONE
+/// harvest between them rather than racing N login shells.
+struct HarvestedPathMemo {
+    /// `Some((harvested_at, path))` once a harvest has succeeded. A FAILED harvest never
+    /// writes here — see [`HarvestedPathMemo::get_or_harvest`].
+    slot: Mutex<Option<(Instant, OsString)>>,
+}
+
+impl HarvestedPathMemo {
+    const fn new() -> Self {
+        Self {
+            slot: Mutex::const_new(None),
+        }
+    }
+
+    /// The memoized value if it was harvested less than [`HARVESTED_PATH_TTL`] before `now`,
+    /// otherwise a fresh `harvest()` — whose result is stored ONLY on success.
+    ///
+    /// **Failures are never memoized.** Caching a failed harvest would convert a transient
+    /// hiccup (a momentarily wedged rc file, a shell mid-upgrade) into a self-inflicted
+    /// outage lasting the whole TTL; instead the very next cycle retries. The corollary is
+    /// that a still-fresh SUCCESS shields the caller from a transient failure entirely,
+    /// because the harvest is not attempted at all while the memo is warm.
+    ///
+    /// `now` is threaded in rather than read here so the TTL boundary is testable without a
+    /// clock or a sleep — the same argument-threading the rest of this module uses.
+    async fn get_or_harvest<F, Fut>(&self, now: Instant, harvest: F) -> Result<OsString>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<OsString>>,
+    {
+        let mut slot = self.slot.lock().await;
+        if let Some((harvested_at, path)) = slot.as_ref() {
+            if now.saturating_duration_since(*harvested_at) < HARVESTED_PATH_TTL {
+                return Ok(path.clone());
+            }
+        }
+        // On failure the `?` returns with the slot UNTOUCHED. A stale entry left behind is
+        // inert — it is already past its TTL, so it can never be served — and the next call
+        // retries the harvest rather than inheriting a cached error.
+        let harvested = harvest().await?;
+        *slot = Some((now, harvested.clone()));
+        Ok(harvested)
+    }
+}
+
+/// The process-wide memo backing tier 3 — shared by the periodic sweep, the poll-refresh,
+/// the keep-warm engine and the one-shot CLI verbs, so the harvest cost is paid once per
+/// [`HARVESTED_PATH_TTL`] for the whole process rather than once per caller.
+static HARVESTED_PATH: HarvestedPathMemo = HarvestedPathMemo::new();
+
+/// Tier 3's `PATH` — and the gate on whether tier 3 is consulted at all (issue #784).
+///
+/// `explicit_override` being `Some` means a HIGHER tier already decided — either
+/// `[refresh].claude_bin` or `$CLAUDE_BIN`, after empty values were collapsed away. The
+/// operator named a specific binary, so there is no scan (a missing override must ERROR,
+/// never fall through to some other `claude`) and therefore no harvest either: an
+/// explicitly-pointed daemon never spawns a login shell. That matters beyond the wasted
+/// ~38 ms — the override is the documented escape hatch, and an operator who reaches for it
+/// because their login shell is slow or broken must not have it run anyway.
+///
+/// Otherwise the harvested user-level `PATH` REPLACES the process-inherited one. Replaces,
+/// never unions: a union would let the launchd-inherited `/usr/bin:/bin:/usr/sbin:/sbin`
+/// contribute an entry that outranks the user's own, which is precisely the shadowing the
+/// scan order exists to honor. A successful harvest is authoritative — if it yields no
+/// `claude`, that is [`Error::ClaudeBinaryNotFound`], not a silent retry against the
+/// daemon's `PATH`.
+///
+/// A FAILED harvest degrades to the inherited `$PATH` — the pre-#784 tier 3. The failure is
+/// non-fatal by contract (issue #783) and deliberately silent here: the resolver is a pure
+/// policy, and the outcome the operator needs is already surfaced downstream as the sweep's
+/// `outcome=error` refresh event. Degrading this way is what makes the change strictly
+/// additive on the failure path — it can only add resolutions, never remove one that works
+/// today.
+async fn tier3_path<F, Fut>(
+    explicit_override: Option<&OsStr>,
+    memo: &HarvestedPathMemo,
+    now: Instant,
+    inherited: Option<OsString>,
+    harvest: F,
+) -> Option<OsString>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<OsString>>,
+{
+    if explicit_override.is_some() {
+        return None;
+    }
+    match memo.get_or_harvest(now, harvest).await {
+        Ok(harvested) => Some(harvested),
+        Err(_) => inherited,
+    }
 }
 
 /// Create `path` (and any missing parents) `0700` and assert it is owned by the
@@ -1006,6 +1209,7 @@ mod tests {
 
     use std::collections::BTreeSet;
     use std::ffi::OsStr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn apple_config_prefers_xdg_when_set() {
@@ -1481,25 +1685,606 @@ mod tests {
 
     // --- claude_binary_with_override (issue #105) ---------------------------
 
-    #[test]
-    fn override_prefers_a_present_config_bin() {
+    #[tokio::test]
+    async fn override_prefers_a_present_config_bin() {
         // A `[refresh].claude_bin` pointing at an existing absolute file resolves to it,
-        // ahead of any `$CLAUDE_BIN` / `$PATH` (absolute, so cwd-independent).
+        // ahead of any `$CLAUDE_BIN` / harvested PATH (absolute, so cwd-independent).
         let tmp = tempfile::tempdir().unwrap();
         let bin = tmp.path().join("claude");
         fs::write(&bin, b"#!/bin/sh\n").unwrap();
-        let got = claude_binary_with_override(Some(&bin)).unwrap();
+        let got = claude_binary_with_override(Some(&bin)).await.unwrap();
         assert_eq!(got, bin);
     }
 
-    #[test]
-    fn override_errors_on_a_missing_config_bin() {
-        // A configured-but-missing override fails rather than silently scanning `$PATH`
+    #[tokio::test]
+    async fn override_errors_on_a_missing_config_bin() {
+        // A configured-but-missing override fails rather than silently scanning a PATH
         // for a different `claude` — the operator named a specific binary.
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("no-such-claude");
-        let err = claude_binary_with_override(Some(&missing)).unwrap_err();
+        let err = claude_binary_with_override(Some(&missing))
+            .await
+            .unwrap_err();
         assert!(matches!(err, Error::ClaudeBinaryNotFound));
+    }
+
+    // --- Tier-3 resolution against the harvested PATH (issue #784) ----------
+    //
+    // Every test here drives the REAL composition seam (`claude_binary_tiered`) or the
+    // real memo, never a mirror of them, and none touches the ambient process environment
+    // or spawns a login shell: the `$CLAUDE_BIN` / `$PATH` values, `cwd`, the clock and the
+    // harvest itself are all threaded in as arguments — the same discipline the
+    // `claude_binary_from` and `harvest_path_from` suites above already model. Test names
+    // carry their issue-#784 T-number so each maps back to the specification.
+
+    /// The launchd environment this whole item exists to fix: the bare `PATH` a
+    /// `launchd`-started daemon inherits, which contains no `claude` at all.
+    const LAUNCHD_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+    /// Create a directory holding a `claude` file and return the directory, ready to be
+    /// `join`ed into a `PATH`. Not marked executable — the resolver's gate is `is_file`.
+    fn dir_with_claude(root: &Path, name: &str) -> PathBuf {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("claude"), b"#!/bin/sh\n").unwrap();
+        dir
+    }
+
+    /// Join directories into a `PATH`-shaped value, preserving order.
+    fn join(dirs: &[&Path]) -> OsString {
+        std::env::join_paths(dirs.iter().map(|d| d.as_os_str())).unwrap()
+    }
+
+    /// A stand-in harvest that counts its invocations and yields `outcome`: `Some(path)`
+    /// for a success, `None` for the failure #783 reports on an unusable login shell.
+    ///
+    /// One helper rather than a success/failure pair, so the call count — the property most
+    /// of these tests actually assert on — is produced by ONE piece of code either way.
+    fn harvest_yielding(
+        outcome: Option<OsString>,
+        calls: &AtomicUsize,
+    ) -> impl FnOnce() -> std::future::Ready<Result<OsString>> + '_ {
+        move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(outcome.ok_or(Error::LoginShellUnresolved))
+        }
+    }
+
+    /// Drive `memo` once at `now` against a stand-in harvest yielding `outcome` — the whole
+    /// vocabulary of the memoization suite, which asserts on the value served and on how many
+    /// harvests it took to serve it.
+    async fn memo_get(
+        memo: &HarvestedPathMemo,
+        now: Instant,
+        outcome: Option<&str>,
+        calls: &AtomicUsize,
+    ) -> Result<OsString> {
+        memo.get_or_harvest(now, harvest_yielding(outcome.map(OsString::from), calls))
+            .await
+    }
+
+    /// Resolve through the real composition seam with a fresh memo and no clock pressure,
+    /// returning the resolution alongside how many harvests it took — the shape every
+    /// precedence test wants. `harvested` is the stand-in harvest's outcome (`None` = it
+    /// fails), threaded through [`harvest_yielding`].
+    async fn resolve(
+        config_bin: Option<&Path>,
+        claude_bin_env: Option<OsString>,
+        inherited: Option<OsString>,
+        harvested: Option<OsString>,
+        cwd: &Path,
+    ) -> (Result<PathBuf>, usize) {
+        let memo = HarvestedPathMemo::new();
+        let calls = AtomicUsize::new(0);
+        let got = claude_binary_tiered(
+            config_bin,
+            claude_bin_env,
+            inherited,
+            cwd,
+            &memo,
+            Instant::now(),
+            harvest_yielding(harvested, &calls),
+        )
+        .await;
+        (got, calls.load(Ordering::SeqCst))
+    }
+
+    // -- Precedence (T1-T7) --------------------------------------------------
+
+    #[tokio::test]
+    async fn t1_config_bin_wins_over_claude_bin_env_and_over_a_harvested_match() {
+        // Tier 1 beats tiers 2 AND 3 — and, since #784, suppresses the harvest entirely:
+        // a pinned daemon must never pay a login-shell spawn it cannot use.
+        let tmp = tempfile::tempdir().unwrap();
+        let pinned = dir_with_claude(tmp.path(), "pinned").join("claude");
+        let env_bin = dir_with_claude(tmp.path(), "env").join("claude");
+        let harvested = dir_with_claude(tmp.path(), "harvested");
+        let (got, harvests) = resolve(
+            Some(&pinned),
+            Some(env_bin.as_os_str().to_owned()),
+            Some(OsString::from(LAUNCHD_PATH)),
+            Some(join(&[&harvested])),
+            tmp.path(),
+        )
+        .await;
+        assert_eq!(got.unwrap(), pinned);
+        assert_eq!(harvests, 0, "a config pin must not spawn a login shell");
+    }
+
+    #[tokio::test]
+    async fn t2_claude_bin_env_wins_over_a_harvested_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let env_bin = dir_with_claude(tmp.path(), "env").join("claude");
+        let harvested = dir_with_claude(tmp.path(), "harvested");
+        let (got, harvests) = resolve(
+            None,
+            Some(env_bin.as_os_str().to_owned()),
+            Some(OsString::from(LAUNCHD_PATH)),
+            Some(join(&[&harvested])),
+            tmp.path(),
+        )
+        .await;
+        assert_eq!(got.unwrap(), env_bin);
+        // The same property T1 asserts for tier 1, one tier down: an operator who named a
+        // binary must not have their login shell run for a value that is then discarded. The
+        // gate is on the EFFECTIVE override, not on `[refresh].claude_bin` alone — `$CLAUDE_BIN`
+        // is the documented escape hatch, often reached for BECAUSE the login shell misbehaves.
+        assert_eq!(
+            harvests, 0,
+            "an explicit $CLAUDE_BIN must not spawn a login shell"
+        );
+    }
+
+    #[tokio::test]
+    async fn t3_both_overrides_unset_uses_the_harvested_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let harvested = dir_with_claude(tmp.path(), "harvested");
+        let (got, harvests) = resolve(
+            None,
+            None,
+            Some(OsString::from(LAUNCHD_PATH)),
+            Some(join(&[&harvested])),
+            tmp.path(),
+        )
+        .await;
+        assert_eq!(got.unwrap(), harvested.join("claude"));
+        assert_eq!(harvests, 1, "tier 3 must actually have been consulted");
+    }
+
+    #[tokio::test]
+    async fn t4_missing_config_bin_errors_with_no_harvested_substitution() {
+        // The operator named a specific binary. A wrong pin must fail LOUDLY — the harvested
+        // PATH holding a perfectly good `claude` must not rescue it.
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("no-such-claude");
+        let harvested = dir_with_claude(tmp.path(), "harvested");
+        let (got, harvests) = resolve(
+            Some(&missing),
+            None,
+            None,
+            Some(join(&[&harvested])),
+            tmp.path(),
+        )
+        .await;
+        assert!(matches!(got, Err(Error::ClaudeBinaryNotFound)));
+        assert_eq!(
+            harvests, 0,
+            "a pin that fails must still not have spawned a login shell"
+        );
+    }
+
+    #[tokio::test]
+    async fn t5_missing_claude_bin_env_errors_with_no_harvested_substitution() {
+        // The same contract one tier down — the pre-#784 behavior, unchanged.
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("no-such-claude");
+        let harvested = dir_with_claude(tmp.path(), "harvested");
+        let (got, harvests) = resolve(
+            None,
+            Some(missing.as_os_str().to_owned()),
+            None,
+            Some(join(&[&harvested])),
+            tmp.path(),
+        )
+        .await;
+        assert!(matches!(got, Err(Error::ClaudeBinaryNotFound)));
+        assert_eq!(
+            harvests, 0,
+            "a $CLAUDE_BIN that fails must still not have spawned a login shell"
+        );
+    }
+
+    #[tokio::test]
+    async fn t6_empty_config_bin_falls_through_to_claude_bin_env() {
+        // "Omit OR LEAVE EMPTY to resolve normally" — the documented contract. (Config-load
+        // collapses an empty value to `None`; this pins the resolver's own behavior for a
+        // literal empty string, so the two layers cannot drift apart silently.)
+        let tmp = tempfile::tempdir().unwrap();
+        let env_bin = dir_with_claude(tmp.path(), "env").join("claude");
+        let (got, _) = resolve(
+            Some(Path::new("")),
+            Some(env_bin.as_os_str().to_owned()),
+            None,
+            Some(OsString::from(LAUNCHD_PATH)),
+            tmp.path(),
+        )
+        .await;
+        assert_eq!(got.unwrap(), env_bin);
+    }
+
+    #[tokio::test]
+    async fn t7_empty_claude_bin_env_falls_through_to_the_harvested_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let harvested = dir_with_claude(tmp.path(), "harvested");
+        let (got, _) = resolve(
+            None,
+            Some(OsString::new()),
+            Some(OsString::from(LAUNCHD_PATH)),
+            Some(join(&[&harvested])),
+            tmp.path(),
+        )
+        .await;
+        assert_eq!(got.unwrap(), harvested.join("claude"));
+    }
+
+    // -- Ordering / shadowing: the binding constraint (T8-T11) ---------------
+
+    #[tokio::test]
+    async fn t8_the_earlier_harvested_entry_shadows_the_later_one() {
+        // "It's important that we catch $PATH-shadowed `claude` binary whenever possible."
+        // First on the user's PATH wins — exactly as their own shell resolves it.
+        let tmp = tempfile::tempdir().unwrap();
+        let first = dir_with_claude(tmp.path(), "first");
+        let second = dir_with_claude(tmp.path(), "second");
+        let (got, _) = resolve(None, None, None, Some(join(&[&first, &second])), tmp.path()).await;
+        assert_eq!(got.unwrap(), first.join("claude"));
+    }
+
+    #[tokio::test]
+    async fn t9_reversing_the_harvested_order_reverses_the_winner() {
+        // The twin of T8 over the SAME two directories: proves the winner tracks ORDER
+        // rather than some incidental property (name, mtime, creation order).
+        let tmp = tempfile::tempdir().unwrap();
+        let first = dir_with_claude(tmp.path(), "first");
+        let second = dir_with_claude(tmp.path(), "second");
+        let (got, _) = resolve(None, None, None, Some(join(&[&second, &first])), tmp.path()).await;
+        assert_eq!(got.unwrap(), second.join("claude"));
+    }
+
+    #[tokio::test]
+    async fn t10_a_claude_only_on_the_daemon_path_is_not_selected_when_harvest_succeeds() {
+        // The harvest REPLACES the inherited `$PATH`; it never unions with it. A union would
+        // let a launchd-inherited entry outrank the user's own — defeating the shadowing T8
+        // exists to guarantee.
+        let tmp = tempfile::tempdir().unwrap();
+        let inherited_only = dir_with_claude(tmp.path(), "inherited-only");
+        let harvested = dir_with_claude(tmp.path(), "harvested");
+        let (got, _) = resolve(
+            None,
+            None,
+            Some(join(&[&inherited_only])),
+            Some(join(&[&harvested])),
+            tmp.path(),
+        )
+        .await;
+        assert_eq!(got.unwrap(), harvested.join("claude"));
+    }
+
+    #[tokio::test]
+    async fn t11_empty_entries_in_the_harvested_path_are_skipped() {
+        // A trailing / leading / doubled `:` is a legal (and common) `PATH`; the empty entry
+        // means "cwd" to some shells, and the existing `is_empty` guard skips it rather than
+        // probing `cwd/claude`. Guarded here because a cwd that happens to hold a `claude`
+        // would otherwise win over the user's real one.
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = dir_with_claude(tmp.path(), "cwd");
+        let harvested = dir_with_claude(tmp.path(), "harvested");
+        let mut path = OsString::from(":");
+        path.push(harvested.as_os_str());
+        path.push(":");
+        let (got, _) = resolve(None, None, None, Some(path), &cwd).await;
+        assert_eq!(got.unwrap(), harvested.join("claude"));
+    }
+
+    // -- Fallback (T12-T14) --------------------------------------------------
+
+    #[tokio::test]
+    async fn t12_a_failed_harvest_degrades_to_the_daemon_path() {
+        // Strictly additive on the failure path: the change can only ADD resolutions, never
+        // remove one that works today.
+        let tmp = tempfile::tempdir().unwrap();
+        let inherited = dir_with_claude(tmp.path(), "inherited");
+        let (got, harvests) =
+            resolve(None, None, Some(join(&[&inherited])), None, tmp.path()).await;
+        assert_eq!(got.unwrap(), inherited.join("claude"));
+        assert_eq!(harvests, 1, "the failure must have been a real attempt");
+    }
+
+    #[tokio::test]
+    async fn t13_a_failed_harvest_with_no_claude_on_the_daemon_path_is_not_found() {
+        // T12's other half: the degrade is a fall-BACK, not a rescue — when the daemon's own
+        // `$PATH` has no `claude` either, the failure is reported rather than papered over.
+        // The inherited `$PATH` is a controlled empty directory rather than [`LAUNCHD_PATH`],
+        // both so this stays independent of what the host happens to have in `/usr/bin` and
+        // so it does not restate T17, which pins the literal launchd value on purpose.
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = tmp.path().join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        let (got, harvests) = resolve(None, None, Some(join(&[&empty])), None, tmp.path()).await;
+        assert!(matches!(got, Err(Error::ClaudeBinaryNotFound)));
+        assert_eq!(harvests, 1, "the failure must have been a real attempt");
+    }
+
+    #[tokio::test]
+    async fn t14_a_successful_harvest_without_claude_does_not_retry_the_daemon_path() {
+        // A successful harvest is AUTHORITATIVE. Silently retrying the daemon's `$PATH` here
+        // would resurrect the union T10 forbids, so "the user has no `claude`" is reported as
+        // such rather than papered over with a launchd-inherited one.
+        let tmp = tempfile::tempdir().unwrap();
+        let inherited = dir_with_claude(tmp.path(), "inherited");
+        let empty = tmp.path().join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        let (got, _) = resolve(
+            None,
+            None,
+            Some(join(&[&inherited])),
+            Some(join(&[&empty])),
+            tmp.path(),
+        )
+        .await;
+        assert!(matches!(got, Err(Error::ClaudeBinaryNotFound)));
+    }
+
+    // -- Regression guards (T15-T18) -----------------------------------------
+
+    #[tokio::test]
+    async fn t15_a_symlinked_claude_resolves_to_the_symlink_not_its_target() {
+        // Issue #101: a `claude` wrapper on PATH must be spawned AS-IS. `absolutize` performs
+        // no canonicalization, and #784 did not change that.
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("claude-real");
+        fs::write(&real, b"#!/bin/sh\n").unwrap();
+        let dir = tmp.path().join("harvested");
+        fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("claude");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let (got, _) = resolve(None, None, None, Some(join(&[&dir])), tmp.path()).await;
+        let got = got.unwrap();
+        assert_eq!(got, link);
+        assert_ne!(got, real);
+    }
+
+    #[tokio::test]
+    async fn t16_a_relative_harvested_entry_is_absolutized_against_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let abs = dir_with_claude(tmp.path(), "relbin");
+        let (got, _) = resolve(None, None, None, Some(OsString::from("relbin")), tmp.path()).await;
+        let got = got.unwrap();
+        assert_eq!(got, abs.join("claude"));
+        assert!(got.is_absolute());
+    }
+
+    #[tokio::test]
+    async fn t17_the_literal_launchd_path_without_a_harvest_is_the_production_outage() {
+        // The bug, encoded: `PATH=/usr/bin:/bin:/usr/sbin:/sbin` holds no `claude`, so every
+        // refresh errored BEFORE any spawn (83/83 `outcome=error window_secs=0`). Named so the
+        // regression stays legible; T18 is its inverse.
+        let tmp = tempfile::tempdir().unwrap();
+        let (got, _) = resolve(
+            None,
+            None,
+            Some(OsString::from(LAUNCHD_PATH)),
+            None,
+            tmp.path(),
+        )
+        .await;
+        assert!(matches!(got, Err(Error::ClaudeBinaryNotFound)));
+    }
+
+    #[tokio::test]
+    async fn t18_the_same_launchd_path_with_a_harvest_resolves() {
+        // The fix, expressed as T17's inverse over an IDENTICAL inherited `$PATH`: the only
+        // difference is that the harvest succeeded.
+        let tmp = tempfile::tempdir().unwrap();
+        let harvested = dir_with_claude(tmp.path(), "user-local-bin");
+        let (got, _) = resolve(
+            None,
+            None,
+            Some(OsString::from(LAUNCHD_PATH)),
+            Some(join(&[&harvested])),
+            tmp.path(),
+        )
+        .await;
+        assert_eq!(got.unwrap(), harvested.join("claude"));
+    }
+
+    // -- Cross-platform (T19) ------------------------------------------------
+
+    /// T19 (per issue #797's premise correction): the resolver must gain NO platform
+    /// conditional. There is no Linux CI to catch one — `test` and `msrv` are both
+    /// `runs-on: macos-latest` — so the guard is a source assertion rather than a build.
+    /// No Linux claim is made or implied by this test.
+    #[test]
+    fn t19_the_resolver_introduces_no_platform_conditional() {
+        let source = include_str!("paths.rs");
+        // Bound the window to the resolution chain + harvest section, so an unrelated
+        // `cfg(target_os)` elsewhere in this module could never mask a regression here.
+        let start = source
+            .find("pub(crate) async fn claude_binary()")
+            .expect("resolution chain moved — re-anchor this guard");
+        let end = source
+            .find("pub(crate) fn ensure_private_dir")
+            .expect("harvest section moved — re-anchor this guard");
+        assert!(
+            start < end,
+            "the anchors were reordered — re-anchor this guard rather than let it slice backwards"
+        );
+        let window = &source[start..end];
+        assert!(
+            !window.contains("target_os"),
+            "the tier-3 resolver must stay platform-unconditional (issue #784 AC9)"
+        );
+    }
+
+    // -- Harvest memoization (T20-T23) ---------------------------------------
+    //
+    // What is memoized is the PATH STRING, never the resolution — so #375 holds: the
+    // directory scan still runs on every call, against the memoized PATH.
+
+    #[tokio::test]
+    async fn t20_one_sweep_over_many_accounts_performs_one_harvest() {
+        // `resolve_binary` runs once per ACCOUNT. Unmemoized, the reference 6-account roster
+        // would spawn 6 login shells per sweep (~230 ms at the measured ~38 ms each). The
+        // spawn COUNT is asserted directly; a timing assertion would be flaky.
+        let memo = HarvestedPathMemo::new();
+        let calls = AtomicUsize::new(0);
+        let now = Instant::now();
+        for _ in 0..6 {
+            let got = memo_get(&memo, now, Some("/user/bin"), &calls)
+                .await
+                .unwrap();
+            assert_eq!(got, OsString::from("/user/bin"));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn t21_a_later_sweep_past_the_ttl_re_harvests() {
+        // The memo must not become a start-up freeze by another name (issue #375).
+        let memo = HarvestedPathMemo::new();
+        let calls = AtomicUsize::new(0);
+        let first = Instant::now();
+        memo_get(&memo, first, Some("/a"), &calls).await.unwrap();
+        // Still inside the TTL: served from the memo.
+        let inside_ttl = first + HARVESTED_PATH_TTL - Duration::from_secs(1);
+        memo_get(&memo, inside_ttl, Some("/a"), &calls)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // Past it: re-harvested.
+        memo_get(&memo, first + HARVESTED_PATH_TTL, Some("/a"), &calls)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn t22_a_path_change_between_sweeps_is_observed_without_a_restart() {
+        // The user edits their profile and the daemon picks it up within one TTL — no restart.
+        let memo = HarvestedPathMemo::new();
+        let calls = AtomicUsize::new(0);
+        let first = Instant::now();
+        let before = memo_get(&memo, first, Some("/before"), &calls)
+            .await
+            .unwrap();
+        assert_eq!(before, OsString::from("/before"));
+        let after = memo_get(&memo, first + HARVESTED_PATH_TTL, Some("/after"), &calls)
+            .await
+            .unwrap();
+        assert_eq!(after, OsString::from("/after"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn t23_a_failed_harvest_is_not_cached_as_a_permanent_failure() {
+        // A cached failure would convert a transient hiccup into a self-inflicted outage
+        // lasting the whole TTL. The retry is immediate — no TTL wait — because nothing was
+        // written on the failing call.
+        let memo = HarvestedPathMemo::new();
+        let calls = AtomicUsize::new(0);
+        let now = Instant::now();
+        let err = memo_get(&memo, now, None, &calls).await.unwrap_err();
+        assert!(matches!(err, Error::LoginShellUnresolved));
+        let recovered = memo_get(&memo, now, Some("/user/bin"), &calls)
+            .await
+            .unwrap();
+        assert_eq!(recovered, OsString::from("/user/bin"));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_claude_appearing_under_a_warm_memo_is_still_found_the_next_cycle() {
+        // Issue #375's decisive scenario, end-to-end through the REAL composition — the one
+        // thing the memo could plausibly have broken, and the reason what is memoized is the
+        // PATH string rather than the resolution.
+        //
+        // T20-T23 exercise the memo in isolation (they only count harvests) and every
+        // precedence test builds a FRESH memo, so each of their resolutions is a first, live
+        // one. Neither shape can catch a future refactor that memoizes the RESOLUTION: it
+        // would leave the whole suite green while a `claude` installed after the daemon
+        // started stayed invisible for a TTL. This is that guard.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("user-local-bin");
+        fs::create_dir_all(&dir).unwrap();
+        let memo = HarvestedPathMemo::new();
+        let calls = AtomicUsize::new(0);
+        let now = Instant::now();
+        let path = join(&[&dir]);
+
+        // Cycle 1: the directory is on the harvested PATH but holds no `claude` yet.
+        let first = claude_binary_tiered(
+            None,
+            None,
+            None,
+            tmp.path(),
+            &memo,
+            now,
+            harvest_yielding(Some(path.clone()), &calls),
+        )
+        .await;
+        assert!(matches!(first, Err(Error::ClaudeBinaryNotFound)));
+
+        // Claude Code installs itself into that ALREADY-HARVESTED directory.
+        fs::write(dir.join("claude"), b"#!/bin/sh\n").unwrap();
+
+        // Cycle 2, one second later — still deep inside the TTL, so the harvest is NOT
+        // re-run. The scan is, and it finds the new binary: no restart, no TTL wait.
+        let second = claude_binary_tiered(
+            None,
+            None,
+            None,
+            tmp.path(),
+            &memo,
+            now + Duration::from_secs(1),
+            harvest_yielding(Some(path), &calls),
+        )
+        .await;
+        assert_eq!(second.unwrap(), dir.join("claude"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the memo must still have been warm — otherwise this proves nothing about it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_warm_memo_shields_the_caller_from_a_transient_harvest_failure() {
+        // The corollary of T23: while the memo is warm the harvest is not attempted AT ALL,
+        // so a login shell that breaks mid-TTL cannot disturb resolution until the TTL lapses.
+        let memo = HarvestedPathMemo::new();
+        let calls = AtomicUsize::new(0);
+        let now = Instant::now();
+        memo_get(&memo, now, Some("/user/bin"), &calls)
+            .await
+            .unwrap();
+        let still = memo_get(&memo, now + Duration::from_secs(1), None, &calls)
+            .await
+            .unwrap();
+        assert_eq!(still, OsString::from("/user/bin"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "harvest was not attempted");
+    }
+
+    #[test]
+    fn the_harvested_path_ttl_is_pinned_to_the_refresh_idle_floor() {
+        // AC11's settled lifetime, asserted against its SOURCE rather than a literal: the TTL
+        // is `[refresh].idle_after_secs`'s default, an interval this daemon already treats as
+        // meaningful — not an invented constant. Re-pointing one must not silently orphan the
+        // other.
+        assert_eq!(
+            HARVESTED_PATH_TTL,
+            Duration::from_secs(crate::config::DEFAULT_REFRESH_IDLE_AFTER_SECS)
+        );
+        assert_eq!(HARVESTED_PATH_TTL, Duration::from_secs(60));
     }
 
     // --- Login-shell PATH harvest (issue #783) ------------------------------
