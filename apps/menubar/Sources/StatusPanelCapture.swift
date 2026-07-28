@@ -103,7 +103,7 @@ private struct CaptureAffordance: View {
                 .font(.system(size: 11))
                 .foregroundStyle(.green)
                 .lineLimit(1)
-                .truncationMode(.middle)
+                .truncationMode(StatusPanelFormat.identityElision.truncationMode)
         case .failed(let failure):
             Label(StatusPanelFormat.captureErrorText(failure), systemImage: "exclamationmark.triangle.fill")
                 .font(.system(size: 11))

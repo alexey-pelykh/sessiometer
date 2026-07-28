@@ -155,7 +155,7 @@ private struct StatStripRow: View {
     var body: some View {
         let signal = StatusPanelFormat.statsSignal(account.band)
         VStack(alignment: .leading, spacing: 9) {
-            HStack(spacing: 9) {
+            HStack(spacing: StatusPanelFormat.rowInterElementSpacing) {
                 StatusDot(isActive: isActive)
                 MonogramBadge(label: handle, monogram: monogram)
                 // Provider-neutral name (#15): the redacted handle, exactly as the Status roster shows it —
@@ -164,7 +164,7 @@ private struct StatStripRow: View {
                     .font(.system(size: 13, weight: .semibold))
                     // MIDDLE-truncation (issue #445) — same as the Status roster, so a same-local-part handle's
                     // distinguishing suffix survives elision on the Stats tab too.
-                    .lineLimit(1).truncationMode(.middle)
+                    .lineLimit(1).truncationMode(StatusPanelFormat.identityElision.truncationMode)
                     // The label GROWS into the free width (mock `.s-meta { flex:1 1 auto; min-width:0 }`), so the
                     // pill still sits at the trailing edge. This replaces a `Spacer(minLength: 6)`, which the
                     // HStack charged a 9 pt gap on BOTH sides of — 24 pt of dead space between label and pill
