@@ -284,17 +284,42 @@ struct SwapCalloutCard: View {
 /// `LoginItemModel.reconcileDaemonAgentRegistration()` repairs a registration an app update left stale, and it
 /// paints the SAME `.registering` beat and `.failed` reason on this card, with no press behind it. So the
 /// spinner can appear on its own at launch, and a reason shown here may belong to that repair rather than to
-/// anything the operator just did — this card is the sole surface for both.
+/// anything the operator just did — this card is the sole surface for both. Issue #820 is what makes that
+/// second writer survivable, in two places:
+///
+///  1. THE REASON IS NOT GATED ON THE BUTTON. The `.failed` line used to live INSIDE the `canStartDaemon`
+///     branch, which was sound while a press was the only way to reach it — the operator had just pressed
+///     and was watching. With a second, launch-time writer it is not: any daemon subsequently taking the
+///     single-instance lock flips `canStartDaemon` false and the reason vanished, including the case where
+///     the unregister threw and the repair genuinely failed. And nothing retries behind it — the repair is
+///     one-shot by design (`reconcileDaemonAgentRegistration()` carries the why). The reason is therefore
+///     not decoration, it is the SOLE recovery signal, so it renders whenever one exists. The BUTTON and its
+///     hint stay gated — an affordance that cannot act is still withheld, which is the honest-degradation
+///     rule this card was built on.
+///  2. THE COPY SAYS WHICH WRITER. Both beats carry a `StartOrigin` and route through
+///     `StatusPanelFormat.startDaemonPendingText(for:)` / `startDaemonFailureText(reason:origin:)`, so a
+///     repair the operator never asked for no longer reads exactly like a button press that failed.
+///
+/// What issue #820 deliberately did NOT add: a notification, a badge, or a menu-bar glyph state. Those are a
+/// separate UX decision with their own design gate; the panel remains the sole surface.
+///
+/// ONE WINDOW THE DECOUPLING OPENS, accepted knowingly. `startPhase` is not reset when a daemon appears
+/// late, so between a `notStartedReason` timing out and the next `watch` snapshot moving the panel off
+/// `.notRunning`, the card can say "registered but didn't start" about a daemon that has since come up. The
+/// old coupling hid that window by hiding the reason with the affordance — which is exactly the bug, so this
+/// is the cost side of the fix, not a regression to chase: the reason is the SOLE recovery signal for the
+/// case that matters (no daemon, no retry), and it self-clears on the next snapshot. Do not "fix" it by
+/// re-gating the render.
 struct StartDaemonCard: View {
     /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
     @Environment(\.panelScale) private var scale
     @EnvironmentObject private var loginItem: LoginItemModel
 
-    /// A registration is in flight (the transient spinner beat) — either the button below, or the launch-time
-    /// re-registration (issue #788).
-    private var isRegistering: Bool {
-        if case .registering = loginItem.startPhase { return true }
-        return false
+    /// The in-flight beat's writer (issue #788/#820), or nil when no registration is in flight — either the
+    /// button below, or the launch-time re-registration.
+    private var registeringOrigin: StartOrigin? {
+        if case .registering(let origin) = loginItem.startPhase { return origin }
+        return nil
     }
 
     var body: some View {
@@ -302,12 +327,17 @@ struct StartDaemonCard: View {
             BannerView(banner: StatusPanelFormat.banner(for: .notRunning, accountCount: 0))
             if loginItem.canStartDaemon {
                 startButton
-                if case .failed(let reason) = loginItem.startPhase {
-                    Label(reason, systemImage: "exclamationmark.triangle.fill")
-                        .font(.panel(11, scale: scale))
-                        .foregroundStyle(.red)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+            }
+            // OUTSIDE the gate above — see (1) in this view's header. The three branches keep the resting
+            // `canStartDaemon` order (button → reason → hint) byte-identical to what issue #170 shipped.
+            if case .failed(let reason, let origin) = loginItem.startPhase {
+                Label(StatusPanelFormat.startDaemonFailureText(reason: reason, origin: origin),
+                      systemImage: "exclamationmark.triangle.fill")
+                    .font(.panel(11, scale: scale))
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if loginItem.canStartDaemon {
                 Text(StatusPanelFormat.startDaemonHint)
                     .font(.panel(10.5, scale: scale))
                     .foregroundStyle(.secondary)
@@ -317,11 +347,15 @@ struct StartDaemonCard: View {
     }
 
     private var startButton: some View {
-        Button(action: { Task { await loginItem.startDaemon() } }) {
-            if isRegistering {
+        // The pending label is the WRITER's, not the button's (issue #820): a launch repair disables this
+        // button and drives its beat, so labelling that "Starting…" would credit the operator with a press
+        // they never made.
+        let pendingText = registeringOrigin.map(StatusPanelFormat.startDaemonPendingText(for:))
+        return Button(action: { Task { await loginItem.startDaemon() } }) {
+            if let pendingText {
                 HStack(spacing: 5 * scale) {
                     ProgressView().controlSize(PanelTypeScale.controlSize(for: scale))
-                    Text(StatusPanelFormat.startDaemonPendingText)
+                    Text(pendingText)
                 }
             } else {
                 Label(StatusPanelFormat.startDaemonButtonTitle, systemImage: "play.fill")
@@ -330,10 +364,8 @@ struct StartDaemonCard: View {
         .font(.panel(12, .semibold, scale: scale))
         .buttonStyle(.borderedProminent)
         .controlSize(PanelTypeScale.controlSize(for: scale))
-        .disabled(isRegistering)
-        .accessibilityLabel(isRegistering
-                            ? StatusPanelFormat.startDaemonPendingText
-                            : StatusPanelFormat.startDaemonButtonTitle)
+        .disabled(pendingText != nil)
+        .accessibilityLabel(pendingText ?? StatusPanelFormat.startDaemonButtonTitle)
     }
 }
 

@@ -77,6 +77,22 @@ enum DaemonAgentRunState: Equatable {
     case unknown
 }
 
+/// WHICH writer painted the current `StartPhase` beat (issue #820). Issue #788 made `startPhase` a
+/// TWO-writer channel — the Start button and the launch-time registration repair — and the card had no way
+/// to say which, so a repair the operator never asked for read exactly like a press they had just made.
+///
+/// Top-level rather than nested in the `@MainActor` model, alongside `LoginItemStatus` and
+/// `DaemonAgentRunState` above and for the same reason: `StatusPanelFormat` (a non-isolated namespace, with
+/// non-isolated tests) selects the card's copy from it.
+enum StartOrigin: Equatable {
+    /// The operator pressed **Start daemon** and is watching the card. Needs no attribution — they know
+    /// what they just did, which is why this path's copy is left exactly as issue #170 shipped it.
+    case operatorStart
+    /// `reconcileDaemonAgentRegistration()` repaired a stale registration at launch. NOTHING the operator
+    /// did stands behind this beat, so its copy has to say so.
+    case launchRepair
+}
+
 /// The OS surface the `LoginItemModel` drives, behind a protocol so the model's decisions are tested against a
 /// fake. `SMAppService` exposes no injectable state, so this seam is the ONLY testability boundary; the concrete
 /// implementation wraps `SMAppService.mainApp` / `SMAppService.agent(plistName:)` and the CLI-owner probe.
@@ -208,10 +224,15 @@ final class LoginItemModel: ObservableObject {
     /// "registered but never started" liveness timeout. `idle` is the resting state and TRUE success: register
     /// succeeded AND a daemon took the single-instance lock, so the panel will leave `.notRunning` on the next
     /// `watch` snapshot, exactly as a swap's new active row arrives.
+    ///
+    /// Both non-resting beats carry their `StartOrigin` (issue #820). The reason ALONE cannot identify its
+    /// writer — `notStartedReason` is emitted byte-identically by `startDaemon()` and by the launch-time
+    /// repair — so the attribution has to be recorded HERE, where the writer is known, rather than
+    /// reconstructed downstream from copy that does not distinguish them.
     enum StartPhase: Equatable {
         case idle
-        case registering
-        case failed(reason: String)
+        case registering(StartOrigin)
+        case failed(reason: String, origin: StartOrigin)
     }
 
     // MARK: Published state
@@ -338,7 +359,7 @@ final class LoginItemModel: ObservableObject {
         guard canStartDaemon else { return }
         if case .registering = startPhase { return }
 
-        startPhase = .registering
+        startPhase = .registering(.operatorStart)
         await Task.yield()  // let the "Starting…" beat paint before the synchronous register
         do {
             try service.registerDaemonAgent()
@@ -356,10 +377,10 @@ final class LoginItemModel: ObservableObject {
             // daemon, never arrives.
             startPhase = await daemonBecameLive()
                 ? .idle
-                : .failed(reason: Self.notStartedReason)
+                : .failed(reason: Self.notStartedReason, origin: .operatorStart)
         } catch {
             loginItemLog.error("daemon agent register failed: \(String(describing: error), privacy: .public)")
-            startPhase = .failed(reason: Self.startFailureReason(error))
+            startPhase = .failed(reason: Self.startFailureReason(error), origin: .operatorStart)
         }
     }
 
@@ -403,11 +424,13 @@ final class LoginItemModel: ObservableObject {
     /// lock therefore no longer defers the repair forever, and is not displaced by it either: it is not our
     /// job, so we never unload it.
     ///
-    /// Failures surface on the existing not-running card (issue #745's pattern, issue #15's redaction), which
-    /// is visible in exactly the state this runs in: no daemon holds the lock, so the panel is `.notRunning`
-    /// and `canStartDaemon` is true. Should the unregister land but the register throw, the agent is left
-    /// honestly unregistered with the reason shown and Start offered — recoverable, never a silent half-state.
-    /// No new UI is introduced.
+    /// Failures surface on the existing not-running card (issue #745's pattern, issue #15's redaction), and —
+    /// since issue #820 — they surface there whatever `canStartDaemon` later becomes: the card's reason line is
+    /// no longer nested inside the Start affordance's gate, because a daemon taking the lock afterwards used to
+    /// erase the reason silently. They are also ATTRIBUTED, via the `.launchRepair` origin every `.failed` below
+    /// carries: no press stands behind this repair, so its copy must not read like a failed button. Should the
+    /// unregister land but the register throw, the agent is left honestly unregistered with the reason shown and
+    /// Start offered — recoverable, never a silent half-state. No new UI is introduced.
     func reconcileDaemonAgentRegistration() async {
         // A repair already in flight is never re-entered. `startDaemon()` carries the mirror guard, so the two
         // paths cannot interleave into a double unregister→register.
@@ -440,8 +463,8 @@ final class LoginItemModel: ObservableObject {
         // deferral paths asymmetric and silently erase a pre-existing `.failed` reason — inert today (one call
         // site, at launch, where the phase is always `.idle`) but live the moment a second call site is added.
         let phaseBeforeRepair = startPhase
-        startPhase = .registering
-        await Task.yield()  // let the "Starting…" beat paint before the synchronous unregister/register
+        startPhase = .registering(.launchRepair)
+        await Task.yield()  // let the "Repairing…" beat paint before the synchronous unregister/register
         // Re-probe across the yield. At login the app (a login item) and the agent (`RunAtLoad`) start
         // CONCURRENTLY — which is exactly the first launch after an update, when the identity has changed — so
         // OUR agent can come up between gate 4 and the unregister below. Re-probing collapses the
@@ -466,28 +489,31 @@ final class LoginItemModel: ObservableObject {
             // only on a confirmed spawn would be worse — a daemon that cannot start (bad config, crash-loop)
             // would then be unregistered and re-registered on EVERY launch, the storm gate 3 exists to
             // prevent. So recovery is deliberately the operator's: the reason below, and the Start affordance.
-            // Issue #820 tracks where that reason can go unread.
+            // Issue #820 is what makes that reason actually READABLE — it is no longer erased by a daemon
+            // taking the lock after the fact, which is the only thing that made this trade survivable.
             registrationStore.lastRegisteredIdentity = identity
             if foreignLockHolder {
                 // The liveness wait CANNOT answer here, so it is not asked: a foreign holder falsifies the
                 // premise `daemonBecameLive()` states, and the poll would attribute that daemon to this
-                // repair. `.failed` would be wrong too, and invisible: a daemon IS serving, so the panel is
-                // not `.notRunning`, and `StartDaemonCard` renders a reason only while `canStartDaemon`,
-                // which a held lock already makes false. So land `.idle` — the registration (the thing this
-                // method repairs) succeeded — and say in the log what was NOT established.
+                // repair. `.failed` would be wrong on the facts too — the registration this method exists to
+                // repair SUCCEEDED, and a daemon IS serving — and since issue #820 decoupled the card's
+                // reason from `canStartDaemon`, a wrong `.failed` here is no longer hidden by the held lock
+                // but plainly visible. So land `.idle`, and say in the log what was NOT established.
                 loginItemLog.info("daemon agent re-registered: \(Self.foreignHolderLivenessNote, privacy: .public)")
                 startPhase = .idle
             } else {
                 // Same #745 honesty as `startDaemon()`: a register that launchd ACCEPTS still has to be
                 // SPAWNED by `RunAtLoad`, and that spawn can fail silently. The lock was free at the re-probe,
                 // so a lock taken within the window is the daemon this re-registration started.
-                startPhase = await daemonBecameLive() ? .idle : .failed(reason: Self.notStartedReason)
+                startPhase = await daemonBecameLive()
+                    ? .idle
+                    : .failed(reason: Self.notStartedReason, origin: .launchRepair)
             }
         } catch {
             loginItemLog.error(
                 "daemon agent re-registration failed: \(String(describing: error), privacy: .public)")
             daemonStatus = service.daemonAgentStatus
-            startPhase = .failed(reason: Self.reregisterFailureReason(error))
+            startPhase = .failed(reason: Self.reregisterFailureReason(error), origin: .launchRepair)
         }
     }
 
@@ -608,9 +634,13 @@ final class LoginItemModel: ObservableObject {
     }
 
     /// The re-registration counterpart of `startFailureReason` (issue #788) — same redaction discipline
-    /// (issue #15), only the empty-message fallback differs, naming the situation the operator is actually in.
+    /// (issue #15), only the empty-message fallback differs, naming the operation that failed.
+    ///
+    /// The fallback deliberately does NOT say "after the app update" (issue #820): every call site passes
+    /// `origin: .launchRepair`, so the card already prefixes it with `startDaemonRepairAttribution`, and
+    /// carrying the occasion here as well rendered "…after an app update — …after the app update."
     private static func reregisterFailureReason(_ error: Error) -> String {
         let message = (error as NSError).localizedDescription
-        return message.isEmpty ? "The daemon couldn’t be re-registered after the app update." : message
+        return message.isEmpty ? "The daemon couldn’t be re-registered." : message
     }
 }

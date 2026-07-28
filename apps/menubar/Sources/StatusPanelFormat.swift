@@ -1106,11 +1106,45 @@ enum StatusPanelFormat {
 
     /// The "Start daemon" button title — mirrors the design mock's not-running card.
     static let startDaemonButtonTitle = "Start daemon"
-    /// The in-flight label while the SMAppService agent registration is pending (the mock's transient beat).
-    static let startDaemonPendingText = "Starting…"
+    /// The in-flight label while an OPERATOR-pressed registration is pending (the mock's transient beat) —
+    /// issue #170's shipped wording, unchanged.
+    static let startDaemonOperatorPendingText = "Starting…"
+    /// The launch-time repair's in-flight label (issue #820). Issue #788 made the repair paint the SAME beat
+    /// as the button, so both read "Starting…" — a spinner that appeared on its own at launch was
+    /// indistinguishable from one the operator had just summoned. "Repairing…" says the app is fixing a
+    /// registration an update left stale, which is what is actually happening and what no press caused.
+    static let startDaemonRepairPendingText = "Repairing…"
+    /// The in-flight label for the writer that painted the beat (issue #820) — the card's only reader of the
+    /// two constants above. Switched rather than ternaried so a THIRD writer (which is exactly what #788 was)
+    /// cannot silently inherit the operator's wording.
+    static func startDaemonPendingText(for origin: StartOrigin) -> String {
+        switch origin {
+        case .operatorStart: return startDaemonOperatorPendingText
+        case .launchRepair: return startDaemonRepairPendingText
+        }
+    }
     /// The reassurance hint beneath the button: starting the daemon is a runtime/lifecycle action that
     /// touches no credential (issue #15 redaction discipline) — the product half of the mock's `msg-hint`.
     static let startDaemonHint = "Start is a runtime action — it touches no credentials."
+
+    /// The attribution lead-in for a failure the LAUNCH-TIME repair raised (issue #820). It answers the one
+    /// question the bare reason cannot: *who did this?* — because the operator did not, and the reason strings
+    /// themselves are no help (`notStartedReason` is emitted byte-identically by both writers).
+    static let startDaemonRepairAttribution = "Automatic repair after an app update"
+
+    /// The not-running card's failure line, attributed to the writer that raised it (issue #820).
+    ///
+    /// ASYMMETRIC ON PURPOSE. An operator-initiated Start gets the reason VERBATIM — they pressed the button a
+    /// moment ago and are watching the card, so a prefix telling them they pressed it is noise (and it keeps
+    /// the issue #170 / #745 copy byte-unchanged on the path those issues shipped). The launch-time repair is
+    /// the case that needs saying out loud: it runs with the popover closed and no press behind it, so its
+    /// reason is prefixed with what caused it.
+    static func startDaemonFailureText(reason: String, origin: StartOrigin) -> String {
+        switch origin {
+        case .operatorStart: return reason
+        case .launchRepair: return "\(startDaemonRepairAttribution) — \(reason)"
+        }
+    }
 
     // MARK: - Snapshot age (issue #326 / council — the CLI's parity render of the wire `generated_at`)
 
