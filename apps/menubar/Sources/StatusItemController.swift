@@ -48,8 +48,6 @@ final class StatusItemController {
     /// The subscription that re-sizes the panel whenever the Stats model changes (installed in `init`).
     private var statsObserver: AnyCancellable?
     private var presentationTask: Task<Void, Never>?
-    /// The UX gap between the menu bar and the panel's top edge.
-    private let panelGap: CGFloat = 6
     /// The outside-click monitor installed WHILE the panel is open (see `openPanel`). `nil` when closed.
     private var dismissMonitor: Any?
     /// Injected by `main.swift` to open the Settings window (issue #268). The controller owns the menu ENTRY
@@ -169,22 +167,17 @@ final class StatusItemController {
     }
 
     /// The status-item action, fired on a primary OR secondary mouse-up (see `configureButton`). A
-    /// secondary click (see `isSecondaryClick`) raises the lifecycle menu; a primary click toggles
+    /// secondary click (see `StatusItemChrome.click`) raises the lifecycle menu; a primary click toggles
     /// the panel.
     @objc private func handleClick() {
-        if isSecondaryClick(NSApp.currentEvent) {
-            showLifecycleMenu()
-        } else {
-            togglePanel()
+        // The classification itself is pure (issue #764): `StatusItemChrome.click` decides, this shell only
+        // reads the live event and dispatches, so the right-vs-control-left-vs-primary rule is covered
+        // headlessly instead of needing a synthesized `NSEvent`.
+        let event = NSApp.currentEvent
+        switch StatusItemChrome.click(forEventType: event?.type, modifiers: event?.modifierFlags ?? []) {
+        case .secondary: showLifecycleMenu()
+        case .primary:   togglePanel()
         }
-    }
-
-    /// A secondary (menu-summoning) click: a right mouse-up, or a control-held left mouse-up. A
-    /// `nil` event (the programmatic-click path) is treated as primary.
-    private func isSecondaryClick(_ event: NSEvent?) -> Bool {
-        guard let event else { return false }
-        return event.type == .rightMouseUp
-            || (event.type == .leftMouseUp && event.modifierFlags.contains(.control))
     }
 
     /// Toggle the panel (AC — clicking the item shows AND hides it).
@@ -197,31 +190,41 @@ final class StatusItemController {
     }
 
     /// The secondary-click menu — the OFF-PANEL home for cold-path actions, so the status panel stays a
-    /// pure display + manual-swap surface (design C-005 IA scope guard). It carries "Add account…" (issue
-    /// #394 — the capture entry point now that the populated panel has no persistent capture bar; capture
-    /// is a rare, deliberate action, neither display nor swap, so it belongs here) and "Quit Sessiometer"
-    /// (a pure-CLIENT control that terminates the menu-bar app via `NSApp.terminate`, the clean
-    /// `applicationWillTerminate` transport-stop path; it does NOT touch the daemon, whose quit/restart
-    /// lifecycle is #170). It is the natural future home for the remaining runtime controls (daemon
-    /// quit/restart); launch-at-login now ships in Settings (the "General" toggle) plus the not-running
-    /// panel card's Start affordance (#170). Shown via a TRANSIENT `statusItem.menu` so AppKit positions and
-    /// highlights it natively under the item, then cleared so the primary click keeps toggling the panel
-    /// (setting `statusItem.menu` permanently would hijack the primary click, #325/#326).
+    /// pure display + manual-swap surface (design C-005 IA scope guard). WHICH rows it carries, in what
+    /// order, with what copy and why each belongs off-panel is `StatusItemChrome.lifecycleMenu`'s to
+    /// state (and to test); this method owns only their AppKit presentation. It is the natural future home
+    /// for the remaining runtime controls (daemon quit/restart); launch-at-login now ships in Settings (the
+    /// "General" toggle) plus the not-running panel card's Start affordance (#170). Shown via a TRANSIENT
+    /// `statusItem.menu` so AppKit positions and highlights it natively under the item, then cleared so the
+    /// primary click keeps toggling the panel (setting `statusItem.menu` permanently would hijack the
+    /// primary click, #325/#326).
     private func showLifecycleMenu() {
         // Close the panel first if it is open: the click-outside global monitor never sees our own
         // status-item events, so without this a secondary click would leave the panel lingering.
         if panel.isVisible { closePanel() }
+        // Built from the pure `StatusItemChrome.lifecycleMenu` spec (issue #764) — the copy, the order, and
+        // the separator placement are covered headlessly; this shell only binds each row's action to its
+        // selector. Binding is by `MenuAction` IDENTITY, never by title, so renaming a row cannot silently
+        // unbind it, and a new action fails to compile here until it is wired.
         let menu = NSMenu()
-        let addItem = NSMenuItem(title: "Add account…", action: #selector(addAccount), keyEquivalent: "")
-        addItem.target = self
-        menu.addItem(addItem)
-        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
-        settingsItem.target = self
-        menu.addItem(settingsItem)
-        menu.addItem(.separator())
-        let quitItem = NSMenuItem(title: "Quit Sessiometer", action: #selector(quit), keyEquivalent: "")
-        quitItem.target = self
-        menu.addItem(quitItem)
+        for entry in StatusItemChrome.lifecycleMenu {
+            // Route on the seam's OWN predicate, so the shell and the spec can never disagree about what
+            // a separator is (`MenuEntry`'s private init already makes a half-populated row impossible).
+            if entry.isSeparator {
+                menu.addItem(.separator())
+                continue
+            }
+            guard let action = entry.action, let title = entry.title else { continue }
+            let selector: Selector
+            switch action {
+            case .addAccount:   selector = #selector(addAccount)
+            case .openSettings: selector = #selector(openSettings)
+            case .quit:         selector = #selector(quit)
+            }
+            let item = NSMenuItem(title: title, action: selector, keyEquivalent: entry.keyEquivalent)
+            item.target = self
+            menu.addItem(item)
+        }
         statusItem.menu = menu
         statusItem.button?.performClick(nil)
         statusItem.menu = nil
@@ -246,14 +249,16 @@ final class StatusItemController {
         onOpenSettings?()
     }
 
-    /// Quit the menu-bar app (a pure-client control). The daemon keeps running — its lifecycle is #170.
+    /// Quit the menu-bar app (a pure-client control) via `NSApp.terminate` — the clean path, since it runs
+    /// `applicationWillTerminate` and so stops the transport. The daemon keeps running: it is a separate
+    /// process, and its quit/restart lifecycle is #170.
     @objc private func quit() {
         NSApp.terminate(nil)
     }
 
-    /// Size the panel to its CURRENT SwiftUI content and position it a `panelGap` below the icon, clamped
-    /// on-screen on BOTH axes. This is the single sizing seam (issue #446): `openPanel` calls it once at
-    /// open, and `resizePanelToContentIfOpen` re-calls it whenever the hosted content changes height (a
+    /// Size the panel to its CURRENT SwiftUI content and position it a `StatusItemChrome.panelGap` below
+    /// the icon, clamped on-screen. This is the single sizing seam (issue #446): `openPanel` calls it
+    /// once at open, and `resizePanelToContentIfOpen` re-calls it whenever the hosted content changes (a
     /// Status↔Stats tab switch, or the stats series loading in). The prior `openPanel` sized ONCE at
     /// open-time and clamped X only, so a taller Stats tab appearing after open both clipped and ran off the
     /// bottom. Placement is derived from the icon's OWN window frame, correct on any display / menu-bar
@@ -261,21 +266,16 @@ final class StatusItemController {
     private func setPanelFrameToContent() {
         guard let button = statusItem.button, let iconWindow = button.window else { return }
         hostingView.layoutSubtreeIfNeeded()
-        var size = hostingView.fittingSize
-        if size.width < 1 || size.height < 1 { size = NSSize(width: 360, height: 240) }
         let iconFrame = iconWindow.frame
         // The VISIBLE frame (excludes the menu bar + Dock) is the correct bound for on-screen clamping — a
         // physical-frame clamp would still let a tall panel slide under the Dock.
         let visible = (iconWindow.screen ?? NSScreen.main)?.visibleFrame ?? iconFrame
-        var x = iconFrame.midX - size.width / 2
-        x = min(max(x, visible.minX + 8), visible.maxX - size.width - 8)
-        // Hang below the icon's bottom edge with the gap; then Y-CLAMP so a tall panel keeps its bottom
-        // on-screen instead of clipping off the bottom (the #446 bug: X was clamped, Y was not). When the
-        // full height fits below the icon, `y` is unchanged and the panel hangs normally under the gap;
-        // switching back to the shorter Status tab recomputes a higher `y`, restoring the original look.
-        var y = iconFrame.minY - panelGap - size.height
-        if y < visible.minY + 8 { y = visible.minY + 8 }
-        panel.setFrame(NSRect(x: x, y: y, width: size.width, height: size.height), display: true)
+        // The arithmetic itself is pure (issue #764) — centering, the degenerate-fitting-size substitution,
+        // both-axis clamping, and the #446 bottom-floor all live in `StatusItemChrome` and are covered
+        // headlessly. This shell only reads the live AppKit geometry and applies the result.
+        let size = StatusItemChrome.contentSize(fitting: hostingView.fittingSize)
+        panel.setFrame(StatusItemChrome.panelFrame(iconFrame: iconFrame, visibleFrame: visible, contentSize: size),
+                       display: true)
     }
 
     /// Re-fit the panel to its content, but ONLY while it is open (issue #446). The Stats model's observer
@@ -286,13 +286,14 @@ final class StatusItemController {
         setPanelFrameToContent()
     }
 
-    /// Show the panel a `panelGap` below the status item, centered under the icon and clamped on-screen.
-    /// Positioning is derived from the icon's OWN window frame, so it is correct on any display and any
-    /// menu-bar height (notch or not) without hardcoding — the icon stays visible above the gap.
+    /// Show the panel a `StatusItemChrome.panelGap` below the status item, centered under the icon and
+    /// clamped on-screen. Positioning is derived from the icon's OWN window frame, so it is correct on any
+    /// display and any menu-bar height (notch or not) without hardcoding — the icon stays visible above
+    /// the gap.
     private func openPanel() {
         // Bail before showing if the icon has no window yet: `setPanelFrameToContent` would then no-op,
         // so `orderFrontRegardless` below would flash the panel at a stale, unpositioned frame.
-        guard statusItem.button?.window != nil else { return }
+        guard StatusItemChrome.canOpenPanel(iconHasWindow: statusItem.button?.window != nil) else { return }
         setPanelFrameToContent()
         panel.orderFrontRegardless()
         // Make the panel key so VoiceOver focus moves INTO it (the borderless-panel regression: a
@@ -309,17 +310,25 @@ final class StatusItemController {
         dismissMonitor = NSEvent.addGlobalMonitorForEvents(
             matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
             guard let self else { return }
-            if let button = self.statusItem.button, let window = button.window,
-               window.frame.contains(NSEvent.mouseLocation) {
-                return
+            let onOwnItem: Bool
+            if let button = self.statusItem.button, let window = button.window {
+                onOwnItem = window.frame.contains(NSEvent.mouseLocation)
+            } else {
+                onOwnItem = false
             }
-            // #360: don't dismiss while the operator is mid-edit or a capture is in flight — an accidental
-            // outside-click must not drop a typed-but-unsubmitted label or hide an in-flight capture. #169
-            // extends the same retain to an in-flight SWAP, which writes the active account: its outcome
-            // (committed, or refused with a reason) must not be hidden before the operator reads it. The
-            // Esc key (field `.onExitCommand`) and the status-item toggle remain the deliberate closers.
-            if self.captureModel.isBusy || self.swapModel.isBusy { return }
-            self.closePanel()
+            // The disposition is pure (issue #764): `StatusItemChrome.outsideClick` owns the own-icon
+            // exclusion (#325/#326's second-click toggle) and the #360/#169 in-flight retain — an accidental
+            // outside-click must not drop a typed-but-unsubmitted label, hide an in-flight capture, or hide
+            // an in-flight SWAP, which writes the active account and whose outcome must be read. The Esc key
+            // (field `.onExitCommand`) and the status-item toggle remain the deliberate closers.
+            switch StatusItemChrome.outsideClick(landedOnStatusItem: onOwnItem,
+                                                 captureBusy: self.captureModel.isBusy,
+                                                 swapBusy: self.swapModel.isBusy) {
+            case .ignoreOwnStatusItem, .retain:
+                return
+            case .dismiss:
+                self.closePanel()
+            }
         }
     }
 
