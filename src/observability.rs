@@ -28,6 +28,13 @@
 //! split the `key=val` grammar. Enforcing the handle charset is the meter's job
 //! (#15); this module localizes the surface but does not police it.
 //!
+//! The one FREE-FORM value on this channel is the resolved `claude` path
+//! ([`Event::RefreshBinaryResolved`], issue #786) — a filesystem location, still
+//! never a token or an email. Because a path can legally contain a space, it is the
+//! one value this module DOES police: it renders percent-encoded ([`path_value`]),
+//! so the whitespace-free grammar every parser assumes holds by construction rather
+//! than by the operator's good luck in naming their directories.
+//!
 //! ## The diagnostic channel (issue #77)
 //!
 //! Separate from the event log above, the OPERATOR-FACING diagnostic channel
@@ -44,6 +51,7 @@
 
 use std::fs::File;
 use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -195,18 +203,28 @@ impl RefreshEventOutcome {
 
 /// WHY an isolated-refresh cycle produced an `outcome=error` — the non-secret `reason=` sub-class
 /// of an error [`Event::Refresh`] line (issue #377). The event-level mirror of the engine's
-/// [`crate::refresh::RefreshErrorReason`], carrying one variant the engine cannot: [`Timeout`],
-/// the tick's `tokio::time::timeout` bound firing — never a value a completed cycle produces (the
-/// same event-adds-a-variant split by which [`RefreshEventOutcome`] adds `RefreshedNotReStashed`).
-/// A FIXED, secret-free-BY-CONSTRUCTION classification: it makes a wholesale refresh failure (the
-/// #375 incident — every account a bare `error` for hours) diagnosable from the log without ever
-/// folding a token / path / email onto the #15 channel.
+/// [`crate::refresh::RefreshErrorReason`], carrying TWO variants the engine cannot: [`Timeout`],
+/// the tick's `tokio::time::timeout` bound firing, and [`Unresolved`], the `claude` binary failing
+/// to resolve at all — neither a value a completed cycle produces, because both are detected
+/// OUTSIDE one (the same event-adds-a-variant split by which [`RefreshEventOutcome`] adds
+/// `RefreshedNotReStashed`). A FIXED, secret-free-BY-CONSTRUCTION classification: it makes a
+/// wholesale refresh failure (the #375 incident — every account a bare `error` for hours)
+/// diagnosable from the log without ever folding a token / path / email onto the #15 channel.
 ///
-/// Rendered ONLY on an error line, and ONLY for a sub-cause classifiable secret-free — a hard
-/// engine `Err` (a locked keychain, a contended lock, an FS error, an unresolved binary) has no
-/// such class, so it stays a bare `outcome=error` with no `reason=`.
+/// Rendered ONLY on an error line, and ONLY for a sub-cause classifiable secret-free.
+/// [`Unresolved`] (issue #786) meets that test BY CONSTRUCTION — a fixed token, with the resolved
+/// path carried on its own [`Event::RefreshBinaryResolved`] line rather than folded in here — and
+/// it is the sub-cause this enum most needed: it exists so a #375-class outage is diagnosable from
+/// the log, and an unresolvable `claude` is precisely the cause that PRODUCED one (24 h of bare
+/// `outcome=error` lines while `status` pointed the operator at a `reason=` no refresh event had
+/// ever carried).
+///
+/// The REMAINING hard engine `Err`s — a locked keychain, a contended lock, an FS error — still
+/// have no class here and still render a bare `outcome=error` with no `reason=`. That narrowness
+/// is deliberate, and argued where it is enforced (`refresh_tick::engine_error_reason`).
 ///
 /// [`Timeout`]: RefreshEventReason::Timeout
+/// [`Unresolved`]: RefreshEventReason::Unresolved
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RefreshEventReason {
     /// The `claude` binary resolved but could not be spawned / exec'd.
@@ -215,9 +233,16 @@ pub(crate) enum RefreshEventReason {
     ReadbackUnreadable,
     /// The stored / read-back blob was unparseable.
     Malformed,
-    /// The cycle exceeded `[refresh].timeout_secs` — the tick's whole-cycle timeout bound (the
-    /// one sub-cause detected OUTSIDE a completed engine cycle, hence event-level only).
+    /// The cycle exceeded `[refresh].timeout_secs` — the tick's whole-cycle timeout bound (one of
+    /// the two sub-causes detected OUTSIDE a completed engine cycle, hence event-level only).
     Timeout,
+    /// The `claude` binary could not be located at all (issue #786,
+    /// [`crate::error::Error::ClaudeBinaryNotFound`]): no `[refresh].claude_bin` pin, no
+    /// `$CLAUDE_BIN`, and no `claude` on the harvested login-shell `PATH`. Event-level only for
+    /// the same structural reason as [`Timeout`](Self::Timeout) — it is detected at RESOLUTION
+    /// time, before any engine cycle exists to classify. The token names the failure; the paths
+    /// searched never ride it.
+    Unresolved,
 }
 
 impl RefreshEventReason {
@@ -228,6 +253,7 @@ impl RefreshEventReason {
             RefreshEventReason::ReadbackUnreadable => "readback_unreadable",
             RefreshEventReason::Malformed => "malformed",
             RefreshEventReason::Timeout => "timeout",
+            RefreshEventReason::Unresolved => "unresolved",
         }
     }
 }
@@ -624,9 +650,10 @@ pub(crate) struct BlindVelocity {
 /// One observable daemon state change, rendered as a single `key=val` log line by
 /// [`Event::to_log_line`].
 ///
-/// Every field is a handle / enum / number / timestamp — never a token or email
-/// (issue #15). That is the type-level guarantee behind the single-surface
-/// redaction claim in the module docs.
+/// Every field is a handle / enum / number / timestamp — or, in the single case of the resolved
+/// `claude` path (issue #786), a percent-encoded filesystem location. Never a token or email
+/// (issue #15). That is the type-level guarantee behind the single-surface redaction claim in the
+/// module docs.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Event {
     /// The active credential was rotated away from `from` to `to` because `reason`
@@ -902,10 +929,11 @@ pub(crate) enum Event {
         /// The non-secret error sub-class on an `outcome=error` line (issue #377), rendered as
         /// an additive TRAILING `reason=` field (precedent: `late=` / `rotated=`) so existing
         /// `key=val` parsers are unaffected. `Some` ONLY on an error whose sub-cause is
-        /// classifiable secret-free (the three completed-cycle sub-causes plus `timeout`);
-        /// `None` on every non-error outcome AND on a hard engine `Err` that carries no such
-        /// class — in both cases NO `reason=` is rendered. A [`RefreshEventReason`] is a fixed
-        /// enum token, never dynamic error text, so it cannot carry a secret onto the line.
+        /// classifiable secret-free (the three completed-cycle sub-causes, plus `timeout` and —
+        /// since issue #786 — `unresolved`); `None` on every non-error outcome AND on a hard
+        /// engine `Err` that STILL carries no such class (a locked keychain, a contended lock,
+        /// an FS error) — in both cases NO `reason=` is rendered. A [`RefreshEventReason`] is a
+        /// fixed enum token, never dynamic error text, so it cannot carry a secret onto the line.
         reason: Option<RefreshEventReason>,
         /// The per-account refresh back-off armed by THIS `outcome=error` cycle (issue #408),
         /// in seconds — the window before this account's next sweep-refresh is permitted. `Some`
@@ -979,6 +1007,30 @@ pub(crate) enum Event {
     /// two-edge idiom at the refresh-MECHANISM scope. No fields — a daemon-global recovery with
     /// nothing account-specific to carry (#15).
     RefreshSystemicRecovered,
+    /// The absolute path of the `claude` binary the refresh sweep RESOLVED and is spawning
+    /// (issue #786) — the "WHICH `claude` did the daemon pick?" question the log previously could
+    /// not answer at all. With three resolution tiers (`[refresh].claude_bin`, `$CLAUDE_BIN`, the
+    /// harvested login-shell `PATH`, #784) and no symlink canonicalization, an operator staring at
+    /// a failing refresh cannot otherwise tell a shadowed `claude` from the one they meant.
+    ///
+    /// EDGE-TRIGGERED, not per-resolution. Resolution runs per ACCOUNT per CYCLE (#375 put it at
+    /// the spawn site deliberately), so an unconditional line would be N identical lines every
+    /// sweep, forever — burying the signal it exists to give and working against #15's "carry only
+    /// what is needed". Emitted on the FIRST resolution and on every CHANGE of the resolved path,
+    /// including the first success after a failure (a `claude` that came back is as worth seeing
+    /// as one that moved); an unchanged re-resolution is silent, which is also what collapses one
+    /// sweep's N same-binary resolutions to a single line.
+    ///
+    /// DELIBERATELY a SEPARATE event from the `reason=unresolved` [`Refresh`](Self::Refresh) line,
+    /// and judged against issue #15 on its own footing: a filesystem location is not a credential
+    /// — the standing this crate's [`crate::error::Error`] variants already give a path — and
+    /// keeping it off `reason=` is what preserves that field's fixed-token guarantee.
+    ///
+    /// `path` is the first FREE-FORM value this channel has ever carried — every other field is a
+    /// handle, an enum, a number or a timestamp — and a path may legally contain a space, so it is
+    /// rendered percent-encoded rather than raw. [`path_value`] owns that argument, including why
+    /// field POSITION alone would not have been enough.
+    RefreshBinaryResolved { path: PathBuf },
     /// `account`'s 5-state credential-health rollup (issue #119) TRANSITIONED to `state`
     /// this cycle. Edge-triggered: emitted exactly ONCE per change (not per poll while
     /// the state holds), so the event log carries the per-account health timeline. The
@@ -1667,6 +1719,17 @@ impl Event {
                 // with nothing account-specific to carry.
                 format!("ts={ts} event=refresh_systemic_recovered")
             }
+            Event::RefreshBinaryResolved { path } => {
+                // Percent-encoded (see `path_value`) so the value can never split into a second
+                // token, and kept LAST anyway — a reader's eye lands on it, and any future field
+                // is appended after a value that cannot be mistaken for one. A filesystem
+                // location, never a credential (#15), and deliberately NOT folded into the
+                // `reason=unresolved` refresh line — the variant doc says why.
+                format!(
+                    "ts={ts} event=refresh_binary_resolved path={}",
+                    path_value(path)
+                )
+            }
             Event::CredentialHealth { account, state } => {
                 let state = state.as_str();
                 format!("ts={ts} event=credential_health account={account} state={state}")
@@ -1963,6 +2026,51 @@ impl Event {
             }
         }
     }
+}
+
+/// Render a filesystem path as a log-line VALUE — percent-encoded so it can never contain
+/// whitespace (issue #786).
+///
+/// Every other value on this channel is a handle, an enum, a number or a timestamp, and is
+/// whitespace-free by construction. That is not incidental: `reliability::parse_events` tokenizes a
+/// line on spaces and says so — *"handles/values are whitespace-free by the log's grammar, so
+/// tokenizing on spaces is exact"*. A path is the first free-form value the log carries, and a path
+/// may legally contain a space, so rendering one raw would not bend that invariant but BREAK it:
+/// `path=/Users/o/x event=swap from=a to=b/claude` tokenizes into a spurious `event=swap` that
+/// OVERWRITES the real `event` in a field map, and the reliability parser would then run the line
+/// through its swap arm. Field POSITION cannot prevent that; a whitespace-free value can.
+///
+/// So whitespace is encoded, and `%` with it — `%` first, so the mapping stays reversible and a
+/// literal `%` in a path (`%25`) is never confusable with an encoded space. Multi-byte whitespace
+/// (U+00A0 and friends) is encoded per UTF-8 byte, as percent-encoding is defined on bytes.
+/// NOTHING else is touched, deliberately: an `=` inside the value is harmless once the value is a
+/// single token (`split_once('=')` splits at the FIRST `=`, so the key stays `path`), and leaving
+/// it alone keeps the overwhelmingly common case — a path with no space and no `%` — byte-for-byte
+/// identical to the raw path, so `grep path=` and copy-paste behave exactly as an operator expects.
+///
+/// `display()` is lossy for a non-UTF-8 path. A byte-level encoding over the raw `OsStr` COULD
+/// carry one intact — this is a deliberate omission, not a limitation of the grammar. Such a path
+/// cannot name an existing `claude` on the filesystems this daemon targets, so the resolver never
+/// yields one, and the extra machinery would buy fidelity for a value that cannot occur. The
+/// grammar holds either way: U+FFFD is not whitespace.
+fn path_value(path: &Path) -> String {
+    /// Uppercase hex digits, the percent-encoding convention.
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let raw = path.display().to_string();
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch != '%' && !ch.is_whitespace() {
+            out.push(ch);
+            continue;
+        }
+        let mut buf = [0u8; 4];
+        for byte in ch.encode_utf8(&mut buf).as_bytes() {
+            out.push('%');
+            out.push(HEX[usize::from(byte >> 4)] as char);
+            out.push(HEX[usize::from(byte & 0x0F)] as char);
+        }
+    }
+    out
 }
 
 /// A [`SystemTime`] from epoch seconds — used to render an `all_exhausted`
@@ -3265,7 +3373,8 @@ mod tests {
         // Issue #377: the non-secret error sub-class rides an additive TRAILING `reason=` field,
         // AFTER the always-present `rotated=` (mirroring the swap line's optional trailing
         // `late=`), so a normal-outcome line is byte-for-byte unchanged and existing `key=val`
-        // parsers are unaffected. Each fixed class renders its documented token.
+        // parsers are unaffected. Each fixed class renders its documented token — including
+        // `unresolved`, added the same way `timeout` was (issue #786).
         for (reason, token) in [
             (RefreshEventReason::SpawnFailed, "spawn_failed"),
             (
@@ -3274,6 +3383,7 @@ mod tests {
             ),
             (RefreshEventReason::Malformed, "malformed"),
             (RefreshEventReason::Timeout, "timeout"),
+            (RefreshEventReason::Unresolved, "unresolved"),
         ] {
             let line = Event::Refresh {
                 account: "spare".to_owned(),
@@ -3352,6 +3462,187 @@ mod tests {
             !ok.contains("backoff_secs="),
             "a success omits backoff_secs: {ok}"
         );
+    }
+
+    #[test]
+    fn unresolved_keeps_reason_a_trailing_additive_field() {
+        // T6 / issue #786: the new class changes nothing about the line's SHAPE. `reason=` stays
+        // where #377 put it — after the always-present `rotated=`, before `backoff_secs=` and
+        // `window_secs=` — so every existing `key=val` parser reads the line exactly as before
+        // and simply sees one more token value. Asserted with the full field set present, which
+        // is the only arrangement that can catch a placement regression.
+        let line = Event::Refresh {
+            account: "spare".to_owned(),
+            outcome: RefreshEventOutcome::Error,
+            expires_before: Some(1_000_000),
+            expires_after: Some(1_000_000),
+            refresh_token_rotated: false,
+            reason: Some(RefreshEventReason::Unresolved),
+            backoff_secs: Some(120),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!(
+                "{TS0} event=refresh account=spare outcome=error \
+                 expires_before=1970-01-01T00:16:40Z expires_after=1970-01-01T00:16:40Z \
+                 rotated=false reason=unresolved backoff_secs=120 window_secs=0"
+            )
+        );
+    }
+
+    #[test]
+    fn every_refresh_reason_token_is_distinct_and_grep_safe() {
+        // T9 + T10 / issue #15. Every `reason=` value is a FIXED snake_case token: no `/` (a
+        // path), no `@` (an email), no separator that could split the `key=val` grammar, and
+        // nothing long enough to be a credential. Distinctness is the other half — two classes
+        // sharing a token would silently merge two causes in the log, which is the failure #786
+        // is fixing, one level down.
+        //
+        // Exhaustiveness is enforced by the COMPILER, not here: `RefreshEventReason::as_str` has
+        // no `_` arm, so a new variant fails to build until it is given a token. This list is
+        // what asserts the tokens themselves are usable once they exist.
+        let reasons = [
+            RefreshEventReason::SpawnFailed,
+            RefreshEventReason::ReadbackUnreadable,
+            RefreshEventReason::Malformed,
+            RefreshEventReason::Timeout,
+            RefreshEventReason::Unresolved,
+        ];
+        let mut seen: Vec<&str> = Vec::new();
+        for reason in reasons {
+            let token = reason.as_str();
+            assert!(!token.is_empty(), "{reason:?} renders an empty token");
+            assert!(
+                token.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{reason:?} renders {token:?}, which is not a fixed snake_case token"
+            );
+            assert!(
+                !token.contains('/') && !token.contains('@') && !token.contains(char::is_whitespace),
+                "{reason:?} renders {token:?}, which could carry a path / email / field split (#15)"
+            );
+            assert!(
+                !seen.contains(&token),
+                "{reason:?} reuses the token {token:?} — two causes would merge in the log"
+            );
+            seen.push(token);
+        }
+    }
+
+    #[test]
+    fn the_resolved_binary_line_is_its_own_event_carrying_the_absolute_path() {
+        // T8 / issue #786 AC6: the resolved PATH rides a DISTINCT event, never folded into
+        // `reason=`. That separation is what lets each be judged against #15 on its own terms —
+        // `reason=` keeps its fixed-token guarantee, and the path is evaluated as what it is, a
+        // filesystem location rather than a credential.
+        let line = Event::RefreshBinaryResolved {
+            path: PathBuf::from("/opt/homebrew/bin/claude"),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!("{TS0} event=refresh_binary_resolved path=/opt/homebrew/bin/claude")
+        );
+        assert!(
+            !line.contains("reason="),
+            "the path must never ride `reason=`: {line}"
+        );
+
+        // And the `reason=unresolved` line stays free of the path, from the other direction.
+        let unresolved = Event::Refresh {
+            account: "spare".to_owned(),
+            outcome: RefreshEventOutcome::Error,
+            expires_before: None,
+            expires_after: None,
+            refresh_token_rotated: false,
+            reason: Some(RefreshEventReason::Unresolved),
+            backoff_secs: None,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            unresolved,
+            format!(
+                "{TS0} event=refresh account=spare outcome=error rotated=false reason=unresolved"
+            )
+        );
+        assert!(
+            !unresolved.contains('/'),
+            "no path may reach the classification line: {unresolved}"
+        );
+    }
+
+    #[test]
+    fn a_resolved_path_never_splits_the_key_val_grammar() {
+        // The grammar guard. A path is the only free-form value on this channel and may legally
+        // contain a space, while `reliability::parse_events` tokenizes on whitespace and states
+        // that values are whitespace-free. Percent-encoding is what keeps that true, and this
+        // pins it against the two adversarial shapes — a plain space, and the injection a
+        // trailing-but-raw path would still allow — with an ordinary path as the control.
+        let plain = Event::RefreshBinaryResolved {
+            path: PathBuf::from("/opt/homebrew/bin/claude"),
+        }
+        .to_log_line(at_epoch(0));
+
+        let spaced = Event::RefreshBinaryResolved {
+            path: PathBuf::from("/Users/o/My Tools/claude"),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            spaced,
+            format!("{TS0} event=refresh_binary_resolved path=/Users/o/My%20Tools/claude")
+        );
+
+        // The injection a raw path would permit: a directory whose NAME carries ` event=swap `.
+        // Rendered raw this would tokenize into a real `event=swap` field and OVERWRITE the
+        // line's own `event`, sending it through `reliability::parse_events`' swap arm.
+        let hostile = Event::RefreshBinaryResolved {
+            path: PathBuf::from("/tmp/x event=swap from=a to=b/claude"),
+        }
+        .to_log_line(at_epoch(0));
+        for line in [&plain, &spaced, &hostile] {
+            let fields: Vec<(&str, &str)> = line
+                .split_whitespace()
+                .filter_map(|token| token.split_once('='))
+                .collect();
+            assert_eq!(
+                fields.len(),
+                3,
+                "exactly ts/event/path — no injected field: {line}"
+            );
+            assert_eq!(fields[1], ("event", "refresh_binary_resolved"));
+            assert_eq!(fields[2].0, "path");
+            assert!(
+                !line
+                    .rsplit_once("path=")
+                    .expect("the line carries a path")
+                    .1
+                    .contains(char::is_whitespace),
+                "the rendered value must be whitespace-free: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_encoding_is_reversible_and_leaves_ordinary_paths_alone() {
+        // `%` is encoded too, so an encoded space is never confusable with a literal `%20` that
+        // was already in the path — the property that makes the rendering decodable rather than
+        // merely safe. Ordinary paths (the overwhelming majority) pass through untouched, which
+        // is what keeps `grep path=` and copy-paste working.
+        assert_eq!(
+            path_value(Path::new("/usr/local/bin/claude")),
+            "/usr/local/bin/claude"
+        );
+        assert_eq!(path_value(Path::new("/a b/claude")), "/a%20b/claude");
+        assert_eq!(path_value(Path::new("/a%20b/claude")), "/a%2520b/claude");
+        assert_eq!(path_value(Path::new("/a\tb/claude")), "/a%09b/claude");
+        // Multi-byte whitespace is encoded per UTF-8 byte (U+00A0 → C2 A0).
+        assert_eq!(
+            path_value(Path::new("/a\u{a0}b/claude")),
+            "/a%C2%A0b/claude"
+        );
+        // An `=` needs no encoding: the value is a single token, and `split_once('=')` splits at
+        // the FIRST `=`, so the key stays `path` and the rest is the value verbatim.
+        assert_eq!(path_value(Path::new("/a=b/claude")), "/a=b/claude");
     }
 
     #[test]

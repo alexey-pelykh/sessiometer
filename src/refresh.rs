@@ -182,13 +182,14 @@ pub(crate) enum RefreshOutcome {
 /// *the read failed* vs *a blob was read but would not parse*: only a failed read-back is
 /// [`ReadbackUnreadable`](Self::ReadbackUnreadable); every "obtained bytes, then could not
 /// parse them" case is [`Malformed`](Self::Malformed). The whole-cycle TIMEOUT is a fourth
-/// `reason=`, but NOT here — it is the tick's `tokio::time::timeout` bound
-/// ([`crate::refresh_tick`]) firing, never a value a completed cycle produces, so only the
-/// event-level [`crate::observability::RefreshEventReason`] carries it (the same split by which
-/// [`crate::observability::RefreshEventOutcome`] adds a variant this engine enum lacks). A hard
-/// engine `Err` (a locked keychain, a contended lock, an FS error, an unresolved binary) is
-/// likewise NOT one of these — it yields no `RefreshOutcome` at all — so it renders a bare
-/// `outcome=error` with no `reason=`.
+/// `reason=`, and the UNRESOLVED `claude` binary a fifth, but NEITHER is here — the first is the
+/// tick's `tokio::time::timeout` bound ([`crate::refresh_tick`]) firing, the second a resolution
+/// failure that precedes any cycle (issue #786), so neither is a value a completed cycle produces
+/// and only the event-level [`crate::observability::RefreshEventReason`] carries them (the same
+/// split by which [`crate::observability::RefreshEventOutcome`] adds a variant this engine enum
+/// lacks). A hard engine `Err` is likewise NOT one of these — it yields no `RefreshOutcome` at
+/// all. Of those, only the unresolved binary earns a `reason=`; the rest (a locked keychain, a
+/// contended lock, an FS error) render a bare `outcome=error` with none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RefreshErrorReason {
     /// The `claude` binary resolved but could not be spawned / exec'd (the STEP 4 spawn
