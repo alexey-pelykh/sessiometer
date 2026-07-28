@@ -2365,6 +2365,522 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
         );
     }
 
+    // --- #806 frozen replay corpus (cross-surface regression gate) --------------
+
+    /// The frozen corpus window, `[2026-07-24T00:00:00Z, 2026-07-26T00:00:00Z)` — the two worst
+    /// days of the Jul-2026 fleet drain. PINNED as constants rather than derived from `now`: a
+    /// replay that reads the clock is not a regression gate, it is a different test every day.
+    const CORPUS_START: i64 = 1_784_851_200;
+    const CORPUS_END: i64 = 1_785_024_000;
+
+    /// The frozen sample corpus — committed, read-only, never regenerated. `include_str!` makes it
+    /// a compile-time input, exactly as [`crate::migration`] pins its v1 artifacts, so a deleted
+    /// or renamed fixture fails the BUILD rather than silently skipping the gate.
+    const REPLAY_CORPUS: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/build/fixtures/capacity-replay-corpus.tsv"
+    ));
+
+    /// The frozen ORACLE: the `event=all_exhausted` ENTERs the running daemon logged over the very
+    /// same 48 h. Its independence is the whole design — it was produced by the daemon's live tick
+    /// decisions, not by the aggregator, so it can refute the aggregator in a way no fixture
+    /// derived from the aggregator's own premise ever can.
+    const REPLAY_ORACLE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/build/fixtures/capacity-replay-oracle.tsv"
+    ));
+
+    /// The corpus's redacted roster, in the order the handles first appear.
+    const REPLAY_ROSTER: [&str; 6] = ["a1", "a2", "a3", "a4", "a5", "a6"];
+
+    /// The corpus's stated shape. Asserted before every gate below, because a gate that passes on
+    /// a truncated corpus is not evidence — a degraded subject makes the assertions vacuous rather
+    /// than false, which is the failure mode that reads as green.
+    const CORPUS_SAMPLES: usize = 1_734;
+    /// ENTERs the daemon logged in the window. NOT a bound on the hold count in either direction
+    /// (the daemon re-arms its guard, so it over-counts ~33x here) — used only to witness that the
+    /// condition physically occurred, and reported as a diagnostic ratio.
+    const ORACLE_ENTERS: usize = 67;
+
+    /// Skip the fixture's `#` provenance header, yielding only data rows.
+    fn data_rows(fixture: &str) -> impl Iterator<Item = &str> {
+        fixture
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+    }
+
+    /// Rehydrate the frozen corpus into [`Sample`]s. Offsets are re-anchored to [`CORPUS_START`];
+    /// an empty reset column is the store's own `None`, which [`relief_of`] must keep treating as
+    /// "return time unknown" rather than inventing one.
+    fn replay_samples() -> Vec<Sample> {
+        data_rows(REPLAY_CORPUS)
+            .map(|line| {
+                let mut f = line.split('\t');
+                let mut next = || f.next().expect("corpus row has 6 tab-separated columns");
+                let ts: i64 = next().parse::<i64>().expect("ts offset") + CORPUS_START;
+                let acct = next();
+                let session: f64 = next().parse().expect("session fraction");
+                let weekly: f64 = next().parse().expect("weekly fraction");
+                let reset = |s: &str| -> Option<i64> {
+                    (!s.is_empty()).then(|| s.parse::<i64>().expect("reset offset") + CORPUS_START)
+                };
+                let (sr, wr) = (reset(next()), reset(next()));
+                Sample::new(ts, "claude", acct, session, weekly).with_resets(sr, wr)
+            })
+            .collect()
+    }
+
+    /// Rehydrate the oracle into `(instant, held-on handle, cause)` triples. The handle is carried
+    /// rather than dropped: it is what a maintainer greps the daemon's own log with when a figure
+    /// below moves, and the shape guard asserts it names the SAME redacted roster as the corpus —
+    /// two fixtures cut from different alias mappings would silently compare two different fleets.
+    fn replay_oracle() -> Vec<(i64, &'static str, &'static str)> {
+        data_rows(REPLAY_ORACLE)
+            .map(|line| {
+                let mut f = line.split('\t');
+                let mut next = || f.next().expect("oracle row has 3 tab-separated columns");
+                let ts: i64 = next().parse::<i64>().expect("ts offset") + CORPUS_START;
+                (ts, next(), next())
+            })
+            .collect()
+    }
+
+    /// The frozen corpus aggregated at `stale_after`, over the full corpus roster.
+    fn replay_at(stale_after: i64) -> RosterStats {
+        let mut params = hold_params();
+        params.stale_after_secs = stale_after;
+        aggregate_with_roster(
+            &replay_samples(),
+            &[],
+            Period::new(CORPUS_START, CORPUS_END),
+            &params,
+            Some(&roster(&REPLAY_ROSTER)),
+        )
+        .roster
+    }
+
+    #[test]
+    fn the_frozen_replay_corpus_parses_to_its_stated_shape() {
+        // The degenerate-subject guard for every gate below. A corpus silently truncated to one
+        // account, or an oracle emptied by a header-parsing slip, would make the differential pass
+        // on nothing at all — cardinality-zero reads exactly like cardinality-correct once the
+        // assertions are `>= 0`-shaped. So the shape is asserted first, and by content.
+        let samples = replay_samples();
+        assert_eq!(
+            samples.len(),
+            CORPUS_SAMPLES,
+            "corpus row count — the corpus is frozen INPUT, so this can only move if the fixture \
+             itself was edited; nothing the aggregator does can reach it"
+        );
+        let accts: BTreeSet<&str> = samples.iter().map(|s| s.acct.as_str()).collect();
+        assert_eq!(
+            accts,
+            REPLAY_ROSTER.iter().copied().collect::<BTreeSet<&str>>(),
+            "all six redacted handles are present — a collapsed roster cannot corner a fleet"
+        );
+        assert!(
+            samples
+                .iter()
+                .all(|s| (CORPUS_START..CORPUS_END).contains(&s.ts)),
+            "every reading lands in the pinned window"
+        );
+        assert!(
+            samples.iter().any(|s| s.session_resets_at.is_some())
+                && samples.iter().any(|s| s.weekly_resets_at.is_some()),
+            "both carried resets survive the redaction — they are what makes the census \
+             reset-anchored rather than cadence-anchored"
+        );
+
+        let oracle = replay_oracle();
+        assert_eq!(
+            oracle.len(),
+            ORACLE_ENTERS,
+            "oracle ENTER count — frozen INPUT, same as the corpus"
+        );
+        assert!(
+            oracle
+                .iter()
+                .all(|(ts, _, cause)| (CORPUS_START..CORPUS_END).contains(ts)
+                    && (*cause == "session" || *cause == "weekly")),
+            "every ENTER is in-window and names one of the daemon's two causes"
+        );
+        assert!(
+            oracle
+                .iter()
+                .all(|(_, hold, _)| REPLAY_ROSTER.contains(hold)),
+            "an ENTER names a handle outside the corpus roster — the two fixtures were cut from \
+             different redaction mappings, so the differential is comparing two different fleets \
+             (and an un-aliased handle here is a leaked real address)"
+        );
+    }
+
+    #[test]
+    fn the_replay_corpus_detects_the_capacity_holds_the_daemon_logged() {
+        // THE GATE. Two surfaces, two independent premises, one physical condition: the daemon's
+        // live tick decisions said it was cornered 67 times over these 48 h, so an offline census
+        // folded from the same window's samples MUST also see it. This is the shape of assertion
+        // that the pre-#803 suite could not make — every all-high fixture was derived from the
+        // aggregator's own premise, so none of them could refute it.
+        //
+        // The direction is DETECTION, never a count comparison: the daemon re-arms its ENTER guard
+        // on any non-`NoViableTarget` tick, so `count(ENTER)` over-counts episodes by design and
+        // `episodes <= ENTERs` is unsound in both directions (merging collapses many ENTERs into
+        // one hold; a coverage gap fragments one hold into several). The ratio is reported below
+        // as a diagnostic and gated on nowhere.
+        let oracle = replay_oracle();
+        assert_eq!(
+            oracle.len(),
+            ORACLE_ENTERS,
+            "antecedent: the daemon did report itself cornered in this window"
+        );
+
+        let r = replay_at(300);
+        assert!(
+            r.capacity_hold_covered_secs > 0,
+            "the census reports UNKNOWN over a window the daemon spent cornered — a `—` printed \
+             over a real drain is the exact blindness this corpus exists to catch"
+        );
+        assert!(
+            r.capacity_holds > 0,
+            "the daemon logged {} all-exhausted ENTERs here and the census found no hold at all",
+            oracle.len()
+        );
+        assert!(
+            r.capacity_hold_secs_lower_bound > 0,
+            "positive witness: a held count with zero held seconds is a stub, not a measurement"
+        );
+
+        // Cause agreement. The oracle exercises BOTH of the daemon's causes (12 session, 55
+        // weekly), so a census that can only ever name one — a tie-rule or relief-preference
+        // regression — disagrees with the surface it is supposed to reconcile against.
+        let (o_session, o_weekly) = oracle.iter().fold((0, 0), |(s, w), (_, _, cause)| {
+            if *cause == "session" {
+                (s + 1, w)
+            } else {
+                (s, w + 1)
+            }
+        });
+        assert!(
+            o_session > 0 && o_weekly > 0,
+            "antecedent: the oracle itself names both causes ({o_session} session, {o_weekly} weekly)"
+        );
+        assert!(
+            r.capacity_holds_session > 0 && r.capacity_holds_weekly > 0,
+            "the daemon named both causes over this window but the census named only one \
+             (session {}, weekly {})",
+            r.capacity_holds_session,
+            r.capacity_holds_weekly
+        );
+        assert_eq!(
+            r.capacity_holds_session + r.capacity_holds_weekly,
+            r.capacity_holds,
+            "the cause split partitions the count exactly — every hold is named one or the other"
+        );
+
+        // Frozen regression pins. The corpus is immutable INPUT, so these are stable by
+        // construction: any movement is a change in the aggregator, which is the point.
+        assert_eq!(
+            (
+                r.capacity_holds,
+                r.capacity_holds_session,
+                r.capacity_holds_weekly,
+                r.capacity_hold_secs_lower_bound,
+                r.capacity_hold_covered_secs,
+            ),
+            (2, 1, 1, 74_961, 157_187),
+            "frozen replay figures moved — the corpus did not, so the aggregator did. Order is \
+             (holds, session, weekly, held_secs_lower_bound, covered_secs); the held figure is the \
+             same one `..._under_both_real_poll_cadences` pins at its near horizon, so a genuine \
+             rebaseline moves BOTH tests and both are supposed to be re-derived, not edited to fit"
+        );
+
+        // Reported, never gated (see above): no tuning-accident inequality is enforced anywhere on
+        // this ratio. It surfaces when the test fails — which is when a maintainer wants to know
+        // how far the two surfaces sit apart — and under `cargo test -- --nocapture` otherwise.
+        eprintln!(
+            "[#806 diagnostic] daemon ENTERs {} vs census holds {} — ratio {:.1}x; held >= {} s \
+             over {} s jointly covered",
+            oracle.len(),
+            r.capacity_holds,
+            oracle.len() as f64 / f64::from(r.capacity_holds),
+            r.capacity_hold_secs_lower_bound,
+            r.capacity_hold_covered_secs,
+        );
+    }
+
+    #[test]
+    fn the_replay_corpus_detects_the_same_holds_under_both_real_poll_cadences() {
+        // `capacity_holds_are_insensitive_to_the_staleness_horizon` asserts this on four synthetic
+        // readings; this asserts it on 1,734 real ones, with the real gaps, the real
+        // `exhausted_poll_secs` sparsity, and the real resets. That is the falsifier with teeth:
+        // cadence-anchoring this corpus swings the count 0 -> 69 across exactly these two horizons
+        // (0 -> 84 over the full 7 d store, the figure `capacity_holds` cites), so detection
+        // agreement here is not something a broken window can fake.
+        let (near, far) = (replay_at(300), replay_at(3_600));
+        assert_eq!(
+            (
+                near.capacity_holds,
+                near.capacity_holds_session,
+                near.capacity_holds_weekly
+            ),
+            (
+                far.capacity_holds,
+                far.capacity_holds_session,
+                far.capacity_holds_weekly
+            ),
+            "moving stale_after between poll_secs (300) and exhausted_poll_secs (3600) moved the \
+             answer — that is a reading of the poll schedule, not of the fleet. Order is (holds, \
+             session, weekly), left at 300 and right at 3600"
+        );
+        assert!(
+            near.capacity_holds > 0,
+            "positive witness: two equal ZEROES would satisfy the equality above vacuously"
+        );
+        // Covered time may legitimately grow with the horizon (an unblocked reading's plain
+        // cadence window is longer), so only DETECTION is invariant — which is precisely the
+        // refinement gap honesty permits. Held time is pinned at BOTH horizons rather than bounded
+        // by a tolerance: the far horizon is exactly as deterministic as the near one over frozen
+        // input, so a tuned percentage would only be a place for a real drift to hide.
+        assert_eq!(
+            (
+                near.capacity_hold_secs_lower_bound,
+                far.capacity_hold_secs_lower_bound
+            ),
+            (74_961, 75_213),
+            "held time moved across the two horizons — reset-anchored spans barely notice the \
+             staleness knob, so this is a window that has stopped being anchored to its reset. \
+             Order is (at 300, at 3600); the near figure is the same one the gate above pins"
+        );
+    }
+
+    #[test]
+    fn on_the_replay_corpus_the_utilisation_census_is_unknown_where_the_capacity_census_measures() {
+        // The shipped blindness, frozen — and stated as the fact it is rather than as a bare
+        // inequality. On this window the two readouts do not merely differ: the cadence-anchored
+        // utilisation census cannot be TAKEN AT ALL (zero jointly-covered seconds, the documented
+        // UNKNOWN sentinel), while the reset-anchored capacity census measures a real drain over
+        // the very same samples. One cannot see; the other can. That asymmetry is the entire
+        // reason issue #803 made capacity its own readout instead of a parameterisation of the
+        // utilisation water.
+        //
+        // Pinning the UNKNOWN rather than asserting `!=` is the stronger gate in both directions:
+        // it fails if #804's gap honesty is ever repealed into a fabricated calm zero, AND it
+        // fails if the two censuses are conflated onto one predicate. It asserts nothing about
+        // whether either figure is individually right, and touches no existing all-high test.
+        let r = replay_at(300);
+        assert_eq!(
+            (r.all_high_covered_secs, r.all_high_episodes),
+            (0, 0),
+            "the utilisation census reports jointly-covered time on this corpus — either gap \
+             honesty moved, or the two censuses now share one anchoring"
+        );
+        assert!(
+            r.capacity_hold_covered_secs > 0 && r.capacity_holds > 0,
+            "the capacity census went UNKNOWN alongside the utilisation one, so this window now \
+             has no readout at all — which is the state issue #803 exists to prevent"
+        );
+    }
+
+    // --- #806 roster-size scaling (T2) ------------------------------------------
+
+    /// A fully-blocked roster of `n` accounts sampled on a shared cadence, each account's readings
+    /// offset by `jitter` seconds from the previous one's — the shape a real poll produces, where
+    /// accounts are visited in sequence rather than simultaneously.
+    ///
+    /// Per-account coverage is held FIXED as `n` grows: every account gets the same number of
+    /// readings at the same spacing. Only the roster SIZE varies, which is the whole point.
+    fn scaling_corpus(n: usize, jitter: i64, cadence: i64, readings: i64) -> Vec<Sample> {
+        let mut out = Vec::new();
+        for (i, handle) in REPLAY_ROSTER.iter().take(n).enumerate() {
+            for k in 0..readings {
+                let ts = k * cadence + (i as i64) * jitter;
+                let relief = ts + cadence * readings;
+                out.push(dated(ts, handle, 0.95, 0.99, relief, relief));
+            }
+        }
+        out
+    }
+
+    /// A [`scaling_corpus`] aggregated over the fixed sweep window, at the default boundary — the
+    /// synthetic twin of [`replay_at`]. The window is 100 000 s, comfortably longer than either
+    /// regime's own span, so every arm is bounded by the coverage being probed rather than by the
+    /// period clipping it.
+    fn scaling_at(n: usize, jitter: i64, cadence: i64, readings: i64) -> RosterStats {
+        aggregate_with_roster(
+            &scaling_corpus(n, jitter, cadence, readings),
+            &[],
+            Period::new(0, 100_000),
+            &hold_params(),
+            Some(&roster(&REPLAY_ROSTER[..n])),
+        )
+        .roster
+    }
+
+    /// The two sampling regimes the sweep runs in, as `(cadence, readings, label)`.
+    ///
+    /// The second one is the point. A corpus whose cadence EQUALS `stale_after` (300/300) has every
+    /// window abutting the next, so per-account coverage is ~100 %, ∏ᵢcoverageᵢ is 1, and the very
+    /// decay the sweep exists to detect is structurally unreachable — which is the mechanical
+    /// blindness issue #806 indicts in the pre-existing fixtures, and it would be self-defeating to
+    /// reproduce it here. Production runs `exhausted_poll_secs` (3600) against a `poll_secs` (300)
+    /// staleness horizon: a 12× UNDER-coverage, in exactly the regime being measured.
+    const SCALING_REGIMES: [(i64, i64, &str); 2] =
+        [(300, 100, "abutting"), (3_600, 12, "under-covered")];
+
+    #[test]
+    fn the_capacity_census_does_not_decay_as_the_roster_grows_at_fixed_per_account_coverage() {
+        // T2 — the property that would have caught the shipped defect before it shipped, and the
+        // cheapest of the lot. Both censuses are N-fold INTERSECTIONS, so the naive expectation is
+        // that their value decays as the product of the per-account coverages: at the roster's real
+        // coverages (24-44%) that product is 0.076% of a 168 h window, and at N=1 the penalty is
+        // absent entirely while at N=2 — every unit fixture in this file — it is merely squared.
+        // A defect that only bites at N >= 3 is therefore invisible to the whole unit suite.
+        //
+        // Held at FIXED per-account coverage, with every account equally blocked, growing the
+        // roster must not erode the CAPACITY figure: the accounts agree, so their intersection is
+        // their common span. Anything else is the intersection losing spans per fold. The
+        // cadence-anchored utilisation census is held to the weaker bar it actually deserves — it
+        // may go honestly UNKNOWN as the roster grows apart, but it may never fabricate a calm
+        // zero, which is the branch at the foot of the loop.
+        for &(cadence, readings, regime) in &SCALING_REGIMES {
+            // 0 = simultaneous polls; 60 = staggered, the shape a real poll produces by visiting
+            // accounts in sequence. The stagger is what makes the sweep discriminating: at jitter 0
+            // a correct N-fold intersection and a DELETED one both return a constant, so only the
+            // staggered arm can tell them apart.
+            for &jitter in &[0_i64, 60] {
+                let first = scaling_at(1, jitter, cadence, readings);
+                for n in 1..=REPLAY_ROSTER.len() {
+                    let r = scaling_at(n, jitter, cadence, readings);
+                    let case = format!("regime {regime}, jitter {jitter}, roster size {n}");
+
+                    // Positive witness at EVERY n, not merely at the end: on the jitter-0 arm the
+                    // exact equality below degenerates to `0 == 0 - 0`, so an all-zero stub would
+                    // satisfy it at every roster size. This is what makes the sweep non-vacuous.
+                    assert!(
+                        r.capacity_holds > 0 && r.capacity_hold_secs_lower_bound > 0,
+                        "capacity census collapsed at {case} — {} holds / {} s. The roster grew; \
+                         per-account coverage did not change.",
+                        r.capacity_holds,
+                        r.capacity_hold_secs_lower_bound
+                    );
+
+                    // The EXACT erosion, not a tolerance. Every account is equally covered and
+                    // equally blocked, so the intersection is their common span and the only thing
+                    // an added account can take is the `jitter` seconds by which its first reading
+                    // starts later. A defect that drops or duplicates a fold breaks this equality
+                    // immediately — including one that deletes the fold entirely, which holds the
+                    // figure CONSTANT where it must decay.
+                    assert_eq!(
+                        r.capacity_hold_secs_lower_bound,
+                        first.capacity_hold_secs_lower_bound - jitter * (n as i64 - 1),
+                        "held time at {case} is not first-minus-stagger — the roster dimension \
+                         is being folded wrongly, or not at all"
+                    );
+                    assert_eq!(
+                        r.capacity_holds, first.capacity_holds,
+                        "the roster grew and FRAGMENTED the hold at {case}"
+                    );
+
+                    // The utilisation census is cadence-anchored, so in the UNDER-COVERED regime it
+                    // legitimately goes blind as the roster grows — that is REQ-STA-B-008 gap
+                    // honesty, not a defect, and it is exactly why issue #803 gave capacity its own
+                    // readout. What it must NEVER do is fabricate a calm zero: an unmeasurable
+                    // census has to say so through a zero denominator (issue #804).
+                    if r.all_high_covered_secs == 0 {
+                        assert_eq!(
+                            r.all_high_episodes, 0,
+                            "utilisation census reported episodes it could not have seen at \
+                             {case}"
+                        );
+                        assert!(
+                            regime == "under-covered" && jitter > 0,
+                            "utilisation census went UNKNOWN at {case}, where every account is \
+                             fully covered — it should have been measurable"
+                        );
+                    } else {
+                        assert!(
+                            r.all_high_episodes > 0 && r.all_high_secs > 0,
+                            "utilisation census measured {} s jointly yet found no episode at \
+                             {case}, where every account is high throughout",
+                            r.all_high_covered_secs
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn under_real_poll_sparsity_a_growing_roster_blinds_the_census_but_not_the_capacity_readout() {
+        // The shipped defect, reproduced synthetically at the roster size and in the sampling
+        // regime where it actually bit — the companion to the frozen live corpus above, and the
+        // single clearest statement of why these are two readouts and not one.
+        //
+        // Six accounts, every one of them blocked for the whole window, polled at
+        // `exhausted_poll_secs` (3600) against a `poll_secs` (300) staleness horizon and staggered
+        // 60 s apart as a real sequential poll staggers them. Each account is observable for 300 s
+        // out of every 3600, and the six 300 s windows walk apart until, at the sixth account, they
+        // no longer share a single instant.
+        //
+        // This is the sweep's under-covered / jitter-60 / n=6 arm, and deliberately not only that:
+        // the sweep pins held time RELATIVELY (`first` minus the stagger), which a uniform scaling
+        // of every figure would survive intact. The absolute pin below is what closes that door,
+        // so this is not the sweep restated.
+        let six = scaling_at(6, 60, 3_600, 12);
+
+        assert_eq!(
+            (six.all_high_episodes, six.all_high_covered_secs),
+            (0, 0),
+            "the cadence-anchored utilisation census still has joint visibility here — if this \
+             ever becomes measurable the regime has changed and the comparison below is no longer \
+             the one this test was written to make"
+        );
+        assert!(
+            six.capacity_hold_covered_secs > 0 && six.capacity_hold_secs_lower_bound > 0,
+            "the RESET-anchored capacity census went blind in the same breath as the utilisation \
+             one — reset-anchoring is the only reason it can see here, and this is the regression \
+             that would resurrect `all-accounts-high: 0 episodes` as the fleet's only answer while \
+             the daemon sits cornered"
+        );
+        assert_eq!(
+            six.capacity_hold_secs_lower_bound, 82_500,
+            "held time under real poll sparsity moved. This corpus is synthetic and fully \
+             deterministic (6 accounts x 12 readings at 3600 s, staggered 60 s), so the input did \
+             not move and the aggregator did — and the sweep's relative pin is blind to a uniform \
+             rescale, which is exactly why this figure is spelled out here"
+        );
+    }
+
+    #[test]
+    fn a_single_account_roster_hides_the_intersection_the_sweep_exercises() {
+        // Why the sweep above needs its full range, stated as a test rather than a comment. At
+        // N=1 an "intersection" is just the account's own span, so every intersection defect —
+        // dropped fold, mis-ordered merge, emptied accumulator — is unreachable. This pins that
+        // N=1 and N=6 are genuinely different computations over the same per-account data.
+        //
+        // The sweep's exact identity already IMPLIES this inequality, so as an assertion it is
+        // redundant today. It is kept as a standalone tripwire for the one edit that would make it
+        // stop being redundant: trimming the sweep to "one representative roster size". After such
+        // a trim this test still states the fact the sweep would have stopped covering, which a
+        // comment inside the deleted loop could not.
+        let one = scaling_at(1, 60, 300, 100);
+        let six = scaling_at(6, 60, 300, 100);
+        assert!(
+            one.capacity_hold_secs_lower_bound > 0 && six.capacity_hold_secs_lower_bound > 0,
+            "positive witness, kept for the DIAGNOSIS it gives rather than for extra strength: a \
+             zero stub also trips the inequality below, but as `0 != 0`, which reads as \"the \
+             roster dimension collapsed\" when the truth is \"nothing was measured at all\" — two \
+             different defects in two different places (N=1 {} s, N=6 {} s)",
+            one.capacity_hold_secs_lower_bound,
+            six.capacity_hold_secs_lower_bound
+        );
+        assert_ne!(
+            one.capacity_hold_secs_lower_bound, six.capacity_hold_secs_lower_bound,
+            "N=1 and N=6 produced identical held time — the roster dimension is not being \
+             intersected over at all"
+        );
+    }
+
     // --- test constructors ----------------------------------------------------
 
     /// A swap with placeholder handles at `ts` with `kind`.
