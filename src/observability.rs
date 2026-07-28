@@ -4010,12 +4010,225 @@ mod tests {
         }
     }
 
-    #[test]
-    fn no_event_line_carries_an_email_or_token_sigil() {
-        // #15/#444: every field is a handle / enum / number / timestamp, so a token
-        // or a NON-authored email can never reach a rendered line. The handles here are
-        // plain (non-email) labels; an operator's own email label would be permitted.
-        let events = [
+    // --- issue #15 redaction sweep: mechanically total variant coverage (issue #891) ------
+    //
+    // The two sweeps below render every `Event` / `Diagnostic` variant and scan the line for
+    // an email or token sigil. WHICH variants they scan is enforced, not curated. A
+    // hand-listed array lets a new payload-carrying variant ship with ZERO redaction coverage
+    // while every test stays green — and it had: the `Event` array covered 18 of 51 variants
+    // when issue #891 was filed. Two layers close that.
+    //
+    //   LAYER 1, at COMPILE TIME. `event_variant_name` / `diagnostic_variant_name` match
+    //   exhaustively over their enum, so adding a variant does not compile until it is named
+    //   there — a compile error rather than a runtime assertion. Both helpers are `#[cfg(test)]`,
+    //   so that error surfaces when the TEST target is built (`cargo test`, including
+    //   `--no-run`); a bare `cargo build` satisfies only the production `to_log_line` match and
+    //   will not raise it.
+    //
+    //   LAYER 2, at TEST TIME. Layer 1 forces an ARM, not a SAMPLE — a variant named in the
+    //   match but missing from the sample list would still never be rendered, so the hole
+    //   would reopen one step later. `every_event_variant` / `every_diagnostic_variant`
+    //   therefore assert that the set of variants they sample EQUALS the set the enum
+    //   declares, read out of this file by `declared_variant_names` (the source-scan idiom
+    //   the `usage.rs` egress meta-tests already use in this crate).
+    //
+    // Together these prove RENDERING, not merely absence of omission: every declared variant
+    // is shown to reach `to_log_line` and be scanned. More than one sample per variant is
+    // welcome — several below carry two, to exercise optional-field renderings — because the
+    // assertion is on the SET of variants covered, never on a sample count.
+
+    /// Split one enum-body line on the commas that separate VARIANTS, ignoring commas nested
+    /// inside a variant's own `{ … }` / `( … )` body.
+    ///
+    /// The job it does on EVERY line is stripping the trailing comma, and that is what makes a
+    /// FIELDLESS variant visible at all: `AllExhaustedCleared,` yields `AllExhaustedCleared` —
+    /// an identifier with nothing after it, one of the three shapes `declared_variant_names`
+    /// accepts. Drop the call and the seven bare-token `Event` variants and `Diagnostic::Stop`
+    /// go undeclared. Today that fails loudly, because they are all sampled; but a bare-token
+    /// variant added LATER would be missing from BOTH sets at once, and the sweep would pass
+    /// over it in silence — which is precisely the hole issue #891 closes.
+    ///
+    /// Separating variants that share a line is the secondary job: `A, B,` yields `A` and `B`,
+    /// while `Monitor401 { account: String, consecutive: u32 },` yields the single whole
+    /// declaration, because its inner comma sits at nesting depth 1. `cargo fmt` gives every
+    /// variant its own line, so that case guards against future packing rather than answering a
+    /// live need — under-matching being the silently-passing direction either way.
+    fn split_top_level(line: &str) -> Vec<&str> {
+        let (mut segments, mut start, mut nesting) = (Vec::new(), 0, 0i32);
+        for (offset, ch) in line.char_indices() {
+            match ch {
+                '{' | '(' => nesting += 1,
+                '}' | ')' => nesting -= 1,
+                ',' if nesting == 0 => {
+                    segments.push(line[start..offset].trim());
+                    start = offset + 1;
+                }
+                _ => {}
+            }
+        }
+        segments.push(line[start..].trim());
+        segments.into_iter().filter(|s| !s.is_empty()).collect()
+    }
+
+    /// The variant names declared by `enum {enum_name}` in this file, parsed from its source.
+    ///
+    /// Anchored at `CARGO_MANIFEST_DIR`, so the scan is tied to the crate under test whatever
+    /// the test CWD — the same idiom as the `usage.rs` egress meta-tests.
+    ///
+    /// This set is layer 2's ground truth, so where it could diverge from the COMPILER's variant
+    /// set a variant would be forced to have a match arm but not a sample — reopening the very
+    /// hole issue #891 closes, one level down. Divergence is therefore avoided in the parser
+    /// rather than delegated to convention: identifiers admit `_` (so a non-camel-case variant
+    /// is still seen, not silently dropped), and a body line is split on its top-level commas
+    /// (so `A, B,` on one line yields both). Over-matching is safe — a name that is not really
+    /// a variant lands in `declared`, goes unsampled, and FAILS loudly; it is under-matching
+    /// that would pass quietly, and that is what these two rules remove.
+    fn declared_variant_names(enum_name: &str) -> std::collections::BTreeSet<String> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/observability.rs");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+        let header = format!("enum {enum_name} {{");
+        let mut lines = text
+            .lines()
+            .map(str::trim)
+            // Comments may carry braces, which would corrupt the depth walk below.
+            .filter(|line| !line.starts_with("//"))
+            .skip_while(|line| !line.ends_with(header.as_str()));
+        let opening = lines
+            .next()
+            .unwrap_or_else(|| panic!("no `{header}` declaration in {}", path.display()));
+
+        let mut depth = opening.matches('{').count() - opening.matches('}').count();
+        let mut names = std::collections::BTreeSet::new();
+        for line in lines {
+            if depth == 0 {
+                break;
+            }
+            // Only a line DIRECTLY inside the enum body declares a variant: deeper is a
+            // field, shallower is past the enum.
+            if depth == 1 {
+                for segment in split_top_level(line) {
+                    let name: String = segment
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect();
+                    let rest = segment[name.len()..].trim_start();
+                    // A variant is an identifier that ends the segment, or is followed by its
+                    // struct/tuple body. Anything else at this depth is not a declaration.
+                    let declares_variant = name.starts_with(|c: char| c.is_ascii_uppercase())
+                        && (rest.is_empty() || rest.starts_with('{') || rest.starts_with('('));
+                    if declares_variant {
+                        names.insert(name);
+                    }
+                }
+            }
+            depth = depth + line.matches('{').count() - line.matches('}').count();
+        }
+
+        // A scan that finds nothing would let the sweeps pass vacuously, so an empty parse is
+        // a hard failure rather than a silently permissive one.
+        assert!(
+            !names.is_empty(),
+            "parsed no variants out of `enum {enum_name}` in {} — the source scan is broken",
+            path.display()
+        );
+        names
+    }
+
+    /// Assert `samples` covers every variant `enum {enum_name}` declares — layer 2 of the
+    /// issue #891 guarantee.
+    fn assert_samples_every_variant<T>(
+        enum_name: &str,
+        samples: &[T],
+        variant_name: fn(&T) -> &'static str,
+    ) {
+        let declared = declared_variant_names(enum_name);
+        let sampled: std::collections::BTreeSet<String> =
+            samples.iter().map(|s| variant_name(s).to_owned()).collect();
+        // Equality BOTH ways. Declared-but-unsampled is the hole this exists to close;
+        // sampled-but-undeclared means the source scan itself has drifted, which would
+        // quietly weaken the check rather than fail it.
+        let unsampled: Vec<&String> = declared.difference(&sampled).collect();
+        let undeclared: Vec<&String> = sampled.difference(&declared).collect();
+        assert!(
+            unsampled.is_empty() && undeclared.is_empty(),
+            "issue #891: the `{enum_name}` issue #15 redaction sweep must render EVERY declared \
+             variant.\n  declared but never sampled (would ship with zero redaction coverage): \
+             {unsampled:?}\n  sampled but absent from the enum source (the scan has drifted): \
+             {undeclared:?}"
+        );
+    }
+
+    /// This `Event`'s variant name, spelled as the enum declares it.
+    ///
+    /// Layer 1 of the issue #891 guarantee: the match is exhaustive, so adding a variant to
+    /// `Event` FAILS TO COMPILE until it is named here — after which
+    /// `assert_samples_every_variant` fails until it is also sampled in `every_event_variant`.
+    fn event_variant_name(event: &Event) -> &'static str {
+        match event {
+            Event::Swap { .. } => "Swap",
+            Event::ReStash { .. } => "ReStash",
+            Event::AllExhausted { .. } => "AllExhausted",
+            Event::AllExhaustedCleared => "AllExhaustedCleared",
+            Event::ActiveDeadNoTarget { .. } => "ActiveDeadNoTarget",
+            Event::ActiveDeadNoTargetCleared => "ActiveDeadNoTargetCleared",
+            Event::FleetRunwayLow { .. } => "FleetRunwayLow",
+            Event::FleetRunwayRecovered => "FleetRunwayRecovered",
+            Event::Monitor401 { .. } => "Monitor401",
+            Event::CredentialDead { .. } => "CredentialDead",
+            Event::EmergencySwap { .. } => "EmergencySwap",
+            Event::CredentialRestored { .. } => "CredentialRestored",
+            Event::CanonicalScrubbed { .. } => "CanonicalScrubbed",
+            Event::CanonicalRestored { .. } => "CanonicalRestored",
+            Event::CanonicalRecovered { .. } => "CanonicalRecovered",
+            Event::CanonicalRecoveryExhausted { .. } => "CanonicalRecoveryExhausted",
+            Event::CanaryDrift { .. } => "CanaryDrift",
+            Event::CanaryUnparseableCanonical { .. } => "CanaryUnparseableCanonical",
+            Event::CanaryOnlineProbe { .. } => "CanaryOnlineProbe",
+            Event::CanaryAmbiguous { .. } => "CanaryAmbiguous",
+            Event::CanaryCleared => "CanaryCleared",
+            Event::CredentialUnrecoverable { .. } => "CredentialUnrecoverable",
+            Event::KeychainLockedWait => "KeychainLockedWait",
+            Event::UsageScopeFail { .. } => "UsageScopeFail",
+            Event::Refresh { .. } => "Refresh",
+            Event::PollRefresh { .. } => "PollRefresh",
+            Event::KeepWarm { .. } => "KeepWarm",
+            Event::RefreshSystemicFailure { .. } => "RefreshSystemicFailure",
+            Event::RefreshSystemicRecovered => "RefreshSystemicRecovered",
+            Event::RefreshPreflightUnresolved => "RefreshPreflightUnresolved",
+            Event::RefreshBinaryResolved { .. } => "RefreshBinaryResolved",
+            Event::CredentialHealth { .. } => "CredentialHealth",
+            Event::Login { .. } => "Login",
+            Event::Capture { .. } => "Capture",
+            Event::UsageRollup { .. } => "UsageRollup",
+            Event::UsageGap { .. } => "UsageGap",
+            Event::UncapturedLogin { .. } => "UncapturedLogin",
+            Event::Export { .. } => "Export",
+            Event::Import { .. } => "Import",
+            Event::UsageBackoff { .. } => "UsageBackoff",
+            Event::UsageBackoffCleared { .. } => "UsageBackoffCleared",
+            Event::ExhaustedSlowPoll { .. } => "ExhaustedSlowPoll",
+            Event::ExhaustedSlowPollCleared { .. } => "ExhaustedSlowPollCleared",
+            Event::NearLimitPollCoverage { .. } => "NearLimitPollCoverage",
+            Event::UsageVelocity { .. } => "UsageVelocity",
+            Event::BlindWindow { .. } => "BlindWindow",
+            Event::BlindEnter { .. } => "BlindEnter",
+            Event::BlindExit { .. } => "BlindExit",
+            Event::BlindGateEligible { .. } => "BlindGateEligible",
+            Event::BlindPreemptReserveHold { .. } => "BlindPreemptReserveHold",
+            Event::RetryAfterWalk { .. } => "RetryAfterWalk",
+        }
+    }
+
+    /// Every `Event` variant, as the subject of the issue #15 sweep below — totality asserted
+    /// here rather than trusted, per the two-layer note above `declared_variant_names`.
+    ///
+    /// Handles are plain (non-email) labels throughout: the sweep asserts a rendered line
+    /// carries no NON-AUTHORED email, and an operator's own email label would be permitted,
+    /// so sampling one here would prove nothing about redaction.
+    fn every_event_variant() -> Vec<Event> {
+        let samples = vec![
             Event::Swap {
                 from: "work".to_owned(),
                 to: "spare".to_owned(),
@@ -4024,7 +4237,7 @@ mod tests {
                 projection: None,
             },
             // Issue #634: the projection-carrying + velocity-carrying variants ride the same
-            // redaction sweep — the new tokens are bare numbers, so they add no email/token surface.
+            // sweep — the extra tokens are bare numbers, so they add no email/token surface.
             Event::Swap {
                 from: "work".to_owned(),
                 to: "spare".to_owned(),
@@ -4037,40 +4250,20 @@ mod tests {
                     ceiling_pct: 89.0,
                 }),
             },
-            Event::BlindWindow {
+            Event::ReStash {
                 account: "work".to_owned(),
-                duration_secs: 480,
-                session_pct: 29,
-                session_at_recovery: 61,
-                near_limit: false,
-                velocity: Some(BlindVelocity {
-                    rate_pct_per_sec: 0.05,
-                    inflation: 1.75,
-                    ceiling_pct: 95.0,
-                }),
-                // Issue #670: the corrected-anchor mark rides the same sweep — a bare number, so it
-                // adds no email/token surface even when the anchor was stale-low.
-                session_high_water_pct: Some(88),
             },
             Event::AllExhausted {
                 hold: "work".to_owned(),
                 cause: SwapReason::Weekly,
                 resets_at: Some(1_782_777_600),
             },
-            // Issue #800: the durable LEAVE partner — a bare token with no field at all, so it
-            // rides the sweep trivially, but keeping it listed keeps the sweep exhaustive.
             Event::AllExhaustedCleared,
             Event::ActiveDeadNoTarget {
                 hold: "work".to_owned(),
                 cause: SwapReason::Weekly,
                 resets_at: Some(1_782_777_600),
             },
-            // Issue #827: the two durable LEAVE partners promoted off the diagnostic channel —
-            // bare tokens with no field at all, so they ride the sweep trivially, and the sweep
-            // that covers them is now THIS one rather than the diagnostic one below. Listing them
-            // is a deliberate act: this array is a CURATED subset of `Event`, not an
-            // enforced-exhaustive one — nothing makes adding a variant add a row here, so a
-            // payload-carrying variant still needs listing by hand.
             Event::ActiveDeadNoTargetCleared,
             // Issue #650: the proactive fleet-runway warn line — four bare integers, no handle.
             Event::FleetRunwayLow {
@@ -4080,9 +4273,6 @@ mod tests {
                 observed: 3,
             },
             Event::FleetRunwayRecovered,
-            Event::ReStash {
-                account: "work".to_owned(),
-            },
             Event::Monitor401 {
                 account: "work".to_owned(),
                 consecutive: 2,
@@ -4097,6 +4287,33 @@ mod tests {
             Event::CredentialRestored {
                 account: "work".to_owned(),
             },
+            Event::CanonicalScrubbed {
+                account: Some("work".to_owned()),
+            },
+            Event::CanonicalRestored {
+                account: Some("work".to_owned()),
+            },
+            Event::CanonicalRecovered {
+                account: "work".to_owned(),
+            },
+            Event::CanonicalRecoveryExhausted {
+                account: Some("work".to_owned()),
+            },
+            Event::CanaryDrift {
+                displayed: "work".to_owned(),
+                matched: "spare".to_owned(),
+                overridden: true,
+            },
+            Event::CanaryUnparseableCanonical { overridden: false },
+            Event::CanaryOnlineProbe {
+                verdict: "rejected",
+                refused: true,
+            },
+            Event::CanaryAmbiguous { count: 2 },
+            Event::CanaryCleared,
+            Event::CredentialUnrecoverable {
+                account: "work".to_owned(),
+            },
             Event::KeychainLockedWait,
             Event::UsageScopeFail {
                 account: "work".to_owned(),
@@ -4107,8 +4324,27 @@ mod tests {
                 expires_before: Some(1_782_777_600_000),
                 expires_after: Some(1_782_781_200_000),
                 refresh_token_rotated: true,
-                reason: None,
-                backoff_secs: None,
+                reason: Some(RefreshEventReason::Timeout),
+                backoff_secs: Some(240),
+            },
+            Event::PollRefresh {
+                account: "work".to_owned(),
+                outcome: RefreshEventOutcome::RefreshedNotReStashed,
+                refresh_token_rotated: true,
+            },
+            Event::KeepWarm {
+                account: "work".to_owned(),
+                trigger: KeepWarmTrigger::Proactive,
+                outcome: RefreshEventOutcome::NoChange,
+                refresh_token_rotated: false,
+            },
+            Event::RefreshSystemicFailure { consecutive: 3 },
+            Event::RefreshSystemicRecovered,
+            Event::RefreshPreflightUnresolved,
+            // Issue #786: the one variant whose payload is a filesystem location rather than a
+            // handle/enum/number, percent-encoded by the formatter.
+            Event::RefreshBinaryResolved {
+                path: PathBuf::from("/opt/homebrew/bin/claude"),
             },
             Event::CredentialHealth {
                 account: "work".to_owned(),
@@ -4122,8 +4358,122 @@ mod tests {
                 account: None,
                 outcome: LoginEventOutcome::Cancelled,
             },
+            Event::Capture {
+                account: Some("work".to_owned()),
+                outcome: CaptureEventOutcome::Captured,
+            },
+            Event::UsageRollup {
+                rolled_through: 1_782_777_600,
+                raw_lines: 128,
+            },
+            Event::UsageGap {
+                account: "work".to_owned(),
+                since: 1_782_777_600,
+            },
+            // An opaque account UUID — an identifier, but not a token or an email.
+            Event::UncapturedLogin {
+                account_uuid: Some("u-Z".to_owned()),
+            },
+            Event::Export {
+                accounts: 3,
+                encrypted: true,
+                mode: ExportMode::Full,
+            },
+            Event::Import {
+                imported: 2,
+                skipped: 1,
+                overwritten: 1,
+                failed: 0,
+            },
+            Event::UsageBackoff {
+                account: "work".to_owned(),
+                class: BackoffClass::RateLimited,
+                consecutive: 2,
+                retry_after_secs: Some(3600),
+                backoff_secs: 120,
+            },
+            Event::UsageBackoffCleared {
+                account: "work".to_owned(),
+            },
+            Event::ExhaustedSlowPoll {
+                account: "work".to_owned(),
+                window_secs: 3600,
+            },
+            Event::ExhaustedSlowPollCleared {
+                account: "work".to_owned(),
+            },
+            Event::NearLimitPollCoverage {
+                account: "work".to_owned(),
+                sub_interval_secs: 60,
+            },
+            Event::UsageVelocity {
+                account: "work".to_owned(),
+                session_delta_pct: 7,
+                weekly_delta_pct: -1,
+                elapsed_secs: 300,
+            },
+            Event::BlindWindow {
+                account: "work".to_owned(),
+                duration_secs: 480,
+                session_pct: 29,
+                session_at_recovery: 61,
+                near_limit: false,
+                velocity: Some(BlindVelocity {
+                    rate_pct_per_sec: 0.05,
+                    inflation: 1.75,
+                    ceiling_pct: 95.0,
+                }),
+                // Issue #670: the corrected-anchor mark rides the same sweep — a bare number,
+                // so it adds no email/token surface even when the anchor was stale-low.
+                session_high_water_pct: Some(88),
+            },
+            Event::BlindEnter {
+                account: "work".to_owned(),
+                session_pct: 82,
+                weekly_pct: 44,
+                was_active: true,
+                near_limit: true,
+            },
+            Event::BlindExit {
+                account: "work".to_owned(),
+                duration_secs: 480,
+                session_pct: 82,
+                session_at_recovery: 91,
+                weekly_pct: 44,
+                weekly_at_recovery: 46,
+                was_active: true,
+                swapped_away: true,
+                near_limit: true,
+            },
+            Event::BlindGateEligible {
+                account: "work".to_owned(),
+                viable_target: true,
+                blind_secs: 300,
+                session_pct: 88,
+            },
+            Event::BlindPreemptReserveHold {
+                account: "work".to_owned(),
+                retry_after_secs: 600,
+                blind_secs: 300,
+            },
+            Event::RetryAfterWalk {
+                account: "work".to_owned(),
+                swaps: 3,
+                window_secs: 900,
+                retry_after_secs: 600,
+            },
         ];
-        for event in &events {
+        assert_samples_every_variant("Event", &samples, event_variant_name);
+        samples
+    }
+
+    #[test]
+    fn no_event_line_carries_an_email_or_token_sigil() {
+        // #15/#444: every field is a handle / enum / number / timestamp — or, in the single
+        // case of the resolved `claude` path (#786), a percent-encoded filesystem location —
+        // so a token or a NON-authored email can never reach a rendered line. Total over
+        // `Event` by construction: see the two-layer note above `declared_variant_names`.
+        for event in &every_event_variant() {
             let line = event.to_log_line(at_epoch(0));
             assert!(
                 crate::redaction::meter::unauthored_emails(line.as_str(), &[]).is_empty(),
@@ -5436,13 +5786,24 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
         }
     }
 
-    #[test]
-    fn no_diagnostic_line_carries_an_email_or_token_sigil() {
-        // #15: every diagnostic field is a handle / enum / number / timestamp / hash
-        // prefix, so a token or email can never reach a rendered line. The handles here
-        // are plain (non-email) labels; an operator's own email label would be
-        // permitted. Mirrors the event-log guard.
-        let diags = [
+    /// This `Diagnostic`'s variant name, spelled as the enum declares it.
+    ///
+    /// Layer 1 of the issue #891 guarantee for the diagnostic channel — the sibling of
+    /// `event_variant_name`; see the two-layer note above `declared_variant_names`.
+    fn diagnostic_variant_name(diagnostic: &Diagnostic) -> &'static str {
+        match diagnostic {
+            Diagnostic::Start { .. } => "Start",
+            Diagnostic::Stop => "Stop",
+            Diagnostic::Poll { .. } => "Poll",
+            Diagnostic::Tick { .. } => "Tick",
+            Diagnostic::Canonical { .. } => "Canonical",
+        }
+    }
+
+    /// Every `Diagnostic` variant, as the subject of the issue #15 sweep below — totality
+    /// asserted before returning, as in `every_event_variant`.
+    fn every_diagnostic_variant() -> Vec<Diagnostic> {
+        let samples = vec![
             Diagnostic::Start {
                 accounts: 2,
                 poll_secs: 30,
@@ -5463,10 +5824,10 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
                 // Exercise the #295 source-label field through the #15 redaction scan too.
                 retry_after_secs: Some(3600),
             },
-            // Issue #464: the identifier-shaped variant — a hash-prefix fingerprint, an
-            // operator handle, a timestamp. All four optional fields are populated (a live
-            // `Present` read), so the issue #475 rotation-yank marker's trailing
-            // `prev=<prior-fingerprint>` — a second fingerprint — rides the scan too.
+            // Issue #464, listed by issue #890: the identifier-shaped variant — a hash-prefix
+            // fingerprint, an operator handle, a timestamp. All four optional fields are
+            // populated (a live `Present` read), so the issue #475 rotation-yank marker's
+            // trailing `prev=<prior-fingerprint>` — a second fingerprint — rides the scan too.
             Diagnostic::Canonical {
                 state: CanonicalLiveness::Present,
                 fingerprint: Some("0123456789abcdef".to_owned()),
@@ -5475,8 +5836,17 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
                 rotated_from: Some("fedcba9876543210".to_owned()),
             },
         ];
-        for diag in &diags {
-            let line = diag.to_log_line(at_epoch(0));
+        assert_samples_every_variant("Diagnostic", &samples, diagnostic_variant_name);
+        samples
+    }
+
+    #[test]
+    fn no_diagnostic_line_carries_an_email_or_token_sigil() {
+        // #15: every diagnostic field is a handle / enum / number / timestamp / hash prefix,
+        // so a token or email can never reach a rendered line. Mirrors the event-log guard,
+        // and is total over `Diagnostic` by the same two-layer mechanism (issue #891).
+        for diagnostic in &every_diagnostic_variant() {
+            let line = diagnostic.to_log_line(at_epoch(0));
             assert!(
                 crate::redaction::meter::unauthored_emails(line.as_str(), &[]).is_empty(),
                 "no non-authored email sigil (#15/#444): {line}"
