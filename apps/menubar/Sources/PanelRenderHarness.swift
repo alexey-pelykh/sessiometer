@@ -441,6 +441,10 @@ private final class PanelRenderLoginItemService: LoginItemService {
     // No daemon running in a design render → the lock is free, so the liveness gate (issue #742)
     // stays open and the not-running fixture keeps rendering the Start-daemon affordance.
     let daemonLockHeld: Bool = false
+    // Nothing of ours is running either (issue #819) — consistent with the free lock above, and with the
+    // `.notRegistered` agent status: there is no job to be running. A design render never reaches the
+    // reconcile, so this seed only has to be COHERENT, never exercised.
+    let daemonAgentRunState: DaemonAgentRunState = .notRunning
     func registerApp() throws {}
     func unregisterApp() throws {}
     func registerDaemonAgent() throws {}
