@@ -1363,6 +1363,12 @@ async fn run(verbosity: Verbosity, managed: bool) -> Result<()> {
     // error across every eligible account, the daemon surfaces a mechanism-down signal (event +
     // `status` indicator), distinct from per-account at-risk. Config-backed (ADR-0005 hand-emit).
     .with_systemic_failure_n(config.refresh.systemic_failure_n)
+    // The refresh-token foresight horizon (#878): how far ahead each account's fixed
+    // `refreshTokenExpiresAt` deadline is classified, so an operator can re-login BEFORE a lapse
+    // instead of learning about it from a failed refresh. Wired unconditionally — NOT inside the
+    // `[refresh].enabled` block below — because the deadline is read from the credential itself and
+    // matters most precisely when the refresh tick is off.
+    .with_credential_expiry_horizon(config.credential.expiry_horizon_secs)
     // Arm the per-daemon target-selection seed (#612): a once-drawn process-entropy value enables
     // the velocity-aware + per-daemon-jittered selection so independent daemons over the same roster
     // disperse instead of co-selecting (and hammering) one target. Drawn from the same coarse
@@ -4769,6 +4775,7 @@ mod tests {
             login: crate::config::LoginConfig::default(),
             stats: crate::config::StatsConfig::default(),
             migration: crate::config::MigrationConfig::default(),
+            credential: crate::config::CredentialConfig::default(),
         }
     }
 

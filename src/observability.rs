@@ -363,6 +363,54 @@ impl CredentialHealth {
     }
 }
 
+/// Where an account's REFRESH-token deadline (`refreshTokenExpiresAt`, issue #878) sits relative
+/// to the operator's configurable foresight horizon (`[credential].expiry_horizon_secs`).
+///
+/// **ORTHOGONAL to [`CredentialHealth`], deliberately not a variant of it.** That enum is a
+/// severity RAMP over *current* validity; this is a *forward-looking* axis over a FIXED deadline
+/// refreshing does not move. An account whose refresh token expires in five days is
+/// [`CredentialHealth::Healthy`] **right now** — a valid access token and a working refresh path —
+/// yet more urgent than a plain healthy account and less severe than [`CredentialHealth::Stale`].
+/// It has no defensible position in that ordinal ladder, so it gets its own axis; the two render as
+/// INDEPENDENT cells. This follows the ratified ADR-0017 `blind_active` precedent: a per-account
+/// MODIFIER on an otherwise-healthy row, never a new state.
+///
+/// Non-secret by construction: a bare classification, never a token, an email, or a timestamp — the
+/// same issue #15 discipline as [`CredentialHealth`].
+///
+/// The `snake_case` serde rename mirrors [`CredentialHealth`]'s, so the tokens an event log and a
+/// `--json` field would carry agree by construction once issue #880 emits the horizon-entry Event
+/// and issue #882 puts the modifier on the wire. This item stops at daemon-internal state, so it
+/// deliberately ships no `as_str` renderer — the consumer that needs one brings it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ExpiryHorizon {
+    /// No usable `refreshTokenExpiresAt` was observed — the field is absent from the credential
+    /// blob (an older Claude Code, a changed upstream policy, a non-first-party credential), or the
+    /// blob was unreadable.
+    ///
+    /// **NEVER read this as "not expiring."** It is the issue #137 invariant applied to foresight:
+    /// *absence of a NEGATIVE signal alone is not health.* The daemon cannot vouch for a deadline it
+    /// never saw, so it says "unknown" rather than the false-reassuring "fine" that would let an
+    /// account lapse silently. This single rule is what makes the whole feature degrade SAFELY if
+    /// upstream ever drops the field — and is why this variant, not `Beyond`, is the enum's
+    /// [`Default`]: a consumer that forgets to classify gets the honest answer, not the dangerous
+    /// one.
+    #[default]
+    Unknown,
+    /// A deadline was observed and it is FURTHER OUT than the horizon — the only variant that
+    /// actually means "not expiring soon", and it is reachable ONLY from a parsed timestamp.
+    Beyond,
+    /// A deadline was observed and it falls WITHIN the horizon: still valid, but the operator
+    /// should re-login before it lapses. The foresight the feature exists to provide.
+    Within,
+    /// A deadline was observed and it has already PASSED. No refresh can recover the account —
+    /// only an operator `claude /login`. Distinct from [`CredentialHealth::Dead`], which is set
+    /// only once a refresh has actually FAILED (`src/poke.rs`): this is the same fact seen
+    /// BEFORE the failure rather than after it.
+    Lapsed,
+}
+
 /// The shared canonical `Claude Code-credentials` item's OWN per-poll liveness (issue #464) — the
 /// one keychain item every local `claude` session reads, distinct from any single roster account's
 /// [`CredentialHealth`]. A closed classification carried on the `diag=canonical` per-poll line and

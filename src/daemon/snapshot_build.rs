@@ -18,31 +18,43 @@ where
     S: AccountStash,
     K: Clock,
 {
-    /// Read the just-polled account's stored access-token expiry (epoch SECONDS, issue
-    /// #141) — the DISPLAY clock the poll path feeds into [`AccountHealth::poll_expires_at`],
-    /// so `status --json` surfaces an expiry even with `[refresh]` off. Reads the SAME
-    /// credential the usage poll used: the CANONICAL item for the active account (its token
-    /// refreshes in place there, the freshest expiry), the per-account STASH otherwise —
+    /// Read the just-polled account's credential deadlines (epoch SECONDS) in ONE credential read:
+    /// the access-token expiry (issue #141) — the DISPLAY clock the poll path feeds into
+    /// [`AccountHealth::poll_expires_at`], so `status --json` surfaces an expiry even with
+    /// `[refresh]` off — and the REFRESH-token deadline (issue #878) feeding
+    /// [`AccountHealth::refresh_token_expires_at`].
+    ///
+    /// Reads the SAME credential the usage poll used: the CANONICAL item for the active account
+    /// (its token refreshes in place there, the freshest expiry), the per-account STASH otherwise —
     /// mirroring [`RealRosterPoller::poll`]. Reuses the non-secret
-    /// [`crate::refresh::expires_at`] / [`crate::refresh::stored_expires_at`] extractors
-    /// (only the `i64` is pulled, never the token) and converts MS→s at this boundary. A
-    /// best-effort clock, never a gate: `None` when the credential is unreadable (a locked
-    /// keychain, an absent stash), which just leaves the wire field null this cycle.
-    pub(super) async fn read_poll_expires_at(
+    /// [`crate::refresh::credential_clocks`] / [`crate::refresh::stored_credential_clocks`]
+    /// extractors (only the two `i64`s are pulled, never the token) and folds MS→s here — the ONE
+    /// place the unit changes. Both deadlines come from that single read for the reason
+    /// [`crate::refresh::stored_credential_clocks`] documents: a second read would double every
+    /// cycle's `security` subprocess count.
+    ///
+    /// Best-effort clocks, never a gate: an unreadable credential (a locked keychain, an absent
+    /// stash) yields all-`None`, leaving the fields null this cycle. The refresh-token deadline is
+    /// independently optional even on a READABLE credential — an older Claude Code omits it —
+    /// which [`account_expiry`] classifies [`ExpiryHorizon::Unknown`] (issue #137).
+    pub(super) async fn read_poll_clocks(
         &self,
         account: &Account,
         active: bool,
-    ) -> Option<i64> {
-        let expires_at_ms = if active {
+    ) -> CredentialClocks {
+        let ms = if active {
             self.store
                 .read()
                 .await
-                .ok()
-                .and_then(|credential| crate::refresh::expires_at(credential.expose()))
+                .map(|credential| crate::refresh::credential_clocks(credential.expose()))
+                .unwrap_or_default()
         } else {
-            crate::refresh::stored_expires_at(&self.stash, &account.stash()).await
+            crate::refresh::stored_credential_clocks(&self.stash, &account.stash()).await
         };
-        expires_at_ms.map(millis_to_secs)
+        CredentialClocks {
+            access_expires_at: ms.access_expires_at.map(millis_to_secs),
+            refresh_token_expires_at: ms.refresh_token_expires_at.map(millis_to_secs),
+        }
     }
 
     /// Recompute every account's 5-state credential-health rollup (issue #119) against
@@ -187,6 +199,19 @@ where
                         } else {
                             None
                         },
+                        // The REFRESH-token expiry modifier (issue #878) — the axis carried
+                        // orthogonally to the `health` rollup above; see `AccountReading::expiry`.
+                        // Keyed on `polled_once`, the daemon's own "this account has been observed"
+                        // latch, NOT on a clock being `Some`: an unreadable credential (a locked
+                        // keychain) leaves BOTH clocks `None` on a poll that DID happen, and
+                        // collapsing that into "never observed" would hide a real `Unknown`.
+                        expiry: self.state.accounts[i].polled_once.then(|| {
+                            account_expiry(
+                                health.refresh_token_expires_at,
+                                self.credential_expiry_horizon_secs,
+                                now_secs,
+                            )
+                        }),
                     }
                 })
                 .collect(),
@@ -356,6 +381,228 @@ mod tests {
         // email nor a token can ever reach the wire — the new candidate and overshoot included.
         assert!(crate::redaction::meter::unauthored_emails(&json, &[]).is_empty());
         assert!(!json.to_lowercase().contains("token"));
+    }
+
+    // --- refresh-token expiry modifier (issue #878) ------------------------
+
+    /// The horizon used by the expiry tests: seven days, the shipped default. Named so the tests
+    /// read against a horizon they state rather than a magic number.
+    const HORIZON_7D: u64 = 7 * 86_400;
+
+    /// One day of deadline offset, for the same reason.
+    const DAY_SECS: i64 = 86_400;
+
+    /// AC: an ABSENT `refreshTokenExpiresAt` classifies UNKNOWN — never "not expiring".
+    ///
+    /// This is THE load-bearing branch of the feature. An older Claude Code, a changed upstream
+    /// policy, or a non-first-party credential all yield no deadline, and the honest answer is
+    /// "unverified" (the #137 invariant: absence of a NEGATIVE signal alone is not health). Were
+    /// this to classify `Beyond`, a fleet could lapse in total silence the moment upstream dropped
+    /// the field — the feature would fail unsafely and invisibly.
+    #[test]
+    fn account_expiry_classifies_an_absent_deadline_as_unknown_never_as_not_expiring() {
+        const NOW: i64 = 1_782_777_600;
+
+        let absent = account_expiry(None, HORIZON_7D, NOW);
+        assert_eq!(
+            absent.horizon_state,
+            ExpiryHorizon::Unknown,
+            "an absent refreshTokenExpiresAt must be UNKNOWN"
+        );
+        assert_ne!(
+            absent.horizon_state,
+            ExpiryHorizon::Beyond,
+            "UNKNOWN must never be reported as the reassuring 'not expiring' verdict"
+        );
+        // The deadline field mirrors the absence, so no consumer can read a timestamp that was
+        // never observed.
+        assert_eq!(absent.expires_at, None);
+        // `Unknown` is also the type's Default, so a consumer that forgets to classify still gets
+        // the honest answer rather than the dangerous one.
+        assert_eq!(
+            AccountExpiry::default().horizon_state,
+            ExpiryHorizon::Unknown
+        );
+    }
+
+    /// AC: classification against the configurable horizon — the three OBSERVED-deadline verdicts.
+    /// `Beyond` is reachable ONLY from a parsed timestamp (the absent case is covered above).
+    #[test]
+    fn account_expiry_classifies_an_observed_deadline_against_the_horizon() {
+        const NOW: i64 = 1_782_777_600;
+
+        // Beyond — 30 days out, well past a 7-day horizon.
+        assert_eq!(
+            account_expiry(Some(NOW + 30 * DAY_SECS), HORIZON_7D, NOW).horizon_state,
+            ExpiryHorizon::Beyond
+        );
+        // Within — 3 days out, inside the horizon: still working, but act before it lapses.
+        assert_eq!(
+            account_expiry(Some(NOW + 3 * DAY_SECS), HORIZON_7D, NOW).horizon_state,
+            ExpiryHorizon::Within
+        );
+        // Lapsed — already past; only a re-login recovers it.
+        assert_eq!(
+            account_expiry(Some(NOW - 1), HORIZON_7D, NOW).horizon_state,
+            ExpiryHorizon::Lapsed
+        );
+        // The two boundaries are inclusive and adjacent, with no gap between the verdicts.
+        assert_eq!(
+            account_expiry(Some(NOW), HORIZON_7D, NOW).horizon_state,
+            ExpiryHorizon::Lapsed,
+            "a deadline exactly at now has lapsed"
+        );
+        assert_eq!(
+            account_expiry(Some(NOW + HORIZON_7D as i64), HORIZON_7D, NOW).horizon_state,
+            ExpiryHorizon::Within,
+            "a deadline exactly at the horizon edge is still Within"
+        );
+        assert_eq!(
+            account_expiry(Some(NOW + HORIZON_7D as i64 + 1), HORIZON_7D, NOW).horizon_state,
+            ExpiryHorizon::Beyond
+        );
+        // The observed deadline is carried through verbatim for a downstream surface to render.
+        assert_eq!(
+            account_expiry(Some(NOW + 3 * DAY_SECS), HORIZON_7D, NOW).expires_at,
+            Some(NOW + 3 * DAY_SECS)
+        );
+    }
+
+    /// AC: the HORIZON is what is configurable — the lifetime is always read from the credential,
+    /// never assumed. The SAME deadline must classify differently as the operator's horizon moves;
+    /// if any lifetime constant (the observed ~30 d server default, say) were baked into the path,
+    /// this test would show a verdict that ignores the knob.
+    #[test]
+    fn account_expiry_honours_the_configured_horizon_and_hardcodes_no_lifetime() {
+        const NOW: i64 = 1_782_777_600;
+        // One fixed, credential-sourced deadline: 10 days out.
+        let deadline = Some(NOW + 10 * DAY_SECS);
+
+        assert_eq!(
+            account_expiry(deadline, HORIZON_7D, NOW).horizon_state,
+            ExpiryHorizon::Beyond,
+            "10d deadline is beyond a 7d horizon"
+        );
+        assert_eq!(
+            account_expiry(deadline, 14 * 86_400, NOW).horizon_state,
+            ExpiryHorizon::Within,
+            "the SAME deadline is within a 14d horizon — the knob, not a constant, decides"
+        );
+        // A 30-day horizon likewise admits it: nothing in the path treats 30 d as special.
+        assert_eq!(
+            account_expiry(deadline, 30 * 86_400, NOW).horizon_state,
+            ExpiryHorizon::Within
+        );
+        // An extreme horizon saturates instead of wrapping into a false `Beyond`.
+        assert_eq!(
+            account_expiry(deadline, u64::MAX, NOW).horizon_state,
+            ExpiryHorizon::Within
+        );
+    }
+
+    /// AC: the expiry axis is ORTHOGONAL to `CredentialHealth` — no variant was added to that enum,
+    /// and an account inside its expiry horizon is still `Healthy` *right now*.
+    ///
+    /// This is the design decision the issue turns on, so it is pinned as an executable claim: the
+    /// two classifiers take DISJOINT inputs (the refresh-token deadline reaches `account_expiry`
+    /// only), so no expiry state can perturb the health ramp.
+    #[test]
+    fn expiry_is_orthogonal_to_credential_health_and_adds_no_ramp_variant() {
+        const NOW: i64 = 1_782_777_600;
+
+        // An account expiring in 5 days, with a live reading and a valid access token.
+        let expiry = account_expiry(Some(NOW + 5 * DAY_SECS), HORIZON_7D, NOW);
+        assert_eq!(expiry.horizon_state, ExpiryHorizon::Within);
+
+        // …is nonetheless HEALTHY on the severity ramp: valid access token, working refresh path.
+        let health = credential_health(false, None, 0, Some(NOW + 3600), true, NOW);
+        assert_eq!(
+            health,
+            CredentialHealth::Healthy,
+            "an imminent refresh-token expiry must not force a healthy account to render non-healthy"
+        );
+
+        // The ramp is exactly the six pre-existing states — no expiry variant was smuggled in.
+        // This EXHAUSTIVE match is the mechanical guard for that acceptance criterion: adding a
+        // variant to `CredentialHealth` makes it fail to COMPILE (non-exhaustive pattern), so the
+        // "no new variant" rule is enforced by the type system rather than by review vigilance.
+        // Anyone who genuinely must extend the ramp has to come here and justify it.
+        //
+        // The match yields the variant's POSITION on the severity ladder, so the assertion is a
+        // real one about this account rather than a tautology: the expiring-soon account must sit
+        // at position 0 (Healthy), and the arms double as the ladder's documented order.
+        let ramp_position = match health {
+            CredentialHealth::Healthy => 0,
+            CredentialHealth::Unknown => 1,
+            CredentialHealth::Stale => 2,
+            CredentialHealth::AtRisk => 3,
+            CredentialHealth::Degraded => 4,
+            CredentialHealth::Dead => 5,
+        };
+        assert_eq!(
+            ramp_position, 0,
+            "an account inside its expiry horizon must still sit at Healthy on the severity ramp"
+        );
+
+        // Cohort grouping is issue #879's job; this item only carries the field, never populates it.
+        assert_eq!(expiry.cohort_id, None);
+    }
+
+    /// Issue #878: the snapshot carries the modifier per account — `None` before the account has
+    /// ever been polled, and `Some(Unknown)` once polled with a credential that has no deadline.
+    /// The two absences are DIFFERENT facts (never-observed vs observed-without-the-field), and
+    /// neither may be read as "not expiring".
+    #[tokio::test]
+    async fn snapshot_carries_the_expiry_modifier_and_distinguishes_unpolled_from_unknown() {
+        const NOW: i64 = 1_782_777_600;
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+
+        // Before any poll: `None` — the daemon has observed nothing at all.
+        let readings = daemon.decision_readings(daemon.state.active);
+        let before = daemon.snapshot(daemon.state.active, &readings, NOW);
+        assert!(
+            before.accounts.iter().all(|a| a.expiry.is_none()),
+            "an unpolled account carries no expiry observation"
+        );
+
+        // After polling, every account has been observed. The fake stash carries no
+        // `refreshTokenExpiresAt`, so each classifies UNKNOWN — never "not expiring".
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        let readings = daemon.decision_readings(daemon.state.active);
+        let polled = daemon.snapshot(daemon.state.active, &readings, NOW);
+        for account in &polled.accounts {
+            let observed = account
+                .expiry
+                .expect("a polled account carries an expiry observation");
+            assert_eq!(
+                observed.horizon_state,
+                ExpiryHorizon::Unknown,
+                "polled but no deadline in the credential ⇒ Unknown, never 'not expiring'"
+            );
+            assert_eq!(observed.expires_at, None);
+        }
+
+        // With a deadline folded in from the poll path, the snapshot classifies THAT account only —
+        // the modifier is strictly per-account.
+        daemon.state.accounts[0].health.refresh_token_expires_at = Some(NOW + 2 * DAY_SECS);
+        let readings = daemon.decision_readings(daemon.state.active);
+        let classified = daemon.snapshot(daemon.state.active, &readings, NOW);
+        assert_eq!(
+            classified.accounts[0].expiry.unwrap().horizon_state,
+            ExpiryHorizon::Within
+        );
+        assert_eq!(
+            classified.accounts[1].expiry.unwrap().horizon_state,
+            ExpiryHorizon::Unknown
+        );
     }
 
     // --- credential-health rollup (issue #119) -----------------------------
@@ -642,6 +889,95 @@ mod tests {
         // so a consumer can tell "unverified" apart from a genuine "healthy". The wire key
         // is `auth` (issue #143 renamed the field `health` → `auth`).
         assert!(corpus.contains(r#""auth":"unknown""#));
+    }
+
+    /// Issue #878: the poll path folds the REFRESH-token deadline MS→s too, from the same
+    /// credential as the access clock — canonical for the active account, the stash for any other.
+    ///
+    /// This pins the conversion on its OWN clock rather than trusting the sibling access clock's
+    /// coverage, because a dropped `millis_to_secs` here fails in the single most dangerous
+    /// direction the feature has: a raw millisecond deadline (~1.78e12) compared against `now_secs`
+    /// (~1.78e9) is enormously far in the "future", so EVERY account would classify `Beyond` —
+    /// "not expiring". That is exactly the false reassurance the absent-field invariant exists to
+    /// prevent, arriving through a different door, and it would be silent. Hence the explicit
+    /// horizon assertion at the end: the fold is checked by its VISIBLE CONSEQUENCE, not only by
+    /// the stored integer.
+    #[tokio::test]
+    async fn poll_folds_the_refresh_token_deadline_from_millis_to_seconds() {
+        const TOKEN: &str = "sk-ant-oat-SECRET-must-not-leak";
+        // Two DISTINCT deadlines, so the assertions prove each account's value is sourced from the
+        // credential its own poll used — and that the refresh deadline is not the access one.
+        const ACCESS_MS: i64 = 1_782_777_600_000;
+        const CANON_RT_MS: i64 = 1_783_382_400_000; // canonical: 7 days after ACCESS_MS
+        const CANON_RT_S: i64 = 1_783_382_400;
+        const STASH_RT_MS: i64 = 1_784_592_000_000; // stash: 21 days after ACCESS_MS
+        const STASH_RT_S: i64 = 1_784_592_000;
+        let blob = |rt_ms: i64| -> Vec<u8> {
+            format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"{TOKEN}","expiresAt":{ACCESS_MS},"refreshTokenExpiresAt":{rt_ms}}}}}"#
+            )
+            .into_bytes()
+        };
+
+        let canon_blob = blob(CANON_RT_MS);
+        let stash_blob = blob(STASH_RT_MS);
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(&canon_blob).await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", &stash_blob, "u-A"),
+            ("Sessiometer/u-B", &stash_blob, "u-B"),
+        ])
+        .await;
+        let (dir, json) = claude_json("u-A");
+        std::mem::forget(dir);
+        let tun = tunables(95, 80, 0);
+        let mut daemon = Daemon::new(
+            roster,
+            FakeRosterPoller::new()
+                .ok("u-A", 0.11, 0.10)
+                .ok("u-B", 0.22, 0.10),
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+
+        // Tick 1 polls the ACTIVE account (u-A) → deadline read from the CANONICAL item, in SECONDS.
+        daemon.tick().await;
+        assert_eq!(
+            daemon.state.accounts[0].health.refresh_token_expires_at,
+            Some(CANON_RT_S),
+            "the refresh deadline must be folded ms→s, not stored raw"
+        );
+        // Tick 2 polls a NON-active account (u-B) → deadline read from that account's STASH.
+        daemon.tick().await;
+        assert_eq!(
+            daemon.state.accounts[1].health.refresh_token_expires_at,
+            Some(STASH_RT_S)
+        );
+
+        // The consequence check. At a `now` three days before the canonical deadline, a correctly
+        // folded clock classifies `Within` a 7-day horizon. An UNFOLDED (still-millisecond) value
+        // would land absurdly far ahead and read `Beyond` — "not expiring" — so this assertion is
+        // what actually fails if the conversion is ever dropped.
+        let now = CANON_RT_S - 3 * DAY_SECS;
+        let readings = daemon.state.readings();
+        let snapshot = daemon.snapshot(daemon.state.active, &readings, now);
+        assert_eq!(
+            snapshot.accounts[0].expiry.unwrap().horizon_state,
+            ExpiryHorizon::Within,
+            "a deadline 3d out must read Within a 7d horizon; Beyond here means the ms→s fold was lost"
+        );
+        // The peer's deadline is 21d out — genuinely Beyond — so the test is not vacuously passing
+        // by classifying everything the same way.
+        assert_eq!(
+            snapshot.accounts[1].expiry.unwrap().horizon_state,
+            ExpiryHorizon::Beyond
+        );
+        // The surrounding bearer token never rode along with the deadline (issue #15).
+        let corpus = serde_json::to_string(&status_response(&snapshot)).unwrap();
+        assert!(!corpus.contains(TOKEN));
     }
 
     #[tokio::test]

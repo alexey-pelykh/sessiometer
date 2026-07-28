@@ -379,6 +379,21 @@ pub(crate) struct AccountReading {
     /// Computed in [`Daemon::snapshot`] from the retained `last_good` anchor (#450) and the ADR-0017
     /// gate thresholds; copied straight to the wire ([`status_response`]).
     pub(crate) blind_active: Option<BlindActive>,
+    /// The REFRESH-token expiry modifier (issue #878), or `None` until this account has been
+    /// POLLED at all. Keyed on the poll latch, NOT on a deadline being present: an unreadable
+    /// credential (a locked keychain) on a poll that DID happen still carries `Some(_)` holding
+    /// [`ExpiryHorizon::Unknown`], because *observed, no deadline in the credential* and *never
+    /// observed* are different facts and neither means "not expiring" (issue #137).
+    ///
+    /// Carried ORTHOGONALLY to [`health`](Self::health): the two are independent axes, and an
+    /// account is routinely [`CredentialHealth::Healthy`] while its refresh token is
+    /// [`ExpiryHorizon::Within`] the horizon.
+    ///
+    /// Computed in [`Daemon::snapshot`] by [`account_expiry`]. Daemon-internal: projecting it onto
+    /// the versioned wire is issue #882's job, so the field is WRITTEN by the snapshot and READ
+    /// only by the tests that pin its classification until #882's surfaces land.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) expiry: Option<AccountExpiry>,
 }
 
 /// The status-snapshot wire contract's version (issue #164): a `major.minor` the daemon stamps
@@ -989,6 +1004,96 @@ pub(crate) fn credential_health(
         CredentialHealth::Healthy
     } else {
         CredentialHealth::Unknown
+    }
+}
+
+/// One account's REFRESH-token expiry MODIFIER (issue #878) — the forward-looking axis carried
+/// ALONGSIDE [`CredentialHealth`], never folded into it.
+///
+/// Follows the ratified ADR-0017 `blind_active` precedent ([`BlindActive`]): a per-account
+/// condition hung on an otherwise-connected row rather than a new state in an existing ramp. The
+/// two axes answer different questions and are rendered as INDEPENDENT cells — an account can be
+/// (and typically is) `Healthy` **and** `Within` its expiry horizon at the same time, which is
+/// precisely the case the operator needs to see and which no single ordinal ladder can express.
+///
+/// DAEMON-INTERNAL for now: computed in [`Daemon::snapshot`] and carried on [`AccountReading`],
+/// which is not `Serialize`. Projecting it onto the versioned wire ([`AccountStatusLine`]) is
+/// issue #882's job, together with the [`STATUS_SCHEMA_VERSION`] bump and the lockstep Swift
+/// fixtures; nothing here touches that contract.
+///
+/// Non-secret: one timestamp, one classification, and a group id — never a token or email (#15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct AccountExpiry {
+    /// The observed `refreshTokenExpiresAt` deadline as epoch SECONDS (converted from the
+    /// credential's milliseconds at the read boundary, as [`AccountReading::access_expires_at`] is),
+    /// or `None` when the credential carried no parseable value.
+    ///
+    /// `None` here ALWAYS pairs with [`ExpiryHorizon::Unknown`] in
+    /// [`horizon_state`](Self::horizon_state): [`account_expiry`] admits no other combination.
+    pub(crate) expires_at: Option<i64>,
+    /// Where [`expires_at`](Self::expires_at) sits relative to the operator's configured horizon.
+    /// [`ExpiryHorizon::Unknown`] whenever no deadline was observed — never "not expiring" (the
+    /// issue #137 invariant).
+    pub(crate) horizon_state: ExpiryHorizon,
+    /// The synchronized-expiry COHORT this account belongs to, once cohort detection exists.
+    ///
+    /// Always `None` here: grouping deadlines into cohorts is issue #879's job. The field is
+    /// carried now so that item adds a populator rather than re-shaping this type and every
+    /// consumer of it. A `None` means "not grouped", never "alone".
+    pub(crate) cohort_id: Option<u32>,
+}
+
+/// Classify one account's REFRESH-token deadline against the operator's foresight horizon
+/// (issue #878) — the orthogonal sibling of [`credential_health`], and the ONLY constructor of
+/// [`AccountExpiry`].
+///
+/// `refresh_expires_at` is this account's `refreshTokenExpiresAt` deadline in epoch SECONDS — the
+/// poll path is its only source, extracting it with
+/// [`crate::refresh::refresh_token_expires_at`] and folding the credential's MILLISECONDS to
+/// seconds at that boundary; `horizon_secs` is `[credential].expiry_horizon_secs`.
+///
+/// The classification, in order:
+/// - **`None` ⇒ [`ExpiryHorizon::Unknown`]** — the load-bearing branch. An absent
+///   `refreshTokenExpiresAt` (an older Claude Code, a changed upstream policy, a non-first-party
+///   credential) is reported as UNKNOWN, **never** as "not expiring". This is the issue #137
+///   invariant — *absence of a NEGATIVE signal alone is not health* — and it is what makes the whole
+///   feature degrade safely should upstream ever drop the field: the daemon goes quiet-but-honest
+///   rather than confidently wrong.
+/// - **`deadline <= now` ⇒ [`ExpiryHorizon::Lapsed`]** — already past; only a re-login recovers it.
+/// - **`deadline <= now + horizon` ⇒ [`ExpiryHorizon::Within`]** — inside the lookahead: still
+///   working, but act before it lapses.
+/// - **otherwise ⇒ [`ExpiryHorizon::Beyond`]** — further out than the horizon.
+///
+/// The deadline is ALWAYS read from the credential and never inferred: the ~30-day refresh-token
+/// lifetime observed in the field is a server-side default, not a contract, so no lifetime constant
+/// appears anywhere in this path. `horizon_secs` bounds the LOOKAHEAD only.
+///
+/// A pure function of explicit inputs (no clock, no I/O), so every branch — including the absent
+/// field — is deterministically testable. Saturating arithmetic keeps an extreme horizon from
+/// wrapping the comparison into a false `Beyond`.
+pub(crate) fn account_expiry(
+    refresh_expires_at: Option<i64>,
+    horizon_secs: u64,
+    now_secs: i64,
+) -> AccountExpiry {
+    let horizon_state = match refresh_expires_at {
+        // Absent ⇒ UNKNOWN, never "not expiring" (issue #137).
+        None => ExpiryHorizon::Unknown,
+        Some(deadline) if deadline <= now_secs => ExpiryHorizon::Lapsed,
+        Some(deadline) => {
+            let edge = now_secs.saturating_add(i64::try_from(horizon_secs).unwrap_or(i64::MAX));
+            if deadline <= edge {
+                ExpiryHorizon::Within
+            } else {
+                ExpiryHorizon::Beyond
+            }
+        }
+    };
+    AccountExpiry {
+        expires_at: refresh_expires_at,
+        horizon_state,
+        // Issue #879 owns cohort detection; this item only carries the field.
+        cohort_id: None,
     }
 }
 
