@@ -42,6 +42,7 @@ issue threads is consolidated here in a stable, discoverable place.
 | [0027](0027-macos-app-bundle-identity.md) | macOS app bundle identity — freeze `org.sessiometer.menubar` on the `<surface>` axis | Accepted |
 | [0028](0028-version-range-provenance-canary-runtime-guard.md) | CC version range is provenance, not a runtime gate; the #714 behavioral canary is the runtime compatibility guard | Accepted (#730 hardening has since landed) |
 | [0029](0029-macos-is-the-only-supported-build-target.md) | macOS is the only supported build target; cross-platform support is tracked, not claimed | Accepted |
+| [0030](0030-one-resolution-policy-cli-included.md) | One `claude`-resolution policy for every caller — `poke` / `login` resolve via the login-shell `PATH` too | Accepted |
 
 ## Conventions
 

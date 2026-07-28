@@ -605,8 +605,11 @@ permitted (a *provenance-scoped* waiver — #444) while an unauthored one never 
 (issue #15). A non-PII nickname stays a fine option, no longer a requirement.
 (`login` takes the label as an explicit argument; the editable email pre-fill is
 `capture`'s interactive prompt — #447.)
-`login` needs a real terminal and the `claude` binary on your `PATH` (or
-`$CLAUDE_BIN`); tune its timeout in the [`[login]`](#login) block. On success it
+`login` needs a real terminal and the `claude` binary on your **login shell's** `PATH` —
+not the `PATH` of the shell you run it from, which is ignored (or `$CLAUDE_BIN` /
+[`[login].claude_bin`](#login), which override both; see
+[Which `PATH` the CLI resolves `claude` on](#which-path-the-cli-resolves-claude-on));
+tune its timeout in the [`[login]`](#login) block. On success it
 prints one redacted line — `Onboarded` (new) or `Revived` (existing); an unfinished
 login prints `login cancelled, nothing captured` and still exits `0`. Unlike the
 daemon, a **locked keychain aborts the login at once** (one-shot, no back-off,
@@ -635,8 +638,10 @@ sessiometer poke
 (naming it is refused, and the all-accounts sweep skips it), so the live session's
 credential is left alone. A cycle reports one redacted line per account —
 `refreshed`, `no change`, `dead` (needs re-login), or `error` — naming only the
-account's `list` label, never a token. It needs the `claude` binary on your `PATH`
-(or `$CLAUDE_BIN` set to its absolute path).
+account's `list` label, never a token. It needs the `claude` binary on your **login
+shell's** `PATH` — not the `PATH` of the shell you run it from, which is ignored (or
+`$CLAUDE_BIN` set to its absolute path, which overrides both). See
+[Which `PATH` the CLI resolves `claude` on](#which-path-the-cli-resolves-claude-on).
 
 ## Refreshing parked credentials automatically
 
@@ -702,6 +707,39 @@ recur on `cadence_secs` alone. Keep it comfortably below `cadence_secs`; the def
 > pinned, so the shipped cadence/idle defaults are deliberately conservative and may
 > change once the engine's own first-run telemetry establishes the real TTL. Pick a
 > `cadence_secs` comfortably shorter than your observed token lifetime.
+
+### Which `PATH` the CLI resolves `claude` on
+
+The `claude_bin` → `$CLAUDE_BIN` → **login shell's `PATH`** ladder above is not the
+daemon's alone. `sessiometer poke` and `sessiometer login` share one resolver with it, so
+they resolve `claude` on your **login shell's** `PATH` too — **not** on the `PATH` of the
+shell you typed the command into. In a terminal the harvest normally succeeds, and a
+successful harvest *replaces* the inherited `PATH` (it never unions with it), so a
+shell-local prefix is never consulted:
+
+```sh
+# Does NOT pick up /custom/bin/claude — the prefix is ignored, and the `claude` found
+# on your LOGIN SHELL's PATH is spawned instead:
+PATH=/custom/bin:$PATH sessiometer poke
+
+# Do this instead. $CLAUDE_BIN is the per-invocation override, and it wins outright
+# (it also skips the login-shell harvest entirely):
+CLAUDE_BIN=/custom/bin/claude sessiometer poke
+```
+
+This is deliberate, and it is the reason a union is refused: unioning would let an entry
+from the daemon's bare `launchd` `PATH` outrank one of your own, which is exactly the
+shadowing the scan order exists to honor. The payoff is that **`poke` predicts the
+daemon** — it resolves the same binary the next refresh cycle will, so a working `poke`
+alongside a failing daemon can no longer mean "the two found different binaries". That
+divergence is what once turned an environment problem into hours of credential
+debugging. The trade — a CLI that ignores its own `$PATH` — is recorded in
+[ADR-0030](docs/adr/0030-one-resolution-policy-cli-included.md), with the alternatives
+and why each was rejected.
+
+`claude_bin` in `[login]` (for `login`) or `[refresh]` (for the daemon), and
+`$CLAUDE_BIN` for any of them, all take precedence and all skip the harvest. `poke` has
+no `claude_bin` key of its own — `$CLAUDE_BIN` is its only override.
 
 ### Keeping the active credential warm in place
 
@@ -799,7 +837,7 @@ Settings for `sessiometer login`, the interactive re-auth verb.
 | Key | Meaning | Range | Default |
 |-----|---------|-------|---------|
 | `timeout_secs` | Seconds bounding one whole interactive login capture — longer than a refresh, since it waits on a human completing a browser OAuth handoff. | `60..=600` | `180` |
-| `claude_bin` | Absolute path to the `claude` binary to spawn, overriding `$CLAUDE_BIN` and your login shell's `PATH`. Omit (or leave empty) to resolve normally. | — | unset |
+| `claude_bin` | Absolute path to the `claude` binary to spawn, overriding `$CLAUDE_BIN` and your login shell's `PATH`. Omit (or leave empty) to resolve normally. Note that `login` resolves on your **login shell's** `PATH`, not the one you invoke it from — see [Which `PATH` the CLI resolves `claude` on](#which-path-the-cli-resolves-claude-on). | — | unset |
 
 ### Other blocks
 
