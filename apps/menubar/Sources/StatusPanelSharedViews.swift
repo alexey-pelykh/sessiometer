@@ -114,7 +114,10 @@ struct StatusDot: View {
 
     var body: some View {
         Circle()
-            .fill(isActive ? Color.accentColor : Color.clear)
+            // `panelAccent`, not `accentColor` — the same brand-blue asset (#391), named explicitly so the
+            // hue does not depend on one target's `ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME` setting
+            // (issue #754; see `Color.panelAccent`).
+            .fill(isActive ? Color.panelAccent : Color.clear)
             .overlay(
                 // Inactive ring = mock `--text-3` (`.acct:not(.active) .dot { inset 0 0 0 1.5px var(--text-3) }`).
                 // `.tertiaryLabelColor` is the label-family neutral the footer freshness line also uses for
