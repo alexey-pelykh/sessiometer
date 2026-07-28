@@ -117,7 +117,8 @@ targets:
       - path: Sources/ConfigWire.swift
       # Settings UI (#268) model: the pure @MainActor load/apply/draft-diff shell (idle→loading→loaded→failed
       # + idle→applying→applied/rejected/invalidInput). Compiled here (NOT SettingsView/SettingsWindowController
-      # — those are SwiftUI/AppKit the headless bundle can't drive) so config-get load, the batched config-set of
+      # — the window controller drives an NSWindow, and no gate needs the view; since #754 the reason is NOT
+      # "SwiftUI can't compile here", which #749 disproved) so config-get load, the batched config-set of
       # only-dirty keys, client-side format validation, and the notification-toggle write-through are exercised
       # against the same fake connector as AccountSwapModel — no socket, no live daemon, never a real config write.
       - path: Sources/SettingsModel.swift
@@ -132,13 +133,16 @@ targets:
       - path: Sources/WatchStatusStore.swift
       # Native swap / all-accounts-exhausted notifications (#267): the pure event deriver + neutral
       # (redacted) content + toggle-gating shell. Compiled here (NOT UserNotificationPresenter.swift or
-      # main.swift — those touch UNUserNotificationCenter / AppKit the headless bundle can't drive) so
+      # main.swift — UNUserNotificationCenter needs a real app bundle identity, and main.swift is top-level
+      # entry code that cannot live in a test bundle at all) so
       # swap/exhausted detection, content redaction, and toggle gating are tested against a spy
       # presenter with no OS notification surface.
       - path: Sources/AccountEventNotifier.swift
       # Status-item gauge (#325): the pure, shape-encoded template `NSImage` factory. Added here (NOT
-      # StatusItemController/StatusPanelView/main.swift — those touch NSStatusBar/AppKit UI that a
-      # headless logic-test bundle can't drive) so the shape-per-state contract is tested in isolation.
+      # StatusItemController/main.swift — those touch the NSStatusBar / app-entry surface a headless
+      # logic-test bundle can't drive) so the shape-per-state contract is tested in isolation.
+      # `StatusPanelView` was in that exclusion list until #754; it is now COMPILED here — see the panel
+      # view block below for what #749 measured and what remains excluded.
       - path: Sources/StatusGauge.swift
       # Bar-glyph render-parity renderer (#525): the pure template-tint + explicit-pixel-size raster factory
       # `BarGlyphParityTests` drives (NOT RenderBarGlyphTool.swift — that touches CommandLine/exit app-tool
@@ -150,10 +154,43 @@ targets:
       # fallbackRing here (the logic-test bundle's `Bundle.main` is the xctest runner, not the catalog).
       # actool compiles it into `MenubarTests.xctest/Contents/Resources/Assets.car`.
       - path: Sources/Assets.xcassets
-      # Status-panel format (#326): the pure, `src/cli.rs`-mirroring presentation layer (health/reset/pct).
-      # Added here (NOT StatusPanelView.swift/main.swift — SwiftUI/AppKit the headless bundle can't drive)
+      # Status-panel format (#326): the pure, `src/cli.rs`-mirroring presentation layer (health/reset/pct),
       # so the byte-parity contract with the Rust `status` verb is tested in isolation.
       - path: Sources/StatusPanelFormat.swift
+      # The panel's SwiftUI VIEW hierarchy (#754) — the one deliberate widening of this bundle beyond
+      # Foundation/AppKit-free logic. Until now the comments above excluded `StatusPanelView` on the
+      # grounds that SwiftUI is something a headless bundle "can't drive" (those rationales are corrected
+      # in place rather than left to contradict this block); issue #749 (PR #771) MEASURED that belief and retired it: SwiftUI
+      # `ImageRenderer` rasterizes inside THIS `TEST_HOST: ""` bundle (bare view, SF Symbol, and the
+      # `@EnvironmentObject`/`@Published` injection path) on the `macos-26` runner. So the panel's own
+      # golden drift gate (`PanelGoldenParityTests`) is reachable in-process, and these files are what it
+      # needs. Note what is still excluded and why: `main.swift` (top-level AppKit entry — cannot live in a
+      # unit-test bundle), `StatusItemController` (NSStatusBar/NSPopover), `SettingsView` /
+      # `SettingsWindowController` (a separate window surface, not the panel), `SMAppServiceLoginItem`
+      # (imports ServiceManagement), `UserNotificationPresenter` (UNUserNotificationCenter). The panel files
+      # below import only SwiftUI/AppKit and reference only models already compiled above.
+      #
+      # Why not the #750 trick: #750 kept a panel gate out of this bundle by moving the Foundation-only
+      # CONSTANTS it needed down into `StatusPanelFormat`. That works for values; it cannot work for
+      # rasterizing a view — the view hierarchy itself has to compile here.
+      - path: Sources/StatusPanelView.swift
+      - path: Sources/StatusPanelChrome.swift
+      - path: Sources/StatusPanelRoster.swift
+      - path: Sources/StatusPanelStats.swift
+      - path: Sources/StatusPanelSharedViews.swift
+      - path: Sources/StatusPanelTint.swift
+      - path: Sources/StatusPanelCapture.swift
+      # The SINGLE environment-injection seam (#504) both panel hosts route through — the app
+      # (`StatusItemController`) and the render harness. Compiled here so the golden gate injects the
+      # panel's environment through the SAME modifier, and so a newly-required `@EnvironmentObject`
+      # breaks this bundle's build too rather than trapping at render time.
+      - path: Sources/StatusPanelEnvironment.swift
+      # The shared panel-render fixture catalog + renderer (#754): the ONE definition of which panel states
+      # get rendered and how, consumed by BOTH the app's `--render-panel` design-oracle tool and the
+      # in-bundle golden gate. Same #504 anti-drift shape as StatusPanelEnvironment above — a fixture list
+      # duplicated between the app tool and the test bundle would rot exactly the way #504's injection sites
+      # did. (`RenderPanelTool.swift` itself stays app-only: it is the CommandLine/exit tool surface.)
+      - path: Sources/PanelRenderHarness.swift
       - path: Tests
     settings:
       base:
