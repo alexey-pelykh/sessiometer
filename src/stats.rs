@@ -289,6 +289,23 @@ struct Report {
     /// velocity), so the readout is presentation-additive: a report built without it renders
     /// and serializes exactly as it did pre-#543. Summary-window only, like `orphans`.
     velocity: BTreeMap<String, AccountVelocity>,
+    /// WHICH SET the all-accounts-high census intersected over (issue #836): `true` when
+    /// [`build_report`] had the CONFIGURED roster, `false` when it did not and the census
+    /// degraded to whoever held samples in the period.
+    ///
+    /// Issue #804 introduced the two regimes and they are NOT interchangeable — under the
+    /// fallback an unsampled account silently leaves the intersection, so the metric fires on
+    /// strictly less evidence than the configured form, which is the one direction
+    /// REQ-STA-B-005's amendment forbids. Without this the human render states the census's
+    /// water but not its set, so the two regimes print the same bytes and a reader cannot tell
+    /// which number they hold.
+    ///
+    /// CARRIED from the very `roster` argument [`aggregate_with_roster`] consumed, for the same
+    /// reason [`crate::usage_stats::RosterStats::high_threshold`] is carried rather than
+    /// re-derived: a render that recomputes the regime from a second source (the caller's own
+    /// `Config`, one hop earlier) would keep printing a claim about the census after the
+    /// census's input stopped agreeing with it.
+    census_over_roster: bool,
 }
 
 /// One account's velocity + runway readout (issue #543) — the recent per-account usage RATE
@@ -457,9 +474,14 @@ fn run_output(
         // this key it is exactly as blind as the panel was.
         render_json(&report, config_fault.map(|f| f.wire_reason))
     } else {
+        // …and so does the HUMAN render (issue #836), which is the surface this metric is
+        // actually read on. It was the last one left without the provenance: `--json` got it in
+        // #642 and stderr in #627, while `render_text` / `render_charts` printed a census whose
+        // roster regime — configured or degraded — was unstated and therefore unknowable.
         Ok(render_human(
             &report,
             TermEnv::detect(args.no_color, args.ascii),
+            config_fault.map(|f| f.wire_reason),
         ))
     }
 }
@@ -607,10 +629,18 @@ fn term_is_dumb() -> bool {
 /// `None`), so `stats | grep` and `stats > file` stay the plain, greppable numeric
 /// surface with zero ANSI. Pure over `env`, so the whole view is golden-testable at a
 /// fixed width / colour / ramp.
-fn render_human(report: &Report, env: TermEnv) -> String {
+///
+/// `config_unreadable` is the malformed-config provenance [`render_json`] already carries for
+/// issue #642, taken here as an ARGUMENT for the same reason it is one there: the fact belongs
+/// to the CALLER's config load, not to the aggregate, and one carrier per fact keeps the human
+/// and `--json` surfaces from describing the same failure two different ways. `None` for a
+/// readable — or absent — config. See [`config_regime_line`], which is the only thing that
+/// reads it; the census's own SET rides [`Report::census_over_roster`] instead, on a separate
+/// key, because it is true under an absent config too (issue #836).
+fn render_human(report: &Report, env: TermEnv, config_unreadable: Option<&str>) -> String {
     match env.cols {
-        None => render_text(report),
-        Some(w) => render_charts(report, w, env.color, env.ascii),
+        None => render_text(report, config_unreadable),
+        Some(w) => render_charts(report, w, env.color, env.ascii, config_unreadable),
     }
 }
 
@@ -1167,6 +1197,10 @@ fn build_report(
         // this pure aggregate, by [`with_velocity`], so a bare `build_report` (every hermetic
         // aggregate test) renders/serializes exactly as it did pre-#543.
         velocity: BTreeMap::new(),
+        // Read off the SAME `roster` the census above consumed, not off the caller's config
+        // (issue #836) — the render's claim about which set was intersected then cannot drift
+        // from the set that actually was.
+        census_over_roster: roster.is_some(),
     }
 }
 
@@ -1260,7 +1294,10 @@ fn bucket_bounds(start: i64, end: i64, base: i64) -> Vec<(i64, i64)> {
 /// renders exactly this — plain, greppable, zero ANSI, no chart glyph — while an interactive
 /// TTY gets [`render_charts`]. Reports only magnitudes and neutral descriptors — no
 /// recommendation, no forecast (issue #160).
-fn render_text(report: &Report) -> String {
+///
+/// `config_unreadable` is [`render_human`]'s issue #642 provenance, rendered by
+/// [`config_regime_line`] directly above the roster line it qualifies (issue #836).
+fn render_text(report: &Report, config_unreadable: Option<&str>) -> String {
     let mut out = String::new();
     let label = format_window_label(&report.window, report.offset);
     out.push_str(&format!("usage — {label}\n\n"));
@@ -1303,14 +1340,19 @@ fn render_text(report: &Report) -> String {
 
     out.push('\n');
     // The bottom roster block (§D-STA-5): the aggregate-only summary (lowest-utilisation +
-    // fleet-runway), then the roster line — ONE contiguous block, no blank line between. The
-    // summary carries no trailing newline, so the terminating `\n` here abuts the roster line.
+    // fleet-runway), then the config-regime caveat, then the roster line — ONE contiguous
+    // block, no blank line between. The summary carries no trailing newline, so the
+    // terminating `\n` here abuts whatever follows. The caveat sits directly ABOVE the line it
+    // qualifies (issue #836) so it is read before the census number, not after it.
     let band = render_summary(report);
     if !band.is_empty() {
         out.push_str(&band);
         out.push('\n');
     }
-    out.push_str(&roster_line(summary));
+    if let Some(line) = config_regime_line(config_unreadable) {
+        out.push_str(&line);
+    }
+    out.push_str(&roster_line(summary, report.census_over_roster));
     out
 }
 
@@ -1329,7 +1371,34 @@ fn render_text(report: &Report) -> String {
 /// SAME report as the numerator and cannot be mismatched by a caller. The wire needs no
 /// equivalent field: `all_high_covered_secs` rides on it alongside the window's own `start`
 /// / `end`, so every surface can derive the same share.
-fn roster_line(report: &UsageReport) -> String {
+///
+/// It also states its SET, for exactly the reason it states its water (issue #836).
+/// `census_over_roster` is [`Report::census_over_roster`] — `false` means no roster was known
+/// and the census degraded to the sampled accounts, where an unsampled account cannot withhold
+/// the metric and it therefore fires more readily. The qualifier rides the census label's own
+/// parenthetical, beside the water, because both are parameters of the same reading; a reader
+/// who greps out this line cannot separate the number from the set that produced it.
+///
+/// STATED ONLY WHEN THE CENSUS WAS TAKEN. `—` is the UNKNOWN sentinel: it carries no confident
+/// number to misread and reads the same under both regimes ("I could not see"), so naming the
+/// set there would describe a measurement that never happened — and, since a pre-`capture`
+/// install has no roster AND nothing to report, it would put a permanent qualifier on the most
+/// common render of all for no informational gain. Note this is NOT the same rule
+/// [`capacity_holds_cell`] follows: that cell drops its boundary on `—` because the carried
+/// lines are then `0.0`, whereas the water here is carried and IS still stated on `—`. So one
+/// parameter of this cell is stated on a non-reading and the other is not, deliberately.
+///
+/// The residual, stated rather than implied: an ABSENT config with an untaken census gets
+/// neither this qualifier (suppressed) nor [`config_regime_line`]'s caveat (no fault to report),
+/// so those two regimes do still print identical bytes. That corner is the one where the
+/// distinction carries no operator consequence — both readings are `—` — which is why it is
+/// accepted here rather than closed.
+///
+/// The capacity-holds cell beside this one degrades over the SAME `roster` and is deliberately
+/// NOT annotated by this change (issue #836 is scoped to the census); that asymmetry is tracked
+/// as issue #864. Until it lands, a reader who notices one cell carrying a regime qualifier may
+/// infer the neighbour is regime-independent — it is not.
+fn roster_line(report: &UsageReport, census_over_roster: bool) -> String {
     let r = &report.roster;
     let period_secs = report.period.duration();
     // "Insufficient" is taken at its most conservative: NO jointly-covered instant at all.
@@ -1371,9 +1440,16 @@ fn roster_line(report: &UsageReport) -> String {
         // cells degrade to — one UNKNOWN vocabulary across the surface.
         "—".to_owned()
     };
+    // The census's SET, named beside its water and only when a reading was actually taken
+    // (issue #836) — see this function's doc comment for why the `—` branch omits it.
+    let set = if census_over_roster || r.all_high_covered_secs == 0 {
+        String::new()
+    } else {
+        ", sampled accounts".to_owned()
+    };
     format!(
         "roster: {} swap{} ({} session, {} weekly, {} manual, {} forced, {} emergency) · \
-         all-accounts-high (≥{}%): {} · {}\n",
+         all-accounts-high (≥{}%{}): {} · {}\n",
         r.swap_count,
         plural(r.swap_count),
         r.swaps.session,
@@ -1382,9 +1458,38 @@ fn roster_line(report: &UsageReport) -> String {
         r.swaps.forced,
         r.swaps.emergency,
         pct(r.high_threshold),
+        set,
         census,
         capacity_holds_cell(r),
     )
+}
+
+/// The config-provenance caveat the human render places directly ABOVE the roster line when
+/// `config.toml` exists but could not be read (issue #836), e.g.
+/// `all-accounts-high fires more readily without a roster — config.toml is not valid TOML —
+/// run `sessiometer config validate` for the detail`. `None` — nothing rendered — for a
+/// readable config AND for an ABSENT one, which is the normal pre-`capture` state issue #627
+/// deliberately keeps silent (its regime is already stated by [`roster_line`]'s own qualifier).
+///
+/// `reason` is the SAME static string [`wire_config_reason`] puts on the wire for issue #642,
+/// so the human surface and `--json` cannot describe one config failure two ways. That type is
+/// what makes printing it safe here: a `&'static str` cannot carry a byte of the operator's
+/// `config.toml`, which is the whole reason #642 chose it for the wider surfaces — and stdout,
+/// piped into a file or a screenshot, is one of them.
+///
+/// This is a SEPARATE annotation from the roster line's set qualifier, on a separate key,
+/// because the two answer different questions: the qualifier says WHICH SET the census used
+/// (true under an absent config too), while this says WHY there was no roster to use. It is
+/// NOT gated on the census having fired — "fires more readily" is a property of the metric
+/// under this regime, not a claim that it fired — so a broken config is stated whether or not
+/// the window happened to yield a reading.
+///
+/// The stderr warning [`run_output`] already emits is not a substitute: it carries the FULL
+/// operator-scoped parser detail to a stream that a `stats > file`, a dashboard, or a
+/// screenshot does not capture, and it says nothing about the census's regime.
+fn config_regime_line(reason: Option<&str>) -> Option<String> {
+    reason
+        .map(|reason| format!("all-accounts-high fires more readily without a roster — {reason}\n"))
 }
 
 /// The capacity-holds cell of the roster line (§D-STA-5, issue #803): `capacity holds (session
@@ -1409,6 +1514,13 @@ fn roster_line(report: &UsageReport) -> String {
 /// same contract the census beside it keeps. The boundary is omitted from THAT branch on purpose:
 /// with the census untaken the carried lines are `0.0`, and printing `≥0%` would state a line no
 /// reading was ever measured against.
+///
+/// It does NOT yet state its SET, and the omission is a gap rather than a decision. The
+/// `capacity_holds` aggregate (`src/usage_stats.rs`) intersects over the same `roster` the census
+/// does and degrades the same way when none is known, so this cell has the two regimes issue #836
+/// made the census beside it declare — it is simply out of that issue's scope, and is tracked as
+/// issue #864. Until then the parenthetical asymmetry on the rendered line (a qualified census
+/// beside an unqualified holds cell) reads as though holds were regime-independent. It is not.
 fn capacity_holds_cell(r: &crate::usage_stats::RosterStats) -> String {
     if r.capacity_hold_covered_secs == 0 {
         return "capacity holds: —".to_owned();
@@ -2913,7 +3025,17 @@ fn orphan_names_line(orphans: &BTreeMap<String, AccountStats>) -> Option<String>
 /// by an optional "not in roster" line (issue #314) and the same roster line the numeric
 /// view uses. Pure over `(w, color, ascii)` so the whole view is golden-testable at a fixed
 /// width / colour / ramp.
-fn render_charts(report: &Report, w: usize, color: bool, ascii: bool) -> String {
+///
+/// `config_unreadable` is [`render_human`]'s issue #642 provenance, rendered by
+/// [`config_regime_line`] directly above the roster line — the SAME placement [`render_text`]
+/// uses, so neither human surface is the one that stays blind (issue #836).
+fn render_charts(
+    report: &Report,
+    w: usize,
+    color: bool,
+    ascii: bool,
+    config_unreadable: Option<&str>,
+) -> String {
     let mut out = format!(
         "usage — {}\n\n",
         format_window_label(&report.window, report.offset)
@@ -2926,7 +3048,10 @@ fn render_charts(report: &Report, w: usize, color: bool, ascii: bool) -> String 
         if let Some(line) = orphan_names_line(&report.orphans) {
             out.push_str(&line);
         }
-        out.push_str(&roster_line(&report.summary));
+        if let Some(line) = config_regime_line(config_unreadable) {
+            out.push_str(&line);
+        }
+        out.push_str(&roster_line(&report.summary, report.census_over_roster));
         return out;
     }
     out.push_str(&render_chart_table(report, &accounts, w, color, ascii));
@@ -2944,9 +3069,11 @@ fn render_charts(report: &Report, w: usize, color: bool, ascii: bool) -> String 
     out.push('\n');
     // The bottom roster block (§D-STA-5): the aggregate-only summary (lowest-utilisation +
     // fleet-runway — per-account signal/velocity/runway are TABLE COLUMNS now, not band lists),
-    // the "not in roster" line (issue #314), then the roster line — ONE contiguous block. The
-    // summary is colour-free: it reports roster-level magnitudes, and the per-account `signal`
-    // colour lives in the table cell (issue #160 symmetric emphasis, unchanged).
+    // the "not in roster" line (issue #314), the config-regime caveat (issue #836), then the
+    // roster line — ONE contiguous block. The summary is colour-free: it reports roster-level
+    // magnitudes, and the per-account `signal` colour lives in the table cell (issue #160
+    // symmetric emphasis, unchanged). The caveat is colour-free for the same reason and sits
+    // directly above the line it qualifies, so it is read before the census number.
     let band = render_summary(report);
     if !band.is_empty() {
         out.push_str(&band);
@@ -2955,7 +3082,10 @@ fn render_charts(report: &Report, w: usize, color: bool, ascii: bool) -> String 
     if let Some(line) = orphan_names_line(&report.orphans) {
         out.push_str(&line);
     }
-    out.push_str(&roster_line(&report.summary));
+    if let Some(line) = config_regime_line(config_unreadable) {
+        out.push_str(&line);
+    }
+    out.push_str(&roster_line(&report.summary, report.census_over_roster));
     out
 }
 
@@ -3025,6 +3155,9 @@ mod tests {
             offset: 0,
             orphans: BTreeMap::new(),
             velocity: BTreeMap::new(),
+            // The CONFIGURED regime — the normal one, so the chart fixtures below keep pinning
+            // the un-annotated render. The degraded regime has its own fixtures (issue #836).
+            census_over_roster: true,
         }
     }
 
@@ -3289,7 +3422,7 @@ mod tests {
         // (bytes) AND padded on char count. The coverage `%` terminates `cov`, the first NUMERIC
         // column after the label, so it lands at one display column per row only when the label
         // column is sized AND padded on display width.
-        let out = render_text(&wide_glyph_charts());
+        let out = render_text(&wide_glyph_charts(), None);
         let pct_col = |label: &str| {
             let line = out.lines().find(|l| l.contains(label)).unwrap();
             display_width(&line[..line.find('%').unwrap()])
@@ -3357,7 +3490,7 @@ mod tests {
         // its column, so it fills the column under EITHER alignment. The piped surface's `cov`
         // can: a 3-cell header over 4-cell `100%` values, so a left-aligned header would sit one
         // column left of the data it heads.
-        let piped = render_text(&r);
+        let piped = render_text(&r, None);
         let cov_header = cell_right_edge(&piped, "account", "cov");
         for (handle, _) in MIXED_WEEKLY {
             assert_eq!(
@@ -3461,7 +3594,7 @@ mod tests {
     #[test]
     fn full_charts_view_wide_tty() {
         let r = two_account_charts();
-        let out = render_charts(&r, 60, false, false);
+        let out = render_charts(&r, 60, false, false, None);
         assert!(out.starts_with("usage — last 24h (Jun 30–Jul 1)\n\n"));
         assert!(out.contains("account  signal     session  weekly  trend\n"));
         assert!(out.contains("contribution share\n"));
@@ -3531,7 +3664,7 @@ mod tests {
         assert!(render_bars(&r, &keys(&r), 12, false).is_none());
         assert!(render_heatmap(&r, &keys(&r), 8, false, false).is_none());
         assert!(render_percentiles(&r, &keys(&r), 20, false).is_none());
-        let out = render_charts(&r, 12, false, false);
+        let out = render_charts(&r, 12, false, false, None);
         assert!(out.contains("account"), "the table still renders");
         assert!(out.contains("roster:"), "the roster line still renders");
         assert!(!out.contains('\x1b'));
@@ -3549,10 +3682,11 @@ mod tests {
                 color: false,
                 ascii: false,
             },
+            None,
         );
         assert_eq!(
             piped,
-            render_text(&r),
+            render_text(&r, None),
             "a piped stats is the #158 numeric table verbatim"
         );
         assert!(!piped.contains('\x1b'), "zero ANSI on a pipe");
@@ -3596,7 +3730,7 @@ mod tests {
             },
         );
         assert_eq!(
-            render_text(&r),
+            render_text(&r, None),
             "usage — last 24h (Jun 30–Jul 1)\n\n\
              account  signal      cov  session m/p/p95  weekly m/p/p95  caps  t@cap  share  velocity  runway\n\
              aa       saturated  100%         30/90/85          0/40/0     0     0s    60%  0.9%/min     ~2h\n\
@@ -3671,7 +3805,7 @@ mod tests {
         );
 
         // Each surface's RENDERED header row carries its declared subset, in order.
-        let piped = render_text(&r);
+        let piped = render_text(&r, None);
         let tty = render_chart_table(&r, &keys(&r), 200, false, false);
         let piped_header_line = piped
             .lines()
@@ -3738,7 +3872,7 @@ mod tests {
         );
         // Gate closed → not one escape byte anywhere in the whole view, yet the full signal
         // survives in text (the percentages and the glyphs).
-        let plain = render_charts(&r, 60, false, false);
+        let plain = render_charts(&r, 60, false, false, None);
         assert!(!plain.contains('\x1b'), "no ANSI when the gate is closed");
         assert!(
             plain.contains("50/99") && plain.contains("▃▅█"),
@@ -3835,7 +3969,7 @@ mod tests {
         // §D-STA-5: the aggregate summary (lowest-utilisation [+ fleet]) and the roster line form
         // ONE block beneath the table — the aggregate lines 2-space indented, and NO blank line
         // separating them from the roster line (they read as a single foot).
-        let text = render_text(&report_fixture());
+        let text = render_text(&report_fixture(), None);
         let lines: Vec<&str> = text.lines().collect();
         let lu = lines
             .iter()
@@ -3864,7 +3998,7 @@ mod tests {
         // fleet where AT LEAST ONE account has a rate shows the column, with `—` for the accounts
         // lacking it (an explicit gap, never a fabricated 0).
         let sparse = two_account_charts(); // no velocity overlay
-        let text = render_text(&sparse);
+        let text = render_text(&sparse, None);
         assert!(
             !text.contains("velocity") && !text.contains("runway"),
             "both columns elide on a sparse fleet: {text}"
@@ -3879,7 +4013,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let text = render_text(&mixed);
+        let text = render_text(&mixed, None);
         assert!(
             text.contains("velocity") && text.contains("runway"),
             "the columns appear when one account has the datum: {text}"
@@ -4010,27 +4144,27 @@ mod tests {
     fn degenerate_series_render_without_panicking() {
         // Empty roster.
         let empty = charts_report(&[], &[]);
-        let out = render_charts(&empty, 80, true, false);
+        let out = render_charts(&empty, 80, true, false, None);
         assert!(out.contains("no per-account usage in this window"));
         assert!(out.contains("roster:"));
 
         // A single account with a single sample and no series buckets.
         let single = charts_report(&[("solo", stat(1, ds(0.5, 0.5, 0.5), 0.5, 1.0))], &[]);
-        let _ = render_charts(&single, 80, true, false);
-        let _ = render_charts(&single, 1, true, true);
+        let _ = render_charts(&single, 80, true, false, None);
+        let _ = render_charts(&single, 1, true, true, None);
 
         // An account present in the summary but a GAP in every series bucket.
         let all_gap = charts_report(
             &[("ghost", stat(1, ds(0.0, 0.0, 0.0), 0.0, 0.0))],
             &[&[], &[]],
         );
-        let out = render_charts(&all_gap, 80, false, false);
+        let out = render_charts(&all_gap, 80, false, false, None);
         assert!(
             out.contains("ghost"),
             "an all-gap account still lists, its trend all breaks"
         );
         // A pathological width of 0 must not panic either.
-        let _ = render_charts(&two_account_charts(), 0, true, true);
+        let _ = render_charts(&two_account_charts(), 0, true, true, None);
     }
 
     /// A minimal reading: `provider="claude"`, given `acct`, no optionals.
@@ -4495,7 +4629,7 @@ mod tests {
 
     #[test]
     fn text_render_has_the_echo_a_table_and_a_roster_line_but_no_glyphs() {
-        let out = render_text(&report_fixture());
+        let out = render_text(&report_fixture(), None);
         assert!(
             out.starts_with("usage — last 24h ("),
             "leads with the window echo"
@@ -4529,17 +4663,20 @@ mod tests {
         water: f64,
         period_secs: i64,
     ) -> String {
-        roster_line(&UsageReport {
-            period: Period::new(0, period_secs),
-            per_account: BTreeMap::new(),
-            roster: RosterStats {
-                all_high_episodes: episodes,
-                all_high_secs: secs,
-                all_high_covered_secs: covered,
-                high_threshold: water,
-                ..Default::default()
+        roster_line(
+            &UsageReport {
+                period: Period::new(0, period_secs),
+                per_account: BTreeMap::new(),
+                roster: RosterStats {
+                    all_high_episodes: episodes,
+                    all_high_secs: secs,
+                    all_high_covered_secs: covered,
+                    high_threshold: water,
+                    ..Default::default()
+                },
             },
-        })
+            true,
+        )
     }
 
     // --- issue #803: the capacity-holds cell ------------------------------------------
@@ -4547,20 +4684,23 @@ mod tests {
     /// A roster line from a capacity-holds census with the given figures, over a
     /// [`CENSUS_WINDOW`] period at the shipping-default boundary (0.80 session / 0.97 weekly).
     fn capacity_line(holds: u32, session: u32, weekly: u32, secs: i64, covered: i64) -> String {
-        roster_line(&UsageReport {
-            period: Period::new(0, CENSUS_WINDOW),
-            per_account: BTreeMap::new(),
-            roster: RosterStats {
-                capacity_holds: holds,
-                capacity_holds_session: session,
-                capacity_holds_weekly: weekly,
-                capacity_hold_secs_lower_bound: secs,
-                capacity_hold_covered_secs: covered,
-                capacity_session_line: 0.80,
-                capacity_weekly_line: 0.97,
-                ..Default::default()
+        roster_line(
+            &UsageReport {
+                period: Period::new(0, CENSUS_WINDOW),
+                per_account: BTreeMap::new(),
+                roster: RosterStats {
+                    capacity_holds: holds,
+                    capacity_holds_session: session,
+                    capacity_holds_weekly: weekly,
+                    capacity_hold_secs_lower_bound: secs,
+                    capacity_hold_covered_secs: covered,
+                    capacity_session_line: 0.80,
+                    capacity_weekly_line: 0.97,
+                    ..Default::default()
+                },
             },
-        })
+            true,
+        )
     }
 
     #[test]
@@ -4619,19 +4759,22 @@ mod tests {
         // positional `≥80%/≥97%` pair would re-introduce in the render the silent transposition
         // `ViabilityBoundary` is a named struct to prevent. A non-default, ASYMMETRIC boundary
         // proves each number is bound to its own dimension rather than to its position.
-        let line = roster_line(&UsageReport {
-            period: Period::new(0, CENSUS_WINDOW),
-            per_account: BTreeMap::new(),
-            roster: RosterStats {
-                capacity_holds: 1,
-                capacity_holds_session: 1,
-                capacity_hold_secs_lower_bound: 60,
-                capacity_hold_covered_secs: CENSUS_WINDOW,
-                capacity_session_line: 0.55,
-                capacity_weekly_line: 0.91,
-                ..Default::default()
+        let line = roster_line(
+            &UsageReport {
+                period: Period::new(0, CENSUS_WINDOW),
+                per_account: BTreeMap::new(),
+                roster: RosterStats {
+                    capacity_holds: 1,
+                    capacity_holds_session: 1,
+                    capacity_hold_secs_lower_bound: 60,
+                    capacity_hold_covered_secs: CENSUS_WINDOW,
+                    capacity_session_line: 0.55,
+                    capacity_weekly_line: 0.91,
+                    ..Default::default()
+                },
             },
-        });
+            true,
+        );
         assert!(
             line.contains("capacity holds (session ≥55%, weekly ≥91%):"),
             "each line is named by its own dimension: {line}"
@@ -4666,22 +4809,25 @@ mod tests {
         // capacity fact beside it reads a measured hold. They are separate facts over separate
         // denominators (issue #803 vs #804), and merging or substituting one for the other is
         // exactly the defect that left a 95-hold week reading as calm.
-        let line = roster_line(&UsageReport {
-            period: Period::new(0, CENSUS_WINDOW),
-            per_account: BTreeMap::new(),
-            roster: RosterStats {
-                all_high_covered_secs: 0, // census unmeasurable
-                high_threshold: 0.95,
-                capacity_holds: 5,
-                capacity_holds_session: 4,
-                capacity_holds_weekly: 1,
-                capacity_hold_secs_lower_bound: 99_435,
-                capacity_hold_covered_secs: CENSUS_WINDOW, // capacity measured
-                capacity_session_line: 0.80,
-                capacity_weekly_line: 0.97,
-                ..Default::default()
+        let line = roster_line(
+            &UsageReport {
+                period: Period::new(0, CENSUS_WINDOW),
+                per_account: BTreeMap::new(),
+                roster: RosterStats {
+                    all_high_covered_secs: 0, // census unmeasurable
+                    high_threshold: 0.95,
+                    capacity_holds: 5,
+                    capacity_holds_session: 4,
+                    capacity_holds_weekly: 1,
+                    capacity_hold_secs_lower_bound: 99_435,
+                    capacity_hold_covered_secs: CENSUS_WINDOW, // capacity measured
+                    capacity_session_line: 0.80,
+                    capacity_weekly_line: 0.97,
+                    ..Default::default()
+                },
             },
-        });
+            true,
+        );
         assert!(
             line.contains("all-accounts-high (≥95%): — ·"),
             "census UNKNOWN: {line}"
@@ -4807,7 +4953,7 @@ mod tests {
         );
         assert_eq!(over_roster.summary.roster.all_high_covered_secs, 0);
         assert!(
-            render_text(&over_roster).contains("all-accounts-high (≥80%): —"),
+            render_text(&over_roster, None).contains("all-accounts-high (≥80%): —"),
             "an unobserved rostered account leaves the census UNKNOWN"
         );
         // The SERIES buckets take the roster too, not just the summary. Asserted on
@@ -4834,6 +4980,345 @@ mod tests {
                 .any(|b| b.roster.all_high_covered_secs > 0),
             "the fallback reaches the buckets too — so the assertion above is a real gate on \
              the pass-through, not a summary-only one that a `None` bucket would still pass"
+        );
+    }
+
+    // --- issue #836: the human render says WHICH regime produced the census ------------
+
+    /// A census that FIRED — an episode over a fully-covered day — rendered under the given
+    /// regime. The fired branch is the one whose number can be misread, so it is the branch
+    /// every regime assertion below is measured on.
+    fn fired_census_line(census_over_roster: bool) -> String {
+        roster_line(
+            &UsageReport {
+                period: Period::new(0, CENSUS_WINDOW),
+                per_account: BTreeMap::new(),
+                roster: RosterStats {
+                    all_high_episodes: 3,
+                    all_high_secs: 6_000,
+                    all_high_covered_secs: CENSUS_WINDOW,
+                    high_threshold: 0.95,
+                    ..Default::default()
+                },
+            },
+            census_over_roster,
+        )
+    }
+
+    #[test]
+    fn a_fired_census_names_its_set_only_when_the_roster_was_unknown() {
+        // THE reported defect: issue #804 gave the census two regimes that print the same
+        // bytes. The degraded one drops an unsampled account from the intersection, so it fires
+        // on strictly less evidence — the direction REQ-STA-B-005's amendment forbids — and a
+        // reader holding the number could not tell which one produced it.
+        let configured = fired_census_line(true);
+        assert!(
+            configured.contains("all-accounts-high (≥95%): 3 episodes (1h40m)"),
+            "the configured regime is the norm and stays unqualified: {configured}"
+        );
+        assert!(
+            !configured.contains("sampled accounts"),
+            "no qualifier when the census DID intersect the configured roster: {configured}"
+        );
+
+        // Asserted as ONE contiguous string, which pins PLACEMENT as well as presence:
+        // placement is load-bearing, not cosmetic. The roster line is what a reader greps out
+        // (`stats | grep all-accounts-high`), so a qualifier rendered anywhere else — its own
+        // line, a footer, the neighbouring `·` cell — is separable from the number it qualifies
+        // by exactly the command operators actually run, and would fail here.
+        let degraded = fired_census_line(false);
+        assert!(
+            degraded.contains("all-accounts-high (≥95%, sampled accounts): 3 episodes (1h40m)"),
+            "the degraded regime names its set beside its water: {degraded}"
+        );
+        // The whole degraded line is neutral vocabulary (issue #160 / SUR-001). The qualifier
+        // is authored English on the human surface, so it answers to the same framing guard
+        // every other rendered string here does.
+        assert_eq!(
+            scan_banned(&degraded),
+            None,
+            "the set qualifier must not editorialise: {degraded}"
+        );
+    }
+
+    #[test]
+    fn an_untaken_census_states_no_set_under_either_regime() {
+        // `—` is the UNKNOWN sentinel: it carries no confident number to misread and reads the
+        // same under both regimes ("I could not see"), so naming the set there would describe a
+        // measurement that never happened — the same reason `capacity_holds_cell` withholds its
+        // boundary from this branch. It would also put a permanent qualifier on every
+        // pre-`capture` render, which has no roster and nothing to report.
+        for regime in [true, false] {
+            let line = roster_line(
+                &UsageReport {
+                    period: Period::new(0, CENSUS_WINDOW),
+                    per_account: BTreeMap::new(),
+                    roster: RosterStats {
+                        all_high_covered_secs: 0,
+                        high_threshold: 0.95,
+                        ..Default::default()
+                    },
+                },
+                regime,
+            );
+            assert!(
+                line.contains("all-accounts-high (≥95%): — ·"),
+                "an untaken census renders `—` with no set, regime={regime}: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_config_caveat_carries_the_wire_reason_verbatim_and_only_when_there_is_one() {
+        // One fact, one string: the human surface and `--json` must not describe the same
+        // config failure two different ways, so the caveat prints exactly what
+        // `wire_config_reason` puts on the wire for issue #642 — which is also what makes it
+        // safe to print here, since a `&'static str` cannot carry a byte of the operator's
+        // `config.toml`.
+        let reason = wire_config_reason(&Error::ConfigParse("x".into()));
+        let line = config_regime_line(Some(reason)).expect("a malformed config yields a caveat");
+        assert!(line.contains(reason), "the wire reason, verbatim: {line}");
+        assert!(
+            line.starts_with("all-accounts-high "),
+            "leads with the metric it qualifies, so one grep catches the caveat AND the \
+             number: {line}"
+        );
+        assert!(
+            line.contains("fires more readily"),
+            "states the DIRECTION of the bias, which is the operator-actionable half: {line}"
+        );
+        assert!(
+            line.ends_with('\n'),
+            "a whole line, so the caller never has to append one: {line}"
+        );
+        // EVERY reason arm, against the #160 / SUR-001 framing guard. Until this change those
+        // strings were wire-and-stderr only, and the `--json` scan covers KEYS, not values — so
+        // this is the first gate any of them has ever answered to as authored ENGLISH on a human
+        // surface, alongside the caveat sentence they are composed into.
+        for err in [
+            Error::ConfigParse("x".into()),
+            Error::ConfigInvalid("x".into()),
+            Error::Io(std::io::Error::other("x")),
+        ] {
+            let arm = config_regime_line(Some(wire_config_reason(&err))).expect("a caveat");
+            assert_eq!(
+                scan_banned(&arm),
+                None,
+                "the caveat must not editorialise, whichever reason it carries: {arm}"
+            );
+        }
+        // A readable — or ABSENT — config leaves no trace. The absent case is the normal
+        // pre-`capture` state issue #627 deliberately keeps silent; its regime is already
+        // stated by the roster line's own qualifier, which needs no config to be true.
+        assert!(config_regime_line(None).is_none());
+    }
+
+    /// A report whose census actually FIRED, built through [`build_report`] under the given
+    /// regime over the SAME samples — so the only difference between the two renders is the
+    /// annotation itself, not a number that moved underneath it. A single rostered account
+    /// makes the two censuses numerically identical by construction (the sampled set IS the
+    /// roster), which is what isolates the annotation as the sole variable.
+    fn fired_report(census_over_roster: bool) -> Report {
+        let now = epoch("2026-07-01T12:00:00Z");
+        let store = data(
+            vec![
+                sample(now - 600, "alpha", 0.97, 0.4),
+                sample(now - 400, "alpha", 0.98, 0.45),
+            ],
+            "",
+        );
+        let window = plan_window(Some("day"), None, now, &store).unwrap();
+        let roster: BTreeSet<String> = ["alpha"].iter().map(|h| (*h).to_owned()).collect();
+        build_report(
+            &store,
+            window,
+            vec![],
+            census_over_roster.then_some(&roster),
+            &params(),
+            0,
+        )
+    }
+
+    #[test]
+    fn both_human_surfaces_state_the_regime_not_just_the_piped_one() {
+        // `render_charts` had exactly the same blind spot as `render_text`, and the issue's
+        // example named only the latter. A fix that covered one surface would leave the metric
+        // unannotated on the interactive TTY — the surface an operator actually watches.
+        let degraded = fired_report(false);
+        assert!(
+            degraded.summary.roster.all_high_covered_secs > 0,
+            "the fixture's census really fired — else every assertion below rides the `—` \
+             branch and gates nothing"
+        );
+        let reason = wire_config_reason(&Error::ConfigInvalid("x".into()));
+        let piped = render_text(&degraded, Some(reason));
+        let charts = render_charts(&degraded, 100, false, false, Some(reason));
+        for (surface, out) in [("piped", &piped), ("charts", &charts)] {
+            assert!(
+                out.contains("sampled accounts"),
+                "{surface} names the census's set: {out}"
+            );
+            assert!(out.contains(reason), "{surface} carries the reason: {out}");
+            // Directly ABOVE the line it qualifies, so it is read BEFORE the number rather
+            // than as a footnote correcting a reading already taken.
+            let caveat = out
+                .find("all-accounts-high fires more readily")
+                .expect("the caveat is present");
+            let roster = out.find("\nroster: ").expect("the roster line is present");
+            assert!(
+                caveat < roster,
+                "{surface} places the caveat above the roster line: {out}"
+            );
+            assert!(
+                !out[caveat..roster].contains('\n'),
+                "{surface} keeps the bottom block contiguous — nothing, not even a blank \
+                 line, between the caveat and what it qualifies: {out}"
+            );
+        }
+        // And the CONFIGURED regime with a readable config renders exactly as it always did:
+        // the annotation is purely additive, which is why no committed golden moved.
+        let normal = fired_report(true);
+        for out in [
+            render_text(&normal, None),
+            render_charts(&normal, 100, false, false, None),
+        ] {
+            assert!(!out.contains("sampled accounts"), "unqualified: {out}");
+            assert!(!out.contains("fires more readily"), "no caveat: {out}");
+        }
+    }
+
+    #[test]
+    fn the_accountless_charts_branch_is_annotated_too_not_just_the_populated_one() {
+        // `render_charts` returns EARLY when no account survives the filter, and that branch
+        // renders its own footer — so the annotation added to the main path does not reach it.
+        // Severing either the caveat or the qualifier there left the whole suite green, which is
+        // exactly the hole `run_output`'s injected-config seam exists to refuse elsewhere.
+        //
+        // Production-reachable, and it is the case an operator most needs: `--account` matching
+        // nothing empties `per_account` while `summary.roster` — computed by
+        // `aggregate_with_roster` BEFORE `apply_filter` — keeps its measured census. A fresh
+        // install with a malformed `config.toml` lands here too, where this caveat is the only
+        // thing on stdout saying the config is broken.
+        let measured = UsageReport {
+            period: Period::new(0, CENSUS_WINDOW),
+            per_account: BTreeMap::new(), // filtered away — the early-return branch
+            roster: RosterStats {
+                all_high_episodes: 2,
+                all_high_secs: 900,
+                all_high_covered_secs: CENSUS_WINDOW, // …but the census WAS taken
+                high_threshold: 0.95,
+                ..Default::default()
+            },
+        };
+        let report = Report {
+            summary: measured.clone(),
+            series: vec![measured],
+            census_over_roster: false,
+            ..fired_report(false)
+        };
+        let reason = wire_config_reason(&Error::Io(std::io::Error::other("x")));
+        let out = render_charts(&report, 100, false, false, Some(reason));
+        assert!(
+            out.contains("no per-account usage in this window"),
+            "the fixture really takes the early-return branch — else this gates the main path \
+             a second time and the hole stays open: {out}"
+        );
+        assert!(
+            out.contains("all-accounts-high (≥95%, sampled accounts): 2 episodes"),
+            "the accountless branch names the census's set: {out}"
+        );
+        assert!(out.contains(reason), "…and carries the reason: {out}");
+    }
+
+    #[test]
+    fn build_report_records_the_set_the_census_actually_intersected() {
+        // The carrier is read off the very `roster` argument `aggregate_with_roster` consumed,
+        // not re-derived from the caller's `Config` one hop earlier — so a render that states
+        // the regime cannot drift from the census that produced the number.
+        let now = 1_000_000;
+        let store = data(vec![sample(now - 600, "alpha", 0.96, 0.1)], "");
+        let window = plan_window(None, None, now, &store).unwrap();
+        let configured: BTreeSet<String> = ["alpha"].iter().map(|h| (*h).to_owned()).collect();
+
+        assert!(
+            build_report(
+                &store,
+                window.clone(),
+                vec![],
+                Some(&configured),
+                &params(),
+                0
+            )
+            .census_over_roster,
+            "a known roster IS the configured regime"
+        );
+        assert!(
+            !build_report(&store, window, vec![], None, &params(), 0).census_over_roster,
+            "no roster IS the degraded regime — the case issue #804 documented as the fallback"
+        );
+    }
+
+    #[test]
+    fn the_cli_run_path_wires_the_regime_all_the_way_to_the_human_render() {
+        // The CLI's OWN call site, not just the seam it calls — the human-render sibling of
+        // `the_cli_run_path_wires_the_signal_all_the_way_to_stdout`, and for the same reason:
+        // `run` reads the AMBIENT config, so without driving `run_output` the whole annotation
+        // could be severed at the `render_human` call site with every test above still green.
+        // Both halves ride this one path: a malformed config yields no roster (hence the set
+        // qualifier) AND a reason (hence the caveat).
+        let dir = tempfile::tempdir().unwrap();
+        let bad = malformed_config(
+            dir.path(),
+            "cli-human.toml",
+            "[tunables]\nsession_trigger = 50\n",
+        );
+        let now = epoch("2026-07-08T00:00:00Z");
+        // Two readings above the default water, close enough to be jointly covered, so the
+        // census actually FIRES — the branch that carries the qualifier. A window with no
+        // episode would render `—` and pass this test while gating nothing.
+        let store = data(
+            vec![
+                sample(now - 600, "work", 0.97, 0.3),
+                sample(now - 300, "work", 0.98, 0.3),
+            ],
+            "",
+        );
+        let human_args = || StatsArgs {
+            accounts: Vec::new(),
+            period: Some("week".to_owned()),
+            since: None,
+            json: false,
+            no_color: true,
+            ascii: true,
+        };
+
+        let out = run_output(human_args(), &store, now, 0, || Config::load_path(&bad)).unwrap();
+        assert!(
+            out.contains("sampled accounts"),
+            "the human render names the degraded census's set: {out}"
+        );
+        assert!(
+            out.contains(wire_config_reason(&Config::load_path(&bad).unwrap_err())),
+            "…and the reason, which until now reached only `--json` and stderr: {out}"
+        );
+
+        // The healthy counterpart over the SAME path leaves no trace of either annotation — a
+        // roster the census could intersect, and nothing to explain.
+        let good = dir.path().join("good.toml");
+        std::fs::write(
+            &good,
+            "[[account]]\naccount_uuid = \"u-1\"\nlabel = \"work\"\n",
+        )
+        .unwrap();
+        let clean = run_output(human_args(), &store, now, 0, || Config::load_path(&good)).unwrap();
+        assert!(
+            !clean.contains("sampled accounts") && !clean.contains("fires more readily"),
+            "a readable config renders the configured regime, unannotated: {clean}"
+        );
+        assert!(
+            clean.contains("all-accounts-high (≥"),
+            "…and still renders the census itself, so the assertion above is not passing on \
+             an empty render: {clean}"
         );
     }
 
@@ -4867,7 +5352,7 @@ mod tests {
             &params(),
             0,
         );
-        let out = render_text(&report);
+        let out = render_text(&report, None);
         assert!(out.contains("no per-account usage in this window"));
         assert!(out.contains("0 swaps"));
         // JSON of an empty window is still a valid schema:1 document.
@@ -5012,6 +5497,7 @@ mod tests {
             offset: 0,
             orphans: BTreeMap::new(),
             velocity: BTreeMap::new(),
+            census_over_roster: true,
         }
     }
 
@@ -5226,12 +5712,12 @@ mod tests {
     #[test]
     fn summary_band_shows_in_both_human_views_but_never_on_the_json_wire() {
         // Human surfaces (numeric text + charts) both foot with the aggregate roster block.
-        let text = render_text(&report_fixture());
+        let text = render_text(&report_fixture(), None);
         assert!(
             text.contains("lowest utilisation:"),
             "the numeric text carries the roster block"
         );
-        let charts = render_charts(&two_account_charts(), 60, false, false);
+        let charts = render_charts(&two_account_charts(), 60, false, false, None);
         assert!(
             charts.contains("lowest utilisation:"),
             "the charts view carries the roster block"
@@ -5267,8 +5753,8 @@ mod tests {
         for report in [&three, &single, &all_gap] {
             for surface in [
                 render_summary(report),
-                render_text(report),
-                render_charts(report, 80, true, false),
+                render_text(report, None),
+                render_charts(report, 80, true, false, None),
             ] {
                 assert_eq!(
                     scan_banned(&surface),
@@ -5288,7 +5774,7 @@ mod tests {
         // test would FAIL if editorialising copy ever slipped in. Injected into the numeric text
         // (which carries the `signal` column word `balanced`), the aggregate band having no
         // per-account signal list to poison.
-        let poisoned = render_text(&three).replace("balanced", "upgrade");
+        let poisoned = render_text(&three, None).replace("balanced", "upgrade");
         assert_eq!(
             scan_banned(&poisoned),
             Some("upgrade"),
@@ -5371,7 +5857,7 @@ mod tests {
         // Human: velocity + runway are TABLE COLUMNS now (§D-STA-5) — the header carries both and
         // the `work` row its neutral %/min rate + approximate SESSION head-room (`~2h`), facts not
         // advice. (The weekly head-room feeds the aggregate fleet line, not the per-row cell.)
-        let text = render_text(&report);
+        let text = render_text(&report, None);
         assert!(text.contains("velocity"), "velocity column header: {text}");
         assert!(text.contains("runway"), "runway column header: {text}");
         assert!(text.contains("0.2%/min"), "the neutral rate cell: {text}");
@@ -5409,7 +5895,7 @@ mod tests {
             ],
             now,
         );
-        let text = render_text(&report);
+        let text = render_text(&report, None);
         // The per-row runway cell is the SESSION head-room (`~2h`); the WEEKLY head-room feeds the
         // aggregate fleet line (§D-STA-5 — weekly per-account is not a per-row cell), on day scale.
         assert!(text.contains("~2h"), "session head-room cell: {text}");
@@ -5444,7 +5930,7 @@ mod tests {
             ],
             now,
         );
-        let text = render_text(&report);
+        let text = render_text(&report, None);
         // The velocity cell reads the KNOWN zero; the runway column — uniformly `—` across the
         // fleet (no finite head-room) — elides entirely (§D-STA-5 empty-column elision).
         assert!(text.contains("0.0%/min"), "known zero rate cell: {text}");
@@ -5470,7 +5956,7 @@ mod tests {
         // AC's permitted "null / absent" — never a fabricated rate).
         let now = epoch("2026-07-01T12:00:00Z");
         let report = velocity_report(vec![sample(now - 300, "work", 0.60, 0.30)], now);
-        let text = render_text(&report);
+        let text = render_text(&report, None);
         assert!(
             text.contains("work"),
             "the account still appears in the table"
@@ -5509,7 +5995,7 @@ mod tests {
             ],
             now,
         );
-        let text = render_text(&report);
+        let text = render_text(&report, None);
         assert!(
             !text.contains("velocity"),
             "a stale reading shows no velocity column (elided): {text}"
@@ -5552,13 +6038,13 @@ mod tests {
         // velocity column (it is not width-degraded); every surface — the aggregate band included —
         // stays neutral.
         assert!(
-            render_text(&report).contains("velocity"),
+            render_text(&report, None).contains("velocity"),
             "the piped table carries the velocity column"
         );
         for surface in [
             render_summary(&report),
-            render_text(&report),
-            render_charts(&report, 80, true, false),
+            render_text(&report, None),
+            render_charts(&report, 80, true, false, None),
         ] {
             assert_eq!(
                 scan_banned(&surface),
@@ -5639,7 +6125,7 @@ mod tests {
 
         // Human: the roster block foots with ONE approximate, neutral fleet figure + the n-of-m
         // cardinality (§D-STA-5 — an aggregate line, 2-space indented, no per-account `fleet` prefix).
-        let text = render_text(&report);
+        let text = render_text(&report, None);
         assert!(
             text.contains("  accounts last ~2 days at the current combined rate (2 of 3 counted)"),
             "fleet line: {text}"
@@ -5739,7 +6225,7 @@ mod tests {
             "no combined burn → unknown runway"
         );
         assert!(
-            !render_text(&flat).contains("fleet  "),
+            !render_text(&flat, None).contains("fleet  "),
             "no fleet line without a figure"
         );
         let v: serde_json::Value =
@@ -5769,7 +6255,7 @@ mod tests {
             fleet_runway(&thin).is_none(),
             "nothing countable → no fleet"
         );
-        assert!(!render_text(&thin).contains("fleet  "));
+        assert!(!render_text(&thin, None).contains("fleet  "));
         let v2: serde_json::Value =
             serde_json::from_str(&render_json(&thin, None).unwrap()).unwrap();
         assert!(
@@ -5909,8 +6395,8 @@ mod tests {
         // own "no per-account usage" line, never a panic.
         let empty = charts_report(&[], &[]);
         assert_eq!(render_summary(&empty), "");
-        let _ = render_text(&empty);
-        let _ = render_charts(&empty, 80, true, false);
+        let _ = render_text(&empty, None);
+        let _ = render_charts(&empty, 80, true, false, None);
 
         // A single account is its own lowest-utilisation pick. The band is AGGREGATE-ONLY now
         // (§D-STA-5) — the per-account `signal` word is a table column, not a band entry.
@@ -5985,7 +6471,7 @@ mod tests {
     #[test]
     fn text_lists_non_roster_handles_in_a_separate_section() {
         let live = roster(&["work", "spare"]);
-        let out = render_text(&orphan_report(Some(&live)));
+        let out = render_text(&orphan_report(Some(&live)), None);
         // Two orphans get their own counted, labelled section.
         assert!(
             out.contains("not in roster (2):"),
@@ -6016,7 +6502,7 @@ mod tests {
     #[test]
     fn charts_exclude_orphans_from_peer_charts_and_name_them_in_a_footer() {
         let live = roster(&["work", "spare"]);
-        let out = render_charts(&orphan_report(Some(&live)), 120, false, false);
+        let out = render_charts(&orphan_report(Some(&live)), 120, false, false, None);
         // A compact, counted footer names the orphans.
         assert!(
             out.contains("not in roster (2): "),
@@ -6092,7 +6578,7 @@ mod tests {
     fn absent_roster_leaves_every_handle_in_the_main_table() {
         // No config / roster (None) → no partition: every handle stays a live row, no section
         // — a pre-`capture` `stats` reads exactly as before roster-awareness.
-        let out = render_text(&orphan_report(None));
+        let out = render_text(&orphan_report(None), None);
         assert!(
             !out.contains("not in roster"),
             "no orphan section without a roster:\n{out}"
@@ -6117,7 +6603,7 @@ mod tests {
         let report = orphan_report(Some(&empty));
         assert_eq!(report.summary.per_account.len(), 0, "no live accounts");
         assert_eq!(report.orphans.len(), 4, "every handle is an orphan");
-        let out = render_text(&report);
+        let out = render_text(&report, None);
         assert!(
             out.contains("not in roster (4):"),
             "all four surface in the section:\n{out}"
@@ -6178,7 +6664,7 @@ mod tests {
         // `render_charts` takes its `no per-account usage` early return. That path must still
         // surface the orphan footer (and never call the peer chart sub-renderers).
         let empty = roster(&[]);
-        let out = render_charts(&orphan_report(Some(&empty)), 120, false, false);
+        let out = render_charts(&orphan_report(Some(&empty)), 120, false, false, None);
         assert!(
             out.contains("no per-account usage in this window"),
             "no LIVE accounts:\n{out}"
@@ -6223,7 +6709,7 @@ mod tests {
             report.orphans.contains_key("backup"),
             "the filtered-to handle is the orphan"
         );
-        let out = render_text(&report);
+        let out = render_text(&report, None);
         assert!(
             out.contains("not in roster (1):"),
             "shown, honestly, as an orphan:\n{out}"
@@ -6956,7 +7442,33 @@ mod tests {
                 ]
                 .into_iter()
                 .collect(),
+                // The CONFIGURED regime — every golden derived from this fixture pins the
+                // un-annotated render, so the degraded one gets its own case (issue #836).
+                census_over_roster: true,
             }
+        }
+
+        /// The same roster under the DEGRADED census regime (issue #836): no configured roster
+        /// was known, so the census intersected whoever held samples and fires more readily.
+        ///
+        /// Goldened because the whole point of issue #836 is that the two regimes used to print
+        /// IDENTICAL bytes over identical data — which is exactly the corruption a substring
+        /// assertion cannot see and a whole-output golden can. Every other `stats` case pins
+        /// the CONFIGURED regime, so this one is the other half of the pair: diff it against
+        /// `stats-piped` / `stats-wide-unicode-plain` and the only delta is the annotation.
+        fn fallback_census_report() -> Report {
+            Report {
+                census_over_roster: false,
+                ..golden_report()
+            }
+        }
+
+        /// The malformed-config reason the degraded goldens carry — the SAME static string
+        /// [`wire_config_reason`] puts on the wire for issue #642, taken through that function
+        /// rather than hand-written so a reworded reason moves the golden and is reviewed,
+        /// instead of the golden silently pinning a string the wire no longer emits.
+        fn fallback_census_reason() -> &'static str {
+            wire_config_reason(&Error::ConfigParse("golden".into()))
         }
 
         /// The same roster with the velocity overlay ABSENT — a "sparse fleet". Every
@@ -7135,38 +7647,59 @@ mod tests {
             vec![
                 // Piped / not a TTY: `cols` is `None`, so `render_human` takes the
                 // `render_text` branch — the WIDER numeric column set, zero ANSI, no charts.
-                Case::new("stats-piped", render_human(&full, PIPED)),
+                Case::new("stats-piped", render_human(&full, PIPED, None)),
                 // A wide TTY: the full chart surface, in each of the three glyph/colour modes.
                 Case::new(
                     "stats-wide-unicode-plain",
-                    render_human(&full, WIDE_UNICODE_PLAIN),
+                    render_human(&full, WIDE_UNICODE_PLAIN, None),
                 ),
                 Case::new(
                     "stats-wide-unicode-color",
-                    render_human(&full, WIDE_UNICODE_COLOR),
+                    render_human(&full, WIDE_UNICODE_COLOR, None),
                 ),
-                Case::new("stats-wide-ascii", render_human(&full, WIDE_ASCII)),
+                Case::new("stats-wide-ascii", render_human(&full, WIDE_ASCII, None)),
                 // Narrow: the lowest-priority columns shed and the wide blocks shrink.
-                Case::new("stats-narrow", render_human(&full, NARROW)),
+                Case::new("stats-narrow", render_human(&full, NARROW, None)),
                 // Very narrow: only the floor remains, OVERFLOWING rather than wrapping.
-                Case::new("stats-very-narrow", render_human(&full, VERY_NARROW)),
+                Case::new("stats-very-narrow", render_human(&full, VERY_NARROW, None)),
                 // Sparse fleet: the empty-column elision self-drops `velocity` + `runway`.
                 Case::new(
                     "stats-sparse-fleet",
-                    render_human(&report_without_velocity(), WIDE_UNICODE_PLAIN),
+                    render_human(&report_without_velocity(), WIDE_UNICODE_PLAIN, None),
                 ),
                 // Degenerate rosters.
                 Case::new(
                     "stats-empty-roster",
-                    render_human(&empty_report(), WIDE_UNICODE_PLAIN),
+                    render_human(&empty_report(), WIDE_UNICODE_PLAIN, None),
                 ),
                 Case::new(
                     "stats-single-account",
-                    render_human(&single_report(), WIDE_UNICODE_PLAIN),
+                    render_human(&single_report(), WIDE_UNICODE_PLAIN, None),
                 ),
                 Case::new(
                     "stats-all-na",
-                    render_human(&all_unobserved_report(), WIDE_UNICODE_PLAIN),
+                    render_human(&all_unobserved_report(), WIDE_UNICODE_PLAIN, None),
+                ),
+                // The DEGRADED census regime (issue #836), on BOTH human surfaces — the charts
+                // view had the same blind spot as the numeric one, so goldening only the piped
+                // case would leave the TTY free to regress. Same report as `stats-piped` /
+                // `stats-wide-unicode-plain` above, so the diff between the pairs is exactly
+                // the annotation and nothing else.
+                Case::new(
+                    "stats-fallback-census-piped",
+                    render_human(
+                        &fallback_census_report(),
+                        PIPED,
+                        Some(fallback_census_reason()),
+                    ),
+                ),
+                Case::new(
+                    "stats-fallback-census-wide",
+                    render_human(
+                        &fallback_census_report(),
+                        WIDE_UNICODE_PLAIN,
+                        Some(fallback_census_reason()),
+                    ),
                 ),
             ]
         }
@@ -7185,6 +7718,8 @@ mod tests {
             "stats-empty-roster",
             "stats-single-account",
             "stats-all-na",
+            "stats-fallback-census-piped",
+            "stats-fallback-census-wide",
         ];
 
         /// One-time emitter for the committed `stats` render goldens (issue #767).
@@ -7226,8 +7761,8 @@ mod tests {
             render_golden::assert_perturbed_input_is_rejected(
                 "stats",
                 "stats-piped",
-                &render_human(&golden_report(), PIPED),
-                &render_human(&perturbed, PIPED),
+                &render_human(&golden_report(), PIPED, None),
+                &render_human(&perturbed, PIPED, None),
             );
         }
 
@@ -7239,7 +7774,7 @@ mod tests {
         #[test]
         fn each_stats_case_exercises_the_axis_it_claims() {
             let full = golden_report();
-            let render = |term| render_human(&full, term);
+            let render = |term| render_human(&full, term, None);
 
             // WIDTH: each step must shed at least one more column than the last.
             let header_cols = |term| {
@@ -7301,7 +7836,7 @@ mod tests {
 
             // ELISION: the sparse fleet must actually LOSE the two columns the populated
             // fixture carries — otherwise `stats-sparse-fleet` is a second copy of the wide case.
-            let sparse = render_human(&report_without_velocity(), WIDE_UNICODE_PLAIN);
+            let sparse = render_human(&report_without_velocity(), WIDE_UNICODE_PLAIN, None);
             for column in ["velocity", "runway"] {
                 assert!(
                     unicode.contains(column),
@@ -7319,10 +7854,10 @@ mod tests {
             // two halves — a DROPPABLE all-gap column goes, a FLOOR one stays and prints the
             // sentinel. Without this assertion the golden could not distinguish "the roster is
             // unmeasured" from "the roster is absent", which are different facts.
-            let all_na = render_human(&all_unobserved_report(), WIDE_UNICODE_PLAIN);
+            let all_na = render_human(&all_unobserved_report(), WIDE_UNICODE_PLAIN, None);
             assert_ne!(
                 all_na,
-                render_human(&empty_report(), WIDE_UNICODE_PLAIN),
+                render_human(&empty_report(), WIDE_UNICODE_PLAIN, None),
                 "an all-unobserved roster renders identically to an EMPTY one — the render is \
                  conflating `we measured nothing about these accounts` with `there are no \
                  accounts`"
@@ -7346,6 +7881,48 @@ mod tests {
                 "the FLOOR column `signal` was elided when every one of its cells was a gap — a \
                  keep-column must never be elided, however empty"
             );
+
+            // REGIME (issue #836): the fallback pair claims to differ from its configured twin
+            // by EXACTLY the two annotations, over the same report — and each annotation has to
+            // be asserted on its own. The pair is wired five lines from the correct call, so
+            // half of it can be mis-wired to `golden_report()` / `None`; the render then still
+            // differs from the twin by whichever annotation survived, and a whole-render
+            // `assert_ne!` passes while the golden pins one annotation under the name of two.
+            //
+            // Read off the CASES rather than re-derived like the axes above: this cell's inputs
+            // are two independent arguments (which report, which reason), so re-rendering them
+            // here would assert the render and never the wiring — which is the half that can
+            // actually be wrong.
+            let all = cases();
+            let caveat =
+                config_regime_line(Some(fallback_census_reason())).expect("a reason, a caveat");
+            for (name, twin_name) in [
+                ("stats-fallback-census-piped", "stats-piped"),
+                ("stats-fallback-census-wide", "stats-wide-unicode-plain"),
+            ] {
+                let fallback = render_golden::rendered(&all, name);
+                let twin = render_golden::rendered(&all, twin_name);
+                for annotation in [caveat.as_str(), ", sampled accounts"] {
+                    assert!(
+                        fallback.contains(annotation),
+                        "`{name}` is missing `{annotation}` — its golden pins the un-annotated \
+                         render under the regime's name"
+                    );
+                    assert!(
+                        !twin.contains(annotation),
+                        "`{twin_name}` already carries `{annotation}`, so the pair no longer \
+                         isolates the regime"
+                    );
+                }
+                assert_eq!(
+                    fallback
+                        .replace(&caveat, "")
+                        .replace(", sampled accounts", ""),
+                    twin,
+                    "`{name}` differs from `{twin_name}` by more than the regime annotation — \
+                     the golden is pinning an unrelated render change"
+                );
+            }
         }
 
         /// The goldens must AGREE with the property tests that already guard this surface —
