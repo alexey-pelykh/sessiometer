@@ -499,3 +499,292 @@ final class SettingsModel: ObservableObject {
         (drafts[field] ?? "").trimmingCharacters(in: .whitespaces)
     }
 }
+
+// MARK: - SettingsFormat — the Settings window's Foundation-only presentation layer
+
+/// Every string the Settings form renders and every width it lays out against, as pure `Foundation`
+/// values (issue #762). The config-editing sibling of `StatusPanelFormat`, and it exists for the same
+/// reason: a number the view lays out with, or a sentence the operator reads, must not be a second copy
+/// that can drift from the one a test checks.
+///
+/// WHY IT LIVES IN THIS FILE rather than its own. `MenubarTests` enumerates its SOURCE files one by one
+/// (`project.yml`) but takes `Tests` WHOLESALE, so a new test file costs nothing while a new source file
+/// costs a `project.yml` edit. Issue #750 hit the identical wall for the panel's cell widths and resolved
+/// it the identical way — move the Foundation-only values DOWN into a file the headless bundle already
+/// compiles, rather than pull a SwiftUI view UP into it. `SettingsModel.swift` is that file for this
+/// surface: it already owns `TunableField`, `ConfigFailure` and `ApplyPhase`, the three types every
+/// function below switches over. That is a BUNDLE-MEMBERSHIP constraint, NOT a layering claim — nothing
+/// here is model state. Compiling `SettingsView` into the bundle is issue #840's AC-1 to decide (it says
+/// so explicitly, to keep the two items from adding it twice); if that lands, this can move to its own
+/// file with no behaviour change.
+///
+/// TWO KINDS OF WIDTH live here and the difference is load-bearing — do not read the second as the first
+/// (the same taxonomy `StatusPanelFormat` § Text-cell layout budgets established):
+///
+///   * LINKED — `SettingsView` / `SettingsWindowController` lay out with this exact constant, so there is
+///     no second copy: `windowContentWidth`, `windowContentHeight`, `windowMinContentWidth`,
+///     `windowMinContentHeight`, `tunableFieldWidth`, `accountLabelFieldWidth`,
+///     `accountRowInterElementSpacing`, `footerPadding`, `footerInterElementSpacing`.
+///   * ALLOWANCE — no view site exists to link, because the element sizes to its own content and has no
+///     fixed frame: `roundedBorderTextInset`, `saveButtonAllowance`, `statusLabelIconAllowance`,
+///     `formRowHorizontalInset`. These are RESERVED budgets, good to about ±10 pt, which is why
+///     `SettingsTextMetricsTests` asserts HEADROOM and reports measured numbers rather than pinning an
+///     exact fit.
+///
+/// The copy below is INFERRED product copy, not a locked spec: hq specifies no per-field lexicon
+/// (`prd-menubar.md`:25 ratifies "tunables + labels" without one), and `SettingsView`'s layout is absent
+/// from `menubar-preview.html` — issue #763 owns closing that design-provenance hole. Extracting these
+/// strings does not ratify them; it only makes them reachable from a test.
+enum SettingsFormat {
+
+    // MARK: Per-field copy (label with unit + hover help)
+
+    /// Human label (with unit) + hover help for a tunable. INFERRED from the field name + `src/config.rs`
+    /// semantics. The daemon is the validation authority; these strings never gate a value.
+    static func copy(for field: TunableField) -> (title: String, help: String) {
+        switch field {
+        case .pollSecs: return ("Poll interval (s)", "How often the daemon checks usage.")
+        case .exhaustedPollSecs: return ("Exhausted poll (s)", "Slower poll while every account is exhausted.")
+        case .nearLimitPollSecs: return ("Near-limit poll (s)", "Faster poll when an account is close to a limit.")
+        case .cooldownSecs: return ("Swap cooldown (s)", "Minimum time between automatic swaps.")
+        case .targetMaxSessionUsage: return ("Target session usage (%)", "Aim to keep session usage below this.")
+        case .sessionCeiling: return ("Session ceiling (%)", "Swap away early enough that session usage lands below this.")
+        case .weeklyCeiling: return ("Weekly ceiling (%)", "Swap away early enough that weekly usage lands below this.")
+        case .sessionBlindSwapSecs: return ("Blind swap delay (s)", "Wait this long before a preemptive swap while usage is blind (429).")
+        case .sessionBlindRiskBand: return ("Blind risk band (%)", "Retained usage that counts as risky while blind.")
+        case .sessionVelocityHorizonSecs: return ("Velocity horizon (s)", "Look-ahead window for the usage-velocity projection.")
+        case .sessionVelocityMinProjectAbove: return ("Velocity floor (%)", "Only project a swap when usage is above this.")
+        case .sessionVelocityEmaAlphaPct: return ("Velocity smoothing (%)", "EMA smoothing factor for usage velocity.")
+        case .monitor401N: return ("401 tolerance", "Consecutive 401s before an account is treated as needing re-login.")
+        case .monitorRecoveryM: return ("Recovery threshold", "Consecutive good checks before an account is considered recovered.")
+        case .fleetRunwayWarnSecs: return ("Runway warning (s)", "Warn when the whole fleet’s combined runway drops below this many seconds. 0 turns the warning off.")
+        }
+    }
+
+    // MARK: Load-phase copy (the honest-disconnected / no-config states, AC 7 of issue #268)
+
+    static func loadFailureHeadline(_ failure: ConfigFailure) -> String {
+        switch failure {
+        case .daemonError(ConfigGetErrorReason.noConfig): return "No configuration yet"
+        case .daemonError(ConfigGetErrorReason.unreadable): return "Configuration unreadable"
+        case .daemonError: return "Configuration unavailable"
+        case .transport, .unavailable: return "Sessiometer isn’t connected"
+        case .undecodable: return "Unexpected response"
+        }
+    }
+
+    static func loadFailureDetail(_ failure: ConfigFailure) -> String {
+        switch failure {
+        case .daemonError(ConfigGetErrorReason.noConfig):
+            return "Capture your first account with the sessiometer CLI, then reopen Settings."
+        case .daemonError(ConfigGetErrorReason.unreadable):
+            return "Sessiometer’s configuration file exists but couldn’t be read — it may be malformed. "
+                + "Fix or re-capture it with the sessiometer CLI, then reopen Settings."
+        case .daemonError(let reason):
+            return "The daemon reported: \(reason)."
+        case .transport, .unavailable:
+            return "Start the sessiometer daemon, then try again. Settings edits the running daemon’s configuration."
+        case .undecodable:
+            return "The daemon sent a reply this app doesn’t understand — it may be a different version."
+        }
+    }
+
+    /// The loading + failure sections' shared header. One constant so the three daemon-config sections
+    /// cannot drift apart — the footer of the Notifications section points at "the daemon configuration
+    /// below" and means exactly this heading.
+    static let daemonConfigSectionTitle = "Daemon Configuration"
+
+    // MARK: Static section copy (headers, footers, control titles)
+
+    // These carry no logic, so they were nearly left in the view as literals. They are here because the
+    // alternative is a coverage claim with a hole in it: an adversarial review of the first draft found
+    // 14 operator-visible strings still hardcoded while this file's header claimed every string had
+    // moved. Narrowing the claim was the other option; completing the seam is the better one, because a
+    // string that lives here is one a test can assert is present, non-empty and distinct — and `saveTitle`
+    // in particular MUST live here, since `applyStatusBudget` reserves width for that exact button and a
+    // second copy would let the two drift apart silently.
+
+    static let generalSectionTitle = "General"
+    static let launchAtLoginToggleTitle = "Launch Sessiometer at login"
+    static let launchAtLoginApprovalHint =
+        "Approve Sessiometer in System Settings › General › Login Items to finish enabling this."
+    static let launchAtLoginApprovalButtonTitle = "Open Login Items settings"
+    static let generalSectionFooter =
+        "Start Sessiometer automatically when you log in. This launches the menu-bar app only — "
+        + "the background daemon is started separately."
+
+    static let notificationsSectionTitle = "Notifications"
+    static let notificationsToggleTitle = "Notify on account swaps and exhaustion"
+    static let notificationsSectionFooter =
+        "A local macOS notification when the active account changes or every account is exhausted. "
+        + "This is an app preference — it isn’t part of the daemon configuration below."
+
+    static let loadingText = "Loading settings…"
+    static let retryButtonTitle = "Try Again"
+
+    static let accountsSectionTitle = "Accounts"
+    static let accountLabelFieldPlaceholder = "Label"
+    static let accountsSectionFooter =
+        "Rename accounts here. Add, remove, or re-authenticate accounts with the sessiometer CLI — "
+        + "the settings window never touches credentials."
+
+    /// The footer's commit button. LINKED to `saveButtonAllowance` — the width every footer budget
+    /// reserves is reserved for THIS string, so renaming the button without re-measuring the allowance is
+    /// exactly the drift this seam exists to make impossible.
+    static let saveTitle = "Save"
+
+    // MARK: Apply-outcome copy (the footer status)
+
+    /// The daemon's own `rejected` verdict, rendered. `detail` is the daemon's non-secret message when it
+    /// supplied one (issue #645); the fallbacks are this app's.
+    static func rejectionText(_ reason: ConfigSetRejection, _ detail: String?) -> String {
+        switch reason {
+        case .invalid: return detail ?? "That value isn’t allowed."
+        case .unknownAccount: return "That account is no longer in the roster — reopen Settings."
+        case .noConfig: return "No configuration to update — capture an account with the CLI first."
+        case .configUnreadable: return "The configuration file couldn’t be read — it was left unchanged."
+        case .saveFailed: return "The configuration couldn’t be saved — the old file is intact."
+        case .unavailable: return "The daemon can’t change configuration right now."
+        }
+    }
+
+    /// A transport / decode failure on the APPLY path, rendered.
+    ///
+    /// UNBOUNDED BY CONSTRUCTION on the `.daemonError` arm: the string it interpolates is the daemon's
+    /// `detail` (issue #628 threads serde's own message through, and serde's `deny_unknown_fields` error
+    /// names EVERY expected field), so this can reach several hundred characters from a version-skewed
+    /// app. `SettingsTextMetricsTests` measures exactly that against `applyStatusBudget` rather than
+    /// leaving it to the hover tooltip.
+    static func applyFailureText(_ failure: ConfigFailure) -> String {
+        switch failure {
+        case .transport, .unavailable: return "Not saved — Sessiometer isn’t connected."
+        case .undecodable: return "Not saved — the daemon sent an unexpected reply."
+        case .daemonError(let reason): return "Not saved — \(reason)."
+        }
+    }
+
+    static let savingText = "Saving…"
+    static let savedText = "Saved"
+    /// The daemon applied nothing because the submitted values already matched (a stale baseline or a
+    /// concurrent change) — "Saved" would imply a write that didn't happen.
+    static let unchangedText = "Already up to date"
+    static let invalidInputText = "Fix the highlighted fields."
+    static let restartRequiredText = "Saved — restart the daemon to apply."
+
+    // MARK: Roster-row copy
+
+    /// A roster row's leading label. `enabled` is read-only in this window — parking / add / remove are
+    /// CLI-only (issue #268 AC 5) — so the parked state is stated, never offered as an edit.
+    static func accountRowTitle(enabled: Bool) -> String { enabled ? "Account" : "Account (parked)" }
+
+    /// The trailing state cue beside a roster row's label field.
+    static func accountStateCue(enabled: Bool) -> String { enabled ? "Active" : "Parked" }
+
+    // MARK: Enable/disable predicates
+
+    /// Save is live only when there is a clean edit to submit and no apply is in flight.
+    ///
+    /// The in-flight half is not cosmetic: `SettingsModel.apply()` carries its own re-entrancy guard
+    /// precisely because a rapid double Cmd-S can outrun SwiftUI's re-render, so this predicate and that
+    /// guard are two layers of the same contract — and this is the layer a test can reach.
+    static func saveEnabled(isDirty: Bool, applyPhase: SettingsModel.ApplyPhase) -> Bool {
+        guard isDirty else { return false }
+        if case .applying = applyPhase { return false }
+        return true
+    }
+
+    // MARK: Layout — the widths the form lays out with
+
+    /// LINKED — `SettingsWindowController.setContentSize`. The window is NOT resizable
+    /// (`styleMask == [.titled, .closable]`), so this is the width the form actually gets on screen.
+    static let windowContentWidth: Double = 460
+
+    /// LINKED — `SettingsWindowController.setContentSize`.
+    static let windowContentHeight: Double = 560
+
+    /// LINKED — `SettingsView`'s `.frame(minWidth:)`. Unreachable on today's non-resizable window, but it
+    /// is the floor the view itself declares, so it is the width a future `.resizable` would expose. The
+    /// two content-width budgets below (`applyStatusBudget`, `formRowTextBudget`) do NOT default to it —
+    /// see the first, which measured the conservative choice and rejected it — but both take it as a
+    /// parameter, and this is the value the latent-defect tests pass in.
+    static let windowMinContentWidth: Double = 440
+
+    /// LINKED — `SettingsView`'s `.frame(minHeight:)`.
+    static let windowMinContentHeight: Double = 420
+
+    /// LINKED — the tunable row's value `TextField`'s `.frame(width:)`.
+    static let tunableFieldWidth: Double = 96
+
+    /// LINKED — the account row's label `TextField`'s `.frame(width:)`.
+    static let accountLabelFieldWidth: Double = 160
+
+    /// LINKED — the account row's `HStack` spacing, charged once between the label field and its trailing
+    /// Active/Parked cue. Hoisted for the same reason as `footerInterElementSpacing`: the gate charges this
+    /// gap when it measures whether the row's whole value column fits the window.
+    static let accountRowInterElementSpacing: Double = 8
+
+    /// LINKED — the footer's `.padding(12)`, charged on every side.
+    static let footerPadding: Double = 12
+
+    /// LINKED — the footer `HStack`'s spacing, charged between each adjacent pair (status | Spacer | Save).
+    static let footerInterElementSpacing: Double = 12
+
+    /// ALLOWANCE — a `.roundedBorder` text field's internal text inset per side (bezel + text margin).
+    /// No view site to link: the inset belongs to the AppKit control's own drawing, not to a modifier.
+    static let roundedBorderTextInset: Double = 5
+
+    /// ALLOWANCE — the footer's trailing `Button("Save")` total width, bezel included. The button sizes to
+    /// its own title, so there is no frame to link; `SettingsTextMetricsTests` measures the title and
+    /// asserts this allowance actually clears it with bezel room, so it cannot quietly become nonsense.
+    static let saveButtonAllowance: Double = 62
+
+    /// ALLOWANCE — a `Label`'s leading SF Symbol plus the gap to its title, at footer text size.
+    static let statusLabelIconAllowance: Double = 22
+
+    /// ALLOWANCE — a grouped `Form` row's own horizontal inset per side (the section inset plus the row's
+    /// content padding). No view site to link: `.formStyle(.grouped)` owns this, not a modifier this app
+    /// writes, so it is a reserved budget rather than a pin.
+    static let formRowHorizontalInset: Double = 24
+
+    /// The text a `.roundedBorder` `TextField` of `width` can show AT ONCE.
+    ///
+    /// A text field scrolls rather than truncates, so exceeding this is a LEGIBILITY limit (the operator
+    /// must scroll to read or verify the value), not clipping. Naming the difference matters: the
+    /// truncation gate issue #750 built is about text that is *lost*; this is about text that is merely
+    /// *off-screen*, and the two deserve different verdicts.
+    static func fieldTextBudget(_ width: Double) -> Double { width - 2 * roundedBorderTextInset }
+
+    /// The width a full-span element inside a `Form` row gets — the inline field error under a tunable, and
+    /// the row's own label + value columns together. Unlike `fieldTextBudget` this is NOT a `.frame(width:)`
+    /// a view declares; it is the content width less `formRowHorizontalInset` on each side.
+    ///
+    /// `contentWidth` is REQUIRED, deliberately unlike `applyStatusBudget`'s: that one defaults to the
+    /// shipped 460 because measurement forced it to, and a sibling here quietly defaulting the other way
+    /// would be the easiest possible way to derive a row budget 20 pt too generous by accident.
+    static func formRowTextBudget(contentWidth: Double) -> Double {
+        contentWidth - 2 * formRowHorizontalInset
+    }
+
+    /// The width available to the footer's apply-status `Label` TITLE.
+    ///
+    /// Derived, never hand-tuned: the content width less both footer paddings, the two `HStack` gaps, the
+    /// Save button and the `Label`'s own leading icon. At the SHIPPED 460 pt window that is
+    /// 460 − 24 − 24 − 62 − 22 = **328 pt**. Its weakest inputs are the two allowances above, so treat it
+    /// as ±10 pt rather than exact.
+    ///
+    /// WHY IT DEFAULTS TO THE SHIPPED WIDTH AND NOT THE DECLARED FLOOR (issue #762, measured). The floor
+    /// would be the conservative choice, and it was the first one taken — but measurement rejected it:
+    /// at 440 pt the budget is 308 pt and the widest ORDINARY failure sentence ("Not saved — the daemon
+    /// sent an unexpected reply.", 310.53 pt) does not fit, so a floor-derived gate would have opened red
+    /// on shipped, correct copy. The window carries no `.resizable` in its style mask, so 460 is the width
+    /// the form actually gets and 440 is unreachable today. The 2.53 pt shortfall at the declared floor is
+    /// not swept away for that: `SettingsTextMetricsTests` asserts it explicitly as a LATENT defect that
+    /// goes live the moment anyone makes the window resizable.
+    static func applyStatusBudget(contentWidth: Double = windowContentWidth) -> Double {
+        contentWidth
+            - 2 * footerPadding
+            - 2 * footerInterElementSpacing
+            - saveButtonAllowance
+            - statusLabelIconAllowance
+    }
+}

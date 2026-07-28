@@ -4,8 +4,28 @@
 // The Settings window's SwiftUI form (issue #268): a native grouped `Form` over the daemon's editable
 // tunables + roster labels, plus the app-local notification toggle. It is a PURE view over `SettingsModel`
 // — every decision (dirty tracking, validation split, apply outcome) lives in the tested model; this file
-// only renders phases and binds drafts. AppKit/SwiftUI, so it stays in the app target (untested), the
-// counterpart split to `PanelStatsModel` (tested) vs `StatusPanelView` (app-only).
+// only renders phases and binds drafts. AppKit/SwiftUI, so it stays in the app target, the counterpart
+// split to `PanelStatsModel` (tested) vs `StatusPanelView` (app-only).
+//
+// COVERAGE (issue #762). "Untested" used to be true of this file wholesale. It is no longer: every
+// operator-visible STRING, and every layout constant a text budget is derived from, now lives in
+// `SettingsFormat` (`SettingsModel.swift`) — the Foundation-only layer the headless `MenubarTests` bundle
+// already compiles — where `SettingsTextMetricsTests` covers and measures them. Read every
+// `SettingsFormat.` reference below as a LINK, not a copy: this file deliberately holds NO
+// operator-visible literal of its own, so changing a label or a width means changing it there, which is
+// what reddens the gate. (The only string literals remaining below are the five SF Symbol NAMES, the
+// `"s"` ⌘S key equivalent, and the `?? ""` empty-tooltip fallback — none of which is text an operator
+// reads. The bare `spacing:` / `padding:` numbers that remain are cosmetic ones no budget charges.)
+//
+// The rule to keep: a new string, or a frame constant any budget would charge, goes in `SettingsFormat`
+// FIRST and is referenced from here. Adding it as a literal is not caught by any compiler — it just
+// silently leaves the coverage claim above false, which is exactly how the first draft of this seam
+// shipped 14 strings behind a header that said they had all moved (`SettingsFormat` § static section
+// copy records that).
+//
+// What is still genuinely unreachable from a headless bundle — the `Form` chrome, the accessibility
+// tree, the rendered pixels — is enumerated with its route, as a cardinality rather than a gesture, in
+// `SettingsTextMetricsTests`' header (issue #762 AC-4).
 //
 // LAYERING (issue #573, load-bearing): the two surfaces here have DIFFERENT dependencies, so they sit on
 // different sides of the load-phase gate. The Notifications toggle is app-local (`UserDefaults`, nil-client
@@ -42,7 +62,10 @@ struct SettingsView: View {
             Divider()
             footer
         }
-        .frame(minWidth: 440, idealWidth: 460, minHeight: 420, idealHeight: 560)
+        .frame(minWidth: CGFloat(SettingsFormat.windowMinContentWidth),
+               idealWidth: CGFloat(SettingsFormat.windowContentWidth),
+               minHeight: CGFloat(SettingsFormat.windowMinContentHeight),
+               idealHeight: CGFloat(SettingsFormat.windowContentHeight))
         // No `.task { load() }` here: loads are driven SOLELY by SettingsWindowController.show() (first open
         // AND reopens), so the form never races two config-get fetches on first open.
     }
@@ -58,21 +81,20 @@ struct SettingsView: View {
     /// decouples the two owners).
     private var launchAtLoginSection: some View {
         Section {
-            Toggle("Launch Sessiometer at login", isOn: launchAtLoginBinding)
+            Toggle(SettingsFormat.launchAtLoginToggleTitle, isOn: launchAtLoginBinding)
             if loginItem.needsApproval {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Approve Sessiometer in System Settings › General › Login Items to finish enabling this.")
+                    Text(SettingsFormat.launchAtLoginApprovalHint)
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    Button("Open Login Items settings") { loginItem.openLoginItemsSettings() }
+                    Button(SettingsFormat.launchAtLoginApprovalButtonTitle) { loginItem.openLoginItemsSettings() }
                         .font(.caption)
                 }
             }
         } header: {
-            Text("General")
+            Text(SettingsFormat.generalSectionTitle)
         } footer: {
-            Text("Start Sessiometer automatically when you log in. This launches the menu-bar app only — "
-                + "the background daemon is started separately.")
+            Text(SettingsFormat.generalSectionFooter)
         }
     }
 
@@ -92,12 +114,11 @@ struct SettingsView: View {
     /// operator can always reach, even with the daemon stopped or on a fresh install (issue #573).
     private var notificationsSection: some View {
         Section {
-            Toggle("Notify on account swaps and exhaustion", isOn: $model.notificationsEnabled)
+            Toggle(SettingsFormat.notificationsToggleTitle, isOn: $model.notificationsEnabled)
         } header: {
-            Text("Notifications")
+            Text(SettingsFormat.notificationsSectionTitle)
         } footer: {
-            Text("A local macOS notification when the active account changes or every account is exhausted. "
-                + "This is an app preference — it isn’t part of the daemon configuration below.")
+            Text(SettingsFormat.notificationsSectionFooter)
         }
     }
 
@@ -122,11 +143,11 @@ struct SettingsView: View {
     /// The loading placeholder — headed "Daemon Configuration" so a slow first fetch reads as the daemon
     /// area filling in below the (already usable) Notifications toggle, not a stalled window.
     private var loadingSection: some View {
-        Section("Daemon Configuration") {
+        Section(SettingsFormat.daemonConfigSectionTitle) {
             HStack(spacing: 8) {
                 Spacer()
                 ProgressView().controlSize(.small)
-                Text("Loading settings…").foregroundStyle(.secondary)
+                Text(SettingsFormat.loadingText).foregroundStyle(.secondary)
                 Spacer()
             }
             .padding(.vertical, 8)
@@ -138,48 +159,22 @@ struct SettingsView: View {
     /// stays live), matching the Notifications footer's "the daemon configuration below".
     @ViewBuilder
     private func loadFailureSection(_ failure: ConfigFailure) -> some View {
-        Section("Daemon Configuration") {
+        Section(SettingsFormat.daemonConfigSectionTitle) {
             VStack(spacing: 10) {
                 Image(systemName: "exclamationmark.triangle")
                     .font(.largeTitle)
                     .foregroundStyle(.secondary)
                     .accessibilityHidden(true)  // decorative — the headline + detail carry the state for VoiceOver
-                Text(loadFailureHeadline(failure)).font(.headline)
-                Text(loadFailureDetail(failure))
+                Text(SettingsFormat.loadFailureHeadline(failure)).font(.headline)
+                Text(SettingsFormat.loadFailureDetail(failure))
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
-                Button("Try Again") { Task { await model.load() } }
+                Button(SettingsFormat.retryButtonTitle) { Task { await model.load() } }
                     .padding(.top, 4)
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, 12)
-        }
-    }
-
-    private func loadFailureHeadline(_ failure: ConfigFailure) -> String {
-        switch failure {
-        case .daemonError(ConfigGetErrorReason.noConfig): return "No configuration yet"
-        case .daemonError(ConfigGetErrorReason.unreadable): return "Configuration unreadable"
-        case .daemonError: return "Configuration unavailable"
-        case .transport, .unavailable: return "Sessiometer isn’t connected"
-        case .undecodable: return "Unexpected response"
-        }
-    }
-
-    private func loadFailureDetail(_ failure: ConfigFailure) -> String {
-        switch failure {
-        case .daemonError(ConfigGetErrorReason.noConfig):
-            return "Capture your first account with the sessiometer CLI, then reopen Settings."
-        case .daemonError(ConfigGetErrorReason.unreadable):
-            return "Sessiometer’s configuration file exists but couldn’t be read — it may be malformed. "
-                + "Fix or re-capture it with the sessiometer CLI, then reopen Settings."
-        case .daemonError(let reason):
-            return "The daemon reported: \(reason)."
-        case .transport, .unavailable:
-            return "Start the sessiometer daemon, then try again. Settings edits the running daemon’s configuration."
-        case .undecodable:
-            return "The daemon sent a reply this app doesn’t understand — it may be a different version."
         }
     }
 
@@ -203,22 +198,21 @@ struct SettingsView: View {
                 accountRow(account)
             }
         } header: {
-            Text("Accounts")
+            Text(SettingsFormat.accountsSectionTitle)
         } footer: {
-            Text("Rename accounts here. Add, remove, or re-authenticate accounts with the sessiometer CLI — "
-                + "the settings window never touches credentials.")
+            Text(SettingsFormat.accountsSectionFooter)
         }
     }
 
     private func tunableRow(_ field: TunableField) -> some View {
-        let copy = Self.copy(for: field)
+        let copy = SettingsFormat.copy(for: field)
         return VStack(alignment: .leading, spacing: 2) {
             LabeledContent(copy.title) {
                 TextField(copy.title, text: tunableBinding(field))
                     .labelsHidden()
                     .multilineTextAlignment(.trailing)
                     .textFieldStyle(.roundedBorder)
-                    .frame(width: 96)
+                    .frame(width: CGFloat(SettingsFormat.tunableFieldWidth))
                     .help(copy.help)
             }
             if let error = model.fieldErrors[field] {
@@ -231,37 +225,30 @@ struct SettingsView: View {
 
     private func accountRow(_ account: AccountView) -> some View {
         LabeledContent {
-            HStack(spacing: 8) {
-                TextField("Label", text: labelBinding(account.accountUuid))
+            HStack(spacing: CGFloat(SettingsFormat.accountRowInterElementSpacing)) {
+                TextField(SettingsFormat.accountLabelFieldPlaceholder, text: labelBinding(account.accountUuid))
                     .textFieldStyle(.roundedBorder)
-                    .frame(width: 160)
-                Text(account.enabled ? "Active" : "Parked")
+                    .frame(width: CGFloat(SettingsFormat.accountLabelFieldWidth))
+                Text(SettingsFormat.accountStateCue(enabled: account.enabled))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
         } label: {
-            Text(account.enabled ? "Account" : "Account (parked)")
+            Text(SettingsFormat.accountRowTitle(enabled: account.enabled))
         }
     }
 
     // MARK: - Footer: Save + apply status
 
     private var footer: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: CGFloat(SettingsFormat.footerInterElementSpacing)) {
             applyStatus
             Spacer()
-            Button("Save") { Task { await model.apply() } }
+            Button(SettingsFormat.saveTitle) { Task { await model.apply() } }
                 .keyboardShortcut("s", modifiers: .command)
-                .disabled(!saveEnabled)
+                .disabled(!SettingsFormat.saveEnabled(isDirty: model.isDirty, applyPhase: model.applyPhase))
         }
-        .padding(12)
-    }
-
-    /// Save is live only when there is a clean edit to submit and no apply is in flight.
-    private var saveEnabled: Bool {
-        guard model.isDirty else { return false }
-        if case .applying = model.applyPhase { return false }
-        return true
+        .padding(CGFloat(SettingsFormat.footerPadding))
     }
 
     @ViewBuilder
@@ -270,56 +257,43 @@ struct SettingsView: View {
         case .idle:
             if model.restartPending { restartBanner }
         case .applying:
-            HStack(spacing: 6) { ProgressView().controlSize(.small); Text("Saving…") }
+            HStack(spacing: 6) { ProgressView().controlSize(.small); Text(SettingsFormat.savingText) }
                 .foregroundStyle(.secondary)
         case .applied(let effect):
             switch effect {
             case .restartRequired: restartBanner
             case .live:
-                Label("Saved", systemImage: "checkmark.circle").foregroundStyle(.green)
+                Label(SettingsFormat.savedText, systemImage: "checkmark.circle").foregroundStyle(.green)
             case .unchanged:
-                // The daemon applied nothing because the submitted values already matched (a stale baseline
-                // or a concurrent change) — "Saved" would imply a write that didn't happen.
-                Label("Already up to date", systemImage: "checkmark.circle").foregroundStyle(.green)
+                Label(SettingsFormat.unchangedText, systemImage: "checkmark.circle").foregroundStyle(.green)
             }
         case .invalidInput:
-            Label("Fix the highlighted fields.", systemImage: "exclamationmark.triangle")
+            Label(SettingsFormat.invalidInputText, systemImage: "exclamationmark.triangle")
                 .foregroundStyle(.orange)
         case .rejected(let reason, let detail):
-            Label(rejectionText(reason, detail), systemImage: "xmark.octagon")
+            Label(SettingsFormat.rejectionText(reason, detail), systemImage: "xmark.octagon")
                 .foregroundStyle(.red)
                 .help(detail ?? "")
         case .failed(let failure):
             // `.help` mirrors the `rejected` path: a daemon-error `detail` (the #628 stale-key message,
-            // issue #645) can be long, so keep it fully readable on hover even when the inline label truncates.
-            Label(applyFailureText(failure), systemImage: "bolt.horizontal.circle")
+            // issue #645) can be long, so keep it fully readable on hover.
+            //
+            // MEASURED (issue #762, `SettingsTextMetricsTests`): "can be long" understates it by an order
+            // of magnitude. The #628 detail is serde's `deny_unknown_fields` error, which names EVERY
+            // expected tunable, so this reaches AT LEAST ~2 700 pt of text in the 328 pt footer slot (the
+            // gate's fixture is a deliberate lower bound). And there is NO `.lineLimit` here — so it WRAPS,
+            // to at least 10 lines / 160 pt, rather than truncating, in a window that is not resizable.
+            // The overflow is filed as issue #844 rather than fixed inline (this umbrella's standing
+            // rule); the gate pins the measured boundary so a fix is verifiable and a regression is loud.
+            Label(SettingsFormat.applyFailureText(failure), systemImage: "bolt.horizontal.circle")
                 .foregroundStyle(.red)
-                .help(applyFailureText(failure))
+                .help(SettingsFormat.applyFailureText(failure))
         }
     }
 
     private var restartBanner: some View {
-        Label("Saved — restart the daemon to apply.", systemImage: "arrow.clockwise.circle")
+        Label(SettingsFormat.restartRequiredText, systemImage: "arrow.clockwise.circle")
             .foregroundStyle(.orange)
-    }
-
-    private func rejectionText(_ reason: ConfigSetRejection, _ detail: String?) -> String {
-        switch reason {
-        case .invalid: return detail ?? "That value isn’t allowed."
-        case .unknownAccount: return "That account is no longer in the roster — reopen Settings."
-        case .noConfig: return "No configuration to update — capture an account with the CLI first."
-        case .configUnreadable: return "The configuration file couldn’t be read — it was left unchanged."
-        case .saveFailed: return "The configuration couldn’t be saved — the old file is intact."
-        case .unavailable: return "The daemon can’t change configuration right now."
-        }
-    }
-
-    private func applyFailureText(_ failure: ConfigFailure) -> String {
-        switch failure {
-        case .transport, .unavailable: return "Not saved — Sessiometer isn’t connected."
-        case .undecodable: return "Not saved — the daemon sent an unexpected reply."
-        case .daemonError(let reason): return "Not saved — \(reason)."
-        }
     }
 
     // MARK: - Bindings
@@ -330,31 +304,5 @@ struct SettingsView: View {
 
     private func labelBinding(_ uuid: String) -> Binding<String> {
         Binding(get: { model.labelDraft(for: uuid) }, set: { model.setLabelDraft($0, for: uuid) })
-    }
-
-    // MARK: - Inferred per-field copy
-
-    /// Human label (with unit) + hover help for a tunable. INFERRED from the field name + `src/config.rs`
-    /// semantics — hq specifies no per-field lexicon (`prd-menubar.md`:25), so this is refinable product
-    /// copy, deliberately kept in the view (not the tested model). The daemon is the validation authority;
-    /// these strings never gate a value.
-    static func copy(for field: TunableField) -> (title: String, help: String) {
-        switch field {
-        case .pollSecs: return ("Poll interval (s)", "How often the daemon checks usage.")
-        case .exhaustedPollSecs: return ("Exhausted poll (s)", "Slower poll while every account is exhausted.")
-        case .nearLimitPollSecs: return ("Near-limit poll (s)", "Faster poll when an account is close to a limit.")
-        case .cooldownSecs: return ("Swap cooldown (s)", "Minimum time between automatic swaps.")
-        case .targetMaxSessionUsage: return ("Target session usage (%)", "Aim to keep session usage below this.")
-        case .sessionCeiling: return ("Session ceiling (%)", "Swap away early enough that session usage lands below this.")
-        case .weeklyCeiling: return ("Weekly ceiling (%)", "Swap away early enough that weekly usage lands below this.")
-        case .sessionBlindSwapSecs: return ("Blind swap delay (s)", "Wait this long before a preemptive swap while usage is blind (429).")
-        case .sessionBlindRiskBand: return ("Blind risk band (%)", "Retained usage that counts as risky while blind.")
-        case .sessionVelocityHorizonSecs: return ("Velocity horizon (s)", "Look-ahead window for the usage-velocity projection.")
-        case .sessionVelocityMinProjectAbove: return ("Velocity floor (%)", "Only project a swap when usage is above this.")
-        case .sessionVelocityEmaAlphaPct: return ("Velocity smoothing (%)", "EMA smoothing factor for usage velocity.")
-        case .monitor401N: return ("401 tolerance", "Consecutive 401s before an account is treated as needing re-login.")
-        case .monitorRecoveryM: return ("Recovery threshold", "Consecutive good checks before an account is considered recovered.")
-        case .fleetRunwayWarnSecs: return ("Runway warning (s)", "Warn when the whole fleet’s combined runway drops below this many seconds. 0 turns the warning off.")
-        }
     }
 }

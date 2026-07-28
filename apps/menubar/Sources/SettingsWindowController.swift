@@ -67,7 +67,11 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         window.isReleasedWhenClosed = false  // single-instance: reuse across opens, never a dangling ref
         window.identifier = NSUserInterfaceItemIdentifier("SessiometerSettings")
         window.delegate = self
-        window.setContentSize(NSSize(width: 460, height: 560))
+        // LINKED to `SettingsFormat` (issue #762) — the same constants `SettingsView`'s ideal frame and the
+        // text-metrics gate read, so the window this form actually gets and the width its budgets are
+        // derived at cannot drift apart.
+        window.setContentSize(NSSize(width: SettingsFormat.windowContentWidth,
+                                     height: SettingsFormat.windowContentHeight))
         window.center()
         self.window = window
         return window
