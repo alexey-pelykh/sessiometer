@@ -29,7 +29,7 @@ plus one calm variant:
 |---|---|---|
 | `keychain_locked` — the login keychain is LOCKED, the shared item is UNREADABLE | now | #498 |
 | `canonical_scrub = exhausted` — the shared item is readable but EMPTIED, auto-recovery gave up | now | #469 |
-| `systemic_refresh_failure` — the refresh MECHANISM is down (N all-error sweeps), every account still alive | pre-death | #378 |
+| `systemic_refresh_failure` — the refresh MECHANISM is down (N all-error sweeps, **or** a startup preflight that could not resolve the binary — #787/#813), every account still alive | pre-death | #378 |
 | `canonical_scrub = recovering` — scrubbed, adopt-recovery in flight | no (may self-heal) | #469 |
 
 Both surfaces render these, and **they ranked them in opposite order** (#575):
@@ -92,8 +92,11 @@ Concretely:
    `daemon_fault_line` helper that applies the fault's rank band when the colour gate is
    open. The panel is UNCHANGED — it was already correct.
 3. **The remedy-availability distinction moves to the text**, where it already lives:
-   "unlock it" (keychain) / "run claude /login" (scrub) vs "check the daemon log
-   'reason='" (systemic). Colour now carries *rank*; the text carries *remedy*.
+   "unlock it" (keychain) / "run claude /login" (scrub) vs "check the daemon log"
+   (systemic). Colour now carries *rank*; the text carries *remedy*. (The systemic
+   remedy read "check the daemon log 'reason='" when this ADR was written; issue #787
+   made the pointer provenance-neutral, since a preflight-opened episode has no
+   `reason=` line to read. The rank argument is unaffected.)
 4. **Documentation.** The CLI comments stop citing ADR-0016 as the reason for plainness;
    this ADR is the cross-surface severity-rank record a future editor of either surface
    will meet.

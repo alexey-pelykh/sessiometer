@@ -72,6 +72,16 @@ final class WatchStatusStore: ObservableObject {
     /// (see `StatusPanelFormat.daemonFaultBanner`). `nil` when the mechanism is healthy (or a pre-#378
     /// daemon omits the wire key). A COUNT only, never a token or path (issue #15).
     @Published private(set) var systemicRefreshFailure: UInt32?
+    /// WHICH opening bracket opened that episode (#813, wire since schema 1.11) — the #378 sweep crossing
+    /// or the #787 startup preflight that could not resolve the `claude` binary. Published beside the count
+    /// it qualifies (the daemon sets both from one latch, so they arrive and clear together) and consumed
+    /// only to pick the banner's EVIDENCE clause: without it the panel asserted "1 consecutive sweep failed"
+    /// for a preflight-opened episode in which zero sweeps had run — the count alone cannot carry the
+    /// distinction, because that arm seeds it at one for pre-#813 grammar. Never a severity input: a down
+    /// mechanism is the same next-break fault however its episode opened. `nil` when healthy (or a pre-#813
+    /// daemon omits the wire key, in which case the banner keeps the historical phrasing). A fixed-token
+    /// class, never a token or path (issue #15).
+    @Published private(set) var systemicRefreshSource: SystemicRefreshSource?
     /// The behavioral-canary verdict (#714, wire since schema 1.9; its #730/#738
     /// `refusedUnparseableCanonical` verdict since 1.10) — the keychain-derivation identity check's
     /// LAST result. The panel renders its ALARM verdicts (`drift`, `ambiguous`, `refusedUnparseableCanonical`)
@@ -258,6 +268,7 @@ final class WatchStatusStore: ObservableObject {
         canonicalScrub = machine.canonicalScrub
         keychainLocked = machine.keychainLocked
         systemicRefreshFailure = machine.systemicRefreshFailure
+        systemicRefreshSource = machine.systemicRefreshSource
         canary = machine.canary
         presentationsContinuation.yield(machine.presentation)
     }
@@ -452,6 +463,7 @@ extension WatchStatusStore {
                         canonicalScrub: CanonicalScrub? = nil,
                         keychainLocked: Bool = false,
                         systemicRefreshFailure: UInt32? = nil,
+                        systemicRefreshSource: SystemicRefreshSource? = nil,
                         canary: CanaryStatus? = nil) -> WatchStatusStore {
         let store = WatchStatusStore()
         store.connectionState = state
@@ -461,6 +473,7 @@ extension WatchStatusStore {
         store.canonicalScrub = canonicalScrub
         store.keychainLocked = keychainLocked
         store.systemicRefreshFailure = systemicRefreshFailure
+        store.systemicRefreshSource = systemicRefreshSource
         store.canary = canary
         return store
     }

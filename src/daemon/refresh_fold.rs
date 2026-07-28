@@ -918,13 +918,17 @@ mod tests {
     /// the default 3, since `three_account_daemon` leaves `systemic_failure_n` at the config default
     /// (the "drives at defaults" integration case the field's doc-comment anticipates) — and an
     /// active episode surfaces in `snapshot`'s `systemic_refresh` projection, the `status`-visible
-    /// indicator that shows the mechanism is down without waiting for an account to die.
+    /// indicator that shows the mechanism is down without waiting for an account to die — together
+    /// with the `systemic_refresh_source` PROVENANCE beside it (issue #813), since it is this seam,
+    /// not the pure state machine, that decides whether the wire says anything at all.
     #[tokio::test]
     async fn note_systemic_refresh_threads_the_configured_threshold_and_projects_into_snapshot() {
         let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
         const NOW: i64 = 1_782_777_600;
         let no_readings: [Option<Usage>; 3] = [None, None, None];
         let indicator = |d: &FakeDaemon| d.snapshot(None, &no_readings, NOW).systemic_refresh;
+        let provenance =
+            |d: &FakeDaemon| d.snapshot(None, &no_readings, NOW).systemic_refresh_source;
 
         // Below the default threshold the mechanism-down streak climbs but stays silent, and the
         // indicator reads healthy — proving the daemon threads its own `systemic_failure_n`, not a
@@ -932,6 +936,7 @@ mod tests {
         assert_eq!(daemon.note_systemic_refresh(SweepHealth::AllError), None);
         assert_eq!(daemon.note_systemic_refresh(SweepHealth::AllError), None);
         assert_eq!(indicator(&daemon), None, "healthy below the threshold");
+        assert_eq!(provenance(&daemon), None, "and no provenance while healthy");
 
         // The 3rd consecutive all-error sweep crosses the threshold → exactly one edge-triggered
         // failure carrying the count, and the snapshot now surfaces the mechanism-down count.
@@ -944,10 +949,18 @@ mod tests {
             Some(3),
             "active episode is status-visible"
         );
+        assert_eq!(
+            provenance(&daemon),
+            Some(SystemicRefreshSource::Sweep),
+            "#813: the count reaches the wire STAMPED as a genuine sweep crossing — without this the \
+             projection could drop the discriminant and every surface would silently fall back to \
+             the sweep phrasing, which is right here and a fabrication on the preflight arm"
+        );
 
         // A further all-error sweep keeps climbing but does NOT re-emit (edge-, not level-triggered).
         assert_eq!(daemon.note_systemic_refresh(SweepHealth::AllError), None);
         assert_eq!(indicator(&daemon), Some(4));
+        assert_eq!(provenance(&daemon), Some(SystemicRefreshSource::Sweep));
 
         // A single working sweep is the recovery edge: one recovery event, and the indicator clears.
         assert_eq!(
@@ -959,6 +972,11 @@ mod tests {
             None,
             "recovery clears the status indicator"
         );
+        assert_eq!(
+            provenance(&daemon),
+            None,
+            "#813: and its provenance, together — a stale bracket must never outlive its episode"
+        );
     }
 
     /// The #787 daemon-side wiring the pure `SystemicRefreshHealth` unit tests can't reach: a
@@ -967,19 +985,24 @@ mod tests {
     /// This is the difference between "the fault is in memory" and "the operator sees the fault":
     /// the defect #787 fixes was precisely a board that read healthy over a broken daemon.
     ///
-    /// Also pins the projection's shape at the seam the wire cares about. `status` renders that
-    /// count as "N consecutive sweep(s) failed", so a preflight-opened episode must project a
-    /// non-degenerate `>= 1` rather than a zero that would render "0 consecutive sweeps failed" on
-    /// both surfaces.
+    /// Also pins the projection's shape at the seam the wire cares about. The count is seeded to a
+    /// non-degenerate `>= 1` rather than a zero, so a PRE-#813 client — which renders it
+    /// unconditionally as "N consecutive sweep(s) failed" — does not print "0 consecutive sweeps
+    /// failed". Current surfaces no longer read the count on this arm at all: since issue #813 the
+    /// snapshot also carries `systemic_refresh_source`, and they branch on that instead, which is
+    /// pinned here because THIS seam is what decides whether the wire carries it at all.
     #[tokio::test]
     async fn note_refresh_preflight_projects_a_restart_established_fault_into_snapshot() {
         let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
         const NOW: i64 = 1_782_777_600;
         let no_readings: [Option<Usage>; 3] = [None, None, None];
         let indicator = |d: &FakeDaemon| d.snapshot(None, &no_readings, NOW).systemic_refresh;
+        let provenance =
+            |d: &FakeDaemon| d.snapshot(None, &no_readings, NOW).systemic_refresh_source;
 
         // A freshly-restarted daemon reads healthy — the false-green the preflight closes.
         assert_eq!(indicator(&daemon), None, "a fresh daemon starts healthy");
+        assert_eq!(provenance(&daemon), None);
 
         // The preflight finds the mechanism already broken: one signal, and the board goes DOWN
         // immediately — WITHOUT the three all-error sweeps the threshold would otherwise demand.
@@ -992,11 +1015,24 @@ mod tests {
             Some(1),
             "a restart-established fault is status-visible at once, with a renderable count"
         );
+        assert_eq!(
+            provenance(&daemon),
+            Some(SystemicRefreshSource::Preflight),
+            "#813: and the wire says a PREFLIGHT opened it, so no surface cites that seeded 1 as a \
+             sweep count. This assertion is the whole fix's load-bearing leg: drop the projection \
+             and every surface silently reverts to inventing a sweep that never ran"
+        );
 
         // Sweeps that keep failing climb the count for `status` without re-emitting — the
         // once-per-episode contract holds across the two openers, at the daemon seam too.
         assert_eq!(daemon.note_systemic_refresh(SweepHealth::AllError), None);
         assert_eq!(indicator(&daemon), Some(2));
+        assert_eq!(
+            provenance(&daemon),
+            Some(SystemicRefreshSource::Preflight),
+            "#813: an episode is ONE span — a mid-episode sweep climbs the count but does not \
+             re-open it, so it must not restamp the bracket that did"
+        );
 
         // …and the first working sweep still closes it. The episode is re-derived at each startup
         // rather than persisted precisely so it can never go stale in the false-POSITIVE direction:
@@ -1006,6 +1042,7 @@ mod tests {
             Some(Event::RefreshSystemicRecovered)
         );
         assert_eq!(indicator(&daemon), None, "recovery clears it");
+        assert_eq!(provenance(&daemon), None, "#813: and the bracket with it");
     }
 
     /// The preflight is inert when the operator has `[refresh]` OFF (issue #787). Not a

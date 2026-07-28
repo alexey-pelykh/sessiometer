@@ -92,6 +92,8 @@ final class WatchStatusStoreTests: XCTestCase {
         try await waitForGlyph(recorder, .attention)
         XCTAssertEqual(store.connectionState, .connected)
         XCTAssertEqual(store.systemicRefreshFailure, 3, "the panel's banner input is published")
+        XCTAssertEqual(store.systemicRefreshSource, .sweep,
+                       "#813: the episode's provenance is published alongside its count — the banner needs BOTH")
         XCTAssertEqual(store.currentPresentation.glyph, .attention, "the glance shows the next-break !")
         // The roster alongside it reads healthy — the exact false-healthy state the pair exists to correct.
         XCTAssertEqual(store.rows.first?.auth, .healthy)

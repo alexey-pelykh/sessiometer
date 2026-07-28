@@ -142,7 +142,7 @@ pub(crate) use snapshot::{
     credential_health, refresh_health_view, to_pct, to_pct_exact, versioned_status_response,
     AccountReading, AccountStatusLine, BlindActive, BlindPreemptSwap, CanaryStatus, CanonicalScrub,
     LandingOvershoot, NextSwap, NextSwapReason, NoTargetCause, SchemaVersion, StatusResponse,
-    StatusSnapshot, VersionedStatus, STATUS_SCHEMA_VERSION,
+    StatusSnapshot, SystemicRefreshSource, VersionedStatus, STATUS_SCHEMA_VERSION,
 };
 // `status_response` (the payload projection) and `RefreshHealth` are named only by the in-module
 // tests — production reaches the wire through `versioned_status_response` (issue #164) and builds
