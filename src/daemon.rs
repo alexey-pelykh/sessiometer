@@ -1333,10 +1333,10 @@ struct DecisionState {
     /// stays exhausted — and fires afresh if the state clears and is re-entered.
     signaled_all_exhausted: bool,
     /// Edge-trigger guard for the proactive fleet-runway warning (issue #650): set when a
-    /// `fleet_runway_low` event is emitted, cleared — with the `fleet_runway_recovered` LEAVE
-    /// marker — only when a checked, KNOWN aggregate reads back at/over the threshold. So the
-    /// warning fires exactly ONCE per below-threshold episode and afresh after a genuine
-    /// recovery; an UNKNOWN probe reading holds the state as-is (mirrors
+    /// `fleet_runway_low` event is emitted, cleared — with the durable `fleet_runway_recovered`
+    /// LEAVE event (issue #827) — only when a checked, KNOWN aggregate reads back at/over the
+    /// threshold. So the warning fires exactly ONCE per below-threshold episode and afresh after a
+    /// genuine recovery; an UNKNOWN probe reading holds the state as-is (mirrors
     /// `signaled_canonical_scrubbed`'s "a flaky read never fabricates a recovery", where
     /// `signaled_all_exhausted` clears on any non-exhausted cycle).
     signaled_fleet_runway_low: bool,
@@ -1348,7 +1348,8 @@ struct DecisionState {
     last_fleet_runway_check: Option<i64>,
     /// Edge-trigger guard for the active-dead-no-target strand signal (issue #405):
     /// set when an `active_dead_no_target` event is emitted (the emergency path found
-    /// no live target for a DEAD active), cleared by [`Daemon::tick`] on any cycle
+    /// no live target for a DEAD active), cleared by [`Daemon::tick`] — with the durable
+    /// `active_dead_no_target_cleared` LEAVE event (issue #827) — on any cycle
     /// that is NOT that strand. So the signal fires exactly ONCE per strand episode —
     /// not once per emergency tick while every spare stays weekly-exhausted — and
     /// fires afresh if the strand clears and is re-entered. The strictly-worse sibling
@@ -2068,19 +2069,15 @@ where
     ///   crossing or a recovery.
     /// - **Edge-triggered.** A KNOWN runway below the line emits `fleet_runway_low` exactly ONCE
     ///   on the downward crossing (held silent while it stays below); a KNOWN runway back
-    ///   at/over the line emits the [`Diagnostic::FleetRunwayRecovered`] LEAVE marker once and
+    ///   at/over the line emits the [`Event::FleetRunwayRecovered`] LEAVE marker once and
     ///   re-arms, so a later crossing fires afresh — the `all_exhausted` / `all_exhausted_cleared`
-    ///   bracket exactly.
+    ///   bracket exactly. BOTH edges land on the durable event log since issue #827, so an
+    ///   episode's span is reconstructable offline; the helper emits no diagnostics at all.
     ///
     /// `now` is the wall-clock epoch second ([`wall_clock_now_secs`]) the caller reads once per
     /// tick — passed in (not read here) so the cadence + edge-trigger logic is unit-tested
     /// without wall-clock flakiness, as [`maintain_stats_store`](Self::maintain_stats_store) is.
-    fn check_fleet_runway_warn(
-        &mut self,
-        now: i64,
-        events: &mut Vec<Event>,
-        diagnostics: &mut Vec<Diagnostic>,
-    ) {
+    fn check_fleet_runway_warn(&mut self, now: i64, events: &mut Vec<Event>) {
         if self.fleet_runway_warn_secs == 0 {
             return; // opt-in OFF (default) → fully inert: no probe, no state churn
         }
@@ -2121,9 +2118,11 @@ where
             }
         } else {
             // KNOWN recovery: emit the LEAVE marker BEFORE the reset so a re-crossing signals
-            // afresh, mirroring the `AllExhaustedCleared` bracket.
+            // afresh, mirroring the `AllExhaustedCleared` bracket — and, since issue #827, onto
+            // the SAME durable sink as its ENTER, so the episode closes in the log and not merely
+            // in code.
             if self.state.signaled_fleet_runway_low {
-                diagnostics.push(Diagnostic::FleetRunwayRecovered);
+                events.push(Event::FleetRunwayRecovered);
             }
             self.state.signaled_fleet_runway_low = false;
         }
@@ -2605,10 +2604,13 @@ where
         // the `all_exhausted` clear above: any cycle that is NOT the strand clears the guard, and
         // a still-set guard on that cycle means we are LEAVING the strand — push the
         // `active_dead_no_target_cleared` marker BEFORE the reset, so a re-entry signals afresh and
-        // a stale strand reading is told from a current one.
+        // a stale strand reading is told from a current one. Durable since issue #827; see
+        // [`Event::ActiveDeadNoTargetCleared`] for why it is an event and not a diagnostic.
+        // Pushed AFTER `decide_action` returned, so an escape swap's `event=emergency_swap`
+        // precedes the clear on the same tick — the causal reading order.
         if !matches!(action, TickAction::ActiveDeadNoTarget) {
             if self.state.signaled_active_dead_no_target {
-                diagnostics.push(Diagnostic::ActiveDeadNoTargetCleared);
+                events.push(Event::ActiveDeadNoTargetCleared);
             }
             self.state.signaled_active_dead_no_target = false;
         }
@@ -2618,7 +2620,7 @@ where
         // inert unless opted in; placed POST-decide so it never shares state with `decide_action`
         // (the swap path is untouched — the issue's pinned non-goal). Reads the wall epoch once
         // (display/event-emission path, off the deterministic `Clock`).
-        self.check_fleet_runway_warn(wall_clock_now_secs(), &mut events, &mut diagnostics);
+        self.check_fleet_runway_warn(wall_clock_now_secs(), &mut events);
         // Issue #540: refresh the near-limit poll-coverage verdict from the POST-decision state
         // (`self.state.active` is the post-swap active — the same index the snapshot below reads),
         // so `next_subinterval` tightens the wait against the CURRENT active's freshest reading. Its
@@ -12912,7 +12914,8 @@ mod tests {
     // ── issue #650: the proactive fleet-runway warning edge trigger ──
     //
     // `check_fleet_runway_warn` is a self-contained post-decide helper — it reads only its own
-    // config field + injected probe + guard, taking `now` and pushing to events/diagnostics — so
+    // config field + injected probe + guard, taking `now` and pushing to `events` (BOTH edges,
+    // since issue #827 — it produces no diagnostics at all, which the signature now enforces) — so
     // these drive it DIRECTLY (like the `stats` tests drive `stats_events_for_poll`) on a minimal
     // `reconcile_daemon`, scripting the probe's successive readings and advancing `now` past the
     // cadence, rather than standing up a full `tick`. The swap path is never entered.
@@ -12980,9 +12983,8 @@ mod tests {
         daemon.fleet_runway_probe = Some(probe);
 
         let mut events = vec![];
-        let mut diags = vec![];
         // First armed check (no prior anchor → due): the crossing fires once.
-        daemon.check_fleet_runway_warn(RUNWAY_T0, &mut events, &mut diags);
+        daemon.check_fleet_runway_warn(RUNWAY_T0, &mut events);
         assert_eq!(
             events,
             vec![Event::FleetRunwayLow {
@@ -12992,43 +12994,39 @@ mod tests {
                 observed: 2,
             }],
         );
-        assert!(diags.is_empty());
         assert!(daemon.state.signaled_fleet_runway_low);
 
         // Two more DUE checks (past the cadence each time), still below → edge-triggered, so
         // NOTHING further is emitted.
         events.clear();
         for k in 1i64..=2 {
-            daemon.check_fleet_runway_warn(
-                RUNWAY_T0 + k * FLEET_RUNWAY_WARN_CHECK_SECS,
-                &mut events,
-                &mut diags,
-            );
+            daemon
+                .check_fleet_runway_warn(RUNWAY_T0 + k * FLEET_RUNWAY_WARN_CHECK_SECS, &mut events);
         }
         assert!(
             events.is_empty(),
             "held below must stay silent, got {events:?}"
         );
-        assert!(diags.is_empty());
         assert!(daemon.state.signaled_fleet_runway_low);
     }
 
     #[test]
     fn fleet_runway_warn_rearms_after_a_known_recovery() {
-        // AC4: a KNOWN runway back at/over the line clears the guard with ONE `fleet_runway_recovered`
-        // LEAVE marker, so a LATER crossing fires afresh — the `all_exhausted`/`all_exhausted_cleared`
-        // bracket exactly.
+        // AC4: a KNOWN runway back at/over the line clears the guard with ONE
+        // `fleet_runway_recovered` LEAVE marker, so a LATER crossing fires afresh — the
+        // `all_exhausted`/`all_exhausted_cleared` bracket exactly. Since issue #827 that marker is
+        // a DURABLE `Event` on the same sink as its ENTER, so the low-runway episode's span closes
+        // in the LOG and not merely in code — asserted here by reading it out of `events`.
         let (probe, _calls) = scripted_fleet_probe(vec![
             known_runway(1800), // below → fires
-            known_runway(7200), // recovered (>= 3600) → LEAVE marker, re-arm
+            known_runway(7200), // recovered (>= 3600) → LEAVE event, re-arm
             known_runway(1200), // below again → fires afresh
         ]);
         let mut daemon = probed_runway_daemon(3600);
         daemon.fleet_runway_probe = Some(probe);
 
         let mut events = vec![];
-        let mut diags = vec![];
-        daemon.check_fleet_runway_warn(RUNWAY_T0, &mut events, &mut diags);
+        daemon.check_fleet_runway_warn(RUNWAY_T0, &mut events);
         assert_eq!(
             events,
             vec![Event::FleetRunwayLow {
@@ -13041,27 +13039,20 @@ mod tests {
         );
         assert!(daemon.state.signaled_fleet_runway_low);
 
-        // Recovery at the next due check: the LEAVE marker, guard cleared, no event.
+        // Recovery at the next due check: the durable LEAVE event, guard cleared. Asserting the
+        // whole vec — not just "contains" — pins that the recovery emits the LEAVE edge and
+        // NOTHING else, so the bracket's closing line cannot be diluted.
         events.clear();
-        daemon.check_fleet_runway_warn(
-            RUNWAY_T0 + FLEET_RUNWAY_WARN_CHECK_SECS,
-            &mut events,
-            &mut diags,
-        );
-        assert!(events.is_empty(), "recovery emits no event");
-        assert_eq!(diags, vec![Diagnostic::FleetRunwayRecovered]);
+        daemon.check_fleet_runway_warn(RUNWAY_T0 + FLEET_RUNWAY_WARN_CHECK_SECS, &mut events);
+        assert_eq!(events, vec![Event::FleetRunwayRecovered]);
         assert!(
             !daemon.state.signaled_fleet_runway_low,
             "a known recovery re-arms the guard"
         );
 
         // A re-crossing after the re-arm fires afresh.
-        diags.clear();
-        daemon.check_fleet_runway_warn(
-            RUNWAY_T0 + 2 * FLEET_RUNWAY_WARN_CHECK_SECS,
-            &mut events,
-            &mut diags,
-        );
+        events.clear();
+        daemon.check_fleet_runway_warn(RUNWAY_T0 + 2 * FLEET_RUNWAY_WARN_CHECK_SECS, &mut events);
         assert_eq!(
             events,
             vec![Event::FleetRunwayLow {
@@ -13084,12 +13075,8 @@ mod tests {
         assert_eq!(off.fleet_runway_warn_secs, 0, "the shipped default is OFF");
         off.fleet_runway_probe = Some(probe);
         let mut events = vec![];
-        let mut diags = vec![];
-        off.check_fleet_runway_warn(RUNWAY_T0, &mut events, &mut diags);
-        assert!(
-            events.is_empty() && diags.is_empty(),
-            "off must emit nothing"
-        );
+        off.check_fleet_runway_warn(RUNWAY_T0, &mut events);
+        assert!(events.is_empty(), "off must emit nothing");
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -13107,12 +13094,8 @@ mod tests {
         // at the cadence, not once per poll.
         let mut unwired = probed_runway_daemon(3600); // probe left None
         let mut events = vec![];
-        let mut diags = vec![];
-        unwired.check_fleet_runway_warn(RUNWAY_T0, &mut events, &mut diags);
-        assert!(
-            events.is_empty() && diags.is_empty(),
-            "an unwired probe never fires"
-        );
+        unwired.check_fleet_runway_warn(RUNWAY_T0, &mut events);
+        assert!(events.is_empty(), "an unwired probe never fires");
         assert!(!unwired.state.signaled_fleet_runway_low);
         assert_eq!(unwired.state.last_fleet_runway_check, Some(RUNWAY_T0));
     }
@@ -13138,27 +13121,17 @@ mod tests {
         daemon.fleet_runway_probe = Some(probe);
 
         let mut events = vec![];
-        let mut diags = vec![];
-        daemon.check_fleet_runway_warn(RUNWAY_T0, &mut events, &mut diags);
+        daemon.check_fleet_runway_warn(RUNWAY_T0, &mut events);
         assert_eq!(events.len(), 1, "the first crossing fires");
         assert!(daemon.state.signaled_fleet_runway_low);
 
-        // Two unknown readings: neither fires nor re-arms; guard held, no diagnostics.
+        // Two unknown readings: neither fires nor re-arms; guard held, nothing emitted. That
+        // includes the LEAVE edge — a flaky read must never fabricate a `fleet_runway_recovered`,
+        // which since issue #827 would be a DURABLE line asserting a recovery that never happened.
         events.clear();
-        daemon.check_fleet_runway_warn(
-            RUNWAY_T0 + FLEET_RUNWAY_WARN_CHECK_SECS,
-            &mut events,
-            &mut diags,
-        );
-        daemon.check_fleet_runway_warn(
-            RUNWAY_T0 + 2 * FLEET_RUNWAY_WARN_CHECK_SECS,
-            &mut events,
-            &mut diags,
-        );
-        assert!(
-            events.is_empty() && diags.is_empty(),
-            "unknown readings emit nothing"
-        );
+        daemon.check_fleet_runway_warn(RUNWAY_T0 + FLEET_RUNWAY_WARN_CHECK_SECS, &mut events);
+        daemon.check_fleet_runway_warn(RUNWAY_T0 + 2 * FLEET_RUNWAY_WARN_CHECK_SECS, &mut events);
+        assert!(events.is_empty(), "unknown readings emit nothing");
         assert!(
             daemon.state.signaled_fleet_runway_low,
             "unknown holds the prior signaled state"
@@ -13166,11 +13139,7 @@ mod tests {
 
         // The still-below reading after the two unknowns does NOT re-fire — the guard was correctly
         // held through them, so there was no spurious clear to re-cross.
-        daemon.check_fleet_runway_warn(
-            RUNWAY_T0 + 3 * FLEET_RUNWAY_WARN_CHECK_SECS,
-            &mut events,
-            &mut diags,
-        );
+        daemon.check_fleet_runway_warn(RUNWAY_T0 + 3 * FLEET_RUNWAY_WARN_CHECK_SECS, &mut events);
         assert!(
             events.is_empty(),
             "a below reading after a held-through-unknown episode does not re-fire"
@@ -13187,20 +13156,15 @@ mod tests {
         let mut daemon = probed_runway_daemon(3600);
         daemon.fleet_runway_probe = Some(probe);
         let mut events = vec![];
-        let mut diags = vec![];
 
         // t0: due (no anchor) → probe called once.
-        daemon.check_fleet_runway_warn(RUNWAY_T0, &mut events, &mut diags);
+        daemon.check_fleet_runway_warn(RUNWAY_T0, &mut events);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(daemon.state.last_fleet_runway_check, Some(RUNWAY_T0));
 
         // t0 + (cadence − 1): NOT due → skipped entirely, probe NOT called again.
         events.clear();
-        daemon.check_fleet_runway_warn(
-            RUNWAY_T0 + FLEET_RUNWAY_WARN_CHECK_SECS - 1,
-            &mut events,
-            &mut diags,
-        );
+        daemon.check_fleet_runway_warn(RUNWAY_T0 + FLEET_RUNWAY_WARN_CHECK_SECS - 1, &mut events);
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -13214,15 +13178,63 @@ mod tests {
         );
 
         // t0 + cadence: due again → probe called.
-        daemon.check_fleet_runway_warn(
-            RUNWAY_T0 + FLEET_RUNWAY_WARN_CHECK_SECS,
-            &mut events,
-            &mut diags,
-        );
+        daemon.check_fleet_runway_warn(RUNWAY_T0 + FLEET_RUNWAY_WARN_CHECK_SECS, &mut events);
         assert_eq!(
             calls.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "an at-cadence check runs the probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tick_carries_both_fleet_runway_edges_onto_the_durable_event_log() {
+        // Issue #827's end-to-end claim for THIS strand: the LEAVE edge must reach the durable
+        // event log, so a low-runway episode's span is reconstructable offline. The tests above
+        // drive `check_fleet_runway_warn` DIRECTLY, so they pin the helper's edge logic but say
+        // nothing about the wiring — `tick` passing the helper the same `events` vec that becomes
+        // `TickOutcome.events`. Swapping that argument for a throwaway vec drops BOTH edges off
+        // the durable log and leaves every direct-drive test green, which is precisely the
+        // coverage shape the sibling strand's
+        // `keep_warm::tests::an_escape_swap_emits_the_durable_leave_edge_after_its_own_emergency_swap_event`
+        // exists to close. This is its fleet-runway twin.
+        //
+        // (The ENTER half of the wiring predates #827 and was unpinned for the same reason; it
+        // rides along here because the two edges share the one argument.)
+        let (probe, _calls) = scripted_fleet_probe(vec![
+            known_runway(1800), // below 3600 → ENTER
+            known_runway(7200), // recovered → LEAVE, re-arm
+        ]);
+        let mut daemon = lifecycle_daemon().await;
+        daemon.fleet_runway_warn_secs = 3600;
+        daemon.fleet_runway_probe = Some(probe);
+
+        let entered = daemon.tick().await;
+        assert!(
+            entered.events.contains(&Event::FleetRunwayLow {
+                runway_secs: 1800,
+                threshold_secs: 3600,
+                counted: 2,
+                observed: 2,
+            }),
+            "the ENTER edge must reach TickOutcome.events: {:?}",
+            entered.events
+        );
+
+        // Re-arm the CADENCE anchor so the next tick's check is due. The helper reads the real
+        // wall clock (it is off the deterministic `Clock`), so two ticks in one test are always
+        // inside the 600 s window; clearing the anchor is the timing seam, not the edge logic
+        // under test.
+        daemon.state.last_fleet_runway_check = None;
+
+        let recovered = daemon.tick().await;
+        assert!(
+            recovered.events.contains(&Event::FleetRunwayRecovered),
+            "the LEAVE edge must reach TickOutcome.events — the durable sink #827 promoted it to: {:?}",
+            recovered.events
+        );
+        assert!(
+            !daemon.state.signaled_fleet_runway_low,
+            "a known recovery re-arms the guard"
         );
     }
 
