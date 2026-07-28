@@ -24,6 +24,13 @@
 //! discipline) is a requirement on the Windows-enablement work, which is also
 //! where that branch first compiles.
 //!
+//! That same password-database discipline extends past *locations* to the user's
+//! login shell (issue #783): under launchd the daemon inherits a bare
+//! `PATH=/usr/bin:/bin:/usr/sbin:/sbin` with no `~/.local/bin`, so the user-level
+//! `PATH` has to be reconstructed by running the login shell — resolved from
+//! `pw_shell`, never from `$SHELL`, for the same reason the home directory is never
+//! read from `$HOME`.
+//!
 //! Directories are created `0700` and files `0600`, and every directory we
 //! create is asserted to be owned by the current uid before use.
 
@@ -33,8 +40,13 @@ use std::io::{ErrorKind, Write};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+
+use tokio::process::Command;
 
 use crate::error::{Error, Result};
+use crate::isolated_spawn::SPAWN_ENV_REMOVE;
 
 /// `0700` — owner `rwx`, nothing for group/other.
 const DIR_MODE: u32 = 0o700;
@@ -58,10 +70,16 @@ pub(crate) fn current_uid() -> u32 {
 /// environment variable is intentionally ignored.
 fn home_dir() -> Result<PathBuf> {
     let uid = current_uid();
-    // SAFETY: `getpwuid` returns a pointer into a static buffer owned by libc.
-    // The process is single-threaded at startup (the only caller path), makes
-    // no other `getpw*` call before reading the result, and copies `pw_dir`
-    // into an owned `OsString` before the pointer can be invalidated.
+    // SAFETY: `getpwuid` returns a pointer into a libc-owned static buffer. Exactly
+    // THREE functions read it — this one, [`username`], and [`login_shell`] (issue
+    // #783) — and they are the crate's only `getpw*` callers, so nothing else can
+    // invalidate the buffer between the call and the copy. What rules out a
+    // concurrent `getpw*` is the single-threaded executor
+    // (`#[tokio::main(flavor = "current_thread")]` in `src/main.rs`, ADR-0001) — NOT
+    // "single-threaded at startup", which would be the wrong argument: all three are
+    // reachable mid-runtime (the #102 refresh engine resolves the `acct` per cycle,
+    // and the #783 harvest is built for that same per-cycle path). `pw_dir` is copied
+    // into an owned `OsString` before any later `getpw*` could run.
     unsafe {
         let pw = libc::getpwuid(uid);
         if pw.is_null() {
@@ -93,13 +111,15 @@ fn home_dir() -> Result<PathBuf> {
 /// a spoofed environment, which is exactly what this function guarantees.
 pub(crate) fn username() -> Result<OsString> {
     let uid = current_uid();
-    // SAFETY: `getpwuid` returns a pointer into a libc-owned static buffer. The crate
-    // runs on a single-threaded executor (`#[tokio::main(flavor = "current_thread")]`)
-    // and `getpwuid` (here and in [`home_dir`]) is the crate's ONLY `getpw*` caller, so
-    // no concurrent `getpw*` can race or invalidate the shared buffer — this holds for
-    // this function's mid-runtime callers too (the #102 refresh engine resolves the
-    // `acct` per cycle), not only at startup. `pw_name` is copied into an owned
-    // `OsString` before any later `getpw*` (e.g. a subsequent `home_dir`) could run.
+    // SAFETY: `getpwuid` returns a pointer into a libc-owned static buffer. Exactly
+    // THREE functions read it — this one, [`home_dir`], and [`login_shell`] (issue
+    // #783) — and they are the crate's only `getpw*` callers, so no concurrent
+    // `getpw*` can race or invalidate the shared buffer; the guarantee comes from the
+    // single-threaded executor (`#[tokio::main(flavor = "current_thread")]`,
+    // ADR-0001), and it holds for every mid-runtime caller (the #102 refresh engine
+    // resolves the `acct` per cycle; the #783 harvest is built for that same per-cycle
+    // path), not only at startup. `pw_name` is copied into an owned `OsString` before
+    // any later `getpw*` (e.g. a subsequent `home_dir`) could run.
     unsafe {
         let pw = libc::getpwuid(uid);
         if pw.is_null() {
@@ -115,6 +135,73 @@ pub(crate) fn username() -> Result<OsString> {
         }
         Ok(OsString::from_vec(bytes))
     }
+}
+
+/// The current user's login shell from the password database
+/// (`getpwuid(getuid())->pw_shell`), resolved exactly like [`home_dir`] and
+/// [`username`] — never from `$SHELL`.
+///
+/// `$SHELL` is unusable here for two independent reasons: under launchd it is simply
+/// absent (the same impoverished environment that motivates issue #783 at all), and
+/// where it *is* set it is an inherited, spoofable value rather than the user's
+/// registered login shell. The password database is the same identity source the rest
+/// of this module already keys off.
+///
+/// The THIRD `getpw*` accessor in the crate, and deliberately a third *function*
+/// rather than a multi-field read folded into [`home_dir`]: both existing accessors
+/// have callers of their own, and merging them would be a refactor buying nothing the
+/// immediate-copy discipline (see the SAFETY note) does not already provide.
+///
+/// A `pw_shell` that is absent, or that does not name an absolute path, is
+/// [`Error::LoginShellUnresolved`] — a `nologin`-style account may legitimately carry an
+/// empty one, and the caller degrades rather than guessing a shell. See
+/// [`login_shell_from`] for why a *relative* entry is refused on the same footing. Not
+/// yet wired into production (the harvest's resolution-chain wiring is issue #784), so —
+/// like [`usage_samples`] — it is `allow(dead_code)` off the test path.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn login_shell() -> Result<PathBuf> {
+    let uid = current_uid();
+    // SAFETY: `getpwuid` returns a pointer into a libc-owned static buffer. Exactly
+    // THREE functions read it — this one, [`home_dir`], and [`username`] — and they
+    // are the crate's only `getpw*` callers, so nothing else can invalidate the buffer
+    // between the call and the copy. What rules out a concurrent `getpw*` is the
+    // single-threaded executor (`#[tokio::main(flavor = "current_thread")]`,
+    // ADR-0001); this function in particular is built for the per-cycle refresh path
+    // (#784), so "single-threaded at startup" would NOT be a sufficient argument for
+    // it. `pw_shell` is copied into an owned `OsString` before any later `getpw*`
+    // could run.
+    let bytes = unsafe {
+        let pw = libc::getpwuid(uid);
+        if pw.is_null() {
+            return Err(Error::LoginShellUnresolved);
+        }
+        let shell = (*pw).pw_shell;
+        if shell.is_null() {
+            return Err(Error::LoginShellUnresolved);
+        }
+        CStr::from_ptr(shell).to_bytes().to_vec()
+    };
+    login_shell_from(&bytes)
+}
+
+/// The pure validation half of [`login_shell`], taking the raw `pw_shell` bytes so both
+/// rejections are testable without a passwd entry to forge — the same
+/// argument-threading the [`claude_binary_from`] and [`harvest_path_from`] seams in this
+/// module already use.
+///
+/// A single predicate covers both rejections, because an EMPTY path is not an absolute
+/// one: `pw_shell` must be an absolute path. Empty is the `nologin`-class passwd entry
+/// (there is nothing to execute); relative is the transport rule's discipline #1
+/// (`CONTRIBUTING.md`: "Absolute path …, never `$PATH`-resolved"), which applies with
+/// more force to the binary actually exec'd than to the `/usr/bin/env` it runs — a
+/// relative `pw_shell` would otherwise be resolved against the very `PATH` whose absence
+/// is the reason this harvest exists.
+fn login_shell_from(pw_shell: &[u8]) -> Result<PathBuf> {
+    let path = PathBuf::from(OsString::from_vec(pw_shell.to_vec()));
+    if !path.is_absolute() {
+        return Err(Error::LoginShellUnresolved);
+    }
+    Ok(path)
 }
 
 /// The ephemeral isolated-refresh directory for account `uuid`:
@@ -619,6 +706,199 @@ fn absolutize(path: PathBuf, cwd: &Path) -> PathBuf {
     }
 }
 
+// --- Login-shell PATH harvest (issue #783) -------------------------------------
+//
+// Under launchd the daemon inherits `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, which does
+// not contain `~/.local/bin/claude` — so once the daemon moved under launchd (issue
+// #171) every automatic refresh failed to resolve a `claude` at all. The daemon must
+// spawn the SAME binary the user's terminal would, which means reconstructing the
+// user-level PATH that launchd never handed it.
+//
+// This section provides the harvest capability only; feeding its result into
+// [`claude_binary_from`] is issue #784, so nothing here has a production caller yet
+// (hence the `allow(dead_code)` off the test path, as elsewhere in this module).
+
+/// The absolute `env(1)` run inside the login shell to read its environment.
+///
+/// Absolute per the transport rule (`CONTRIBUTING.md` § "System CLIs, not client
+/// crates"): a hijacked `PATH` must not be able to substitute a different binary —
+/// which matters doubly here, because the entire purpose of the call is to obtain a
+/// `PATH` we do not yet have.
+///
+/// `env` and NOT `echo $PATH`: fish and nu print `$PATH` as a space-separated LIST, so
+/// an `echo`-based harvest would silently corrupt the value on exactly the shells whose
+/// users are most likely to have a customized `PATH`. `env` emits the colon-joined
+/// variable verbatim regardless of which shell runs it.
+const ENV_BIN: &str = "/usr/bin/env";
+
+/// How long the login-shell PATH harvest may run before the child is killed.
+///
+/// **5 s.** The measured cost of `zsh -l -c /usr/bin/env` on the reference machine is
+/// **~38 ms**, so this leaves ~130× headroom — a pathologically slow rc file still
+/// finishes comfortably.
+///
+/// The value is fixed from ABOVE, not below: `[refresh].timeout_secs` bounds the whole
+/// refresh cycle and defaults to 90 s ([`crate::config::RefreshConfig`]), emitting
+/// `RefreshEventReason::Timeout` when it fires. A harvest allowed to approach that
+/// number could hang long enough to trip the cycle bound instead, and the operator
+/// would be pointed at the `claude` spawn rather than at their own shell. At 5 s the
+/// harvest is 18× below the cycle bound, so a hang always surfaces as a harvest
+/// failure. `harvest_bound_stays_far_below_the_refresh_cycle_bound` pins the ratio so a
+/// future tuner cannot silently close the gap.
+pub(crate) const LOGIN_SHELL_HARVEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Build the login-shell PATH-harvest command — **the single site this spawn's env
+/// scrub is applied**, mirroring [`crate::isolated_spawn::SpawnPlan::build_command`].
+///
+/// `<shell> -l -c /usr/bin/env`: a LOGIN shell (`-l`) because the user's `PATH`
+/// additions live in the login profile, and non-interactive (`-c`, never `-i`) because
+/// an interactive shell was measured at ~284 ms for a byte-identical result — 7.5× the
+/// non-interactive ~38 ms — while additionally sourcing `.zshrc`.
+///
+/// stdout is captured (it is the answer); stdin is nulled so a shell that reads from it
+/// gets EOF instead of blocking the daemon forever; stderr is nulled because rc chatter
+/// is noise the parser does not need and must not reach the daemon's own streams.
+///
+/// The [`SPAWN_ENV_REMOVE`] scrub is applied LAST, exactly as on the `claude` spawn
+/// paths and for the same reason, which is sharper here than anywhere else: a login
+/// shell sources ARBITRARY user rc files, so it must never inherit
+/// `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` / `CLAUDE_SECURESTORAGE_CONFIG_DIR`.
+/// This command is the THIRD parametrization
+/// `isolated_spawn::tests::all_parametrizations_apply_the_full_scrub_set` asserts the
+/// complete set against — a dropped entry there is a silent isolation regression here.
+pub(crate) fn build_login_shell_env_command(shell: &Path) -> Command {
+    let mut command = Command::new(shell);
+    command
+        .arg("-l")
+        .arg("-c")
+        .arg(ENV_BIN)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        // A child that outlives its bound must not outlive this process: on timeout the
+        // `wait_with_output` future is dropped, which drops the `Child`, which kills it.
+        .kill_on_drop(true);
+    // The security-critical scrub, applied LAST so no earlier `.env` can resurrect a
+    // scrubbed var (see [`SPAWN_ENV_REMOVE`]).
+    for var in SPAWN_ENV_REMOVE {
+        command.env_remove(var);
+    }
+    command
+}
+
+/// Extract the `PATH` value from `/usr/bin/env` output.
+///
+/// Scans line by line for the FIRST line beginning exactly with `PATH=` and returns the
+/// remainder of that line verbatim.
+///
+/// Byte-oriented, never `str`: a `PATH` entry is an arbitrary OS byte string, and a
+/// lossy UTF-8 conversion would silently rewrite a non-UTF-8 directory into replacement
+/// characters — the same reason [`home_dir`] builds its result with `OsString::from_vec`.
+///
+/// Matching an anchored whole-line prefix (rather than splitting each line on `=`) is
+/// what makes the awkward cases fall out for free: a value that itself contains `=`
+/// (`FOO=a=b`) cannot split wrong, because only the text after the leading `PATH=`
+/// is ever taken; a key merely *ending* in `PATH` (`XPATH=`, `MYPATH=`) never matches,
+/// because the prefix is anchored at the line start; and rc chatter a login shell
+/// prints to stdout is skipped, because it does not carry the prefix.
+///
+/// `env`'s newline-separated format is inherently ambiguous once a value contains a
+/// newline — a continuation line is indistinguishable from a fresh entry. Continuation
+/// lines of an ordinary multi-line value are simply skipped (they do not start with
+/// `PATH=`), which is the case that matters. A value deliberately embedding a literal
+/// `"\nPATH="` could shadow the real entry; that is accepted rather than defended
+/// against, because the environment being read is the user's OWN login shell and anyone
+/// able to plant such a variable can already replace the `claude` on the user's
+/// interactive `PATH` — a daemon-side defense would be stricter than the terminal it
+/// exists to imitate.
+///
+/// An absent `PATH=` line and a present-but-EMPTY one are both errors. An empty `PATH`
+/// is not a usable answer, and returning it as success would present a failed harvest
+/// as a successful one.
+fn path_from_env_output(shell: &Path, output: &[u8]) -> Result<OsString> {
+    for line in output.split(|byte| *byte == b'\n') {
+        if let Some(value) = line.strip_prefix(b"PATH=") {
+            if value.is_empty() {
+                return Err(Error::LoginShellPathUnharvested {
+                    shell: shell.to_path_buf(),
+                    reason: "it reported an empty PATH",
+                });
+            }
+            return Ok(OsString::from_vec(value.to_vec()));
+        }
+    }
+    Err(Error::LoginShellPathUnharvested {
+        shell: shell.to_path_buf(),
+        reason: "its environment contained no PATH= line",
+    })
+}
+
+/// Harvest the user-level `PATH` by running the current user's login shell (issue #783).
+///
+/// The production entry point: resolves the shell from the password database via
+/// [`login_shell`] and hands it to [`harvest_path_from`] under
+/// [`LOGIN_SHELL_HARVEST_TIMEOUT`]. Wired into the resolution chain by issue #784.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn harvest_login_shell_path() -> Result<OsString> {
+    harvest_path_from(&login_shell()?, LOGIN_SHELL_HARVEST_TIMEOUT).await
+}
+
+/// The parametrized harvest behind [`harvest_login_shell_path`], taking `shell` and the
+/// run `bound` as arguments so every branch — success, missing shell, non-zero exit,
+/// hang — is testable against a deterministic stand-in without touching process-global
+/// state or depending on whichever shell the test host's user happens to have.
+///
+/// Every failure is [`Error::LoginShellPathUnharvested`], a single variant the caller
+/// matches once to degrade non-fatally (issue #375's contract: record it and retry next
+/// cycle, never permanently disable the tick). The one exception is a `shell` that is not
+/// an ABSOLUTE path, which is [`Error::LoginShellUnresolved`] and short-circuits before
+/// any spawn: empty means the passwd entry named nothing to execute, and relative would
+/// be `PATH`-resolved by `Command` against the very `PATH` whose absence is the reason
+/// this function exists (the transport rule's discipline #1). Both are passwd-entry
+/// problems rather than failed harvests, and the gate is repeated here — [`login_shell`]
+/// already applies it — because THIS is the boundary that execs.
+///
+/// The exit status is checked BEFORE the output is parsed, which is load-bearing rather
+/// than stylistic: a `nologin`-class shell prints its refusal to stdout and exits
+/// non-zero, and a refusal message must never be mistaken for environment output.
+async fn harvest_path_from(shell: &Path, bound: Duration) -> Result<OsString> {
+    if !shell.is_absolute() {
+        return Err(Error::LoginShellUnresolved);
+    }
+    let child = build_login_shell_env_command(shell).spawn().map_err(|_| {
+        // The io error is classified, never embedded: `Display` on it is safe, but the
+        // single-variant contract above is what the caller actually needs.
+        Error::LoginShellPathUnharvested {
+            shell: shell.to_path_buf(),
+            reason: "it could not be spawned",
+        }
+    })?;
+    let output = match tokio::time::timeout(bound, child.wait_with_output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(_)) => {
+            return Err(Error::LoginShellPathUnharvested {
+                shell: shell.to_path_buf(),
+                reason: "it could not be run to completion",
+            })
+        }
+        // The bound fired: the future above is dropped here, and with it the `Child`,
+        // whose `kill_on_drop` reaps the hung shell rather than leaking it.
+        Err(_) => {
+            return Err(Error::LoginShellPathUnharvested {
+                shell: shell.to_path_buf(),
+                reason: "it did not exit within the harvest timeout",
+            })
+        }
+    };
+    if !output.status.success() {
+        return Err(Error::LoginShellPathUnharvested {
+            shell: shell.to_path_buf(),
+            reason: "it exited non-zero without producing an environment",
+        });
+    }
+    path_from_env_output(shell, &output.stdout)
+}
+
 /// Create `path` (and any missing parents) `0700` and assert it is owned by the
 /// current uid. Idempotent: if the directory already exists it re-tightens the
 /// mode and re-checks ownership.
@@ -723,6 +1003,9 @@ pub(crate) fn write_preserving_mode(path: &Path, contents: &[u8]) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::collections::BTreeSet;
+    use std::ffi::OsStr;
 
     #[test]
     fn apple_config_prefers_xdg_when_set() {
@@ -1217,5 +1500,567 @@ mod tests {
         let missing = tmp.path().join("no-such-claude");
         let err = claude_binary_with_override(Some(&missing)).unwrap_err();
         assert!(matches!(err, Error::ClaudeBinaryNotFound));
+    }
+
+    // --- Login-shell PATH harvest (issue #783) ------------------------------
+    //
+    // Split in two, matching the seam: the PARSE tests feed captured `env` output
+    // straight to `path_from_env_output` (no spawn at all), and the SPAWN tests drive
+    // `harvest_path_from` against deterministic `/bin/sh` stand-ins rather than the
+    // test host user's real shell. Neither half mutates the ambient process
+    // environment: every value the code under test reads is threaded in as an
+    // argument, exactly as the `claude_binary_from` tests above already model, so the
+    // suite cannot race another test that happens to touch the same variable.
+
+    /// A stand-in login shell: an executable `/bin/sh` script that IGNORES its
+    /// `-l -c /usr/bin/env` arguments and instead runs `body`. That substitution is
+    /// what makes the spawn tests hermetic — the harvested bytes are whatever `body`
+    /// prints, rather than whatever environment the test runner happens to carry.
+    fn fake_shell(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&path, Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// A real `false`(1), which is the concrete `pw_shell` value AC10 names. Merged-`/usr`
+    /// systems (macOS, current Debian/Ubuntu) carry `/usr/bin/false`; the `/bin/false`
+    /// fallback keeps the test honest on hosts that only have the unmerged location,
+    /// rather than silently skipping.
+    fn real_false_binary() -> PathBuf {
+        for candidate in ["/usr/bin/false", "/bin/false"] {
+            let path = PathBuf::from(candidate);
+            if path.is_file() {
+                return path;
+            }
+        }
+        panic!("no `false` binary at /usr/bin/false or /bin/false");
+    }
+
+    fn unharvested_reason(err: &Error) -> &'static str {
+        match err {
+            Error::LoginShellPathUnharvested { reason, .. } => reason,
+            other => panic!("expected LoginShellPathUnharvested, got {other:?}"),
+        }
+    }
+
+    /// [`path_from_env_output`] against a fixed stand-in shell. Every parse test asserts on
+    /// the parsed value or the classified reason and never on which shell was named, so the
+    /// `shell` argument is pure carrier for the error payload — naming it once here keeps it
+    /// from reading like a variable of the parse.
+    fn parse_env_output(output: &[u8]) -> Result<OsString> {
+        path_from_env_output(Path::new("/bin/zsh"), output)
+    }
+
+    // --- Pure parse (T1-T9): no spawn, captured `env` output only -----------
+
+    /// T1: a well-formed environment among many other variables.
+    #[test]
+    fn parses_the_path_line_out_of_a_well_formed_environment() {
+        let output = b"SHELL=/bin/zsh\nPATH=/opt/homebrew/bin:/usr/bin:/bin\nTERM=xterm\n";
+        let got = parse_env_output(output).unwrap();
+        assert_eq!(got, OsString::from("/opt/homebrew/bin:/usr/bin:/bin"));
+    }
+
+    /// T2: no `PATH=` line at all is a typed error, NOT an empty-string success — the
+    /// caller must be able to tell "no answer" from "the answer is nothing".
+    #[test]
+    fn an_absent_path_line_is_a_typed_error() {
+        let err = parse_env_output(b"HOME=/Users/x\nTERM=xterm\n").unwrap_err();
+        assert!(matches!(err, Error::LoginShellPathUnharvested { .. }));
+        assert_eq!(
+            unharvested_reason(&err),
+            "its environment contained no PATH= line"
+        );
+    }
+
+    /// T3: `PATH=` present but EMPTY is likewise no usable answer. Distinct from T2 by
+    /// reason string, so an operator can tell an unset PATH from an emptied one.
+    #[test]
+    fn a_present_but_empty_path_is_not_a_success() {
+        let err = parse_env_output(b"HOME=/Users/x\nPATH=\nTERM=xterm\n").unwrap_err();
+        assert!(matches!(err, Error::LoginShellPathUnharvested { .. }));
+        assert_eq!(unharvested_reason(&err), "it reported an empty PATH");
+    }
+
+    /// T4: a value containing `=` must not corrupt the match. Both directions are
+    /// checked — an `=`-bearing OTHER variable is skipped, and an `=` inside PATH's own
+    /// value survives verbatim (a naive `split('=')` would truncate it).
+    #[test]
+    fn a_value_containing_an_equals_sign_does_not_corrupt_the_match() {
+        let output = b"FOO=a=b\nPATH=/usr/bin:/opt/x=y/bin\nBAR=1\n";
+        let got = parse_env_output(output).unwrap();
+        assert_eq!(got, OsString::from("/usr/bin:/opt/x=y/bin"));
+    }
+
+    /// T5: a value containing a NEWLINE must not cause the following line to be
+    /// mis-parsed. `FOO`'s value spans two lines; its continuation carries no `PATH=`
+    /// prefix, so it is skipped and the real entry below it is still found.
+    #[test]
+    fn a_value_containing_a_newline_does_not_misparse_the_next_line() {
+        let output = b"FOO=first\nsecond-line-of-foo\nPATH=/usr/bin:/bin\nBAR=1\n";
+        let got = parse_env_output(output).unwrap();
+        assert_eq!(got, OsString::from("/usr/bin:/bin"));
+    }
+
+    /// T6: a key merely ENDING in `PATH` is not the `PATH` variable. The prefix is
+    /// anchored at the line start, so `XPATH=` / `MYPATH=` cannot match — and with no
+    /// real `PATH` line present the result must be the typed error, never `XPATH`'s value.
+    #[test]
+    fn a_key_merely_ending_in_path_is_not_matched() {
+        let output = b"XPATH=/wrong/one\nMYPATH=/also/wrong\nCLASSPATH=/nope\n";
+        let err = parse_env_output(output).unwrap_err();
+        assert_eq!(
+            unharvested_reason(&err),
+            "its environment contained no PATH= line"
+        );
+
+        // ...and the real entry is still found when it sits among those decoys.
+        let with_real = b"XPATH=/wrong/one\nPATH=/usr/bin\nMYPATH=/also/wrong\n";
+        assert_eq!(
+            parse_env_output(with_real).unwrap(),
+            OsString::from("/usr/bin")
+        );
+    }
+
+    /// T7: a trailing newline and its absence parse identically — the last line of
+    /// `env` output is as valid a carrier as any other.
+    #[test]
+    fn parses_with_and_without_a_trailing_newline() {
+        let with = b"HOME=/Users/x\nPATH=/usr/bin:/bin\n";
+        let without = b"HOME=/Users/x\nPATH=/usr/bin:/bin";
+        assert_eq!(
+            parse_env_output(with).unwrap(),
+            OsString::from("/usr/bin:/bin")
+        );
+        assert_eq!(
+            parse_env_output(without).unwrap(),
+            OsString::from("/usr/bin:/bin")
+        );
+    }
+
+    /// T8: completely empty output is a typed error, not an empty success.
+    #[test]
+    fn empty_output_is_a_typed_error() {
+        let err = parse_env_output(b"").unwrap_err();
+        assert!(matches!(err, Error::LoginShellPathUnharvested { .. }));
+        assert_eq!(
+            unharvested_reason(&err),
+            "its environment contained no PATH= line"
+        );
+    }
+
+    /// T9: rc chatter — a login shell printing banners/warnings to stdout — is ignored,
+    /// and the `PATH=` line is still found among it. This is the realistic shape of a
+    /// customized login profile, not a synthetic edge case.
+    #[test]
+    fn rc_chatter_is_ignored_and_the_path_is_still_found() {
+        let output = b"Welcome back!\n  nvm: using v22\n\nPATH=/usr/local/bin:/usr/bin\ndone.\n";
+        let got = parse_env_output(output).unwrap();
+        assert_eq!(got, OsString::from("/usr/local/bin:/usr/bin"));
+    }
+
+    /// The harvested value is preserved BYTE-for-byte, including bytes that are not
+    /// valid UTF-8. A `String`-based parse would lossily rewrite such a directory into
+    /// replacement characters and resolve `claude` against a path that does not exist.
+    #[test]
+    fn a_non_utf8_path_entry_survives_verbatim() {
+        let mut output = b"PATH=/usr/bin:/opt/".to_vec();
+        output.push(0xff);
+        output.extend_from_slice(b"dir/bin\n");
+        let got = parse_env_output(&output).unwrap();
+
+        let mut expected = b"/usr/bin:/opt/".to_vec();
+        expected.push(0xff);
+        expected.extend_from_slice(b"dir/bin");
+        assert_eq!(got, OsString::from_vec(expected));
+    }
+
+    // --- Spawn (T10-T14, T17-T19) -------------------------------------------
+
+    /// T10: a shell that prints a known environment has its PATH harvested verbatim.
+    #[tokio::test]
+    async fn harvest_reads_the_path_the_shell_prints() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shell = fake_shell(
+            tmp.path(),
+            "shell",
+            "printf 'HOME=/Users/x\\nPATH=/harvested/bin:/usr/bin\\nTERM=xterm\\n'",
+        );
+        let got = harvest_path_from(&shell, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert_eq!(got, OsString::from("/harvested/bin:/usr/bin"));
+    }
+
+    /// T11: a `pw_shell` naming a file that does not exist is a typed error — the spawn
+    /// fails, and it must not panic or propagate a bare io error.
+    #[tokio::test]
+    async fn a_nonexistent_shell_is_a_typed_error() {
+        let err = harvest_path_from(Path::new("/no/such/shell"), Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::LoginShellPathUnharvested { .. }));
+        assert_eq!(unharvested_reason(&err), "it could not be spawned");
+    }
+
+    /// T12: a shell that exits non-zero is a typed error even when it printed nothing.
+    #[tokio::test]
+    async fn a_shell_exiting_non_zero_is_a_typed_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shell = fake_shell(tmp.path(), "shell", "exit 1");
+        let err = harvest_path_from(&shell, Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            unharvested_reason(&err),
+            "it exited non-zero without producing an environment"
+        );
+    }
+
+    /// T13 (and the live half of AC3): a shell that never exits is cut off by the bound
+    /// and yields the typed error rather than hanging the caller. Driven with a short
+    /// injected bound so the suite does not pay the real 5 s; the constant's own
+    /// relationship to the refresh cycle is pinned separately by
+    /// `harvest_bound_stays_far_below_the_refresh_cycle_bound` (T20).
+    #[tokio::test]
+    async fn a_hanging_shell_is_cut_off_by_the_bound() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shell = fake_shell(tmp.path(), "shell", "sleep 120");
+        let bound = Duration::from_millis(250);
+        // The ceiling sits below `LOGIN_SHELL_HARVEST_TIMEOUT` on purpose: a looser one
+        // would also pass if `bound` were ignored and the 5 s constant used instead, so
+        // the assertion would no longer prove the bound is the parameter. Still 8x slack
+        // over the 250 ms injected value, so a loaded CI runner cannot flake it.
+        let ceiling = Duration::from_secs(2);
+
+        let started = std::time::Instant::now();
+        let err = harvest_path_from(&shell, bound).await.unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            unharvested_reason(&err),
+            "it did not exit within the harvest timeout"
+        );
+        assert!(
+            elapsed < ceiling,
+            "harvest must return on the INJECTED bound, took {elapsed:?}"
+        );
+        assert!(
+            ceiling < LOGIN_SHELL_HARVEST_TIMEOUT,
+            "this ceiling only discriminates while it stays below the constant"
+        );
+    }
+
+    /// T14: the child's environment carries none of the scrubbed credential vars —
+    /// asserted on the built command, which is where the scrub actually lives and the
+    /// only place it can be checked EXHAUSTIVELY. A live child can only ever
+    /// demonstrate the absence of variables the ambient environment happened to set,
+    /// and setting them would mean mutating process-global state this suite refuses to
+    /// touch. The live-child corroboration is the test below; the parity assertion
+    /// against the two `claude` spawn plans lives in
+    /// `isolated_spawn::tests::all_parametrizations_apply_the_full_scrub_set`.
+    #[test]
+    fn the_harvest_command_scrubs_the_full_credential_set() {
+        let command = build_login_shell_env_command(Path::new("/bin/zsh"));
+        let removed: BTreeSet<OsString> = command
+            .as_std()
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(key, _)| key.to_os_string())
+            .collect();
+        let expected: BTreeSet<OsString> = SPAWN_ENV_REMOVE
+            .iter()
+            .map(|s| OsString::from(*s))
+            .collect();
+        assert_eq!(
+            removed, expected,
+            "the login-shell harvest must scrub the full credential/config-override set — \
+             a login shell sources arbitrary rc files"
+        );
+        // The argv shape the whole mechanism rests on: a LOGIN shell, non-interactive,
+        // running `env` at its absolute path (never `echo $PATH`).
+        let args: Vec<&OsStr> = command.as_std().get_args().collect();
+        assert_eq!(
+            args,
+            [
+                OsStr::new("-l"),
+                OsStr::new("-c"),
+                OsStr::new("/usr/bin/env")
+            ]
+        );
+        assert!(Path::new(ENV_BIN).is_absolute());
+    }
+
+    /// T14, live half: a real child prints its real environment, and no scrubbed name
+    /// appears among its keys. Deliberately paired with the exhaustive command-level
+    /// assertion above rather than replacing it — this half proves the scrub survives an
+    /// actual spawn, and its subject is verified non-degenerate (the child really did
+    /// emit a populated environment) before the absence claim is made.
+    #[tokio::test]
+    async fn a_live_harvest_child_emits_no_scrubbed_variable() {
+        // The real shape — `/bin/sh -l -c /usr/bin/env` — so the child's own `env`
+        // output is what gets inspected.
+        let shell = PathBuf::from("/bin/sh");
+        let mut command = build_login_shell_env_command(&shell);
+        let output = command.spawn().unwrap().wait_with_output().await.unwrap();
+        assert!(output.status.success(), "/bin/sh -l -c env must succeed");
+
+        let keys: Vec<&[u8]> = output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| line.iter().position(|b| *b == b'=').map(|i| &line[..i]))
+            .collect();
+        // Non-degenerate subject: an empty or unparsed corpus would make the absence
+        // assertion below vacuously true, so prove the corpus is real first.
+        assert!(
+            keys.contains(&b"PATH".as_slice()),
+            "the child's environment must be populated for the absence check to mean anything"
+        );
+        for scrubbed in SPAWN_ENV_REMOVE {
+            assert!(
+                !keys.contains(&scrubbed.as_bytes()),
+                "{scrubbed} must not survive into the harvest child"
+            );
+        }
+    }
+
+    /// T17: the concrete `pw_shell` AC10 names — a real `false`(1), a valid passwd entry
+    /// for a service-ish account. It exits non-zero immediately and must degrade to the
+    /// typed error, never a hang or a bogus empty PATH treated as success.
+    #[tokio::test]
+    async fn a_false_login_shell_is_a_typed_error() {
+        let err = harvest_path_from(&real_false_binary(), Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            unharvested_reason(&err),
+            "it exited non-zero without producing an environment"
+        );
+    }
+
+    /// T18: a `nologin`-style shell prints its refusal to STDOUT and exits non-zero. The
+    /// refusal must not be parsed as environment output — so the stand-in prints text
+    /// that WOULD parse as a valid PATH line, proving the exit-status check runs first
+    /// and this is not merely passing because the message happened to be unparseable.
+    #[tokio::test]
+    async fn a_nologin_refusal_on_stdout_is_never_parsed_as_an_environment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shell = fake_shell(
+            tmp.path(),
+            "nologin",
+            "printf 'This account is currently not available.\\nPATH=/refused/nonsense\\n'\nexit 1",
+        );
+        let err = harvest_path_from(&shell, Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            unharvested_reason(&err),
+            "it exited non-zero without producing an environment"
+        );
+        // The parseable-looking refusal really was on stdout — otherwise this test would
+        // pass for the wrong reason (nothing to mis-parse in the first place).
+        let raw = Command::new(&shell)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap()
+            .wait_with_output()
+            .await
+            .unwrap();
+        assert!(path_from_env_output(&shell, &raw.stdout).is_ok());
+    }
+
+    /// T19, exec-boundary side: an EMPTY shell is `LoginShellUnresolved` — a passwd-entry
+    /// problem, not a failed harvest — and short-circuits before any spawn is attempted.
+    /// The passwd-side guard that production actually reaches is covered by
+    /// `an_empty_pw_shell_entry_is_unresolved` below.
+    #[tokio::test]
+    async fn an_empty_shell_is_unresolved_and_never_spawned() {
+        let err = harvest_path_from(Path::new(""), Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::LoginShellUnresolved),
+            "an empty pw_shell is a passwd problem, not a harvest failure; got {err:?}"
+        );
+    }
+
+    // --- The passwd accessors together (T16) + the bound (T20, AC11/AC12) ----
+
+    /// T16: all three passwd-derived accessors return their OWN field, and re-reading in
+    /// the reverse order returns identical values. Each copies out of the same
+    /// libc-owned static buffer, so a borrow left dangling by one would be clobbered by
+    /// the next `getpwuid` — this is the test that would catch it.
+    #[test]
+    fn every_passwd_accessor_returns_its_own_field() {
+        let home_first = home_dir().unwrap();
+        let name_first = username().unwrap();
+        let shell_first = login_shell().unwrap();
+        // Reverse order: an accessor that returned a view into the shared buffer rather
+        // than an owned copy would now disagree with itself.
+        let shell_second = login_shell().unwrap();
+        let name_second = username().unwrap();
+        let home_second = home_dir().unwrap();
+
+        assert_eq!(
+            home_first, home_second,
+            "home_dir clobbered by a later getpw*"
+        );
+        assert_eq!(
+            name_first, name_second,
+            "username clobbered by a later getpw*"
+        );
+        assert_eq!(
+            shell_first, shell_second,
+            "login_shell clobbered by a later getpw*"
+        );
+
+        assert!(!name_first.is_empty());
+        assert!(
+            home_first.is_absolute(),
+            "home must be absolute, got {home_first:?}"
+        );
+        assert!(
+            shell_first.is_absolute(),
+            "the login shell must be an absolute path, got {shell_first:?}"
+        );
+        // Three DISTINCT fields, not one value read three ways.
+        assert_ne!(home_first.as_os_str(), shell_first.as_os_str());
+        assert_ne!(home_first.as_os_str(), name_first.as_os_str());
+        assert_ne!(shell_first.as_os_str(), name_first.as_os_str());
+    }
+
+    /// The login shell comes from the password database, NOT `$SHELL` (AC2). Asserted
+    /// without touching the ambient environment: `login_shell` takes no input and reads
+    /// no env var, so whatever `$SHELL` says cannot reach it — and the value it does
+    /// return is a real executable, which a spoofed `$SHELL` need not be.
+    #[test]
+    fn the_login_shell_comes_from_the_password_database() {
+        let shell = login_shell().unwrap();
+        assert!(
+            shell.is_file(),
+            "pw_shell must name a real executable, got {shell:?}"
+        );
+        // The passwd answer is independent of `$SHELL`: reading it twice under whatever
+        // environment this process carries yields the same value, and the function has
+        // no parameter or env read through which `$SHELL` could influence it.
+        assert_eq!(shell, login_shell().unwrap());
+    }
+
+    /// The production entry point draws its shell from [`login_shell`] — asserted as an
+    /// EQUIVALENCE against the explicit composition rather than against a fixed expected
+    /// PATH, which keeps it host-independent: the two sides agree whether this machine's
+    /// login shell yields a PATH, refuses to run, or has no passwd entry at all. Without
+    /// it the entry point would be the one unexercised piece of the mechanism.
+    ///
+    /// Scope, stated precisely because an overclaiming test comment is exactly the hazard
+    /// AC8 exists to prevent: this pins the shell SOURCE, not the bound. A healthy login
+    /// shell returns in ~40 ms under any plausible timeout, so no equivalence test can
+    /// observe which `Duration` the entry point passed. The bound is pinned separately —
+    /// structurally by `harvest_bound_stays_far_below_the_refresh_cycle_bound`, and
+    /// behaviorally by `a_hanging_shell_is_cut_off_by_the_bound`.
+    #[tokio::test]
+    async fn the_entry_point_draws_its_shell_from_the_password_database() {
+        let via_entry_point = harvest_login_shell_path().await;
+        let via_composition = match login_shell() {
+            Ok(shell) => harvest_path_from(&shell, LOGIN_SHELL_HARVEST_TIMEOUT).await,
+            Err(err) => Err(err),
+        };
+
+        match (&via_entry_point, &via_composition) {
+            (Ok(entry), Ok(composed)) => assert_eq!(entry, composed),
+            // Errors compare by variant + reason: both sides must fail the SAME way, and
+            // the payload is secret-free by construction (see `LoginShellPathUnharvested`).
+            (
+                Err(Error::LoginShellPathUnharvested { reason: a, .. }),
+                Err(Error::LoginShellPathUnharvested { reason: b, .. }),
+            ) => assert_eq!(a, b),
+            (Err(Error::LoginShellUnresolved), Err(Error::LoginShellUnresolved)) => {}
+            (entry, composed) => panic!(
+                "the entry point must draw its shell from `login_shell()`, but it diverged \
+                 from that composition: {entry:?} vs {composed:?}"
+            ),
+        }
+    }
+
+    /// T19, passwd side: the guard that production actually reaches. `login_shell()`
+    /// rejects a `nologin`-class EMPTY `pw_shell` before `harvest_path_from` is ever
+    /// called, so testing only the latter's gate would leave the reachable branch
+    /// uncovered — the seam exists so the raw passwd bytes can be threaded in.
+    #[test]
+    fn an_empty_pw_shell_entry_is_unresolved() {
+        assert!(matches!(
+            login_shell_from(b"").unwrap_err(),
+            Error::LoginShellUnresolved
+        ));
+    }
+
+    /// A RELATIVE `pw_shell` is refused rather than `PATH`-resolved. `Command::new` would
+    /// otherwise search `$PATH` for it — resolving the shell against the very `PATH` this
+    /// harvest exists because the daemon does not have, and violating the transport rule's
+    /// discipline #1 (absolute path, never `$PATH`-resolved) that this module's own
+    /// `/usr/bin/env` comment invokes.
+    #[test]
+    fn a_relative_pw_shell_is_refused_not_path_resolved() {
+        assert!(matches!(
+            login_shell_from(b"sh").unwrap_err(),
+            Error::LoginShellUnresolved
+        ));
+        assert!(matches!(
+            login_shell_from(b"bin/zsh").unwrap_err(),
+            Error::LoginShellUnresolved
+        ));
+        // ...and an absolute one is accepted, so the guard is not simply rejecting all.
+        assert_eq!(
+            login_shell_from(b"/bin/zsh").unwrap(),
+            PathBuf::from("/bin/zsh")
+        );
+    }
+
+    /// The same refusal at the exec boundary: `harvest_path_from` must not spawn a
+    /// relative shell even when handed one directly, because that is the call that execs.
+    #[tokio::test]
+    async fn a_relative_shell_is_never_spawned() {
+        // `sh` really is resolvable on this host's PATH — otherwise the test would pass
+        // for the wrong reason (nothing to find), and the guard would be unproven.
+        assert!(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .any(|dir| dir.join("sh").is_file()),
+            "expected a resolvable `sh` on PATH for this test to be meaningful"
+        );
+        let err = harvest_path_from(Path::new("sh"), Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::LoginShellUnresolved),
+            "a relative shell must be refused, not PATH-resolved; got {err:?}"
+        );
+    }
+
+    /// T20 / AC11 / AC12: the harvest bound sits far enough below the whole-cycle
+    /// `[refresh].timeout_secs` that a hung harvest can only surface as a HARVEST
+    /// failure — never as `RefreshEventReason::Timeout`, which would point an operator
+    /// at the `claude` spawn instead of at their own login shell.
+    ///
+    /// Read off `RefreshConfig::default()` rather than restating 90 s, so retuning the
+    /// cycle bound in `config.rs` re-checks this relationship instead of silently
+    /// invalidating it.
+    #[test]
+    fn harvest_bound_stays_far_below_the_refresh_cycle_bound() {
+        let cycle = crate::config::RefreshConfig::default().timeout();
+        assert!(
+            LOGIN_SHELL_HARVEST_TIMEOUT < cycle,
+            "harvest bound {LOGIN_SHELL_HARVEST_TIMEOUT:?} must be below the cycle bound {cycle:?}"
+        );
+        // "Meaningfully shorter" made falsifiable: an order of magnitude of clearance,
+        // not a hair. At the shipped values this is 5 s against 90 s (18x).
+        assert!(
+            LOGIN_SHELL_HARVEST_TIMEOUT * 10 < cycle,
+            "harvest bound {LOGIN_SHELL_HARVEST_TIMEOUT:?} leaves too little clearance under \
+             the cycle bound {cycle:?} — a hung harvest could be misattributed to reason=timeout"
+        );
+        // And it is generous against the measured ~38 ms cost the comment cites: two
+        // orders of magnitude of headroom for a slow rc file.
+        assert!(LOGIN_SHELL_HARVEST_TIMEOUT >= Duration::from_secs(1));
     }
 }

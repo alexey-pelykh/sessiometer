@@ -98,6 +98,40 @@ pub(crate) enum Error {
     #[error("could not resolve the login name for the current user")]
     UserUnresolved,
 
+    /// The current user's login shell could not be resolved from the password
+    /// database (`getpwuid(getuid())->pw_shell`, see [`crate::paths`]): the entry is
+    /// absent, or does not name an absolute path — empty (a `nologin`-class account
+    /// names nothing to execute) or relative (which `Command` would resolve against
+    /// the very `PATH` the harvest exists to reconstruct) — so there is no shell to
+    /// run (issue #783). Also raised at the exec boundary, before any spawn is
+    /// attempted: a non-absolute `pw_shell` is a passwd-entry problem, never a failed
+    /// harvest.
+    ///
+    /// Non-fatal by contract, like [`Error::LoginShellPathUnharvested`] below: the
+    /// resolution caller records it and retries next cycle rather than permanently
+    /// disabling the tick (the issue #375 stale-path contract).
+    #[error("could not resolve the login shell for the current user")]
+    LoginShellUnresolved,
+
+    /// The user-level `PATH` could not be harvested by running the login shell
+    /// (issue #783) — it could not be spawned, exited non-zero (a `nologin`-class
+    /// shell that refuses `-l -c`), outran the harvest timeout, or produced no usable
+    /// `PATH=` line.
+    ///
+    /// `shell` is a filesystem location and `reason` a `&'static str`, so the crate's
+    /// "an [`Error`] never carries secret material" invariant holds by construction:
+    /// the child's output is the user's whole environment and is therefore NEVER
+    /// embedded here, only classified.
+    ///
+    /// One variant for every harvest failure mode on purpose — the caller's contract
+    /// is a single non-fatal degrade (fall back to the ambient `PATH`, record, retry
+    /// next cycle), so it should match once rather than enumerate causes.
+    #[error("could not harvest the user-level PATH by running the login shell {shell}: {reason}")]
+    LoginShellPathUnharvested {
+        shell: PathBuf,
+        reason: &'static str,
+    },
+
     /// The ephemeral isolated-refresh directory (`<support>/refresh/<account-uuid>`,
     /// issue #102) could not be created as a safe private directory: a pre-existing
     /// entry at that path is a symlink, refused rather than followed — a planted
