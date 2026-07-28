@@ -255,6 +255,33 @@ pub(crate) fn expires_at(blob: &[u8]) -> Option<i64> {
     value.get("claudeAiOauth")?.get("expiresAt")?.as_i64()
 }
 
+/// `claudeAiOauth.refreshTokenExpiresAt` as an epoch-millisecond integer (issue #878),
+/// or `None` if absent / unparseable. Non-secret — only the deadline is read, never the
+/// token, exactly as [`expires_at`] does.
+///
+/// DISTINCT from [`expires_at`] in KIND, not just in field name, and the two must never
+/// be conflated:
+/// - [`expires_at`] is the **access** token's expiry (~8 h) and SLIDES forward on every
+///   refresh — the clock [`crate::daemon::credential_health`]'s `Stale` branch
+///   and the near-expiry refresh selection read.
+/// - This is the **refresh** token's own FIXED deadline: refreshing does NOT move it
+///   (observed on CC v2.1.218–220, issue #876). Once it passes, no refresh can recover
+///   the account — only an operator `claude /login`. It is therefore a FORESIGHT input,
+///   never a liveness one.
+///
+/// The field is OPTIONAL by design: an older client, a changed upstream policy, or a
+/// non-first-party credential yields `None`. Callers MUST render that as
+/// [`ExpiryHorizon::Unknown`](crate::observability::ExpiryHorizon::Unknown) — never as
+/// "not expiring" (the issue #137 invariant: absence of a NEGATIVE signal is not health).
+/// [`crate::daemon::account_expiry`] is the one classifier that enforces this.
+pub(crate) fn refresh_token_expires_at(blob: &[u8]) -> Option<i64> {
+    let value: Value = serde_json::from_slice(blob).ok()?;
+    value
+        .get("claudeAiOauth")?
+        .get("refreshTokenExpiresAt")?
+        .as_i64()
+}
+
 /// `claudeAiOauth.refreshToken` as raw bytes wrapped `Zeroizing` (wiped on drop), or
 /// `None` if the field is absent / the blob is unparseable. `Some(empty)` is the DEAD
 /// signal (CC clears the RT in place — `build/version-compat.md` #101) and is kept
@@ -713,6 +740,57 @@ pub(crate) async fn stored_expires_at<S: AccountStash>(stash: &S, service: &str)
     expires_at(snapshot.credential.expose())
 }
 
+/// BOTH of a credential's deadlines (issue #878). Exists so the daemon's poll path can learn the
+/// access-token expiry AND the refresh-token expiry from ONE credential read — see
+/// [`stored_credential_clocks`].
+///
+/// UNIT-AGNOSTIC on purpose: the extractors here fill it in epoch MILLISECONDS (the unit CC
+/// stores), and the daemon's `read_poll_clocks` re-uses the same shape for the epoch SECONDS it
+/// stores, folding both fields at that one boundary.
+///
+/// Each field is independently optional: the two live under different keys and an older Claude Code
+/// carries only the first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct CredentialClocks {
+    /// `claudeAiOauth.expiresAt` — see [`expires_at`].
+    pub(crate) access_expires_at: Option<i64>,
+    /// `claudeAiOauth.refreshTokenExpiresAt` — see [`refresh_token_expires_at`], whose doc carries
+    /// the access-vs-refresh distinction and the `None` ⇒ `Unknown` contract (issue #137).
+    pub(crate) refresh_token_expires_at: Option<i64>,
+}
+
+/// Both deadlines from one already-in-hand `blob` (epoch MILLISECONDS, the unit CC stores), via the
+/// two audited single-field extractors — one blob parse, no second definition of the credential
+/// shape. Non-secret: only the two integers are read, never a token.
+pub(crate) fn credential_clocks(blob: &[u8]) -> CredentialClocks {
+    CredentialClocks {
+        access_expires_at: expires_at(blob),
+        refresh_token_expires_at: refresh_token_expires_at(blob),
+    }
+}
+
+/// Both deadlines (epoch milliseconds) for the account stashed at `service`, from a SINGLE stash
+/// read — all-`None` if the stash is unreadable (locked keychain, absent item).
+///
+/// The combined reader exists precisely to keep that read singular: a stash read is a `security`
+/// subprocess, and the daemon does one per non-active account per poll, so extracting the
+/// refresh-token deadline via a second [`stored_expires_at`]-shaped call would DOUBLE the
+/// subprocess count of every poll cycle. Callers that need only the access clock should keep using
+/// [`stored_expires_at`].
+///
+/// **Non-secret**, exactly as [`stored_expires_at`]: the raw blob is read, parsed for the two
+/// timestamps, and dropped here — a caller never handles credential bytes.
+pub(crate) async fn stored_credential_clocks<S: AccountStash>(
+    stash: &S,
+    service: &str,
+) -> CredentialClocks {
+    stash
+        .read(service)
+        .await
+        .map(|snapshot| credential_clocks(snapshot.credential.expose()))
+        .unwrap_or_default()
+}
+
 /// Reap orphaned isolated-refresh artifacts left behind by a crashed cycle (issue
 /// #103).
 ///
@@ -1092,6 +1170,75 @@ mod tests {
     fn backdate_rejects_a_malformed_blob() {
         assert!(backdate(b"not json", NOW_MS).is_none());
         assert!(backdate(br#"{"no":"oauth"}"#, NOW_MS).is_none());
+    }
+
+    /// Issue #878: a REAL observed `refreshTokenExpiresAt` is read as an epoch-MILLISECOND integer.
+    /// The fixture value is a genuine field capture (account prefix `94f27044`, decoding to
+    /// 2026-07-31 14:10 CEST), so the test pins the actual upstream shape rather than a value
+    /// invented to match the parser.
+    #[test]
+    fn refresh_token_expires_at_reads_the_observed_epoch_millisecond_deadline() {
+        let blob = br#"{"claudeAiOauth":{"accessToken":"at","refreshToken":"rt",
+            "expiresAt":1785499802819,"refreshTokenExpiresAt":1785499802819}}"#;
+        assert_eq!(refresh_token_expires_at(blob), Some(1785499802819));
+    }
+
+    /// Issue #878 (the load-bearing invariant): an ABSENT `refreshTokenExpiresAt` yields `None` —
+    /// which the classifier turns into `Unknown`, NEVER "not expiring" (#137). This is the branch
+    /// that makes the whole feature degrade safely if upstream ever drops the field, so it is
+    /// pinned at the extractor as well as at the classifier.
+    ///
+    /// Also pins that the two deadlines are read INDEPENDENTLY: a blob carrying only the
+    /// access-token `expiresAt` (every pre-v2.1.218 Claude Code) must NOT have that value
+    /// mistaken for the refresh-token deadline.
+    #[test]
+    fn refresh_token_expires_at_is_none_when_absent_and_never_borrows_the_access_expiry() {
+        let older_client = blob(NOW_MS, "sk-ant-ort-RT");
+        assert_eq!(
+            expires_at(&older_client),
+            Some(NOW_MS),
+            "the access-token expiry is present"
+        );
+        assert_eq!(
+            refresh_token_expires_at(&older_client),
+            None,
+            "an absent refreshTokenExpiresAt must never fall back to the access expiry"
+        );
+        // An unparseable blob and a non-CC shape are `None` too, like every other extractor.
+        assert_eq!(refresh_token_expires_at(b"not json"), None);
+        assert_eq!(refresh_token_expires_at(br#"{"no":"oauth"}"#), None);
+        // A wrong-typed value is `None` rather than a panic or a coerced 0.
+        assert_eq!(
+            refresh_token_expires_at(
+                br#"{"claudeAiOauth":{"refreshTokenExpiresAt":"2026-07-31"}}"#
+            ),
+            None
+        );
+    }
+
+    /// Issue #878: the combined reader returns BOTH deadlines from ONE parse, and each field is
+    /// independently optional — the whole point of the struct (one credential read, two clocks).
+    #[test]
+    fn credential_clocks_reads_both_deadlines_independently() {
+        let both = br#"{"claudeAiOauth":{"accessToken":"at","refreshToken":"rt",
+            "expiresAt":1000,"refreshTokenExpiresAt":1785499802819}}"#;
+        assert_eq!(
+            credential_clocks(both),
+            CredentialClocks {
+                access_expires_at: Some(1000),
+                refresh_token_expires_at: Some(1785499802819),
+            }
+        );
+        // Access-only (an older client): the refresh deadline stays `None`, the access one survives.
+        assert_eq!(
+            credential_clocks(&blob(NOW_MS, "rt")),
+            CredentialClocks {
+                access_expires_at: Some(NOW_MS),
+                refresh_token_expires_at: None,
+            }
+        );
+        // An unreadable blob degrades to all-`None`, never a partial or a panic.
+        assert_eq!(credential_clocks(b"not json"), CredentialClocks::default());
     }
 
     #[test]

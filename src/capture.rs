@@ -51,7 +51,8 @@
 
 use crate::claude_state::{read_oauth_account_from, write_oauth_account, OauthAccount};
 use crate::config::{
-    Account, Config, LoginConfig, MigrationConfig, RefreshConfig, StatsConfig, Tunables,
+    Account, Config, CredentialConfig, LoginConfig, MigrationConfig, RefreshConfig, StatsConfig,
+    Tunables,
 };
 use crate::error::{Error, Result};
 use crate::keychain::{Credential, CredentialStore, RealCredentialStore};
@@ -422,27 +423,28 @@ async fn run_capture(
     label: Option<&str>,
 ) -> Result<CaptureReport> {
     // Preserve the existing tunables, the periodic-refresh schedule, the `[login]` settings, the
-    // `[stats]` settings AND the `[migration]` settings across a capture (issue #58, extended for
-    // #105/#135/#161/#150): adding an account to a config that already carries custom tunables / a
-    // `[refresh]` / `[login]` / `[stats]` / `[migration]` block must not reset any to defaults.
-    let (mut roster, tunables, refresh, login, stats, migration) = match existing {
-        Some(config) => (
-            config.roster,
-            config.tunables,
-            config.refresh,
-            config.login,
-            config.stats,
-            config.migration,
-        ),
-        None => (
-            Vec::new(),
-            Tunables::default(),
-            RefreshConfig::default(),
-            LoginConfig::default(),
-            StatsConfig::default(),
-            MigrationConfig::default(),
-        ),
-    };
+    // `[stats]` settings, the `[migration]` settings AND the `[credential]` settings across a
+    // capture (issue #58, extended for #105/#135/#161/#150/#878): adding an account to a config
+    // that already carries custom tunables / a `[refresh]` / `[login]` / `[stats]` / `[migration]` /
+    // `[credential]` block must not reset any to defaults. Destructured field-by-field with no
+    // `..` rest pattern, so a future block is a COMPILE error here rather than a silent reset.
+    let Config {
+        mut roster,
+        tunables,
+        refresh,
+        login,
+        stats,
+        migration,
+        credential: credential_config,
+    } = existing.unwrap_or_else(|| Config {
+        roster: Vec::new(),
+        tunables: Tunables::default(),
+        refresh: RefreshConfig::default(),
+        login: LoginConfig::default(),
+        stats: StatsConfig::default(),
+        migration: MigrationConfig::default(),
+        credential: CredentialConfig::default(),
+    });
 
     let (stash_name, outcome) = plan_capture(&mut roster, oauth.account_uuid(), label)?;
 
@@ -471,6 +473,7 @@ async fn run_capture(
             login,
             stats,
             migration,
+            credential: credential_config,
         },
         outcome,
         label,
@@ -641,27 +644,27 @@ where
 {
     let HarvestedLogin { captured, activate } = login;
 
-    // Preserve the operator's tunables + refresh schedule + `[login]` + `[stats]` + `[migration]`
-    // settings across the reconcile, exactly like `run_capture` (#58/#105/#135/#161/#150): landing
-    // a login must never reset any of them to defaults.
-    let (mut roster, tunables, refresh, login, stats, migration) = match existing {
-        Some(config) => (
-            config.roster,
-            config.tunables,
-            config.refresh,
-            config.login,
-            config.stats,
-            config.migration,
-        ),
-        None => (
-            Vec::new(),
-            Tunables::default(),
-            RefreshConfig::default(),
-            LoginConfig::default(),
-            StatsConfig::default(),
-            MigrationConfig::default(),
-        ),
-    };
+    // Preserve the operator's tunables + refresh schedule + `[login]` + `[stats]` + `[migration]` +
+    // `[credential]` settings across the reconcile, exactly like `run_capture`
+    // (#58/#105/#135/#161/#150/#878): landing a login must never reset any of them to defaults.
+    // Destructured exactly as `run_capture` does, and for the same compile-time reason.
+    let Config {
+        mut roster,
+        tunables,
+        refresh,
+        login,
+        stats,
+        migration,
+        credential: credential_config,
+    } = existing.unwrap_or_else(|| Config {
+        roster: Vec::new(),
+        tunables: Tunables::default(),
+        refresh: RefreshConfig::default(),
+        login: LoginConfig::default(),
+        stats: StatsConfig::default(),
+        migration: MigrationConfig::default(),
+        credential: CredentialConfig::default(),
+    });
 
     let (stash_name, outcome) =
         plan_capture(&mut roster, captured.oauth_account.account_uuid(), label)?;
@@ -704,6 +707,7 @@ where
             login,
             stats,
             migration,
+            credential: credential_config,
         },
         outcome: outcome.into(),
         label,
@@ -1097,6 +1101,7 @@ mod tests {
             login: LoginConfig::default(),
             stats: StatsConfig::default(),
             migration: MigrationConfig::default(),
+            credential: CredentialConfig::default(),
         };
 
         let report = run_capture(
@@ -1134,6 +1139,7 @@ mod tests {
             login: login.clone(),
             stats: StatsConfig::default(),
             migration: MigrationConfig::default(),
+            credential: CredentialConfig::default(),
         };
 
         let report = run_capture(
@@ -1161,6 +1167,7 @@ mod tests {
             login: LoginConfig::default(),
             stats: StatsConfig::default(),
             migration: MigrationConfig::default(),
+            credential: CredentialConfig::default(),
         };
 
         let report = run_capture(
@@ -1193,6 +1200,7 @@ mod tests {
             login: LoginConfig::default(),
             stats: StatsConfig::default(),
             migration: MigrationConfig::default(),
+            credential: CredentialConfig::default(),
         };
 
         let report = run_capture(
@@ -1391,6 +1399,7 @@ mod tests {
             login: LoginConfig::default(),
             stats: StatsConfig::default(),
             migration: MigrationConfig::default(),
+            credential: CredentialConfig::default(),
         };
 
         let report = run_login(
@@ -1441,6 +1450,7 @@ mod tests {
             login: LoginConfig::default(),
             stats: StatsConfig::default(),
             migration: MigrationConfig::default(),
+            credential: CredentialConfig::default(),
         };
 
         run_login(
@@ -1489,6 +1499,7 @@ mod tests {
             login: LoginConfig::default(),
             stats: StatsConfig::default(),
             migration: MigrationConfig::default(),
+            credential: CredentialConfig::default(),
         };
 
         let report = run_login(

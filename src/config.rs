@@ -195,6 +195,21 @@ const DEFAULT_SESSION_VELOCITY_EMA_ALPHA_PCT: u8 = 50;
 /// covers less than a day at the observed burn).
 const DEFAULT_FLEET_RUNWAY_WARN_SECS: u64 = 0;
 
+/// Default `[credential].expiry_horizon_secs` (issue #878): how far ahead the daemon looks at each
+/// account's REFRESH-token deadline (`refreshTokenExpiresAt`) when classifying its
+/// [`ExpiryHorizon`](crate::observability::ExpiryHorizon). **Seven days.**
+///
+/// The floor to BEAT is three days — the window Claude Code's own client warns in. Matching it
+/// would leave an operator no more warning than they already get; the point of the foresight is to
+/// arrive EARLIER, so the default is set at the issue's ≥ 7 d goal. That is comfortably above the
+/// 3 d floor while staying short enough that a `Within` classification still means "act on this",
+/// not permanent background noise (a fleet re-onboarded in one sitting sits `Beyond` for weeks).
+///
+/// This bounds the LOOKAHEAD only. It is emphatically **not** an assumed refresh-token lifetime:
+/// the ~30 d figure observed in the field is a server-side default, not a guarantee, so the daemon
+/// always reads the deadline from the credential and never infers one from a constant.
+pub(crate) const DEFAULT_CREDENTIAL_EXPIRY_HORIZON_SECS: u64 = 7 * 86_400;
+
 /// Default seconds between periodic isolated-refresh ticks (issue #105). A conservative one-hour
 /// cadence: #101's TTL question is resolved (the stored access-token expiry slides forward on each
 /// refresh — a sliding window, not a fixed cap), but the cadence is deliberately NOT pinned to a
@@ -771,6 +786,56 @@ impl LoginConfig {
     }
 }
 
+/// The credential-continuity settings (issue #878): how far ahead the daemon looks when
+/// classifying each account's REFRESH-token deadline into an
+/// [`ExpiryHorizon`](crate::observability::ExpiryHorizon).
+///
+/// Its own `[credential]` block rather than a key on an existing one, for two reasons:
+/// - **Not `[tunables]`** — that block is mirrored field-for-field by [`TunablesView`] and edited by
+///   the menubar Settings form, so a knob there is a cross-surface contract; this one is
+///   daemon-internal foresight with no UI half (yet).
+/// - **Not `[refresh]`** — that block configures the periodic isolated-refresh *schedule* and is
+///   gated by its own `enabled`. Refresh-token expiry must be watched *regardless* of whether that
+///   tick runs; an account with refresh OFF is if anything MORE exposed to a silent lapse. Filing
+///   the horizon under a switch that can turn it off would defeat it.
+///
+/// The single key is optional with a documented default, so a config with no `[credential]` table
+/// (or none at all) uses [`CredentialConfig::default`] — the same opt-out contract as the other
+/// blocks. Nothing here is secret: one duration, never an account handle, email, or token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CredentialConfig {
+    /// Seconds of LOOKAHEAD over an account's `refreshTokenExpiresAt` deadline: a deadline falling
+    /// within this many seconds of now classifies
+    /// [`Within`](crate::observability::ExpiryHorizon::Within), one further out
+    /// [`Beyond`](crate::observability::ExpiryHorizon::Beyond). Bounds `86_400..=7_776_000` (one day
+    /// to ninety days); **default** [`DEFAULT_CREDENTIAL_EXPIRY_HORIZON_SECS`] (seven days).
+    ///
+    /// The lower bound is deliberately a day rather than zero: this knob has no "off" setting,
+    /// because a zero horizon would silently reduce the feature to reporting only already-LAPSED
+    /// credentials — the very after-the-fact signal the issue exists to get ahead of. An operator
+    /// who wants less foresight shortens it; they cannot disable the axis.
+    ///
+    /// Governs CLASSIFICATION only. It never feeds a swap or poll decision — expiry is surfaced,
+    /// not acted upon.
+    pub(crate) expiry_horizon_secs: u64,
+}
+
+impl Default for CredentialConfig {
+    fn default() -> Self {
+        Self {
+            expiry_horizon_secs: DEFAULT_CREDENTIAL_EXPIRY_HORIZON_SECS,
+        }
+    }
+}
+
+impl CredentialConfig {
+    /// The refresh-token foresight horizon as a [`Duration`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn expiry_horizon(&self) -> Duration {
+        Duration::from_secs(self.expiry_horizon_secs)
+    }
+}
+
 /// The usage-stats subsystem's settings (issue #161): the retention horizons the daemon
 /// threads into the store's [`RetentionPolicy`] when it compacts + rolls the sample store
 /// (issues #155/#156), plus the default reporting period for the offline `stats` verb (#158).
@@ -948,6 +1013,9 @@ pub(crate) struct Config {
     /// encrypted artifact at ([`MigrationConfig::kdf_cost`]) and the default `import` conflict
     /// policy. Consumed by the `export` / `import` verbs, never by the daemon.
     pub(crate) migration: MigrationConfig,
+    /// The credential-continuity settings (issue #878): the refresh-token foresight horizon the
+    /// daemon classifies each account's `refreshTokenExpiresAt` deadline against.
+    pub(crate) credential: CredentialConfig,
 }
 
 /// Whether an effective config value came from `config.toml` or a compiled-in
@@ -1277,6 +1345,8 @@ struct RawConfig {
     stats: RawStats,
     #[serde(default)]
     migration: RawMigration,
+    #[serde(default)]
+    credential: RawCredential,
 }
 
 #[derive(Deserialize)]
@@ -1534,6 +1604,29 @@ impl Default for RawLogin {
 
 fn default_login_timeout_secs() -> i64 {
     DEFAULT_LOGIN_TIMEOUT_SECS as i64
+}
+
+/// Permissive deserialization of the optional `[credential]` table (issue #878): the one key is
+/// optional with a documented default and kept wide (`i64`) so an out-of-range value reaches
+/// [`Config::validate`] with a clear message rather than a bare `serde` type error.
+/// `deny_unknown_fields` rejects a stray key as a parse error.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCredential {
+    #[serde(default = "default_credential_expiry_horizon_secs")]
+    expiry_horizon_secs: i64,
+}
+
+impl Default for RawCredential {
+    fn default() -> Self {
+        Self {
+            expiry_horizon_secs: default_credential_expiry_horizon_secs(),
+        }
+    }
+}
+
+fn default_credential_expiry_horizon_secs() -> i64 {
+    DEFAULT_CREDENTIAL_EXPIRY_HORIZON_SECS as i64
 }
 
 /// Permissive deserialization of the optional `[stats]` table (issue #161): every key

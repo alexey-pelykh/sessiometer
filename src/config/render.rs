@@ -292,8 +292,21 @@ impl Config {
             ],
         };
 
+        let cr = &self.credential;
+        let credential = OriginSection {
+            header: "[credential]",
+            present: table.contains_key("credential"),
+            entries: vec![entry(
+                "expiry_horizon_secs",
+                cr.expiry_horizon_secs.to_string(),
+                present("credential", "expiry_horizon_secs"),
+            )],
+        };
+
         OriginReport {
-            sections: vec![tunables, jitter, refresh, login, stats, migration],
+            sections: vec![
+                tunables, jitter, refresh, login, stats, migration, credential,
+            ],
             roster_count: self.roster.len(),
             // The roster is the `[[account]]` array-of-tables (RawConfig's `account`).
             roster_present: table.contains_key("account"),
@@ -718,7 +731,7 @@ impl Config {
 
         // The migration subsystem (issue #150): the Argon2id KDF cost `export` writes an
         // encrypted artifact at, and the default `import` conflict policy. Renders after
-        // [stats], before [[account]] — the last tunables block.
+        // [stats], before [credential] + [[account]].
         let mi = &self.migration;
         out.push_str("\n[migration]\n");
         out.push_str(
@@ -743,6 +756,27 @@ impl Config {
         out.push_str(&format!(
             "conflict_policy = {}\n",
             basic_string(mi.conflict_policy.as_str())
+        ));
+
+        // Credential continuity (issue #878): how far ahead to watch each account's REFRESH-token
+        // deadline. Renders after [migration], before [[account]] — the last tunables block.
+        let cr = &self.credential;
+        out.push_str("\n[credential]\n");
+        out.push_str(
+            "# Foresight over your accounts' REFRESH tokens. A refresh token has its own FIXED\n\
+             # expiry that refreshing does NOT slide forward; once it lapses, only `sessiometer\n\
+             # login` (a `claude /login`) can recover the account. The daemon reads that deadline\n\
+             # from the credential itself and warns ahead of it.\n",
+        );
+        out.push_str(
+            "# Seconds of lookahead (86400..=7776000, i.e. 1d..90d): a refresh token expiring\n\
+             # within this window is flagged while it is still working, so you can re-login on\n\
+             # your schedule instead of discovering it after a refresh has already failed. There\n\
+             # is no `off` — a zero window would only report credentials that had ALREADY lapsed.\n",
+        );
+        out.push_str(&format!(
+            "expiry_horizon_secs = {}\n",
+            cr.expiry_horizon_secs
         ));
 
         for account in &self.roster {
@@ -932,6 +966,34 @@ mod tests {
         assert_eq!(
             Config::parse(&text).unwrap().refresh,
             RefreshConfig::default()
+        );
+    }
+
+    /// Issue #878: a customised `[credential]` block survives render → parse, and the rendered
+    /// DEFAULT block round-trips to the default. Without this, `sessiometer capture` (which
+    /// rewrites the whole file) would silently drop an operator's horizon back to seven days.
+    #[test]
+    fn credential_round_trips_render_then_parse() {
+        let toml = format!("{VALID}\n[credential]\nexpiry_horizon_secs = 1209600\n");
+        let original = Config::parse(&toml).unwrap();
+        let reparsed = Config::parse(&original.render()).unwrap();
+        assert_eq!(original.credential, reparsed.credential);
+        assert_eq!(reparsed.credential.expiry_horizon_secs, 1_209_600);
+
+        // The rendered default block is emitted, documented, and reparses to the default.
+        let default = Config::parse(VALID).unwrap();
+        let text = default.render();
+        assert!(
+            text.contains("[credential]"),
+            "render must emit [credential]: {text}"
+        );
+        assert!(
+            text.contains("expiry_horizon_secs = 604800"),
+            "default credential block must render the 7d horizon: {text}"
+        );
+        assert_eq!(
+            Config::parse(&text).unwrap().credential,
+            CredentialConfig::default()
         );
     }
 
@@ -1177,7 +1239,14 @@ mod tests {
         assert_eq!(by_key("monitor_401_n").origin, Origin::Default);
 
         // Every optional section is absent → not present, all values Default.
-        for header in ["[jitter]", "[refresh]", "[login]", "[stats]", "[migration]"] {
+        for header in [
+            "[jitter]",
+            "[refresh]",
+            "[login]",
+            "[stats]",
+            "[migration]",
+            "[credential]",
+        ] {
             let section = report
                 .sections
                 .iter()
