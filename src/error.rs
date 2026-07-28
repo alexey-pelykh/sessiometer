@@ -87,9 +87,14 @@ pub(crate) enum Error {
     ForeignOwnership(PathBuf),
 
     /// The current user's login name could not be resolved from the password
-    /// database (`getpwuid(getuid())->pw_name`, see [`crate::paths`]). The
-    /// isolated-refresh engine (issue #102) seeds its keychain item under this
-    /// `acct` (the name Claude Code reads with), so it cannot proceed without it.
+    /// database (`getpwuid(getuid())->pw_name`, see [`crate::paths`]).
+    ///
+    /// The login name is the FALLBACK source for the keychain item's `acct`, not the
+    /// `acct` itself — Claude Code's own derivation prefers `$USER` (issue #711) — so
+    /// the isolated-refresh engine (issue #102) does NOT abort on this: it mirrors
+    /// CC's `catch` arm and substitutes the literal `claude-code-user`, exactly as a
+    /// live CC would. Constructed only by `paths::username`, whose callers today all
+    /// choose that fallback over propagating.
     #[error("could not resolve the login name for the current user")]
     UserUnresolved,
 

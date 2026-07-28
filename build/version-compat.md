@@ -918,7 +918,7 @@ below rather than run unattended.
 | **#101 AC-6 — keychain-primary, plaintext-fallback** | static decode | ✅ **UNCHANGED** — `name:"plaintext"` is still the fallback arm only |
 | **#466 — scrub present, empties both tokens, un-gated** | `scripts/spike-466-invalid-grant-scrub-probe.sh` | ✅ **PASS** (exit 0, all 4 assertions) |
 | **H3 — fresh-start adoption** · **H2 — token/`oauthAccount` orthogonality** | production observation | ✅ **HOLDS** — see below |
-| **New — the item `acct` derivation is `$USER`-first** | static decode | ⚠️ **LATENT** — exposes the isolated-item path only; the canonical path is immune. Tracked as #711 |
+| **New — the item `acct` derivation is `$USER`-first** | static decode | ⚠️ **OBSERVED**, then **MIRRORED** — exposed the isolated-item path only (the canonical path is immune). Closed by #711: the isolated path now replicates `uq()` and pins it with test vectors |
 | **ADR-0018 — does the first `invalid_grant` still empty the shared item?** | — | ⏸ **DEFERRED** — see below |
 
 Legend: ✅ re-verified · ⚠️ new observation · ⏸ deferred (live-oracle)
@@ -1038,6 +1038,15 @@ Blast radius is asymmetric across sessiometer's two keychain paths:
 derivation, **not** evidence of a regression introduced in the `2.1.21x` line. Whether `2.1.181`
 already had this shape could not be re-checked (that build is no longer on disk). Tracked as #711
 rather than fixed here; it does not gate the range bump.
+
+**Resolution (#711).** The isolated path now replicates `uq()` rather than pinning `getpwuid`:
+`keychain::claude_code_acct_from` takes `$USER` first, falls back to the passwd login name only when
+`$USER` is unset or empty, sanitizes the resolved name against `/^[a-zA-Z0-9._-]+$/`, and substitutes
+the literal `claude-code-user` for both a failed lookup and a failed charset test. The canonical path
+was deliberately left alone — it reads the `acct` back *as stored*, so re-pointing it at any computed
+name would have regressed it from immune to exposed. All three constituents (precedence, sanitize,
+fallback) are pinned by test vectors written against CC's derivation, so a future CC change trips a
+test rather than silently mis-targeting the item.
 
 ## Deferred — ADR-0018's live re-check trigger ⏸
 

@@ -807,9 +807,11 @@ const LOGIN_REAP_RETRY_WAIT: Duration = Duration::from_millis(100);
 /// different suffix. It never enumerates the keychain by a `Claude Code-credentials-*` prefix.
 ///
 /// Best-effort with retry (a per-start failure is logged and retried on the next daemon / `login`
-/// start); a genuinely-stranded orphan is logged when reaped, and the common clean-start case is
-/// silent. Run at daemon start (in `cli`, beside [`reap_orphans`]) and at `login` start (in
-/// [`crate::login`]).
+/// start); a genuinely-stranded root is logged when swept — deliberately not phrased as a confirmed
+/// reap, since the item delete cannot distinguish "deleted" from "already absent" and the
+/// `$USER`-derived `acct` (issue #711) is no longer uid-stable across processes (issue #769) — and
+/// the common clean-start case is silent. Run at daemon start (in `cli`, beside [`reap_orphans`])
+/// and at `login` start (in [`crate::login`]).
 pub(crate) async fn reap_login_orphan() {
     if let Err(err) = reap_login_orphan_inner().await {
         eprintln!("sessiometer: isolated-login orphan reap skipped: {err}");
@@ -831,8 +833,16 @@ async fn reap_login_orphan_inner() -> Result<()> {
     let item = crate::keychain::IsolatedKeychainItem::new(iso_dir.as_os_str())?;
     reap_login_isolated(&item, &iso_dir).await?;
     if stranded {
+        // "swept", not "reaped": the item delete treats an already-absent item as
+        // success (exit 44), so a clean return does NOT prove an item was deleted.
+        // Since issue #711 the `acct` is `$USER`-derived rather than uid-stable, so a
+        // `$USER` that changed between the crashed process and this one addresses a
+        // different name and the delete is a silent no-op — claiming a reap here
+        // would be an operator-facing false success. Closing that addressing gap
+        // (reap by enumerating the service, which is `$USER`-independent) is tracked
+        // as issue #769; this line only refuses to overstate what it knows.
         eprintln!(
-            "sessiometer: reaped a stranded isolated-login orphan under {}",
+            "sessiometer: swept the stranded isolated-login root under {}",
             iso_dir.display()
         );
     }

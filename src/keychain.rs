@@ -20,6 +20,17 @@
 //! *resolved* name, so a CC instance run under an isolated config dir is managed,
 //! not invisible.
 //!
+//! **Item `acct`.** The two item paths reach the `acct` attribute from opposite
+//! ends, and only one of them has to derive it. The **canonical** item is read back
+//! *as stored* (see resolve, below), so it is immune to however Claude Code computed
+//! the name. The **isolated** item (issue #102 refresh / issue #132 capture) has
+//! nothing to read back — it pins `acct` up front, *before* the `claude` it seeds
+//! for has written anything — so it must replicate CC's own derivation exactly
+//! ([`claude_code_acct_from`], issue #711: `$USER` first, the passwd login name only
+//! as its fallback). Deriving it as the bare login name instead would mis-target the
+//! item whenever `$USER` diverges from passwd, and the only symptom would be a
+//! misleading `Not logged in`.
+//!
 //! The mechanism and the facts this module depends on were verified empirically
 //! before implementation — see `build/version-compat.md` (the issue #16 ledger):
 //! the store is the legacy file-based `login.keychain-db`, every call pins that
@@ -143,6 +154,147 @@ fn canonical_service() -> Result<String> {
 pub(crate) fn service_for_config_dir(config_dir: &OsStr) -> Result<String> {
     canonical_service_from(None, Some(config_dir))
 }
+
+/// The literal Claude Code substitutes for a login name it will not use. Both of
+/// `uq()`'s reject arms — the `catch` (lookup failed) and the `!xGh.test(e)`
+/// (charset failed) — converge on this same string. (issue #711)
+const ACCT_FALLBACK: &str = "claude-code-user";
+
+/// Does `name` satisfy Claude Code's `xGh` = `/^[a-zA-Z0-9._-]+$/` — one or more
+/// ASCII letters, ASCII digits, `.`, `_` or `-`, anchored at both ends?
+///
+/// Hand-rolled over the raw bytes rather than pulled from a regex crate: the crate
+/// hand-rolls its primitives to keep the dependency graph minimal (see
+/// [`crate::sha256`]), and byte-wise is exactly equivalent here. Every byte the class
+/// admits is ASCII, so any non-ASCII byte — every byte of a multi-byte UTF-8
+/// sequence, and every byte of a name that is not UTF-8 at all — is rejected, which
+/// is what CC's test does to the same names once decoded. The `+` makes the empty
+/// name a non-match, and the anchors mean an embedded newline or space is rejected
+/// too (JS `$` without the `m` flag matches only the true end of input).
+fn is_well_formed_acct(name: &OsStr) -> bool {
+    let bytes = name.as_bytes();
+    !bytes.is_empty()
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Derive the `acct` attribute Claude Code addresses its credential item under,
+/// replicating CC 2.1.217's `uq()`:
+///
+/// ```js
+/// function uq(){
+///   let e;
+///   try{ e=process.env.USER||FWn.userInfo().username }catch{ e="claude-code-user" }
+///   if(!xGh.test(e)) return "claude-code-user";            // xGh = /^[a-zA-Z0-9._-]+$/
+///   return e
+/// }
+/// ```
+///
+/// Three load-bearing constituents, each pinned by a test vector below:
+///
+/// - **precedence** — `$USER` wins; the passwd login name is consulted ONLY when
+///   `$USER` is unset or empty (JS `||` tests falsiness, so a defined-but-empty
+///   `USER=` falls through). `login_name` is a thunk, not a value, so a usable
+///   `$USER` costs no passwd lookup — the short-circuit is part of the semantics.
+/// - **sanitize** — the RESOLVED name, from whichever source, must pass
+///   [`is_well_formed_acct`]. Note the ordering subtlety: a non-empty `$USER` that
+///   fails the charset does **not** fall back to the passwd name, it becomes
+///   [`ACCT_FALLBACK`] — the `||` has already committed to it by the time `xGh` runs.
+/// - **fallback** — the literal [`ACCT_FALLBACK`], for both a failed lookup
+///   (`login_name` yields `None`, CC's `catch`) and a failed charset test.
+///
+/// Infallible by construction, as `uq()` is: there is no input for which CC declines
+/// to name an item, so neither may we. A `Result` here would let the isolated path
+/// abort exactly where a live CC would go on reading `claude-code-user`.
+///
+/// Pure — the env read and the passwd lookup both live in
+/// [`IsolatedKeychainItem::new`] — so every arm is unit-testable without mutating
+/// process-global env, which `cargo test`'s parallelism would make racy (mirrors
+/// [`canonical_service_from`]). (issue #711)
+fn claude_code_acct_from<F>(user_env: Option<&OsStr>, login_name: F) -> CcAcct
+where
+    F: FnOnce() -> Option<OsString>,
+{
+    let resolved = match user_env {
+        // CC's `||`: a non-empty `$USER` short-circuits — passwd is never consulted.
+        Some(user) if !user.is_empty() => Some(user.to_owned()),
+        // Unset or defined-empty `$USER` is falsy → fall through to the login name.
+        _ => login_name(),
+    };
+    CcAcct::from_derivation(match resolved {
+        Some(name) if is_well_formed_acct(&name) => name,
+        _ => OsString::from(ACCT_FALLBACK),
+    })
+}
+
+/// Privacy boundary for [`CcAcct`]. The type is a newtype over `OsString`, and the
+/// point of it is that the wrapped value cannot be supplied from just anywhere — but
+/// a tuple struct's `CcAcct(..)` constructor and its `.0` field are visible
+/// everywhere in the *defining* module, which is exactly where both seeding sites
+/// live. Nesting it one module down makes the field and the tuple constructor
+/// genuinely unreachable from `keychain`, leaving the named constructors below as the
+/// only way in. (issue #711)
+mod cc_acct {
+    use std::ffi::{OsStr, OsString};
+
+    /// An `acct` that came from Claude Code's own derivation.
+    ///
+    /// A newtype rather than a bare `OsString` because the *derivation* being right
+    /// is not the same guarantee as the *call site* using it, and only the latter is
+    /// what issue #711 actually fixes. Outside this module the only ways to build one
+    /// are [`from_derivation`](CcAcct::from_derivation) — whose sole caller is
+    /// `claude_code_acct_from` — and a `#[cfg(test)]` escape hatch, so re-inlining
+    /// `acct: paths::username()?` at a seeding site is a COMPILE error rather than a
+    /// silent regression.
+    ///
+    /// Tests pin the seeding sites that exist today; only the type covers one added
+    /// later. What remains possible is passing a non-derived name to a function named
+    /// `from_derivation` — self-evidently wrong at the call site, rather than a
+    /// plausible-looking refactor.
+    pub(super) struct CcAcct(OsString);
+
+    /// Render the wrapped name in test failures. Not available in production builds:
+    /// an `acct` is not secret, but nothing outside tests has a reason to print one.
+    #[cfg(test)]
+    impl std::fmt::Debug for CcAcct {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CcAcct({:?})", self.0)
+        }
+    }
+
+    /// Compare a derived `acct` against an expected name, so the pinned vectors keep
+    /// reading as the derivation's semantics rather than as newtype plumbing.
+    #[cfg(test)]
+    impl PartialEq<OsString> for CcAcct {
+        fn eq(&self, other: &OsString) -> bool {
+            self.0 == *other
+        }
+    }
+
+    impl CcAcct {
+        /// Wrap the output of Claude Code's derivation. Called only by
+        /// `claude_code_acct_from`, which is the derivation.
+        pub(super) fn from_derivation(name: OsString) -> Self {
+            Self(name)
+        }
+
+        /// Borrow the derived name for the `security` argument builders.
+        pub(super) fn as_os_str(&self) -> &OsStr {
+            &self.0
+        }
+
+        /// Wrap an explicit name, bypassing the derivation — tests only, so the
+        /// real-CLI round-trip can pin a throwaway `acct` without weakening the
+        /// production guarantee above.
+        #[cfg(test)]
+        pub(super) fn for_test(name: OsString) -> Self {
+            Self(name)
+        }
+    }
+}
+
+use cc_acct::CcAcct;
 
 /// An opaque credential blob (the active account's OAuth tokens).
 ///
@@ -481,8 +633,14 @@ async fn run_interactive_write(line: &[u8]) -> Result<std::process::Output> {
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()?;
-    // One small (< pipe-buffer) write, so there is no stdin/stderr deadlock risk;
-    // dropping the handle at the end of the statement closes the pipe → EOF.
+    // The whole write lands before `wait_with_output` drains stderr, so it rests on
+    // `line` fitting the pipe buffer — and nothing bounds `line`: neither the
+    // credential blob (uncapped all along) nor, since issue #711, the `$USER`-derived
+    // `acct`. Unreachable in practice (a deadlock needs a ~64 KiB `line` AND
+    // `security` filling its own stderr buffer in the same call), and capping the
+    // `acct` here would re-introduce the very divergence #711 closed — so the
+    // concurrent-drain hardening that removes the precondition for both is tracked as
+    // issue #747. Dropping the handle at the end of the statement closes the pipe → EOF.
     child
         .stdin
         .take()
@@ -760,8 +918,10 @@ impl CredentialStore for FakeCredentialStore {
 
 /// Seam: the isolated keychain item a spawned `claude` refreshes for the
 /// isolated-refresh engine (issue #102) — the generic-password item at the
-/// config-dir-suffixed service ([`service_for_config_dir`]), keyed by the macOS login
-/// name (`acct`) Claude Code reads with ([`paths::username`]).
+/// config-dir-suffixed service ([`service_for_config_dir`]), keyed by the `acct`
+/// Claude Code itself derives ([`claude_code_acct_from`], issue #711). Usually that
+/// IS the login name, but characterizing it as the login name is what made the
+/// divergence invisible.
 ///
 /// Distinct from [`CredentialStore`] (the single CANONICAL active item, whose `acct`
 /// is resolved by uniqueness): the isolated item's `acct` is KNOWN up front, and it is
@@ -791,14 +951,16 @@ pub(crate) trait IsolatedKeychain {
 /// Real isolated keychain item, driving `/usr/bin/security` against the login
 /// keychain (issue #102). Reuses the canonical item's off-argv `security -i` write
 /// and `-w` read primitives, addressing the config-dir-suffixed service under the
-/// macOS login-name `acct`.
+/// `acct` CC itself would derive.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct IsolatedKeychainItem {
     /// The config-dir-suffixed service ([`service_for_config_dir`]) of the spawned
     /// `claude`'s isolated `CLAUDE_CONFIG_DIR`.
     service: String,
-    /// The macOS login name CC reads/writes the item under.
-    acct: OsString,
+    /// The `acct` CC reads/writes the item under, derived by CC's own rule
+    /// ([`claude_code_acct_from`], issue #711). Typed [`CcAcct`] so it can only ever
+    /// hold a name that came from that derivation.
+    acct: CcAcct,
     /// Keychain to operate on. `None` is production (the login keychain); `Some` pins
     /// a throwaway keychain for the real-CLI round-trip test.
     keychain: Option<PathBuf>,
@@ -807,12 +969,39 @@ pub(crate) struct IsolatedKeychainItem {
 #[cfg_attr(not(test), allow(dead_code))]
 impl IsolatedKeychainItem {
     /// Production isolated store for a `claude` spawned under `config_dir`: the
-    /// service is derived from `config_dir` by #100, the `acct` is the login name,
-    /// and operations target the login keychain.
+    /// service is derived from `config_dir` by #100, the `acct` by CC's own `uq()`
+    /// rule ([`claude_code_acct_from`], issue #711 — NOT the bare login name), and
+    /// operations target the login keychain.
+    ///
+    /// A pure delegation to [`new_from`](Self::new_from), which holds all of the
+    /// wiring: this shim exists only to read the two environment inputs, exactly as
+    /// [`canonical_service`] shims [`canonical_service_from`]. Keep it that way —
+    /// logic added here would sit outside the seam the tests drive.
     pub(crate) fn new(config_dir: &OsStr) -> Result<Self> {
+        Self::new_from(config_dir, std::env::var_os("USER").as_deref(), || {
+            paths::username().ok()
+        })
+    }
+
+    /// [`new`](Self::new) with its two environment inputs threaded in — the `$USER`
+    /// value, and a thunk for the passwd login name (deferred so a usable `$USER`
+    /// short-circuits it, as CC's `||` does).
+    ///
+    /// This is where the isolated path commits to an `acct`, and it takes those
+    /// inputs as arguments so a test can drive the one environment that can tell a
+    /// correct wiring from a wrong one: a DIVERGENT one, where `$USER` and the passwd
+    /// name differ. That is the whole case issue #711 is about, and it is exactly the
+    /// case the ambient environment cannot exercise — on any machine where the two
+    /// agree (this one, and every standard CI runner) an assertion made against
+    /// ambient env passes whichever name the constructor picked, so it would guard
+    /// nothing. Threading beats mutating `$USER` in-process: the suite runs parallel.
+    fn new_from<F>(config_dir: &OsStr, user_env: Option<&OsStr>, login_name: F) -> Result<Self>
+    where
+        F: FnOnce() -> Option<OsString>,
+    {
         Ok(Self {
             service: service_for_config_dir(config_dir)?,
-            acct: paths::username()?,
+            acct: claude_code_acct_from(user_env, login_name),
             keychain: None,
         })
     }
@@ -828,7 +1017,7 @@ impl IsolatedKeychainItem {
     ) -> Result<Self> {
         Ok(Self {
             service: service_for_config_dir(config_dir)?,
-            acct,
+            acct: CcAcct::for_test(acct),
             keychain: Some(keychain),
         })
     }
@@ -850,7 +1039,7 @@ impl IsolatedKeychainItem {
             "-s".into(),
             self.service.as_str().into(),
             "-a".into(),
-            self.acct.clone(),
+            self.acct.as_os_str().to_owned(),
             keychain.as_os_str().to_owned(),
         ]
     }
@@ -859,7 +1048,7 @@ impl IsolatedKeychainItem {
 impl IsolatedKeychain for IsolatedKeychainItem {
     async fn seed(&self, blob: &[u8]) -> Result<()> {
         let keychain = self.keychain_path()?;
-        let line = write_command_line(&self.service, &self.acct, &keychain, blob);
+        let line = write_command_line(&self.service, self.acct.as_os_str(), &keychain, blob);
         let output = run_interactive_write(&line).await?;
         finish_write(output.status.success(), output.status.code().unwrap_or(-1))
     }
@@ -867,7 +1056,7 @@ impl IsolatedKeychain for IsolatedKeychainItem {
     async fn read_back(&self) -> Result<Credential> {
         let keychain = self.keychain_path()?;
         let output = Command::new(SECURITY)
-            .args(read_args(&self.service, &self.acct, &keychain))
+            .args(read_args(&self.service, self.acct.as_os_str(), &keychain))
             .stdin(Stdio::null())
             .output()
             .await?;
@@ -1040,6 +1229,223 @@ mod tests {
             service_for_config_dir(OsStr::new("/Users/café/refresh")),
             Err(Error::NonAsciiConfigDir)
         ));
+    }
+
+    // --- item `acct` derivation (issue #711) --------------------------------
+    //
+    // Replicates Claude Code 2.1.217's `uq()`, decoded verbatim from the stock binary
+    // (the same shape is present in 2.1.209, 2.1.215, 2.1.216, 2.1.217 —
+    // `build/version-compat.md`); the decode itself is quoted on
+    // `claude_code_acct_from`. These vectors are the tripwire: they are written
+    // against CC's derivation, not against ours, so a future CC change trips a test
+    // rather than silently mis-targeting the isolated item (whose only symptom would
+    // be a misleading `Not logged in`).
+
+    /// A passwd thunk yielding `name`, for the arms where the login name is reached.
+    fn passwd(name: &str) -> impl FnOnce() -> Option<OsString> + use<'_> {
+        move || Some(OsString::from(name))
+    }
+
+    #[test]
+    fn a_valid_user_env_wins_over_the_passwd_login_name() {
+        // CC's `process.env.USER || userInfo().username`: `$USER` is consulted FIRST
+        // and a usable value wins outright, even when passwd says something else.
+        // This is the whole divergence #711 exists to close — deriving the bare login
+        // name here would seed the isolated item under `loginname` while the `claude`
+        // we spawned for it reads `envuser`.
+        assert_eq!(
+            claude_code_acct_from(Some(OsStr::new("envuser")), passwd("loginname")),
+            OsString::from("envuser")
+        );
+    }
+
+    #[test]
+    fn a_valid_user_env_short_circuits_the_passwd_lookup_entirely() {
+        // The `||` short-circuits: with a usable `$USER`, `userInfo()` is never
+        // called. Pinned because it is load-bearing beyond cost — CC cannot fail on a
+        // broken passwd entry when `$USER` is set, so neither may we.
+        let consulted = Cell::new(false);
+        let acct = claude_code_acct_from(Some(OsStr::new("envuser")), || {
+            consulted.set(true);
+            Some(OsString::from("loginname"))
+        });
+        assert_eq!(acct, OsString::from("envuser"));
+        assert!(
+            !consulted.get(),
+            "passwd was consulted despite a usable $USER"
+        );
+    }
+
+    #[test]
+    fn an_unset_user_env_falls_back_to_the_passwd_login_name() {
+        // `process.env.USER` is `undefined` → falsy → `userInfo().username`. This is
+        // the ordinary case on every machine where the two agree, and it is why this
+        // change is a no-op for current usage rather than a behaviour break.
+        assert_eq!(
+            claude_code_acct_from(None, passwd("loginname")),
+            OsString::from("loginname")
+        );
+    }
+
+    #[test]
+    fn a_defined_but_empty_user_env_falls_back_to_the_passwd_login_name() {
+        // `USER=` (defined, empty) is falsy in JS exactly as `undefined` is, so the
+        // `||` falls through. The subtle arm: "defined" is not "usable".
+        assert_eq!(
+            claude_code_acct_from(Some(OsStr::new("")), passwd("loginname")),
+            OsString::from("loginname")
+        );
+    }
+
+    #[test]
+    fn a_user_env_outside_the_charset_becomes_the_literal_fallback() {
+        // `!xGh.test(e)` → `"claude-code-user"`. Note the ordering subtlety: the `||`
+        // has ALREADY committed to `$USER` by the time the charset test runs, so a
+        // non-empty-but-invalid `$USER` does NOT fall back to the passwd name — it
+        // becomes the literal. Asserting `!= "loginname"` is the point of the vector.
+        for bad in [
+            "has space",
+            "naïve",
+            "back\\slash",
+            "semi;colon",
+            "new\nline",
+            // TRAILING newline specifically: JS `$` without the `m` flag matches only
+            // the true end of input (unlike Python/PCRE, where `$` also matches before
+            // a final newline), so CC rejects this too. Pinned separately from the
+            // embedded case because the byte scan makes them one code path here, while
+            // a future port to a regex crate could silently diverge on exactly this.
+            "trailing\n",
+        ] {
+            let acct = claude_code_acct_from(Some(OsStr::new(bad)), passwd("loginname"));
+            assert_eq!(
+                acct,
+                OsString::from("claude-code-user"),
+                "expected the literal fallback for {bad:?}"
+            );
+            assert_ne!(
+                acct,
+                OsString::from("loginname"),
+                "an invalid $USER must NOT fall back to the passwd name ({bad:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_within_the_charset_is_accepted_verbatim() {
+        // A name inside `[a-zA-Z0-9._-]+` is returned as-is — CC addresses the item
+        // under it verbatim, so we must too rather than "sanitize" it away. Covers
+        // each punctuation character alone (the edge the class still admits) and the
+        // realistic mixed forms.
+        for ok in [
+            "_",
+            ".",
+            "-",
+            "._-",
+            "first.last",
+            "svc_acct",
+            "build-bot",
+            "u2",
+        ] {
+            assert_eq!(
+                claude_code_acct_from(Some(OsStr::new(ok)), passwd("loginname")),
+                OsString::from(ok),
+                "expected {ok:?} to be accepted verbatim"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_passwd_lookup_becomes_the_literal_fallback() {
+        // CC's `catch` arm: `userInfo()` throws → `e = "claude-code-user"`, which then
+        // passes `xGh` and is returned. Our thunk yields `None` for the same case
+        // (`paths::username()` `Err`), and the derivation stays infallible — CC never
+        // declines to name an item, so neither may we.
+        assert_eq!(
+            claude_code_acct_from(None, || None),
+            OsString::from("claude-code-user")
+        );
+    }
+
+    #[test]
+    fn a_passwd_login_name_outside_the_charset_becomes_the_literal_fallback() {
+        // `xGh.test(e)` runs on the RESOLVED name whatever its source, so a weird
+        // passwd entry is sanitized identically to a weird `$USER` — the regex sits
+        // after the `||`, not inside either branch of it.
+        assert_eq!(
+            claude_code_acct_from(None, passwd("weird name")),
+            OsString::from("claude-code-user")
+        );
+        // Including the empty passwd name: `+` requires at least one character.
+        assert_eq!(
+            claude_code_acct_from(None, passwd("")),
+            OsString::from("claude-code-user")
+        );
+    }
+
+    #[test]
+    fn a_non_utf8_name_is_rejected_rather_than_addressed_raw() {
+        // Env values and passwd entries are bytes on Unix; CC sees them decoded, where
+        // an invalid sequence surfaces as U+FFFD and fails `xGh`. Our byte-wise test
+        // rejects the same input (no byte of a non-ASCII sequence is in the class), so
+        // both land on the literal — we never address an item under raw garbage.
+        let raw = OsString::from_vec(vec![b'a', 0xFF, b'b']);
+        assert_eq!(
+            claude_code_acct_from(Some(&raw), passwd("loginname")),
+            OsString::from("claude-code-user")
+        );
+    }
+
+    #[test]
+    fn the_isolated_item_commits_to_the_derived_acct_not_the_bare_login_name() {
+        // The seam this issue is about: the constructor must commit to the DERIVED
+        // `acct` (issue #711), never to `paths::username()`. Driven through a
+        // DIVERGENT environment ($USER != passwd name) — the only one that
+        // discriminates a correct wiring from a wrong one, and the reason `new_from`
+        // takes these as arguments at all (see its doc). Revert the `acct:` line
+        // there to `paths::username()?` and this test fails; that is the point of it.
+        let item = IsolatedKeychainItem::new_from(
+            OsStr::new("/abs/path"),
+            Some(OsStr::new("envuser")),
+            || Some(OsString::from("loginname")),
+        )
+        .unwrap();
+        assert_eq!(item.acct, OsString::from("envuser"));
+        assert_ne!(
+            item.acct,
+            OsString::from("loginname"),
+            "the isolated item committed to the passwd name — the #711 divergence is back"
+        );
+        // …and the #100 service derivation is unchanged alongside it.
+        assert_eq!(item.service, "Claude Code-credentials-6d80187b");
+    }
+
+    #[test]
+    fn the_production_constructor_commits_to_a_well_formed_acct() {
+        // `new` is a pure delegation to `new_from` (which the test above drives), so
+        // what is left to check is the shim itself: against the real ambient
+        // environment it must still yield a name that can actually be pinned as an
+        // `acct`. Reads env, never mutates it.
+        let item = IsolatedKeychainItem::new(OsStr::new("/abs/path")).unwrap();
+        assert!(is_well_formed_acct(item.acct.as_os_str()));
+        assert_eq!(item.service, "Claude Code-credentials-6d80187b");
+    }
+
+    #[test]
+    fn the_derived_acct_is_always_well_formed_whatever_the_environment() {
+        // The totality property that lets this derivation drop the `Result` the bare
+        // `paths::username()` carried: for EVERY environment — no `$USER`, a hostile
+        // one, a broken passwd entry — the result is a name that can actually be
+        // pinned as an `acct`, because the fallback is itself charset-clean.
+        for user in [None, Some(""), Some("has space"), Some("ok.name")] {
+            for login in [None, Some(""), Some("weird name"), Some("loginname")] {
+                let acct =
+                    claude_code_acct_from(user.map(OsStr::new), || login.map(OsString::from));
+                assert!(
+                    is_well_formed_acct(acct.as_os_str()),
+                    "malformed acct {acct:?} from $USER={user:?} passwd={login:?}"
+                );
+            }
+        }
     }
 
     #[test]
