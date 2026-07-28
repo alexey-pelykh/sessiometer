@@ -1,0 +1,47 @@
+sessiometer reliability — swap-out overshoot SLO readout (offline; reads the event log + usage samples)
+
+swap-out session_pct (reason=session, reaction-latency), n=2
+  P50  = 94  target <= 97  [ok]
+  P95  = 98
+  P100 = 98  target < 99   [ok]
+capacity-held (reason=session, all_exhausted — no viable target; out of #363 scope), n=1
+  P50  = 100
+  P100 = 100
+
+projective swap-out session_pct (reason=velocity_preempt), n=1
+  P50  = 88  target <= 94  [ok]
+  P95  = 88
+  P100 = 88  target <= 98  [ok]
+
+landing-point session_pct (post-swap peak of the outgoing account, window <= 900s)
+  measured n=2 of 2 reason=session swaps (0 with no post-swap sample)
+  P50  = 98
+  P90  = 99  (issue #597 tail-calibration input)
+  P100 = 99  vs ceiling < 99  [OVER]
+  breach classes: 1 post-swap tail (fired < 99, landed >= 99); 0 gap-crossing (decision >= 99); blind-burn: see time-blind SLI (issue #583)
+  capacity-held (all_exhausted, excluded — out of #363 scope): 1
+
+observed session velocity (session_pct_per_min, positive climbs only; the v_peak reserve-coupling calibration input)
+  measured n=1 usage_velocity samples
+  P50  = 0.20 %/min
+  P90  = 0.20 %/min
+  P100 = 0.20 %/min  vs assumed v_peak 6.95 %/min  [ok]
+
+time blind & near-limit: 900s (sum of blind_window duration_secs where near_limit=true)
+  uncensored episodes: entered=1 exited=1 swapped_away=0 never_recovered=0 anchor_lost=0
+  near-limit blind time: >= 480s (480s measured + 0s right-censored floor, n=1)
+
+false-preempt (preemptive swap whose target turned out unnecessary)
+  preemptive swaps observed: 0
+  proxy (blind-window reconciliation, interim margin 20pp): 1 of 2 near-limit windows would-be-wasted
+
+false-projection (velocity-projection swap fired ahead of the observed overshoot)
+  velocity-projection swaps observed: 1
+
+blind-arm projection error (projected − session_at_recovery, pp; the BLIND_VELOCITY_RATE_INFLATION tuning input)
+  reconcilable n=0 of 0 projectable (0 excluded: session_at_recovery=0 window-reset sentinel), from 3 blind windows
+  outside the arm's domain: 2 below the T=300s gate; 1 with no retained velocity; 0 malformed
+  censoring: RECOVERED-ONLY — excludes 0 swapped-away and 0 never-recovered episodes (counted from the uncensored blind_enter/blind_exit pair above)
+  no reconcilable blind windows — percentiles withheld (an empty subject is not a 0 pp error)
+
+usage-poll 429 neutrality (roster-wide): rate_limited=1 transient=1 cleared=1

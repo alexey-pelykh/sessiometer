@@ -1,0 +1,34 @@
+sessiometer reliability — swap-out overshoot SLO readout (offline; reads the event log + usage samples)
+
+window: since 2026-07-11T00:25:00Z (6h) — all SLIs bounded to events at/after the cutoff
+
+swap-out session_pct (reason=session, reaction-latency): no swaps observed
+
+projective swap-out session_pct (reason=velocity_preempt): no projective swaps observed
+
+landing-point session_pct (post-swap peak of the outgoing account): no reason=session swaps observed
+
+observed session velocity (session_pct_per_min, positive climbs only; the v_peak reserve-coupling calibration input)
+  measured n=1 usage_velocity samples
+  P50  = 0.20 %/min
+  P90  = 0.20 %/min
+  P100 = 0.20 %/min  vs assumed v_peak 6.95 %/min  [ok]
+
+time blind & near-limit: 0s (sum of blind_window duration_secs where near_limit=true)
+  uncensored episodes: entered=1 exited=1 swapped_away=0 never_recovered=0 anchor_lost=0
+  near-limit blind time: >= 480s (480s measured + 0s right-censored floor, n=1)
+
+false-preempt (preemptive swap whose target turned out unnecessary)
+  preemptive swaps observed: 0
+  proxy (blind-window reconciliation, interim margin 20pp): 0 of 0 near-limit windows would-be-wasted
+
+false-projection (velocity-projection swap fired ahead of the observed overshoot)
+  velocity-projection swaps observed: 0
+
+blind-arm projection error (projected − session_at_recovery, pp; the BLIND_VELOCITY_RATE_INFLATION tuning input)
+  reconcilable n=0 of 0 projectable (0 excluded: session_at_recovery=0 window-reset sentinel), from 1 blind windows
+  outside the arm's domain: 1 below the T=300s gate; 0 with no retained velocity; 0 malformed
+  censoring: RECOVERED-ONLY — excludes 0 swapped-away and 0 never-recovered episodes (counted from the uncensored blind_enter/blind_exit pair above)
+  no reconcilable blind windows — percentiles withheld (an empty subject is not a 0 pp error)
+
+usage-poll 429 neutrality (roster-wide): rate_limited=1 transient=1 cleared=1

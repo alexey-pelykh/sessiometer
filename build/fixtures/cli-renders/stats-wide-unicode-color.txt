@@ -1,0 +1,30 @@
+usage — last 24h (Jun 30–Jul 1)
+
+account  signal     session  weekly  runway  velocity  trend
+alpha    [33msaturated[0m    [31m62/99[0m     [32m48%[0m     ~2h  0.9%/min  ▃▆▇█
+beta     balanced     [33m44/66[0m     [32m24%[0m     ~9h  0.3%/min  ▃ ▅▆
+delta    —              [32m0/0[0m      [32m0%[0m       —         —
+ガンマ   [33munderused[0m     [32m8/17[0m      [32m5%[0m       —         —  ▂▂ ▂
+
+contribution share
+alpha   ██████████████████████░░░░░░░░░░░░░░░░░░   55%
+beta    ████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░   30%
+delta   ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░    0%
+ガンマ  ██████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   15%
+
+session pattern — hourly mean
+alpha   [32m▒[0m[33m▓[0m[31m▓[0m[31m█[0m
+beta    [32m▒[0m [33m▓[0m[33m▓[0m
+delta
+ガンマ  [32m░[0m[32m░[0m [32m░[0m
+
+session distribution — mean · p95 · peak
+alpha   ┤────────────────────────m────────────P─x├  62% · 94% · 99%
+beta    ┤─────────────────m──────P─x─────────────├  44% · 61% · 66%
+delta   ┤x───────────────────────────────────────├  0% · 0% · 0%
+ガンマ  ┤───m──Px────────────────────────────────├  8% · 15% · 17%
+
+  lowest utilisation: ガンマ (session mean 8%)
+  accounts last ~3 days at the current combined rate (2 of 3 counted)
+not in roster (1): retired
+roster: 4 swaps (2 session, 1 weekly, 1 manual, 0 forced, 0 emergency) · all-accounts-high: 0 episodes (0s)

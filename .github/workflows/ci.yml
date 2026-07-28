@@ -47,8 +47,11 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'deny.toml'
-              # `include_str!` compile-time inputs for the migration tests (src/migration.rs);
-              # a fixture-only edit is still a Rust-affecting change and must run the Rust jobs.
+              # `include_str!` compile-time inputs for the migration tests (src/migration.rs), the
+              # wire goldens (src/daemon/snapshot_build.rs, src/stats.rs) and the CLI full-output
+              # render goldens (build/fixtures/cli-renders/**, issue #767); a fixture-only edit is
+              # still a Rust-affecting change and must run the Rust jobs — for the render goldens
+              # especially, since a golden-only PR is exactly the shape a silent re-baseline takes.
               - 'build/fixtures/**'
               - 'scripts/**'
               # Cargo auto-detects these inputs, so a PR that adds one must run the Rust jobs — else
@@ -368,6 +371,17 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: ./scripts/check-panel-golden-rebaseline.sh
+      # CLI full-output render-golden re-baseline discipline (issue #767). Third member of the
+      # trailer-guard family, hosted here for the same reasons as the panel one: it needs the
+      # identical fetch-depth-0 PR range and must be un-skippable. Distinct trailer
+      # (`CLI-Goldens-Rebaselined:`) and distinct question — "what changed in the CLI's rendered
+      # TEXT?" rather than the panel's "appearance" or `Gate-Change-Acknowledged:`'s "is this gate
+      # weakening safe?" — so all three audit trails stay separately greppable.
+      - name: Require a justification when a PR re-baselines the CLI render goldens
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: ./scripts/check-cli-golden-rebaseline.sh
 
   # Single always-running summary gate. This is the ONE check branch protection should
   # require: it runs on every PR/push regardless of path filters, and passes only when every
