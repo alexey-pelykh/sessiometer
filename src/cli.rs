@@ -122,6 +122,9 @@ enum Command {
     Stats(crate::stats::StatsArgs),
     /// `reliability [--json]` — the OFFLINE reliability-SLO readout over the event log (#455).
     Reliability(crate::reliability::ReliabilityArgs),
+    /// `log [--since <duration>] [--event <name>] [--json]` — the OFFLINE reader for the event
+    /// log's lines themselves (issue #773), as opposed to the SLIs `reliability` folds them into.
+    Log(crate::log::LogArgs),
     /// `export [PATH] …`. The raw flags are carried and resolved to an `Encryption` in
     /// `execute`, so this variant stays a plain comparable value for the parser tests.
     Export {
@@ -218,6 +221,7 @@ enum HelpTopic {
     Poke,
     Stats,
     Reliability,
+    Log,
     Export,
     Import,
 }
@@ -242,6 +246,7 @@ impl HelpTopic {
             HelpTopic::Poke => "sessiometer poke --help",
             HelpTopic::Stats => "sessiometer stats --help",
             HelpTopic::Reliability => "sessiometer reliability --help",
+            HelpTopic::Log => "sessiometer log --help",
             HelpTopic::Export => "sessiometer export --help",
             HelpTopic::Import => "sessiometer import --help",
         }
@@ -268,6 +273,7 @@ impl HelpTopic {
             HelpTopic::Poke => POKE_USAGE,
             HelpTopic::Stats => STATS_USAGE,
             HelpTopic::Reliability => RELIABILITY_USAGE,
+            HelpTopic::Log => LOG_USAGE,
             HelpTopic::Export => EXPORT_USAGE,
             HelpTopic::Import => IMPORT_USAGE,
         }
@@ -582,6 +588,37 @@ fn parse_reliability(parser: &mut lexopt::Parser) -> Result<Command> {
     }))
 }
 
+/// Parse `log [--since <duration>] [--event <name>] [--json]` (issue #773) — the offline reader
+/// for the event log's lines themselves. Flags only: there is no positional form, because the
+/// thing one would filter by is an event name, and that is `--event`.
+fn parse_log(parser: &mut lexopt::Parser) -> Result<Command> {
+    let mut json = false;
+    let mut since = None;
+    let mut event = None;
+    while let Some(arg) = parser.next()? {
+        match arg {
+            Short('h') | Long("help") => return Ok(Command::Help(HelpTopic::Log)),
+            Long("json") => json = true,
+            Long("since") => {
+                since = Some(
+                    required_value(parser, "since", HelpTopic::Log)?
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            Long("event") => {
+                event = Some(
+                    required_value(parser, "event", HelpTopic::Log)?
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+            other => return Err(unexpected(other, HelpTopic::Log)),
+        }
+    }
+    Ok(Command::Log(crate::log::LogArgs { since, event, json }))
+}
+
 /// Parse `export [PATH] [--plaintext] [--no-secrets] [--passphrase-file <path> |
 /// --passphrase-stdin]` (issue #148) — the first non-flag token is the PATH, extras
 /// ignored. The passphrase source is NEVER an argv value (#39): `--passphrase-file` takes
@@ -702,6 +739,7 @@ fn parse_subcommand(name: &OsStr, parser: &mut lexopt::Parser) -> Result<Command
         "poke" => parse_positional(parser, HelpTopic::Poke, |target| Command::Poke { target }),
         "stats" => parse_stats(parser),
         "reliability" => parse_reliability(parser),
+        "log" => parse_log(parser),
         "export" => parse_export(parser),
         "import" => parse_import(parser),
         other => Err(Error::UnknownCommand(other.to_owned())),
@@ -763,6 +801,7 @@ async fn execute(command: Command) -> Result<()> {
         Command::Poke { target } => crate::poke::poke(target).await,
         Command::Stats(args) => crate::stats::run(args).await,
         Command::Reliability(args) => crate::reliability::run(args),
+        Command::Log(args) => crate::log::run(args),
         Command::Export {
             path,
             no_secrets,
@@ -826,6 +865,7 @@ COMMANDS:
     poke [<account>]     Run Claude Code once in an isolated config dir so it refreshes a parked account's credential (all near-expiry if omitted)
     stats [<account>...] [--period day|week|month|lifetime] [--since <when>] [--json]  Show usage over a period, offline (reads the sample store directly)
     reliability [--json]  Swap-out overshoot SLO readout, offline (reads the event log): swap-out session_pct P50/P95/P100 vs targets, time-blind, false-preempt proxy, 429 counts
+    log [--since <duration>] [--event <name>] [--json]  Show the daemon's event log itself, offline (reads the log file directly) — the raw-lines counterpart to reliability
     export [PATH] [--plaintext] [--no-secrets] [--passphrase-stdin]  Serialize state to an (encrypted by default) migration artifact — a file (0600) or stdout
     import <PATH> [--overwrite] [--passphrase-stdin]  Rehydrate accounts from a migration artifact — skips accounts already present unless --overwrite
 
@@ -1058,6 +1098,37 @@ false-preempt proxy from the blind-window recovery reconciliation; and the usage
 transient counts. By default the indicators fold the whole log; --since <duration> bounds them to a
 recent window (the cutoff is documented in both output forms). The readout is roster-wide numbers
 only — no per-account breakdown, no identifiers.
+";
+
+const LOG_USAGE: &str =
+    "sessiometer log — show the daemon's event log, offline (reads the log file directly)
+
+USAGE:
+    sessiometer log [--since <duration>] [--event <name>] [--json]
+
+    --since <d>  show only events at/after now - <duration>. <duration> is a non-negative
+                 integer with a unit: s, m, h, d, w (e.g. 30m, 24h, 7d, 2w) — the same
+                 grammar as `reliability --since`. Omit for the whole log (the default).
+    --event <n>  show only lines whose `event=` token is EXACTLY <n> (e.g. swap, restash,
+                 all_exhausted). Omit for every event.
+    --json       print the matched lines as JSON records (schema:1, for scripts) instead of
+                 the text view
+    -h, --help   print this help
+
+READ-ONLY: it reads ~/Library/Logs/sessiometer/sessiometer.log and makes no live call, so it
+works when the daemon is down. This is the raw-lines counterpart to `reliability`, which reads
+the same file but only to fold it into SLIs.
+
+The text view writes the matched lines to stdout VERBATIM and nothing else, so a piped
+`sessiometer log` stays a clean line stream (`| grep`, `| wc -l` stay honest). The resolved
+window, the active filter, the match count, and any empty result go to stderr instead — so an
+empty stdout is never an ambiguous silence: it says whether there is no log file yet, an empty
+one, or simply no matching event. An absent log is a normal cold state, not an error: the verb
+says so and exits 0.
+
+The log identifies accounts by the label the operator chose, written verbatim, which may be an
+email address. The file is 0600 on disk; piping or pasting this output moves it somewhere that
+is not, so treat it accordingly.
 ";
 
 const EXPORT_USAGE: &str = "sessiometer export — serialize state to an (encrypted by default) migration artifact
@@ -9814,6 +9885,117 @@ spare  22222222-2222\n\
         // A stray positional or flag the readout does not accept → strict-usage error.
         let err = parse_argv(&["reliability", "--period"]).unwrap_err();
         assert!(matches!(err, Error::CliUsage { .. }));
+    }
+
+    #[test]
+    fn log_parses_bare_and_each_flag() {
+        // Bare defaults to the whole log, every event, the text view.
+        assert_eq!(
+            parse_argv(&["log"]).unwrap(),
+            Command::Log(crate::log::LogArgs {
+                since: None,
+                event: None,
+                json: false,
+            })
+        );
+        // `--since` / `--event` capture their RAW values (space- or `=`-separated); duration
+        // parse + validation are deferred to `log::run`, so the CLI layer carries them through.
+        for argv in [
+            vec!["log", "--since", "7d", "--event", "swap"],
+            vec!["log", "--since=7d", "--event=swap"],
+        ] {
+            assert_eq!(
+                parse_argv(&argv).unwrap(),
+                Command::Log(crate::log::LogArgs {
+                    since: Some("7d".to_string()),
+                    event: Some("swap".to_string()),
+                    json: false,
+                }),
+                "argv {argv:?} must carry the raw flag values",
+            );
+        }
+        // All three compose.
+        assert_eq!(
+            parse_argv(&["log", "--since", "24h", "--event", "restash", "--json"]).unwrap(),
+            Command::Log(crate::log::LogArgs {
+                since: Some("24h".to_string()),
+                event: Some("restash".to_string()),
+                json: true,
+            })
+        );
+    }
+
+    #[test]
+    fn log_value_bearing_flags_without_a_value_are_clear_errors() {
+        // Each as the last token → a clear "needs a value", never a silent whole-log fallback.
+        for flag in ["since", "event"] {
+            let err = parse_argv(&["log", &format!("--{flag}")]).unwrap_err();
+            assert!(matches!(err, Error::CliUsage { .. }));
+            assert!(err.to_string().contains(flag), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn log_help_routes_and_an_unknown_flag_is_a_clear_error() {
+        assert_eq!(
+            parse_argv(&["log", "--help"]).unwrap(),
+            Command::Help(HelpTopic::Log)
+        );
+        // A stray positional or a flag the reader does not accept → strict-usage error.
+        assert!(matches!(
+            parse_argv(&["log", "--period"]).unwrap_err(),
+            Error::CliUsage { .. }
+        ));
+        assert!(matches!(
+            parse_argv(&["log", "swap"]).unwrap_err(),
+            Error::CliUsage { .. }
+        ));
+    }
+
+    #[test]
+    fn log_usage_lists_exactly_the_flags_the_parser_accepts() {
+        // The issue #175 help/parser lockstep, both directions.
+        //
+        // Forward: every flag the parser accepts is documented.
+        for flag in ["--since", "--event", "--json"] {
+            assert!(LOG_USAGE.contains(flag), "LOG_USAGE must document {flag}");
+            assert!(
+                parse_argv(&["log", flag, "x"]).is_ok() || parse_argv(&["log", flag]).is_ok(),
+                "{flag} must be accepted by the parser"
+            );
+        }
+        assert!(LOG_USAGE.contains("-h, --help"));
+
+        // Backward: no flag the parser REJECTS may be documented — the drift a copy-pasted
+        // usage block actually produces. Includes the two flags deferred to the sibling issues
+        // (#774 `--follow`, #775 `--channel`), so shipping one without its help text trips here.
+        for foreign in [
+            "--period",
+            "--no-color",
+            "--ascii",
+            "--plaintext",
+            "--overwrite",
+            "--follow",
+            "--channel",
+            "--verbose",
+        ] {
+            assert!(
+                !LOG_USAGE.contains(foreign),
+                "LOG_USAGE documents {foreign}, which the parser rejects"
+            );
+            assert!(
+                parse_argv(&["log", foreign]).is_err(),
+                "{foreign} must be rejected by the parser"
+            );
+        }
+
+        // And the verb is reachable from the top-level overview.
+        assert!(
+            ROOT_USAGE
+                .lines()
+                .any(|line| line.trim_start().starts_with("log ")),
+            "ROOT_USAGE must carry a `log` line"
+        );
     }
 
     #[test]

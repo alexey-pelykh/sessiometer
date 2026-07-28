@@ -435,6 +435,55 @@ active account; a large server value governs it in full (the `==` case above).
 Both channels carry handles, enums, percentages, and timestamps only — and a CI
 redaction meter scans every rendered line of each (issues #9, #15, #77).
 
+### Reading the event log (`sessiometer log`)
+
+`log` prints the event log itself, **offline** — it reads the file directly and
+makes no live call, so it works with the daemon down:
+
+```sh
+# The whole log.
+sessiometer log
+
+# Just the last day, and just the swaps.
+sessiometer log --since 24h
+sessiometer log --event swap
+
+# Both, as JSON records (schema:1) for a script.
+sessiometer log --since 7d --event swap --json
+```
+
+`--since` takes a non-negative integer and a unit — `s`, `m`, `h`, `d`, `w` (e.g.
+`30m`, `24h`, `7d`, `2w`) — the same grammar as `sessiometer reliability --since`; a
+malformed value is an error, never a silent whole-log fallback. `--event` matches the
+`event=` token **exactly**, so `--event swap` will not also match a longer name that
+starts with it.
+
+The two streams are split, so a pipe stays clean:
+
+- **stdout** carries the data. In the default text view that is the matched log lines
+  **verbatim and nothing else** — every byte already existed in the file, so
+  `sessiometer log | grep …`, `| wc -l` and `| head` stay honest, and with no flags
+  stdout reproduces the log byte for byte. With `--json` it is instead a single JSON
+  document, which is what a script parses — there `| wc -l` counts lines of JSON, not
+  events, so read `n_matched`.
+- **stderr** carries the operator notice: the resolved window, the active filter, the
+  match count, and — when nothing came back — *which* empty state it was. An empty
+  stdout is never an ambiguous silence: it tells you whether there is no log file yet,
+  an empty one, or simply no matching event. A missing log is a normal cold state on a
+  fresh install, not an error, so the verb says so and exits `0`.
+
+Because the window is stated on stderr, a redirect like `sessiometer log --since 1h >
+audit.txt` keeps the lines but not the record of which window produced them. Use
+`--json`, whose `window` object travels with the data, when that provenance matters.
+
+`log` is the raw-lines counterpart to `sessiometer reliability`, which reads the same
+file but only to fold it into SLIs. Run `sessiometer log --help` for the full usage.
+
+> **Piping moves it somewhere less private.** The log is `0600` on disk and, as described
+> above, identifies accounts by the label you chose — which may be your email.
+> `sessiometer log` does not redact (that is the point: what it prints is what the file
+> says), so treat what you pipe, paste, or attach accordingly.
+
 ## Switching the active account
 
 Switch the active account **on demand**, without waiting for the daemon to swap
