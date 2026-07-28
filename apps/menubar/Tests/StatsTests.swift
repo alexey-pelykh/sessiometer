@@ -76,6 +76,9 @@ final class StatsTests: XCTestCase {
         XCTAssertEqual(wire.summary.roster.swaps.weekly, 0)
         XCTAssertEqual(wire.summary.roster.allHighEpisodes, 0)
         XCTAssertEqual(wire.summary.roster.allHighSecs, 0)
+        // The census water the daemon actually used (issue #804), as a FRACTION — the label reads it
+        // from here rather than hardcoding one (issue #805).
+        XCTAssertEqual(try XCTUnwrap(wire.summary.roster.allHighThreshold), 0.95, accuracy: 1e-9)
 
         // Summary per-account: the numeric body + signal source.
         let work = try XCTUnwrap(wire.summary.accounts["work"])
@@ -289,6 +292,16 @@ final class StatsTests: XCTestCase {
         XCTAssertEqual(StatusPanelFormat.statsPercent(1.0), 100)
         XCTAssertEqual(StatusPanelFormat.statsPercent(1.2), 120, "an over-cap peak legitimately reads > 100%")
         XCTAssertEqual(StatusPanelFormat.statsPercent(-0.1), 0, "a negative never prints below zero")
+        // Ties mirror the CLI's `pct` (`src/stats.rs`) — away from zero, as Rust's `f64::round` does — so the
+        // two surfaces cannot state percents differing by one for the same wire fraction. Load-bearing since
+        // both render the `≥N%` census water through this helper (issue #805).
+        //
+        // 0.845 is the case that actually DISCRIMINATES the rounding mode: `0.845 * 100` is exactly 84.5 in
+        // IEEE-754, and 84 is even, so ties-away-from-zero gives 85 where banker's rounding (ties-to-even)
+        // would give 84. A tie whose integer part is ODD — 0.855 → 86 — agrees under both modes and would
+        // pass even against the wrong rule, which is why it is not the assertion relied on here.
+        XCTAssertEqual(StatusPanelFormat.statsPercent(0.845), 85, "ties round AWAY from zero, as Rust does")
+        XCTAssertEqual(StatusPanelFormat.statsPercent(0.855), 86)
     }
 
     func testStatsNumericCells() throws {
@@ -344,17 +357,91 @@ final class StatsTests: XCTestCase {
         guard case .ok(let wire) = try decodeStatsReply(Fixtures.statsBasic) else {
             return XCTFail("expected a StatsWire document")
         }
-        // The golden roster: 0 all-high episodes (0s), swap_count 1, over a `day` window.
+        // The golden roster: 0 all-high episodes (0s), swap_count 1, over a `day` window, censused
+        // at the golden's own 0.95 water.
         XCTAssertEqual(StatusPanelFormat.statsAggregateText(roster: wire.summary.roster, window: wire.window),
-                       "All accounts ≥90% at once — 0 episodes (0s) · swaps 1 · last 24h")
+                       "All accounts ≥95% at once — 0 episodes (0s) · swaps 1 · last 24h")
     }
 
     func testAggregateTextSingularEpisode() {
         let roster = StatsRoster(swapCount: 28,
                                  swaps: StatsSwaps(session: 20, weekly: 4, manual: 3, forced: 1, emergency: 0),
-                                 allHighEpisodes: 1, allHighSecs: 6000)
+                                 allHighEpisodes: 1, allHighSecs: 6000, allHighThreshold: 0.95)
         XCTAssertEqual(StatusPanelFormat.statsAggregateText(roster: roster, window: window(period: "week")),
-                       "All accounts ≥90% at once — 1 episode (1h40m) · swaps 28 · last 7 days")
+                       "All accounts ≥95% at once — 1 episode (1h40m) · swaps 28 · last 7 days")
+    }
+
+    // MARK: - The census water is READ, never assumed (issue #805)
+
+    /// THE CROSS-LANGUAGE DRIFT GATE. The rendered label's threshold must equal the AGGREGATOR's,
+    /// and this asserts that across the language boundary rather than against a second hand-typed
+    /// literal — by deriving the expectation from the same bytes the Rust encoder emitted.
+    ///
+    /// The chain each link of which is already enforced elsewhere, so this closes it at near-zero cost:
+    ///   1. `params_from` (`src/stats.rs`) derives the water from `session_ceiling` and hands it to
+    ///      `RosterWire.all_high_threshold`;
+    ///   2. Rust byte-pins its own encoder output into `build/fixtures/wire-stats-basic.json`
+    ///      (`the_committed_stats_wire_golden_still_matches_the_socket_encoder`);
+    ///   3. `WireGoldenTests.testStatsFixtureMatchesRustGolden` byte-pins `Fixtures.statsBasic` to
+    ///      that golden;
+    ///   4. THIS test pins the rendered label to the water decoded from that fixture.
+    ///
+    /// So retuning the aggregator's water forces the golden to be regenerated, which breaks link 3
+    /// until the fixture is updated, at which point THIS test fails unless the label tracked it. A
+    /// literal re-hardcoded into the label cannot survive that, which is precisely the regression
+    /// issue #805 fixed and this gate exists to prevent recurring.
+    func testRenderedLabelStatesTheAggregatorsOwnWater() throws {
+        guard case .ok(let wire) = try decodeStatsReply(Fixtures.statsBasic) else {
+            return XCTFail("expected a StatsWire document")
+        }
+        let water = try XCTUnwrap(wire.summary.roster.allHighThreshold,
+                                  "the current daemon always sends all_high_threshold (issue #804)")
+        // Derived from the wire, NOT restated: `95` never appears as a literal expectation here.
+        let expected = "All accounts ≥\(Int((water * 100).rounded()))% at once"
+        XCTAssertTrue(
+            StatusPanelFormat.statsAggregateText(roster: wire.summary.roster, window: wire.window)
+                .hasPrefix(expected),
+            "the aggregate label must state the aggregator's own census water, not a hardcoded one"
+        )
+    }
+
+    /// The label must be DERIVED, not merely correct-by-coincidence at the default. A hardcoded
+    /// literal passes any single-value assertion; it cannot pass two different waters. This is the
+    /// test that actually kills the hardcode class rather than re-pinning today's value.
+    func testLabelTracksARetunedWaterRatherThanAFixedLiteral() {
+        func label(_ water: Double) -> String {
+            StatusPanelFormat.statsAggregateText(
+                roster: StatsRoster(swapCount: 0,
+                                    swaps: StatsSwaps(session: 0, weekly: 0, manual: 0, forced: 0, emergency: 0),
+                                    allHighEpisodes: 0, allHighSecs: 0, allHighThreshold: water),
+                window: window(period: "week"))
+        }
+        XCTAssertTrue(label(0.95).hasPrefix("All accounts ≥95% at once"))
+        XCTAssertTrue(label(0.80).hasPrefix("All accounts ≥80% at once"), "an operator-retuned water must show")
+        XCTAssertTrue(label(0.90).hasPrefix("All accounts ≥90% at once"))
+    }
+
+    /// A pre-#804 daemon never sent the water. The panel must then DROP the qualifier — it must not
+    /// invent one, and it must not fail to decode: an absent additive key is the `decodeIfPresent`
+    /// forward-compat path, and a fabricated threshold is the defect issue #805 exists to end.
+    func testAbsentWaterDropsTheQualifierInsteadOfFabricatingOne() {
+        let roster = StatsRoster(swapCount: 28,
+                                 swaps: StatsSwaps(session: 20, weekly: 4, manual: 3, forced: 1, emergency: 0),
+                                 allHighEpisodes: 1, allHighSecs: 6000, allHighThreshold: nil)
+        let text = StatusPanelFormat.statsAggregateText(roster: roster, window: window(period: "week"))
+        XCTAssertEqual(text, "All accounts high at once — 1 episode (1h40m) · swaps 28 · last 7 days")
+        // The counted fact survives; only the unknown water is withheld. No digit-then-% may appear
+        // before the episode count, which is what a fabricated threshold would look like.
+        XCTAssertFalse(text.hasPrefix("All accounts ≥"), "no water may be stated when none was reported")
+    }
+
+    /// The pre-#804 wire shape decodes rather than throwing — the compat half of the above.
+    func testPre804RosterWithoutTheWaterStillDecodes() throws {
+        let line = #"{"swap_count":2,"swaps":{"session":1,"weekly":1,"manual":0,"forced":0,"emergency":0},"# +
+                   #""all_high_episodes":3,"all_high_secs":600}"#
+        let roster = try JSONDecoder().decode(StatsRoster.self, from: Data(line.utf8))
+        XCTAssertNil(roster.allHighThreshold, "an absent additive key is nil, never a decode error")
+        XCTAssertEqual(roster.allHighEpisodes, 3, "the rest of the roster decodes unchanged")
     }
 
     // MARK: - Failure copy (StatsFailure → the honest one-line Stats-tab message)
@@ -522,9 +609,10 @@ final class StatsTests: XCTestCase {
         XCTAssertEqual(StatusPanelFormat.statsSessionMeanPeak(work), "42 / 100%")
         XCTAssertEqual(StatusPanelFormat.statsWeeklyPeak(work), "88%")
         XCTAssertEqual(work.capHits, 42)
-        // The aggregate callout matches the mock.
+        // The aggregate callout matches the mock — whose water is the shipping default (95) the
+        // fixture also carries, ILLUSTRATED there rather than pinned (issue #805).
         XCTAssertEqual(StatusPanelFormat.statsAggregateText(roster: wire.summary.roster, window: wire.window),
-                       "All accounts ≥90% at once — 3 episodes (1h40m) · swaps 28 · last 7 days")
+                       "All accounts ≥95% at once — 3 episodes (1h40m) · swaps 28 · last 7 days")
         // Seven daily buckets → a per-bucket sparkline point, on the fixed [0, 1] scale (peak reaches the top).
         let series = StatusPanelFormat.sparkSeries(wire.series, handle: "Work")
         XCTAssertEqual(series.count, 7)

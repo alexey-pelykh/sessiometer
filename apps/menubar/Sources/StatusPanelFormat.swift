@@ -1590,6 +1590,12 @@ enum StatusPanelFormat {
     /// A quota fraction (0…1, the `StatsDim` wire scale) as a whole percent — the stats analogue of the CLI's
     /// `pct` (`src/stats.rs`), which rounds `fraction × 100`. Clamped at the floor so a tiny negative never
     /// prints; NOT clamped at the top (an over-cap peak legitimately reads > 100%).
+    ///
+    /// The rounding RULE is part of the mirror, not an incidental detail: Swift's default `.rounded()`
+    /// (to-nearest, ties away from zero) is exactly Rust's `f64::round`, so a fraction landing on a half
+    /// percent cannot read one lower here than it does in the CLI. Load-bearing wherever both surfaces
+    /// render the SAME wire figure — above all the `≥N%` census water, which the CLI's `roster_line` prints
+    /// through this very `pct` (see `statsAllHighLabel`, issue #805).
     static func statsPercent(_ fraction: Double) -> Int {
         Int((max(0, fraction) * 100).rounded())
     }
@@ -1662,14 +1668,33 @@ enum StatusPanelFormat {
         }
     }
 
-    /// The aggregate callout under the Stats rows — mock `.agg` "All accounts ≥90% at once — 3 episodes
+    /// The aggregate callout under the Stats rows — mock `.agg` "All accounts ≥95% at once — 3 episodes
     /// (1h40m) · swaps 28 · last 7 days", built from the summary `roster` (`StatsRoster`) + the window phrase.
     /// Facts only (magnitudes + the neutral span), never a recommendation.
+    ///
+    /// The water is READ FROM THE WIRE (`allHighThreshold`), never assumed: it is `session_ceiling`,
+    /// which the operator can retune, so a literal here would silently lie the moment it is retuned
+    /// (issue #805 — the label had been pinned at `≥90%` while the aggregator censused at 95).
     static func statsAggregateText(roster: StatsRoster, window: StatsWindow) -> String {
         let episodes = roster.allHighEpisodes
         let epWord = episodes == 1 ? "episode" : "episodes"
-        return "All accounts ≥90% at once — \(episodes) \(epWord) (\(statsDuration(roster.allHighSecs)))"
+        return "\(statsAllHighLabel(roster.allHighThreshold)) — \(episodes) \(epWord)"
+            + " (\(statsDuration(roster.allHighSecs)))"
             + " · swaps \(roster.swapCount) · \(statsWindowPhrase(window))"
+    }
+
+    /// The aggregate callout's leading clause, stating the water the census actually used.
+    ///
+    /// A `nil` water (a pre-#804 daemon that never sent `all_high_threshold` — see `StatsRoster`)
+    /// DROPS the qualifier rather than substituting a number: naming a threshold the daemon never
+    /// reported would fabricate exactly the fact this issue exists to stop fabricating. The metric's
+    /// own identity survives the drop — "all-accounts-high" is what the census is called — so the
+    /// degraded line still says WHAT was counted, only not the water it was counted at. This is the
+    /// panel's standing honesty rule on the read-only Stats surface (never a fabricated number),
+    /// applied to a label rather than to a magnitude.
+    static func statsAllHighLabel(_ threshold: Double?) -> String {
+        guard let threshold else { return "All accounts high at once" }
+        return "All accounts ≥\(statsPercent(threshold))% at once"
     }
 
     /// A whole-second span as the compact coarse duration the aggregate callout uses — the two-largest-unit

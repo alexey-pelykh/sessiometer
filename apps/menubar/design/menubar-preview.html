@@ -776,7 +776,11 @@
             </div>
             <div class="agg">
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19V5M4 19h16M8 15l3-4 3 2 4-6"/></svg>
-              <span>All accounts &ge;90% at once &mdash; <b>3 episodes</b> (1h40m) &middot; swaps <b>28</b> &middot; last 7 days</span>
+              <!-- The water is ILLUSTRATIVE, showing the shipping default (session_ceiling = 95). It is
+                   operator-tunable and the panel reads it from the wire (`all_high_threshold`, issue #804)
+                   rather than from this render — do NOT treat this number as a pinned value. Reading the
+                   earlier `90` here as a spec is exactly what issue #805 fixed. -->
+              <span>All accounts &ge;95% at once &mdash; <b>3 episodes</b> (1h40m) &middot; swaps <b>28</b> &middot; last 7 days</span>
             </div>
             <div class="sig-legend">
               <span class="lg-t">Signal</span>
@@ -849,7 +853,11 @@
             </div>
             <div class="agg">
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19V5M4 19h16M8 15l3-4 3 2 4-6"/></svg>
-              <span>All accounts &ge;90% at once &mdash; <b>3 episodes</b> (1h40m) &middot; swaps <b>28</b> &middot; last 7 days</span>
+              <!-- The water is ILLUSTRATIVE, showing the shipping default (session_ceiling = 95). It is
+                   operator-tunable and the panel reads it from the wire (`all_high_threshold`, issue #804)
+                   rather than from this render — do NOT treat this number as a pinned value. Reading the
+                   earlier `90` here as a spec is exactly what issue #805 fixed. -->
+              <span>All accounts &ge;95% at once &mdash; <b>3 episodes</b> (1h40m) &middot; swaps <b>28</b> &middot; last 7 days</span>
             </div>
             <div class="sig-legend">
               <span class="lg-t">Signal</span>
