@@ -1052,6 +1052,21 @@ long-running rotation hits:
   override, since ambiguity has no false-positive story. (The `use --force`
   adopt-target recovery is deliberately outside this gate: it runs only when the
   credential is confirmed gone, so there is no resolved item to cross-check.)
+
+  The same gate also refuses when the resolved item matches **no** stashed
+  account *and* is **not in Claude Code's own credential format** — that
+  combination means the item is most likely an unrelated secret that happens to
+  sit under the derived service name, and an in-place overwrite would destroy it
+  unrecoverably. `status` and the menu-bar panel both name this as an
+  *unrecognized credential*. Once you have checked what that item actually is and
+  confirmed it is safe to replace (for example, a legitimately **new** Claude
+  Code credential format that you will re-stash), set
+  `canary_nostashmatch_override = true` under `[tunables]` in `config.toml` and
+  restart the daemon; every overridden write is logged with `overridden=true`.
+  This is a **separate** switch from `canary_drift_override` and neither covers
+  the other. An item that matches no stash but *does* parse as a Claude Code
+  credential is the ordinary case of a token refreshed in place since it was last
+  stashed, so it is never refused and needs no override.
 - **Concurrent swap + re-login race (known limitation).** If you run
   `claude /login` at the exact moment the daemon is mid-swap, the two writers race
   on the canonical credential. Last-writer-wins, and the daemon reconciles on its

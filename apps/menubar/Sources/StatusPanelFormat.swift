@@ -1112,12 +1112,17 @@ enum StatusPanelFormat {
     /// while the live rows still show.
     ///
     /// Content-parity with the CLI's `keychain canary: …` line (`src/cli.rs` `render_canary`): the SAME state,
-    /// the SAME labels/count, and the SAME `canary_drift_override` remedy, each medium phrasing it its own way
-    /// (R-2 STATE-parity, as ADR-0016 did for the other daemon-payload faults). Three ALARM shapes:
+    /// the SAME labels/count, and the SAME override remedy (each verdict naming its OWN tunable), each medium
+    /// phrasing it its own way (R-2 STATE-parity, as ADR-0016 did for the other daemon-payload faults).
+    /// Four ALARM shapes:
     ///   * `drift` NOT overridden → `.error`: the resolved credential belongs to `matched`, not the
     ///     named-active `displayed`; writes are REFUSED. The act-now severity of the vault pair.
     ///   * `ambiguous` → `.error`: more than one keychain item matches, so there is no unique write target;
     ///     writes are REFUSED. Also act-now.
+    ///   * `refused_unparseable_canonical` (#730/#738) → `.error`: the resolved item matches no stash and is
+    ///     not in Claude Code's format, so it is probably an unrelated secret; writes are REFUSED rather than
+    ///     clobber it. Also act-now. Its remedy names `canary_nostashmatch_override` — a SEPARATE switch from
+    ///     the drift one, so the two must never be cross-quoted.
     ///   * `drift` overridden → `.warning`: the drift stands, but `canary_drift_override` lets writes proceed
     ///     (each logged) — a standing, operator-acknowledged alarm, not a block. Next-break severity.
     /// The quiet verdicts (`ok` / `inconclusive` / `not_found`) and no verdict (`nil`) → no banner: `ok` /
@@ -1127,8 +1132,8 @@ enum StatusPanelFormat {
     /// token, email, or account-uuid (issue #15).
     ///
     /// Split across `daemonFaultBanner`'s rank arms because the drift variants are NOT one severity (like the
-    /// scrub's `exhausted` / `recovering` split): the REFUSAL pair sits at ranks 3-4 (act-now `.error`) while
-    /// an OVERRIDDEN drift sits at rank 6 (next-break `.warning`), SEPARATED by systemic-refresh — severity
+    /// scrub's `exhausted` / `recovering` split): the REFUSAL trio sits at ranks 3-5 (act-now `.error`) while
+    /// an OVERRIDDEN drift sits at rank 7 (next-break `.warning`), SEPARATED by systemic-refresh — severity
     /// ranks by (fault, VARIANT), never by fault identity (#575).
     static func canaryBanner(_ canary: CanaryStatus?) -> Banner? {
         switch canary {
@@ -1145,33 +1150,48 @@ enum StatusPanelFormat {
             return Banner(title: "Keychain identity ambiguous",
                           detail: "\(count) duplicate keychain items found (expected one) — credential writes are refused until the extras are removed.",
                           kind: .error)
+        case .refusedUnparseableCanonical:
+            // #738: the #730 fail-CLOSED refuse, given the banner it never had. `.error` — the SAME
+            // act-now rank as `CanaryDriftRefusing`, because it blocks credential writes identically;
+            // there is no lower-severity sibling to confuse it with, since the operator's override
+            // makes the daemon send `inconclusive` instead of this verdict. Content-parity with the
+            // CLI's `keychain canary: unrecognized credential …` line: same evidence, same refusal,
+            // same remedy — and the remedy names `canary_nostashmatch_override`, NOT the drift
+            // override, which cannot clear this case.
+            return Banner(title: "Unrecognized keychain credential",
+                          detail: "The keychain item matches no stashed account and is not in Claude Code's own format — it is probably an unrelated secret, so credential writes are refused rather than overwrite it (vetted it as safe? set canary_nostashmatch_override and restart the daemon).",
+                          kind: .error)
         case .ok, .inconclusive, .notFound, nil:
             return nil
         }
     }
 
     /// The single worst-first daemon-level fault banner for the `.connected` / `.stale` body — the panel
-    /// shows ONE banner even when multiple daemon-level faults are set. SEVEN ranks over FOUR faults, because
-    /// canonical-scrub AND the canary each split by VARIANT rather than occupying one slot:
+    /// shows ONE banner even when multiple daemon-level faults are set. EIGHT ranks over FOUR faults, because
+    /// canonical-scrub AND the canary each split by VARIANT rather than occupying one slot (the canary alone
+    /// spans four of the eight):
     ///
     ///   1. **keychain-locked** (#498) — `.error`, act now
     ///   2. **canonical-scrub `exhausted`** (#469) — `.error`, act now
     ///   3. **canary `drift` refusing** (#714) — `.error`, act now
     ///   4. **canary `ambiguous`** (#714) — `.error`, act now
-    ///   5. **systemic-refresh-failure** (#523) — `.warning`, next break
-    ///   6. **canary `drift` overridden** (#714) — `.warning`, next break
-    ///   7. **canonical-scrub `recovering`** (#469) — `.info`, calm; no action needed
+    ///   5. **canary `refused_unparseable_canonical`** (#730/#738) — `.error`, act now
+    ///   6. **systemic-refresh-failure** (#523) — `.warning`, next break
+    ///   7. **canary `drift` overridden** (#714) — `.warning`, next break
+    ///   8. **canonical-scrub `recovering`** (#469) — `.info`, calm; no action needed
     ///
     /// This order is pinned to the CLI's single canonical rank (`src/cli.rs` `DaemonPayloadFault::severity` +
     /// its enum declaration order): each surface renders in its own medium — an SGR line vs a banner tint —
     /// but the RANK must agree (R-2 rank-parity), and #575 caught the two surfaces ranking in OPPOSITE order
     /// precisely because each re-derived the rank independently.
     ///
-    /// Ranks 1-4 are the "act now" band: the vault pair (an UNREADABLE shared item, ordered first because
+    /// Ranks 1-5 are the "act now" band: the vault pair (an UNREADABLE shared item, ordered first because
     /// unlock-the-keychain must precede the scrub's `claude /login`, which cannot help while the keychain is
-    /// locked; then the readable-but-SCRUBBED `exhausted`) PLUS the #714 canary REFUSAL pair (a refusing drift
-    /// and an ambiguous resolution — credential writes, swaps AND auto-protection, are blocked NOW, the same
-    /// operator urgency). Systemic-refresh ranks under all four because it is PRE-DEATH — the act-now band
+    /// locked; then the readable-but-SCRUBBED `exhausted`) PLUS the canary REFUSAL TRIO (a refusing drift, an
+    /// ambiguous resolution, and the #730/#738 unparseable canonical — credential writes, swaps AND
+    /// auto-protection, are blocked NOW, the same operator urgency; the unparseable refusal sorts last of the
+    /// three because the other two are POSITIVE identity failures while it is precautionary).
+    /// Systemic-refresh ranks under all five because it is PRE-DEATH — the act-now band
     /// blocks the operator now, while a down refresh mechanism leaves every account still working (a next-break
     /// task, `.warning`). It genuinely arbitrates rather than tie-breaks: it can coincide with a canary or scrub
     /// fault (the refresh mechanism spawns `claude` while the vault/identity live in the keychain).
@@ -1199,13 +1219,21 @@ enum StatusPanelFormat {
         // an ambiguous resolution both block credential writes NOW, the same operator urgency as the vault pair.
         if case .drift(_, _, let overridden) = canary, !overridden { return canaryBanner(canary) }
         if case .ambiguous = canary { return canaryBanner(canary) }
-        // Rank 5 — the "next break" mechanism fault, ABOVE the overridden-drift and calm-scrub arms below.
+        // Rank 5 — the #730/#738 unparseable-canonical refusal, closing the act-now canary TRIO: it
+        // blocks credential writes exactly as ranks 3-4 do. Its position AFTER the two drift/ambiguous
+        // arms is a reading-order convention mirroring the CLI's `DaemonPayloadFault` declaration, not
+        // runtime arbitration — `canary` holds ONE verdict, so this arm and those can never both match.
+        // The real arbitration is against the OTHER faults (the vault pair above, systemic below),
+        // which is what the rank tests exercise. It needs no overridden twin below systemic: the
+        // operator's canary_nostashmatch_override makes the daemon send `inconclusive`, reaching no arm.
+        if case .refusedUnparseableCanonical = canary { return canaryBanner(canary) }
+        // Rank 6 — the "next break" mechanism fault, ABOVE the overridden-drift and calm-scrub arms below.
         if let systemic = systemicRefreshFailureBanner(systemicRefreshFailure) { return systemic }
-        // Rank 6 — an OVERRIDDEN drift (next-break `.warning`): the identity alarm stands, but the operator's
+        // Rank 7 — an OVERRIDDEN drift (next-break `.warning`): the identity alarm stands, but the operator's
         // canary_drift_override lets writes proceed (each logged), so it ranks BELOW systemic and ABOVE the
-        // calm recovering scrub. Only the overridden variant moved down — the refusal pair stays at ranks 3-4.
+        // calm recovering scrub. Only the overridden variant moved down — the refusal trio stays at ranks 3-5.
         if case .drift(_, _, let overridden) = canary, overridden { return canaryBanner(canary) }
-        // Rank 7 — `recovering` (or nothing): the calm self-healing state has the lowest claim on the one
+        // Rank 8 — `recovering` (or nothing): the calm self-healing state has the lowest claim on the one
         // banner slot, precisely because it is the one that says no action is needed.
         return canonicalScrubBanner(scrub)
     }

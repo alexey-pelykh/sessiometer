@@ -2111,8 +2111,9 @@ pub(crate) fn render_status(
     }
     // Worst-first (ADR-0026), so the CLI's print order agrees with its colour rank AND with the
     // menubar panel's `daemonFaultBanner`: keychain unreadable (rank 1, act-now `Red`), then canonical
-    // scrubbed-`exhausted` (rank 2, act-now `Red`), then the #714 canary REFUSAL pair (drift-refusing /
-    // ambiguous, act-now `Red` — credential writes are blocked), then the landing-overshoot SLO breach
+    // scrubbed-`exhausted` (rank 2, act-now `Red`), then the canary REFUSAL TRIO (drift-refusing /
+    // ambiguous / #738 unparseable-canonical, act-now `Red` — credential writes are blocked), then
+    // the landing-overshoot SLO breach
     // (#613, `Red`), then the pre-death systemic mechanism-down (rank 3, `Yellow`,
     // act-at-your-next-break), then the OVERRIDDEN canary drift (`Yellow` — writes proceed under a
     // standing operator override; an acknowledged alarm ranks below the unacknowledged systemic
@@ -2128,12 +2129,17 @@ pub(crate) fn render_status(
     if matches!(response.canonical_scrub, Some(CanonicalScrub::Exhausted)) {
         out.push_str(&render_canonical_scrub(response, color));
     }
+    // The act-now canary band. #738 makes it a TRIO: the unparseable-canonical refusal blocks
+    // credential writes exactly as the #714 pair does, so it prints here and not below the
+    // `Yellow` band. It has no overridden VARIANT to split off — the override collapses the wire
+    // verdict back to the quiet `inconclusive`, which reaches no arm at all.
     if matches!(
         response.canary,
         Some(CanaryStatus::Drift {
             overridden: false,
             ..
         }) | Some(CanaryStatus::Ambiguous { .. })
+            | Some(CanaryStatus::RefusedUnparseableCanonical)
     ) {
         out.push_str(&render_canary(response, color));
     }
@@ -2347,6 +2353,18 @@ enum DaemonPayloadFault {
     /// #714 — the canary's fresh resolution probe found MORE THAN ONE matching
     /// keychain item: no unique write target, credential writes REFUSED (no override).
     CanaryAmbiguous,
+    /// #730/#738 — the resolved canonical matches NO stash AND parses as no Claude Code
+    /// credential, so it is overwhelmingly an UNRELATED secret: credential writes are
+    /// REFUSED rather than clobber it. Act-now, like its two siblings above.
+    ///
+    /// Declared last of the three purely as a CONVENTION: the canary reports ONE verdict
+    /// at a time, so no snapshot can hold this and a drift together and nothing here ever
+    /// arbitrates between them. What the position does buy is a stable reading order for
+    /// the band — the two above are POSITIVE identity failures (a known-wrong match, a
+    /// broken uniqueness rule) while this is the precautionary "unrecognized item, refuse
+    /// to overwrite" case. Only the cross-FAULT edges are real arbitration (the vault pair
+    /// above, systemic below), and those are what the rank tests exercise.
+    CanaryRefusedUnparseableCanonical,
     /// #378 — the refresh MECHANISM is down (N consecutive all-error sweeps).
     SystemicRefreshFailure,
     /// #714 — identity DRIFT stands but `canary_drift_override` lets writes proceed
@@ -2369,14 +2387,19 @@ impl DaemonPayloadFault {
     /// contradicted the CLI's own vocabulary — the inversion #575 fixes.
     fn severity(self) -> Option<Severity> {
         match self {
-            // The #714 canary REFUSAL pair joins the act-now band: credential writes are
+            // The canary REFUSAL TRIO joins the act-now band: credential writes are
             // blocked NOW (auto-protection cannot swap), the same operator urgency as the
             // vault pair. An OVERRIDDEN drift is next-break `Yellow` — writes proceed, but a
             // standing identity alarm rides an operator override that deserves re-checking.
+            // The #738 unparseable-canonical refusal is `Red` for the SAME reason its two
+            // #714 siblings are — it blocks writes now — and it has no override VARIANT to
+            // rank apart: the override collapses the wire verdict back to the quiet
+            // `inconclusive` (`canary_status_of`), so no fault reaches here at all.
             Self::KeychainLocked
             | Self::CanonicalScrubExhausted
             | Self::CanaryDriftRefusing
-            | Self::CanaryAmbiguous => Some(Severity::Red),
+            | Self::CanaryAmbiguous
+            | Self::CanaryRefusedUnparseableCanonical => Some(Severity::Red),
             Self::SystemicRefreshFailure | Self::CanaryDriftOverridden => Some(Severity::Yellow),
             Self::CanonicalScrubRecovering => None,
         }
@@ -2385,7 +2408,7 @@ impl DaemonPayloadFault {
 
 /// Render a daemon-payload-fault line at its canonical rank colour (ADR-0026): the fault's
 /// [`DaemonPayloadFault::severity`] band as an SGR overlay when the `color` gate is open, or plain
-/// when the fault is calm (`recovering`) or the gate is closed. Folds the four fault sites into one
+/// when the fault is calm (`recovering`) or the gate is closed. Folds the fault sites into one
 /// call so they render identically. The plain text always carries the whole message (colour only
 /// augments), so a `--no-color` / piped reader loses nothing.
 fn daemon_fault_line(body: &str, fault: DaemonPayloadFault, color: bool) -> String {
@@ -2684,15 +2707,19 @@ fn render_canonical_scrub(response: &StatusResponse, color: bool) -> String {
 
 /// The behavioral-canary verdict line (issue #714): rendered as DATA (unconditional — like the
 /// `canonical_scrub` footer, an operator's piped health check must see a refused-writes state),
-/// only for the ALARM verdicts. A REFUSING drift and an AMBIGUOUS resolution are act-now `Red`
-/// (credential writes — swaps AND auto-protection — are refused until cleared); an OVERRIDDEN
+/// only for the ALARM verdicts. A REFUSING drift, an AMBIGUOUS resolution and the #730/#738
+/// UNPARSEABLE-CANONICAL refusal are act-now `Red` (credential writes — swaps AND
+/// auto-protection — are refused until cleared); an OVERRIDDEN
 /// drift is next-break `Yellow` (writes proceed under the operator's `canary_drift_override`,
 /// each logged). The healthy / no-verdict states print NOTHING: `ok` and `inconclusive` are the
-/// quiet normal, `not_found` is already voiced by the `canonical_scrub` / `keychain_locked`
+/// quiet normal (`inconclusive` covers the identity-unverified cases that do NOT refuse — including
+/// an unparseable canonical the operator has explicitly overridden), `not_found` is already voiced
+/// by the `canonical_scrub` / `keychain_locked`
 /// machinery (a second line would double-report the same absent credential), and `None` is a
 /// pre-#714 daemon that omits the field. Wording parity with [`Error::CanaryDrift`] /
-/// [`Error::CredentialAmbiguous`] so the refused swap's stderr and this durable surface tell one
-/// story. Operator LABELS and a COUNT only — never a token, email, or account-uuid (issue #15).
+/// [`Error::CredentialAmbiguous`] / [`Error::CanaryUnparseableCanonical`] so the refused swap's
+/// stderr and this durable surface tell one story — the last of those already tells the operator to
+/// "Investigate with `sessiometer status`", an instruction issue #738 is what finally makes pay off. Operator LABELS and a COUNT only — never a token, email, or account-uuid (issue #15).
 fn render_canary(response: &StatusResponse, color: bool) -> String {
     match &response.canary {
         Some(CanaryStatus::Drift {
@@ -2729,6 +2756,22 @@ fn render_canary(response: &StatusResponse, color: bool) -> String {
                  are removed"
             ),
             DaemonPayloadFault::CanaryAmbiguous,
+            color,
+        ),
+        // Issue #738: the #730 fail-CLOSED refuse, finally voiced. Names the EVIDENCE (the
+        // resolved item does not look like a Claude Code credential), the CONSEQUENCE (writes
+        // refused, so nothing overwrites it) and the ONE remedy — the same shape as the drift
+        // line above, whose override it deliberately mirrors WITHOUT sharing: the tunables are
+        // separate, and naming the wrong one would send the operator to a switch that cannot
+        // help. Describes the item's SHAPE only, never its bytes (issue #15) — the whole point
+        // is that those bytes are somebody else's secret.
+        Some(CanaryStatus::RefusedUnparseableCanonical) => daemon_fault_line(
+            "keychain canary: unrecognized credential — the Claude Code-credentials item \
+             matches no stashed account and is not in Claude Code's own format, so it is \
+             probably an unrelated secret; credential writes are refused to avoid \
+             overwriting it (vetted it as safe? set canary_nostashmatch_override = true \
+             and restart the daemon)",
+            DaemonPayloadFault::CanaryRefusedUnparseableCanonical,
             color,
         ),
         Some(CanaryStatus::Ok | CanaryStatus::Inconclusive | CanaryStatus::NotFound) | None => {
@@ -5016,6 +5059,31 @@ spare  22222222-2222\n\
             "ambiguity has no override: {line}"
         );
 
+        // Issue #738 — the #730 refuse, finally voiced. Names the evidence, the refusal, and its
+        // OWN override (never the drift one, which cannot clear this case).
+        let unparseable = render_status(
+            &response(Some(CanaryStatus::RefusedUnparseableCanonical)),
+            NOW,
+            None,
+            false,
+        );
+        let line = unparseable
+            .lines()
+            .find(|l| l.contains("keychain canary: unrecognized credential"))
+            .expect("the unparseable-canonical refusal line is present");
+        assert!(
+            line.contains("matches no stashed account")
+                && line.contains("not in Claude Code's own format")
+                && line.contains("credential writes are refused")
+                && line.contains("canary_nostashmatch_override"),
+            "the refusal names the evidence, the refusal, and its own remedy: {line}"
+        );
+        assert!(
+            !line.contains("canary_drift_override"),
+            "the unparseable refusal must not name the DRIFT override — a separate switch that \
+             cannot clear this case: {line}"
+        );
+
         // The QUIET verdicts (and a pre-#714 daemon omitting the field) print nothing.
         for quiet in [
             Some(CanaryStatus::Ok),
@@ -5040,6 +5108,10 @@ spare  22222222-2222\n\
                 Severity::Red.sgr(),
             ),
             (drift(true), Severity::Yellow.sgr()),
+            (
+                Some(CanaryStatus::RefusedUnparseableCanonical),
+                Severity::Red.sgr(),
+            ),
         ] {
             let colored = render_status(&response(canary), NOW, None, true)
                 .lines()
@@ -5053,7 +5125,7 @@ spare  22222222-2222\n\
         }
 
         // #15/#444: no secret reaches any rendered canary surface.
-        for out in [&refusing, &overridden, &ambiguous] {
+        for out in [&refusing, &overridden, &ambiguous, &unparseable] {
             assert!(
                 crate::redaction::meter::unauthored_emails(out, &[]).is_empty()
                     && !out.to_lowercase().contains("token"),
@@ -5107,6 +5179,15 @@ spare  22222222-2222\n\
             DaemonPayloadFault::CanaryDriftOverridden.severity(),
             Some(Severity::Yellow),
             "an overridden canary drift is next-break Yellow"
+        );
+        // #738: the unparseable-canonical refusal makes the act-now canary band a TRIO. It has
+        // no overridden VARIANT to rank apart — the override collapses the wire verdict back to
+        // the quiet `inconclusive`, so no fault ever reaches `severity()` for that case.
+        assert_eq!(
+            DaemonPayloadFault::CanaryRefusedUnparseableCanonical.severity(),
+            Some(Severity::Red),
+            "an unparseable-canonical refusal is act-now Red — it blocks writes NOW, exactly \
+             like its two #714 siblings"
         );
 
         // Rendered together (a locked keychain makes the refresh mechanism fail too, so they CO-OCCUR):

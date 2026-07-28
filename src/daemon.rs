@@ -3540,10 +3540,11 @@ where
                 // #730: the resolved canonical matches no stash AND does not parse as a
                 // Claude Code credential — overwhelmingly an unrelated secret the atomic
                 // `-U` upsert must NOT clobber. Fail CLOSED unless the dedicated override
-                // is set. `refresh_canary` above mapped this to `CanaryStatus::Inconclusive`
-                // (no schema bump — the identity verdict IS inconclusive), so it emitted no
-                // alarm event; log the refusal HERE, the compensating operator signal for
-                // the deliberately-quiet wire — one line per refused/overridden attempt.
+                // is set. `refresh_canary` above already projected this onto the wire —
+                // `CanaryStatus::RefusedUnparseableCanonical` when refusing (issue #738),
+                // `Inconclusive` when the override has restored the fail-OPEN — and emitted
+                // no event for it, so the durable line is logged HERE: one per refused or
+                // overridden ATTEMPT, which the verdict edge alone cannot count.
                 let overridden = self.canary_nostashmatch_override;
                 events.push(Event::CanaryUnparseableCanonical { overridden });
                 if !overridden {
