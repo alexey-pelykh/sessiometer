@@ -588,14 +588,20 @@ fn parse_reliability(parser: &mut lexopt::Parser) -> Result<Command> {
     }))
 }
 
-/// Parse `log [--since <duration>] [--event <name>] [--json] [-f|--follow]` (issues #773, #774) —
-/// the offline reader for the event log's lines themselves. Flags only: there is no positional
-/// form, because the thing one would filter by is an event name, and that is `--event`.
+/// Parse `log [--since <duration>] [--event <name>] [--channel <c>] [--json] [-f|--follow]`
+/// (issues #773, #774, #775) — the offline reader for the daemon's own output lines. Flags only:
+/// there is no positional form, because the thing one would filter by is an event name, and that
+/// is `--event`.
+///
+/// `--channel` is validated HERE, unlike `--since` (whose grammar is resolved in `log::run`, where
+/// the clock is read): its value set is closed and needs no clock, so rejecting a typo at the
+/// parse boundary keeps the reader's own path total over an enum rather than a string.
 fn parse_log(parser: &mut lexopt::Parser) -> Result<Command> {
     let mut json = false;
     let mut since = None;
     let mut event = None;
     let mut follow = false;
+    let mut channel = crate::log::Channel::Event;
     while let Some(arg) = parser.next()? {
         match arg {
             Short('h') | Long("help") => return Ok(Command::Help(HelpTopic::Log)),
@@ -617,6 +623,12 @@ fn parse_log(parser: &mut lexopt::Parser) -> Result<Command> {
                         .into_owned(),
                 );
             }
+            Long("channel") => {
+                let raw = required_value(parser, "channel", HelpTopic::Log)?
+                    .to_string_lossy()
+                    .into_owned();
+                channel = crate::log::Channel::parse(&raw).ok_or(Error::LogChannelInvalid(raw))?;
+            }
             other => return Err(unexpected(other, HelpTopic::Log)),
         }
     }
@@ -625,6 +637,7 @@ fn parse_log(parser: &mut lexopt::Parser) -> Result<Command> {
         event,
         json,
         follow,
+        channel,
     }))
 }
 
@@ -874,7 +887,7 @@ COMMANDS:
     poke [<account>]     Run Claude Code once in an isolated config dir so it refreshes a parked account's credential (all near-expiry if omitted)
     stats [<account>...] [--period day|week|month|lifetime] [--since <when>] [--json]  Show usage over a period, offline (reads the sample store directly)
     reliability [--json]  Swap-out overshoot SLO readout, offline (reads the event log): swap-out session_pct P50/P95/P100 vs targets, time-blind, false-preempt proxy, 429 counts
-    log [--since <duration>] [--event <name>] [--json] [-f|--follow]  Show the daemon's event log itself, offline (reads the log file directly) — the raw-lines counterpart to reliability; --follow keeps printing new lines as they arrive
+    log [--since <duration>] [--event <name>] [--channel <c>] [--json] [-f|--follow]  Show the daemon's own log lines, offline (reads the log files directly) — the raw-lines counterpart to reliability; --follow keeps printing new lines as they arrive; --channel picks event (default), diag or all
     export [PATH] [--plaintext] [--no-secrets] [--passphrase-stdin]  Serialize state to an (encrypted by default) migration artifact — a file (0600) or stdout
     import <PATH> [--overwrite] [--passphrase-stdin]  Rehydrate accounts from a migration artifact — skips accounts already present unless --overwrite
 
@@ -926,7 +939,11 @@ const RUN_USAGE: &str = "sessiometer run — run the foreground daemon (poll eve
 USAGE:
     sessiometer run [-v|--verbose] [--managed]
 
-    -v, --verbose  emit per-tick run diagnostics on stderr
+    -v, --verbose  emit per-tick run diagnostics on stderr. A launchd-managed daemon gets no
+                   -v, so for THAT one set `verbose = true` under [tunables] in the config
+                   (`sessiometer config path`) and restart it — effective at the next daemon
+                   start, and readable with `sessiometer log --channel diag`. This flag is
+                   unaffected by that knob, and wins over it.
         --managed  mark a launchd-invoked agent: on single-instance-lock contention exit 0
                    (stand down cleanly) instead of the exit-3 `already running` a bare `run`
                    returns, so the generated LaunchAgent's conditional KeepAlive does not
@@ -1113,21 +1130,44 @@ const LOG_USAGE: &str =
     "sessiometer log — show the daemon's event log, offline (reads the log file directly)
 
 USAGE:
-    sessiometer log [--since <duration>] [--event <name>] [--json] [-f|--follow]
+    sessiometer log [--since <duration>] [--event <name>] [--channel <c>] [--json] [-f|--follow]
 
-    --since <d>   show only events at/after now - <duration>. <duration> is a non-negative
-                  integer with a unit: s, m, h, d, w (e.g. 30m, 24h, 7d, 2w) — the same
-                  grammar as `reliability --since`. Omit for the whole log (the default).
-    --event <n>   show only lines whose `event=` token is EXACTLY <n> (e.g. swap, restash,
-                  all_exhausted). Omit for every event.
-    --json        print the matched lines as JSON records (schema:1, for scripts) instead of
-                  the text view
-    -f, --follow  keep printing newly appended lines until interrupted (Ctrl-C)
-    -h, --help    print this help
+    --since <d>    show only events at/after now - <duration>. <duration> is a non-negative
+                   integer with a unit: s, m, h, d, w (e.g. 30m, 24h, 7d, 2w) — the same
+                   grammar as `reliability --since`. Omit for the whole log (the default).
+    --event <n>    show only lines whose kind token is EXACTLY <n> — `event=` on the event
+                   channel (e.g. swap, restash, all_exhausted), `diag=` on the diagnostic one
+                   (e.g. tick, poll, canonical). Omit for every kind.
+    --channel <c>  which channel to read: event (the default), diag, or all. See CHANNELS below.
+    --json         print the matched lines as JSON records (schema:2, for scripts) instead of
+                   the text view
+    -f, --follow   keep printing newly appended lines until interrupted (Ctrl-C)
+    -h, --help     print this help
 
 READ-ONLY: it reads ~/Library/Logs/sessiometer/sessiometer.log and makes no live call, so it
 works when the daemon is down. This is the raw-lines counterpart to `reliability`, which reads
 the same file but only to fold it into SLIs.
+
+CHANNELS (--channel): the daemon writes two, and they are NOT the same kind of thing.
+
+  event  (the default) ~/Library/Logs/sessiometer/sessiometer.log — the durable event log. Every
+         field is a handle, an enum, a number or a timestamp by construction, and the whole
+         channel is redaction-checked in CI.
+  diag   ~/Library/Logs/sessiometer/daemon.err.log — a launchd-managed daemon's raw stderr, where
+         the per-poll / per-tick / lifecycle diagnostics land. Being raw stderr it is NOT
+         redaction-checked and can carry panic output, which is why it is strictly opt-in and
+         never folded into the default view.
+  all    both, interleaved in timestamp order. Each source keeps its own order internally, so a
+         panic backtrace stays contiguous; ties put the event line first. A diagnostic line with
+         no timestamp of its own (raw stderr, a panic payload) is placed at the timestamp of the
+         nearest line before it, so it lands where it happened. Not available with --follow: a
+         live merge would have to stall one stream waiting for the other.
+
+TURNING DIAGNOSTICS ON for a background daemon: a launchd-managed daemon runs `run --managed`
+with no -v, so by default it writes none. Set `verbose = true` under [tunables] in the config
+(`sessiometer config path`) and restart it (`sessiometer daemon restart`) — no plist edit, which
+`service install` would overwrite anyway. It takes effect at the NEXT daemon start, not live. An
+interactive `sessiometer run` is unaffected by the knob; use -v there.
 
 FOLLOWING (-f, --follow): the log is printed as usual, then newly appended lines are printed as
 they arrive. The two filters do NOT behave the same way here, and the difference is deliberate:
@@ -1185,11 +1225,38 @@ USAGE:
 /// single-instance lock FIRST (a second `run` fails to take it and returns
 /// without disturbing the first), then bind the control socket, then run.
 ///
+/// The diagnostic channel's effective gate: the `-v` flag, OR — for a LAUNCHD-MANAGED daemon —
+/// the `[tunables].verbose` knob (issue #775).
+///
+/// Split out as a pure function because it is the whole of the issue #775 wiring that a test can
+/// actually reach: "a launchd-managed daemon writes diagnostics to its stderr file" needs real
+/// launchd, but "`--managed` + the knob resolves to [`Verbosity::Verbose`], and every other
+/// combination does not" is a total function over three booleans, pinned exhaustively below.
+///
+/// Two properties are deliberate, and each is an answer to a way this could have gone wrong:
+///
+/// - **The knob is `--managed`-scoped.** An interactive `sessiometer run` resolves from `-v`
+///   alone, exactly as it always has. An operator who arms the knob for their background agent
+///   has not also signed up for console spam the next time they run the daemon in a terminal to
+///   watch it — and the issue's D2 asked for a MANAGED-daemon switch, not a global one.
+/// - **`-v` still wins.** The two OR together rather than the knob overriding, so `run -v` is
+///   verbose whatever the config says. A flag that a config file could silently veto would be a
+///   worse surprise than the gap this closes.
+fn effective_verbosity(flag: Verbosity, managed: bool, configured: bool) -> Verbosity {
+    if flag == Verbosity::Verbose || (managed && configured) {
+        Verbosity::Verbose
+    } else {
+        Verbosity::Quiet
+    }
+}
+
 /// `verbosity` (issue #77) gates the operator-facing diagnostic channel: this
 /// function owns the process lifecycle, so it brackets the loop with the
 /// `diag=start` / `diag=stop` markers, and the per-tick diagnostics are emitted
 /// inside [`run_loop`]. Default [`Verbosity::Quiet`] keeps `run` silent on that
-/// channel; `-v`/`--verbose` opts in.
+/// channel; `-v`/`--verbose` opts in — as does `[tunables].verbose` for a MANAGED
+/// daemon (issue #775), resolved by [`effective_verbosity`] below once the config
+/// is in hand.
 async fn run(verbosity: Verbosity, managed: bool) -> Result<()> {
     // The native-local support dir holds both the lock and the socket; ensure it
     // (0700) before either touches it.
@@ -1313,12 +1380,18 @@ async fn run(verbosity: Verbosity, managed: bool) -> Result<()> {
     );
 
     // The operator-facing diagnostic channel (issue #77): stderr, gated by the
-    // verbosity selected from `-v`/`--verbose` (default quiet — no console spam).
+    // verbosity selected from `-v`/`--verbose` — or, for a MANAGED daemon, from
+    // `[tunables].verbose` (issue #775), which is why this is resolved HERE and not at
+    // the `Command::Run` dispatch: the config is not loaded until a few lines above,
+    // and re-loading it in the dispatch just to read one bool would give the process
+    // two reads that could disagree. Default quiet — no console spam.
+    //
     // The lifecycle markers bracket the loop HERE because `cli` owns the process
     // lifecycle: a clean shutdown through EITHER of `run_loop`'s exit paths (the
     // startup-delay or the idle loop) returns `Ok`, so a single `diag=stop` after it
     // covers both. The per-tick diagnostics are emitted inside `run_loop`. The Start
     // summary is the effective config, so one run's lines read against it.
+    let verbosity = effective_verbosity(verbosity, managed, config.tunables.verbose);
     let mut diag = DiagnosticLog::new(std::io::stderr(), verbosity);
     diag.emit(&Diagnostic::Start {
         accounts: config.roster.len(),
@@ -10089,6 +10162,7 @@ spare  22222222-2222\n\
                 event: None,
                 json: false,
                 follow: false,
+                channel: crate::log::Channel::Event,
             })
         );
         // `--since` / `--event` capture their RAW values (space- or `=`-separated); duration
@@ -10104,6 +10178,7 @@ spare  22222222-2222\n\
                     event: Some("swap".to_string()),
                     json: false,
                     follow: false,
+                    channel: crate::log::Channel::Event,
                 }),
                 "argv {argv:?} must carry the raw flag values",
             );
@@ -10117,6 +10192,7 @@ spare  22222222-2222\n\
                 event: Some("restash".to_string()),
                 json: true,
                 follow: true,
+                channel: crate::log::Channel::Event,
             })
         );
     }
@@ -10134,6 +10210,7 @@ spare  22222222-2222\n\
                 event: None,
                 json: false,
                 follow: true,
+                channel: crate::log::Channel::Event,
             })
         );
         // Non-degeneracy: the default is genuinely `false`, so the assertions above are not
@@ -10145,6 +10222,7 @@ spare  22222222-2222\n\
                 event: None,
                 json: false,
                 follow: false,
+                channel: crate::log::Channel::Event,
             })
         );
     }
@@ -10152,10 +10230,127 @@ spare  22222222-2222\n\
     #[test]
     fn log_value_bearing_flags_without_a_value_are_clear_errors() {
         // Each as the last token → a clear "needs a value", never a silent whole-log fallback.
-        for flag in ["since", "event"] {
+        for flag in ["since", "event", "channel"] {
             let err = parse_argv(&["log", &format!("--{flag}")]).unwrap_err();
             assert!(matches!(err, Error::CliUsage { .. }));
             assert!(err.to_string().contains(flag), "got: {err}");
+        }
+    }
+
+    /// **CONSTRAINT-C at the argv boundary (issue #775)**: the flag defaults to `event`, so a
+    /// bare `sessiometer log` can never reach the ungoverned diagnostic channel. Pinned here
+    /// rather than only in `log`'s own tests, because THIS is the layer that decides it.
+    #[test]
+    fn log_channel_defaults_to_event_and_parses_each_value() {
+        use crate::log::Channel;
+
+        // The default, from a bare invocation and from every other flag combination — the knob
+        // is opt-in, and nothing else can turn it on by accident.
+        for argv in [
+            vec!["log"],
+            vec!["log", "--json"],
+            vec!["log", "--follow"],
+            vec!["log", "--since", "7d", "--event", "swap", "--json"],
+        ] {
+            let Command::Log(args) = parse_argv(&argv).unwrap() else {
+                panic!("{argv:?} must parse to a log command");
+            };
+            assert_eq!(
+                args.channel,
+                Channel::Event,
+                "argv {argv:?} must default to the event channel"
+            );
+        }
+
+        // Each value, space- and `=`-separated (lexopt handles both, and a short form would be
+        // ambiguous with `-f`, so there deliberately is none).
+        for (value, expected) in [
+            ("event", Channel::Event),
+            ("diag", Channel::Diag),
+            ("all", Channel::All),
+        ] {
+            for argv in [
+                vec![
+                    "log".to_string(),
+                    "--channel".to_string(),
+                    value.to_string(),
+                ],
+                vec!["log".to_string(), format!("--channel={value}")],
+            ] {
+                let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
+                let Command::Log(args) = parse_argv(&borrowed).unwrap() else {
+                    panic!("{argv:?} must parse to a log command");
+                };
+                assert_eq!(args.channel, expected, "argv {argv:?}");
+            }
+        }
+
+        // An unrecognized value is rejected AT THE PARSE, with a message naming the closed set —
+        // not deferred into the reader, and never silently falling back to the default.
+        for bad in ["stderr", "both", "Event", "diagnostics", ""] {
+            let err = parse_argv(&["log", "--channel", bad]).unwrap_err();
+            assert!(
+                matches!(err, Error::LogChannelInvalid(_)),
+                "{bad:?} must be LogChannelInvalid, got {err:?}"
+            );
+            let shown = err.to_string();
+            assert!(
+                shown.contains("event") && shown.contains("diag") && shown.contains("all"),
+                "the error must enumerate the accepted set, got {shown:?}"
+            );
+        }
+    }
+
+    /// **The issue #775 R8 gap, at the one place a test can reach it**: `run --managed` honors
+    /// the `[tunables].verbose` knob, and nothing else changes.
+    ///
+    /// Exhaustive over the three booleans — eight cases, all of them — because the interesting
+    /// content of this function is entirely in which combinations do NOT turn diagnostics on.
+    /// ("A launchd-managed daemon actually writes to its stderr file" is the other half, and it
+    /// needs real launchd; it is verified as the documented manual check in the PR, not faked
+    /// green here.)
+    #[test]
+    fn managed_run_honors_the_config_knob_and_an_interactive_run_is_unchanged() {
+        use crate::observability::Verbosity::{Quiet, Verbose};
+
+        for (flag, managed, configured, expected, why) in [
+            // The gap this closes: a managed daemon with the knob set is verbose WITHOUT -v.
+            (
+                Quiet,
+                true,
+                true,
+                Verbose,
+                "managed + knob is the whole point",
+            ),
+            // Unchanged defaults: silent everywhere the operator did not ask.
+            (Quiet, true, false, Quiet, "managed, knob off — the default"),
+            (
+                Quiet,
+                false,
+                false,
+                Quiet,
+                "interactive, no -v — the default",
+            ),
+            // The knob is MANAGED-scoped: an interactive run is not touched by it, so arming it
+            // for the background agent cannot surprise a foreground `sessiometer run`.
+            (
+                Quiet,
+                false,
+                true,
+                Quiet,
+                "the knob does not leak to interactive runs",
+            ),
+            // `-v` still wins, on either, whatever the config says.
+            (Verbose, false, false, Verbose, "-v alone"),
+            (Verbose, false, true, Verbose, "-v with the knob set"),
+            (Verbose, true, false, Verbose, "-v on a managed run"),
+            (Verbose, true, true, Verbose, "both"),
+        ] {
+            assert_eq!(
+                effective_verbosity(flag, managed, configured),
+                expected,
+                "flag={flag:?} managed={managed} configured={configured}: {why}"
+            );
         }
     }
 
@@ -10181,13 +10376,31 @@ spare  22222222-2222\n\
         // The issue #175 help/parser lockstep, both directions.
         //
         // Forward: every flag the parser accepts is documented. `--follow` joined this set in
-        // issue #774, moved out of the `foreign` reservation below — which is exactly the trip
-        // wire that reservation existed to be.
-        for flag in ["--since", "--event", "--json", "--follow"] {
+        // issue #774 and `--channel` in issue #775, each moved out of the `foreign` reservation
+        // below — which is exactly the trip wire that reservation existed to be. With `--channel`
+        // gone, that reservation now holds only genuinely-foreign flags.
+        // Each flag is probed with a value it would actually accept. The probe used to be a
+        // literal `"x"` for everything, which worked only because `--since` and `--event` defer
+        // their validation to `log::run` and so accept any string at this layer. `--channel`
+        // validates AT the parse boundary (its value set is closed and needs no clock), so a
+        // junk probe would fail it for the right reason and make the lockstep unsatisfiable.
+        // Carrying the probe alongside the flag keeps the assertion "the parser accepts this
+        // flag" rather than weakening it to "the parser accepts it OR rejects it somehow".
+        for (flag, value) in [
+            ("--since", Some("7d")),
+            ("--event", Some("swap")),
+            ("--json", None),
+            ("--follow", None),
+            ("--channel", Some("diag")),
+        ] {
             assert!(LOG_USAGE.contains(flag), "LOG_USAGE must document {flag}");
+            let argv = match value {
+                Some(value) => vec!["log", flag, value],
+                None => vec!["log", flag],
+            };
             assert!(
-                parse_argv(&["log", flag, "x"]).is_ok() || parse_argv(&["log", flag]).is_ok(),
-                "{flag} must be accepted by the parser"
+                parse_argv(&argv).is_ok(),
+                "{flag} must be accepted by the parser (argv {argv:?})"
             );
         }
         // The short forms, which the loop above cannot express: each must be documented in the
@@ -10201,15 +10414,15 @@ spare  22222222-2222\n\
         }
 
         // Backward: no flag the parser REJECTS may be documented — the drift a copy-pasted
-        // usage block actually produces. Still includes the flag deferred to the sibling issue
-        // (#775 `--channel`), so shipping it without its help text trips here.
+        // usage block actually produces. Every entry here is now a flag that belongs to some
+        // OTHER verb; the last reserved-for-a-sibling-issue entry (`--channel`) graduated to the
+        // accepted set above in issue #775.
         for foreign in [
             "--period",
             "--no-color",
             "--ascii",
             "--plaintext",
             "--overwrite",
-            "--channel",
             "--verbose",
         ] {
             assert!(
@@ -10230,7 +10443,7 @@ spare  22222222-2222\n\
             .lines()
             .find(|line| line.trim_start().starts_with("log "))
             .expect("ROOT_USAGE must carry a `log` line");
-        for flag in ["--since", "--event", "--json", "--follow"] {
+        for flag in ["--since", "--event", "--json", "--follow", "--channel"] {
             assert!(
                 root_line.contains(flag),
                 "the ROOT_USAGE `log` synopsis must carry {flag}, got {root_line:?}"

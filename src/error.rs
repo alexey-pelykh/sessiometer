@@ -90,6 +90,22 @@ pub(crate) enum Error {
     #[error("could not render the log view as JSON: {0}")]
     LogSerialize(&'static str),
 
+    /// `log --channel` got a value that is not one of the three (issue #775). The accepted set
+    /// is closed and small, so the message enumerates it rather than pointing at `--help`.
+    #[error("invalid --channel `{0}`: expected one of event, diag, all")]
+    LogChannelInvalid(String),
+
+    /// `log --follow --channel all` (issue #775). Refused rather than approximated: ordering a
+    /// live merge means holding each new line back until the other channel has produced one at
+    /// least as late, which on a quiet channel never happens — so the only options are stalling
+    /// a stream or emitting out of order.
+    #[error(
+        "--follow cannot merge both channels: ordering a live merge would have to stall one \
+         stream waiting for the other. Follow one at a time (--channel event or --channel diag); \
+         `--channel all` works without --follow."
+    )]
+    LogFollowAllUnsupported,
+
     /// The current user's home directory could not be resolved — from the
     /// password database on Unix, or from the Windows user-profile ladder
     /// (`%USERPROFILE%`, then the `FOLDERID_Profile` Known Folder); see

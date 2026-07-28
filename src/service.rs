@@ -83,7 +83,10 @@ pub(crate) async fn install() -> Result<()> {
     let program = current_binary()?;
     let logs = paths::logs_dir()?;
     let stdout_log = logs.join("daemon.out.log");
-    let stderr_log = logs.join("daemon.err.log");
+    // Through `paths`, not `logs.join(…)`: issue #775's `log --channel diag` reads this
+    // exact file back, so the installer and the reader resolve it through ONE function
+    // and cannot drift apart. The rendered plist is byte-unchanged.
+    let stderr_log = paths::daemon_stderr_log()?;
     // launchd creates the redirect files but not their parent, so ensure the log
     // dir exists (our own private dir → 0700).
     paths::ensure_private_dir(&logs)?;

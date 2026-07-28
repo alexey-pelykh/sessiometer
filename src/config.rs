@@ -536,6 +536,24 @@ pub(crate) struct Tunables {
     /// answers `401` while the credential is perfectly healthy. That false-positive story is
     /// exactly why refusing is opt-in and `false` is the safe posture.
     pub(crate) canary_online_probe_strict: bool,
+    /// Whether a LAUNCHD-MANAGED daemon (`run --managed`) emits the operator-facing diagnostic
+    /// channel (issue #775). `false` (silent) is the default and the unchanged behavior.
+    ///
+    /// The channel (issue #77) was reachable only from `-v` on an interactive `sessiometer run`,
+    /// and the installed agent's `ProgramArguments` is exactly `["run", "--managed"]` — so a
+    /// BACKGROUND daemon, the one an operator most needs to debug, emitted nothing at all and the
+    /// only way to change that was to hand-edit a plist `service install` overwrites. This knob is
+    /// that switch, in the config surface the operator already owns.
+    ///
+    /// Scoped to `--managed` deliberately: an interactive `sessiometer run` keeps meaning exactly
+    /// what it meant, so setting this for the background agent cannot surprise a foreground run
+    /// with console spam. `-v` still wins on either (the two OR together).
+    ///
+    /// No hot reload — like every other tunable, it takes effect at the NEXT daemon start
+    /// (`sessiometer daemon restart`). Diagnostics land on the agent's `StandardErrorPath`
+    /// ([`crate::paths::daemon_stderr_log`]) and are read back by `log --channel diag`; they never
+    /// reach the durable event log, whose grammar `reliability` parses and this cannot touch.
+    pub(crate) verbose: bool,
     /// Poll-interval timing strategy (issue #38): base = `poll_secs` (seconds),
     /// normal jitter by default. The daemon draws + clamps to `5..=3600` each
     /// cycle instead of sleeping a fixed interval.
@@ -585,6 +603,9 @@ impl Default for Tunables {
             // The #736 strict mode: OFF — a probe that fails degrades gracefully (log, then
             // proceed), so a network outage never becomes a swap outage.
             canary_online_probe_strict: false,
+            // The #775 managed-daemon diagnostic channel: OFF — a background daemon stays silent
+            // unless the operator asks for it, exactly as before the knob existed.
+            verbose: false,
             poll_strategy: Strategy {
                 base: DEFAULT_POLL_SECS as f64,
                 jitter: default_poll_jitter(),
@@ -1347,6 +1368,12 @@ struct RawTunables {
     // bool, separate from `canary_online_probe`, with no range to validate.
     #[serde(default)]
     canary_online_probe_strict: bool,
+    // Issue #775: the managed daemon's diagnostic channel — an absent key resolves to `false`
+    // (a background daemon stays silent), the unchanged default. `#[serde(default)]` is what
+    // keeps EVERY existing `config.toml` loading under this struct's `deny_unknown_fields`: the
+    // key is new, so no file on disk carries it. A plain bool with no range to validate.
+    #[serde(default)]
+    verbose: bool,
 }
 
 impl Default for RawTunables {
@@ -1371,6 +1398,7 @@ impl Default for RawTunables {
             canary_nostashmatch_override: false,
             canary_online_probe: false,
             canary_online_probe_strict: false,
+            verbose: false,
         }
     }
 }

@@ -375,7 +375,10 @@ appear — see below):
   appended to `~/Library/Logs/sessiometer/sessiometer.log` (surfaced in Console.app).
   Always on.
 - **The diagnostic channel** — per-cycle DETAIL for debugging a live `run`, on
-  **stderr**, **off by default**.
+  **stderr**, **off by default**. For an interactive `run` that is `-v`; for a
+  **background (launchd-managed) daemon**, which gets no `-v`, it is the
+  `[tunables].verbose` knob — see
+  [Turning diagnostics on for a background daemon](#turning-diagnostics-on-for-a-background-daemon).
 
 The event log — and the `-v` diagnostic channel — identify accounts by their
 **`label`**, written **verbatim** as the account handle (e.g. `event=swap from=…
@@ -435,6 +438,13 @@ active account; a large server value governs it in full (the `==` case above).
 Both channels carry handles, enums, percentages, and timestamps only — and a CI
 redaction meter scans every rendered line of each (issues #9, #15, #77).
 
+That guarantee is about the **lines these two channels emit**. The *file* a managed
+daemon's stderr lands in is a wider surface than the diagnostics written to it: being
+raw stderr, `daemon.err.log` also collects anything else the process printed there,
+**panic output included**, which never passed that meter. So `sessiometer log` treats
+it as an ungoverned channel and keeps it strictly opt-in — see
+[The two channels](#the-two-channels---channel).
+
 ### Reading the event log (`sessiometer log`)
 
 `log` prints the event log itself, **offline** — it reads the file directly and
@@ -448,19 +458,23 @@ sessiometer log
 sessiometer log --since 24h
 sessiometer log --event swap
 
-# Both, as JSON records (schema:1) for a script.
+# Both, as JSON records (schema:2) for a script.
 sessiometer log --since 7d --event swap --json
 
 # Watch a running daemon: print the log, then keep printing what arrives.
 sessiometer log --follow
 sessiometer log -f --event swap
+
+# The daemon's diagnostics instead — see "The two channels" below.
+sessiometer log --channel diag
 ```
 
 `--since` takes a non-negative integer and a unit — `s`, `m`, `h`, `d`, `w` (e.g.
 `30m`, `24h`, `7d`, `2w`) — the same grammar as `sessiometer reliability --since`; a
 malformed value is an error, never a silent whole-log fallback. `--event` matches the
-`event=` token **exactly**, so `--event swap` will not also match a longer name that
-starts with it.
+line's kind token **exactly**, so `--event swap` will not also match a longer name that
+starts with it. (That token is `event=` on the event log and `diag=` on the diagnostic
+channel, so `--event tick --channel diag` selects `diag=tick`.)
 
 The two streams are split, so a pipe stays clean:
 
@@ -529,6 +543,54 @@ what lets a consumer act on an event the moment it arrives:
 ```sh
 sessiometer log --follow --json | jq --unbuffered -r .line
 ```
+
+#### The two channels (`--channel`)
+
+The daemon writes two streams, and they are **not** the same kind of thing:
+
+| `--channel` | File | What it is |
+| --- | --- | --- |
+| `event` *(default)* | `~/Library/Logs/sessiometer/sessiometer.log` | The durable event log. Every field is a handle, an enum, a number or a timestamp by construction, and the whole channel is redaction-checked in CI. |
+| `diag` | `~/Library/Logs/sessiometer/daemon.err.log` | A launchd-managed daemon's raw stderr, where the per-poll / per-tick / lifecycle diagnostics land. |
+| `all` | both | Interleaved in timestamp order. |
+
+> **The diagnostic channel is not redaction-checked.** It is raw process stderr, so
+> besides the diagnostics it can carry anything the daemon printed there — including
+> **panic output**, which never passed the checks the event log's every field passes by
+> construction. That is why it is strictly opt-in: a bare `sessiometer log` never reads
+> it, `--channel all` is never the default, and the verb says so on stderr whenever you
+> do ask for it.
+
+Under `--channel all`, each file keeps its own internal order — so a panic backtrace
+stays contiguous — and ties put the event line first. A diagnostic line with no
+timestamp of its own (raw stderr, a panic payload) is placed at the timestamp of the
+nearest line before it, so it lands where it actually happened rather than being dropped
+as unplaceable. `--channel all` is not available with `--follow`: ordering a *live* merge
+would mean holding each new line back until the other channel produced one at least as
+late, which on a quiet channel never happens. Follow one at a time.
+
+##### Turning diagnostics on for a background daemon
+
+A launchd-managed daemon runs `run --managed` with no `-v`, so **by default it writes no
+diagnostics at all** — `--channel diag` on a fresh install correctly reports that none
+exist. To turn them on, set `verbose` under `[tunables]` in the config
+(`sessiometer config path`) and restart the daemon:
+
+```toml
+[tunables]
+verbose = true
+```
+
+```sh
+sessiometer daemon restart
+sessiometer log --channel diag
+```
+
+No plist editing — `sessiometer service install` would overwrite it anyway. Like every
+other tunable this is **not hot-reloaded**: it takes effect at the *next* daemon start,
+which is what the restart above is for. The knob is scoped to the managed daemon, so an
+interactive `sessiometer run` is unaffected; use `-v` there. `-v` still wins over the
+knob on either.
 
 ## Switching the active account
 
