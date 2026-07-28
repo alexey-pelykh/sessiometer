@@ -253,12 +253,19 @@ whole table means running the default suite too.
 `testEachFreshRenderIsNearestToItsOwnGolden` — asks that a fresh render's closest same-size golden be
 itself, which needs no cross-machine calibration and catches one state morphing into another. It only has
 power where a same-size golden of a *different* fixture exists to lose to, and goldens are sized by
-content: 5 of the 17 fixtures (`stats`, `disconnected`, `not-running`, `empty-roster`, `blind-cornered`)
-own a unique height, so their size group holds only their own two themes, ~0.97 apart. For those **10 of
-34 cells the relative check is trivially satisfied** and the absolute ceiling — the cross-machine
-*unvalidated* half — is the only thing defending them. The suite asserts that count rather than merely
-noting it, and prints it on every run alongside the weakest real margin (measured **0.002513**), so the
-promotion decision in issue #790 has the number in front of it.
+content: 7 of the 17 fixtures (`stats`, `disconnected`, `not-running`, `empty-roster`, `blind-cornered`,
+`starting`, `crash-looping`) own a unique height, so their size group holds only their own two themes,
+~0.97 apart. For those **14 of 34 cells the relative check is trivially satisfied** and the absolute
+ceiling — the cross-machine *unvalidated* half — is the only thing defending them. The suite asserts that
+count rather than merely noting it, and prints it on every run alongside the weakest real margin (measured
+**0.002513**), so the promotion decision in issue #790 has the number in front of it.
+
+> That count **regressed from 10 to 14 at issue #776**, and the promotion decision should read it as a
+> cost, not a detail. `View log` made `starting` and `crash-looping` taller by *different* amounts — the
+> mock styles the action `.btn.link` in one and `.btn` in the other — so the 8-cell size group those two
+> shared with `connecting` / `unsupported` split into a 4-cell group plus two singleton pairs. Four more
+> cells now rest on the absolute ceiling alone, and the distinctness check's subject fell from 57 same-size
+> pairs to 37. Nothing about the panel got less correct; the *relative* gate simply has less to compare.
 
 **What runs where.** Only the two committed-golden comparisons are cross-machine sensitive (goldens
 rasterized on one machine, re-rendered on an unpinned `macos-latest`), so they are env-gated off by
@@ -477,6 +484,19 @@ release, with VoiceOver on (`⌘F5`):
 - [ ] Rotor (`VO`+U): the roster is navigable by control type; note which rows are missing from the
       button/text lists (this is the observation issue #839 is tracking — confirm or correct it here).
 - [ ] Switching Status ↔ Stats moves focus somewhere sensible rather than dumping it at the panel root.
+
+**Cold-state message cards** — the panel states that replace the roster with a message plus an action.
+Every item above walks the *healthy* panel, so nothing here was covered until now; these cards are where
+the panel's only other controls live (`Start daemon`, #170; `View log`, #776).
+
+- [ ] With the daemon stopped (`not-running`) and again while it is coming up (`starting`), `VO`+arrow
+      reaches the card's action and announces it as a **button** with its own name — not as text, and not
+      skipped on the way from the header to the footer.
+- [ ] `View log` is reachable and activatable by **keyboard alone** (`Tab` to it, `Space` to press) in both
+      the `starting` and `crash-looping` cards, and pressing it brings Console.app forward.
+- [ ] Where there is no log to open, `View log` is genuinely **absent** rather than present-and-silent —
+      VoiceOver should find no button to announce (issue #169's honest-affordance rule; delete the log at
+      `~/Library/Logs/sessiometer/sessiometer.log` to check).
 
 **Settings window** — `⌘,`:
 

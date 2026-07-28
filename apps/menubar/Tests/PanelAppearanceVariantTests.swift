@@ -517,7 +517,14 @@ final class PanelAppearanceVariantTests: XCTestCase {
                                     swap: AccountSwapModel(client: nil),
                                     stats: fixture.statsWire.map { PanelStatsModel.loadedPreview($0) }
                                         ?? PanelStatsModel(client: nil),
-                                    loginItem: LoginItemModel(service: AppearanceVariantLoginItemService()))
+                                    loginItem: LoginItemModel(service: AppearanceVariantLoginItemService()),
+                                    // Seed the `View log` probe from the FIXTURE, exactly as
+                                    // `PanelRenderHarness.render` does (issue #776). This composite is warmed by
+                                    // a harness render of the same fixture above, so anything but the same
+                                    // seeding would make the two disagree for `starting` / `crash-looping` —
+                                    // the only two fixtures that carry a path — for no reason connected to the
+                                    // appearance axes under test.
+                                    daemonLog: .fixed(fixture.daemonLogPath))
             .environment(\.colorScheme, scheme)
             .tint(Color.panelAccent)
             .dynamicTypeSize(.large)

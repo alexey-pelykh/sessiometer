@@ -71,6 +71,13 @@ struct PanelRenderFixture {
     // to `.stats`/`.loaded` so the render shows the account cards, not the Status glance. `var` with a
     // default for the same memberwise-init reason as the payload faults above.
     var statsWire: StatsWire?
+    // The `View log` affordance's honest-affordance gate (#776), pinned per fixture rather than probed.
+    // Non-nil ONLY on the two states the mock gives the action — it seeds `DaemonLogProbe.fixed`, so the
+    // render shows the button the reference specifies. The VALUE is a fixed literal and is never read from
+    // disk: a real filesystem probe would render differently on a machine that has run the daemon than on a
+    // fresh CI runner, which is exactly the machine-dependence the goldens cannot tolerate (the same trap the
+    // `.tint` pin below guards for the accent). `var` with a default, memberwise-init reason as above.
+    var daemonLogPath: String?
 }
 
 @MainActor
@@ -101,6 +108,16 @@ enum PanelRenderHarness {
     /// 30 s is half a minute — the finest unit `humanizeUntil` prints — so a render that lands anywhere in
     /// a ±30 s window around the seed instant formats to the same string.
     nonisolated static let boundaryGuardSecs: Int64 = 30
+
+    /// The `View log` fixture's stand-in log path (#776) — a FIXED literal, never a resolved one.
+    ///
+    /// The affordance's honest-affordance gate is "does the daemon's log exist", and answering it from the
+    /// real filesystem here would make every render depend on whether the rendering machine has ever run the
+    /// daemon. That is precisely the machine-dependence the committed goldens cannot survive (the sibling of
+    /// the `.tint` accent pin in `render`). Only the button's PRESENCE is rendered — nothing draws the path —
+    /// so a literal is a complete stand-in, and its shape still mirrors `DaemonLogLocation.logTail` so a
+    /// reader can see what the real value looks like.
+    nonisolated static let fixtureLogPath = "/Users/sessiometer/Library/Logs/sessiometer/sessiometer.log"
 
     // MARK: - Fixture catalog
 
@@ -217,11 +234,18 @@ enum PanelRenderHarness {
             // starting, and the not-running card. #170 adds the Start-daemon affordance to the not-running
             // card: the harness seeds `canStartDaemon` true (see `render`) so this fixture shows the
             // mock's Start button; the shipped app gates it off until #171 bundles the agent plist.
-            PanelRenderFixture(name: "starting", state: .starting, rows: [], nextSwap: nil, generatedAt: nil),
+            //
+            // #776 does the same for `View log`: `starting` and `crash-looping` — and ONLY those two, which
+            // is the whole set the mock gives the action — seed a `daemonLogPath` so the render shows it.
+            // Seeding it is what keeps this harness usable as the design oracle: a fixture rendered without
+            // the affordance would read as a permanent mismatch against the mock in `build-comparison.py`,
+            // for a button that is present in the shipped app whenever there is a log to open.
+            PanelRenderFixture(name: "starting", state: .starting, rows: [], nextSwap: nil, generatedAt: nil,
+                               daemonLogPath: fixtureLogPath),
             PanelRenderFixture(name: "not-running", state: .notRunning, rows: [], nextSwap: nil,
                                generatedAt: nil),
             PanelRenderFixture(name: "crash-looping", state: .crashLooping, rows: [], nextSwap: nil,
-                               generatedAt: nil),
+                               generatedAt: nil, daemonLogPath: fixtureLogPath),
             PanelRenderFixture(name: "unsupported", state: .unsupported, rows: [], nextSwap: nil,
                                generatedAt: nil),
             PanelRenderFixture(name: "empty-roster", state: .emptyRoster, rows: [], nextSwap: nil,
@@ -407,7 +431,8 @@ enum PanelRenderHarness {
                                     capture: AccountCaptureModel(client: nil),
                                     swap: AccountSwapModel(client: nil),
                                     stats: stats,
-                                    loginItem: loginItem)
+                                    loginItem: loginItem,
+                                    daemonLog: .fixed(fixture.daemonLogPath))
             .environment(\.colorScheme, scheme)
             // PIN the accent (#754). `Color.accentColor` — and every SwiftUI control that tints itself from
             // it — resolves through `ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME`, which is set on the

@@ -188,7 +188,15 @@ enum PanelA11y {
     /// The status panel for one render fixture, wired through the SAME `statusPanelEnvironment` seam
     /// (issue #504) the app and the golden gate use, so a newly-required environment object breaks this
     /// suite too rather than silently rendering a degraded tree.
-    static func panelTree(fixture: PanelRenderFixture, scheme: ColorScheme = .dark) -> [A11yNode] {
+    ///
+    /// `daemonLogOverride` exists for one specific vacuity (issue #776). The #776 availability probe is
+    /// seeded PER FIXTURE, so a caller asking "does this state offer `View log`?" against the fixture's own
+    /// seed learns only that the fixture was not seeded — the probe withholds the button no matter what the
+    /// view code does. Any test whose subject is the VIEW's state-gating must therefore force the probe ON
+    /// for every fixture, so absence can only mean the view declined to render it. Defaults to the fixture's
+    /// own seed, which is what a test about rendering (rather than about gating) wants.
+    static func panelTree(fixture: PanelRenderFixture, scheme: ColorScheme = .dark,
+                          daemonLogOverride: DaemonLogProbe? = nil) -> [A11yNode] {
         let store = WatchStatusStore.preview(state: fixture.state, rows: fixture.rows,
                                              nextSwap: fixture.nextSwap, generatedAt: fixture.generatedAt,
                                              canonicalScrub: fixture.canonicalScrub,
@@ -201,7 +209,11 @@ enum PanelA11y {
                                     capture: AccountCaptureModel(client: nil),
                                     swap: AccountSwapModel(client: nil),
                                     stats: stats,
-                                    loginItem: LoginItemModel(service: A11yProbeLoginItemService()))
+                                    loginItem: LoginItemModel(service: A11yProbeLoginItemService()),
+                                    // The fixture's own #776 seed by default, so this tree matches what the
+                                    // golden renderer draws for the same fixture rather than a second
+                                    // opinion — overridable per the parameter's docs.
+                                    daemonLog: daemonLogOverride ?? .fixed(fixture.daemonLogPath))
             .environment(\.colorScheme, scheme)
             .tint(Color.panelAccent)
         return tree(for: view, size: CGSize(width: 380, height: 420))
@@ -497,9 +509,14 @@ final class PanelAccessibilityTreeTests: XCTestCase {
             "stale": "AXButton:5 AXStaticText:3 AXUnknown:1",
             "disconnected": "AXStaticText:3 AXUnknown:3",
             "connecting": "AXStaticText:2",
-            "starting": "AXStaticText:2",
+            // `starting` / `crash-looping` carry `AXButton:1` since issue #776: the mock specifies a
+            // `View log` action in exactly these two cold states, and their fixtures seed a `daemonLogPath`
+            // so it renders. Their `.connecting` / `.unsupported` siblings below stay button-free — the mock
+            // gives them no action — which is what keeps this pin a statement about the reference rather
+            // than about "cold states have a button".
+            "starting": "AXButton:1 AXStaticText:2",
             "not-running": "AXButton:1 AXStaticText:3",
-            "crash-looping": "AXStaticText:2",
+            "crash-looping": "AXButton:1 AXStaticText:2",
             "unsupported": "AXStaticText:2",
             "empty-roster": "AXButton:1 AXStaticText:4 AXTextField:1",
             "blind-ok": "AXButton:5 AXStaticText:3 AXUnknown:1",

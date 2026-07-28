@@ -506,13 +506,21 @@ final class PanelGoldenParityTests: XCTestCase {
                 }
             }
         }
-        // Degenerate-subject guard, exact rather than non-zero: `> 0` would pass having compared 1 of the 57
+        // Degenerate-subject guard, exact rather than non-zero: `> 0` would pass having compared 1 of the 37
         // planned pairs, which is the partial-subject hole its four siblings in this file are closed against.
-        // 57 = the measured pair count over the 34-cell catalog's same-size groups
-        // (C(8,2) + 4·C(4,2) + 5·C(2,2) = 28 + 24 + 5). It moves only when the catalog or a panel height
+        // 37 = the measured pair count over the 34-cell catalog's same-size groups
+        // (C(4,2) + 4·C(4,2) + 7·C(2,2) = 6 + 24 + 7). It moves only when the catalog or a panel height
         // does, which is a deliberate act — re-measure with SESSIOMETER_PANEL_MEASURE=1, do not tune.
-        XCTAssertEqual(compared, 57,
-                       "expected 57 same-size fixture pairs, compared \(compared) — the distinctness check's "
+        //
+        // It moved from 57 at issue #776, and the move is the point: `View log` made `starting` and
+        // `crash-looping` TALLER, and by different amounts (the mock styles the action `.btn.link` in one and
+        // `.btn` in the other), so the 8-cell group those two shared with `connecting` / `unsupported` split
+        // into a 4-cell group plus two singleton pairs — 28 → 6 + 1 + 1. Losing 20 comparisons is a real
+        // reduction in this check's subject; the coverage consequence is recorded against
+        // `testEachFreshRenderIsNearestToItsOwnGolden`'s `withoutCrossStateRival` tripwire, which is the
+        // number the issue #790 promotion decision reads.
+        XCTAssertEqual(compared, 37,
+                       "expected 37 same-size fixture pairs, compared \(compared) — the distinctness check's "
                        + "subject changed; re-measure rather than relaxing this count")
     }
 
@@ -714,10 +722,12 @@ final class PanelGoldenParityTests: XCTestCase {
     // 0.000000, so the whole separation is headroom).
     //
     // MEASURED LIMIT, and it is not small: this check only has power where a same-size golden of a
-    // DIFFERENT fixture exists to lose to. Goldens are sized by content, and 5 of the 17 fixtures own a
-    // unique pixel height (`stats`, `disconnected`, `not-running`, `empty-roster`, `blind-cornered`), so
-    // their size group holds only their own two themes. Light-vs-dark of the same fixture sits ~0.97 apart,
-    // so "nearest is itself" is trivially true for those 10 of 34 cells and detects nothing. Those cells
+    // DIFFERENT fixture exists to lose to. Goldens are sized by content, and 7 of the 17 fixtures own a
+    // unique pixel height (`stats`, `disconnected`, `not-running`, `empty-roster`, `blind-cornered`, and —
+    // since issue #776 gave each of them a differently-styled `View log` action — `starting` and
+    // `crash-looping`), so their size group holds only their own two themes. Light-vs-dark of the same
+    // fixture sits ~0.97 apart, so "nearest is itself" is trivially true for those 14 of 34 cells and
+    // detects nothing. That is 4 cells WORSE than before #776, and deliberately recorded as such. Those cells
     // rest on `testEveryRenderMatchesItsCommittedGolden`'s absolute ceiling alone — i.e. on the
     // cross-machine-UNVALIDATED half, which is a real input to the promotion decision (issue #790) and is
     // why the count below is asserted rather than merely mentioned. Both numbers print on every run.
@@ -770,8 +780,8 @@ final class PanelGoldenParityTests: XCTestCase {
         // Tripwire, not a preference: this is the measured coverage of the PRIMARY gate. If a fixture is
         // added or a layout changes a panel's height, this number moves and the promotion decision in issue
         // #790 needs to know. Re-measure and update deliberately — never widen it to make a run green.
-        XCTAssertEqual(withoutCrossStateRival, 10,
-                       "measured 10 of 34 cells have no same-size cross-state rival; got "
+        XCTAssertEqual(withoutCrossStateRival, 14,
+                       "measured 14 of 34 cells have no same-size cross-state rival; got "
                        + "\(withoutCrossStateRival). The relative gate's coverage changed — re-measure and "
                        + "record it against the promotion criterion (issue #790) rather than adjusting this "
                        + "number to fit")
