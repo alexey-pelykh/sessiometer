@@ -799,12 +799,26 @@ struct StatsRoster: Decodable, Equatable {
     let swaps: StatsSwaps
     let allHighEpisodes: UInt32
     let allHighSecs: Int64
+    /// The session-utilisation water each account had to be at/above for the census above, as a
+    /// FRACTION (`session_ceiling` / 100 — 0.95 at defaults, but OPERATOR-TUNABLE). Issue #804
+    /// carries it precisely so this surface states the water it actually measured instead of
+    /// hardcoding a literal; issue #805 is the panel consuming it.
+    ///
+    /// OPTIONAL only for the pre-#804 daemon that never sent the key. The CURRENT daemon always
+    /// sends it (`RosterWire` deliberately does NOT `skip_serializing_if` it), so `nil` here means
+    /// "an older daemon, which never told us its water" — NOT "no water was used". The renderer
+    /// must therefore DROP the qualifier rather than substitute a number
+    /// (`StatusPanelFormat.statsAllHighLabel`): a fabricated threshold is the very defect #805
+    /// exists to end. Absent-key → `nil` rather than a decode error is the same `decodeIfPresent`
+    /// forward-compat path the snapshot mirror uses for its additive fields.
+    let allHighThreshold: Double?
 
     private enum CodingKeys: String, CodingKey {
         case swapCount = "swap_count"
         case swaps
         case allHighEpisodes = "all_high_episodes"
         case allHighSecs = "all_high_secs"
+        case allHighThreshold = "all_high_threshold"
     }
 }
 
