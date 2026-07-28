@@ -401,6 +401,11 @@ as exit 36 / hang).
 
 ## AC-3 — `expiresAt` evolution: CC-side sliding (proven); server datum residual ⚠️
 
+> **Update 2026-07-28 (issue #876)**: open **question 2** below is now **resolved NEGATIVE** and
+> **triggers this section's own "fixed-cap ⇒ reassess" contingency** — see the
+> **"AC-3 question 2 — RESOLVED NEGATIVE"** subsection at the end of this section.
+> Question 1 (access-token slide-vs-cap) remains open.
+
 CC stores the refreshed expiry **verbatim from the server, with no client-side cap**:
 
 ```js
@@ -415,6 +420,8 @@ never caps it. Whether the *feature* delivers durable value over many days there
 
 1. Does `expires_in` stay constant across refreshes (slide) or shrink toward a deadline (cap)?
 2. Does the server **rotate** the refresh token, and does the new RT get a fresh `refresh_token_expires_in`?
+   (→ rotation **YES**, spike #262; fresh RT lifetime **NO** — **RESOLVED NEGATIVE**, see the subsection
+   at the end of this section.)
    - rotates + fresh RT life ⇒ indefinitely sliding (durable).
    - no rotation (CC keeps the old RT via `c=e`) + fixed RT life ⇒ hard ceiling = the RT's original
      lifetime (capped ⇒ reassess).
@@ -430,10 +437,87 @@ inherently longitudinal. **Resolution path** (either suffices):
   #102 and AC-3 settles itself in production.
 - **Or — operator-gated probe**: pause the daemon, pick a disposable account, do one refresh, record the
   integer `expires_in` / `refresh_token_expires_in` / rotation flag (redacted), re-stash.
+  (→ Now needed for **question 1 only**: the RT-lifetime half turned out readable **at rest** — see the
+  RESOLVED NEGATIVE subsection at the end of this section.)
 
 **Build is not blocked** (AC-2, the true blocker, is favourable). AC-3 gates *value*, not feasibility;
 CC-side sliding + the forced-refresh lever (AC-5) make the engine able to drive refreshes deterministically.
 Recommend **proceed**, carrying "fixed-cap ⇒ reassess" as the documented contingency.
+(→ That contingency is now **TRIGGERED** — 2026-07-28, see the subsection at the end of this section.)
+
+### AC-3 question 2 — RESOLVED NEGATIVE (2026-07-28, CC v2.1.218–220 · issue #876)
+
+> Question 2 above: *"Does the server rotate the refresh token, and does the new RT get a fresh
+> `refresh_token_expires_in`?"* The **rotation** half was already resolved YES (spike #262). The
+> **fresh-RT-lifetime** half is now resolved **NO** — and, per the branch above, that is the
+> `no rotation … + fixed RT life ⇒ hard ceiling` arm's outcome reached by a different route:
+> the RT rotates, but its recorded **deadline does not move**. **This TRIGGERS this document's own
+> "fixed-cap ⇒ reassess" contingency** (the last line of AC-3 above). Reassessment is a **product
+> decision, tracked outside this ledger** — not a doc edit, and not resolved here.
+
+**What was measured.** The datum turned out to be readable **at rest**, so no live `/v1/oauth/token`
+interception was needed: CC v2.1.218–220 persists the refresh-token deadline into the `claudeAiOauth`
+blob as `refreshTokenExpiresAt`. Across **6 accounts whose access tokens had all refreshed within
+hours**, the refresh-token deadlines sat **unmoved at fixed absolute timestamps** — 4 of the 6 landing
+in one ~4-minute window, 30 days after a single onboarding sitting.
+
+**Why it does not move — and what that does, and does not, license concluding:**
+
+```js
+function ano(e,t){if(typeof e==="number")return Date.now()+e*1000; return t?Date.now()+sxg:void 0}
+var sxg=2592000000                                    // 30 days
+// login   path: refreshTokenExpiresAt: ano(e.refresh_token_expires_in, !0)   // true  -> 30d fallback
+// refresh path: f =                    ano(l.refresh_token_expires_in, !1)   // false -> undefined
+// blob merge  : refreshTokenExpiresAt: t.refreshTokenExpiresAt ?? e?.refreshTokenExpiresAt
+```
+
+The numeric test fires **first and unconditionally** — the `t` fallback flag is consulted **only** when
+the value is absent or non-numeric. So a **numeric** `refresh_token_expires_in` on the refresh path
+always becomes a fresh absolute deadline, and because a number is not nullish the `??` merge **stores
+it** (traced through: the refresh result's `refreshTokenExpiresAt: f` reaches the blob via the same
+`ltu` merge). **The deadline would therefore MOVE.**
+
+⇒ "the server sends a fresh lifetime that CC discards" is **not available** as an explanation for a
+numeric value. Given the observation, the server does **not** send a numeric
+`refresh_token_expires_in` on refresh — it omits it, or sends it non-numerically.
+
+**This is still NOT proof of a server-side fixed cap.** The recorded deadline reports what CC was
+*told*, not what the server would *grant*; the server's own refresh-token lifetime policy is not
+observable at rest. What IS settled is the operational consequence: **the deadline CC records and
+warns on does not slide**, so the engine cannot extend it by refreshing.
+
+**CC does not ENFORCE that deadline** — load-bearing for #102. All 12 `refreshTokenExpiresAt` sites in
+2.1.220 are writes, the `ltu` merge, or the `NRr()` render read; there is **no refresh-refusal
+predicate**. The refresh trigger stays the 5-minute pre-expiry check on `expiresAt` (the ACCESS token —
+AC-5 above). So past the refresh-token deadline the engine keeps attempting refreshes and the failure
+arrives **server-side**, surfacing through the existing step-6 `Dead` classification
+(`refreshToken == ""`) — not as a client-side refusal the engine would need new handling for.
+
+CC also **renders** the deadline — `daysLeft = Math.ceil((refreshTokenExpiresAt − now) / 86400000)`
+gates a persistent `oauth-expiry` warning inside a 3-day window and an `oauth-expiry-warning` toast at
+≤ 1 day. (This is the *"Your login expires in 3 days"* banner that prompted the investigation.)
+
+**Supersedes** the AC-3 framing above on one point only: this ledger's own claim that obtaining the
+RT-lifetime datum *"requires a real account's refresh token"* does not hold — the datum is readable at
+rest. The `expires_in`-slide-vs-cap facet of the **access** token is untouched and still rides #102
+telemetry.
+
+**Version pin + re-verification trigger.** RE-derived from
+`~/.local/share/claude/versions/{2.1.218,2.1.219,2.1.220}` on **2026-07-28** — note this is **above**
+`CC_SUPPORTED_MAX` (2.1.217); this addendum is an observation on a newer client and **does NOT widen
+the supported range** (widening additionally requires re-verifying H3 + the #100 `n1()` derivation and
+updating the README + `src/cc_version.rs`). Minified identifiers are **build-specific** — the helper
+above is `ano` in 2.1.220, `sno` in 2.1.219, `jeo` in 2.1.218 — so **re-verify semantically, never by
+minified name**: `grep -a` the stock binary for `refresh_token_expires_in`, `refreshTokenExpiresAt`
+and `daysLeft:Math.ceil`. **Re-verify on any CC bump touching the credential or OAuth path.**
+
+**Divergence from the v2.1.198 record is UNRESOLVED.** `src/refresh.rs` (via PR #290) and the final
+comment on closed spike **#281** asserted a six-field blob with no RT expiry and no Anthropic-path read
+of `refresh_token_expires_in`, attributing the field solely to the bundled `@azure/msal-node` copy.
+That MSAL copy is still present on v2.1.218–220 — but so is a genuine Anthropic-path use. The v2.1.198
+binary is **not installed**, so *"CC changed after v2.1.198"* and *"the original RE was wrong"* cannot
+be distinguished; **this ledger asserts neither**. **#281 is NOT reopened** — the correction is tracked
+in **#876**.
 
 ## AC-4 — path-normalization before hashing ✅ (= #100, byte-for-byte)
 
