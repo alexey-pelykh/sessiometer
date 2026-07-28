@@ -339,9 +339,11 @@ struct SwapOut {
     decision_pct: u8,
     /// Whether this swap resolved an `all_exhausted` capacity hold (issue #719): the outgoing
     /// account was pinned at the ceiling because NO viable target existed, not because a reaction
-    /// was late. `true` when this swap's `to=` matches the `hold=` of the latest unrelieved
-    /// `all_exhausted` — that `hold=` names the soonest-returning spare the relief lands on, so the
-    /// OUTGOING (`from=`) account is the capacity casualty. #363 explicitly EXCLUDES the all-exhausted
+    /// was late. `true` when this swap's `to=` matches the `hold=` of the latest STILL-OPEN
+    /// `all_exhausted` — an episode already closed by its `all_exhausted_cleared` LEAVE edge holds
+    /// nothing back, so a later swap onto that same spare is a plain reaction-latency sample (issue
+    /// #828). That `hold=` names the soonest-returning spare the relief lands on, so the OUTGOING
+    /// (`from=`) account is the capacity casualty. #363 explicitly EXCLUDES the all-exhausted
     /// condition, so a held anchor is kept OUT of the landing SLO and counted in
     /// [`Landing::capacity_held`] instead of a breach class.
     held: bool,
@@ -867,12 +869,14 @@ fn record_blind_projection(inputs: &mut Inputs, fields: &BTreeMap<&str, &str>) {
 fn parse_events(text: &str, cutoff: Option<i64>) -> Inputs {
     let mut inputs = Inputs::default();
     // The pending `all_exhausted` hold (issue #719): the `hold=` account of the latest
-    // `all_exhausted` event not yet relieved by a swap. `all_exhausted` is edge-triggered (one event
-    // on entering the exhausted state), and a swap is its relief edge. `hold=` names the soonest-
-    // returning SPARE the daemon holds out for (not the pinned-active account), so the relief swap
-    // lands on it — a `reason=session` swap whose `to=` equals this pending hold resolved a capacity
-    // hold (no viable target); its OUTGOING account was pinned at the ceiling, NOT a reaction-latency
-    // miss. Reset to `None` on ANY swap (the relief), so it never leaks past the swap it belongs to.
+    // `all_exhausted` event whose episode has not yet ended. `all_exhausted` is edge-triggered (one
+    // event on entering the exhausted state). `hold=` names the soonest-returning SPARE the daemon
+    // holds out for (not the pinned-active account), so the relief swap lands on it — a
+    // `reason=session` swap whose `to=` equals this pending hold resolved a capacity hold (no viable
+    // target); its OUTGOING account was pinned at the ceiling, NOT a reaction-latency miss. Reset to
+    // `None` on BOTH edges that end an episode, so a hold never leaks past the one it belongs to:
+    // ANY swap (the relief) and `all_exhausted_cleared` (the LEAVE edge — issue #828). The arms
+    // below carry why each edge ends it.
     let mut exhausted_hold: Option<String> = None;
     for (seq, line) in text.lines().enumerate() {
         // Field map from the whitespace-separated `key=val` tokens. Handles/values are
@@ -1078,6 +1082,18 @@ fn parse_events(text: &str, cutoff: Option<i64>) -> Inputs {
             // `from=`==`hold=` resolved it and is a CAPACITY limit, not a reaction-latency miss (#363
             // explicitly excludes the all-exhausted condition). `cause=`/`resets_at=` are informational.
             Some("all_exhausted") => exhausted_hold = fields.get("hold").map(|h| h.to_string()),
+            // The matching LEAVE edge (issue #828, durable since issue #800). A hold does not only
+            // end in a swap: the daemon leaves the no-viable-target state on ANY non-`NoViableTarget`
+            // tick, so a plain `Hold` tick (the active account's own window resetting, say) ends the
+            // episode with no swap at all and emits only this marker. Closing the pending hold here
+            // stops a stale `hold=` from outliving its episode and mislabeling a later, unrelated
+            // swap onto that same spare as capacity-held — which would silently drop a genuine
+            // reaction-latency sample out of the #363 gate.
+            //
+            // Inert on a RELIEF swap's own tick, by emission order: the daemon pushes the clear
+            // AFTER `decide_action` returns, so the swap arm above has already captured
+            // `held_by_exhaustion` and reset the hold by the time this line is read.
+            Some("all_exhausted_cleared") => exhausted_hold = None,
             // An emergency swap (issue #405 dead-active escape) is a DISTINCT event token, but it too
             // moves the active account onto `to=` — so it is a re-activation edge for the #595 landing
             // filter, exactly like a normal swap-in. It is NOT a session overshoot, so — unlike the
@@ -2641,17 +2657,22 @@ ts=2026-07-11T00:03:00Z event=swap from=c to=a reason=session session_pct=98
     }
 
     #[test]
-    fn the_durable_all_exhausted_cleared_leave_edge_is_folded_transparently() {
-        // Issue #800 promoted the all-exhausted LEAVE edge from a stderr `Diagnostic` to a durable
-        // `Event`, so `event=all_exhausted_cleared` lines now appear in the log this parser reads.
-        // This SLI must be indifferent to them: the parser is a tolerant field-map fold, and an
-        // unrecognised `event=` kind falls through every arm. Pinned by parsing the SAME log with
-        // and without the new line and asserting the folds are IDENTICAL — a stronger claim than
-        // spot-checking one field, since it also covers `horizon_ts` and every other ingredient.
+    fn the_leave_edge_is_inert_on_a_relief_swap_tick() {
+        // On a RELIEF-swap tick the LEAVE edge changes nothing — not because the parser ignores it
+        // (issue #828 gave the kind its own arm), but because the swap arm consumed the hold before
+        // this line is ever read. That inertness is a consequence of emission ORDER, so this is the
+        // parser-side guard on the daemon-side contract
+        // `daemon::tests::a_relief_swap_emits_the_durable_leave_edge_after_its_own_swap_event` pins:
+        // the clear is pushed post-`decide_action`, hence `event=swap` THEN
+        // `event=all_exhausted_cleared` on the same tick. (This NARROWS the claim the test asserted
+        // before issue #828 — that the SLI is indifferent to the marker because an unrecognised
+        // `event=` kind falls through every arm, which the new arm made false.)
         //
-        // The cleared line sits exactly where the daemon emits it: on the relief swap's own tick,
-        // AFTER the swap event (the daemon pushes it post-`decide_action`). Its `ts` is not the
-        // log's maximum, so the observation horizon is untouched too.
+        // The whole-`Inputs` equivalence is kept rather than spot-checking one field: it also covers
+        // `horizon_ts` and every other ingredient, and it is what proves issue #828's new arm left
+        // the issue #719 relief-swap classification undisturbed. The cleared line sits exactly where
+        // the daemon emits it — on the relief swap's own tick, AFTER the swap event — and its `ts`
+        // is not the log's maximum, so the observation horizon is untouched too.
         let without = "\
 ts=2026-07-11T00:01:00Z event=all_exhausted hold=c cause=all_accounts_exhausted resets_at=2026-07-11T05:00:00Z
 ts=2026-07-11T00:02:00Z event=swap from=b to=c reason=session session_pct=100
@@ -2686,6 +2707,75 @@ ts=2026-07-11T00:01:00Z event=swap from=y to=z reason=session session_pct=99
         let inputs = parse_events(log, None);
         assert_eq!(inputs.swap_out_pcts, vec![99.0]);
         assert!(inputs.swap_out_held_pcts.is_empty());
+    }
+
+    #[test]
+    fn a_hold_left_without_a_swap_does_not_taint_a_later_unrelated_swap() {
+        // Issue #828, and the LEAVE-with-no-swap shape the clear arm exists for: here the active
+        // account's own session window resets and it drops below its trigger, so the tick decides
+        // `Hold`, not `Swapped`, and the episode ends on a bare marker. That shape is pinned
+        // daemon-side by `daemon::tests::leaving_the_all_exhausted_state_clears_the_edge_guard`,
+        // which asserts the LEAVE tick emits `Event::AllExhaustedCleared` and NOTHING else — so this
+        // log is the daemon's real output, not an invented shape.
+        //
+        // Before the fix the parser cleared `exhausted_hold` on a swap and on nothing else, so the
+        // stale hold outlived the leave and the next unrelated swap that merely HAPPENED to land on
+        // the former `hold=` account was misclassified as capacity-held — deleting a genuine
+        // reaction-latency sample in the direction that FLATTERS the #363 gate. That is why the
+        // assertions below check the gate's VERDICT, not just the partition.
+        let log = "\
+ts=2026-07-11T00:00:00Z event=all_exhausted hold=c cause=all_accounts_exhausted resets_at=2026-07-11T05:00:00Z
+ts=2026-07-11T00:01:00Z event=all_exhausted_cleared
+ts=2026-07-11T00:02:00Z event=swap from=a to=c reason=session session_pct=99
+";
+        let inputs = parse_events(log, None);
+        // The hold ended at 00:01 with no relief swap. The 00:02 swap is a plain climb→swap that
+        // only coincidentally lands on `c`; it resolved no capacity hold, so it is a
+        // reaction-latency sample and must reach the #363 gate.
+        assert_eq!(inputs.swap_out_pcts, vec![99.0]);
+        assert!(inputs.swap_out_held_pcts.is_empty());
+
+        let r = aggregate(&inputs, &[], None);
+        // The stakes, made explicit: with the stale hold the gate saw a CARDINALITY-ZERO subject
+        // (n=0, p100=None, verdict None — no verdict at all); with the hold correctly closed it
+        // sees the sample and correctly reports the breach (99 is not `< 99`). A gate that reads
+        // "no data" because a sample was misfiled is exactly the flattering failure.
+        assert_eq!(r.swap_overshoot.n, 1);
+        assert_eq!(r.swap_overshoot.p100, Some(99));
+        assert_eq!(r.swap_overshoot.p100_met(), Some(false));
+        assert_eq!(r.capacity_held.n, 0);
+        // The classification feeds a SECOND consumer: landing anchors carry the same flag through
+        // `SwapOut::held` (issue #595), so the stale hold was emptying the landing SLI's denominator
+        // too — `(capacity_held, swaps_total)` read `(1, 0)` before this fix and `(0, 1)` after. That
+        // is a second cardinality-zero subject in the same flattering direction, and it was covered
+        // only transitively; pin it directly so a future change cannot split the two consumers apart.
+        assert_eq!(r.landing.capacity_held, 0);
+        assert_eq!(r.landing.swaps_total, 1);
+    }
+
+    #[test]
+    fn a_leave_edge_closes_only_its_own_episode_and_a_re_entry_re_arms() {
+        // Issue #828's clear arm resets the pending hold UNCONDITIONALLY, so the companion property
+        // is that it disarms the episode it ends and nothing more — a later re-entry must arm a
+        // FRESH hold and still be classifiable. Without this, a clear that permanently disabled hold
+        // tracking would look identical to the fix in the single-episode test above, and every
+        // capacity-hold after the fleet's first LEAVE would be silently re-admitted to the #363 gate
+        // (the exact defect this issue fixes, merely displaced one episode later).
+        //
+        // Two episodes, and the second names a DIFFERENT spare — so this also pins that the re-entry
+        // arms on the new `hold=`, not a remembered one.
+        let log = "\
+ts=2026-07-11T00:00:00Z event=all_exhausted hold=c cause=all_accounts_exhausted resets_at=2026-07-11T05:00:00Z
+ts=2026-07-11T00:01:00Z event=all_exhausted_cleared
+ts=2026-07-11T00:02:00Z event=swap from=a to=c reason=session session_pct=99
+ts=2026-07-11T00:03:00Z event=all_exhausted hold=d cause=all_accounts_exhausted resets_at=2026-07-11T05:00:00Z
+ts=2026-07-11T00:04:00Z event=swap from=c to=d reason=session session_pct=100
+";
+        let inputs = parse_events(log, None);
+        // First episode ended without a swap → its trailing swap onto `c` is reaction-latency.
+        // Second episode ended IN its relief swap onto `d` (`hold=d` == `to=d`) → capacity-held.
+        assert_eq!(inputs.swap_out_pcts, vec![99.0]);
+        assert_eq!(inputs.swap_out_held_pcts, vec![100.0]);
     }
 
     #[test]
