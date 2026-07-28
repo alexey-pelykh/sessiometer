@@ -233,7 +233,12 @@ pub(crate) trait RefreshTicker {
 /// [`Event::CredentialRestored`] in the one place that owns the health machine.
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct SweepOutcome {
-    /// One [`Event::Refresh`] per refreshed account, in sweep order.
+    /// The sweep's events, in sweep order: one [`Event::Refresh`] per refreshed account, plus —
+    /// since issue #786 — an [`Event::RefreshBinaryResolved`] immediately BEFORE the cycle whose
+    /// `claude`-binary resolution was news (the first one, or a change). NOT homogeneous, then: a
+    /// consumer must not assume every element is a `Refresh`. Neither current one has to — the
+    /// daemon's run loop emits them variant-agnostically through [`Event::to_log_line`], and the
+    /// #378 systemic classification keys off [`observations`](Self::observations), not this list.
     pub(crate) events: Vec<Event>,
     /// `account_uuid`s of quarantined accounts the cycle proved still refreshable.
     pub(crate) restored: Vec<String>,
