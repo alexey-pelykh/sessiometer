@@ -711,6 +711,33 @@ garbage line with no fields
     }
 
     #[test]
+    fn parsing_skips_the_all_exhausted_cleared_leave_edge() {
+        // Issue #800 promoted the all-exhausted LEAVE edge from a stderr `Diagnostic` to a durable
+        // `Event`, so `event=all_exhausted_cleared` lines now appear in the log this parser reads.
+        // It carries NEITHER `from=`/`to=` NOR a `reason=`, so it must land on the `_ => continue`
+        // drop like any other non-swap event — never a malformed `SwapEvent` that would corrupt the
+        // contribution timeline. Pinned against the real production shape: the daemon emits the
+        // clear on the relief swap's OWN tick, immediately after the swap line.
+        let log = "\
+ts=2026-01-01T00:00:00Z event=all_exhausted hold=play cause=session resets_at=2026-01-01T05:00:00Z
+ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=97
+ts=2026-01-01T00:05:00Z event=all_exhausted_cleared
+";
+        assert_eq!(
+            parse_swap_events(log).len(),
+            1,
+            "only the swap parses; the ENTER and LEAVE edges are both skipped"
+        );
+        // Equivalence with the same log minus the LEAVE line — the new event kind is inert here.
+        assert_eq!(
+            parse_swap_events(log),
+            parse_swap_events(
+                "ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=97\n"
+            )
+        );
+    }
+
+    #[test]
     fn velocity_preempt_swap_parses_as_preempt_bounds_the_timeline_and_is_excluded_from_count() {
         // Issue #539 regression, two halves. PARSER: a `reason=velocity_preempt` line must fold onto
         // SwapKind::Preempt (like #452's blind_preempt), NEVER the `_ => continue` drop — dropping it

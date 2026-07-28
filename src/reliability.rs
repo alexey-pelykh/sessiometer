@@ -2663,6 +2663,39 @@ ts=2026-07-11T00:03:00Z event=swap from=c to=a reason=session session_pct=98
     }
 
     #[test]
+    fn the_durable_all_exhausted_cleared_leave_edge_is_folded_transparently() {
+        // Issue #800 promoted the all-exhausted LEAVE edge from a stderr `Diagnostic` to a durable
+        // `Event`, so `event=all_exhausted_cleared` lines now appear in the log this parser reads.
+        // This SLI must be indifferent to them: the parser is a tolerant field-map fold, and an
+        // unrecognised `event=` kind falls through every arm. Pinned by parsing the SAME log with
+        // and without the new line and asserting the folds are IDENTICAL — a stronger claim than
+        // spot-checking one field, since it also covers `horizon_ts` and every other ingredient.
+        //
+        // The cleared line sits exactly where the daemon emits it: on the relief swap's own tick,
+        // AFTER the swap event (the daemon pushes it post-`decide_action`). Its `ts` is not the
+        // log's maximum, so the observation horizon is untouched too.
+        let without = "\
+ts=2026-07-11T00:01:00Z event=all_exhausted hold=c cause=all_accounts_exhausted resets_at=2026-07-11T05:00:00Z
+ts=2026-07-11T00:02:00Z event=swap from=b to=c reason=session session_pct=100
+ts=2026-07-11T00:03:00Z event=swap from=c to=a reason=session session_pct=98
+";
+        let with = "\
+ts=2026-07-11T00:01:00Z event=all_exhausted hold=c cause=all_accounts_exhausted resets_at=2026-07-11T05:00:00Z
+ts=2026-07-11T00:02:00Z event=swap from=b to=c reason=session session_pct=100
+ts=2026-07-11T00:02:00Z event=all_exhausted_cleared
+ts=2026-07-11T00:03:00Z event=swap from=c to=a reason=session session_pct=98
+";
+        assert_eq!(parse_events(with, None), parse_events(without, None));
+        // …and the #719 classification the bracket sits inside is still correct with the LEAVE
+        // edge present: the relief swap (`to=c` == `hold=c`) is still segregated as capacity-held,
+        // and the later swap is still a clean reaction-latency sample. A cleared line must neither
+        // consume the hold early nor resurrect a consumed one.
+        let inputs = parse_events(with, None);
+        assert_eq!(inputs.swap_out_held_pcts, vec![100.0]);
+        assert_eq!(inputs.swap_out_pcts, vec![98.0]);
+    }
+
+    #[test]
     fn a_relief_swap_to_a_different_account_than_the_hold_is_not_capacity_held() {
         // The discriminator is precise: `all_exhausted hold=` names ONE awaited spare; a swap whose
         // `to=` is a DIFFERENT account did not land on that spare, so it did not resolve THAT hold and
