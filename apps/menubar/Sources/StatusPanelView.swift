@@ -42,13 +42,29 @@ import SwiftUI
 /// measure. `StatusPanelFormat.rowFitsSwitchAffordance` gates the manual-switch affordance on it (issue
 /// #169's "gate the affordance on available row width"). If the panel ever becomes resizable or gains a
 /// compact mode, feed a MEASURED width into that same gate — the gate itself does not change.
+///
+/// Every constant here is the value at the DEFAULT text size; the `scale:` overloads are what the views
+/// actually lay out with (issue #756). Because the panel scales UNIFORMLY — every font and every constant
+/// multiplied by the same factor — the unscaled forms remain the honest base measurements, and anything
+/// derived from them (`StatusPanelFormat.rosterLabelBudget` and friends) scales by simple multiplication.
 enum PanelMetrics {
-    /// The panel's fixed content width.
+    /// The panel's content width at the default text size.
     static let width = CGFloat(StatusPanelFormat.panelContentWidth)
-    /// The roster's horizontal inset (`RosterView`), which the rows sit inside.
+    /// The roster's horizontal inset (`RosterView`), which the rows sit inside, at the default text size.
     static let rosterInset = CGFloat(StatusPanelFormat.rosterHorizontalInset)
-    /// The width available to one roster row.
+    /// The width available to one roster row at the default text size.
     static var rowWidth: Double { StatusPanelFormat.defaultRowWidth }
+
+    /// The panel's content width at `scale`. The panel stays FIXED-width at any given size class — it is
+    /// the size class, not the content, that moves it.
+    static func scaledWidth(_ scale: Double) -> CGFloat { width * scale }
+    /// The roster's horizontal inset at `scale`.
+    static func scaledRosterInset(_ scale: Double) -> CGFloat { rosterInset * scale }
+
+    // There is deliberately NO `scaledRowWidth`. Its one would-be caller — `rowFitsSwitchAffordance` in
+    // `RosterRow.offersSwitch` — compares the row against a constant the same `k` also scales, so that
+    // verdict is scale-INVARIANT and reads the unscaled `rowWidth` on purpose. Offering a scaled accessor
+    // would invite feeding it to an unscaled threshold, which is a real bug rather than a tidier call site.
 }
 
 /// The root panel. Observes the store and re-derives the reset-in against the client's own wall clock
@@ -70,16 +86,34 @@ struct StatusPanelView: View {
     /// (`canStartDaemon`) and otherwise degrades to the same inert banner the other cold states show.
     @EnvironmentObject private var loginItem: LoginItemModel
 
+    /// The operator's Dynamic Type size class (issue #756) — the panel's ONE reader of it. Every subview
+    /// reads the derived `\.panelScale` this view injects below, so the factor is computed exactly once
+    /// and no subview can disagree with another about what size class is in effect.
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
     /// How often the resting panel re-derives clock-relative text (reset-in). A minute is finer than
     /// the reset-in's own minute granularity, so the displayed value never visibly lags the clock.
     private static let clockTick: TimeInterval = 60
 
     var body: some View {
+        // The panel's uniform Dynamic Type multiplier (issue #756). `factor(for:)` clamps to
+        // `PanelTypeScale.ceiling` itself, so this is the clamped value even before the limiting modifier
+        // below; at the default `.large` it is EXACTLY 1.0, which is what keeps this whole change a no-op
+        // at the default text size (and the issue #754 goldens valid without a re-baseline).
+        let scale = PanelTypeScale.factor(for: dynamicTypeSize)
         TimelineView(.periodic(from: .now, by: Self.clockTick)) { context in
-            content(now: Int64(context.date.timeIntervalSince1970))
+            content(now: Int64(context.date.timeIntervalSince1970), scale: scale)
         }
-        .frame(width: PanelMetrics.width, alignment: .leading)
+        .frame(width: PanelMetrics.scaledWidth(scale), alignment: .leading)
         .fixedSize(horizontal: false, vertical: true)
+        // Inject the derived factor for the whole subtree — the single seam every panel subview reads.
+        .environment(\.panelScale, scale)
+        // DECLARE the supported range with SwiftUI's own limiting modifier, in addition to the clamp
+        // inside `factor(for:)`. Both are deliberate: the clamp is what the panel's own arithmetic obeys,
+        // while this modifier makes `\.dynamicTypeSize` itself report the clamped class to anything in the
+        // subtree that reads it directly — so the two representations state the same ceiling instead of a
+        // subview seeing `.accessibility5` while the layout is sized for `.accessibility3`.
+        .dynamicTypeSize(...PanelTypeScale.ceiling)
         // A translucent `.regularMaterial` scrim over the host's `.popover` vibrancy (StatusItemController):
         // the desktop blur reads through (matching the design reference's `backdrop-filter` translucency)
         // while the material's built-in frosting keeps every label + metric legible against a busy wallpaper
@@ -89,7 +123,7 @@ struct StatusPanelView: View {
     }
 
     @ViewBuilder
-    private func content(now: Int64) -> some View {
+    private func content(now: Int64, scale: Double) -> some View {
         // The snapshot's freshness, re-derived against the client's own clock on each `TimelineView`
         // tick so a resting panel's "updated Ns ago" keeps advancing (and a wedged-but-heartbeating
         // daemon's growing age is visible without a manual refresh). `nil` generatedAt → no age.
@@ -140,17 +174,18 @@ struct StatusPanelView: View {
                 // right-click menu now that the populated panel carries no persistent capture bar. The
                 // header above stays, so its honest state sub-line still governs; a capture attempt over a
                 // degraded daemon surfaces its own honest error through the affordance, never a false ok.
-                Divider().padding(.horizontal, 14)
+                Divider().padding(.horizontal, 14 * scale)
                 CaptureCard(title: "Add account")
-                    .padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 10)
+                    .padding(.horizontal, 12 * scale)
+                    .padding(.top, 10 * scale).padding(.bottom, 10 * scale)
             } else if onStatsTab {
                 // The Stats tab (issue #446): the mock's per-account 7-day sparklines + numeric body,
                 // aggregate callout, and signal legend — fed by the socket `stats` verb (never a store read).
                 // A separate view from the Status body; the footer's `next_swap` line stays the Status tab's.
-                Divider().padding(.horizontal, 14)
+                Divider().padding(.horizontal, 14 * scale)
                 StatsView()
             } else {
-                stateBody(state: state, now: now, ageText: ageText, ageStale: ageStale)
+                stateBody(state: state, now: now, ageText: ageText, ageStale: ageStale, scale: scale)
             }
         }
     }
@@ -161,13 +196,15 @@ struct StatusPanelView: View {
     /// an empty-roster / first-run onboarding affordance, and adding an account otherwise lives off-panel
     /// in the status-item right-click menu (issue #394; matches the re-locked mock, #387).
     @ViewBuilder
-    private func stateBody(state: ConnectionState, now: Int64, ageText: String?, ageStale: Bool) -> some View {
+    private func stateBody(state: ConnectionState, now: Int64, ageText: String?,
+                           ageStale: Bool, scale: Double) -> some View {
         switch state {
         case .emptyRoster:
             // A live onboarding state, not stale data — distinct from daemon-down.
-            Divider().padding(.horizontal, 14)
+            Divider().padding(.horizontal, 14 * scale)
             CaptureCard(title: "Capture your first account")
-                .padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 10)
+                .padding(.horizontal, 12 * scale)
+                .padding(.top, 10 * scale).padding(.bottom, 10 * scale)
 
         case .connecting, .starting, .unsupported, .crashLooping:
             // No trustworthy reading to show — a plain honest message card. `.crashLooping` (#169) holds
@@ -176,9 +213,9 @@ struct StatusPanelView: View {
             // the crown-jewel anti-#137 debounce. `.starting` (#499) is the cold-refused daemon-absent
             // state that never held a reading, so it renders the honest banner card. (`.notRunning` is its
             // sibling but now carries the #170 Start affordance — see the dedicated branch below.)
-            Divider().padding(.horizontal, 14)
+            Divider().padding(.horizontal, 14 * scale)
             BannerView(banner: StatusPanelFormat.banner(for: state, accountCount: store.rows.count))
-                .padding(.horizontal, 14).padding(.vertical, 14)
+                .padding(.horizontal, 14 * scale).padding(.vertical, 14 * scale)
 
         case .notRunning:
             // The daemon is installed-but-down (#499): it never held a reading, so — like its `.starting`
@@ -189,9 +226,9 @@ struct StatusPanelView: View {
             // plist is bundled yet (that co-lands with #171), so `canStartDaemon` is false and the card is
             // exactly the inert banner it was before — never a dead button. (View log / Restart remain
             // #169/#171 siblings.)
-            Divider().padding(.horizontal, 14)
+            Divider().padding(.horizontal, 14 * scale)
             StartDaemonCard()
-                .padding(.horizontal, 14).padding(.vertical, 14)
+                .padding(.horizontal, 14 * scale).padding(.vertical, 14 * scale)
 
         case .disconnected, .reconnecting:
             // A warm drop: an explicit honest strip over the DIMMED last-known roster — never frozen-as-live
@@ -213,7 +250,7 @@ struct StatusPanelView: View {
             // exactly where the swap-callout card renders, so the panel's two swap paths (per-row manual,
             // footer recommendation) are live and dead together (#169). No capture bar — capture moved to
             // the status-item menu / empty-roster onboarding (issue #394).
-            Divider().padding(.horizontal, 14)
+            Divider().padding(.horizontal, 14 * scale)
             if let faultBanner = StatusPanelFormat.daemonFaultBanner(keychainLocked: store.keychainLocked,
                                                                      scrub: store.canonicalScrub,
                                                                      systemicRefreshFailure: store.systemicRefreshFailure,
@@ -234,8 +271,8 @@ struct StatusPanelView: View {
                 // click away in the panel" (#524). Each fault the glyph shouts MUST land here, or the click
                 // that follows finds a healthy roster and no explanation.
                 BannerView(banner: faultBanner)
-                    .padding(.horizontal, 14).padding(.vertical, 14)
-                Divider().padding(.horizontal, 14)
+                    .padding(.horizontal, 14 * scale).padding(.vertical, 14 * scale)
+                Divider().padding(.horizontal, 14 * scale)
             }
             if !store.rows.isEmpty {
                 // #572: the active blind row composes the CORNERED verdict from `store.rosterNextSwap` — the

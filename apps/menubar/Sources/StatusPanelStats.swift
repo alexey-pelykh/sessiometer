@@ -38,16 +38,18 @@ struct StatsView: View {
 /// A centered one-line Stats-tab message — the loading placeholder and the honest failure surface. Keeps the
 /// tab from ever rendering blank (or a fabricated number) when there is no series to show.
 private struct StatsMessage: View {
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
     let text: String
 
     var body: some View {
         Text(text)
-            .font(.system(size: 12))
+            .font(.panel(12, scale: scale))
             .foregroundStyle(.secondary)
             .multilineTextAlignment(.center)
             .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .center)
-            .padding(.horizontal, 20).padding(.vertical, 22)
+            .padding(.horizontal, 20 * scale).padding(.vertical, 22 * scale)
     }
 }
 
@@ -55,6 +57,8 @@ private struct StatsMessage: View {
 /// callout + signal legend. Identity (name + monogram + active marker) joins the stats handles with the
 /// live roster the panel already holds — provider-neutral (#173), exactly like the Status roster.
 private struct StatsContent: View {
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
     let wire: StatsWire
     /// The active account's handle (from the watch snapshot the panel already renders) — marks the active
     /// stats row, the only roster fact the Stats tab reads. `nil` when none is active.
@@ -74,7 +78,7 @@ private struct StatsContent: View {
             if let detail = wire.configUnreadable {
                 StatsCaveat(text: StatusPanelFormat.statsConfigUnreadableNote(detail))
             }
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 2 * scale) {
                 ForEach(handles, id: \.self) { handle in
                     if let account = wire.summary.accounts[handle] {
                         StatStripRow(handle: handle,
@@ -86,7 +90,7 @@ private struct StatsContent: View {
                 }
             }
             // Mock `.stats { padding:6px 8px 2px }` — inset to align with the roster + aggregate below.
-            .padding(.horizontal, PanelMetrics.rosterInset).padding(.top, 6).padding(.bottom, 2)
+            .padding(.horizontal, PanelMetrics.scaledRosterInset(scale)).padding(.top, 6 * scale).padding(.bottom, 2 * scale)
 
             StatsAggregate(roster: wire.summary.roster, window: wire.window)
             SignalLegend()
@@ -107,16 +111,18 @@ private struct StatsContent: View {
 /// the popover is fixed in WIDTH (380pt) but INTRINSIC in height, with no `ScrollView`, so an unbounded
 /// reason from a drifted daemon would not clip, it would grow the whole panel arbitrarily tall.
 private struct StatsCaveat: View {
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
     let text: String
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
+        HStack(alignment: .firstTextBaseline, spacing: 8 * scale) {
             Circle()
                 .fill(Color.orange)
-                .frame(width: 6, height: 6)
+                .frame(width: 6 * scale, height: 6 * scale)
                 .accessibilityHidden(true)
             Text(text)
-                .font(.caption)
+                .font(.panel(style: .caption1, scale: scale))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
                 .lineLimit(5)
@@ -126,8 +132,9 @@ private struct StatsCaveat: View {
         // `rosterInset` is the stats block's own inset; the card padding is a row card's internal one, so this
         // dot lines up with a row's status dot, not its card edge. Both are named constants rather than the
         // literals they were, so this alignment tracks the row it is aligning WITH instead of drifting off it.
-        .padding(.horizontal, PanelMetrics.rosterInset + StatusPanelFormat.statsCardHorizontalPadding)
-        .padding(.top, 8)
+        .padding(.horizontal, (PanelMetrics.rosterInset
+                               + StatusPanelFormat.statsCardHorizontalPadding) * scale)
+        .padding(.top, 8 * scale)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(text)
     }
@@ -143,6 +150,8 @@ private struct StatsCaveat: View {
 /// defeating the card's primary job of telling the accounts apart. Moving it to its own row hands that width
 /// back to the label (~198 pt, enough for a 28-character handle untruncated) and stops starving the chart.
 private struct StatStripRow: View {
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
     let handle: String
     /// The roster-resolved 2-char monogram for this handle (issue #445), computed once by `StatsContent`.
     let monogram: String
@@ -154,14 +163,14 @@ private struct StatStripRow: View {
 
     var body: some View {
         let signal = StatusPanelFormat.statsSignal(account.band)
-        VStack(alignment: .leading, spacing: 9) {
-            HStack(spacing: StatusPanelFormat.rowInterElementSpacing) {
+        VStack(alignment: .leading, spacing: 9 * scale) {
+            HStack(spacing: StatusPanelFormat.rowInterElementSpacing * scale) {
                 StatusDot(isActive: isActive)
                 MonogramBadge(label: handle, monogram: monogram)
                 // Provider-neutral name (#15): the redacted handle, exactly as the Status roster shows it —
                 // the mock's `.s-prov` provider brand is intentionally dropped (the shipped app names no provider).
                 Text(handle)
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.panel(13, .semibold, scale: scale))
                     // MIDDLE-truncation (issue #445) — same as the Status roster, so a same-local-part handle's
                     // distinguishing suffix survives elision on the Stats tab too.
                     .lineLimit(1).truncationMode(StatusPanelFormat.identityElision.truncationMode)
@@ -180,18 +189,19 @@ private struct StatStripRow: View {
             // rather than sitting inline, because `statsChartWidth` — the width the mock authors its
             // `.spark` viewBox at — is DERIVED from them; a literal here could drift out from under it.
             Sparkline(values: series)
-                .padding(.leading, StatusPanelFormat.statsChartLeadingInset)
-            HStack(alignment: .top, spacing: 8) {
+                .padding(.leading, StatusPanelFormat.statsChartLeadingInset * scale)
+            HStack(alignment: .top, spacing: 8 * scale) {
                 StatCell(label: "Session m/pk", value: StatusPanelFormat.statsSessionMeanPeak(account))
                 StatCell(label: "Weekly pk", value: StatusPanelFormat.statsWeeklyPeak(account))
                 StatCell(label: "Cap-hits", value: "\(account.capHits)")
             }
-            .padding(.leading, StatusPanelFormat.statsChartLeadingInset)  // aligns the body under the name
+            .padding(.leading, StatusPanelFormat.statsChartLeadingInset * scale)  // aligns the body under the name
         }
         // mock `.stat { padding:10px 8px }`
-        .padding(.vertical, 10).padding(.horizontal, StatusPanelFormat.statsCardHorizontalPadding)
+        .padding(.vertical, 10 * scale)
+        .padding(.horizontal, StatusPanelFormat.statsCardHorizontalPadding * scale)
         .background(
-            RoundedRectangle(cornerRadius: 9)
+            RoundedRectangle(cornerRadius: 9 * scale)
                 .fill(isActive ? Color.accentEmphasis(.activeRowFill, dark: colorScheme == .dark) : Color.clear)
         )
         .accessibilityElement(children: .ignore)
@@ -214,17 +224,19 @@ private struct StatStripRow: View {
 /// One numeric cell of the Stats row's three-column body (mock `.sc`): an uppercase micro-label over a
 /// tabular-figure value. Equal-width (`maxWidth: .infinity`), mirroring the mock's `repeat(3, 1fr)` grid.
 private struct StatCell: View {
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
     let label: String
     let value: String
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
+        VStack(alignment: .leading, spacing: 2 * scale) {
             Text(label.uppercased())
-                .font(.system(size: 9, weight: .semibold)).tracking(0.5)
+                .font(.panel(9, .semibold, scale: scale)).tracking(0.5 * scale)
                 .foregroundStyle(.tertiary)
                 .lineLimit(1)
             Text(value)
-                .font(.system(size: 13, weight: .semibold)).monospacedDigit()
+                .font(.panel(13, .semibold, scale: scale)).monospacedDigit()
                 .lineLimit(1)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -240,14 +252,19 @@ private struct StatCell: View {
 /// `sparkPoints` is already width-parametric, so the box the `Canvas` is actually handed threads straight
 /// through rather than pinning a second hard-coded constant beside the old 96. Widening changes the box
 /// GEOMETRY only — the [0, 1] y-mapping is untouched, so the series semantics are identical at any width.
-/// Height stays the mock's 28 and inset its 3; the inset exists to keep the 1.75 pt stroke and the r 1.7
-/// end-dot off the edges, which is a fixed stroke-clearance concern, so it does NOT scale with width.
+/// Height is the mock's 28 and inset its 3, both at the DEFAULT text size. Neither scales with the laid-out
+/// WIDTH — the inset exists to keep the 1.75 pt stroke and the r 1.7 end-dot off the edges, a stroke-clearance
+/// concern, so a wider box must not thicken it. Both DO scale with the Dynamic Type factor (issue #756),
+/// because the stroke and the dot they are clearing scale with it: holding them fixed while the stroke grew
+/// would clip the line against the box edge at the larger size classes.
 private struct Sparkline: View {
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
     let values: [Double]
     @Environment(\.colorScheme) private var colorScheme
 
-    private let boxHeight = 28.0
-    private let inset = 3.0
+    private var boxHeight: Double { 28.0 * scale }
+    private var inset: Double { 3.0 * scale }
 
     var body: some View {
         Canvas { context, size in
@@ -278,14 +295,16 @@ private struct Sparkline: View {
             context.fill(area, with: .color(color.opacity(0.2)))
 
             context.stroke(line, with: .color(color),
-                           style: StrokeStyle(lineWidth: 1.75, lineCap: .round, lineJoin: .round))
+                           style: StrokeStyle(lineWidth: 1.75 * scale, lineCap: .round, lineJoin: .round))
 
             // The end dot marks the latest bucket (mock `.sp-dot`, r 1.7).
             let last = points[points.count - 1]
-            let dot = Path(ellipseIn: CGRect(x: last.x - 1.7, y: last.y - 1.7, width: 3.4, height: 3.4))
+            let r = 1.7 * scale
+            let dot = Path(ellipseIn: CGRect(x: last.x - r, y: last.y - r, width: 2 * r, height: 2 * r))
             context.fill(dot, with: .color(color))
         }
-        // Greedy in width (the point of the full-width row), pinned to the mock's 28 pt in height.
+        // Greedy in width (the point of the full-width row), pinned in height to the mock's 28 pt × the
+        // Dynamic Type factor — a scaled stroke inside a fixed box would clip (see the type comment).
         .frame(maxWidth: .infinity, minHeight: boxHeight, maxHeight: boxHeight)
         .accessibilityHidden(true)  // a purely visual trend; the row label speaks the numeric values
     }
@@ -295,21 +314,23 @@ private struct Sparkline: View {
 /// balanced / saturated), tinted by the mock's `--sig-*` tokens. A DESCRIPTOR of the session-peak band, never
 /// a recommendation — the read-only Stats tab states the magnitude, it does not advise.
 private struct SignalPill: View {
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
     let signal: StatusPanelFormat.StatSignal
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
         let dark = colorScheme == .dark
-        HStack(spacing: 5) {
+        HStack(spacing: 5 * scale) {
             Circle()
                 .fill(Color.statsSignalText(signal, dark: dark))
-                .frame(width: 6, height: 6)
+                .frame(width: 6 * scale, height: 6 * scale)
             Text(signal.label)
-                .font(.system(size: 11, weight: .semibold))
+                .font(.panel(11, .semibold, scale: scale))
                 .foregroundStyle(Color.statsSignalText(signal, dark: dark))
                 .lineLimit(1)
         }
-        .padding(.horizontal, 8).padding(.vertical, 3)
+        .padding(.horizontal, 8 * scale).padding(.vertical, 3 * scale)
         .background(Capsule().fill(Color.statsSignalFill(signal, dark: dark)))
         .fixedSize()
         .accessibilityHidden(true)  // spoken via the row's accessibility label
@@ -319,35 +340,39 @@ private struct SignalPill: View {
 /// The aggregate callout under the Stats rows (mock `.agg`): the roster-wide all-accounts-high water + swap
 /// count over the window, in a neutral card. Facts only (magnitudes + the span), never a recommendation.
 private struct StatsAggregate: View {
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
     let roster: StatsRoster
     let window: StatsWindow
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        HStack(alignment: .top, spacing: 8) {
+        HStack(alignment: .top, spacing: 8 * scale) {
             Image(systemName: "chart.line.uptrend.xyaxis")
-                .font(.system(size: 12))
+                .font(.panel(12, scale: scale))
                 .foregroundStyle(.secondary)
             Text(StatusPanelFormat.statsAggregateText(roster: roster, window: window))
-                .font(.system(size: 11.5))
+                .font(.panel(11.5, scale: scale))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
         }
-        .padding(.vertical, 9).padding(.horizontal, 11)
-        .background(RoundedRectangle(cornerRadius: 9).fill(Color.panelFill(.card, dark: colorScheme == .dark)))
-        .padding(.horizontal, 12).padding(.vertical, 6)  // mock `.agg { margin:6px 12px }`
+        .padding(.vertical, 9 * scale).padding(.horizontal, 11 * scale)
+        .background(RoundedRectangle(cornerRadius: 9 * scale).fill(Color.panelFill(.card, dark: colorScheme == .dark)))
+        .padding(.horizontal, 12 * scale).padding(.vertical, 6 * scale)  // mock `.agg { margin:6px 12px }`
     }
 }
 
 /// The signal legend (mock `.sig-legend`): the three descriptor pills + the neutrality note. Reinforces the
 /// read-only ethos — "descriptive · equal weight · no action implied" — so the pills never read as an alarm.
 private struct SignalLegend: View {
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 7) {
+        VStack(alignment: .leading, spacing: 6 * scale) {
+            HStack(spacing: 7 * scale) {
                 Text("SIGNAL")
-                    .font(.system(size: 9.5, weight: .semibold)).tracking(0.6)
+                    .font(.panel(9.5, .semibold, scale: scale)).tracking(0.6 * scale)
                     .foregroundStyle(.tertiary)
                 SignalPill(signal: .underused)
                 SignalPill(signal: .balanced)
@@ -355,13 +380,13 @@ private struct SignalLegend: View {
                 Spacer(minLength: 0)
             }
             Text("descriptive · equal weight · no action implied")
-                .font(.system(size: 10)).italic()
+                .font(.panel(10, scale: scale)).italic()
                 .foregroundStyle(.tertiary)
         }
         // Mock `.sig-legend { margin:2px 12px 13px; border-top }` — a hairline over the note.
-        .padding(.horizontal, 12).padding(.top, 10).padding(.bottom, 13)
+        .padding(.horizontal, 12 * scale).padding(.top, 10 * scale).padding(.bottom, 13 * scale)
         .overlay(alignment: .top) {
-            Divider().padding(.horizontal, 12)
+            Divider().padding(.horizontal, 12 * scale)
         }
         .accessibilityHidden(true)  // static explanatory chrome; the per-row labels speak each signal
     }

@@ -17,6 +17,8 @@ import SwiftUI
 /// footer dims in lock-step) — this view just lays the rows out and decides, per row, whether it is a
 /// manual-switch target (issue #169).
 struct RosterView: View {
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
     let rows: [AccountRow]
     let now: Int64
     /// Whether rows offer the manual-switch affordance at all. `false` on a dropped connection, where a
@@ -32,7 +34,7 @@ struct RosterView: View {
         // Resolve every row's smart monogram ONCE over the whole roster (issue #445), so collision-escalation
         // sees all sibling labels — a same-local-part roster gets distinct 2-char monograms, not one letter.
         let monograms = StatusPanelFormat.accountMonograms(rows.map(\.label))
-        VStack(alignment: .leading, spacing: 2) {
+        VStack(alignment: .leading, spacing: 2 * scale) {
             ForEach(rows) { row in
                 // On a dropped connection every row is `notATarget` (non-interactive); otherwise the pure
                 // `rowSwitchState` verdict decides (active → plain row, non-viable → disabled-with-reason,
@@ -51,7 +53,7 @@ struct RosterView: View {
         // The design reference insets the roster (`.accts { padding: 6px 8px 2px }`): 8px horizontal so
         // the active row's accent card aligns with the swap-callout card below (also inset 8) instead of
         // bleeding edge-to-edge, plus 6px above / 2px below for breathing room under the divider.
-        .padding(.horizontal, PanelMetrics.rosterInset).padding(.top, 6).padding(.bottom, 2)
+        .padding(.horizontal, PanelMetrics.scaledRosterInset(scale)).padding(.top, 6 * scale).padding(.bottom, 2 * scale)
     }
 }
 
@@ -63,6 +65,10 @@ struct RosterView: View {
 private struct RowSwitchButtonStyle: ButtonStyle {
     let hovering: Bool
     let live: Bool
+    /// The panel's Dynamic Type multiplier (issue #756), passed IN rather than read from the environment:
+    /// a `ButtonStyle` is not itself part of the view hierarchy, so `@Environment` is not dependable here.
+    /// The caller is a panel view that already holds the injected `\.panelScale`.
+    let scale: Double
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
@@ -82,9 +88,9 @@ private struct RowSwitchButtonStyle: ButtonStyle {
             //     a swap is reversible (undo = switch back), and a sibling swap is `.disabled()` mid-flight.
             // Net: cheaper than a confirm dialog, honest at rest. The real-popover press feel is a #380
             // manual-check item.
-            .contentShape(RoundedRectangle(cornerRadius: 9))
+            .contentShape(RoundedRectangle(cornerRadius: 9 * scale))
             .background(
-                RoundedRectangle(cornerRadius: 9)
+                RoundedRectangle(cornerRadius: 9 * scale)
                     // #388-EXEMPT: a COMPUTED hover/press interaction wash, not one of the mock's absolute
                     // chrome fills (the static mock has no hover state), so it keeps `Color.secondary.opacity(k)`
                     // rather than a `panelFill` token — `wash` is 0 at rest, a faint neutral only while live+hovered.
@@ -106,6 +112,8 @@ private struct RowSwitchButtonStyle: ButtonStyle {
 /// chip is PERSISTENT — quiet at rest, brightening when the row is armed on hover (#448). The resting
 /// row carries the quiet chip; arming still gates the wash + `pointingHand` cursor.
 private struct AccountRowView: View {
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
     let row: AccountRow
     /// The roster-resolved 2-char monogram for this row's label (issue #445), computed once by `RosterView`.
     let monogram: String
@@ -174,6 +182,12 @@ private struct AccountRowView: View {
     /// connection) never is; otherwise it is, GATED on the row's available width — too narrow to host the
     /// affordance ⇒ not interactive, rather than an invisible whole-row hot-zone. The panel is
     /// fixed-width, so the width is a derived constant (`PanelMetrics`), not a measurement.
+    ///
+    /// Deliberately reads the UNSCALED width (issue #756). Under uniform scaling the row and the affordance
+    /// it must host both grow by the same `k`, so `k·rowWidth ≥ k·minRowWidth` ⟺ `rowWidth ≥ minRowWidth`:
+    /// the verdict is scale-INVARIANT and the unscaled pair is its honest statement. Feeding a scaled width
+    /// to an unscaled threshold would be the actual bug — it would start offering the affordance at large
+    /// text sizes where it fits no better in proportion than it did at the default.
     private var offersSwitch: Bool {
         switchState != .notATarget
             && StatusPanelFormat.rowFitsSwitchAffordance(rowWidth: PanelMetrics.rowWidth)
@@ -198,7 +212,7 @@ private struct AccountRowView: View {
                 // not receive their own events. Hoist the secondary control into a trailing accessory or
                 // a context menu and shrink the button to the identity region.
                 Button(action: submit) { rowContent }
-                    .buttonStyle(RowSwitchButtonStyle(hovering: isHovering, live: isLiveSwitch))
+                    .buttonStyle(RowSwitchButtonStyle(hovering: isHovering, live: isLiveSwitch, scale: scale))
                     .disabled(blockReason != nil || swap.phase.isPending)
                     .help(hoverText)
                     // The button trait + `dimmed` come from `Button` + `.disabled()`; the label carries
@@ -257,13 +271,13 @@ private struct AccountRowView: View {
     /// The row's visual content — identical whether or not it is wrapped in a `Button`, so the two
     /// branches cannot drift.
     private var rowContent: some View {
-        VStack(alignment: .leading, spacing: 9) {
-            HStack(spacing: StatusPanelFormat.rowInterElementSpacing) {
+        VStack(alignment: .leading, spacing: 9 * scale) {
+            HStack(spacing: StatusPanelFormat.rowInterElementSpacing * scale) {
                 StatusDot(isActive: row.isActive)
                 MonogramBadge(label: row.label, monogram: monogram)
 
                 Text(row.label)
-                    .font(.body)
+                    .font(.panel(style: .body, scale: scale))
                     .fontWeight(.semibold)
                     .lineLimit(1)
                     // MIDDLE-truncation (issue #445): a same-local-part label's distinguishing suffix /
@@ -277,7 +291,7 @@ private struct AccountRowView: View {
                 // of the account label's width — pushing near-identical fleet emails into truncation. The
                 // row's spoken label is unaffected: `rowAccessibilityLabel` derives ", active" from
                 // `isActive` independently, and the capsule was `accessibilityHidden` anyway (#325).
-                Spacer(minLength: StatusPanelFormat.rowSpacerMinLength)
+                Spacer(minLength: StatusPanelFormat.rowSpacerMinLength * scale)
 
                 authView
                 switchSlot
@@ -291,7 +305,7 @@ private struct AccountRowView: View {
                 // with the snapshot `nextSwap` (cornered iff DEGRADED + no viable target).
                 BlindMeter(blind: blind, severity: blindSeverity, nextSwap: nextSwap, now: now)
             } else {
-                VStack(spacing: 6) {
+                VStack(spacing: 6 * scale) {
                     UsageMeter(label: "Session", pct: row.sessionPct, severity: sessionSeverity,
                                reset: sessionReset)
                     UsageMeter(label: "Weekly", pct: row.weeklyPct, severity: weeklySeverity,
@@ -299,9 +313,9 @@ private struct AccountRowView: View {
                 }
             }
         }
-        .padding(.horizontal, StatusPanelFormat.rowHorizontalPadding)
-        .padding(.top, 9)
-        .padding(.bottom, 10)
+        .padding(.horizontal, StatusPanelFormat.rowHorizontalPadding * scale)
+        .padding(.top, 9 * scale)
+        .padding(.bottom, 10 * scale)
         // Active emphasis follows the design reference: an accent-tint fill ONLY. The accent ring was
         // dropped (#387 M5, ratified) to cut active over-signaling, and the text capsule with it (#699) —
         // active stays encoded by the filled leading dot (shape) + this tint, so color is never the SOLE
@@ -309,7 +323,7 @@ private struct AccountRowView: View {
         // (menubar-preview.html `.acct.active` / `.stat.active`). The fill OPACITY is theme-aware (#388,
         // mock `--active-bg`): .08 light / .15 dark — the dark active row was ~1.5× too faint when hardcoded.
         .background(
-            RoundedRectangle(cornerRadius: 9)
+            RoundedRectangle(cornerRadius: 9 * scale)
                 .fill(row.isActive
                       ? Color.accentEmphasis(.activeRowFill, dark: colorScheme == .dark)
                       : Color.clear)
@@ -322,8 +336,8 @@ private struct AccountRowView: View {
             if let ruleTint = blindRuleTint {
                 Capsule()
                     .fill(Color.panel(StatusPanelFormat.healthTint(ruleTint)))
-                    .frame(width: 3)
-                    .padding(.vertical, 7)
+                    .frame(width: 3 * scale)
+                    .padding(.vertical, 7 * scale)
                     .accessibilityHidden(true)
             }
         }
@@ -334,7 +348,7 @@ private struct AccountRowView: View {
     /// color). The tint is applied by `switchSlot` per emphasis level, so this stays tint-free.
     private var chipGlyph: some View {
         Image(systemName: blockReason == nil ? "arrow.left.arrow.right" : "nosign")
-            .font(.system(size: 11, weight: .semibold))
+            .font(.panel(11, .semibold, scale: scale))
     }
 
     /// The trailing manual-switch chip (issue #169, made PERSISTENT by #448) — a quiet affordance shown at
@@ -356,7 +370,7 @@ private struct AccountRowView: View {
     private var switchSlot: some View {
         Group {
             if isSwitching {
-                ProgressView().controlSize(.small)
+                ProgressView().controlSize(PanelTypeScale.controlSize(for: scale))
             } else {
                 switch StatusPanelFormat.switchChipEmphasis(offersSwitch: offersSwitch, armed: isHovering) {
                 case .hidden:
@@ -372,13 +386,20 @@ private struct AccountRowView: View {
                 }
             }
         }
-        .frame(width: CGFloat(StatusPanelFormat.switchAffordanceSlotWidth), alignment: .trailing)
+        .frame(width: CGFloat(StatusPanelFormat.switchAffordanceSlotWidth) * scale, alignment: .trailing)
         .accessibilityHidden(true)
     }
 
     /// The auth glyph (modern path) or the legacy tag text (pre-#119), plus the DEAD/`disabled` cue.
     /// A blind active account (#485) shows the eye-slash blind glyph HERE instead — the credential may be
     /// fine; what's lost is usage visibility, so the health slot reports that, not a false auth verdict.
+    ///
+    /// The glyphs below carry an EXPLICIT `.font` (issue #756) where they previously carried none, which is
+    /// an ADDITION rather than a substitution. An `Image(systemName:)` sizes off the ambient font, and the
+    /// panel's ambient font is the unscaled system `.body` — so left alone these three would have held their
+    /// default size while every label and cell around them grew, which is the scaled-text-beside-a-fixed-
+    /// element mismatch AC-2 forbids. At the default factor `.panel(style: .body, …)` resolves to the same
+    /// `.body` point size the ambient font was already giving them, which is why the goldens do not move.
     @ViewBuilder
     private var authView: some View {
         if row.blindActive != nil {
@@ -387,32 +408,35 @@ private struct AccountRowView: View {
             // If the credential is ITSELF in a warning state (stale/at-risk — orthogonal to usage-blindness),
             // its glyph rides ALONGSIDE the eye-slash so the warning isn't suppressed (the CLI keeps both;
             // #137 honest-state one axis over). Healthy/unknown → eye-slash alone (the common, ratified case).
-            HStack(spacing: 4) {
+            HStack(spacing: 4 * scale) {
                 if let auth = row.auth, StatusPanelFormat.blindCoShowsAuthWarning(auth) {
                     let authSymbol = StatusPanelFormat.healthSymbol(auth)
                     Image(systemName: authSymbol.name)
                         .symbolRenderingMode(.hierarchical)
+                        .font(.panel(style: .body, scale: scale))
                         .foregroundStyle(healthColor(authSymbol.tint))
                         .accessibilityHidden(true)
                 }
                 let symbol = StatusPanelFormat.blindSymbol(blindSeverity)
                 Image(systemName: symbol.name)
                     .symbolRenderingMode(.hierarchical)
+                    .font(.panel(style: .body, scale: scale))
                     .foregroundStyle(healthColor(symbol.tint))
                     .accessibilityHidden(true)
             }
         } else if let auth = row.auth {
-            HStack(spacing: 4) {
+            HStack(spacing: 4 * scale) {
                 let symbol = StatusPanelFormat.healthSymbol(auth)
                 Image(systemName: symbol.name)
                     .symbolRenderingMode(.hierarchical)
+                    .font(.panel(style: .body, scale: scale))
                     .foregroundStyle(healthColor(symbol.tint))
                     .accessibilityHidden(true)
                 if let cue = StatusPanelFormat.authCue(auth: auth,
                                                        recovering: row.isRecovering,
                                                        enabled: row.isEnabled) {
                     Text(cue)
-                        .font(.caption)
+                        .font(.panel(style: .caption1, scale: scale))
                         .foregroundStyle(cueColor(for: auth))
                 }
             }
@@ -422,7 +446,7 @@ private struct AccountRowView: View {
                                                             recovering: row.isRecovering)
             if !legacy.isEmpty {
                 Text(legacy)
-                    .font(.caption)
+                    .font(.panel(style: .caption1, scale: scale))
                     .foregroundStyle(.secondary)
             }
         }
@@ -472,31 +496,33 @@ private struct AccountRowView: View {
 /// `status` CLI) carry severity in COLOR, not weight; the fixed column widths + monospaced digits keep
 /// Session and Weekly aligned.
 private struct UsageMeter: View {
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
     let label: String
     let pct: UInt8?
     let severity: StatusPanelFormat.UsageSeverity?
     let reset: String
 
     var body: some View {
-        HStack(spacing: 9) {
+        HStack(spacing: 9 * scale) {
             Text(label.uppercased())
-                .font(.system(size: 10, weight: .semibold))
+                .font(.panel(10, .semibold, scale: scale))
                 .foregroundStyle(.secondary)
                 // The three cell widths come from `StatusPanelFormat` (#750) rather than sitting inline, so
                 // `PanelTextMetricsTests` measures text against the SAME number this lays out with.
-                .frame(width: StatusPanelFormat.meterLabelCellWidth, alignment: .leading)
+                .frame(width: StatusPanelFormat.meterLabelCellWidth * scale, alignment: .leading)
 
             UsageBar(fraction: fraction, color: barColor)
 
             Text(StatusPanelFormat.pct(pct))
-                .font(.system(size: 12, weight: .semibold)).monospacedDigit()
+                .font(.panel(12, .semibold, scale: scale)).monospacedDigit()
                 .foregroundStyle(pctColor)
-                .frame(width: StatusPanelFormat.meterPercentCellWidth, alignment: .trailing)
+                .frame(width: StatusPanelFormat.meterPercentCellWidth * scale, alignment: .trailing)
 
             Text(reset)
-                .font(.system(size: 11)).monospacedDigit()
+                .font(.panel(11, scale: scale)).monospacedDigit()
                 .foregroundStyle(.secondary)
-                .frame(width: StatusPanelFormat.meterResetCellWidth, alignment: .trailing)
+                .frame(width: StatusPanelFormat.meterResetCellWidth * scale, alignment: .trailing)
                 .lineLimit(1)
         }
     }
@@ -534,6 +560,8 @@ private struct UsageMeter: View {
 /// A capsule fill proportional to `fraction` (0…1), with a minimum sliver so a live-but-tiny percent
 /// never reads as empty; a zero/failed reading shows a bare track. The number carries the real value.
 private struct UsageBar: View {
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
     let fraction: Double
     let color: Color
     @Environment(\.colorScheme) private var colorScheme
@@ -551,7 +579,7 @@ private struct UsageBar: View {
                     .frame(width: StatusPanelFormat.meterFillWidth(fraction: fraction, full: geo.size.width))
             }
         }
-        .frame(height: 6)
+        .frame(height: 6 * scale)
         .accessibilityHidden(true)
     }
 }
@@ -565,6 +593,8 @@ private struct UsageBar: View {
 /// trailing chip is wider (58 vs the reset column's 52) to fit `blind {dur}` un-clipped, so the held bar
 /// itself sits ~6 pt narrower than a live sibling's — an accepted legibility trade, not a lined-up column.
 private struct BlindMeter: View {
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
     let blind: BlindActive
     /// The composed blind severity (#485 OK/DEGRADED, #572 CORNERED) — resolved once by `AccountRowView`
     /// so the held block, the eye-slash, and the leading rule all read one source.
@@ -581,47 +611,47 @@ private struct BlindMeter: View {
         // channels). Named distinctly from the stored `severity` (the composed `BlindSeverity`) so the two
         // never shadow — the bar keys off the % BAND, the verdict off the auto-protection state.
         let lastKnownBand = StatusPanelFormat.utilSeverity(blind.lastKnownSessionPct)
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 9) {
+        VStack(alignment: .leading, spacing: 4 * scale) {
+            HStack(spacing: 9 * scale) {
                 Text("SESSION")
-                    .font(.system(size: 10, weight: .semibold))
+                    .font(.panel(10, .semibold, scale: scale))
                     .foregroundStyle(.secondary)
                     // The SAME constants the live `UsageMeter` lays out with (#750), so the type comment
                     // above — "reuses UsageMeter's SESSION-label (52) and percent (40) columns" — is now
                     // structurally true rather than two literals that happen to agree today.
-                    .frame(width: StatusPanelFormat.meterLabelCellWidth, alignment: .leading)
+                    .frame(width: StatusPanelFormat.meterLabelCellWidth * scale, alignment: .leading)
 
                 HeldUsageBar(fraction: Double(blind.lastKnownSessionPct) / 100.0, color: barColor(lastKnownBand))
 
                 Text(StatusPanelFormat.pct(blind.lastKnownSessionPct))
-                    .font(.system(size: 12, weight: .semibold)).monospacedDigit()
+                    .font(.panel(12, .semibold, scale: scale)).monospacedDigit()
                     .foregroundStyle(Color.panel(StatusPanelFormat.usageTextTint(lastKnownBand)))
-                    .frame(width: StatusPanelFormat.meterPercentCellWidth, alignment: .trailing)
+                    .frame(width: StatusPanelFormat.meterPercentCellWidth * scale, alignment: .trailing)
 
                 Text(StatusPanelFormat.blindDurationChip(blind.blindSecs))
-                    .font(.system(size: 11, weight: .medium)).monospacedDigit()
+                    .font(.panel(11, .medium, scale: scale)).monospacedDigit()
                     .foregroundStyle(.secondary)
-                    .frame(width: 58, alignment: .trailing)
+                    .frame(width: 58 * scale, alignment: .trailing)
                     .lineLimit(1)
             }
 
             // WHY the bar is held — the value is last-known and the poll is rate-limited (the #137 tell,
             // so a held bar is never read as a live one).
             Text(StatusPanelFormat.blindLastKnownCaption)
-                .font(.system(size: 9, weight: .semibold))
-                .tracking(0.3)
+                .font(.panel(9, .semibold, scale: scale))
+                .tracking(0.3 * scale)
                 .foregroundStyle(.tertiary)
 
             // The auto-protection verdict — OK calm / DEGRADED orange / CORNERED red — mirroring the CLI's
             // blind line (#485; #572 adds CORNERED "cannot act" + the remedy sub-line below).
             let verdict = StatusPanelFormat.blindVerdict(severity, nextSwap: nextSwap, now: now)
-            HStack(spacing: 5) {
+            HStack(spacing: 5 * scale) {
                 Image(systemName: verdict.symbol)
                     .symbolRenderingMode(.hierarchical)
-                    .font(.system(size: 11))
+                    .font(.panel(11, scale: scale))
                     .foregroundStyle(Color.panel(StatusPanelFormat.healthTint(verdict.tint)))
                 Text(verdict.text)
-                    .font(.caption)
+                    .font(.panel(style: .caption1, scale: scale))
                     .foregroundStyle(Color.panel(StatusPanelFormat.healthTint(verdict.tint)))
             }
             // The row's VoiceOver label already speaks the whole blind state — verdict AND cornered remedy
@@ -632,10 +662,10 @@ private struct BlindMeter: View {
             // OK/DEGRADED (`remedy == nil`). Wraps rather than truncates: it is the one actionable line.
             if let remedy = verdict.remedy {
                 Text(remedy)
-                    .font(.system(size: 10.5))
+                    .font(.panel(10.5, scale: scale))
                     .foregroundStyle(Color.panel(StatusPanelFormat.healthTint(verdict.tint)))
                     .fixedSize(horizontal: false, vertical: true)
-                    .padding(.leading, 18)
+                    .padding(.leading, 18 * scale)
                     .accessibilityHidden(true)
             }
         }
@@ -657,6 +687,8 @@ private struct BlindMeter: View {
 /// frozen last-known value is never mistaken for a live meter (#137). The fill itself keeps the severity
 /// hue (muted) so the band is still legible.
 private struct HeldUsageBar: View {
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
     let fraction: Double
     let color: Color
     @Environment(\.colorScheme) private var colorScheme
@@ -672,10 +704,10 @@ private struct HeldUsageBar: View {
                     .frame(width: StatusPanelFormat.meterFillWidth(fraction: fraction, full: geo.size.width))
                 // Dashed outline over the whole track — the legible-at-6px "held" signal.
                 Capsule().strokeBorder(color.opacity(0.9),
-                                       style: StrokeStyle(lineWidth: 1, dash: [2.5, 2]))
+                                       style: StrokeStyle(lineWidth: 1 * scale, dash: [2.5 * scale, 2 * scale]))
             }
         }
-        .frame(height: 6)
+        .frame(height: 6 * scale)
         .accessibilityHidden(true)
     }
 }

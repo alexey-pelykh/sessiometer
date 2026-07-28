@@ -24,6 +24,8 @@ import SwiftUI
 /// DIFFERENT account the operator runs `claude /login` first, then captures (the honest scope boundary,
 /// surfaced as the secondary hint). An already-active-and-rostered account is an idempotent refresh.
 private struct CaptureAffordance: View {
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
     @EnvironmentObject private var capture: AccountCaptureModel
     @State private var label = ""
     @FocusState private var fieldFocused: Bool
@@ -31,15 +33,15 @@ private struct CaptureAffordance: View {
     var body: some View {
         // The prominent, stacked treatment — the field, the primary Capture button, the status line, then
         // the scope hint. Both capture surfaces (#360 onboarding, #394 menu) use this one treatment.
-        VStack(alignment: .leading, spacing: 9) {
+        VStack(alignment: .leading, spacing: 9 * scale) {
             field
-            HStack(spacing: 8) {
+            HStack(spacing: 8 * scale) {
                 button
                 Spacer(minLength: 0)
             }
             status
             Text("To add a different account, run claude /login first, then capture.")
-                .font(.system(size: 10.5))
+                .font(.panel(10.5, scale: scale))
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -63,7 +65,7 @@ private struct CaptureAffordance: View {
     private var field: some View {
         TextField("e.g. Work, Personal", text: $label)
             .textFieldStyle(.roundedBorder)
-            .font(.system(size: 12))
+            .font(.panel(12, scale: scale))
             .focused($fieldFocused)
             .onSubmit(submit)
             .disabled(capture.phase.isPending)
@@ -75,16 +77,16 @@ private struct CaptureAffordance: View {
     private var button: some View {
         Button(action: submit) {
             if capture.phase.isPending {
-                HStack(spacing: 5) {
-                    ProgressView().controlSize(.small)
+                HStack(spacing: 5 * scale) {
+                    ProgressView().controlSize(PanelTypeScale.controlSize(for: scale))
                     Text(StatusPanelFormat.capturePendingText)
                 }
             } else {
                 Label("Capture active account", systemImage: "rectangle.badge.plus")
             }
         }
-        .font(.system(size: 12, weight: .semibold))
-        .controlSize(.small)
+        .font(.panel(12, .semibold, scale: scale))
+        .controlSize(PanelTypeScale.controlSize(for: scale))
         .buttonStyle(.borderedProminent)
         .disabled(capture.phase.isPending)
         .accessibilityLabel(capture.phase.isPending ? "Capturing the active account"
@@ -100,13 +102,13 @@ private struct CaptureAffordance: View {
             EmptyView()
         case .done(let doneLabel):
             Label(StatusPanelFormat.captureDoneText(label: doneLabel), systemImage: "checkmark.circle.fill")
-                .font(.system(size: 11))
+                .font(.panel(11, scale: scale))
                 .foregroundStyle(.green)
                 .lineLimit(1)
                 .truncationMode(StatusPanelFormat.identityElision.truncationMode)
         case .failed(let failure):
             Label(StatusPanelFormat.captureErrorText(failure), systemImage: "exclamationmark.triangle.fill")
-                .font(.system(size: 11))
+                .font(.panel(11, scale: scale))
                 .foregroundStyle(.red)
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -131,23 +133,25 @@ private struct CaptureAffordance: View {
 /// its own via the `watch` snapshot (the app still originates no credential — a verb + label out, a redacted
 /// ack back).
 struct CaptureCard: View {
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
     let title: String
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 9) {
+        VStack(alignment: .leading, spacing: 9 * scale) {
             Text(title)
-                .font(.subheadline.weight(.semibold))
+                .font(.panel(style: .subheadline, .semibold, scale: scale))
             Text("Capture the account you’re signed into — the daemon adds it to the roster and starts tracking it here.")
-                .font(.caption)
+                .font(.panel(style: .caption1, scale: scale))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
             CaptureAffordance()
         }
-        .padding(12)
+        .padding(12 * scale)
         .frame(maxWidth: .infinity, alignment: .leading)
         // Mock `--card-bg` neutral fill (#388) — replaces a washed `Color.secondary.opacity(0.08)`.
-        .background(RoundedRectangle(cornerRadius: 10).fill(Color.panelFill(.card, dark: colorScheme == .dark)))
+        .background(RoundedRectangle(cornerRadius: 10 * scale).fill(Color.panelFill(.card, dark: colorScheme == .dark)))
     }
 }
