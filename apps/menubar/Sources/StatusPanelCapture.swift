@@ -33,14 +33,14 @@ private struct CaptureAffordance: View {
     var body: some View {
         // The prominent, stacked treatment — the field, the primary Capture button, the status line, then
         // the scope hint. Both capture surfaces (#360 onboarding, #394 menu) use this one treatment.
-        VStack(alignment: .leading, spacing: 9 * scale) {
+        VStack(alignment: .leading, spacing: StatusPanelFormat.captureCardSpacing * scale) {
             field
             HStack(spacing: 8 * scale) {
                 button
                 Spacer(minLength: 0)
             }
             status
-            Text("To add a different account, run claude /login first, then capture.")
+            Text(StatusPanelFormat.captureScopeHint)
                 .font(.panel(10.5, scale: scale))
                 .foregroundStyle(.tertiary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -63,13 +63,13 @@ private struct CaptureAffordance: View {
     /// The label field — the placeholder invites an OPTIONAL label; blank → the daemon derives the handle
     /// from the account UUID (never the email). Disabled while a capture is in flight.
     private var field: some View {
-        TextField("e.g. Work, Personal", text: $label)
+        TextField(StatusPanelFormat.captureFieldPlaceholder, text: $label)
             .textFieldStyle(.roundedBorder)
             .font(.panel(12, scale: scale))
             .focused($fieldFocused)
             .onSubmit(submit)
             .disabled(capture.phase.isPending)
-            .accessibilityLabel("Account label, optional")
+            .accessibilityLabel(StatusPanelFormat.captureFieldAccessibilityLabel)
     }
 
     /// The "Capture active account" button — the primary action; disabled and spinner-labelled while
@@ -82,15 +82,15 @@ private struct CaptureAffordance: View {
                     Text(StatusPanelFormat.capturePendingText)
                 }
             } else {
-                Label("Capture active account", systemImage: "rectangle.badge.plus")
+                Label(StatusPanelFormat.captureButtonTitle, systemImage: "rectangle.badge.plus")
             }
         }
         .font(.panel(12, .semibold, scale: scale))
         .controlSize(PanelTypeScale.controlSize(for: scale))
         .buttonStyle(.borderedProminent)
         .disabled(capture.phase.isPending)
-        .accessibilityLabel(capture.phase.isPending ? "Capturing the active account"
-                                                     : "Capture the active account")
+        .accessibilityLabel(
+            StatusPanelFormat.captureButtonAccessibilityLabel(pending: capture.phase.isPending))
     }
 
     /// The done / error status line — rendered from the PURE `StatusPanelFormat` copy, never a string the
@@ -139,17 +139,17 @@ struct CaptureCard: View {
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 9 * scale) {
+        VStack(alignment: .leading, spacing: StatusPanelFormat.captureCardSpacing * scale) {
             Text(title)
                 .font(.panel(style: .subheadline, .semibold, scale: scale))
-            Text("Capture the account you’re signed into — the daemon adds it to the roster and starts tracking it here.")
+            Text(StatusPanelFormat.captureCardExplainer)
                 .font(.panel(style: .caption1, scale: scale))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
             CaptureAffordance()
         }
-        .padding(12 * scale)
+        .padding(StatusPanelFormat.captureCardPadding * scale)
         .frame(maxWidth: .infinity, alignment: .leading)
         // Mock `--card-bg` neutral fill (#388) — replaces a washed `Color.secondary.opacity(0.08)`.
         .background(RoundedRectangle(cornerRadius: 10 * scale).fill(Color.panelFill(.card, dark: colorScheme == .dark)))
