@@ -23,10 +23,15 @@ import ServiceManagement
 
 private let loginItemServiceLog = Logger(subsystem: "org.sessiometer.menubar", category: "login-item")
 
+/// The ratified daemon LaunchAgent label (`src/service.rs` `AGENT_LABEL`) — ONE identity shared by the app
+/// and the CLI (the two-owner invariant). It is also the launchd job name the run-state probe queries
+/// (issue #819), so it is declared once here and the plist filename is derived from it below.
+private let daemonAgentLabel = "org.sessiometer.agent"
+
 /// The bundled daemon LaunchAgent's plist filename — resolved by `SMAppService.agent(plistName:)` relative to
-/// the app bundle's `Contents/Library/LaunchAgents/`. It is `<label>.plist` for the ratified daemon label
-/// (`org.sessiometer.agent`, `src/service.rs` `AGENT_LABEL`), so the app and the CLI register ONE identity.
-private let daemonAgentPlistName = "org.sessiometer.agent.plist"
+/// the app bundle's `Contents/Library/LaunchAgents/`. It is `<label>.plist` for the label above, so the app
+/// and the CLI register ONE identity.
+private let daemonAgentPlistName = "\(daemonAgentLabel).plist"
 
 final class SMAppServiceLoginItemService: LoginItemService {
 
@@ -70,6 +75,15 @@ final class SMAppServiceLoginItemService: LoginItemService {
                 "daemon-lock liveness probe skipped (path unresolved): \(String(describing: error), privacy: .public)")
             return false
         }
+    }
+
+    /// What launchd reports about OUR bundled agent's job (issue #819) — the provenance-bearing complement
+    /// of `daemonLockHeld` above. `daemonAgent.status` cannot answer this: it reports REGISTRATION, so a
+    /// registered-but-not-running agent reads `.enabled`, which is exactly the state issue #819 was observed
+    /// in. `LaunchdJobProbe` asks launchd about the label directly and fails safe to `.unknown`; see its
+    /// header for why a subprocess is the only available signal and what a format drift degrades to.
+    var daemonAgentRunState: DaemonAgentRunState {
+        LaunchdJobProbe.runState(label: daemonAgentLabel)
     }
 
     func registerDaemonAgent() throws { try daemonAgent.register() }

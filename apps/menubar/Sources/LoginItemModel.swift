@@ -32,6 +32,11 @@
 // affordance cannot repair it (it stands down once a daemon holds the lock, issue #742). So the model
 // reconciles at launch (`reconcileDaemonAgentRegistration()`), unregistering BEFORE re-registering. The
 // two-owner invariant above OUTRANKS the header: a CLI-managed agent is never unregistered by the app.
+//
+// The repair's live-daemon gate asks about OUR OWN launchd job, not about the lock (issue #819): the lock
+// probe is any-provenance by design (issue #742) and reported a hand-run `sessiometer run` as a reason to
+// defer, which made the repair permanently inert on exactly the machines that run their daemon by hand.
+// `daemonAgentRunState` is the narrower signal the seam grew for it.
 
 import Combine
 import Foundation
@@ -55,6 +60,21 @@ enum LoginItemStatus: Equatable {
     /// No such registrable item — for the daemon agent in #170 this is the expected state until #171 embeds
     /// the daemon binary + ships the bundled `Contents/Library/LaunchAgents` plist.
     case notFound
+}
+
+/// What launchd reports about the RUN state of the bundled daemon agent's job (issue #819) — the
+/// dimension `LoginItemStatus` above does NOT carry. The two are orthogonal: a `.enabled` registration
+/// can be `.notRunning` (registered, loaded, no process behind it), which is exactly the state issue
+/// #819 was observed in. `LaunchdJobProbe` produces it; `SMAppServiceLoginItemService` exposes it.
+enum DaemonAgentRunState: Equatable {
+    /// launchd reports the job is running — a process exists that unloading the job would terminate.
+    case running
+    /// launchd reports the job is loaded but NOT running — unloading it terminates nothing.
+    case notRunning
+    /// The probe could not answer (spawn failed, timed out, non-zero exit, or output this does not
+    /// recognise). Deliberately NOT collapsed into either verdict: the caller reads it as "I cannot
+    /// tell" and falls back to the any-provenance lock gate, which is issue #788's behaviour.
+    case unknown
 }
 
 /// The OS surface the `LoginItemModel` drives, behind a protocol so the model's decisions are tested against a
@@ -81,6 +101,17 @@ protocol LoginItemService: AnyObject {
     /// so the Start affordance can stand down honestly rather than register an agent that would just
     /// lose the lock.
     var daemonLockHeld: Bool { get }
+    /// What launchd reports about OUR bundled agent's job — running, loaded-but-not-running, or
+    /// unknown (issue #819). The provenance-BEARING complement of `daemonLockHeld` above, which is
+    /// any-provenance by design (issue #742) and stays that way: this is a NEW signal, not a
+    /// redefinition of that one. It answers the only question the stale-registration repair needs —
+    /// "would unloading OUR job terminate a live daemon?" — which the lock cannot answer, because the
+    /// lock's holder may be a daemon we never started and would never unload.
+    ///
+    /// What it does NOT answer: it does not identify the lock's holder. When our job is `.notRunning`
+    /// and the lock IS held, the holder is some other daemon by ELIMINATION (it cannot be ours — ours
+    /// is not running), not by direct evidence of who owns that fd.
+    var daemonAgentRunState: DaemonAgentRunState { get }
     /// Register (and, via the plist's `RunAtLoad`, start) the embedded daemon LaunchAgent. Throws on failure.
     func registerDaemonAgent() throws
     /// Unregister the bundled daemon LaunchAgent. Throws on failure.
@@ -200,9 +231,10 @@ final class LoginItemModel: ObservableObject {
     private let registrationStore: DaemonAgentRegistrationStore
 
     /// The identity of the executable this bundle would register right now (issue #788). A closure, not a
-    /// `LoginItemService` member, deliberately: the protocol's three conformances (the real `SMAppService`
-    /// adapter, the render-harness stub, the test double) are unchanged by this feature — the seam it needed
-    /// already existed in `unregisterDaemonAgent()`.
+    /// `LoginItemService` member, deliberately: the protocol's four conformances (the real `SMAppService`
+    /// adapter, the render-harness stub, the test double, and the accessibility-tree stub) were unchanged by
+    /// that feature — the seam it needed already existed in `unregisterDaemonAgent()`. Issue #819 DID need a
+    /// new member, and updating all four is what it cost.
     private let agentIdentity: () -> String
 
     /// The post-register liveness wait (issue #745): how often to re-probe the single-instance lock, and how
@@ -332,11 +364,16 @@ final class LoginItemModel: ObservableObject {
     }
 
     /// Poll for a daemon to take the single-instance lock after a successful register (issue #745). Reuses the
-    /// same `daemonLockHeld` flock probe `canStartDaemon` gates on (issue #742): `canStartDaemon` guaranteed the
-    /// lock was FREE at the button press, so a lock that becomes held within the window is the daemon our
-    /// register just started (via `RunAtLoad`). Returns `true` as soon as the lock is held, `false` if the
-    /// bounded window elapses with no daemon — the honest "registered but never started" signal. Bounded and
-    /// cancellation-aware so it never spins the UI.
+    /// same `daemonLockHeld` flock probe `canStartDaemon` gates on (issue #742).
+    ///
+    /// ITS PREMISE, which both callers must establish before calling: the lock was FREE at the decision point,
+    /// so a lock that becomes held within the window is the daemon our register just started (via `RunAtLoad`).
+    /// `startDaemon()` gets that from `canStartDaemon`, which includes `!daemonLockHeld`. The reconcile gets it
+    /// from `foreignLockHolder` being false — and where a foreign holder IS present it does not call this at
+    /// all (issue #819), because the poll would then answer on its first read about somebody else's daemon.
+    ///
+    /// Returns `true` as soon as the lock is held, `false` if the bounded window elapses with no daemon — the
+    /// honest "registered but never started" signal. Bounded and cancellation-aware so it never spins the UI.
     private func daemonBecameLive() async -> Bool {
         if service.daemonLockHeld { return true }
         let clock = ContinuousClock()
@@ -360,13 +397,11 @@ final class LoginItemModel: ObservableObject {
     /// daemon nobody asked for). Four gates below guard the four ways a repair could do harm, each annotated
     /// at its guard; the first is where the two-owner invariant OUTRANKS the header's "must be re-registered".
     ///
-    /// The gate-4 deferral is self-healing for the case the header actually warns about — a stale registration
-    /// that "MAY not launch" leaves the lock free, so the next launch finds it and repairs — but NOT in
-    /// general: `daemonLockHeld` is ANY-provenance by design (issue #742), so a hand-run `sessiometer run`
-    /// holds the lock while OUR agent may be registered-but-not-running, deferring the repair indefinitely.
-    /// That is the conservative direction — a working setup is never disturbed — at the cost of this reconcile
-    /// being inert on a machine whose daemon is run by hand. A provenance-aware gate would need a signal the
-    /// `LoginItemService` seam does not carry.
+    /// Gate 4 asks whether unloading OUR job would terminate a live daemon, NOT whether any daemon is alive
+    /// (issue #819 narrowed it from the latter to the former — see `repairDisplacementCheck()` for the full
+    /// table and for what the narrowed signal cannot distinguish). A hand-run `sessiometer run` holding the
+    /// lock therefore no longer defers the repair forever, and is not displaced by it either: it is not our
+    /// job, so we never unload it.
     ///
     /// Failures surface on the existing not-running card (issue #745's pattern, issue #15's redaction), which
     /// is visible in exactly the state this runs in: no daemon holds the lock, so the panel is `.notRunning`
@@ -393,14 +428,12 @@ final class LoginItemModel: ObservableObject {
         let identity = agentIdentity()
         guard registrationStore.lastRegisteredIdentity != identity else { return }
 
-        // Gate 4 — never displace a LIVE daemon: `unregister()` makes launchd unload the job, terminating the
-        // daemon running the OLD executable, and doing that unannounced mid-launch is a silent kill. So defer
-        // and retry next launch — logged, never painted `.failed`, which would show an error card over a
-        // perfectly healthy state.
-        guard !service.daemonLockHeld else {
-            loginItemLog.info("daemon agent re-registration deferred: a live daemon holds the single-instance lock")
-            return
-        }
+        // Gate 4 — never displace a LIVE daemon OF OURS: `unregister()` makes launchd unload the job,
+        // terminating the daemon running the OLD executable, and doing that unannounced mid-launch is a
+        // silent kill. So defer and retry next launch — logged, never painted `.failed`, which would show
+        // an error card over a perfectly healthy state. See `repairDisplacementCheck()` for what "of ours"
+        // narrowed to in issue #819, and what the narrowed signal can and cannot distinguish.
+        guard case .proceed = repairDisplacementCheck() else { return }
 
         // Captured so the re-probe deferral below can put the phase back EXACTLY as it found it, matching
         // gate 4, which defers without touching it at all. Forcing `.idle` there instead would make the two
@@ -411,11 +444,12 @@ final class LoginItemModel: ObservableObject {
         await Task.yield()  // let the "Starting…" beat paint before the synchronous unregister/register
         // Re-probe across the yield. At login the app (a login item) and the agent (`RunAtLoad`) start
         // CONCURRENTLY — which is exactly the first launch after an update, when the identity has changed — so
-        // a daemon can take the lock between gate 4 and the unregister below. Re-probing collapses the
-        // check-then-act window to the two synchronous calls that follow; it cannot close it (the lock belongs
-        // to another process), but it keeps the widest part of the window out of the race.
-        guard !service.daemonLockHeld else {
-            loginItemLog.info("daemon agent re-registration deferred: a daemon took the lock while starting up")
+        // OUR agent can come up between gate 4 and the unregister below. Re-probing collapses the
+        // check-then-act window to the two synchronous calls that follow; it cannot close it (the job belongs
+        // to launchd), but it keeps the widest part of the window out of the race. THIS reading of
+        // `foreignLockHolder` — not gate 4's — is the one carried forward, because it is the later and
+        // therefore closer-to-the-act one.
+        guard case .proceed(let foreignLockHolder) = repairDisplacementCheck() else {
             startPhase = phaseBeforeRepair
             return
         }
@@ -434,10 +468,21 @@ final class LoginItemModel: ObservableObject {
             // prevent. So recovery is deliberately the operator's: the reason below, and the Start affordance.
             // Issue #820 tracks where that reason can go unread.
             registrationStore.lastRegisteredIdentity = identity
-            // Same #745 honesty as `startDaemon()`: a register that launchd ACCEPTS still has to be SPAWNED by
-            // `RunAtLoad`, and that spawn can fail silently. The lock was free at gate 4, so a lock taken
-            // within the window is the daemon this re-registration started.
-            startPhase = await daemonBecameLive() ? .idle : .failed(reason: Self.notStartedReason)
+            if foreignLockHolder {
+                // The liveness wait CANNOT answer here, so it is not asked: a foreign holder falsifies the
+                // premise `daemonBecameLive()` states, and the poll would attribute that daemon to this
+                // repair. `.failed` would be wrong too, and invisible: a daemon IS serving, so the panel is
+                // not `.notRunning`, and `StartDaemonCard` renders a reason only while `canStartDaemon`,
+                // which a held lock already makes false. So land `.idle` — the registration (the thing this
+                // method repairs) succeeded — and say in the log what was NOT established.
+                loginItemLog.info("daemon agent re-registered: \(Self.foreignHolderLivenessNote, privacy: .public)")
+                startPhase = .idle
+            } else {
+                // Same #745 honesty as `startDaemon()`: a register that launchd ACCEPTS still has to be
+                // SPAWNED by `RunAtLoad`, and that spawn can fail silently. The lock was free at the re-probe,
+                // so a lock taken within the window is the daemon this re-registration started.
+                startPhase = await daemonBecameLive() ? .idle : .failed(reason: Self.notStartedReason)
+            }
         } catch {
             loginItemLog.error(
                 "daemon agent re-registration failed: \(String(describing: error), privacy: .public)")
@@ -446,12 +491,108 @@ final class LoginItemModel: ObservableObject {
         }
     }
 
+    /// Whether unregistering the bundled agent right now could terminate a live daemon (issue #819) — asked
+    /// at gate 4 and again after the yield, so the two checks cannot drift apart.
+    private enum RepairDisplacement: Equatable {
+        /// Unloading our job terminates nothing. `foreignLockHolder` reports whether some OTHER daemon holds
+        /// the single-instance lock — not a reason to stop (it is not ours to unload) but load-bearing
+        /// afterwards, because the post-register liveness wait must not misattribute that daemon to us.
+        case proceed(foreignLockHolder: Bool)
+        /// Unloading our job could terminate a live daemon, or the probe could not tell. Every postponement
+        /// is logged with its reason at the point of decision (`postpone(because:)`), so this case carries
+        /// no payload.
+        case postpone
+    }
+
+    /// Gate 4's question, narrowed by issue #819 — and the narrowing is the whole fix.
+    ///
+    /// Issue #788 asked "does ANY daemon hold the single-instance lock?" via `daemonLockHeld`, which is
+    /// any-provenance BY DESIGN (issue #742). On a machine whose daemon is run by hand — a provenance #742
+    /// explicitly supports — that answer is permanently yes, so the repair deferred forever and #788 was
+    /// inert exactly where it was needed.
+    ///
+    /// The question gate 4 actually needs is narrower: `unregister()` unloads OUR launchd job, and unloading
+    /// a job can only terminate a daemon IF THAT JOB IS RUNNING. A hand-run `sessiometer run` is not our job
+    /// and is not unloaded by us, whether or not it holds the lock. So ask launchd about our own label
+    /// (`daemonAgentRunState`) instead of asking the lock about everyone.
+    ///
+    /// The resulting table, against #788:
+    ///
+    /// | our job       | lock | verdict  | vs. issue #788                                   |
+    /// |---------------|------|----------|--------------------------------------------------|
+    /// | `.running`    | any  | postpone | STRICTER (#788 proceeded when the lock was free) |
+    /// | `.notRunning` | free | proceed  | same                                             |
+    /// | `.notRunning` | held | proceed  | **the issue #819 fix** — #788 deferred forever   |
+    /// | `.unknown`    | free | proceed  | same                                             |
+    /// | `.unknown`    | held | postpone | same                                             |
+    ///
+    /// So it is never more destructive than #788 in any cell, and strictly less inert in one. The `.running`
+    /// row is deliberately stricter than #788: our job running while the lock is free is a transient (the
+    /// daemon is starting up, or standing down and about to exit), and unloading it there WOULD be the silent
+    /// kill gate 4 exists to prevent. The next launch repairs.
+    ///
+    /// WHAT THIS CANNOT DISTINGUISH, stated rather than implied: it does not identify the lock's holder.
+    /// `foreignLockHolder` is an inference by ELIMINATION — our job is not running, so the daemon holding the
+    /// lock is not one we started — not direct evidence about that process. And `.unknown` is a genuine
+    /// "cannot tell", which is why it falls back to #788's gate rather than guessing either way.
+    private func repairDisplacementCheck() -> RepairDisplacement {
+        switch service.daemonAgentRunState {
+        case .running:
+            return postpone(because: Self.ownJobRunningDeferral)
+        case .notRunning:
+            // Our job has no process behind it, so the unregister below terminates nothing — whoever holds
+            // the lock. Reading the lock here is not a gate; it records what the liveness wait must not
+            // misattribute afterwards.
+            return .proceed(foreignLockHolder: service.daemonLockHeld)
+        case .unknown:
+            // No answer about our own job ⇒ fall back EXACTLY to issue #788's any-provenance gate. Never
+            // better than #788 here, and never worse.
+            guard service.daemonLockHeld else { return .proceed(foreignLockHolder: false) }
+            return postpone(because: Self.unknownRunStateDeferral)
+        }
+    }
+
+    /// Log a gate-4 postponement and report it. Both deferral paths share one message prefix, and `Logger`
+    /// needs that prefix as a LITERAL (`OSLogMessage`), so it cannot be folded into the reason constants —
+    /// here is the one place it can live once. Returning the verdict rather than only logging is what keeps
+    /// "logged" and "postponed" impossible to do apart.
+    private func postpone(because reason: String) -> RepairDisplacement {
+        loginItemLog.info("daemon agent re-registration deferred: \(reason, privacy: .public)")
+        return .postpone
+    }
+
     /// Re-read both statuses from the OS — called when the Settings window (re)opens and when the app becomes
     /// active, so a login-item change the user made directly in System Settings is reflected without a relaunch.
     func refreshStatus() {
         appStatus = service.appStatus
         daemonStatus = service.daemonAgentStatus
     }
+
+    // The three issue #819 log reasons. Constants rather than inline literals because `Logger` takes an
+    // `OSLogMessage` (a literal with interpolations), which a `"…" + "…"` concatenation is not — and each of
+    // these is too long for one line. They are LOG copy, not UI copy: no `.failed` card is painted on any of
+    // these paths, so none of them reaches the operator's screen.
+
+    /// Gate 4's `.running` deferral — the invariant, stated as the reason.
+    private static let ownJobRunningDeferral =
+        "our LaunchAgent's job is running, so unloading it would terminate that daemon"
+
+    /// Gate 4's `.unknown` deferral — the honest "I could not tell, so I fell back" note.
+    private static let unknownRunStateDeferral =
+        "launchd's run state for our job is unknown and a daemon holds the single-instance lock"
+
+    /// The foreign-holder repair's note. It says what was NOT established, so a reader of the log is never
+    /// left to infer that this repair's own daemon was seen to come up.
+    ///
+    /// It says NEXT LOGIN, not "when that daemon exits", and the distinction is load-bearing. `register()`
+    /// fires the plist's `RunAtLoad`; `run --managed` finds the lock held and exits 0 — a CLEAN stand-down,
+    /// which the bundled plist's conditional `KeepAlive` (`SuccessfulExit: false`) deliberately does NOT
+    /// respawn (`src/service.rs`, issue #742). So nothing re-triggers our job when the other daemon later
+    /// exits; launchd starts it at the next login. Promising the sooner recovery would send an operator to
+    /// kill the daemon they have and be left with none.
+    private static let foreignHolderLivenessNote =
+        "another daemon holds the single-instance lock, so this registration's own startup is not observable "
+        + "from here; it will start at the next login"
 
     /// The #745 silent-failure copy: register succeeded but no daemon took the lock within the liveness window.
     /// There is no OS error to surface (register did NOT throw), so this is a plain, actionable statement rather

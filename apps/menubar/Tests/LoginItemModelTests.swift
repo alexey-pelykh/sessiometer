@@ -281,7 +281,11 @@ final class LoginItemModelTests: XCTestCase {
         await model.startDaemon()
         XCTAssertEqual(store.lastRegisteredIdentity, "build-2")
 
-        fake.daemonLockHeld = false  // simulate the next launch finding the lock free
+        // Simulate the next launch finding the daemon gone and the lock free. BOTH must be cleared: leaving
+        // the job `.running` would make the reconcile below defer at gate 4 and pass this test vacuously,
+        // proving nothing about the identity short-circuit it is actually here to pin (issue #819).
+        fake.daemonAgentRunState = .notRunning
+        fake.daemonLockHeld = false
         await model.reconcileDaemonAgentRegistration()
         XCTAssertEqual(fake.unregisterDaemonCount, 0, "a freshly-registered agent is never churned")
         XCTAssertEqual(fake.registerDaemonCount, 1)
@@ -318,9 +322,13 @@ final class LoginItemModelTests: XCTestCase {
     /// T7 / AC5 — a re-registration that would displace a LIVE daemon running the old executable is DEFERRED,
     /// never silently performed: `unregister()` unloads the launchd job and terminates that daemon. The
     /// deferral leaves the recorded identity stale ON PURPOSE, so the next launch retries.
+    ///
+    /// Staged with OUR job running (issue #819): that — not the bare lock — is the state in which the
+    /// unregister would actually kill something, and it is what the gate now branches on. The lock is held
+    /// too, because a running daemon of ours is holding it.
     func testLiveDaemonIsDeferredToNextLaunchNeverSilentlyKilled() async {
         let (model, fake, store) = makeReconcileModel(
-            daemonAgentStatus: .enabled, daemonLockHeld: true,
+            daemonAgentStatus: .enabled, daemonLockHeld: true, daemonAgentRunState: .running,
             lastRegisteredIdentity: "build-1", agentIdentity: "build-2")
 
         await model.reconcileDaemonAgentRegistration()
@@ -333,15 +341,17 @@ final class LoginItemModelTests: XCTestCase {
     }
 
     /// T7 (the retry half) — the deferral above is genuinely self-healing: the same model, on a later launch
-    /// that finds the lock free, performs the repair it postponed.
-    func testDeferredRepairIsPerformedOnTheNextLaunchWithAFreeLock() async {
+    /// that finds our job stopped, performs the repair it postponed.
+    func testDeferredRepairIsPerformedOnTheNextLaunchOnceOurJobHasStopped() async {
         let (model, fake, store) = makeReconcileModel(
-            daemonAgentStatus: .enabled, daemonLockHeld: true,
+            daemonAgentStatus: .enabled, daemonLockHeld: true, daemonAgentRunState: .running,
             lastRegisteredIdentity: "build-1", agentIdentity: "build-2")
 
         await model.reconcileDaemonAgentRegistration()
         XCTAssertEqual(fake.daemonCalls, [])
 
+        // Our daemon exited, releasing the lock — the state a later launch finds.
+        fake.daemonAgentRunState = .notRunning
         fake.daemonLockHeld = false
         await model.reconcileDaemonAgentRegistration()
 
@@ -498,8 +508,10 @@ final class LoginItemModelTests: XCTestCase {
         // not passing.
         fake.daemonRegisterError = nil
         fake.daemonAgentStatus = .enabled
-        // A daemon takes the lock DURING the next repair — free at gate 4, held by the time of the re-probe.
-        fake.takeLockOnNextProbe = true
+        // OUR agent comes up DURING the next repair — not running at gate 4, running by the time of the
+        // re-probe (and holding the lock it took). That is the launch-time race the re-probe exists for:
+        // the app is a login item and the agent is `RunAtLoad`, so both start at once.
+        fake.agentSpawnsOnNextProbe = true
         await model.reconcileDaemonAgentRegistration()
 
         XCTAssertEqual(fake.daemonCalls.count, 2,
@@ -509,6 +521,159 @@ final class LoginItemModelTests: XCTestCase {
             return XCTFail("the deferral erased the prior reason; got \(model.startPhase)")
         }
         XCTAssertEqual(preserved, reason, "a deferral reports nothing of its own — it restores what it found")
+    }
+
+    // MARK: - Whose daemon is it (issue #819)
+
+    // The two directions AC4 names, stated as a pair. They differ in ONE input — who is running — and land on
+    // opposite verdicts, which is what makes them a gate rather than two agreeing assertions.
+
+    /// AC1 / AC4 (the proceed direction) — THE ISSUE. A FOREIGN daemon holds the single-instance lock (a
+    /// hand-run `sessiometer run`, the provenance issue #742 explicitly supports) while OUR registered agent
+    /// is not running. Issue #788's any-provenance gate deferred here forever, leaving the repair permanently
+    /// inert. It must now proceed: unloading a job with no process behind it terminates nothing, whoever
+    /// holds the lock.
+    func testRepairProceedsWhenOnlyAForeignDaemonHoldsTheLock() async {
+        let (model, fake, store) = makeReconcileModel(
+            daemonAgentStatus: .enabled, daemonLockHeld: true, daemonAgentRunState: .notRunning,
+            lastRegisteredIdentity: "build-1", agentIdentity: "build-2",
+            // Our re-registered agent's `RunAtLoad` spawn stands down (exit 0) because that foreign daemon
+            // still holds the lock — the realistic outcome, and the reason the liveness wait is skipped below.
+            daemonComesUpOnRegister: false)
+
+        await model.reconcileDaemonAgentRegistration()
+
+        XCTAssertEqual(fake.daemonCalls, [.unregister, .register],
+                       "a foreign lock holder is not ours to unload, so it is no reason to defer the repair")
+        XCTAssertEqual(store.lastRegisteredIdentity, "build-2", "the repair happened, so it is recorded")
+        XCTAssertTrue(fake.daemonLockHeld,
+                      "and the foreign daemon is untouched — our unregister unloaded OUR job, not its process")
+    }
+
+    /// AC2 / AC4 (the defer direction) — the same lock, the same detected change, the ONLY difference being
+    /// that the running daemon is OURS. Here `unregister()` really would kill it, so the repair still defers.
+    /// Issue #788's live-daemon gate is narrowed, not removed.
+    func testRepairStillDefersWhenOurOwnAgentIsLive() async {
+        let (model, fake, store) = makeReconcileModel(
+            daemonAgentStatus: .enabled, daemonLockHeld: true, daemonAgentRunState: .running,
+            lastRegisteredIdentity: "build-1", agentIdentity: "build-2")
+
+        await model.reconcileDaemonAgentRegistration()
+
+        XCTAssertEqual(fake.daemonCalls, [], "our own live daemon is never displaced mid-launch")
+        XCTAssertEqual(store.lastRegisteredIdentity, "build-1",
+                       "a deferral is not a repair — the next launch retries")
+        XCTAssertEqual(model.startPhase, .idle, "a healthy postponement paints no error card")
+    }
+
+    /// The proceed direction's OTHER half: a repair performed behind a foreign lock holder must not CLAIM a
+    /// liveness it cannot observe. `daemonBecameLive()` decides by polling the single-instance lock, and its
+    /// premise is written down — the lock was FREE at the decision point, so a lock taken inside the window is
+    /// the daemon we just started. Behind a foreign holder that premise is false: the poll would return true on
+    /// its first read and attribute a stranger's daemon to this repair.
+    ///
+    /// ASSERTED ON THE PROBE COUNT, not the phase, and that is the point. Both the correct path and a path
+    /// that polled anyway land `.idle` — the foreign daemon's lock satisfies the poll immediately — so the end
+    /// state cannot tell them apart, and a test that asserted only `.idle` would pass with the skip removed.
+    /// (It did: that mutant survived until this counter was added.) What distinguishes them is whether the
+    /// unanswerable question was asked at all.
+    func testForeignHolderRepairDoesNotEnterALivenessWaitItCannotAttribute() async {
+        let (model, fake, _) = makeReconcileModel(
+            daemonAgentStatus: .enabled, daemonLockHeld: true, daemonAgentRunState: .notRunning,
+            lastRegisteredIdentity: "build-1", agentIdentity: "build-2",
+            daemonComesUpOnRegister: false)  // our agent never comes up — it stood down behind the foreign one
+
+        await model.reconcileDaemonAgentRegistration()
+
+        XCTAssertEqual(fake.daemonCalls, [.unregister, .register], "precondition: the repair did happen")
+        XCTAssertEqual(fake.lockProbeCount, 2,
+                       "exactly the two gate reads — `repairDisplacementCheck()` at gate 4 and again at the "
+                       + "re-probe. A third would mean the liveness wait ran on a lock it cannot attribute.")
+        XCTAssertEqual(model.startPhase, .idle,
+                       "the registration succeeded and a daemon IS serving — neither a spinner nor the #745 "
+                       + "\"didn't start\" card belongs here")
+    }
+
+    /// The counter's own control, so the assertion above cannot pass by the wait being unreachable in general.
+    /// Same repair with the lock FREE: the liveness wait DOES run, so the probe count exceeds the two gate
+    /// reads. Without this, a change that broke `daemonBecameLive()` entirely would leave the test above green.
+    func testTheLivenessWaitIsStillEnteredWhenTheLockIsFree() async {
+        let (model, fake, _) = makeReconcileModel(
+            daemonAgentStatus: .enabled, daemonLockHeld: false, daemonAgentRunState: .notRunning,
+            lastRegisteredIdentity: "build-1", agentIdentity: "build-2",
+            daemonComesUpOnRegister: true)
+
+        await model.reconcileDaemonAgentRegistration()
+
+        XCTAssertEqual(fake.daemonCalls, [.unregister, .register], "precondition: the repair did happen")
+        XCTAssertGreaterThan(fake.lockProbeCount, 2,
+                            "with the lock free the wait is attributable, so it must actually be performed")
+        XCTAssertEqual(model.startPhase, .idle, "and our daemon came up, so the repair truly succeeded")
+    }
+
+    /// The `.unknown` fallback, both directions. A probe that cannot answer must land EXACTLY on issue #788's
+    /// any-provenance behaviour — defer iff any daemon holds the lock — never guess. Without this, a
+    /// `launchctl` output-format drift would silently become either permanent inertness or, far worse, an
+    /// unregister that kills a live daemon.
+    func testUnknownRunStateFallsBackToTheAnyProvenanceLockGate() async {
+        let (deferred, deferredFake, _) = makeReconcileModel(
+            daemonAgentStatus: .enabled, daemonLockHeld: true, daemonAgentRunState: .unknown,
+            lastRegisteredIdentity: "build-1", agentIdentity: "build-2")
+        await deferred.reconcileDaemonAgentRegistration()
+        XCTAssertEqual(deferredFake.daemonCalls, [],
+                       "cannot tell whose daemon holds the lock ⇒ defer, exactly as issue #788 did")
+
+        let (repaired, repairedFake, _) = makeReconcileModel(
+            daemonAgentStatus: .enabled, daemonLockHeld: false, daemonAgentRunState: .unknown,
+            lastRegisteredIdentity: "build-1", agentIdentity: "build-2")
+        await repaired.reconcileDaemonAgentRegistration()
+        XCTAssertEqual(repairedFake.daemonCalls, [.unregister, .register],
+                       "a free lock ⇒ repair, exactly as issue #788 did — the fallback is never MORE inert")
+    }
+
+    /// AC3 — the two-owner guard outranks the new signal too. Even with our job demonstrably stopped (the
+    /// state that now green-lights a repair), a CLI-owned label is still not the app's to touch.
+    ///
+    /// PRECEDENCE, not just outcome. "The repair did nothing" is satisfied by a guard that runs LAST as
+    /// readily as by one that runs first, so the probe counters are what pin the ordering — and the ordering
+    /// has teeth here: the CLI and the app share ONE launchd label (`org.sessiometer.agent`), so a demoted
+    /// guard would have the run-state probe reading the CLI'S job and reporting it as "our LaunchAgent's job",
+    /// plus a needless `launchctl` spawn on every launch of a CLI-managed machine.
+    func testTwoOwnerGuardIsConsultedBeforeAnyOtherSignal() async {
+        let (model, fake, _) = makeReconcileModel(
+            daemonAgentStatus: .enabled, cliManagedAgentPresent: true,
+            daemonLockHeld: true, daemonAgentRunState: .notRunning,
+            lastRegisteredIdentity: "build-1", agentIdentity: "build-2")
+
+        await model.reconcileDaemonAgentRegistration()
+
+        XCTAssertEqual(fake.daemonCalls, [],
+                       "a stopped job does not license the app to re-point a LaunchAgent the CLI owns")
+        XCTAssertEqual(fake.runStateProbeCount, 0,
+                       "the two-owner guard must short-circuit BEFORE the run-state probe — a CLI-owned label "
+                       + "means launchd's answer about that label is not about us at all")
+        XCTAssertEqual(fake.lockProbeCount, 0, "and before the lock probe, for the same reason")
+    }
+
+    /// The one cell of `repairDisplacementCheck()`'s table that is STRICTER than issue #788: our job running
+    /// while the lock is free. #788 would have proceeded there and unloaded a live job of ours; the narrowed
+    /// gate postpones. Documented at length in the model, and — until this test — unguarded: every other
+    /// `.running` case stages a held lock, so reverting this cell alone left the suite green.
+    ///
+    /// The state is real, if transient: our daemon is starting up and has not taken the lock yet, or it has
+    /// stood down and not yet exited. Unloading it there is exactly the silent kill gate 4 exists to prevent.
+    func testOurRunningJobDefersEvenWhenTheLockIsFree() async {
+        let (model, fake, store) = makeReconcileModel(
+            daemonAgentStatus: .enabled, daemonLockHeld: false, daemonAgentRunState: .running,
+            lastRegisteredIdentity: "build-1", agentIdentity: "build-2")
+
+        await model.reconcileDaemonAgentRegistration()
+
+        XCTAssertEqual(fake.daemonCalls, [],
+                       "a running job of ours is never unloaded, whatever the lock says — the lock is not the "
+                       + "thing that dies when launchd unloads the job")
+        XCTAssertEqual(store.lastRegisteredIdentity, "build-1",
+                       "a deferral is not a repair — the next launch retries")
     }
 
     // MARK: - The identity the detector compares (issue #788)
@@ -619,6 +784,7 @@ final class LoginItemModelTests: XCTestCase {
         daemonAgentStatus: LoginItemStatus = .enabled,
         cliManagedAgentPresent: Bool = false,
         daemonLockHeld: Bool = false,
+        daemonAgentRunState: DaemonAgentRunState = .notRunning,
         lastRegisteredIdentity: String? = nil,
         agentIdentity: String = "build-1",
         daemonComesUpOnRegister: Bool = true
@@ -627,7 +793,8 @@ final class LoginItemModelTests: XCTestCase {
             appStatus: appStatus,
             daemonAgentStatus: daemonAgentStatus,
             cliManagedAgentPresent: cliManagedAgentPresent,
-            daemonLockHeld: daemonLockHeld)
+            daemonLockHeld: daemonLockHeld,
+            daemonAgentRunState: daemonAgentRunState)
         fake.daemonComesUpOnRegister = daemonComesUpOnRegister
 
         let store = ephemeralRegistrationStore()
@@ -701,26 +868,64 @@ private final class FakeLoginItemService: LoginItemService {
     var daemonAgentStatus: LoginItemStatus
     var cliManagedAgentPresent: Bool
 
-    /// Whether a daemon holds the single-instance lock. A COMPUTED probe rather than a plain stored flag, so a
-    /// test can stage the check-then-act window issue #788's re-probe narrows: with `takeLockOnNextProbe` set,
-    /// the first read reports the lock FREE and every read after reports it HELD — exactly how a `RunAtLoad`
-    /// spawn arriving between two probes looks to the app. Reading it is therefore NOT side-effect-free while
-    /// armed; that one-shot transition is the whole point.
+    /// Whether a daemon holds the single-instance lock — and how many times that was ASKED.
+    ///
+    /// The count is the only instrument that can tell the foreign-holder repair path from the lock-polling
+    /// one (issue #819), because the two land on the SAME `startPhase`: with another daemon holding the lock,
+    /// `daemonBecameLive()` returns true on its first read, so `.idle` results either way. The difference is
+    /// whether the liveness wait was ENTERED AT ALL — i.e. whether the model asked a question whose answer it
+    /// could not attribute. Same reasoning as `daemonCalls` recording ORDER: the thing that distinguishes
+    /// right from wrong here is not the end state, so the end state cannot be the assertion.
     var daemonLockHeld: Bool {
         get {
-            guard takeLockOnNextProbe else { return lockHeldStorage }
-            // The spawn lands between this probe and the next: report free, then hold from here on.
-            takeLockOnNextProbe = false
-            lockHeldStorage = true
-            return false
+            lockProbeCount += 1
+            return lockHeldStorage
         }
         set { lockHeldStorage = newValue }
     }
 
-    /// Arms the one-shot spawn-mid-window race `daemonLockHeld` describes; disarms itself on the next read.
-    var takeLockOnNextProbe = false
+    /// How many times `daemonLockHeld` has been read. See its doc comment for why this exists.
+    ///
+    /// A TEST reading the property counts too: this and `runStateProbeCount` tally EVERY access, including
+    /// one made from an `XCTAssert`. So assert a count BEFORE reading the property it counts, or the
+    /// assertion perturbs its own instrument. Unlike `daemonCalls`, these are not inert to observation.
+    private(set) var lockProbeCount = 0
+
+    /// What launchd reports about OUR agent's job (issue #819). A COMPUTED probe rather than a plain stored
+    /// value, so a test can stage the check-then-act window the reconcile's re-probe narrows: with
+    /// `agentSpawnsOnNextProbe` set, the FIRST read reports the job not running and every read after reports
+    /// it running — and the same transition takes the lock, because one `RunAtLoad` spawn does both. That is
+    /// exactly how our agent coming up between two probes looks to the app. Reading it is therefore NOT
+    /// side-effect-free while armed; that one-shot transition is the whole point.
+    ///
+    /// It is the RUN STATE that carries the one-shot, not the lock (which it did before issue #819), because
+    /// the run state is what the gate now branches on — arming the lock alone would stage a race the gate no
+    /// longer reacts to, and the test would pass without exercising anything.
+    var daemonAgentRunState: DaemonAgentRunState {
+        get {
+            runStateProbeCount += 1
+            guard agentSpawnsOnNextProbe else { return runStateStorage }
+            // The spawn lands between this probe and the next: report the pre-spawn state, then hold the
+            // post-spawn one — running, and holding the lock it just took.
+            agentSpawnsOnNextProbe = false
+            let before = runStateStorage
+            runStateStorage = .running
+            lockHeldStorage = true
+            return before
+        }
+        set { runStateStorage = newValue }
+    }
+
+    /// Arms the one-shot spawn-mid-window race `daemonAgentRunState` describes; disarms itself on the next read.
+    var agentSpawnsOnNextProbe = false
+
+    /// How many times `daemonAgentRunState` has been read. The instrument for gate PRECEDENCE: the two-owner
+    /// guard's invariant is that no other signal is consulted BEFORE it, and "the repair did nothing" is
+    /// satisfied by a demoted guard too. Zero reads is what says "not consulted at all".
+    private(set) var runStateProbeCount = 0
 
     private var lockHeldStorage: Bool
+    private var runStateStorage: DaemonAgentRunState
 
     /// The status `registerApp()` lands on when it does not throw (default `.enabled`; set `.requiresApproval`).
     var appRegisterResult: LoginItemStatus = .enabled
@@ -751,12 +956,14 @@ private final class FakeLoginItemService: LoginItemService {
         appStatus: LoginItemStatus,
         daemonAgentStatus: LoginItemStatus,
         cliManagedAgentPresent: Bool,
-        daemonLockHeld: Bool = false
+        daemonLockHeld: Bool = false,
+        daemonAgentRunState: DaemonAgentRunState = .notRunning
     ) {
         self.appStatus = appStatus
         self.daemonAgentStatus = daemonAgentStatus
         self.cliManagedAgentPresent = cliManagedAgentPresent
         self.lockHeldStorage = daemonLockHeld
+        self.runStateStorage = daemonAgentRunState
     }
 
     func registerApp() throws {
@@ -777,8 +984,18 @@ private final class FakeLoginItemService: LoginItemService {
         if let daemonRegisterError { throw daemonRegisterError }
         daemonAgentStatus = daemonRegisterResult
         // Simulate the plist's `RunAtLoad`: a register that "takes" brings the daemon up, which then holds the
-        // single-instance lock. When false, the daemon never appears — the #745 silent-start failure mode.
-        if daemonComesUpOnRegister { daemonLockHeld = true }
+        // single-instance lock and makes our job running. When false, the daemon never appears — the #745
+        // silent-start failure mode.
+        //
+        // The `lockHeldStorage` guard models the stand-down (issue #742 / #819): if ANOTHER daemon already
+        // holds the single-instance lock, our freshly-spawned one exits 0 rather than fighting for it, and
+        // the conditional KeepAlive does not restart it — so the job ends up NOT running and the lock stays
+        // that other daemon's. Without the guard the fake could reach a state the product cannot (two live
+        // daemons, one lock), and a test staged on it would prove nothing.
+        if daemonComesUpOnRegister && !lockHeldStorage {
+            lockHeldStorage = true
+            runStateStorage = .running
+        }
     }
 
     func unregisterDaemonAgent() throws {
@@ -786,9 +1003,15 @@ private final class FakeLoginItemService: LoginItemService {
         daemonCalls.append(.unregister)
         if let daemonUnregisterError { throw daemonUnregisterError }
         daemonAgentStatus = .notRegistered
-        // Unloading the launchd job stops whatever daemon that registration was running, so the
-        // single-instance lock it held is released.
-        daemonLockHeld = false
+        // Unloading the launchd job stops the daemon THAT JOB was running — and only that one. If our job was
+        // not running, whatever holds the lock is somebody else's process and unloading ours does not touch it
+        // (issue #819). Modelling that faithfully is what lets a test tell the foreign-holder path apart from
+        // the old any-provenance one: a fake that cleared the lock unconditionally would show a foreign daemon
+        // being killed by our unregister, which is precisely what does NOT happen.
+        if runStateStorage == .running {
+            runStateStorage = .notRunning
+            lockHeldStorage = false
+        }
     }
 
     func openLoginItemsSettings() { openSettingsCount += 1 }

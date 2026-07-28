@@ -84,6 +84,12 @@ targets:
       # headless bundle and `DaemonLockProbeTests` exercises absent/held/freed against a temp file,
       # exactly like the Rust seam test.
       - path: Sources/DaemonLockProbe.swift
+      # Launchd run-state probe (#819): the provenance-BEARING sibling of DaemonLockProbe above. Its
+      # `classify` is pure over (exit status, output) and carries the whole decision, so `LaunchdJobProbeTests`
+      # drives it against captured real `launchctl print` output — the nested `state = active` decoys and the
+      # `not running`/`running` substring trap included — with no subprocess spawned in the suite. Foundation
+      # + os only, like its sibling, so it compiles into this headless bundle.
+      - path: Sources/LaunchdJobProbe.swift
       - path: Sources/WatchConnection.swift
       - path: Sources/WatchTransport.swift
       # Control-command transport (#358): the short-lived client→daemon write path + its redacted-ack
