@@ -9847,4 +9847,374 @@ spare  22222222-2222\n\
             );
         }
     }
+
+    // --- issue #767: FULL-OUTPUT goldens for the `status` human render ----------------
+    //
+    // Every `render_status` assertion above this line is either a substring check or an
+    // exact-match over a deliberately tiny roster. Neither sees the whole render of a
+    // REALISTIC roster, so a corruption outside the asserted fragment — a misaligned column,
+    // a dropped row, a duplicated footer, a reordered pair — passes them green. These pin the
+    // entire output, byte for byte, across the axes `status` actually degrades on: terminal
+    // WIDTH (piped / wide / narrow / very narrow), the COLOUR gate, and a degenerate roster
+    // (empty / single / all-`n/a`). The ASCII axis is deliberately absent: `status` has no
+    // glyph ramp to fall back to (that is `stats`' chart surface, goldened in `stats.rs`).
+    //
+    // The clock is PINNED (`GOLDEN_NOW`) so every `humanize_until` cell — `12m`, `2h`, `5d` —
+    // is deterministic; `render_status` takes `now` as a parameter, so no ambient clock
+    // reaches this render.
+    mod goldens {
+        use super::*;
+        use crate::render_golden::{self, Case};
+
+        /// The pinned render instant. Every reset in [`golden_roster`] is an offset from THIS and
+        /// `render_status` is handed the same value, so the humanized cells (`12m`, `2h`, `5d`)
+        /// are fixed bytes and the constant's own value never reaches the render. Kept separate
+        /// from the `NOW` above because that one serves the issue #72 `resets in` tests and is
+        /// theirs to move; these goldens should not be reading a constant whose contract belongs
+        /// to somebody else.
+        const GOLDEN_NOW: i64 = 1_785_000_000;
+
+        /// An all-quiet roster row: enabled, in no fault state, with no readings and no known
+        /// resets. Every fixture row below is written as its DELTA from this via struct-update
+        /// syntax, so a call site states exactly what it varies — `quiet("unseen")` says "nothing
+        /// was ever read for this account" far more legibly than ten positional arguments whose
+        /// meanings are invisible at the call site. Spelling the base out field by field here
+        /// keeps the complete, auditable input a golden fixture wants.
+        ///
+        /// A local builder rather than the `status_line_resets` helper above, because the goldens
+        /// vary fields that helper fixes (`active`, `enabled`, `quarantined`, `health`).
+        fn quiet(label: &str) -> AccountStatusLine {
+            AccountStatusLine {
+                label: label.to_owned(),
+                active: false,
+                enabled: true,
+                quarantined: false,
+                recovering: false,
+                session_pct: None,
+                weekly_pct: None,
+                session_resets_at: None,
+                weekly_resets_at: None,
+                weekly_exhausted: false,
+                access_expires_at: None,
+                refresh_health: None,
+                health: None,
+                blind_active: None,
+            }
+        }
+
+        /// A `StatusResponse` carrying `accounts` and a next-swap target, with every fault
+        /// field quiet. The fault band (keychain-locked, canonical scrub, canary, landing
+        /// overshoot, systemic refresh) is OUT of this item's stated matrix and stays
+        /// un-goldened here; issue #767's axes are width × colour × degenerate roster.
+        fn response(
+            accounts: Vec<AccountStatusLine>,
+            next_swap: Option<NextSwap>,
+        ) -> StatusResponse {
+            StatusResponse {
+                systemic_refresh_failure: None,
+                canonical_scrub: None,
+                keychain_locked: false,
+                canary: None,
+                recent_blind_preempt_swap: None,
+                recent_landing_overshoot: None,
+                refresh_enabled: None,
+                accounts,
+                next_swap,
+            }
+        }
+
+        /// The canonical multi-account fixture. Deliberately heterogeneous, because a golden
+        /// over a uniform roster proves very little:
+        ///
+        /// - `work` is the ACTIVE account, near its session trigger, with both resets known;
+        /// - `世界` carries a WIDE-GLYPH label, so the goldens pin display-width padding
+        ///   (UAX #11, issue #176) — the alignment bug class a `contains()` check cannot see;
+        /// - `parked` is DISABLED and `stale` is QUARANTINED-and-recovering, so the optional
+        ///   `AUTH` column is present with two different tag shapes;
+        /// - `unseen` has NO readings at all, pinning that a failed poll renders `n/a` rather
+        ///   than a fabricated `0%`.
+        fn golden_roster() -> Vec<AccountStatusLine> {
+            vec![
+                AccountStatusLine {
+                    active: true,
+                    session_pct: Some(97),
+                    weekly_pct: Some(40),
+                    session_resets_at: Some(GOLDEN_NOW + 12 * 60),
+                    weekly_resets_at: Some(GOLDEN_NOW + 5 * 86_400),
+                    health: Some(CredentialHealth::Healthy),
+                    ..quiet("work")
+                },
+                AccountStatusLine {
+                    session_pct: Some(10),
+                    weekly_pct: Some(20),
+                    session_resets_at: Some(GOLDEN_NOW + 2 * 3_600),
+                    weekly_resets_at: Some(GOLDEN_NOW + 3 * 86_400 + 4 * 3_600),
+                    health: Some(CredentialHealth::Healthy),
+                    ..quiet("世界")
+                },
+                AccountStatusLine {
+                    enabled: false,
+                    session_pct: Some(5),
+                    weekly_pct: Some(8),
+                    session_resets_at: Some(GOLDEN_NOW + 45 * 60),
+                    weekly_resets_at: Some(GOLDEN_NOW + 86_400),
+                    health: Some(CredentialHealth::Stale),
+                    ..quiet("parked")
+                },
+                AccountStatusLine {
+                    quarantined: true,
+                    recovering: true,
+                    session_pct: Some(60),
+                    weekly_pct: Some(55),
+                    session_resets_at: Some(GOLDEN_NOW + 3_600),
+                    weekly_resets_at: Some(GOLDEN_NOW + 2 * 86_400),
+                    health: Some(CredentialHealth::Degraded),
+                    ..quiet("stale")
+                },
+                // Never polled — no readings at all, so every cell must render `n/a`.
+                quiet("unseen"),
+            ]
+        }
+
+        /// The next-swap footer target used by every non-degenerate case.
+        fn to_spare() -> Option<NextSwap> {
+            Some(NextSwap::Target {
+                to: "世界".to_owned(),
+                reason: Some(crate::daemon::NextSwapReason::OnlyCandidate),
+            })
+        }
+
+        /// Every goldened `status` case, freshly rendered. The single source of truth for the
+        /// case list: the comparison, the canary, and the emitter all consume THIS, so a case
+        /// can never be asserted in one and skipped in another.
+        fn cases() -> Vec<Case> {
+            let full = response(golden_roster(), to_spare());
+            vec![
+                // Piped / not a TTY: `cols` is `None`, so no column ever drops.
+                Case::new(
+                    "status-piped",
+                    render_status(&full, GOLDEN_NOW, None, false),
+                ),
+                // A wide TTY: the full column set fits, uncoloured and coloured.
+                Case::new(
+                    "status-wide-plain",
+                    render_status(&full, GOLDEN_NOW, Some(WIDE_COLS), false),
+                ),
+                Case::new(
+                    "status-wide-color",
+                    render_status(&full, GOLDEN_NOW, Some(WIDE_COLS), true),
+                ),
+                // Narrow: the lowest-priority droppable columns shed. The WEEKLY pair leaves
+                // ATOMICALLY — never a `%` stranded without its reset.
+                Case::new(
+                    "status-narrow",
+                    render_status(&full, GOLDEN_NOW, Some(NARROW_COLS), false),
+                ),
+                // Very narrow: only the keep-columns remain and they OVERFLOW rather than
+                // wrap — one record per line is the invariant, at any width.
+                Case::new(
+                    "status-very-narrow",
+                    render_status(&full, GOLDEN_NOW, Some(VERY_NARROW_COLS), false),
+                ),
+                // Degenerate rosters.
+                Case::new(
+                    "status-empty-roster",
+                    render_status(
+                        &response(Vec::new(), None),
+                        GOLDEN_NOW,
+                        Some(WIDE_COLS),
+                        false,
+                    ),
+                ),
+                Case::new(
+                    "status-single-account",
+                    render_status(
+                        &response(golden_roster().into_iter().take(1).collect(), to_spare()),
+                        GOLDEN_NOW,
+                        Some(WIDE_COLS),
+                        false,
+                    ),
+                ),
+                Case::new(
+                    "status-all-na",
+                    render_status(
+                        &response(
+                            vec![
+                                AccountStatusLine {
+                                    active: true,
+                                    ..quiet("work")
+                                },
+                                quiet("世界"),
+                            ],
+                            None,
+                        ),
+                        GOLDEN_NOW,
+                        Some(WIDE_COLS),
+                        false,
+                    ),
+                ),
+            ]
+        }
+
+        /// Comfortably wider than the full table — nothing drops.
+        const WIDE_COLS: usize = 200;
+        /// Narrow enough to shed the lowest-priority columns, wide enough to keep some.
+        const NARROW_COLS: usize = 40;
+        /// Narrower than the `ACCOUNT · SESSION% · RESET` floor itself.
+        const VERY_NARROW_COLS: usize = 12;
+
+        /// The committed goldens, named by case. The macro derives each path from the name, so
+        /// an entry cannot pair a case with someone else's bytes, and `include_str!` keeps every
+        /// file a COMPILE-TIME input — a missing golden is a build error rather than a test that
+        /// quietly skips, the same property the crate's wire goldens rely on
+        /// (`src/stats.rs`, `src/daemon/snapshot_build.rs`).
+        const GOLDENS: &[(&str, &str)] = render_golden::cli_render_goldens![
+            "status-piped",
+            "status-wide-plain",
+            "status-wide-color",
+            "status-narrow",
+            "status-very-narrow",
+            "status-empty-roster",
+            "status-single-account",
+            "status-all-na",
+        ];
+
+        /// One-time emitter for the committed `status` render goldens (issue #767).
+        /// `#[ignore]` — NOT part of the suite; it WRITES the bytes the gate below compares
+        /// against. Run it ONLY alongside a DELIBERATE change to the `status` render:
+        ///   `cargo test -- --ignored emit_cli_render_goldens`
+        /// then look at the regenerated files and record why in a `CLI-Goldens-Rebaselined:`
+        /// commit trailer (CI requires it — `scripts/check-cli-golden-rebaseline.sh`).
+        #[test]
+        #[ignore = "one-time cli-render-golden emitter — run ONLY alongside a deliberate render change"]
+        fn emit_cli_render_goldens_status() {
+            render_golden::emit(&cases());
+        }
+
+        #[test]
+        fn the_committed_status_goldens_still_match_the_render() {
+            render_golden::assert_matches_goldens("status", &cases(), GOLDENS);
+        }
+
+        /// CONSTRAINT-A: the gate can FAIL, demonstrated by MUTATION through the SAME
+        /// predicate the assertion above uses — not by inspection.
+        #[test]
+        fn the_status_golden_gate_rejects_a_corrupted_render() {
+            render_golden::assert_canary("status", &cases(), &[]);
+        }
+
+        /// The input-side half of the canary: a roster whose readings actually changed must
+        /// not match the unperturbed golden. Mutating rendered bytes proves the comparison is
+        /// byte-exact; this proves it is sensitive to the data flowing THROUGH the renderer,
+        /// which is the shape a real regression takes.
+        #[test]
+        fn a_perturbed_roster_does_not_match_the_status_golden() {
+            let mut perturbed = golden_roster();
+            perturbed[0].session_pct = Some(96); // was 97
+            render_golden::assert_perturbed_input_is_rejected(
+                "status",
+                "status-wide-plain",
+                &render_status(
+                    &response(golden_roster(), to_spare()),
+                    GOLDEN_NOW,
+                    Some(WIDE_COLS),
+                    false,
+                ),
+                &render_status(
+                    &response(perturbed, to_spare()),
+                    GOLDEN_NOW,
+                    Some(WIDE_COLS),
+                    false,
+                ),
+            );
+        }
+
+        /// The matrix cells must actually DIFFER along the axis they claim to exercise.
+        ///
+        /// Without this a badly-chosen width silently renders `status-narrow` identically to
+        /// `status-wide-plain`, and the "narrow" golden — green forever — asserts nothing
+        /// about degradation. Stated as properties of the render rather than as pinned bytes,
+        /// so it stays true across a re-baseline.
+        #[test]
+        fn each_width_case_exercises_the_degradation_it_claims() {
+            let full = response(golden_roster(), to_spare());
+            let header = |cols: Option<usize>| {
+                render_status(&full, GOLDEN_NOW, cols, false)
+                    .lines()
+                    .next()
+                    .expect("the table has a header row")
+                    .split_whitespace()
+                    .count()
+            };
+            let (wide, narrow, very_narrow) = (
+                header(Some(WIDE_COLS)),
+                header(Some(NARROW_COLS)),
+                header(Some(VERY_NARROW_COLS)),
+            );
+            assert!(
+                narrow < wide,
+                "NARROW_COLS={NARROW_COLS} dropped no column (headers {narrow} vs {wide}) — the \
+                 `status-narrow` golden is a duplicate of the wide one and proves nothing"
+            );
+            assert!(
+                very_narrow < narrow,
+                "VERY_NARROW_COLS={VERY_NARROW_COLS} shed nothing beyond NARROW_COLS (headers \
+                 {very_narrow} vs {narrow})"
+            );
+
+            // The PIPED cell is the one width case that is identical to `status-wide-plain` BY
+            // DESIGN: `fit_columns` never enters its drop loop for `cols: None`, which is
+            // exactly what a comfortably-wide terminal also produces. Recorded here rather
+            // than left implicit, because "two goldens are byte-identical" is otherwise
+            // indistinguishable from the accident this whole test exists to catch — and
+            // because the equality is the CONTRACT (a redirected `status` must not silently
+            // start degrading to some assumed 80 columns). If a change ever makes piped and
+            // wide diverge, this goes red and forces that to be a decision.
+            assert_eq!(
+                render_status(&full, GOLDEN_NOW, None, false),
+                render_status(&full, GOLDEN_NOW, Some(WIDE_COLS), false),
+                "the piped render diverged from the wide one — a non-TTY `status` is dropping \
+                 columns, which means some width is being assumed where none is known"
+            );
+
+            // …and the floor OVERFLOWS rather than wrapping: one record per line at any width.
+            let text = render_status(&full, GOLDEN_NOW, Some(VERY_NARROW_COLS), false);
+            let table: Vec<&str> = text.lines().take_while(|l| !l.is_empty()).collect();
+            assert_eq!(
+                table.len(),
+                golden_roster().len() + 1,
+                "the very-narrow table wrapped: {} lines for {} accounts + a header",
+                table.len(),
+                golden_roster().len()
+            );
+            assert!(
+                table.iter().any(|l| display_width(l) > VERY_NARROW_COLS),
+                "nothing overflowed {VERY_NARROW_COLS} columns, so this case does not pin the \
+                 overflow-rather-than-wrap invariant"
+            );
+        }
+
+        /// Colour AUGMENTS: stripping every SGR escape from the coloured render must yield the
+        /// uncoloured one, byte for byte. That is only true if padding is computed on display
+        /// width BEFORE the colour wrap — an escape counted into a column width would leave
+        /// the two rows differently padded. The one property most likely to break silently,
+        /// and the reason `status-wide-color` is in the matrix at all.
+        #[test]
+        fn the_colour_overlay_never_enters_the_column_width_math() {
+            let all = cases();
+            let find = |name: &str| render_golden::rendered(&all, name);
+            let coloured = find("status-wide-color");
+            assert!(
+                coloured.contains('\x1b'),
+                "the coloured case carries no SGR escape, so it is not exercising the colour gate"
+            );
+            assert_eq!(
+                render_golden::strip_ansi(coloured)
+                    .expect("the coloured render has escapes to strip"),
+                *find("status-wide-plain"),
+                "the coloured render does not reduce to the plain one — colour is changing the \
+                 layout, not augmenting it (pad-before-colour is broken)"
+            );
+        }
+    }
 }

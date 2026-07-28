@@ -1,0 +1,5 @@
+ACCOUNT  SESSION% RESET  WEEKLY% RESET
+* work   n/a      n/a    n/a     n/a
+  世界   n/a      n/a    n/a     n/a
+
+next swap: none

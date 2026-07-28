@@ -1,0 +1,21 @@
+usage — last 24h (Jun 30–Jul 1)
+
+account  signal  session  weekly  trend
+alpha    —           0/0      0%
+beta     —           0/0      0%
+delta    —           0/0      0%
+ガンマ   —           0/0      0%
+
+contribution share
+alpha   ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░    0%
+beta    ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░    0%
+delta   ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░    0%
+ガンマ  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░    0%
+
+session distribution — mean · p95 · peak
+alpha   ┤x───────────────────────────────────────├  0% · 0% · 0%
+beta    ┤x───────────────────────────────────────├  0% · 0% · 0%
+delta   ┤x───────────────────────────────────────├  0% · 0% · 0%
+ガンマ  ┤x───────────────────────────────────────├  0% · 0% · 0%
+
+roster: 4 swaps (2 session, 1 weekly, 1 manual, 0 forced, 0 emergency) · all-accounts-high: 0 episodes (0s)

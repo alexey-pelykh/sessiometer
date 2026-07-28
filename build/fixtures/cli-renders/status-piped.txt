@@ -1,0 +1,8 @@
+ACCOUNT   SESSION% RESET  WEEKLY% RESET  AUTH
+* work    97%      12m    40%     5d     🟢
+  世界    10%      2h     20%     3d4h   🟢
+  parked  5%       45m    8%      1d     🟡 disabled
+  stale   60%      1h     55%     2d     🟠 recovering
+  unseen  n/a      n/a    n/a     n/a
+
+next swap: 世界 (only viable target)

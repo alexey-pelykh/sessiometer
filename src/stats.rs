@@ -6134,4 +6134,747 @@ mod tests {
              (apps/menubar/Tests/Fixtures.swift) so its fixture stays byte-identical"
         );
     }
+
+    // --- issue #767: FULL-OUTPUT goldens for the `stats` human render ----------------
+    //
+    // The chart tests above assert PROPERTIES (a gap is a break, a label column aligns, a
+    // narrow terminal sheds `trend` before `weekly`). Valuable, and structurally unable to see
+    // the render as a whole: none would notice a duplicated block, a dropped section, or the
+    // two chart blocks swapping places. These pin the ENTIRE output, byte for byte, across
+    // every axis `stats` degrades on — terminal WIDTH (piped / wide / narrow / very narrow),
+    // the ASCII glyph ramp vs the Unicode blocks, the COLOUR gate, and a degenerate roster
+    // (empty / single / sparse).
+    //
+    // Determinism: `render_human` is pure over `(Report, TermEnv)` and the fixture's `window`
+    // is a pair of FIXED epochs at `offset: 0`, so no wall clock reaches the render — the
+    // `stats` surface has no `humanize_until`-style relative cell to pin a clock for (that is
+    // `status`, whose goldens pin `GOLDEN_NOW` in `src/cli.rs`).
+    //
+    // PROVISIONAL BYTES — read before re-baselining. The `signal` column's class words
+    // (`underused` / `balanced` / `saturated`) come from `SignalBand::label`, which is marked
+    // PROVISIONAL pending a brand/framing review (issue #160), and the roster line's
+    // `all-accounts-high: 0 episodes` is the reading issue #804 is open to change to the gap
+    // sentinel `—`. Both are goldened deliberately: this issue pins CURRENT behaviour, and a
+    // re-baseline is precisely the designed response when either lands. Neither is a settled
+    // decision that these files should be read as ratifying.
+    mod goldens {
+        use super::*;
+        use crate::render_golden::{self, Case};
+
+        /// Comfortably wider than the full chart table — nothing priority-drops.
+        const WIDE_COLS: usize = 120;
+        /// Narrow enough to shed the lowest-priority columns, wide enough to keep some.
+        const NARROW_COLS: usize = 52;
+        /// Narrower than the `account · signal · session` floor itself.
+        const VERY_NARROW_COLS: usize = 16;
+
+        /// One account row, spelled out field by field — a golden fixture should read as its
+        /// own complete, auditable input rather than lean on the chart helpers' defaults.
+        fn acct(
+            seen: u32,
+            coverage: f64,
+            session: crate::usage_stats::DimStats,
+            weekly: crate::usage_stats::DimStats,
+            cap_hits: u32,
+            time_at_cap_secs: i64,
+            share: f64,
+        ) -> AccountStats {
+            AccountStats {
+                seen,
+                expected: 12.0,
+                coverage,
+                session,
+                weekly,
+                cap_hits,
+                time_at_cap_secs,
+                contribution_share: share,
+            }
+        }
+
+        /// A velocity overlay entry. Values are supplied ALREADY DERIVED (a rate and a
+        /// runway in seconds), so no `session_ceiling` is pinned by these goldens — the
+        /// config-derived ceiling never enters the rendered bytes. That is deliberate: the
+        /// ceiling is a tunable each surface states for itself, and a golden that froze the
+        /// default 95 would quietly turn a tunable into a constant.
+        fn vel(
+            session_rate: Option<f64>,
+            weekly_rate: Option<f64>,
+            session_runway_secs: Option<i64>,
+            weekly_runway_secs: Option<i64>,
+            weekly_headroom: Option<f64>,
+        ) -> AccountVelocity {
+            AccountVelocity {
+                session_rate,
+                weekly_rate,
+                session_runway_secs,
+                weekly_runway_secs,
+                weekly_headroom,
+            }
+        }
+
+        /// The canonical multi-account fixture. Deliberately heterogeneous — a golden over a
+        /// uniform roster proves very little:
+        ///
+        /// - `alpha` is SATURATED (session peak 0.99), fully covered, with cap hits and a
+        ///   known velocity + runway;
+        /// - `beta` is BALANCED and only partially covered, with a known-but-flat weekly rate
+        ///   (so it contributes head-room to the fleet aggregate with zero burn);
+        /// - `ガンマ` carries a WIDE-GLYPH label and is UNDERUSED, so the goldens pin
+        ///   display-width padding (UAX #11, issue #176) across every block;
+        /// - `delta` has `seen == 0` — never observed — so its `signal`, `velocity` and
+        ///   `runway` cells must render the gap sentinel `—` and NOT a fabricated `0`.
+        ///
+        /// The series carries interior GAPS (a bucket where an account has no reading), so the
+        /// `trend` sparkline shows breaks rather than fabricated zeroes, and one ORPHAN handle
+        /// exercises the #314 "not in roster" section.
+        fn golden_report() -> Report {
+            let d = |mean, peak, p95| crate::usage_stats::DimStats { mean, peak, p95 };
+            let summary = [
+                (
+                    "alpha",
+                    acct(
+                        12,
+                        1.0,
+                        d(0.62, 0.99, 0.94),
+                        d(0.40, 0.48, 0.46),
+                        3,
+                        900,
+                        0.55,
+                    ),
+                ),
+                (
+                    "beta",
+                    acct(
+                        7,
+                        0.58,
+                        d(0.44, 0.66, 0.61),
+                        d(0.20, 0.24, 0.23),
+                        0,
+                        0,
+                        0.30,
+                    ),
+                ),
+                (
+                    "ガンマ",
+                    acct(
+                        9,
+                        0.75,
+                        d(0.08, 0.17, 0.15),
+                        d(0.03, 0.05, 0.04),
+                        0,
+                        0,
+                        0.15,
+                    ),
+                ),
+                (
+                    "delta",
+                    acct(0, 0.0, d(0.0, 0.0, 0.0), d(0.0, 0.0, 0.0), 0, 0, 0.0),
+                ),
+            ];
+            // Four hourly buckets. `beta` is absent from bucket 1 and `ガンマ` from bucket 2,
+            // so two sparklines carry an INTERIOR break — the gap-is-not-zero invariant.
+            let bucket = |accts: &[(&str, AccountStats)], start: i64| UsageReport {
+                period: Period::new(start, start + HOUR_SECS),
+                per_account: accts.iter().map(|(h, a)| ((*h).to_owned(), *a)).collect(),
+                roster: RosterStats::default(),
+            };
+            let point = |mean: f64, peak: f64| {
+                acct(1, 1.0, d(mean, peak, peak), d(0.0, 0.0, 0.0), 0, 0, 0.0)
+            };
+            Report {
+                window: Window {
+                    start: epoch("2026-06-30T12:00:00Z"),
+                    end: epoch("2026-07-01T12:00:00Z"),
+                    kind: WindowKind::Period(PeriodSpec::Day),
+                },
+                accounts: vec![],
+                summary: UsageReport {
+                    period: Period::new(
+                        epoch("2026-06-30T12:00:00Z"),
+                        epoch("2026-07-01T12:00:00Z"),
+                    ),
+                    per_account: summary.iter().map(|(h, a)| ((*h).to_owned(), *a)).collect(),
+                    roster: RosterStats {
+                        swap_count: 4,
+                        swaps: crate::usage_stats::SwapBreakdown {
+                            session: 2,
+                            weekly: 1,
+                            manual: 1,
+                            forced: 0,
+                            emergency: 0,
+                        },
+                        all_high_episodes: 0,
+                        all_high_secs: 0,
+                    },
+                },
+                series: vec![
+                    bucket(
+                        &[
+                            ("alpha", point(0.20, 0.28)),
+                            ("beta", point(0.30, 0.35)),
+                            ("ガンマ", point(0.05, 0.09)),
+                        ],
+                        0,
+                    ),
+                    bucket(
+                        &[("alpha", point(0.55, 0.70)), ("ガンマ", point(0.10, 0.14))],
+                        HOUR_SECS,
+                    ), // beta: GAP
+                    bucket(
+                        &[("alpha", point(0.80, 0.92)), ("beta", point(0.50, 0.58))],
+                        2 * HOUR_SECS,
+                    ), // ガンマ: GAP
+                    bucket(
+                        &[
+                            ("alpha", point(0.90, 0.99)),
+                            ("beta", point(0.60, 0.66)),
+                            ("ガンマ", point(0.12, 0.17)),
+                        ],
+                        3 * HOUR_SECS,
+                    ),
+                ],
+                offset: 0,
+                orphans: [(
+                    "retired".to_owned(),
+                    acct(4, 0.33, d(0.11, 0.19, 0.18), d(0.02, 0.03, 0.03), 0, 0, 0.0),
+                )]
+                .into_iter()
+                .collect(),
+                velocity: [
+                    // A climbing account: both rates known, both runways finite.
+                    (
+                        "alpha".to_owned(),
+                        vel(
+                            Some(0.000_15),
+                            Some(0.000_004),
+                            Some(2 * 3_600),
+                            Some(4 * 86_400),
+                            Some(0.47),
+                        ),
+                    ),
+                    // A KNOWN-flat weekly dimension: `0` burn is a reading, so it contributes
+                    // head-room to the fleet aggregate but has no per-account weekly runway.
+                    (
+                        "beta".to_owned(),
+                        vel(Some(0.000_05), Some(0.0), Some(9 * 3_600), None, Some(0.71)),
+                    ),
+                    // Unknown session rate → the `velocity` / `runway` cells degrade to `—`
+                    // for this row while remaining populated for the others, so the goldens
+                    // pin per-cell degradation as well as the whole-column elision below.
+                    ("ガンマ".to_owned(), vel(None, None, None, None, None)),
+                ]
+                .into_iter()
+                .collect(),
+            }
+        }
+
+        /// The same roster with the velocity overlay ABSENT — a "sparse fleet". Every
+        /// `velocity` and `runway` cell is then uniformly `—`, which fires the EMPTY-COLUMN
+        /// ELISION pre-pass: both columns are dropped entirely rather than rendered as a wall
+        /// of sentinels (design-stats.md §D-STA-5). This is the axis the populated fixture
+        /// above cannot exercise.
+        fn report_without_velocity() -> Report {
+            Report {
+                velocity: BTreeMap::new(),
+                ..golden_report()
+            }
+        }
+
+        /// A report with no per-account usage at all — the degenerate roster.
+        fn empty_report() -> Report {
+            let base = golden_report();
+            Report {
+                summary: UsageReport {
+                    period: base.summary.period,
+                    per_account: BTreeMap::new(),
+                    roster: base.summary.roster,
+                },
+                series: Vec::new(),
+                orphans: BTreeMap::new(),
+                velocity: BTreeMap::new(),
+                ..base
+            }
+        }
+
+        /// A single-account report — the other degenerate shape, where every chart has exactly
+        /// one row and the fleet aggregate has a cardinality of one.
+        fn single_report() -> Report {
+            let base = golden_report();
+            let keep = |m: &BTreeMap<String, AccountStats>| {
+                m.iter()
+                    .filter(|(h, _)| h.as_str() == "alpha")
+                    .map(|(h, a)| (h.clone(), *a))
+                    .collect::<BTreeMap<_, _>>()
+            };
+            Report {
+                summary: UsageReport {
+                    period: base.summary.period,
+                    per_account: keep(&base.summary.per_account),
+                    roster: base.summary.roster,
+                },
+                series: base
+                    .series
+                    .iter()
+                    .map(|b| UsageReport {
+                        period: b.period,
+                        per_account: keep(&b.per_account),
+                        roster: b.roster,
+                    })
+                    .collect(),
+                orphans: BTreeMap::new(),
+                velocity: base
+                    .velocity
+                    .iter()
+                    .filter(|(h, _)| h.as_str() == "alpha")
+                    .map(|(h, v)| (h.clone(), *v))
+                    .collect(),
+                ..base
+            }
+        }
+
+        /// A roster where EVERY account was never observed (`seen == 0`) — the third degenerate
+        /// shape, and a distinct path from both `empty_report` (no accounts at all) and
+        /// `sparse_report` (accounts observed, velocity overlay absent).
+        ///
+        /// It is the case that separates the two elision rules: the empty-column pre-pass drops
+        /// only DROPPABLE columns, so `velocity` / `runway` vanish while the FLOOR column
+        /// `signal` stays and renders a full column of the gap sentinel `—`. A keep-column is
+        /// never elided even when every one of its cells is a gap — the roster is unmeasured,
+        /// not absent, and the render must say so rather than quietly narrowing to look tidy.
+        fn all_unobserved_report() -> Report {
+            let base = golden_report();
+            let unobserved = |m: &BTreeMap<String, AccountStats>| {
+                m.keys()
+                    .map(|handle| {
+                        (
+                            handle.clone(),
+                            AccountStats {
+                                seen: 0,
+                                expected: 12.0,
+                                coverage: 0.0,
+                                session: crate::usage_stats::DimStats {
+                                    mean: 0.0,
+                                    peak: 0.0,
+                                    p95: 0.0,
+                                },
+                                weekly: crate::usage_stats::DimStats {
+                                    mean: 0.0,
+                                    peak: 0.0,
+                                    p95: 0.0,
+                                },
+                                cap_hits: 0,
+                                time_at_cap_secs: 0,
+                                contribution_share: 0.0,
+                            },
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            };
+            Report {
+                summary: UsageReport {
+                    period: base.summary.period,
+                    per_account: unobserved(&base.summary.per_account),
+                    roster: base.summary.roster,
+                },
+                series: Vec::new(),
+                orphans: BTreeMap::new(),
+                velocity: BTreeMap::new(),
+                ..base
+            }
+        }
+
+        /// The terminal environments the matrix uses, named after the cases they produce so a
+        /// call site says WHICH axis it is on.
+        ///
+        /// Named consts rather than a positional `env(cols, color, ascii)` helper: the COLOUR and
+        /// ASCII cells are the two most important in the matrix and a positional form
+        /// distinguishes them only by an argument order the reader cannot see. The repo's habit
+        /// for `TermEnv` in tests is the named-field literal, as in
+        /// `non_tty_falls_back_to_the_numeric_table_with_zero_ansi` above.
+        const PIPED: TermEnv = TermEnv {
+            cols: None,
+            color: false,
+            ascii: false,
+        };
+        const WIDE_UNICODE_PLAIN: TermEnv = TermEnv {
+            cols: Some(WIDE_COLS),
+            color: false,
+            ascii: false,
+        };
+        const WIDE_UNICODE_COLOR: TermEnv = TermEnv {
+            cols: Some(WIDE_COLS),
+            color: true,
+            ascii: false,
+        };
+        const WIDE_ASCII: TermEnv = TermEnv {
+            cols: Some(WIDE_COLS),
+            color: false,
+            ascii: true,
+        };
+        const NARROW: TermEnv = TermEnv {
+            cols: Some(NARROW_COLS),
+            color: false,
+            ascii: false,
+        };
+        const VERY_NARROW: TermEnv = TermEnv {
+            cols: Some(VERY_NARROW_COLS),
+            color: false,
+            ascii: false,
+        };
+
+        /// Every goldened `stats` case, freshly rendered. The single source of truth for the
+        /// case list: the comparison, the canary, and the emitter all consume THIS.
+        fn cases() -> Vec<Case> {
+            let full = golden_report();
+            vec![
+                // Piped / not a TTY: `cols` is `None`, so `render_human` takes the
+                // `render_text` branch — the WIDER numeric column set, zero ANSI, no charts.
+                Case::new("stats-piped", render_human(&full, PIPED)),
+                // A wide TTY: the full chart surface, in each of the three glyph/colour modes.
+                Case::new(
+                    "stats-wide-unicode-plain",
+                    render_human(&full, WIDE_UNICODE_PLAIN),
+                ),
+                Case::new(
+                    "stats-wide-unicode-color",
+                    render_human(&full, WIDE_UNICODE_COLOR),
+                ),
+                Case::new("stats-wide-ascii", render_human(&full, WIDE_ASCII)),
+                // Narrow: the lowest-priority columns shed and the wide blocks shrink.
+                Case::new("stats-narrow", render_human(&full, NARROW)),
+                // Very narrow: only the floor remains, OVERFLOWING rather than wrapping.
+                Case::new("stats-very-narrow", render_human(&full, VERY_NARROW)),
+                // Sparse fleet: the empty-column elision self-drops `velocity` + `runway`.
+                Case::new(
+                    "stats-sparse-fleet",
+                    render_human(&report_without_velocity(), WIDE_UNICODE_PLAIN),
+                ),
+                // Degenerate rosters.
+                Case::new(
+                    "stats-empty-roster",
+                    render_human(&empty_report(), WIDE_UNICODE_PLAIN),
+                ),
+                Case::new(
+                    "stats-single-account",
+                    render_human(&single_report(), WIDE_UNICODE_PLAIN),
+                ),
+                Case::new(
+                    "stats-all-na",
+                    render_human(&all_unobserved_report(), WIDE_UNICODE_PLAIN),
+                ),
+            ]
+        }
+
+        /// The committed goldens, named by case. The macro derives each path from the name, so an
+        /// entry cannot pair a case with someone else's bytes, and `include_str!` keeps every
+        /// file a COMPILE-TIME input — a missing golden is a build error, not a silent skip.
+        const GOLDENS: &[(&str, &str)] = render_golden::cli_render_goldens![
+            "stats-piped",
+            "stats-wide-unicode-plain",
+            "stats-wide-unicode-color",
+            "stats-wide-ascii",
+            "stats-narrow",
+            "stats-very-narrow",
+            "stats-sparse-fleet",
+            "stats-empty-roster",
+            "stats-single-account",
+            "stats-all-na",
+        ];
+
+        /// One-time emitter for the committed `stats` render goldens (issue #767).
+        /// `#[ignore]` — NOT part of the suite. Run it ONLY alongside a DELIBERATE change to
+        /// the `stats` render:
+        ///   `cargo test -- --ignored emit_cli_render_goldens`
+        /// then look at the regenerated files and record why in a `CLI-Goldens-Rebaselined:`
+        /// commit trailer (CI requires it — `scripts/check-cli-golden-rebaseline.sh`).
+        #[test]
+        #[ignore = "one-time cli-render-golden emitter — run ONLY alongside a deliberate render change"]
+        fn emit_cli_render_goldens_stats() {
+            render_golden::emit(&cases());
+        }
+
+        #[test]
+        fn the_committed_stats_goldens_still_match_the_render() {
+            render_golden::assert_matches_goldens("stats", &cases(), GOLDENS);
+        }
+
+        /// CONSTRAINT-A: the gate can FAIL, demonstrated by MUTATION through the SAME
+        /// predicate the assertion above uses — not by inspection.
+        #[test]
+        fn the_stats_golden_gate_rejects_a_corrupted_render() {
+            render_golden::assert_canary("stats", &cases(), &[]);
+        }
+
+        /// The input-side half of the canary: a report whose readings actually changed must
+        /// not match the unperturbed golden.
+        #[test]
+        fn a_perturbed_report_does_not_match_the_stats_golden() {
+            let mut perturbed = golden_report();
+            perturbed
+                .summary
+                .per_account
+                .get_mut("alpha")
+                .expect("`alpha` is in the golden roster")
+                .session
+                .peak = 0.98; // was 0.99
+            render_golden::assert_perturbed_input_is_rejected(
+                "stats",
+                "stats-piped",
+                &render_human(&golden_report(), PIPED),
+                &render_human(&perturbed, PIPED),
+            );
+        }
+
+        /// The matrix cells must actually DIFFER along the axis they claim to exercise.
+        ///
+        /// Stated as properties of the render rather than pinned bytes, so it survives a
+        /// re-baseline — and it is what stops a badly-chosen width or an inert axis from
+        /// leaving a green golden that asserts nothing.
+        #[test]
+        fn each_stats_case_exercises_the_axis_it_claims() {
+            let full = golden_report();
+            let render = |term| render_human(&full, term);
+
+            // WIDTH: each step must shed at least one more column than the last.
+            let header_cols = |term| {
+                header_line(&render(term))
+                    .expect("the chart table has a header row")
+                    .split_whitespace()
+                    .count()
+            };
+            let (wide, narrow, very_narrow) = (
+                header_cols(WIDE_UNICODE_PLAIN),
+                header_cols(NARROW),
+                header_cols(VERY_NARROW),
+            );
+            assert!(
+                narrow < wide,
+                "NARROW_COLS={NARROW_COLS} dropped no column (headers {narrow} vs {wide}) — the \
+                 `stats-narrow` golden duplicates the wide one and proves nothing"
+            );
+            assert!(
+                very_narrow < narrow,
+                "VERY_NARROW_COLS={VERY_NARROW_COLS} shed nothing beyond NARROW_COLS (headers \
+                 {very_narrow} vs {narrow})"
+            );
+
+            // ASCII: the Unicode blocks must actually be replaced, not merely re-laid-out.
+            let unicode = render(WIDE_UNICODE_PLAIN);
+            let ascii = render(WIDE_ASCII);
+            assert_ne!(
+                unicode, ascii,
+                "the `--ascii` case renders identically to the Unicode one — the ramp axis is inert"
+            );
+            // The account labels stay Unicode (an operator's label is their own), so the
+            // check is on the RAMP: no block glyph may survive `--ascii`.
+            const BLOCKS: [char; 9] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█', '░'];
+            assert!(
+                unicode.contains(BLOCKS),
+                "the Unicode case renders no block glyph, so the ASCII case has nothing to replace"
+            );
+            assert!(
+                !ascii.contains(BLOCKS),
+                "the `--ascii` render still contains a Unicode block glyph — the ramp did not \
+                 fall back"
+            );
+
+            // COLOUR: augments only — stripping every SGR escape must yield the plain render.
+            // Only true if padding is computed on display width BEFORE the colour wrap.
+            let coloured = render(WIDE_UNICODE_COLOR);
+            assert!(
+                coloured.contains('\x1b'),
+                "the coloured case carries no SGR escape, so it is not exercising the colour gate"
+            );
+            assert_eq!(
+                render_golden::strip_ansi(&coloured)
+                    .expect("the coloured render has escapes to strip"),
+                unicode,
+                "the coloured render does not reduce to the plain one — colour is changing the \
+                 layout, not augmenting it (pad-before-colour is broken)"
+            );
+
+            // ELISION: the sparse fleet must actually LOSE the two columns the populated
+            // fixture carries — otherwise `stats-sparse-fleet` is a second copy of the wide case.
+            let sparse = render_human(&report_without_velocity(), WIDE_UNICODE_PLAIN);
+            for column in ["velocity", "runway"] {
+                assert!(
+                    unicode.contains(column),
+                    "the populated fixture does not render a `{column}` column, so the elision \
+                     case has nothing to elide"
+                );
+                assert!(
+                    !sparse.contains(column),
+                    "`{column}` survived the empty-column elision on a fleet with no velocity \
+                     overlay — the sparse case is not exercising §D-STA-5's elision pre-pass"
+                );
+            }
+
+            // ALL-`n/a`: the third degenerate roster, and the case that separates the elision's
+            // two halves — a DROPPABLE all-gap column goes, a FLOOR one stays and prints the
+            // sentinel. Without this assertion the golden could not distinguish "the roster is
+            // unmeasured" from "the roster is absent", which are different facts.
+            let all_na = render_human(&all_unobserved_report(), WIDE_UNICODE_PLAIN);
+            assert_ne!(
+                all_na,
+                render_human(&empty_report(), WIDE_UNICODE_PLAIN),
+                "an all-unobserved roster renders identically to an EMPTY one — the render is \
+                 conflating `we measured nothing about these accounts` with `there are no \
+                 accounts`"
+            );
+            let signal_cells: Vec<&str> = table_rows(&all_na)
+                .iter()
+                .filter_map(|row| split_columns(row).get(1).copied())
+                .collect();
+            assert_eq!(
+                signal_cells.len(),
+                all_unobserved_report().summary.per_account.len(),
+                "expected one `signal` cell per unobserved account"
+            );
+            assert!(
+                signal_cells.iter().all(|cell| *cell == "—"),
+                "the floor `signal` column does not read as all-gap on an all-unobserved \
+                 roster: {signal_cells:?}"
+            );
+            assert!(
+                all_na.contains("signal"),
+                "the FLOOR column `signal` was elided when every one of its cells was a gap — a \
+                 keep-column must never be elided, however empty"
+            );
+        }
+
+        /// The goldens must AGREE with the property tests that already guard this surface —
+        /// they are two views of one behaviour, and a golden that contradicted
+        /// `narrow_terminal_drops_trend_then_weekly_keeping_session_never_wrapping` would be
+        /// pinning a regression rather than the contract.
+        #[test]
+        fn the_width_goldens_agree_with_the_existing_degradation_contract() {
+            let all = cases();
+            let case = |name: &str| render_golden::rendered(&all, name);
+
+            // The floor is never dropped, at any width.
+            for name in ["stats-narrow", "stats-very-narrow"] {
+                let text = case(name);
+                for floor in ["account", "signal"] {
+                    assert!(
+                        text.contains(floor),
+                        "`{name}` dropped the `{floor}` floor column, which is never droppable"
+                    );
+                }
+            }
+            // `trend` sheds before `weekly` (the catalog's priority order).
+            let narrow = case("stats-narrow");
+            assert!(
+                !narrow.contains("trend"),
+                "`trend` is the first-shed column but survived at {NARROW_COLS} columns"
+            );
+            // Never wrap: at ANY width the per-account table holds exactly one line per
+            // account. Scoped to the TABLE block, because an account handle also leads each
+            // chart-block row — counting handles across the whole render would conflate the
+            // two and read a legitimate heatmap row as a wrap.
+            for name in ["stats-narrow", "stats-very-narrow"] {
+                let rows = table_rows(case(name));
+                assert_eq!(
+                    rows.len(),
+                    golden_report().summary.per_account.len(),
+                    "`{name}`'s table holds {} lines for {} accounts — it wrapped instead of \
+                     overflowing:\n{}",
+                    rows.len(),
+                    golden_report().summary.per_account.len(),
+                    rows.join("\n")
+                );
+                for handle in ["alpha", "beta", "delta", "ガンマ"] {
+                    assert_eq!(
+                        rows.iter()
+                            .filter(|l| l.split_whitespace().next() == Some(handle))
+                            .count(),
+                        1,
+                        "`{handle}` does not occupy exactly one table line in `{name}`"
+                    );
+                }
+            }
+
+            // …and the very-narrow floor OVERFLOWS its width rather than being truncated.
+            let floor = table_rows(case("stats-very-narrow"));
+            assert!(
+                floor
+                    .iter()
+                    .any(|l| crate::cli::display_width(l) > VERY_NARROW_COLS),
+                "nothing overflowed {VERY_NARROW_COLS} columns, so the very-narrow case does not \
+                 pin the overflow-rather-than-wrap invariant"
+            );
+        }
+
+        /// One table line's cells. Columns are delimited by a run of TWO OR MORE spaces (the
+        /// inter-column gap plus padding); a single interior space belongs to a cell or a
+        /// header label (`session m/p/p95`), so it must NOT split. Applied to the header and to
+        /// a data row alike, this yields matching arity and lets a column be looked up by name.
+        fn split_columns(line: &str) -> Vec<&str> {
+            line.split("  ")
+                .map(str::trim)
+                .filter(|cell| !cell.is_empty())
+                .collect()
+        }
+
+        /// The per-account table's header line — the single predicate the row scanner, the column
+        /// counter and the sentinel check all use, so they can never disagree about where the
+        /// table starts. Anchored on `account ` WITH its trailing space: a bare `contains`
+        /// would also match a data row for an account whose handle contains "account".
+        fn header_line(rendered: &str) -> Option<&str> {
+            rendered
+                .lines()
+                .find(|l| l.trim_start().starts_with("account "))
+        }
+
+        /// The per-account table's DATA rows (header and blank line excluded) from a rendered
+        /// view — the block between the `account …` header and the following blank line.
+        fn table_rows(rendered: &str) -> Vec<&str> {
+            rendered
+                .lines()
+                .skip_while(|l| Some(*l) != header_line(rendered))
+                .skip(1)
+                .take_while(|l| !l.trim().is_empty())
+                .collect()
+        }
+
+        /// The gap sentinel is semantic, not cosmetic: for an account that was never observed
+        /// (`seen == 0`) the OBSERVED-ONLY columns — `signal`, `velocity`, `runway` — render
+        /// `—`, never a fabricated reading. An unmeasurable period is not a calm one.
+        ///
+        /// Asserted per named column (not "the row contains a `—` somewhere"), so a
+        /// re-baseline cannot quietly turn one of them into a zero while another still carries
+        /// the sentinel and keeps a loose check green.
+        #[test]
+        fn an_unobserved_account_renders_the_gap_sentinel_in_every_observed_only_column() {
+            let all = cases();
+            let piped = render_golden::rendered(&all, "stats-piped");
+            let header = header_line(piped).expect("the numeric table has a header row");
+            let row = table_rows(piped)
+                .into_iter()
+                .find(|l| l.split_whitespace().next() == Some("delta"))
+                .expect("the never-observed account has a table row");
+
+            // Header and data row must yield the same arity for the per-column lookup below to
+            // mean anything — see `split_columns` for why the split is on 2+-space runs.
+            let headers = split_columns(header);
+            let cells = split_columns(row);
+            assert_eq!(
+                headers.len(),
+                cells.len(),
+                "header/cell arity disagree, so the per-column lookup below would be wrong:\n\
+                 {header}\n{row}"
+            );
+            for column in ["signal", "velocity", "runway"] {
+                let at = headers
+                    .iter()
+                    .position(|h| *h == column)
+                    .unwrap_or_else(|| panic!("the piped table renders a `{column}` column"));
+                assert_eq!(
+                    cells[at], "—",
+                    "the never-observed account's `{column}` cell is `{}`, not the gap sentinel \
+                     — a fabricated reading where a gap belongs:\n{row}",
+                    cells[at]
+                );
+            }
+        }
+    }
 }

@@ -1,0 +1,30 @@
+usage — last 24h (Jun 30–Jul 1)
+
+account  signal     session  weekly  runway
+alpha    saturated    62/99     48%     ~2h
+beta     balanced     44/66     24%     ~9h
+delta    —              0/0      0%       —
+ガンマ   underused     8/17      5%       —
+
+contribution share
+alpha   █████████████████████░░░░░░░░░░░░░░░░░   55%
+beta    ███████████░░░░░░░░░░░░░░░░░░░░░░░░░░░   30%
+delta   ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░    0%
+ガンマ  ██████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░   15%
+
+session pattern — hourly mean
+alpha   ▒▓▓█
+beta    ▒ ▓▓
+delta
+ガンマ  ░░ ░
+
+session distribution — mean · p95 · peak
+alpha   ┤───────────────m───────Px├  62% · 94% · 99%
+beta    ┤───────────m───Px────────├  44% · 61% · 66%
+delta   ┤x────────────────────────├  0% · 0% · 0%
+ガンマ  ┤──m─x────────────────────├  8% · 15% · 17%
+
+  lowest utilisation: ガンマ (session mean 8%)
+  accounts last ~3 days at the current combined rate (2 of 3 counted)
+not in roster (1): retired
+roster: 4 swaps (2 session, 1 weekly, 1 manual, 0 forced, 0 emergency) · all-accounts-high: 0 episodes (0s)
