@@ -248,6 +248,56 @@ where
                         events.push(Event::ReStash {
                             account: self.roster[idx].label.clone(),
                         });
+                        // Issue #880: record what this EXTERNAL write did to the account's
+                        // refresh-token deadline — including when it did NOTHING, which is the third
+                        // row of the issue #877 table (`ExpiryProvenance::CanonicalRestash` carries
+                        // what turns on it). Read off the SAME `canonical` blob just re-stashed,
+                        // through the audited non-secret extractor (only the deadline is pulled,
+                        // never the token), folded MS→s here as every other credential-read boundary
+                        // does. Emitted at the TOP of the tick, so the later poll of this account
+                        // finds the baseline already reconciled and cannot re-report this same write
+                        // as an inferred `external_change`.
+                        let observed = crate::refresh::refresh_token_expires_at(canonical.expose())
+                            .map(millis_to_secs);
+                        // Was a NEW OAuth grant minted, or is this the same grant re-written? The
+                        // `Changed` classification alone cannot say, and issue #877's third row needs
+                        // it: a `claude /login` and another Claude Code's in-place refresh are the
+                        // same observation here. This is the one place two blobs for the account
+                        // coexist — the pre-write baseline is still standing, because the
+                        // `canonical_watch.commit` below has not run yet.
+                        //
+                        // A BOOL out of a byte comparison, and nothing else: `refresh_token`'s
+                        // contract is that its value is "only ever emptiness-checked or
+                        // byte-compared, never logged", which is exactly this use. `None` when there
+                        // is no baseline to compare against (the first change of the run) or either
+                        // blob has no readable token — an unknown is omitted from the line, never
+                        // guessed, and NEVER defaulted to `false`, which would silently assert the
+                        // grant was unchanged and corrupt the row it feeds.
+                        //
+                        // An EMPTY token is filtered to that same unknown, and that filter is
+                        // load-bearing rather than defensive. `Some(empty)` is `refresh_token`'s
+                        // documented DEAD signal — CC clears the RT in place (`build/version-compat.md`
+                        // #101) — so a canonical whose token was emptied while it still carries a
+                        // `refreshTokenExpiresAt` would compare unequal to the live baseline and
+                        // publish `grant_replaced=true`: a cleared credential read as a fresh
+                        // login, on exactly the line issue #877's conclusion is drawn from. An
+                        // emptied grant is not a new grant, and it is not a same grant either.
+                        let live_rt = |c: &Credential| {
+                            crate::refresh::refresh_token(c.expose()).filter(|rt| !rt.is_empty())
+                        };
+                        let grant_replaced =
+                            self.state.canonical_watch.baseline().and_then(|prev| {
+                                let before = live_rt(&prev)?;
+                                let after = live_rt(canonical)?;
+                                Some(*before != *after)
+                            });
+                        self.note_restash_expiry(
+                            idx,
+                            observed,
+                            grant_replaced,
+                            wall_clock_now_secs(),
+                            events,
+                        );
                         // A re-login of a quarantined account un-quarantines it ON THE
                         // SPOT (issue #107): a just-re-authenticated canonical IS a live
                         // credential, so stranding it in `needs re-login` for
@@ -2553,5 +2603,184 @@ mod tests {
             .await
             .unwrap()
             .matches(&cred(b"A-token")));
+    }
+
+    // --- issue #880: grant identity at the re-stash edge ----------------------
+
+    /// A `claudeAiOauth` blob carrying BOTH deadlines, so
+    /// [`crate::refresh::refresh_token_expires_at`] and [`crate::refresh::refresh_token`] each parse
+    /// — the issue #880 re-stash edge reads both, and a raw non-JSON token (what most tests in this
+    /// module use) would make it silently emit nothing.
+    fn rt_blob(refresh_token: &str, rt_expires_at_ms: i64) -> Credential {
+        cred(
+            format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"a","refreshToken":"{refresh_token}","expiresAt":1782777600000,"refreshTokenExpiresAt":{rt_expires_at_ms}}}}}"#
+            )
+            .as_bytes(),
+        )
+    }
+
+    fn expiry_observations(events: &[Event]) -> Vec<&Event> {
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::CredentialExpiryObserved { .. }))
+            .collect()
+    }
+
+    /// Issue #880 (AC-2/AC-3): the re-stash edge decides `grant_replaced` by comparing the canonical it
+    /// is about to commit against the baseline still standing — so the durable line can say whether a
+    /// NEW OAuth grant was minted, which is what separates a re-login from an in-place refresh of the
+    /// same grant. `reconcile_canonical_change` sees those two as one observation; this field is the
+    /// only thing that tells them apart, so it is computed here or nowhere.
+    ///
+    /// Both directions are asserted because they carry opposite weight: `true` is a NARROWING (a
+    /// re-login is now possible), while `false` is a hard EXCLUSION (a byte-identical refresh token
+    /// cannot have come from a fresh login). Defaulting either way when unknown would fabricate one of
+    /// those readings, which is why the third case — no baseline to compare — must OMIT the field.
+    #[tokio::test]
+    async fn the_restash_edge_reports_whether_a_new_grant_was_minted() {
+        let mut daemon = lifecycle_daemon().await;
+        let deadline_ms = 1_785_499_802_819;
+
+        // Prime the watch. A first observation seeds the baseline and detects no change, so it also
+        // reaches no re-stash — hence no line yet.
+        let mut events = Vec::new();
+        daemon
+            .reconcile_canonical_change(&rt_blob("rt-1", deadline_ms), &mut events)
+            .await;
+        assert!(
+            expiry_observations(&events).is_empty(),
+            "priming detects nothing, so it records nothing: {events:?}"
+        );
+
+        // Anchor the EXPIRY baseline the way production does — the poll loop, not this edge. The two
+        // baselines are deliberately separate (the canonical watch tracks the blob, this tracks the
+        // deadline), so priming the watch above did NOT establish one, and without this step the next
+        // line would honestly carry `before: None` and derive no delta.
+        events.clear();
+        daemon.note_polled_expiry(0, Some(1_785_499_802), 1_782_777_600, &mut events);
+        events.clear();
+
+        // A DIFFERENT refresh token under the same deadline: a new grant that did NOT move the
+        // deadline — the issue #877 third row, end to end through the real reconcile path.
+        daemon
+            .reconcile_canonical_change(&rt_blob("rt-2", deadline_ms), &mut events)
+            .await;
+        assert_eq!(
+            expiry_observations(&events),
+            vec![&Event::CredentialExpiryObserved {
+                account: "u-A".to_owned(),
+                provenance: ExpiryProvenance::CanonicalRestash,
+                before: Some(1_785_499_802),
+                after: 1_785_499_802,
+                grant_replaced: Some(true),
+            }],
+            "a rotated refresh token is a NEW grant: {events:?}"
+        );
+
+        // The SAME refresh token written again, with the deadline moved. Some other field of the blob
+        // changed, so the watch fires — but the grant is byte-identical, which RULES OUT a re-login.
+        events.clear();
+        daemon
+            .reconcile_canonical_change(&rt_blob("rt-2", deadline_ms + 86_400_000), &mut events)
+            .await;
+        assert_eq!(
+            expiry_observations(&events),
+            vec![&Event::CredentialExpiryObserved {
+                account: "u-A".to_owned(),
+                provenance: ExpiryProvenance::CanonicalRestash,
+                before: Some(1_785_499_802),
+                after: 1_785_586_202,
+                grant_replaced: Some(false),
+            }],
+            "an unchanged grant excludes a re-login rather than staying silent: {events:?}"
+        );
+    }
+
+    /// Issue #880: a canonical the daemon cannot read a refresh token OUT of records the deadline with
+    /// `grant_replaced` OMITTED — never `Some(false)`, which would assert the grant was unchanged on the
+    /// strength of a failed parse. The absent-not-guessed rule the whole record is built on.
+    #[tokio::test]
+    async fn an_unparseable_grant_omits_the_replacement_verdict_rather_than_denying_it() {
+        let mut daemon = lifecycle_daemon().await;
+        let deadline_ms = 1_785_499_802_819;
+
+        let mut events = Vec::new();
+        daemon
+            .reconcile_canonical_change(&rt_blob("rt-1", deadline_ms), &mut events)
+            .await;
+
+        // The replacement blob carries the deadline but NO `refreshToken` field, so the grant
+        // comparison has nothing to compare and the deadline still does.
+        events.clear();
+        let no_rt = cred(
+            format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"a","expiresAt":1782777600000,"refreshTokenExpiresAt":{deadline_ms}}}}}"#
+            )
+            .as_bytes(),
+        );
+        daemon.reconcile_canonical_change(&no_rt, &mut events).await;
+        let observed = expiry_observations(&events);
+        assert_eq!(
+            observed.len(),
+            1,
+            "the deadline is still recorded: {events:?}"
+        );
+        let Event::CredentialExpiryObserved { grant_replaced, .. } = observed[0] else {
+            unreachable!("filtered to the variant above")
+        };
+        assert_eq!(
+            *grant_replaced, None,
+            "an unreadable grant is UNKNOWN, not unchanged"
+        );
+    }
+
+    /// Issue #880: a refresh token CLEARED in place records `grant_replaced` as UNKNOWN, not
+    /// as a replacement. `Some(empty)` is [`crate::refresh::refresh_token`]'s documented DEAD signal
+    /// (`build/version-compat.md` #101), and an empty token compares unequal to a live one — so a
+    /// naive byte diff publishes a KILLED credential as a fresh grant, on precisely the line issue
+    /// #877's conclusion is read from.
+    ///
+    /// The distinction the assertion turns on: `None` here does not mean *we failed to look*. It means
+    /// *what we found is not a grant at all* — neither the same one nor a new one — and the record
+    /// declines to answer rather than answering wrongly in either direction.
+    #[tokio::test]
+    async fn a_cleared_refresh_token_is_not_reported_as_a_replaced_grant() {
+        let mut daemon = lifecycle_daemon().await;
+        let deadline_ms = 1_785_499_802_819;
+
+        let mut events = Vec::new();
+        daemon
+            .reconcile_canonical_change(&rt_blob("rt-1", deadline_ms), &mut events)
+            .await;
+        events.clear();
+        daemon.note_polled_expiry(0, Some(1_785_499_802), 1_782_777_600, &mut events);
+        events.clear();
+
+        // CC clears the refresh token in place, leaving the deadline behind. The blob changed, so the
+        // watch fires and the deadline is still recorded — but the grant question has no answer.
+        daemon
+            .reconcile_canonical_change(&rt_blob("", deadline_ms), &mut events)
+            .await;
+        let observed = expiry_observations(&events);
+        assert_eq!(
+            observed.len(),
+            1,
+            "a cleared token still yields a deadline record: {events:?}"
+        );
+        let Event::CredentialExpiryObserved { grant_replaced, .. } = observed[0] else {
+            unreachable!("filtered to the variant above")
+        };
+        assert_eq!(
+            *grant_replaced, None,
+            "an emptied token is NOT a new grant — a bare byte diff would say `Some(true)` here"
+        );
+        // And it does not reach the rendered line at all, so no offline reader can mistake it.
+        assert!(
+            !observed[0]
+                .to_log_line(std::time::UNIX_EPOCH)
+                .contains("grant_replaced"),
+            "the unknown is omitted from the line: {observed:?}"
+        );
     }
 }

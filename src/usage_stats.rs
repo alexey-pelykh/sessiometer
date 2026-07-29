@@ -1231,6 +1231,39 @@ ts=2026-01-01T00:06:00Z event=fleet_runway_low runway_secs=1800 threshold_secs=3
     }
 
     #[test]
+    fn parsing_skips_the_refresh_token_expiry_lines() {
+        // Issue #880 added two durable event kinds to the log this parser reads — the horizon-entry
+        // edge and the provenance-tagged deadline observation. Sibling of the issue #800 / #827 tests
+        // above.
+        //
+        // Neither carries `from=`/`to=` NOR a `reason=`, so both must land on the `_ => continue`
+        // drop like any other non-swap event — never a malformed `SwapEvent` that would corrupt the
+        // contribution timeline. Their `acct=` key is deliberately not one this parser reads, and the
+        // observed line's trailing `delta_secs=` is the kind of numeric a careless arm could latch
+        // onto. Pinned against the real shape: the expiry lines are interleaved around a swap this
+        // parser DOES fold (it bounds the timeline), so the drop has to be precise rather than "skip
+        // everything nearby".
+        let log = "\
+ts=2026-01-01T00:04:00Z event=credential_expiry_observed acct=u-A provenance=first_observation after=2026-01-31T00:00:00Z
+ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=96
+ts=2026-01-01T00:06:00Z event=credential_expiry_horizon acct=u-A state=within expires_at=2026-01-06T00:00:00Z horizon_secs=604800
+ts=2026-01-01T00:07:00Z event=credential_expiry_observed acct=u-A provenance=my_refresh before=2026-01-06T00:00:00Z after=2026-01-07T00:00:00Z delta_secs=86400
+";
+        assert_eq!(
+            parse_swap_events(log).len(),
+            1,
+            "only the swap parses; both expiry event kinds are skipped"
+        );
+        // Equivalence with the same log minus the three new lines — the new event kinds are inert.
+        assert_eq!(
+            parse_swap_events(log),
+            parse_swap_events(
+                "ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=96\n"
+            )
+        );
+    }
+
+    #[test]
     fn velocity_preempt_swap_parses_as_preempt_bounds_the_timeline_and_is_excluded_from_count() {
         // Issue #539 regression, two halves. PARSER: a `reason=velocity_preempt` line must fold onto
         // SwapKind::Preempt (like #452's blind_preempt), NEVER the `_ => continue` drop — dropping it
