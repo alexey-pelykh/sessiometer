@@ -197,18 +197,18 @@ row of an aligned, border-less table under a labelled header — greppable, one
 record per line:
 
 ```text
-ACCOUNT  SESSION% RESET  WEEKLY% RESET  AUTH
-* work   97%      12m    40%     5d     🟢
-  spare  10%      2h     20%     3d     🟢
-  idle   n/a      n/a    n/a     n/a    🟠 degraded — run 'sessiometer poke'
-  gone   n/a      n/a    n/a     n/a    🔴 claude /login
+ACCOUNT  SESSION% RESET  WEEKLY% RESET  EXPIRY  AUTH
+* work   97%      12m    40%     5d     21d3h   🟢
+  spare  10%      2h     20%     3d     6d21h   🟢
+  idle   n/a      n/a    n/a     n/a    —       🟠 degraded — run 'sessiometer poke'
+  gone   n/a      n/a    n/a     n/a    lapsed  🔴 claude /login
 
 next swap: spare
 ```
 
 - A **header row** labels the columns: `ACCOUNT`, then the grouped `SESSION%` +
-  `RESET`, then the grouped `WEEKLY%` + `RESET`, then `AUTH`. It is plain
-  (uncolored) and aligned with the data; each window's reset shares the `RESET`
+  `RESET`, then the grouped `WEEKLY%` + `RESET`, then `EXPIRY`, then `AUTH`. It is
+  plain (uncolored) and aligned with the data; each window's reset shares the `RESET`
   label, disambiguated by sitting beside its own `%`.
 - `*` marks the **active** account.
 - Each account carries **two `% reset` pairs**: a **session** pair (the rolling
@@ -220,6 +220,17 @@ next swap: spare
 - Each reset is the compact time until that window refills (e.g. `12m`, `2h`,
   `3d4h`), shown for **every** account, not only an exhausted one — `n/a` when that
   reset instant is unknown.
+- An **`EXPIRY`** column carries each account's **refresh-token deadline** — the
+  instant its stored credential stops being renewable — as a compact time-until
+  (`6d21h`), the word **`lapsed`** once that instant has passed, or **`—`** when no
+  deadline was observed. It is a cell of **its own**, never folded into `AUTH`: the two
+  axes are independent, so an account can read **🟢** in `AUTH` and still sit days from
+  its refresh-token deadline. On an interactive terminal the cell is tinted by its own
+  band — red once `lapsed`, yellow inside the [`[credential]`](#credential) foresight
+  horizon, dimmed beyond it, and left uncolored when nothing was observed. Like the
+  health-text column it is **conditional**: a roster whose credentials carry no deadline
+  renders exactly as it did before the column existed, rather than growing a column of em
+  dashes. See [The refresh-token deadline](#the-refresh-token-deadline-expiry) below.
 - A trailing **`AUTH`** column reports each account's **credential-auth state** as one
   self-coloring glyph — **🟢** healthy (a positive liveness signal), **🟡** stale (the
   access token has expired but the refresh token still recovers it), **🟠** at-risk (the
@@ -256,11 +267,13 @@ cycle, so — unlike a remembered "last swap" — it survives a daemon restart a
 shows where the next rotation will land.
 
 On a terminal too narrow for the full table the lowest-priority columns drop in
-order — the **weekly pair** (`weekly%` + `weekly-reset`) first and together, then
-the health-text column, each taking its header label with it — never wrapping a
-row; the `ACCOUNT` label and the **session pair** (the soonest, most actionable
-reset) and their labels are always kept. Output that is piped or redirected (not a
-TTY) always keeps the full table, so `sessiometer status | grep work` stays complete.
+order — **`EXPIRY`** first (the **slowest-moving** fact on the row: a server-issued
+deadline in days that no tick moves, where every other column can flip inside the
+current session), then the **weekly pair** (`weekly%` + `weekly-reset`) together, then
+the health-text column, each taking its header label with it — never wrapping a row;
+the `ACCOUNT` label and the **session pair** (the soonest, most actionable reset) and
+their labels are always kept. Output that is piped or redirected (not a TTY) always
+keeps the full table, so `sessiometer status | grep work` stays complete.
 
 On an interactive terminal each **cell** is **color-coded by its own health** —
 **green** / **yellow** / **red**. Each `%` is coloured by its own utilization
@@ -329,6 +342,70 @@ text view, mirroring `--json`, which already carries the raw `access_expires_at`
 account. Like the table, the block is content (it survives a pipe), never colored, and
 sourced only from non-secret fields, so it never prints a token or an *unauthored* email
 (issue #15; an operator-authored email label may appear — #444).
+
+### The refresh-token deadline (`EXPIRY`)
+
+Each stored credential carries **two** clocks, and only one of them slides:
+
+| Clock | Where it shows | Does it move? |
+|-------|----------------|---------------|
+| **Access token** — the short-lived token a session actually spends | the `-v` block above, `access_expires_at` in `--json` | **Yes.** Claude Code and the daemon refresh it invisibly; each refresh slides it forward. |
+| **Refresh token** — the credential's own lifetime | the `EXPIRY` column of `sessiometer status` | **No.** It is a fixed instant the server issued at login. |
+
+**Refreshing does not extend the refresh-token deadline.** Every *other* expiry in this
+tool slides forward on use, which is what makes this one easy to guess wrong. The daemon
+keeps access tokens alive indefinitely — that is what `[refresh]` and `sessiometer poke`
+are for — but it cannot move this wall.
+
+Two independent lines of evidence, against Claude Code v2.1.218–220. **From the client
+code**: the login path computes `refreshTokenExpiresAt` with a fallback, the refresh path
+computes the same field *without* it so the value resolves undefined, and the merge step
+keeps whichever deadline was already stored — an omitted field preserves the old one.
+**From observation**: across six accounts whose access tokens had all refreshed within
+hours, the refresh-token deadlines sat unmoved at fixed absolute instants. A refresh does
+rotate the refresh token itself, but a new token is not a new deadline.
+
+So an account can be **🟢** in `AUTH`, refreshing on schedule, and still be counting down
+to a deadline nothing in that loop will move. That gap is what the `EXPIRY` column exists
+to close: the deadline is reported **ahead** of the lapse rather than after it, so it is
+visible while there is still a whole horizon of room.
+
+A credential past that deadline is replaced by
+[`sessiometer login`](#logging-in--re-authenticating) — the same verb that onboards a new
+account, and the only path that writes a fresh credential rather than renewing the stored
+one. It lands that credential in the rotation **without disturbing the active session**:
+logging in an account other than the active one adds or revives it and performs no swap.
+
+> **What is not yet established:** whether a fresh login lands a deadline *further out*
+> than the one it replaces. The client code computes the field on the login path, but what
+> the server actually sends is a separate question, and the deadline could be anchored to
+> something a re-login does not move. The "thirty days from login" figure sometimes quoted
+> is an inference, not a measurement, and `sessiometer` never assumes it — it reads
+> whatever deadline the credential carries and reports that. Tracking in
+> [issue #877](https://github.com/alexey-pelykh/sessiometer/issues/877).
+
+**`—` means not observed — it does not mean "not expiring."** The daemon found no usable
+`refreshTokenExpiresAt` in the credential: an older Claude Code, a changed upstream policy,
+or a non-first-party credential all produce it, as does an account the daemon has not
+polled yet. Absence of a deadline in the blob is not evidence that no deadline exists — the
+daemon cannot vouch for one it never saw, so it reports the absence rather than the
+false-reassuring "fine" that would let an account lapse quietly. This is the same invariant
+the **⚪** `unknown` auth glyph follows (issue #137), applied to foresight: an unverified
+account is unverified, not well. It is also why the whole feature degrades safely if
+upstream ever drops the field — every cell reads `—`, the column elides, and nothing claims
+an all-clear it cannot support.
+
+The same cell is defined for the `expiry` column of `sessiometer stats` — right-aligned and
+uncolored there, since that surface's colors are the neutral utilization band.
+
+**It does not appear there yet.** `stats` is a structurally offline reader: it is a pure
+function of the sample store and the daemon's own event log, and never queries a running
+daemon. The daemon does write the deadline to that log, but the step that folds those lines
+into one deadline per account is not built, so the overlay is empty on every path and the
+column elides. Its absence in `stats` therefore means *that missing step* — not an account
+without an observed deadline, which is what the same absence means in `status`. Tracking in
+[issue #917](https://github.com/alexey-pelykh/sessiometer/issues/917); until it lands,
+`sessiometer status` is where the deadline is reported.
 
 ## Listing accounts (offline)
 
@@ -679,7 +756,13 @@ or sign in again.
 
 ## Logging in / re-authenticating
 
-Revive a **`dead`** account — or onboard a new one — by re-authenticating it.
+Revive a **`dead`** account — or one whose [refresh-token deadline has
+`lapsed`](#the-refresh-token-deadline-expiry) — by re-authenticating it; the same verb
+onboards a new account. Those are the two ways a credential stops being recoverable by
+refresh: a refresh that **failed** (🔴 `dead`), and a deadline that **passed** (`lapsed`
+in `EXPIRY`) — the same fact, observed after a refresh fails and known before one is
+tried. Neither is recoverable by `poke` or `[refresh]`; both are re-established here.
+
 `sessiometer login` runs `claude /login` inside an **isolated, throwaway
 `CLAUDE_CONFIG_DIR`** (the same isolation `poke` uses), so the browser OAuth
 handoff never touches the live `Claude Code-credentials` item a running session
@@ -946,6 +1029,29 @@ Settings for `sessiometer login`, the interactive re-auth verb.
 |-----|---------|-------|---------|
 | `timeout_secs` | Seconds bounding one whole interactive login capture — longer than a refresh, since it waits on a human completing a browser OAuth handoff. | `60..=600` | `180` |
 | `claude_bin` | Absolute path to the `claude` binary to spawn, overriding `$CLAUDE_BIN` and your login shell's `PATH`. Omit (or leave empty) to resolve normally. Note that `login` resolves on your **login shell's** `PATH`, not the one you invoke it from — see [Which `PATH` the CLI resolves `claude` on](#which-path-the-cli-resolves-claude-on). | — | unset |
+
+### `[credential]`
+
+How far ahead the daemon looks at each account's **refresh-token deadline** when
+classifying it for the [`EXPIRY` column](#the-refresh-token-deadline-expiry).
+
+| Key | Meaning | Range | Default |
+|-----|---------|-------|---------|
+| `expiry_horizon_secs` | Seconds of lookahead over `refreshTokenExpiresAt`. A deadline falling inside this window classifies as *within* the horizon (the yellow band); one further out classifies as *beyond* it (dimmed). | `86_400..=7_776_000` (one day to ninety days) | `604800` (seven days) |
+
+This bounds the **lookahead only** — it is emphatically not an assumed refresh-token
+lifetime. The daemon always reads the deadline from the credential and never infers one
+from a constant, which is why an account with no observable deadline reads `—` instead of a
+computed guess.
+
+The knob has no "off" setting, and the one-day floor is deliberate: a zero horizon would
+quietly reduce the column to reporting only *already-lapsed* credentials — the
+after-the-fact signal the foresight exists to get ahead of. Shorten it for less lookahead;
+the axis itself stays on. It governs **classification** only, and never feeds a swap or
+poll decision — expiry is surfaced, not acted upon. It is also independent of
+[`[refresh]`](#refreshing-parked-credentials-automatically), and keeps classifying whether
+or not that periodic refresh is enabled — an account with refresh off is if anything more
+exposed to a quiet lapse.
 
 ### Other blocks
 

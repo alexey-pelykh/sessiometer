@@ -932,6 +932,11 @@ already-active account (re-auth in place) or no account is active (bootstrap);
 logging in a different account adds or revives it in the rotation without a swap,
 and a revived quarantined account is un-quarantined at once. Switch to it with
 `sessiometer use <account>` when you're ready.
+
+This verb is also what recovers an account whose REFRESH-token deadline has lapsed — the
+`lapsed` cell in `sessiometer status`'s EXPIRY column. That deadline is a fixed instant issued
+at login and no refresh moves it, so once it passes the stored credential is past renewing and
+a fresh login is what replaces it.
 ";
 
 const RUN_USAGE: &str = "sessiometer run — run the foreground daemon (poll every account's usage and swap before exhaustion)
@@ -1032,6 +1037,25 @@ USAGE:
     --no-color     force the urgency colour overlay off
     -v, --verbose  add each account's access-token expiry under the table
     -h, --help     print this help
+
+The EXPIRY column carries each account's REFRESH-token deadline — the instant its stored
+credential stops being renewable — as a compact time-until (`6d21h`), the word `lapsed` once
+that instant has passed, or `—` when no deadline was observed. It is a cell of its own, never
+folded into AUTH: the two axes are independent, so an account with no AUTH fault at all can
+still sit days from its refresh-token deadline. The column is absent entirely when no account
+has an observed deadline, and it is the first to go on a narrow terminal.
+
+Refreshing does NOT extend that deadline. The daemon keeps ACCESS tokens alive indefinitely —
+that is the separate clock `-v` prints, and it does slide forward on every refresh — but the
+refresh-token deadline is a fixed instant issued at login that no refresh moves. A credential
+past it is replaced by `sessiometer login` — the only path that writes a fresh credential
+rather than renewing the stored one — which lands it in the rotation without disturbing the
+active session.
+
+An `—` cell reads NOT OBSERVED, never \"not expiring\": no deadline was read for this account —
+the daemon has not polled it yet, or it found none in the credential (an older Claude Code, a
+changed upstream policy, a non-first-party credential) — so it reports that absence rather than
+implying the account is exempt.
 ";
 
 const LIST_USAGE: &str =
@@ -1104,6 +1128,16 @@ USAGE:
     --no-color      force the chart colour overlay off
     --ascii         force the ASCII glyph ramp
     -h, --help      print this help
+
+The `expiry` column carries the same REFRESH-token deadline `sessiometer status` reports — a
+compact time-until, `lapsed` for one already past, or `—` for one never observed. It is
+right-aligned and uncoloured here, since this surface's colour vocabulary is the neutral
+utilisation band, and it goes first on a narrow terminal.
+
+That column does not appear yet. `stats` reads offline, and the step that folds the daemon's
+durable expiry log lines into one deadline per account is not built — so the overlay is empty
+on every path and an empty column elides. Its absence HERE means that missing step, not an
+account without an observed deadline. `sessiometer status` reports the deadline today.
 ";
 
 const RELIABILITY_USAGE: &str = "sessiometer reliability — swap-out overshoot SLO readout, offline (reads the event log directly)
@@ -9939,6 +9973,179 @@ spare  22222222-2222\n\
         assert!(
             help.contains("not affiliated with or endorsed by Anthropic"),
             "root help must carry the not-affiliated notice:\n{help}"
+        );
+    }
+
+    /// The three help constants issue #885 documents the REFRESH-token expiry state on.
+    const EXPIRY_HELP_SURFACES: &[(&str, &str)] = &[
+        ("STATUS_USAGE", STATUS_USAGE),
+        ("LOGIN_USAGE", LOGIN_USAGE),
+        ("STATS_USAGE", STATS_USAGE),
+    ];
+
+    /// The framing vocabulary the expiry help must never reach for (issue #885 / §D-STA-6): the
+    /// acquisitive CALL the issue enumerates, plus the recommendation and alarmist-projection
+    /// framing that turns a stated deadline into a call to action.
+    ///
+    /// Deliberately NARROWER than `stats.rs`'s central `BANNED_TOKENS`, and the difference is the
+    /// point: that list bans `remove` / `disable` / `enable`, which are this CLI's own COMMAND
+    /// NAMES and appear in `ROOT_USAGE` as such, and `add`, which `STATUS_USAGE` — a surface
+    /// scanned right here — spends on its own `-v` line ("add each account's access-token
+    /// expiry"). A scan of help text against the central list would fail on `main` today — which
+    /// is also why no such scan exists (the central scanner is private to `stats.rs`'s test module
+    /// and covers only stats renders and `--json` keys). This guard covers the surface issue #885
+    /// owns; widening it repo-wide is issue #918.
+    const EXPIRY_HELP_BANNED_TOKENS: &[&str] = &[
+        // The acquisitive call (issue #885's enumerated list).
+        "buy",
+        "purchase",
+        "upgrade",
+        "cancel",
+        "bypass",
+        "beat",
+        // Recommendation framing — "you should re-login".
+        "should",
+        "must",
+        "ought",
+        "recommend",
+        "recommended",
+        "suggest",
+        "consider",
+        "advise",
+        // Alarmist projection framing — a deadline is a FACT, never a forecast.
+        "forecast",
+        "predict",
+        "projected",
+        "anticipate",
+        "imminent",
+        "soon",
+    ];
+
+    /// Acquisitive calls spanning adjacent words, which the single-token scan misses — the same
+    /// shape `stats.rs`'s `BANNED_PHRASES` guards, including issue #885's `need more`.
+    const EXPIRY_HELP_BANNED_PHRASES: &[&str] = &["need more", "top up", "get more"];
+
+    /// The first banned token or phrase in `text`, or `None` when it is clean. Matches whole
+    /// lowercase WORDS on non-alphanumeric boundaries, mirroring `stats.rs`'s `scan_banned`, so
+    /// `bypasses` does not trip `bypass` and an account handle never false-trips.
+    fn scan_expiry_help(text: &str) -> Option<&'static str> {
+        let words: Vec<String> = text
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(str::to_ascii_lowercase)
+            .collect();
+        if let Some(hit) = EXPIRY_HELP_BANNED_TOKENS
+            .iter()
+            .copied()
+            .find(|b| words.iter().any(|w| w == b))
+        {
+            return Some(hit);
+        }
+        EXPIRY_HELP_BANNED_PHRASES.iter().copied().find(|phrase| {
+            let parts: Vec<&str> = phrase.split(' ').collect();
+            words
+                .windows(parts.len())
+                .any(|win| win.iter().zip(&parts).all(|(w, p)| w.as_str() == *p))
+        })
+    }
+
+    /// Issue #885 AC1–AC3: the operator-facing help states the per-account expiry cell, the
+    /// counterintuitive non-extending deadline, the not-observable reading of the gap, and names
+    /// `sessiometer login` as the remedy.
+    #[test]
+    fn expiry_help_carries_the_state_the_fixed_deadline_and_the_login_remedy() {
+        // The two surfaces that carry the lapsed state AND its remedy; `STATS_USAGE` names
+        // neither (it documents a column that does not populate yet), so it is asserted apart.
+        let remedy_surfaces = [("STATUS_USAGE", STATUS_USAGE), ("LOGIN_USAGE", LOGIN_USAGE)];
+
+        // AC1 — the cell's three renderings, and the remedy named on both surfaces that carry it.
+        for (name, help) in remedy_surfaces {
+            assert!(
+                help.contains("lapsed"),
+                "{name} must name the lapsed state:\n{help}"
+            );
+            assert!(
+                help.contains("sessiometer login"),
+                "{name} must name `sessiometer login` as the remedy:\n{help}"
+            );
+        }
+        assert!(
+            STATUS_USAGE.contains("EXPIRY column"),
+            "STATUS_USAGE must describe the EXPIRY column:\n{STATUS_USAGE}"
+        );
+        assert!(
+            STATS_USAGE.contains("`expiry` column"),
+            "STATS_USAGE must describe the expiry column:\n{STATS_USAGE}"
+        );
+
+        // AC2 — refreshing does NOT extend the refresh-token deadline. The single fact an
+        // operator is most likely to guess wrong, because every other expiry here slides forward.
+        // Pinned to the claim's subject + negated verb, not to a whole sentence: the surrounding
+        // wording is free to change, the negation is not.
+        assert!(
+            STATUS_USAGE.contains("Refreshing does NOT extend"),
+            "STATUS_USAGE must state that refreshing does not extend the deadline:\n{STATUS_USAGE}"
+        );
+        for (name, help) in remedy_surfaces {
+            assert!(
+                help.contains("no refresh moves"),
+                "{name} must state the deadline is fixed against refresh:\n{help}"
+            );
+        }
+
+        // AC3 — the gap is NOT OBSERVABLE, never "not expiring" (the issue #137 invariant).
+        assert!(
+            STATUS_USAGE.contains("NOT OBSERVED"),
+            "STATUS_USAGE must read the gap as not observed:\n{STATUS_USAGE}"
+        );
+        assert!(
+            STATUS_USAGE.contains("never \"not expiring\""),
+            "STATUS_USAGE must reject the 'not expiring' reading explicitly:\n{STATUS_USAGE}"
+        );
+    }
+
+    /// Issue #885 AC4: the expiry help states the deadline as a present-tense FACT and never turns
+    /// it into a call to action. A refresh-token deadline clears the §D-STA-6 firewall because it
+    /// is a SERVER-ISSUED timestamp about authentication lifetime — not a rate projection about
+    /// capacity — and its remedy is free and local; what stays out is the imperative.
+    #[test]
+    fn expiry_help_carries_no_banned_token_but_the_guard_bites_on_injection() {
+        for (name, help) in EXPIRY_HELP_SURFACES {
+            assert_eq!(
+                scan_expiry_help(help),
+                None,
+                "{name} must carry no banned token or imperative framing:\n{help}"
+            );
+        }
+
+        // The guard BITES: it is only evidence if it can fail. Inject each shape into a real
+        // surface and confirm it is caught — a scanner that matches nothing passes every
+        // "no false positives" test while proving nothing.
+        assert_eq!(
+            scan_expiry_help(&format!("{STATUS_USAGE}\nYou should re-login.")),
+            Some("should")
+        );
+        assert_eq!(
+            scan_expiry_help(&format!("{STATUS_USAGE}\nUpgrade your plan.")),
+            Some("upgrade")
+        );
+        assert_eq!(
+            scan_expiry_help(&format!("{STATUS_USAGE}\nExpiring soon.")),
+            Some("soon")
+        );
+        assert_eq!(
+            scan_expiry_help(&format!("{STATUS_USAGE}\nRunning out — need more seats.")),
+            Some("need more")
+        );
+
+        // …and it does NOT bite the permitted FACT: the deadline itself, its `lapsed` state, and
+        // the free local remedy are all descriptive, which is exactly what AC1 requires alongside
+        // AC4. Word-boundary matching also keeps `bypasses` from tripping `bypass`.
+        assert_eq!(
+            scan_expiry_help(
+                "expiry 6d21h; lapsed once past; recovered by `sessiometer login`; nothing bypasses it"
+            ),
+            None
         );
     }
 
