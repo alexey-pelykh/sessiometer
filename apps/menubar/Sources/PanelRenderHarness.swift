@@ -30,8 +30,8 @@
 // the Retina surface the panel actually ships on.
 //
 // HOST-EQUIVALENCE, measured. Because both consumers route through this one `render`, the app tool and the
-// in-bundle gate produce PIXEL-IDENTICAL output — verified by rendering all 36 cells through
-// `--render-panel` and diffing them against the in-bundle goldens (max drift 0.000000 over 36 cells). The
+// in-bundle gate produce PIXEL-IDENTICAL output — verified by rendering all 44 cells through
+// `--render-panel` and diffing them against the in-bundle goldens (max drift 0.000000 over 44 cells). The
 // PNG *files* still differ byte-wise, because the app tool encodes the renderer's `CGImage` directly while
 // the gate encodes from its normalized comparison buffer; only the pixels are the claim. That equivalence
 // is not free — it is what `Color.panelAssets` (asset lookup follows the compiled-into bundle, not
@@ -295,7 +295,7 @@ enum PanelRenderHarness {
                                generatedAt: fresh),
             // #886: the per-row REFRESH-token expiry line (#884) in ALL FOUR of its states at once.
             // Every other fixture leaves `expiry` nil, so `rosterShowsExpiry` is false and the line is
-            // absent from the OTHER 34 committed cells — those pin the ELISION (a fleet whose credentials
+            // absent from the OTHER 42 committed cells — those pin the ELISION (a fleet whose credentials
             // carry no deadline shows no line rather than a column of `—`); this one is the only frame
             // in which the line ships.
             //
@@ -325,6 +325,9 @@ enum PanelRenderHarness {
         // different axis: same `.connected` state and same healthy roster, differing only in which payload
         // fault is set. See `faultFixtures`.
         ] + faultFixtures(rows: rows, nextSwap: nextSwap, generatedAt: fresh)
+          // …plus the four PATHOLOGICAL-CONTENT rosters (#753). A third axis again: the state is
+          // `.connected` and no payload fault is set, only the CONTENT is hostile. See `stressFixtures`.
+          + stressFixtures(now: now, generatedAt: fresh)
     }
 
     /// The four NON-CANARY daemon-level FAULT fixtures (#592) — the four ranks of
@@ -373,6 +376,161 @@ enum PanelRenderHarness {
             // outrank one that cannot self-heal. (Rank 7, an overridden canary drift, sits just above but is
             // not rendered here — see the doc above.)
             fault("fault-scrub-recovering") { $0.canonicalScrub = .recovering },
+        ]
+    }
+
+    // MARK: - Pathological content (#753)
+
+    /// The four PATHOLOGICAL-CONTENT rosters (#753) — hostile LABELS, PERCENTS and DURATIONS on an
+    /// otherwise-ordinary `.connected` snapshot, so the panel's whole-frame behaviour under them is
+    /// captured rather than assumed.
+    ///
+    /// WHY A RENDER AND NOT A MEASUREMENT. `Tests/PanelTextMetricsTests` (#750) already answers "does this
+    /// label fit its cell", per cell, through CoreText. It cannot answer what happens to the FRAME —
+    /// whether a row grows, whether a meter and its label start competing for the same width, whether the
+    /// callout or the footer collapses. Those are whole-panel claims, and only a render makes them.
+    ///
+    /// PAIRED BY NAME, and that is the point. Each fixture's name is a `data-frame` base in the mock
+    /// (`design/menubar-preview.html` group 7), so `design/build-comparison.py` sets each capture beside the
+    /// frame that AUTHORS what it should look like. Without that the stress renders could only
+    /// self-baseline — a golden blessing whatever the renderer emits, which then DEFENDS a broken renderer
+    /// (the trap `Tests/BarGlyphParityTests.swift:38` documents, and the one issue #437 was misread through
+    /// five times). Renaming a fixture here silently unpairs it, so keep these four names in step with the
+    /// mock's.
+    ///
+    /// FOUR fixtures for the SIX pathological concepts issue #753 lists — #752 folded them when it authored
+    /// the frames, because a frame is a whole roster and several concepts sit in one without interfering.
+    /// Expect four names, not six; the fold, its rationale and the concept-per-frame table live in
+    /// `design/README.md` § Pathological content (#752).
+    ///
+    /// EVERY VALUE HERE IS TRANSCRIBED FROM THE MOCK, never chosen. The mock's numbers are themselves
+    /// measured — through the same CoreText primitives the shipped #750 gate drives, against the shipped
+    /// budgets — so re-picking one here would silently replace a measured oracle with an eyeballed one.
+    /// Three of those measurements contradict issue #753's own prose and the frames follow the MEASUREMENT:
+    ///   • CJK / RTL labels do NOT elide at the 171 pt roster budget (119.32 / 116.30 / 123.72 pt) — they
+    ///     render whole. Only the 40-char row (273.65 pt) elides.
+    ///   • `365d23h` does NOT overflow the 52 pt reset cell (48.32 pt), nor does any three-digit day count.
+    ///     Overflow begins at FOUR digits (`1000d23h` = 55.32 pt), which is issue #927 and is deliberately
+    ///     NOT rendered here — `999d23h` below is the widest form that still fits.
+    ///   • `255%` is rendered HONESTLY, with only the meter GEOMETRY clamped
+    ///     (`StatusPanelFormat.meterFillWidth`) — the shipped split on both surfaces, ratified in hq
+    ///     `strategy/design-menubar.md` § D-UX-PATHOLOGICAL. Nothing here clamps the number.
+    ///
+    /// Clock-relative instants take `boundaryGuardSecs` exactly as the ordinary fixtures do, so every
+    /// duration below renders the mock's literal string rather than a value that flips mid-suite.
+    private static func stressFixtures(now: Int64, generatedAt: Int64) -> [PanelRenderFixture] {
+        let minute: Int64 = 60
+        let hour: Int64 = 60 * minute
+        let day: Int64 = 24 * hour
+        let guardSecs = boundaryGuardSecs
+
+        /// One roster row, seeded from the mock's two meter cells — hence one call-site line per cell
+        /// below. `sessionIn` / `weeklyIn` are the DURATIONS the mock prints, converted to instants here so
+        /// the render re-derives the same string.
+        func row(_ label: String, active: Bool = false, isTarget: Bool = false,
+                 session: UInt8, sessionIn: Int64, weekly: UInt8, weeklyIn: Int64) -> AccountRow {
+            AccountRow(label: label, isActive: active, isEnabled: true, isQuarantined: false,
+                       isRecovering: false, auth: .healthy, sessionPct: session, weeklyPct: weekly,
+                       sessionResetsAt: now + sessionIn + guardSecs,
+                       weeklyResetsAt: now + weeklyIn + guardSecs,
+                       weeklyExhausted: false, isNextSwapTarget: isTarget, blindActive: nil)
+        }
+
+        func stress(_ name: String, rows: [AccountRow], swapTo: String,
+                    swapResetIn: Int64) -> PanelRenderFixture {
+            let reason = NextSwapReason.soonestReset(resetsAt: now + swapResetIn + guardSecs)
+            return PanelRenderFixture(name: name, state: .connected, rows: rows,
+                                      nextSwap: .target(to: swapTo, reason: reason),
+                                      generatedAt: generatedAt)
+        }
+
+        return [
+            // LONG · CJK · RTL, one roster. The active row's label is 273.65 pt against the 171 pt budget,
+            // so the panel MIDDLE-truncates it — the elision the mock authors as a literal because CSS
+            // `text-overflow` is tail-only. The other three are the scripts that measurement cleared: they
+            // fit whole, and the claim under test is that the row's LTR layout (badge leads, health trails)
+            // survives a bidi-shaped text run, not that anything elides.
+            stress("pathological-label",
+                   rows: [
+                       row("continuous-integration-runner@example.io", active: true,
+                           session: 92, sessionIn: 2 * hour + 14 * minute,
+                           weekly: 61, weeklyIn: 2 * day + 4 * hour),
+                       row("用户@例子公司.中国", isTarget: true,
+                           session: 31, sessionIn: hour + 2 * minute,
+                           weekly: 44, weeklyIn: 4 * day),
+                       row("مستخدم@شركة.مصر",
+                           session: 12, sessionIn: 5 * hour + 20 * minute,
+                           weekly: 27, weeklyIn: 6 * day + 3 * hour),
+                       row("משתמש@חברה.co.il",
+                           session: 7, sessionIn: 3 * hour + 40 * minute,
+                           weekly: 19, weeklyIn: 5 * day + 2 * hour),
+                   ],
+                   swapTo: "用户@例子公司.中国", swapResetIn: 4 * day),
+            // The issue #445 invariant, visually: which substring survives elision. The short pair holds by
+            // HEADROOM (81.16 / 81.80 pt against 171) and renders whole — its disambiguation rests on the
+            // monogram pair the shipped collision-escalation resolves (WC / WB, first⋅last then
+            // first⋅second once the pair is taken). The long pair is the case MIDDLE-truncation exists for:
+            // at 216.37 / 215.94 pt the distinguishing `-one` / `-two` survives in the kept TAIL, where
+            // tail-truncation would collapse both rows to the same `oleksii.pelykh@company`.
+            stress("same-local-part",
+                   rows: [
+                       row("work@a.com", active: true,
+                           session: 42, sessionIn: 2 * hour + 14 * minute,
+                           weekly: 66, weeklyIn: 2 * day + 4 * hour),
+                       row("work@b.com", isTarget: true,
+                           session: 18, sessionIn: 3 * hour + 5 * minute,
+                           weekly: 51, weeklyIn: 3 * day),
+                       row("oleksii.pelykh@company-one.com",
+                           session: 24, sessionIn: hour + 48 * minute,
+                           weekly: 39, weeklyIn: 4 * day + 6 * hour),
+                       row("oleksii.pelykh@company-two.com",
+                           session: 9, sessionIn: 5 * hour,
+                           weekly: 22, weeklyIn: 5 * day + 1 * hour),
+                   ],
+                   swapTo: "work@b.com", swapResetIn: 3 * day),
+            // DEGENERATE labels — an empty string and a whitespace-only one, between two ordinary rows so
+            // the departure is legible. The name line must stay genuinely BLANK: no placeholder, no quoted
+            // empty string, no synthesised identity. Identity then rests entirely on #445's other two cues,
+            // and the `?` / `?2` monogram sentinel is the NON-colour one that keeps WCAG 1.4.1 satisfied —
+            // load-bearing here because the colour hash TRIMS its input, so these two labels hash to the
+            // SAME badge colour and the monogram is the only thing separating them.
+            //
+            // The swap target is deliberately the ORDINARY `Personal`: what the callout should render for a
+            // DEGENERATE target is an open question in the design record (#930), not one to guess at here.
+            stress("degenerate-label",
+                   rows: [
+                       row("Work", active: true,
+                           session: 42, sessionIn: 2 * hour + 14 * minute,
+                           weekly: 88, weeklyIn: 2 * day + 4 * hour),
+                       row("",
+                           session: 31, sessionIn: hour + 2 * minute,
+                           weekly: 71, weeklyIn: 4 * day),
+                       row("     ",
+                           session: 4, sessionIn: 5 * hour + 20 * minute,
+                           weekly: 18, weeklyIn: 6 * day + 3 * hour),
+                       row("Personal", isTarget: true,
+                           session: 16, sessionIn: 4 * hour + 30 * minute,
+                           weekly: 34, weeklyIn: 5 * day),
+                   ],
+                   swapTo: "Personal", swapResetIn: 5 * day),
+            // WIRE-HOSTILE NUMERICS — a percent the wire should never carry and durations at the reset
+            // cell's measured edge, over THREE rows (the mock's roster; the two hostile rows read as
+            // departures from the ordinary third). `255%` takes the red band and prints verbatim while the
+            // bar stops at its own track; `365d23h` / `999d23h` are the three-digit day counts that still
+            // FIT (48.32 pt of 52), and `23h59m` is the widest sub-day form, the ordinary counterpart.
+            stress("wire-hostile-numerics",
+                   rows: [
+                       row("Work", active: true,
+                           session: 255, sessionIn: 2 * hour + 14 * minute,
+                           weekly: 100, weeklyIn: 2 * day + 4 * hour),
+                       row("Personal",
+                           session: 42, sessionIn: 365 * day + 23 * hour,
+                           weekly: 88, weeklyIn: 999 * day + 23 * hour),
+                       row("Scratch", isTarget: true,
+                           session: 4, sessionIn: 23 * hour + 59 * minute,
+                           weekly: 18, weeklyIn: 3 * day),
+                   ],
+                   swapTo: "Scratch", swapResetIn: 3 * day),
         ]
     }
 
