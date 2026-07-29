@@ -154,9 +154,10 @@ pub(crate) use snapshot::{
 // `use super::*` resolves them while a non-test build sees no unused re-export.
 //
 // `AccountExpiry` (issue #878) joins them for the same reason with a different cause: production
-// CONSTRUCTS it via `account_expiry` and stores it on `AccountReading` without ever naming the type,
-// and nothing reads it back until issue #882 projects it onto the wire. Only the tests that pin its
-// classification name it today.
+// CONSTRUCTS it via `account_expiry`, stores it on `AccountReading`, and — since issue #882 — copies
+// it onto `AccountStatusLine` for the wire, all without ever NAMING the type outside the `snapshot`
+// module that declares it. So the re-export stays test-scoped even now that the field is projected:
+// what it serves is the tests that pin the classification and its wire shape.
 #[cfg(test)]
 pub(crate) use snapshot::{status_response, AccountExpiry, RefreshHealth};
 

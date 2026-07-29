@@ -1884,6 +1884,147 @@ mod tests {
     }
 
     #[test]
+    fn account_line_encodes_the_expiry_modifier_only_once_the_account_has_been_polled() {
+        // Issue #882: the ADDITIVE per-account `expiry` wire field (schema 1.12), the ADR-0017
+        // `blind_active` modifier posture applied to the #878 refresh-token foresight axis. The 4
+        // committed goldens all build their reading with `..Default::default()`, so `expiry` is
+        // `None` there and THEY prove the omit-when-absent half — every unpolled row stays
+        // byte-identical, which is why the regenerated goldens differ from their predecessors in
+        // `schema_version` and nothing else. None of them exercise the POPULATED shape, so this
+        // locks the bytes the field emits when a reading IS present: a later `#[serde(rename)]`,
+        // reorder, or retype of `AccountExpiry` / `ExpiryHorizon` drifts this test. The menubar
+        // mirror is out of scope here (issue #884 owns the panel, #883 the CLI cell), so this stays
+        // a Rust-side byte-lock rather than a fifth cross-language golden — exactly the posture
+        // issue #479 took for `recent_blind_preempt_swap` above; the Swift decoder's forward-
+        // compatible tolerance of a new unknown PER-ACCOUNT key is already covered by the
+        // `future_field` fixture (apps/menubar Fixtures.swift).
+        let mut snapshot = watch_snapshot("work", 42, 0.60);
+        snapshot.accounts[0].expiry = Some(AccountExpiry {
+            expires_at: Some(1_893_800_000),
+            horizon_state: ExpiryHorizon::Within,
+            cohort_id: None,
+        });
+        let frame = encode_snapshot_frame(&versioned_status_response(&snapshot));
+        assert!(
+            frame.contains(r#""expiry":{"expires_at":1893800000,"horizon_state":"within"}"#),
+            "the populated expiry modifier serializes its exact wire shape: {frame}"
+        );
+        // The classification tokens are the `snake_case` serde renames #878 chose so the wire, the
+        // event log and any future `--json` field agree by construction — pin every one of them, a
+        // silent respelling being a decode error on a client that gates the alarm states.
+        for (state, token) in [
+            (ExpiryHorizon::Unknown, "unknown"),
+            (ExpiryHorizon::Beyond, "beyond"),
+            (ExpiryHorizon::Within, "within"),
+            (ExpiryHorizon::Lapsed, "lapsed"),
+        ] {
+            snapshot.accounts[0].expiry = Some(AccountExpiry {
+                expires_at: Some(1_893_800_000),
+                horizon_state: state,
+                cohort_id: None,
+            });
+            let frame = encode_snapshot_frame(&versioned_status_response(&snapshot));
+            assert!(
+                frame.contains(&format!(r#""horizon_state":"{token}""#)),
+                "{state:?} serializes as `{token}`: {frame}"
+            );
+        }
+
+        // POLLED but the credential carried no deadline: `Some(_)` holding `Unknown` with a NULL
+        // deadline — the issue #137 distinction, preserved verbatim on the wire. `expires_at` is
+        // emitted as an explicit null rather than skipped, so a client can tell "observed, no
+        // deadline" from the absent-`expiry` "never observed" WITHOUT re-deriving it, and neither
+        // is readable as "not expiring".
+        snapshot.accounts[0].expiry = Some(AccountExpiry::default());
+        let frame = encode_snapshot_frame(&versioned_status_response(&snapshot));
+        assert!(
+            frame.contains(r#""expiry":{"expires_at":null,"horizon_state":"unknown"}"#),
+            "an observed-but-deadline-less credential keeps both facts on the wire: {frame}"
+        );
+
+        // Issue #879 owns cohort DETECTION; this item ships only the classification + the deadline.
+        // The field is carried on `AccountExpiry` so #879 adds a populator rather than reshaping the
+        // type, but `skip_serializing_if` keeps it OFF the wire while nothing can populate it — so
+        // #882 never promises a grouping no build produces.
+        assert!(
+            !frame.contains("cohort_id"),
+            "cohort_id stays off the wire until #879 can populate it: {frame}"
+        );
+
+        // Never polled → the key is omitted entirely (the additive-minor discipline the goldens
+        // rely on, and what keeps a pre-#882 client's bytes unchanged).
+        let unpolled = watch_snapshot("work", 42, 0.60);
+        let frame = encode_snapshot_frame(&versioned_status_response(&unpolled));
+        assert!(
+            !frame.contains("expiry"),
+            "the field is omitted for an account that has never been polled: {frame}"
+        );
+    }
+
+    #[test]
+    fn a_pre_882_status_payload_still_decodes_with_no_expiry() {
+        // Issue #882 (the tolerate-by-ignoring half): an older daemon omits the per-account
+        // `expiry` key entirely, and that must decode to `None` rather than throw — the same
+        // additive-field contract `blind_active` / `canary` / `systemic_refresh_source` rest on, and
+        // the reason a MINOR bump is safe for internal readers (`poke`, `use_account`) that decode a
+        // bare `StatusResponse`. What this pins is that the FIELD stays optional; note serde already
+        // resolves a missing key on any `Option<_>` to `None`, so the `#[serde(default)]` on the
+        // carrying field is convention rather than the mechanism here. The attribute that IS
+        // load-bearing sits one level down, on the non-`Option` `AccountExpiry::horizon_state` — see
+        // `a_partial_expiry_object_degrades_to_unknown_rather_than_dropping_the_frame`.
+        let pre_882 = r#"{"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":true,"systemic_refresh_failure":null}"#;
+        let parsed: StatusResponse = serde_json::from_str(pre_882).unwrap();
+        assert!(
+            parsed.accounts[0].expiry.is_none(),
+            "an omitted expiry decodes to None, never a fabricated classification"
+        );
+
+        // And the round trip holds for a CURRENT frame, so the modifier survives the socket rather
+        // than only serializing: the menubar decodes exactly this (issue #884).
+        let mut snapshot = watch_snapshot("work", 42, 0.60);
+        let expiry = AccountExpiry {
+            expires_at: Some(1_893_800_000),
+            horizon_state: ExpiryHorizon::Lapsed,
+            cohort_id: None,
+        };
+        snapshot.accounts[0].expiry = Some(expiry);
+        let json = serde_json::to_string(&versioned_status_response(&snapshot)).unwrap();
+        let back: VersionedStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.status.accounts[0].expiry, Some(expiry));
+    }
+
+    #[test]
+    fn a_partial_expiry_object_degrades_to_unknown_rather_than_dropping_the_frame() {
+        // Issue #882: `horizon_state` is the one NON-`Option` field inside `AccountExpiry`, so its
+        // `#[serde(default)]` is genuinely load-bearing — without it a `expiry` object missing that
+        // key is a HARD decode error that costs the whole frame, not just the cell.
+        //
+        // Defaulting rather than throwing is the DELIBERATE choice here, and it is the opposite of
+        // the sibling `BlindActive` posture ("the daemon always sends all three, so a malformed
+        // `blind_active` missing one throws rather than mis-reads"). The difference is that this
+        // enum has a fail-SAFE default: `ExpiryHorizon::Unknown` means "no deadline observed", never
+        // "not expiring" (issue #137, and exactly why #878 made `Unknown` the `#[default]` — "a
+        // consumer that forgets to classify gets the honest answer, not the dangerous one"). So the
+        // degraded read is honest, whereas dropping the frame would also take out the roster, the
+        // meters and every fault banner over one absent sub-key.
+        let partial = r#"{"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"expiry":{"expires_at":1893800000}}],"next_swap":null,"refresh_enabled":true}"#;
+        let parsed: StatusResponse =
+            serde_json::from_str(partial).expect("a partial expiry object must not cost the frame");
+        let expiry = parsed.accounts[0].expiry.expect("the object still decodes");
+        assert_eq!(expiry.expires_at, Some(1_893_800_000));
+        assert_eq!(
+            expiry.horizon_state,
+            ExpiryHorizon::Unknown,
+            "an absent classification degrades to the honest Unknown, never a fabricated Beyond"
+        );
+
+        // The empty object degrades the same way — both facts absent, neither invented.
+        let empty = r#"{"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"expiry":{}}],"next_swap":null,"refresh_enabled":true}"#;
+        let parsed: StatusResponse = serde_json::from_str(empty).expect("an empty expiry decodes");
+        assert_eq!(parsed.accounts[0].expiry, Some(AccountExpiry::default()));
+    }
+
+    #[test]
     fn control_reply_rejects_malformed_json() {
         let (reply, signal) = control_reply("not json", &StatusSnapshot::default(), true);
         assert!(reply.contains("malformed"));
@@ -2317,7 +2458,7 @@ mod tests {
         };
         let json = serde_json::to_string(&versioned_status_response(&snapshot)).unwrap();
         assert!(
-            json.contains(r#""schema_version":{"major":1,"minor":11}"#),
+            json.contains(r#""schema_version":{"major":1,"minor":12}"#),
             "got {json}"
         );
         assert!(json.contains(r#""generated_at":1782777600"#), "got {json}");

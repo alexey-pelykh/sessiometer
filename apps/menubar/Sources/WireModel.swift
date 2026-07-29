@@ -333,8 +333,8 @@ extension CanonicalScrub: Decodable {
 /// that decodes fine, and this one only picks which evidence clause the banner cites. Rejecting would
 /// throw away the whole frame — roster, vault pair, canary alarm and the mechanism-down count itself —
 /// over a phrasing selector. It would also be unrecoverable rather than gateable: `WireContract`
-/// `isSupported` keys on the MAJOR only, so a future 1.12 daemon adding a third bracket is a version
-/// this client reports as SUPPORTED while blanking every frame it sends.
+/// `isSupported` keys on the MAJOR only, so a future MINOR adding a third bracket is a version this
+/// client reports as SUPPORTED while blanking every frame it sends.
 ///
 /// It degrades to [`unrecognized`](Self/unrecognized) rather than to `nil`, because those two states
 /// are NOT the same and must not render the same. `nil` means "no provenance on this wire" — a
