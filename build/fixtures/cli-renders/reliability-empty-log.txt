@@ -25,3 +25,7 @@ blind-arm projection error (projected − session_at_recovery, pp; the BLIND_VEL
   no reconcilable blind windows — percentiles withheld (an empty subject is not a 0 pp error)
 
 usage-poll 429 neutrality (roster-wide): rate_limited=0 transient=0 cleared=0
+
+refresh-token loss (credential lifecycle — cure is `sessiometer login`; NOT a swap-out failure, and folded into no SLI above)
+  accounts observed lost: 0 (from 0 dead-refresh observations: sweep=0 poll-retry=0 keep-warm=0)
+  confirmed unrecoverable (automated recovery exhausted): 0

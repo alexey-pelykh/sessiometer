@@ -48,6 +48,16 @@
 //!    `false_projection.rate` stays `None` rather than gaining a symmetric forecast-error rate.
 //!    The error percentiles are published PAIRED with their cardinality + censoring counts (the
 //!    survivorship guard, issue #484) and never bare.
+//! 7. **refresh-token loss** (issue #881) — the accounts a lapsed/revoked REFRESH token removed
+//!    from the fleet. Attributed DISTINCTLY from every swap SLI above, following the issue #719
+//!    precedent that segregated `all_exhausted` capacity-holds out of the swap-out SLI: an account
+//!    lost this way is a credential-LIFECYCLE event with a known operator cure (`sessiometer
+//!    login`), not a swap-out failure, so folding it into a reliability signal would contaminate
+//!    that signal with an operator-action-pending condition. Unlike #719 the segregation here is
+//!    STRUCTURAL rather than a filter — the loss evidence rides refresh-family events, which are
+//!    disjoint from the `event=swap` population every swap SLI folds — so no existing partition
+//!    changes meaning. Depth lives with the code: [`RefreshTokenLoss`] for the segregation, the
+//!    refresh-family arm of [`parse_events`] for the predicate and its lapsed-vs-revoked scope bound.
 //!
 //! Like `stats` (issue #158) this is an OFFLINE reader: it reads the daemon's durable files
 //! directly — the event log for SLIs 1-4, plus (for SLI 5) the `usage-samples.jsonl` store
@@ -128,7 +138,7 @@
 use crate::error::{Error, Result};
 use crate::usage::epoch_from_rfc3339;
 use crate::usage_store::Sample;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// SLO target: swap-out `session_pct` **P100 must be `< 99`** — no `reason=session` swap fires
 /// at or above 99%. INTERIM per issue #455 (the extended #363 acceptance); the source of
@@ -210,7 +220,14 @@ pub(crate) const LANDING_WINDOW_SECS: i64 = 15 * 60;
 /// percentiles now reflect reaction-latency only, and the excluded population reads from
 /// `capacity_held` / `landing.capacity_held`. A consumer reading `swap_overshoot.met.p100` now gets
 /// the honest gate verdict; the pre-9 total is reconstructable as `swap_overshoot.n + capacity_held.n`.
-const JSON_SCHEMA_VERSION: u32 = 9;
+/// Bumped `9 → 10` (issue #881) when the refresh-token-loss attribution added the top-level
+/// `refresh_token_loss` object — ADDITIVE (a new always-present field; every schema:9 key is
+/// byte-identical and keeps its meaning). Unlike `8 → 9` it carries NO value-domain correction:
+/// the new block folds refresh-family events, which are DISJOINT from the `event=swap` population
+/// every swap SLI reads, so not one prior figure moves. That is the issue #881 acceptance ("the
+/// existing swap-out SLI partition is unchanged in meaning") holding BY CONSTRUCTION rather than by
+/// a filter — diff a schema:9 and a schema:10 readout of one log and only the added key differs.
+const JSON_SCHEMA_VERSION: u32 = 10;
 
 /// Parsed `reliability` options (issues #455/#494). A plain comparable value so the CLI parser
 /// is unit-testable by value, like `StatsArgs`.
@@ -472,6 +489,31 @@ struct Inputs {
     /// an undisclosed drop is a missing denominator, the survivorship failure this module guards
     /// against everywhere else.
     blind_pair_malformed: usize,
+    /// The DISTINCT accounts a refresh cycle reported `outcome=dead` for (issue #881) — the
+    /// refresh-token-loss population. A [`BTreeSet`] because the same loss is observed repeatedly:
+    /// on the live log one account's single lapse produced four `outcome=dead` lines across two
+    /// mechanisms, so counting lines would report four losses where one account was lost.
+    ///
+    /// The handles are a join key used INTERNALLY only — never rendered, exactly like
+    /// [`SwapOut::acct`] — so the roster-wide, secret-free output contract (issue #15) holds: the
+    /// readout publishes this set's CARDINALITY, never its members.
+    refresh_token_loss_accounts: BTreeSet<String>,
+    /// Every `outcome=dead` line in view, split by the refresh mechanism that observed it (issue
+    /// #881) — the raw evidence count behind [`Inputs::refresh_token_loss_accounts`], and the reason this
+    /// readout can say WHERE a loss was seen rather than only that one happened.
+    refresh_token_loss_by_mechanism: RefreshTokenLossByMechanism,
+    /// `event=credential_unrecoverable` count (issue #261): the terminal latch fired once a
+    /// QUARANTINED account's sweep-refresh came back dead, i.e. automated recovery is exhausted and
+    /// only an operator re-login can revive it — the same `sessiometer login` this readout renders
+    /// as the cure (the daemon's own `status` cue names the `claude /login` it wraps).
+    ///
+    /// Counted BESIDE the `outcome=dead` observations above, never as the predicate itself: it
+    /// requires an account to be quarantined FIRST, so it is strictly rarer than the loss it
+    /// confirms — zero across the whole 13,983-line live log while six `outcome=dead` lines sat in
+    /// the same file. A predicate keyed on this event ALONE would have matched nothing and passed
+    /// every test that only asserts "no false positives" (the issue #719 inert-predicate lesson,
+    /// where a drafted `hold == from` rule matched 0 of 11 relief swaps).
+    refresh_token_loss_confirmed: u32,
     /// The latest `ts=` seen ANYWHERE in the folded text — the OBSERVATION HORIZON a
     /// never-recovered episode's right-censored floor is measured to (issue #591).
     ///
@@ -481,6 +523,41 @@ struct Inputs {
     /// count the gap since the daemon last wrote as blindness. Taken over ALL lines, not just the
     /// blind family, so a quiet account's open episode is still measured to the log's real end.
     horizon_ts: Option<i64>,
+}
+
+/// WHICH refresh mechanism observed each refresh-token loss (issue #881) — the three durable
+/// families that carry a [`crate::observability::RefreshEventOutcome`], counted separately.
+///
+/// Published rather than summed away because the three cover DIFFERENT parts of the fleet, so the
+/// split is the operator's first diagnostic: a loss seen only on `keep_warm` is the ACTIVE account
+/// lapsing under a live session, one seen only on `sweep` is a parked spare rotting unnoticed, and
+/// `poll_retry` is a parked account caught at its first usage-401. Same total, different problem.
+///
+/// It is also this readout's own evidence that the classification predicate is not inert: the
+/// counts show the union genuinely spans three producers instead of resting on one that may never
+/// fire (issue #719's lesson — see [`Inputs::refresh_token_loss_confirmed`]).
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
+struct RefreshTokenLossByMechanism {
+    /// `event=refresh outcome=dead` — the periodic isolated-refresh sweep (issue #105), which walks
+    /// PARKED accounts on a cadence. The only mechanism that reaches an account nothing else touched.
+    sweep: u32,
+    /// `event=poll_refresh outcome=dead` — the poll-path refresh-then-retry (issue #162/#255), fired
+    /// on the FIRST usage-401 of a streak in the hope a merely-expired ACCESS token is revived. A
+    /// `dead` here means the retry found the REFRESH token itself gone. Never the active account.
+    poll_retry: u32,
+    /// `event=keep_warm outcome=dead` — the in-place ACTIVE-account keep-warm (issue #282). A `dead`
+    /// here is the sharpest signal in the set: the account serving live traffic cannot re-mint.
+    keep_warm: u32,
+}
+
+impl RefreshTokenLossByMechanism {
+    /// Every `outcome=dead` observation in view, across all three mechanisms — the raw evidence
+    /// count. Saturating, matching the per-mechanism counters' own overflow discipline.
+    fn total(self) -> u32 {
+        self.sweep
+            .saturating_add(self.poll_retry)
+            .saturating_add(self.keep_warm)
+    }
 }
 
 /// The complete classification of the `blind_window` lines in view (issue #636).
@@ -1132,6 +1209,60 @@ fn parse_events(text: &str, cutoff: Option<i64>) -> Inputs {
                     inputs.session_velocities.push(rate);
                 }
             }
+            // Refresh-token loss (issue #881). THE CLASSIFICATION PREDICATE: an account is lost to
+            // refresh-token expiry/revocation exactly when a refresh cycle reports `outcome=dead` —
+            // `RefreshEventOutcome::Dead`, "CC cleared the refresh token in place — the credential is
+            // dead and needs an operator re-login". That outcome vocabulary is SHARED by the three
+            // refresh mechanisms and by no other event, so the union of the three IS the predicate.
+            //
+            // VALIDATED AGAINST THE LIVE EVENT LOG, not assumed — the issue #719 discipline, where a
+            // drafted `hold == from` rule was inert (0 of 11 relief swaps) and only a replay caught
+            // it. Over 13,983 live lines an exhaustive `(event, outcome)` enumeration found
+            // `outcome=dead` on EXACTLY these three families — sweep 1, poll_retry 3, keep_warm 2 —
+            // and on no fourth producer; `event=login`'s own `outcome=` vocabulary
+            // (`onboarded`/`revived`/`failed`/`cancelled`) cannot collide. The union therefore
+            // matches 6 of 6 real dead-outcome lines. The tempting narrower predicate,
+            // `event=credential_unrecoverable`, matched ZERO in the same file (see
+            // `Inputs::refresh_token_loss_confirmed`) — it is counted below as corroboration,
+            // never as the key.
+            //
+            // SCOPE BOUND, stated rather than glossed: `outcome=dead` is Claude Code's `invalid_grant`
+            // scrub, which covers a token that LAPSED on its deadline and one that was REVOKED. The
+            // signal that would split those is the `refreshTokenExpiresAt` horizon issue #878 reads,
+            // and it is daemon-INTERNAL — `ExpiryHorizon` rides a non-`Serialize` reading and issue
+            // #880 owns putting it on a durable Event. So this block attributes the LOSS CLASS, whose
+            // members share one cure (`sessiometer login`) and one exclusion (not a swap-out
+            // failure), and #880 is what later lets a sub-split name the deadline case. Narrowing to
+            // "deadline lapse" today would key on a token no log carries: an inert predicate.
+            Some(family @ ("refresh" | "poll_refresh" | "keep_warm")) => {
+                if fields.get("outcome").copied() == Some("dead") {
+                    let m = &mut inputs.refresh_token_loss_by_mechanism;
+                    match family {
+                        "refresh" => m.sweep = m.sweep.saturating_add(1),
+                        "poll_refresh" => m.poll_retry = m.poll_retry.saturating_add(1),
+                        // `_` is `keep_warm` and nothing else — the arm's own pattern admits
+                        // exactly these three tokens, so widening it means revisiting this line.
+                        _ => m.keep_warm = m.keep_warm.saturating_add(1),
+                    }
+                    // A line with no parseable `account=` still counts as an observation above but
+                    // cannot join the distinct-account set — the tolerant-drop precedent the sibling
+                    // arms use (a landing anchor missing `from=` feeds the pct and no window). The
+                    // two figures are published together, so such a line is visible as the gap
+                    // between them rather than silently inflating either.
+                    if let Some(account) = fields.get("account").copied() {
+                        inputs
+                            .refresh_token_loss_accounts
+                            .insert(account.to_owned());
+                    }
+                }
+            }
+            // The terminal confirmation (issue #261): automated recovery is EXHAUSTED for an already-
+            // quarantined account. Corroborates the loss above; deliberately not the predicate, since
+            // it requires quarantine first and so under-counts (0 live occurrences).
+            Some("credential_unrecoverable") => {
+                inputs.refresh_token_loss_confirmed =
+                    inputs.refresh_token_loss_confirmed.saturating_add(1);
+            }
             _ => {}
         }
     }
@@ -1501,6 +1632,61 @@ struct RateLimit {
     cleared: u32,
 }
 
+/// The refresh-token-loss attribution (issue #881): accounts removed from the fleet because their
+/// REFRESH token lapsed or was revoked, reported as their OWN class rather than folded into any
+/// swap SLI.
+///
+/// **Why it is separate, and why that is not merely tidy.** An account lost this way is a
+/// credential-LIFECYCLE event with a known operator cure — `sessiometer login` mints a new token —
+/// so it is *pending an operator action*, not evidence that the swap machinery reacted late. A
+/// reliability signal that mixed the two would move for a reason no amount of daemon work can fix,
+/// and an operator reading a degraded swap-out SLO would go looking in the wrong place entirely.
+/// Same argument, same shape, as issue #719's segregation of `all_exhausted` capacity-holds.
+///
+/// **The segregation is STRUCTURAL, which is stronger than #719's.** #719 had to *filter* a shared
+/// population: capacity-holds and reaction-latency misses are both `reason=session` swaps, so a
+/// classification rule decides which bucket each lands in — and a wrong rule silently re-baselines
+/// the #363 gate. Here the two SWAP populations never meet: loss evidence rides `event=refresh` /
+/// `event=poll_refresh` / `event=keep_warm`, while every swap SLI folds `event=swap`. A
+/// refresh-family line therefore CANNOT reach [`Inputs::swap_out_pcts`] — not because a filter
+/// excludes it, but because no code path connects them. That is the issue #881 acceptance
+/// discharged by construction rather than by assertion.
+///
+/// **One shared input, named rather than glossed**: [`Inputs::horizon_ts`] is tracked OUTSIDE the
+/// event match, so every `ts=`-bearing line advances it — refresh-family lines included, and they
+/// did so before this attribution existed too, since the horizon has never been event-keyed. It is
+/// the only figure a refresh-family line can influence, it does so identically on either side of
+/// this change, and the influence is confined to a never-recovered episode's right-censored floor
+/// (issue #591). So "no swap SLI moves" is exact, where the broader "no code anywhere reads both"
+/// would not be.
+///
+/// Roster-wide and secret-free (issue #15): cardinalities and fixed labels, never a handle.
+#[derive(Debug, PartialEq)]
+struct RefreshTokenLoss {
+    /// DISTINCT accounts observed lost — the loss population, and the figure to read as "how many
+    /// accounts need a re-login". Deduplicated because one lapse is observed many times (see
+    /// [`Inputs::refresh_token_loss_accounts`]).
+    accounts: usize,
+    /// Which mechanism saw each `outcome=dead` observation. Its
+    /// [`RefreshTokenLossByMechanism::total`] is the raw evidence count; it is `>= accounts`
+    /// whenever a loss was seen more than once, and the gap between the two is exactly that
+    /// repetition (plus any line whose `account=` was unparseable).
+    by_mechanism: RefreshTokenLossByMechanism,
+    /// `credential_unrecoverable` LATCH EVENTS in view (issue #261) — the edge fired once an already-
+    /// quarantined account's sweep-refresh came back dead, i.e. automated recovery is exhausted.
+    ///
+    /// An EVENT COUNT over the window, deliberately NOT a subset of [`RefreshTokenLoss::accounts`],
+    /// and the two are independent in BOTH directions — stated plainly, because "confirmed" invites
+    /// the subset reading. It commonly reads `0` while `accounts` is non-zero (the latch needs a
+    /// prior quarantine, so it is strictly rarer than the loss it confirms — zero across the whole
+    /// live log while six `outcome=dead` lines sat in the same file). It can also EXCEED `accounts`,
+    /// or be non-zero while `accounts` is `0`: the count is per event, not per account, and under
+    /// `--since` a window can catch a latch whose originating dead-refresh line fell before the
+    /// cutoff. Neither reading is a defect — they answer different questions over the same window,
+    /// which is exactly why they are published side by side rather than folded together.
+    confirmed_unrecoverable: u32,
+}
+
 /// The aggregated readout — one pass folded into the four SLIs, plus the active window (if
 /// any). With `window: None` this is the whole-log aggregate; with `Some` the four SLIs above
 /// were computed over the windowed subset only, and `window` documents the bound.
@@ -1534,6 +1720,9 @@ struct Report {
     /// rather than silently folded away.
     blind_episodes: BlindEpisodes,
     rate_limit: RateLimit,
+    /// The issue #881 refresh-token-loss attribution — the credential-lifecycle class, reported
+    /// distinctly from every swap SLI above (which it cannot reach: disjoint event families).
+    refresh_token_loss: RefreshTokenLoss,
 }
 
 /// Fold the parsed [`Inputs`] into a [`Report`], attaching the active `window` for display.
@@ -1582,6 +1771,16 @@ fn aggregate(inputs: &Inputs, samples: &[Sample], window: Option<Window>) -> Rep
         p50: projective_pct(0.50),
         p95: projective_pct(0.95),
         p100: projective_pct(1.0),
+    };
+
+    // The #881 refresh-token-loss attribution — a straight carry-through of the parse-side counters,
+    // with NO cardinality gate unlike the three blocks above: a zero here is a genuine reading
+    // ("nothing was lost in view"), not the empty subject they withhold a figure for. Why this class
+    // is segregated from every swap SLI, and why that segregation is structural: [`RefreshTokenLoss`].
+    let refresh_token_loss = RefreshTokenLoss {
+        accounts: inputs.refresh_token_loss_accounts.len(),
+        by_mechanism: inputs.refresh_token_loss_by_mechanism,
+        confirmed_unrecoverable: inputs.refresh_token_loss_confirmed,
     };
 
     let near_limit_windows = inputs.near_limit_reconciliations.len() as u32;
@@ -1685,6 +1884,7 @@ fn aggregate(inputs: &Inputs, samples: &[Sample], window: Option<Window>) -> Rep
             transient: inputs.transient,
             cleared: inputs.cleared,
         },
+        refresh_token_loss,
     }
 }
 
@@ -1979,6 +2179,34 @@ fn render_human(r: &Report) -> String {
         "usage-poll 429 neutrality (roster-wide): rate_limited={} transient={} cleared={}\n",
         r.rate_limit.rate_limited, r.rate_limit.transient, r.rate_limit.cleared
     ));
+    out.push('\n');
+
+    // SLI 7 — refresh-token loss (issue #881). Rendered as its OWN block rather than under the
+    // swap-out SLI on purpose: #719's `capacity-held` sits inside that block because it is a
+    // partition OF the same `reason=session` swaps, whereas this is a different population entirely
+    // (refresh-family events), and nesting it there would read as a third swap bucket. The heading
+    // therefore carries the exclusion in words, since the layout alone cannot say it.
+    //
+    // Always rendered, including at zero — unlike `capacity-held`, which is hidden when empty. Zero
+    // accounts lost is a real and reassuring reading, not an absent measurement, and suppressing it
+    // would leave an operator unable to tell "no losses" from "this readout does not track losses".
+    let loss = &r.refresh_token_loss;
+    let m = loss.by_mechanism;
+    out.push_str(
+        "refresh-token loss (credential lifecycle — cure is `sessiometer login`; NOT a swap-out failure, and folded into no SLI above)\n",
+    );
+    out.push_str(&format!(
+        "  accounts observed lost: {} (from {} dead-refresh observations: sweep={} poll-retry={} keep-warm={})\n",
+        loss.accounts,
+        m.total(),
+        m.sweep,
+        m.poll_retry,
+        m.keep_warm,
+    ));
+    out.push_str(&format!(
+        "  confirmed unrecoverable (automated recovery exhausted): {}\n",
+        loss.confirmed_unrecoverable
+    ));
     out
 }
 
@@ -2013,6 +2241,47 @@ struct ReliabilityWire {
     /// `blind_exit` population beside the `blind_window`-derived figures above.
     blind_episodes: BlindEpisodesWire,
     rate_limit_neutrality: RateLimitWire,
+    /// The issue #881 refresh-token-loss attribution (schema:10, additive) — the credential-
+    /// lifecycle class, kept out of every swap SLI above. Placed LAST so every schema:9 key keeps
+    /// its position as well as its meaning.
+    refresh_token_loss: RefreshTokenLossWire,
+}
+
+/// The issue #881 refresh-token-loss block: accounts a lapsed/revoked REFRESH token removed from
+/// the fleet — an operator-cured credential-lifecycle condition (`sessiometer login`), NOT a
+/// swap-out failure. No `targets`/`met`: it gates nothing, and deliberately so — this is the
+/// population a reliability gate must EXCLUDE, not one it should score.
+///
+/// Plain counts rather than nullable percentiles (the shape its swap-SLI siblings use): a zero here
+/// is a real, meaningful reading — "no account was lost in view" — not the empty subject those
+/// blocks guard against by withholding a figure.
+#[derive(serde::Serialize)]
+struct RefreshTokenLossWire {
+    /// DISTINCT accounts observed lost — how many need a `sessiometer login`.
+    accounts: usize,
+    /// Total `outcome=dead` observations behind `accounts`. `>= accounts`; one lapse is commonly
+    /// observed several times across mechanisms.
+    observations: u32,
+    /// The observation split by refresh mechanism — WHERE each loss was seen.
+    by_mechanism: RefreshTokenLossByMechanismWire,
+    /// `credential_unrecoverable` latch EVENTS in view (issue #261) — automated recovery exhausted
+    /// for an already-quarantined account. An event count, NOT a subset of `accounts`: it commonly
+    /// reads `0` while `accounts` is non-zero, and can equally exceed it or be non-zero at
+    /// `accounts: 0`. See [`RefreshTokenLoss::confirmed_unrecoverable`] for why both directions are
+    /// expected rather than contradictory.
+    confirmed_unrecoverable: u32,
+}
+
+/// Which refresh mechanism observed each loss (issue #881) — different fleet coverage, different
+/// operator conclusion. See [`RefreshTokenLossByMechanism`].
+#[derive(serde::Serialize)]
+struct RefreshTokenLossByMechanismWire {
+    /// `event=refresh outcome=dead` — the periodic isolated-refresh sweep over PARKED accounts.
+    sweep: u32,
+    /// `event=poll_refresh outcome=dead` — the first-usage-401 refresh-then-retry on a parked account.
+    poll_retry: u32,
+    /// `event=keep_warm outcome=dead` — the in-place ACTIVE-account keep-warm. The sharpest signal.
+    keep_warm: u32,
 }
 
 /// The `--since` window bound (issue #494). Carries the operator's raw span plus the resolved
@@ -2367,6 +2636,16 @@ fn reliability_wire(r: &Report) -> ReliabilityWire {
             p95: r.blind_projection_error.p95,
             p100: r.blind_projection_error.p100,
         },
+        refresh_token_loss: RefreshTokenLossWire {
+            accounts: r.refresh_token_loss.accounts,
+            observations: r.refresh_token_loss.by_mechanism.total(),
+            by_mechanism: RefreshTokenLossByMechanismWire {
+                sweep: r.refresh_token_loss.by_mechanism.sweep,
+                poll_retry: r.refresh_token_loss.by_mechanism.poll_retry,
+                keep_warm: r.refresh_token_loss.by_mechanism.keep_warm,
+            },
+            confirmed_unrecoverable: r.refresh_token_loss.confirmed_unrecoverable,
+        },
         blind_episodes: BlindEpisodesWire {
             n_entered: r.blind_episodes.n_entered,
             n_exited: r.blind_episodes.n_exited,
@@ -2481,6 +2760,323 @@ ts=2026-07-11T00:50:00Z event=usage_velocity acct=u-A session_pct_per_min=0.20 w
         assert_eq!(inputs.rate_limited, 2);
         assert_eq!(inputs.transient, 1);
         assert_eq!(inputs.cleared, 1);
+        // #881: FIXTURE_LOG carries no refresh-family line, so the loss attribution is empty — the
+        // blast-radius guard's third direction (the new arms must not fire on unrelated families).
+        assert!(inputs.refresh_token_loss_accounts.is_empty());
+        assert_eq!(
+            inputs.refresh_token_loss_by_mechanism,
+            RefreshTokenLossByMechanism::default()
+        );
+        assert_eq!(inputs.refresh_token_loss_confirmed, 0);
+    }
+
+    // --- issue #881: refresh-token-loss attribution ---------------------------------------
+
+    /// A VERBATIM REPLAY of the refresh-token losses in the author's live event log
+    /// (`~/Library/Logs/sessiometer/sessiometer.log`, 13,983 lines as of 2026-07-29): every
+    /// `outcome=dead` line it contains, unaltered in shape, field order, or handle.
+    ///
+    /// This fixture exists because issue #719 shipped a classification rule that was drafted as
+    /// `hold == from`, matched ZERO of 11 real relief swaps, and passed every test that only
+    /// asserted the absence of false positives. A replay of real lines is the one check that would
+    /// have caught it, so #881's predicate is pinned against real lines before anything else.
+    ///
+    /// The population is deliberately uneven — one account observed FOUR times across two
+    /// mechanisms, two others once each — because that is what the real log looks like, and it is
+    /// exactly the shape that makes line-counting and account-counting diverge.
+    const LIVE_REPLAY_REFRESH_TOKEN_LOSS_LOG: &str = "\
+ts=2026-07-14T13:25:30Z event=keep_warm account=oleksii@pelykh.com trigger=reactive outcome=dead rotated=true
+ts=2026-07-15T15:12:53Z event=keep_warm account=oleksii@pelykhconsulting.com trigger=reactive outcome=dead rotated=true
+ts=2026-07-19T03:25:39Z event=poll_refresh account=oleksii@pelykhconsulting.eu trigger=poll_401 outcome=dead rotated=true
+ts=2026-07-19T04:39:31Z event=poll_refresh account=oleksii@pelykhconsulting.eu trigger=poll_401 outcome=dead rotated=true
+ts=2026-07-19T05:56:47Z event=poll_refresh account=oleksii@pelykhconsulting.eu trigger=poll_401 outcome=dead rotated=true
+ts=2026-07-19T06:07:06Z event=refresh account=oleksii@pelykhconsulting.eu outcome=dead expires_before=1970-01-01T00:00:00Z expires_after=1970-01-01T00:00:00Z rotated=false window_secs=0
+";
+
+    /// The healthy refresh traffic that surrounds those losses in the same live log — the
+    /// overwhelming majority of refresh-family lines (338 `refreshed`, 83 `error`, 52
+    /// `refreshed_not_restashed`, …). Kept as its own fixture so "the predicate fires" and "the
+    /// predicate is selective" are pinned by separate assertions rather than one combined count.
+    const LIVE_REPLAY_HEALTHY_REFRESH_LOG: &str = "\
+ts=2026-07-19T07:00:00Z event=refresh account=oleksii@pelykh.com outcome=refreshed expires_before=2026-07-19T06:00:00Z expires_after=2026-07-19T14:00:00Z rotated=false window_secs=28800
+ts=2026-07-19T07:05:00Z event=refresh account=oleksii@pelykh.com outcome=error rotated=false reason=timeout backoff_secs=60
+ts=2026-07-19T07:10:00Z event=poll_refresh account=oleksii@pelykh.com trigger=poll_401 outcome=refreshed rotated=false
+ts=2026-07-19T07:15:00Z event=keep_warm account=oleksii@pelykh.com trigger=proactive outcome=refreshed_not_restashed rotated=false
+ts=2026-07-19T07:20:00Z event=refresh account=oleksii@pelykh.com outcome=no_change rotated=false
+";
+
+    /// THE non-inertness check. Replays the real losses and asserts the predicate fires on all
+    /// three mechanisms with the real cardinalities — the assertion #719's drafted rule would have
+    /// failed, and the reason this predicate is not merely plausible.
+    #[test]
+    fn the_refresh_token_loss_predicate_fires_on_every_real_dead_refresh_line() {
+        let inputs = parse_events(LIVE_REPLAY_REFRESH_TOKEN_LOSS_LOG, None);
+        // 6 real `outcome=dead` lines, split exactly as the live log splits them.
+        assert_eq!(
+            inputs.refresh_token_loss_by_mechanism,
+            RefreshTokenLossByMechanism {
+                sweep: 1,
+                poll_retry: 3,
+                keep_warm: 2,
+            },
+            "the predicate must match every real dead-refresh line, on all three mechanisms"
+        );
+        assert_eq!(inputs.refresh_token_loss_by_mechanism.total(), 6);
+        // 3 DISTINCT accounts behind those 6 observations — the dedup that makes the two figures
+        // differ, and the reason `accounts` is not a line count.
+        assert_eq!(inputs.refresh_token_loss_accounts.len(), 3);
+    }
+
+    /// The DISCRIMINATING half: the narrower, semantically-tempting predicate
+    /// (`event=credential_unrecoverable`, issue #261's "confirmed dead and unrecoverable" latch)
+    /// matches NOTHING on the same real lines, because it requires an account to be quarantined
+    /// first. Keying on it alone would have shipped an inert rule that passes every no-false-
+    /// positive test — the #719 failure mode, reproduced here as an executable falsifier rather
+    /// than a comment.
+    #[test]
+    fn keying_refresh_token_loss_on_credential_unrecoverable_alone_would_be_inert() {
+        let inputs = parse_events(LIVE_REPLAY_REFRESH_TOKEN_LOSS_LOG, None);
+        assert_eq!(
+            inputs.refresh_token_loss_confirmed, 0,
+            "the live log carries no credential_unrecoverable line; a predicate keyed on it \
+             would report zero losses while six dead-refresh lines sat in the same file"
+        );
+        assert!(
+            inputs.refresh_token_loss_by_mechanism.total() > 0,
+            "the shipped predicate must find the losses the narrow one misses"
+        );
+    }
+
+    /// The latch IS counted when it fires — corroboration beside the observations, never instead
+    /// of them. Pins that `confirmed_unrecoverable` is wired, so the assertion above measures the
+    /// live log's silence rather than a dead code path.
+    #[test]
+    fn a_credential_unrecoverable_line_is_counted_as_confirmation() {
+        let log = format!(
+            "{LIVE_REPLAY_REFRESH_TOKEN_LOSS_LOG}\
+ts=2026-07-19T08:00:00Z event=credential_unrecoverable account=oleksii@pelykhconsulting.eu\n"
+        );
+        let inputs = parse_events(&log, None);
+        assert_eq!(inputs.refresh_token_loss_confirmed, 1);
+        // The latch adds no observation and no account — it confirms a loss already counted.
+        assert_eq!(inputs.refresh_token_loss_by_mechanism.total(), 6);
+        assert_eq!(inputs.refresh_token_loss_accounts.len(), 3);
+    }
+
+    /// `confirmed_unrecoverable` is an EVENT count over the window, independent of `accounts` in
+    /// BOTH directions — pinned because the word "confirmed" invites the subset reading, and a doc
+    /// that merely asserted the independence would be the kind of prose the code can quietly
+    /// contradict. The live log shows one direction (0 latches beside 3 lost accounts); this pins
+    /// the other, which `--since` makes routine: a window can catch the latch while the dead-refresh
+    /// line that produced it falls before the cutoff.
+    #[test]
+    fn confirmed_unrecoverable_is_an_event_count_not_a_subset_of_accounts() {
+        let log = "\
+ts=2026-07-19T08:00:00Z event=credential_unrecoverable account=oleksii@pelykhconsulting.eu
+ts=2026-07-19T08:05:00Z event=credential_unrecoverable account=oleksii@pelykhconsulting.eu
+";
+        let r = aggregate(&parse_events(log, None), &[], None);
+        assert_eq!(
+            r.refresh_token_loss.accounts, 0,
+            "no dead-refresh line in view"
+        );
+        assert_eq!(
+            r.refresh_token_loss.confirmed_unrecoverable, 2,
+            "latches are counted per EVENT, so they can exceed accounts — and at accounts=0"
+        );
+        // The render must show both without pretending one bounds the other.
+        let text = render_human(&r);
+        assert!(text.contains("accounts observed lost: 0"));
+        assert!(text.contains("confirmed unrecoverable (automated recovery exhausted): 2"));
+    }
+
+    /// Selectivity: the healthy refresh traffic that dwarfs the losses in the real log contributes
+    /// nothing. Without this, a predicate that matched the FAMILY rather than the OUTCOME would
+    /// pass the non-inertness test above while reporting the whole fleet lost.
+    #[test]
+    fn healthy_refresh_outcomes_are_not_refresh_token_losses() {
+        let inputs = parse_events(LIVE_REPLAY_HEALTHY_REFRESH_LOG, None);
+        assert_eq!(
+            inputs.refresh_token_loss_by_mechanism,
+            RefreshTokenLossByMechanism::default()
+        );
+        assert!(inputs.refresh_token_loss_accounts.is_empty());
+    }
+
+    /// One account's single lapse is observed repeatedly, so the account count MUST dedup while
+    /// the observation count MUST not. Both directions are asserted: reporting 4 losses for one
+    /// account overstates the operator's work, and collapsing the observations would hide which
+    /// mechanisms saw it.
+    #[test]
+    fn repeated_observations_of_one_loss_count_as_one_account() {
+        let inputs = parse_events(LIVE_REPLAY_REFRESH_TOKEN_LOSS_LOG, None);
+        let report = aggregate(&inputs, &[], None);
+        assert_eq!(report.refresh_token_loss.accounts, 3);
+        assert_eq!(report.refresh_token_loss.by_mechanism.total(), 6);
+        assert!(
+            report.refresh_token_loss.by_mechanism.total()
+                > u32::try_from(report.refresh_token_loss.accounts).unwrap(),
+            "the live replay's whole point is that observations outnumber accounts"
+        );
+    }
+
+    /// A dead line whose `account=` is missing still counts as EVIDENCE but cannot join the
+    /// account set — the tolerant-drop precedent (a landing anchor missing `from=` feeds the pct
+    /// and opens no window). The gap between the two figures is where such a line is visible.
+    #[test]
+    fn a_dead_line_without_an_account_counts_as_an_observation_only() {
+        let log = "ts=2026-07-19T09:00:00Z event=refresh outcome=dead rotated=false\n";
+        let inputs = parse_events(log, None);
+        assert_eq!(inputs.refresh_token_loss_by_mechanism.total(), 1);
+        assert!(inputs.refresh_token_loss_accounts.is_empty());
+    }
+
+    /// `--since` bounds the loss attribution exactly as it bounds every other SLI: the window gate
+    /// runs before the event match, so no per-SLI windowing code is needed — this pins that the new
+    /// arms sit downstream of it rather than beside it.
+    #[test]
+    fn the_since_window_bounds_the_refresh_token_loss_attribution() {
+        // Cutoff between the 07-15 keep_warm and the 07-19 poll_refresh burst.
+        let cutoff = epoch("2026-07-17T00:00:00Z");
+        let inputs = parse_events(LIVE_REPLAY_REFRESH_TOKEN_LOSS_LOG, Some(cutoff));
+        assert_eq!(
+            inputs.refresh_token_loss_by_mechanism,
+            RefreshTokenLossByMechanism {
+                sweep: 1,
+                poll_retry: 3,
+                keep_warm: 0,
+            },
+            "the two pre-cutoff keep_warm losses must fall outside the window"
+        );
+        assert_eq!(inputs.refresh_token_loss_accounts.len(), 1);
+    }
+
+    /// THE issue #881 ACCEPTANCE — "the existing swap-out SLI partition is unchanged in meaning".
+    ///
+    /// Asserted EXHAUSTIVELY rather than field-by-field: both readouts are rendered to JSON, the
+    /// `refresh_token_loss` key is removed from each, and the remainders must be byte-identical.
+    /// A field-by-field comparison would silently stop covering a future SLI; this cannot, because
+    /// any new key appears in both documents automatically.
+    ///
+    /// The segregation being verified is STRUCTURAL — refresh-family events and `event=swap` are
+    /// disjoint populations — so this test is pinning that no code path was accidentally wired
+    /// between them, not that a filter is tuned correctly.
+    #[test]
+    fn adding_refresh_token_losses_changes_no_other_figure() {
+        // The added lines are dated INSIDE the fixture's own span (00:00–00:50) rather than reusing
+        // the live replay's 07-14→07-19 dates. That is deliberate and load-bearing: `horizon_ts` is
+        // tracked outside the event match, so ANY later-dated line — of any family — advances the
+        // observation horizon, and a never-recovered episode would then legitimately report a larger
+        // censored floor. FIXTURE_LOG happens to have no such episode, so out-of-span dates would
+        // pass here anyway — on a branch that never runs. Keeping the lines in-span makes the
+        // equality below hold for the stated reason (disjoint populations) instead of by luck, so
+        // the test cannot silently start proving something weaker than it claims.
+        const IN_SPAN_LOSSES: &str = "\
+ts=2026-07-11T00:12:00Z event=keep_warm account=work trigger=reactive outcome=dead rotated=true
+ts=2026-07-11T00:13:00Z event=poll_refresh account=spare trigger=poll_401 outcome=dead rotated=true
+ts=2026-07-11T00:14:00Z event=refresh account=spare outcome=dead rotated=false
+";
+        let without = aggregate(&parse_events(FIXTURE_LOG, None), &[], None);
+        let with = aggregate(
+            &parse_events(&format!("{FIXTURE_LOG}{IN_SPAN_LOSSES}"), None),
+            &[],
+            None,
+        );
+
+        let strip = |r: &Report| -> serde_json::Value {
+            let mut v: serde_json::Value = serde_json::from_str(&render_json(r).expect("render"))
+                .expect("the readout renders valid JSON");
+            let removed = v
+                .as_object_mut()
+                .expect("the readout is a JSON object")
+                .remove("refresh_token_loss");
+            assert!(removed.is_some(), "the block under test must be present");
+            v
+        };
+        assert_eq!(
+            strip(&without),
+            strip(&with),
+            "adding refresh-token-loss lines must leave every other figure identical"
+        );
+
+        // The canary: the perturbation must actually have DONE something, or the equality above is
+        // satisfied by a fixture that changed nothing (the degenerate-subject failure).
+        assert_ne!(
+            without.refresh_token_loss, with.refresh_token_loss,
+            "the added lines must move the loss block, else this test proves nothing"
+        );
+        assert_eq!(with.refresh_token_loss.accounts, 2, "work + spare");
+        assert_eq!(with.refresh_token_loss.by_mechanism.total(), 3);
+    }
+
+    /// The swap SLIs are computed from `event=swap` alone, so a log of PURE losses yields no swap
+    /// evidence at all. The complement of the test above: there, losses do not perturb swaps; here,
+    /// losses cannot manufacture them.
+    #[test]
+    fn refresh_token_losses_alone_produce_no_swap_evidence() {
+        let inputs = parse_events(LIVE_REPLAY_REFRESH_TOKEN_LOSS_LOG, None);
+        assert!(inputs.swap_out_pcts.is_empty());
+        assert!(inputs.swap_out_held_pcts.is_empty());
+        assert!(inputs.projective_swap_out_pcts.is_empty());
+        assert!(inputs.session_swaps.is_empty());
+        assert!(inputs.reactivations.is_empty());
+    }
+
+    /// The block reaches the human readout with its exclusion stated in words — the layout alone
+    /// cannot say "this is not a swap-out failure", and an operator reading a degraded swap SLO
+    /// needs to see where credential losses went.
+    #[test]
+    fn the_human_readout_renders_the_loss_block_with_its_exclusion() {
+        let text = render_human(&aggregate(
+            &parse_events(LIVE_REPLAY_REFRESH_TOKEN_LOSS_LOG, None),
+            &[],
+            None,
+        ));
+        assert!(text.contains("refresh-token loss"));
+        assert!(text.contains("NOT a swap-out failure"));
+        assert!(text.contains("sessiometer login"));
+        assert!(text.contains("accounts observed lost: 3"));
+        assert!(text.contains("sweep=1 poll-retry=3 keep-warm=2"));
+    }
+
+    /// The `--json` contract: the block is on the wire, under the bumped schema, with the shape a
+    /// consumer is promised. The schema assertion is deliberately literal — the issue #881 AC ties
+    /// the bump to a payload-shape change, so the two must be pinned together or a later edit can
+    /// add a key and leave the version behind.
+    #[test]
+    fn the_json_wire_carries_the_loss_block_under_schema_10() {
+        let r = aggregate(
+            &parse_events(LIVE_REPLAY_REFRESH_TOKEN_LOSS_LOG, None),
+            &[],
+            None,
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&render_json(&r).expect("serializes")).expect("valid JSON");
+        assert_eq!(json["schema"], 10);
+        let loss = &json["refresh_token_loss"];
+        assert_eq!(loss["accounts"], 3);
+        assert_eq!(loss["observations"], 6);
+        assert_eq!(loss["by_mechanism"]["sweep"], 1);
+        assert_eq!(loss["by_mechanism"]["poll_retry"], 3);
+        assert_eq!(loss["by_mechanism"]["keep_warm"], 2);
+        assert_eq!(loss["confirmed_unrecoverable"], 0);
+        // No `targets` / `met`: this block gates nothing, deliberately — it is the population a
+        // reliability gate must EXCLUDE, so publishing a pass/fail flag would invite the exact
+        // conflation issue #881 exists to prevent.
+        assert!(loss.get("targets").is_none());
+        assert!(loss.get("met").is_none());
+    }
+
+    /// Zero is RENDERED, not suppressed. "No account was lost in view" is a real reading, and an
+    /// absent block would leave an operator unable to distinguish it from a readout that does not
+    /// track losses at all — the same absence-is-not-evidence discipline the percentile blocks
+    /// apply by withholding a figure instead of printing a passing `0`.
+    #[test]
+    fn a_clean_log_still_renders_the_loss_block_at_zero() {
+        let text = render_human(&aggregate(&parse_events("", None), &[], None));
+        assert!(text.contains("refresh-token loss"));
+        assert!(text.contains("accounts observed lost: 0"));
+        assert!(text.contains("confirmed unrecoverable (automated recovery exhausted): 0"));
     }
 
     #[test]
@@ -2862,6 +3458,14 @@ ts=2026-07-11T00:04:00Z event=swap from=c to=d reason=session session_pct=100
                 "  no reconcilable blind windows — percentiles withheld (an empty subject is not a 0 pp error)\n",
                 "\n",
                 "usage-poll 429 neutrality (roster-wide): rate_limited=2 transient=1 cleared=1\n",
+                "\n",
+                // Issue #881: the refresh-token-loss block, always rendered — at ZERO here, since
+                // FIXTURE_LOG carries no refresh-family line. Pinned in the byte-exact expectation
+                // rather than only in a `contains` assertion so its position (last, after the 429
+                // line) and its zero wording are both regression-locked.
+                "refresh-token loss (credential lifecycle — cure is `sessiometer login`; NOT a swap-out failure, and folded into no SLI above)\n",
+                "  accounts observed lost: 0 (from 0 dead-refresh observations: sweep=0 poll-retry=0 keep-warm=0)\n",
+                "  confirmed unrecoverable (automated recovery exhausted): 0\n",
             )
         );
     }
@@ -2878,7 +3482,7 @@ ts=2026-07-11T00:04:00Z event=swap from=c to=d reason=session session_pct=100
     }
 
     #[test]
-    fn json_render_is_stable_schema_9() {
+    fn json_render_is_stable_schema_10() {
         // The whole-log default: `window` is null and every field except the #635-renamed
         // velocity-projection key (`projective_swap_out_pct`, schema:6) is byte-identical to
         // schema:1–5 — the additive contract (#494/#539/#595/#608/#636/#591) plus the one #635
@@ -2901,12 +3505,19 @@ ts=2026-07-11T00:04:00Z event=swap from=c to=d reason=session session_pct=100
         // and `projective_swap_out_pct`) and `landing.capacity_held` — both ADDITIVE and always
         // present. FIXTURE_LOG carries no all_exhausted, so both read empty (n=0 / all-null / 0): the
         // segregation is inert here, so every prior figure is byte-unchanged but for the schema bump.
+        //
+        // schema:10 (issue #881) appends the top-level `refresh_token_loss` object — ADDITIVE, and
+        // this time with no value-domain correction at all: it folds refresh-family events, which
+        // are DISJOINT from the `event=swap` population every figure above is computed from. So
+        // unlike the 8→9 bump, nothing above moved even in meaning. This document is the direct
+        // evidence for that acceptance: read it against the schema:9 expectation in git history and
+        // exactly two things differ — the version integer and the appended block.
         let out = render_json(&fixture_report()).expect("integer wire serializes");
         assert_eq!(
             out,
             concat!(
                 "{\n",
-                "  \"schema\": 9,\n",
+                "  \"schema\": 10,\n",
                 "  \"window\": null,\n",
                 "  \"swap_overshoot\": {\n",
                 "    \"n\": 2,\n",
@@ -3014,6 +3625,21 @@ ts=2026-07-11T00:04:00Z event=swap from=c to=d reason=session session_pct=100
                 "    \"rate_limited\": 2,\n",
                 "    \"transient\": 1,\n",
                 "    \"cleared\": 1\n",
+                "  },\n",
+                // schema:10 (issue #881): the refresh-token-loss block, appended LAST so every
+                // schema:9 key keeps its position as well as its value. FIXTURE_LOG carries no
+                // refresh-family line, so it reads all-zero — and every figure above is byte-for-
+                // byte what schema:9 emitted, which is the "unchanged in meaning" acceptance
+                // pinned as bytes rather than argued in prose.
+                "  \"refresh_token_loss\": {\n",
+                "    \"accounts\": 0,\n",
+                "    \"observations\": 0,\n",
+                "    \"by_mechanism\": {\n",
+                "      \"sweep\": 0,\n",
+                "      \"poll_retry\": 0,\n",
+                "      \"keep_warm\": 0\n",
+                "    },\n",
+                "    \"confirmed_unrecoverable\": 0\n",
                 "  }\n",
                 "}\n",
             )
@@ -3654,7 +4280,10 @@ ts=2026-07-10T00:00:00Z event=swap from=a to=b reason=session session_pct=97
             Some(window),
         ))
         .expect("serializes");
-        assert!(out.contains("\"schema\": 9,"), "schema bumped to 9: {out}");
+        assert!(
+            out.contains("\"schema\": 10,"),
+            "schema bumped to 10: {out}"
+        );
         assert!(
             out.contains(concat!(
                 "  \"window\": {\n",
@@ -3856,6 +4485,12 @@ ts=2026-07-12T00:10:00Z event=usage_backoff acct=u-B class=transient consecutive
             !crate::redaction::meter::unauthored_emails(FIXTURE_LOG, &[]).is_empty(),
             "fixture must contain an email so the leak guard is a real regression catch"
         );
+        // The #15/#444 meter fixture (issue #881): a realistic credential blob plus its two
+        // `sk-ant-…` tokens and owner email, so `assert_clean` below scans for KNOWN secret values
+        // as well as the generic shapes. `authored_labels` is deliberately EMPTY: unlike the `log`
+        // verb, this readout renders no operator label at all, so every email shape is a leak here
+        // and none may be excused as permitted.
+        let secrets = crate::redaction::meter::Secrets::meter_fixture();
         // Cover BOTH output paths: the whole-log default AND a windowed readout (#494), the
         // latter built over the same email-bearing fixture so the window line + JSON `window`
         // block are exercised on real swap data — the window metadata (a duration + a bare
@@ -3901,9 +4536,35 @@ ts=2026-07-12T00:10:00Z event=usage_backoff acct=u-B class=transient consecutive
                     crate::redaction::meter::unauthored_emails(out.as_str(), &[]).is_empty(),
                     "no non-authored email may appear (#15): {out}"
                 );
-                assert!(!out.contains("token"), "no token may appear: {out}");
-                assert!(!out.contains("Bearer"), "no bearer may appear: {out}");
-                assert!(!out.contains("sk-ant"), "no api key may appear: {out}");
+                // The full redaction METER, replacing a bare `contains("token")` word check that
+                // issue #881 made untenable: this readout's own heading ("refresh-token loss") and
+                // wire key (`refresh_token_loss`) contain that word as legitimate vocabulary, so the
+                // blanket check now fires on a FIXED in-code label that cannot carry data.
+                //
+                // The remedy STRENGTHENS rather than narrows. `meter::assert_clean` is the repo's
+                // shared #15/#444 guard (`src/redaction.rs`, already used by `log`, `login`,
+                // `refresh`, `use_account`): the `sk-ant-` prefix, the fixture's token values
+                // verbatim, the credential blob's raw and sha256 fingerprints, email shapes, and —
+                // the part no substring list can reach — an ENTROPY backstop for a leak in a format
+                // nobody enumerated. It catches what the word check could not, e.g. a blob dump
+                // whose token value is already redacted (`BlobLeadingBytes`): `contains("token")`
+                // misses that outright, since `accessToken` carries a capital T.
+                //
+                // Not "strictly stronger" as a set relation, so state the trade plainly: three
+                // WORD-PRESENCE proxies go — lowercase `token` (the necessary narrowing), `Bearer`,
+                // and `sk-ant` widened to the real `sk-ant-` prefix. No secret hides behind any of
+                // them: a real `Bearer <token>` still trips `TokenPrefix` or the entropy backstop,
+                // and no Anthropic token has the `sk-antXYZ` shape (`redaction.rs`'s own
+                // `TOKEN_PREFIXES = ["sk-ant-"]` is the repo's model of that). Three proxies for the
+                // meter's whole detector set, and one less bespoke predicate maintained here.
+                //
+                // Non-vacuity is proved by MUTATION of THIS readout's own rendered bytes, in
+                // `the_redaction_meter_catches_a_token_planted_in_this_readout` — measured, not
+                // assumed: a canary asserting a COPY of the predicate against local literals keeps
+                // passing after this very line is deleted, so it certifies nothing. Deleting the
+                // call is itself a CI failure rather than a silent weakening — it orphans
+                // `secrets`, which the repo's `clippy -D warnings` gate rejects as unused.
+                crate::redaction::meter::assert_clean(out.as_str(), &secrets, &[]);
                 assert!(!out.contains("label="), "no operator label: {out}");
                 assert!(!out.contains("acct="), "no account uuid: {out}");
                 // DISCRIMINATING, not just prefix-shaped: assert the identifiers THEMSELVES are
@@ -3914,6 +4575,53 @@ ts=2026-07-12T00:10:00Z event=usage_backoff acct=u-B class=transient consecutive
                     assert!(!out.contains(acct), "no account identifier {acct}: {out}");
                 }
             }
+        }
+    }
+
+    /// CONSTRAINT: the redaction meter guarding this readout can still FAIL — proved by MUTATION
+    /// of the readout's OWN bytes, not by re-implementing the predicate beside it.
+    ///
+    /// That distinction is the whole point. Issue #881 replaced a blanket `contains("token")` word
+    /// check (which its own "refresh-token loss" heading trips) with `meter::assert_clean`. A
+    /// relaxation-or-swap of a leak guard is worth nothing unless the replacement is shown to bite,
+    /// and a canary that asserts predicates against LOCAL LITERALS would keep passing even if every
+    /// assertion in `readout_carries_no_pii` were deleted — a rubber stamp. So this plants a leak
+    /// into the rendered readout and asserts the meter catches it there, the same
+    /// mutate-the-real-subject discipline `a_poisoned_diagnostic_channel_never_reaches_the_default_view`
+    /// (`src/log.rs`) and the golden canary both use.
+    #[test]
+    fn the_redaction_meter_catches_a_token_planted_in_this_readout() {
+        use crate::redaction::meter;
+        let secrets = meter::Secrets::meter_fixture();
+        let clean = render_human(&fixture_report());
+        // Baseline: the real readout is clean, so the mutation below is what makes the difference.
+        meter::assert_clean(&clean, &secrets, &[]);
+
+        // Each mutation is a way a secret has actually reached a string in this daemon: a panic
+        // payload carrying a token (the #15 poisoned-channel case), the credential blob's own JSON,
+        // and a bearer header. Planted INTO the readout so the meter runs over the same bytes the
+        // production assertions run over.
+        for leak in [
+            "sk-ant-oat-LEAK0abc0def0ghi0jkl0mno0pqr0stu0vwx",
+            r#"{"claudeAiOauth":{"accessToken":"sk-ant-oat-METER0SECRET0ACCESS0bC9dE2fG7hJ4kL6mN8"}}"#,
+            "Authorization: Bearer victim@meter-redaction.example",
+        ] {
+            let poisoned = format!("{clean}{leak}\n");
+            assert!(
+                !meter::scan(&poisoned, &secrets, &[])
+                    .into_iter()
+                    .filter(|f| !matches!(f, meter::Finding::KnownEmail))
+                    .collect::<Vec<_>>()
+                    .is_empty(),
+                "the meter must reject a readout carrying: {leak}"
+            );
+        }
+
+        // The complement, and the reason the word check had to go: issue #881's fixed vocabulary is
+        // NOT a leak. Asserted against the meter itself, so a future re-tightening back to a bare
+        // `contains("token")` goes red HERE rather than silently breaking the readout's own heading.
+        for vocabulary in ["refresh-token loss", "\"refresh_token_loss\": {"] {
+            meter::assert_clean(&format!("{clean}{vocabulary}\n"), &secrets, &[]);
         }
     }
 
@@ -4448,6 +5156,11 @@ ts=2026-07-11T00:32:00Z event=blind_exit acct=u-D duration_secs=480 session_burn
 ts=2026-07-11T00:40:00Z event=usage_backoff acct=u-A class=rate_limited consecutive=1 backoff_secs=60
 ts=2026-07-11T00:41:00Z event=usage_backoff acct=u-B class=transient consecutive=1 backoff_secs=30
 ts=2026-07-11T00:45:00Z event=usage_backoff_cleared acct=u-A
+ts=2026-07-11T00:45:00Z event=keep_warm account=work trigger=reactive outcome=dead rotated=true
+ts=2026-07-11T00:46:00Z event=poll_refresh account=spare trigger=poll_401 outcome=dead rotated=true
+ts=2026-07-11T00:47:00Z event=refresh account=spare outcome=dead expires_before=1970-01-01T00:00:00Z expires_after=1970-01-01T00:00:00Z rotated=false window_secs=0
+ts=2026-07-11T00:48:00Z event=refresh account=third outcome=refreshed expires_before=2026-07-11T00:00:00Z expires_after=2026-07-11T08:00:00Z rotated=false window_secs=28800
+ts=2026-07-11T00:49:00Z event=credential_unrecoverable account=spare
 ts=2026-07-11T00:50:00Z event=usage_velocity acct=u-A session_pct_per_min=0.20 weekly_pct_per_min=0.01 elapsed_secs=120 session_delta_pct=1 weekly_delta_pct=0
 ";
 
