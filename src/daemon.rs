@@ -110,8 +110,8 @@ use crate::keychain::{
 use crate::landing;
 use crate::observability::{
     BackoffClass, BlindVelocity, CanonicalLiveness, CaptureEventOutcome, CredentialHealth,
-    DecisionClass, Diagnostic, DiagnosticLog, Event, EventLog, ExpiryHorizon, KeepWarmTrigger,
-    PollClass, RefreshEventOutcome, SwapProjection, SwapReason,
+    DecisionClass, Diagnostic, DiagnosticLog, Event, EventLog, ExpiryHorizon, ExpiryProvenance,
+    KeepWarmTrigger, PollClass, RefreshEventOutcome, SwapProjection, SwapReason,
 };
 use crate::refresh::{CredentialClocks, RefreshOutcome, RefreshReport};
 use crate::refresh_tick::{refresh_event_outcome, RealRefreshEngine, RefreshEngine};
@@ -1082,6 +1082,58 @@ pub(crate) struct AccountHealth {
     /// current-validity ramp would both mis-rank it and force a genuinely healthy account to render
     /// non-healthy. Surfaced, never acted upon — no swap or poll decision reads it (issue #878).
     refresh_token_expires_at: Option<i64>,
+    /// The last deadline actually OBSERVED for this account (issue #880) — the baseline the durable
+    /// [`Event::CredentialExpiryObserved`] record differences against, in the same epoch SECONDS.
+    ///
+    /// A SEPARATE field from [`refresh_token_expires_at`](Self::refresh_token_expires_at) above,
+    /// which it otherwise shadows, because the two answer different questions and one of them must
+    /// not be bent to serve the other:
+    /// - That field is THIS POLL's reading, feeding the DISPLAY axis. Issue #878 deliberately
+    ///   CLOBBERS it to `None` on an unreadable credential so `status` renders an honest
+    ///   [`ExpiryHorizon::Unknown`] rather than a stale reassurance. Untouched here.
+    /// - This one is the last KNOWN deadline, RETAINED across a poll that could not look. A locked
+    ///   keychain proves *we could not read*, never *upstream dropped the field*, so letting it
+    ///   clear the baseline would make the very next successful poll report a fabricated
+    ///   `None -> Some` change — the flaky-read-fabricates-an-edge failure
+    ///   [`DecisionState::signaled_canonical_scrubbed`] guards against on the canonical read.
+    ///
+    /// The name carries `_baseline` because the role, not the clock, is what distinguishes it from
+    /// its neighbour: both hold the same quantity, and only one of them is allowed to go stale.
+    ///
+    /// `None` means the deadline has never been observed, and it is the ONLY thing that means that —
+    /// a successful observation always writes `Some`, and nothing ever clears it back. So *never
+    /// looked* and *looked, and there is no deadline* are not two readings of `None` here: the second
+    /// state is unrepresentable, because a poll that reads no deadline returns from
+    /// `fold_expiry_observation` before touching this field at all. Distinct from
+    /// `AccountRuntime::polled_once`, which tracks the POLL and is set even by a poll that read no
+    /// credential.
+    refresh_token_expires_at_baseline: Option<i64>,
+    /// Whether the daemon's OWN refresh wrote this account's credential since the last deadline
+    /// observation (issue #880) — the `my_refresh`-vs-`external_change` provenance latch.
+    ///
+    /// Set by [`note_own_credential_refresh`](Daemon::note_own_credential_refresh) at every path
+    /// that refreshes an account through the daemon (the #119 isolated sweep fold, the #255 reactive
+    /// poll-refresh, the #282 keep-warm mint) and CLEARED when the next observation consumes it, so
+    /// it means "a daemon refresh intervened in THIS interval" rather than "has ever refreshed".
+    ///
+    /// The latch covers the daemon's own IN-PROCESS refresh paths, which is narrower than "every
+    /// first-party refresh" — an out-of-process `sessiometer poke` arms nothing here. So a clear latch
+    /// means only *this process did not refresh*, and the change it fails to explain is attributed
+    /// `external_change`, which is a residual category rather than a positive finding. The set of
+    /// writes that land there wrongly is enumerated once, on
+    /// [`ExpiryProvenance::ExternalChange`] — read it before drawing a conclusion from that tag.
+    own_refresh_since_expiry_observation: bool,
+    /// The horizon band this account was last SIGNALED at (issue #880) — the edge-trigger latch
+    /// behind [`Event::CredentialExpiryHorizon`], so an entry is emitted once per band change rather
+    /// than on every poll of a seven-day window.
+    ///
+    /// `None` until a band has been signalled. Only the actionable bands are ever stored
+    /// ([`ExpiryHorizon::Within`] / [`ExpiryHorizon::Lapsed`]): a classification of
+    /// [`ExpiryHorizon::Unknown`] RETAINS whatever is here (going blind is not recovery — the issue
+    /// #137 invariant), and [`ExpiryHorizon::Beyond`] resets it to `None` so a deadline that moves
+    /// back out and later returns signals afresh. In-memory only, so a restart mid-band re-emits the
+    /// entry — the same documented over-count as issue #827's ENTER guards.
+    signaled_expiry_horizon: Option<ExpiryHorizon>,
     /// The last-observed refresh classification (issue #119): drives the rollup's `Dead`
     /// (a cleared refresh token) check and the `--json` `last_ok` projection. `None` until
     /// a refresh has been observed. Stored as the full enum (not the reduced `last_ok`)
@@ -2409,6 +2461,15 @@ where
             // `with_refresh_engine` wired it, so every other path behaves exactly as before.
             if self.should_refresh_retry(i, &result) {
                 result = self.refresh_retry(i, &mut events).await;
+                // Issue #880: the daemon just refreshed THIS account's credential, so arm the
+                // `my_refresh` provenance latch before the deadline read at the end of this same
+                // poll observes the result. Armed HERE rather than inside `refresh_retry` because
+                // that helper takes `&self` (it emits into `events` without mutating carried
+                // state); armed unconditionally on a firing, including a refresh that reported
+                // `Dead` or could not run at all — the SERVER may have moved the deadline even
+                // where the local outcome was a failure, and mis-attributing that to an external
+                // write is the one direction that would corrupt the issue #877 answer.
+                self.note_own_credential_refresh(i);
             } else if self.should_keep_warm_retry(i, &result) {
                 // Issue #282 REACTIVE backstop: the ACTIVE account's first usage-401. The #162
                 // path above EXCLUDES the active account (it writes the stash, #253); this mints
@@ -2602,6 +2663,18 @@ where
             self.state.accounts[i].health.poll_expires_at = clocks.access_expires_at;
             self.state.accounts[i].health.refresh_token_expires_at =
                 clocks.refresh_token_expires_at;
+            // Issue #880: fold that same reading into the DURABLE record — the provenance-tagged
+            // deadline observation and the horizon-entry edge. Runs on the reading just stored
+            // above, and AFTER any `refresh_retry` earlier in this poll armed the `my_refresh`
+            // latch, so a deadline the daemon's own refresh moved is attributed to it rather than
+            // inferred to be an external write. Reads the wall epoch (an event-emission path, off
+            // the deterministic `Clock`), like the fleet-runway warn below.
+            self.note_polled_expiry(
+                i,
+                clocks.refresh_token_expires_at,
+                wall_clock_now_secs(),
+                &mut events,
+            );
             self.note_polled(i);
         }
 

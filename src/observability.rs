@@ -383,9 +383,15 @@ impl CredentialHealth {
 /// `status`/`watch` wire ([`AccountStatusLine::expiry`](crate::daemon::AccountStatusLine),
 /// schema 1.12), and these renames ARE those wire tokens — pinned by
 /// `account_line_encodes_the_expiry_modifier_only_once_the_account_has_been_polled`, so respelling a
-/// variant here is a wire-contract change, not a local edit. Issue #880 will emit the horizon-entry
-/// Event against the same vocabulary. Still no `as_str` renderer: serde is the only projection any
-/// consumer has needed so far — the one that needs a different rendering brings it.
+/// variant here is a wire-contract change, not a local edit.
+///
+/// Issue #878 shipped this enum with NO `as_str` renderer, on the principle that the consumer needing
+/// one brings it; issue #880's [`Event::CredentialExpiryHorizon`] is that consumer, so [`Self::as_str`]
+/// now exists. It is pinned AGAINST the serde spelling by a test rather than trusted to stay in
+/// agreement — and with #882 landed that pin is load-bearing in both directions: it is what keeps the
+/// event-log token and the schema-1.12 wire token the same string, so an operator correlating a
+/// `state=` on the durable log against an `expiry` on the wire is reading one vocabulary, not two that
+/// happen to match today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ExpiryHorizon {
@@ -413,6 +419,145 @@ pub(crate) enum ExpiryHorizon {
     /// only once a refresh has actually FAILED (`src/poke.rs`): this is the same fact seen
     /// BEFORE the failure rather than after it.
     Lapsed,
+}
+
+impl ExpiryHorizon {
+    /// The `state=` token for the [`Event::CredentialExpiryHorizon`] log line (issue #880).
+    ///
+    /// Issue #878 deliberately shipped this enum WITHOUT a renderer — *"the consumer that needs one
+    /// brings it"* — and this event is that consumer. Matches the `snake_case` serde rename exactly,
+    /// so the token this line carries and the token issue #882's `--json` field will carry agree BY
+    /// CONSTRUCTION rather than by two hand-maintained lists happening to say the same thing; the
+    /// test below pins that agreement against the serde output rather than against a copy of it.
+    fn as_str(self) -> &'static str {
+        match self {
+            ExpiryHorizon::Unknown => "unknown",
+            ExpiryHorizon::Beyond => "beyond",
+            ExpiryHorizon::Within => "within",
+            ExpiryHorizon::Lapsed => "lapsed",
+        }
+    }
+}
+
+/// WHO wrote the `refreshTokenExpiresAt` deadline change an [`Event::CredentialExpiryObserved`]
+/// line reports (issue #880) — the load-bearing half of that record.
+///
+/// Logging the deadline alone answers nothing: a change has more than one possible cause, and the
+/// causes imply OPPOSITE operational conclusions. Only a provenance-tagged observation separates
+/// them, which is what makes the spike question in issue #877 — *does a re-login reset the
+/// refresh-token deadline?* — answerable from the durable log alone instead of from a hand-run
+/// browser experiment.
+///
+/// **Deliberately NOT `re_login`.** The tempting fourth variant would name the operator action
+/// rather than the daemon's observation, and the daemon cannot see that action:
+/// [`crate::daemon::Daemon::reconcile_canonical_change`]'s own contract is that a CHANGED canonical
+/// means *"the operator ran `claude /login`* **or** *the active token silently refreshed in
+/// place"*, and those two are indistinguishable from the blob. So every variant here names what was
+/// OBSERVED, never what it is taken to mean.
+///
+/// The re-login-vs-in-place-refresh reading is NOT recoverable by joining the sibling events, and it
+/// is worth being precise about why, because the join looks available and is not: `event=restash` is
+/// emitted at the very same edge as this record, one-for-one, so it adds no fact — and it carries the
+/// free-form `account=` label where this line carries `acct=`, so the two share no key to join ON.
+/// `event=login` covers only the MANAGED `sessiometer login` (#132/#134/#135); an operator's own
+/// `claude /login` — precisely the population #877 asks about — produces no such line at all. The
+/// discriminator therefore lives ON this record, as
+/// [`Event::CredentialExpiryObserved::grant_replaced`]: whether a NEW OAuth grant was minted. Even that
+/// narrows rather than decides, and the variant naming stays observational for the same reason.
+///
+/// Carries NO serde derive, unlike [`ExpiryHorizon`]: this discriminant reaches no JSON wire (the
+/// reliability SLI attribution of issue #881 reads the event log as TEXT), so [`Self::as_str`] is
+/// its sole renderer and there is no second spelling to keep in agreement.
+///
+/// Non-secret by construction: a bare classification, never a token, an email, or a timestamp — the
+/// same issue #15 discipline as [`ExpiryHorizon`] and [`CredentialHealth`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExpiryProvenance {
+    /// The FIRST deadline this run observed for the account — an absolute anchor, not a change.
+    ///
+    /// Exists because the change baseline is IN-MEMORY: a restart drops it, so without an anchor a
+    /// deadline that moved while the daemon was down would be folded in silently and be
+    /// indistinguishable, offline, from *nothing happened* — the absence-is-not-evidence trap this
+    /// record exists to close. One line per account per daemon lifetime bounds the cost, and it
+    /// makes every account's deadline durable regardless of horizon band (an account sitting
+    /// [`ExpiryHorizon::Beyond`] emits no horizon edge, so this is the only line that carries it).
+    FirstObservation,
+    /// The daemon's OWN refresh cycle ran for this account between the two observations — the
+    /// isolated #119 sweep, the #255 reactive poll-refresh, or the #282 keep-warm mint — so the
+    /// change is the SERVER extending the deadline on refresh.
+    ///
+    /// Essentially free to attribute: each of those paths writes the credential through a
+    /// CAS-protected flow the daemon drives, so it KNOWS it caused the write; there is nothing to
+    /// infer. This follows the observe-through-the-real-flow discipline `crate::refresh`'s AC-3
+    /// already establishes — *"the engine's OWN first days of operation are the safe multi-day
+    /// observation … gathered through this CAS-protected flow, never a bespoke probe"* — so no
+    /// probe is added here either.
+    MyRefresh,
+    /// NO daemon refresh ran for this account, yet its deadline moved: something ELSE wrote the
+    /// credential. The inferred half of the pair, and the row that would license a proactive
+    /// re-login cadence if re-logins turned out to reset the deadline.
+    ///
+    /// "Something else" means EXTERNAL TO THE DAEMON PROCESS — read it that literally, because the
+    /// population is wider than *another Claude Code instance*. The latch behind this inference is
+    /// armed only by the daemon's own in-process refresh paths, so any first-party write from
+    /// ANOTHER process lands here too. Known members, and the reason the tag is an observation and
+    /// not a verdict:
+    ///
+    /// - an operator's own `claude /login` or a concurrent Claude Code's in-place refresh — the
+    ///   intended population;
+    /// - **`sessiometer poke`** ([`crate::poke`]) — the operator refreshing an account from a
+    ///   SEPARATE process. Its isolated-refresh engine re-stashes the credential and the daemon never
+    ///   learns it ran, so a deadline the poke moved is reported here. First-party in spirit,
+    ///   external to this process in fact, and the record cannot tell them apart. `poke` emits no
+    ///   durable event of its own either, so there is nothing to correlate against — tracked as
+    ///   issue #906;
+    /// - a swap-lock-serialized write by any other CLI verb on the same stash;
+    /// - **a change of READ SOURCE, with nothing written at all.**
+    ///   [`crate::daemon::Daemon::read_poll_clocks`] reads the ACTIVE account's deadline from the
+    ///   canonical keychain item and a PARKED account's from its stash copy, so an account that
+    ///   swapped in or out between two polls has its deadline read from a DIFFERENT item on either
+    ///   side of the comparison. Those two normally agree — the daemon re-stashes on every write it
+    ///   makes — but while they transiently disagree the delta is an artifact of where we looked, not
+    ///   of anything that happened. Correlate against `event=swap` / `event=restash` for the same
+    ///   `acct=` when a change lands on a swap boundary; closing it needs a baseline that carries the
+    ///   read source, tracked as issue #907.
+    ///
+    /// The inference is one-directional in the OTHER direction from what a reader might hope: an
+    /// external write that RACES the daemon's own refresh inside one poll interval is attributed
+    /// [`Self::MyRefresh`] instead (the latch wins), so this variant can both MISS a real external
+    /// write and — via the out-of-process paths above — name one that was really the operator's own
+    /// tooling. Neither error is silent, because both leave the deadline delta on the line; what
+    /// matters for issue #877 is that a `my_refresh` attribution is HARD evidence (the daemon knows
+    /// it caused the write) while this one is a residual category. Weigh them differently when the
+    /// spike is read, and cross-check a surprising cluster against `event=refresh` for the same
+    /// `acct=` before concluding anything about re-login behaviour.
+    ExternalChange,
+    /// The daemon HEALED an out-of-band canonical write (the issue #13 re-auth re-stash) — the same
+    /// external class as [`Self::ExternalChange`], but caught AT the write edge rather than inferred
+    /// from a later poll delta.
+    ///
+    /// The ONE provenance that also records a NON-change, and the reason it exists: *unchanged
+    /// across an external credential write* is the third row of the issue #877 table — the row that
+    /// KILLS the proactive re-login lever — and it is structurally unobservable from change records
+    /// alone, because its evidence is the absence of one. Emitting it positively at the edge turns
+    /// that row from absence-reasoning into a line (`delta_secs=0`).
+    ///
+    /// Not per-tick noise: the EDGE is the external write (discrete and rare), not the deadline.
+    CanonicalRestash,
+}
+
+impl ExpiryProvenance {
+    /// The `provenance=` token for the [`Event::CredentialExpiryObserved`] log line. A FIXED
+    /// `snake_case` token per variant — never dynamic text, so the line cannot carry a secret
+    /// (issue #15).
+    fn as_str(self) -> &'static str {
+        match self {
+            ExpiryProvenance::FirstObservation => "first_observation",
+            ExpiryProvenance::MyRefresh => "my_refresh",
+            ExpiryProvenance::ExternalChange => "external_change",
+            ExpiryProvenance::CanonicalRestash => "canonical_restash",
+        }
+    }
 }
 
 /// The shared canonical `Claude Code-credentials` item's OWN per-poll liveness (issue #464) — the
@@ -1589,6 +1734,148 @@ pub(crate) enum Event {
         window_secs: u64,
         retry_after_secs: u64,
     },
+    /// An account's REFRESH-token deadline ENTERED the operator's foresight horizon (issue #880):
+    /// its `refreshTokenExpiresAt` (issue #878) now falls inside `[credential].expiry_horizon_secs`
+    /// — [`ExpiryHorizon::Within`] — or has already passed it, [`ExpiryHorizon::Lapsed`]. The
+    /// operator must `claude /login` before it lapses; no refresh and no `poke` can recover a lapsed
+    /// refresh token.
+    ///
+    /// DURABLE, not a diagnostic, and the distinction is the whole point (issue #800 / #827): the
+    /// stderr-bound [`DiagnosticLog`] is OPT-IN and DEFAULT OFF (`[tunables] verbose`, and
+    /// `sessiometer log` defaults to `--channel event`), so on a default install a diagnostic would
+    /// be absent entirely — while this is exactly the state change an operator must be able to
+    /// reconstruct OFFLINE, weeks later, from the always-on governed log.
+    ///
+    /// EDGE-TRIGGERED on the BAND, not per tick: emitted when the classification first becomes
+    /// `within`, and again if it later becomes `lapsed` (an escalation the operator needs, since the
+    /// remedy window has closed). A held band re-emits nothing — a seven-day window spans thousands
+    /// of polls. A daemon that first meets an ALREADY-lapsed account emits `state=lapsed` directly:
+    /// the `within` edge is not a precondition, so a restart or a long absence can never swallow the
+    /// more severe fact.
+    ///
+    /// Three caveats, stated rather than implied:
+    /// - The latch is IN-MEMORY, so a restart mid-band RE-EMITS the entry. Band entries therefore
+    ///   over-count episodes, exactly as issue #827's ENTER guards do; deduplicate on `acct=` when
+    ///   counting.
+    /// - A poll that cannot READ a deadline emits nothing here and leaves the latch standing — but by
+    ///   a shorter route than a reader might assume: the fold returns at its no-deadline guard and
+    ///   this edge is never reached, so there is no [`ExpiryHorizon::Unknown`] classification to
+    ///   retain the latch against. The behaviour is the intended one (an unreadable credential is *we
+    ///   can no longer see*, never *recovered* — the issue #137 invariant; resetting would let a flaky
+    ///   keychain read manufacture a duplicate entry on every flap), and the `Unknown` arm exists for
+    ///   a future caller that classifies without a parsed deadline in hand.
+    /// - There is NO paired CLEARED partner, deliberately: leaving the band requires the FIXED
+    ///   deadline to move, and every move emits [`Self::CredentialExpiryObserved`] — which carries
+    ///   strictly MORE than a bare marker would (both deadlines and the provenance). A `cleared` line
+    ///   would be a second, poorer line about the same tick. Same reasoning as
+    ///   [`Self::NearLimitPollCoverage`]'s silent band exit, which is unpaired for the same cause.
+    ///
+    /// `expires_at` is the observed deadline in epoch SECONDS and is NON-optional by type: only a
+    /// PARSED deadline can classify `within` / `lapsed` ([`crate::daemon::account_expiry`]), so
+    /// "entered the horizon with no deadline" is unrepresentable rather than merely unreachable.
+    /// `horizon_secs` is the lookahead it was classified against, carried so the line EXPLAINS its
+    /// own verdict (a six-day deadline is `within` only because the horizon is seven) and stays
+    /// readable after an operator retunes the knob — the same store-the-decision's-ingredients idiom
+    /// as [`SwapProjection`]. `account` is the account UUID (#15) — matching the usage-family
+    /// `acct=`, never the free-form label; every other field an enum or a bare number.
+    CredentialExpiryHorizon {
+        account: String,
+        state: ExpiryHorizon,
+        expires_at: i64,
+        horizon_secs: u64,
+    },
+    /// One PROVENANCE-TAGGED observation of an account's REFRESH-token deadline (issue #880) — the
+    /// record that makes the issue #877 spike answerable from production data alone.
+    ///
+    /// Named *observed* rather than *changed* on purpose. The third row of #877's table is
+    /// "UNCHANGED across an external credential write" — see [`ExpiryProvenance::CanonicalRestash`]
+    /// for what turns on it — so the record MUST be able to say *nothing moved*, which a
+    /// change-only record structurally cannot. [`ExpiryProvenance::CanonicalRestash`] is the
+    /// provenance that carries that case; every other provenance fires only on an actual change.
+    ///
+    /// Emitted on exactly three conditions, none of them per-tick:
+    /// - the FIRST deadline observed for the account this run ([`ExpiryProvenance::FirstObservation`]
+    ///   — an absolute anchor, see that variant for the restart gap it closes),
+    /// - a CHANGE against the last observed deadline ([`ExpiryProvenance::MyRefresh`] /
+    ///   [`ExpiryProvenance::ExternalChange`]),
+    /// - the daemon healing an out-of-band canonical write ([`ExpiryProvenance::CanonicalRestash`]),
+    ///   change or no change.
+    ///
+    /// A poll that could NOT observe a deadline — a locked keychain, an absent stash — emits
+    /// NOTHING and leaves the baseline standing. That is not a gap: *we could not look* and *we
+    /// looked and the field is gone* are different facts, and only the first is what an unreadable
+    /// credential proves. Reporting it as a `Some -> None` change would let a flaky read fabricate
+    /// "upstream dropped the field", the same discipline
+    /// [`crate::daemon`]'s `signaled_canonical_scrubbed` applies to a flaky canonical read. (The
+    /// DISPLAY axis still reports [`ExpiryHorizon::Unknown`] for that poll — issue #878 owns that
+    /// decision and it is untouched here; the two answer different questions.)
+    ///
+    /// `before` / `after` are epoch SECONDS, rendered RFC 3339 through the same formatter as the line
+    /// `ts`. Their types are deliberately ASYMMETRIC. `after` is a bare `i64` because there is nothing
+    /// to observe if no deadline was read — the fold returns before emitting — so *an observation with
+    /// no deadline* is unrepresentable here rather than merely unreachable, the same reasoning that
+    /// makes [`Self::CredentialExpiryHorizon`]'s `expires_at` an `i64`. `before` is genuinely optional:
+    /// the anchor line has no baseline to have changed from, and it is OMITTED from the line rather
+    /// than rendered empty (an empty value would split the `key=val` grammar — the same handling as
+    /// [`Self::Refresh`]'s optional `expires_before` / `expires_after`).
+    ///
+    /// `delta_secs` is DERIVED at render time, and only when `before` is known — so *unchanged* reads
+    /// as `delta_secs=0` at a glance instead of requiring the reader to subtract two timestamps by
+    /// hand, and the anchor claims no delta against a baseline it does not have. Mirrors
+    /// `event=refresh`'s derived `window_secs`. `account` is the account UUID (#15) — matching the
+    /// usage-family `acct=`, never the free-form label. No token material: only the non-secret
+    /// deadlines and a fixed provenance token, exactly as
+    /// [`crate::refresh::refresh_token_expires_at`] reads only the deadline and never the token it
+    /// belongs to.
+    ///
+    /// `grant_replaced` is the GRANT-IDENTITY discriminator, and it is what makes row 3 of the #877
+    /// table answerable rather than merely representable. [`ExpiryProvenance::CanonicalRestash`]
+    /// proves *somebody else wrote the credential*, but a `claude /login` and an in-place token
+    /// refresh by another Claude Code instance are the SAME observation to
+    /// [`crate::daemon::Daemon::reconcile_canonical_change`] — and row 3 needs a re-login
+    /// specifically. `Some(true)` says the stored refresh token is different bytes than the one the
+    /// daemon last had — consistent with a NEW OAuth grant having been issued; `Some(false)` says the
+    /// grant is byte-identical, which RULES A RE-LOGIN OUT. `None` means this path could not tell:
+    /// every poll path (the poll fold reads the deadline from the account's clocks and never sees two
+    /// credential blobs to compare), a first change with no baseline yet, and — deliberately — a
+    /// CLEARED refresh token. `Some(empty)` is [`crate::refresh::refresh_token`]'s documented DEAD
+    /// signal, not a grant, so an emptied token must not render `true`; it is filtered to the unknown
+    /// at the computation site rather than being allowed to masquerade as a fresh login.
+    ///
+    /// NOT the same field as `rotated=` on `event=refresh` / `poll_refresh` / `keep_warm`, though the
+    /// two read alike. That one comes from the refresh engine's own report — *the refresh I just ran
+    /// rotated the token* — and is therefore about an action the daemon took. This one is a byte diff
+    /// against the canonical-watch baseline, about a write the daemon did NOT make. Different
+    /// derivations, different provenance, and only this one can appear on a line the daemon did not
+    /// cause; do not fold them together when reading the log.
+    ///
+    /// Named for the GRANT, not the token, and the name is load-bearing twice over. A grant is the
+    /// OAuth thing that was or was not re-issued; the refresh token is merely the artifact
+    /// representing it, and this field says nothing about that artifact's value. It also keeps the key
+    /// free of the substring `token`, which matters mechanically: `no_event_line_carries_an_email_or_
+    /// token_sigil` rejects any rendered line containing it, and that check earns its bluntness — do
+    /// not respell this key into tripping it, and do not relax the check to accommodate a respelling.
+    ///
+    /// Read it as a NECESSARY, not sufficient, condition: a new grant is consistent with a re-login,
+    /// it does not prove one, because whether Claude Code rotates the refresh token on an ordinary
+    /// refresh is exactly the kind of upstream behaviour issue #876 had to establish empirically for
+    /// the deadline. The analytical value is the NARROWING plus the deadline delta on the same line:
+    /// `grant_replaced=true delta_secs=0` is row 3's signature (a fresh grant that did NOT move the
+    /// deadline), and `Some(false)` excludes a population that would otherwise pollute it. It is
+    /// deliberately ON this record and not left to a join — the sibling `event=restash` shares no
+    /// key with this line, and `event=login` fires only for the MANAGED `sessiometer login`, so
+    /// neither can supply this fact after the fact.
+    ///
+    /// A BOOLEAN, computed from a byte comparison and thrown away: the sanctioned use of
+    /// [`crate::refresh::refresh_token`], whose contract is that its value "is only ever
+    /// emptiness-checked or byte-compared, never logged". No token material reaches the line.
+    CredentialExpiryObserved {
+        account: String,
+        provenance: ExpiryProvenance,
+        before: Option<i64>,
+        after: i64,
+        grant_replaced: Option<bool>,
+    },
 }
 
 impl Event {
@@ -2217,6 +2504,67 @@ impl Event {
                 // `acct=` is the UUID, matching the usage-family lines.
                 format!(
                     "ts={ts} event=retry_after_walk acct={account} swaps={swaps} window_secs={window_secs} retry_after_secs={retry_after_secs}"
+                )
+            }
+            Event::CredentialExpiryHorizon {
+                account,
+                state,
+                expires_at,
+                horizon_secs,
+            } => {
+                let state = state.as_str();
+                // The epoch-SECOND deadline is rendered to RFC 3339 through the SAME formatter as
+                // the line `ts` (and `all_exhausted`'s `resets_at`), so a human reads the date
+                // without converting. Unlike `event=refresh`'s expiries this field is already
+                // seconds — the daemon folds MS→s at the credential-read boundary (issue #878) —
+                // so there is no `/ 1000` here, and adding one would silently render 1970.
+                let expires_at = rfc3339(system_time_from_epoch(*expires_at));
+                // An enum token, a timestamp and two bare numbers (#15); `acct=` is the UUID,
+                // matching the usage-family lines.
+                format!(
+                    "ts={ts} event=credential_expiry_horizon acct={account} state={state} expires_at={expires_at} horizon_secs={horizon_secs}"
+                )
+            }
+            Event::CredentialExpiryObserved {
+                account,
+                provenance,
+                before,
+                after,
+                grant_replaced,
+            } => {
+                let provenance = provenance.as_str();
+                // Each deadline is OMITTED when absent rather than rendered empty (an empty value
+                // after `=` would split the `key=val` grammar) — the same handling as
+                // `event=refresh`'s optional `expires_before` / `expires_after`. Epoch SECONDS
+                // already, so no `/ 1000`: see the horizon arm above.
+                let before_field = match before {
+                    Some(secs) => {
+                        format!(" before={}", rfc3339(system_time_from_epoch(*secs)))
+                    }
+                    None => String::new(),
+                };
+                // ALWAYS present — an observation without a deadline never reaches a line at all.
+                let after_field = format!(" after={}", rfc3339(system_time_from_epoch(*after)));
+                // `delta_secs=` is DERIVED from the pair, not stored — the same
+                // store-the-ingredients-derive-the-view idiom as `event=refresh`'s `window_secs=`
+                // and `event=blind_exit`'s burn fields. Rendered only when the BASELINE is known, so
+                // it never claims a delta against one we do not have; a `delta_secs=0` on a
+                // `provenance=canonical_restash` line IS the issue #877 third row (an external
+                // credential write that did NOT move the deadline). Trails the whole line, so the
+                // tolerant `key=val` field-map parsers are unaffected by its absence.
+                let delta = match before {
+                    Some(before) => format!(" delta_secs={}", after.saturating_sub(*before)),
+                    None => String::new(),
+                };
+                // OMITTED when the path could not tell (`None`) — same absent-not-empty rule as the
+                // deadlines above, and it keeps every poll-fold line byte-unchanged. A BOOL derived
+                // from a byte comparison: no token material, by construction.
+                let rt_field = match grant_replaced {
+                    Some(replaced) => format!(" grant_replaced={replaced}"),
+                    None => String::new(),
+                };
+                format!(
+                    "ts={ts} event=credential_expiry_observed acct={account} provenance={provenance}{before_field}{after_field}{delta}{rt_field}"
                 )
             }
         }
@@ -4230,6 +4578,8 @@ mod tests {
             Event::BlindGateEligible { .. } => "BlindGateEligible",
             Event::BlindPreemptReserveHold { .. } => "BlindPreemptReserveHold",
             Event::RetryAfterWalk { .. } => "RetryAfterWalk",
+            Event::CredentialExpiryHorizon { .. } => "CredentialExpiryHorizon",
+            Event::CredentialExpiryObserved { .. } => "CredentialExpiryObserved",
         }
     }
 
@@ -4473,6 +4823,28 @@ mod tests {
                 swaps: 3,
                 window_secs: 900,
                 retry_after_secs: 600,
+            },
+            // Issue #880: the two refresh-token-expiry lines. The file's first CREDENTIAL-DERIVED
+            // payload beyond a classification — the deadlines come out of the credential blob itself,
+            // so the scan matters more here than for a variant built from counters. Issue #891's
+            // two-layer guarantee is what got them here rather than diligence: `event_variant_name`
+            // would not compile without them, and `assert_samples_every_variant` would then fail
+            // until they were sampled. `grant_replaced` is populated on the observation so
+            // the grant verdict — the one field derived from the token itself — is scanned rather
+            // than sitting omitted, and `before` is populated so the derived trailing `delta_secs`
+            // rides the scan too.
+            Event::CredentialExpiryHorizon {
+                account: "u-A".to_owned(),
+                state: ExpiryHorizon::Within,
+                expires_at: 1_785_499_802,
+                horizon_secs: 604_800,
+            },
+            Event::CredentialExpiryObserved {
+                account: "u-A".to_owned(),
+                provenance: ExpiryProvenance::CanonicalRestash,
+                before: Some(1_785_499_802),
+                after: 1_785_586_202,
+                grant_replaced: Some(true),
             },
         ];
         assert_samples_every_variant("Event", &samples, event_variant_name);
@@ -5541,6 +5913,271 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
             format!(
                 "{TS0} event=retry_after_walk acct=u-A swaps=2 window_secs=3600 retry_after_secs=3600"
             )
+        );
+    }
+
+    /// Issue #880 (AC-1): the durable horizon-entry line. `expires_at` renders as whole-second
+    /// RFC 3339 through the same formatter as the line `ts`, and `horizon_secs` carries the lookahead
+    /// the verdict was reached against so the line explains itself.
+    ///
+    /// The deadline is the REAL observed capture issue #878 pinned at the extractor
+    /// (`1785499802819` ms, account prefix `94f27044`), folded to the epoch SECONDS this event
+    /// carries — so the fixture vocabulary stays continuous across the two items rather than
+    /// inventing a value that merely satisfies the formatter.
+    #[test]
+    fn credential_expiry_horizon_line_carries_the_band_deadline_and_lookahead() {
+        let line = Event::CredentialExpiryHorizon {
+            account: "u-A".to_owned(),
+            state: ExpiryHorizon::Within,
+            expires_at: 1_785_499_802,
+            horizon_secs: 604_800,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!(
+                "{TS0} event=credential_expiry_horizon acct=u-A state=within expires_at=2026-07-31T12:10:02Z horizon_secs=604800"
+            )
+        );
+    }
+
+    /// Issue #880: the ESCALATION within the actionable band renders its own token. A daemon that
+    /// first meets an already-lapsed account emits this directly, with no preceding `within` — which
+    /// is why `state=` is a field rather than the entry being implicit in the event name.
+    #[test]
+    fn credential_expiry_horizon_line_renders_the_lapsed_escalation() {
+        let line = Event::CredentialExpiryHorizon {
+            account: "u-A".to_owned(),
+            state: ExpiryHorizon::Lapsed,
+            expires_at: 1_785_499_802,
+            horizon_secs: 604_800,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!(
+                "{TS0} event=credential_expiry_horizon acct=u-A state=lapsed expires_at=2026-07-31T12:10:02Z horizon_secs=604800"
+            )
+        );
+    }
+
+    /// Issue #880: every [`ExpiryHorizon`] token this event can carry agrees with the `snake_case`
+    /// serde spelling issue #882 will put on the `--json` wire.
+    ///
+    /// Pinned against the SERDE output rather than against a hand-copied token list, so the two
+    /// spellings cannot drift: a renamed variant, or an `as_str` arm edited in isolation, fails here.
+    /// Issue #878's doc makes this agreement an explicit promise ("the tokens an event log and a
+    /// `--json` field would carry agree by construction"); this is the test that keeps it one.
+    #[test]
+    fn expiry_horizon_tokens_match_their_serde_spelling() {
+        for state in [
+            ExpiryHorizon::Unknown,
+            ExpiryHorizon::Beyond,
+            ExpiryHorizon::Within,
+            ExpiryHorizon::Lapsed,
+        ] {
+            let serde_token = serde_json::to_string(&state).expect("a bare enum serializes");
+            assert_eq!(
+                format!("\"{}\"", state.as_str()),
+                serde_token,
+                "as_str must match the serde rename: {state:?}"
+            );
+        }
+    }
+
+    /// Issue #880 (AC-2): a FIRST observation is an anchor, not a change — it carries `after` alone,
+    /// with no `before` and therefore no derived `delta_secs`. Rendering an empty `before=` would
+    /// split the `key=val` grammar, so the key is OMITTED entirely, exactly as `event=refresh`
+    /// handles an unreadable expiry.
+    #[test]
+    fn credential_expiry_observed_line_omits_an_absent_baseline() {
+        let line = Event::CredentialExpiryObserved {
+            account: "u-A".to_owned(),
+            provenance: ExpiryProvenance::FirstObservation,
+            before: None,
+            after: 1_785_499_802,
+            grant_replaced: None,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!(
+                "{TS0} event=credential_expiry_observed acct=u-A provenance=first_observation after=2026-07-31T12:10:02Z"
+            )
+        );
+    }
+
+    /// Issue #880 (AC-2): a change the daemon's OWN refresh caused carries both deadlines and the
+    /// DERIVED forward delta — so an operator reads "the server extended it by a day" off the line
+    /// without subtracting two timestamps, the same store-the-ingredients-derive-the-view idiom as
+    /// `event=refresh`'s `window_secs`.
+    #[test]
+    fn credential_expiry_observed_line_derives_the_delta_from_both_deadlines() {
+        let line = Event::CredentialExpiryObserved {
+            account: "u-A".to_owned(),
+            provenance: ExpiryProvenance::MyRefresh,
+            before: Some(1_785_499_802),
+            after: 1_785_586_202,
+            grant_replaced: None,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!(
+                "{TS0} event=credential_expiry_observed acct=u-A provenance=my_refresh before=2026-07-31T12:10:02Z after=2026-08-01T12:10:02Z delta_secs=86400"
+            )
+        );
+    }
+
+    /// Issue #880 (AC-3, the third row of the issue #877 table): an external credential write that
+    /// minted a NEW grant and did NOT move the deadline. `delta_secs=0 grant_replaced=true` IS
+    /// that row — [`ExpiryProvenance::CanonicalRestash`] carries what turns on it.
+    ///
+    /// Both halves are load-bearing, which is why this pins the whole line. `delta_secs=0` alone says
+    /// only *something rewrote the credential and the deadline held* — true of an unrelated blob edit
+    /// that never issued a grant, and #877 is not asking about those. `grant_replaced=true` is what makes
+    /// the line evidence about RE-LOGIN behaviour specifically (narrowing, not deciding — see the
+    /// variant's own doc).
+    ///
+    /// This is the case a change-only record structurally cannot express — its evidence is the
+    /// absence of a change — which is why the provenance exists and why the fold emits it even
+    /// though nothing moved.
+    #[test]
+    fn credential_expiry_observed_line_records_an_unmoved_deadline_across_an_external_write() {
+        let line = Event::CredentialExpiryObserved {
+            account: "u-A".to_owned(),
+            provenance: ExpiryProvenance::CanonicalRestash,
+            before: Some(1_785_499_802),
+            after: 1_785_499_802,
+            grant_replaced: Some(true),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!(
+                "{TS0} event=credential_expiry_observed acct=u-A provenance=canonical_restash before=2026-07-31T12:10:02Z after=2026-07-31T12:10:02Z delta_secs=0 grant_replaced=true"
+            )
+        );
+    }
+
+    /// Issue #880: `grant_replaced=false` renders as the explicit NEGATIVE rather than being folded in
+    /// with the unknown case. It is the one direction of this field that is a hard exclusion — a
+    /// byte-identical refresh token cannot have come from a fresh login — so collapsing it into the
+    /// omitted-when-unknown branch would discard the field's only conclusive reading.
+    #[test]
+    fn credential_expiry_observed_line_distinguishes_an_unreplaced_grant_from_an_unknown_one() {
+        let same_grant = Event::CredentialExpiryObserved {
+            account: "u-A".to_owned(),
+            provenance: ExpiryProvenance::CanonicalRestash,
+            before: Some(1_785_499_802),
+            after: 1_785_499_802,
+            grant_replaced: Some(false),
+        }
+        .to_log_line(at_epoch(0));
+        assert!(
+            same_grant.ends_with(" delta_secs=0 grant_replaced=false"),
+            "a same-grant write says so out loud: {same_grant}"
+        );
+
+        let unknown = Event::CredentialExpiryObserved {
+            account: "u-A".to_owned(),
+            provenance: ExpiryProvenance::CanonicalRestash,
+            before: Some(1_785_499_802),
+            after: 1_785_499_802,
+            grant_replaced: None,
+        }
+        .to_log_line(at_epoch(0));
+        assert!(
+            unknown.ends_with(" delta_secs=0"),
+            "an unknown is OMITTED, never rendered as a value: {unknown}"
+        );
+    }
+
+    /// Issue #880: a deadline pulled EARLIER renders a negative delta rather than saturating to
+    /// zero. The direction is diagnostic — a shrinking deadline is the opposite operational story
+    /// from a server extension — so a `u64` subtraction that clamped it would erase the signal while
+    /// still looking plausible on the line.
+    #[test]
+    fn credential_expiry_observed_line_renders_a_backwards_delta_signed() {
+        let line = Event::CredentialExpiryObserved {
+            account: "u-A".to_owned(),
+            provenance: ExpiryProvenance::ExternalChange,
+            before: Some(1_785_586_202),
+            after: 1_785_499_802,
+            grant_replaced: None,
+        }
+        .to_log_line(at_epoch(0));
+        assert!(
+            line.ends_with(" delta_secs=-86400"),
+            "a shrinking deadline keeps its sign: {line}"
+        );
+    }
+
+    /// Issue #880: the #15 guarantee for both new lines, mirroring `the_durable_582_lines_carry_no_pii`
+    /// — every field is a UUID, an enum token, a bare number or a timestamp; never an email, a token,
+    /// or the free-form operator `label`. The deadlines are the ONLY credential-derived values, and
+    /// `crate::refresh::refresh_token_expires_at` reads exactly those two integers and never the
+    /// token they belong to.
+    #[test]
+    fn the_durable_880_lines_carry_no_pii() {
+        let lines = [
+            Event::CredentialExpiryHorizon {
+                account: "u-A".to_owned(),
+                state: ExpiryHorizon::Within,
+                expires_at: 1_785_499_802,
+                horizon_secs: 604_800,
+            },
+            Event::CredentialExpiryObserved {
+                account: "u-A".to_owned(),
+                provenance: ExpiryProvenance::MyRefresh,
+                before: Some(1_785_499_802),
+                after: 1_785_586_202,
+                grant_replaced: None,
+            },
+            // The SAME variant with `grant_replaced` PRESENT. Listed separately on purpose: that field
+            // is the only one here derived from the refresh token itself, so a sweep that only ever
+            // rendered it as the omitted `None` would be exercising the wrong shape — it would pass
+            // while saying nothing about the field whose provenance most warrants the check.
+            Event::CredentialExpiryObserved {
+                account: "u-A".to_owned(),
+                provenance: ExpiryProvenance::CanonicalRestash,
+                before: Some(1_785_499_802),
+                after: 1_785_499_802,
+                grant_replaced: Some(true),
+            },
+        ];
+        let rendered: Vec<String> = lines
+            .iter()
+            .map(|event| event.to_log_line(at_epoch(0)))
+            .collect();
+        for line in &rendered {
+            assert!(!line.contains('@'), "no email: {line}");
+            // The SAME blunt whole-line check `no_event_line_carries_an_email_or_token_sigil` applies
+            // to every variant, restated here because these two lines are the file's only
+            // credential-DERIVED payload and because the check constrains the field NAMES as well as
+            // their values — which is why the grant verdict is spelled `grant_replaced` (see the
+            // variant's doc) rather than for the refresh token it is computed from.
+            assert!(!line.to_lowercase().contains("token"), "no token: {line}");
+            assert!(!line.contains("sk-ant"), "no credential sigil: {line}");
+            assert!(line.contains("acct=u-A"), "uuid identity: {line}");
+        }
+        // NON-DEGENERATE on the field that most warrants the check: `grant_replaced` is the only one
+        // here derived from the refresh token itself, and it is OMITTED on two of these three lines.
+        // Without this count, deleting the one event that carries it would leave the loop above
+        // passing while asserting nothing at all about it.
+        let carrying: Vec<&String> = rendered
+            .iter()
+            .filter(|l| l.contains(" grant_replaced="))
+            .collect();
+        assert_eq!(
+            carrying.len(),
+            1,
+            "exactly one line must exercise the rendered grant verdict: {rendered:?}"
+        );
+        assert!(
+            carrying[0].ends_with(" grant_replaced=true"),
+            "and it renders as a bare bool: {}",
+            carrying[0]
         );
     }
 
