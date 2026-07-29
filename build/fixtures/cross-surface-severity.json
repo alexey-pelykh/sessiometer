@@ -1,0 +1,295 @@
+{
+  "schema": 2,
+  "about": "Cross-surface severity contract (issue #768). EMITTED by the Rust gate (`cargo test -- --ignored emit_cross_surface_severity_manifest`) from `src/cli.rs`'s `DaemonPayloadFault`, which ADR-0026 makes the single home of the rank; CONSUMED by both `src/cli.rs` (mod tests::cross_surface_parity) and `apps/menubar/Tests/CrossSurfaceSeverityParityTests.swift`. Neither surface can change its rank alone: the emitting side reddens until this file is re-emitted, and re-emitting reddens the other side until it follows. Hand-editing this file is not a re-baseline — it is a way to break both gates at once.",
+  "daemon_fault_ranks": [
+    {
+      "rank": 1,
+      "id": "keychain_locked",
+      "severity": "red"
+    },
+    {
+      "rank": 2,
+      "id": "canonical_scrub_exhausted",
+      "severity": "red"
+    },
+    {
+      "rank": 3,
+      "id": "canary_drift_refusing",
+      "severity": "red"
+    },
+    {
+      "rank": 4,
+      "id": "canary_ambiguous",
+      "severity": "red"
+    },
+    {
+      "rank": 5,
+      "id": "canary_refused_unparseable_canonical",
+      "severity": "red"
+    },
+    {
+      "rank": 6,
+      "id": "systemic_refresh_failure",
+      "severity": "yellow"
+    },
+    {
+      "rank": 7,
+      "id": "canary_drift_overridden",
+      "severity": "yellow"
+    },
+    {
+      "rank": 8,
+      "id": "canonical_scrub_recovering",
+      "severity": "plain"
+    }
+  ],
+  "systemic_provenance_variants": [
+    "none",
+    "sweep",
+    "preflight"
+  ],
+  "exclusive_groups": [
+    {
+      "wire_field": "canonical_scrub",
+      "members": [
+        "canonical_scrub_exhausted",
+        "canonical_scrub_recovering"
+      ],
+      "why": "`canonical_scrub` is one wire value, so a snapshot is exhausted-XOR-recovering. The two variants sit at OPPOSITE ends of the rank (2 and 8) on purpose — severity ranks by (fault, VARIANT), never fault identity — but nothing ever arbitrates between them."
+    },
+    {
+      "wire_field": "canary",
+      "members": [
+        "canary_drift_refusing",
+        "canary_ambiguous",
+        "canary_refused_unparseable_canonical",
+        "canary_drift_overridden"
+      ],
+      "why": "The canary reports ONE verdict at a time, so no snapshot holds two of these. Their relative order is a stable READING convention (positive identity failures before the precautionary refusal), not runtime arbitration — which is exactly why the real arbitration edges below are the ones against the OTHER fault families."
+    }
+  ],
+  "arbitration_edges": [
+    {
+      "winner": "keychain_locked",
+      "loser": "canonical_scrub_exhausted"
+    },
+    {
+      "winner": "keychain_locked",
+      "loser": "canary_drift_refusing"
+    },
+    {
+      "winner": "keychain_locked",
+      "loser": "canary_ambiguous"
+    },
+    {
+      "winner": "keychain_locked",
+      "loser": "canary_refused_unparseable_canonical"
+    },
+    {
+      "winner": "keychain_locked",
+      "loser": "systemic_refresh_failure"
+    },
+    {
+      "winner": "keychain_locked",
+      "loser": "canary_drift_overridden"
+    },
+    {
+      "winner": "keychain_locked",
+      "loser": "canonical_scrub_recovering"
+    },
+    {
+      "winner": "canonical_scrub_exhausted",
+      "loser": "canary_drift_refusing"
+    },
+    {
+      "winner": "canonical_scrub_exhausted",
+      "loser": "canary_ambiguous"
+    },
+    {
+      "winner": "canonical_scrub_exhausted",
+      "loser": "canary_refused_unparseable_canonical"
+    },
+    {
+      "winner": "canonical_scrub_exhausted",
+      "loser": "systemic_refresh_failure"
+    },
+    {
+      "winner": "canonical_scrub_exhausted",
+      "loser": "canary_drift_overridden"
+    },
+    {
+      "winner": "canary_drift_refusing",
+      "loser": "systemic_refresh_failure"
+    },
+    {
+      "winner": "canary_drift_refusing",
+      "loser": "canonical_scrub_recovering"
+    },
+    {
+      "winner": "canary_ambiguous",
+      "loser": "systemic_refresh_failure"
+    },
+    {
+      "winner": "canary_ambiguous",
+      "loser": "canonical_scrub_recovering"
+    },
+    {
+      "winner": "canary_refused_unparseable_canonical",
+      "loser": "systemic_refresh_failure"
+    },
+    {
+      "winner": "canary_refused_unparseable_canonical",
+      "loser": "canonical_scrub_recovering"
+    },
+    {
+      "winner": "systemic_refresh_failure",
+      "loser": "canary_drift_overridden"
+    },
+    {
+      "winner": "systemic_refresh_failure",
+      "loser": "canonical_scrub_recovering"
+    },
+    {
+      "winner": "canary_drift_overridden",
+      "loser": "canonical_scrub_recovering"
+    }
+  ],
+  "account_severity_cases": [
+    {
+      "name": "both-green",
+      "session_pct": 0,
+      "weekly_pct": 10,
+      "weekly_exhausted": false,
+      "session_severity": "green",
+      "weekly_severity": "green"
+    },
+    {
+      "name": "just-below-yellow",
+      "session_pct": 74,
+      "weekly_pct": 74,
+      "weekly_exhausted": false,
+      "session_severity": "green",
+      "weekly_severity": "green"
+    },
+    {
+      "name": "at-yellow",
+      "session_pct": 75,
+      "weekly_pct": 75,
+      "weekly_exhausted": false,
+      "session_severity": "yellow",
+      "weekly_severity": "yellow"
+    },
+    {
+      "name": "just-below-red",
+      "session_pct": 89,
+      "weekly_pct": 89,
+      "weekly_exhausted": false,
+      "session_severity": "yellow",
+      "weekly_severity": "yellow"
+    },
+    {
+      "name": "at-red",
+      "session_pct": 90,
+      "weekly_pct": 90,
+      "weekly_exhausted": false,
+      "session_severity": "red",
+      "weekly_severity": "red"
+    },
+    {
+      "name": "full",
+      "session_pct": 100,
+      "weekly_pct": 100,
+      "weekly_exhausted": false,
+      "session_severity": "red",
+      "weekly_severity": "red"
+    },
+    {
+      "name": "weekly-exhausted-overrides-a-green-percent",
+      "session_pct": 20,
+      "weekly_pct": 3,
+      "weekly_exhausted": true,
+      "session_severity": "green",
+      "weekly_severity": "red"
+    },
+    {
+      "name": "no-session-reading",
+      "session_pct": null,
+      "weekly_pct": 50,
+      "weekly_exhausted": false,
+      "session_severity": null,
+      "weekly_severity": "green"
+    },
+    {
+      "name": "no-weekly-reading",
+      "session_pct": 50,
+      "weekly_pct": null,
+      "weekly_exhausted": false,
+      "session_severity": "green",
+      "weekly_severity": null
+    },
+    {
+      "name": "no-readings-at-all",
+      "session_pct": null,
+      "weekly_pct": null,
+      "weekly_exhausted": false,
+      "session_severity": null,
+      "weekly_severity": null
+    }
+  ],
+  "known_divergences": [
+    {
+      "id": "blind-degraded-tint",
+      "cli": "red",
+      "panel": "orange",
+      "why": "A DEGRADED blind-active account. The CLI emphasizes the line in `Severity::Red`; the panel deliberately uses ORANGE because the blind-DEGRADED GLANCE is `.attention`, one rung below `.noRunway`, so red would over-signal PAST the glance. A per-medium colour choice under R-2 STATE-parity — and it is a divergence in the per-account tint only, never in the daemon-payload rank above. CORNERED is `.red` on BOTH surfaces, because its glance IS `.noRunway`.",
+      "record": "apps/menubar/Sources/StatusPanelFormat.swift `blindSymbol` (#485/#572); ../hq/strategy/design-menubar.md R-2",
+      "pinned": true
+    },
+    {
+      "id": "fault-render-medium",
+      "cli": "one SGR-tinted text line per applicable fault, all of them printed, worst-first",
+      "panel": "exactly ONE banner — the worst applicable fault — tinted .error/.warning/.info",
+      "why": "R-2 is RANK-parity, not glyph-parity: the vocabulary of a terminal line and a popover banner may differ, and so may how many are shown at once. What may not differ is which fault is worst. This is why the gate compares ORDER and BAND rather than pixels or bytes — a gate that forced byte-parity here would be a wrong gate.",
+      "record": "docs/adr/0026-daemon-fault-severity-rank-is-cross-surface.md § Decision",
+      "pinned": true
+    },
+    {
+      "id": "next-swap-footer-wording",
+      "cli": "`next swap: …` footer, deliberately uncoloured",
+      "panel": "medium-idiomatic swap callout",
+      "why": "ADR-0016 settled this as CONTENT-parity, explicitly `not byte-identical … footers are medium-idiomatic`. It is a capacity signal, not a payload fault, so ADR-0026's rank does not reach it and this gate does not assert it.",
+      "record": "docs/adr/0016-dead-active-no-target-surfaced-not-relaxed.md",
+      "pinned": false
+    },
+    {
+      "id": "panel-header-gauge-vs-mock-mark",
+      "cli": "n/a — the CLI has no header glyph",
+      "panel": "the neutral system `gauge.medium`, where the design mock draws the locked Cycle-Gauge brand mark",
+      "why": "A MOCK-vs-panel divergence, not a CLI-vs-panel one, so it is outside this contract's axis entirely — enumerated because issue #768 AC4 names it, and so a reader hunting `known divergences` finds it recorded rather than concluding it was overlooked. NOTE: #768's AC4 calls this `an issue #173 provider-neutrality divergence`, and that attribution is WRONG — measured, not assumed. #173 is the separate PROVIDER-LINE divergence recorded below; the header glyph is a BRAND one (#437/#524). `build-comparison.py` states both in one sentence, which is very likely where the two got conflated.",
+      "record": "apps/menubar/design/build-comparison.py (the healthy-status STATES note) — NOT design/README.md § Expected reconciliations, whose list carries the provider line but no header-glyph entry",
+      "pinned": false
+    },
+    {
+      "id": "panel-provider-line-absent",
+      "cli": "n/a — the CLI's table has no provider column",
+      "panel": "no provider secondary line under each account name, where the mock draws one",
+      "why": "The ACTUAL issue #173 provider-neutrality divergence, recorded here beside the header-glyph one precisely because the two are routinely conflated. The wire carries no `provider` field yet, so the panel has nothing to render — and, like the glyph above, this is MOCK-vs-panel rather than CLI-vs-panel, hence outside this contract's axis.",
+      "record": "apps/menubar/design/README.md § Expected reconciliations (first entry)",
+      "pinned": false
+    }
+  ],
+  "uncovered_axes": [
+    {
+      "id": "blind-active-session-band",
+      "why": "The CLI colours a BLIND active account's stale `~%` off `util_severity(last_known_session_pct)`, while `StatusPanelFormat.sessionSeverity` takes only the fresh percent and the panel reaches the blind row through `blindSeverity` / `blindSymbol` instead. The two surfaces may well agree, but they agree through DIFFERENT functions, and this contract has not measured it — so the account-severity cases below are all non-blind. Stating the boundary beats implying coverage."
+    },
+    {
+      "id": "reset-proximity-bands",
+      "why": "`proximity_severity` (issue #94) colours the reset cells by how soon a window flips, framed as RELIEF. It is a third band family, not part of ADR-0026's rank nor of the utilization bands, and no cross-surface claim about it has been ratified."
+    },
+    {
+      "id": "runtime-notice-lines",
+      "why": "`render_landing_overshoot` (issue #613) is a per-machine RUNTIME notice that prints Red among the fault lines but is deliberately OUTSIDE the ADR-0026 daemon-payload rank (its own doc comment says so, and it keeps `red_line` rather than `daemon_fault_line`). It is therefore not ranked here, and the render observer's snapshots leave it unset."
+    }
+  ]
+}

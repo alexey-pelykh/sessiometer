@@ -2612,6 +2612,53 @@ enum DaemonPayloadFault {
 }
 
 impl DaemonPayloadFault {
+    /// Every fault, in DECLARATION order — which IS the canonical worst-first rank (ADR-0026), the
+    /// same order [`render_status`] prints them in and the same order the panel's
+    /// `daemonFaultBanner` arbitrates in.
+    ///
+    /// Hand-written, because Rust cannot enumerate a variant set without a derive this crate does
+    /// not carry — so be precise about what that costs. A ninth variant is a compile error in three
+    /// TOTAL matches ([`Self::severity`], [`Self::cross_surface_id`], and the one in
+    /// `cross_surface_rank_is_the_declaration_order`), which is what routes its author to this
+    /// list; and that test's count assertion reddens if a fault is DROPPED from the list. What
+    /// nothing catches is a variant added to the enum and to all three matches but never added
+    /// HERE: it would go unranked, and both gates would still read the same 8-fault manifest and
+    /// report green. Stating that boundary beats letting the list read as provably exhaustive.
+    ///
+    /// Test-only: the shipping binary reaches each fault through its own renderer and never needs
+    /// the list.
+    #[cfg(test)]
+    const ALL: &'static [Self] = &[
+        Self::KeychainLocked,
+        Self::CanonicalScrubExhausted,
+        Self::CanaryDriftRefusing,
+        Self::CanaryAmbiguous,
+        Self::CanaryRefusedUnparseableCanonical,
+        Self::SystemicRefreshFailure,
+        Self::CanaryDriftOverridden,
+        Self::CanonicalScrubRecovering,
+    ];
+
+    /// This fault's stable CROSS-SURFACE identifier (issue #768) — the name the committed
+    /// `build/fixtures/cross-surface-severity.json` manifest and the menubar panel's parity gate
+    /// both key on. Deliberately NOT a wire field: the wire carries `keychain_locked`,
+    /// `canonical_scrub` and `canary` as three separate shapes, while the rank is over the
+    /// (fault, VARIANT) pairs — the distinction ADR-0026 and the panel both insist on, since a
+    /// `recovering` scrub and an `exhausted` one are not one severity.
+    #[cfg(test)]
+    fn cross_surface_id(self) -> &'static str {
+        match self {
+            Self::KeychainLocked => "keychain_locked",
+            Self::CanonicalScrubExhausted => "canonical_scrub_exhausted",
+            Self::CanaryDriftRefusing => "canary_drift_refusing",
+            Self::CanaryAmbiguous => "canary_ambiguous",
+            Self::CanaryRefusedUnparseableCanonical => "canary_refused_unparseable_canonical",
+            Self::SystemicRefreshFailure => "systemic_refresh_failure",
+            Self::CanaryDriftOverridden => "canary_drift_overridden",
+            Self::CanonicalScrubRecovering => "canonical_scrub_recovering",
+        }
+    }
+
     /// The canonical cross-surface severity RANK of this fault (ADR-0026), in the CLI's own
     /// [`Severity`] vocabulary. It MUST agree with the menubar panel's rank
     /// (`StatusPanelFormat.daemonFaultBanner`'s `.error`/`.warning`/`.info`), though each surface
@@ -11498,6 +11545,883 @@ spare  22222222-2222\n\
                 "the coloured render does not reduce to the plain one — colour is changing the \
                  layout, not augmenting it (pad-before-colour is broken)"
             );
+        }
+    }
+
+    /// The CLI half of the CROSS-SURFACE severity gate (issue #768) — see [`crate::cross_surface`]
+    /// for why the contract exists and what the committed manifest is.
+    ///
+    /// Three INDEPENDENT observers converge on the one manifest here, and the independence is the
+    /// point — any single one of them would leave a real gap:
+    ///
+    /// 1. **The declaration observer** — [`DaemonPayloadFault::ALL`] + `DaemonPayloadFault::
+    ///    severity`. This is the rank's declared home.
+    /// 2. **The RENDER observer** — the order and SGR band `render_status` actually prints. Issue
+    ///    #575 was a defect of the RENDER SITES, not of any declaration (there was no shared
+    ///    declaration then), so an enum-only gate would have missed it by construction: the enum
+    ///    can rank correctly while a render site prints in a different order. Measured, not
+    ///    argued — hoisting `render_systemic_refresh_failure` above the vault pair leaves the
+    ///    declaration observer GREEN and reddens only this one.
+    /// 3. **The per-account observer** — `StatusRow`'s own `session_severity` / `weekly_severity`,
+    ///    the second axis issue #768's AC names.
+    ///
+    /// What this module does NOT do is compare the two surfaces directly — it cannot; the panel is
+    /// Swift. It pins the CLI to the committed manifest;
+    /// `apps/menubar/Tests/CrossSurfaceSeverityParityTests.swift` pins the panel to the SAME
+    /// committed bytes. Neither surface can then move alone.
+    mod cross_surface_parity {
+        use super::*;
+        use crate::cross_surface::{
+            self, band, ArbitrationEdge, ExclusiveGroup, FaultRank, KnownDivergence, Manifest,
+            ObservedFault, UncoveredAxis,
+        };
+
+        /// A fixed render instant. Nothing in this module reads a humanized cell, but
+        /// `render_status` needs one and a constant keeps every render in the module comparable.
+        const AT: i64 = 1_785_000_000;
+
+        /// The CLI's own band vocabulary, mapped to the manifest's medium-neutral one. `Dim` has
+        /// no manifest spelling on purpose — nothing this gate observes is ever `Dim`, so if one
+        /// ever reached here it would fail the manifest's band spell-check by name rather than be
+        /// quietly folded into a band somebody agreed on.
+        fn band_of(severity: Option<Severity>) -> &'static str {
+            match severity {
+                Some(Severity::Red) => band::RED,
+                Some(Severity::Yellow) => band::YELLOW,
+                Some(Severity::Green) => band::GREEN,
+                Some(Severity::Dim) => "dim",
+                None => band::PLAIN,
+            }
+        }
+
+        /// The `systemic_refresh_source` values both surfaces must rank identically. `None` is a
+        /// pre-#813 daemon that sends no discriminant; the two `Some` arms are #378's sweep
+        /// crossing and #787's startup preflight. Provenance picks the systemic banner's EVIDENCE
+        /// clause and — per the panel resolver's own comment — "never moves this rank"; walking
+        /// every variant is what turns that prose into an assertion.
+        const SYSTEMIC_PROVENANCE: &[Option<SystemicRefreshSource>] = &[
+            None,
+            Some(SystemicRefreshSource::Sweep),
+            Some(SystemicRefreshSource::Preflight),
+        ];
+
+        /// The manifest tokens for [`SYSTEMIC_PROVENANCE`], in the same order.
+        fn provenance_token(source: Option<SystemicRefreshSource>) -> &'static str {
+            match source {
+                None => "none",
+                Some(SystemicRefreshSource::Sweep) => "sweep",
+                Some(SystemicRefreshSource::Preflight) => "preflight",
+            }
+        }
+
+        /// A snapshot carrying exactly the named faults and nothing else noisy: one healthy
+        /// account, refresh explicitly enabled (so the disabled-advisory stays silent), no swap
+        /// footer, no overshoot. Everything that varies between two renders here is a fault line.
+        fn response_with(faults: &[&str], source: Option<SystemicRefreshSource>) -> StatusResponse {
+            let mut response = StatusResponse {
+                systemic_refresh_failure: None,
+                systemic_refresh_source: None,
+                canonical_scrub: None,
+                keychain_locked: false,
+                canary: None,
+                recent_blind_preempt_swap: None,
+                recent_landing_overshoot: None,
+                refresh_enabled: Some(true),
+                accounts: vec![status_line("work", true, Some(50), Some(25))],
+                next_swap: None,
+            };
+            for id in faults {
+                match *id {
+                    "keychain_locked" => response.keychain_locked = true,
+                    "canonical_scrub_exhausted" => {
+                        response.canonical_scrub = Some(CanonicalScrub::Exhausted);
+                    }
+                    "canonical_scrub_recovering" => {
+                        response.canonical_scrub = Some(CanonicalScrub::Recovering);
+                    }
+                    "canary_drift_refusing" => {
+                        response.canary = Some(CanaryStatus::Drift {
+                            displayed: "work".to_owned(),
+                            matched: "spare".to_owned(),
+                            overridden: false,
+                        });
+                    }
+                    "canary_drift_overridden" => {
+                        response.canary = Some(CanaryStatus::Drift {
+                            displayed: "work".to_owned(),
+                            matched: "spare".to_owned(),
+                            overridden: true,
+                        });
+                    }
+                    "canary_ambiguous" => {
+                        response.canary = Some(CanaryStatus::Ambiguous { count: 2 });
+                    }
+                    "canary_refused_unparseable_canonical" => {
+                        response.canary = Some(CanaryStatus::RefusedUnparseableCanonical);
+                    }
+                    "systemic_refresh_failure" => {
+                        response.systemic_refresh_failure = Some(3);
+                        response.systemic_refresh_source = source;
+                    }
+                    other => panic!(
+                        "no wire mapping for cross-surface fault `{other}` — a fault added to the \
+                         manifest must also be constructible here, or the render observer silently \
+                         stops covering it"
+                    ),
+                }
+            }
+            response
+        }
+
+        /// The ONE line a fault adds to the render, found by DIFFERENCE: render the same snapshot
+        /// with and without the fault and take the added line. No marker substrings, so the
+        /// observer cannot drift out of step with a re-worded fault line — and a fault whose
+        /// renderer stopped emitting anything fails loudly here instead of going quietly unranked.
+        fn fault_line(id: &str, source: Option<SystemicRefreshSource>, color: bool) -> String {
+            let quiet = render_status(&response_with(&[], source), AT, None, color);
+            let noisy = render_status(&response_with(&[id], source), AT, None, color);
+            let added: Vec<&str> = noisy
+                .lines()
+                .filter(|line| !quiet.lines().any(|base| base == *line))
+                .collect();
+            assert_eq!(
+                added.len(),
+                1,
+                "`{id}` added {} line(s) to the render, expected exactly 1 — the fault-line \
+                 observer cannot identify it (provenance {}): {added:?}",
+                added.len(),
+                provenance_token(source)
+            );
+            added[0].to_owned()
+        }
+
+        /// The band a rendered fault line carries, read from its SGR overlay — the CLI's actual
+        /// urgency signal, not a re-derivation of what it ought to be.
+        fn band_of_line(line: &str) -> &'static str {
+            if line.starts_with("\x1b[31m") {
+                band::RED
+            } else if line.starts_with("\x1b[33m") {
+                band::YELLOW
+            } else {
+                assert!(
+                    !line.starts_with('\x1b'),
+                    "fault line carries an SGR that is neither red nor yellow: {line:?}"
+                );
+                band::PLAIN
+            }
+        }
+
+        /// Read a rendered `status` back as an ordered, banded fault sequence: each named fault
+        /// located by its own rendered line, ordered by where that line appears. `color` must
+        /// describe how `rendered` was produced — the lines are matched exactly, SGR and all, so a
+        /// mismatch would find nothing and panic below rather than quietly mis-order.
+        fn observe_render(
+            rendered: &str,
+            present: &[&str],
+            source: Option<SystemicRefreshSource>,
+            color: bool,
+        ) -> Vec<ObservedFault> {
+            let mut located: Vec<(usize, ObservedFault)> = present
+                .iter()
+                .map(|id| {
+                    let line = fault_line(id, source, color);
+                    let at = rendered
+                        .lines()
+                        .position(|candidate| candidate == line)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "`{id}`'s line is ABSENT from a render that sets it — the fault \
+                                 stopped rendering, so it is unranked on this surface:\n{rendered}"
+                            )
+                        });
+                    (at, ObservedFault::new(id, band_of_line(&line)))
+                })
+                .collect();
+            located.sort_by_key(|(at, _)| *at);
+            located.into_iter().map(|(_, fault)| fault).collect()
+        }
+
+        /// The manifest as the LIVE Rust source of truth would write it. The emitter's body and the
+        /// gate's expectation are the same function, so a re-baseline cannot bless something the
+        /// gate would not accept.
+        fn manifest_from_source() -> Manifest {
+            Manifest {
+                schema: cross_surface::MANIFEST_SCHEMA,
+                about: "Cross-surface severity contract (issue #768). EMITTED by the Rust gate \
+                        (`cargo test -- --ignored emit_cross_surface_severity_manifest`) from \
+                        `src/cli.rs`'s `DaemonPayloadFault`, which ADR-0026 makes the single home \
+                        of the rank; CONSUMED by both `src/cli.rs` \
+                        (mod tests::cross_surface_parity) and \
+                        `apps/menubar/Tests/CrossSurfaceSeverityParityTests.swift`. Neither \
+                        surface can change its rank alone: the emitting side reddens until this \
+                        file is re-emitted, and re-emitting reddens the other side until it \
+                        follows. Hand-editing this file is not a re-baseline — it is a way to \
+                        break both gates at once."
+                    .to_owned(),
+                daemon_fault_ranks: DaemonPayloadFault::ALL
+                    .iter()
+                    .enumerate()
+                    .map(|(index, fault)| FaultRank {
+                        rank: u8::try_from(index + 1).expect("at most 255 daemon-payload faults"),
+                        id: fault.cross_surface_id().to_owned(),
+                        severity: band_of(fault.severity()).to_owned(),
+                    })
+                    .collect(),
+                exclusive_groups: vec![
+                    ExclusiveGroup {
+                        wire_field: "canonical_scrub".to_owned(),
+                        members: vec![
+                            "canonical_scrub_exhausted".to_owned(),
+                            "canonical_scrub_recovering".to_owned(),
+                        ],
+                        why: "`canonical_scrub` is one wire value, so a snapshot is \
+                              exhausted-XOR-recovering. The two variants sit at OPPOSITE ends of \
+                              the rank (2 and 8) on purpose — severity ranks by (fault, VARIANT), \
+                              never fault identity — but nothing ever arbitrates between them."
+                            .to_owned(),
+                    },
+                    ExclusiveGroup {
+                        wire_field: "canary".to_owned(),
+                        members: vec![
+                            "canary_drift_refusing".to_owned(),
+                            "canary_ambiguous".to_owned(),
+                            "canary_refused_unparseable_canonical".to_owned(),
+                            "canary_drift_overridden".to_owned(),
+                        ],
+                        why: "The canary reports ONE verdict at a time, so no snapshot holds two \
+                              of these. Their relative order is a stable READING convention \
+                              (positive identity failures before the precautionary refusal), not \
+                              runtime arbitration — which is exactly why the real arbitration \
+                              edges below are the ones against the OTHER fault families."
+                            .to_owned(),
+                    },
+                ],
+                systemic_provenance_variants: SYSTEMIC_PROVENANCE
+                    .iter()
+                    .map(|source| provenance_token(*source).to_owned())
+                    .collect(),
+                arbitration_edges: arbitration_edges(),
+                account_severity_cases: account_severity_cases(),
+                known_divergences: vec![
+                    KnownDivergence {
+                        id: "blind-degraded-tint".to_owned(),
+                        cli: "red".to_owned(),
+                        panel: "orange".to_owned(),
+                        why: "A DEGRADED blind-active account. The CLI emphasizes the line in \
+                              `Severity::Red`; the panel deliberately uses ORANGE because the \
+                              blind-DEGRADED GLANCE is `.attention`, one rung below `.noRunway`, \
+                              so red would over-signal PAST the glance. A per-medium colour \
+                              choice under R-2 STATE-parity — and it is a divergence in the \
+                              per-account tint only, never in the daemon-payload rank above. \
+                              CORNERED is `.red` on BOTH surfaces, because its glance IS \
+                              `.noRunway`."
+                            .to_owned(),
+                        record: "apps/menubar/Sources/StatusPanelFormat.swift `blindSymbol` \
+                                 (#485/#572); ../hq/strategy/design-menubar.md R-2"
+                            .to_owned(),
+                        pinned: true,
+                    },
+                    KnownDivergence {
+                        id: "fault-render-medium".to_owned(),
+                        cli: "one SGR-tinted text line per applicable fault, all of them printed, \
+                              worst-first"
+                            .to_owned(),
+                        panel: "exactly ONE banner — the worst applicable fault — tinted \
+                                .error/.warning/.info"
+                            .to_owned(),
+                        why: "R-2 is RANK-parity, not glyph-parity: the vocabulary of a terminal \
+                              line and a popover banner may differ, and so may how many are shown \
+                              at once. What may not differ is which fault is worst. This is why \
+                              the gate compares ORDER and BAND rather than pixels or bytes — a \
+                              gate that forced byte-parity here would be a wrong gate."
+                            .to_owned(),
+                        record: "docs/adr/0026-daemon-fault-severity-rank-is-cross-surface.md \
+                                 § Decision"
+                            .to_owned(),
+                        pinned: true,
+                    },
+                    KnownDivergence {
+                        id: "next-swap-footer-wording".to_owned(),
+                        cli: "`next swap: …` footer, deliberately uncoloured".to_owned(),
+                        panel: "medium-idiomatic swap callout".to_owned(),
+                        why: "ADR-0016 settled this as CONTENT-parity, explicitly `not \
+                              byte-identical … footers are medium-idiomatic`. It is a capacity \
+                              signal, not a payload fault, so ADR-0026's rank does not reach it \
+                              and this gate does not assert it."
+                            .to_owned(),
+                        record: "docs/adr/0016-dead-active-no-target-surfaced-not-relaxed.md"
+                            .to_owned(),
+                        pinned: false,
+                    },
+                    KnownDivergence {
+                        id: "panel-header-gauge-vs-mock-mark".to_owned(),
+                        cli: "n/a — the CLI has no header glyph".to_owned(),
+                        panel:
+                            "the neutral system `gauge.medium`, where the design mock draws the \
+                                locked Cycle-Gauge brand mark"
+                                .to_owned(),
+                        why:
+                            "A MOCK-vs-panel divergence, not a CLI-vs-panel one, so it is outside \
+                              this contract's axis entirely — enumerated because issue #768 AC4 \
+                              names it, and so a reader hunting `known divergences` finds it \
+                              recorded rather than concluding it was overlooked. NOTE: #768's AC4 \
+                              calls this `an issue #173 provider-neutrality divergence`, and that \
+                              attribution is WRONG — measured, not assumed. #173 is the separate \
+                              PROVIDER-LINE divergence recorded below; the header glyph is a BRAND \
+                              one (#437/#524). `build-comparison.py` states both in one sentence, \
+                              which is very likely where the two got conflated."
+                                .to_owned(),
+                        record:
+                            "apps/menubar/design/build-comparison.py (the healthy-status STATES \
+                                 note) — NOT design/README.md § Expected reconciliations, whose \
+                                 list carries the provider line but no header-glyph entry"
+                                .to_owned(),
+                        pinned: false,
+                    },
+                    KnownDivergence {
+                        id: "panel-provider-line-absent".to_owned(),
+                        cli: "n/a — the CLI's table has no provider column".to_owned(),
+                        panel:
+                            "no provider secondary line under each account name, where the mock \
+                                draws one"
+                                .to_owned(),
+                        why: "The ACTUAL issue #173 provider-neutrality divergence, recorded here \
+                              beside the header-glyph one precisely because the two are routinely \
+                              conflated. The wire carries no `provider` field yet, so the panel \
+                              has nothing to render — and, like the glyph above, this is \
+                              MOCK-vs-panel rather than CLI-vs-panel, hence outside this \
+                              contract's axis."
+                            .to_owned(),
+                        record: "apps/menubar/design/README.md § Expected reconciliations \
+                                 (first entry)"
+                            .to_owned(),
+                        pinned: false,
+                    },
+                ],
+                uncovered_axes: vec![
+                    UncoveredAxis {
+                        id: "blind-active-session-band".to_owned(),
+                        why: "The CLI colours a BLIND active account's stale `~%` off \
+                              `util_severity(last_known_session_pct)`, while \
+                              `StatusPanelFormat.sessionSeverity` takes only the fresh percent \
+                              and the panel reaches the blind row through `blindSeverity` / \
+                              `blindSymbol` instead. The two surfaces may well agree, but they \
+                              agree through DIFFERENT functions, and this contract has not \
+                              measured it — so the account-severity cases below are all \
+                              non-blind. Stating the boundary beats implying coverage."
+                            .to_owned(),
+                    },
+                    UncoveredAxis {
+                        id: "reset-proximity-bands".to_owned(),
+                        why: "`proximity_severity` (issue #94) colours the reset cells by how \
+                              soon a window flips, framed as RELIEF. It is a third band family, \
+                              not part of ADR-0026's rank nor of the utilization bands, and no \
+                              cross-surface claim about it has been ratified."
+                            .to_owned(),
+                    },
+                    UncoveredAxis {
+                        id: "runtime-notice-lines".to_owned(),
+                        why: "`render_landing_overshoot` (issue #613) is a per-machine RUNTIME \
+                              notice that prints Red among the fault lines but is deliberately \
+                              OUTSIDE the ADR-0026 daemon-payload rank (its own doc comment says \
+                              so, and it keeps `red_line` rather than `daemon_fault_line`). It is \
+                              therefore not ranked here, and the render observer's snapshots \
+                              leave it unset."
+                            .to_owned(),
+                    },
+                ],
+            }
+        }
+
+        /// Every ordered pair of faults that can co-occur — the arbitration EDGES, derived from
+        /// the declaration order minus the mutually-exclusive families. Emitted into the manifest
+        /// so the Swift gate provably walks the same universe.
+        fn arbitration_edges() -> Vec<ArbitrationEdge> {
+            let excluded = |a: DaemonPayloadFault, b: DaemonPayloadFault| {
+                use DaemonPayloadFault::{
+                    CanaryAmbiguous, CanaryDriftOverridden, CanaryDriftRefusing,
+                    CanaryRefusedUnparseableCanonical, CanonicalScrubExhausted,
+                    CanonicalScrubRecovering,
+                };
+                let scrub = |f| matches!(f, CanonicalScrubExhausted | CanonicalScrubRecovering);
+                let canary = |f| {
+                    matches!(
+                        f,
+                        CanaryDriftRefusing
+                            | CanaryAmbiguous
+                            | CanaryRefusedUnparseableCanonical
+                            | CanaryDriftOverridden
+                    )
+                };
+                (scrub(a) && scrub(b)) || (canary(a) && canary(b))
+            };
+            let mut edges = Vec::new();
+            for (i, winner) in DaemonPayloadFault::ALL.iter().enumerate() {
+                for loser in &DaemonPayloadFault::ALL[i + 1..] {
+                    if !excluded(*winner, *loser) {
+                        edges.push(ArbitrationEdge {
+                            winner: winner.cross_surface_id().to_owned(),
+                            loser: loser.cross_surface_id().to_owned(),
+                        });
+                    }
+                }
+            }
+            edges
+        }
+
+        /// The per-account utilization cases, classified by the CLI's own `StatusRow` — the same
+        /// code path the table colours cells with, not a re-statement of the band constants.
+        fn account_severity_cases() -> Vec<cross_surface::AccountSeverityCase> {
+            // Chosen to pin every BOUNDARY (the two thresholds, from both sides), the exhaustion
+            // override, and the two no-reading arms — the cases where a band mistake is a real
+            // operator-visible error rather than a rounding argument.
+            let inputs: &[(&str, Option<u8>, Option<u8>, bool)] = &[
+                ("both-green", Some(0), Some(10), false),
+                ("just-below-yellow", Some(74), Some(74), false),
+                ("at-yellow", Some(75), Some(75), false),
+                ("just-below-red", Some(89), Some(89), false),
+                ("at-red", Some(90), Some(90), false),
+                ("full", Some(100), Some(100), false),
+                (
+                    "weekly-exhausted-overrides-a-green-percent",
+                    Some(20),
+                    Some(3),
+                    true,
+                ),
+                ("no-session-reading", None, Some(50), false),
+                ("no-weekly-reading", Some(50), None, false),
+                ("no-readings-at-all", None, None, false),
+            ];
+            inputs
+                .iter()
+                .map(|(name, session, weekly, exhausted)| {
+                    let account =
+                        status_line_resets(name, *session, *weekly, *exhausted, None, None);
+                    let row = StatusRow::new(&account, AT);
+                    cross_surface::AccountSeverityCase {
+                        name: (*name).to_owned(),
+                        session_pct: *session,
+                        weekly_pct: *weekly,
+                        weekly_exhausted: *exhausted,
+                        session_severity: row.session_severity.map(|s| band_of(Some(s)).to_owned()),
+                        weekly_severity: row.weekly_severity.map(|s| band_of(Some(s)).to_owned()),
+                    }
+                })
+                .collect()
+        }
+
+        /// `#[ignore]` — NOT part of the suite; it WRITES the bytes both gates compare against.
+        /// Run it ONLY alongside a DELIBERATE change to the cross-surface severity contract:
+        ///   `cargo test -- --ignored emit_cross_surface_severity_manifest`
+        /// then move the PANEL to match, or `CrossSurfaceSeverityParityTests` stays red. That is
+        /// the mechanism, not an inconvenience.
+        #[test]
+        #[ignore = "one-time cross-surface manifest emitter — run ONLY alongside a deliberate rank change"]
+        fn emit_cross_surface_severity_manifest() {
+            cross_surface::emit(&manifest_from_source());
+        }
+
+        // ---- Observer 1: the declaration ------------------------------------------------------
+
+        #[test]
+        fn the_committed_manifest_still_describes_the_declaration() {
+            let committed = cross_surface::committed_manifest();
+            let live = manifest_from_source();
+            // Name a RANK move in the module's own prose first. The whole-manifest compare below
+            // is the complete check, but it fails by printing ~300 lines of JSON twice, and a rank
+            // change is both the likeliest reason to be standing here and the one thing this
+            // contract exists for — so say which rank moved, in the same vocabulary the render
+            // observer uses.
+            let declared: Vec<ObservedFault> = live
+                .daemon_fault_ranks
+                .iter()
+                .map(|entry| ObservedFault::new(&entry.id, &entry.severity))
+                .collect();
+            let findings =
+                cross_surface::rank_divergences(&committed.daemon_fault_ranks, &declared);
+            assert!(
+                findings.is_empty(),
+                "`DaemonPayloadFault` no longer declares the rank the committed manifest pins:\n  \
+                 {}{}",
+                findings.join("\n  "),
+                cross_surface::rebaseline_hint()
+            );
+            // …and everything else the manifest carries: the exclusive groups, the arbitration
+            // edges, the account cases, the divergence register, the uncovered axes, the `about`
+            // prose.
+            assert_eq!(
+                cross_surface::to_committed_bytes(&committed),
+                cross_surface::to_committed_bytes(&live),
+                "the committed cross-surface manifest no longer matches what `src/cli.rs` \
+                 declares.{}",
+                cross_surface::rebaseline_hint()
+            );
+        }
+
+        #[test]
+        fn cross_surface_rank_is_the_declaration_order() {
+            // `ALL` is hand-written, so this is the guard that it is actually EXHAUSTIVE: the
+            // match below is total, so a ninth variant fails to compile until it is added to the
+            // arm list, and the count assertion catches a variant added to the enum and to this
+            // match but forgotten in `ALL`.
+            let mut seen = std::collections::BTreeSet::new();
+            for fault in DaemonPayloadFault::ALL {
+                assert!(
+                    seen.insert(fault.cross_surface_id()),
+                    "`{}` appears twice in DaemonPayloadFault::ALL",
+                    fault.cross_surface_id()
+                );
+                // Total match: adding a variant to the enum breaks the build here.
+                let expected_band = match fault {
+                    DaemonPayloadFault::KeychainLocked
+                    | DaemonPayloadFault::CanonicalScrubExhausted
+                    | DaemonPayloadFault::CanaryDriftRefusing
+                    | DaemonPayloadFault::CanaryAmbiguous
+                    | DaemonPayloadFault::CanaryRefusedUnparseableCanonical => band::RED,
+                    DaemonPayloadFault::SystemicRefreshFailure
+                    | DaemonPayloadFault::CanaryDriftOverridden => band::YELLOW,
+                    DaemonPayloadFault::CanonicalScrubRecovering => band::PLAIN,
+                };
+                assert_eq!(
+                    band_of(fault.severity()),
+                    expected_band,
+                    "`{}` renders band `{}`",
+                    fault.cross_surface_id(),
+                    band_of(fault.severity())
+                );
+            }
+            assert_eq!(
+                seen.len(),
+                8,
+                "DaemonPayloadFault::ALL lists {} faults, expected 8 — the daemon-payload fault \
+                 set changed shape. Add (or drop) the variant in ALL, then re-emit the manifest so \
+                 the panel is handed the new rank",
+                seen.len()
+            );
+        }
+
+        // ---- Observer 2: what `render_status` actually prints ----------------------------------
+
+        #[test]
+        fn every_fault_renders_a_distinct_line_so_the_observer_can_identify_it() {
+            // Degenerate-subject guard for the render observer: it locates a fault by its exact
+            // rendered line, so two faults sharing a line would make every position lookup
+            // ambiguous and the ordering assertions below meaningless.
+            let manifest = cross_surface::committed_manifest();
+            for source in SYSTEMIC_PROVENANCE {
+                let lines: Vec<(String, String)> = manifest
+                    .ordered_ids()
+                    .iter()
+                    .map(|id| ((*id).to_owned(), fault_line(id, *source, false)))
+                    .collect();
+                assert_eq!(
+                    lines.len(),
+                    8,
+                    "expected 8 fault lines, observed {}",
+                    lines.len()
+                );
+                for (i, (id_a, line_a)) in lines.iter().enumerate() {
+                    for (id_b, line_b) in &lines[i + 1..] {
+                        assert_ne!(
+                            line_a,
+                            line_b,
+                            "`{id_a}` and `{id_b}` render the SAME line at provenance {} — the \
+                             render observer cannot tell them apart",
+                            provenance_token(*source)
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn a_maximal_snapshot_prints_the_faults_worst_first_at_their_pinned_bands() {
+            // Issue #768 AC1 on this surface: ONE fixture snapshot, rendered, its fault ordering
+            // read back out of the text. Four faults is the maximum a single snapshot can hold —
+            // `canonical_scrub` and `canary` are each one wire value — so this is the widest real
+            // co-occurrence, and it spans all three bands.
+            let present = [
+                "keychain_locked",
+                "canonical_scrub_exhausted",
+                "canary_drift_refusing",
+                "systemic_refresh_failure",
+            ];
+            let manifest = cross_surface::committed_manifest();
+            // `projection` itself asserts every named fault is pinned, and names the one that is
+            // not — so no weaker count check is needed here.
+            let expected = manifest.projection(&present);
+
+            // Once per systemic PROVENANCE. Provenance picks the systemic line's evidence clause
+            // (#787/#813) and must never move the rank — an invariant the panel states in prose
+            // and, before this walk, nothing asserted on either surface.
+            for source in SYSTEMIC_PROVENANCE {
+                let rendered = render_status(&response_with(&present, *source), AT, None, true);
+                let observed = observe_render(&rendered, &present, *source, true);
+                let findings = cross_surface::rank_divergences(&expected, &observed);
+                assert!(
+                    findings.is_empty(),
+                    "the `status` render diverges from the committed cross-surface contract at \
+                     provenance {}:\n  {}{}",
+                    provenance_token(*source),
+                    findings.join("\n  "),
+                    cross_surface::rebaseline_hint()
+                );
+
+                // …and the CONSTRAINT-A canary, over this very observation: prove it can fail.
+                cross_surface::assert_canary(
+                    "status render (maximal snapshot)",
+                    &expected,
+                    &observed,
+                );
+            }
+        }
+
+        #[test]
+        fn every_arbitration_edge_prints_the_worse_fault_first() {
+            // The total order, edge by edge. A maximal snapshot can only hold four faults at once,
+            // so the pairwise walk is what actually establishes the full worst-first rank — and it
+            // is the SAME edge list the panel's gate walks, read from the same manifest.
+            let manifest = cross_surface::committed_manifest();
+            assert_eq!(
+                manifest.systemic_provenance_variants.len(),
+                SYSTEMIC_PROVENANCE.len(),
+                "the manifest pins {} provenance variant(s), this gate walks {} — the two must \
+                 agree or one side is covering less than the contract claims",
+                manifest.systemic_provenance_variants.len(),
+                SYSTEMIC_PROVENANCE.len()
+            );
+            let mut checked = 0;
+            for edge in &manifest.arbitration_edges {
+                let present = [edge.winner.as_str(), edge.loser.as_str()];
+                // An edge that involves systemic is walked once per provenance; the rest have no
+                // provenance to vary, so one pass covers them.
+                let involves_systemic = present.contains(&"systemic_refresh_failure");
+                let sources: &[Option<SystemicRefreshSource>] = if involves_systemic {
+                    SYSTEMIC_PROVENANCE
+                } else {
+                    &[None]
+                };
+                for source in sources {
+                    let rendered = render_status(&response_with(&present, *source), AT, None, true);
+                    let observed = observe_render(&rendered, &present, *source, true);
+                    let findings =
+                        cross_surface::rank_divergences(&manifest.projection(&present), &observed);
+                    assert!(
+                        findings.is_empty(),
+                        "`{}` vs `{}` diverges from the contract at provenance {}:\n  {}{}",
+                        edge.winner,
+                        edge.loser,
+                        provenance_token(*source),
+                        findings.join("\n  "),
+                        cross_surface::rebaseline_hint()
+                    );
+                    checked += 1;
+                }
+            }
+            // Cardinality: a pass over a shrunken edge list is not evidence. 21 co-occurrable
+            // pairs over 8 faults (28 total minus 1 scrub pair and 6 canary pairs); 7 of them
+            // involve systemic and are walked once per provenance, so 14 + 7 × 3 = 35 comparisons.
+            let systemic_edges = manifest
+                .arbitration_edges
+                .iter()
+                .filter(|edge| {
+                    edge.winner == "systemic_refresh_failure"
+                        || edge.loser == "systemic_refresh_failure"
+                })
+                .count();
+            assert_eq!(
+                manifest.arbitration_edges.len(),
+                21,
+                "the edge universe changed shape"
+            );
+            assert_eq!(systemic_edges, 7, "systemic should meet all 7 other faults");
+            let expected_comparisons =
+                (21 - systemic_edges) + systemic_edges * SYSTEMIC_PROVENANCE.len();
+            assert_eq!(
+                checked,
+                expected_comparisons,
+                "walked {checked} comparisons — expected {expected_comparisons} ({} \
+                 provenance-free edges + {systemic_edges} systemic edges × {} provenance variants)",
+                21 - systemic_edges,
+                SYSTEMIC_PROVENANCE.len()
+            );
+        }
+
+        #[test]
+        fn the_colour_gate_changes_only_the_band_never_the_fault_order() {
+            // Colour is additive (ADR-0026): a `--no-color` / piped reader must lose the band but
+            // never the ranking. Asserted rather than assumed, because a piped `status | grep` is
+            // how an operator's health check most often reads these lines.
+            let present = [
+                "keychain_locked",
+                "canonical_scrub_recovering",
+                "canary_drift_overridden",
+                "systemic_refresh_failure",
+            ];
+            // Through the SAME observer the ranking assertions use, so this compares what those
+            // read rather than a second, parallel way of reading it. Bands necessarily differ
+            // between the two runs — the ORDER is the claim.
+            let order = |color: bool| -> Vec<String> {
+                let rendered = render_status(&response_with(&present, None), AT, None, color);
+                observe_render(&rendered, &present, None, color)
+                    .into_iter()
+                    .map(|fault| fault.id)
+                    .collect()
+            };
+            assert_eq!(
+                order(false),
+                order(true),
+                "the colour gate changed the fault ORDER — colour must be purely additive, so a \
+                 piped `status | grep` reader keeps the ranking even without the bands"
+            );
+            let plain_render = render_status(&response_with(&present, None), AT, None, false);
+            assert!(
+                plain_render.lines().all(|line| !line.starts_with('\x1b')),
+                "the uncoloured render still carries an SGR overlay"
+            );
+            // …and the coloured render genuinely exercised the bands, so the equality above is not
+            // two identical uncoloured runs agreeing with each other.
+            let coloured_render = render_status(&response_with(&present, None), AT, None, true);
+            assert!(
+                coloured_render.contains('\x1b'),
+                "the coloured render carries no SGR at all — this case is not exercising the gate"
+            );
+        }
+
+        // ---- Observer 3: the per-account utilization bands --------------------------------------
+
+        #[test]
+        fn the_committed_account_severity_cases_still_match_the_table_classifier() {
+            // The per-account half of issue #768's AC2, on this surface. `StatusRow::new` is the
+            // real code path the table colours cells with — not a re-statement of the band
+            // constants, which would only prove the constants equal themselves.
+            let manifest = cross_surface::committed_manifest();
+            let live = account_severity_cases();
+            assert_eq!(
+                manifest.account_severity_cases,
+                live,
+                "the committed per-account severity cases no longer match `StatusRow`'s \
+                 classification.{}",
+                cross_surface::rebaseline_hint()
+            );
+            // Cardinality + non-degeneracy: cases that were all-`None` would compare equal while
+            // asserting nothing about the bands.
+            assert!(
+                live.len() >= 8,
+                "only {} account-severity cases — too few to pin both thresholds from both sides",
+                live.len()
+            );
+            assert!(
+                live.iter()
+                    .any(|c| c.session_severity.as_deref() == Some(band::GREEN))
+                    && live
+                        .iter()
+                        .any(|c| c.session_severity.as_deref() == Some(band::YELLOW))
+                    && live
+                        .iter()
+                        .any(|c| c.session_severity.as_deref() == Some(band::RED))
+                    && live.iter().any(|c| c.session_severity.is_none()),
+                "the account-severity cases do not span all four session outcomes \
+                 (green/yellow/red/no-reading), so a band mistake could hide in an uncovered arm"
+            );
+        }
+
+        // ---- The enumerated legitimate divergences (issue #768 AC4) ----------------------------
+
+        #[test]
+        fn the_cli_side_of_each_pinned_divergence_is_still_true() {
+            // A divergence that is merely DOCUMENTED drifts. Each pinned entry is asserted on this
+            // surface here and on the panel there, so the register cannot quietly come to describe
+            // a divergence that no longer exists — or stop describing one that does.
+            let manifest = cross_surface::committed_manifest();
+            let pinned: Vec<&KnownDivergence> = manifest
+                .known_divergences
+                .iter()
+                .filter(|entry| entry.pinned)
+                .collect();
+            assert!(
+                pinned.len() >= 2,
+                "expected at least two PINNED divergences, found {}",
+                pinned.len()
+            );
+            for entry in pinned {
+                match entry.id.as_str() {
+                    "blind-degraded-tint" => {
+                        // The CLI's half: a DEGRADED blind-active line is Red. (The panel's half —
+                        // orange — is asserted in CrossSurfaceSeverityParityTests.)
+                        assert_eq!(
+                            entry.cli,
+                            band::RED,
+                            "the register claims the CLI paints blind-DEGRADED `{}`",
+                            entry.cli
+                        );
+                        let blind = BlindActive {
+                            blind_secs: 900,
+                            last_known_session_pct: 80,
+                            auto_protection_degraded: true,
+                        };
+                        let line = render_blind_active("work", blind, true);
+                        assert!(
+                            line.starts_with("\x1b[31m"),
+                            "the CLI's DEGRADED blind line is no longer Red, so the enumerated \
+                             divergence no longer describes reality: {line:?}"
+                        );
+                        let ok = render_blind_active(
+                            "work",
+                            BlindActive {
+                                auto_protection_degraded: false,
+                                ..blind
+                            },
+                            true,
+                        );
+                        assert!(
+                            !ok.starts_with('\x1b'),
+                            "an OK blind line should carry no emphasis: {ok:?}"
+                        );
+                    }
+                    "fault-render-medium" => {
+                        // The CLI's half: ALL applicable fault lines print, not just the worst.
+                        // This is what makes byte-parity with the panel's single banner a WRONG
+                        // gate, and why this contract compares rank rather than bytes.
+                        let present = ["keychain_locked", "systemic_refresh_failure"];
+                        let rendered =
+                            render_status(&response_with(&present, None), AT, None, false);
+                        for id in present {
+                            assert!(
+                                rendered
+                                    .lines()
+                                    .any(|line| line == fault_line(id, None, false)),
+                                "`{id}` is missing — the CLI is meant to print EVERY applicable \
+                                 fault line, which is the divergence this entry records"
+                            );
+                        }
+                    }
+                    other => panic!(
+                        "divergence `{other}` is marked pinned but nothing on this surface asserts \
+                         it — either assert it here or set `pinned: false` and re-emit"
+                    ),
+                }
+            }
+        }
+
+        #[test]
+        fn the_uncovered_axes_are_declared_rather_than_implied() {
+            // Honest scope: this gate covers the daemon-payload rank and the per-account
+            // utilization bands. Everything else it deliberately does not touch is named in the
+            // manifest, so a reader can tell "not covered" from "covered and green".
+            let manifest = cross_surface::committed_manifest();
+            assert!(
+                !manifest.uncovered_axes.is_empty(),
+                "no uncovered axes declared — there are some, and an undeclared gap reads exactly \
+                 like coverage"
+            );
+            for axis in &manifest.uncovered_axes {
+                assert!(
+                    axis.why.len() > 40,
+                    "uncovered axis `{}` has no real rationale — a bare id is not an enumeration",
+                    axis.id
+                );
+            }
         }
     }
 }

@@ -17,6 +17,12 @@ mod claude_state;
 mod cli;
 mod config;
 mod contract;
+/// The CROSS-SURFACE severity contract (issue #768) — the committed manifest pinning the ADR-0026
+/// daemon-payload-fault rank across the `status` CLI and the menubar panel, plus the divergence
+/// predicate and the mutation canary both gates run. Test-only: nothing in the shipping binary
+/// reads the manifest.
+#[cfg(test)]
+mod cross_surface;
 mod daemon;
 mod duration;
 mod error;
