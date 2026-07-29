@@ -231,6 +231,12 @@
   .badge.id-scratch{ background:var(--id-scratch-bg); color:var(--id-mono) }
   .id-meta{ flex:1 1 auto; min-width:0 }
   .id-name{ font-size:13px; font-weight:600; letter-spacing:.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
+  /* A genuinely EMPTY label (#752's degenerate frames) collapses this div to zero height, which lets the
+     provider line slide up into the name's slot and read as if the provider WERE the account name — the
+     opposite of what that frame claims. A zero-width space keeps the line occupied without adding a glyph,
+     so the markup can stay honestly empty while the frame still shows a BLANK name line with the monogram
+     carrying the whole identity. Presentation-only, and scoped to `:empty` so no other frame is touched. */
+  .id-name:empty::before{ content:"\200B" }
   .id-prov{ font-size:11px; color:var(--text-2); white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
   .id-trail{ flex:0 0 auto; display:flex; align-items:center; gap:8px; margin-left:6px }
   /* #699 retires the `.tag` "Active" capsule that used to open `.id-trail`. Active was signalled three
@@ -2401,6 +2407,651 @@
         </div>
       </div>
 
+      <!-- ===================================================================== -->
+      <!-- GROUP 7 · PATHOLOGICAL CONTENT (#752)                                  -->
+      <!-- ===================================================================== -->
+      <!-- The CONTENT oracle for the stress fixtures (issue #753) — what a hostile LABEL,
+           PERCENT or DURATION is supposed to look like, so a stress render has a design to
+           be correct AGAINST rather than only something to be unchanged FROM. Why these
+           four frames cover six pathological concepts, what they deliberately do NOT
+           author, and how #753 pairs to them by name: this directory's `README.md`,
+           § Pathological content (#752). The design claim itself is the on-page note at
+           the foot of this file, with the rest of the gallery's constraints.
+
+           EDITING HERE — two kinds of value below are NOT eyeballed and must not be
+           retuned by eye. Every WIDTH is measured through the same CoreText primitives the
+           shipped gate drives (`Tests/TextMetrics.swift`, issue #750), and every MONOGRAM
+           is what the shipped `accountMonograms` actually resolves for that exact roster.
+           Badge COLOURS are the usual exception — illustrative, as everywhere in this
+           gallery (`README.md` § Expected reconciliations, issue #709): the built panel
+           hashes them from the label and needn't match. -->
+      <div class="group-cap">
+        <span class="gc-t">7 &middot; Pathological content</span><span class="gc-line"></span>
+        <span class="gc-note">the stress oracle &mdash; hostile labels, percents and durations (#752)</span>
+      </div>
+
+      <!-- 7 · PATHOLOGICAL LABEL · LIGHT — long / CJK / RTL -->
+      <div class="frame">
+        <div class="fcap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 7.91 13.01 L 9.91 15.21 A 1.2 1.2 0 0 0 11.69 13.59 L 9.69 11.39 A 1.2 1.2 0 0 0 7.91 13.01 Z"/><path d="M 11.70 15.19 L 16.10 10.19 A 1.2 1.2 0 0 0 14.30 8.61 L 9.90 13.61 A 1.2 1.2 0 0 0 11.70 15.19 Z"/><path d="M 9.6 14.4 A 1.2 1.2 0 1 0 12 14.4 A 1.2 1.2 0 1 0 9.6 14.4 Z"/></svg>
+          Pathological label &middot; Light
+        </div>
+        <div class="pop-wrap">
+          <div class="pop theme-light" data-frame="pathological-label-light">
+            <div class="pop-head">
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
+              <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">4 accounts &middot; continuous-integration-runner@example.io active</span></span>
+              <span class="seg"><button class="on">Status</button><button>Stats</button></span>
+            </div>
+            <div class="div"></div>
+            <div class="accts">
+              <!-- LITERAL pre-elided label. Full: continuous-integration-runner@example.io = 273.65 pt against the 171 pt roster-label budget, middle-elided by the shipped policy. Authored as a literal because CSS `text-overflow` is TAIL-only — the mock states the intended RESULT, it does not re-perform the elision. -->
+              <div class="acct active">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-personal">CI</span>
+                  <span class="id-meta"><div class="id-name">continuous-&hellip;example.io</div><div class="id-prov">Claude Code</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill r" style="width:92%"></span></span><span class="m-pct r">92%</span><span class="m-reset">2h14m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:61%"></span></span><span class="m-pct g">61%</span><span class="m-reset">2d4h</span></div>
+                </div>
+              </div>
+              <!-- CJK — the label below is entity-encoded to stay ASCII in the markup; it reads `用户@例子公司.中国`. 119.32 pt, so it FITS WHOLE at 171 pt. No elision: the issue's premise that a CJK label elides is measurably false at the shipped budget. -->
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-scratch">&#29992;&#20013;</span>
+                  <span class="id-meta"><div class="id-name">&#29992;&#25143;@&#20363;&#23376;&#20844;&#21496;.&#20013;&#22269;</div><div class="id-prov">Codex</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h2m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:44%"></span></span><span class="m-pct g">44%</span><span class="m-reset">4d</span></div>
+                </div>
+              </div>
+              <!-- RTL Arabic — entity-encoded below; it reads `مستخدم@شركة.مصر`. 116.30 pt, so it FITS WHOLE. No `dir` attribute: the row's LAYOUT stays LTR (badge leads, health trails) and only the TEXT RUN is bidi-shaped, which is what the panel does — it sets no per-row layout direction. -->
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-work">&#1605;&#1605;</span>
+                  <span class="id-meta"><div class="id-name">&#1605;&#1587;&#1578;&#1582;&#1583;&#1605;@&#1588;&#1585;&#1603;&#1577;.&#1605;&#1589;&#1585;</div><div class="id-prov">Gemini</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:12%"></span></span><span class="m-pct g">12%</span><span class="m-reset">5h20m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:27%"></span></span><span class="m-pct g">27%</span><span class="m-reset">6d3h</span></div>
+                </div>
+              </div>
+              <!-- RTL Hebrew with an LTR tail — entity-encoded below; it reads `משתמש@חברה.co.il`. 123.72 pt, so it FITS WHOLE. Its monogram is the MIXED-SCRIPT pair the shipped algorithm actually resolves (first token's initial + LAST token's initial = Hebrew mem + Latin I), not a guess. -->
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge">&#1502;I</span>
+                  <span class="id-meta"><div class="id-name">&#1502;&#1513;&#1514;&#1502;&#1513;@&#1495;&#1489;&#1512;&#1492;.co.il</div><div class="id-prov">Claude Code</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:7%"></span></span><span class="m-pct g">7%</span><span class="m-reset">3h40m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:19%"></span></span><span class="m-pct g">19%</span><span class="m-reset">5d2h</span></div>
+                </div>
+              </div>
+            </div>
+            <div class="swap-row">
+              <span class="swap-txt"><div class="lead">&rarr; <b>&#29992;&#25143;@&#20363;&#23376;&#20844;&#21496;.&#20013;&#22269;</b></div><div class="why">weekly resets soonest</div></span>
+              <button class="swap-btn">Swap</button>
+            </div>
+            <div class="pop-foot">
+              <span class="fl1">Last swap <b>&#29992;&#25143;@&#20363;&#23376;&#20844;&#21496;.&#20013;&#22269; &rarr; continuous-&hellip;example.io</b> &middot; session-cap &middot; 18m ago</span>
+              <span class="fl2"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg>snapshot 12s old</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 7 · PATHOLOGICAL LABEL · DARK -->
+      <div class="frame">
+        <div class="fcap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 7.91 13.01 L 9.91 15.21 A 1.2 1.2 0 0 0 11.69 13.59 L 9.69 11.39 A 1.2 1.2 0 0 0 7.91 13.01 Z"/><path d="M 11.70 15.19 L 16.10 10.19 A 1.2 1.2 0 0 0 14.30 8.61 L 9.90 13.61 A 1.2 1.2 0 0 0 11.70 15.19 Z"/><path d="M 9.6 14.4 A 1.2 1.2 0 1 0 12 14.4 A 1.2 1.2 0 1 0 9.6 14.4 Z"/></svg>
+          Pathological label &middot; Dark
+        </div>
+        <div class="pop-wrap">
+          <div class="pop theme-dark" data-frame="pathological-label-dark">
+            <div class="pop-head">
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
+              <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">4 accounts &middot; continuous-integration-runner@example.io active</span></span>
+              <span class="seg"><button class="on">Status</button><button>Stats</button></span>
+            </div>
+            <div class="div"></div>
+            <div class="accts">
+              <!-- LITERAL pre-elided label. Full: continuous-integration-runner@example.io = 273.65 pt against the 171 pt roster-label budget, middle-elided by the shipped policy. Authored as a literal because CSS `text-overflow` is TAIL-only — the mock states the intended RESULT, it does not re-perform the elision. -->
+              <div class="acct active">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-personal">CI</span>
+                  <span class="id-meta"><div class="id-name">continuous-&hellip;example.io</div><div class="id-prov">Claude Code</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill r" style="width:92%"></span></span><span class="m-pct r">92%</span><span class="m-reset">2h14m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:61%"></span></span><span class="m-pct g">61%</span><span class="m-reset">2d4h</span></div>
+                </div>
+              </div>
+              <!-- CJK — the label below is entity-encoded to stay ASCII in the markup; it reads `用户@例子公司.中国`. 119.32 pt, so it FITS WHOLE at 171 pt. No elision: the issue's premise that a CJK label elides is measurably false at the shipped budget. -->
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-scratch">&#29992;&#20013;</span>
+                  <span class="id-meta"><div class="id-name">&#29992;&#25143;@&#20363;&#23376;&#20844;&#21496;.&#20013;&#22269;</div><div class="id-prov">Codex</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h2m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:44%"></span></span><span class="m-pct g">44%</span><span class="m-reset">4d</span></div>
+                </div>
+              </div>
+              <!-- RTL Arabic — entity-encoded below; it reads `مستخدم@شركة.مصر`. 116.30 pt, so it FITS WHOLE. No `dir` attribute: the row's LAYOUT stays LTR (badge leads, health trails) and only the TEXT RUN is bidi-shaped, which is what the panel does — it sets no per-row layout direction. -->
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-work">&#1605;&#1605;</span>
+                  <span class="id-meta"><div class="id-name">&#1605;&#1587;&#1578;&#1582;&#1583;&#1605;@&#1588;&#1585;&#1603;&#1577;.&#1605;&#1589;&#1585;</div><div class="id-prov">Gemini</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:12%"></span></span><span class="m-pct g">12%</span><span class="m-reset">5h20m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:27%"></span></span><span class="m-pct g">27%</span><span class="m-reset">6d3h</span></div>
+                </div>
+              </div>
+              <!-- RTL Hebrew with an LTR tail — entity-encoded below; it reads `משתמש@חברה.co.il`. 123.72 pt, so it FITS WHOLE. Its monogram is the MIXED-SCRIPT pair the shipped algorithm actually resolves (first token's initial + LAST token's initial = Hebrew mem + Latin I), not a guess. -->
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge">&#1502;I</span>
+                  <span class="id-meta"><div class="id-name">&#1502;&#1513;&#1514;&#1502;&#1513;@&#1495;&#1489;&#1512;&#1492;.co.il</div><div class="id-prov">Claude Code</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:7%"></span></span><span class="m-pct g">7%</span><span class="m-reset">3h40m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:19%"></span></span><span class="m-pct g">19%</span><span class="m-reset">5d2h</span></div>
+                </div>
+              </div>
+            </div>
+            <div class="swap-row">
+              <span class="swap-txt"><div class="lead">&rarr; <b>&#29992;&#25143;@&#20363;&#23376;&#20844;&#21496;.&#20013;&#22269;</b></div><div class="why">weekly resets soonest</div></span>
+              <button class="swap-btn">Swap</button>
+            </div>
+            <div class="pop-foot">
+              <span class="fl1">Last swap <b>&#29992;&#25143;@&#20363;&#23376;&#20844;&#21496;.&#20013;&#22269; &rarr; continuous-&hellip;example.io</b> &middot; session-cap &middot; 18m ago</span>
+              <span class="fl2"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg>snapshot 12s old</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 7 · SAME-LOCAL-PART · LIGHT — the issue #445 invariant, visually -->
+      <div class="frame">
+        <div class="fcap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 7.91 13.01 L 9.91 15.21 A 1.2 1.2 0 0 0 11.69 13.59 L 9.69 11.39 A 1.2 1.2 0 0 0 7.91 13.01 Z"/><path d="M 11.70 15.19 L 16.10 10.19 A 1.2 1.2 0 0 0 14.30 8.61 L 9.90 13.61 A 1.2 1.2 0 0 0 11.70 15.19 Z"/><path d="M 9.6 14.4 A 1.2 1.2 0 1 0 12 14.4 A 1.2 1.2 0 1 0 9.6 14.4 Z"/></svg>
+          Same-local-part &middot; Light
+        </div>
+        <div class="pop-wrap">
+          <div class="pop theme-light" data-frame="same-local-part-light">
+            <div class="pop-head">
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
+              <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">4 accounts &middot; work@a.com active</span></span>
+              <span class="seg"><button class="on">Status</button><button>Stats</button></span>
+            </div>
+            <div class="div"></div>
+            <div class="accts">
+              <!-- 81.16 pt against 171 pt — the issue #445 AC pair holds by HEADROOM (better than 2x), not by eliding. Both render WHOLE. -->
+              <div class="acct active">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-work">WC</span>
+                  <span class="id-meta"><div class="id-name">work@a.com</div><div class="id-prov">Claude Code</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:66%"></span></span><span class="m-pct g">66%</span><span class="m-reset">2d4h</span></div>
+                </div>
+              </div>
+              <!-- 81.80 pt — whole. The monograms WC / WB are the shipped collision-escalation result (first-last, then first-second when the pair is taken), not `label.first`. -->
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-personal">WB</span>
+                  <span class="id-meta"><div class="id-name">work@b.com</div><div class="id-prov">Claude Code</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:18%"></span></span><span class="m-pct g">18%</span><span class="m-reset">3h5m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:51%"></span></span><span class="m-pct g">51%</span><span class="m-reset">3d</span></div>
+                </div>
+              </div>
+              <!-- LITERAL pre-elided. Full: oleksii.pelykh@company-one.com = 216.37 pt. THIS is the pair the middle-truncation policy exists for: the distinguishing `-one` / `-two` survives in the kept TAIL. Tail-truncation collapses both to `oleksii.pelykh@company`. -->
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-scratch">OC</span>
+                  <span class="id-meta"><div class="id-name">oleksii.pelyk&hellip;ny-one.com</div><div class="id-prov">Codex</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:24%"></span></span><span class="m-pct g">24%</span><span class="m-reset">1h48m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:39%"></span></span><span class="m-pct g">39%</span><span class="m-reset">4d6h</span></div>
+                </div>
+              </div>
+              <!-- LITERAL pre-elided. Full: oleksii.pelykh@company-two.com = 215.94 pt. -->
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge">OP</span>
+                  <span class="id-meta"><div class="id-name">oleksii.pelyk&hellip;ny-two.com</div><div class="id-prov">Codex</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:9%"></span></span><span class="m-pct g">9%</span><span class="m-reset">5h</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:22%"></span></span><span class="m-pct g">22%</span><span class="m-reset">5d1h</span></div>
+                </div>
+              </div>
+            </div>
+            <div class="swap-row">
+              <span class="swap-txt"><div class="lead">&rarr; <b>work@b.com</b></div><div class="why">session resets soonest</div></span>
+              <button class="swap-btn">Swap</button>
+            </div>
+            <div class="pop-foot">
+              <span class="fl1">Last swap <b>work@b.com &rarr; work@a.com</b> &middot; session-cap &middot; 24m ago</span>
+              <span class="fl2"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg>snapshot 12s old</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 7 · SAME-LOCAL-PART · DARK -->
+      <div class="frame">
+        <div class="fcap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 7.91 13.01 L 9.91 15.21 A 1.2 1.2 0 0 0 11.69 13.59 L 9.69 11.39 A 1.2 1.2 0 0 0 7.91 13.01 Z"/><path d="M 11.70 15.19 L 16.10 10.19 A 1.2 1.2 0 0 0 14.30 8.61 L 9.90 13.61 A 1.2 1.2 0 0 0 11.70 15.19 Z"/><path d="M 9.6 14.4 A 1.2 1.2 0 1 0 12 14.4 A 1.2 1.2 0 1 0 9.6 14.4 Z"/></svg>
+          Same-local-part &middot; Dark
+        </div>
+        <div class="pop-wrap">
+          <div class="pop theme-dark" data-frame="same-local-part-dark">
+            <div class="pop-head">
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
+              <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">4 accounts &middot; work@a.com active</span></span>
+              <span class="seg"><button class="on">Status</button><button>Stats</button></span>
+            </div>
+            <div class="div"></div>
+            <div class="accts">
+              <!-- 81.16 pt against 171 pt — the issue #445 AC pair holds by HEADROOM (better than 2x), not by eliding. Both render WHOLE. -->
+              <div class="acct active">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-work">WC</span>
+                  <span class="id-meta"><div class="id-name">work@a.com</div><div class="id-prov">Claude Code</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:66%"></span></span><span class="m-pct g">66%</span><span class="m-reset">2d4h</span></div>
+                </div>
+              </div>
+              <!-- 81.80 pt — whole. The monograms WC / WB are the shipped collision-escalation result (first-last, then first-second when the pair is taken), not `label.first`. -->
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-personal">WB</span>
+                  <span class="id-meta"><div class="id-name">work@b.com</div><div class="id-prov">Claude Code</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:18%"></span></span><span class="m-pct g">18%</span><span class="m-reset">3h5m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:51%"></span></span><span class="m-pct g">51%</span><span class="m-reset">3d</span></div>
+                </div>
+              </div>
+              <!-- LITERAL pre-elided. Full: oleksii.pelykh@company-one.com = 216.37 pt. THIS is the pair the middle-truncation policy exists for: the distinguishing `-one` / `-two` survives in the kept TAIL. Tail-truncation collapses both to `oleksii.pelykh@company`. -->
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-scratch">OC</span>
+                  <span class="id-meta"><div class="id-name">oleksii.pelyk&hellip;ny-one.com</div><div class="id-prov">Codex</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:24%"></span></span><span class="m-pct g">24%</span><span class="m-reset">1h48m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:39%"></span></span><span class="m-pct g">39%</span><span class="m-reset">4d6h</span></div>
+                </div>
+              </div>
+              <!-- LITERAL pre-elided. Full: oleksii.pelykh@company-two.com = 215.94 pt. -->
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge">OP</span>
+                  <span class="id-meta"><div class="id-name">oleksii.pelyk&hellip;ny-two.com</div><div class="id-prov">Codex</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:9%"></span></span><span class="m-pct g">9%</span><span class="m-reset">5h</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:22%"></span></span><span class="m-pct g">22%</span><span class="m-reset">5d1h</span></div>
+                </div>
+              </div>
+            </div>
+            <div class="swap-row">
+              <span class="swap-txt"><div class="lead">&rarr; <b>work@b.com</b></div><div class="why">session resets soonest</div></span>
+              <button class="swap-btn">Swap</button>
+            </div>
+            <div class="pop-foot">
+              <span class="fl1">Last swap <b>work@b.com &rarr; work@a.com</b> &middot; session-cap &middot; 24m ago</span>
+              <span class="fl2"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg>snapshot 12s old</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 7 · DEGENERATE LABEL · LIGHT — empty + whitespace-only, the `?` sentinel in situ -->
+      <div class="frame">
+        <div class="fcap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 7.91 13.01 L 9.91 15.21 A 1.2 1.2 0 0 0 11.69 13.59 L 9.69 11.39 A 1.2 1.2 0 0 0 7.91 13.01 Z"/><path d="M 11.70 15.19 L 16.10 10.19 A 1.2 1.2 0 0 0 14.30 8.61 L 9.90 13.61 A 1.2 1.2 0 0 0 11.70 15.19 Z"/><path d="M 9.6 14.4 A 1.2 1.2 0 1 0 12 14.4 A 1.2 1.2 0 1 0 9.6 14.4 Z"/></svg>
+          Degenerate label &middot; Light
+        </div>
+        <div class="pop-wrap">
+          <div class="pop theme-light" data-frame="degenerate-label-light">
+            <div class="pop-head">
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
+              <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">4 accounts &middot; Work active</span></span>
+              <span class="seg"><button class="on">Status</button><button>Stats</button></span>
+            </div>
+            <div class="div"></div>
+            <div class="accts">
+              <!-- Control row — an ordinary label beside the two degenerate ones. -->
+              <div class="acct active">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-work">WO</span>
+                  <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:88%"></span></span><span class="m-pct a">88%</span><span class="m-reset">2d4h</span></div>
+                </div>
+              </div>
+              <!-- EMPTY label — 0.00 pt. The name line is genuinely blank; it must NOT acquire a placeholder, a quoted empty string, or a synthesised identity. The `?` monogram sentinel is the whole identity cue. This is #445's three-cue kit running shortest: with no label text, identity rests on colour + monogram. WCAG 1.4.1 still holds because the monogram is a NON-colour cue — which is the point of shipping it. A blank line is never to be resolved by letting colour carry identity alone. -->
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge">?</span>
+                  <span class="id-meta"><div class="id-name"></div><div class="id-prov">Codex</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h2m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:71%"></span></span><span class="m-pct g">71%</span><span class="m-reset">4d</span></div>
+                </div>
+              </div>
+              <!-- WHITESPACE-ONLY label (five spaces) — 16.94 pt of real advance width, so the line is blank but not zero-width. Its monogram is `?2`, NOT `?`: the sentinel collided with the empty row above and the shipped collision-escalation appended a digit. Both rows also share ONE badge colour, because the colour hash TRIMS its input and the two labels therefore hash identically — so here the monogram is the ONLY separating cue, and being non-colour it is the one WCAG 1.4.1 needs. NBSP is used because HTML collapses runs of plain spaces; the advance is the same. -->
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge">?2</span>
+                  <span class="id-meta"><div class="id-name">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</div><div class="id-prov">Gemini</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:4%"></span></span><span class="m-pct g">4%</span><span class="m-reset">5h20m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:18%"></span></span><span class="m-pct g">18%</span><span class="m-reset">6d3h</span></div>
+                </div>
+              </div>
+              <!-- An ordinary swap target, so the next-swap callout below names a NON-degenerate label — what the callout renders for a degenerate target is an OPEN question, recorded in the design record rather than guessed at here. -->
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-personal">PE</span>
+                  <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:16%"></span></span><span class="m-pct g">16%</span><span class="m-reset">4h30m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:34%"></span></span><span class="m-pct g">34%</span><span class="m-reset">5d</span></div>
+                </div>
+              </div>
+            </div>
+            <div class="swap-row">
+              <span class="swap-txt"><div class="lead">&rarr; <b>Personal</b></div><div class="why">weekly resets soonest</div></span>
+              <button class="swap-btn">Swap</button>
+            </div>
+            <div class="pop-foot">
+              <span class="fl1">Last swap <b>Personal &rarr; Work</b> &middot; session-cap &middot; 31m ago</span>
+              <span class="fl2"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg>snapshot 12s old</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 7 · DEGENERATE LABEL · DARK -->
+      <div class="frame">
+        <div class="fcap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 7.91 13.01 L 9.91 15.21 A 1.2 1.2 0 0 0 11.69 13.59 L 9.69 11.39 A 1.2 1.2 0 0 0 7.91 13.01 Z"/><path d="M 11.70 15.19 L 16.10 10.19 A 1.2 1.2 0 0 0 14.30 8.61 L 9.90 13.61 A 1.2 1.2 0 0 0 11.70 15.19 Z"/><path d="M 9.6 14.4 A 1.2 1.2 0 1 0 12 14.4 A 1.2 1.2 0 1 0 9.6 14.4 Z"/></svg>
+          Degenerate label &middot; Dark
+        </div>
+        <div class="pop-wrap">
+          <div class="pop theme-dark" data-frame="degenerate-label-dark">
+            <div class="pop-head">
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
+              <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">4 accounts &middot; Work active</span></span>
+              <span class="seg"><button class="on">Status</button><button>Stats</button></span>
+            </div>
+            <div class="div"></div>
+            <div class="accts">
+              <!-- Control row — an ordinary label beside the two degenerate ones. -->
+              <div class="acct active">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-work">WO</span>
+                  <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:88%"></span></span><span class="m-pct a">88%</span><span class="m-reset">2d4h</span></div>
+                </div>
+              </div>
+              <!-- EMPTY label — 0.00 pt. The name line is genuinely blank; it must NOT acquire a placeholder, a quoted empty string, or a synthesised identity. The `?` monogram sentinel is the whole identity cue. This is #445's three-cue kit running shortest: with no label text, identity rests on colour + monogram. WCAG 1.4.1 still holds because the monogram is a NON-colour cue — which is the point of shipping it. A blank line is never to be resolved by letting colour carry identity alone. -->
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge">?</span>
+                  <span class="id-meta"><div class="id-name"></div><div class="id-prov">Codex</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h2m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:71%"></span></span><span class="m-pct g">71%</span><span class="m-reset">4d</span></div>
+                </div>
+              </div>
+              <!-- WHITESPACE-ONLY label (five spaces) — 16.94 pt of real advance width, so the line is blank but not zero-width. Its monogram is `?2`, NOT `?`: the sentinel collided with the empty row above and the shipped collision-escalation appended a digit. Both rows also share ONE badge colour, because the colour hash TRIMS its input and the two labels therefore hash identically — so here the monogram is the ONLY separating cue, and being non-colour it is the one WCAG 1.4.1 needs. NBSP is used because HTML collapses runs of plain spaces; the advance is the same. -->
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge">?2</span>
+                  <span class="id-meta"><div class="id-name">&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</div><div class="id-prov">Gemini</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:4%"></span></span><span class="m-pct g">4%</span><span class="m-reset">5h20m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:18%"></span></span><span class="m-pct g">18%</span><span class="m-reset">6d3h</span></div>
+                </div>
+              </div>
+              <!-- An ordinary swap target, so the next-swap callout below names a NON-degenerate label — what the callout renders for a degenerate target is an OPEN question, recorded in the design record rather than guessed at here. -->
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-personal">PE</span>
+                  <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:16%"></span></span><span class="m-pct g">16%</span><span class="m-reset">4h30m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:34%"></span></span><span class="m-pct g">34%</span><span class="m-reset">5d</span></div>
+                </div>
+              </div>
+            </div>
+            <div class="swap-row">
+              <span class="swap-txt"><div class="lead">&rarr; <b>Personal</b></div><div class="why">weekly resets soonest</div></span>
+              <button class="swap-btn">Swap</button>
+            </div>
+            <div class="pop-foot">
+              <span class="fl1">Last swap <b>Personal &rarr; Work</b> &middot; session-cap &middot; 31m ago</span>
+              <span class="fl2"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg>snapshot 12s old</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 7 · WIRE-HOSTILE NUMERICS · LIGHT — 255% and the reset-cell boundary -->
+      <div class="frame">
+        <div class="fcap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 7.91 13.01 L 9.91 15.21 A 1.2 1.2 0 0 0 11.69 13.59 L 9.69 11.39 A 1.2 1.2 0 0 0 7.91 13.01 Z"/><path d="M 11.70 15.19 L 16.10 10.19 A 1.2 1.2 0 0 0 14.30 8.61 L 9.90 13.61 A 1.2 1.2 0 0 0 11.70 15.19 Z"/><path d="M 9.6 14.4 A 1.2 1.2 0 1 0 12 14.4 A 1.2 1.2 0 1 0 9.6 14.4 Z"/></svg>
+          Wire-hostile numerics &middot; Light
+        </div>
+        <div class="pop-wrap">
+          <div class="pop theme-light" data-frame="wire-hostile-numerics-light">
+            <div class="pop-head">
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
+              <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">3 accounts &middot; Work active</span></span>
+              <span class="seg"><button class="on">Status</button><button>Stats</button></span>
+            </div>
+            <div class="div"></div>
+            <div class="accts">
+              <!-- A 255% reading does NOT escalate the menu-bar glance: quota reaches the glance at exactly one point, aggregate no-viable-target. The glance stays healthy. -->
+              <div class="acct active">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-work">WO</span>
+                  <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <!-- OUT-OF-RANGE PERCENT. The NUMBER is the wire value verbatim (255%, 35.56 pt in the 40 pt cell — identical to `100%`, the digits are monospaced) and it takes the red band, exactly as the CLI does. The METER BAR is clamped to its own track (width:100%, not 255%) — a drawing bound, never a truth edit. -->
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill r" style="width:100%"></span></span><span class="m-pct r">255%</span><span class="m-reset">2h14m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill r" style="width:100%"></span></span><span class="m-pct r">100%</span><span class="m-reset">2d4h</span></div>
+                </div>
+              </div>
+              <!-- The reset-cell boundary, authored at its MEASURED edge rather than at the assumed one. -->
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-personal">PE</span>
+                  <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <!-- EXTREME RESET DURATION. 365d23h = 48.32 pt in the 52 pt cell — it FITS and renders WHOLE. The issue's premise that it overflows is measurably false; every three-digit day count is the same 48.32 pt. -->
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">365d23h</span></div>
+                  <!-- The widest FITTING reset form — still 48.32 pt. Overflow begins at four digits (`1000d23h` = 55.32 pt), which this gallery deliberately does not author: what the cell should render past three digits is an open question in the design record. -->
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:88%"></span></span><span class="m-pct a">88%</span><span class="m-reset">999d23h</span></div>
+                </div>
+              </div>
+              <!-- Control row — ordinary values, so the two hostile rows above read as departures. -->
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-scratch">SC</span>
+                  <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <!-- A live-but-tiny percent keeps the 5 px minimum sliver (`.m-fill{min-width:5px}`) so it never reads as an empty track; `23h59m` is the widest SUB-DAY reset form (hours roll into days at 24), the ordinary counterpart to the day-count extremes above. -->
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:4%"></span></span><span class="m-pct g">4%</span><span class="m-reset">23h59m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:18%"></span></span><span class="m-pct g">18%</span><span class="m-reset">3d</span></div>
+                </div>
+              </div>
+            </div>
+            <div class="swap-row">
+              <span class="swap-txt"><div class="lead">&rarr; <b>Scratch</b></div><div class="why">weekly resets soonest</div></span>
+              <button class="swap-btn">Swap</button>
+            </div>
+            <div class="pop-foot">
+              <span class="fl1">Last swap <b>Scratch &rarr; Work</b> &middot; session-cap &middot; 12m ago</span>
+              <span class="fl2"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg>snapshot 12s old</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 7 · WIRE-HOSTILE NUMERICS · DARK -->
+      <div class="frame">
+        <div class="fcap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M 7.12 19.80 A 9.2 9.2 0 1 1 16.88 19.80 A 1.2 1.2 0 0 1 15.61 17.77 A 6.8 6.8 0 1 0 8.39 17.77 A 1.2 1.2 0 0 1 7.12 19.80 Z"/><path d="M14.04 20.16 15.18 17.08 17.30 20.48 Z"/><path d="M 7.91 13.01 L 9.91 15.21 A 1.2 1.2 0 0 0 11.69 13.59 L 9.69 11.39 A 1.2 1.2 0 0 0 7.91 13.01 Z"/><path d="M 11.70 15.19 L 16.10 10.19 A 1.2 1.2 0 0 0 14.30 8.61 L 9.90 13.61 A 1.2 1.2 0 0 0 11.70 15.19 Z"/><path d="M 9.6 14.4 A 1.2 1.2 0 1 0 12 14.4 A 1.2 1.2 0 1 0 9.6 14.4 Z"/></svg>
+          Wire-hostile numerics &middot; Dark
+        </div>
+        <div class="pop-wrap">
+          <div class="pop theme-dark" data-frame="wire-hostile-numerics-dark">
+            <div class="pop-head">
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
+              <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">3 accounts &middot; Work active</span></span>
+              <span class="seg"><button class="on">Status</button><button>Stats</button></span>
+            </div>
+            <div class="div"></div>
+            <div class="accts">
+              <!-- A 255% reading does NOT escalate the menu-bar glance: quota reaches the glance at exactly one point, aggregate no-viable-target. The glance stays healthy. -->
+              <div class="acct active">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-work">WO</span>
+                  <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <!-- OUT-OF-RANGE PERCENT. The NUMBER is the wire value verbatim (255%, 35.56 pt in the 40 pt cell — identical to `100%`, the digits are monospaced) and it takes the red band, exactly as the CLI does. The METER BAR is clamped to its own track (width:100%, not 255%) — a drawing bound, never a truth edit. -->
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill r" style="width:100%"></span></span><span class="m-pct r">255%</span><span class="m-reset">2h14m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill r" style="width:100%"></span></span><span class="m-pct r">100%</span><span class="m-reset">2d4h</span></div>
+                </div>
+              </div>
+              <!-- The reset-cell boundary, authored at its MEASURED edge rather than at the assumed one. -->
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-personal">PE</span>
+                  <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <!-- EXTREME RESET DURATION. 365d23h = 48.32 pt in the 52 pt cell — it FITS and renders WHOLE. The issue's premise that it overflows is measurably false; every three-digit day count is the same 48.32 pt. -->
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">365d23h</span></div>
+                  <!-- The widest FITTING reset form — still 48.32 pt. Overflow begins at four digits (`1000d23h` = 55.32 pt), which this gallery deliberately does not author: what the cell should render past three digits is an open question in the design record. -->
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:88%"></span></span><span class="m-pct a">88%</span><span class="m-reset">999d23h</span></div>
+                </div>
+              </div>
+              <!-- Control row — ordinary values, so the two hostile rows above read as departures. -->
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-scratch">SC</span>
+                  <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <!-- A live-but-tiny percent keeps the 5 px minimum sliver (`.m-fill{min-width:5px}`) so it never reads as an empty track; `23h59m` is the widest SUB-DAY reset form (hours roll into days at 24), the ordinary counterpart to the day-count extremes above. -->
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:4%"></span></span><span class="m-pct g">4%</span><span class="m-reset">23h59m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:18%"></span></span><span class="m-pct g">18%</span><span class="m-reset">3d</span></div>
+                </div>
+              </div>
+            </div>
+            <div class="swap-row">
+              <span class="swap-txt"><div class="lead">&rarr; <b>Scratch</b></div><div class="why">weekly resets soonest</div></span>
+              <button class="swap-btn">Swap</button>
+            </div>
+            <div class="pop-foot">
+              <span class="fl1">Last swap <b>Scratch &rarr; Work</b> &middot; session-cap &middot; 12m ago</span>
+              <span class="fl2"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg>snapshot 12s old</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
     </div><!-- /gallery -->
   </div><!-- /stage -->
 
@@ -2420,7 +3071,8 @@
       <li><b>Same-local-part accounts stay distinguishable (#445).</b> A roster of accounts sharing a local-part (<code>work-alice</code>, <code>work-bob</code>, …) would collapse to one badge letter under <code>label.first</code> + tail-truncation. The disambiguation kit restores legibility with THREE cues, none alone sufficient: a per-account <b>colour</b> (a fixed low-chroma palette, <b>accent hue excluded</b>, seeded client-side from the wire <code>label</code> &mdash; the one identity handle, R-2; there is no <code>account_uuid</code> on the wire), a smart <b>2-char monogram</b> from the label's distinguishing token (collision-escalating, so two similar labels never share a pair), and <b>middle-</b>truncation (not tail) so the distinguishing suffix / domain survives elision. The colour is <b>never colour-alone</b> &mdash; always paired with the monogram glyph + the label text (WCAG 1.4.1) &mdash; and clears WCAG-AA in both themes (badge fill &ge;3:1, monogram &ge;4.5:1). The per-account colour is a <b>deliberate deviation</b> from this mock's former monochrome badge; a faithful real-popover screenshot vs this updated oracle (both themes) + an owner eyeball is the pre-lock check (render re-baseline is #440).</li>
       <li><b>Per-row switch is discoverable, not loud (#448).</b> Every switchable row (non-active, viable) carries a <b>persistent quiet swap chip</b> in its trailing slot &mdash; neutral <code>--text-3</code> at rest so a first-time operator sees the row is actionable on a transient popover, brightening to <code>--text-2</code> when the row is <i>armed</i> (hover / focus). It stays neutral, never accent: the single accent action is the footer <b>Swap</b> hero (Von Restorff). The chip only <i>hints</i> at rest &mdash; the wash + pointer cursor still gate <i>arming</i>, so the persistent mark aids discovery without raising accidental-swap risk (the daemon re-validates every target, and a swap is reversible). The active row and a dropped/paused roster carry no chip.</li>
       <li><b>No-wrap by construction, every state.</b> Aliases own their line and truncate; badges, health glyphs, strip actions and swap buttons are fixed-width and can never be pushed off. Meters use a fixed 4-column grid so <b>%</b> and reset countdowns stay column-aligned.</li>
-      <li><b>Light + dark hold uniformly.</b> <i>Every</i> frame carries both themes &mdash; 17 bases &times; 2 = 34, zero gaps (#778). Dark is a full oracle, not a spot-check: before #778 nine frames were light-only, so the states where a dark-surface contrast error is likeliest &mdash; three of the four fault ranks, stale-snapshot, version-skew &mdash; had nothing to check against. Every degraded token &mdash; strips, fault/attention badges and the amber stale modifiers &mdash; resolves through a theme-scoped custom property, and <code>.pop.theme-dark</code> redefines all 45 that <code>.pop.theme-light</code> defines, so no severity tint can inherit a light-surface value.</li>
+      <li><b>Pathological content has an oracle now (#752).</b> Group&nbsp;7 answers what a hostile <i>value</i> should look like, so the stress fixtures (#753) can be checked against a design instead of blessing whatever the renderer emits &mdash; the baseline trap that made #437&rsquo;s three render bugs read five times as &ldquo;the design fails distinctness&rdquo;. Every number in those four frames is <b>measured</b>, through the same CoreText primitives the shipped gate uses (<code>Tests/TextMetrics.swift</code>, #750), against the shipped budgets: roster label <b>171&nbsp;pt</b>, meter cells <b>52 / 40 / 52&nbsp;pt</b> (the <code>.meter</code> grid already carries those three verbatim). <b>Two premises did not survive measurement</b>, and the frames are gated at the measured boundary rather than the assumed one: a <b>CJK or RTL label does not elide</b> at the shipped budget (119&ndash;124&nbsp;pt of 171 &mdash; they render whole; only genuinely long labels elide), and <b><code>365d23h</code> does not overflow</b> the reset cell (48.32&nbsp;pt of 52 &mdash; as does every three-digit day count; overflow starts at four digits). Where a label <i>does</i> elide, the frame carries a <b>literal pre-elided string</b>, because CSS <code>text-overflow</code> is tail-only while the panel middle-elides &mdash; so the frame states the intended <i>result</i> rather than re-performing the elision, which is what makes it an oracle. <b>Monograms are the real resolved values</b> (including the mixed-script Hebrew&#8239;+&#8239;Latin pair, and the <code>?</code>&#8239;/&#8239;<code>?2</code> sentinels a degenerate roster escalates to); badge <b>colours stay illustrative</b>, as everywhere else here. An out-of-range percent is <b>rendered honestly and clamped only in the drawing</b>: the number is the wire value verbatim in its real band, the bar stops at its own track &mdash; the CLI and the panel already agree on this, and the design record ratifies it rather than inventing a third answer.</li>
+      <li><b>Light + dark hold uniformly.</b> <i>Every</i> frame carries both themes &mdash; 21 bases &times; 2 = 42, zero gaps (#778, extended by the four pathological-content bases of #752). Dark is a full oracle, not a spot-check: before #778 nine frames were light-only, so the states where a dark-surface contrast error is likeliest &mdash; three of the four fault ranks, stale-snapshot, version-skew &mdash; had nothing to check against. Every degraded token &mdash; strips, fault/attention badges and the amber stale modifiers &mdash; resolves through a theme-scoped custom property, and <code>.pop.theme-dark</code> redefines all 45 that <code>.pop.theme-light</code> defines, so no severity tint can inherit a light-surface value.</li>
     </ul>
   </section>
 

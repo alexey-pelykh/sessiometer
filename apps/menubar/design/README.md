@@ -3,7 +3,9 @@
 The canonical **visual** build-reference for the SwiftUI menubar panel (see #168 / #169).
 `menubar-preview.html` is a single self-contained mock of **all 9 launch-or-attach states**
 (light + dark) in the intended native macOS language, plus a **capture-affordance interaction-states**
-reference card (pending / done / error) for the in-app "Capture active account" action (#360).
+reference card (pending / done / error) for the in-app "Capture active account" action (#360), plus
+the **pathological-content** group (#752) that is the oracle for hostile labels, percents and
+durations — see *Pathological content* below.
 
 ![All 9 menubar states, light + dark](renders/all-states.png)
 
@@ -20,26 +22,35 @@ blacks out the vibrancy). Run from this directory:
 
 ```sh
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
-  --headless=new --hide-scrollbars --force-device-scale-factor=1.25 \
-  --window-size=1200,12500 --screenshot=renders/all-states.png \
+  --headless=new --hide-scrollbars --force-device-scale-factor=1.0 \
+  --window-size=1200,14000 --screenshot=renders/all-states.png \
   menubar-preview.html
 ```
 
 (Bump the `--window-size` height if the page ever grows past it — but **not past the per-scale cap
-below**. The committed render is 1500×15625 at this `12500` height × the `1.25` device scale; a
-shorter height clips the notes. The mock ends at ~11050 CSS px as of #778, so `12500` leaves
-~1450 px before the notes clip — of which only ~600 px is actually bumpable, per the cap.)
+below**. The committed render is 1200×14000 — at the `1.0` device scale the PNG's pixel height is
+just this `--window-size` height, and a shorter one clips the notes. **`14000` is very nearly
+exhausted as of #752** — measured in the page itself, the document is **14039** CSS px and its
+deepest ink ends at **13993**, the 46 px difference being `body`'s `padding-bottom`. So the capture
+keeps every painted pixel with **~7 px** to spare and merely truncates 39 px of trailing padding.
+Adding one more frame clips real content: raise this height first — at this scale there is still
+~2380 px of genuine bump room.)
 
-**Why `1.25` and not `1.5`** — the render height in *device* pixels (CSS height × scale) must stay
-under the GPU's 16384 px max texture dimension. Past it the GPU process dies mid-render
-(`Restarting GPU process due to unrecoverable error`) and no PNG is written. At `1.5` the 34-frame
-mock needs 16536 device px, which is over; `1.25` needs 13776 and fits. Measured empirically at
-#778 (at `1.5`): 16350 device px renders, 17100 fails.
+**Why the scale dropped `1.25` → `1.0` at #752** — the render height in *device* pixels (CSS height ×
+scale) must stay under the GPU's 16384 px max texture dimension. Past it the GPU process dies
+mid-render (`Restarting GPU process due to unrecoverable error`) and no PNG is written. #752's four
+pathological-content bases took the mock from 34 frames / ~11050 CSS px to **42 frames / 14039 CSS
+px**, and 14039 × 1.25 = 17549 device px is over the limit — so this is the documented case of
+"growing the page eventually means lowering the scale, not just raising the height", not a
+preference. At `1.0` the same page needs 14039 and fits. Measured empirically at #778 (at
+`1.5`): 16350 device px renders, 17100 fails.
 
-In the units of the knob you actually turn — the maximum `--window-size` height is **13107** at
-`1.25`, **10922** at `1.5`, **16384** at `1.0` (16384 ÷ scale). Past that the bump *itself* kills
-the render, so growing the page eventually means lowering the scale, not just raising the height.
-`1.5` is already unreachable: its 10922 cap is below the mock's own ~11050.
+In the units of the knob you actually turn — the maximum `--window-size` height is **16384** at
+`1.0`, **13107** at `1.25`, **10922** at `1.5` (16384 ÷ scale). Past that the bump *itself* kills
+the render. Both `1.5` and `1.25` are now unreachable: their 10922 and 13107 caps are below the
+mock's own 14039. The cost of the drop is resolution — the committed render is 1200 px wide where
+it used to be 1500 — which is why the HTML, not this PNG, stays the faithful reference (*Viewing
+it*, above).
 
 If another Chrome is already running, add `--user-data-dir=<a scratch dir>` — without it the render
 can block on the profile lock instead of exiting. Chrome also tends to write the screenshot and then
@@ -938,6 +949,82 @@ disconnected (stale), stale-snapshot, keychain-locked, version-skew, empty-roste
 Each state has a **distinct panel message + affordance** under the shared **4-state glance
 glyph** (#524: ✓ healthy · … connecting · ! attention · ∅ no-runway) — several panel states
 share one glyph; the panel never renders healthy on a degraded daemon.
+
+## Pathological content (#752)
+
+Group 7 of the mock is the **content** oracle: what a hostile *value* is supposed to look like, as
+opposed to what a hostile *state* is. It exists so the stress fixtures (#753) can be checked against
+a design instead of self-baselining — the trap `Tests/BarGlyphParityTests.swift:38` documents, where
+a golden blesses whatever the renderer emits and then defends the bug if the renderer is broken.
+
+**Four** frame bases, both themes — carrying all **six** of the pathological concepts #752 lists
+under *Frames needed*. They fold into four frames on purpose, because a frame is a whole roster and
+several concepts sit in one without interfering: the long label and the CJK/RTL labels are four rows
+of a single roster, and the out-of-range percent and the extreme reset duration are two cells of a
+single meter. Splitting them would have produced frames differing by one row — noise for a human
+reading the page, and extra fixtures for #753 to render. Expect four names, not six:
+
+| Frame base | #752 concepts it carries | Is the oracle for |
+|---|---|---|
+| `pathological-label` | long label · CJK and RTL | a 40-char label (middle-elided), CJK, RTL Arabic, RTL Hebrew-with-LTR-tail |
+| `same-local-part` | same-local-part pair | the #445 invariant — which substring survives elision, and what protects the short pair |
+| `degenerate-label` | degenerate labels | empty and whitespace-only labels; the `?` monogram sentinel in situ |
+| `wire-hostile-numerics` | out-of-range percent · extreme reset duration | an out-of-range `255%`, and the reset cell at its measured boundary |
+
+**Every number in them is measured**, through the same CoreText primitives the shipped gate uses
+(`Tests/TextMetrics.swift`, #750), against the shipped budgets — roster label **171 pt**, meter cells
+**52 / 40 / 52 pt** (the mock's `.meter` grid already carries those three verbatim). Two premises
+from #752's own text did not survive measurement, and the frames are gated at the measured boundary
+rather than the assumed one:
+
+- **CJK and RTL labels do not elide** at the shipped budget (119.32 / 116.30 / 123.72 pt against
+  171). They render whole. Only genuinely long labels elide, so the elision frame uses one.
+- **`365d23h` does not overflow** the reset cell — 48.32 pt of 52, as does every three-digit day
+  count. Overflow begins at four digits (`1000d23h` = 55.32 pt).
+
+Three authoring rules make these frames an oracle rather than a screenshot:
+
+1. **An elided label is a literal pre-elided string.** CSS `text-overflow` is tail-only while the
+   panel middle-elides, so the frame states the intended *result* (`oleksii.pelyk…ny-one.com`)
+   instead of re-performing the elision. Each such row carries an HTML comment with the full string
+   and its measured width.
+2. **Monograms are the real resolved values** — what `StatusPanelFormat.accountMonograms` returns for
+   that exact roster, including the mixed-script Hebrew+Latin pair and the `?` / `?2` escalation a
+   degenerate roster produces. Badge **colours stay illustrative**, as everywhere else here (see the
+   #709 note under *Expected reconciliations*).
+3. **An out-of-range percent is rendered honestly and clamped only in the drawing** — the number is
+   the wire value verbatim in its real band, the meter bar stops at its own track. Both surfaces
+   already behave this way (`src/cli.rs` `pct` does not clamp; `StatusPanelFormat.meterFillWidth`
+   clamps the geometry only), and both halves are already pinned: `Tests/PanelTextMetricsTests.swift`
+   asserts `pct(255)` renders `255%` with the fill still inside its track (#750), and #768 asserts
+   the panel bands a percent exactly as the CLI does. The frame ratifies that shipped split rather
+   than inventing a third answer one of those gates would have to be relaxed to accept.
+
+**Pairing with #753.** These frames deliberately carry **no `STATES` entry** in
+`build-comparison.py` yet: `cap()` fails loudly on a missing capture PNG, so wiring them before the
+fixtures exist would break the comparison tool for everyone. Since #581 the pairing is **by name**,
+which is exactly what lets the two land in separate commits — #753 adds the `RenderPanelTool`
+fixtures and the matching `STATES` rows at the same time, pairing `design="<frame-base>-light"` with
+`capture="panel-<frame-base>-light.png"`.
+
+**What these frames do not author.** Three things, deliberately:
+
+- The next-swap callout's rendering for a *degenerate* target (the `degenerate-label` frame
+  deliberately names an ordinary account as its swap target).
+- What the reset cell should show past three digits of days.
+- **The header sub-line** (`.app-sub`, `"N accounts · <label> active"`). Its elision *mode* is
+  faithful — CSS `text-overflow` is tail and so is the panel's (`.truncationMode(.tail)`,
+  `Sources/StatusPanelChrome.swift:53`) — but unlike the roster label it is elided **by the mock's
+  own width**, not authored as a literal, because no shipped gate measures it: the budgets
+  `Tests/PanelTextMetricsTests.swift` pins are `rosterLabelBudget`, the three meter cells, and
+  `statsHandleBudget`, and the header is in none of them. Authoring a pre-elided literal would mean
+  inventing a budget nothing verifies — exactly the fabrication rule 1 above exists to prevent. So
+  the header sub-line in these frames is illustrative, and #753 should not assert against it until a
+  measured budget exists for it.
+
+The first two — the callout and the reset cell — are open questions, recorded in hq
+`strategy/design-menubar.md` (§ D-UX-PATHOLOGICAL) rather than guessed at here. The third is not an
+open question but a scoping line: the header sub-line simply has no budget to be an oracle against.
 
 ## Design constraints the mock honors
 
