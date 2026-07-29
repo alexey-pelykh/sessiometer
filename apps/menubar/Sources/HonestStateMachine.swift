@@ -384,6 +384,45 @@ struct AccountRow: Identifiable, Equatable, Sendable {
     /// row in place of a false-healthy one, #137) and — when auto-protection is DEGRADED — escalates the
     /// menu-bar glance to `.attention`. A pass-through of the wire field; the daemon owns the verdict.
     let blindActive: BlindActive?
+    /// This account's REFRESH-token expiry modifier (issues #878/#882/#884) — present once the account
+    /// has been POLLED. Drives the per-row expiry line, a MODIFIER on an otherwise-connected row in the
+    /// ADR-0017 `blind_active` mould. Deliberately does NOT feed the menu-bar glance: see
+    /// `StatusPanelFormat`'s expiry section for the both-or-neither rationale. A pass-through of the
+    /// wire field; the daemon owns the classification, the client only re-checks it against its own clock.
+    let expiry: AccountExpiry?
+
+    /// Explicit rather than synthesized so `expiry` can carry a default — every existing construction
+    /// site (the render harness and the unit tests) predates the modifier and means "no reading", which
+    /// is exactly `nil`. The synthesized memberwise initializer cannot express that for a `let`.
+    init(label: String,
+         isActive: Bool,
+         isEnabled: Bool,
+         isQuarantined: Bool,
+         isRecovering: Bool,
+         auth: CredentialHealth?,
+         sessionPct: UInt8?,
+         weeklyPct: UInt8?,
+         sessionResetsAt: Int64?,
+         weeklyResetsAt: Int64?,
+         weeklyExhausted: Bool,
+         isNextSwapTarget: Bool,
+         blindActive: BlindActive?,
+         expiry: AccountExpiry? = nil) {
+        self.label = label
+        self.isActive = isActive
+        self.isEnabled = isEnabled
+        self.isQuarantined = isQuarantined
+        self.isRecovering = isRecovering
+        self.auth = auth
+        self.sessionPct = sessionPct
+        self.weeklyPct = weeklyPct
+        self.sessionResetsAt = sessionResetsAt
+        self.weeklyResetsAt = weeklyResetsAt
+        self.weeklyExhausted = weeklyExhausted
+        self.isNextSwapTarget = isNextSwapTarget
+        self.blindActive = blindActive
+        self.expiry = expiry
+    }
 
     /// Project a whole snapshot's accounts into rows, resolving each account's next-swap-target flag
     /// against the snapshot's `next_swap` candidate.
@@ -404,7 +443,8 @@ struct AccountRow: Identifiable, Equatable, Sendable {
                 weeklyResetsAt: account.weeklyResetsAt,
                 weeklyExhausted: account.weeklyExhausted,
                 isNextSwapTarget: account.label == targetLabel,
-                blindActive: account.blindActive)
+                blindActive: account.blindActive,
+                expiry: account.expiry)
         }
     }
 }

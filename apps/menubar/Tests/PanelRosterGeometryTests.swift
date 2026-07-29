@@ -78,6 +78,25 @@
 //     times the tallest display any Mac laptop presents (the 16-inch MacBook Pro's default scaled mode is
 //     1728 × 1117 points) — with no way to reach the 4045 pt below the ceiling.
 //
+// ── THE ROW COST IS NOW CONDITIONAL (issue #884) ───────────────────────────────────────────────────────
+//
+// The 96.00 pt marginal cost above is measured on a roster with NO refresh-token expiry line. Issue #884
+// added a per-row `EXPIRY` line that materializes for the WHOLE roster once ANY account carries an
+// observed deadline (`StatusPanelFormat.rosterShowsExpiry`, mirroring the CLI's column rule), so a real
+// fleet on a #882-or-later daemon pays MORE per row than this table records.
+//
+// Measured through this same render path (macOS 26.5.2 / Xcode 26.6), the harness `healthy` fixture with
+// the line on all three rows is 518.00 pt against its 449.00 pt baseline — 69.00 pt for three rows, so:
+//
+//   • marginal cost per account: 96.00 pt → 119.00 pt (+23.00 pt, the line plus its 9 pt VStack spacing)
+//   • largest roster fitting the 856 pt derived ceiling: SEVEN accounts → SIX
+//
+// Every roster behind the table above carries `expiry: nil` (the `AccountRow` default — only the probe
+// named below opts in), so every number in it remains exactly what it claims; the measurement is simply
+// narrower than "the panel's row cost" now reads. It tightens issue #818's unbounded-growth finding by one
+// account rather than adding a new defect: the panel still has no scroll view at any level, which is what
+// makes either number reachable.
+//
 // So the answer to AC-2's either/or is the second branch: the panel is NOT bounded, it grows without
 // limit, and the overflow is unreachable because there is no scroll view at any level. That defect is
 // already filed as issue #818 (opened by issue #756 with the SCALE axis: 438 pt → 1031 pt for the
@@ -273,7 +292,7 @@ final class PanelRosterGeometryTests: XCTestCase {
     /// the active account (as a real roster always has exactly one). Reset offsets sit a
     /// `boundaryGuardSecs`-style 30 s clear of a `humanizeUntil` rounding boundary, so a sub-second delay
     /// between seeding and rasterizing cannot reflow a cell.
-    private func roster(_ n: Int, now: Int64) -> [AccountRow] {
+    private func roster(_ n: Int, now: Int64, expiry: AccountExpiry? = nil) -> [AccountRow] {
         let sessionReset = now + 2 * 3600 + 14 * 60 + PanelRenderHarness.boundaryGuardSecs
         let weeklyReset = now + 3 * 86_400 + PanelRenderHarness.boundaryGuardSecs
         return (0..<n).map { i -> AccountRow in
@@ -286,7 +305,8 @@ final class PanelRosterGeometryTests: XCTestCase {
                               isQuarantined: false, isRecovering: false, auth: .healthy,
                               sessionPct: 42, weeklyPct: 88,
                               sessionResetsAt: sessionReset, weeklyResetsAt: weeklyReset,
-                              weeklyExhausted: false, isNextSwapTarget: false, blindActive: nil)
+                              weeklyExhausted: false, isNextSwapTarget: false, blindActive: nil,
+                              expiry: expiry)
         }
     }
 
@@ -296,6 +316,71 @@ final class PanelRosterGeometryTests: XCTestCase {
                                            nextSwap: nextSwap, now: now),
                       "the \(n)-account panel did not rasterize at \(size), so nothing was measured")
     }
+
+    /// The same roster with an OBSERVED refresh-token deadline on every account (issue #884), so the
+    /// `EXPIRY` line materializes (`StatusPanelFormat.rosterShowsExpiry`) and its cost is measurable. The
+    /// deadline carries the same `boundaryGuardSecs` clearance the reset instants do — the line renders a
+    /// `humanizeUntil` duration, so it is subject to the identical rounding-reflow hazard.
+    ///
+    /// Goes through `roster` rather than rebuilding its rows, so the pair this suite subtracts differs in
+    /// the expiry modifier and NOTHING else — a field added to `AccountRow` later cannot land on one side
+    /// of the subtraction only.
+    private func rosterWithExpiry(_ n: Int, now: Int64) -> [AccountRow] {
+        let deadline = now + 6 * 86_400 + 21 * 3600 + PanelRenderHarness.boundaryGuardSecs
+        return roster(n, now: now,
+                      expiry: AccountExpiry(expiresAt: deadline, horizonState: .within))
+    }
+
+    // MARK: - The #884 EXPIRY line's row cost (the conditional-cost note above, made executable)
+
+    /// The `EXPIRY` line (issue #884) costs a MEASURED, CONSTANT amount per row, and that constant is what
+    /// moves this file's headline numbers when a real fleet's daemon reports deadlines.
+    ///
+    /// This exists because the line is otherwise UNRENDERED by every test in the suite: each roster here —
+    /// and every `PanelRenderHarness` fixture — carries the `expiry: nil` default, so `rosterShowsExpiry`
+    /// is false and `ExpiryLine` never rasterizes. Without this probe the comment block's 119 pt / SIX
+    /// figures would be a prose claim with no executable backing, and the view itself would have zero
+    /// render coverage. Measured through the SAME `PanelGeometry.height` path as the table above.
+    func testTheExpiryLineCostsAConstantPerRowAndTightensTheCeilingByOneAccount() throws {
+        let now = Self.wallClock()
+        var deltas: [Double] = []
+
+        for n in 1...4 {
+            let without = try XCTUnwrap(
+                PanelGeometry.height(rows: roster(n, now: now), size: .large, nextSwap: nil, now: now),
+                "the \(n)-account panel did not rasterize")
+            let with = try XCTUnwrap(
+                PanelGeometry.height(rows: rosterWithExpiry(n, now: now), size: .large, nextSwap: nil, now: now),
+                "the \(n)-account panel with expiry did not rasterize")
+
+            // The LEVER half: the line must actually cost something, or a `showsExpiry` wired to `false`
+            // (or an `ExpiryLine` that renders empty) would pass every assertion below by reporting a
+            // zero delta at every cardinality.
+            XCTAssertGreaterThan(with, without,
+                                 "the expiry line must add height at \(n) accounts — a zero delta means it never rendered")
+            deltas.append((with - without) / Double(n))
+        }
+
+        // CONSTANT per row: the same cost at 1, 2, 3 and 4 accounts. A per-row line must scale with the
+        // roster; a one-off chrome cost would show a shrinking per-account delta.
+        for (i, delta) in deltas.enumerated() {
+            XCTAssertEqual(delta, Self.expiryRowCost, accuracy: 0.01,
+                           "the per-row expiry cost drifted at \(i + 1) accounts: \(delta) pt")
+        }
+
+        // And the consequence the comment block records: the marginal account cost rises by exactly this
+        // constant, and the largest roster fitting the derived ceiling drops from SEVEN to SIX.
+        let baseFits = (1...20).filter { !PanelGeometry.exceeds(101 + 96.0 * Double($0)) }.max()
+        let expiryFits = (1...20).filter {
+            !PanelGeometry.exceeds(101 + (96.0 + Self.expiryRowCost) * Double($0))
+        }.max()
+        XCTAssertEqual(baseFits, 7)
+        XCTAssertEqual(expiryFits, 6, "the expiry line must cost exactly one account of headroom")
+    }
+
+    /// The measured per-row cost of the `EXPIRY` line: an 11 pt text line plus the row `VStack`'s 9 pt
+    /// spacing. Re-derive with the test above rather than trusting this number.
+    private static let expiryRowCost = 23.00
 
     // MARK: - Control: the measurement is a DIMENSION, so issue #824 cannot reach it
 

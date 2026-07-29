@@ -688,6 +688,165 @@ enum StatusPanelFormat {
         }
     }
 
+    // MARK: - Per-account refresh-token EXPIRY modifier (issues #878/#882/#884)
+    //
+    // The panel's per-medium render of the SAME `AccountExpiry` the `status` CLI shows as its `EXPIRY`
+    // column (`src/cli.rs`, issue #883). R-2 STATE-parity: the CLI prints a table cell, the panel draws a
+    // labelled row line — but the STRING and the SEVERITY are computed by the mirrors below from the same
+    // inputs, so the two surfaces cannot report different states for one snapshot.
+    //
+    // WHY THIS DOES NOT ESCALATE THE MENU-BAR GLANCE (the load-bearing composition call, #884).
+    // `design-menubar.md`: "every fault the glyph shouts MUST have a panel banner — a glance that alarms
+    // over a panel with no banner is a mystery alarm." Both-or-neither; this feature ships NEITHER,
+    // deliberately:
+    //
+    //  1. R-2 forbids it. The CLI renders expiry as a tinted cell in its LOWEST-PRIORITY column — the
+    //     first one `status_columns` sheds under width pressure. It raises no fleet-level alarm. A
+    //     menu-bar `!` IS a fleet-level alarm, so escalating would make the two surfaces disagree about
+    //     one snapshot — exactly the R-2 violation the parity rule exists to prevent.
+    //  2. `within` is the STEADY STATE, not an exception. With the 7-day default horizon and ~30-day
+    //     refresh tokens, every healthy account sits in `within` for a week before every re-login. A
+    //     glance lit ~23% of the time on a perfectly healthy fleet is the cry-wolf this codebase already
+    //     refuses for the `.recovering` scrub (`HonestStateMachine`: alarming there "would cry wolf").
+    //  3. Credential condition is a ROW-axis fact here, not a glance one. `lapsed` is the same fact as
+    //     `CredentialHealth.dead` seen BEFORE the failure rather than after, and `dead` itself is a ROW
+    //     treatment (the `xmark.octagon` glyph + its `claude /login` cue) — `PresentationState.make`
+    //     takes no per-account `auth` at all. Escalating expiry would put the FORESIGHT of a condition
+    //     on a louder surface than the condition itself, inverting the two.
+    //  4. The ADR-0017 precedent points here. Blind-OK is deliberately NOT escalated (only DEGRADED is);
+    //     a per-row modifier's default posture in this codebase is "does not escalate".
+    //
+    // THE KNOWN LIMIT of this decision, recorded rather than papered over: because the glance carries no
+    // per-account credential axis, a LAPSED refresh token on the ACTIVE account leaves the menu-bar glyph
+    // calm until something else fires. `credential_health` reaches `Dead` only once a refresh has actually
+    // been ATTEMPTED and rejected (`src/daemon/snapshot.rs`), so under `[refresh].enabled = false` — a
+    // supported opt-out — that escalation may never arrive, and `hasNoViableTarget` is a CAPACITY verdict
+    // that can lag it arbitrarily. The panel still shows the row line, and the CLI still shows the cell, so
+    // neither surface is silent; what is deferred is a glance-level cue. Reasons 1-2 (R-2, cry-wolf) are
+    // why that is the right trade TODAY at the `within` band, but a future item may reasonably revisit
+    // `lapsed`-on-active specifically — and it would then owe a panel banner in the same change.
+    //
+    // So: no `PresentationState.make` input, and no `daemonFaultBanner` case. Expiry is a ROW-axis
+    // modifier — it has a row to live on, which is precisely why it is not a daemon-level payload fault.
+
+    /// What the RENDER holds about one account's refresh-token deadline — an arm-for-arm mirror of
+    /// `src/cli.rs` `ExpiryView`: nothing usable, a deadline already past, or a live one at `at` under the
+    /// class that survived the render-time check.
+    ///
+    /// The one place the staleness rule lives, so `expiryCell` and `expirySeverity` cannot disagree about
+    /// whether a credential has lapsed. `live` carries `horizon` for that same reason: the tint reads its
+    /// band OFF THE VIEW rather than back off the raw modifier.
+    enum ExpiryView: Equatable {
+        case gap
+        case lapsed
+        case live(at: Int64, horizon: ExpiryHorizon)
+    }
+
+    /// Resolve the daemon's cached `ExpiryHorizon` against the clock the CLIENT actually holds — mirroring
+    /// `src/cli.rs` `expiry_view` arm-for-arm, INCLUDING the arm ORDER, which is load-bearing.
+    ///
+    /// **The render-time comparison is authoritative.** The panel renders a snapshot built at the daemon's
+    /// last tick, up to `poll_interval_secs` old (300 s default, 3600 s while exhausted). A deadline that
+    /// passes inside that window is still classified `within`/`beyond` when the line draws, and
+    /// `humanizeUntil` maps a non-positive remainder to `now` — this panel's vocabulary for a *benign*
+    /// reset ARRIVING. The one line built to warn would then read as fine at exactly the moment it matters,
+    /// and every token lapse passes through that window exactly once. So an observed deadline at or before
+    /// `now` reads `lapsed` whatever the cached class says.
+    ///
+    /// The rule is MONOTONE in the safe direction: a class of `.lapsed` stays lapsed even should the client
+    /// clock read earlier than the daemon's (backwards skew, NTP). Once either clock has seen the deadline
+    /// pass, the line does not un-lapse.
+    ///
+    /// `.unknown` is authoritative in the OTHER direction: the daemon found no parseable deadline, so a
+    /// stray `expiresAt` beside it is not trusted into a rendered duration.
+    static func expiryView(_ expiry: AccountExpiry?, now: Int64) -> ExpiryView {
+        // No modifier on the wire at all: a pre-#882 daemon, or an account not yet polled.
+        guard let expiry = expiry else { return .gap }
+        switch (expiry.horizonState, expiry.expiresAt) {
+        // `.unknown` FIRST: no parseable deadline was found, so a stray `expiresAt` is not trusted.
+        case (.unknown, _):
+            return .gap
+        // A DECLARED lapse outranks a missing deadline, and the order of these two arms is the whole
+        // point: `lapsed` is a bare state word that never reads `at`, so an absent `expiresAt` is not a
+        // data-insufficiency case here. Falling through to the gap below would discard the strongest
+        // negative signal the wire can carry — and since the roster hides the line entirely when every
+        // row is a gap, an account whose lapse is the roster's only expiry datum would take the whole
+        // line down with it and render a dead login as no login problem at all.
+        case (.lapsed, _):
+            return .lapsed
+        case (_, .none):
+            return .gap
+        case (_, .some(let at)) where at <= now:
+            return .lapsed
+        case (let horizon, .some(let at)):
+            return .live(at: at, horizon: horizon)
+        }
+    }
+
+    /// The cell for an account with no observed refresh-token deadline — byte-identical to the CLI's
+    /// `EXPIRY_GAP` (`src/cli.rs`). Deliberately NOT `n/a`, which this panel already spends on a FAILED
+    /// poll: filing an observed absence under transient failure would misreport it. Rendering it as
+    /// anything an operator could mistake for "fine" is the one failure mode the whole foresight feature
+    /// exists to avoid (#137).
+    static let expiryGap = "—"
+
+    /// The label for the row's expiry line — the CLI's column header, so the two surfaces name the fact
+    /// identically.
+    static let expiryRowLabel = "EXPIRY"
+
+    /// One account's refresh-token expiry cell — byte-identical to `src/cli.rs` `expiry_cell`.
+    ///
+    /// PRESENT-TENSE STATE, never an imperative: a compact time-until (`6d21h`, the same shape the reset
+    /// cells carry) for an observed deadline, the bare state word `lapsed` for one already past, and the
+    /// gap when none was observed. The remedy (`sessiometer login` — it runs `claude /login` under a
+    /// throwaway `CLAUDE_CONFIG_DIR` and lands the harvested credential in the rotation, per README
+    /// § Revive a dead account) is deliberately NOT named here — this line
+    /// reports a fact, and the AUTH glyph already owns the actionable cue once the credential actually
+    /// fails.
+    static func expiryCell(_ expiry: AccountExpiry?, now: Int64) -> String {
+        switch expiryView(expiry, now: now) {
+        case .gap:               return expiryGap
+        case .lapsed:            return "lapsed"
+        case .live(let at, _):   return humanizeUntil(at - now)
+        }
+    }
+
+    /// The tint ROLE for an expiry cell, mirroring `src/cli.rs` `expiry_severity`: `.red` for a deadline
+    /// already past (only an operator `sessiometer login` recovers it), `.yellow` for one WITHIN the configured
+    /// horizon, and `.neutral` for one BEYOND it — the same de-emphasis a far-off reset gets, since there
+    /// is nothing to act on. `nil` — uncoloured — for an unobserved deadline, matching every other cell
+    /// with no reading: absence of colour is not a false "healthy" signal.
+    ///
+    /// The CLI's `Severity::Dim` and its absence of colour both land on the panel's de-emphasised
+    /// `.secondary`, so `.neutral` and `nil` render alike; they stay DISTINCT verdicts anyway so this
+    /// mirrors its CLI counterpart arm-for-arm and is testable as one. STATE-parity is unaffected — the
+    /// two cases carry different TEXT (`29d` vs `—`), so the operator is never asked to tell them apart
+    /// by colour.
+    ///
+    /// Takes `now` and routes through `expiryView` for the same reason the cell does: a tint read off the
+    /// cached class alone would paint a `lapsed` line `.yellow`.
+    static func expirySeverity(_ expiry: AccountExpiry?, now: Int64) -> HealthTint? {
+        switch expiryView(expiry, now: now) {
+        case .gap:                       return nil
+        case .lapsed:                    return .red
+        case .live(_, .beyond):          return .neutral
+        // `within` — and, defensively, any class that survived the render-time check above.
+        case .live:                      return .yellow
+        }
+    }
+
+    /// Whether the roster shows the expiry line AT ALL — true once ANY row has an observed deadline.
+    ///
+    /// Mirrors the CLI's column materialization (`src/cli.rs` `status_columns`: the `EXPIRY` column is
+    /// built only `if rows.iter().any(|row| row.expiry != EXPIRY_GAP)`). An all-gap roster therefore shows
+    /// NO expiry line on either surface — which is gap-honest, not a false-calm: the panel claims nothing
+    /// about a deadline no account could observe, exactly as the CLI prints no column. Once ANY row can
+    /// speak, EVERY row does, so a `—` beside a sibling's real deadline reads as the pointed absence it is
+    /// rather than silently vanishing.
+    static func rosterShowsExpiry(_ expiries: [AccountExpiry?], now: Int64) -> Bool {
+        expiries.contains { expiryView($0, now: now) != .gap }
+    }
+
     // MARK: - Active-account bounded-blindness row (issues #479/#485)
     //
     // The panel's per-medium render of the SAME daemon `BlindActive` the `status` CLI narrates as a line
@@ -1656,7 +1815,9 @@ enum StatusPanelFormat {
         weeklyReset: String,
         blind: BlindActive? = nil,
         nextSwap: NextSwap? = nil,
-        now: Int64 = 0
+        now: Int64 = 0,
+        expiry: AccountExpiry? = nil,
+        showsExpiry: Bool = false
     ) -> String {
         var parts: [String] = [label]
         if isActive { parts.append("active") }
@@ -1684,6 +1845,25 @@ enum StatusPanelFormat {
             // Both windows, each with its reset — matching the row's two meters and the CLI's two columns.
             parts.append("session \(pct(sessionPct)) resets in \(sessionReset)")
             parts.append("weekly \(pct(weeklyPct)) resets in \(weeklyReset)")
+        }
+        // The refresh-token expiry line (#884), spoken whenever the roster shows it — the visual line is
+        // `accessibilityHidden` so the row stays ONE VoiceOver element, which makes this the only place a
+        // screen-reader user learns their login has a deadline. Spoken OUTSIDE the blind branch above for
+        // the same reason the line renders outside it: the two axes are orthogonal, so a blind row must
+        // still announce its expiry. The gap says "not observed" in words rather than reading out the bare
+        // `—` dash, which VoiceOver would either skip or pronounce as punctuation — the #137 honest-state
+        // rule carried onto the spoken surface, where a silently-dropped absence is a false calm.
+        // Spoken as PRESENT-TENSE STATE, matching the visual line cell-for-cell — deliberately WITHOUT a
+        // remedy, even for `lapsed`. An earlier draft spoke "run claude slash login" here; that made the
+        // spoken row MORE actionable than the sighted one, which is a parity defect in the direction people
+        // check least. The row's remedies are carried by `authSpoken`/`authCue`, which the visual row shows
+        // too — spoken and visual say the same thing or the pair is a bug.
+        if showsExpiry {
+            switch expiryView(expiry, now: now) {
+            case .gap:             parts.append("login expiry not observed")
+            case .lapsed:          parts.append("login expired")
+            case .live(let at, _): parts.append("login expires in \(humanizeUntil(at - now))")
+            }
         }
         // Drop any empty auth phrase (a healthy pre-#119 legacy account speaks no auth verdict).
         return parts.filter { !$0.isEmpty }.joined(separator: ", ")
