@@ -57,6 +57,215 @@ where
         }
     }
 
+    /// Record that the daemon's OWN refresh wrote account `idx`'s credential (issue #880) — the
+    /// `my_refresh` provenance latch behind [`Event::CredentialExpiryObserved`].
+    ///
+    /// Called from every path that refreshes an account THROUGH the daemon: the #119 isolated sweep
+    /// fold ([`Daemon::note_refresh_outcome`], shared by the #643 recovery re-probe), the #255
+    /// reactive poll-refresh, and the #282 keep-warm mint. Each of those writes the credential
+    /// through a CAS-protected flow the daemon drives, so it KNOWS it caused the write — which is why
+    /// this provenance needs no inference and no probe (`crate::refresh`'s AC-3 discipline).
+    ///
+    /// Idempotent: a path that both mints and folds sets it twice with no effect. The latch is
+    /// consumed and cleared by the next observation, so it always means "a daemon refresh intervened
+    /// in THIS interval".
+    pub(super) fn note_own_credential_refresh(&mut self, idx: usize) {
+        self.state.accounts[idx]
+            .health
+            .own_refresh_since_expiry_observation = true;
+    }
+
+    /// Fold one POLL's observation of account `idx`'s refresh-token deadline (issue #880), deriving
+    /// the provenance from the latches — the ONE emission site on the poll path.
+    ///
+    /// `observed` is the deadline in epoch SECONDS as
+    /// [`read_poll_clocks`](Self::read_poll_clocks) just read it, or `None` when this poll could not
+    /// observe one (an unreadable credential, or a Claude Code that omits the field).
+    ///
+    /// Provenance, in order: the first observation this run is
+    /// [`ExpiryProvenance::FirstObservation`]; a change with the own-refresh latch set is
+    /// [`ExpiryProvenance::MyRefresh`]; a change with the latch clear is
+    /// [`ExpiryProvenance::ExternalChange`] — *a delta observed on a poll with no intervening daemon
+    /// refresh for that account*.
+    ///
+    /// The emitted record's `grant_replaced` is always `None` here: this path reads the deadline out of
+    /// the account's poll clocks and never holds two credential blobs to compare, so it cannot speak
+    /// to grant identity. Only the re-stash edge can — see
+    /// [`note_restash_expiry`](Self::note_restash_expiry).
+    pub(super) fn note_polled_expiry(
+        &mut self,
+        idx: usize,
+        observed: Option<i64>,
+        now_secs: i64,
+        events: &mut Vec<Event>,
+    ) {
+        let health = &self.state.accounts[idx].health;
+        let provenance = if health.refresh_token_expires_at_baseline.is_none() {
+            ExpiryProvenance::FirstObservation
+        } else if health.own_refresh_since_expiry_observation {
+            ExpiryProvenance::MyRefresh
+        } else {
+            ExpiryProvenance::ExternalChange
+        };
+        self.fold_expiry_observation(idx, observed, provenance, None, now_secs, events);
+    }
+
+    /// Fold the observation the #13 re-auth re-stash just made (issue #880): the daemon HEALED an
+    /// out-of-band canonical write, so `observed` is the deadline carried by the credential that was
+    /// written underneath it, in epoch SECONDS.
+    ///
+    /// Records even when the deadline did NOT move, which is the whole reason this entry point exists
+    /// separately from [`note_polled_expiry`](Self::note_polled_expiry): *unchanged across an
+    /// external credential write* is the third row of the issue #877 table and is unobservable from
+    /// change records alone. See [`ExpiryProvenance::CanonicalRestash`].
+    ///
+    /// **This provenance's honesty INHERITS the canonical-watch commit discipline** — worth naming,
+    /// because nothing here re-checks it. Every path by which the DAEMON writes the canonical
+    /// baseline-commits that write (`promote_canonical` for the #282 keep-warm, `record_swap` for an
+    /// autonomous swap and the #467 scrub adopt, `adopt_manual_swap` for a `use` / socket swap), so
+    /// [`Daemon::reconcile_canonical_change`] classifies the daemon's own writes `Unchanged` and this
+    /// entry point is reached ONLY on a genuinely external one. If a future write path skipped that
+    /// commit, it would not merely re-fire the pre-existing [`Event::ReStash`] — it would publish a
+    /// daemon-caused write as an EXTERNAL one, quietly polluting the third row that issue #877's
+    /// conclusion rests on. Keep new canonical writers committing the baseline.
+    ///
+    /// Runs at the TOP of the tick, BEFORE the poll loop, so its baseline reconciliation means the
+    /// later poll of this same account sees no residual delta and cannot re-report the same write as
+    /// an inferred [`ExpiryProvenance::ExternalChange`].
+    ///
+    /// `grant_replaced` is the grant-identity fact ONLY this edge can supply — it is the one place two
+    /// credential blobs for the same account exist side by side (the canonical-watch baseline and the
+    /// blob that replaced it), and it is what turns the #877 third row from *somebody wrote the
+    /// credential* into *a new grant was minted and the deadline still did not move*. See
+    /// [`Event::CredentialExpiryObserved`] for why it narrows rather than decides. Pass `None` if the
+    /// baseline is unavailable — an unknown is recorded as an omitted field, never guessed.
+    pub(super) fn note_restash_expiry(
+        &mut self,
+        idx: usize,
+        observed: Option<i64>,
+        grant_replaced: Option<bool>,
+        now_secs: i64,
+        events: &mut Vec<Event>,
+    ) {
+        self.fold_expiry_observation(
+            idx,
+            observed,
+            ExpiryProvenance::CanonicalRestash,
+            grant_replaced,
+            now_secs,
+            events,
+        );
+    }
+
+    /// The shared core of [`note_polled_expiry`](Self::note_polled_expiry) and
+    /// [`note_restash_expiry`](Self::note_restash_expiry) (issue #880), so the baseline update, the
+    /// latch bookkeeping and the horizon edge stay single-homed and cannot drift across the two
+    /// callers — the same shared-primitive shape as [`Daemon::note_refresh_outcome`].
+    ///
+    /// Whether an observation that MATCHES the baseline still emits is DERIVED from the provenance
+    /// rather than passed: only [`ExpiryProvenance::CanonicalRestash`] records a non-change (the #877
+    /// third row), and the poll provenances never do (a held deadline across thousands of polls must
+    /// stay silent). The two were separate parameters and were necessarily set in lockstep by the two
+    /// callers — one fact, derived once here, so they cannot drift apart.
+    ///
+    /// A `None` `observed` returns immediately, touching NOTHING — not the baseline, not the latches,
+    /// not the horizon. A poll that could not look is a NON-observation, not an observation of
+    /// absence: see [`AccountHealth::refresh_token_expires_at_baseline`] for why clearing the baseline there would
+    /// let a flaky read fabricate a change, and [`Event::CredentialExpiryObserved`] for why it must
+    /// not be reported as a `Some -> None` transition.
+    fn fold_expiry_observation(
+        &mut self,
+        idx: usize,
+        observed: Option<i64>,
+        provenance: ExpiryProvenance,
+        grant_replaced: Option<bool>,
+        now_secs: i64,
+        events: &mut Vec<Event>,
+    ) {
+        // Nothing was observed: leave every piece of carried state exactly as it was. Returning
+        // BEFORE the latch clear is deliberate — a daemon refresh whose effect this poll could not
+        // read must keep its `my_refresh` claim armed for the poll that finally can. Nothing above
+        // this guard may touch state, so the `record_unchanged` derivation sits below it.
+        let Some(deadline) = observed else {
+            return;
+        };
+        let record_unchanged = provenance == ExpiryProvenance::CanonicalRestash;
+        let health = &mut self.state.accounts[idx].health;
+        let before = health.refresh_token_expires_at_baseline;
+        health.refresh_token_expires_at_baseline = Some(deadline);
+        health.own_refresh_since_expiry_observation = false;
+        // Emit on a CHANGE, or — for the re-stash edge only — on an explicit no-change. A FIRST
+        // observation needs no separate arm: it has no baseline, so `before` is `None`, which never
+        // equals `Some(deadline)` and is therefore always a change. That is also why the anchor line
+        // carries `after` alone and derives no delta.
+        let changed = before != Some(deadline);
+        if changed || record_unchanged {
+            events.push(Event::CredentialExpiryObserved {
+                account: self.roster[idx].account_uuid.clone(),
+                provenance,
+                before,
+                after: deadline,
+                grant_replaced,
+            });
+        }
+        self.note_expiry_horizon_edge(idx, deadline, now_secs, events);
+    }
+
+    /// Emit [`Event::CredentialExpiryHorizon`] when account `idx`'s freshly-observed `deadline`
+    /// moves it into a new ACTIONABLE horizon band (issue #880) — the AC-1 durable entry edge.
+    ///
+    /// Classifies through [`account_expiry`], the one classifier, against the operator's configured
+    /// [`credential_expiry_horizon_secs`](Daemon::credential_expiry_horizon_secs) — so the event and
+    /// the `status` modifier can never disagree about the band.
+    ///
+    /// The latch transitions:
+    /// - `within` / `lapsed` DIFFERENT from what was last signalled → emit and store. This is what
+    ///   makes a `within → lapsed` escalation durable, and what lets a daemon meeting an
+    ///   already-lapsed account emit `lapsed` without a preceding `within`.
+    /// - the SAME actionable band → silent (edge-triggered, not per-poll).
+    /// - `beyond` → clear the latch, silently, so a deadline that later returns signals afresh. The
+    ///   exit needs no marker of its own: leaving the band requires the deadline to MOVE, and the
+    ///   [`Event::CredentialExpiryObserved`] line the caller just emitted for that move already
+    ///   carries strictly more (both deadlines and the provenance).
+    /// - `unknown` → RETAIN the latch, untouched. Unreachable today (this is only ever called with a
+    ///   parsed deadline in hand, which [`account_expiry`] maps to one of the other three), but given
+    ///   its own arm rather than folded into `beyond`, because the two must behave OPPOSITELY if it
+    ///   ever becomes reachable: `beyond` is *the deadline moved out*, `unknown` is *we can no longer
+    ///   see it*, and treating the second as the first would clear the latch on a blind read and let
+    ///   the next successful poll re-emit a duplicate entry. Going blind is not recovery — the issue
+    ///   #137 invariant.
+    fn note_expiry_horizon_edge(
+        &mut self,
+        idx: usize,
+        deadline: i64,
+        now_secs: i64,
+        events: &mut Vec<Event>,
+    ) {
+        let horizon_secs = self.credential_expiry_horizon_secs;
+        let state = account_expiry(Some(deadline), horizon_secs, now_secs).horizon_state;
+        let signaled = &mut self.state.accounts[idx].health.signaled_expiry_horizon;
+        match state {
+            ExpiryHorizon::Within | ExpiryHorizon::Lapsed => {
+                if *signaled != Some(state) {
+                    *signaled = Some(state);
+                    events.push(Event::CredentialExpiryHorizon {
+                        account: self.roster[idx].account_uuid.clone(),
+                        state,
+                        expires_at: deadline,
+                        horizon_secs,
+                    });
+                }
+            }
+            // Out of the horizon: re-arm so a deadline that later moves back in signals afresh.
+            ExpiryHorizon::Beyond => *signaled = None,
+            // Blind, NOT recovered (issue #137): retain the latch rather than re-arming it. Its own
+            // arm, not folded into `Beyond` above, because the required behaviour is the OPPOSITE —
+            // see the doc. Unreachable today; spelled out rather than wildcarded so a fifth band
+            // would be a compile error instead of a silently mis-handled one.
+            ExpiryHorizon::Unknown => {}
+        }
+    }
+
     /// Recompute every account's 5-state credential-health rollup (issue #119) against
     /// `now_secs` and emit one [`Event::CredentialHealth`] per account whose verdict CHANGED
     /// since the last call — the edge-triggered health timeline the issue's AC-3 requires
@@ -1036,6 +1245,536 @@ mod tests {
                 account: "work".to_owned(),
                 state: CredentialHealth::Healthy,
             }]
+        );
+    }
+
+    // --- issue #880: the durable expiry-observation fold ---------------------
+
+    /// The shared instant + horizon these tests classify against: the daemon's default seven-day
+    /// lookahead ([`DEFAULT_CREDENTIAL_EXPIRY_HORIZON_SECS`]), which `three_account_daemon` inherits
+    /// without extra wiring.
+    const EXPIRY_NOW: i64 = 1_782_777_600;
+    /// A deadline FURTHER OUT than the horizon — the quiet band.
+    /// Derived from the daemon's OWN default rather than a repeated literal: if that default ever
+    /// changes, `BEYOND` would silently become `Within` and several tests below would fail without
+    /// naming the cause. The bare `604_800` survives only in the RENDERED-line assertions, where the
+    /// wire value is itself the thing under test.
+    const BEYOND: i64 = EXPIRY_NOW + DEFAULT_CREDENTIAL_EXPIRY_HORIZON_SECS as i64 + 1;
+    /// A deadline INSIDE the horizon — one day out.
+    const WITHIN: i64 = EXPIRY_NOW + 86_400;
+    /// A deadline already PAST.
+    const LAPSED: i64 = EXPIRY_NOW - 1;
+
+    /// Issue #880: the FIRST deadline seen for an account anchors the log — it is an observation, not
+    /// a change — and a later poll reading the SAME deadline stays silent.
+    ///
+    /// Both halves matter. Without the anchor, a deadline that moved while the daemon was down is
+    /// folded in silently and is indistinguishable offline from *nothing happened*; without the
+    /// silence, a seven-day window would emit on every poll of it.
+    #[tokio::test]
+    async fn a_first_deadline_observation_anchors_the_log_and_a_repeat_stays_silent() {
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        let mut events = Vec::new();
+
+        daemon.note_polled_expiry(0, Some(BEYOND), EXPIRY_NOW, &mut events);
+        assert_eq!(
+            events,
+            vec![Event::CredentialExpiryObserved {
+                account: "u-A".to_owned(),
+                provenance: ExpiryProvenance::FirstObservation,
+                before: None,
+                after: BEYOND,
+                grant_replaced: None,
+            }],
+            // `Beyond` is not an actionable band, so the anchor rides ALONE — the vec equality
+            // above already proves no horizon entry joined it.
+            "the anchor carries no baseline — there is none to have changed from"
+        );
+
+        events.clear();
+        daemon.note_polled_expiry(0, Some(BEYOND), EXPIRY_NOW, &mut events);
+        assert!(
+            events.is_empty(),
+            "an unchanged deadline is not an event: {events:?}"
+        );
+    }
+
+    /// Issue #880 (AC-2): the provenance discrimination, both directions, on one account.
+    ///
+    /// A change with a daemon refresh in the interval is `my_refresh`; the latch is then CONSUMED, so
+    /// the very next change — with no refresh since — is `external_change`. The consumption is the
+    /// load-bearing half: a latch that merely recorded "has ever refreshed" would attribute every
+    /// later external write to the daemon and silently answer issue #877 backwards.
+    #[tokio::test]
+    async fn deadline_change_provenance_distinguishes_the_daemons_own_refresh_from_an_external_write(
+    ) {
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        let mut events = Vec::new();
+        daemon.note_polled_expiry(0, Some(BEYOND), EXPIRY_NOW, &mut events);
+        events.clear();
+
+        // The daemon refreshed this account, THEN the deadline moved → the server extended it.
+        daemon.note_own_credential_refresh(0);
+        daemon.note_polled_expiry(0, Some(BEYOND + 86_400), EXPIRY_NOW, &mut events);
+        assert_eq!(
+            events,
+            vec![Event::CredentialExpiryObserved {
+                account: "u-A".to_owned(),
+                provenance: ExpiryProvenance::MyRefresh,
+                before: Some(BEYOND),
+                after: BEYOND + 86_400,
+                grant_replaced: None,
+            }]
+        );
+
+        // No refresh since → the next change was written by something ELSE.
+        events.clear();
+        daemon.note_polled_expiry(0, Some(BEYOND + 172_800), EXPIRY_NOW, &mut events);
+        assert_eq!(
+            events,
+            vec![Event::CredentialExpiryObserved {
+                account: "u-A".to_owned(),
+                provenance: ExpiryProvenance::ExternalChange,
+                before: Some(BEYOND + 86_400),
+                after: BEYOND + 172_800,
+                grant_replaced: None,
+            }],
+            "the latch is consumed per observation, not sticky for the run"
+        );
+    }
+
+    /// Issue #880 (the load-bearing regression): a poll that could NOT observe a deadline — a locked
+    /// keychain, an absent stash, all-`None` clocks — must touch NOTHING.
+    ///
+    /// Three properties, and each fails under a different plausible implementation:
+    /// - It emits no line. Reporting `Some -> None` would let a flaky read publish "upstream dropped
+    ///   the field", a claim the read does not support.
+    /// - It leaves the BASELINE standing. Clobbering it (which is exactly what issue #878's display
+    ///   field deliberately does, so mirroring that field here is the tempting mistake) makes the
+    ///   NEXT successful poll emit a fabricated `None -> Some` change against an unchanged deadline.
+    ///   That is what the final assertion pins, and a mutation that assigns the baseline before the
+    ///   `None` guard passes every other test in this file.
+    /// - It leaves the own-refresh LATCH armed, so a refresh whose effect this poll could not read
+    ///   keeps its `my_refresh` claim for the poll that finally can — otherwise the deferred
+    ///   observation is mis-attributed to an external write.
+    #[tokio::test]
+    async fn an_unobservable_credential_neither_reports_a_change_nor_disturbs_the_baseline() {
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        let mut events = Vec::new();
+        daemon.note_polled_expiry(0, Some(BEYOND), EXPIRY_NOW, &mut events);
+        events.clear();
+        daemon.note_own_credential_refresh(0);
+
+        // The unreadable poll.
+        daemon.note_polled_expiry(0, None, EXPIRY_NOW, &mut events);
+        assert!(events.is_empty(), "a non-observation is not an event");
+        assert_eq!(
+            daemon.state.accounts[0]
+                .health
+                .refresh_token_expires_at_baseline,
+            Some(BEYOND),
+            "the last KNOWN deadline survives a poll that could not look"
+        );
+        assert!(
+            daemon.state.accounts[0]
+                .health
+                .own_refresh_since_expiry_observation,
+            "the my_refresh claim waits for a poll that can actually read the result"
+        );
+
+        // The next successful poll reads the SAME deadline: still silent. A cleared baseline would
+        // have made this a fabricated change here.
+        daemon.note_polled_expiry(0, Some(BEYOND), EXPIRY_NOW, &mut events);
+        assert!(
+            events.is_empty(),
+            "a flaky read must not manufacture a change: {events:?}"
+        );
+    }
+
+    /// Issue #880 (AC-1): the durable horizon entry is edge-triggered on the BAND — emitted once when
+    /// the deadline first falls inside the lookahead, silent while it stays there, and emitted again
+    /// on the `within → lapsed` ESCALATION (the remedy window has closed; that is a different
+    /// operator fact, not a repeat).
+    #[tokio::test]
+    async fn the_horizon_entry_edge_fires_once_per_band_and_escalates_to_lapsed() {
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        let mut events = Vec::new();
+        daemon.note_polled_expiry(0, Some(BEYOND), EXPIRY_NOW, &mut events);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::CredentialExpiryHorizon { .. })),
+            "an account beyond the horizon signals no entry: {events:?}"
+        );
+
+        // ENTRY.
+        events.clear();
+        daemon.note_polled_expiry(0, Some(WITHIN), EXPIRY_NOW, &mut events);
+        assert!(events.contains(&Event::CredentialExpiryHorizon {
+            account: "u-A".to_owned(),
+            state: ExpiryHorizon::Within,
+            expires_at: WITHIN,
+            horizon_secs: 604_800,
+        }));
+
+        // HELD: the same band re-polls silently, even though the deadline itself moved (so the
+        // observation record still fires — this pins that the two edges are independent).
+        events.clear();
+        daemon.note_polled_expiry(0, Some(WITHIN + 60), EXPIRY_NOW, &mut events);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::CredentialExpiryHorizon { .. })),
+            "a held band must not re-signal on every poll: {events:?}"
+        );
+        assert_eq!(events.len(), 1, "only the deadline observation: {events:?}");
+
+        // ESCALATION.
+        events.clear();
+        daemon.note_polled_expiry(0, Some(LAPSED), EXPIRY_NOW, &mut events);
+        assert!(events.contains(&Event::CredentialExpiryHorizon {
+            account: "u-A".to_owned(),
+            state: ExpiryHorizon::Lapsed,
+            expires_at: LAPSED,
+            horizon_secs: 604_800,
+        }));
+    }
+
+    /// Issue #880: a daemon whose FIRST sight of an account is an ALREADY-LAPSED deadline emits
+    /// `state=lapsed` directly. The `within` edge is not a precondition, so a restart — or a daemon
+    /// that was simply down through the window — can never swallow the more severe fact.
+    #[tokio::test]
+    async fn an_already_lapsed_first_observation_emits_the_lapsed_band_without_a_within_edge() {
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        let mut events = Vec::new();
+        daemon.note_polled_expiry(0, Some(LAPSED), EXPIRY_NOW, &mut events);
+        assert_eq!(
+            events,
+            vec![
+                Event::CredentialExpiryObserved {
+                    account: "u-A".to_owned(),
+                    provenance: ExpiryProvenance::FirstObservation,
+                    before: None,
+                    after: LAPSED,
+                    grant_replaced: None,
+                },
+                Event::CredentialExpiryHorizon {
+                    account: "u-A".to_owned(),
+                    state: ExpiryHorizon::Lapsed,
+                    expires_at: LAPSED,
+                    horizon_secs: 604_800,
+                },
+            ]
+        );
+    }
+
+    /// Issue #880: the PRODUCTION path into the horizon — a deadline that never moves, crossed by the
+    /// clock. `refreshTokenExpiresAt` is a FIXED instant (issue #876), so in production an account
+    /// almost always enters the band because *time passed*, not because anything was written.
+    ///
+    /// That makes this the AC-1 path, and it is the one every other test here misses: they all hold
+    /// `now_secs` at [`EXPIRY_NOW`] and move the deadline instead, which is the *rarer* real-world
+    /// event (it takes a credential write). The distinction is load-bearing rather than stylistic,
+    /// because the horizon edge is evaluated on a DIFFERENT trigger from the observation record — the
+    /// deadline here is unchanged on the second poll, so the fold emits no
+    /// [`Event::CredentialExpiryObserved`] at all, and the band entry has to stand on its own.
+    ///
+    /// Pinning it: if `note_expiry_horizon_edge` were ever folded inside the change-or-first guard
+    /// that gates the observation record, a stationary deadline could never signal band entry and
+    /// issue #880's headline requirement would silently produce nothing in production while every
+    /// deadline-moving test above stayed green. The `expires_at` assertion is what keeps the emitted
+    /// line self-contained, since it is the only line this poll produces.
+    #[tokio::test]
+    async fn a_stationary_deadline_signals_the_band_when_the_clock_crosses_it() {
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        let mut events = Vec::new();
+
+        // One hour BEFORE the deadline enters the seven-day window.
+        let deadline = EXPIRY_NOW + 604_800 + 3_600;
+        daemon.note_polled_expiry(0, Some(deadline), EXPIRY_NOW, &mut events);
+        assert_eq!(
+            events,
+            vec![Event::CredentialExpiryObserved {
+                account: "u-A".to_owned(),
+                provenance: ExpiryProvenance::FirstObservation,
+                before: None,
+                after: deadline,
+                grant_replaced: None,
+            }],
+            "the anchor alone — the deadline is still beyond the horizon: {events:?}"
+        );
+
+        // Two hours later. The SAME deadline is now inside the window.
+        events.clear();
+        daemon.note_polled_expiry(0, Some(deadline), EXPIRY_NOW + 7_200, &mut events);
+        assert_eq!(
+            events,
+            vec![Event::CredentialExpiryHorizon {
+                account: "u-A".to_owned(),
+                state: ExpiryHorizon::Within,
+                expires_at: deadline,
+                horizon_secs: 604_800,
+            }],
+            "an unchanged deadline emits the band entry and NOTHING else: {events:?}"
+        );
+
+        // Still inside, still stationary — the latch holds, exactly as for a moving deadline.
+        events.clear();
+        daemon.note_polled_expiry(0, Some(deadline), EXPIRY_NOW + 10_800, &mut events);
+        assert!(
+            events.is_empty(),
+            "the entry edge fires once, not once per poll: {events:?}"
+        );
+
+        // The clock walks past the deadline itself: `lapsed` is a distinct band, so it re-signals.
+        events.clear();
+        daemon.note_polled_expiry(0, Some(deadline), deadline + 1, &mut events);
+        assert_eq!(
+            events,
+            vec![Event::CredentialExpiryHorizon {
+                account: "u-A".to_owned(),
+                state: ExpiryHorizon::Lapsed,
+                expires_at: deadline,
+                horizon_secs: 604_800,
+            }],
+            "escalation to lapsed is also clock-driven: {events:?}"
+        );
+    }
+
+    /// Issue #880: a deadline that moves back OUT of the horizon re-arms the entry edge, so a later
+    /// return signals afresh rather than being swallowed by a stale latch.
+    ///
+    /// This is the only way to leave the band — the deadline is FIXED, so it takes a write to move —
+    /// and it is why the bracket needs no paired CLEARED partner: the observation record emitted on
+    /// the same call already carries both deadlines and the provenance, strictly more than a bare
+    /// marker would.
+    #[tokio::test]
+    async fn a_deadline_that_moves_back_out_of_the_horizon_re_arms_the_entry_edge() {
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        let mut events = Vec::new();
+        daemon.note_polled_expiry(0, Some(WITHIN), EXPIRY_NOW, &mut events);
+
+        // Out of the band — the exit is carried by the observation record, not a marker.
+        events.clear();
+        daemon.note_polled_expiry(0, Some(BEYOND), EXPIRY_NOW, &mut events);
+        assert_eq!(
+            events,
+            vec![Event::CredentialExpiryObserved {
+                account: "u-A".to_owned(),
+                provenance: ExpiryProvenance::ExternalChange,
+                before: Some(WITHIN),
+                after: BEYOND,
+                grant_replaced: None,
+            }],
+            "no `cleared` marker: the move that caused the exit IS the record"
+        );
+        assert_eq!(
+            daemon.state.accounts[0].health.signaled_expiry_horizon,
+            None
+        );
+
+        // Back in — signals again.
+        events.clear();
+        daemon.note_polled_expiry(0, Some(WITHIN), EXPIRY_NOW, &mut events);
+        assert!(events.contains(&Event::CredentialExpiryHorizon {
+            account: "u-A".to_owned(),
+            state: ExpiryHorizon::Within,
+            expires_at: WITHIN,
+            horizon_secs: 604_800,
+        }));
+    }
+
+    /// Issue #880 (AC-3, the third row of the issue #877 table): an EXTERNAL credential write that
+    /// did NOT move the deadline is still recorded. See [`ExpiryProvenance::CanonicalRestash`] for
+    /// what turns on that row.
+    ///
+    /// A change-only fold passes every other test in this file and fails this one, because the
+    /// evidence for this row is the ABSENCE of a change. The second half pins the reconciliation: the
+    /// later poll of the same account must not re-report the same write as an inferred
+    /// `external_change`, which would double-count one write as two.
+    #[tokio::test]
+    async fn an_external_write_that_leaves_the_deadline_alone_is_still_recorded_exactly_once() {
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        let mut events = Vec::new();
+        daemon.note_polled_expiry(0, Some(WITHIN), EXPIRY_NOW, &mut events);
+        events.clear();
+
+        // The #13 re-stash edge: the canonical was rewritten underneath the daemon, a NEW grant was
+        // minted, and the deadline is UNCHANGED. That conjunction is row 3's whole signature.
+        daemon.note_restash_expiry(0, Some(WITHIN), Some(true), EXPIRY_NOW, &mut events);
+        assert_eq!(
+            events,
+            vec![Event::CredentialExpiryObserved {
+                account: "u-A".to_owned(),
+                provenance: ExpiryProvenance::CanonicalRestash,
+                before: Some(WITHIN),
+                after: WITHIN,
+                grant_replaced: Some(true),
+            }],
+            "an unmoved deadline across an external write is the record #877 needs"
+        );
+        // And it RENDERS as that row: the provenance names the external write, and the derived delta
+        // says the deadline did not move. Only the row's shape is asserted here — the byte-for-byte
+        // timestamp form is pinned once, at the renderer, rather than restated at every fold site.
+        let line = events[0].to_log_line(std::time::UNIX_EPOCH);
+        assert!(line.contains(" provenance=canonical_restash "), "{line}");
+        assert!(
+            line.ends_with(" delta_secs=0 grant_replaced=true"),
+            "{line}"
+        );
+
+        // The later poll of the same account is silent — the baseline was reconciled at the edge.
+        events.clear();
+        daemon.note_polled_expiry(0, Some(WITHIN), EXPIRY_NOW, &mut events);
+        assert!(
+            events.is_empty(),
+            "one write must not be recorded twice: {events:?}"
+        );
+    }
+
+    /// Issue #880 (AC-3 end to end): all THREE rows of the issue #877 table are distinguishable from
+    /// the persisted LINES alone — the property AC-3 actually asks for, asserted on rendered text
+    /// rather than on in-memory values, because "answerable from production data" means answerable by
+    /// something reading the log file.
+    ///
+    /// Driven on three separate accounts so each row stands alone, exactly as an offline reader would
+    /// partition the log by `acct=`.
+    #[tokio::test]
+    async fn the_three_provenance_rows_are_distinguishable_from_the_rendered_log_alone() {
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        let mut events = Vec::new();
+        // Anchor all three, then discard the anchors: the rows under test are what follows.
+        for i in 0..3 {
+            daemon.note_polled_expiry(i, Some(WITHIN), EXPIRY_NOW, &mut events);
+        }
+        events.clear();
+
+        // Row 1: changed DURING the daemon's own refresh cycle.
+        daemon.note_own_credential_refresh(0);
+        daemon.note_polled_expiry(0, Some(WITHIN + 3600), EXPIRY_NOW, &mut events);
+        // Row 2: changed between polls with NO daemon refresh.
+        daemon.note_polled_expiry(1, Some(WITHIN + 3600), EXPIRY_NOW, &mut events);
+        // Row 3: UNCHANGED across an external credential write that DID mint a new grant.
+        daemon.note_restash_expiry(2, Some(WITHIN), Some(true), EXPIRY_NOW, &mut events);
+
+        let log: Vec<String> = events
+            .iter()
+            .map(|e| e.to_log_line(std::time::UNIX_EPOCH))
+            .collect();
+        let observed: Vec<&String> = log
+            .iter()
+            .filter(|l| l.contains(" event=credential_expiry_observed "))
+            .collect();
+        assert_eq!(observed.len(), 3, "one line per row: {log:?}");
+        assert!(observed[0].contains(" acct=u-A provenance=my_refresh "));
+        assert!(observed[0].ends_with(" delta_secs=3600"));
+        assert!(observed[1].contains(" acct=u-B provenance=external_change "));
+        assert!(observed[1].ends_with(" delta_secs=3600"));
+        assert!(observed[2].contains(" acct=u-C provenance=canonical_restash "));
+        // Row 3 is a CONJUNCTION, and the whole conjunction has to be on the one line: the deadline
+        // did not move AND a new grant was minted. `delta_secs=0` alone would leave the row ambiguous
+        // between a re-login that held the deadline (what #877 asks about) and some unrelated
+        // credential-blob rewrite that never issued a grant at all.
+        assert!(
+            observed[2].ends_with(" delta_secs=0 grant_replaced=true"),
+            "row 3 is an unmoved deadline across a NEW grant: {:?}",
+            observed[2]
+        );
+        // And the poll-path rows stay silent on grant identity rather than guessing at it.
+        assert!(
+            !observed[0].contains("grant_replaced") && !observed[1].contains("grant_replaced"),
+            "a poll cannot compare two blobs, so it must not claim to: {observed:?}"
+        );
+    }
+
+    /// Issue #880 (the WIRING test, and the one this change would be incomplete without): the two
+    /// durable events reach the tick's OWN `events` vec — the one `run_loop` drains into the
+    /// [`EventLog`] — rather than merely being produced when the fold is driven directly.
+    ///
+    /// This gap is not hypothetical. Issue #827 landed the same test for the fleet-runway helper —
+    /// `a_tick_carries_both_fleet_runway_edges_onto_the_durable_event_log` in [`crate::daemon`]'s
+    /// tests — whose own comment records why: the direct-drive tests *"pin the helper's edge logic but
+    /// say nothing about the wiring"*, and swapping `tick`'s `events` argument for a throwaway vec
+    /// *"drops BOTH edges off the durable log and leaves every direct-drive test green"*. Every fold
+    /// test above would pass under that mutation here too, because they supply the vec themselves;
+    /// only driving the real `tick` and reading `TickOutcome::events` can tell the difference — which
+    /// is what makes AC-1's word *durable* actually asserted rather than assumed.
+    ///
+    /// Driven through a NON-ACTIVE account, whose poll reads the per-account stash — the real
+    /// `read_poll_clocks` path, a genuine JSON credential blob carrying the field, parsed by the
+    /// production extractor. The deadline is issue #878's real observed capture (`1785499802819` ms,
+    /// account prefix `94f27044`), and the fake clock's `wall_clock_now_secs()` is the true current
+    /// time, so that 2026-07-31 deadline lands inside the shipped seven-day horizon only while this
+    /// test is run near it — hence the deadline is computed FROM the wall clock instead, with the
+    /// real capture pinned at the extractor in `crate::refresh` where it belongs.
+    #[tokio::test]
+    async fn a_tick_carries_both_expiry_events_onto_the_durable_event_log() {
+        // A deadline one day out: inside the default seven-day horizon whenever this test runs.
+        let deadline_ms = (crate::daemon::wall_clock_now_secs() + 86_400) * 1000;
+        let blob = format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"B-token","refreshToken":"rt","expiresAt":{deadline_ms},"refreshTokenExpiresAt":{deadline_ms}}}}}"#
+        );
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", blob.as_bytes(), "u-B"),
+        ])
+        .await;
+        let (dir, json) = claude_json("u-A");
+        std::mem::forget(dir);
+        let tun = tunables(95, 80, 0);
+        let mut daemon = Daemon::new(
+            roster,
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .ok("u-B", 0.10, 0.10),
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+
+        // Tick until the non-active `u-B` has been polled (the loop staggers the peers behind the
+        // active account, so its poll is not the first tick's).
+        let mut events = Vec::new();
+        for _ in 0..4 {
+            events.extend(daemon.tick().await.events);
+        }
+
+        let observed = events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    Event::CredentialExpiryObserved { account, .. } if account == "u-B"
+                )
+            })
+            .count();
+        assert_eq!(
+            observed, 1,
+            "exactly one anchor for u-B reached the durable log: {events:?}"
+        );
+        let entered = events.iter().any(|e| {
+            matches!(
+                e,
+                Event::CredentialExpiryHorizon { account, state, .. }
+                    if account == "u-B" && *state == ExpiryHorizon::Within
+            )
+        });
+        assert!(
+            entered,
+            "the horizon entry reached the durable log: {events:?}"
+        );
+        // `u-A`'s stash carries no such field, so it contributes nothing — the events are strictly
+        // per-account, and a poll that observes no deadline stays silent even on the real path.
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                Event::CredentialExpiryObserved { account, .. } if account == "u-A"
+            )),
+            "an account whose credential omits the field emits nothing: {events:?}"
         );
     }
 

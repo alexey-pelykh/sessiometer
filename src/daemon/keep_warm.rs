@@ -224,6 +224,14 @@ where
                 }
             }
         };
+        // Issue #880: a mint the DAEMON drove has now run against this account's credential, so arm
+        // the `my_refresh` provenance latch for the next deadline observation. Armed HERE — after the
+        // engine actually ran — rather than at the top: the two early returns above (a dead/absent
+        // refresh token, an unwired engine) spawn nothing at all, so arming for them would claim a
+        // refresh that never happened. Armed for an `Err` too: the spawn may have refreshed
+        // server-side even where the read-back failed, and attributing a resulting deadline move to
+        // an external write is the one direction that would corrupt issue #877's answer.
+        self.note_own_credential_refresh(i);
         // The cycle's non-secret classification, computed once and reused by the event + the return.
         let (outcome, token_rotated) = match &minted {
             Ok((report, _)) => (refresh_event_outcome(report), report.refresh_token_rotated),

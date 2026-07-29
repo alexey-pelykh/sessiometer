@@ -3331,6 +3331,72 @@ ts=2026-07-11T00:04:00Z event=swap from=b to=c reason=session session_pct=97
     }
 
     #[test]
+    fn the_refresh_token_expiry_lines_are_folded_transparently() {
+        // Issue #880 added two durable event kinds to the log this parser reads — the horizon-entry
+        // edge (`event=credential_expiry_horizon`) and the provenance-tagged deadline observation
+        // (`event=credential_expiry_observed`). Neither may contribute to any reliability SLI:
+        // refresh-token expiry is a FORESIGHT axis. Attributing it to one is issue #881's job, and
+        // doing it accidentally — through a field this tolerant map-fold happens to share — is
+        // exactly what this pins against.
+        //
+        // "Contributes to no SLI" is the precise claim, NOT that the lines are wholly inert: the
+        // `horizon_ts` fold above the event `match` runs on EVERY line carrying a parseable `ts`, so
+        // these two advance the observation horizon exactly as every other durable event does. That
+        // is correct — the horizon measures how long the log was being written, and these lines are
+        // evidence it was — and the second half of this test pins it rather than leaving it to be
+        // rediscovered as a surprise.
+        //
+        // Sibling of `the_promoted_leave_edges_are_folded_transparently` above, and pinned the same
+        // stronger way: parse the SAME log with and without the new lines and assert the folds are
+        // IDENTICAL, which also covers `horizon_ts` and every other ingredient rather than
+        // spot-checking one field.
+        //
+        // The shapes are the real ones. `acct=` is deliberately NOT the `from=`/`to=`/`hold=` key
+        // any arm reads, and neither line carries a `reason=`; the observed line's trailing
+        // `delta_secs=` is the kind of numeric field a careless arm could pick up. Neither `ts` is
+        // the log's maximum, so the observation horizon is untouched too.
+        let without = "\
+ts=2026-07-11T00:01:00Z event=all_exhausted hold=a cause=session resets_at=2026-07-11T05:00:00Z
+ts=2026-07-11T00:04:00Z event=swap from=b to=c reason=session session_pct=97
+";
+        let with = "\
+ts=2026-07-11T00:01:00Z event=all_exhausted hold=a cause=session resets_at=2026-07-11T05:00:00Z
+ts=2026-07-11T00:02:00Z event=credential_expiry_observed acct=u-A provenance=first_observation after=2026-08-30T12:00:00Z
+ts=2026-07-11T00:02:30Z event=credential_expiry_horizon acct=u-A state=within expires_at=2026-07-16T12:00:00Z horizon_secs=604800
+ts=2026-07-11T00:03:00Z event=credential_expiry_observed acct=u-A provenance=canonical_restash before=2026-07-16T12:00:00Z after=2026-07-16T12:00:00Z delta_secs=0
+ts=2026-07-11T00:04:00Z event=swap from=b to=c reason=session session_pct=97
+";
+        assert_eq!(parse_events(with, None), parse_events(without, None));
+        // Non-degenerate: an equivalence between two EMPTY parses would pass vacuously, so pin that
+        // the surrounding swap still landed as a sample with the new lines interleaved.
+        assert!(!parse_events(with, None).swap_out_pcts.is_empty());
+
+        // The one fold these lines DO reach, stated as behaviour instead of assumed away: a #880 line
+        // that is the log's LATEST advances `horizon_ts`, and changes nothing else. Asserted by
+        // normalizing the horizon and re-comparing — so if a future arm ever started reading one of
+        // these lines into an SLI, this would fail rather than be masked by the horizon difference.
+        let trailing = format!(
+            "{without}ts=2026-07-11T09:00:00Z event=credential_expiry_horizon acct=u-A state=lapsed expires_at=2026-07-11T08:00:00Z horizon_secs=604800\n"
+        );
+        let mut folded = parse_events(&trailing, None);
+        let baseline = parse_events(without, None);
+        assert_eq!(
+            folded.horizon_ts,
+            Some(epoch_from_rfc3339("2026-07-11T09:00:00Z").unwrap()),
+            "a trailing durable line extends the observation horizon"
+        );
+        assert_ne!(
+            folded.horizon_ts, baseline.horizon_ts,
+            "…and the two logs genuinely differ there, so the normalization below is not vacuous"
+        );
+        folded.horizon_ts = baseline.horizon_ts;
+        assert_eq!(
+            folded, baseline,
+            "the horizon is the ONLY thing a #880 line touches"
+        );
+    }
+
+    #[test]
     fn a_relief_swap_to_a_different_account_than_the_hold_is_not_capacity_held() {
         // The discriminator is precise: `all_exhausted hold=` names ONE awaited spare; a swap whose
         // `to=` is a DIFFERENT account did not land on that spare, so it did not resolve THAT hold and

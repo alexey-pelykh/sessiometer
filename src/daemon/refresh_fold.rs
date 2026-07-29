@@ -544,6 +544,14 @@ where
         outcome: RefreshEventOutcome,
         token_rotated: bool,
     ) -> Option<Event> {
+        // Issue #880: a refresh the DAEMON drove just wrote this account's credential, so arm the
+        // `my_refresh` provenance latch for the next deadline observation. Placed on this shared
+        // primitive rather than on its two callers so the #119 sweep fold and the #643 recovery
+        // re-probe cannot drift apart on it, exactly as the fields below are single-homed here.
+        // Armed for EVERY outcome, including `Dead` / `Error`: the server may have moved the
+        // refresh-token deadline even where the local classification was a failure, and attributing
+        // that to an external write is the one direction that would corrupt issue #877's answer.
+        self.note_own_credential_refresh(idx);
         let health = &mut self.state.accounts[idx].health;
         health.last_refresh_outcome = Some(outcome);
         health.refresh_token_rotated = Some(token_rotated);
