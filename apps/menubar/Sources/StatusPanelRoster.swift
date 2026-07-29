@@ -596,7 +596,7 @@ private struct ExpiryLine: View {
                 .foregroundStyle(.secondary)
                 .frame(width: StatusPanelFormat.meterLabelCellWidth * scale, alignment: .leading)
 
-            Text(StatusPanelFormat.expiryCell(expiry, now: now))
+            Text(StatusPanelFormat.expiryLineCell(expiry, now: now))
                 .font(.panel(11, scale: scale)).monospacedDigit()
                 .foregroundStyle(valueColor)
                 .lineLimit(1)

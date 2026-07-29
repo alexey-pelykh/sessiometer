@@ -697,6 +697,9 @@ elsewhere, 4 routed to the checklist below.** Nothing is left silent.
 | Delivered notification content carries no account label or email | `NotificationDeliveryTests` (end-to-end, past the seam) |
 | Delivery identity is fresh per post (no coalescing) + the app-level grouping decision | `NotificationDeliveryTests` |
 | Swap / exhaustion detection, redaction at the model layer, toggle gating | Already: `AccountEventNotifierTests` (#267) |
+| Expiry-horizon detection: one account at a time, spaced, never a cohort fan-out | `AccountEventNotifierTests` (#935) |
+| Every notified expiry state also renders on the panel row (both-or-neither) | `AccountEventNotifierTests` (#935) |
+| Notification copy is non-imperative and names the replacement verb (§D-STA-6) | `NotificationDeliveryTests` (#935) |
 | Live-panel focus, keystroke routing, Return / Esc | Manual, step 1 |
 | Capture-card fidelity against the mock's onboarding frames | Manual, step 2 |
 | The OS authorization prompt, and a denial | Manual, step 3 |
@@ -726,6 +729,16 @@ Run these against a real build:
       is where the exposure actually is. Then trigger a second swap and confirm you now have TWO
       notifications stacked under Sessiometer rather than one replacing the other (the per-post identity),
       and that they group under the app rather than into sub-threads.
+- [ ] **Expiry notification rendering** (#935). With at least one account inside the configured horizon
+      (`[credential].expiry_horizon_secs` — widen it temporarily rather than waiting a week), confirm a
+      notification appears reading "A login is inside its expiry horizon" / "One account's refresh token
+      expires within the configured horizon…", and — as above — **that it names no account**. Then open
+      the panel and confirm the account it refers to is findable there: its `EXPIRY` row reads a
+      BRACKETED duration (`[5d18h]`). That pairing is the whole delivery path, since the notification
+      cannot name the account and the panel is the only thing that can. Finally, with SEVERAL accounts
+      inside the horizon, confirm you get ONE notification and not a stack of them — the fan-out is what
+      would lead you to re-login the cohort in one sitting and rebuild the cluster a grant later (#877).
+      The automated half proves the derivation; what a delivered notification LOOKS like is this step.
 
 Not on this list on purpose: what the notification SAYS, and whether a label could leak into it. Both are
 measured in `NotificationDeliveryTests` against the `NotificationDeliveryPlan` the presenter copies onto
