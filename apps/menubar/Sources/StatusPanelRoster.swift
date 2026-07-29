@@ -47,7 +47,11 @@ struct RosterView: View {
                                                        isEnabled: row.isEnabled)
                     : .notATarget
                 AccountRowView(row: row, monogram: monograms[row.label] ?? "?", now: now,
-                               switchState: state, nextSwap: nextSwap)
+                               switchState: state, nextSwap: nextSwap,
+                               // The panel is fixed-width, so this is a derived constant rather than a
+                               // measurement — passed IN (#766) so the row's affordance-budget verdict has
+                               // an injectable width rather than reaching for the global itself.
+                               rowWidth: PanelMetrics.rowWidth)
             }
         }
         // The design reference insets the roster (`.accts { padding: 6px 8px 2px }`): 8px horizontal so
@@ -111,7 +115,7 @@ private struct RowSwitchButtonStyle: ButtonStyle {
 /// A non-active row is ALSO the manual-switch affordance (issue #169): a `Button` whose trailing swap
 /// chip is PERSISTENT — quiet at rest, brightening when the row is armed on hover (#448). The resting
 /// row carries the quiet chip; arming still gates the wash + `pointingHand` cursor.
-private struct AccountRowView: View {
+struct AccountRowView: View {
     /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
     @Environment(\.panelScale) private var scale
     let row: AccountRow
@@ -127,6 +131,21 @@ private struct AccountRowView: View {
     /// (the honest-state discipline the glance already applies). Inert for every non-blind row.
     let nextSwap: NextSwap?
 
+    /// The width available to THIS row, which `offersSwitch` measures the switch affordance against. A
+    /// parameter rather than a read of the `PanelMetrics.rowWidth` global (issue #766) so the WIDTH axis of
+    /// the mis-click guard is drivable: the whole point of `rowFitsSwitchAffordance` is that a sub-budget
+    /// row goes NON-INTERACTIVE, and with the width hardcoded that branch was unreachable from a test, so
+    /// only the pure predicate was ever exercised — never the row's actual interactive shape at a narrow
+    /// width. `RosterView` passes the panel's real row width, so the shipped behaviour is unchanged.
+    let rowWidth: Double
+    /// Force the row into its ARMED presentation without a pointer (issue #766) — the render seam that makes
+    /// the hover treatment measurable. `isHovering` is `@State` driven by `.onHover`, and an offscreen
+    /// `ImageRenderer` / `NSHostingView` never receives a hover event, so the armed frame was un-renderable
+    /// and the brighten could only be asserted as an enum value. This is a PRESENTATION-only override: it
+    /// deliberately does NOT reach `syncCursor()`, so a forced-arm render never pushes a real `pointingHand`
+    /// onto the operator's cursor stack. Always `false` in the app.
+    let armed: Bool
+
     @EnvironmentObject private var swap: AccountSwapModel
     /// The active row's accent-tint fill opacity is theme-aware (#388): the mock raises it in dark mode.
     @Environment(\.colorScheme) private var colorScheme
@@ -135,6 +154,32 @@ private struct AccountRowView: View {
     /// balanced by exactly one pop, even when the row stops being live WHILE the pointer is inside it
     /// (a sibling swap starting mid-hover would otherwise strand the cursor).
     @State private var cursorPushed = false
+
+    /// Explicit rather than memberwise: the `private` `@State` / `@Environment` members above would make a
+    /// synthesized memberwise initializer private too, and `PanelInteractionStateTests` (#766) constructs
+    /// this view directly.
+    ///
+    /// `armed` defaults to the shipped value so that every existing call site — and every committed panel
+    /// golden — is untouched. `rowWidth` deliberately does NOT default: a default would be the same reach
+    /// for the `PanelMetrics` global that giving the row an injectable width exists to remove, and it would
+    /// let a future call site inherit a width it never stated while the affordance-budget verdict silently
+    /// depends on it. Every caller states its width.
+    init(row: AccountRow, monogram: String, now: Int64,
+         switchState: StatusPanelFormat.RowSwitchState, nextSwap: NextSwap?,
+         rowWidth: Double, armed: Bool = false) {
+        self.row = row
+        self.monogram = monogram
+        self.now = now
+        self.switchState = switchState
+        self.nextSwap = nextSwap
+        self.rowWidth = rowWidth
+        self.armed = armed
+    }
+
+    /// Whether the row is ARMED — a real pointer over it, or the render seam above. The single source both
+    /// arm treatments read (the `RowSwitchButtonStyle` wash and the chip's brighten), so a render can never
+    /// arm one and not the other.
+    private var isArmed: Bool { isHovering || armed }
 
     /// Each window's reset-in against the client's own clock — both shown, never collapsed to one pick.
     private var sessionReset: String {
@@ -190,7 +235,7 @@ private struct AccountRowView: View {
     /// text sizes where it fits no better in proportion than it did at the default.
     private var offersSwitch: Bool {
         switchState != .notATarget
-            && StatusPanelFormat.rowFitsSwitchAffordance(rowWidth: PanelMetrics.rowWidth)
+            && StatusPanelFormat.rowFitsSwitchAffordance(rowWidth: rowWidth)
     }
 
     /// This row's own swap is in flight.
@@ -212,7 +257,7 @@ private struct AccountRowView: View {
                 // not receive their own events. Hoist the secondary control into a trailing accessory or
                 // a context menu and shrink the button to the identity region.
                 Button(action: submit) { rowContent }
-                    .buttonStyle(RowSwitchButtonStyle(hovering: isHovering, live: isLiveSwitch, scale: scale))
+                    .buttonStyle(RowSwitchButtonStyle(hovering: isArmed, live: isLiveSwitch, scale: scale))
                     .disabled(blockReason != nil || swap.phase.isPending)
                     .help(hoverText)
                     // The button trait + `dimmed` come from `Button` + `.disabled()`; the label carries
@@ -254,6 +299,10 @@ private struct AccountRowView: View {
     }
 
     /// Push / pop the `pointingHand` cursor to match whether a click here would do anything.
+    ///
+    /// Reads `isHovering`, NOT `isArmed`: the cursor follows a REAL pointer only. The `armed` render seam
+    /// (#766) exists to make the arm treatment visible offscreen, and a headless render pushing a cursor
+    /// onto the operator's stack would be a side effect no render should have — and one nothing would pop.
     private func syncCursor() {
         setCursor(pushed: isHovering && isLiveSwitch)
     }
@@ -372,7 +421,7 @@ private struct AccountRowView: View {
             if isSwitching {
                 ProgressView().controlSize(PanelTypeScale.controlSize(for: scale))
             } else {
-                switch StatusPanelFormat.switchChipEmphasis(offersSwitch: offersSwitch, armed: isHovering) {
+                switch StatusPanelFormat.switchChipEmphasis(offersSwitch: offersSwitch, armed: isArmed) {
                 case .hidden:
                     Color.clear
                 case .resting:

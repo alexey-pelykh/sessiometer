@@ -195,8 +195,13 @@ enum PanelA11y {
     /// view code does. Any test whose subject is the VIEW's state-gating must therefore force the probe ON
     /// for every fixture, so absence can only mean the view declined to render it. Defaults to the fixture's
     /// own seed, which is what a test about rendering (rather than about gating) wants.
+    ///
+    /// `swapOverride` is the same shape for the swap phase (issue #766). The fixtures all render at
+    /// `.idle`, so a caller asking what the panel publishes MID-SWAP learns only that no swap was seeded.
+    /// Defaults to the socket-free idle model every fixture has always used, so no existing tree moves.
     static func panelTree(fixture: PanelRenderFixture, scheme: ColorScheme = .dark,
-                          daemonLogOverride: DaemonLogProbe? = nil) -> [A11yNode] {
+                          daemonLogOverride: DaemonLogProbe? = nil,
+                          swapOverride: AccountSwapModel? = nil) -> [A11yNode] {
         let store = WatchStatusStore.preview(state: fixture.state, rows: fixture.rows,
                                              nextSwap: fixture.nextSwap, generatedAt: fixture.generatedAt,
                                              canonicalScrub: fixture.canonicalScrub,
@@ -207,7 +212,7 @@ enum PanelA11y {
         let view = StatusPanelView()
             .statusPanelEnvironment(store: store,
                                     capture: AccountCaptureModel(client: nil),
-                                    swap: AccountSwapModel(client: nil),
+                                    swap: swapOverride ?? AccountSwapModel(client: nil),
                                     stats: stats,
                                     loginItem: LoginItemModel(service: A11yProbeLoginItemService()),
                                     // The fixture's own #776 seed by default, so this tree matches what the

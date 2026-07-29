@@ -334,9 +334,14 @@ enum PanelRenderHarness {
     ///     `ImageRenderer` blank (see design/README.md).
     ///   • `AccountSwapModel` renders at `.idle`, so the fixtures capture the RESTING row (no hover, no
     ///     pending). As of #448 the per-row switch chip is PERSISTENT, so its resting glyph
-    ///     (`arrow.left.arrow.right`, or the `nosign` on a non-viable row) IS captured in a static render;
-    ///     only the ARMED hover/focus brighten and the in-flight `Switching…` spinner stay a manual-check
-    ///     surface (#380).
+    ///     (`arrow.left.arrow.right`, or the `nosign` on a non-viable row) IS captured in a static render.
+    ///     This previously said "only the ARMED brighten and the in-flight `Switching…` spinner stay a
+    ///     manual-check surface (#380)" — corrected per issue #766: those states are un-captured HERE
+    ///     because these fixtures supply no input, not because the renderer cannot reach them. Given a
+    ///     seam that does (`AccountRowView.armed`, `AccountSwapModel.pendingPreview`) the same
+    ///     `ImageRenderer` renders both, and `PanelInteractionStateTests` measures them every run. What
+    ///     stays manual is narrower: the pressed wash, the `pointingHand` cursor, the hover tooltip, and
+    ///     the real-popover round-trip.
     ///   • `PanelStatsModel` (#446) renders at its default `.status` tab / `.idle` phase for every fixture
     ///     EXCEPT `stats` (#704), which `loadedPreview` seeds straight to `.stats`/`.loaded` from
     ///     `loadedPreviewFixture` so the render shows the account cards. BOTH stay socket-free: the default
