@@ -152,14 +152,16 @@ pub(crate) use snapshot::{
 // tests — production reaches the wire through `versioned_status_response` (issue #164) and builds
 // the health view through `refresh_health_view` without naming the type. Re-export test-scoped so
 // `use super::*` resolves them while a non-test build sees no unused re-export.
-//
-// `AccountExpiry` (issue #878) joins them for the same reason with a different cause: production
-// CONSTRUCTS it via `account_expiry`, stores it on `AccountReading`, and — since issue #882 — copies
-// it onto `AccountStatusLine` for the wire, all without ever NAMING the type outside the `snapshot`
-// module that declares it. So the re-export stays test-scoped even now that the field is projected:
-// what it serves is the tests that pin the classification and its wire shape.
 #[cfg(test)]
-pub(crate) use snapshot::{status_response, AccountExpiry, RefreshHealth};
+pub(crate) use snapshot::{status_response, RefreshHealth};
+
+// `AccountExpiry` (issue #878) was test-scoped alongside them while production only ever
+// CONSTRUCTED it (`account_expiry`), stored it on `AccountReading`, and — since issue #882 —
+// copied it onto `AccountStatusLine`, never NAMING the type outside the `snapshot` module that
+// declares it. Issue #883 ends that: `crate::cli::expiry_cell` takes one by value to render the
+// `status` EXPIRY column and the `stats` `expiry` column from ONE formatter, so the type is now
+// named in a non-test build and the re-export is unconditional.
+pub(crate) use snapshot::AccountExpiry;
 
 mod socket;
 
@@ -15491,6 +15493,16 @@ mod tests {
         assert!(
             corpus.contains(r#""result":"captured""#),
             "control channel: capture ack missing"
+        );
+        // The `status` table's EXPIRY column (#883): the fixture blob carries a
+        // `refreshTokenExpiresAt`, so the column MATERIALIZES rather than eliding on the
+        // empty-column rule. Without this the sweep would pass over a corpus that never held the
+        // cell — a green gate on a degraded subject, which proves nothing about the new surface.
+        assert!(
+            corpus.contains("EXPIRY"),
+            "status channel: the refresh-token expiry column missing — the meter fixture's \
+             `refreshTokenExpiresAt` stopped reaching the render, so the clean verdict below is \
+             vacuous for it"
         );
         assert!(
             corpus.len() > 800,

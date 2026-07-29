@@ -392,6 +392,12 @@ impl CredentialHealth {
 /// event-log token and the schema-1.12 wire token the same string, so an operator correlating a
 /// `state=` on the durable log against an `expiry` on the wire is reading one vocabulary, not two that
 /// happen to match today.
+///
+/// That vocabulary is for MACHINES, and issue #883's operator surfaces deliberately do not speak it:
+/// [`crate::cli::expiry_cell`] renders a time-until (`3d`, `29d4h`) for `Within` / `Beyond` and the
+/// gap `—` for `Unknown`, so `Lapsed` is the only variant whose cell coincides with its token at all.
+/// Routing a UI cell through [`Self::as_str`] to save a match would be precisely the
+/// wire-token-as-UI-string coupling the pin above exists to keep visible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ExpiryHorizon {
