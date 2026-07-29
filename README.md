@@ -197,11 +197,11 @@ row of an aligned, border-less table under a labelled header — greppable, one
 record per line:
 
 ```text
-ACCOUNT  SESSION% RESET  WEEKLY% RESET  EXPIRY  AUTH
-* work   97%      12m    40%     5d     21d3h   🟢
-  spare  10%      2h     20%     3d     6d21h   🟢
-  idle   n/a      n/a    n/a     n/a    —       🟠 degraded — run 'sessiometer poke'
-  gone   n/a      n/a    n/a     n/a    lapsed  🔴 claude /login
+ACCOUNT  SESSION% RESET  WEEKLY% RESET  EXPIRY   AUTH
+* work   97%      12m    40%     5d     21d3h    🟢
+  spare  10%      2h     20%     3d     [6d21h]  🟢
+  idle   n/a      n/a    n/a     n/a    —        🟠 degraded — run 'sessiometer poke'
+  gone   n/a      n/a    n/a     n/a    lapsed   🔴 claude /login
 
 next swap: spare
 ```
@@ -223,14 +223,18 @@ next swap: spare
 - An **`EXPIRY`** column carries each account's **refresh-token deadline** — the
   instant its stored credential stops being renewable — as a compact time-until
   (`6d21h`), the word **`lapsed`** once that instant has passed, or **`—`** when no
-  deadline was observed. It is a cell of **its own**, never folded into `AUTH`: the two
-  axes are independent, so an account can read **🟢** in `AUTH` and still sit days from
-  its refresh-token deadline. On an interactive terminal the cell is tinted by its own
-  band — red once `lapsed`, yellow inside the [`[credential]`](#credential) foresight
-  horizon, dimmed beyond it, and left uncolored when nothing was observed. Like the
-  health-text column it is **conditional**: a roster whose credentials carry no deadline
-  renders exactly as it did before the column existed, rather than growing a column of em
-  dashes. See [The refresh-token deadline](#the-refresh-token-deadline-expiry) below.
+  deadline was observed. A time-until in **brackets** (`[6d21h]`) sits **inside** the
+  [`[credential]`](#credential) foresight horizon; a bare one (`21d3h`) sits beyond it.
+  The brackets are what make that distinction survive `--no-color`, `NO_COLOR`, a pipe,
+  and a log capture — they matter because the horizon is **yours to configure**, so the
+  bare duration alone cannot tell you which side of it you are on. It is a cell of **its
+  own**, never folded into `AUTH`: the two axes are independent, so an account can read
+  **🟢** in `AUTH` and still sit days from its refresh-token deadline. On an interactive
+  terminal the cell is additionally tinted by its own band — red once `lapsed`, yellow
+  inside the horizon, dimmed beyond it, and left uncolored when nothing was observed.
+  Like the health-text column it is **conditional**: a roster whose credentials carry no
+  deadline renders exactly as it did before the column existed, rather than growing a column
+  of em dashes. See [The refresh-token deadline](#the-refresh-token-deadline-expiry) below.
 - A trailing **`AUTH`** column reports each account's **credential-auth state** as one
   self-coloring glyph — **🟢** healthy (a positive liveness signal), **🟡** stale (the
   access token has expired but the refresh token still recovers it), **🟠** at-risk (the
@@ -280,11 +284,14 @@ On an interactive terminal each **cell** is **color-coded by its own health** �
 (green = plenty of quota, red = heavily used); each reset is coloured by its own
 **proximity** — a far reset reads green, an imminent one red — so a far weekly
 reset can sit green beside an imminent session reset in red on the same row. The
-colour **augments** the row — every percentage and reset is fully readable without
-it — and is never the only signal. Color is emitted **only** on an interactive
-TTY: it is suppressed when output is piped or redirected, when `--no-color` is
-passed, or when `NO_COLOR`, `CLICOLOR=0`, or `TERM=dumb` is set in the environment
-— so an escape sequence never reaches a pipe, a redirect, or a log.
+colour **augments** the row — every cell is fully readable without it — and is
+never the only signal: a percentage and a reset each state their own number, and
+the `EXPIRY` cell brackets a within-horizon deadline, so the one distinction that
+lived only in the tint now survives the colour being stripped. Color is emitted
+**only** on an interactive TTY: it is suppressed when output is piped or
+redirected, when `--no-color` is passed, or when `NO_COLOR`, `CLICOLOR=0`, or
+`TERM=dumb` is set in the environment — so an escape sequence never reaches a
+pipe, a redirect, or a log.
 
 When the periodic refresh (**`[refresh]`**) is **off** and at least one **non-active**
 account is unverified or going stale (**⚪**/**🟡**/**🟠**/**🔴** in `AUTH`), a single
@@ -385,6 +392,18 @@ logging in an account other than the active one adds or revives it and performs 
 > none — it reads whatever deadline the credential carries and reports that. Recorded in
 > [issue #877](https://github.com/alexey-pelykh/sessiometer/issues/877).
 
+**Brackets mean *inside the horizon*.** A time-until rendered `[6d21h]` sits within the
+[`[credential]`](#credential) foresight horizon; a bare `21d3h` sits beyond it. That is the
+only thing the brackets say — they are a descriptor, not a prompt, and they ask for nothing.
+They exist because the horizon is **operator-configurable**: unlike `SESSION%`, where `98%`
+describes itself, a bare deadline cannot tell you which side of *your* window it falls on.
+Before them the distinction lived only in the colour band, so it vanished under `--no-color`,
+`NO_COLOR`, a pipe, a log capture, or colour-blindness — a first-class supported mode losing
+the whole per-account signal. `lapsed` and `—` are never bracketed: neither is *within* a
+forward-looking window, and both are already words among durations. Since the brackets are
+literal characters, match one with `grep -F` — bare `grep` would read `[6d21h]` as a
+character class.
+
 **`—` means not observed — it does not mean "not expiring."** The daemon found no usable
 `refreshTokenExpiresAt` in the credential: an older Claude Code, a changed upstream policy,
 or a non-first-party credential all produce it, as does an account the daemon has not
@@ -397,7 +416,8 @@ upstream ever drops the field — every cell reads `—`, the column elides, and
 an all-clear it cannot support.
 
 The same cell is defined for the `expiry` column of `sessiometer stats` — right-aligned and
-uncolored there, since that surface's colors are the neutral utilization band.
+uncolored there, since that surface's colors are the neutral utilization band. The brackets
+carry over, and there they are the *only* channel for the horizon: that column never tints.
 
 **It does not appear there yet.** `stats` is a structurally offline reader: it is a pure
 function of the sample store and the daemon's own event log, and never queries a running
@@ -1038,7 +1058,7 @@ classifying it for the [`EXPIRY` column](#the-refresh-token-deadline-expiry).
 
 | Key | Meaning | Range | Default |
 |-----|---------|-------|---------|
-| `expiry_horizon_secs` | Seconds of lookahead over `refreshTokenExpiresAt`. A deadline falling inside this window classifies as *within* the horizon (the yellow band); one further out classifies as *beyond* it (dimmed). | `86_400..=7_776_000` (one day to ninety days) | `604800` (seven days) |
+| `expiry_horizon_secs` | Seconds of lookahead over `refreshTokenExpiresAt`. A deadline falling inside this window classifies as *within* the horizon (bracketed, `[6d21h]`, and tinted yellow); one further out classifies as *beyond* it (bare, and dimmed). | `86_400..=7_776_000` (one day to ninety days) | `604800` (seven days) |
 
 This bounds the **lookahead only** — it is emphatically not an assumed refresh-token
 lifetime. The daemon always reads the deadline from the credential and never infers one
