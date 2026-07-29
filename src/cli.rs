@@ -6567,6 +6567,8 @@ spare  22222222-2222\n\
             refresh_health: None,
             health: None,
             blind_active: None,
+            // The #882 expiry modifier has no CLI cell yet (issue #883 owns it) — inert here.
+            expiry: None,
         }
     }
 
@@ -6595,6 +6597,7 @@ spare  22222222-2222\n\
             refresh_health: None,
             health: None,
             blind_active: None,
+            expiry: None,
         }
     }
 
@@ -10587,6 +10590,8 @@ spare  22222222-2222\n\
                 refresh_health: None,
                 health: None,
                 blind_active: None,
+                // The #882 expiry modifier has no CLI cell yet (issue #883 owns it) — inert here.
+                expiry: None,
             }
         }
 

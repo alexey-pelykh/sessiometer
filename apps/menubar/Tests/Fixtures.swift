@@ -40,7 +40,7 @@ enum Fixtures {
     /// the canonical frame the Rust `parse_watch_frame` test decodes. One account, session 60,
     /// weekly 10, all-default flags, `auth` = the default `healthy`, `next_swap` null.
     static let snapshotBasic = #"""
-    {"type":"snapshot","schema_version":{"major":1,"minor":11},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null}
+    {"type":"snapshot","schema_version":{"major":1,"minor":12},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null}
     """#
 
     /// The basic frame but with `next_swap` = target carrying the #393 structured reason
@@ -49,7 +49,7 @@ enum Fixtures {
     /// cross-language byte-drift guard (#340). The basic golden's `next_swap` is null, so without
     /// this the `NextSwap.target` `reason` would have NO byte coverage.
     static let snapshotNextSwap = #"""
-    {"type":"snapshot","schema_version":{"major":1,"minor":11},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":{"state":"target","to":"spare","reason":{"kind":"soonest_reset","resets_at":1893800000}},"refresh_enabled":false,"systemic_refresh_failure":null}
+    {"type":"snapshot","schema_version":{"major":1,"minor":12},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":{"state":"target","to":"spare","reason":{"kind":"soonest_reset","resets_at":1893800000}},"refresh_enabled":false,"systemic_refresh_failure":null}
     """#
 
     /// `next_swap` = target with the #393 `roster_order` reason: ≥2 accounts qualified but none
@@ -59,14 +59,14 @@ enum Fixtures {
     /// cannot cover. (An UNKNOWN `kind`, by contrast, degrades to `reason: nil` — issue #412,
     /// `snapshotUnknownReasonKind` — rather than failing the frame.)
     static let snapshotRosterOrderTarget = #"""
-    {"type":"snapshot","schema_version":{"major":1,"minor":11},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":{"state":"target","to":"spare","reason":{"kind":"roster_order"}},"refresh_enabled":false,"systemic_refresh_failure":null}
+    {"type":"snapshot","schema_version":{"major":1,"minor":12},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":{"state":"target","to":"spare","reason":{"kind":"roster_order"}},"refresh_enabled":false,"systemic_refresh_failure":null}
     """#
 
     /// `next_swap` = target with the #393 `only_candidate` reason (personal is the lone viable
     /// spare — work is active), two accounts. Exercises `auth` at_risk + unknown, `refresh_health`
     /// present + null, `session_pct`/resets/expires present + null, `refresh_enabled` true.
     static let snapshotRichTarget = #"""
-    {"type":"snapshot","schema_version":{"major":1,"minor":11},"generated_at":1893456000,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":30,"weekly_pct":20,"session_resets_at":1893460000,"weekly_resets_at":1893800000,"weekly_exhausted":false,"access_expires_at":1893470000,"refresh_health":{"last_ok":true,"rotated":true,"consecutive_failures":0},"auth":"at_risk"},{"label":"personal","active":false,"enabled":true,"quarantined":false,"recovering":false,"session_pct":null,"weekly_pct":null,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"unknown"}],"next_swap":{"state":"target","to":"personal","reason":{"kind":"only_candidate"}},"refresh_enabled":true,"systemic_refresh_failure":null}
+    {"type":"snapshot","schema_version":{"major":1,"minor":12},"generated_at":1893456000,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":30,"weekly_pct":20,"session_resets_at":1893460000,"weekly_resets_at":1893800000,"weekly_exhausted":false,"access_expires_at":1893470000,"refresh_health":{"last_ok":true,"rotated":true,"consecutive_failures":0},"auth":"at_risk"},{"label":"personal","active":false,"enabled":true,"quarantined":false,"recovering":false,"session_pct":null,"weekly_pct":null,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"unknown"}],"next_swap":{"state":"target","to":"personal","reason":{"kind":"only_candidate"}},"refresh_enabled":true,"systemic_refresh_failure":null}
     """#
 
     /// `next_swap` = no_viable_target carrying the #405 fleet-capacity RELIEF: a weekly-exhausted,
@@ -74,7 +74,7 @@ enum Fixtures {
     /// reset (this lone account's `weekly_resets_at`). The renderer then reads "Out of capacity …
     /// resets in ⟨dur⟩ · add an account" rather than a content-free "no viable target".
     static let snapshotNoViable = #"""
-    {"type":"snapshot","schema_version":{"major":1,"minor":11},"generated_at":1893456100,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":95,"weekly_pct":100,"session_resets_at":1893460500,"weekly_resets_at":1893800500,"weekly_exhausted":true,"access_expires_at":1893470500,"refresh_health":{"last_ok":false,"rotated":false,"consecutive_failures":2},"auth":"stale"}],"next_swap":{"state":"no_viable_target","cause":"weekly","resets_at":1893800500},"refresh_enabled":true,"systemic_refresh_failure":null}
+    {"type":"snapshot","schema_version":{"major":1,"minor":12},"generated_at":1893456100,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":95,"weekly_pct":100,"session_resets_at":1893460500,"weekly_resets_at":1893800500,"weekly_exhausted":true,"access_expires_at":1893470500,"refresh_health":{"last_ok":false,"rotated":false,"consecutive_failures":2},"auth":"stale"}],"next_swap":{"state":"no_viable_target","cause":"weekly","resets_at":1893800500},"refresh_enabled":true,"systemic_refresh_failure":null}
     """#
 
     /// A pre-#405 daemon (minor 2): `next_swap` = no_viable_target WITHOUT the `cause`/`resets_at`
@@ -88,7 +88,7 @@ enum Fixtures {
 
     /// `next_swap` = awaiting_data; a quarantined dead account with no usage.
     static let snapshotAwaitingDead = #"""
-    {"type":"snapshot","schema_version":{"major":1,"minor":11},"generated_at":1893456200,"accounts":[{"label":"work","active":false,"enabled":true,"quarantined":true,"recovering":false,"session_pct":null,"weekly_pct":null,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"dead"}],"next_swap":{"state":"awaiting_data"},"refresh_enabled":false,"systemic_refresh_failure":null}
+    {"type":"snapshot","schema_version":{"major":1,"minor":12},"generated_at":1893456200,"accounts":[{"label":"work","active":false,"enabled":true,"quarantined":true,"recovering":false,"session_pct":null,"weekly_pct":null,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"dead"}],"next_swap":{"state":"awaiting_data"},"refresh_enabled":false,"systemic_refresh_failure":null}
     """#
 
     /// A quarantined-but-refreshable account carrying the NON-TERMINAL `"auth":"degraded"` verdict
@@ -96,14 +96,14 @@ enum Fixtures {
     /// The client MUST decode it (a value it cannot read is a hard decode error — a menubar that
     /// rejected `degraded` would blank on exactly the account this fix exists to render honestly).
     static let snapshotDegraded = #"""
-    {"type":"snapshot","schema_version":{"major":1,"minor":11},"generated_at":1893456300,"accounts":[{"label":"work","active":false,"enabled":true,"quarantined":true,"recovering":false,"session_pct":null,"weekly_pct":null,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"degraded"}],"next_swap":{"state":"awaiting_data"},"refresh_enabled":false,"systemic_refresh_failure":null}
+    {"type":"snapshot","schema_version":{"major":1,"minor":12},"generated_at":1893456300,"accounts":[{"label":"work","active":false,"enabled":true,"quarantined":true,"recovering":false,"session_pct":null,"weekly_pct":null,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"degraded"}],"next_swap":{"state":"awaiting_data"},"refresh_enabled":false,"systemic_refresh_failure":null}
     """#
 
     /// A schema-supported snapshot with ZERO accounts — the real first-run / empty-roster frame the
     /// daemon emits before any account is captured (B-014). Supported major, so it is a DISTINCT
     /// "connected but empty" state, NOT the pre-freeze / unsupported empty snapshots below.
     static let snapshotEmptyRoster = #"""
-    {"type":"snapshot","schema_version":{"major":1,"minor":11},"generated_at":100,"accounts":[],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null}
+    {"type":"snapshot","schema_version":{"major":1,"minor":12},"generated_at":100,"accounts":[],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null}
     """#
 
     /// The daemon-level `canonical_scrub` = `exhausted` rollup (issue #516): the shared canonical is
@@ -113,7 +113,7 @@ enum Fixtures {
     /// byte-drift guard (#340) — the basic golden omits `canonical_scrub` (healthy), so without this
     /// the rollup would have NO byte coverage. Built as the basic frame with the scrub field set.
     static let snapshotCanonicalScrubExhausted = #"""
-    {"type":"snapshot","schema_version":{"major":1,"minor":11},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null,"canonical_scrub":{"state":"exhausted"}}
+    {"type":"snapshot","schema_version":{"major":1,"minor":12},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null,"canonical_scrub":{"state":"exhausted"}}
     """#
 
     /// The `canonical_scrub` = `recovering` rollup (issue #516): the canonical is scrubbed but the
@@ -122,7 +122,7 @@ enum Fixtures {
     /// client decodes the OTHER known `state` the daemon emits to its own case, which one golden cannot
     /// cover (mirrors `snapshotRosterOrderTarget` for the #393 reason variants).
     static let snapshotCanonicalScrubRecovering = #"""
-    {"type":"snapshot","schema_version":{"major":1,"minor":11},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null,"canonical_scrub":{"state":"recovering"}}
+    {"type":"snapshot","schema_version":{"major":1,"minor":12},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null,"canonical_scrub":{"state":"recovering"}}
     """#
 
     /// The daemon-level `keychain_locked` = `true` flag (issue #498): the macOS login keychain is
@@ -135,7 +135,7 @@ enum Fixtures {
     /// the `"keychain_locked":true` discriminant decode coverage (mirrors
     /// `snapshotCanonicalScrubRecovering`). Built as the basic frame with the flag set.
     static let snapshotKeychainLocked = #"""
-    {"type":"snapshot","schema_version":{"major":1,"minor":11},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null,"keychain_locked":true}
+    {"type":"snapshot","schema_version":{"major":1,"minor":12},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null,"keychain_locked":true}
     """#
 
     /// The daemon-level `systemic_refresh_failure` count (issue #378): the refresh MECHANISM is down — 3
@@ -150,7 +150,7 @@ enum Fixtures {
     /// — the episode's opening bracket, beside the count it qualifies. Carries only the count and that
     /// fixed-token class, never a token or path (issue #15).
     static let snapshotSystemicRefreshFailure = #"""
-    {"type":"snapshot","schema_version":{"major":1,"minor":11},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":true,"systemic_refresh_failure":3,"systemic_refresh_source":"sweep"}
+    {"type":"snapshot","schema_version":{"major":1,"minor":12},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":true,"systemic_refresh_failure":3,"systemic_refresh_source":"sweep"}
     """#
 
     /// The SAME mechanism-down verdict opened by the OTHER bracket (issue #813): a startup preflight that
@@ -161,7 +161,7 @@ enum Fixtures {
     /// count and asserted "1 consecutive sweep failed" over an episode in which ZERO sweeps had run.
     /// Pairs with `snapshotSystemicRefreshFailure` as the two arms the renderers must split on.
     static let snapshotSystemicRefreshPreflight = #"""
-    {"type":"snapshot","schema_version":{"major":1,"minor":11},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":true,"systemic_refresh_failure":1,"systemic_refresh_source":"preflight"}
+    {"type":"snapshot","schema_version":{"major":1,"minor":12},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":true,"systemic_refresh_failure":1,"systemic_refresh_source":"preflight"}
     """#
 
     /// A PRE-#813 daemon reporting a mechanism-down episode (minor 10): the count WITHOUT the
@@ -183,7 +183,7 @@ enum Fixtures {
     /// hand-built frame gives the `drift` decode coverage (mirrors `snapshotKeychainLocked`). Operator LABELS
     /// only, never a token or email (issue #15).
     static let snapshotCanaryDriftRefusing = #"""
-    {"type":"snapshot","schema_version":{"major":1,"minor":11},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null,"canary":{"verdict":"drift","displayed":"work","matched":"personal","overridden":false}}
+    {"type":"snapshot","schema_version":{"major":1,"minor":12},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null,"canary":{"verdict":"drift","displayed":"work","matched":"personal","overridden":false}}
     """#
 
     /// The `drift` verdict WITH `canary_drift_override` set (issue #714): the identity drift stands, but the
@@ -192,7 +192,7 @@ enum Fixtures {
     /// the (fault, VARIANT) split from the refusing drift at rank 3. Hand-built to the current contract, like
     /// `snapshotCanaryDriftRefusing`.
     static let snapshotCanaryDriftOverridden = #"""
-    {"type":"snapshot","schema_version":{"major":1,"minor":11},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null,"canary":{"verdict":"drift","displayed":"work","matched":"personal","overridden":true}}
+    {"type":"snapshot","schema_version":{"major":1,"minor":12},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null,"canary":{"verdict":"drift","displayed":"work","matched":"personal","overridden":true}}
     """#
 
     /// The `ambiguous` verdict (issue #714): the fresh keychain resolution found MORE THAN ONE matching item
@@ -200,7 +200,7 @@ enum Fixtures {
     /// canary alarm, surfaced at rank 4 (`.error`). Carries only the COUNT, never a token (issue #15).
     /// Hand-built to the current contract, like `snapshotCanaryDriftRefusing`.
     static let snapshotCanaryAmbiguous = #"""
-    {"type":"snapshot","schema_version":{"major":1,"minor":11},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null,"canary":{"verdict":"ambiguous","count":2}}
+    {"type":"snapshot","schema_version":{"major":1,"minor":12},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null,"canary":{"verdict":"ambiguous","count":2}}
     """#
 
     /// The `refused_unparseable_canonical` verdict (issues #730/#738, wire since schema 1.10): the resolved
@@ -211,7 +211,7 @@ enum Fixtures {
     /// refused while the panel showed nothing — the bug this fixture pins closed. Hand-built to the current
     /// contract, like `snapshotCanaryDriftRefusing`.
     static let snapshotCanaryRefusedUnparseableCanonical = #"""
-    {"type":"snapshot","schema_version":{"major":1,"minor":11},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null,"canary":{"verdict":"refused_unparseable_canonical"}}
+    {"type":"snapshot","schema_version":{"major":1,"minor":12},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null,"canary":{"verdict":"refused_unparseable_canonical"}}
     """#
 
     /// The `ok` verdict (issue #714): the canary's positive identity pass — a QUIET verdict that decodes to
@@ -219,7 +219,7 @@ enum Fixtures {
     /// alarm (contrast the ALARM fixtures above), and that the field decodes on a frame the current daemon
     /// really emits once a canary run concludes clean. Hand-built to the current contract.
     static let snapshotCanaryOk = #"""
-    {"type":"snapshot","schema_version":{"major":1,"minor":11},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null,"canary":{"verdict":"ok"}}
+    {"type":"snapshot","schema_version":{"major":1,"minor":12},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null,"canary":{"verdict":"ok"}}
     """#
 
     /// The active account's bounded-blindness projection (issues #479/#485) — auto-protection OK. The
@@ -229,7 +229,7 @@ enum Fixtures {
     /// NOT byte-pinned — the goldens cover non-blind frames that omit the key (`skip_serializing_if`), so a
     /// non-blind frame stays byte-unchanged; this hand-built frame gives `blind_active` decode coverage.
     static let snapshotBlindActiveOK = #"""
-    {"type":"snapshot","schema_version":{"major":1,"minor":11},"generated_at":1893456000,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":null,"weekly_pct":null,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy","blind_active":{"blind_secs":240,"last_known_session_pct":64,"auto_protection_degraded":false}},{"label":"spare","active":false,"enabled":true,"quarantined":false,"recovering":false,"session_pct":20,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":{"state":"target","to":"spare","reason":{"kind":"soonest_reset","resets_at":1893800000}},"refresh_enabled":true,"systemic_refresh_failure":null}
+    {"type":"snapshot","schema_version":{"major":1,"minor":12},"generated_at":1893456000,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":null,"weekly_pct":null,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy","blind_active":{"blind_secs":240,"last_known_session_pct":64,"auto_protection_degraded":false}},{"label":"spare","active":false,"enabled":true,"quarantined":false,"recovering":false,"session_pct":20,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":{"state":"target","to":"spare","reason":{"kind":"soonest_reset","resets_at":1893800000}},"refresh_enabled":true,"systemic_refresh_failure":null}
     """#
 
     /// The blind projection with ADR-0017 auto-protection DEGRADED (`auto_protection_degraded: true`) — the
@@ -237,12 +237,30 @@ enum Fixtures {
     /// band). Non-cornered (a viable `spare` remains), so the glance escalates to `.attention`, NOT
     /// `.noRunway`. 23m blind, last-known 87%.
     static let snapshotBlindActiveDegraded = #"""
-    {"type":"snapshot","schema_version":{"major":1,"minor":11},"generated_at":1893456000,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":null,"weekly_pct":null,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy","blind_active":{"blind_secs":1380,"last_known_session_pct":87,"auto_protection_degraded":true}},{"label":"spare","active":false,"enabled":true,"quarantined":false,"recovering":false,"session_pct":20,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":{"state":"target","to":"spare","reason":{"kind":"soonest_reset","resets_at":1893800000}},"refresh_enabled":true,"systemic_refresh_failure":null}
+    {"type":"snapshot","schema_version":{"major":1,"minor":12},"generated_at":1893456000,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":null,"weekly_pct":null,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy","blind_active":{"blind_secs":1380,"last_known_session_pct":87,"auto_protection_degraded":true}},{"label":"spare","active":false,"enabled":true,"quarantined":false,"recovering":false,"session_pct":20,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":{"state":"target","to":"spare","reason":{"kind":"soonest_reset","resets_at":1893800000}},"refresh_enabled":true,"systemic_refresh_failure":null}
+    """#
+
+    /// The per-account REFRESH-token expiry modifier (issue #882, schema 1.12) — a real CURRENT-daemon
+    /// frame carrying the `expiry` object this build does not yet mirror. `work` is inside the operator's
+    /// foresight horizon (`within`, deadline carried), `spare` was polled but its credential held no
+    /// parseable `refreshTokenExpiresAt` (`unknown` with a NULL deadline — which means "no deadline
+    /// observed", NEVER "not expiring", the issue #137 invariant).
+    ///
+    /// NOT byte-pinned — the goldens build their reading with `expiry: None`, so a never-polled row omits
+    /// the key (`skip_serializing_if`) and the goldens' per-account bytes are unchanged by 1.12. That is
+    /// exactly why this fixture exists: it is the shape a SHIPPED 1.12 daemon puts in front of a menubar
+    /// build predating the mirror. Decoding it must not cost the frame — the additive-minor
+    /// tolerate-by-ignoring contract, here for a nested OBJECT rather than the scalar
+    /// `snapshotUnknownAdditiveFields` covers. `WireModel.swift` gains the `expiry` property with the
+    /// panel surface (issue #884), mirroring how `blind_active` landed under #485 rather than the #479
+    /// wire item; until then this pins the tolerance, not a rendering.
+    static let snapshotExpiryModifier = #"""
+    {"type":"snapshot","schema_version":{"major":1,"minor":12},"generated_at":1893456000,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":30,"weekly_pct":20,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":1893470000,"refresh_health":{"last_ok":true,"rotated":false,"consecutive_failures":0},"auth":"healthy","expiry":{"expires_at":1893800000,"horizon_state":"within"}},{"label":"spare","active":false,"enabled":true,"quarantined":false,"recovering":false,"session_pct":20,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy","expiry":{"expires_at":null,"horizon_state":"unknown"}}],"next_swap":{"state":"target","to":"spare","reason":{"kind":"only_candidate"}},"refresh_enabled":true,"systemic_refresh_failure":null}
     """#
 
     /// `encode_heartbeat_frame(42)` — the canonical beat the Rust test decodes.
     static let heartbeatBasic = #"""
-    {"type":"heartbeat","generated_at":42,"schema_version":{"major":1,"minor":11}}
+    {"type":"heartbeat","generated_at":42,"schema_version":{"major":1,"minor":12}}
     """#
 
     /// The daemon `stats` socket reply (issue #356) — the bounded per-account daily series the panel
@@ -340,11 +358,11 @@ enum Fixtures {
 
     /// An unknown `canonical_scrub` state (issue #516) — like `next_swap.state`, the daemon's
     /// internally-tagged enum rejects a variant it does not know, so the client must too (a hard decode
-    /// error, NOT a tolerated unknown — a mis-rendered fleet state is dangerous). Minor 9 marks a NEWER
-    /// daemon than this build (minor 8 is real as of issue #613) that added a `canonical_scrub` variant this
-    /// client cannot read.
+    /// error, NOT a tolerated unknown — a mis-rendered fleet state is dangerous). Carried at the CURRENT
+    /// minor and swept forward with the other current-daemon fixtures: what it pins is the unknown TOKEN,
+    /// not any particular contract version, so the version is incidental here.
     static let snapshotUnknownCanonicalScrub = #"""
-    {"type":"snapshot","schema_version":{"major":1,"minor":11},"generated_at":1,"accounts":[],"next_swap":null,"refresh_enabled":false,"canonical_scrub":{"state":"future_state"}}
+    {"type":"snapshot","schema_version":{"major":1,"minor":12},"generated_at":1,"accounts":[],"next_swap":null,"refresh_enabled":false,"canonical_scrub":{"state":"future_state"}}
     """#
 
     /// An unknown `canary` verdict (issue #714) — like `canonical_scrub.state` / `next_swap.state`, the
@@ -353,7 +371,7 @@ enum Fixtures {
     /// last-known render, strictly safer than silently decoding a newer daemon's alarm to `nil` = a false "all
     /// clear". Contrast the tolerated-decoration posture of an unknown `reason.kind` (`snapshotUnknownReasonKind`).
     static let snapshotUnknownCanary = #"""
-    {"type":"snapshot","schema_version":{"major":1,"minor":11},"generated_at":1,"accounts":[],"next_swap":null,"refresh_enabled":false,"canary":{"verdict":"future_verdict"}}
+    {"type":"snapshot","schema_version":{"major":1,"minor":12},"generated_at":1,"accounts":[],"next_swap":null,"refresh_enabled":false,"canary":{"verdict":"future_verdict"}}
     """#
 
     /// An unknown `auth` value — rejected (mirrors serde's unknown-variant error).

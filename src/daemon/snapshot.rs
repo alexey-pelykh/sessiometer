@@ -389,10 +389,8 @@ pub(crate) struct AccountReading {
     /// account is routinely [`CredentialHealth::Healthy`] while its refresh token is
     /// [`ExpiryHorizon::Within`] the horizon.
     ///
-    /// Computed in [`Daemon::snapshot`] by [`account_expiry`]. Daemon-internal: projecting it onto
-    /// the versioned wire is issue #882's job, so the field is WRITTEN by the snapshot and READ
-    /// only by the tests that pin its classification until #882's surfaces land.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Computed in [`Daemon::snapshot`] by [`account_expiry`] and copied straight to the wire
+    /// ([`AccountStatusLine::expiry`], issue #882).
     pub(crate) expiry: Option<AccountExpiry>,
 }
 
@@ -474,9 +472,17 @@ pub(crate) struct SchemaVersion {
 /// `skip_serializing_if`) omitted entirely while the mechanism is healthy — so a healthy frame's
 /// bytes are unchanged AND an episode frame keeps the exact count an older client already renders.
 /// A pre-#813 client ignores the unknown key (the minor-bump tolerate-by-ignoring convention).
+/// `1.12` ADDED the per-account [`AccountStatusLine::expiry`] REFRESH-token expiry modifier
+/// ([`AccountExpiry`], issue #882) — the observed `refreshTokenExpiresAt` deadline plus its
+/// [`ExpiryHorizon`] classification against `[credential].expiry_horizon_secs`, so the menubar and
+/// `status` can warn BEFORE a refresh token lapses instead of after. Takes `blind_active`'s
+/// per-account omit-when-absent pattern: optional and (via `skip_serializing_if`) omitted entirely
+/// until an account has been polled, so an unpolled row's per-line bytes are unchanged. ORTHOGONAL
+/// to the `auth` rollup rather than a variant of it (the ADR-0017 modifier posture) — an account is
+/// routinely healthy AND inside its expiry horizon. A pre-#882 client ignores the unknown key.
 pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion {
     major: 1,
-    minor: 11,
+    minor: 12,
 };
 
 /// The control socket's `status` reply PAYLOAD — handles + percentages + the forward-looking
@@ -720,6 +726,51 @@ pub(crate) struct AccountStatusLine {
     /// unknown key, the minor-bump tolerate-by-ignoring convention). Non-secret (issue #15).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) blind_active: Option<BlindActive>,
+    /// This account's REFRESH-token expiry MODIFIER ([`AccountExpiry`], issue #882): the observed
+    /// `refreshTokenExpiresAt` deadline plus its [`ExpiryHorizon`] classification against the
+    /// operator's `[credential].expiry_horizon_secs` foresight window — or absent until the account
+    /// has been POLLED at all.
+    ///
+    /// ORTHOGONAL to [`health`](Self::health) and never folded into it — an account is routinely
+    /// [`CredentialHealth::Healthy`] *right now* while its refresh token is already
+    /// [`ExpiryHorizon::Within`] the horizon, so the two are INDEPENDENT cells. [`AccountExpiry`]
+    /// carries the full ADR-0017 modifier-rather-than-a-new-auth-state rationale.
+    ///
+    /// `Option` + `#[serde(default, skip_serializing_if = "Option::is_none")]` per the added-field
+    /// convention (the MINOR [`STATUS_SCHEMA_VERSION`] bump 1.11 → 1.12, mirroring `blind_active`):
+    /// a pre-#882 daemon omits the field → `None`, AND a never-polled account omits it entirely, so
+    /// an unpolled row's wire bytes are byte-for-byte unchanged (a pre-#882 client ignores the
+    /// unknown key, the minor-bump tolerate-by-ignoring convention).
+    ///
+    /// Absent is "never observed", NOT "not expiring" — and neither is
+    /// [`ExpiryHorizon::Unknown`], which is what a POLLED account whose credential carried no
+    /// deadline reports (issue #137). Only [`ExpiryHorizon::Beyond`] means "further out than the
+    /// horizon". Non-secret — one timestamp and one classification, never a token or email
+    /// (issue #15).
+    ///
+    /// Tolerance is ASYMMETRIC between that unknown key and an unknown TOKEN inside it:
+    /// [`ExpiryHorizon`] has no catch-all variant, so a LATER minor adding a fifth classification
+    /// costs a client built before it the whole [`VersionedStatus`] decode rather than one cell —
+    /// the hard reject every RUST decoder of this wire takes, none of these enums carrying a
+    /// `#[serde(other)]` catch-all. Harmless in the two internal readers (`poke` and `use_account`
+    /// both swallow any decode error into a benign fall-back), NOT in [`crate::cli`]'s
+    /// `gate_status`, where the matching major bypasses the visible schema-mismatch degrade. The
+    /// menubar's posture is deliberately SPLIT rather than uniform, so the #884 mirror has a real
+    /// choice to make: an unknown `canonical_scrub.state` / `next_swap.state` / `canary.verdict`
+    /// rejects, while an unknown `next_swap.reason.kind` degrades to `nil` (issue #412) and an
+    /// unknown `systemic_refresh_source` to `unrecognized` (issue #813) — the rule being whether
+    /// the unknown value IS the fault or only decorates one that decodes fine. Either way that
+    /// variant earns the minor bump a client COULD gate on, as
+    /// [`CanaryStatus::RefusedUnparseableCanonical`] earned one at `1.10` for the same asymmetry.
+    /// Nothing gates on the minor today: `gate_status` and the menubar's
+    /// `WireContract.isSupported` both key on the MAJOR alone.
+    ///
+    /// A partial `expiry` OBJECT is the one case that degrades instead of throwing: `horizon_state`
+    /// defaults to the fail-safe [`ExpiryHorizon::Unknown`] (see
+    /// [`AccountExpiry::horizon_state`]), deliberately unlike [`BlindActive`], whose fields have no
+    /// honest default and so throw.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) expiry: Option<AccountExpiry>,
 }
 
 /// The next swap candidate shown by `status` (issue #88): who the daemon would
@@ -869,6 +920,11 @@ pub(crate) fn status_response(snapshot: &StatusSnapshot) -> StatusResponse {
                 // `Daemon::snapshot`; copied straight to the wire. `None` for every non-active or
                 // non-blind account, so `skip_serializing_if` omits it there.
                 blind_active: account.blind_active,
+                // The refresh-token expiry modifier (issue #882), classified daemon-side in
+                // `Daemon::snapshot` by `account_expiry`; copied straight to the wire. `None` until
+                // the account has been polled at all, so `skip_serializing_if` omits it there — and
+                // that absence means "never observed", never "not expiring" (issue #137).
+                expiry: account.expiry,
             })
             .collect(),
         // Already computed at snapshot build (issue #88); copy it to the wire.
@@ -1016,13 +1072,13 @@ pub(crate) fn credential_health(
 /// (and typically is) `Healthy` **and** `Within` its expiry horizon at the same time, which is
 /// precisely the case the operator needs to see and which no single ordinal ladder can express.
 ///
-/// DAEMON-INTERNAL for now: computed in [`Daemon::snapshot`] and carried on [`AccountReading`],
-/// which is not `Serialize`. Projecting it onto the versioned wire ([`AccountStatusLine`]) is
-/// issue #882's job, together with the [`STATUS_SCHEMA_VERSION`] bump and the lockstep Swift
-/// fixtures; nothing here touches that contract.
+/// ONE type for both the daemon-internal reading ([`AccountReading::expiry`]) and the wire
+/// ([`AccountStatusLine::expiry`], issue #882) — the same single-type posture [`BlindActive`] and
+/// [`RefreshHealth`] take, and safe for the same reason: every field is already non-secret, so
+/// there is nothing a wire-local twin would have to redact.
 ///
 /// Non-secret: one timestamp, one classification, and a group id — never a token or email (#15).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub(crate) struct AccountExpiry {
     /// The observed `refreshTokenExpiresAt` deadline as epoch SECONDS (converted from the
     /// credential's milliseconds at the read boundary, as [`AccountReading::access_expires_at`] is),
@@ -1030,16 +1086,38 @@ pub(crate) struct AccountExpiry {
     ///
     /// `None` here ALWAYS pairs with [`ExpiryHorizon::Unknown`] in
     /// [`horizon_state`](Self::horizon_state): [`account_expiry`] admits no other combination.
+    ///
+    /// Emitted as an explicit `null` rather than omitted: inside a PRESENT `expiry` object, "polled
+    /// and the credential carried no deadline" is a positive observation, not a missing key.
+    #[serde(default)]
     pub(crate) expires_at: Option<i64>,
     /// Where [`expires_at`](Self::expires_at) sits relative to the operator's configured horizon.
     /// [`ExpiryHorizon::Unknown`] whenever no deadline was observed — never "not expiring" (the
     /// issue #137 invariant).
+    #[serde(default)]
     pub(crate) horizon_state: ExpiryHorizon,
     /// The synchronized-expiry COHORT this account belongs to, once cohort detection exists.
     ///
     /// Always `None` here: grouping deadlines into cohorts is issue #879's job. The field is
     /// carried now so that item adds a populator rather than re-shaping this type and every
     /// consumer of it. A `None` means "not grouped", never "alone".
+    ///
+    /// `skip_serializing_if` keeps it OFF the wire entirely while it is unpopulatable, so issue
+    /// #882 ships exactly the two facts it owns — the classification and the deadline — and #879's
+    /// populator makes the key APPEAR rather than flipping a shipped `null` that promised a grouping
+    /// no build could produce.
+    ///
+    /// **That appearance is a wire-contract change and owes the full ritual**: a MINOR
+    /// [`STATUS_SCHEMA_VERSION`] bump, a regeneration of the four `build/fixtures/wire-*.json`
+    /// goldens, and the current-daemon Swift fixture lockstep — the same debt every other additive
+    /// field here paid. Do not read "additive" as "free", and do not expect a gate to say so: all
+    /// four goldens carry `expiry: None`, so populating this leaves them byte-identical and the
+    /// golden pin stays green. Nor does the `assert!(!frame.contains("cohort_id"))` in
+    /// `account_line_encodes_the_expiry_modifier_only_once_the_account_has_been_polled` close the
+    /// gap — that test hand-builds its own `AccountExpiry`, so what it pins is only that a `None`
+    /// cohort stays OFF the wire; a populator added upstream leaves it green. This comment is the
+    /// whole reminder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cohort_id: Option<u32>,
 }
 

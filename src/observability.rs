@@ -379,9 +379,13 @@ impl CredentialHealth {
 /// same issue #15 discipline as [`CredentialHealth`].
 ///
 /// The `snake_case` serde rename mirrors [`CredentialHealth`]'s, so the tokens an event log and a
-/// `--json` field would carry agree by construction once issue #880 emits the horizon-entry Event
-/// and issue #882 puts the modifier on the wire. This item stops at daemon-internal state, so it
-/// deliberately ships no `as_str` renderer — the consumer that needs one brings it.
+/// `--json` field carry agree by construction. Issue #882 has since put the modifier on the
+/// `status`/`watch` wire ([`AccountStatusLine::expiry`](crate::daemon::AccountStatusLine),
+/// schema 1.12), and these renames ARE those wire tokens — pinned by
+/// `account_line_encodes_the_expiry_modifier_only_once_the_account_has_been_polled`, so respelling a
+/// variant here is a wire-contract change, not a local edit. Issue #880 will emit the horizon-entry
+/// Event against the same vocabulary. Still no `as_str` renderer: serde is the only projection any
+/// consumer has needed so far — the one that needs a different rendering brings it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ExpiryHorizon {
