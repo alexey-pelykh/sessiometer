@@ -22,17 +22,17 @@ use unicode_width::UnicodeWidthStr;
 use crate::claude_state::OauthAccount;
 use crate::config::{Account, Config, ConflictPolicy, Origin, OriginReport};
 use crate::daemon::{
-    emit_best_effort, run_loop, AccountStatusLine, BlindActive, CanaryStatus, CanonicalScrub,
-    Daemon, ExternalLoginWatcher, InstanceLock, NextSwap, NextSwapReason, NoTargetCause, RealClock,
-    RealKeepWarmEngine, RealRosterPoller, RealShutdown, SchemaVersion, StatusResponse,
-    SystemicRefreshSource, UnixControl, VersionedStatus, STATUS_SCHEMA_VERSION,
+    emit_best_effort, run_loop, AccountExpiry, AccountStatusLine, BlindActive, CanaryStatus,
+    CanonicalScrub, Daemon, ExternalLoginWatcher, InstanceLock, NextSwap, NextSwapReason,
+    NoTargetCause, RealClock, RealKeepWarmEngine, RealRosterPoller, RealShutdown, SchemaVersion,
+    StatusResponse, SystemicRefreshSource, UnixControl, VersionedStatus, STATUS_SCHEMA_VERSION,
 };
 use crate::error::{Error, Result};
 use crate::keychain::{Credential, RealCredentialStore};
 use crate::migration::{ManagedAccount, MigrationArtifact, Passphrase, Payload, PLAINTEXT_WARNING};
 use crate::observability::{
-    CredentialHealth, Diagnostic, DiagnosticLog, Event, EventLog, ExportMode, RefreshEventOutcome,
-    Verbosity,
+    CredentialHealth, Diagnostic, DiagnosticLog, Event, EventLog, ExpiryHorizon, ExportMode,
+    RefreshEventOutcome, Verbosity,
 };
 use crate::paths;
 use crate::refresh;
@@ -2248,17 +2248,17 @@ fn management_suffix(managed: bool) -> &'static str {
 ///
 /// Columns, in display order: `account` then the SESSION pair (`session% `
 /// `session-reset`), then the WEEKLY pair (`weekly% ` `weekly-reset`), then the
-/// health-text tags (issue #94). A labelled header row (issue #99) tops the table —
-/// `ACCOUNT`, the grouped `SESSION%` + `RESET`, the grouped `WEEKLY%` + `RESET`, then
-/// `AUTH` — measured into the SAME column widths as the data so the labels line up;
-/// the pairing is also read by adjacency (each `%` sits immediately before its OWN
-/// reset), so the two reset columns share the `RESET` label. A reset's lead gap is a
+/// REFRESH-token `EXPIRY` (issue #883), then the health-text tags (issue #94). A labelled header
+/// row (issue #99) tops the table — `ACCOUNT`, the grouped `SESSION%` + `RESET`, the grouped
+/// `WEEKLY%` + `RESET`, `EXPIRY`, then `AUTH` — measured into the SAME column widths as the data
+/// so the labels line up; the pairing is also read by adjacency (each `%` sits immediately before
+/// its OWN reset), so the two reset columns share the `RESET` label. A reset's lead gap is a
 /// single space (tying it to its `%`); independent columns are two spaces apart. When
-/// the full table is wider than `cols`, the lowest-priority columns drop — the WEEKLY
-/// pair (`weekly%` + `weekly-reset`) FIRST and ATOMICALLY (never a `%` stranded
-/// without its reset), then the health-text column, each taking its own header label
-/// with it — never wrapping a row; `account` + the SESSION pair (the soonest, most
-/// actionable reset) and their labels are always kept. A `None` width (piped /
+/// the full table is wider than `cols`, the lowest-priority columns drop — `EXPIRY` FIRST (the
+/// slowest-moving axis, [`status_columns`]), then the WEEKLY pair (`weekly%` + `weekly-reset`)
+/// ATOMICALLY (never a `%` stranded without its reset), then the health-text column, each taking
+/// its own header label with it — never wrapping a row; `account` + the SESSION pair (the soonest,
+/// most actionable reset) and their labels are always kept. A `None` width (piped /
 /// redirected) keeps the full table, so `status | grep` and `status > file` stay the
 /// complete, greppable surface.
 ///
@@ -2373,13 +2373,24 @@ pub(crate) fn render_status(
 }
 
 /// The `status` table's column set, in display order (issue #94): `account`, then the SESSION
-/// pair (% + its reset), then the WEEKLY pair, then the health-text tags. Each column carries a
-/// lead gap (the spaces BEFORE it): `0` for the first column, `1` to tie a reset tightly to the
-/// `%` it pairs with, `2` between independent columns — so each `%` reads immediately followed by
-/// its own reset, the pairing the header row (issue #99) also labels. A drop priority of `None`
-/// always keeps the column; the WEEKLY pair shares priority 1 so both leave atomically (never a
-/// `%` without its reset); the health-text column is priority 2 (drops next). The health-text
-/// column is included only when some account carries a tag — an all-healthy roster shows none.
+/// pair (% + its reset), then the WEEKLY pair, then the REFRESH-token `EXPIRY` (issue #883), then
+/// the health-text tags. Each column carries a lead gap (the spaces BEFORE it): `0` for the first
+/// column, `1` to tie a reset tightly to the `%` it pairs with, `2` between independent columns —
+/// so each `%` reads immediately followed by its own reset, the pairing the header row (issue #99)
+/// also labels.
+///
+/// A drop priority of `None` always keeps the column; otherwise the LOWEST priority sheds first.
+/// The order is `EXPIRY` (1) → the WEEKLY pair (2, shared so both leave atomically — never a `%`
+/// without its reset) → the health-text `AUTH` column (3). `EXPIRY` sheds FIRST because it is the
+/// SLOWEST-MOVING axis on the row: a server-issued deadline measured in days that no tick can
+/// move, so a narrow terminal loses the least by deferring it — every other column reports a fact
+/// that can flip inside the current session.
+///
+/// Two columns are conditionally present, each on the same empty-column rule: the health-text
+/// column only when some account carries a tag (an all-healthy roster shows none), and `EXPIRY`
+/// only when some account has an OBSERVED deadline. A roster whose credentials carry no
+/// `refreshTokenExpiresAt` — every cell [`EXPIRY_GAP`] — therefore renders exactly as it did
+/// before issue #883, rather than growing a column of em dashes.
 fn status_columns(rows: &[StatusRow]) -> Vec<Column> {
     let mut columns: Vec<Column> = vec![
         Column::keep("ACCOUNT", |row| &row.account, |row| row.account_severity, 0),
@@ -2397,29 +2408,44 @@ fn status_columns(rows: &[StatusRow]) -> Vec<Column> {
         ),
         Column::droppable(
             "WEEKLY%",
-            1,
+            2,
             |row| &row.weekly,
             |row| row.weekly_severity,
             STATUS_COL_GAP,
         ),
         Column::droppable(
             "RESET",
-            1,
+            2,
             |row| &row.weekly_reset,
             |row| row.weekly_reset_severity,
             STATUS_PAIR_GAP,
         ),
     ];
+    if rows.iter().any(|row| row.expiry != EXPIRY_GAP) {
+        // The REFRESH-token expiry modifier (issue #883) — a cell of its OWN, deliberately NOT
+        // folded into `AUTH`: the two axes are orthogonal (issue #878), so an account can be
+        // 🟢 healthy AND days from needing a re-login at the same time. Placed BEFORE `AUTH` so
+        // that column's ragged free-text cue (`claude /login`, `degraded — run 'sessiometer
+        // poke'`) stays last on the line, where its variable length costs nothing.
+        columns.push(Column::droppable(
+            "EXPIRY",
+            1,
+            |row| &row.expiry,
+            |row| row.expiry_severity,
+            STATUS_COL_GAP,
+        ));
+    }
     if rows.iter().any(|row| !row.status.is_empty()) {
         // The AUTH column carries the credential-auth state — the 5-state+Unknown glyph
         // (issue #119/#137) plus its cues (`claude /login` on 🔴, `recovering`, `disabled`);
         // it is never tinted (issue #84) — the glyph is self-coloring and the tags are their
         // own signal, so its severity getter is always `None`. Its header is `AUTH` (issue
         // #143, renamed from the over-general `HEALTH` of issue #99 — this column reports
-        // the credential-AUTH standing, while rate-limit health lives in `SESSION%`/`WEEKLY%`).
+        // the credential-AUTH standing, while rate-limit health lives in `SESSION%`/`WEEKLY%`,
+        // and the credential's forward-looking DEADLINE in `EXPIRY`).
         columns.push(Column::droppable(
             "AUTH",
-            2,
+            3,
             |row| &row.status,
             |_| None,
             STATUS_COL_GAP,
@@ -2429,7 +2455,7 @@ fn status_columns(rows: &[StatusRow]) -> Vec<Column> {
 }
 
 /// Drop the lowest-priority droppable columns until the table fits `cols`. ALL columns sharing
-/// the lowest present priority drop together, so the WEEKLY pair (both priority 1) leaves
+/// the lowest present priority drop together, so the WEEKLY pair (both priority 2) leaves
 /// atomically — never a weekly `%` stranded without its reset. A non-TTY width (`None`) never
 /// enters the loop — the full table is kept.
 fn fit_columns(columns: &mut Vec<Column>, rows: &[StatusRow], cols: Option<usize>) {
@@ -3145,6 +3171,11 @@ struct StatusRow {
     /// when the daemon sent no rollup (a pre-#119 daemon, `health == None`). Empty only for a
     /// pre-#119 daemon with no tags.
     status: String,
+    /// The EXPIRY cell (issue #883): this account's REFRESH-token deadline as a compact
+    /// time-until (`6d21h`), the state word `lapsed`, or [`EXPIRY_GAP`] when none was observed.
+    /// A cell of its OWN — never folded into [`status`](Self::status) — because the expiry axis is
+    /// orthogonal to [`CredentialHealth`] (issue #878). See [`expiry_cell`].
+    expiry: String,
     /// Per-cell urgency for the color overlay (issue #84): each cell carries its OWN
     /// health, so one row can show several independent colors (a red `session` reset
     /// beside a green `weekly` reset, etc.). Each is `None` when its cell has no
@@ -3154,12 +3185,14 @@ struct StatusRow {
     /// [`weekly_cell_severity`] utilization bands on each `%`; each reset its OWN
     /// [`proximity_severity`] (issue #94) — how soon that window flips, independent
     /// of utilization. The health-text column is never tinted (its tags are their own
-    /// signal), so it has no field here.
+    /// signal), so it has no field here; `expiry` IS tinted (issue #883) — its cell is a
+    /// plain duration with no self-colouring glyph, so the band is its only at-a-glance signal.
     account_severity: Option<Severity>,
     session_severity: Option<Severity>,
     session_reset_severity: Option<Severity>,
     weekly_severity: Option<Severity>,
     weekly_reset_severity: Option<Severity>,
+    expiry_severity: Option<Severity>,
 }
 
 impl StatusRow {
@@ -3182,6 +3215,7 @@ impl StatusRow {
             weekly: pct(account.weekly_pct),
             weekly_reset: reset_cell(account.weekly_resets_at, now),
             status: health_cell(account),
+            expiry: expiry_cell(account.expiry, now),
             // Each cell colored by its OWN health (issue #84): `account` → the overall
             // binding-window severity; `session` / `weekly` `%` → each window's own
             // utilization bands (weekly honoring the exhaustion override); each reset →
@@ -3198,6 +3232,7 @@ impl StatusRow {
             session_reset_severity: proximity_severity(account.session_resets_at, now),
             weekly_severity: weekly_cell_severity(account),
             weekly_reset_severity: proximity_severity(account.weekly_resets_at, now),
+            expiry_severity: expiry_severity(account.expiry, now),
         }
     }
 }
@@ -3655,6 +3690,137 @@ fn reset_cell(reset_at: Option<i64>, now: i64) -> String {
     }
 }
 
+/// The gap sentinel for the REFRESH-token expiry cell (issue #883): an em dash, DELIBERATELY not
+/// the `n/a` the sibling `status` cells use, because the two absences are different facts.
+///
+/// `n/a` in [`reset_cell`] / [`pct`] means *this poll produced no reading* — a transient read
+/// failure. `—` here is the absence that must NOT be filed under that: chiefly the account WAS
+/// read and the credential carried no parseable `refreshTokenExpiresAt` at all
+/// ([`ExpiryHorizon::Unknown`]) — a positive observation of absence, the issue #137 invariant. The
+/// same cell also stands in when the wire carries no modifier at all (a pre-#882 daemon, an
+/// unpolled account; see [`expiry_view`]), because the operator-facing fact is identical: no
+/// deadline is known here. Rendering EITHER as anything an operator could mistake for "fine" is the
+/// one failure mode the whole foresight feature exists to avoid, and reusing `n/a` would file the
+/// observed absence under transient failure. Also the gap sentinel `stats`'
+/// `render_account_table` elides a uniformly-empty column on, so ONE spelling serves both surfaces.
+pub(crate) const EXPIRY_GAP: &str = "—";
+
+/// One account's REFRESH-token expiry cell (issue #883) — the operator-facing projection of the
+/// [`AccountExpiry`] modifier issue #882 put on the `status`/`watch` wire.
+///
+/// Rendered as PRESENT-TENSE STATE, never an imperative: a compact time-until (`6d21h`, `29d`,
+/// reusing [`humanize_until`], the same shape the `RESET` cells carry) for an observed deadline,
+/// the bare state word `lapsed` for one already past, and [`EXPIRY_GAP`] when none was observed.
+/// The remedy (`sessiometer login`) is deliberately NOT named here: this cell reports a fact, and
+/// the AUTH cell already owns the actionable cue once the credential actually fails.
+///
+/// ORTHOGONAL to [`CredentialHealth`] and so never folded into [`health_cell`] — an account is
+/// routinely `Healthy` *and* [`ExpiryHorizon::Within`] its horizon at the same time, which is
+/// exactly the case the operator needs to see and which no single ordinal ladder can express
+/// (issue #878).
+///
+/// Distinct from the `--verbose` access-token block ([`render_access_token_expiry`]): that clock is
+/// the ACCESS token Claude Code refreshes invisibly, explicitly *not* a re-login deadline. This one
+/// is the REFRESH token — the login itself — and no refresh moves it.
+///
+/// `expires_at == None` under a non-`Unknown` state is unreachable from [`crate::daemon::account_expiry`],
+/// which admits no such combination; it is still handled rather than unwrapped, because the wire is
+/// `#[serde(default)]`-decoded and a malformed frame must degrade honestly, not panic. Degrading
+/// honestly is NOT uniformly "render a gap": a declared [`ExpiryHorizon::Lapsed`] still reads
+/// `lapsed` without a deadline, since that word never needed one (see [`expiry_view`]).
+///
+/// `pub(crate)` so the `stats` per-account table renders the SAME cell from the SAME code — one
+/// spelling of this FACT across both surfaces, which is what keeps them from drifting. Only the
+/// fact: `status` additionally TINTS the cell ([`expiry_severity`]) while `stats` leaves it
+/// uncoloured, because that surface's colour vocabulary is the neutral utilisation band and an
+/// urgency tint on a credential deadline would editorialise inside it (D-STA-6). Presentation
+/// diverges deliberately; the string cannot.
+pub(crate) fn expiry_cell(expiry: Option<AccountExpiry>, now: i64) -> String {
+    match expiry_view(expiry, now) {
+        ExpiryView::Gap => EXPIRY_GAP.to_owned(),
+        ExpiryView::Lapsed => "lapsed".to_owned(),
+        ExpiryView::Live { at, .. } => humanize_until(at - now),
+    }
+}
+
+/// The colour band for an [`expiry_cell`] (issue #883), following the per-cell overlay discipline
+/// (issue #84): [`Severity::Red`] for a deadline already past (only an operator `sessiometer login`
+/// recovers it), [`Severity::Yellow`] for one [`ExpiryHorizon::Within`] the configured horizon, and
+/// [`Severity::Dim`] for one [`ExpiryHorizon::Beyond`] it — the same de-emphasis
+/// [`proximity_severity`] gives a far-off reset, since there is nothing to act on.
+///
+/// Takes `now` and routes through [`expiry_view`] for the same reason the cell does: a tint read
+/// off the cached class alone would paint a `lapsed` cell `Yellow`.
+///
+/// `None` — uncoloured — for an unobserved deadline, matching every other cell with no reading:
+/// absence of colour is not a false "healthy" signal.
+fn expiry_severity(expiry: Option<AccountExpiry>, now: i64) -> Option<Severity> {
+    match expiry_view(expiry, now) {
+        ExpiryView::Gap => None,
+        ExpiryView::Lapsed => Some(Severity::Red),
+        ExpiryView::Live {
+            horizon: ExpiryHorizon::Beyond,
+            ..
+        } => Some(Severity::Dim),
+        // `Within` — and, defensively, any other class that survived the render-time check.
+        ExpiryView::Live { .. } => Some(Severity::Yellow),
+    }
+}
+
+/// What the RENDER holds about one account's refresh-token deadline: nothing usable, a deadline
+/// already past, or a live one at `at` under the class that survived the render-time check.
+///
+/// The one place the staleness rule lives, so [`expiry_cell`] and [`expiry_severity`] cannot
+/// disagree about whether a credential has lapsed. `Live` carries `horizon` for that same reason:
+/// the tint reads its band OFF THE VIEW rather than back off the raw modifier, so there is no
+/// second path by which a cell rendered as a duration could be coloured on the stale class.
+enum ExpiryView {
+    Gap,
+    Lapsed,
+    Live { at: i64, horizon: ExpiryHorizon },
+}
+
+/// Resolve the daemon's cached [`ExpiryHorizon`] against the clock the RENDER actually holds
+/// (issue #883).
+///
+/// **The render-time comparison is authoritative, and that is load-bearing.** `status` is served
+/// from the snapshot built at the LAST TICK, not per request — up to `poll_interval_secs` old
+/// (default 300 s, 3600 s while exhausted). A deadline that passes inside that window is still
+/// classified [`ExpiryHorizon::Within`]/[`ExpiryHorizon::Beyond`] when the cell renders, and
+/// [`humanize_until`] maps a non-positive remainder to `now` — this table's vocabulary for a
+/// *benign* reset ARRIVING. The one cell built to warn would then read as fine, at exactly the
+/// moment it matters, and every token lapse passes through that window exactly once. So an
+/// observed deadline at or before `now` reads `lapsed` whatever the cached class says.
+///
+/// The rule is MONOTONE in the safe direction: a class of [`ExpiryHorizon::Lapsed`] also stays
+/// `Lapsed` even should the render clock read earlier than the tick's (backwards skew, NTP). Once
+/// either clock has seen the deadline pass, the cell does not un-lapse.
+///
+/// [`ExpiryHorizon::Unknown`] is authoritative in the OTHER direction: it means the daemon found no
+/// parseable deadline, so a stray `expires_at` beside it is not trusted into a rendered duration.
+fn expiry_view(expiry: Option<AccountExpiry>, now: i64) -> ExpiryView {
+    // No modifier on the wire at all: a pre-#882 daemon, or an account not yet polled.
+    let Some(expiry) = expiry else {
+        return ExpiryView::Gap;
+    };
+    match (expiry.horizon_state, expiry.expires_at) {
+        // `Unknown` is authoritative FIRST: no parseable deadline was found, so a stray
+        // `expires_at` beside it is not trusted into a rendered duration.
+        (ExpiryHorizon::Unknown, _) => ExpiryView::Gap,
+        // A DECLARED lapse outranks a missing deadline, and the order of these two arms is the
+        // whole point: `lapsed` is a bare state word that never reads `at`, so an absent
+        // `expires_at` is not a data-insufficiency case here. Falling through to the gap below
+        // would discard the strongest negative signal the wire can carry — and on `status`,
+        // where `status_columns` materialises the column only once some row is non-gap, an
+        // account whose lapse is the roster's only expiry datum would take the entire column
+        // down with it and render a dead login as no login problem at all.
+        (ExpiryHorizon::Lapsed, _) => ExpiryView::Lapsed,
+        (_, None) => ExpiryView::Gap,
+        (_, Some(at)) if at <= now => ExpiryView::Lapsed,
+        (horizon, Some(at)) => ExpiryView::Live { at, horizon },
+    }
+}
+
 /// A `0..=100` percent as `N%`, or `n/a` when the last poll for that account
 /// failed (never a fabricated `0`).
 fn pct(percent: Option<u8>) -> String {
@@ -3708,6 +3874,12 @@ fn humanize_until(secs: i64) -> String {
 /// is the `🔴` AUTH cell's `claude /login` cue (issue #143). Kept out of the default table
 /// (a raw clock there would be misread as a deadline); `--verbose` is the opt-in for the
 /// raw number, mirroring the `--json` full-data contract that already carries it.
+///
+/// Distinct from the table's `EXPIRY` column ([`expiry_cell`], issue #883), which reports the
+/// REFRESH token — the login itself, a server-issued deadline no refresh moves. That IS the
+/// forward-looking re-login signal this block explicitly is not, and it is why a raw clock in the
+/// default table is no longer the only thing an operator could mistake for one: the two are
+/// different tokens on different clocks, and only the `EXPIRY` column belongs in the table.
 ///
 /// Sourced solely from each account's label + the non-secret `access_expires_at` timestamp
 /// — a reprojection of fields the wire and table already carry, no new secret-bearing input —
@@ -6247,6 +6419,376 @@ spare  22222222-2222\n\
         );
     }
 
+    // --- status: the REFRESH-token EXPIRY column (issue #883) ------------------
+
+    #[test]
+    fn expiry_cell_classifies_each_horizon_and_reports_an_unobserved_deadline_as_a_gap() {
+        // The four #878 states, projected. An OBSERVED deadline (`Within` / `Beyond`) renders the
+        // compact time-until the `RESET` cells already use; a `Lapsed` one the bare state word.
+        assert_eq!(
+            expiry_cell(
+                Some(AccountExpiry {
+                    expires_at: Some(NOW + 3 * 86_400),
+                    horizon_state: ExpiryHorizon::Within,
+                    cohort_id: None,
+                }),
+                NOW
+            ),
+            "3d"
+        );
+        assert_eq!(
+            expiry_cell(
+                Some(AccountExpiry {
+                    expires_at: Some(NOW + 29 * 86_400 + 4 * 3_600),
+                    horizon_state: ExpiryHorizon::Beyond,
+                    cohort_id: None,
+                }),
+                NOW
+            ),
+            "29d4h"
+        );
+        assert_eq!(
+            expiry_cell(
+                Some(AccountExpiry {
+                    expires_at: Some(NOW - 86_400),
+                    horizon_state: ExpiryHorizon::Lapsed,
+                    cohort_id: None,
+                }),
+                NOW
+            ),
+            "lapsed",
+            "a passed deadline is a STATE word, never `now` — `humanize_until`'s zero case would \
+             read as a reset arriving, the opposite of what has happened"
+        );
+
+        // GAP HONESTY (issue #137). All three absences render `—`, never a silent "fine":
+        // `Unknown` (polled, credential carried no deadline) …
+        assert_eq!(
+            expiry_cell(
+                Some(AccountExpiry {
+                    expires_at: None,
+                    horizon_state: ExpiryHorizon::Unknown,
+                    cohort_id: None,
+                }),
+                NOW
+            ),
+            EXPIRY_GAP
+        );
+        // … no modifier on the wire at all (a pre-#882 daemon, or an unpolled account) …
+        assert_eq!(expiry_cell(None, NOW), EXPIRY_GAP);
+        // … and a MALFORMED frame that claims a FORWARD-LOOKING state with no deadline: `Within`
+        // is a claim ABOUT a deadline, so without one there is nothing to say. Unreachable from
+        // `account_expiry`, but the wire is `#[serde(default)]`-decoded, so it degrades honestly
+        // instead of unwrapping a `None`.
+        assert_eq!(
+            expiry_cell(
+                Some(AccountExpiry {
+                    expires_at: None,
+                    horizon_state: ExpiryHorizon::Within,
+                    cohort_id: None,
+                }),
+                NOW
+            ),
+            EXPIRY_GAP
+        );
+        // But a declared `Lapsed` with no deadline is NOT that case, and this is the arm-ordering
+        // pin: `lapsed` is a bare state word that never reads `expires_at`, so the missing field
+        // costs it nothing. Were it to fall through to the gap above, `status` would drop the
+        // whole column whenever the lapse was the roster's only expiry datum (`status_columns`
+        // materialises it only once some row is non-gap) — a dead login rendered as no login
+        // problem at all, the one outcome this cell exists to prevent.
+        assert_eq!(
+            expiry_cell(
+                Some(AccountExpiry {
+                    expires_at: None,
+                    horizon_state: ExpiryHorizon::Lapsed,
+                    cohort_id: None,
+                }),
+                NOW
+            ),
+            "lapsed",
+            "a DECLARED lapse outranks a missing deadline; the gap would discard the strongest \
+             negative signal the wire can carry"
+        );
+        // …and it is tinted RED rather than left uncoloured, so the two projections agree.
+        assert_eq!(
+            expiry_severity(
+                Some(AccountExpiry {
+                    expires_at: None,
+                    horizon_state: ExpiryHorizon::Lapsed,
+                    cohort_id: None,
+                }),
+                NOW
+            ),
+            Some(Severity::Red)
+        );
+        // `Unknown` is authoritative in the other direction too: it says the daemon found no
+        // PARSEABLE deadline, so a stray timestamp beside it is not trusted into a duration.
+        assert_eq!(
+            expiry_cell(
+                Some(AccountExpiry {
+                    expires_at: Some(NOW + 3 * 86_400),
+                    horizon_state: ExpiryHorizon::Unknown,
+                    cohort_id: None,
+                }),
+                NOW
+            ),
+            EXPIRY_GAP
+        );
+    }
+
+    #[test]
+    fn a_deadline_that_passed_since_the_last_tick_reads_lapsed_never_now() {
+        // The staleness trap, and the sharpest failure this cell can have. `status` is served from
+        // the snapshot built at the LAST TICK — up to `poll_interval_secs` old (300 s by default,
+        // 3600 s while exhausted) — so a deadline can pass while the daemon still has it filed
+        // `Within`. Dispatching on that cached class alone hands `humanize_until` a non-positive
+        // remainder, which renders `now`: this table's word for a reset ARRIVING. The one cell
+        // built to warn would read as good news at the exact moment it stops being true, and every
+        // token lapse crosses that window exactly once.
+        let stale = |horizon_state| {
+            Some(AccountExpiry {
+                // Classified one minute before the deadline, rendered five minutes after it.
+                expires_at: Some(NOW - 300),
+                horizon_state,
+                cohort_id: None,
+            })
+        };
+        for horizon_state in [ExpiryHorizon::Within, ExpiryHorizon::Beyond] {
+            assert_eq!(
+                expiry_cell(stale(horizon_state), NOW),
+                "lapsed",
+                "the RENDER clock outranks the cached {horizon_state:?} class — dispatching on the \
+                 class alone yields `now`, the RESET vocabulary for relief arriving, which is the \
+                 opposite of a dead login"
+            );
+            assert_eq!(
+                expiry_severity(stale(horizon_state), NOW),
+                Some(Severity::Red),
+                "the tint follows the same verdict — a stale {horizon_state:?} must not stay Yellow"
+            );
+        }
+        // The boundary: `at == now` is already past (the deadline is not a reset instant).
+        assert_eq!(
+            expiry_cell(
+                Some(AccountExpiry {
+                    expires_at: Some(NOW),
+                    horizon_state: ExpiryHorizon::Within,
+                    cohort_id: None,
+                }),
+                NOW
+            ),
+            "lapsed"
+        );
+        // MONOTONE the other way too: a daemon-classified `Lapsed` does not un-lapse should the
+        // render clock read EARLIER than the tick's (backwards skew, NTP step). Once either clock
+        // has seen the deadline pass, the cell stays `lapsed`.
+        let skewed = Some(AccountExpiry {
+            expires_at: Some(NOW + 3 * 86_400),
+            horizon_state: ExpiryHorizon::Lapsed,
+            cohort_id: None,
+        });
+        assert_eq!(expiry_cell(skewed, NOW), "lapsed");
+        assert_eq!(expiry_severity(skewed, NOW), Some(Severity::Red));
+
+        // End to end, through the table: the stale row reads `lapsed`, not `now`.
+        let response = expiry_response(vec![AccountStatusLine {
+            health: Some(CredentialHealth::Healthy),
+            expiry: stale(ExpiryHorizon::Within),
+            ..status_line("work", true, Some(10), Some(20))
+        }]);
+        let out = render_status(&response, NOW, None, false);
+        let work = out
+            .lines()
+            .find(|l| l.contains("work"))
+            .expect("work's row");
+        assert!(
+            work.contains("lapsed"),
+            "the rendered row states the lapse: {work:?}"
+        );
+    }
+
+    #[test]
+    fn the_expiry_column_is_independent_of_auth_never_folded_into_it() {
+        // The load-bearing #878 invariant, rendered: the two axes are ORTHOGONAL, so an account
+        // that is 🟢 Healthy RIGHT NOW and three days from needing a re-login shows BOTH facts, in
+        // two INDEPENDENT cells. Folding expiry into the AUTH cell (or degrading the glyph to say
+        // it) would erase exactly the case the feature exists to surface.
+        let response = expiry_response(vec![AccountStatusLine {
+            health: Some(CredentialHealth::Healthy),
+            ..status_line_expiry("work", true, 3 * 86_400, ExpiryHorizon::Within)
+        }]);
+        let out = render_status(&response, NOW, None, false);
+        let header = out.lines().next().expect("a header row");
+        let work = out
+            .lines()
+            .find(|l| l.contains("work"))
+            .expect("work's row");
+
+        assert!(
+            header.contains("EXPIRY") && header.contains("AUTH"),
+            "two labelled columns, not one: {header:?}"
+        );
+        assert!(
+            header.find("EXPIRY") < header.find("AUTH"),
+            "EXPIRY precedes AUTH, so AUTH's ragged free-text cue stays last on the line: \
+             {header:?}"
+        );
+        assert!(
+            work.contains("🟢") && work.contains("3d"),
+            "healthy AND three days out — both cells present: {work:?}"
+        );
+        // The AUTH cell itself is UNCHANGED. A DIFFERENTIAL over the one varied input — the same
+        // healthy account with and without the modifier — so what is pinned is that the modifier
+        // does not reach `health_cell`, on the very glyph path this scenario renders.
+        let healthy = |expiry| AccountStatusLine {
+            health: Some(CredentialHealth::Healthy),
+            expiry,
+            ..status_line("work", true, Some(10), Some(20))
+        };
+        let with_expiry =
+            status_line_expiry("work", true, 3 * 86_400, ExpiryHorizon::Within).expiry;
+        assert_eq!(
+            health_cell(&healthy(with_expiry)),
+            health_cell(&healthy(None)),
+            "the expiry modifier does not reach the AUTH cell"
+        );
+        assert_eq!(
+            health_cell(&healthy(with_expiry)),
+            "🟢",
+            "and that cell is the bare glyph — so the equality above is not two empty strings"
+        );
+        // #15-clean, and the whole render carries no imperative: this cell states a fact and
+        // leaves the remedy to the operator.
+        assert!(crate::redaction::meter::unauthored_emails(&out, &[]).is_empty());
+        for imperative in ["re-login", "renew", "sessiometer login"] {
+            assert!(
+                !out.contains(imperative),
+                "the expiry column names no imperative (`{imperative}`): {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_expiry_column_elides_until_some_account_has_an_observed_deadline() {
+        // Empty-column elision, the same rule the `stats` table applies (§D-STA-5): a roster whose
+        // credentials carry no `refreshTokenExpiresAt` — including every pre-#882 daemon — renders
+        // exactly as it did before issue #883, rather than growing a column of em dashes.
+        let none = expiry_response(vec![
+            status_line("work", true, Some(10), Some(20)),
+            status_line("spare", false, Some(30), Some(40)),
+        ]);
+        let out = render_status(&none, NOW, None, false);
+        assert!(
+            !out.contains("EXPIRY") && !out.contains(EXPIRY_GAP),
+            "no observed deadline anywhere → no column at all: {out}"
+        );
+
+        // `Unknown` is an OBSERVATION, not a deadline — it must not materialize the column either.
+        let unknown = expiry_response(vec![status_line_expiry(
+            "work",
+            true,
+            0,
+            ExpiryHorizon::Unknown,
+        )]);
+        assert!(
+            !render_status(&unknown, NOW, None, false).contains("EXPIRY"),
+            "an all-unknown roster still elides"
+        );
+
+        // ONE observed deadline materializes it — and the account WITHOUT one gets an explicit
+        // gap, never a fabricated or reassuring value.
+        let mixed = expiry_response(vec![
+            status_line_expiry("work", true, 3 * 86_400, ExpiryHorizon::Within),
+            status_line("spare", false, Some(30), Some(40)),
+        ]);
+        let out = render_status(&mixed, NOW, None, false);
+        let spare = out
+            .lines()
+            .find(|l| l.contains("spare"))
+            .expect("spare's row");
+        assert!(out.contains("EXPIRY"), "one datum materializes it: {out}");
+        assert!(
+            spare.contains(EXPIRY_GAP),
+            "the account with no observed deadline is an explicit gap: {spare:?}"
+        );
+    }
+
+    #[test]
+    fn the_expiry_column_sheds_first_under_a_narrow_terminal() {
+        // Recorded shed decision (`status_columns`): EXPIRY (1) → the WEEKLY pair (2, atomic) →
+        // AUTH (3). Expiry is the slowest-moving axis on the row — a server-issued deadline no
+        // tick can move — so a narrow terminal loses the least by deferring it.
+        let response = expiry_response(vec![AccountStatusLine {
+            health: Some(CredentialHealth::Healthy),
+            ..status_line_expiry("work", true, 3 * 86_400, ExpiryHorizon::Within)
+        }]);
+        let full = render_status(&response, NOW, None, false);
+        let full_header = full.lines().next().expect("a header row");
+        let width = display_width(full_header);
+
+        // One column narrower than the full table: EXPIRY goes, and NOTHING else does yet.
+        let narrowed = render_status(&response, NOW, Some(width - 1), false);
+        let header = narrowed.lines().next().expect("a header row");
+        assert!(!header.contains("EXPIRY"), "EXPIRY sheds first: {header:?}");
+        assert!(
+            header.contains("WEEKLY%") && header.contains("AUTH"),
+            "and it sheds ALONE — the WEEKLY pair and AUTH both survive: {header:?}"
+        );
+
+        // Squeezed further, the established order continues unchanged: the WEEKLY pair leaves
+        // atomically next, then AUTH, leaving the ACCOUNT + SESSION floor.
+        let tighter = render_status(&response, NOW, Some(30), false);
+        let header = tighter.lines().next().expect("a header row");
+        assert!(
+            !header.contains("EXPIRY") && !header.contains("WEEKLY%"),
+            "the weekly pair follows expiry: {header:?}"
+        );
+        let floor = render_status(&response, NOW, Some(1), false);
+        let header = floor.lines().next().expect("a header row");
+        assert_eq!(
+            header.split_whitespace().collect::<Vec<_>>(),
+            ["ACCOUNT", "SESSION%", "RESET"],
+            "the floor never drops and the row overflows rather than wrapping"
+        );
+        assert_eq!(floor.lines().filter(|l| l.contains("work")).count(), 1);
+    }
+
+    #[test]
+    fn the_expiry_cell_is_tinted_by_its_own_horizon_band() {
+        // Per-cell colour (issue #84): the expiry cell carries no self-colouring glyph, so its
+        // band is the only at-a-glance signal. Lapsed is act-now Red; Within the configured
+        // horizon is Yellow; Beyond it is Dim — the same de-emphasis a far-off reset gets, since
+        // there is nothing to act on. An UNOBSERVED deadline is uncoloured: absence of colour is
+        // not a false "healthy" signal.
+        let of = |offset, state| {
+            expiry_severity(status_line_expiry("a", true, offset, state).expiry, NOW)
+        };
+        assert_eq!(of(-86_400, ExpiryHorizon::Lapsed), Some(Severity::Red));
+        assert_eq!(
+            of(3 * 86_400, ExpiryHorizon::Within),
+            Some(Severity::Yellow)
+        );
+        assert_eq!(of(29 * 86_400, ExpiryHorizon::Beyond), Some(Severity::Dim));
+        assert_eq!(of(0, ExpiryHorizon::Unknown), None);
+        assert_eq!(expiry_severity(None, NOW), None);
+
+        // End to end: the tint reaches the rendered cell, and the plain text survives underneath
+        // it — colour AUGMENTS, it is never the only signal.
+        let response = expiry_response(vec![status_line_expiry(
+            "work",
+            true,
+            -86_400,
+            ExpiryHorizon::Lapsed,
+        )]);
+        let colored = render_status(&response, NOW, None, true);
+        assert!(
+            colored.contains(&format!("\x1b[{}mlapsed", Severity::Red.sgr())),
+            "the lapsed cell is tinted red: {colored:?}"
+        );
+        assert!(render_status(&response, NOW, None, false).contains("lapsed"));
+    }
+
     // --- status: AUTH column rename + verbose access-token clock (issue #143) --
 
     #[test]
@@ -6567,8 +7109,52 @@ spare  22222222-2222\n\
             refresh_health: None,
             health: None,
             blind_active: None,
-            // The #882 expiry modifier has no CLI cell yet (issue #883 owns it) — inert here.
+            // No observed refresh-token deadline, so the issue #883 `EXPIRY` column elides and
+            // every layout / alignment / colouring test below keeps pinning the pre-#883 table.
+            // The column's own tests build their lines with `status_line_expiry`.
             expiry: None,
+        }
+    }
+
+    /// A reading carrying the issue #878 REFRESH-token expiry modifier — the axis `status_line`
+    /// leaves absent. `offset_secs` is relative to [`NOW`], so a fixture reads as
+    /// "`state`, `offset` from now" and the rendered cell is deterministic.
+    fn status_line_expiry(
+        label: &str,
+        active: bool,
+        offset_secs: i64,
+        horizon_state: ExpiryHorizon,
+    ) -> AccountStatusLine {
+        AccountStatusLine {
+            expiry: Some(AccountExpiry {
+                // `Unknown` is the one state that CANNOT carry a deadline — `account_expiry`
+                // admits no other combination — so the helper honours that invariant rather than
+                // letting a test build a shape production can never produce.
+                expires_at: match horizon_state {
+                    ExpiryHorizon::Unknown => None,
+                    _ => Some(NOW + offset_secs),
+                },
+                horizon_state,
+                cohort_id: None,
+            }),
+            ..status_line(label, active, Some(10), Some(20))
+        }
+    }
+
+    /// A [`StatusResponse`] carrying `accounts` and no fleet-level fault — the envelope the
+    /// `EXPIRY` column tests vary only the account lines of.
+    fn expiry_response(accounts: Vec<AccountStatusLine>) -> StatusResponse {
+        StatusResponse {
+            systemic_refresh_failure: None,
+            systemic_refresh_source: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            canary: None,
+            recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
+            refresh_enabled: None,
+            accounts,
+            next_swap: None,
         }
     }
 
@@ -10590,7 +11176,10 @@ spare  22222222-2222\n\
                 refresh_health: None,
                 health: None,
                 blind_active: None,
-                // The #882 expiry modifier has no CLI cell yet (issue #883 owns it) — inert here.
+                // No observed refresh-token deadline, so the issue #883 `EXPIRY` column elides on
+                // the empty-column rule and every committed CLI-render golden stays byte-identical.
+                // Populating it here would move all 23 files under `build/fixtures/cli-renders/`,
+                // which is issue #886's to do — with the rebaseline trailer that gate demands.
                 expiry: None,
             }
         }

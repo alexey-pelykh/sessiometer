@@ -112,12 +112,19 @@ pub(crate) mod meter {
         /// carrying two `sk-ant-…` tokens, plus a distinctive account email. The
         /// values are deliberately recognizable so a leak is unambiguous, and
         /// high-entropy so the entropy backstop would also catch the tokens.
+        ///
+        /// The blob also carries `refreshTokenExpiresAt` (issue #883). Without it the daemon
+        /// classifies every metered account [`ExpiryHorizon::Unknown`](crate::observability::ExpiryHorizon::Unknown),
+        /// the `status` table's `EXPIRY` column elides on the empty-column rule, and the sweep
+        /// would pass over a corpus that never contained the cell — a green gate on a degraded
+        /// subject, which is not evidence. Three days past the fixture clock, so the cell renders
+        /// a populated `3d` on every horizon setting rather than a gap.
         pub(crate) fn meter_fixture() -> Self {
             let access = "sk-ant-oat-METER0SECRET0ACCESS0bC9dE2fG7hJ4kL6mN8";
             let refresh = "sk-ant-ort-METER0SECRET0REFRESH0pQ3rS5tU7vW9xY1zA2";
             let email = "victim@meter-redaction.example";
             let blob = format!(
-                r#"{{"claudeAiOauth":{{"accessToken":"{access}","refreshToken":"{refresh}","expiresAt":1782777600}}}}"#
+                r#"{{"claudeAiOauth":{{"accessToken":"{access}","refreshToken":"{refresh}","expiresAt":1782777600,"refreshTokenExpiresAt":1783036800000}}}}"#
             )
             .into_bytes();
             Self {
