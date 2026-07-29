@@ -23,9 +23,10 @@ use crate::claude_state::OauthAccount;
 use crate::config::{Account, Config, ConflictPolicy, Origin, OriginReport};
 use crate::daemon::{
     emit_best_effort, run_loop, AccountExpiry, AccountStatusLine, BlindActive, CanaryStatus,
-    CanonicalScrub, Daemon, ExternalLoginWatcher, InstanceLock, NextSwap, NextSwapReason,
-    NoTargetCause, RealClock, RealKeepWarmEngine, RealRosterPoller, RealShutdown, SchemaVersion,
-    StatusResponse, SystemicRefreshSource, UnixControl, VersionedStatus, STATUS_SCHEMA_VERSION,
+    CanonicalScrub, Daemon, ExpiryCohort, ExternalLoginWatcher, InstanceLock, NextSwap,
+    NextSwapReason, NoTargetCause, RealClock, RealKeepWarmEngine, RealRosterPoller, RealShutdown,
+    SchemaVersion, StatusResponse, SystemicRefreshSource, UnixControl, VersionedStatus,
+    STATUS_SCHEMA_VERSION,
 };
 use crate::error::{Error, Result};
 use crate::keychain::{Credential, RealCredentialStore};
@@ -1403,6 +1404,12 @@ async fn run(verbosity: Verbosity, managed: bool) -> Result<()> {
     // `[refresh].enabled` block below — because the deadline is read from the credential itself and
     // matters most precisely when the refresh tick is off.
     .with_credential_expiry_horizon(config.credential.expiry_horizon_secs)
+    // The synchronized-cohort grouping window (#879): how close together several deadlines must
+    // fall to count as one cohort, so the fleet-level "the pool loses N members at once" fact is
+    // visible — the thing no single row can show, and the thing the upstream client (which warns
+    // only for the ACTIVE account) structurally cannot see. Wired unconditionally beside the
+    // horizon above, for the same reason.
+    .with_credential_expiry_cohort_window(config.credential.expiry_cohort_window_secs)
     // Arm the per-daemon target-selection seed (#612): a once-drawn process-entropy value enables
     // the velocity-aware + per-daemon-jittered selection so independent daemons over the same roster
     // disperse instead of co-selecting (and hammering) one target. Drawn from the same coarse
@@ -2399,6 +2406,14 @@ pub(crate) fn render_status(
     ) {
         out.push_str(&render_canary(response, color));
     }
+    // The synchronized-expiry cohort (#879) prints BELOW every band above, and the placement is a
+    // claim about kind rather than about loudness: each of those reports something ALREADY WRONG
+    // (credential writes refused, an identity drifting under an override, the mechanism down, a
+    // breach already taken), while a cohort is forward-looking and nothing has broken yet — the
+    // pool is intact today. It carries its own tint, tracking the SOONEST member's cell, rather
+    // than joining the ADR-0026 fault rank; see `render_expiry_cohort` for why it is deliberately
+    // not a `DaemonPayloadFault`.
+    out.push_str(&render_expiry_cohort(response, now, color));
     if matches!(response.canonical_scrub, Some(CanonicalScrub::Recovering)) {
         out.push_str(&render_canonical_scrub(response, color));
     }
@@ -3169,6 +3184,96 @@ fn render_refresh_disabled_advisory(response: &StatusResponse, color: bool) -> S
     } else {
         String::new()
     }
+}
+
+/// The daemon-level SYNCHRONIZED-EXPIRY COHORT line (issue #879, REQ-CC-B-004): several accounts'
+/// refresh tokens reach their deadlines inside one window, so the swap pool thins by more than one
+/// member at a time.
+///
+/// **The fleet fact no row can carry.** The `EXPIRY` column beside it shows each member's own
+/// deadline, and every one of them reads individually survivable; only this states that they go
+/// TOGETHER. It is also the half the upstream Claude Code client structurally cannot provide — that
+/// warns for the ACTIVE account only, so a parked account's deadline stays invisible to it until
+/// swap-in, possibly after death.
+///
+/// Rendered as an AGGREGATE sentence — counts, a span, and one instant. Never a list of
+/// handles-with-deadlines: per-account facts belong on the per-account row (the shape issues
+/// #543/#544 were retired for, and design-stats.md §D-STA-5's structural rule). Membership is on the
+/// wire per row as [`AccountExpiry::cohort_id`], so a reader who wants the names has them without
+/// this line duplicating them.
+///
+/// **This is `status`, not the `stats` roster block — a deliberate departure from #879's AC2, which
+/// named that block.** The `stats` verb is an OFFLINE reader of the persisted event series and never
+/// talks to the daemon, so a cohort — a live fact derived from the credentials the daemon holds
+/// right now — has no producer on that surface. Not merely an empty one: `stats::Report::expiry`
+/// is written as an empty map on every production path, blocked on issue #917 (folding the durable
+/// expiry events into the per-account report), so a roster-block cell added today would render `—`
+/// unconditionally. REQ-CC-B-004 says "the DAEMON shall surface", and the issue is titled
+/// `(feat) daemon:` — so the fact ships where it exists. AC2's load-bearing
+/// half, the PROHIBITION on a per-account band or footer list, is honoured exactly. Its positive
+/// half — a `stats` roster-block mirror — is unbuilt and unblocks with #917; the same reasoning
+/// applies to whichever surface fires the fleet-level line there.
+///
+/// **Deliberately NOT a [`DaemonPayloadFault`].** Nothing is broken and the daemon can act
+/// perfectly well; this is a forward-looking capacity fact. Routing it through that enum would
+/// enrol it in the ADR-0026 cross-surface rank contract — which obliges a matching menubar panel
+/// banner (issue #575's both-or-neither invariant) — and the menubar half of the expiry feature is
+/// issue #884's, not this one's. It therefore prints below every band that reports something
+/// ALREADY WRONG — whether the daemon is blocked by it or merely proceeding under an override — and
+/// carries its own tint instead.
+///
+/// That tint tracks the SOONEST member — [`Severity::Red`] once its deadline has passed,
+/// [`Severity::Yellow`] while it is still ahead — which is the band [`expiry_severity`] gives that
+/// member's own cell, so the fleet line never reads calmer than the row that bites first. It does
+/// NOT promise every member matches: a cohort can straddle the horizon (a 24h window against a 7d
+/// horizon admits an anchor at 6d23h and a member at 7d12h), leaving a Yellow fleet line beside a
+/// [`Severity::Dim`] `Beyond` cell. That is the honest reading — the later member IS further out —
+/// and the cohort's urgency is the earliest deadline's, not an average. Resolved against the
+/// RENDER's clock for the same reason [`expiry_view`] is: `status` is served from the last tick's
+/// snapshot, so a deadline can pass inside the poll interval, and a line built to warn must not
+/// read as calm at exactly the moment it starts mattering.
+///
+/// Present-tense state, never an imperative (D-CC-3's firewall condition): it says what IS, and the
+/// remedy — a `sessiometer login` per member — rides the operator docs (issue #885), not this line.
+///
+/// Empty when the wire carries no cohort. That absence is NOT a claim the fleet is unsynchronized:
+/// a roster whose credentials carry no `refreshTokenExpiresAt` produces no cohort AND no `EXPIRY`
+/// column, so nothing anywhere reports a reassuring zero for a fleet that was never measured (the
+/// issue #137 invariant). The `of N accounts with a known deadline` denominator carries the same
+/// discipline into the line that DOES print — it names the observed set rather than letting the
+/// reader assume the whole roster was seen.
+fn render_expiry_cohort(response: &StatusResponse, now: i64, color: bool) -> String {
+    let Some(cohort) = response.expiry_cohort else {
+        return String::new();
+    };
+    let lapsed = cohort.earliest <= now;
+    // `humanize_until` maps a non-positive remainder to `now` — this table's vocabulary for a
+    // benign reset ARRIVING — so a passed deadline must be worded, not humanized.
+    let earliest = if lapsed {
+        "earliest already lapsed".to_owned()
+    } else {
+        format!("earliest in {}", humanize_until(cohort.earliest - now))
+    };
+    // A zero span is the sharpest form of the finding (identical deadlines), not a degenerate one,
+    // so it gets its own wording rather than `humanize_until(0)`'s "now".
+    let spread = if cohort.span_secs <= 0 {
+        "share one deadline instant".to_owned()
+    } else {
+        format!(
+            "fall within {} of each other",
+            humanize_until(cohort.span_secs)
+        )
+    };
+    let ExpiryCohort { size, observed, .. } = cohort;
+    let body = format!(
+        "expiry cohort: {size} of {observed} accounts with a known deadline {spread} — {earliest}"
+    );
+    let severity = if lapsed {
+        Severity::Red
+    } else {
+        Severity::Yellow
+    };
+    severity_line(&body, severity, color)
 }
 
 /// The age (in seconds) past which a snapshot's data is UNAMBIGUOUSLY stale — the maximum possible
@@ -5247,6 +5352,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -5279,6 +5385,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: Some(true),
@@ -5417,6 +5524,7 @@ spare  22222222-2222\n\
             canonical_scrub: scrub,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: Some(true),
@@ -5519,6 +5627,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: locked,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: Some(true),
@@ -5592,6 +5701,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: Some(true),
@@ -5796,6 +5906,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: true,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: Some(true),
@@ -5852,6 +5963,7 @@ spare  22222222-2222\n\
             canonical_scrub: Some(CanonicalScrub::Recovering),
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: Some(true),
@@ -5910,6 +6022,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -5950,6 +6063,7 @@ spare  22222222-2222\n\
                 canonical_scrub: None,
                 keychain_locked: false,
                 canary: None,
+                expiry_cohort: None,
                 recent_blind_preempt_swap: None,
                 recent_landing_overshoot: None,
                 refresh_enabled: None,
@@ -5973,6 +6087,7 @@ spare  22222222-2222\n\
                 canonical_scrub: None,
                 keychain_locked: false,
                 canary: None,
+                expiry_cohort: None,
                 recent_blind_preempt_swap: None,
                 recent_landing_overshoot: None,
                 refresh_enabled: None,
@@ -6000,6 +6115,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -6036,6 +6152,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -6199,6 +6316,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: Some(BlindPreemptSwap {
                 from_label: "spare".to_owned(),
                 to_label: "work".to_owned(),
@@ -6246,6 +6364,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: Some(LandingOvershoot {
                 from_label: "spare".to_owned(),
@@ -6273,6 +6392,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: Some(LandingOvershoot {
                 from_label: "spare".to_owned(),
@@ -6319,6 +6439,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -6361,6 +6482,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -6466,6 +6588,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -6883,6 +7006,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -6917,6 +7041,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -6989,6 +7114,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -7053,6 +7179,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -7231,6 +7358,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -7297,6 +7425,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -7343,6 +7472,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -7402,6 +7532,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -7494,6 +7625,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -7525,6 +7657,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -7618,6 +7751,7 @@ spare  22222222-2222\n\
                 canonical_scrub: None,
                 keychain_locked: false,
                 canary: None,
+                expiry_cohort: None,
                 recent_blind_preempt_swap: None,
                 recent_landing_overshoot: None,
                 refresh_enabled: None,
@@ -7753,6 +7887,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -7769,6 +7904,252 @@ spare  22222222-2222\n\
             !footer.contains('\x1b'),
             "the next-swap footer is never tinted: {colored:?}"
         );
+    }
+
+    // --- status: synchronized-expiry cohort (issue #879) ---------------------
+
+    /// A response carrying the fleet-level cohort condition over two synchronized rows.
+    fn cohort_response(cohort: Option<ExpiryCohort>) -> StatusResponse {
+        StatusResponse {
+            expiry_cohort: cohort,
+            ..expiry_response(vec![
+                status_line_expiry("work", true, 2 * 86_400, ExpiryHorizon::Within),
+                status_line_expiry("spare", false, 2 * 86_400 + 60, ExpiryHorizon::Within),
+            ])
+        }
+    }
+
+    /// AC-1: the cohort renders as a FLEET-level statement, distinct from any single account's
+    /// state — and AC-2's structural rule: an AGGREGATE sentence, never a per-account list of
+    /// handles-with-deadlines (the retired #543/#544 shape).
+    ///
+    /// The handle assertion is the load-bearing one. The obvious wrong implementation of "surface
+    /// the cohort" is to enumerate its members on the line, which is exactly the band-keyed-per-
+    /// account form design-stats.md §D-STA-5 forbids; the rows already carry membership.
+    #[test]
+    fn the_cohort_line_is_an_aggregate_fleet_statement_naming_no_account() {
+        let cohort = ExpiryCohort {
+            size: 4,
+            observed: 5,
+            earliest: NOW + 2 * 86_400,
+            span_secs: 240,
+        };
+        let out = render_status(&cohort_response(Some(cohort)), NOW, None, false);
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("expiry cohort:"))
+            .expect("the cohort line renders");
+
+        assert_eq!(
+            line,
+            "expiry cohort: 4 of 5 accounts with a known deadline fall within 4m of each other \
+             — earliest in 2d"
+        );
+        // No handle appears on it: the fleet fact is aggregate, membership lives on the rows.
+        for handle in ["work", "spare"] {
+            assert!(
+                !line.contains(handle),
+                "the cohort line must name no account: {line:?}"
+            );
+        }
+        // It is ONE line, not a stacked per-account block.
+        assert_eq!(
+            out.lines()
+                .filter(|l| l.starts_with("expiry cohort:"))
+                .count(),
+            1
+        );
+    }
+
+    /// The line states the OBSERVED denominator, so a partly-measured fleet cannot read as a
+    /// fully-measured one — the issue #137 invariant carried into an aggregate. And when no cohort
+    /// is on the wire, NOTHING is printed: absence is never rendered as a reassuring "no cohort".
+    #[test]
+    fn the_cohort_line_names_its_denominator_and_prints_nothing_when_absent() {
+        // Four of five observed — the fifth is a known deadline outside the cohort, and any
+        // account with no deadline at all is outside the denominator entirely.
+        let out = render_status(
+            &cohort_response(Some(ExpiryCohort {
+                size: 4,
+                observed: 5,
+                earliest: NOW + 86_400,
+                span_secs: 60,
+            })),
+            NOW,
+            None,
+            false,
+        );
+        assert!(out.contains("4 of 5 accounts with a known deadline"));
+
+        // No cohort on the wire ⇒ no line at all. The absence is left unstated rather than
+        // rendered as a positive all-clear, because the daemon cannot distinguish "no cohort" from
+        // "too few deadlines observed to tell" — so any "0 cohorts" / "no cohort" wording would
+        // claim more than the reading supports (the issue #137 invariant).
+        //
+        // Scoped to cohort wording deliberately: the unrelated `next swap: none` footer is a
+        // different fact about a different thing, and a whole-render ban on the word would pin
+        // that instead of this.
+        let quiet = render_status(&cohort_response(None), NOW, None, false);
+        for reassurance in ["expiry cohort", "cohort"] {
+            assert!(
+                !quiet.contains(reassurance),
+                "an absent cohort says nothing at all, reassuring or otherwise: {quiet:?}"
+            );
+        }
+    }
+
+    /// The wording adapts to the two edges the humanizer cannot express: identical deadlines (a
+    /// zero span, which `humanize_until` would render as the reset-arriving word "now") and a
+    /// soonest member that has ALREADY passed (which it would render the same way). Both are
+    /// worded instead — a line built to warn must not read as calm at the moment it starts
+    /// mattering, the same rule `expiry_view` follows for the per-account cell.
+    #[test]
+    fn the_cohort_line_words_a_zero_span_and_an_already_lapsed_deadline() {
+        let same_instant = render_status(
+            &cohort_response(Some(ExpiryCohort {
+                size: 2,
+                observed: 2,
+                earliest: NOW + 3_600,
+                span_secs: 0,
+            })),
+            NOW,
+            None,
+            false,
+        );
+        assert!(
+            same_instant.contains(
+                "expiry cohort: 2 of 2 accounts with a known deadline share one deadline instant \
+                 — earliest in 1h"
+            ),
+            "{same_instant:?}"
+        );
+        assert!(!same_instant.contains("within now"));
+
+        let lapsed = render_status(
+            &cohort_response(Some(ExpiryCohort {
+                size: 3,
+                observed: 4,
+                earliest: NOW - 86_400,
+                span_secs: 120,
+            })),
+            NOW,
+            None,
+            false,
+        );
+        assert!(
+            lapsed.contains("— earliest already lapsed"),
+            "a passed deadline is worded, never humanized to 'now': {lapsed:?}"
+        );
+    }
+
+    /// The line's tint tracks the SOONEST member — yellow while its deadline is ahead, red once it
+    /// has passed — which is the band `expiry_severity` gives that member's own cell, so the fleet
+    /// line never reads calmer than the row that bites first. A cohort STRADDLING the horizon is
+    /// the case that proves it is the soonest and not a consensus: the line stays yellow beside a
+    /// dim `Beyond` cell, because the cohort's urgency is its earliest deadline's. Under
+    /// `--no-color` the plain text carries the whole message.
+    #[test]
+    fn the_cohort_line_tint_follows_the_soonest_member() {
+        let ahead = ExpiryCohort {
+            size: 2,
+            observed: 2,
+            earliest: NOW + 2 * 86_400,
+            span_secs: 60,
+        };
+        let past = ExpiryCohort {
+            earliest: NOW - 60,
+            ..ahead
+        };
+
+        let yellow = render_status(&cohort_response(Some(ahead)), NOW, None, true);
+        let yellow_line = yellow
+            .lines()
+            .find(|l| l.contains("expiry cohort:"))
+            .unwrap();
+        assert!(
+            yellow_line.contains("\x1b[33m"),
+            "a cohort still ahead wears the same Yellow its Within cells do: {yellow_line:?}"
+        );
+
+        let red = render_status(&cohort_response(Some(past)), NOW, None, true);
+        let red_line = red.lines().find(|l| l.contains("expiry cohort:")).unwrap();
+        assert!(
+            red_line.contains("\x1b[31m"),
+            "a lapsed cohort wears the same Red its Lapsed cells do: {red_line:?}"
+        );
+
+        // Colour only augments: the uncoloured render carries every fact.
+        let plain = render_status(&cohort_response(Some(ahead)), NOW, None, false);
+        assert!(!plain.contains('\x1b'));
+        assert!(plain.contains("2 of 2 accounts with a known deadline"));
+
+        // A cohort STRADDLING the horizon: the anchor is inside it, a member 13h later is past it.
+        // The window (24h) is wider than the gap between the anchor and the horizon edge, so this
+        // is reachable on shipped defaults, not a contrived shape. The fleet line reads the
+        // SOONEST member's band — Yellow — while the later member's own cell is Dim `Beyond`. The
+        // two disagreeing is correct, and pinning it here stops a later "make them consistent"
+        // edit from re-tinting the line off the LATEST deadline, which would under-report.
+        let straddle = StatusResponse {
+            expiry_cohort: Some(ExpiryCohort {
+                size: 2,
+                observed: 2,
+                earliest: NOW + 6 * 86_400 + 23 * 3_600,
+                span_secs: 13 * 3_600,
+            }),
+            ..expiry_response(vec![
+                status_line_expiry("work", true, 6 * 86_400 + 23 * 3_600, ExpiryHorizon::Within),
+                status_line_expiry(
+                    "spare",
+                    false,
+                    7 * 86_400 + 12 * 3_600,
+                    ExpiryHorizon::Beyond,
+                ),
+            ])
+        };
+        let rendered = render_status(&straddle, NOW, None, true);
+        let cohort_line = rendered
+            .lines()
+            .find(|l| l.contains("expiry cohort:"))
+            .unwrap();
+        assert!(
+            cohort_line.contains("\x1b[33m"),
+            "a cohort anchored inside the horizon stays Yellow however far its last member sits: \
+             {cohort_line:?}"
+        );
+        let spare_row = rendered.lines().find(|l| l.contains("spare")).unwrap();
+        assert!(
+            spare_row.contains("\x1b[2m"),
+            "the straddling member keeps its own Dim `Beyond` cell — the line does not restate it: \
+             {spare_row:?}"
+        );
+    }
+
+    /// The cohort line prints BELOW every band reporting a fault that is ALREADY REAL. The two
+    /// pinned here straddle the colour rank on purpose — an unreadable vault is act-now `Red`, a
+    /// down refresh mechanism next-break `Yellow` — so what the ordering encodes is KIND, not
+    /// loudness: those report something already wrong, a cohort something that has not happened
+    /// yet. Pinned so a later insertion cannot quietly float a forward-looking fact above a
+    /// present one.
+    #[test]
+    fn the_cohort_line_prints_below_the_bands_reporting_a_present_fault() {
+        let response = StatusResponse {
+            keychain_locked: true,
+            systemic_refresh_failure: Some(3),
+            ..cohort_response(Some(ExpiryCohort {
+                size: 2,
+                observed: 2,
+                earliest: NOW + 2 * 86_400,
+                span_secs: 60,
+            }))
+        };
+        let out = render_status(&response, NOW, None, false);
+        let position = |needle: &str| {
+            out.lines()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} is missing from {out:?}"))
+        };
+        assert!(position("shared login: unreadable") < position("expiry cohort:"));
+        assert!(position("refresh mechanism") < position("expiry cohort:"));
     }
 
     // --- status: isolated-refresh discoverability advisory (issue #138) -------
@@ -7795,6 +8176,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: Some(false),
@@ -7834,6 +8216,7 @@ spare  22222222-2222\n\
                 canonical_scrub: None,
                 keychain_locked: false,
                 canary: None,
+                expiry_cohort: None,
                 recent_blind_preempt_swap: None,
                 recent_landing_overshoot: None,
                 refresh_enabled: Some(false),
@@ -7861,6 +8244,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: Some(true),
@@ -7886,6 +8270,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: Some(false),
@@ -7914,6 +8299,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: Some(false),
@@ -7942,6 +8328,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: Some(false),
@@ -7973,6 +8360,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -8001,6 +8389,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: Some(false),
@@ -8031,6 +8420,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -8349,6 +8739,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -8377,6 +8768,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -8443,6 +8835,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -8486,6 +8879,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -8535,6 +8929,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -8576,6 +8971,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -8636,6 +9032,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -8728,6 +9125,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -8767,6 +9165,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -8876,6 +9275,7 @@ spare  22222222-2222\n\
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
@@ -9088,6 +9488,7 @@ spare  22222222-2222\n\
                 canonical_scrub: None,
                 keychain_locked: false,
                 canary: None,
+                expiry_cohort: None,
                 recent_blind_preempt_swap: None,
                 recent_landing_overshoot: None,
                 refresh_enabled: None,
@@ -9154,6 +9555,7 @@ spare  22222222-2222\n\
                 canonical_scrub: None,
                 keychain_locked: false,
                 canary: None,
+                expiry_cohort: None,
                 recent_blind_preempt_swap: None,
                 recent_landing_overshoot: None,
                 refresh_enabled: None,
@@ -11452,6 +11854,7 @@ spare  22222222-2222\n\
                 canonical_scrub: None,
                 keychain_locked: false,
                 canary: None,
+                expiry_cohort: None,
                 recent_blind_preempt_swap: None,
                 recent_landing_overshoot: None,
                 refresh_enabled: None,
@@ -11836,6 +12239,10 @@ spare  22222222-2222\n\
                 refresh_enabled: Some(true),
                 accounts: vec![status_line("work", true, Some(50), Some(25))],
                 next_swap: None,
+                // Not a fault and deliberately absent: the synchronized-expiry cohort (issue #879)
+                // is forward-looking capacity, never a `DaemonPayloadFault`, so it carries no rank
+                // in the ADR-0026 table this helper feeds and would only add noise here.
+                expiry_cohort: None,
             };
             for id in faults {
                 match *id {

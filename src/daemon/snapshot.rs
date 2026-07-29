@@ -92,6 +92,13 @@ pub(crate) struct StatusSnapshot {
     /// [`Daemon::snapshot`]; [`status_response`] copies it straight onto the wire. `None` by
     /// `Default`. Labels only — never a token or email (the #15 discipline).
     pub(crate) canary: Option<CanaryStatus>,
+    /// The fleet-level synchronized-expiry cohort condition (issue #879), or `None` when no cohort
+    /// reaches the foresight horizon. Resolved in [`Daemon::snapshot`] by [`expiry_cohorts`] over
+    /// the deadlines every account's [`AccountReading::expiry`] already carries — ONE walk that also
+    /// stamps each member's [`AccountExpiry::cohort_id`], so the row grouping and the fleet
+    /// statement cannot disagree about who is in what. [`status_response`] copies it straight onto
+    /// the wire. `None` by `Default`. Counts and instants only (the #15 discipline).
+    pub(crate) expiry_cohort: Option<ExpiryCohort>,
 }
 
 /// The non-secret refresh-health inputs `status` surfaces in `--json` (issue #119): the
@@ -480,9 +487,18 @@ pub(crate) struct SchemaVersion {
 /// until an account has been polled, so an unpolled row's per-line bytes are unchanged. ORTHOGONAL
 /// to the `auth` rollup rather than a variant of it (the ADR-0017 modifier posture) — an account is
 /// routinely healthy AND inside its expiry horizon. A pre-#882 client ignores the unknown key.
+/// `1.13` ADDED the daemon-level [`StatusResponse::expiry_cohort`] SYNCHRONIZED-EXPIRY cohort
+/// condition ([`ExpiryCohort`], issue #879) AND made the per-account
+/// [`AccountExpiry::cohort_id`] grouping key REACHABLE — the field shipped at 1.12 but was
+/// unconditionally `None`, so it never appeared on the wire until #879's populator landed. Both
+/// halves of one fact: `cohort_id` says WHICH group a row is in, `expiry_cohort` states the
+/// fleet-level condition no single row can express (the sibling of `keychain_locked` /
+/// `canonical_scrub`, both likewise fleet-wide). Takes the omit-when-absent pattern: via
+/// `skip_serializing_if` an ungrouped roster's bytes are unchanged, so a fleet with no synchronized
+/// deadlines still serializes exactly as it did at 1.12. A pre-#879 client ignores both keys.
 pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion {
     major: 1,
-    minor: 12,
+    minor: 13,
 };
 
 /// The control socket's `status` reply PAYLOAD — handles + percentages + the forward-looking
@@ -611,6 +627,39 @@ pub(crate) struct StatusResponse {
     /// account-uuid (issue #15).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) canary: Option<CanaryStatus>,
+    /// The daemon-level SYNCHRONIZED-EXPIRY COHORT condition (issue #879, REQ-CC-B-004): `Some`
+    /// when two or more accounts' refresh-token deadlines fall within one
+    /// `[credential].expiry_cohort_window_secs` window AND the soonest of them is inside the
+    /// foresight horizon, else absent.
+    ///
+    /// The fleet-level half of the expiry feature, and the half the upstream client structurally
+    /// cannot provide: it warns only for the ACTIVE account, so a parked account's deadline is
+    /// invisible to it until swap-in — possibly after death. The per-account
+    /// [`AccountStatusLine::expiry`] modifier beside it shows four rows that each look individually
+    /// survivable; only this states that the swap pool loses several members at once.
+    ///
+    /// A DAEMON-LEVEL field, deliberately, exactly like [`Self::keychain_locked`] and
+    /// [`Self::canonical_scrub`] — a condition distinct from any single account's state, never a
+    /// per-account modifier and never a footer list keyed per account. Membership stays on the rows
+    /// themselves via [`AccountExpiry::cohort_id`], so this field carries no handles.
+    ///
+    /// `Option` + `#[serde(default, skip_serializing_if = "Option::is_none")]` per the added-field
+    /// convention (the MINOR [`STATUS_SCHEMA_VERSION`] bump 1.12 → 1.13, mirroring
+    /// `canonical_scrub`'s omit-when-absent pattern): a pre-#879 daemon omits the field → `None`,
+    /// AND an unsynchronized roster omits it entirely, so an unaffected frame's bytes are
+    /// byte-for-byte unchanged (a pre-#879 client ignores the unknown key, the minor-bump
+    /// tolerate-by-ignoring convention).
+    ///
+    /// Absence means "no cohort was DETECTED among the deadlines actually observed" — it is never
+    /// a claim that the fleet is unsynchronized. A roster whose credentials carry no
+    /// `refreshTokenExpiresAt` at all produces no condition and no per-account cell, so no surface
+    /// reports a reassuring zero for a fleet it could not measure (the issue #137 invariant). That
+    /// is also why [`ExpiryCohort::observed`] rides along: it names the denominator rather than
+    /// letting a reader assume the roster.
+    ///
+    /// Counts and instants only — never a token, email, or handle (issue #15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) expiry_cohort: Option<ExpiryCohort>,
 }
 
 /// The FROZEN status-snapshot wire contract (issue #164): the [`StatusResponse`] payload plus the
@@ -957,6 +1006,12 @@ pub(crate) fn status_response(snapshot: &StatusSnapshot) -> StatusResponse {
         // `None` otherwise (and then omitted via `skip_serializing_if`).
         recent_landing_overshoot: snapshot.recent_landing_overshoot.clone(),
         canary: snapshot.canary.clone(),
+        // The daemon-level synchronized-expiry cohort condition (issue #879), already resolved
+        // daemon-side in `Daemon::snapshot`: `Some` when two or more deadlines share a window and
+        // the soonest is inside the horizon, `None` otherwise (and then omitted via
+        // `skip_serializing_if`). Its absence is "none detected among what was observed", never a
+        // claim that the fleet is unsynchronized.
+        expiry_cohort: snapshot.expiry_cohort,
     }
 }
 
@@ -1096,27 +1151,30 @@ pub(crate) struct AccountExpiry {
     /// issue #137 invariant).
     #[serde(default)]
     pub(crate) horizon_state: ExpiryHorizon,
-    /// The synchronized-expiry COHORT this account belongs to, once cohort detection exists.
+    /// The synchronized-expiry COHORT this account belongs to (issue #879), or `None` when this
+    /// deadline groups with no other — which means "not grouped", never "alone at the front".
     ///
-    /// Always `None` here: grouping deadlines into cohorts is issue #879's job. The field is
-    /// carried now so that item adds a populator rather than re-shaping this type and every
-    /// consumer of it. A `None` means "not grouped", never "alone".
+    /// [`account_expiry`] cannot fill this in: cohort membership is a property of the WHOLE fleet's
+    /// deadlines, invisible to a per-account classifier. [`Daemon::snapshot`](crate::daemon::Daemon)
+    /// overwrites it from [`expiry_cohorts`] once every account has been classified, which is why
+    /// this type's own constructor still writes `None`.
     ///
-    /// `skip_serializing_if` keeps it OFF the wire entirely while it is unpopulatable, so issue
-    /// #882 ships exactly the two facts it owns — the classification and the deadline — and #879's
-    /// populator makes the key APPEAR rather than flipping a shipped `null` that promised a grouping
-    /// no build could produce.
+    /// The id is a per-SNAPSHOT ordinal, assigned in ascending-deadline order and stable only
+    /// within the frame that carried it. It identifies co-membership — two rows sharing an id
+    /// expire together — and nothing beyond that; it is not a handle to look a cohort up by, and
+    /// comparing one across frames is meaningless.
     ///
-    /// **That appearance is a wire-contract change and owes the full ritual**: a MINOR
-    /// [`STATUS_SCHEMA_VERSION`] bump, a regeneration of the four `build/fixtures/wire-*.json`
-    /// goldens, and the current-daemon Swift fixture lockstep — the same debt every other additive
-    /// field here paid. Do not read "additive" as "free", and do not expect a gate to say so: all
-    /// four goldens carry `expiry: None`, so populating this leaves them byte-identical and the
-    /// golden pin stays green. Nor does the `assert!(!frame.contains("cohort_id"))` in
-    /// `account_line_encodes_the_expiry_modifier_only_once_the_account_has_been_polled` close the
-    /// gap — that test hand-builds its own `AccountExpiry`, so what it pins is only that a `None`
-    /// cohort stays OFF the wire; a populator added upstream leaves it green. This comment is the
-    /// whole reminder.
+    /// `skip_serializing_if` keeps an ungrouped account's key OFF the wire, so the common
+    /// unsynchronized fleet still serializes byte-identically to a pre-#879 frame and the
+    /// `build/fixtures/wire-*.json` goldens — all four of which carry no cohort — stay unchanged
+    /// across this bump. **The key's mere APPEARANCE was the wire-contract change**, and #879 paid
+    /// the full ritual for it: the MINOR [`STATUS_SCHEMA_VERSION`] bump to 1.13, the golden
+    /// regeneration, and the current-daemon Swift fixture lockstep. Note what that byte-identity
+    /// means for anyone extending this: a gate CANNOT tell you when a new grouping reaches the wire,
+    /// because the goldens go on passing. The same is true of the
+    /// `assert!(!frame.contains("cohort_id"))` in
+    /// `account_line_encodes_the_expiry_modifier_only_once_the_account_has_been_polled`, which
+    /// hand-builds its own `AccountExpiry` and so pins only that an ungrouped account stays quiet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) cohort_id: Option<u32>,
 }
@@ -1147,8 +1205,9 @@ pub(crate) struct AccountExpiry {
 /// appears anywhere in this path. `horizon_secs` bounds the LOOKAHEAD only.
 ///
 /// A pure function of explicit inputs (no clock, no I/O), so every branch — including the absent
-/// field — is deterministically testable. Saturating arithmetic keeps an extreme horizon from
-/// wrapping the comparison into a false `Beyond`.
+/// field — is deterministically testable. The `Within` edge comes from the shared [`horizon_edge`],
+/// whose saturating arithmetic keeps an extreme horizon from wrapping the comparison into a false
+/// `Beyond`.
 pub(crate) fn account_expiry(
     refresh_expires_at: Option<i64>,
     horizon_secs: u64,
@@ -1158,21 +1217,173 @@ pub(crate) fn account_expiry(
         // Absent ⇒ UNKNOWN, never "not expiring" (issue #137).
         None => ExpiryHorizon::Unknown,
         Some(deadline) if deadline <= now_secs => ExpiryHorizon::Lapsed,
-        Some(deadline) => {
-            let edge = now_secs.saturating_add(i64::try_from(horizon_secs).unwrap_or(i64::MAX));
-            if deadline <= edge {
-                ExpiryHorizon::Within
-            } else {
-                ExpiryHorizon::Beyond
-            }
-        }
+        Some(deadline) if deadline <= horizon_edge(now_secs, horizon_secs) => ExpiryHorizon::Within,
+        Some(_) => ExpiryHorizon::Beyond,
     };
     AccountExpiry {
         expires_at: refresh_expires_at,
         horizon_state,
-        // Issue #879 owns cohort detection; this item only carries the field.
+        // Ungrouped by construction: cohort membership is a property of the WHOLE fleet's
+        // deadlines, which this per-account classifier cannot see. `Daemon::snapshot` overwrites
+        // this from [`expiry_cohorts`] once every account has been classified (issue #879).
         cohort_id: None,
     }
+}
+
+/// The instant the operator's foresight reaches — `now + horizon_secs`, saturating so an extreme
+/// horizon cannot wrap it back into the past.
+///
+/// ONE definition, shared by [`account_expiry`] and [`expiry_cohorts`] deliberately: the
+/// per-account [`ExpiryHorizon::Within`] boundary and the fleet condition's RAISE boundary are the
+/// SAME instant, so a deadline sitting exactly on it must classify and raise together rather than
+/// one but not the other. Two open-coded copies of this expression could only agree by intent.
+fn horizon_edge(now_secs: i64, horizon_secs: u64) -> i64 {
+    now_secs.saturating_add(i64::try_from(horizon_secs).unwrap_or(i64::MAX))
+}
+
+/// The fleet-level SYNCHRONIZED-EXPIRY COHORT condition (issue #879, REQ-CC-B-004): two or more
+/// accounts whose `refreshTokenExpiresAt` deadlines fall within one grouping window, so the swap
+/// pool loses several members at once.
+///
+/// **A FLEET fact, not a per-account one — that distinction is the whole point of the issue.** Each
+/// member row already looks individually survivable; what no single row can show is that several of
+/// them go together. So this is a DAEMON-LEVEL field of [`StatusResponse`], a sibling of
+/// [`StatusResponse::keychain_locked`] and [`StatusResponse::canonical_scrub`], never a per-account
+/// modifier and never a band listing handles-with-deadlines (the shape issues #543/#544 were retired
+/// for). The upstream Claude Code client cannot see this at all: it warns only for the ACTIVE
+/// account, so a parked account's deadline is invisible to it until swap-in.
+///
+/// Carries COUNTS and INSTANTS only — deliberately no member handles. Membership is already
+/// recoverable from the per-account [`AccountExpiry::cohort_id`], so repeating it here would add
+/// nothing while handing a renderer the per-account list the issue forbids. Non-secret by
+/// construction: four numbers, never a token, email, or handle (issue #15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ExpiryCohort {
+    /// How many accounts are in this cohort. ALWAYS `>= 2` — a lone expiring account is not a
+    /// cohort, which is the acceptance criterion most easily got wrong (REQ-CC-B-004 says "two or
+    /// more"). [`expiry_cohorts`] is the only constructor and enforces it.
+    pub(crate) size: u32,
+    /// How many accounts carried a PARSED deadline at all — the denominator `size` is out of.
+    ///
+    /// Deliberately NOT the roster size. An account whose credential carried no
+    /// `refreshTokenExpiresAt` is [`ExpiryHorizon::Unknown`], and the daemon cannot say whether it
+    /// belongs to this cohort or not; quoting the roster would silently claim the unobserved
+    /// accounts are OUTSIDE the cohort. Naming the observed denominator states the coverage instead
+    /// of assuming it — the issue #137 invariant applied to an aggregate.
+    pub(crate) observed: u32,
+    /// The SOONEST member's deadline, epoch seconds — the instant the pool starts losing members.
+    pub(crate) earliest: i64,
+    /// Seconds between the soonest and latest member deadlines. `0` when they coincide, and never
+    /// greater than the configured window (the anchored grouping in [`expiry_cohorts`] guarantees
+    /// it), so "these fall within one window" is literally true of the members rather than an
+    /// approximation.
+    pub(crate) span_secs: i64,
+}
+
+/// Group a fleet's REFRESH-token deadlines into synchronized cohorts (issue #879) — the detector
+/// REQ-CC-B-004 asks for, and the populator [`AccountExpiry::cohort_id`] was carved out for.
+///
+/// `deadlines` is one entry per account IN ROSTER ORDER, `None` where no deadline was observed;
+/// `window_secs` is `[credential].expiry_cohort_window_secs`. Returns a per-account cohort
+/// assignment aligned with the input, plus the fleet-level [`ExpiryCohort`] condition.
+///
+/// **Grouping is ANCHORED, not single-linkage.** Deadlines are sorted; the earliest ungrouped one
+/// ANCHORS a cohort and every deadline up to `anchor + window` joins it; the next ungrouped deadline
+/// anchors the next cohort. This guarantees every cohort's own span is `<= window`, so the claim
+/// "these deadlines fall within one window" holds for the members themselves. Single-linkage
+/// (extend while each CONSECUTIVE gap is within the window) was rejected for exactly that reason: it
+/// chains, so ten accounts a day apart under a one-day window would form one "cohort" spanning nine
+/// days and be reported as expiring together, which is false.
+///
+/// **The cardinality guard is load-bearing.** A group of one is not a cohort — it gets no
+/// `cohort_id` and raises no condition. A cohort is by definition a MULTI-account synchronization,
+/// and a per-account expiry warning is already the job of [`ExpiryHorizon`].
+///
+/// **Which cohort becomes the condition**: the one whose earliest deadline is soonest — it is the
+/// one that bites first — and ONLY when that deadline is inside `horizon_secs`, the operator's
+/// existing foresight knob, reused rather than joined by a second urgency threshold. Grouping is
+/// unconditional, so `cohort_id` stays populated for a distant cohort and a client can group rows by
+/// it; what waits for the horizon is only the RAISED condition. Without that gate a fleet onboarded
+/// in one sitting would fly the banner permanently for the weeks it sits `Beyond`, and a condition
+/// that is always on carries no information.
+///
+/// A pure function of explicit inputs — no clock, no I/O, no config read — so every branch is
+/// deterministically testable, the same posture [`account_expiry`] takes.
+pub(crate) fn expiry_cohorts(
+    deadlines: &[Option<i64>],
+    window_secs: u64,
+    horizon_secs: u64,
+    now_secs: i64,
+) -> (Vec<Option<u32>>, Option<ExpiryCohort>) {
+    let mut assignment: Vec<Option<u32>> = vec![None; deadlines.len()];
+
+    // Sort the OBSERVED deadlines, carrying each one's roster index so the assignment can be
+    // written back in place. The pair is DEADLINE-FIRST so a plain sort orders by deadline, the
+    // index only breaking ties. Unobserved accounts never enter the walk: an absent deadline is not
+    // a deadline "at time zero", and letting one anchor a cohort would invent a grouping out of the
+    // very absence issue #137 forbids reading as information.
+    let mut observed: Vec<(i64, usize)> = deadlines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, d)| d.map(|deadline| (deadline, i)))
+        .collect();
+    observed.sort_unstable();
+
+    // The two bounds the walk reads, both drawn once: the grouping window is a SPAN added to each
+    // anchor below, the foresight edge an INSTANT that does not move between cohorts.
+    let window = i64::try_from(window_secs).unwrap_or(i64::MAX);
+    let horizon_edge = horizon_edge(now_secs, horizon_secs);
+    let mut condition: Option<ExpiryCohort> = None;
+    let mut next_id: u32 = 0;
+    let mut start = 0usize;
+
+    while start < observed.len() {
+        let anchor = observed[start].0;
+        // Saturating, so an extreme window cannot wrap the edge into a false non-member.
+        let window_edge = anchor.saturating_add(window);
+        // The sort makes membership a contiguous RUN: once one deadline is past the edge, so is
+        // every later one.
+        let mut end = start + 1;
+        while end < observed.len() && observed[end].0 <= window_edge {
+            end += 1;
+        }
+
+        let size = end - start;
+        if size >= 2 {
+            let id = next_id;
+            next_id += 1;
+            for (_, idx) in &observed[start..end] {
+                assignment[*idx] = Some(id);
+            }
+            let latest = observed[end - 1].0;
+            let candidate = ExpiryCohort {
+                // Saturating rather than asserting a ceiling: the roster has NO configured upper
+                // bound (`Config::validate` documents that it enforces none), so these casts
+                // degrade instead of claiming a bound nothing keeps. Truncation would take four
+                // billion accounts.
+                size: u32::try_from(size).unwrap_or(u32::MAX),
+                observed: u32::try_from(observed.len()).unwrap_or(u32::MAX),
+                earliest: anchor,
+                span_secs: latest.saturating_sub(anchor),
+            };
+            // Raise only what the operator can act on: the anchor must reach into the foresight
+            // horizon. Both this and `account_expiry`'s own `Within` test read the one
+            // [`horizon_edge`] with the same `<=`, so a deadline sitting exactly on the edge
+            // classifies and raises together rather than one but not the other. An already-LAPSED
+            // cohort is past that edge in the other direction and is likewise inside — hence
+            // comparing the deadline itself, not its distance.
+            if anchor <= horizon_edge {
+                // Cohorts are walked in ascending anchor order, so the FIRST one to qualify is
+                // already the soonest; a later cohort can only be further out. Recording just the
+                // first is therefore the soonest-wins rule, not an approximation of it.
+                condition.get_or_insert(candidate);
+            }
+        }
+
+        start = end;
+    }
+
+    (assignment, condition)
 }
 
 /// Reduce one account's stored refresh observations into the non-secret [`RefreshHealth`]

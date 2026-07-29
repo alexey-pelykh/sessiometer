@@ -409,8 +409,20 @@ impl Config {
             86_400,
             7_776_000,
         )?;
+        // The cohort window (issue #879) is bounds-checked on its OWN scale, deliberately NOT
+        // cross-checked against the horizon above. The two measure different things (how soon vs
+        // how close together), so a window wider than the horizon is a coherent operator choice —
+        // "group generously, warn only near the deadline" — and rejecting it would forbid a
+        // legitimate configuration to enforce a relationship neither knob's meaning implies.
+        range(
+            "credential.expiry_cohort_window_secs",
+            c.expiry_cohort_window_secs,
+            60,
+            604_800,
+        )?;
         let credential = CredentialConfig {
             expiry_horizon_secs: c.expiry_horizon_secs as u64,
+            expiry_cohort_window_secs: c.expiry_cohort_window_secs as u64,
         };
 
         Ok(Config {
@@ -1298,12 +1310,85 @@ mod tests {
             config.credential,
             CredentialConfig {
                 expiry_horizon_secs: 1_209_600,
+                // Unset in the TOML above, so it falls to the shipped default — the per-key
+                // opt-out contract: naming one key in `[credential]` must not silently reset its
+                // sibling.
+                expiry_cohort_window_secs: DEFAULT_CREDENTIAL_EXPIRY_COHORT_WINDOW_SECS,
             }
         );
         assert_eq!(
             config.credential.expiry_horizon(),
             Duration::from_secs(14 * 86_400)
         );
+    }
+
+    /// Issue #879: the cohort window is a SECOND, independent key on `[credential]` — it parses on
+    /// its own, defaults on its own, and the two knobs do not perturb each other.
+    #[test]
+    fn parses_the_credential_cohort_window_independently_of_the_horizon() {
+        // Set alone: the horizon keeps its default.
+        let toml = format!("{VALID}\n[credential]\nexpiry_cohort_window_secs = 3600\n");
+        let config = Config::parse(&toml).unwrap();
+        assert_eq!(
+            config.credential,
+            CredentialConfig {
+                expiry_horizon_secs: DEFAULT_CREDENTIAL_EXPIRY_HORIZON_SECS,
+                expiry_cohort_window_secs: 3_600,
+            }
+        );
+        assert_eq!(
+            config.credential.expiry_cohort_window(),
+            Duration::from_secs(3_600)
+        );
+
+        // Both set, and deliberately in the "window wider than the horizon" relation: the two
+        // measure different things (how soon vs how close together), so this is a coherent
+        // operator choice — "group generously, warn only near the deadline" — and must NOT be
+        // rejected by a cross-field rule.
+        let toml = format!(
+            "{VALID}\n[credential]\nexpiry_horizon_secs = 86400\nexpiry_cohort_window_secs = 604800\n"
+        );
+        let config = Config::parse(&toml).expect("a window wider than the horizon is legal");
+        assert_eq!(config.credential.expiry_horizon_secs, 86_400);
+        assert_eq!(config.credential.expiry_cohort_window_secs, 604_800);
+
+        // An absent `[credential]` table leaves both at their shipped defaults.
+        let config = Config::parse(VALID).unwrap();
+        assert_eq!(config.credential, CredentialConfig::default());
+        assert_eq!(
+            config.credential.expiry_cohort_window_secs,
+            DEFAULT_CREDENTIAL_EXPIRY_COHORT_WINDOW_SECS
+        );
+    }
+
+    /// The cohort window's bounds, and why each end is where it is.
+    #[test]
+    fn credential_expiry_cohort_window_out_of_range_is_rejected() {
+        // Below the 1-minute floor: a zero (or sub-minute) window groups only near-identical
+        // timestamps, a detector that fires on nothing real. Above the 7-day ceiling: pushed
+        // toward the ~30d refresh-token lifetime, EVERY account trivially lands in one cohort and
+        // the signal stops distinguishing anything — the load-bearing bound, not a sanity rail.
+        for bad in [
+            "expiry_cohort_window_secs = 0",
+            "expiry_cohort_window_secs = 59",
+            "expiry_cohort_window_secs = 604801",
+        ] {
+            let toml = format!("{VALID}\n[credential]\n{bad}\n");
+            let err = Config::parse(&toml).unwrap_err();
+            assert!(
+                matches!(&err, Error::ConfigInvalid(msg)
+                    if msg.contains("credential.expiry_cohort_window_secs")),
+                "expected a credential.expiry_cohort_window_secs range error for {bad:?}, got {err:?}"
+            );
+        }
+        // The inclusive bounds themselves are accepted.
+        for edge in [60, 604_800] {
+            let toml = format!("{VALID}\n[credential]\nexpiry_cohort_window_secs = {edge}\n");
+            let config = Config::parse(&toml).unwrap_or_else(|e| {
+                panic!("expiry_cohort_window_secs = {edge} is a valid edge: {e:?}")
+            });
+            assert_eq!(config.credential.expiry_cohort_window_secs, edge);
+        }
     }
 
     #[test]

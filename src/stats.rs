@@ -4156,7 +4156,9 @@ mod tests {
         AccountExpiry {
             expires_at: Some(now + offset_secs),
             horizon_state: state,
-            // Issue #879 owns cohort detection; this column carries none.
+            // Issue #879 shipped cohort detection on the DAEMON, and deliberately not here: the
+            // offline `stats` verb never talks to the daemon, so this column has no cohort to
+            // carry.
             cohort_id: None,
         }
     }

@@ -569,9 +569,12 @@ extension ExpiryHorizon: Decodable {
 /// deliberately unlike `BlindActive`. Non-secret — one timestamp and one classification, never a token
 /// or email (issue #15).
 ///
-/// The daemon's `cohort_id` is deliberately NOT mirrored: it is unpopulatable until issue #879 ships a
-/// detector, and `skip_serializing_if` keeps it off the wire entirely until then. Mirroring a key no
-/// daemon emits would be modelling a grouping no build can produce.
+/// The daemon's `cohort_id` is deliberately NOT mirrored, and since issue #879 shipped the detector
+/// that is a CHOICE rather than a vacancy: a 1.13 daemon really does emit the key on every account
+/// that shares a synchronized-expiry window with another. Nothing in the panel groups rows yet, so
+/// mirroring it would model a relationship no surface draws — and the unknown key costs this build
+/// nothing, which `WireDecoderTests.testCurrentDaemonExpiryCohortIsToleratedWithoutAMirror` pins.
+/// The fleet-level `expiry_cohort` object that rides beside it is unmirrored for the same reason.
 struct AccountExpiry: Decodable, Equatable, Sendable {
     /// The observed `refreshTokenExpiresAt` deadline as epoch SECONDS, or `nil` when the credential
     /// carried no parseable value. Emitted by the daemon as an explicit `null` rather than omitted:
