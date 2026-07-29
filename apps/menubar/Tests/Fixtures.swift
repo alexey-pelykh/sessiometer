@@ -241,7 +241,7 @@ enum Fixtures {
     """#
 
     /// The per-account REFRESH-token expiry modifier (issue #882, schema 1.12) — a real CURRENT-daemon
-    /// frame carrying the `expiry` object this build does not yet mirror. `work` is inside the operator's
+    /// frame carrying the `expiry` object. `work` is inside the operator's
     /// foresight horizon (`within`, deadline carried), `spare` was polled but its credential held no
     /// parseable `refreshTokenExpiresAt` (`unknown` with a NULL deadline — which means "no deadline
     /// observed", NEVER "not expiring", the issue #137 invariant).
@@ -251,9 +251,10 @@ enum Fixtures {
     /// exactly why this fixture exists: it is the shape a SHIPPED 1.12 daemon puts in front of a menubar
     /// build predating the mirror. Decoding it must not cost the frame — the additive-minor
     /// tolerate-by-ignoring contract, here for a nested OBJECT rather than the scalar
-    /// `snapshotUnknownAdditiveFields` covers. `WireModel.swift` gains the `expiry` property with the
+    /// `snapshotUnknownAdditiveFields` covers. `WireModel.swift` GAINED the `expiry` property with the
     /// panel surface (issue #884), mirroring how `blind_active` landed under #485 rather than the #479
-    /// wire item; until then this pins the tolerance, not a rendering.
+    /// wire item — so this now pins the READING as well as the tolerance
+    /// (`WireDecoderTests.testCurrentDaemonExpiryModifierDecodesOnBothThePopulatedAndDeadlinelessRow`).
     static let snapshotExpiryModifier = #"""
     {"type":"snapshot","schema_version":{"major":1,"minor":12},"generated_at":1893456000,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":30,"weekly_pct":20,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":1893470000,"refresh_health":{"last_ok":true,"rotated":false,"consecutive_failures":0},"auth":"healthy","expiry":{"expires_at":1893800000,"horizon_state":"within"}},{"label":"spare","active":false,"enabled":true,"quarantined":false,"recovering":false,"session_pct":20,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy","expiry":{"expires_at":null,"horizon_state":"unknown"}}],"next_swap":{"state":"target","to":"spare","reason":{"kind":"only_candidate"}},"refresh_enabled":true,"systemic_refresh_failure":null}
     """#

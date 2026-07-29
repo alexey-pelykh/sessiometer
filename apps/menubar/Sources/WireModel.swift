@@ -488,6 +488,119 @@ struct BlindActive: Decodable, Equatable, Sendable {
     }
 }
 
+// MARK: - The per-account refresh-token expiry modifier
+
+/// Where one account's REFRESH-token deadline sits relative to the operator's configured foresight
+/// horizon (`[credential].expiry_horizon_secs`) — mirrors the daemon's `ExpiryHorizon`
+/// (`src/observability.rs`, issue #878).
+///
+/// **`unknown` NEVER means "not expiring."** It is the issue #137 invariant applied to foresight: the
+/// daemon found no parseable `refreshTokenExpiresAt`, so it says "unknown" rather than the
+/// false-reassuring "fine". Only `beyond` means "further out than the horizon". That is why `unknown`
+/// is also this type's DEGRADE target below — a consumer that cannot classify gets the honest answer.
+///
+/// Decoded with a TOTAL mapping (an unrecognised token becomes `unknown`) rather than the throwing
+/// raw-value conformance `CredentialHealth` uses. The daemon's own doc calls this out as a real choice
+/// for this item, and the menubar's posture is deliberately SPLIT rather than uniform — the rule being
+/// *whether the unknown value IS the fault or only decorates one that decodes fine*. Two facts settle
+/// it toward degrading:
+///
+///  1. **Expiry only DECORATES a row that decodes fine.** It is the orthogonal foresight axis, never
+///     the row's fault state (`auth` owns that). `WatchStatusStore` DROPS an undecodable line, so
+///     throwing here would blank the WHOLE panel on every frame to refuse ONE cell — the trade
+///     `next_swap.reason.kind` (#412) and `systemic_refresh_source` (#813) already declined.
+///  2. **It matches the daemon's own posture for this object.** `AccountExpiry.horizon_state` is
+///     `#[serde(default)]` on the Rust side precisely so a partial `expiry` degrades to the fail-safe
+///     `Unknown` instead of throwing — deliberately unlike `BlindActive`, whose fields have no honest
+///     default. Degrading an unrecognised TOKEN to the same fail-safe extends that rule rather than
+///     inventing one.
+///
+/// The cost is that a future fifth classification renders as the gap `—` on an un-updated client
+/// instead of announcing itself. That is the safe direction: a gap claims nothing, and the minor bump
+/// such a variant owes is what a client would gate on if it ever needed to.
+enum ExpiryHorizon: Equatable, Sendable {
+    /// No usable `refreshTokenExpiresAt` was observed — or the wire carried a token this build does
+    /// not recognise. Renders as the gap, never as calm.
+    case unknown
+    /// A deadline was observed and it is FURTHER OUT than the horizon — the only variant that means
+    /// "not expiring soon", reachable ONLY from a parsed timestamp.
+    case beyond
+    /// A deadline was observed and it falls WITHIN the horizon: still valid, re-login before it lapses.
+    case within
+    /// A deadline was observed and it has already PASSED. No refresh recovers the account — only an
+    /// operator `claude /login`. Distinct from `CredentialHealth.dead`, which is set only once a
+    /// refresh has actually FAILED: this is the same fact seen BEFORE the failure rather than after.
+    case lapsed
+
+    /// The only way in FROM THE WIRE, which keeps that mapping TOTAL (the `SystemicRefreshSource` idiom,
+    /// #813). The cases stay directly constructible so tests and fixtures can name a state without
+    /// round-tripping a string.
+    init(wireToken: String) {
+        switch wireToken {
+        case "beyond": self = .beyond
+        case "within": self = .within
+        case "lapsed": self = .lapsed
+        // `"unknown"` and every unrecognised token alike — see the type doc.
+        default:       self = .unknown
+        }
+    }
+}
+
+extension ExpiryHorizon: Decodable {
+    init(from decoder: Decoder) throws {
+        self.init(wireToken: try decoder.singleValueContainer().decode(String.self))
+    }
+}
+
+/// One account's REFRESH-token expiry MODIFIER (`src/daemon/snapshot.rs` `AccountExpiry`, wire key
+/// `expiry`, issues #878/#882) — the forward-looking axis carried ALONGSIDE `auth`, never folded into it.
+///
+/// ORTHOGONAL to `CredentialHealth`: an account is routinely `.healthy` *and* `.within` its expiry
+/// horizon at the same time, which is precisely the case the operator needs to see and which no single
+/// ordinal ladder can express. Follows the ratified ADR-0017 `blind_active` precedent — a per-account
+/// condition hung on an otherwise-connected row rather than a new state in an existing ramp.
+///
+/// Present only once the account has been POLLED (the daemon omits the key otherwise via
+/// `skip_serializing_if`), so an unpolled row's bytes are unchanged by the additive minor 1.11 → 1.12.
+/// An ABSENT modifier is "never observed", NOT "not expiring" — and neither is `.unknown`.
+///
+/// Both fields decode via `decodeIfPresent`, mirroring the Rust `#[serde(default)]` on each: a partial
+/// `expiry` object DEGRADES (a missing `horizon_state` → the fail-safe `.unknown`) rather than throwing,
+/// deliberately unlike `BlindActive`. Non-secret — one timestamp and one classification, never a token
+/// or email (issue #15).
+///
+/// The daemon's `cohort_id` is deliberately NOT mirrored: it is unpopulatable until issue #879 ships a
+/// detector, and `skip_serializing_if` keeps it off the wire entirely until then. Mirroring a key no
+/// daemon emits would be modelling a grouping no build can produce.
+struct AccountExpiry: Decodable, Equatable, Sendable {
+    /// The observed `refreshTokenExpiresAt` deadline as epoch SECONDS, or `nil` when the credential
+    /// carried no parseable value. Emitted by the daemon as an explicit `null` rather than omitted:
+    /// inside a PRESENT `expiry` object, "polled and the credential carried no deadline" is a positive
+    /// observation, not a missing key.
+    let expiresAt: Int64?
+    /// Where `expiresAt` sits relative to the operator's configured horizon; `.unknown` whenever no
+    /// deadline was observed — never "not expiring".
+    let horizonState: ExpiryHorizon
+
+    private enum CodingKeys: String, CodingKey {
+        case expiresAt = "expires_at"
+        case horizonState = "horizon_state"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        expiresAt = try c.decodeIfPresent(Int64.self, forKey: .expiresAt)
+        horizonState = try c.decodeIfPresent(ExpiryHorizon.self, forKey: .horizonState) ?? .unknown
+    }
+
+    /// Memberwise construction for fixtures and the render harness — the decoder is the only path the
+    /// wire takes, but the panel's pure verdicts are unit-tested against hand-built values.
+    init(expiresAt: Int64?, horizonState: ExpiryHorizon) {
+        self.expiresAt = expiresAt
+        self.horizonState = horizonState
+    }
+}
+
 // MARK: - The redacted per-account payload line
 
 /// One account's redacted status line (`src/daemon/snapshot.rs` `AccountStatusLine`) — a
@@ -531,6 +644,14 @@ struct AccountStatusLine: Decodable, Equatable {
     /// auto-protection is OK or DEGRADED — in place of a false-healthy row (#137). Reflect-only: the
     /// surface never self-polls or self-swaps off it (#169).
     let blindActive: BlindActive?
+    /// This account's REFRESH-token expiry modifier (issues #878/#882), wire key `expiry`; present only
+    /// once the account has been POLLED (the daemon omits the key otherwise). Mirrored here by #884 —
+    /// #882 shipped the wire and a forward-compat tolerance pin, and the property lands with the panel
+    /// surface exactly as `blind_active` landed under #485 rather than the #479 wire item.
+    ///
+    /// Distinct from `accessExpiresAt`: that is the ACCESS token Claude Code refreshes invisibly; this
+    /// is the REFRESH token — the login itself — and no refresh moves it. Two different clocks.
+    let expiry: AccountExpiry?
 
     private enum CodingKeys: String, CodingKey {
         case label
@@ -547,6 +668,7 @@ struct AccountStatusLine: Decodable, Equatable {
         case refreshHealth = "refresh_health"
         case auth
         case blindActive = "blind_active"
+        case expiry
     }
 
     init(from decoder: Decoder) throws {
@@ -565,6 +687,7 @@ struct AccountStatusLine: Decodable, Equatable {
         refreshHealth = try c.decodeIfPresent(RefreshHealth.self, forKey: .refreshHealth)
         auth = try c.decodeIfPresent(CredentialHealth.self, forKey: .auth)
         blindActive = try c.decodeIfPresent(BlindActive.self, forKey: .blindActive)
+        expiry = try c.decodeIfPresent(AccountExpiry.self, forKey: .expiry)
     }
 }
 

@@ -425,17 +425,17 @@ final class WireDecoderTests: XCTestCase {
         XCTAssertEqual(v.accounts[0].label, "work")
     }
 
-    // AC (#882 forward-compat): a CURRENT 1.12 daemon carries the additive per-account `expiry`
-    // modifier. This build does not mirror it yet — the property lands with the panel surface (#884),
-    // exactly as `blind_active` arrived under #485 rather than the #479 wire item — so the whole
-    // contract this test defends is that the unknown key COSTS NOTHING: the frame decodes, and every
-    // field the client DOES know keeps its value on both the populated and the deadline-less row.
+    // AC (#884): a CURRENT 1.12 daemon carries the additive per-account `expiry` modifier, and this
+    // build now MIRRORS it — the property landed with the panel surface, exactly as `blind_active`
+    // arrived under #485 rather than the #479 wire item. #882 pinned the tolerance (the frame must
+    // decode even unmirrored); this now additionally pins the READING, on both the populated and the
+    // deadline-less row.
     //
-    // Not redundant with `testUnknownAdditiveFieldsAreIgnored`: that fixture's unknown additive is a
-    // scalar (`"future_field":"x"`) on a hand-built 1.5 frame. This one is a nested OBJECT with its own
+    // Still not redundant with `testUnknownAdditiveFieldsAreIgnored`: that fixture's unknown additive is
+    // a scalar (`"future_field":"x"`) on a hand-built 1.5 frame. This one is a nested OBJECT with its own
     // keys, on the real shape a shipped daemon emits — and `WatchStatusStore` DROPS an undecodable
     // line, so getting this wrong blanks the panel on every frame rather than degrading one cell.
-    func testCurrentDaemonExpiryModifierIsToleratedByAPreMirrorClient() throws {
+    func testCurrentDaemonExpiryModifierDecodesOnBothThePopulatedAndDeadlinelessRow() throws {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotExpiryModifier) else {
             return XCTFail("the #882 expiry modifier must not cost us the frame")
         }
@@ -456,15 +456,21 @@ final class WireDecoderTests: XCTestCase {
                        "the ACCESS-token clock is a different field from the REFRESH-token modifier")
         XCTAssertEqual(work.refreshHealth, RefreshHealth(lastOk: true, rotated: false, consecutiveFailures: 0))
         XCTAssertNil(work.blindActive, "the sibling per-account modifier is independent of this one")
+        XCTAssertEqual(work.expiry, AccountExpiry(expiresAt: 1_893_800_000, horizonState: .within),
+                       "the mirrored modifier carries BOTH facts — the deadline and its classification")
 
         // And the row whose credential held NO parseable deadline — `expiry` present with a null
-        // `expires_at` and `horizon_state: "unknown"`. This build skips the whole unknown key either
-        // way, so what the second row buys is the FIXTURE: the deadline-less shape a shipped 1.12
-        // daemon really emits, on hand and pinned against drift for the #884 mirror.
+        // `expires_at` and `horizon_state: "unknown"`. The object's PRESENCE is itself the observation
+        // ("polled, and the credential carried no deadline"), which is why the daemon emits an explicit
+        // `null` rather than omitting the key — and why this decodes to a non-nil `expiry` holding a nil
+        // deadline, NOT to a nil `expiry`. Those two are different facts (#137: `unknown` is never "not
+        // expiring", and an ABSENT modifier is "never observed").
         let spare = v.accounts[1]
         XCTAssertEqual(spare.label, "spare")
         XCTAssertEqual(spare.auth, .healthy)
         XCTAssertEqual(spare.weeklyPct, 10)
+        XCTAssertEqual(spare.expiry, AccountExpiry(expiresAt: nil, horizonState: .unknown))
+        XCTAssertNotNil(spare.expiry, "a polled-but-deadline-less row is OBSERVED, not absent")
 
         // The rest of the frame is untouched by the new key.
         XCTAssertEqual(v.nextSwap, .target(to: "spare", reason: .onlyCandidate))
@@ -483,6 +489,63 @@ final class WireDecoderTests: XCTestCase {
         XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 1))
         XCTAssertTrue(v.isSchemaSupported, "a pre-#393 minor stays supported")
         XCTAssertEqual(v.nextSwap, .target(to: "spare", reason: nil))
+    }
+
+    // AC (#884): a NEWER daemon's unrecognised `expiry.horizon_state` DEGRADES to `.unknown` and the
+    // frame STILL decodes — the same forward-compat posture `next_swap.reason.kind` (#412) and
+    // `systemic_refresh_source` (#813) take, and for the same reason: the modifier only DECORATES a row
+    // that decodes fine, and `WatchStatusStore` DROPS an undecodable line, so throwing would blank the
+    // WHOLE panel on every frame to refuse ONE cell.
+    //
+    // `.unknown` is the right degrade target specifically because it renders as the GAP: a client that
+    // cannot classify says "no deadline observed" rather than inventing a reassuring one (#137). The
+    // daemon's own `horizon_state` is `#[serde(default)]` to the same fail-safe, so this extends that
+    // rule to the token rather than inventing a new one.
+    func testUnknownExpiryHorizonTokenDegradesToTheGapRatherThanCostingTheFrame() throws {
+        let frame = #"""
+        {"type":"snapshot","schema_version":{"major":1,"minor":12},"generated_at":1893456000,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":30,"weekly_pct":20,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy","expiry":{"expires_at":1893800000,"horizon_state":"cohort_pending"}}],"next_swap":{"state":"awaiting_data"},"refresh_enabled":true,"systemic_refresh_failure":null}
+        """#
+        guard case .snapshot(let v) = try parseWatchFrame(frame) else {
+            return XCTFail("an unrecognised horizon token must not cost us the frame")
+        }
+        XCTAssertEqual(v.accounts.count, 1, "the roster survives the unknown token")
+        XCTAssertEqual(v.accounts[0].auth, .healthy, "every other field keeps its value")
+        XCTAssertEqual(v.accounts[0].expiry?.horizonState, .unknown)
+
+        // …and the honest consequence: the cell reads as the GAP, NOT as a duration derived from the
+        // deadline sitting right beside it. `.unknown` is authoritative — the client will not narrate a
+        // classification it does not understand.
+        XCTAssertEqual(
+            StatusPanelFormat.expiryCell(v.accounts[0].expiry, now: 1_893_456_000),
+            StatusPanelFormat.expiryGap)
+    }
+
+    // AC (#884): a PARTIAL `expiry` object degrades rather than throwing — deliberately unlike
+    // `BlindActive`, whose three fields have no honest default and so throw when one is missing. Both
+    // of this object's fields carry `#[serde(default)]` on the daemon side; the mirror matches.
+    func testPartialExpiryObjectDegradesToTheFailSafeRatherThanThrowing() throws {
+        let frame = #"""
+        {"type":"snapshot","schema_version":{"major":1,"minor":12},"generated_at":1893456000,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":30,"weekly_pct":20,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy","expiry":{}}],"next_swap":{"state":"awaiting_data"},"refresh_enabled":true,"systemic_refresh_failure":null}
+        """#
+        guard case .snapshot(let v) = try parseWatchFrame(frame) else {
+            return XCTFail("a partial expiry object must not cost us the frame")
+        }
+        XCTAssertEqual(v.accounts[0].expiry, AccountExpiry(expiresAt: nil, horizonState: .unknown))
+    }
+
+    // AC (#884): an UNPOLLED account omits the key entirely → `expiry == nil`. This is a DIFFERENT fact
+    // from a present object holding a null deadline: "never observed" vs "observed, no deadline in the
+    // credential". Neither means "not expiring", and the shared golden proves the omission is the real
+    // shape a shipped daemon emits (all four wire goldens carry `expiry: None`).
+    func testUnpolledAccountOmitsTheExpiryKeyEntirely() throws {
+        guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotBasic) else {
+            return XCTFail("expected a snapshot frame")
+        }
+        XCTAssertTrue(v.accounts.allSatisfy { $0.expiry == nil },
+                      "an omitted key is 'never observed', never a fabricated reading")
+        XCTAssertFalse(
+            StatusPanelFormat.rosterShowsExpiry(v.accounts.map(\.expiry), now: 1_893_456_000),
+            "and a roster with nothing to say shows no expiry line at all — which is why the committed panel goldens are untouched by #884")
     }
 
     // AC (#412): a NEWER daemon's unrecognised `next_swap.reason.kind` is a forward-compat DECORATION
