@@ -803,6 +803,13 @@ enum StatusPanelFormat {
     /// § Revive a dead account) is deliberately NOT named here — this line
     /// reports a fact, and the AUTH glyph already owns the actionable cue once the credential actually
     /// fails.
+    ///
+    /// **The shared CROSS-SURFACE fact, and it is byte-pinned.** `build/fixtures/cross-surface-severity.json`
+    /// records this exact string for every wire state and `CrossSurfaceSeverityParityTests` asserts against
+    /// it, so a change HERE is a change to a contract the Rust gate reads too. What this panel actually
+    /// DRAWS is `expiryLineCell` — this string plus the horizon mark — for the same reason the CLI keeps
+    /// its own mark in `expiry_table_cell` rather than here (issue #934): R-2 pins the shared state
+    /// vocabulary, while how a surface survives colour loss is that surface's own presentation.
     static func expiryCell(_ expiry: AccountExpiry?, now: Int64) -> String {
         switch expiryView(expiry, now: now) {
         case .gap:               return expiryGap
@@ -833,6 +840,58 @@ enum StatusPanelFormat {
         // `within` — and, defensively, any class that survived the render-time check above.
         case .live:                      return .yellow
         }
+    }
+
+    /// Whether this deadline sits INSIDE the operator's configured expiry horizon — the render-time
+    /// answer to the one question a bare duration cannot carry, since the horizon's width is
+    /// `[credential].expiry_horizon_secs` and the reader cannot know what it is set to.
+    ///
+    /// The panel's twin of `src/cli.rs` `expiry_within_horizon`, and written the same way: its OWN match,
+    /// arm-for-arm against `expirySeverity` rather than derived from it. Reading the mark off
+    /// `.yellow` would couple a typographic affordance to a colour band and silently re-mark every cell
+    /// the day a band moves — which is exactly backwards for a predicate whose whole purpose is to work
+    /// where colour does not.
+    ///
+    /// **This predicate is also the notification's trigger** (`AccountEventDeriver`, issue #935), and that
+    /// sharing is the mechanism behind the both-or-neither composition invariant rather than a convenience:
+    /// the panel marks a row IF AND ONLY IF the notifier would name it, because there is one function and
+    /// not two. A notification that fires while the panel says nothing is unreachable by construction.
+    static func expiryWithinHorizon(_ expiry: AccountExpiry?, now: Int64) -> Bool {
+        switch expiryView(expiry, now: now) {
+        case .gap, .lapsed:      return false
+        case .live(_, .beyond):  return false
+        // `within` — and, defensively, any class that survived the render-time check. The SAME
+        // fallthrough `expirySeverity` resolves to `.yellow`.
+        case .live:              return true
+        }
+    }
+
+    /// What the `EXPIRY` line actually DRAWS: `expiryCell` plus the within-horizon mark — the panel's twin
+    /// of `src/cli.rs` `expiry_table_cell` (issue #934).
+    ///
+    /// WHY THE PANEL OWES THIS TOO. Before it, `within` and `beyond` both rendered a bare duration and the
+    /// TINT was the only thing between them — `5d18h` yellow versus `29d` secondary. Colour is not a
+    /// channel this app is entitled to assume: Increase Contrast, a greyscale accessibility filter, and
+    /// colour-blindness each cost the operator that distinction, and unlike the gap (`—` versus a duration)
+    /// there is no text difference underneath to fall back on. The CLI closed the same hole with brackets
+    /// at issue #934 and scoped the panel's presentation as the panel's own; this is that half.
+    ///
+    /// BRACKETS, matching the CLI exactly — the mark must read identically on both surfaces or an operator
+    /// comparing them learns two vocabularies for one fact. They are a DESCRIPTOR, never an instruction
+    /// (§D-STA-6 / SUR-001): `within` is the STEADY state, not an exception — a 7-day default horizon
+    /// against ~30-day refresh tokens leaves every healthy account inside it for a week before every
+    /// re-login, which is why issue #884 refused a menu-bar `!` on exactly this ground. Brackets say the
+    /// narrow true thing: the horizon is a configured WINDOW and this deadline falls inside it.
+    ///
+    /// **Beyond, gap and `lapsed` stay unmarked**, again matching the CLI: the first two are the calm
+    /// states, and marking `lapsed` would be false twice over — a lapsed deadline is not *within* a
+    /// forward-looking window, and the bare word is already the loudest thing in a column of durations.
+    ///
+    /// The tint is untouched, so colour still augments where it is available (§D-STA-5 `Color augments
+    /// only`) rather than being the signal.
+    static func expiryLineCell(_ expiry: AccountExpiry?, now: Int64) -> String {
+        let cell = expiryCell(expiry, now: now)
+        return expiryWithinHorizon(expiry, now: now) ? "[\(cell)]" : cell
     }
 
     /// Whether the roster shows the expiry line AT ALL — true once ANY row has an observed deadline.
@@ -1860,9 +1919,19 @@ enum StatusPanelFormat {
         // too — spoken and visual say the same thing or the pair is a bug.
         if showsExpiry {
             switch expiryView(expiry, now: now) {
-            case .gap:             parts.append("login expiry not observed")
-            case .lapsed:          parts.append("login expired")
-            case .live(let at, _): parts.append("login expires in \(humanizeUntil(at - now))")
+            case .gap:    parts.append("login expiry not observed")
+            case .lapsed: parts.append("login expired")
+            case .live(let at, _):
+                // The horizon band, spoken. A screen-reader user gets NO colour at all, so before
+                // issue #934/#935 gave the line a mark they had strictly less than a sighted operator
+                // squinting at a tint: `5d18h` and `29d` were the same sentence. The spoken qualifier is
+                // the same distinction the brackets carry visually, read off the SAME predicate — so
+                // marked and spoken-qualified cannot drift apart, and the parity rule this label already
+                // holds itself to (spoken and visual say the same thing or the pair is a bug) survives.
+                let spoken = "login expires in \(humanizeUntil(at - now))"
+                parts.append(expiryWithinHorizon(expiry, now: now)
+                             ? "\(spoken), inside the expiry horizon"
+                             : spoken)
             }
         }
         // Drop any empty auth phrase (a healthy pre-#119 legacy account speaks no auth verdict).

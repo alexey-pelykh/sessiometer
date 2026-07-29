@@ -230,6 +230,52 @@ final class NotificationDeliveryTests: XCTestCase {
         }
     }
 
+    /// The SAME drive for the expiry channel (issue #935), past the same seam.
+    ///
+    /// Worth its own case rather than a row in the one above: expiry opened a SECOND and wider label
+    /// channel into the deriver. `ExpiryObservation` carries one label per ROSTER ROW — not just the
+    /// active account — so a fleet's worth of handles now reaches the derivation layer on every frame,
+    /// where before only the active label did. The model-layer proof lives in `AccountEventNotifierTests`;
+    /// this file exists because that proof stops at the `AccountEventPresenter` seam, and the exposure
+    /// happens past it.
+    func testASentinelExpiryLabelSurvivesNoStepOfTheChainIntoDeliveredContent() throws {
+        let recorder = PlanRecordingPresenter()
+        let notifier = makeNotifier(presenter: recorder, enabled: true)
+        let now = Int64(1_893_456_000)
+        let expiring = AccountExpiry(expiresAt: now + 3 * 86_400, horizonState: .within)
+
+        let projection = AccountEventNotifier.projection(of: store(activeLabel: sentinel + "-EXPIRY",
+                                                                  exhausted: false,
+                                                                  expiry: expiring))
+        // The sentinel really is on the expiry channel the notifier reads — otherwise the drive is
+        // vacuous and every assertion below passes on an empty pipeline.
+        XCTAssertEqual(projection.expiries.map(\.label), [sentinel + "-EXPIRY"],
+                       "the sentinel never reached the expiry projection")
+        notifier.handle(connectionState: projection.connectionState,
+                        activeLabel: projection.activeLabel,
+                        hasNoViableTarget: projection.hasNoViableTarget,
+                        expiries: projection.expiries,
+                        now: now)
+
+        XCTAssertEqual(recorder.events, [.loginExpiring],
+                       "the chain did not deliver the expiry event — the drive proved nothing")
+        let delivered = try XCTUnwrap(recorder.plans.first, "one delivery plan per posted event")
+        XCTAssertEqual(NotificationLeakScan.unreadableFields(of: delivered), [],
+                       "an unreadable field makes this plan's verdict void")
+        XCTAssertTrue(NotificationLeakScan.fields(of: delivered).contains { field in
+            guard case .text(let strings) = field.contribution else { return false }
+            return strings.contains(delivered.title)
+        }, "the scan of this delivered plan found no text at all — its verdict would be vacuous")
+        XCTAssertEqual(NotificationLeakScan.leakedFields(of: delivered, containing: sentinel), [], """
+            an account label reached DELIVERED notification content through the EXPIRY channel. A \
+            notification renders on the lock screen and in Notification Center — more exposed than the \
+            panel — so this is an identity disclosure to anyone who can see the screen.
+              plan: \(delivered)
+            """)
+        XCTAssertEqual(NotificationLeakScan.leakedFields(of: delivered, containing: "@"), [],
+                       "delivered notification content contains an email-shaped token: \(delivered)")
+    }
+
     /// CANARY — the leak scan must FIRE on content that does embed the label, or its silence above is
     /// worthless. Driven through `leakedFields`, the same function the assertion above calls.
     func testTheLeakScanFiresOnAPlanThatEmbedsTheLabel() {
@@ -269,7 +315,7 @@ final class NotificationDeliveryTests: XCTestCase {
     /// CONTROL for both canaries: the shipped plan, scanned by the same function, must come back clean —
     /// so the canaries are testing the leak and not merely "the scanner always finds something".
     func testTheLeakScanIsSilentOnTheShippedPlan() {
-        for event in [AccountEvent.swapped, .allExhausted] {
+        for event in AccountEvent.allCases {
             let plan = NotificationDelivery.plan(for: event, requestIdentifier: "req-1")
             XCTAssertEqual(NotificationLeakScan.leakedFields(of: plan, containing: sentinel), [],
                            "the shipped \(event) plan reports a leak of a label it never saw")
@@ -436,7 +482,7 @@ final class NotificationDeliveryTests: XCTestCase {
     /// named as manual, and the half that is a decision is testable here. What Notification Center renders
     /// from it is the manual half (`design/README.md`).
     func testTheShippedGroupingDecisionIsAppLevelWithNoExplicitThread() {
-        for event in [AccountEvent.swapped, .allExhausted] {
+        for event in AccountEvent.allCases {
             XCTAssertNil(NotificationDelivery.plan(for: event).threadIdentifier, """
                 the delivery plan now sets a thread identifier for \(event). That splits the app's \
                 notifications into sub-stacks in Notification Center — a deliberate change if you meant \
@@ -446,20 +492,103 @@ final class NotificationDeliveryTests: XCTestCase {
         }
     }
 
-    /// Both event kinds deliver DISTINCT, non-empty content — so grouping them under one app stack still
-    /// leaves them individually readable.
-    func testTheTwoEventKindsDeliverDistinctNonEmptyContent() {
-        let swapped = NotificationDelivery.plan(for: .swapped, requestIdentifier: "a")
-        let exhausted = NotificationDelivery.plan(for: .allExhausted, requestIdentifier: "b")
+    /// EVERY event kind delivers DISTINCT, non-empty content — so grouping them under one app stack
+    /// still leaves them individually readable.
+    ///
+    /// Enumerated over `AccountEvent.allCases` rather than a hand-written pair, and that is the whole
+    /// point of the conformance: issue #935's third case would otherwise have been admitted to the
+    /// grouped stack by a test that named only the first two and stayed green.
+    func testEveryEventKindDeliversDistinctNonEmptyContent() {
+        let plans = AccountEvent.allCases.map { (event: $0, plan: NotificationDelivery.plan(for: $0)) }
+        XCTAssertGreaterThan(plans.count, 1, "a single-case enum cannot exercise distinctness")
 
-        for plan in [swapped, exhausted] {
-            XCTAssertFalse(plan.title.isEmpty, "an empty title renders as a blank notification")
-            XCTAssertFalse(plan.body.isEmpty, "an empty body renders as a blank notification")
+        for (event, plan) in plans {
+            XCTAssertFalse(plan.title.isEmpty, "\(event) has an empty title — renders as a blank notification")
+            XCTAssertFalse(plan.body.isEmpty, "\(event) has an empty body — renders as a blank notification")
         }
-        XCTAssertNotEqual(swapped.title, exhausted.title,
-                          "the two event kinds are indistinguishable in a grouped stack")
-        XCTAssertNotEqual(swapped.body, exhausted.body,
-                          "the two event kinds are indistinguishable in a grouped stack")
+        for i in plans.indices {
+            for j in plans.indices where j > i {
+                XCTAssertNotEqual(plans[i].plan.title, plans[j].plan.title,
+                                  "\(plans[i].event) and \(plans[j].event) share a title — "
+                                  + "indistinguishable in a grouped stack")
+                XCTAssertNotEqual(plans[i].plan.body, plans[j].plan.body,
+                                  "\(plans[i].event) and \(plans[j].event) share a body — "
+                                  + "indistinguishable in a grouped stack")
+            }
+        }
+    }
+
+    /// §D-STA-6's banned tokens: the vocabulary of buying or evading capacity.
+    ///
+    /// Declared ONCE and shared with the canary below rather than duplicated into it, which is what
+    /// lets that canary be a canary at all: checked against its own second copy it would only ever
+    /// prove that the copy catches an offending string, so a token typo'd or dropped HERE — precisely
+    /// the silent inertness the canary names — would leave both tests green.
+    private static let bannedTokens = ["buy", "purchase", "upgrade", "cancel", "bypass", "beat", "need more"]
+
+    /// Imperative / urgency framings this project has already refused on operator-facing surfaces.
+    /// Shared with the canary for the same reason as `bannedTokens`.
+    private static let imperativeTokens = ["you must", "act now", "immediately", "right away",
+                                           "don't forget", "please "]
+
+    /// The §D-STA-6 / SUR-001 neutral-framing firewall, applied to the surface that renders on a LOCK
+    /// SCREEN (issue #935). Operator-facing strings state facts; they do not instruct, forecast, or
+    /// reach for the vocabulary of buying capacity.
+    ///
+    /// Enumerated over every case for the same reason as above — a firewall that only covers the
+    /// strings that existed when it was written is not a firewall. It is a token screen, deliberately
+    /// mechanical: it cannot judge tone, and the imperative check below is a keyword list rather than
+    /// a grammar. What it does guarantee is that the specific phrasings this project has already ruled
+    /// out cannot reappear in a notification without reddening.
+    func testNoEventContentReachesForABannedOrImperativeFraming() {
+        for event in AccountEvent.allCases {
+            let text = (event.notificationTitle + " " + event.notificationBody).lowercased()
+            for token in Self.bannedTokens {
+                XCTAssertFalse(text.contains(token),
+                               "\(event) content contains the §D-STA-6 banned token '\(token)': \(text)")
+            }
+            for token in Self.imperativeTokens {
+                XCTAssertFalse(text.contains(token),
+                               "\(event) content is imperative-framed via '\(token)': \(text)")
+            }
+        }
+    }
+
+    /// CANARY for the screen above: it must be able to FAIL. A screen that passes everything is not
+    /// evidence, and this one is a substring list — the class of check most likely to be silently
+    /// inert (a typo'd token, a case-folding slip) while reporting green.
+    ///
+    /// It therefore asserts against the SAME `Self.bannedTokens` / `Self.imperativeTokens` the screen
+    /// consumes. A local copy of the lists would make this test vacuous in the one case it is here to
+    /// cover: the copy would keep catching the offending string while the screen's own list sat typo'd.
+    func testTheNeutralFramingScreenCatchesABannedFraming() {
+        let offending = "You must act now — upgrade the plan.".lowercased()
+
+        XCTAssertTrue(Self.bannedTokens.contains { offending.contains($0) },
+                      "the banned-token list does not catch a deliberately offending string")
+        XCTAssertTrue(Self.imperativeTokens.contains { offending.contains($0) },
+                      "the imperative list does not catch a deliberately offending string")
+    }
+
+    /// `.loginExpiring` NAMES THE VERB that replaces the credential, and names no other (issue #935).
+    ///
+    /// The design record's hard boundary is that the prompt names the verb but never performs it —
+    /// `sessiometer login` is interactive by construction. So the string must actually carry the verb
+    /// (a notification that says "something expires" and leaves the operator to guess the remedy is
+    /// the failure this AC exists to prevent), and it must be THAT verb: `poke` refreshes an access
+    /// token and cannot move a refresh-token deadline, so naming it here would send the operator to
+    /// a command that reports success and changes nothing.
+    func testTheExpiryEventNamesTheReplacementVerbAndNoOther() {
+        let body = AccountEvent.loginExpiring.notificationBody
+        XCTAssertTrue(body.contains("sessiometer login"),
+                      "the expiry notification must name the verb that replaces the credential: \(body)")
+        XCTAssertFalse(body.contains("poke"),
+                       "`poke` refreshes an ACCESS token and cannot move a refresh-token deadline: \(body)")
+        // And it points at the surface that CAN name the account, which the redaction guarantee stops
+        // this string from doing itself — the composition invariant, read from the notification side.
+        XCTAssertTrue(body.lowercased().contains("panel"),
+                      "the expiry notification must point at the panel, its only route to which "
+                      + "account is expiring: \(body)")
     }
 
     // MARK: - Helpers
@@ -525,14 +654,16 @@ final class NotificationDeliveryTests: XCTestCase {
                              + "so no verdict in this file is about delivered content")
     }
 
-    /// A `.connected` snapshot with one active account under `activeLabel`.
-    private func store(activeLabel: String, exhausted: Bool) -> WatchStatusStore {
+    /// A `.connected` snapshot with one active account under `activeLabel`, optionally carrying an
+    /// expiry modifier so the issue #935 channel can be driven down the same chain.
+    private func store(activeLabel: String, exhausted: Bool,
+                       expiry: AccountExpiry? = nil) -> WatchStatusStore {
         WatchStatusStore.preview(
             state: .connected,
             rows: [AccountRow(label: activeLabel, isActive: true, isEnabled: true, isQuarantined: false,
                               isRecovering: false, auth: nil, sessionPct: nil, weeklyPct: nil,
                               sessionResetsAt: nil, weeklyResetsAt: nil, weeklyExhausted: false,
-                              isNextSwapTarget: false, blindActive: nil)],
+                              isNextSwapTarget: false, blindActive: nil, expiry: expiry)],
             nextSwap: exhausted ? .noViableTarget(cause: .weekly, resetsAt: 2) : .target(to: "spare", reason: nil),
             generatedAt: 2)
     }

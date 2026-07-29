@@ -1344,6 +1344,99 @@ final class StatusPanelFormatTests: XCTestCase {
             AccountExpiry(expiresAt: now + 604_800, horizonState: .unknown), now: now))
     }
 
+    /// The within-horizon MARK (issue #935), mirroring the CLI's `expiry_table_cell` (issue #934) —
+    /// what the panel actually DRAWS, as opposed to the byte-pinned cross-surface fact above.
+    ///
+    /// The mark exists because the tint was the ONLY thing between `5d18h` and `29d`: two durations of
+    /// the same shape, distinguished by a colour that Increase Contrast, a greyscale filter, and
+    /// colour-blindness each take away. Unlike the gap (`—` versus a duration) there is no text
+    /// difference underneath to fall back on, so losing the colour lost the whole per-account signal.
+    func testExpiryLineCellBracketsOnlyAWithinHorizonDeadline() {
+        let now = Self.expiryNow
+        let table: [(AccountExpiry?, String)] = [
+            // WITHIN — marked, and the mark wraps whatever `expiryCell` produced.
+            (AccountExpiry(expiresAt: now + 6 * 86_400 + 21 * 3_600, horizonState: .within), "[6d21h]"),
+            (AccountExpiry(expiresAt: now + 45 * 60, horizonState: .within),                 "[45m]"),
+            // BEYOND, the gap, and `lapsed` — all bare, matching the CLI arm for arm.
+            (AccountExpiry(expiresAt: now + 29 * 86_400, horizonState: .beyond),             "29d"),
+            (AccountExpiry(expiresAt: now - 86_400, horizonState: .lapsed),                   "lapsed"),
+            (AccountExpiry(expiresAt: nil, horizonState: .lapsed),                            "lapsed"),
+            (AccountExpiry(expiresAt: nil, horizonState: .unknown),                           "—"),
+            (AccountExpiry(expiresAt: now + 604_800, horizonState: .unknown),                 "—"),
+            (nil,                                                                             "—"),
+            // The render-time staleness rule reaches the mark: a `within` class whose deadline has
+            // already passed renders `lapsed`, so it must lose the bracket in the SAME step it loses
+            // the amber. A cell reading `[lapsed]` would claim a deadline is inside a forward window.
+            (AccountExpiry(expiresAt: now - 60, horizonState: .within),                       "lapsed"),
+            (AccountExpiry(expiresAt: now, horizonState: .within),                            "lapsed"),
+        ]
+        for (expiry, drawn) in table {
+            XCTAssertEqual(StatusPanelFormat.expiryLineCell(expiry, now: now), drawn)
+        }
+    }
+
+    /// The mark and the tint agree on which cells are inside the horizon — written as separate matches
+    /// (as the CLI writes them) precisely so this relation is assertable rather than tautological. If
+    /// they could disagree, an operator without colour and an operator with it would be reading two
+    /// different fleets.
+    func testTheExpiryMarkAndTheTintAgreeOnWhichCellsAreWithin() {
+        let now = Self.expiryNow
+        let candidates: [AccountExpiry?] = [
+            nil,
+            AccountExpiry(expiresAt: nil, horizonState: .unknown),
+            AccountExpiry(expiresAt: now + 604_800, horizonState: .unknown),
+            AccountExpiry(expiresAt: nil, horizonState: .lapsed),
+            AccountExpiry(expiresAt: now - 86_400, horizonState: .lapsed),
+            AccountExpiry(expiresAt: now - 60, horizonState: .within),
+            AccountExpiry(expiresAt: now, horizonState: .within),
+            AccountExpiry(expiresAt: now + 1, horizonState: .within),
+            AccountExpiry(expiresAt: now + 3 * 86_400, horizonState: .within),
+            AccountExpiry(expiresAt: now + 29 * 86_400, horizonState: .beyond),
+        ]
+        var marked = 0
+        for expiry in candidates {
+            let isMarked = StatusPanelFormat.expiryWithinHorizon(expiry, now: now)
+            XCTAssertEqual(isMarked, StatusPanelFormat.expirySeverity(expiry, now: now) == .yellow,
+                           "the mark and the amber band disagree about \(String(describing: expiry))")
+            // And the predicate really is what the drawn cell brackets on.
+            let drawn = StatusPanelFormat.expiryLineCell(expiry, now: now)
+            XCTAssertEqual(isMarked, drawn.hasPrefix("[") && drawn.hasSuffix("]"))
+            if isMarked { marked += 1 }
+        }
+        // Degenerate-subject guard: an all-unmarked sweep would satisfy every assertion above.
+        XCTAssertEqual(marked, 2, "expected exactly the two live within-horizon rows to be marked")
+    }
+
+    /// The mark costs EXACTLY the two bracket characters, whatever the cell underneath is — the claim
+    /// that actually bounds the line's width, and the one that survives a re-configured horizon.
+    ///
+    /// An earlier draft asserted only that `[6d23h]` is 7 characters, which reads as a width ceiling
+    /// but is not one: `expiry_horizon_secs` is operator-configurable, so a 30-day horizon admits
+    /// `[29d23h]` and a 400-day one `[1y2d]`-shaped cells. The bracket overhead is the invariant; the
+    /// widest DURATION is a property of the operator's configuration, not of this function. (Nothing
+    /// truncates either way — the line has no fixed frame and ends in a `Spacer`.)
+    func testTheMarkCostsExactlyTwoCharactersOverTheUnmarkedCell() {
+        let now = Self.expiryNow
+        let withins: [Int64] = [45 * 60, 86_400, 6 * 86_400 + 23 * 3_600, 29 * 86_400, 400 * 86_400]
+        var marked = 0
+        for offset in withins {
+            let expiry = AccountExpiry(expiresAt: now + offset, horizonState: .within)
+            let bare = StatusPanelFormat.expiryCell(expiry, now: now)
+            let drawn = StatusPanelFormat.expiryLineCell(expiry, now: now)
+            XCTAssertEqual(drawn, "[\(bare)]", "the mark must wrap the fact, never restate it")
+            XCTAssertEqual(drawn.count, bare.count + 2)
+            marked += 1
+        }
+        XCTAssertEqual(marked, withins.count, "the sweep skipped a case")
+
+        // At the 7-day DEFAULT horizon the widest cell is `[6d23h]` — 7 columns against the 6 that
+        // `lapsed` and the `EXPIRY` label already require, so the default costs the line one column.
+        XCTAssertEqual(StatusPanelFormat.expiryLineCell(
+            AccountExpiry(expiresAt: now + 6 * 86_400 + 23 * 3_600, horizonState: .within), now: now),
+            "[6d23h]")
+        XCTAssertEqual("lapsed".count, StatusPanelFormat.expiryRowLabel.count)
+    }
+
     /// The roster-level materialization rule, mirroring the CLI's `status_columns` (`EXPIRY` is built
     /// only `if rows.iter().any(|row| row.expiry != EXPIRY_GAP)`). An all-gap roster shows NO line on
     /// either surface — gap-honest, because it CLAIMS nothing — but a single observed deadline turns the
@@ -1383,8 +1476,17 @@ final class StatusPanelFormatTests: XCTestCase {
                 now: now, expiry: expiry, showsExpiry: shows)
         }
 
+        // WITHIN carries the horizon band in words (issue #935) — the spoken twin of the brackets the
+        // line now draws. A screen-reader user gets no colour at all, so before the mark they had
+        // strictly less than a sighted operator squinting at a tint: `3d` and `29d` were one sentence.
         XCTAssertTrue(spoken(AccountExpiry(expiresAt: now + 3 * 86_400, horizonState: .within))
-            .hasSuffix("login expires in 3d"))
+            .hasSuffix("login expires in 3d, inside the expiry horizon"))
+        // BEYOND stays a bare duration, exactly as the line stays unbracketed — spoken and visual are
+        // marked together or neither, so a VoiceOver user and a sighted one read the same fleet.
+        XCTAssertTrue(spoken(AccountExpiry(expiresAt: now + 29 * 86_400, horizonState: .beyond))
+            .hasSuffix("login expires in 29d"))
+        XCTAssertFalse(spoken(AccountExpiry(expiresAt: now + 29 * 86_400, horizonState: .beyond))
+            .contains("horizon"), "a beyond-horizon deadline must not be spoken as if it were inside")
         // PARITY WITH THE VISUAL LINE, not a richer spoken variant: the cell renders a bare `lapsed`, so
         // the label speaks a bare "login expired" — see `rowAccessibilityLabel` for why a spoken-only
         // remedy is the defect this pins against.
