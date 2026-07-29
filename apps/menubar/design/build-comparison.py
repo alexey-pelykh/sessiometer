@@ -250,6 +250,87 @@ STATES = [
               "the systemic fault while the panel answered the click with a grey “no action needed” over a "
               "green roster. That inversion is a purely visual regression, which is exactly what this pair "
               "is here to catch. Per #469/#523."),
+    # The four PATHOLOGICAL-CONTENT rosters (#752 authors the frames, #753 renders the fixtures). A third
+    # axis after states and fault ranks: `.connected`, no payload fault, only the CONTENT hostile. They
+    # pair here by NAME (#581), which is what let the mock frames land in one commit and these captures in
+    # the next — the `STATES` rows below are the second half, added with the fixtures because `cap()` fails
+    # loudly on a capture that does not exist yet.
+    dict(title="Stress 1 · Pathological label — long · CJK · RTL", theme="light",
+         design="pathological-label-light", capture="panel-pathological-label-light.png",
+         note="Four rows, four label hazards. The active row is 273.65 pt against the 171 pt roster budget, so "
+              "the panel MIDDLE-truncates it — the mock authors that as a pre-elided literal because CSS "
+              "<code>text-overflow</code> is tail-only, and middle-truncation is the whole point (#445): the "
+              "distinguishing tail survives. The other three are the scripts MEASUREMENT cleared — CJK 119.32 pt, "
+              "RTL Arabic 116.30 pt, RTL-Hebrew-with-LTR-tail 123.72 pt, all under 171, so they render WHOLE. "
+              "Issue #753's premise that they elide is measurably false and the frames follow the measurement. "
+              "What IS under test here is the frame, not the cell: that a bidi-shaped text run leaves the row's "
+              "LTR layout alone (badge leads, health trails — the panel sets no per-row layout direction), and "
+              "that the taller 4-row roster does not collapse the callout or the footer. Same reconciliations as "
+              "every frame above — no provider line (#173), the neutral <code>gauge.medium</code> header glyph "
+              "(#437/#524), no “Last swap …” footer (#88) — plus one specific to this group: the header sub-line "
+              "is ILLUSTRATIVE, elided by the mock's own width rather than authored, because no shipped gate "
+              "measures a budget for it (design/README.md § Pathological content). Do not read a sub-line "
+              "difference here as panel drift. Nor the active row's elision POINT: the mock pre-elided that "
+              "label at the 171 pt <code>rosterLabelBudget</code>, but the panel lays labels out in ~216 pt, so it "
+              "keeps more than the mock shows (<code>continuous-inte…ner@example.io</code> against the mock's "
+              "<code>continuous-…example.io</code>) — #938, and the mock is the side that moves."),
+    dict(title="Stress 1 · Pathological label (dark)", theme="dark",
+         design="pathological-label-dark", capture="panel-pathological-label-dark.png",
+         note="Same roster, dark appearance."),
+    dict(title="Stress 2 · Same local part — the #445 invariant", theme="light",
+         design="same-local-part-light", capture="panel-same-local-part-light.png",
+         note="Which substring survives elision, and what protects the pair that does not need to elide. The "
+              "short pair (<code>work@a.com</code> / <code>work@b.com</code>, 81.16 / 81.80 pt) holds by "
+              "HEADROOM — better than 2x under the budget — so it renders whole and its disambiguation rests "
+              "entirely on the monogram pair the shipped collision-escalation resolves: WC then WB, first⋅last "
+              "escalating to first⋅second once the pair is taken, never <code>label.first</code>. The long pair "
+              "(216.37 / 215.94 pt) is the case middle-truncation exists for: the distinguishing "
+              "<code>-one</code> / <code>-two</code> lives in the kept TAIL, where tail-truncation would collapse "
+              "both rows to an identical <code>oleksii.pelykh@company</code>. TWO known divergences on this "
+              "frame, and BOTH are the mock's — do not read either as panel drift. (1) Its why-line reads "
+              "“session resets soonest”, a phrase the wire cannot express: <code>NextSwapReason</code> carries a "
+              "single <code>soonest_reset</code> discriminant that <code>StatusPanelFormat.swapCalloutReason</code> "
+              "renders as “weekly resets soonest”, matching the daemon's weekly-reset selection axis (#37/#393) — "
+              "#936. (2) The same 171-vs-~216 pt elision gap as the Stress 1 frame above — #938 — and here it "
+              "costs a whole label: the mock elides <code>oleksii.pelykh@company-two.com</code> at 215.94 pt, "
+              "the panel renders it WHOLE. The #445 invariant still holds on both sides; only the elision "
+              "POINT differs."),
+    dict(title="Stress 2 · Same local part (dark)", theme="dark",
+         design="same-local-part-dark", capture="panel-same-local-part-dark.png",
+         note="Same roster, dark appearance."),
+    dict(title="Stress 3 · Degenerate labels — empty and whitespace-only", theme="light",
+         design="degenerate-label-light", capture="panel-degenerate-label-light.png",
+         note="An empty label and a whitespace-only one, between two ordinary rows so the departure is legible. "
+              "The name line must be genuinely BLANK — no placeholder, no quoted empty string, no synthesised "
+              "identity — which leaves identity resting on the other two cues of #445's three-cue kit, and makes "
+              "the <code>?</code> / <code>?2</code> monogram sentinel load-bearing rather than decorative: the "
+              "colour hash TRIMS its input, so these two labels hash to the SAME badge colour and the monogram is "
+              "the only thing separating them. That is also why the sentinel is a NON-colour cue (WCAG 1.4.1). "
+              "The swap target is deliberately the ordinary <code>Personal</code>: what the callout should render "
+              "for a DEGENERATE target is an open question in the design record (#930), not something either "
+              "surface guesses at. Badge COLOURS stay illustrative here as everywhere (#709) — the panel hashes "
+              "them from the label, so mock and panel need not match, only the monogram must."),
+    dict(title="Stress 3 · Degenerate labels (dark)", theme="dark",
+         design="degenerate-label-dark", capture="panel-degenerate-label-dark.png",
+         note="Same roster, dark appearance."),
+    dict(title="Stress 4 · Wire-hostile numerics — 255% and the reset-cell edge", theme="light",
+         design="wire-hostile-numerics-light", capture="panel-wire-hostile-numerics-light.png",
+         note="A percent the wire should never carry, and durations at the reset cell's MEASURED edge. "
+              "<code>255%</code> is rendered HONESTLY — the number is the wire value verbatim, in its real (red) "
+              "band, while only the meter GEOMETRY is clamped to its own track "
+              "(<code>StatusPanelFormat.meterFillWidth</code>). Both surfaces already split it that way and both "
+              "halves are pinned (<code>pct(255)</code> in <code>PanelTextMetricsTests</code>, #750; the band in "
+              "#768), so this frame ratifies the shipped behaviour rather than inventing a third answer — hq "
+              "<code>strategy/design-menubar.md</code> § D-UX-PATHOLOGICAL. The durations are the FITTING "
+              "extremes: <code>365d23h</code> and <code>999d23h</code> are 48.32 pt in the 52 pt cell, as is every "
+              "three-digit day count — issue #753's premise that <code>365d23h</code> overflows is measurably "
+              "false. Overflow begins at FOUR digits (<code>1000d23h</code> = 55.32 pt), which is #927 and is "
+              "deliberately unauthored here. <code>23h59m</code> on the third row is the widest sub-day form, the "
+              "ordinary counterpart. Three rows, not four, so this is the one stress frame that shares "
+              "<code>healthy</code>'s panel height."),
+    dict(title="Stress 4 · Wire-hostile numerics (dark)", theme="dark",
+         design="wire-hostile-numerics-dark", capture="panel-wire-hostile-numerics-dark.png",
+         note="Same roster, dark appearance."),
 ]
 
 sections = "".join(f"""

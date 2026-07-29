@@ -540,6 +540,21 @@ final class PanelAccessibilityTreeTests: XCTestCase {
             "fault-scrub-exhausted": "AXButton:5 AXStaticText:4 AXUnknown:1",
             "fault-systemic-refresh": "AXButton:5 AXStaticText:4 AXUnknown:1",
             "fault-scrub-recovering": "AXButton:5 AXStaticText:4 AXUnknown:1",
+            // The four pathological-content rosters (#753). Their shapes are the ORDINARY ones for their
+            // row counts — the three 4-row rosters match `expiry` and the 3-row `wire-hostile-numerics`
+            // matches `healthy` — and that is the claim worth pinning: hostile CONTENT must not change the
+            // panel's accessibility STRUCTURE. A 40-char label, a bidi text run, an empty label and a 255 %
+            // reading each stay exactly one focusable row, gaining no element and losing none.
+            "pathological-label": "AXButton:6 AXStaticText:3 AXUnknown:1",
+            "same-local-part": "AXButton:6 AXStaticText:3 AXUnknown:1",
+            // `degenerate-label` matching its siblings is a NARROW claim, and issue #939 is the reason to
+            // say so here: the two blank-label rows are focusable and structurally identical to any other
+            // row, but their spoken LABEL carries no identity — `rowAccessibilityLabel` filters the empty
+            // string out entirely, so the `?` / `?2` monogram the badge shows has no spoken counterpart. A
+            // role histogram cannot see that; it is a text-level defect on a structurally-correct tree.
+            // Do not read this green pin as "the degenerate rows are accessible".
+            "degenerate-label": "AXButton:6 AXStaticText:3 AXUnknown:1",
+            "wire-hostile-numerics": "AXButton:5 AXStaticText:3 AXUnknown:1",
         ]
 
         let fixtures = PanelA11y.allFixtures

@@ -63,11 +63,12 @@
 //
 // Thresholds are calibrated to MEASURED separations on THIS content, not guessed. Re-derive every number
 // with the commands recorded in design/README.md § Panel golden drift gate; these are what those runs
-// printed on arm64 / macOS 26.5.2 / Xcode 26.6, over the full 36-cell catalog (18 fixtures × 2 themes).
-// The catalog grew from 34 cells at issue #886, which added the four-state `expiry` fixture; the two
-// counts that moved with it are re-measured and explained at their assertions below. Every SEPARATION
-// number in this table was re-derived on that catalog and is unchanged — the new fixture is a comfortable
-// distance from everything else, so it neither set a new closest pair nor weakened the margin.
+// printed on arm64 / macOS 26.5.2 / Xcode 26.6, over the full 44-cell catalog (22 fixtures × 2 themes).
+// The catalog has grown twice since it was first blessed — 34 → 36 at issue #886 (the four-state `expiry`
+// fixture) and 36 → 44 at issue #753 (the four pathological-content rosters) — and the counts that moved
+// with each are re-measured and explained at their assertions below. Every SEPARATION number in this table
+// survived both: the added fixtures sit a comfortable distance from everything else, so none of them set a
+// new closest pair or weakened the margin.
 // The provenance column matters — two rows do NOT come from `testMeasureSeparations`, so re-deriving the
 // whole table means running the default suite as well as the measurement test:
 //
@@ -76,9 +77,9 @@
 //   golden PNG round-trip (write → read → compare) .................... 0.000000  ← testMeasureSeparations
 //   same fixture under aqua vs darkAqua host appearance .............. 0.000000  ← testRendersDoNotDepend…
 //                                                                                 (no host Dark-Mode dep)
-//   app `--render-panel` output vs in-bundle goldens, all 36 cells .... 0.000000  ← out-of-band, recipe in
+//   app `--render-panel` output vs in-bundle goldens, all 44 cells .... 0.000000  ← out-of-band, recipe in
 //                                                                                 design/README.md; also
-//                                                                                 BYTE-identical, 36/36
+//                                                                                 BYTE-identical, 44/44
 //   closest distinct same-size pair .................................. 0.002513  healthy/dark vs stale/dark
 //   … #2 .............................................................. 0.002621  healthy/light vs stale/light
 //   … #3 .............................................................. 0.003827  fault-scrub-exhausted/dark
@@ -103,10 +104,11 @@
 // can still redden on a run that rasterizes a cell for the first time. Tracked as issue #824; do NOT
 // absorb it into a tolerance.
 //
-// The median is quoted only to be dismissed: of the 57 same-size pairs, 37 are cross-theme (light vs dark,
-// ~0.97), which drags the median to 0.971210 and so says nothing whatever about the gate's real margin. The
-// 20 same-theme pairs are the informative ones, and the CLOSEST of those is what the thresholds must
-// respect. They are narrow by nature — `healthy` vs `stale` differ only by a banner and a footer string.
+// The median is quoted only to be dismissed: of the 62 same-size pairs, 42 are cross-theme (light vs dark,
+// ~0.97), which is what drags the median up to the figure in the table and so says nothing whatever about
+// the gate's real margin. The 20 same-theme pairs are the informative ones, and the CLOSEST of those is what
+// the thresholds must respect. They are narrow by nature — `healthy` vs `stale` differ only by a banner and
+// a footer string.
 //
 // From those:
 //   • `distinctnessFloor` = 0.0005 — 5× under the 0.002513 closest REAL pair, so no genuinely-distinct
@@ -211,7 +213,7 @@ final class PanelGoldenParityTests: XCTestCase {
 
     private static func wallClock() -> Int64 { Int64(Date().timeIntervalSince1970) }
 
-    /// Render cache — 36 `ImageRenderer` passes are the expensive part of this suite and several tests need
+    /// Render cache — 44 `ImageRenderer` passes are the expensive part of this suite and several tests need
     /// the same set. Keyed by filename; only ever holds un-lagged renders (`seedLag == 0`).
     private static var cache: [String: PanelRaster] = [:]
 
@@ -221,7 +223,7 @@ final class PanelGoldenParityTests: XCTestCase {
     /// The fixtures are seeded from the wall clock read HERE, immediately before rasterizing, so the gap
     /// between seeding and `TimelineView`'s own `context.date` is always sub-second — far inside
     /// `PanelRenderHarness.boundaryGuardSecs`. A single class-wide seed would instead let that gap grow with
-    /// the suite's own runtime (36 renders take seconds), so a later test would rasterize different
+    /// the suite's own runtime (44 renders take seconds), so a later test would rasterize different
     /// clock-relative text than an earlier one and the whole comparison basis would rot mid-run. Re-reading
     /// the clock per render makes every render in the suite — and every render on any future day, against
     /// the committed goldens — carry identical clock-relative strings.
@@ -510,10 +512,10 @@ final class PanelGoldenParityTests: XCTestCase {
                 }
             }
         }
-        // Degenerate-subject guard, exact rather than non-zero: `> 0` would pass having compared 1 of the 38
+        // Degenerate-subject guard, exact rather than non-zero: `> 0` would pass having compared 1 of the 62
         // planned pairs, which is the partial-subject hole its four siblings in this file are closed against.
-        // 38 = the measured pair count over the 36-cell catalog's same-size groups
-        // (C(4,2) + 4·C(4,2) + 8·C(2,2) = 6 + 24 + 8). It moves only when the catalog or a panel height
+        // 62 = the measured pair count over the 44-cell catalog's same-size groups
+        // (2·C(6,2) + 4·C(4,2) + 8·C(2,2) = 30 + 24 + 8). It moves only when the catalog or a panel height
         // does, which is a deliberate act — re-measure with SESSIOMETER_PANEL_MEASURE=1, do not tune.
         //
         // It moved from 57 at issue #776, and the move is the point: `View log` made `starting` and
@@ -530,8 +532,17 @@ final class PanelGoldenParityTests: XCTestCase {
         // C(2,2) = 1 new pair, nothing regrouped. Its own light-vs-dark pair is the only comparison it
         // contributes, so it gains this check one cell-pair and gains the RELATIVE gate below nothing;
         // see that tripwire for the coverage side of the same fact.
-        XCTAssertEqual(compared, 38,
-                       "expected 38 same-size fixture pairs, compared \(compared) — the distinctness check's "
+        //
+        // 38 → 62 at issue #753, the largest move yet and the first that GROWS both gates. The four stress
+        // fixtures split by row count: the three 4-row rosters (`pathological-label`, `same-local-part`,
+        // `degenerate-label`) all render 760x1090 and form a NEW 6-cell group (C(6,2) = 15 pairs, 12 of
+        // them cross-fixture and 3 the fixtures' own light-vs-dark), while the 3-row
+        // `wire-hostile-numerics` joins `healthy`/`stale` at 760x898 and turns that 4-cell group into a
+        // 6-cell one (6 → 15, +9). 15 + 9 = 24. Unlike #886's addition these pairs are mostly
+        // CROSS-FIXTURE rather than a lone light-vs-dark pair, so the relative gate below gains real
+        // subject too — see its tripwire.
+        XCTAssertEqual(compared, 62,
+                       "expected 62 same-size fixture pairs, compared \(compared) — the distinctness check's "
                        + "subject changed; re-measure rather than relaxing this count")
     }
 
@@ -641,6 +652,174 @@ final class PanelGoldenParityTests: XCTestCase {
         }
     }
 
+    // MARK: - CANARY: the STRESS goldens can FAIL (semantic mutation, same predicate)
+
+    // The three canaries above prove the METRIC can fire. None of them proves anything about the four
+    // pathological-content fixtures (issue #753), and the hole that leaves is the exact one issue #437 was
+    // misread through five times: if the harness ever stopped APPLYING the hostile content — a mis-seeded
+    // roster, a label sanitized on its way to the view, a percent clamped before it reached the meter — the
+    // stress fixtures would render as ordinary panels, `SESSIOMETER_PANEL_GOLDENS=update` would bless those
+    // ordinary panels, and the gate would thereafter DEFEND the neutered fixture and report green. Every
+    // other check in this file would stay green too: the renders are non-blank, deterministic, and pairwise
+    // distinct whether or not the content is hostile.
+    //
+    // So the mutation here is SEMANTIC, not a blot: each stress fixture is rebuilt with its pathology
+    // REMOVED — the 40-char and non-Latin labels made ordinary ASCII, the same-local-part collisions made
+    // distinct, the blank labels given text, the out-of-range percent and the extreme durations made
+    // ordinary — and the render must move by more than `driftCeiling`, through the same
+    // `diffFraction(...) < driftCeiling` predicate `testEveryRenderMatchesItsCommittedGolden` applies to the
+    // committed goldens. A fixture that has silently LOST its pathology already IS its own twin and scores
+    // ~0, which reddens this test rather than sailing through the suite.
+    //
+    // TWO GUARDS, because a canary that cannot fail honestly is worth less than none:
+    //   • the SIZE guard. `diffFraction` returns 1 for mismatched dimensions, so a twin that happened to
+    //     render at a different height would score a maximal 1 > ceiling and this test would pass while
+    //     measuring nothing. The dimensions are asserted equal FIRST; only then is the score meaningful.
+    //   • the ZERO-SUBSTITUTION control. The twin is rebuilt through the same `PanelRenderFixture` /
+    //     `render` path as the original, so an identity substitution must score EXACTLY 0 — proving the
+    //     measured score is the pathology and not the rebuild. The direct analogue of
+    //     `perturbed(areaFraction: 0)` in the drift canary above.
+    //
+    // MEASURED MARGINS — the light / dark cell of each fixture, as the canary itself prints them. One of
+    // them is thin enough to be a FINDING rather than a footnote:
+    //
+    //     pathological-label     0.018306 / 0.018324    9.2x /  9.2x  ceiling
+    //     same-local-part        0.019663 / 0.019736    9.8x /  9.9x  ceiling
+    //     degenerate-label       0.002529 / 0.002499    1.3x /  1.2x  ceiling   ← thin
+    //     wire-hostile-numerics  0.024713 / 0.024046   12.4x / 12.0x  ceiling
+    //
+    // `degenerate-label`'s whole pathology is TWO blank name lines and the `?` / `?2` monogram sentinel —
+    // a few hundred pixels of missing text on a 760x1090 frame — so neutralizing it moves barely more than
+    // the 0.002 ceiling. The consequence is specific and worth stating plainly: that fixture's hostile
+    // content is defended by the ABSOLUTE ceiling alone, with ~25 % headroom, and the absolute ceiling is
+    // the half this suite's header records as UNVALIDATED cross-machine. The relative gate cannot help
+    // here — a neutralized `degenerate-label` is still nearest to its OWN golden by a wide margin, because
+    // its 760x1090 rivals differ from it by whole labels. Two things follow, both deliberate:
+    //   • this canary is now a TRIPWIRE ON THE CEILING itself. Raise `driftCeiling` past 0.0025 — which a
+    //     promotion re-calibration might well want to do — and this test reddens on `degenerate-label`
+    //     first. That is the intended loud failure: it means the ceiling can no longer tell a degenerate
+    //     roster from an ordinary one, and the answer is a targeted check for that fixture, NOT a relaxed
+    //     assertion here. Filed as issue #937, against the issue #790 promotion decision.
+    //   • do NOT "fix" the thin margin by inflating the mutation (blanking more rows, changing percents
+    //     too). The mutation is exactly the pathology the fixture exists to carry; a bigger mutation would
+    //     report a bigger number while testing something the fixture does not claim.
+    // Same-run comparison, no committed file → runs in the required job, like its sibling canaries.
+    func testANeutralizedStressFixtureTripsTheDriftCeiling() throws {
+        let now = Self.wallClock()
+        let catalog = PanelRenderHarness.fixtures(now: now)
+
+        /// Rebuild `fixture` with `rows`, keeping every other field — so the ONLY difference between a twin
+        /// and its original is the substitution, and an identity substitution is a byte-for-byte rebuild.
+        func rebuilt(_ fixture: PanelRenderFixture, rows: [AccountRow]) -> PanelRenderFixture {
+            // The callout names a label, so a renamed target has to be renamed there too or the frame would
+            // differ by a SECOND thing (a callout pointing at a row that no longer exists).
+            var swap = fixture.nextSwap
+            if case .target(_, let reason) = fixture.nextSwap,
+               let target = rows.first(where: { $0.isNextSwapTarget }) {
+                swap = .target(to: target.label, reason: reason)
+            }
+            return PanelRenderFixture(name: fixture.name, state: fixture.state, rows: rows,
+                                      nextSwap: swap, generatedAt: fixture.generatedAt)
+        }
+
+        /// One row with an ordinary label, everything else untouched.
+        func relabelled(_ row: AccountRow, _ label: String) -> AccountRow {
+            AccountRow(label: label, isActive: row.isActive, isEnabled: row.isEnabled,
+                       isQuarantined: row.isQuarantined, isRecovering: row.isRecovering, auth: row.auth,
+                       sessionPct: row.sessionPct, weeklyPct: row.weeklyPct,
+                       sessionResetsAt: row.sessionResetsAt, weeklyResetsAt: row.weeklyResetsAt,
+                       weeklyExhausted: row.weeklyExhausted, isNextSwapTarget: row.isNextSwapTarget,
+                       blindActive: row.blindActive, expiry: row.expiry)
+        }
+
+        /// One row with ordinary NUMERICS — the mutation for the fixture whose pathology is not its labels.
+        ///
+        /// Takes `boundaryGuardSecs` for the same reason `stressFixtures` does: the offsets below are whole
+        /// units, so seeding them bare would put every twin duration exactly ON a `humanizeUntil` boundary
+        /// and the twin's rendered strings would depend on how many whole seconds elapse before
+        /// rasterization. The verdict could not flip either way (this fixture scores ~12x the ceiling), but
+        /// the SCORE is quoted as a measurement in design/README.md, and a measurement that moves with the
+        /// clock is not one.
+        func renumbered(_ row: AccountRow, session: UInt8, sessionIn: Int64,
+                        weekly: UInt8, weeklyIn: Int64) -> AccountRow {
+            let guardSecs = PanelRenderHarness.boundaryGuardSecs
+            return AccountRow(label: row.label, isActive: row.isActive, isEnabled: row.isEnabled,
+                              isQuarantined: row.isQuarantined, isRecovering: row.isRecovering,
+                              auth: row.auth, sessionPct: session, weeklyPct: weekly,
+                              sessionResetsAt: now + sessionIn + guardSecs,
+                              weeklyResetsAt: now + weeklyIn + guardSecs,
+                              weeklyExhausted: row.weeklyExhausted,
+                              isNextSwapTarget: row.isNextSwapTarget,
+                              blindActive: row.blindActive, expiry: row.expiry)
+        }
+
+        let hour: Int64 = 3600, day: Int64 = 86_400
+
+        // One neutralization per fixture, each removing exactly what that fixture exists to capture.
+        let neutralizations: [(fixture: String, what: String, rows: ([AccountRow]) -> [AccountRow])] = [
+            ("pathological-label", "the 40-char, CJK and RTL labels made ordinary ASCII", { rows in
+                zip(rows, ["Work", "Personal", "Temp", "Scratch"]).map(relabelled)
+            }),
+            ("same-local-part", "the colliding local parts and the elided long pair made distinct", { rows in
+                zip(rows, ["Alpha", "Bravo", "Charlie", "Delta"]).map(relabelled)
+            }),
+            ("degenerate-label", "the empty and whitespace-only labels given text", { rows in
+                // Rows 0 and 3 are the ordinary controls; only the two degenerate ones are mutated.
+                [rows[0], relabelled(rows[1], "Second"), relabelled(rows[2], "Third"), rows[3]]
+            }),
+            ("wire-hostile-numerics", "the out-of-range percent and the extreme durations made ordinary", {
+                rows in
+                [renumbered(rows[0], session: 42, sessionIn: 2 * hour, weekly: 61, weeklyIn: 2 * day),
+                 renumbered(rows[1], session: 31, sessionIn: hour, weekly: 44, weeklyIn: 4 * day),
+                 rows[2]]
+            }),
+        ]
+
+        for (name, what, mutate) in neutralizations {
+            let original = try XCTUnwrap(catalog.first { $0.name == name },
+                                         "no fixture named \(name) — the stress catalog changed and this "
+                                         + "canary is no longer exercising it")
+            for scheme in PanelRenderHarness.themes {
+                let token = PanelRenderHarness.themeToken(scheme)
+
+                // Control: the rebuild path itself changes nothing.
+                let clean = try XCTUnwrap(PanelRenderHarness.render(original, scheme: scheme)
+                    .flatMap(PanelRaster.normalize))
+                let identity = try XCTUnwrap(PanelRenderHarness.render(rebuilt(original, rows: original.rows),
+                                                                       scheme: scheme)
+                    .flatMap(PanelRaster.normalize))
+                XCTAssertEqual(PanelRaster.diffFraction(clean, identity), 0.0, accuracy: 0.0,
+                               "\(name)/\(token): an IDENTITY substitution moved the render — the twin "
+                               + "builder is not exact, so the mutation score below would measure the "
+                               + "rebuild rather than the pathology")
+
+                let twin = try XCTUnwrap(PanelRenderHarness.render(rebuilt(original,
+                                                                           rows: mutate(original.rows)),
+                                                                   scheme: scheme)
+                    .flatMap(PanelRaster.normalize))
+
+                // Size guard, BEFORE the score: mismatched dimensions score a maximal 1 by construction,
+                // which would make the assertion below pass while measuring nothing at all.
+                XCTAssertEqual([twin.width, twin.height], [clean.width, clean.height],
+                               "\(name)/\(token): the neutralized twin rendered "
+                               + "\(twin.width)x\(twin.height) against the original's "
+                               + "\(clean.width)x\(clean.height) — `diffFraction` scores mismatched sizes a "
+                               + "maximal 1, so this canary would be a rubber stamp. Keep the twin the same "
+                               + "shape (same row count, same callout) and mutate CONTENT only")
+                guard twin.width == clean.width, twin.height == clean.height else { continue }
+
+                let score = PanelRaster.diffFraction(clean, twin)
+                XCTAssertGreaterThan(score, driftCeiling,
+                    "\(name)/\(token) scored \(score) with \(what) — at or under the \(driftCeiling) ceiling "
+                    + "the committed golden could not tell the pathological roster from an ordinary one, so "
+                    + "a fixture that silently lost its hostile content would be blessed and then defended")
+                print(String(format: "[panel-goldens] stress canary %@/%@ %.6f (%.1fx ceiling) — %@",
+                             name as NSString, token as NSString, score, score / driftCeiling,
+                             what as NSString))
+            }
+        }
+    }
+
     // MARK: - Pipeline integrity: a golden round-trips exactly
 
     // The gate compares a fresh in-memory raster against a raster decoded from a committed PNG. If that
@@ -733,14 +912,14 @@ final class PanelGoldenParityTests: XCTestCase {
     // 0.000000, so the whole separation is headroom).
     //
     // MEASURED LIMIT, and it is not small: this check only has power where a same-size golden of a
-    // DIFFERENT fixture exists to lose to. Goldens are sized by content, and 8 of the 18 fixtures own a
+    // DIFFERENT fixture exists to lose to. Goldens are sized by content, and 8 of the 22 fixtures own a
     // unique pixel height (`stats`, `disconnected`, `not-running`, `empty-roster`, `blind-cornered`, and —
     // since issue #776 gave each of them a differently-styled `View log` action — `starting` and
     // `crash-looping`, plus `expiry` since issue #886), so their size group holds only their own two
     // themes. Light-vs-dark of the same fixture sits ~0.97 apart, so "nearest is itself" is trivially true
-    // for those 16 of 36 cells and detects nothing. That is 4 cells WORSE than before #776 and 2 worse again
-    // since #886, and deliberately recorded as such. Those cells
-    // rest on `testEveryRenderMatchesItsCommittedGolden`'s absolute ceiling alone — i.e. on the
+    // for those 16 of 44 cells and detects nothing. That is 4 cells WORSE than before #776 and 2 worse
+    // again since #886, and deliberately recorded as such. Those cells rest on
+    // `testEveryRenderMatchesItsCommittedGolden`'s absolute ceiling alone — i.e. on the
     // cross-machine-UNVALIDATED half, which is a real input to the promotion decision (issue #790) and is
     // why the count below is asserted rather than merely mentioned. Both numbers print on every run.
     //
@@ -750,6 +929,9 @@ final class PanelGoldenParityTests: XCTestCase {
     // other fixtures to manufacture a rival would change what THEY assert, which is a worse trade. The two
     // cells are covered by the absolute ceiling (0.000000 measured) and by
     // `testDistinctFixturesRenderDistinctly`'s own light-vs-dark pair.
+    //
+    // Issue #753 is the first growth to move that ratio the RIGHT way — the count below stayed at 16 while
+    // its denominator rose to 44. Why, and what it means for #790, is recorded at the tripwire itself.
     func testEachFreshRenderIsNearestToItsOwnGolden() throws {
         try XCTSkipUnless(isGoldenGateEnabled,
                           "committed-golden comparison is the non-required half: SESSIOMETER_PANEL_GOLDEN_GATE=1")
@@ -799,8 +981,15 @@ final class PanelGoldenParityTests: XCTestCase {
         // Tripwire, not a preference: this is the measured coverage of the PRIMARY gate. If a fixture is
         // added or a layout changes a panel's height, this number moves and the promotion decision in issue
         // #790 needs to know. Re-measure and update deliberately — never widen it to make a run green.
+        // Issue #753 is the first change to move this number's DENOMINATOR without moving the number: the
+        // four stress fixtures each landed in a size group that already held another fixture (three at
+        // 760x1090 together, `wire-hostile-numerics` alongside `healthy`/`stale` at 760x898), so all eight
+        // new cells have a cross-state rival and the uncovered set is the same 8 fixtures as before. The
+        // gate's coverage therefore IMPROVED, 16-of-36 (44 %) → 16-of-44 (36 %) uncovered, which is the
+        // direction the issue #790 promotion decision wants — record it, do not read the unchanged 16 as
+        // "nothing happened".
         XCTAssertEqual(withoutCrossStateRival, 16,
-                       "measured 16 of 36 cells have no same-size cross-state rival; got "
+                       "measured 16 of 44 cells have no same-size cross-state rival; got "
                        + "\(withoutCrossStateRival). The relative gate's coverage changed — re-measure and "
                        + "record it against the promotion criterion (issue #790) rather than adjusting this "
                        + "number to fit")
