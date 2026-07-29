@@ -1535,6 +1535,9 @@ mod tests {
             // Bounded-blindness (#479) is a daemon `status`-snapshot concern, not read by the
             // cached-viability gate — inert here.
             blind_active: None,
+            // Likewise the #882 refresh-token expiry modifier: surfaced, never acted upon, so the
+            // viability gate does not read it.
+            expiry: None,
         }
     }
 
