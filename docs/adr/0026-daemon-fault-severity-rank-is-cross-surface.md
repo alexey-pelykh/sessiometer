@@ -161,6 +161,20 @@ is intentionally uncoloured even with the gate open).
   `daemonFaultBanner`), reconciled by this ADR and by tests, not by a shared compiled
   source. Accepted for the current fault count (see Alternative 3).
 
+  **Those tests exist as of issue #768.** When this ADR was written they did not: each surface
+  asserted its rank against its own hand-written expectation, which is the very
+  re-derive-independently mechanism that produced #575. `build/fixtures/cross-surface-severity.json`
+  is now emitted from `DaemonPayloadFault` (§ Decision 1's single home) and read by BOTH
+  `src/cli.rs` (`mod tests::cross_surface_parity`) and
+  `apps/menubar/Tests/CrossSurfaceSeverityParityTests.swift`, so neither surface can move its rank
+  alone — the emitting side reddens until the manifest is re-emitted, and re-emitting reddens the
+  other side until it follows. This is deliberately NOT Alternative 3: no wire field, no codegen, no
+  build-time coupling — only a committed fixture, which is the lighter mechanism Alternative 3's
+  deferral left room for. The manifest also carries the ENUMERATED legitimate divergences (the
+  blind-DEGRADED tint; the CLI's every-line vs the panel's one-banner medium difference) so R-2's
+  "rank-parity, not glyph-parity" is enforced without flattening deliberate differences, and an
+  explicit list of axes the contract does not cover.
+
 ## Related
 
 - Issues: **#575** (this ADR — the cross-surface inversion). **#378** (systemic refresh
