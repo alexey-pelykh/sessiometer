@@ -183,3 +183,25 @@ final class AccountSwapModel: ObservableObject {
         }
     }
 }
+
+#if DEBUG
+extension AccountSwapModel {
+    /// Tooling / preview only: a model pinned straight to the IN-FLIGHT `.pending(target:)` phase WITHOUT a
+    /// transport, so the panel's mid-swap presentation can be rendered and tree-walked offscreen
+    /// (issue #766). NOT a production path — the real phase is machine-derived from a socket exchange,
+    /// never set directly. It is available to the render harness and to SwiftUI previews; today its only
+    /// caller is `PanelInteractionStateTests`.
+    ///
+    /// SOCKET-FREE by construction: the client is nil and `swap(to:)` is never called, so no `swap` verb is
+    /// ever written and a test run can never perform a real credential switch. Same-file so it can set the
+    /// `private(set)` projection, mirroring `PanelStatsModel.loadedPreview` and `WatchStatusStore.preview`.
+    ///
+    /// The in-flight window is the ONE interaction state issue #761 measured as reachable by an XCUITest;
+    /// this seam reaches it from the existing headless bundle instead, so no UI-test target is needed.
+    static func pendingPreview(target: String) -> AccountSwapModel {
+        let model = AccountSwapModel(client: nil)
+        model.phase = .pending(target: target)
+        return model
+    }
+}
+#endif

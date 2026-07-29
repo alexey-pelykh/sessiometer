@@ -133,13 +133,21 @@ Two measured facts from building that gate, recorded because they are easy to re
   `testTheScaleMutationIsProvablyInertOnTheSingleLineLane` re-measures the mutated case (~92 % of an
   unscaled card) that makes the over-wide fixture the honest falsifier here.
 
-**Harness limitation — ARMED / in-flight states are NOT captured.** `ImageRenderer` draws one resting
-frame. As of #448 the per-row manual-switch chip is PERSISTENT, so a render captures its resting glyph
-(`arrow.left.arrow.right`, or the `nosign` on a non-viable row) at its quiet `.tertiary` emphasis — the
-committed `panel-healthy-*.png` show it on every switchable row. What a single resting frame still
-can't show is the ARMED state — the hover/focus brighten to `.secondary`, the row wash, the
-`pointingHand` cursor — nor the in-flight `Switching…` spinner; those are interaction states, so they
-stay a manual operator check (#380) — as does the real-popover swap round-trip.
+**Harness limitation — the committed goldens capture only the RESTING frame.** `ImageRenderer` draws one
+frame, and the fixtures render every model at rest, so the committed `panel-*.png` are resting frames by
+construction. As of #448 the per-row manual-switch chip is PERSISTENT, so those renders do capture its
+resting glyph (`arrow.left.arrow.right`, or the `nosign` on a non-viable row) at its quiet `.tertiary`
+emphasis, on every switchable row.
+
+**Corrected (issue #766): "not captured" was read as "not measurable", and that second claim is wrong.**
+This note previously routed the ARMED brighten, the row wash and the in-flight `Switching…` spinner to a
+manual operator check (#380) as though a static renderer could not reach them at all. What is actually
+true is narrower: those states need an *input*, and the fixtures supply none. Given a seam that supplies
+one — `AccountRowView`'s `armed` parameter, `AccountSwapModel.pendingPreview` — the same `ImageRenderer`
+renders them fine, and `Tests/PanelInteractionStateTests` measures the difference every run. See
+§ Interaction-state coverage for what that gate does and does not settle. Genuinely still manual, and
+now listed rather than implied: the *pressed* wash, the `pointingHand` cursor (not a rendered property of
+the view), the hover tooltip, and the real-popover swap round-trip.
 
 **Correction (issue #749): `ImageRenderer` rasterizes headlessly.** This note previously said
 regenerating the committed PNGs "needs a GUI / windowserver session — not something headless CI can
@@ -444,6 +452,9 @@ issue #868; the contrast half stays with issue #832.
 
 ### Appearance-settings pre-release checklist (manual)
 
+> This is one of **six** manual pre-release checklists, each owning a disjoint surface — see
+> § The manual checklists, indexed for the full set and what each covers.
+
 The three axes above have no automated coverage and cannot get any, so they are checked by hand. Toggle
 each in **System Settings → Accessibility → Display**, then open the panel:
 
@@ -690,6 +701,211 @@ the notification, with a source pin holding the presenter to that plan — so ne
 the pin for what it does and does not cover: it catches an added field, a KVC or `userInfo` write, and a
 substituted value on `title`/`body`; it cannot see an assignment made through a local alias or a helper in
 another file, because `UNUserNotificationCenter` keeps the presenter out of the test bundle.
+
+## Interaction-state coverage (#766)
+
+`ImageRenderer` draws one **resting** frame, so every state that needs an *input* to reach was a silent
+gap: the armed brighten on hover, the in-flight `Switching…` spinner, and the row's interactive shape at a
+width below the affordance budget. Since #448 the switch chip is *persistent*, so its resting glyph is
+captured by the panel goldens — what follows is about the rest.
+
+### The build reference authors the armed TOKEN, not an armed FRAME
+
+Measured, not assumed. `menubar-preview.html:242-249` **does** define the armed treatment and even names
+its SwiftUI mapping:
+
+```css
+.rowact{ … color:var(--text-3) }
+.acct:hover .rowact{ color:var(--text-2) }   /* armed on hover */
+.rowact.armed{ color:var(--text-2) }          /* explicit armed modifier */
+/* Mirrors SwiftUI `StatusPanelFormat.switchChipEmphasis` → `.tertiary` (rest) / `.secondary` (armed). */
+```
+
+But **no element in the mock carries `class="rowact armed"`** — all ~20 instantiated chips render at rest,
+and that last rule exists only to preview the brighten statically. There is likewise **no in-flight frame
+anywhere in the mock**; grepping for switching/spinner returns only daemon-starting's static forming glyph
+and the capture card's pending state.
+
+So the mock ratifies the armed **relation** (rest quieter → armed brighter, in named tokens) and authors
+neither the armed nor the in-flight **appearance**. That distinction decides the gate's shape: a committed
+golden of an armed panel would self-baseline against an oracle that does not exist — the same
+missing-oracle shape issue #752 names for content edge cases — so **this axis ships no new golden**. It
+asserts the relation the mock *does* ratify, both magnitude and direction, which needs no baseline because
+both sides are rendered in the same run.
+
+The missing frames are themselves tracked: **issue #903** asks the mock to instantiate an armed row and an
+in-flight row, which would let this axis graduate from a relational gate to real goldens. Read the gate
+below as the honest floor under that, not as a replacement for it.
+
+### The automated gate
+
+`Tests/PanelInteractionStateTests` (headless, inside the required `swift` job). Two lanes, both driving
+production code through seams added for the purpose — `AccountRowView`'s `armed` and `rowWidth`
+parameters, and `AccountSwapModel.pendingPreview(target:)`:
+
+- **render lane** — rasterizes the real row twice and diffs, via `PanelRaster.diffFraction`;
+- **tree lane** — walks the live accessibility tree via `PanelA11y` (the #758 harness), which is what makes
+  the in-flight window reachable **without** the XCUITest target issue #761 priced for it. No UI-test
+  bundle, no scheme outside `swift`, no TCC grant, and immune to the locked-session dead end that returned
+  0 of 20 valid local runs for that spike.
+
+**Measured separations** (arm64 / macOS 26.5.2 / Xcode 26.6, one row at the shipped width, 728×188 @2×),
+because the thresholds are calibrated to these rather than guessed:
+
+```
+                   T=2       T=4       T=8       T=16      T=32      T=64
+armed (light)   0.933825  0.930946  0.881298  0.001607  0.001439  0.000833
+armed (dark)    0.933138  0.930661  0.911503  0.001637  0.001454  0.001030
+in-flight       0.007482  0.007482  0.007482  0.007482  0.007482  0.007482
+canary          0.000000  0.000000  0.000000  0.000000  0.000000  0.000000
+chip only (T=4) 0.001914 light / 0.001929 dark
+```
+
+The suite runs at **T=4/255**, not the golden gate's 64. Arming is a large-area, low-amplitude change — the
+`opacity(0.08)` wash repaints ~93 % of the row by only ~8–15/255, which is why the number falls off a cliff
+between T=8 and T=16 — so at 64/255 the whole ratified design step reads as 0.0008, indistinguishable from
+nothing. That is not a fault in the golden gate; 64/255 is correctly tuned to ignore antialiasing on a
+*drift* comparison, and it is simply the wrong instrument for this question. The in-flight change is the
+opposite shape (small area, high amplitude) and reads flat at every threshold.
+
+**Proven by mutation.** Each gate was run against a deliberately broken build of the production code:
+
+| Mutation applied to `Sources/` | Which test reddens |
+|---|---|
+| chip `.armed` case → `.tertiary` (brighten deleted) | chip-isolation **only** |
+| chip `.resting`/`.armed` tints SWAPPED (arming DIMS) | chip-isolation **only**, via its DIRECTION half |
+| `RowSwitchButtonStyle.wash` → 0 (wash deleted) | whole-row arm **only** |
+| `offersSwitch` drops `rowFitsSwitchAffordance` | narrow-row mis-click guard |
+| row `ProgressView()` → `Color.clear` (spinner deleted) | in-flight render lane |
+| `isSwitching` / `isSwitchingToTarget` → `false` | both in-flight tests |
+
+Rows 1 and 3 are why there are **two** arm tests rather than one. They are not redundant — each is blind to
+the other's mutation. The whole-row measurement is dominated by the wash ~500:1, so deleting the chip
+brighten leaves it green; that hole was found by *running* the mutation, not by reading the code, and it is
+exactly the shape #437 warns about. The chip lane isolates the brighten without cropping to a hardcoded rect
+(which would rot on any layout change): a **blocked** row is not `live`, so its own guard holds the wash out
+while the chip still resolves through `switchChipEmphasis`.
+
+Row 2 is why that lane carries **two** assertions. Every *magnitude* measurement here — this suite's and the
+committed goldens' alike — is blind to INVERSION: swapping the two tints so that arming *dims* the chip left
+all 767 tests that existed before the direction assertion did green, the goldens included (at 64/255 they
+read the whole step as ~0.0008; the 768th test is the direction predicate's own canary, which this hole is
+what produced). The mock ratifies
+a *directed* relation, `--text-3` at rest → `--text-2` armed, so shipping its inverse under a green suite is
+a real regression class, and the lane closes it with a strict direction comparison alongside the magnitude
+one. That comparison needs no threshold: the mutation only swaps which render carries which label, so the
+same pair of values is compared either way (41.4885 vs 41.4039 light, 59.2353 vs 58.8083 dark, settled via
+#760's `stableRender`).
+
+### Where every interaction surface went
+
+**27 rows: 10 covered by this item, 7 already covered elsewhere, 6 routed to the manual checklist below,
+3 filed as defects, and 1 that structurally cannot exist.** Nothing is left silent. (Counted from the
+table, not from the suite's test count — several rows share one test function, and one test carries two
+rows because it asserts both the magnitude and the direction of the chip step.)
+
+| Surface | Disposition |
+|---|---|
+| Chip resting glyph (`arrow.left.arrow.right` / `nosign`) | Already: panel goldens (#754), captured since #448 made the chip persistent |
+| `switchChipEmphasis` hidden/resting/armed value mapping | Already: `AccountSwapTests` |
+| `rowFitsSwitchAffordance` budget predicate | Already: `AccountSwapTests` |
+| Base row a11y label | Already: `StatusPanelFormatTests` (`rowAccessibilityLabel`) |
+| Switch hint + blocked-reason copy | Already: `AccountSwapTests` (`rowSwitchAccessibilityLabel`, `switchBlockedText`, `switchHelpText`) |
+| Blocked row publishes `enabled=false` | Already: `PanelAccessibilityTreeTests` (#758) |
+| Row / chip / tab element roles at rest | Already: `PanelAccessibilityTreeTests` (#758) |
+| Armed chip BRIGHTEN — that it moved | `PanelInteractionStateTests` (chip-isolation lane, magnitude) |
+| Armed chip brighten — that it moved the RIGHT WAY | `PanelInteractionStateTests` (chip-isolation lane, direction) |
+| Armed row WASH, as rendered pixels | `PanelInteractionStateTests` (whole-row lane) |
+| Arming a non-target row is inert (the wash's `live` guard) | `PanelInteractionStateTests` (liveness control) |
+| Arming never resizes or reflows the row | `PanelInteractionStateTests` (render lane) |
+| In-flight `Switching…` announcement, naming its target | `PanelInteractionStateTests` (tree lane) |
+| In-flight sibling-disable — no second swap reachable | `PanelInteractionStateTests` (tree lane) |
+| In-flight row spinner replaces the chip | `PanelInteractionStateTests` (render lane) |
+| Mis-click guard: sub-budget row publishes NO control | `PanelInteractionStateTests` (tree lane) |
+| Mis-click guard: at/above budget the row IS a control | `PanelInteractionStateTests` (tree lane) |
+| PRESSED wash (0.16) — needs a real mouse-down | Manual, step 1 |
+| Real hover arming with a physical pointer | Manual, step 1 |
+| `pointingHand` cursor push / pop, and its balance | Manual, step 2 |
+| Per-row hover tooltip (`.help`) | Manual, step 2 |
+| Footer **Swap** button's own tooltip | Manual, step 2 |
+| Real-popover swap round-trip (click → daemon → roster) | Manual, step 3 |
+| Focus-based arming — documented but **not wired** | Filed: issue #901 |
+| Keyboard activation (`Space` fires a swap with no arm step) | Filed: issue #901 |
+| Armed / in-flight frames missing from the design mock | Filed: issue #903 |
+| VoiceOver distinguishing armed from resting | Cannot exist — see below |
+
+Three rows deserve their reasoning stated. **Focus arming and keyboard activation** are a divergence found
+while measuring, not a gap: two doc comments still describe the chip as brightening on "hover / focus"
+(`StatusPanelRoster.swift`'s `switchChip`, `StatusPanelFormat.swift`'s `switchChipEmphasis` — a third, in
+`PanelRenderHarness.swift`, was corrected by this item), but
+`isHovering` is written only by `.onHover` and there is no `@FocusState` anywhere in the roster — so a
+keyboard operator gets the focus ring without the arm treatment, and `Space` still fires a credential swap
+with no armed step in between. Since the arm step is what the mis-click rationale on `RowSwitchButtonStyle`
+leans on, that guard currently has a keyboard-shaped hole. Issue #901's to settle, not this item's.
+
+The **missing mock frames** are the reverse direction — a defect in the build *reference* rather than in
+the code, so the panel conforms faithfully to a mock that never shows either state. Issue #903 tracks
+adding them, which would also unblock real goldens for this axis; until then the relational gate above is
+what stands in, and it is deliberately weaker than a golden.
+
+And **VoiceOver** is not a routing omission: hovering drives only the row wash, the chip tint and the
+cursor, none of which is an accessibility attribute, so an armed row and a resting row are byte-identical in
+the tree (#761, source-verified). There is no VoiceOver behaviour to check, which is why the VoiceOver
+checklist above explicitly points here instead.
+
+### Interaction-state pre-release checklist (manual)
+
+What is left needs a real pointer, a real popover and a real daemon — none of which a headless bundle has.
+Run these against a real build with the daemon RUNNING and at least two switchable accounts:
+
+- [ ] **Arm and press a row.** Move the pointer onto a non-active, viable row: a faint wash appears under
+      it AND its trailing chip brightens — both, together. Move off: both go. Press and hold without
+      releasing: the wash deepens (0.16 vs 0.08), and releasing outside the row cancels without swapping.
+      The arm step is what the mis-click guard rests on, so the failure to look for is a row that reacts
+      to the *press* while never having looked armed.
+- [ ] **Cursor and tooltip.** Over a viable row the cursor becomes a pointing hand; over the ACTIVE row and
+      over a weekly-exhausted row it stays an arrow. Then check the push/pop balance, which is the part a
+      test cannot reach: rest the pointer on a viable row and, **without moving it, run `sessiometer use
+      <other-account>` from a terminal** — the hand must revert to an arrow while the pointer sits still.
+      (It has to come
+      from outside: clicking the footer Swap would move the pointer and defeat the test. An external swap
+      changes this row's own viability, so the resync arrives via `.onChange(of: switchState)` rather than
+      the `swap.phase` path a click would take — both are wired, and only this one is reachable by hand.)
+      Sweep several rows quickly and confirm the cursor is not left stuck as a hand afterwards. Hover a
+      blocked row and confirm its tooltip names the reason (`sessiometer poke …` for quarantined, not
+      `claude /login`), and hover the footer **Swap** button for its own tooltip.
+- [ ] **Real-popover swap round-trip.** Click a viable row: its chip becomes a spinner, every other row and
+      the footer Swap go dim and unclickable, then the roster updates and the active marker moves. Do it
+      once more via the footer **Swap** button. Then force the ambiguous case: **`kill -STOP $(pgrep -x
+      sessiometer)` FIRST, then click a row** — the swap client's ack wait is bounded at 15 s
+      (`AppLaunchPlan.swapTimeout`, sized to clear `SWAP_LOCK_MAX_WAIT`; the 2 s figure is
+      `ControlCommandClient`'s default and the capture path's budget, not this one), so it lands
+      deterministically in the timed-out branch instead of asking you to win a sub-second race. Wait the
+      full 15 s. Confirm the copy sends you to the roster rather than claiming the switch
+      failed, then `kill -CONT` the daemon. (Phases and copy are gated automatically; that a live popover
+      survives the round-trip is not.)
+- [ ] **Narrow-row guard, if the panel width ever becomes variable.** Today the panel is fixed-width and the
+      sub-budget branch is unreachable in the shipped app, so the gate above drives it through an injected
+      width. If a future change makes the row width vary, hover the row at its narrowest: no wash, no
+      pointing hand, no chip, and a click must do nothing.
+
+Not on this list on purpose, because another checklist owns them: the row spinner under **Reduce Motion**
+(§ Appearance-settings checklist, step 3), the panel **staying open** when you click away mid-swap
+(§ Status item + app entry checklist, step 2), and anything VoiceOver (§ VoiceOver checklist — which
+correctly carries no armed/hover row, per the reasoning above).
+
+### The manual checklists, indexed
+
+Six now exist, each owning a disjoint surface. Read the one matching what you changed:
+
+| Checklist | Owns | Item |
+|---|---|---|
+| Appearance settings | Increase Contrast, Reduce Transparency, Reduce Motion — including every in-flight spinner | #760 |
+| VoiceOver | Rotor, focus traversal, speech — everything a tree walk cannot see | #758 |
+| Settings window (non-VoiceOver) | Window lifecycle, activation policy, `⌘S`, focus rings, field tooltips | #762 |
+| Status item + app entry | `NSStatusBar` chrome, click routing, the lifecycle menu, sleep/wake, agent shape | #764 |
+| Capture + notification | Live-panel key routing, the OS authorization prompt, Notification Center rendering | #765 |
+| Interaction states | Hover arming, the press wash, cursor push/pop, the real-popover swap round-trip | #766 |
 
 ## It's a mock, not code
 

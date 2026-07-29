@@ -1010,6 +1010,12 @@ struct PanelRaster {
     /// `BarGlyphRenderer.inkCoverage` uses, and it behaves the same way here: a blank raster AND a uniform
     /// fill both collapse to 0, so the LOWER bound is the load-bearing one (see
     /// `ImageRendererHeadlessProbeTests`' header, which measured this).
+    ///
+    /// RGB-ONLY, which is correct for the OPAQUE full-panel rasters it was written for and a trap on a
+    /// TRANSPARENT-backed one: the normalized raster is premultiplied, so near-black ink over a clear
+    /// backdrop is `(0,0,0)` at EVERY opacity and an opacity-only change is invisible here while remaining
+    /// plainly visible to `diffFraction` (which does compare alpha). Measured in issue #766 — see
+    /// `PanelInteractionStateTests.inkMass`, the alpha-inclusive variant written for exactly that case.
     static func inkCoverage(_ raster: PanelRaster) -> Double {
         guard raster.width > 0, raster.height > 0, raster.bytes.count >= bytesPerPixel else { return 0 }
         let br = Int(raster.bytes[0]), bg = Int(raster.bytes[1]), bb = Int(raster.bytes[2])
