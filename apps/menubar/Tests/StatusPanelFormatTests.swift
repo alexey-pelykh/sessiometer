@@ -1179,6 +1179,250 @@ final class StatusPanelFormatTests: XCTestCase {
                 + "auto-protection degraded, acting on a stale anchor")
     }
 
+    // MARK: - Per-account refresh-token EXPIRY modifier (issues #878/#882/#884)
+    //
+    // R-2 STATE-parity with the `status` CLI's `EXPIRY` column (#883): the SAME cases the Rust
+    // `expiry_cell_classifies_each_horizon_and_reports_an_unobserved_deadline_as_a_gap` /
+    // `the_expiry_cell_is_tinted_by_its_own_horizon_band` tests pin, asserted here against the Swift
+    // mirrors. The panel cannot be screenshot-verified in CI, so these pure verdicts ARE the acceptance
+    // gate for AC-1/3/4.
+
+    /// The panel test clock — an arbitrary fixed epoch, matching the Rust tests' `NOW` discipline.
+    private static let expiryNow: Int64 = 1_893_456_000
+
+    func testExpiryCellMirrorsTheCLIForEveryHorizon() {
+        let now = Self.expiryNow
+
+        // An OBSERVED deadline renders the compact time-until the RESET cells already use — the same
+        // `humanizeUntil` both surfaces share, so `3d` / `29d4h` are byte-identical to the CLI's.
+        XCTAssertEqual(
+            StatusPanelFormat.expiryCell(
+                AccountExpiry(expiresAt: now + 3 * 86_400, horizonState: .within), now: now),
+            "3d")
+        XCTAssertEqual(
+            StatusPanelFormat.expiryCell(
+                AccountExpiry(expiresAt: now + 29 * 86_400 + 4 * 3_600, horizonState: .beyond), now: now),
+            "29d4h")
+
+        // A passed deadline is a STATE word, never `now` — `humanizeUntil`'s zero case would read as a
+        // reset ARRIVING, the exact opposite of what has happened.
+        XCTAssertEqual(
+            StatusPanelFormat.expiryCell(
+                AccountExpiry(expiresAt: now - 86_400, horizonState: .lapsed), now: now),
+            "lapsed")
+    }
+
+    func testExpiryCellIsGapHonestForEveryFlavourOfAbsence() {
+        let now = Self.expiryNow
+
+        // GAP HONESTY (#137) — all three absences render the gap, never a silent "fine".
+        // (a) polled, but the credential carried no parseable deadline …
+        XCTAssertEqual(
+            StatusPanelFormat.expiryCell(
+                AccountExpiry(expiresAt: nil, horizonState: .unknown), now: now),
+            StatusPanelFormat.expiryGap)
+        // … (b) no modifier on the wire at all (a pre-#882 daemon, or an unpolled account) …
+        XCTAssertEqual(StatusPanelFormat.expiryCell(nil, now: now), StatusPanelFormat.expiryGap)
+        // … and (c) a MALFORMED frame claiming a FORWARD-LOOKING state with no deadline: `within` is a
+        // claim ABOUT a deadline, so without one there is nothing to say. Unreachable from the daemon's
+        // `account_expiry`, but the wire decodes each field independently, so it degrades honestly.
+        XCTAssertEqual(
+            StatusPanelFormat.expiryCell(
+                AccountExpiry(expiresAt: nil, horizonState: .within), now: now),
+            StatusPanelFormat.expiryGap)
+
+        // The GAP IS NOT `n/a`: this panel already spends `n/a` on a FAILED poll, and filing an OBSERVED
+        // absence under transient failure would misreport it.
+        XCTAssertNotEqual(StatusPanelFormat.expiryGap, StatusPanelFormat.pct(nil))
+
+        // Every absence is UNCOLOURED too, not merely gap-TEXTED — the tint half of the same rule, pinned
+        // for each flavour so a future edit cannot leave a `within`-with-no-deadline showing an amber `—`.
+        for absent in [nil,
+                       AccountExpiry(expiresAt: nil, horizonState: .unknown),
+                       AccountExpiry(expiresAt: nil, horizonState: .within),
+                       AccountExpiry(expiresAt: nil, horizonState: .beyond),
+                       AccountExpiry(expiresAt: now + 604_800, horizonState: .unknown)] {
+            XCTAssertNil(StatusPanelFormat.expirySeverity(absent, now: now),
+                         "absence of a reading must never carry colour")
+        }
+    }
+
+    /// The arm-ordering pin, mirroring the Rust test's: a DECLARED `lapsed` with no deadline is NOT a
+    /// data-insufficiency case — `lapsed` is a bare state word that never reads `expiresAt`. Were it to
+    /// fall through to the gap, the roster would hide the whole line whenever the lapse was its only
+    /// expiry datum (`rosterShowsExpiry` materializes it only once some row is non-gap) — a dead login
+    /// rendered as no login problem at all, the one outcome this surface exists to prevent.
+    func testDeclaredLapseWithNoDeadlineOutranksTheGapAndStillShowsTheLine() {
+        let now = Self.expiryNow
+        let declared = AccountExpiry(expiresAt: nil, horizonState: .lapsed)
+
+        XCTAssertEqual(StatusPanelFormat.expiryCell(declared, now: now), "lapsed")
+        XCTAssertEqual(StatusPanelFormat.expirySeverity(declared, now: now), .red)
+        XCTAssertTrue(StatusPanelFormat.rosterShowsExpiry([declared], now: now),
+                      "a lapse must never be swallowed by the roster-level gap elision")
+    }
+
+    /// The render-time comparison is AUTHORITATIVE (the CLI's `expiry_view` rule). The panel draws a
+    /// snapshot built at the daemon's last tick — up to `poll_interval_secs` old — so a deadline that
+    /// passes inside that window still arrives classified `within`/`beyond`. Trusting the cached class
+    /// would render `now` (this panel's word for a BENIGN reset arriving) at exactly the moment the login
+    /// died, and every token lapse crosses that window exactly once.
+    func testAPassedDeadlineReadsLapsedEvenWhenTheCachedClassSaysOtherwise() {
+        let now = Self.expiryNow
+        for stale: ExpiryHorizon in [.within, .beyond] {
+            let expiry = AccountExpiry(expiresAt: now - 60, horizonState: stale)
+            XCTAssertEqual(StatusPanelFormat.expiryCell(expiry, now: now), "lapsed",
+                           "a \(stale) class over a passed deadline must not render a duration")
+            XCTAssertEqual(StatusPanelFormat.expirySeverity(expiry, now: now), .red)
+        }
+
+        // The BOUNDARY: `at == now` is already gone, matching the CLI's `at <= now`.
+        XCTAssertEqual(
+            StatusPanelFormat.expiryCell(
+                AccountExpiry(expiresAt: now, horizonState: .within), now: now),
+            "lapsed")
+
+        // MONOTONE in the safe direction: a declared `lapsed` stays lapsed even should the client clock
+        // read EARLIER than the daemon's (backwards skew, NTP). Once either clock has seen the deadline
+        // pass, the line does not un-lapse.
+        XCTAssertEqual(
+            StatusPanelFormat.expiryCell(
+                AccountExpiry(expiresAt: now + 86_400, horizonState: .lapsed), now: now),
+            "lapsed")
+    }
+
+    func testExpirySeverityMirrorsTheCLIColourBands() {
+        let now = Self.expiryNow
+
+        // Red for a deadline already past (only an operator `claude /login` recovers it) …
+        XCTAssertEqual(
+            StatusPanelFormat.expirySeverity(
+                AccountExpiry(expiresAt: now - 1, horizonState: .lapsed), now: now), .red)
+        // … amber for one WITHIN the configured horizon (the foresight the feature exists to give) …
+        XCTAssertEqual(
+            StatusPanelFormat.expirySeverity(
+                AccountExpiry(expiresAt: now + 3 * 86_400, horizonState: .within), now: now), .yellow)
+        // … de-emphasised for one BEYOND it (the CLI's `Dim`): nothing to act on …
+        XCTAssertEqual(
+            StatusPanelFormat.expirySeverity(
+                AccountExpiry(expiresAt: now + 90 * 86_400, horizonState: .beyond), now: now), .neutral)
+        // … and UNCOLOURED for an unobserved deadline: absence of colour is not a false "healthy".
+        XCTAssertNil(StatusPanelFormat.expirySeverity(nil, now: now))
+        XCTAssertNil(StatusPanelFormat.expirySeverity(
+            AccountExpiry(expiresAt: nil, horizonState: .unknown), now: now))
+
+        // The amber/red pair must stay DISTINCT from each other — the whole point of the band is that
+        // "re-login soon" and "re-login now" do not read alike.
+        XCTAssertNotEqual(StatusPanelFormat.healthTint(.yellow), StatusPanelFormat.healthTint(.red))
+    }
+
+    /// AC-3 STATE-parity, stated as a relation rather than trusted to prose: for every input the two
+    /// surfaces could see, the panel's cell string IS the CLI's cell string. The Rust side pins the same
+    /// table (`src/cli.rs` `expiry_cell` tests); this asserts the Swift mirror lands on it case-for-case,
+    /// so a future edit to one surface that forgets the other fails HERE rather than in an operator's eye.
+    func testExpiryStateParityTableMatchesTheCLIVocabularyExactly() {
+        let now = Self.expiryNow
+        let table: [(AccountExpiry?, String, StatusPanelFormat.HealthTint?)] = [
+            (nil,                                                             "—",      nil),
+            (AccountExpiry(expiresAt: nil, horizonState: .unknown),           "—",      nil),
+            (AccountExpiry(expiresAt: now + 604_800, horizonState: .unknown), "—",      nil),
+            (AccountExpiry(expiresAt: nil, horizonState: .lapsed),            "lapsed", .red),
+            (AccountExpiry(expiresAt: now - 86_400, horizonState: .lapsed),   "lapsed", .red),
+            (AccountExpiry(expiresAt: now + 6 * 86_400 + 21 * 3_600, horizonState: .within), "6d21h", .yellow),
+            (AccountExpiry(expiresAt: now + 45 * 60, horizonState: .within),  "45m",    .yellow),
+            (AccountExpiry(expiresAt: now + 29 * 86_400, horizonState: .beyond), "29d", .neutral),
+        ]
+        for (expiry, cell, severity) in table {
+            XCTAssertEqual(StatusPanelFormat.expiryCell(expiry, now: now), cell)
+            XCTAssertEqual(StatusPanelFormat.expirySeverity(expiry, now: now), severity,
+                           "severity drifted for the cell rendering '\(cell)'")
+        }
+
+        // An `unknown` class is authoritative in the OTHER direction: a stray `expiresAt` beside it is
+        // NOT trusted into a rendered duration (row 3 above) — the daemon saw no parseable deadline.
+        XCTAssertNil(StatusPanelFormat.expirySeverity(
+            AccountExpiry(expiresAt: now + 604_800, horizonState: .unknown), now: now))
+    }
+
+    /// The roster-level materialization rule, mirroring the CLI's `status_columns` (`EXPIRY` is built
+    /// only `if rows.iter().any(|row| row.expiry != EXPIRY_GAP)`). An all-gap roster shows NO line on
+    /// either surface — gap-honest, because it CLAIMS nothing — but a single observed deadline turns the
+    /// line on for EVERY row, so a sibling's `—` reads as the pointed absence it is.
+    func testRosterShowsExpiryOnlyOnceSomeAccountHasAnObservedDeadline() {
+        let now = Self.expiryNow
+
+        XCTAssertFalse(StatusPanelFormat.rosterShowsExpiry([], now: now),
+                       "an empty roster claims nothing")
+        XCTAssertFalse(StatusPanelFormat.rosterShowsExpiry([nil, nil], now: now),
+                       "an unpolled / pre-#882 roster shows no line rather than a column of dashes")
+        XCTAssertFalse(
+            StatusPanelFormat.rosterShowsExpiry(
+                [nil, AccountExpiry(expiresAt: nil, horizonState: .unknown)], now: now),
+            "polled-but-no-deadline is still a gap — an all-unknown roster stays silent, exactly as the CLI elides its column")
+
+        XCTAssertTrue(
+            StatusPanelFormat.rosterShowsExpiry(
+                [nil, AccountExpiry(expiresAt: now + 86_400, horizonState: .within)], now: now),
+            "one observed deadline turns the line on for the whole roster")
+        XCTAssertTrue(
+            StatusPanelFormat.rosterShowsExpiry(
+                [AccountExpiry(expiresAt: now - 1, horizonState: .lapsed), nil], now: now),
+            "a lapse alone must materialize the line")
+    }
+
+    /// AC-4: the spoken row carries the expiry too. The visual line is `accessibilityHidden` (the row is
+    /// ONE VoiceOver element), so this label is the ONLY place a screen-reader user learns their login
+    /// has a deadline — and the gap is spoken in WORDS, never as the bare `—` dash VoiceOver would skip
+    /// or pronounce as punctuation. A silently-dropped absence is a false calm.
+    func testRowAccessibilityLabelSpeaksTheExpiryIncludingTheGap() {
+        let now = Self.expiryNow
+        func spoken(_ expiry: AccountExpiry?, shows: Bool = true) -> String {
+            StatusPanelFormat.rowAccessibilityLabel(
+                label: "work", isActive: false, auth: .healthy, recovering: false, enabled: true,
+                quarantined: false, sessionPct: 30, weeklyPct: 20, sessionReset: "2h", weeklyReset: "3d",
+                now: now, expiry: expiry, showsExpiry: shows)
+        }
+
+        XCTAssertTrue(spoken(AccountExpiry(expiresAt: now + 3 * 86_400, horizonState: .within))
+            .hasSuffix("login expires in 3d"))
+        // PARITY WITH THE VISUAL LINE, not a richer spoken variant: the cell renders a bare `lapsed`, so
+        // the label speaks a bare "login expired" — see `rowAccessibilityLabel` for why a spoken-only
+        // remedy is the defect this pins against.
+        XCTAssertTrue(spoken(AccountExpiry(expiresAt: now - 1, horizonState: .lapsed))
+            .hasSuffix("login expired"))
+        XCTAssertFalse(spoken(AccountExpiry(expiresAt: now - 1, horizonState: .lapsed)).contains("claude"),
+                       "the spoken line must not carry a remedy the visual cell withholds")
+        XCTAssertTrue(spoken(nil).hasSuffix("login expiry not observed"),
+                      "the gap is spoken as an absence, never as a dash and never dropped")
+
+        // When the roster hides the line, the label stays silent about expiry too — the spoken and visual
+        // surfaces materialize together, so VoiceOver never announces a fact the panel does not show.
+        XCTAssertFalse(spoken(nil, shows: false).contains("login expir"))
+        XCTAssertEqual(spoken(nil, shows: false),
+                       "work, auth healthy, session 30% resets in 2h, weekly 20% resets in 3d")
+    }
+
+    /// The composition invariant (#884), pinned as an executable claim rather than a comment: expiry does
+    /// NOT escalate the menu-bar glance, therefore it ships NO panel banner — "both or neither", resolved
+    /// as NEITHER. `PresentationState.make` takes no expiry input at all, so the strongest possible expiry
+    /// signal (a LAPSED login on the active account) leaves a healthy fleet's glyph healthy.
+    ///
+    /// What this can and cannot catch: it pins both SIGNATURES, so a later item that feeds expiry in as a
+    /// REQUIRED input breaks here at compile time and owes its sibling banner in the same change. An input
+    /// added with a default would slip past — so the invariant's real home is the rationale block in
+    /// `StatusPanelFormat`, and this is its cheapest executable half.
+    func testALapsedExpiryNeitherEscalatesTheGlanceNorRaisesADaemonBanner() {
+        let healthy = PresentationState.make(for: .connected, accountCount: 2)
+        XCTAssertEqual(healthy.glyph, .healthy)
+
+        // The daemon-level banner set is unchanged: expiry is a ROW-axis modifier — it HAS a row to live
+        // on, which is exactly why it is not a fourth daemon-level payload fault (the vault and the
+        // refresh mechanism are faults precisely because neither has a row).
+        XCTAssertNil(StatusPanelFormat.daemonFaultBanner(
+            keychainLocked: false, scrub: nil, systemicRefreshFailure: nil,
+            systemicRefreshSource: nil, canary: nil))
+    }
+
     // MARK: - Integration: wire → AccountRow → panel format (recovering distinct from dead)
 
     func testDeadVersusRecoveringSurviveTheStoreProjection() throws {

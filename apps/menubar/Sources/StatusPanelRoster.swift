@@ -34,6 +34,12 @@ struct RosterView: View {
         // Resolve every row's smart monogram ONCE over the whole roster (issue #445), so collision-escalation
         // sees all sibling labels — a same-local-part roster gets distinct 2-char monograms, not one letter.
         let monograms = StatusPanelFormat.accountMonograms(rows.map(\.label))
+        // Resolve the expiry line's presence ONCE over the whole roster (issue #884), mirroring the CLI,
+        // which materializes its `EXPIRY` column only when some row has an observed deadline. Deciding it
+        // per row would let the line appear on one account and vanish on the next — a ragged roster where
+        // the CLI shows a uniform column, and a `—` that reads as "nothing here" rather than the pointed
+        // absence it is beside a sibling's real deadline.
+        let showsExpiry = StatusPanelFormat.rosterShowsExpiry(rows.map(\.expiry), now: now)
         VStack(alignment: .leading, spacing: 2 * scale) {
             ForEach(rows) { row in
                 // On a dropped connection every row is `notATarget` (non-interactive); otherwise the pure
@@ -51,7 +57,8 @@ struct RosterView: View {
                                // The panel is fixed-width, so this is a derived constant rather than a
                                // measurement — passed IN (#766) so the row's affordance-budget verdict has
                                // an injectable width rather than reaching for the global itself.
-                               rowWidth: PanelMetrics.rowWidth)
+                               rowWidth: PanelMetrics.rowWidth,
+                               showsExpiry: showsExpiry)
             }
         }
         // The design reference insets the roster (`.accts { padding: 6px 8px 2px }`): 8px horizontal so
@@ -145,6 +152,12 @@ struct AccountRowView: View {
     /// deliberately does NOT reach `syncCursor()`, so a forced-arm render never pushes a real `pointingHand`
     /// onto the operator's cursor stack. Always `false` in the app.
     let armed: Bool
+    /// Whether the roster shows the refresh-token expiry line at all (issue #884) — a roster-wide verdict
+    /// `RosterView` resolves ONCE and passes down (`StatusPanelFormat.rosterShowsExpiry` carries the why),
+    /// never something a row decides for itself. The default is for the one call site that builds a row
+    /// outside a roster (`PanelInteractionStateTests`); every rendered panel, goldens included, gets the
+    /// resolved value.
+    let showsExpiry: Bool
 
     @EnvironmentObject private var swap: AccountSwapModel
     /// The active row's accent-tint fill opacity is theme-aware (#388): the mock raises it in dark mode.
@@ -166,7 +179,7 @@ struct AccountRowView: View {
     /// depends on it. Every caller states its width.
     init(row: AccountRow, monogram: String, now: Int64,
          switchState: StatusPanelFormat.RowSwitchState, nextSwap: NextSwap?,
-         rowWidth: Double, armed: Bool = false) {
+         rowWidth: Double, armed: Bool = false, showsExpiry: Bool = false) {
         self.row = row
         self.monogram = monogram
         self.now = now
@@ -174,6 +187,7 @@ struct AccountRowView: View {
         self.nextSwap = nextSwap
         self.rowWidth = rowWidth
         self.armed = armed
+        self.showsExpiry = showsExpiry
     }
 
     /// Whether the row is ARMED — a real pointer over it, or the render seam above. The single source both
@@ -361,6 +375,16 @@ struct AccountRowView: View {
                                reset: weeklyReset)
                 }
             }
+
+            // The refresh-token expiry modifier (#884) — OUTSIDE the blind branch above, deliberately.
+            // Usage-blindness and credential expiry are ORTHOGONAL per-account axes (a 429'd `/usage` poll
+            // says nothing about the refresh token's deadline), so a blind row must not have its expiry
+            // SUPPRESSED just because the held block took the meters' slot. The CLI keeps both for the same
+            // reason — its `EXPIRY` column is untouched by the blind line — and hiding a real credential
+            // signal is the #137 honest-state failure one axis over.
+            if showsExpiry {
+                ExpiryLine(expiry: row.expiry, now: now)
+            }
         }
         .padding(.horizontal, StatusPanelFormat.rowHorizontalPadding * scale)
         .padding(.top, 9 * scale)
@@ -535,11 +559,64 @@ struct AccountRowView: View {
             weeklyReset: weeklyReset,
             blind: row.blindActive,
             nextSwap: nextSwap,
-            now: now)
+            now: now,
+            expiry: row.expiry,
+            showsExpiry: showsExpiry)
     }
 }
 
 // MARK: - Row building blocks (per the design reference)
+
+/// The row's refresh-token expiry line (issues #878/#882/#884) — the panel's render of the daemon's
+/// `AccountExpiry`, and the R-2 STATE-parity twin of the `status` CLI's `EXPIRY` column.
+///
+/// **The design mock does not author this element**, and that is not a divergence to reconcile: the mock
+/// (`apps/menubar/design/menubar-preview.html`) predates the credential-continuity work and carries no
+/// expiry surface at all — the repo `CLAUDE.md` scopes it as the oracle "only for what it authors", and
+/// silence is not authority. So this borrows the mock's ROW GRAMMAR, which it does author: the same
+/// uppercase 10 pt semibold label in the same `meterLabelCellWidth` cell the two `UsageMeter` rows use,
+/// so the three sub-lines share one left edge and the new one reads as a sibling rather than an intruder.
+/// No bar — expiry is a CREDENTIAL fact, not a usage window, and a bar would imply a fraction of a
+/// quantity that has none.
+///
+/// The STRING and the TINT are both `StatusPanelFormat` verdicts computed from the same inputs the CLI's
+/// `expiry_cell` / `expiry_severity` consume, so the two surfaces cannot disagree about one snapshot.
+/// This line NEVER escalates the menu-bar glance and has no banner — see `StatusPanelFormat`'s expiry
+/// section for the both-or-neither rationale.
+private struct ExpiryLine: View {
+    /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
+    @Environment(\.panelScale) private var scale
+    let expiry: AccountExpiry?
+    let now: Int64
+
+    var body: some View {
+        HStack(spacing: 9 * scale) {
+            Text(StatusPanelFormat.expiryRowLabel)
+                .font(.panel(10, .semibold, scale: scale))
+                .foregroundStyle(.secondary)
+                .frame(width: StatusPanelFormat.meterLabelCellWidth * scale, alignment: .leading)
+
+            Text(StatusPanelFormat.expiryCell(expiry, now: now))
+                .font(.panel(11, scale: scale)).monospacedDigit()
+                .foregroundStyle(valueColor)
+                .lineLimit(1)
+
+            Spacer(minLength: 0)
+        }
+        // One VoiceOver element already speaks this row (`rowAccessibilityLabel` carries the expiry
+        // phrase), so the line's own text would be read twice.
+        .accessibilityHidden(true)
+    }
+
+    /// The CLI's `Severity` mapped onto the panel's contrast-safe tokens (#388). An unobserved deadline
+    /// (`nil`) and a `BEYOND` one (`.neutral`) both land on `.secondary` — matching the CLI, where
+    /// uncoloured and `Dim` are likewise both de-emphasised, and honest either way: the TEXT (`—` vs a
+    /// duration) is what distinguishes them, never the colour alone.
+    private var valueColor: Color {
+        guard let tint = StatusPanelFormat.expirySeverity(expiry, now: now) else { return .secondary }
+        return .panel(StatusPanelFormat.healthTint(tint))
+    }
+}
 
 /// One usage window's meter. Both percents render at a uniform weight — the design reference (and the
 /// `status` CLI) carry severity in COLOR, not weight; the fixed column widths + monospaced digits keep
