@@ -29,8 +29,12 @@
 // and the Rust gate reddens until the manifest is re-emitted — at which point THIS file reddens
 // until the panel follows. A one-sided rank change has nowhere to hide.
 //
-// SCOPE — a RANK gate, not a render gate. It asserts WHICH fault the panel calls worst and at WHICH
-// band, never how the banner looks; `PanelGoldenParityTests` (issue #754) owns appearance. And it
+// SCOPE — a CLASSIFICATION gate, not a render gate. Mostly a RANK gate: which fault the panel calls
+// worst and at which band, never how the banner looks; `PanelGoldenParityTests` (issue #754) owns
+// appearance. The one section that pins cell TEXT is the per-account expiry axis (issue #886), and
+// only because `StatusPanelFormat.expiryCell` claims to be BYTE-IDENTICAL to the CLI's
+// `expiry_cell` — a claim of byte-identity is worth asserting as one. Still not appearance: the
+// claim is about the string, not about how it is drawn. And it
 // deliberately does NOT force byte-parity with the CLI: the CLI prints every applicable fault line
 // while the panel shows exactly ONE banner, which is a legitimate, enumerated divergence
 // (`fault-render-medium` in the manifest's register). A gate that flattened deliberate differences
@@ -101,6 +105,35 @@ private struct AccountSeverityCase: Decodable, Equatable {
     }
 }
 
+/// One REFRESH-token expiry case (issue #886) — the wire payload both surfaces classify, plus the
+/// cell TEXT and tint BAND they must both produce.
+///
+/// Unlike every other section of this manifest, this pins TEXT as well as band. `expiryCell` is
+/// documented as "byte-identical to `src/cli.rs` `expiry_cell`", and a claim of byte-identity is
+/// worth asserting as one — the two surfaces deliberately share the expiry vocabulary (`6d21h`,
+/// `lapsed`, `—`) rather than each narrating the state in its own idiom.
+private struct ExpiryParityCase: Decodable, Equatable {
+    let name: String
+    /// The deadline as an offset in SECONDS from the render instant — relative on purpose, so this
+    /// side evaluates the SAME payload against its own `now`. Several cases carry deadlines that
+    /// have already passed, and the render-time re-check firing on them is exactly what is pinned.
+    let offsetSecs: Int64?
+    /// The daemon's cached classification in its WIRE spelling, decoded here through the same
+    /// `ExpiryHorizon` the production decoder uses — so a token the panel could not decode fails
+    /// HERE rather than degrading silently to `.unknown` and comparing equal by accident.
+    let horizonState: String
+    let cell: String
+    let severity: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case name
+        case offsetSecs = "offset_secs"
+        case horizonState = "horizon_state"
+        case cell
+        case severity
+    }
+}
+
 private struct KnownDivergence: Decodable, Equatable {
     let id: String
     let cli: String
@@ -129,6 +162,8 @@ private struct CrossSurfaceManifest: Decodable {
     let exclusiveGroups: [ExclusiveGroup]
     let arbitrationEdges: [ArbitrationEdge]
     let accountSeverityCases: [AccountSeverityCase]
+    /// The REFRESH-token expiry cases (issue #886). Added at manifest schema 3.
+    let expiryCases: [ExpiryParityCase]
     let knownDivergences: [KnownDivergence]
     let uncoveredAxes: [UncoveredAxis]
 
@@ -140,6 +175,7 @@ private struct CrossSurfaceManifest: Decodable {
         case exclusiveGroups = "exclusive_groups"
         case arbitrationEdges = "arbitration_edges"
         case accountSeverityCases = "account_severity_cases"
+        case expiryCases = "expiry_cases"
         case knownDivergences = "known_divergences"
         case uncoveredAxes = "uncovered_axes"
     }
@@ -167,6 +203,9 @@ private enum Band {
     static let yellow = "yellow"
     static let plain = "plain"
     static let green = "green"
+    /// De-emphasis — the CLI's `Severity::Dim`, the panel's `.neutral`. Expiry only: it is what a
+    /// deadline BEYOND the operator's horizon gets, where there is nothing to act on.
+    static let dim = "dim"
 }
 
 // MARK: - The observed side
@@ -256,7 +295,7 @@ final class CrossSurfaceSeverityParityTests: XCTestCase {
     /// The manifest shape this consumer was written against — the Swift mirror of
     /// `cross_surface::MANIFEST_SCHEMA`. Bumped only when a section is added or renamed, never for
     /// a content re-baseline.
-    private static let expectedSchema = 2
+    private static let expectedSchema = 3
 
     private func manifest(file: StaticString = #filePath, line: UInt = #line) throws
         -> CrossSurfaceManifest {
@@ -598,6 +637,119 @@ final class CrossSurfaceSeverityParityTests: XCTestCase {
         case .yellow: return Band.yellow
         case .red:    return Band.red
         case nil:     return nil
+        }
+    }
+
+    // MARK: - The REFRESH-token expiry axis (issue #886)
+
+    /// R-2 STATE-parity for the per-account foresight axis: one payload, both surfaces, same cell
+    /// and same band.
+    ///
+    /// `StatusPanelFormat.expiryView` is documented as mirroring `src/cli.rs`'s `expiry_view`
+    /// "arm-for-arm, INCLUDING the arm ORDER", and `expiryCell` as "byte-identical to `src/cli.rs`
+    /// `expiry_cell`". Until this test those were prose governing runtime — `StatusPanelFormatTests`
+    /// asserts the panel's cells against HAND-WRITTEN expectations, which is the same
+    /// re-derive-independently shape that produced issue #575 on the fault ranks. The manifest's
+    /// `cell` and `severity` come from the CLI's own `expiry_cell` / `expiry_severity`, so this
+    /// compares the panel against what the CLI ACTUALLY renders.
+    ///
+    /// The case set deliberately includes three payloads where the daemon's cached classification
+    /// and the client's clock DISAGREE, because that is where the arm ORDER decides the answer and
+    /// where a one-case-per-state set has no power: a `within` deadline already past must read
+    /// `lapsed` on both, `unknown` must outrank a stray deadline on both, and a declared `lapsed`
+    /// with no deadline must NOT fall through to the gap on either.
+    func testTheExpiryCellAndTintMatchTheCLIForEveryPinnedPayload() throws {
+        let manifest = try manifest()
+        XCTAssertFalse(manifest.expiryCases.isEmpty,
+                       "zero expiry cases — cardinality-zero is an automatic FAIL")
+        // Any instant works: every case states its deadline as an OFFSET, so what is compared is
+        // the classification of a relative payload rather than an absolute moment either side could
+        // read differently. Deliberately NOT the Rust gate's own constant — if the two sides had to
+        // agree on an instant for this to pass, the test would be pinning the instant, not the rule.
+        let now: Int64 = 1_700_000_000
+
+        for entry in manifest.expiryCases {
+            // Decode the wire token through the SAME `ExpiryHorizon` production uses, so a spelling
+            // this build does not know fails HERE rather than downstream.
+            let horizon = try JSONDecoder().decode(
+                ExpiryHorizon.self,
+                from: Data("\"\(entry.horizonState)\"".utf8))
+            // That decoder is deliberately TOTAL — an unrecognised token becomes `.unknown` instead
+            // of throwing (`ExpiryHorizon(wireToken:)`, the `SystemicRefreshSource` idiom). Which
+            // means a Rust-side rename would land silently on the one state this whole test exists
+            // to keep distinct, and every assertion below would still pass. Only the literal
+            // `"unknown"` is allowed to arrive there.
+            if entry.horizonState != "unknown" {
+                XCTAssertNotEqual(horizon, .unknown,
+                    "`\(entry.name)`: the manifest spells the horizon `\(entry.horizonState)`, "
+                    + "which this build does not decode — it degraded to `.unknown`, so a wire "
+                    + "rename would pass as a parity match\n\n" + Self.rebaselineHint)
+            }
+            let expiry = AccountExpiry(expiresAt: entry.offsetSecs.map { now + $0 },
+                                       horizonState: horizon)
+
+            XCTAssertEqual(StatusPanelFormat.expiryCell(expiry, now: now), entry.cell,
+                "`\(entry.name)`: the CLI renders `\(entry.cell)`, the panel renders "
+                + "`\(StatusPanelFormat.expiryCell(expiry, now: now))` — these two surfaces must "
+                + "never show a different state for one snapshot\n\n" + Self.rebaselineHint)
+            let band = bandName(StatusPanelFormat.expirySeverity(expiry, now: now), entry.name)
+            XCTAssertEqual(band, entry.severity,
+                "`\(entry.name)`: the CLI bands it `\(entry.severity ?? "nil")`, the panel bands "
+                + "it `\(band ?? "nil")`\n\n" + Self.rebaselineHint)
+        }
+
+        // Non-degeneracy, on OUTCOMES rather than inputs: three of these payloads deliberately land
+        // on the same cell, so a growing case list could distinguish fewer outcomes than before.
+        let cells = Set(manifest.expiryCases.map(\.cell))
+        XCTAssertTrue(cells.isSuperset(of: ["lapsed", StatusPanelFormat.expiryGap]),
+                      "the expiry cases do not span the lapse word and the GAP (\(cells.sorted()))")
+        let bands = Set(manifest.expiryCases.map { $0.severity ?? "nil" })
+        XCTAssertEqual(bands, [Band.red, Band.yellow, Band.dim, "nil"],
+            "the expiry cases must span all four tint outcomes — red (lapsed), yellow (within), "
+            + "dim (beyond) and UNCOLOURED (unobserved); got \(bands.sorted()). An uncovered band "
+            + "is a band the two surfaces can disagree on unobserved")
+
+        // The #137 invariant on THIS surface: an unobserved deadline must not render like the
+        // reassuring `beyond` verdict, in either text or tint.
+        let unknown = try XCTUnwrap(manifest.expiryCases.first { $0.name == "unknown-no-deadline" })
+        let beyond = try XCTUnwrap(manifest.expiryCases.first { $0.name == "beyond" })
+        let unknownExpiry = AccountExpiry(expiresAt: nil, horizonState: .unknown)
+        let beyondExpiry = AccountExpiry(expiresAt: now + (beyond.offsetSecs ?? 0),
+                                         horizonState: .beyond)
+        XCTAssertEqual(StatusPanelFormat.expiryCell(unknownExpiry, now: now),
+                       StatusPanelFormat.expiryGap)
+        XCTAssertNil(StatusPanelFormat.expirySeverity(unknownExpiry, now: now),
+                     "an unobserved deadline carries no tint — a colour would read as a verdict")
+        XCTAssertNotEqual(StatusPanelFormat.expiryCell(unknownExpiry, now: now),
+                          StatusPanelFormat.expiryCell(beyondExpiry, now: now),
+                          "UNKNOWN (\(unknown.cell)) must never render like BEYOND (\(beyond.cell)) "
+                          + "— that resemblance is the silent false-calm the axis exists to refuse")
+    }
+
+    /// The panel tint → manifest band token, EXHAUSTIVE on purpose.
+    ///
+    /// `HealthTint` carries five cases and only four of them are reachable on this axis, so a
+    /// `default:` arm would be the cheap spelling — and it would send `.green` to `nil`, where it
+    /// compares EQUAL to a manifest case the CLI deliberately left UNCOLOURED and passes. Green on
+    /// an unobserved deadline is the exact false-calm the axis exists to refuse, so the one arm a
+    /// `default:` would swallow is the one worth failing on. Same total-mapping discipline the
+    /// `ExpiryHorizon` decode above gets.
+    private func bandName(_ tint: StatusPanelFormat.HealthTint?,
+                          _ caseName: String,
+                          file: StaticString = #filePath,
+                          line: UInt = #line) -> String? {
+        switch tint {
+        case nil:      return nil
+        case .red:     return Band.red
+        case .yellow:  return Band.yellow
+        case .neutral: return Band.dim
+        case .green, .orange:
+            XCTFail("`\(caseName)`: the panel tinted the expiry cell "
+                    + "`\(String(describing: tint!))`, which is not one of the four bands this "
+                    + "axis may use (red / yellow / dim / uncoloured). Green in particular reads "
+                    + "as a verdict of health on a forward-looking deadline",
+                    file: file, line: line)
+            return "not-an-expiry-band(\(String(describing: tint!)))"
         }
     }
 

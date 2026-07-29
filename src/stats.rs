@@ -7776,9 +7776,11 @@ mod tests {
                 ]
                 .into_iter()
                 .collect(),
-                // No expiry overlay (issue #883): the `expiry` column elides, so every golden
-                // derived from this fixture stays byte-identical to its pre-#883 self. The
-                // populated axis is built per-test with `expiry_in`, which no golden consumes.
+                // No expiry overlay (issue #883): the `expiry` column elides, so the twelve
+                // goldens derived from this fixture stay byte-identical to their pre-#883 selves,
+                // and are the only proof that elision holds. The one derived golden that DOES grow
+                // the column is `stats-expiry-wide`, via [`report_with_expiry`] — a separate
+                // fixture precisely so both directions are pinned (issue #886).
                 expiry: BTreeMap::new(),
                 // The CONFIGURED regime — every golden derived from this fixture pins the
                 // un-annotated render, so the degraded one gets its own case (issue #836).
@@ -7819,6 +7821,72 @@ mod tests {
                 velocity: BTreeMap::new(),
                 ..golden_report()
             }
+        }
+
+        /// The same roster WITH the REFRESH-token expiry overlay populated (issue #886) — the
+        /// `expiry` column's other direction.
+        ///
+        /// [`golden_report`] leaves `Report::expiry` empty, which is the shape every PRODUCTION
+        /// path still produces (`stats` reads a persisted series and never talks to the daemon, so
+        /// the overlay has no producer until issue #917 folds the durable expiry events into it).
+        /// That empty map is why the twelve cases above pin the column's ELISION. This one pins
+        /// the POPULATED render, so the column that ships is goldened rather than only unit-tested
+        /// — the layout facts a whole-output comparison sees (its RIGHT alignment among left-aligned
+        /// text cells, its position in the row, the widths around it) are exactly the ones a
+        /// `contains()` assertion is blind to.
+        ///
+        /// The four horizon states are spread across the roster deliberately, `delta` taking the
+        /// UNKNOWN one so the gap sits beside three real deadlines rather than alone: an unmeasured
+        /// credential must read as a pointed absence, never as the calm `Beyond` two rows up
+        /// (issues #137/#876). `delta` is also the never-observed account, so its `—` lands in a
+        /// row whose other cells are already gaps — the honest composite, and the row a reader is
+        /// likeliest to skim past.
+        ///
+        /// Deadlines are offsets from the report window's END, which is the instant
+        /// [`account_rows`] renders each cell against — so the humanized cells are fixed bytes and
+        /// the golden does not move with the wall clock.
+        fn report_with_expiry() -> Report {
+            let base = golden_report();
+            let now = base.window.end;
+            let at = |offset: i64, state: crate::observability::ExpiryHorizon| AccountExpiry {
+                expires_at: Some(now + offset),
+                horizon_state: state,
+                // The offline `stats` verb never talks to the daemon, so this column has no cohort
+                // to carry — the fleet condition lives on `status` (issue #879).
+                cohort_id: None,
+            };
+            let expiry = [
+                // Inside the horizon: 2d10h out.
+                (
+                    "alpha".to_owned(),
+                    at(
+                        2 * 86_400 + 10 * 3_600,
+                        crate::observability::ExpiryHorizon::Within,
+                    ),
+                ),
+                // Beyond it: 29 days out, and the ONLY state that means "not expiring soon".
+                (
+                    "beta".to_owned(),
+                    at(29 * 86_400, crate::observability::ExpiryHorizon::Beyond),
+                ),
+                // Already past — the bare state word, never a humanized negative remainder.
+                (
+                    "ガンマ".to_owned(),
+                    at(-3 * 86_400, crate::observability::ExpiryHorizon::Lapsed),
+                ),
+                // POLLED, and the credential carried no deadline: UNKNOWN, which renders the gap.
+                (
+                    "delta".to_owned(),
+                    AccountExpiry {
+                        expires_at: None,
+                        horizon_state: crate::observability::ExpiryHorizon::Unknown,
+                        cohort_id: None,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect();
+            Report { expiry, ..base }
         }
 
         /// A report with no per-account usage at all — the degenerate roster.
@@ -8039,6 +8107,14 @@ mod tests {
                         Some(fallback_census_reason()),
                     ),
                 ),
+                // The POPULATED `expiry` column (issue #886) — every case above elides it, so
+                // this is the only golden in which the column ships. Rendered on the wide TTY,
+                // where the whole column set fits and the cell's RIGHT alignment among the
+                // left-aligned text cells is visible.
+                Case::new(
+                    "stats-expiry-wide",
+                    render_human(&report_with_expiry(), WIDE_UNICODE_PLAIN, None),
+                ),
             ]
         }
 
@@ -8058,6 +8134,7 @@ mod tests {
             "stats-all-na",
             "stats-fallback-census-piped",
             "stats-fallback-census-wide",
+            "stats-expiry-wide",
         ];
 
         /// One-time emitter for the committed `stats` render goldens (issue #767).
@@ -8101,6 +8178,71 @@ mod tests {
                 "stats-piped",
                 &render_human(&golden_report(), PIPED, None),
                 &render_human(&perturbed, PIPED, None),
+            );
+        }
+
+        /// The expiry case must actually EXERCISE the column it was added for (issue #886) — and
+        /// the twelve cases beside it must go on eliding it.
+        ///
+        /// Both halves matter and neither is visible to [`assert_matches_goldens`]. If
+        /// `report_with_expiry` silently lost its overlay, `stats-expiry-wide` would re-emit as a
+        /// copy of `stats-wide-unicode-plain`, match its own golden forever, and assert nothing
+        /// about the column. If the elision rule broke the other way, twelve goldens would grow a
+        /// wall of `—`. Stated as properties of the render, so both survive a re-baseline.
+        #[test]
+        fn the_expiry_case_renders_the_column_and_the_others_still_elide_it() {
+            let with = render_human(&report_with_expiry(), WIDE_UNICODE_PLAIN, None);
+            let without = render_human(&golden_report(), WIDE_UNICODE_PLAIN, None);
+            assert!(
+                with.contains("expiry"),
+                "the populated overlay must materialize the column:\n{with}"
+            );
+            assert!(
+                !without.contains("expiry"),
+                "…and an empty overlay must still elide it, which is every OTHER stats \
+                 golden's claim:\n{without}"
+            );
+
+            // All four states reach the render, so the case covers what it says it covers.
+            let row = |handle: &str| {
+                with.lines()
+                    .find(|line| line.starts_with(handle))
+                    .unwrap_or_else(|| panic!("`{handle}` is not in the render:\n{with}"))
+            };
+            assert!(row("alpha").contains("2d10h"), "{}", row("alpha")); // Within
+            assert!(row("beta").contains("29d"), "{}", row("beta")); // Beyond
+            assert!(row("ガンマ").contains("lapsed"), "{}", row("ガンマ")); // Lapsed
+
+            // UNKNOWN — the gap, and not the calm `Beyond` cell two rows above it.
+            //
+            // COUNTED rather than `contains`, and that is the whole point of this pair: `delta`'s
+            // row already carries gaps in `signal`, `runway` and `velocity`, so a bare
+            // `delta.contains(EXPIRY_GAP)` is satisfied by three cells that have nothing to do with
+            // expiry — it would stay green if the unmeasured cell started rendering `n/a`, or the
+            // calm `29d`. Differencing against the SAME row in the elided render names the expiry
+            // cell specifically without hard-coding a column position.
+            let gaps = |line: &str| line.matches(EXPIRY_GAP).count();
+            let delta = row("delta");
+            let delta_elided = without
+                .lines()
+                .find(|line| line.starts_with("delta"))
+                .expect("the elided render carries the same roster");
+            assert_eq!(
+                gaps(delta),
+                gaps(delta_elided) + 1,
+                "materializing EXPIRY must add exactly ONE gap to `delta`'s row — the one an \
+                 unmeasured credential earns:\n{delta}\n{delta_elided}"
+            );
+            assert!(
+                !delta.contains("29d"),
+                "an unmeasured credential must never borrow the `Beyond` cell: {delta}"
+            );
+
+            // The `stats` surface leaves the cell UNCOLOURED — the tint is `status`' alone
+            // (`expiry_severity`), and this render is the plain one, so no SGR may appear.
+            assert!(
+                !with.contains('\u{1b}'),
+                "the plain stats render carries no escape sequences:\n{with}"
             );
         }
 

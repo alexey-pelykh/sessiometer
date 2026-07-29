@@ -35,7 +35,8 @@ extension Color {
     /// lets the panel golden gate produce machine-independent references.
     ///
     /// SAME COLOUR IS NOT SAME PIXELS, and the difference was measured rather than assumed. Switching the
-    /// three use sites to this property changes the app's own render on 22 of the 34 golden cells, by up to
+    /// three use sites to this property changed the app's own render on 22 of the 34 golden cells the
+    /// catalog held when it was measured (#391; it has since grown), by up to
     /// 21/255 on a single channel over ~30 % of pixels (A/B against a build-level control that confirmed the
     /// render is otherwise byte-deterministic across independent builds). `AccentColor.colorset` is sRGB
     /// #007AFF / #0A84FF — nominally the macOS default accent — so this is a dynamic-vs-static colour

@@ -209,7 +209,7 @@ longer carries — naming the frame, or the line for an untagged block.
 The harness above is the **fidelity** path (a human eye, against the live mock). This is the **drift**
 path: `Tests/PanelGoldenParityTests` re-renders every panel state in-process — SwiftUI `ImageRenderer`
 inside the headless `MenubarTests` bundle, which issue #749 measured as viable — and diffs the fresh
-renders against committed goldens under `renders/panel-goldens/`. **34 goldens** (17 fixtures × light/dark,
+renders against committed goldens under `renders/panel-goldens/`. **36 goldens** (18 fixtures × light/dark,
 `panel-<state>-<theme>.png`, @2x), rendered through the same `PanelRenderHarness` the app's
 `--render-panel` tool uses, so the automated gate and the human oracle can never render different states.
 
@@ -261,9 +261,9 @@ whole table means running the default suite too.
 `testEachFreshRenderIsNearestToItsOwnGolden` — asks that a fresh render's closest same-size golden be
 itself, which needs no cross-machine calibration and catches one state morphing into another. It only has
 power where a same-size golden of a *different* fixture exists to lose to, and goldens are sized by
-content: 7 of the 17 fixtures (`stats`, `disconnected`, `not-running`, `empty-roster`, `blind-cornered`,
-`starting`, `crash-looping`) own a unique height, so their size group holds only their own two themes,
-~0.97 apart. For those **14 of 34 cells the relative check is trivially satisfied** and the absolute
+content: 8 of the 18 fixtures (`stats`, `disconnected`, `not-running`, `empty-roster`, `blind-cornered`,
+`starting`, `crash-looping`, `expiry`) own a unique height, so their size group holds only their own two
+themes, ~0.97 apart. For those **16 of 36 cells the relative check is trivially satisfied** and the absolute
 ceiling — the cross-machine *unvalidated* half — is the only thing defending them. The suite asserts that
 count rather than merely noting it, and prints it on every run alongside the weakest real margin (measured
 **0.002513**), so the promotion decision in issue #790 has the number in front of it.
@@ -294,7 +294,7 @@ drift. Do not read "the PNG changed" as "the panel changed"; the gate's own verd
 
 **On THIS toolchain the goldens are byte-reproducible, and that is deliberate.** Two independent
 `SESSIOMETER_PANEL_GOLDENS=update` runs produce byte-identical files, and the app's own `--render-panel`
-output is byte-identical to all 34 goldens. It did not start out that way: the first renders in a process
+output is byte-identical to all 36 goldens. It did not start out that way: the first renders in a process
 disagree with the steady state by ±1/255 on ~0.03 % of bytes — a rasterization warm-up artifact, found by
 rendering one fixture six times (renders 0–1 agree with each other, renders 2–5 agree with each other,
 the two groups differ) and ruled out as a clock effect because renders seeded seconds apart are
@@ -343,7 +343,7 @@ So the automated branch is a **GO**, by a cheaper route than the issue anticipat
 ### The automated gate
 
 `Tests/PanelAccessibilityTreeTests` hosts the panel in an `NSHostingView` and walks the live AppKit
-accessibility tree across all 17 render fixtures — no XCUITest, no scheme risk, no TCC grant
+accessibility tree across all 18 render fixtures — no XCUITest, no scheme risk, no TCC grant
 (`AXIsProcessTrusted()` is **false** in that bundle), ~0.6 s, inside the required `swift` job. It asserts
 interactive elements publish `AXButton`, blocked rows publish `enabled=false`, decorative elements are
 **absent** from the tree, no focusable element is silent, navigation order runs header → tabs → roster →

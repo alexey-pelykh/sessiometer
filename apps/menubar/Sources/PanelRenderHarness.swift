@@ -30,8 +30,8 @@
 // the Retina surface the panel actually ships on.
 //
 // HOST-EQUIVALENCE, measured. Because both consumers route through this one `render`, the app tool and the
-// in-bundle gate produce PIXEL-IDENTICAL output — verified by rendering all 34 cells through
-// `--render-panel` and diffing them against the in-bundle goldens (max drift 0.000000 over 34 cells). The
+// in-bundle gate produce PIXEL-IDENTICAL output — verified by rendering all 36 cells through
+// `--render-panel` and diffing them against the in-bundle goldens (max drift 0.000000 over 36 cells). The
 // PNG *files* still differ byte-wise, because the app tool encodes the renderer's `CGImage` directly while
 // the gate encodes from its normalized comparison buffer; only the pixels are the claim. That equivalence
 // is not free — it is what `Color.panelAssets` (asset lookup follows the compiled-into bundle, not
@@ -199,6 +199,36 @@ enum PanelRenderHarness {
                                                        autoProtectionDegraded: true)),
                                  exhaustedPersonal, exhaustedTemp]
 
+        // The four-state expiry roster (#886) — the healthy rows above, each given one horizon verdict,
+        // plus a fourth account carrying the UNMEASURED one. Deadlines are `now`-relative and land on a
+        // `humanizeUntil` plateau via `guardSecs`, exactly as the reset instants above do, so the rendered
+        // durations are stable bytes rather than a value that flips mid-suite.
+        func expiring(_ row: AccountRow, _ expiry: AccountExpiry) -> AccountRow {
+            AccountRow(label: row.label, isActive: row.isActive, isEnabled: row.isEnabled,
+                       isQuarantined: row.isQuarantined, isRecovering: row.isRecovering, auth: row.auth,
+                       sessionPct: row.sessionPct, weeklyPct: row.weeklyPct,
+                       sessionResetsAt: row.sessionResetsAt, weeklyResetsAt: row.weeklyResetsAt,
+                       weeklyExhausted: row.weeklyExhausted, isNextSwapTarget: row.isNextSwapTarget,
+                       blindActive: row.blindActive, expiry: expiry)
+        }
+        let expiryRows = [
+            // WITHIN the operator's horizon — still working, but act before it lapses.
+            expiring(rows[0], AccountExpiry(expiresAt: now + 5 * day + 18 * 3600 + guardSecs,
+                                            horizonState: .within)),
+            // Already LAPSED — only a `sessiometer login` recovers it.
+            expiring(rows[1], AccountExpiry(expiresAt: now - day, horizonState: .lapsed)),
+            // BEYOND it: the one verdict that legitimately means "not expiring soon".
+            expiring(rows[2], AccountExpiry(expiresAt: now + 29 * day + guardSecs, horizonState: .beyond)),
+            // POLLED, and the credential carried NO deadline — UNKNOWN, rendered as the gap. The row
+            // this fixture exists for, and it sits directly under the calm `29d` above on purpose.
+            AccountRow(label: "Unmeasured", isActive: false, isEnabled: true, isQuarantined: false,
+                       isRecovering: false, auth: .healthy, sessionPct: 12, weeklyPct: 24,
+                       sessionResetsAt: now + 4 * 3600 + 30 * 60 + guardSecs,
+                       weeklyResetsAt: now + 3 * day + guardSecs,
+                       weeklyExhausted: false, isNextSwapTarget: false, blindActive: nil,
+                       expiry: AccountExpiry(expiresAt: nil, horizonState: .unknown)),
+        ]
+
         // `generatedAt` sits a comfortable 12 s in the past: `snapshotAgeText` humanizes any sub-minute age
         // to the single string "updated <1m ago", so the whole 1…59 s band renders identically — the widest
         // rounding plateau available, hence no `guardSecs` needed on this one.
@@ -263,6 +293,34 @@ enum PanelRenderHarness {
                                nextSwap: .noViableTarget(cause: .weekly,
                                                          resetsAt: now + 2 * day + 4 * 3600 + guardSecs),
                                generatedAt: fresh),
+            // #886: the per-row REFRESH-token expiry line (#884) in ALL FOUR of its states at once.
+            // Every other fixture leaves `expiry` nil, so `rosterShowsExpiry` is false and the line is
+            // absent from the OTHER 34 committed cells — those pin the ELISION (a fleet whose credentials
+            // carry no deadline shows no line rather than a column of `—`); this one is the only frame
+            // in which the line ships.
+            //
+            // FOUR rows rather than the shared three, because the fourth state is the one that has to
+            // be SEEN: `Unmeasured` was polled and its credential held no deadline, so it renders the
+            // gap `—` DIRECTLY BELOW `Temp`'s calm `29d`. That those two do not look alike is a purely
+            // visual claim — the exact class a unit test cannot make and a golden can — and mistaking
+            // one for the other is the silent false-calm the whole foresight feature exists to refuse
+            // (#137, and #876 for how that assumption already rotted once). A format-layer test can
+            // assert the two STRINGS differ; only a render shows an operator they do not read alike.
+            //
+            // The roster is otherwise the healthy one, and the snapshot stays `.connected` with a fresh
+            // header and footer: expiry is a per-row MODIFIER on a working daemon, never a
+            // whole-snapshot degrade (#137) — an account is routinely healthy AND inside its horizon at
+            // once, which is why #878 made it an orthogonal axis instead of a new `auth` state. There is
+            // deliberately NO banner and no glyph escalation: #884 settled the both-or-neither invariant
+            // as NEITHER, so a frame showing the line under a calm header is the CORRECT render, not an
+            // omission (see `StatusPanelFormat`'s expiry section for the rationale).
+            //
+            // The mock authors no expiry surface, so this fixture has no `.pop` counterpart and is
+            // deliberately absent from `design/build-comparison.py`'s `STATES` — an unpaired capture is
+            // simply never fetched, so nothing there needed changing. That is the documented scope of
+            // the oracle ("only for what it authors"), not a missing frame.
+            PanelRenderFixture(name: "expiry", state: .connected, rows: expiryRows,
+                               nextSwap: nextSwap, generatedAt: fresh),
         // …plus the four daemon-level FAULT ranks (#592) — appended rather than inlined because they vary a
         // different axis: same `.connected` state and same healthy roster, differing only in which payload
         // fault is set. See `faultFixtures`.

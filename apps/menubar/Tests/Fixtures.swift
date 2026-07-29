@@ -282,6 +282,28 @@ enum Fixtures {
     {"type":"snapshot","schema_version":{"major":1,"minor":13},"generated_at":1893456000,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":30,"weekly_pct":20,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":1893470000,"refresh_health":{"last_ok":true,"rotated":false,"consecutive_failures":0},"auth":"healthy","expiry":{"expires_at":1893800000,"horizon_state":"within","cohort_id":0}},{"label":"spare","active":false,"enabled":true,"quarantined":false,"recovering":false,"session_pct":20,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy","expiry":{"expires_at":1893803600,"horizon_state":"within","cohort_id":0}},{"label":"archive","active":false,"enabled":true,"quarantined":false,"recovering":false,"session_pct":5,"weekly_pct":5,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy","expiry":{"expires_at":1896392000,"horizon_state":"beyond"}}],"next_swap":{"state":"target","to":"spare","reason":{"kind":"only_candidate"}},"refresh_enabled":true,"systemic_refresh_failure":null,"expiry_cohort":{"size":2,"observed":3,"earliest":1893800000,"span_secs":3600}}
     """#
 
+    /// **BYTE-PINNED** to `build/fixtures/wire-snapshot-expiry.json` — the expiry modifier in ALL FOUR
+    /// of its states plus the fleet cohort, emitted by the Rust
+    /// `wire_golden_snapshot_expiry_frame` (issue #886).
+    ///
+    /// The two fixtures above are hand-written and pin TOLERANCE; this one is the cross-language
+    /// byte-drift guard for the `AccountExpiry` + `ExpiryCohort` encoders, which had none — every
+    /// other committed golden carries `expiry: None` and no cohort, so both objects are omitted from
+    /// all of them and neither encoder was ever compared across the language boundary. ADR-0010 keeps
+    /// Rust out of the Swift build, so without this the hand-written mirror in `WireModel.swift`
+    /// could drift from the daemon and the Swift suite would go on validating against its own stale
+    /// literal. `WireGoldenTests.testExpiryStatesFixtureMatchesRustGolden` is the assertion.
+    ///
+    /// `unmeasured` is the row this fixture exists for: POLLED, with a credential that carried no
+    /// `refreshTokenExpiresAt`, so it arrives as `{"expires_at":null,"horizon_state":"unknown"}` — an
+    /// explicit null inside a PRESENT object. It must decode to `.unknown`, never to the reassuring
+    /// `.beyond` (the issue #137 invariant), and the explicit null is what distinguishes it from
+    /// `unpolled`, whose key is omitted entirely. If upstream ever stops emitting the deadline, the
+    /// whole fleet degrades to THIS shape — which is why it is pinned rather than assumed.
+    static let snapshotExpiryStates = #"""
+    {"type":"snapshot","schema_version":{"major":1,"minor":13},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy","expiry":{"expires_at":1785499802,"horizon_state":"within","cohort_id":0}},{"label":"spare","active":false,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy","expiry":{"expires_at":1785503402,"horizon_state":"within","cohort_id":0}},{"label":"archive","active":false,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy","expiry":{"expires_at":1788091802,"horizon_state":"beyond"}},{"label":"retired","active":false,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy","expiry":{"expires_at":1782907802,"horizon_state":"lapsed"}},{"label":"unmeasured","active":false,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy","expiry":{"expires_at":null,"horizon_state":"unknown"}}],"next_swap":null,"refresh_enabled":false,"systemic_refresh_failure":null,"expiry_cohort":{"size":2,"observed":4,"earliest":1785499802,"span_secs":3600}}
+    """#
+
     /// `encode_heartbeat_frame(42)` — the canonical beat the Rust test decodes.
     static let heartbeatBasic = #"""
     {"type":"heartbeat","generated_at":42,"schema_version":{"major":1,"minor":13}}

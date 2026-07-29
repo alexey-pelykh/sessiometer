@@ -1,5 +1,5 @@
 {
-  "schema": 2,
+  "schema": 3,
   "about": "Cross-surface severity contract (issue #768). EMITTED by the Rust gate (`cargo test -- --ignored emit_cross_surface_severity_manifest`) from `src/cli.rs`'s `DaemonPayloadFault`, which ADR-0026 makes the single home of the rank; CONSUMED by both `src/cli.rs` (mod tests::cross_surface_parity) and `apps/menubar/Tests/CrossSurfaceSeverityParityTests.swift`. Neither surface can change its rank alone: the emitting side reddens until this file is re-emitted, and re-emitting reddens the other side until it follows. Hand-editing this file is not a re-baseline — it is a way to break both gates at once.",
   "daemon_fault_ranks": [
     {
@@ -234,6 +234,64 @@
       "weekly_exhausted": false,
       "session_severity": null,
       "weekly_severity": null
+    }
+  ],
+  "expiry_cases": [
+    {
+      "name": "within",
+      "offset_secs": 259200,
+      "horizon_state": "within",
+      "cell": "3d",
+      "severity": "yellow"
+    },
+    {
+      "name": "beyond",
+      "offset_secs": 2505600,
+      "horizon_state": "beyond",
+      "cell": "29d",
+      "severity": "dim"
+    },
+    {
+      "name": "lapsed",
+      "offset_secs": -86400,
+      "horizon_state": "lapsed",
+      "cell": "lapsed",
+      "severity": "red"
+    },
+    {
+      "name": "unknown-no-deadline",
+      "offset_secs": null,
+      "horizon_state": "unknown",
+      "cell": "—",
+      "severity": null
+    },
+    {
+      "name": "unknown-outranks-a-stray-deadline",
+      "offset_secs": 259200,
+      "horizon_state": "unknown",
+      "cell": "—",
+      "severity": null
+    },
+    {
+      "name": "within-but-already-past-at-render",
+      "offset_secs": -60,
+      "horizon_state": "within",
+      "cell": "lapsed",
+      "severity": "red"
+    },
+    {
+      "name": "within-exactly-at-now",
+      "offset_secs": 0,
+      "horizon_state": "within",
+      "cell": "lapsed",
+      "severity": "red"
+    },
+    {
+      "name": "lapsed-without-a-deadline",
+      "offset_secs": null,
+      "horizon_state": "lapsed",
+      "cell": "lapsed",
+      "severity": "red"
     }
   ],
   "known_divergences": [
