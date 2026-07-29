@@ -1,8 +1,8 @@
-ACCOUNT   SESSION% RESET  WEEKLY% RESET  EXPIRY  AUTH
-[33m* work[0m    [31m97%[0m      [32m12m[0m    [32m40%[0m     [2m5d[0m     [33m5d18h[0m   🟢
-[32m  世界[0m    [32m10%[0m      [33m2h[0m     [32m20%[0m     [2m3d4h[0m   [33m5d19h[0m   🟢
-[32m  parked[0m  [32m5%[0m       [32m45m[0m    [32m8%[0m      [33m1d[0m     [2m30d[0m     🟡 disabled
-[32m  stale[0m   [32m60%[0m      [32m1h[0m     [32m55%[0m     [2m2d[0m     [31mlapsed[0m  🟠 recovering
+ACCOUNT   SESSION% RESET  WEEKLY% RESET  EXPIRY   AUTH
+[33m* work[0m    [31m97%[0m      [32m12m[0m    [32m40%[0m     [2m5d[0m     [33m[5d18h][0m  🟢
+[32m  世界[0m    [32m10%[0m      [33m2h[0m     [32m20%[0m     [2m3d4h[0m   [33m[5d19h][0m  🟢
+[32m  parked[0m  [32m5%[0m       [32m45m[0m    [32m8%[0m      [33m1d[0m     [2m30d[0m      🟡 disabled
+[32m  stale[0m   [32m60%[0m      [32m1h[0m     [32m55%[0m     [2m2d[0m     [31mlapsed[0m   🟠 recovering
   unseen  n/a      n/a    n/a     n/a    —
 
 next swap: 世界 (only viable target)

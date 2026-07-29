@@ -1046,6 +1046,15 @@ folded into AUTH: the two axes are independent, so an account with no AUTH fault
 still sit days from its refresh-token deadline. The column is absent entirely when no account
 has an observed deadline, and it is the first to go on a narrow terminal.
 
+A time-until in BRACKETS (`[6d21h]`) marks a deadline falling inside the expiry horizon —
+`expiry_horizon_secs` under [credential], seven days by default; an unbracketed one (`29d`)
+falls outside it. The brackets state where the deadline sits relative to that window and
+nothing further — the window's width is yours to set, so the bare duration alone cannot tell
+you which side of it you are on. The colour overlay tints the same distinction where it is
+available; the brackets are what carry it through --no-color, NO_COLOR, and a pipe into a
+file. (They are literal brackets, so `grep -F` matches one as text — bare `grep` would read
+it as a character class.)
+
 Refreshing does NOT extend that deadline. The daemon keeps ACCESS tokens alive indefinitely —
 that is the separate clock `-v` prints, and it does slide forward on every refresh — but the
 refresh-token deadline is a fixed instant issued at login that no refresh moves. A credential
@@ -2473,9 +2482,11 @@ fn status_columns(rows: &[StatusRow]) -> Vec<Column> {
     if rows.iter().any(|row| row.expiry != EXPIRY_GAP) {
         // The REFRESH-token expiry modifier (issue #883) — a cell of its OWN, deliberately NOT
         // folded into `AUTH`: the two axes are orthogonal (issue #878), so an account can be
-        // 🟢 healthy AND days from needing a re-login at the same time. Placed BEFORE `AUTH` so
-        // that column's ragged free-text cue (`claude /login`, `degraded — run 'sessiometer
-        // poke'`) stays last on the line, where its variable length costs nothing.
+        // 🟢 healthy AND days from needing a re-login at the same time. Its cells arrive already
+        // carrying the within-horizon mark (issue #934), so the widths measured below size the
+        // MARKED cell and `expiry_severity`'s tint stays purely additive over it. Placed BEFORE
+        // `AUTH` so that column's ragged free-text cue (`claude /login`, `degraded — run
+        // 'sessiometer poke'`) stays last on the line, where its variable length costs nothing.
         columns.push(Column::droppable(
             "EXPIRY",
             1,
@@ -3358,9 +3369,10 @@ struct StatusRow {
     /// pre-#119 daemon with no tags.
     status: String,
     /// The EXPIRY cell (issue #883): this account's REFRESH-token deadline as a compact
-    /// time-until (`6d21h`), the state word `lapsed`, or [`EXPIRY_GAP`] when none was observed.
+    /// time-until (`6d21h`), the state word `lapsed`, or [`EXPIRY_GAP`] when none was observed —
+    /// BRACKETED (`[6d21h]`) while that deadline is inside the configured horizon (issue #934).
     /// A cell of its OWN — never folded into [`status`](Self::status) — because the expiry axis is
-    /// orthogonal to [`CredentialHealth`] (issue #878). See [`expiry_cell`].
+    /// orthogonal to [`CredentialHealth`] (issue #878). See [`expiry_table_cell`].
     expiry: String,
     /// Per-cell urgency for the color overlay (issue #84): each cell carries its OWN
     /// health, so one row can show several independent colors (a red `session` reset
@@ -3371,8 +3383,10 @@ struct StatusRow {
     /// [`weekly_cell_severity`] utilization bands on each `%`; each reset its OWN
     /// [`proximity_severity`] (issue #94) — how soon that window flips, independent
     /// of utilization. The health-text column is never tinted (its tags are their own
-    /// signal), so it has no field here; `expiry` IS tinted (issue #883) — its cell is a
-    /// plain duration with no self-colouring glyph, so the band is its only at-a-glance signal.
+    /// signal), so it has no field here; `expiry` IS tinted (issue #883) — its cell carries no
+    /// self-colouring glyph, so the band is what makes the horizon readable at a glance. It is no
+    /// longer the ONLY carrier: since issue #934 the cell also brackets a within-horizon deadline,
+    /// so the band augments a signal that already survives `--no-color` rather than being it.
     account_severity: Option<Severity>,
     session_severity: Option<Severity>,
     session_reset_severity: Option<Severity>,
@@ -3401,7 +3415,7 @@ impl StatusRow {
             weekly: pct(account.weekly_pct),
             weekly_reset: reset_cell(account.weekly_resets_at, now),
             status: health_cell(account),
-            expiry: expiry_cell(account.expiry, now),
+            expiry: expiry_table_cell(account.expiry, now),
             // Each cell colored by its OWN health (issue #84): `account` → the overall
             // binding-window severity; `session` / `weekly` `%` → each window's own
             // utilization bands (weekly honoring the exhaustion override); each reset →
@@ -3892,7 +3906,8 @@ fn reset_cell(reset_at: Option<i64>, now: i64) -> String {
 pub(crate) const EXPIRY_GAP: &str = "—";
 
 /// One account's REFRESH-token expiry cell (issue #883) — the operator-facing projection of the
-/// [`AccountExpiry`] modifier issue #882 put on the `status`/`watch` wire.
+/// [`AccountExpiry`] modifier issue #882 put on the `status`/`watch` wire. The shared FACT only:
+/// what either table actually renders is [`expiry_table_cell`], this string plus the horizon mark.
 ///
 /// Rendered as PRESENT-TENSE STATE, never an imperative: a compact time-until (`6d21h`, `29d`,
 /// reusing [`humanize_until`], the same shape the `RESET` cells carry) for an observed deadline,
@@ -3921,11 +3936,97 @@ pub(crate) const EXPIRY_GAP: &str = "—";
 /// uncoloured, because that surface's colour vocabulary is the neutral utilisation band and an
 /// urgency tint on a credential deadline would editorialise inside it (D-STA-6). Presentation
 /// diverges deliberately; the string cannot.
+///
+/// **This is the CROSS-SURFACE vocabulary, and it is byte-pinned.**
+/// `cross_surface::ExpiryParityCase` (test-only, so deliberately not an intra-doc link — the
+/// module is `#[cfg(test)]` and absent from the doc graph) records this exact string into
+/// `build/fixtures/cross-surface-severity.json`, which the panel's own
+/// `CrossSurfaceSeverityParityTests` asserts against — so a change HERE is a change to a contract
+/// the Swift gate reads. The per-account horizon MARK (issue #934) is therefore NOT applied here
+/// but one layer out, in [`expiry_table_cell`]: R-2 pins the shared state vocabulary, while how a
+/// surface makes the horizon band survive colour loss is that surface's own presentation — the
+/// same split the tint above already lives under.
 pub(crate) fn expiry_cell(expiry: Option<AccountExpiry>, now: i64) -> String {
     match expiry_view(expiry, now) {
         ExpiryView::Gap => EXPIRY_GAP.to_owned(),
         ExpiryView::Lapsed => "lapsed".to_owned(),
         ExpiryView::Live { at, .. } => humanize_until(at - now),
+    }
+}
+
+/// One account's EXPIRY table cell (issue #934): the [`expiry_cell`] fact, bracketed when the
+/// deadline falls INSIDE the configured horizon.
+///
+/// **Why a mark at all.** Until now the horizon band reached the operator only as colour —
+/// [`expiry_severity`]'s `Yellow` vs `Dim`. `2d2h` and `28d11h` are typographically identical, so
+/// under `--no-color`, `NO_COLOR=1`, a pipe, a log capture, or colour-blindness the entire
+/// per-account signal was gone; `--no-color` is a first-class supported flag, so the feature was
+/// degrading silently in a mode this CLI advertises. `stats` had it worse — [`crate::stats`]'s
+/// `col_expiry` is uncoloured in EVERY mode, so there the band was never visible at all. This is
+/// design-stats.md §D-STA-5's `Color augments only` rule applied to the one column that broke it:
+/// the `trend` sparkline already carries its meaning in glyph SHAPE, and now so does this.
+///
+/// **Why brackets, and not `!`.** The mark is a DESCRIPTOR, never an instruction (§D-STA-6 /
+/// SUR-001), and `within` is the STEADY state rather than an exception: with the 7-day default
+/// horizon against ~30-day refresh tokens, every healthy account sits inside the horizon for a week
+/// before every re-login — issue #884 measured that at ~23% of the time and refused a menu-bar `!`
+/// on exactly that cry-wolf ground. An alarm sigil would be wrong for a state most of a healthy
+/// fleet occupies most weeks. Brackets say something narrower and true: the horizon is a configured
+/// WINDOW and this deadline falls inside it — which is precisely the fact a bare duration cannot
+/// carry, since the window is operator-configurable and the reader cannot know its width. They also
+/// stay clear of the two sigils this table already spends (`*` marks the ACTIVE account one column
+/// over; `~` is `stats`' approximation prefix on `runway`), and they are pure ASCII, so the mark
+/// survives a pipe, a log capture, and a terminal with no Unicode at all.
+///
+/// The one wrinkle, stated rather than glossed: `[` and `]` are regex metacharacters, so a cell
+/// copied out of the table and pasted into a bare `grep` becomes a CHARACTER CLASS —
+/// `grep '[6d21h]'` matches any row containing one of those characters, which on this table is
+/// most of them. The mark survives the pipe (it is in the bytes either way); it is pattern REUSE
+/// that needs `grep -F`, and the `status` help says so — a documented quoting note being the
+/// cheaper cost against either alternative above.
+///
+/// **Beyond, gap, and `lapsed` are deliberately unmarked.** `Beyond` and the gap are the calm
+/// states, and marking `lapsed` would be false twice over: a lapsed deadline is not *within* a
+/// forward-looking window, and the bare word already reads as the loudest thing in a column of
+/// durations, so it needs no help to be found by eye.
+///
+/// The arms MIRROR [`expiry_severity`] — including the defensive fallthrough — so the mark and the
+/// tint cannot disagree about which cells are inside the horizon: exactly the cells this brackets
+/// are exactly the cells that render `Yellow`.
+/// `the_expiry_mark_and_the_tint_agree_on_which_cells_are_within` pins that, and [`expiry_view`]
+/// remains the single place the staleness rule lives, so a deadline that passes inside the poll
+/// window loses the mark and the `Yellow` in the same step.
+///
+/// COSTS ONE COLUMN, bounded by the horizon itself: a marked cell is only ever as wide as a
+/// within-horizon duration, so at the 7-day default the widest is `[6d23h]` — 7 display columns
+/// against the 6 that `lapsed` and the `EXPIRY` label already require. The table keeps its
+/// §D-STA-5 shed behaviour untouched (EXPIRY still sheds first, at priority 1) and never wraps.
+pub(crate) fn expiry_table_cell(expiry: Option<AccountExpiry>, now: i64) -> String {
+    let cell = expiry_cell(expiry, now);
+    if expiry_within_horizon(expiry, now) {
+        format!("[{cell}]")
+    } else {
+        cell
+    }
+}
+
+/// Whether an [`expiry_table_cell`] carries the horizon mark — the render-time answer to "is this
+/// deadline inside the configured horizon?".
+///
+/// Written as its own match, arm-for-arm against [`expiry_severity`] rather than derived from it,
+/// because the two answer different questions and only one of them is allowed to change if the
+/// tint vocabulary ever does. Reading the mark off `Some(Severity::Yellow)` would couple a
+/// typographic affordance to a colour band and silently re-mark every cell the day a band moves.
+fn expiry_within_horizon(expiry: Option<AccountExpiry>, now: i64) -> bool {
+    match expiry_view(expiry, now) {
+        ExpiryView::Gap | ExpiryView::Lapsed => false,
+        ExpiryView::Live {
+            horizon: ExpiryHorizon::Beyond,
+            ..
+        } => false,
+        // `Within` — and, defensively, any other class that survived the render-time check. The
+        // SAME fallthrough `expiry_severity` resolves to `Yellow`.
+        ExpiryView::Live { .. } => true,
     }
 }
 
@@ -6961,7 +7062,8 @@ spare  22222222-2222\n\
     #[test]
     fn the_expiry_cell_is_tinted_by_its_own_horizon_band() {
         // Per-cell colour (issue #84): the expiry cell carries no self-colouring glyph, so its
-        // band is the only at-a-glance signal. Lapsed is act-now Red; Within the configured
+        // band is what makes the horizon legible at a glance (since issue #934 it augments the
+        // bracket rather than standing alone). Lapsed is act-now Red; Within the configured
         // horizon is Yellow; Beyond it is Dim — the same de-emphasis a far-off reset gets, since
         // there is nothing to act on. An UNOBSERVED deadline is uncoloured: absence of colour is
         // not a false "healthy" signal.
@@ -6991,6 +7093,253 @@ spare  22222222-2222\n\
             "the lapsed cell is tinted red: {colored:?}"
         );
         assert!(render_status(&response, NOW, None, false).contains("lapsed"));
+    }
+
+    // --- status: the within-horizon EXPIRY mark (issue #934) -------------------
+
+    #[test]
+    fn the_expiry_mark_brackets_within_and_leaves_every_other_state_bare() {
+        // The mark answers the one question the bare duration cannot: the horizon is
+        // operator-configurable, so `2d2h` alone never tells a reader which side of it they are
+        // on. Bracketed means INSIDE the configured window; bare means outside it.
+        let cell = |offset, state| {
+            expiry_table_cell(status_line_expiry("a", true, offset, state).expiry, NOW)
+        };
+
+        assert_eq!(cell(3 * 86_400, ExpiryHorizon::Within), "[3d]");
+        assert_eq!(
+            cell(2 * 86_400 + 2 * 3_600, ExpiryHorizon::Within),
+            "[2d2h]",
+            "the measured live-fleet case from the issue: `2d2h` inside the horizon and `28d11h` \
+             outside it were typographically identical before the mark"
+        );
+
+        // Beyond, the gap, and `lapsed` are all deliberately BARE. `lapsed` is not *within* a
+        // forward-looking window, and it is already the loudest thing in a column of durations —
+        // a bare word among digits needs no bracket to be found by eye.
+        assert_eq!(
+            cell(28 * 86_400 + 11 * 3_600, ExpiryHorizon::Beyond),
+            "28d11h"
+        );
+        assert_eq!(cell(-86_400, ExpiryHorizon::Lapsed), "lapsed");
+        assert_eq!(cell(0, ExpiryHorizon::Unknown), EXPIRY_GAP);
+        assert_eq!(
+            expiry_table_cell(None, NOW),
+            EXPIRY_GAP,
+            "an account the daemon never sent a modifier for stays the plain gap — the mark never \
+             manufactures a signal out of an absence"
+        );
+    }
+
+    #[test]
+    fn the_expiry_mark_and_the_tint_agree_on_which_cells_are_within() {
+        // `expiry_table_cell` and `expiry_severity` dispatch through `expiry_view` separately, so
+        // this pins the invariant that keeps them honest: EXACTLY the cells that bracket are the
+        // cells that render Yellow. A reordered arm on either side breaks this, including on the
+        // three payloads where the daemon's cached class and the render clock DISAGREE — which no
+        // per-state case can reach.
+        let day = 86_400;
+        let cases: &[(i64, ExpiryHorizon)] = &[
+            (3 * day, ExpiryHorizon::Within),
+            (29 * day, ExpiryHorizon::Beyond),
+            (-day, ExpiryHorizon::Lapsed),
+            (0, ExpiryHorizon::Unknown),
+            // The render-time re-check: classified `Within` a tick ago, already past at the draw.
+            (-300, ExpiryHorizon::Within),
+            // Its boundary — at the instant counts as passed.
+            (0, ExpiryHorizon::Within),
+            // Backwards skew: a declared `Lapsed` does not un-lapse, so it must not re-acquire the
+            // mark either.
+            (3 * day, ExpiryHorizon::Lapsed),
+            (-300, ExpiryHorizon::Beyond),
+        ];
+        for (offset, state) in cases {
+            let expiry = status_line_expiry("a", true, *offset, *state).expiry;
+            let marked = expiry_table_cell(expiry, NOW).starts_with('[');
+            let yellow = expiry_severity(expiry, NOW) == Some(Severity::Yellow);
+            assert_eq!(
+                marked, yellow,
+                "the mark and the tint disagree about {state:?} at {offset}s: marked={marked}, \
+                 yellow={yellow} — a cell that brackets must be the same cell that tints Yellow"
+            );
+        }
+        assert_eq!(
+            expiry_table_cell(None, NOW).starts_with('['),
+            expiry_severity(None, NOW) == Some(Severity::Yellow),
+        );
+    }
+
+    #[test]
+    fn the_within_horizon_mark_never_reaches_the_cross_surface_fact() {
+        // LOAD-BEARING, and the reason the mark lives one layer out. `expiry_cell` is byte-pinned
+        // for every wire state into `build/fixtures/cross-surface-severity.json`, which the panel's
+        // `CrossSurfaceSeverityParityTests` asserts against — and `.github/workflows/ci.yml` runs
+        // the `swift` job on `build/fixtures/**`, not only on `apps/menubar/**`. Moving the bracket
+        // into `expiry_cell` would regenerate that manifest and take the Swift gate red until the
+        // panel mirrored it. R-2 pins the shared STATE vocabulary; how a surface survives colour
+        // loss is that surface's own presentation, exactly as the tint already is.
+        let day = 86_400;
+        for (offset, state) in [
+            (3 * day, ExpiryHorizon::Within),
+            (29 * day, ExpiryHorizon::Beyond),
+            (-day, ExpiryHorizon::Lapsed),
+            (0, ExpiryHorizon::Unknown),
+        ] {
+            let expiry = status_line_expiry("a", true, offset, state).expiry;
+            let fact = expiry_cell(expiry, NOW);
+            assert!(
+                !fact.contains('[') && !fact.contains(']'),
+                "the cross-surface fact for {state:?} must stay unmarked, got {fact:?}"
+            );
+            // …and the table cell is that same fact, only ever wrapped — never re-spelled.
+            let table = expiry_table_cell(expiry, NOW);
+            assert!(
+                table == fact || table == format!("[{fact}]"),
+                "the table cell must be the fact verbatim or the fact bracketed: {table:?} vs {fact:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_expiry_mark_survives_every_mode_that_drops_colour() {
+        // AC1: the mark reaches the operator under `--no-color`, `NO_COLOR=1`, and a pipe to a
+        // non-tty. All three land on `render_status`'s colour gate being closed; the pipe
+        // additionally passes `cols: None`, which skips column shedding entirely.
+        let response = expiry_response(vec![
+            AccountStatusLine {
+                health: Some(CredentialHealth::Healthy),
+                ..status_line_expiry("near", true, 2 * 86_400 + 2 * 3_600, ExpiryHorizon::Within)
+            },
+            AccountStatusLine {
+                health: Some(CredentialHealth::Healthy),
+                ..status_line_expiry(
+                    "far",
+                    false,
+                    28 * 86_400 + 11 * 3_600,
+                    ExpiryHorizon::Beyond,
+                )
+            },
+        ]);
+        let row = |out: &str, handle: &str| {
+            out.lines()
+                .find(|l| l.contains(handle))
+                .expect("the account's row")
+                .to_owned()
+        };
+
+        // Uncoloured, at a wide terminal AND piped (`cols: None`).
+        for out in [
+            render_status(&response, NOW, Some(200), false),
+            render_status(&response, NOW, None, false),
+        ] {
+            assert!(
+                row(&out, "near").contains("[2d2h]"),
+                "the within-horizon account keeps its mark with no colour at all: {out}"
+            );
+            assert!(
+                row(&out, "far").contains("28d11h") && !row(&out, "far").contains('['),
+                "and the account beyond the horizon carries none: {out}"
+            );
+        }
+
+        // ADDITIVE (AC4): with colour on, the tint is still there AND the mark is inside its span,
+        // so stripping every escape recovers the exact plain table.
+        let colored = render_status(&response, NOW, Some(200), true);
+        assert!(
+            colored.contains(&format!("\x1b[{}m[2d2h]", Severity::Yellow.sgr())),
+            "colour wraps the MARKED cell — the bracket is part of the tinted text, not outside \
+             it, so the two never fight over the cell boundary: {colored:?}"
+        );
+        assert_eq!(
+            strip_ansi(&colored),
+            render_status(&response, NOW, Some(200), false),
+            "colour is purely additive over the marked table"
+        );
+    }
+
+    #[test]
+    fn the_expiry_mark_costs_one_column_and_leaves_the_shed_order_untouched() {
+        // AC6: §D-STA-5's width and shed rules still hold. The mark widens the column by exactly
+        // one display column and no more, because a marked cell is only ever as wide as a
+        // WITHIN-horizon duration — bounded by the horizon itself. At the 7-day default the widest
+        // is `[6d23h]` (7 columns) against the 6 that `lapsed` and the `EXPIRY` label already need.
+        let widest = expiry_table_cell(
+            status_line_expiry("a", true, 6 * 86_400 + 23 * 3_600, ExpiryHorizon::Within).expiry,
+            NOW,
+        );
+        assert_eq!(widest, "[6d23h]");
+        assert_eq!(
+            display_width(&widest),
+            display_width("EXPIRY") + 1,
+            "one column wider than the header label, which `lapsed` already matches"
+        );
+
+        // The shed order is unchanged: EXPIRY still goes first, alone, and the row never wraps.
+        let response = expiry_response(vec![AccountStatusLine {
+            health: Some(CredentialHealth::Healthy),
+            ..status_line_expiry("work", true, 3 * 86_400, ExpiryHorizon::Within)
+        }]);
+        let full = render_status(&response, NOW, None, false);
+        assert!(full.lines().any(|l| l.contains("[3d]")));
+        let width = display_width(full.lines().next().expect("a header row"));
+        let narrowed = render_status(&response, NOW, Some(width - 1), false);
+        let header = narrowed.lines().next().expect("a header row");
+        assert!(
+            !header.contains("EXPIRY"),
+            "EXPIRY still sheds first, marked or not: {header:?}"
+        );
+        assert!(
+            header.contains("WEEKLY%") && header.contains("AUTH"),
+            "and still sheds alone: {header:?}"
+        );
+        assert!(
+            !narrowed.contains('[') && narrowed.lines().count() == full.lines().count(),
+            "the shed drops the whole cell — mark included — rather than wrapping the row: \
+             {narrowed:?}"
+        );
+    }
+
+    #[test]
+    fn the_expiry_mark_is_a_descriptor_and_never_an_instruction() {
+        // AC5 / §D-STA-6 (SUR-001). A bracket is a delimiter: it names WHERE the deadline sits
+        // relative to a configured window and asks for nothing. `!` was refused deliberately —
+        // issue #884 measured `within` as the steady state (a 7-day horizon against ~30-day
+        // tokens leaves every healthy account inside it for a week before every re-login), so an
+        // alarm sigil would cry wolf on a state most of a healthy fleet occupies most weeks.
+        let response = expiry_response(vec![AccountStatusLine {
+            health: Some(CredentialHealth::Healthy),
+            ..status_line_expiry("work", true, 3 * 86_400, ExpiryHorizon::Within)
+        }]);
+        let out = render_status(&response, NOW, Some(200), false);
+        assert!(out.contains("[3d]"));
+        assert_eq!(
+            scan_expiry_help(&out),
+            None,
+            "the marked render names no imperative, no recommendation, and no acquisitive call"
+        );
+        // …and the shapes that scan does NOT carry, so the two are complements rather than one
+        // guard twice: the alarm sigil this mark was chosen over, the remedy the AUTH cell owns
+        // (named nowhere in a healthy row), and second-person address.
+        for imperative in [
+            "!",
+            "re-login",
+            "renew",
+            "log in",
+            "sessiometer login",
+            "you ",
+        ] {
+            assert!(
+                !out.contains(imperative),
+                "the marked cell reaches for no instruction (`{imperative}`): {out:?}"
+            );
+        }
+        // The help text describing the mark is bound by the same rule — its own SUR-001 scan is
+        // `expiry_help_carries_no_banned_token_but_the_guard_bites_on_injection`, which already
+        // covers `STATUS_USAGE`. What is new here is that the mark is documented AT ALL.
+        assert!(
+            STATUS_USAGE.contains("[6d21h]"),
+            "STATUS_USAGE must document the mark — an undocumented sigil is a puzzle"
+        );
     }
 
     // --- status: AUTH column rename + verbose access-token clock (issue #143) --

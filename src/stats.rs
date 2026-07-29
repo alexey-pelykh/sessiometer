@@ -62,7 +62,7 @@ use serde::Serialize;
 // (issue #159) size their columns on the SAME wcwidth — one definition for the crate. The
 // REFRESH-token expiry cell (issue #883) is reused from the same place and for the same reason:
 // ONE spelling of that fact, so the `status` and `stats` renders cannot drift apart.
-use crate::cli::{display_width, expiry_cell, pad_end, EXPIRY_GAP};
+use crate::cli::{display_width, expiry_table_cell, pad_end, EXPIRY_GAP};
 use crate::config::{Config, Tunables};
 use crate::daemon::AccountExpiry;
 use crate::error::{Error, Result};
@@ -2552,10 +2552,11 @@ struct AccountRow<'a> {
     stats: &'a AccountStats,
     velocity: Option<&'a AccountVelocity>,
     trend: String,
-    /// The pre-rendered REFRESH-token expiry cell (issue #883) — [`EXPIRY_GAP`] when this account
-    /// has no entry in the report's `expiry` overlay. Pre-rendered for the same reason `trend` is:
-    /// a [`Column`] extractor is a bare `fn` pointer, so it cannot reach the reference instant the
-    /// cell's time-until needs.
+    /// The pre-rendered REFRESH-token expiry cell (issue #883), bracketed while the deadline is
+    /// inside the configured horizon (issue #934) — [`EXPIRY_GAP`] when this account has no entry
+    /// in the report's `expiry` overlay. Pre-rendered for the same reason `trend` is: a [`Column`]
+    /// extractor is a bare `fn` pointer, so it cannot reach the reference instant the cell's
+    /// time-until needs.
     expiry: String,
 }
 
@@ -2739,7 +2740,8 @@ fn col_trend() -> Column {
     }
 }
 /// `expiry` — this account's REFRESH-token deadline as a compact time-until (`6d21h`), the state
-/// word `lapsed`, or [`EXPIRY_GAP`] when none was observed (issue #883). SHARED by both surfaces.
+/// word `lapsed`, or [`EXPIRY_GAP`] when none was observed (issue #883), BRACKETED (`[6d21h]`)
+/// while that deadline is inside the configured horizon (issue #934). SHARED by both surfaces.
 ///
 /// A COLUMN of the one per-account table, per design-stats.md §D-STA-5's structural rule — never a
 /// band or a footer list keyed per account (the shape issues #543/#544 were retired for). The
@@ -2764,6 +2766,18 @@ fn col_trend() -> Column {
 /// presentation: this surface's colour vocabulary is the neutral utilisation band (§D-STA-6), so an
 /// urgency tint on a credential deadline would editorialise inside it — the very framing the
 /// neutral-band rules exist to keep out.
+///
+/// The horizon MARK (issue #934, `crate::cli::expiry_table_cell`) is a different channel and DOES
+/// apply here. That reasoning above bans spending this surface's COLOUR on a credential deadline;
+/// it says nothing about typography, and a bracket overloads no band. The mark states a fact
+/// ("this deadline is inside the configured window") in the same register as the `lapsed` this
+/// column already renders, so it clears §D-STA-6 on the same ground — and it is the ONLY channel
+/// this column has for that fact, since `status` at least tints while this one never does.
+///
+/// Latent rather than live today: the overlay elides on every production path (above), so the mark
+/// is currently exercised by the tests and goldens only. Wired now so that issue #917 — which gives
+/// `Report::expiry` its first producer — lands a column already colour-independent, rather than one
+/// that has to be revisited.
 fn col_expiry() -> Column {
     Column {
         header: "expiry",
@@ -2831,7 +2845,7 @@ fn account_rows<'a>(
             stats,
             velocity: report.velocity.get(handle),
             trend: render_sparkline(&account_series(&report.series, handle, session_peak), ascii),
-            expiry: expiry_cell(report.expiry.get(handle).copied(), now),
+            expiry: expiry_table_cell(report.expiry.get(handle).copied(), now),
         })
         .collect()
 }
@@ -2890,9 +2904,10 @@ fn render_account_table(
     // `render_table` carried, now over the combined cohort. A keep-column (`priority == None`, the
     // floor) is never elided even if every cell is a gap. The piped view (`w = usize::MAX`) never
     // enters the drop loop.
-    // The elision keys on [`EXPIRY_GAP`] — the SAME em dash `crate::cli::expiry_cell` returns, so
-    // an all-gap `expiry` column (issue #883) elides on the identical string its producer emits
-    // rather than on a second literal that could drift from it. `signal` / `velocity` / `runway`
+    // The elision keys on [`EXPIRY_GAP`] — the SAME em dash `crate::cli::expiry_table_cell`
+    // returns, so an all-gap `expiry` column (issue #883) elides on the identical string its
+    // producer emits rather than on a second literal that could drift from it. The horizon mark
+    // (issue #934) cannot break that: the gap is never bracketed. `signal` / `velocity` / `runway`
     // still spell the sentinel inline; `the_gap_sentinel_is_one_string_across_every_producer` pins
     // all of them equal, so this retain speaks for every droppable column, not just `expiry`.
     cols.retain(|c| c.priority.is_none() || c.cells.iter().any(|s| s != EXPIRY_GAP));
@@ -4168,11 +4183,13 @@ mod tests {
         // The elision pre-pass in `render_account_table` retains a droppable column only when some
         // cell differs from `EXPIRY_GAP`. That is correct ONLY while every producer spells the
         // sentinel identically — `signal` / `velocity` / `runway` write the em dash inline, and
-        // `crate::cli::expiry_cell` returns the constant. Pin them equal, so a change to one is a
-        // test failure rather than a column that silently stops eliding.
+        // `crate::cli::expiry_table_cell` returns the constant. Pin them equal, so a change to one
+        // is a test failure rather than a column that silently stops eliding. The producer here is
+        // the TABLE cell, not the bare fact underneath it (issue #934): a mark that ever wrapped
+        // the gap would take the elision down with it, and only this spelling would catch that.
         assert_eq!(velocity_cell(None), EXPIRY_GAP);
         assert_eq!(runway_cell(None), EXPIRY_GAP);
-        assert_eq!(expiry_cell(None, 0), EXPIRY_GAP);
+        assert_eq!(expiry_table_cell(None, 0), EXPIRY_GAP);
         // `signal` is the floor (`priority: None`) so it never elides, but it is the same gap fact.
         assert_eq!(
             signal_cell(&stat(0, ds(0.0, 0.0, 0.0), 0.0, 0.0)),
@@ -4256,10 +4273,16 @@ mod tests {
             ),
         );
         let wide = render_chart_table(&r, &keys(&r), 200, false, false);
-        // `3d` is narrower than `29d`, so the two cells discriminate the alignment: right-aligned
+        // The two cells are of DIFFERENT widths, so they discriminate the alignment: right-aligned
         // they END at the same column and the SHORTER one starts LATER; left-aligned they would
         // START at the same column and end at different ones. Both cells sit left of the multibyte
         // sparkline, so byte offsets are display columns here.
+        //
+        // Which of the two is shorter INVERTED with issue #934: `alpha` is inside the configured
+        // horizon and so renders `[3d]` (4 columns), against `beta`'s unmarked `29d` (3). Compare
+        // the whole cells rather than the durations inside them — the mark is part of the cell the
+        // column pads, which is exactly what §D-STA-5's "pad on display-width before colorize"
+        // requires it to be.
         let row = |h: &str| {
             wide.lines()
                 .find(|l| l.starts_with(h))
@@ -4267,17 +4290,18 @@ mod tests {
                 .to_owned()
         };
         let (alpha, beta) = (row("alpha"), row("beta"));
-        let a_start = alpha.find("3d").expect("alpha's expiry cell");
+        let a_start = alpha.find("[3d]").expect("alpha's marked expiry cell");
         let b_start = beta.find("29d").expect("beta's expiry cell");
         assert_eq!(
-            a_start + "3d".len(),
+            a_start + "[3d]".len(),
             b_start + "29d".len(),
             "right-aligned: both expiry cells end at the same column: {wide}"
         );
         assert!(
-            a_start > b_start,
-            "right-aligned: the shorter cell starts LATER, i.e. it is padded on the LEFT — a \
-             left-aligned column would start both at the same offset: {wide}"
+            b_start > a_start,
+            "right-aligned: the shorter cell (`29d`, now that `[3d]` carries the mark) starts \
+             LATER, i.e. it is padded on the LEFT — a left-aligned column would start both at the \
+             same offset: {wide}"
         );
 
         // SHED ORDER, as BEHAVIOUR rather than as a priority integer: rendered ONE column narrower

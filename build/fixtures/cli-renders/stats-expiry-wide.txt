@@ -1,10 +1,10 @@
 usage — last 24h (Jun 30–Jul 1)
 
-account  signal     session  weekly  runway  velocity  expiry  trend
-alpha    saturated    62/99     48%     ~2h  0.9%/min   2d10h  ▃▆▇█
-beta     balanced     44/66     24%     ~9h  0.3%/min     29d  ▃ ▅▆
-delta    —              0/0      0%       —         —       —
-ガンマ   underused     8/17      5%       —         —  lapsed  ▂▂ ▂
+account  signal     session  weekly  runway  velocity   expiry  trend
+alpha    saturated    62/99     48%     ~2h  0.9%/min  [2d10h]  ▃▆▇█
+beta     balanced     44/66     24%     ~9h  0.3%/min      29d  ▃ ▅▆
+delta    —              0/0      0%       —         —        —
+ガンマ   underused     8/17      5%       —         —   lapsed  ▂▂ ▂
 
 contribution share
 alpha   ██████████████████████░░░░░░░░░░░░░░░░░░   55%
