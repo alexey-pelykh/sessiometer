@@ -59,9 +59,12 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 
 // The `status` view's terminal-cell width primitive (issue #73), reused so the charts
-// (issue #159) size their columns on the SAME wcwidth — one definition for the crate.
-use crate::cli::{display_width, pad_end};
+// (issue #159) size their columns on the SAME wcwidth — one definition for the crate. The
+// REFRESH-token expiry cell (issue #883) is reused from the same place and for the same reason:
+// ONE spelling of that fact, so the `status` and `stats` renders cannot drift apart.
+use crate::cli::{display_width, expiry_cell, pad_end, EXPIRY_GAP};
 use crate::config::{Config, Tunables};
+use crate::daemon::AccountExpiry;
 use crate::error::{Error, Result};
 use crate::observability;
 use crate::paths;
@@ -289,6 +292,38 @@ struct Report {
     /// velocity), so the readout is presentation-additive: a report built without it renders
     /// and serializes exactly as it did pre-#543. Summary-window only, like `orphans`.
     velocity: BTreeMap<String, AccountVelocity>,
+    /// The per-account REFRESH-token expiry modifier (issue #883), keyed by the SAME handle as
+    /// `summary.per_account` — the overlay backing the `expiry` COLUMN of the one per-account
+    /// table (design-stats.md §D-STA-5: a per-account metric is a COLUMN, never a band or a
+    /// footer list keyed per account, the shape issues #543/#544 were retired for).
+    ///
+    /// **EMPTY on every path this crate builds TODAY, and that is a stated condition with a named
+    /// remaining step, not an oversight.** `stats` is a structurally OFFLINE reader (see the
+    /// module header): its whole pipeline is a pure function of the [`HistoryStore`] seam — raw
+    /// samples, rolled aggregates, event-log text. Two of the three still cannot carry a
+    /// `refreshTokenExpiresAt` deadline: [`crate::usage_store::Sample`] has no such field, and the
+    /// only other local source, [`crate::cli::AuthSubset`], is both the wrong axis (the ACCESS
+    /// token) and a keychain read this verb is forbidden to make. Reaching for the live socket
+    /// would forfeit the "renders when the daemon is down" property that seam exists to guarantee.
+    ///
+    /// The THIRD now can. Issue #880 has landed `event=credential_expiry_horizon` and
+    /// `event=credential_expiry_observed` on the durable log this store already reads via
+    /// [`HistoryStore::read_events`] — so the material is present in the seam. What does not exist
+    /// yet is the FOLD: [`build_report`] parses that text only for swaps
+    /// ([`parse_swap_events`]), and reducing the expiry lines to one deadline per account is
+    /// aggregation-layer work with its own questions (which line wins when both appear, how a
+    /// deadline ages out of the window, whether an account carrying only a `first_observation`
+    /// anchor and no horizon edge should render at all). Issue #883 owns the RENDER path, so the
+    /// fold is tracked separately rather than smuggled in beside a column definition.
+    ///
+    /// So this is the CONSUMER half, wired here so that landing the fold populates one map rather
+    /// than re-shaping `Report`, [`AccountRow`], the catalog, and both subsets. Until then the
+    /// column is uniformly [`EXPIRY_GAP`] and [`render_account_table`]'s empty-column elision
+    /// drops it before the width fit — exactly what `velocity` / `runway` do on a report with no
+    /// velocity overlay, so every existing render stays byte-identical. Gap-honest by
+    /// construction: an unpopulated overlay reads as "not observed", never as "not expiring" (the
+    /// issue #137 invariant).
+    expiry: BTreeMap<String, AccountExpiry>,
     /// WHICH SET the all-accounts-high census intersected over (issue #836): `true` when
     /// [`build_report`] had the CONFIGURED roster, `false` when it did not and the census
     /// degraded to whoever held samples in the period.
@@ -1197,6 +1232,10 @@ fn build_report(
         // this pure aggregate, by [`with_velocity`], so a bare `build_report` (every hermetic
         // aggregate test) renders/serializes exactly as it did pre-#543.
         velocity: BTreeMap::new(),
+        // Empty here AND on every other path this crate can build (issue #883) — see the field's
+        // own doc: the offline `HistoryStore` seam carries no refresh-token deadline until issue
+        // #880's durable horizon Event exists to be read out of the event log.
+        expiry: BTreeMap::new(),
         // Read off the SAME `roster` the census above consumed, not off the caller's config
         // (issue #836) — the render's claim about which set was intersected then cannot drift
         // from the set that actually was.
@@ -2513,6 +2552,11 @@ struct AccountRow<'a> {
     stats: &'a AccountStats,
     velocity: Option<&'a AccountVelocity>,
     trend: String,
+    /// The pre-rendered REFRESH-token expiry cell (issue #883) — [`EXPIRY_GAP`] when this account
+    /// has no entry in the report's `expiry` overlay. Pre-rendered for the same reason `trend` is:
+    /// a [`Column`] extractor is a bare `fn` pointer, so it cannot reach the reference instant the
+    /// cell's time-until needs.
+    expiry: String,
 }
 
 /// One column of the per-account table catalog (issue #557), generalising the [`ChartCol`] idea to
@@ -2620,7 +2664,7 @@ fn col_weekly_peak() -> Column {
         header: "weekly",
         lead_gap: 2,
         align: Align::Right,
-        priority: Some(4),
+        priority: Some(5),
         cell: |r| format!("{}%", pct(r.stats.weekly.peak)),
         color: |r| Some(Band::of(r.stats.weekly.peak).sgr()),
     }
@@ -2665,7 +2709,7 @@ fn col_velocity() -> Column {
         header: "velocity",
         lead_gap: 2,
         align: Align::Right,
-        priority: Some(2),
+        priority: Some(3),
         cell: |r| velocity_cell(r.velocity),
         color: |_| None,
     }
@@ -2677,27 +2721,65 @@ fn col_runway() -> Column {
         header: "runway",
         lead_gap: 2,
         align: Align::Right,
-        priority: Some(3),
+        priority: Some(4),
         cell: |r| runway_cell(r.velocity),
         color: |_| None,
     }
 }
-/// `trend` — the per-bucket session-peak sparkline (the TTY surface); the lowest-priority column,
-/// shedding FIRST under a narrow terminal (a populated rate out-informs the sparkline).
+/// `trend` — the per-bucket session-peak sparkline (the TTY surface); sheds second under a narrow
+/// terminal (a populated rate out-informs the sparkline).
 fn col_trend() -> Column {
     Column {
         header: "trend",
         lead_gap: 2,
         align: Align::Left,
-        priority: Some(1),
+        priority: Some(2),
         cell: |r| r.trend.clone(),
+        color: |_| None,
+    }
+}
+/// `expiry` — this account's REFRESH-token deadline as a compact time-until (`6d21h`), the state
+/// word `lapsed`, or [`EXPIRY_GAP`] when none was observed (issue #883). SHARED by both surfaces.
+///
+/// A COLUMN of the one per-account table, per design-stats.md §D-STA-5's structural rule — never a
+/// band or a footer list keyed per account (the shape issues #543/#544 were retired for). The
+/// FLEET-level synchronized-cohort fact is a different thing entirely and belongs in the roster
+/// block; it is issue #879's, not this column's.
+///
+/// RIGHT-aligned: a time-until is a NUMERIC cell, and §D-STA-5 as amended by issue #793 (→ #795)
+/// right-aligns numeric cells while only the two text cells (`account` / `signal`) stay left.
+///
+/// Sheds FIRST under a narrow terminal (`priority: Some(1)`), ahead of `trend`. It is the
+/// SLOWEST-MOVING fact on the row — a server-issued deadline measured in days that no tick can
+/// move — and this is the HISTORICAL utilisation surface, so a forward-looking credential deadline
+/// is the least-historical thing on it; the live `status` verb reports it first-class and
+/// continuously. The same rule places it first in `status`'s own shed order, so one sentence
+/// explains both surfaces rather than two.
+///
+/// Droppable, so it also participates in the empty-column elision pre-pass: a fleet with no
+/// observed deadline (today, EVERY fleet — see `Report::expiry`) elides it entirely rather than
+/// rendering a column of em dashes.
+/// UNCOLOURED, deliberately, even though `status` tints the same string by its horizon band (its
+/// own private `expiry_severity`). The shared-renderer guarantee covers the FACT, not its
+/// presentation: this surface's colour vocabulary is the neutral utilisation band (§D-STA-6), so an
+/// urgency tint on a credential deadline would editorialise inside it — the very framing the
+/// neutral-band rules exist to keep out.
+fn col_expiry() -> Column {
+    Column {
+        header: "expiry",
+        lead_gap: 2,
+        align: Align::Right,
+        priority: Some(1),
+        cell: |r| r.expiry.clone(),
         color: |_| None,
     }
 }
 
 /// The NUMERIC-text (piped, issue #159) column subset — the WIDER surface (design-stats.md
 /// §D-STA-5): `account · signal · cov · session(m/p/p95) · weekly(m/p/p95) · caps · t@cap · share`
-/// plus the shared `velocity` / `runway`. Rendered at `w = usize::MAX`, so it never priority-drops.
+/// plus the shared `velocity` / `runway` / `expiry`. Rendered at `w = usize::MAX`, so it never
+/// priority-drops — but it DOES elide a uniformly-gap droppable column, so `expiry` (issue #883)
+/// is absent here too until its overlay is populated.
 fn piped_columns() -> Vec<Column> {
     vec![
         col_account(),
@@ -2710,13 +2792,14 @@ fn piped_columns() -> Vec<Column> {
         col_share(),
         col_velocity(),
         col_runway(),
+        col_expiry(),
     ]
 }
 
 /// The TTY chart-table column subset (design-stats.md §D-STA-5): `account · signal ·
-/// session(mean/peak) · weekly(peak) · runway · velocity · trend`. Priority column-drop order
-/// (lowest `Some(n)` first) is `trend → velocity → runway → weekly`; the `account · signal ·
-/// session` floor never drops.
+/// session(mean/peak) · weekly(peak) · runway · velocity · expiry · trend`. Priority column-drop
+/// order (lowest `Some(n)` first) is `expiry → trend → velocity → runway → weekly`; the
+/// `account · signal · session` floor never drops.
 fn tty_columns() -> Vec<Column> {
     vec![
         col_account(),
@@ -2725,6 +2808,7 @@ fn tty_columns() -> Vec<Column> {
         col_weekly_peak(),
         col_runway(),
         col_velocity(),
+        col_expiry(),
         col_trend(),
     ]
 }
@@ -2736,6 +2820,10 @@ fn account_rows<'a>(
     accounts: impl IntoIterator<Item = (&'a String, &'a AccountStats)>,
     ascii: bool,
 ) -> Vec<AccountRow<'a>> {
+    // The reference instant for the expiry cell's time-until. `plan_window` sets `window.end` to
+    // the caller's `now` on EVERY branch (rolling period, `--since`, `lifetime`), so it is the
+    // wall clock the render was built against — not a second, drifting one read here.
+    let now = report.window.end;
     accounts
         .into_iter()
         .map(|(handle, stats)| AccountRow {
@@ -2743,6 +2831,7 @@ fn account_rows<'a>(
             stats,
             velocity: report.velocity.get(handle),
             trend: render_sparkline(&account_series(&report.series, handle, session_peak), ascii),
+            expiry: expiry_cell(report.expiry.get(handle).copied(), now),
         })
         .collect()
 }
@@ -2801,7 +2890,12 @@ fn render_account_table(
     // `render_table` carried, now over the combined cohort. A keep-column (`priority == None`, the
     // floor) is never elided even if every cell is a gap. The piped view (`w = usize::MAX`) never
     // enters the drop loop.
-    cols.retain(|c| c.priority.is_none() || c.cells.iter().any(|s| s != "—"));
+    // The elision keys on [`EXPIRY_GAP`] — the SAME em dash `crate::cli::expiry_cell` returns, so
+    // an all-gap `expiry` column (issue #883) elides on the identical string its producer emits
+    // rather than on a second literal that could drift from it. `signal` / `velocity` / `runway`
+    // still spell the sentinel inline; `the_gap_sentinel_is_one_string_across_every_producer` pins
+    // all of them equal, so this retain speaks for every droppable column, not just `expiry`.
+    cols.retain(|c| c.priority.is_none() || c.cells.iter().any(|s| s != EXPIRY_GAP));
     while table_width(&cols) > w {
         match cols.iter().filter_map(|c| c.priority).min() {
             Some(p) => cols.retain(|c| c.priority != Some(p)),
@@ -2847,13 +2941,14 @@ fn render_account_table(
 /// The per-account chart table (design-stats.md §D-STA-5): `account`, the neutral `signal` word,
 /// the compact `session` mean/peak %, the `weekly` peak %, the session `runway` and `velocity`,
 /// and a `trend` sparkline of the per-bucket session peak. Priority column-drop under a narrow
-/// terminal — `trend` sheds FIRST, then `velocity`, `runway`, `weekly` (a populated rate
-/// out-informs the sparkline; an empty one is already gone via elision) — while the
-/// `account · session · signal` FLOOR is always kept, never wrapping (issue #159). A `velocity` /
-/// `runway` column that is uniformly `—` is elided before the width fit. Colour tints each
-/// magnitude by its neutral utilisation band and the signal word symmetrically; the sparkline
-/// glyphs carry their own magnitude. Since issue #557 this is just the [`tty_columns`] subset over
-/// the shared [`render_account_table`] — one un-headed section of live accounts.
+/// terminal — `expiry` sheds FIRST (the slowest-moving fact, [`col_expiry`]), then `trend`,
+/// `velocity`, `runway`, `weekly` (a populated rate out-informs the sparkline; an empty one is
+/// already gone via elision) — while the `account · session · signal` FLOOR is always kept, never
+/// wrapping (issue #159). A `velocity` / `runway` / `expiry` column that is uniformly `—` is
+/// elided before the width fit. Colour tints each magnitude by its neutral utilisation band and
+/// the signal word symmetrically; the sparkline glyphs carry their own magnitude. Since issue #557
+/// this is just the [`tty_columns`] subset over the shared [`render_account_table`] — one
+/// un-headed section of live accounts.
 fn render_chart_table(
     report: &Report,
     accounts: &[&String],
@@ -3155,6 +3250,10 @@ mod tests {
             offset: 0,
             orphans: BTreeMap::new(),
             velocity: BTreeMap::new(),
+            // No expiry overlay (issue #883) — so the `expiry` column elides and every chart
+            // golden below keeps pinning the pre-#883 render byte for byte. The fixtures that
+            // POPULATE it build on this one via `with_expiry`.
+            expiry: BTreeMap::new(),
             // The CONFIGURED regime — the normal one, so the chart fixtures below keep pinning
             // the un-annotated render. The degraded regime has its own fixtures (issue #836).
             census_over_roster: true,
@@ -3761,8 +3860,9 @@ mod tests {
         // #557 column-parity golden: the piped (w = MAX) and TTY tables render from ONE catalog,
         // each its own declared subset. This pins each surface's columns AND order, so a future edit
         // that diverges one renderer's shape from the catalog — the latent drift #556 left between
-        // the two former hand-built layouts — is caught. `aa` carries a velocity overlay so nothing
-        // elides and the full declared subsets render; the TTY renders wide so nothing drops.
+        // the two former hand-built layouts — is caught. `aa` carries a velocity overlay AND an
+        // expiry one (issue #883) so nothing elides and the full declared subsets render; the TTY
+        // renders wide so nothing drops.
         let mut r = charts_report(
             &[
                 ("aa", stat(3, ds(0.30, 0.90, 0.85), 0.40, 0.60)),
@@ -3777,6 +3877,15 @@ mod tests {
                 session_runway_secs: Some(7200),
                 ..Default::default()
             },
+        );
+        let now = r.window.end;
+        r.expiry.insert(
+            "aa".to_string(),
+            expiry_in(
+                now,
+                3 * DAY_SECS,
+                crate::observability::ExpiryHorizon::Within,
+            ),
         );
 
         // The declared subsets — the catalog constructors' headers, in render order.
@@ -3795,12 +3904,13 @@ mod tests {
                 "share",
                 "velocity",
                 "runway",
+                "expiry",
             ],
             "the piped subset is the wide numeric catalog"
         );
         assert_eq!(
             tty_headers,
-            ["account", "signal", "session", "weekly", "runway", "velocity", "trend"],
+            ["account", "signal", "session", "weekly", "runway", "velocity", "expiry", "trend"],
             "the TTY subset is the compact chart catalog"
         );
 
@@ -4026,6 +4136,227 @@ mod tests {
             text.contains('—'),
             "beta's missing datum is an explicit gap, not a fabricated 0: {text}"
         );
+    }
+
+    // --- AC (issue #883): per-account expiry is a COLUMN of the one table -------------
+
+    /// An OBSERVED expiry `offset_secs` from `now`, classified `state`. Builds the axis
+    /// `Report::expiry` cannot yet reach from real data — the offline `HistoryStore` seam carries
+    /// no refresh-token deadline until issue #880's durable horizon Event exists to be read out of
+    /// the event log — so the column's populated rendering is proven here rather than left
+    /// untested behind an overlay that is empty on every production path.
+    ///
+    /// `now` is the caller's `report.window.end`, which is what [`account_rows`] renders each cell
+    /// against; passing it explicitly keeps the helper correct for fixtures with different windows.
+    fn expiry_in(
+        now: i64,
+        offset_secs: i64,
+        state: crate::observability::ExpiryHorizon,
+    ) -> AccountExpiry {
+        AccountExpiry {
+            expires_at: Some(now + offset_secs),
+            horizon_state: state,
+            // Issue #879 owns cohort detection; this column carries none.
+            cohort_id: None,
+        }
+    }
+
+    #[test]
+    fn the_gap_sentinel_is_one_string_across_every_producer() {
+        // The elision pre-pass in `render_account_table` retains a droppable column only when some
+        // cell differs from `EXPIRY_GAP`. That is correct ONLY while every producer spells the
+        // sentinel identically — `signal` / `velocity` / `runway` write the em dash inline, and
+        // `crate::cli::expiry_cell` returns the constant. Pin them equal, so a change to one is a
+        // test failure rather than a column that silently stops eliding.
+        assert_eq!(velocity_cell(None), EXPIRY_GAP);
+        assert_eq!(runway_cell(None), EXPIRY_GAP);
+        assert_eq!(expiry_cell(None, 0), EXPIRY_GAP);
+        // `signal` is the floor (`priority: None`) so it never elides, but it is the same gap fact.
+        assert_eq!(
+            signal_cell(&stat(0, ds(0.0, 0.0, 0.0), 0.0, 0.0)),
+            EXPIRY_GAP
+        );
+    }
+
+    #[test]
+    fn expiry_is_a_column_of_the_one_table_eliding_when_no_account_has_a_deadline() {
+        // §D-STA-5's structural rule: a per-account metric is a COLUMN of the one per-account
+        // table — never a band or a footer list keyed per account (the shape #543/#544 were
+        // retired for). Same empty-column elision as `velocity` / `runway`.
+        let sparse = two_account_charts(); // no expiry overlay — every production path today
+        let text = render_text(&sparse, None);
+        assert!(
+            !text.contains("expiry"),
+            "the column elides on a fleet with no observed deadline: {text}"
+        );
+
+        let mut mixed = two_account_charts();
+        let now = mixed.window.end;
+        mixed.expiry.insert(
+            "alpha".to_string(),
+            expiry_in(
+                now,
+                3 * DAY_SECS,
+                crate::observability::ExpiryHorizon::Within,
+            ),
+        );
+        let text = render_text(&mixed, None);
+        assert!(
+            text.contains("expiry"),
+            "the column appears when one account has the datum: {text}"
+        );
+
+        // It is a COLUMN — its header sits on the same header row as `account`, and its cell on
+        // alpha's own row. Not a band, not a footer list: nothing keyed per account below the table.
+        let header = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("account"))
+            .expect("a header row");
+        assert!(
+            header.contains("expiry"),
+            "`expiry` is a header of the per-account table: {header:?}"
+        );
+        let alpha = text
+            .lines()
+            .find(|l| l.starts_with("alpha"))
+            .expect("alpha's row");
+        assert!(alpha.contains("3d"), "alpha's populated cell: {alpha:?}");
+        let beta = text
+            .lines()
+            .find(|l| l.starts_with("beta"))
+            .expect("beta's row");
+        assert!(
+            beta.contains(EXPIRY_GAP),
+            "beta's unobserved deadline is an explicit gap, never a silent 'fine': {beta:?}"
+        );
+    }
+
+    #[test]
+    fn the_expiry_column_right_aligns_and_sheds_first_under_a_narrow_terminal() {
+        // ALIGNMENT (§D-STA-5 as amended by #793 → #795): a time-until is a NUMERIC cell, so it
+        // RIGHT-aligns — the trap here is that every older render was all-left.
+        let mut r = two_account_charts();
+        let now = r.window.end;
+        r.expiry.insert(
+            "alpha".to_string(),
+            expiry_in(
+                now,
+                3 * DAY_SECS,
+                crate::observability::ExpiryHorizon::Within,
+            ),
+        );
+        r.expiry.insert(
+            "beta".to_string(),
+            expiry_in(
+                now,
+                29 * DAY_SECS,
+                crate::observability::ExpiryHorizon::Beyond,
+            ),
+        );
+        let wide = render_chart_table(&r, &keys(&r), 200, false, false);
+        // `3d` is narrower than `29d`, so the two cells discriminate the alignment: right-aligned
+        // they END at the same column and the SHORTER one starts LATER; left-aligned they would
+        // START at the same column and end at different ones. Both cells sit left of the multibyte
+        // sparkline, so byte offsets are display columns here.
+        let row = |h: &str| {
+            wide.lines()
+                .find(|l| l.starts_with(h))
+                .unwrap_or_else(|| panic!("{h}'s row in {wide}"))
+                .to_owned()
+        };
+        let (alpha, beta) = (row("alpha"), row("beta"));
+        let a_start = alpha.find("3d").expect("alpha's expiry cell");
+        let b_start = beta.find("29d").expect("beta's expiry cell");
+        assert_eq!(
+            a_start + "3d".len(),
+            b_start + "29d".len(),
+            "right-aligned: both expiry cells end at the same column: {wide}"
+        );
+        assert!(
+            a_start > b_start,
+            "right-aligned: the shorter cell starts LATER, i.e. it is padded on the LEFT — a \
+             left-aligned column would start both at the same offset: {wide}"
+        );
+
+        // SHED ORDER, as BEHAVIOUR rather than as a priority integer: rendered ONE column narrower
+        // than the full table, `expiry` is the column that goes and `trend` — the next-lowest
+        // priority — survives. Both are populated here, so neither can elide; only the priority
+        // drop can remove them.
+        let full_width = wide
+            .lines()
+            .map(display_width)
+            .max()
+            .expect("a rendered table");
+        let narrowed = render_chart_table(&r, &keys(&r), full_width - 1, false, false);
+        assert!(
+            !narrowed.contains("expiry"),
+            "expiry sheds first: {narrowed}"
+        );
+        assert!(
+            narrowed.contains("trend"),
+            "and it sheds ALONE — `trend`, the next-lowest priority, survives: {narrowed}"
+        );
+
+        // The recorded order behind that drop, with the pre-existing columns' RELATIVE order
+        // unchanged by the renumbering issue #883 forced on them.
+        let order: Vec<Option<u8>> = [
+            col_expiry(),
+            col_trend(),
+            col_velocity(),
+            col_runway(),
+            col_weekly_peak(),
+        ]
+        .iter()
+        .map(|c| c.priority)
+        .collect();
+        assert_eq!(
+            order,
+            [Some(1), Some(2), Some(3), Some(4), Some(5)],
+            "shed order is expiry → trend → velocity → runway → weekly"
+        );
+    }
+
+    #[test]
+    fn the_expiry_column_renders_present_tense_state_and_never_an_imperative() {
+        // The D-STA-6 neutral-framing conditions, applied to the one surface the guard scans.
+        // A refresh-token deadline CLEARS the projection ban — it is a server-issued timestamp,
+        // not a rate extrapolation — but only under two conditions: present-tense STATE, and no
+        // banned token. Both are asserted over a render that actually CARRIES the column, which
+        // the guard's own fixtures cannot do (their overlay is empty, so the column elides).
+        let mut r = three_band_report();
+        let now = r.window.end;
+        let handles: Vec<String> = r.summary.per_account.keys().cloned().collect();
+        for (i, handle) in handles.iter().enumerate() {
+            let (offset, state) = match i % 3 {
+                0 => (3 * DAY_SECS, crate::observability::ExpiryHorizon::Within),
+                1 => (29 * DAY_SECS, crate::observability::ExpiryHorizon::Beyond),
+                _ => (-DAY_SECS, crate::observability::ExpiryHorizon::Lapsed),
+            };
+            r.expiry
+                .insert(handle.clone(), expiry_in(now, offset, state));
+        }
+        for surface in [
+            render_text(&r, None),
+            render_chart_table(&r, &keys(&r), 200, true, false),
+        ] {
+            assert!(
+                surface.contains("expiry"),
+                "the fixture actually carries the column — otherwise this proves nothing: {surface}"
+            );
+            assert_eq!(
+                scan_banned(&surface),
+                None,
+                "the expiry column emits no banned token: {surface:?}"
+            );
+            // Present-tense STATE, never an imperative or a remedy: the cell reports the fact and
+            // leaves the action to the operator.
+            for imperative in ["re-login", "renew", "log in", "sessiometer login", "you"] {
+                assert!(
+                    !surface.contains(imperative),
+                    "the expiry column names no imperative (`{imperative}`): {surface:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -5497,6 +5828,7 @@ mod tests {
             offset: 0,
             orphans: BTreeMap::new(),
             velocity: BTreeMap::new(),
+            expiry: BTreeMap::new(),
             census_over_roster: true,
         }
     }
@@ -7442,6 +7774,10 @@ mod tests {
                 ]
                 .into_iter()
                 .collect(),
+                // No expiry overlay (issue #883): the `expiry` column elides, so every golden
+                // derived from this fixture stays byte-identical to its pre-#883 self. The
+                // populated axis is built per-test with `expiry_in`, which no golden consumes.
+                expiry: BTreeMap::new(),
                 // The CONFIGURED regime — every golden derived from this fixture pins the
                 // un-annotated render, so the degraded one gets its own case (issue #836).
                 census_over_roster: true,
