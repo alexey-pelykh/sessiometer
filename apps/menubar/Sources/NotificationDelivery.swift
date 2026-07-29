@@ -65,8 +65,9 @@ struct NotificationDeliveryPlan: Equatable, Sendable {
     ///
     /// `nil` is what ships, and it is a decision rather than an omission: with no thread identifier macOS
     /// groups an app's notifications under the app itself in Notification Center, which is the grouping
-    /// this app wants (two event kinds, both about the same fleet — sub-threading them would scatter a
-    /// short list across two stacks for no gain). Modelled as an `Optional` rather than as `""` so the
+    /// this app wants (a handful of event kinds, all about the same fleet — sub-threading them would
+    /// scatter a short list across several stacks for no gain; the count moved from two to three at
+    /// issue #935 without moving the decision). Modelled as an `Optional` rather than as `""` so the
     /// presenter assigns nothing at all in the shipping case, keeping the delivered object byte-identical
     /// to what issue #267 shipped.
     let threadIdentifier: String?
