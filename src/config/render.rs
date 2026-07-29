@@ -296,11 +296,18 @@ impl Config {
         let credential = OriginSection {
             header: "[credential]",
             present: table.contains_key("credential"),
-            entries: vec![entry(
-                "expiry_horizon_secs",
-                cr.expiry_horizon_secs.to_string(),
-                present("credential", "expiry_horizon_secs"),
-            )],
+            entries: vec![
+                entry(
+                    "expiry_horizon_secs",
+                    cr.expiry_horizon_secs.to_string(),
+                    present("credential", "expiry_horizon_secs"),
+                ),
+                entry(
+                    "expiry_cohort_window_secs",
+                    cr.expiry_cohort_window_secs.to_string(),
+                    present("credential", "expiry_cohort_window_secs"),
+                ),
+            ],
         };
 
         OriginReport {
@@ -777,6 +784,17 @@ impl Config {
         out.push_str(&format!(
             "expiry_horizon_secs = {}\n",
             cr.expiry_horizon_secs
+        ));
+        out.push_str(
+            "# Seconds of spread (60..=604800, i.e. 1m..7d) still counted as ONE synchronized\n\
+             # cohort. Accounts captured in a single sitting tend to expire together, so the pool\n\
+             # can lose several members inside one span — a fleet-level fact no single row shows.\n\
+             # Widening this past a token's own lifetime would put every account in one group and\n\
+             # say nothing.\n",
+        );
+        out.push_str(&format!(
+            "expiry_cohort_window_secs = {}\n",
+            cr.expiry_cohort_window_secs
         ));
 
         for account in &self.roster {
