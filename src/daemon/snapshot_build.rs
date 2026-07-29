@@ -324,106 +324,133 @@ where
         // #450) — the monotonic `clock` seam, DISTINCT from the wall-clock `now_secs` the freshness
         // stamp + health rollup read.
         let blind_at = self.clock.now();
-        StatusSnapshot {
-            accounts: self
-                .roster
-                .iter()
-                .enumerate()
-                .map(|(i, account)| {
-                    let health = &self.state.accounts[i].health;
-                    AccountReading {
-                        label: account.label.clone(),
-                        active: active == Some(i),
-                        enabled: account.enabled,
-                        quarantined: health.quarantined,
-                        // Mid-recovery iff dead AND its credential is currently answering
-                        // again (issue #109) — a refinement of `quarantined`, so `status`
-                        // can soften `needs re-login` to `recovering` for a healing account.
-                        recovering: health.quarantined && health.recovery_successes > 0,
-                        // The daemon's own viability verdict, deterministic (the un-jittered
-                        // rotation line, not a per-cycle draw) so the displayed "resets in"
-                        // matches when `use` would accept the account again (issue #72).
-                        // Issue #607: this is the ROTATION line (ceiling − tail margin), the same
-                        // line the swap + `use` gates use — so "weekly exhausted" means exactly
-                        // "the daemon will not rotate onto this", with no band in which the UI
-                        // reports an account usable while the daemon refuses it.
-                        weekly_exhausted: readings[i]
-                            .is_some_and(|usage| usage.weekly >= self.weekly_rotation_line()),
-                        usage: readings[i],
-                        // The credential clocks + the daemon-computed 5-state rollup (issue
-                        // #119), projected from this account's carried health state. The
-                        // rollup is computed HERE (daemon-side) against `now_secs`; the thin
-                        // client just renders the verdict's glyph + the raw clocks. The wire
-                        // clock prefers the refresh-sourced expiry and falls back to the
-                        // poll-sourced one (issue #141) so it is populated with `[refresh]`
-                        // off; the rollup below still reads ONLY the refresh-sourced field,
-                        // so a lapsed idle poll clock never fires a false-🟠 Stale (see #137).
-                        access_expires_at: health.access_expires_at.or(health.poll_expires_at),
-                        refresh_health: refresh_health_view(health),
-                        // #137: a `Some` reading is this account's positive-liveness signal (a
-                        // successful poll); without one (and no refresh telemetry / expiry) the
-                        // rollup is `Unknown`, never a false 🟢. The poll-sourced clock above is
-                        // display-only and deliberately NOT fed here (set even on a failed poll).
-                        health: credential_health(
+        let mut accounts: Vec<AccountReading> = self
+            .roster
+            .iter()
+            .enumerate()
+            .map(|(i, account)| {
+                let health = &self.state.accounts[i].health;
+                AccountReading {
+                    label: account.label.clone(),
+                    active: active == Some(i),
+                    enabled: account.enabled,
+                    quarantined: health.quarantined,
+                    // Mid-recovery iff dead AND its credential is currently answering
+                    // again (issue #109) — a refinement of `quarantined`, so `status`
+                    // can soften `needs re-login` to `recovering` for a healing account.
+                    recovering: health.quarantined && health.recovery_successes > 0,
+                    // The daemon's own viability verdict, deterministic (the un-jittered
+                    // rotation line, not a per-cycle draw) so the displayed "resets in"
+                    // matches when `use` would accept the account again (issue #72).
+                    // Issue #607: this is the ROTATION line (ceiling − tail margin), the same
+                    // line the swap + `use` gates use — so "weekly exhausted" means exactly
+                    // "the daemon will not rotate onto this", with no band in which the UI
+                    // reports an account usable while the daemon refuses it.
+                    weekly_exhausted: readings[i]
+                        .is_some_and(|usage| usage.weekly >= self.weekly_rotation_line()),
+                    usage: readings[i],
+                    // The credential clocks + the daemon-computed 5-state rollup (issue
+                    // #119), projected from this account's carried health state. The
+                    // rollup is computed HERE (daemon-side) against `now_secs`; the thin
+                    // client just renders the verdict's glyph + the raw clocks. The wire
+                    // clock prefers the refresh-sourced expiry and falls back to the
+                    // poll-sourced one (issue #141) so it is populated with `[refresh]`
+                    // off; the rollup below still reads ONLY the refresh-sourced field,
+                    // so a lapsed idle poll clock never fires a false-🟠 Stale (see #137).
+                    access_expires_at: health.access_expires_at.or(health.poll_expires_at),
+                    refresh_health: refresh_health_view(health),
+                    // #137: a `Some` reading is this account's positive-liveness signal (a
+                    // successful poll); without one (and no refresh telemetry / expiry) the
+                    // rollup is `Unknown`, never a false 🟢. The poll-sourced clock above is
+                    // display-only and deliberately NOT fed here (set even on a failed poll).
+                    health: credential_health(
+                        health.quarantined,
+                        health.last_refresh_outcome,
+                        health.consecutive_refresh_failures,
+                        health.access_expires_at,
+                        readings[i].is_some(),
+                        now_secs,
+                    ),
+                    // The bounded-blindness projection (issue #479): ONLY the active account can
+                    // be in bounded blindness — it is the only one that self-exhausts while
+                    // active and the only one the `last_good` anchor belongs to. Keyed off
+                    // `accounts[active].last_reading.is_none()` (the true blind predicate the anchor +
+                    // `note_blind_gate_eligibility` logic use, NOT the masked `readings` arg) and
+                    // the retained anchor; `None` for every other account (and omitted from the
+                    // wire there via `skip_serializing_if`).
+                    blind_active: if active == Some(i) {
+                        blind_active_view(
+                            // Issue #619: the anchor plus the active's frozen per-window high-water
+                            // mark, so the anchor arm degrades on the PLAUSIBLE pre-blind session (a
+                            // stale-low reading no longer shows false-"OK" while the corrected gate
+                            // is armed).
+                            AnchorArmInputs {
+                                last_good: self.state.last_good,
+                                high_water: self.state.accounts[i].session_high_water,
+                            },
+                            self.state.accounts[i].last_reading.is_none(),
                             health.quarantined,
-                            health.last_refresh_outcome,
-                            health.consecutive_refresh_failures,
-                            health.access_expires_at,
-                            readings[i].is_some(),
+                            // Issue #582: a server `Retry-After` still holding the blind active
+                            // off its poll degrades auto-protection too — read from the SAME
+                            // shared predicate `blind_swap` decides on, so `status` never claims
+                            // "auto-protection OK" during a #582 hold. `health` is this account's.
+                            server_retry_after_holding(health, blind_at).is_some(),
+                            // Issue #584: the active account's retained #539 velocity EMA + the BASE
+                            // (un-jittered) session trigger feed the velocity-projection arm, so
+                            // `status` also degrades a below-band anchor whose measured climb could
+                            // reach the trigger inside the blind window (a burn the anchor arm, frozen
+                            // below the band, cannot see). Report-only — no swap keys off this.
+                            self.state.accounts[i].session_velocity,
+                            self.session_ceiling_base,
+                            blind_at,
+                        )
+                    } else {
+                        None
+                    },
+                    // The REFRESH-token expiry modifier (issue #878) — the axis carried
+                    // orthogonally to the `health` rollup above; see `AccountReading::expiry`.
+                    // Keyed on `polled_once`, the daemon's own "this account has been observed"
+                    // latch, NOT on a clock being `Some`: an unreadable credential (a locked
+                    // keychain) leaves BOTH clocks `None` on a poll that DID happen, and
+                    // collapsing that into "never observed" would hide a real `Unknown`.
+                    expiry: self.state.accounts[i].polled_once.then(|| {
+                        account_expiry(
+                            health.refresh_token_expires_at,
+                            self.credential_expiry_horizon_secs,
                             now_secs,
-                        ),
-                        // The bounded-blindness projection (issue #479): ONLY the active account can
-                        // be in bounded blindness — it is the only one that self-exhausts while
-                        // active and the only one the `last_good` anchor belongs to. Keyed off
-                        // `accounts[active].last_reading.is_none()` (the true blind predicate the anchor +
-                        // `note_blind_gate_eligibility` logic use, NOT the masked `readings` arg) and
-                        // the retained anchor; `None` for every other account (and omitted from the
-                        // wire there via `skip_serializing_if`).
-                        blind_active: if active == Some(i) {
-                            blind_active_view(
-                                // Issue #619: the anchor plus the active's frozen per-window high-water
-                                // mark, so the anchor arm degrades on the PLAUSIBLE pre-blind session (a
-                                // stale-low reading no longer shows false-"OK" while the corrected gate
-                                // is armed).
-                                AnchorArmInputs {
-                                    last_good: self.state.last_good,
-                                    high_water: self.state.accounts[i].session_high_water,
-                                },
-                                self.state.accounts[i].last_reading.is_none(),
-                                health.quarantined,
-                                // Issue #582: a server `Retry-After` still holding the blind active
-                                // off its poll degrades auto-protection too — read from the SAME
-                                // shared predicate `blind_swap` decides on, so `status` never claims
-                                // "auto-protection OK" during a #582 hold. `health` is this account's.
-                                server_retry_after_holding(health, blind_at).is_some(),
-                                // Issue #584: the active account's retained #539 velocity EMA + the BASE
-                                // (un-jittered) session trigger feed the velocity-projection arm, so
-                                // `status` also degrades a below-band anchor whose measured climb could
-                                // reach the trigger inside the blind window (a burn the anchor arm, frozen
-                                // below the band, cannot see). Report-only — no swap keys off this.
-                                self.state.accounts[i].session_velocity,
-                                self.session_ceiling_base,
-                                blind_at,
-                            )
-                        } else {
-                            None
-                        },
-                        // The REFRESH-token expiry modifier (issue #878) — the axis carried
-                        // orthogonally to the `health` rollup above; see `AccountReading::expiry`.
-                        // Keyed on `polled_once`, the daemon's own "this account has been observed"
-                        // latch, NOT on a clock being `Some`: an unreadable credential (a locked
-                        // keychain) leaves BOTH clocks `None` on a poll that DID happen, and
-                        // collapsing that into "never observed" would hide a real `Unknown`.
-                        expiry: self.state.accounts[i].polled_once.then(|| {
-                            account_expiry(
-                                health.refresh_token_expires_at,
-                                self.credential_expiry_horizon_secs,
-                                now_secs,
-                            )
-                        }),
-                    }
-                })
-                .collect(),
+                        )
+                    }),
+                }
+            })
+            .collect();
+
+        // The SYNCHRONIZED-EXPIRY COHORT walk (issue #879), run HERE — after every account has been
+        // classified — because cohort membership is a property of the whole fleet's deadlines and no
+        // per-account pass can see it. `account_expiry` therefore leaves `cohort_id` `None` and this
+        // one walk stamps it, so the per-row grouping key and the fleet-level condition below are
+        // derived from a SINGLE pass and cannot disagree about who is in which cohort.
+        //
+        // An account with no `expiry` reading at all (never polled) contributes `None` and is
+        // neither grouped nor counted in the observed denominator — "never observed" is not a
+        // deadline, and treating it as one would fabricate the grouping issue #137 forbids.
+        let deadlines: Vec<Option<i64>> = accounts
+            .iter()
+            .map(|a| a.expiry.and_then(|e| e.expires_at))
+            .collect();
+        let (cohort_ids, expiry_cohort) = expiry_cohorts(
+            &deadlines,
+            self.credential_expiry_cohort_window_secs,
+            self.credential_expiry_horizon_secs,
+            now_secs,
+        );
+        for (account, cohort_id) in accounts.iter_mut().zip(cohort_ids) {
+            if let Some(expiry) = account.expiry.as_mut() {
+                expiry.cohort_id = cohort_id;
+            }
+        }
+
+        StatusSnapshot {
+            accounts,
             // The forward-looking next-swap candidate (issue #88), computed from the
             // same raw readings; sourced from a label only, so no token/email can
             // reach it (issue #15).
@@ -502,6 +529,11 @@ where
                 self.state.last_landing_overshoot.as_ref(),
                 blind_at,
             ),
+            // The daemon-level synchronized-expiry cohort condition (issue #879), resolved by the
+            // one walk above. `None` when fewer than two deadlines share a window, or when the
+            // soonest cohort is still beyond the foresight horizon — never a claim that the fleet
+            // is unsynchronized (the observed set may simply be too small to tell).
+            expiry_cohort,
         }
     }
 }
@@ -524,6 +556,7 @@ mod tests {
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             // Issue #613: a runtime landing overshoot rides the wire as one operator handle + two
             // small percents — populated here so the secret-free assertion below covers its bytes.
@@ -753,7 +786,10 @@ mod tests {
             "an account inside its expiry horizon must still sit at Healthy on the severity ramp"
         );
 
-        // Cohort grouping is issue #879's job; this item only carries the field, never populates it.
+        // `account_expiry` still leaves the cohort ungrouped, and that stays true after issue #879:
+        // membership is a property of the WHOLE fleet's deadlines, which this per-account
+        // classifier cannot see, so the populator lives in `Daemon::snapshot` instead (the
+        // `snapshot_stamps_…` tests below cover it).
         assert_eq!(expiry.cohort_id, None);
     }
 
@@ -811,6 +847,487 @@ mod tests {
         assert_eq!(
             classified.accounts[1].expiry.unwrap().horizon_state,
             ExpiryHorizon::Unknown
+        );
+    }
+
+    // --- synchronized-expiry cohorts (issue #879) --------------------------
+
+    /// The shipped default grouping window: twenty-four hours.
+    const COHORT_WINDOW_24H: u64 = 86_400;
+
+    /// AC-3, and the criterion most easily got wrong: **a single expiring account does NOT raise a
+    /// cohort condition.**
+    ///
+    /// A cohort is by definition a MULTI-account synchronization; a lone deadline is already the
+    /// per-account `ExpiryHorizon` axis's job. Asserted in BOTH halves of the output — no
+    /// `cohort_id` is stamped and no fleet condition is raised — because either alone would let the
+    /// other regress silently. The deadline used is deliberately IMMINENT (one hour out, well
+    /// inside the horizon), so the test proves the cardinality guard bites rather than the account
+    /// merely being too far off to qualify.
+    #[test]
+    fn a_single_expiring_account_raises_no_cohort() {
+        const NOW: i64 = 1_782_777_600;
+
+        let (assignment, condition) = expiry_cohorts(
+            &[Some(NOW + 3_600), None, None],
+            COHORT_WINDOW_24H,
+            HORIZON_7D,
+            NOW,
+        );
+        assert_eq!(
+            condition, None,
+            "one account inside the horizon is not a synchronization"
+        );
+        assert_eq!(
+            assignment,
+            vec![None, None, None],
+            "a group of one gets no cohort id — `None` means ungrouped, never 'alone'"
+        );
+
+        // Nor does a lone deadline that has ALREADY lapsed — the loudest single-account state there
+        // is. Cardinality, not urgency, is what the guard tests.
+        let (assignment, condition) =
+            expiry_cohorts(&[Some(NOW - 3_600)], COHORT_WINDOW_24H, HORIZON_7D, NOW);
+        assert_eq!(condition, None);
+        assert_eq!(assignment, vec![None]);
+    }
+
+    /// The detector must FIRE on the measured failure mode this issue exists for, using its real
+    /// timestamps: four of six accounts onboarded in one sitting, deadlines landing between
+    /// 2026-07-31 14:10 and 14:14 UTC — a ~4-minute span.
+    ///
+    /// This is the anti-INERT half of the acceptance work, and it is why real values are used
+    /// rather than round synthetic ones. A predicate that fires on nothing passes every
+    /// "no false positives" test ever written; the sibling issue #881 shipped exactly that shape
+    /// (a classification rule matching zero live events). Pinning the actual cluster makes the
+    /// positive direction falsifiable: if a future window default, boundary, or grouping rule
+    /// stopped catching THIS, the test fails rather than the feature quietly going quiet.
+    #[test]
+    fn the_measured_four_minute_cluster_of_four_accounts_is_one_cohort() {
+        // 2026-07-31T14:10:00Z and 14:14:00Z — the observed cluster's edges.
+        const FIRST: i64 = 1_785_507_000;
+        const LAST: i64 = 1_785_507_240;
+        // Two days before the deadlines, so the cohort sits inside the 7-day horizon.
+        const NOW: i64 = FIRST - 2 * DAY_SECS;
+
+        // Four synchronized, two genuinely unrelated (a month later, and one never observed).
+        let deadlines = [
+            Some(FIRST),
+            Some(FIRST + 90),
+            Some(FIRST + 200),
+            Some(LAST),
+            Some(FIRST + 30 * DAY_SECS),
+            None,
+        ];
+        let (assignment, condition) =
+            expiry_cohorts(&deadlines, COHORT_WINDOW_24H, HORIZON_7D, NOW);
+
+        let cohort = condition.expect("the measured cluster must raise a cohort condition");
+        assert_eq!(cohort.size, 4, "four accounts share the window");
+        assert_eq!(
+            cohort.observed, 5,
+            "the denominator is the OBSERVED set (five deadlines), not the six-account roster"
+        );
+        assert_eq!(cohort.earliest, FIRST);
+        assert_eq!(
+            cohort.span_secs,
+            LAST - FIRST,
+            "the reported span is the members' own spread (~4 minutes), not the configured window"
+        );
+
+        // The four members share one id; the far-off account and the unobserved one are ungrouped.
+        assert_eq!(
+            assignment,
+            vec![Some(0), Some(0), Some(0), Some(0), None, None]
+        );
+    }
+
+    /// Grouping is ANCHORED, not single-linkage: every cohort's own span is bounded by the window,
+    /// so "these deadlines fall within one window" is literally true of the members.
+    ///
+    /// The falsifier is a CHAIN — deadlines each a step apart, no two consecutive ones further
+    /// apart than the window. Single-linkage would swallow the whole chain into one "cohort"
+    /// spanning far more than a window and report accounts a week apart as expiring together. Five
+    /// deadlines 20 h apart under a 24 h window span 80 h end to end; the anchored rule must break
+    /// them up instead.
+    #[test]
+    fn cohorts_are_anchored_so_a_chain_of_deadlines_never_spans_more_than_the_window() {
+        const NOW: i64 = 1_782_777_600;
+        const STEP: i64 = 20 * 3_600;
+        let base = NOW + 2 * DAY_SECS;
+
+        let deadlines: Vec<Option<i64>> = (0..5).map(|i| Some(base + i * STEP)).collect();
+        let (assignment, condition) = expiry_cohorts(
+            &deadlines,
+            COHORT_WINDOW_24H,
+            // A horizon wide enough that every cohort qualifies, so this test isolates GROUPING.
+            30 * 86_400,
+            NOW,
+        );
+
+        let cohort = condition.expect("the first two deadlines are 20h apart — inside the window");
+        assert_eq!(cohort.size, 2, "anchored grouping must not chain the run");
+        assert!(
+            cohort.span_secs <= COHORT_WINDOW_24H as i64,
+            "a cohort's own span must never exceed the window, got {}",
+            cohort.span_secs
+        );
+        // {0,1} anchor at base and admit base+20h; base+40h is past that anchor's edge and starts
+        // the next cohort {2,3}; base+80h is then alone and stays ungrouped.
+        assert_eq!(
+            assignment,
+            vec![Some(0), Some(0), Some(1), Some(1), None],
+            "the chain breaks into anchored cohorts, with the trailing singleton ungrouped"
+        );
+    }
+
+    /// Unobserved deadlines never group, and a fleet with NOTHING observed reports no cohort —
+    /// which is not the same as reporting that it has none.
+    ///
+    /// The #137 invariant applied to an aggregate: an absent `refreshTokenExpiresAt` is not a
+    /// deadline "at time zero". Were `None` folded in as one, a roster of unreadable credentials
+    /// would manufacture a cohort out of pure absence — a fleet-scale version of the exact
+    /// false-reassurance the per-account axis is built to refuse.
+    #[test]
+    fn unobserved_deadlines_never_group_and_an_unmeasured_fleet_reports_no_cohort() {
+        const NOW: i64 = 1_782_777_600;
+
+        // Nothing observed at all: no assignment, no condition — and, critically, no cohort of
+        // "everything at epoch zero".
+        let (assignment, condition) = expiry_cohorts(
+            &[None, None, None, None],
+            COHORT_WINDOW_24H,
+            HORIZON_7D,
+            NOW,
+        );
+        assert_eq!(condition, None);
+        assert_eq!(assignment, vec![None, None, None, None]);
+
+        // An empty roster is the degenerate case of the same rule.
+        let (assignment, condition) = expiry_cohorts(&[], COHORT_WINDOW_24H, HORIZON_7D, NOW);
+        assert_eq!(condition, None);
+        assert!(assignment.is_empty());
+
+        // Two real deadlines PLUS unobserved neighbours: the pair groups, the absences do not join
+        // it, and `observed` names the two rather than the four-account roster — so a reader is
+        // told the coverage instead of assuming it.
+        let at = NOW + 2 * DAY_SECS;
+        let (assignment, condition) = expiry_cohorts(
+            &[None, Some(at), None, Some(at + 60)],
+            COHORT_WINDOW_24H,
+            HORIZON_7D,
+            NOW,
+        );
+        let cohort = condition.expect("two observed deadlines one minute apart are a cohort");
+        assert_eq!(cohort.size, 2);
+        assert_eq!(
+            cohort.observed, 2,
+            "the denominator counts observed deadlines, never the unobserved roster"
+        );
+        assert_eq!(assignment, vec![None, Some(0), None, Some(0)]);
+    }
+
+    /// The condition is gated on the FORESIGHT HORIZON while grouping is not: a distant cohort is
+    /// still stamped on its rows (so a client can group them) but raises nothing.
+    ///
+    /// Without the gate, a fleet onboarded in one sitting — the very population this feature is
+    /// for — would fly the banner continuously for the weeks it sits `Beyond`, and a condition that
+    /// is always on carries no information. The knob is the operator's EXISTING
+    /// `expiry_horizon_secs`, so the same test also proves no second urgency threshold was
+    /// introduced: widening only the horizon must flip the condition on.
+    #[test]
+    fn a_distant_cohort_is_grouped_but_raises_no_condition_until_the_horizon_reaches_it() {
+        const NOW: i64 = 1_782_777_600;
+        let at = NOW + 20 * DAY_SECS;
+        let deadlines = [Some(at), Some(at + 3_600)];
+
+        // 20 days out, 7-day horizon: grouped, but nothing raised.
+        let (assignment, condition) =
+            expiry_cohorts(&deadlines, COHORT_WINDOW_24H, HORIZON_7D, NOW);
+        assert_eq!(
+            condition, None,
+            "a cohort beyond the horizon is not yet an operator condition"
+        );
+        assert_eq!(
+            assignment,
+            vec![Some(0), Some(0)],
+            "grouping is unconditional — the rows still carry their cohort id"
+        );
+
+        // The SAME deadlines under a 30-day horizon: the one knob decides.
+        let (_, condition) = expiry_cohorts(&deadlines, COHORT_WINDOW_24H, 30 * 86_400, NOW);
+        let cohort = condition.expect("a 30d horizon reaches a 20d cohort");
+        assert_eq!(cohort.size, 2);
+        assert_eq!(cohort.earliest, at);
+
+        // A cohort already LAPSED is inside the horizon in the other direction, and still raises.
+        let past = [Some(NOW - DAY_SECS), Some(NOW - DAY_SECS + 60)];
+        let (_, condition) = expiry_cohorts(&past, COHORT_WINDOW_24H, HORIZON_7D, NOW);
+        assert!(
+            condition.is_some(),
+            "a cohort whose members have already lapsed must still be surfaced"
+        );
+
+        // The horizon edge is INCLUSIVE, matching `account_expiry`'s own `Within` boundary. Both
+        // read the one `horizon_edge`, so the INSTANT cannot drift apart — but the `<=` is still
+        // written twice, and flipping this one to `<` is otherwise invisible to the suite: an
+        // anchor sitting exactly on the edge must classify `Within` AND raise, not one but not the
+        // other.
+        let on_edge = [
+            Some(NOW + HORIZON_7D as i64),
+            Some(NOW + HORIZON_7D as i64 + 60),
+        ];
+        assert!(
+            expiry_cohorts(&on_edge, COHORT_WINDOW_24H, HORIZON_7D, NOW)
+                .1
+                .is_some(),
+            "an anchor exactly at the horizon edge raises, as `account_expiry` calls it `Within`"
+        );
+        let past_edge = [
+            Some(NOW + HORIZON_7D as i64 + 1),
+            Some(NOW + HORIZON_7D as i64 + 61),
+        ];
+        assert_eq!(
+            expiry_cohorts(&past_edge, COHORT_WINDOW_24H, HORIZON_7D, NOW).1,
+            None,
+            "one second past the edge is Beyond, and raises nothing"
+        );
+    }
+
+    /// When several cohorts qualify, the SOONEST is the condition — it is the one that bites first.
+    /// SIZE is deliberately not the tiebreak: a larger cohort further out is the more dramatic
+    /// number and the wrong answer, because the operator's next deadline is the sooner one.
+    #[test]
+    fn the_soonest_qualifying_cohort_becomes_the_condition_even_when_a_larger_one_follows() {
+        const NOW: i64 = 1_782_777_600;
+        let soon = NOW + 2 * DAY_SECS;
+        let later = NOW + 5 * DAY_SECS;
+
+        let deadlines = [
+            Some(later),
+            Some(later + 60),
+            Some(later + 120),
+            Some(soon),
+            Some(soon + 60),
+        ];
+        let (_, condition) = expiry_cohorts(&deadlines, COHORT_WINDOW_24H, HORIZON_7D, NOW);
+        let cohort = condition.expect("both cohorts are inside the horizon");
+        assert_eq!(cohort.earliest, soon, "the soonest cohort is the condition");
+        assert_eq!(cohort.size, 2, "even though a larger cohort follows it");
+    }
+
+    /// The grouping window is a CONFIGURABLE, not a constant, and its edge is INCLUSIVE — matching
+    /// `account_expiry`'s own horizon boundary, so the two classifiers draw their edges the same
+    /// way. Exercised on one fixed pair of deadlines under varying windows, so what moves between
+    /// the assertions is only the knob.
+    #[test]
+    fn the_grouping_window_is_configurable_and_its_edge_is_inclusive() {
+        const NOW: i64 = 1_782_777_600;
+        let soon = NOW + 2 * DAY_SECS;
+
+        // One fixed pair 6 hours apart groups under the 24 h default and separates under a 1-hour
+        // window.
+        let pair = [Some(soon), Some(soon + 6 * 3_600)];
+        let (_, grouped) = expiry_cohorts(&pair, COHORT_WINDOW_24H, HORIZON_7D, NOW);
+        assert!(grouped.is_some(), "6h apart is inside a 24h window");
+        let (assignment, split) = expiry_cohorts(&pair, 3_600, HORIZON_7D, NOW);
+        assert_eq!(split, None, "the SAME pair separates under a 1h window");
+        assert_eq!(assignment, vec![None, None]);
+
+        // Exactly at the edge is IN; one second past it is out.
+        let edge = [Some(soon), Some(soon + COHORT_WINDOW_24H as i64)];
+        assert!(
+            expiry_cohorts(&edge, COHORT_WINDOW_24H, HORIZON_7D, NOW)
+                .1
+                .is_some(),
+            "a deadline exactly at the window edge is still a member"
+        );
+        let past_edge = [Some(soon), Some(soon + COHORT_WINDOW_24H as i64 + 1)];
+        assert_eq!(
+            expiry_cohorts(&past_edge, COHORT_WINDOW_24H, HORIZON_7D, NOW).1,
+            None,
+            "one second past the window edge is not a member"
+        );
+
+        // An extreme window saturates rather than wrapping the edge into a false non-member.
+        assert!(
+            expiry_cohorts(&pair, u64::MAX, HORIZON_7D, NOW).1.is_some(),
+            "a saturating window must not wrap into a false separation"
+        );
+    }
+
+    /// Identical deadlines are the SHARPEST form of the finding — the whole pool goes at one
+    /// instant — so they must group and report a zero span rather than trip a degenerate-input
+    /// guard. The zero is also what makes the CLI reach for its own wording, since a humanized
+    /// zero would read as the calm "now".
+    #[test]
+    fn identical_deadlines_are_a_cohort_with_a_zero_span() {
+        const NOW: i64 = 1_782_777_600;
+        let soon = NOW + 2 * DAY_SECS;
+
+        let (assignment, condition) = expiry_cohorts(
+            &[Some(soon), Some(soon)],
+            COHORT_WINDOW_24H,
+            HORIZON_7D,
+            NOW,
+        );
+        let cohort = condition.expect("identical deadlines are a cohort");
+        assert_eq!(cohort.size, 2);
+        assert_eq!(cohort.span_secs, 0);
+        assert_eq!(assignment, vec![Some(0), Some(0)]);
+    }
+
+    /// The snapshot stamps the cohort on BOTH halves from ONE walk: each member row carries the
+    /// grouping key, and the daemon-level condition states the fleet fact. Rows and condition are
+    /// derived together precisely so they cannot disagree about who is in the cohort.
+    #[tokio::test]
+    async fn snapshot_stamps_cohort_membership_on_rows_and_raises_the_fleet_condition() {
+        const NOW: i64 = 1_782_777_600;
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+
+        // Two accounts synchronized an hour apart, two days out; the third a month away.
+        let at = NOW + 2 * DAY_SECS;
+        daemon.state.accounts[0].health.refresh_token_expires_at = Some(at);
+        daemon.state.accounts[1].health.refresh_token_expires_at = Some(at + 3_600);
+        daemon.state.accounts[2].health.refresh_token_expires_at = Some(NOW + 30 * DAY_SECS);
+
+        let readings = daemon.decision_readings(daemon.state.active);
+        let snapshot = daemon.snapshot(daemon.state.active, &readings, NOW);
+
+        let cohort = snapshot
+            .expiry_cohort
+            .expect("two accounts an hour apart raise the fleet condition");
+        assert_eq!(cohort.size, 2);
+        assert_eq!(cohort.observed, 3);
+        assert_eq!(cohort.earliest, at);
+        assert_eq!(cohort.span_secs, 3_600);
+
+        // The rows agree with the condition about membership.
+        let ids: Vec<Option<u32>> = snapshot
+            .accounts
+            .iter()
+            .map(|a| a.expiry.and_then(|e| e.cohort_id))
+            .collect();
+        assert_eq!(ids, vec![Some(0), Some(0), None]);
+        assert_eq!(
+            ids.iter().filter(|id| id.is_some()).count() as u32,
+            cohort.size,
+            "the number of stamped rows must equal the condition's size — one walk, one truth"
+        );
+
+        // The condition is FLEET-level, and orthogonal to every member's own health: each of these
+        // accounts is `Healthy` right now, which is exactly why no single row can carry this fact.
+        assert!(
+            snapshot
+                .accounts
+                .iter()
+                .all(|a| a.health == CredentialHealth::Healthy),
+            "every member reads individually Healthy — the fleet fact rides beside the rollup, \
+             not inside it"
+        );
+
+        // De-synchronizing one member dissolves the cohort entirely — the condition tracks the
+        // deadlines rather than latching.
+        daemon.state.accounts[1].health.refresh_token_expires_at = Some(at + 10 * DAY_SECS);
+        let readings = daemon.decision_readings(daemon.state.active);
+        let after = daemon.snapshot(daemon.state.active, &readings, NOW);
+        assert_eq!(after.expiry_cohort, None);
+        let after_ids: Vec<Option<u32>> = after
+            .accounts
+            .iter()
+            .map(|a| a.expiry.and_then(|e| e.cohort_id))
+            .collect();
+        assert_eq!(
+            after_ids,
+            vec![None, None, None],
+            "dissolving the cohort must unstamp the rows too, not leave a stale grouping key"
+        );
+    }
+
+    /// Issue #15: the fleet condition carries counts and instants only. It names no account, so
+    /// neither a handle, an e-mail, nor a token can reach the wire through it — and that is also
+    /// why it cannot degenerate into the per-account list design-stats.md §D-STA-5 forbids.
+    #[tokio::test]
+    async fn the_cohort_condition_carries_no_handle_on_the_wire() {
+        const NOW: i64 = 1_782_777_600;
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        let at = NOW + 2 * DAY_SECS;
+        daemon.state.accounts[0].health.refresh_token_expires_at = Some(at);
+        daemon.state.accounts[1].health.refresh_token_expires_at = Some(at + 60);
+
+        let readings = daemon.decision_readings(daemon.state.active);
+        let snapshot = daemon.snapshot(daemon.state.active, &readings, NOW);
+        let wire = status_response(&snapshot);
+        let cohort_json =
+            serde_json::to_string(&wire.expiry_cohort.expect("the condition is on the wire"))
+                .expect("the cohort serializes");
+
+        for handle in ["u-A", "u-B", "u-C", "one", "two", "three"] {
+            assert!(
+                !cohort_json.contains(handle),
+                "the fleet condition must name no account: {cohort_json}"
+            );
+        }
+        assert!(!cohort_json.to_lowercase().contains("token"));
+        assert!(crate::redaction::meter::unauthored_emails(&cohort_json, &[]).is_empty());
+        // Exactly the four aggregate facts, and nothing else.
+        assert_eq!(
+            cohort_json,
+            format!("{{\"size\":2,\"observed\":2,\"earliest\":{at},\"span_secs\":60}}")
+        );
+    }
+
+    /// An unsynchronized roster leaves the wire byte-identical to a pre-#879 frame: both the
+    /// per-account `cohort_id` and the daemon-level condition are omitted entirely. This is what
+    /// makes the 1.12 → 1.13 bump genuinely additive for every fleet that has no cohort.
+    #[tokio::test]
+    async fn an_unsynchronized_roster_omits_both_cohort_keys_from_the_wire() {
+        const NOW: i64 = 1_782_777_600;
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10),
+        )
+        .await;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        // Deadlines a week apart — observed, but nowhere near synchronized.
+        for (i, account) in daemon.state.accounts.iter_mut().enumerate() {
+            account.health.refresh_token_expires_at = Some(NOW + (i as i64 + 1) * 7 * DAY_SECS);
+        }
+
+        let readings = daemon.decision_readings(daemon.state.active);
+        let snapshot = daemon.snapshot(daemon.state.active, &readings, NOW);
+        assert_eq!(snapshot.expiry_cohort, None);
+
+        let json = serde_json::to_string(&status_response(&snapshot)).expect("the wire serializes");
+        assert!(
+            !json.contains("cohort_id"),
+            "an ungrouped row omits the key entirely: {json}"
+        );
+        assert!(
+            !json.contains("expiry_cohort"),
+            "an unsynchronized fleet omits the condition entirely: {json}"
         );
     }
 
@@ -1793,6 +2310,7 @@ mod tests {
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             generated_at: 0,
@@ -1885,6 +2403,7 @@ mod tests {
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             generated_at: 0,
@@ -2064,6 +2583,7 @@ mod tests {
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             generated_at,
@@ -2681,13 +3201,13 @@ mod tests {
             "an observed-but-deadline-less credential keeps both facts on the wire: {frame}"
         );
 
-        // Issue #879 owns cohort DETECTION; this item ships only the classification + the deadline.
-        // The field is carried on `AccountExpiry` so #879 adds a populator rather than reshaping the
-        // type, but `skip_serializing_if` keeps it OFF the wire while nothing can populate it — so
-        // #882 never promises a grouping no build produces.
+        // An UNGROUPED account stays quiet. Cohort detection (issue #879) populates `cohort_id`
+        // only for accounts that share a window with another, and `skip_serializing_if` keeps the
+        // key off the wire otherwise — so the ordinary unsynchronized fleet is byte-identical to a
+        // pre-#879 frame. This account was hand-built with no cohort, which is that case.
         assert!(
             !frame.contains("cohort_id"),
-            "cohort_id stays off the wire until #879 can populate it: {frame}"
+            "an ungrouped account carries no cohort_id on the wire: {frame}"
         );
 
         // Never polled → the key is omitted entirely (the additive-minor discipline the goldens
@@ -3047,6 +3567,7 @@ mod tests {
         let snapshot = StatusSnapshot {
             keychain_locked: true,
             canary: None,
+            expiry_cohort: None,
             accounts: vec![AccountReading {
                 label: "work".to_owned(),
                 active: true,
@@ -3196,8 +3717,17 @@ mod tests {
             ..Default::default()
         };
         let json = serde_json::to_string(&versioned_status_response(&snapshot)).unwrap();
+        // The version is read from the CONSTANT rather than spelled out. What this test exists to
+        // pin is the envelope's SHAPE — that `schema_version` is present, nested as `major`/`minor`,
+        // and sits beside `generated_at` — not which version is current. The byte pin for that is
+        // the committed `build/fixtures/wire-*.json` goldens, whose regeneration is the deliberate
+        // act a bump has to perform anyway; a second hand-maintained copy here only added an edit
+        // to every bump while catching nothing the goldens miss.
+        let SchemaVersion { major, minor } = STATUS_SCHEMA_VERSION;
         assert!(
-            json.contains(r#""schema_version":{"major":1,"minor":12}"#),
+            json.contains(&format!(
+                r#""schema_version":{{"major":{major},"minor":{minor}}}"#
+            )),
             "got {json}"
         );
         assert!(json.contains(r#""generated_at":1782777600"#), "got {json}");
@@ -3298,6 +3828,7 @@ mod tests {
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             generated_at: 1_782_777_600,
@@ -3610,6 +4141,7 @@ mod tests {
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             generated_at: 0,

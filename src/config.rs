@@ -210,6 +210,27 @@ const DEFAULT_FLEET_RUNWAY_WARN_SECS: u64 = 0;
 /// always reads the deadline from the credential and never infers one from a constant.
 pub(crate) const DEFAULT_CREDENTIAL_EXPIRY_HORIZON_SECS: u64 = 7 * 86_400;
 
+/// Default `[credential].expiry_cohort_window_secs` (issue #879): how wide a span of
+/// `refreshTokenExpiresAt` deadlines still counts as ONE synchronized cohort. **Twenty-four hours.**
+///
+/// The measured failure mode is a fleet onboarded in one sitting, each account carrying a fixed TTL
+/// from its own login: four of six deadlines landed inside a ~4-minute span. The observed span is
+/// NOT the right window, though — sizing to it would make the detector miss the very shape it exists
+/// to catch the moment a sitting stretches across a coffee break, and the accounts would report as
+/// unrelated singletons.
+///
+/// A day is the OPERATOR-CONSEQUENCE granularity. The remedy is a per-account `sessiometer login`,
+/// and deadlines inside one day are operationally simultaneous: there is no day on which they could
+/// be re-logged separately to de-synchronize the pool. Coarser than the failure and finer than the
+/// horizon, which is where a grouping rule belongs.
+///
+/// A seventh of [`DEFAULT_CREDENTIAL_EXPIRY_HORIZON_SECS`], so a cohort's members normally reach
+/// the foresight window TOGETHER: a member can only land on the far side of the horizon when the
+/// cohort's earliest deadline is already inside its final day. That straddle is real — the CLI line
+/// documents what it looks like (`crate::cli::render_expiry_cohort`) — but it is the narrow edge of
+/// the horizon, not the ordinary case.
+pub(crate) const DEFAULT_CREDENTIAL_EXPIRY_COHORT_WINDOW_SECS: u64 = 86_400;
+
 /// Default seconds between periodic isolated-refresh ticks (issue #105). A conservative one-hour
 /// cadence: #101's TTL question is resolved (the stored access-token expiry slides forward on each
 /// refresh — a sliding window, not a fixed cap), but the cadence is deliberately NOT pinned to a
@@ -818,12 +839,31 @@ pub(crate) struct CredentialConfig {
     /// Governs CLASSIFICATION only. It never feeds a swap or poll decision — expiry is surfaced,
     /// not acted upon.
     pub(crate) expiry_horizon_secs: u64,
+    /// Seconds of SPAN within which deadlines are one synchronized COHORT (issue #879): the
+    /// daemon anchors a cohort on the earliest ungrouped deadline and admits every deadline up to
+    /// this many seconds later. Bounds `60..=604_800` (one minute to seven days); **default**
+    /// [`DEFAULT_CREDENTIAL_EXPIRY_COHORT_WINDOW_SECS`] (twenty-four hours).
+    ///
+    /// ORTHOGONAL to [`expiry_horizon_secs`](Self::expiry_horizon_secs), which the two are easy to
+    /// conflate. The horizon asks *how soon* one account's deadline is (an urgency axis, per
+    /// account); this asks *how close together* several deadlines are (a synchronization axis,
+    /// across accounts). A fleet can be wholly `Beyond` the horizon and still perfectly
+    /// synchronized — which is exactly the pre-warning state this exists to make visible.
+    ///
+    /// The seven-day ceiling is the load-bearing bound, not a sanity rail: pushed toward the ~30 d
+    /// refresh-token lifetime observed in the field, EVERY account trivially falls in one cohort and
+    /// the signal says nothing. The one-minute floor is likewise deliberate — a zero window would
+    /// group only byte-identical timestamps, a detector that fires on nothing real.
+    ///
+    /// Governs GROUPING only. Like the horizon beside it, it never feeds a swap or poll decision.
+    pub(crate) expiry_cohort_window_secs: u64,
 }
 
 impl Default for CredentialConfig {
     fn default() -> Self {
         Self {
             expiry_horizon_secs: DEFAULT_CREDENTIAL_EXPIRY_HORIZON_SECS,
+            expiry_cohort_window_secs: DEFAULT_CREDENTIAL_EXPIRY_COHORT_WINDOW_SECS,
         }
     }
 }
@@ -833,6 +873,12 @@ impl CredentialConfig {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn expiry_horizon(&self) -> Duration {
         Duration::from_secs(self.expiry_horizon_secs)
+    }
+
+    /// The synchronized-cohort grouping window as a [`Duration`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn expiry_cohort_window(&self) -> Duration {
+        Duration::from_secs(self.expiry_cohort_window_secs)
     }
 }
 
@@ -1615,18 +1661,25 @@ fn default_login_timeout_secs() -> i64 {
 struct RawCredential {
     #[serde(default = "default_credential_expiry_horizon_secs")]
     expiry_horizon_secs: i64,
+    #[serde(default = "default_credential_expiry_cohort_window_secs")]
+    expiry_cohort_window_secs: i64,
 }
 
 impl Default for RawCredential {
     fn default() -> Self {
         Self {
             expiry_horizon_secs: default_credential_expiry_horizon_secs(),
+            expiry_cohort_window_secs: default_credential_expiry_cohort_window_secs(),
         }
     }
 }
 
 fn default_credential_expiry_horizon_secs() -> i64 {
     DEFAULT_CREDENTIAL_EXPIRY_HORIZON_SECS as i64
+}
+
+fn default_credential_expiry_cohort_window_secs() -> i64 {
+    DEFAULT_CREDENTIAL_EXPIRY_COHORT_WINDOW_SECS as i64
 }
 
 /// Permissive deserialization of the optional `[stats]` table (issue #161): every key

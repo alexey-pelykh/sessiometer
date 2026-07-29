@@ -94,8 +94,8 @@ use tokio::signal::unix::{signal, Signal, SignalKind};
 use crate::canary::{self, CanaryOutcome, InconclusiveReason, Liveness, ProbeGate};
 use crate::claude_state;
 use crate::config::{
-    Account, Config, Tunables, DEFAULT_CREDENTIAL_EXPIRY_HORIZON_SECS,
-    DEFAULT_REFRESH_SYSTEMIC_FAILURE_N,
+    Account, Config, Tunables, DEFAULT_CREDENTIAL_EXPIRY_COHORT_WINDOW_SECS,
+    DEFAULT_CREDENTIAL_EXPIRY_HORIZON_SECS, DEFAULT_REFRESH_SYSTEMIC_FAILURE_N,
 };
 // The daemon↔refresh_tick boundary contract (issue #202) lives in its own leaf module so
 // `refresh_tick` can depend on it without depending on the whole daemon. Re-exported under
@@ -142,11 +142,11 @@ pub(crate) use peer_auth::{is_same_user, peer_euid};
 mod snapshot;
 
 pub(crate) use snapshot::{
-    account_expiry, credential_health, refresh_health_view, to_pct, to_pct_exact,
+    account_expiry, credential_health, expiry_cohorts, refresh_health_view, to_pct, to_pct_exact,
     versioned_status_response, AccountReading, AccountStatusLine, BlindActive, BlindPreemptSwap,
-    CanaryStatus, CanonicalScrub, LandingOvershoot, NextSwap, NextSwapReason, NoTargetCause,
-    SchemaVersion, StatusResponse, StatusSnapshot, SystemicRefreshSource, VersionedStatus,
-    STATUS_SCHEMA_VERSION,
+    CanaryStatus, CanonicalScrub, ExpiryCohort, LandingOvershoot, NextSwap, NextSwapReason,
+    NoTargetCause, SchemaVersion, StatusResponse, StatusSnapshot, SystemicRefreshSource,
+    VersionedStatus, STATUS_SCHEMA_VERSION,
 };
 // `status_response` (the payload projection) and `RefreshHealth` are named only by the in-module
 // tests — production reaches the wire through `versioned_status_response` (issue #164) and builds
@@ -1885,6 +1885,17 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// A CLASSIFICATION bound only. Nothing on the swap or poll path reads it — expiry is
     /// surfaced, not acted upon (issue #878).
     credential_expiry_horizon_secs: u64,
+    /// The synchronized-cohort GROUPING window in seconds (issue #879): how wide a span of
+    /// `refreshTokenExpiresAt` deadlines [`expiry_cohorts`] still
+    /// treats as one cohort. Sourced from `[credential].expiry_cohort_window_secs` via
+    /// [`with_credential_expiry_cohort_window`](Self::with_credential_expiry_cohort_window); `new`'s
+    /// default is the config default ([`DEFAULT_CREDENTIAL_EXPIRY_COHORT_WINDOW_SECS`],
+    /// twenty-four hours), so a hermetic test daemon groups at the shipped window.
+    ///
+    /// A separate axis from [`credential_expiry_horizon_secs`](Self::credential_expiry_horizon_secs)
+    /// beside it — that one measures how SOON one deadline is, this how CLOSE TOGETHER several are.
+    /// Like it, a REPORTING bound only: nothing on the swap or poll path reads it.
+    credential_expiry_cohort_window_secs: u64,
     state: DecisionState,
 }
 
@@ -2019,6 +2030,7 @@ where
             // default rather than an inert one — the classification runs unconditionally, so a
             // hermetic daemon classifies at the shipped seven-day horizon.
             credential_expiry_horizon_secs: DEFAULT_CREDENTIAL_EXPIRY_HORIZON_SECS,
+            credential_expiry_cohort_window_secs: DEFAULT_CREDENTIAL_EXPIRY_COHORT_WINDOW_SECS,
             state: DecisionState {
                 accounts,
                 ..DecisionState::default()
@@ -2275,6 +2287,18 @@ where
     /// builders sit inside — see [`CredentialConfig`](crate::config::CredentialConfig) for why.
     pub(crate) fn with_credential_expiry_horizon(mut self, horizon_secs: u64) -> Self {
         self.credential_expiry_horizon_secs = horizon_secs;
+        self
+    }
+
+    /// Set the synchronized-cohort grouping window (issue #879) from
+    /// `[credential].expiry_cohort_window_secs`. See
+    /// [`credential_expiry_cohort_window_secs`](Self::credential_expiry_cohort_window_secs).
+    ///
+    /// Wired UNCONDITIONALLY alongside [`with_credential_expiry_horizon`](Self::with_credential_expiry_horizon),
+    /// for the same reason: cohort synchronization must be watched regardless of whether the
+    /// periodic refresh tick runs.
+    pub(crate) fn with_credential_expiry_cohort_window(mut self, window_secs: u64) -> Self {
+        self.credential_expiry_cohort_window_secs = window_secs;
         self
     }
 

@@ -15,7 +15,7 @@ final class WireDecoderTests: XCTestCase {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotBasic) else {
             return XCTFail("expected a snapshot frame")
         }
-        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 12))
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 13))
         XCTAssertEqual(v.generatedAt, 42)
         XCTAssertTrue(v.isSchemaSupported)
         XCTAssertNil(v.nextSwap, "next_swap null decodes to nil")
@@ -46,8 +46,8 @@ final class WireDecoderTests: XCTestCase {
     // AC: "Decodes real … `heartbeat` frames." + heartbeat carries the freshness envelope.
     func testDecodesRealHeartbeatFrame() throws {
         let frame = try parseWatchFrame(Fixtures.heartbeatBasic)
-        XCTAssertEqual(frame, .heartbeat(generatedAt: 42, schemaVersion: SchemaVersion(major: 1, minor: 12)))
-        XCTAssertEqual(frame.schemaVersion, SchemaVersion(major: 1, minor: 12))
+        XCTAssertEqual(frame, .heartbeat(generatedAt: 42, schemaVersion: SchemaVersion(major: 1, minor: 13)))
+        XCTAssertEqual(frame.schemaVersion, SchemaVersion(major: 1, minor: 13))
         XCTAssertTrue(WireContract.isSupported(try XCTUnwrap(frame.schemaVersion)))
     }
 
@@ -163,7 +163,7 @@ final class WireDecoderTests: XCTestCase {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotBlindActiveDegraded) else {
             return XCTFail("expected a snapshot frame")
         }
-        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 12))
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 13))
         let work = v.accounts[0]
         XCTAssertTrue(work.active)
         XCTAssertNil(work.sessionPct)
@@ -190,7 +190,7 @@ final class WireDecoderTests: XCTestCase {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotCanonicalScrubExhausted) else {
             return XCTFail("expected a snapshot frame")
         }
-        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 12))
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 13))
         XCTAssertEqual(v.canonicalScrub, .exhausted)
         // The rest of the frame still decodes normally alongside the added rollup.
         XCTAssertEqual(v.accounts.count, 1)
@@ -218,7 +218,7 @@ final class WireDecoderTests: XCTestCase {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotKeychainLocked) else {
             return XCTFail("expected a snapshot frame")
         }
-        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 12))
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 13))
         XCTAssertTrue(v.keychainLocked)
         // The flag is independent of `canonical_scrub` (a locked keychain can't be read to know
         // scrubbed-ness), and the rest of the frame still decodes normally alongside it.
@@ -236,7 +236,7 @@ final class WireDecoderTests: XCTestCase {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotSystemicRefreshFailure) else {
             return XCTFail("expected a snapshot frame")
         }
-        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 12))
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 13))
         XCTAssertEqual(v.systemicRefreshFailure, 3)
         XCTAssertEqual(v.systemicRefreshSource, .sweep, "#813: the episode's opening bracket")
         // Independent of the vault pair — the mechanism can be down while the shared item is fine.
@@ -254,7 +254,7 @@ final class WireDecoderTests: XCTestCase {
         guard case .snapshot(let pre) = try parseWatchFrame(Fixtures.snapshotSystemicRefreshPreflight) else {
             return XCTFail("expected a snapshot frame")
         }
-        XCTAssertEqual(pre.schemaVersion, SchemaVersion(major: 1, minor: 12))
+        XCTAssertEqual(pre.schemaVersion, SchemaVersion(major: 1, minor: 13))
         XCTAssertEqual(pre.systemicRefreshSource, .preflight)
         XCTAssertEqual(pre.systemicRefreshFailure, 1, "the seeded floor, not a sweep count")
 
@@ -279,16 +279,16 @@ final class WireDecoderTests: XCTestCase {
     // unknown `canonical_scrub` state, because the alarm rides in a SEPARATE field here: the count still
     // decodes, so rejecting would throw away the roster, the vault pair, the canary AND the mechanism-down
     // signal itself over a phrasing selector. It would also be unrecoverable — `isSupported` keys on the
-    // MAJOR (pinned two tests above), so a 1.13 daemon is a version this client calls supported while
+    // MAJOR (pinned two tests above), so a 1.14 daemon is a version this client calls supported while
     // blanking every frame it sends.
     //
     // The frame's minor is deliberately ONE AHEAD of `STATUS_SCHEMA_VERSION` — it models a daemon
     // NEWER than this build. It must be re-pointed on every minor bump, or it silently stops being a
     // future frame and starts asserting the current contract emits a token it does not (last moved
-    // 1.12 → 1.13 for issue #882).
+    // 1.13 → 1.14 for issue #879).
     func testUnknownSystemicRefreshSourceIsReadableAsUnrecognizedRatherThanFailingTheFrame() throws {
         let frame = #"""
-        {"type":"snapshot","schema_version":{"major":1,"minor":13},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":true,"systemic_refresh_failure":3,"systemic_refresh_source":"future_bracket"}
+        {"type":"snapshot","schema_version":{"major":1,"minor":14},"generated_at":42,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":60,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy"}],"next_swap":null,"refresh_enabled":true,"systemic_refresh_failure":3,"systemic_refresh_source":"future_bracket"}
         """#
         guard case .snapshot(let v) = try parseWatchFrame(frame) else {
             return XCTFail("an unknown provenance token must not cost us the frame")
@@ -326,7 +326,7 @@ final class WireDecoderTests: XCTestCase {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotCanaryDriftRefusing) else {
             return XCTFail("expected a snapshot frame")
         }
-        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 12))
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 13))
         XCTAssertEqual(v.canary, .drift(displayed: "work", matched: "personal", overridden: false))
         // Independent of its sibling faults — the identity can drift while the vault reads fine.
         XCTAssertNil(v.canonicalScrub)
@@ -366,7 +366,7 @@ final class WireDecoderTests: XCTestCase {
             try parseWatchFrame(Fixtures.snapshotCanaryRefusedUnparseableCanonical) else {
             return XCTFail("expected a snapshot frame")
         }
-        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 12))
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 13))
         XCTAssertEqual(v.canary, .refusedUnparseableCanonical)
         // Independent of its sibling faults — an unrecognized canonical can sit under a vault that
         // reads fine and a roster that is entirely healthy.
@@ -439,7 +439,7 @@ final class WireDecoderTests: XCTestCase {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotExpiryModifier) else {
             return XCTFail("the #882 expiry modifier must not cost us the frame")
         }
-        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 12))
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 13))
         XCTAssertTrue(v.isSchemaSupported, "an additive minor stays supported — major gates, minor does not")
         XCTAssertEqual(v.accounts.count, 2, "the roster survives the unknown per-account key")
 
@@ -479,6 +479,50 @@ final class WireDecoderTests: XCTestCase {
         XCTAssertFalse(v.keychainLocked)
     }
 
+    // AC (#879 forward-compat): a 1.13 daemon carries the synchronized-expiry cohort as TWO new
+    // keys — the per-account `expiry.cohort_id` grouping key, and the DAEMON-LEVEL `expiry_cohort`
+    // condition beside it. Issue #884 has since mirrored the `expiry` object itself, but neither
+    // cohort key: nothing in the panel groups rows, so modelling the relationship would be drawing
+    // a surface that does not exist. The contract this defends is that leaving them unmirrored
+    // costs the build nothing.
+    //
+    // Worth its own test rather than folding into the #882 case above, for the top-level half: every
+    // unmirrored additive object this client has tolerated so far (`blind_active` under #479,
+    // `expiry` under #882) arrived nested inside an account. `expiry_cohort` is the first to arrive
+    // at the ROOT of the payload, which is a different decode path — and the cost of getting it
+    // wrong is not a blank cell but a blank panel, since `WatchStatusStore` drops a line it cannot
+    // decode. A frame carrying BOTH shapes at once is also the realistic one: the daemon populates
+    // `cohort_id` and the condition from a single walk, so they always ship together.
+    func testCurrentDaemonExpiryCohortIsToleratedWithoutAMirror() throws {
+        guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotExpiryCohort) else {
+            return XCTFail("the #879 cohort keys must not cost us the frame")
+        }
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 13))
+        XCTAssertTrue(v.isSchemaSupported, "an additive minor stays supported")
+        XCTAssertEqual(v.accounts.count, 3, "the roster survives an unknown ROOT-level key")
+
+        // Every field this client knows keeps its value, on a grouped row and an ungrouped one
+        // alike. The cohort is ORTHOGONAL to the auth rollup — all three accounts are `healthy`
+        // while two of them are about to expire together, which is precisely why the fleet fact
+        // cannot be read off any single row.
+        for account in v.accounts {
+            XCTAssertEqual(account.auth, .healthy)
+            XCTAssertNil(account.blindActive)
+        }
+        XCTAssertEqual(v.accounts[0].label, "work")
+        XCTAssertEqual(v.accounts[0].sessionPct, 30)
+        XCTAssertEqual(v.accounts[0].accessExpiresAt, 1_893_470_000)
+        XCTAssertEqual(v.accounts[1].label, "spare")
+        XCTAssertEqual(v.accounts[2].label, "archive", "the ungrouped row decodes like any other")
+
+        // And the rest of the frame is untouched by either new key.
+        XCTAssertEqual(v.nextSwap, .target(to: "spare", reason: .onlyCandidate))
+        XCTAssertEqual(v.refreshEnabled, true)
+        XCTAssertNil(v.canonicalScrub)
+        XCTAssertFalse(v.keychainLocked)
+        XCTAssertNil(v.systemicRefreshFailure)
+    }
+
     // AC (#393 forward-compat): a pre-#393 daemon's `target` has no `reason` key → decodes to
     // `reason: nil` (the additive `decodeIfPresent` path), never a decode error. This is the
     // contract that lets the client render an older daemon's next-swap without the rationale line.
@@ -503,7 +547,7 @@ final class WireDecoderTests: XCTestCase {
     // rule to the token rather than inventing a new one.
     func testUnknownExpiryHorizonTokenDegradesToTheGapRatherThanCostingTheFrame() throws {
         let frame = #"""
-        {"type":"snapshot","schema_version":{"major":1,"minor":12},"generated_at":1893456000,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":30,"weekly_pct":20,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy","expiry":{"expires_at":1893800000,"horizon_state":"cohort_pending"}}],"next_swap":{"state":"awaiting_data"},"refresh_enabled":true,"systemic_refresh_failure":null}
+        {"type":"snapshot","schema_version":{"major":1,"minor":13},"generated_at":1893456000,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":30,"weekly_pct":20,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy","expiry":{"expires_at":1893800000,"horizon_state":"cohort_pending"}}],"next_swap":{"state":"awaiting_data"},"refresh_enabled":true,"systemic_refresh_failure":null}
         """#
         guard case .snapshot(let v) = try parseWatchFrame(frame) else {
             return XCTFail("an unrecognised horizon token must not cost us the frame")
@@ -525,7 +569,7 @@ final class WireDecoderTests: XCTestCase {
     // of this object's fields carry `#[serde(default)]` on the daemon side; the mirror matches.
     func testPartialExpiryObjectDegradesToTheFailSafeRatherThanThrowing() throws {
         let frame = #"""
-        {"type":"snapshot","schema_version":{"major":1,"minor":12},"generated_at":1893456000,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":30,"weekly_pct":20,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy","expiry":{}}],"next_swap":{"state":"awaiting_data"},"refresh_enabled":true,"systemic_refresh_failure":null}
+        {"type":"snapshot","schema_version":{"major":1,"minor":13},"generated_at":1893456000,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":30,"weekly_pct":20,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy","expiry":{}}],"next_swap":{"state":"awaiting_data"},"refresh_enabled":true,"systemic_refresh_failure":null}
         """#
         guard case .snapshot(let v) = try parseWatchFrame(frame) else {
             return XCTFail("a partial expiry object must not cost us the frame")

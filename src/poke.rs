@@ -618,6 +618,7 @@ mod tests {
             canonical_scrub: None,
             keychain_locked: false,
             canary: None,
+            expiry_cohort: None,
             recent_blind_preempt_swap: None,
             recent_landing_overshoot: None,
             refresh_enabled: None,
