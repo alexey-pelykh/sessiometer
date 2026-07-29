@@ -161,7 +161,7 @@ enum PanelTypeScale {
     /// therefore saturate: at `.accessibility3` the panel is at ×2.35 and its buttons are not. The
     /// alternative — a hand-rolled `ButtonStyle` that scales continuously — was rejected: it would replace
     /// the panel's ONE native accent action (issue #169's Von Restorff primary) with a look the design
-    /// reference never ratified, and would churn all 36 committed goldens to do it. A stepped native
+    /// reference never ratified, and would churn all 44 committed goldens to do it. A stepped native
     /// control beats a continuous unratified one; issue #757's gate is where the saturation gets measured.
     ///
     /// `.mini` is unreachable by construction — the scale floor is `.large`, so `scale` is never below 1.0.

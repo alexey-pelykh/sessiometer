@@ -183,7 +183,9 @@ automated half (drift against committed goldens) does run headless in CI, and it
 `build-comparison.py` assembles a single self-contained page that puts the mock's **live** `.pop`
 blocks next to the built-panel captures, state by state — the fastest way to eyeball parity across the
 eight connection-states the panel implements, plus the active-account **blind** modifier (OK / DEGRADED,
-#479/#485) and the four **daemon-fault** ranks (#592). Neither of those last two is a connection-state:
+#479/#485), the four **daemon-fault** ranks (#592), and the four **pathological-content** rosters
+(#752/#753 — hostile labels, percents and durations; see § The stress fixtures). None of those last three
+is a connection-state:
 `blind` is a per-row modifier and a fault banner is resolved *over* a connected snapshot, which is why
 both pair against a healthy green roster. The four fault ranks pair in the worst-first order the panel
 resolves them (keychain-locked › scrub-exhausted › systemic › recovering), so a severity **inversion** —
@@ -220,7 +222,7 @@ longer carries — naming the frame, or the line for an untagged block.
 The harness above is the **fidelity** path (a human eye, against the live mock). This is the **drift**
 path: `Tests/PanelGoldenParityTests` re-renders every panel state in-process — SwiftUI `ImageRenderer`
 inside the headless `MenubarTests` bundle, which issue #749 measured as viable — and diffs the fresh
-renders against committed goldens under `renders/panel-goldens/`. **36 goldens** (18 fixtures × light/dark,
+renders against committed goldens under `renders/panel-goldens/`. **44 goldens** (22 fixtures × light/dark,
 `panel-<state>-<theme>.png`, @2x), rendered through the same `PanelRenderHarness` the app's
 `--render-panel` tool uses, so the automated gate and the human oracle can never render different states.
 
@@ -268,16 +270,35 @@ aqua-vs-darkAqua row, and the app-tool-vs-goldens row measured out of band by ru
 into a scratch directory and `diff -rq`-ing it against `renders/panel-goldens/`), so re-deriving the
 whole table means running the default suite too.
 
+> **Keep `-only-testing:` on that command — the `#824` cold-raster edge is now reachable without it.**
+> `SESSIOMETER_PANEL_MEASURE=1` with the WHOLE `PanelGoldenParityTests` class (no `-only-testing:`)
+> reddens `testRendersSurviveTheClockDriftWindow` with `worst delta 1 over up to 19 bytes`. It is
+> deterministic, not flaky, and it is **not** a panel regression: `testMeasureSeparations` adds a second
+> full-catalog render pass, and at 44 cells (was 36) that tips the rasterizer past the cold-raster
+> threshold issue #824 tracks — `PanelRenderHarness.warmUpIfNeeded()` warms only the `healthy` fixture, so
+> a first-render cell can still carry ±1/255. Issue #753 grew the catalog and so turned a latent exposure
+> into a certain one in that one configuration. Nothing else reaches it: the required `swift` job sets no
+> `TEST_RUNNER_*`, the soft `panel-goldens` job runs two named tests, and the recipe above is
+> `-only-testing:`-scoped — the full documented suite is `796 tests, 0 failures`. Fixing it belongs to
+> #824 (warm every fixture, or warm to a fixed point per cell), not to a tolerance here.
+
 **What the relative gate does and does not cover.** The primary check —
 `testEachFreshRenderIsNearestToItsOwnGolden` — asks that a fresh render's closest same-size golden be
 itself, which needs no cross-machine calibration and catches one state morphing into another. It only has
 power where a same-size golden of a *different* fixture exists to lose to, and goldens are sized by
-content: 8 of the 18 fixtures (`stats`, `disconnected`, `not-running`, `empty-roster`, `blind-cornered`,
+content: 8 of the 22 fixtures (`stats`, `disconnected`, `not-running`, `empty-roster`, `blind-cornered`,
 `starting`, `crash-looping`, `expiry`) own a unique height, so their size group holds only their own two
-themes, ~0.97 apart. For those **16 of 36 cells the relative check is trivially satisfied** and the absolute
+themes, ~0.97 apart. For those **16 of 44 cells the relative check is trivially satisfied** and the absolute
 ceiling — the cross-machine *unvalidated* half — is the only thing defending them. The suite asserts that
 count rather than merely noting it, and prints it on every run alongside the weakest real margin (measured
 **0.002513**), so the promotion decision in issue #790 has the number in front of it.
+
+> Issue #753 moved the DENOMINATOR without moving the number, and that is the good direction: all four
+> stress fixtures landed in size groups that already held another fixture (the three 4-row rosters share
+> 760x1090; `wire-hostile-numerics` is 3-row and joins `healthy` / `stale` at 760x898), so every one of the
+> eight new cells has a cross-state rival. Uncovered went **16-of-36 (44 %) → 16-of-44 (36 %)**, and the
+> distinctness check's subject grew 38 → 62 same-size pairs. Read the unchanged 16 as coverage *gained*,
+> not as nothing having happened.
 
 > That count **regressed from 10 to 14 at issue #776**, and the promotion decision should read it as a
 > cost, not a detail. `View log` made `starting` and `crash-looping` taller by *different* amounts — the
@@ -305,7 +326,7 @@ drift. Do not read "the PNG changed" as "the panel changed"; the gate's own verd
 
 **On THIS toolchain the goldens are byte-reproducible, and that is deliberate.** Two independent
 `SESSIOMETER_PANEL_GOLDENS=update` runs produce byte-identical files, and the app's own `--render-panel`
-output is byte-identical to all 36 goldens. It did not start out that way: the first renders in a process
+output is byte-identical to all 44 goldens. It did not start out that way: the first renders in a process
 disagree with the steady state by ±1/255 on ~0.03 % of bytes — a rasterization warm-up artifact, found by
 rendering one fixture six times (renders 0–1 agree with each other, renders 2–5 agree with each other,
 the two groups differ) and ruled out as a clock effect because renders seeded seconds apart are
@@ -1000,12 +1021,78 @@ Three authoring rules make these frames an oracle rather than a screenshot:
    the panel bands a percent exactly as the CLI does. The frame ratifies that shipped split rather
    than inventing a third answer one of those gates would have to be relaxed to accept.
 
-**Pairing with #753.** These frames deliberately carry **no `STATES` entry** in
-`build-comparison.py` yet: `cap()` fails loudly on a missing capture PNG, so wiring them before the
-fixtures exist would break the comparison tool for everyone. Since #581 the pairing is **by name**,
-which is exactly what lets the two land in separate commits — #753 adds the `RenderPanelTool`
-fixtures and the matching `STATES` rows at the same time, pairing `design="<frame-base>-light"` with
-`capture="panel-<frame-base>-light.png"`.
+**Pairing with #753 — done.** These frames landed with **no `STATES` entry** in `build-comparison.py`,
+deliberately: `cap()` fails loudly on a missing capture PNG, so wiring them before the fixtures
+existed would have broken the comparison tool for everyone. Since #581 the pairing is **by name**,
+which is exactly what let the two land in separate commits. Issue #753 closed the loop — the
+`PanelRenderHarness` fixtures and the matching `STATES` rows arrived together, pairing
+`design="<frame-base>-light"` with `capture="panel-<frame-base>-light.png"`. See § The stress
+fixtures below for what the captures then showed.
+
+### The stress fixtures (#753)
+
+Four fixtures in `Sources/PanelRenderHarness.swift`, named to pair with the four frame bases above, each
+rendered light + dark into `renders/panel-goldens/`. They answer the question the per-cell text metrics
+cannot: #750 measures *does this label fit its cell*; only a render shows whether the **frame** survives —
+row-height growth, meter/label competition, callout and footer collapse.
+
+Renaming a fixture silently unpairs it from its frame, which is the one edit to make deliberately.
+`wire-hostile-numerics` carries three rows (the mock's roster), so it is the only stress fixture that
+shares `healthy`'s 760x898 height; the other three are 4-row and 760x1090.
+
+**The renders confirmed the design and contradicted nothing** — the long label middle-elides with its
+distinguishing tail intact, CJK and both RTL labels render whole with the row's LTR layout untouched,
+the `?` / `?2` sentinels sit on genuinely blank name lines under one shared badge colour, and `255%` /
+`365d23h` / `999d23h` render verbatim with only the meter geometry clamped. What they *did* surface is
+four things no per-cell measurement could, all filed rather than fixed here (this item's scope is
+fixtures, `STATES` rows and this section):
+
+- **#938 — `rosterLabelBudget` models 171 pt; the panel lays labels out in ~216 pt.** Measured off the
+  committed goldens: `oleksii.pelykh@company-two.com` (215.94 pt) renders **whole** while
+  `oleksii.pelykh@company-one.com` (216.37 pt) elides, so the effective column is ~216 pt, not 171. The
+  model reserves a 60 pt auth allowance and a 6 pt spacer the live layout does not spend. The error
+  direction is safe — the gate predicts overflow *earlier* than reality, never later — but it is ~45 pt,
+  not the "±10 pt" the constant's own doc claims, and it means **the mock's pre-elided literals are
+  elided too aggressively** (they were authored at 171 pt). Do not read those two frames' elision points
+  as panel drift until #938 settles which side moves.
+- **#936 — the `same-local-part` frame authors a swap reason the wire cannot express.** Its why-line
+  reads "session resets soonest"; `NextSwapReason` carries a single `soonest_reset` discriminant that
+  renders as "weekly resets soonest", matching the daemon's actual selection axis (#37/#393). The panel
+  is right; the mock is the outlier.
+- **#939 — a degenerate label has a visual identity cue but no spoken one.** `rowAccessibilityLabel`
+  leads with the raw label and then filters empties, so the `""` row's spoken sentence starts at the auth
+  verdict with no identity, and the `"     "` row's starts with whitespace. Visually both carry the `?` /
+  `?2` sentinel; spoken, they are mutually indistinguishable — and because `accountColorIndex` trims, they
+  also share one badge colour, so the monogram is the only separator the spoken surface does not get.
+  Structural a11y is fine (`PanelAccessibilityTreeTests` pins the same shape as any 4-row roster), which
+  is exactly why a role histogram could not catch this and a rendered fixture could.
+- **#937 — `degenerate-label`'s pathology clears the drift ceiling by only 1.25×.** See below.
+
+**The harness limitation these expose.** `degenerate-label`'s whole pathology is two *absent* name lines
+plus a monogram sentinel — a few hundred pixels on a 760x1090 frame — so the CONSTRAINT-A canary
+(`testANeutralizedStressFixtureTripsTheDriftCeiling`) scores it at 0.002529 / 0.002499 against a 0.002
+ceiling, where the other three score 9.2–12.4× the ceiling. The relative gate cannot take up the slack: a
+neutralized `degenerate-label` is still nearest its own golden, because its same-size rivals differ from
+it by whole labels. So that fixture rests on the absolute ceiling alone, at ~25 % headroom — and the
+canary is therefore a **tripwire on the ceiling itself**: raise `driftCeiling` past 0.0025 and it reddens
+on `degenerate-label` first. Issue #790's re-calibration must treat that as a blocking input, not a
+nuisance. A pathology made of missing ink is intrinsically hard for a whole-frame ink metric to see; the
+fix is a targeted check (#937), never a bigger mutation, which would report a larger number while testing
+something the fixture does not claim.
+
+**How the canary was verified — by mutation, at both layers.** "It renders" is not evidence:
+
+- *The golden gate.* Each fixture is rebuilt with its pathology **removed** (the hostile labels made
+  ordinary ASCII, the colliding local parts made distinct, the blank labels given text, the out-of-range
+  percent and extreme durations made ordinary) and the render must move past `driftCeiling` — the same
+  predicate `testEveryRenderMatchesItsCommittedGolden` applies to the committed goldens. A fixture that
+  silently lost its hostile content already *is* its own twin, scores ~0, and reddens. Two guards keep
+  that honest: the twin's dimensions are asserted equal **first** (`diffFraction` scores mismatched sizes
+  a maximal 1, which would make the test a rubber stamp), and an identity substitution must score exactly
+  0 (so the number measures the pathology, not the rebuild).
+- *The comparison page.* Deleting one stress capture and, separately, renaming one frame in the mock both
+  exit non-zero with the offending name — `cap()` and `design()` respectively — while the unmutated
+  inputs exit 0. So an unpaired stress frame surfaces loudly instead of quietly dropping out of the page.
 
 **What these frames do not author.** Three things, deliberately:
 
