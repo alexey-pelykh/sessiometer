@@ -63,7 +63,11 @@
 //
 // Thresholds are calibrated to MEASURED separations on THIS content, not guessed. Re-derive every number
 // with the commands recorded in design/README.md § Panel golden drift gate; these are what those runs
-// printed on arm64 / macOS 26.5.2 / Xcode 26.6, over the full 34-cell catalog (17 fixtures × 2 themes).
+// printed on arm64 / macOS 26.5.2 / Xcode 26.6, over the full 36-cell catalog (18 fixtures × 2 themes).
+// The catalog grew from 34 cells at issue #886, which added the four-state `expiry` fixture; the two
+// counts that moved with it are re-measured and explained at their assertions below. Every SEPARATION
+// number in this table was re-derived on that catalog and is unchanged — the new fixture is a comfortable
+// distance from everything else, so it neither set a new closest pair nor weakened the margin.
 // The provenance column matters — two rows do NOT come from `testMeasureSeparations`, so re-deriving the
 // whole table means running the default suite as well as the measurement test:
 //
@@ -72,9 +76,9 @@
 //   golden PNG round-trip (write → read → compare) .................... 0.000000  ← testMeasureSeparations
 //   same fixture under aqua vs darkAqua host appearance .............. 0.000000  ← testRendersDoNotDepend…
 //                                                                                 (no host Dark-Mode dep)
-//   app `--render-panel` output vs in-bundle goldens, all 34 cells .... 0.000000  ← out-of-band, recipe in
+//   app `--render-panel` output vs in-bundle goldens, all 36 cells .... 0.000000  ← out-of-band, recipe in
 //                                                                                 design/README.md; also
-//                                                                                 BYTE-identical, 34/34
+//                                                                                 BYTE-identical, 36/36
 //   closest distinct same-size pair .................................. 0.002513  healthy/dark vs stale/dark
 //   … #2 .............................................................. 0.002621  healthy/light vs stale/light
 //   … #3 .............................................................. 0.003827  fault-scrub-exhausted/dark
@@ -207,7 +211,7 @@ final class PanelGoldenParityTests: XCTestCase {
 
     private static func wallClock() -> Int64 { Int64(Date().timeIntervalSince1970) }
 
-    /// Render cache — 34 `ImageRenderer` passes are the expensive part of this suite and several tests need
+    /// Render cache — 36 `ImageRenderer` passes are the expensive part of this suite and several tests need
     /// the same set. Keyed by filename; only ever holds un-lagged renders (`seedLag == 0`).
     private static var cache: [String: PanelRaster] = [:]
 
@@ -217,7 +221,7 @@ final class PanelGoldenParityTests: XCTestCase {
     /// The fixtures are seeded from the wall clock read HERE, immediately before rasterizing, so the gap
     /// between seeding and `TimelineView`'s own `context.date` is always sub-second — far inside
     /// `PanelRenderHarness.boundaryGuardSecs`. A single class-wide seed would instead let that gap grow with
-    /// the suite's own runtime (34 renders take seconds), so a later test would rasterize different
+    /// the suite's own runtime (36 renders take seconds), so a later test would rasterize different
     /// clock-relative text than an earlier one and the whole comparison basis would rot mid-run. Re-reading
     /// the clock per render makes every render in the suite — and every render on any future day, against
     /// the committed goldens — carry identical clock-relative strings.
@@ -506,10 +510,10 @@ final class PanelGoldenParityTests: XCTestCase {
                 }
             }
         }
-        // Degenerate-subject guard, exact rather than non-zero: `> 0` would pass having compared 1 of the 37
+        // Degenerate-subject guard, exact rather than non-zero: `> 0` would pass having compared 1 of the 38
         // planned pairs, which is the partial-subject hole its four siblings in this file are closed against.
-        // 37 = the measured pair count over the 34-cell catalog's same-size groups
-        // (C(4,2) + 4·C(4,2) + 7·C(2,2) = 6 + 24 + 7). It moves only when the catalog or a panel height
+        // 38 = the measured pair count over the 36-cell catalog's same-size groups
+        // (C(4,2) + 4·C(4,2) + 8·C(2,2) = 6 + 24 + 8). It moves only when the catalog or a panel height
         // does, which is a deliberate act — re-measure with SESSIOMETER_PANEL_MEASURE=1, do not tune.
         //
         // It moved from 57 at issue #776, and the move is the point: `View log` made `starting` and
@@ -519,8 +523,15 @@ final class PanelGoldenParityTests: XCTestCase {
         // reduction in this check's subject; the coverage consequence is recorded against
         // `testEachFreshRenderIsNearestToItsOwnGolden`'s `withoutCrossStateRival` tripwire, which is the
         // number the issue #790 promotion decision reads.
-        XCTAssertEqual(compared, 37,
-                       "expected 37 same-size fixture pairs, compared \(compared) — the distinctness check's "
+        //
+        // 37 → 38 at issue #886, and this one is an ADDITION rather than a redistribution: the `expiry`
+        // fixture's roster carries FOUR rows where every other connected fixture carries three, so it is
+        // taller than everything in the catalog and its two themes form a size group of their own —
+        // C(2,2) = 1 new pair, nothing regrouped. Its own light-vs-dark pair is the only comparison it
+        // contributes, so it gains this check one cell-pair and gains the RELATIVE gate below nothing;
+        // see that tripwire for the coverage side of the same fact.
+        XCTAssertEqual(compared, 38,
+                       "expected 38 same-size fixture pairs, compared \(compared) — the distinctness check's "
                        + "subject changed; re-measure rather than relaxing this count")
     }
 
@@ -722,15 +733,23 @@ final class PanelGoldenParityTests: XCTestCase {
     // 0.000000, so the whole separation is headroom).
     //
     // MEASURED LIMIT, and it is not small: this check only has power where a same-size golden of a
-    // DIFFERENT fixture exists to lose to. Goldens are sized by content, and 7 of the 17 fixtures own a
+    // DIFFERENT fixture exists to lose to. Goldens are sized by content, and 8 of the 18 fixtures own a
     // unique pixel height (`stats`, `disconnected`, `not-running`, `empty-roster`, `blind-cornered`, and —
     // since issue #776 gave each of them a differently-styled `View log` action — `starting` and
-    // `crash-looping`), so their size group holds only their own two themes. Light-vs-dark of the same
-    // fixture sits ~0.97 apart, so "nearest is itself" is trivially true for those 14 of 34 cells and
-    // detects nothing. That is 4 cells WORSE than before #776, and deliberately recorded as such. Those cells
+    // `crash-looping`, plus `expiry` since issue #886), so their size group holds only their own two
+    // themes. Light-vs-dark of the same fixture sits ~0.97 apart, so "nearest is itself" is trivially true
+    // for those 16 of 36 cells and detects nothing. That is 4 cells WORSE than before #776 and 2 worse again
+    // since #886, and deliberately recorded as such. Those cells
     // rest on `testEveryRenderMatchesItsCommittedGolden`'s absolute ceiling alone — i.e. on the
     // cross-machine-UNVALIDATED half, which is a real input to the promotion decision (issue #790) and is
     // why the count below is asserted rather than merely mentioned. Both numbers print on every run.
+    //
+    // The #886 move is the unavoidable cost of what that fixture is FOR: its four-row roster is what puts
+    // all four expiry verdicts — including the `—` an unmeasured credential renders — in one frame, and a
+    // fourth row is exactly what makes it taller than every sibling and so rival-less. Adding rows to the
+    // other fixtures to manufacture a rival would change what THEY assert, which is a worse trade. The two
+    // cells are covered by the absolute ceiling (0.000000 measured) and by
+    // `testDistinctFixturesRenderDistinctly`'s own light-vs-dark pair.
     func testEachFreshRenderIsNearestToItsOwnGolden() throws {
         try XCTSkipUnless(isGoldenGateEnabled,
                           "committed-golden comparison is the non-required half: SESSIOMETER_PANEL_GOLDEN_GATE=1")
@@ -780,8 +799,8 @@ final class PanelGoldenParityTests: XCTestCase {
         // Tripwire, not a preference: this is the measured coverage of the PRIMARY gate. If a fixture is
         // added or a layout changes a panel's height, this number moves and the promotion decision in issue
         // #790 needs to know. Re-measure and update deliberately — never widen it to make a run green.
-        XCTAssertEqual(withoutCrossStateRival, 14,
-                       "measured 14 of 34 cells have no same-size cross-state rival; got "
+        XCTAssertEqual(withoutCrossStateRival, 16,
+                       "measured 16 of 36 cells have no same-size cross-state rival; got "
                        + "\(withoutCrossStateRival). The relative gate's coverage changed — re-measure and "
                        + "record it against the promotion criterion (issue #790) rather than adjusting this "
                        + "number to fit")

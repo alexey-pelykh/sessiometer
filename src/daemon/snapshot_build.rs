@@ -3004,6 +3004,122 @@ mod tests {
         encode_snapshot_frame(&versioned_status_response(&snapshot))
     }
 
+    /// The instant the expiry golden's `within` account reaches its `refreshTokenExpiresAt` — a
+    /// REAL observed deadline (2026-07-31T12:10:02Z, from the credential of the account whose id
+    /// starts `94f27044`), folded from the credential's `1785499802819` milliseconds to seconds at
+    /// the same boundary [`crate::refresh::refresh_token_expires_at`] folds it.
+    ///
+    /// Real rather than round, for the reason
+    /// [`the_measured_four_minute_cluster_of_four_accounts_is_one_cohort`] gives at length: a
+    /// fixture built from invented values can encode a shape the field never produces, and issue
+    /// #881 shipped exactly that (a predicate matching zero live events). The neighbouring
+    /// deadlines below are offsets from THIS, so the whole golden hangs off one measured instant.
+    /// The SAME instant as `cli::tests::goldens::EXPIRY_WITHIN_AT`; they cannot share a constant
+    /// across `cfg(test)` module boundaries, so a correction to this provenance belongs in both.
+    const WIRE_GOLDEN_EXPIRY_AT: i64 = 1_785_499_802;
+
+    /// A snapshot frame carrying the REFRESH-token expiry modifier (issues #878/#882) in **all
+    /// four** of its states, plus the fleet-level `expiry_cohort` condition (issue #879).
+    ///
+    /// The other four goldens carry `expiry: None` on every account and no cohort, so BOTH objects
+    /// are omitted from all of them (`skip_serializing_if`) and neither the [`AccountExpiry`]
+    /// encoder nor the [`ExpiryCohort`] one has any byte-drift coverage. This freezes both.
+    ///
+    /// The fourth account is the load-bearing one and the reason issue #886 exists: it was POLLED
+    /// and its credential carried NO `refreshTokenExpiresAt`, so it encodes
+    /// `{"expires_at":null,"horizon_state":"unknown"}` — an explicit null inside a PRESENT object,
+    /// never an omitted key and never the reassuring `beyond`. Should upstream ever stop emitting
+    /// the field, THAT is the shape the whole fleet degrades to, and these bytes are what stop a
+    /// client from reading it as "not expiring" (the issue #137 invariant). Its Swift mirror
+    /// (`Fixtures.snapshotExpiryStates`) is what carries the same claim across the language
+    /// boundary, since ADR-0010 keeps Rust out of the Swift build.
+    ///
+    /// The first two accounts additionally carry `cohort_id: 0` and pair with the daemon-level
+    /// `expiry_cohort`, so the golden pins the two halves of one fact TOGETHER — which row is in
+    /// the group, and that the group is the fleet condition. `beyond` and the unmeasured row are
+    /// deliberately ungrouped, so the `skip_serializing_if` that keeps an ungrouped account's
+    /// `cohort_id` off the wire is exercised in the same frame as the populated one.
+    ///
+    /// Deadlines are FIXED instants, not `now`-relative: a golden's bytes must not move with the
+    /// wall clock. That is not in tension with the `now`-relative style of the classification tests
+    /// in this module — those exercise [`account_expiry`]'s VERDICT, which is only meaningful
+    /// against a live horizon, whereas this frame pins the encoding of an already-classified
+    /// reading. Mirrored by Swift `Fixtures.snapshotExpiryStates`.
+    fn wire_golden_snapshot_expiry_frame() -> String {
+        let at = WIRE_GOLDEN_EXPIRY_AT;
+        let reading = |label: &str, expiry: Option<AccountExpiry>| AccountReading {
+            label: label.to_owned(),
+            active: label == "work",
+            enabled: true,
+            usage: Some(Usage {
+                session: 0.60,
+                weekly: 0.10,
+                weekly_resets_at: None,
+                session_resets_at: None,
+            }),
+            expiry,
+            ..Default::default()
+        };
+        let mut snapshot = watch_snapshot("work", 42, 0.60);
+        snapshot.accounts = vec![
+            // Inside the horizon, and grouped with `spare` — the pair the condition names.
+            reading(
+                "work",
+                Some(AccountExpiry {
+                    expires_at: Some(at),
+                    horizon_state: ExpiryHorizon::Within,
+                    cohort_id: Some(0),
+                }),
+            ),
+            // The cohort's second member: one hour later, well inside the 24 h grouping window.
+            reading(
+                "spare",
+                Some(AccountExpiry {
+                    expires_at: Some(at + 3_600),
+                    horizon_state: ExpiryHorizon::Within,
+                    cohort_id: Some(0),
+                }),
+            ),
+            // Further out than the horizon — an observed deadline that is not yet a concern, and
+            // the ONLY state that legitimately means "not expiring soon".
+            reading(
+                "archive",
+                Some(AccountExpiry {
+                    expires_at: Some(at + 30 * DAY_SECS),
+                    horizon_state: ExpiryHorizon::Beyond,
+                    cohort_id: None,
+                }),
+            ),
+            // Already past — only a re-login recovers it.
+            reading(
+                "retired",
+                Some(AccountExpiry {
+                    expires_at: Some(at - 30 * DAY_SECS),
+                    horizon_state: ExpiryHorizon::Lapsed,
+                    cohort_id: None,
+                }),
+            ),
+            // POLLED, and the credential carried no deadline: UNKNOWN, with an explicit null.
+            reading(
+                "unmeasured",
+                Some(AccountExpiry {
+                    expires_at: None,
+                    horizon_state: ExpiryHorizon::Unknown,
+                    cohort_id: None,
+                }),
+            ),
+        ];
+        snapshot.expiry_cohort = Some(ExpiryCohort {
+            size: 2,
+            // FOUR observed deadlines across five accounts — the denominator names the measured
+            // set, so a reader is told the coverage rather than assuming the whole roster was seen.
+            observed: 4,
+            earliest: at,
+            span_secs: 3_600,
+        });
+        encode_snapshot_frame(&versioned_status_response(&snapshot))
+    }
+
     /// One-time emitter for the committed wire goldens. `#[ignore]` — NOT part of the suite; it
     /// WRITES the bytes the pin test and the Swift fixtures consume. Run it ONLY alongside a
     /// deliberate wire-contract change:
@@ -3035,6 +3151,11 @@ mod tests {
             wire_golden_snapshot_canonical_scrub_frame(),
         )
         .expect("write wire-snapshot-canonical-scrub golden");
+        std::fs::write(
+            dir.join("wire-snapshot-expiry.json"),
+            wire_golden_snapshot_expiry_frame(),
+        )
+        .expect("write wire-snapshot-expiry golden");
     }
 
     /// The committed snapshot-frame golden — the exact bytes Swift `Fixtures.snapshotBasic` is
@@ -3064,6 +3185,13 @@ mod tests {
     const WIRE_SNAPSHOT_CANONICAL_SCRUB_GOLDEN: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/build/fixtures/wire-snapshot-canonical-scrub.json"
+    ));
+
+    /// The committed all-four-states expiry snapshot golden (issues #878/#882/#879, pinned by
+    /// #886) — the exact bytes Swift `Fixtures.snapshotExpiryStates` is pinned to.
+    const WIRE_SNAPSHOT_EXPIRY_GOLDEN: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/build/fixtures/wire-snapshot-expiry.json"
     ));
 
     #[test]
@@ -3103,6 +3231,100 @@ mod tests {
             "the committed wire-snapshot-canonical-scrub golden drifted from the canonical_scrub \
              rollup encoder (issue #516) — re-run `cargo test -- --ignored emit_wire_golden_fixtures`, \
              then update the Swift mirror (apps/menubar) so its fixtures stay byte-identical"
+        );
+        assert_eq!(
+            wire_golden_snapshot_expiry_frame(),
+            WIRE_SNAPSHOT_EXPIRY_GOLDEN,
+            "the committed wire-snapshot-expiry golden drifted from the AccountExpiry / ExpiryCohort \
+             encoders (issues #878/#882/#879) — re-run `cargo test -- --ignored \
+             emit_wire_golden_fixtures`, then update the Swift mirror (apps/menubar) so its fixtures \
+             stay byte-identical"
+        );
+    }
+
+    /// The expiry golden's CONTENT, asserted as claims rather than left to the byte comparison
+    /// alone (issue #886).
+    ///
+    /// Byte-equality proves the fixture and the encoder agree; it cannot tell you the fixture
+    /// covers what it claims to. A silent edit that dropped the `unknown` row, or flipped it to
+    /// `beyond`, would re-emit cleanly and go on passing
+    /// [`the_committed_wire_goldens_still_match_the_daemon_encoders`] forever — a
+    /// degenerate-subject pass. So the matrix is asserted by CARDINALITY and by state, and the
+    /// absent-field row is asserted TWICE: that it IS `unknown`, and that it is NOT `beyond`.
+    #[test]
+    fn the_expiry_wire_golden_covers_all_four_states_and_says_unknown_for_the_absent_field() {
+        let frame: serde_json::Value = serde_json::from_str(WIRE_SNAPSHOT_EXPIRY_GOLDEN)
+            .expect("the committed expiry golden is JSON");
+        let accounts = frame["accounts"]
+            .as_array()
+            .expect("the frame carries an accounts array");
+
+        // Every account carries the modifier, and the four states are ALL present exactly once
+        // among them — the cardinality guard, so a dropped case cannot pass as a smaller matrix.
+        let states: Vec<&str> = accounts
+            .iter()
+            .map(|a| {
+                a["expiry"]["horizon_state"]
+                    .as_str()
+                    .expect("every account in this fixture carries a classified expiry")
+            })
+            .collect();
+        for want in ["within", "beyond", "lapsed", "unknown"] {
+            assert!(
+                states.contains(&want),
+                "the expiry wire golden no longer covers `{want}` — it carries {states:?}"
+            );
+        }
+
+        // The load-bearing row: polled, no deadline in the credential.
+        let unmeasured = accounts
+            .iter()
+            .find(|a| a["label"] == "unmeasured")
+            .expect("the fixture carries the deadline-less account");
+        assert_eq!(
+            unmeasured["expiry"]["horizon_state"], "unknown",
+            "an absent refreshTokenExpiresAt must reach the wire as UNKNOWN (issue #137)"
+        );
+        // …and it must be encoded DISTINCTLY from the account that genuinely is not expiring soon.
+        // Stated as a comparison between two rows of this same golden rather than as
+        // `assert_ne!(state, "beyond")` beside the `assert_eq!` above: that form is dead on failure
+        // (the `assert_eq!` panics first) and tautological on success, so it asserts nothing. This
+        // form fails for real if a future encoder ever collapses the two states onto one token.
+        let archive = accounts
+            .iter()
+            .find(|a| a["label"] == "archive")
+            .expect("the fixture carries the not-expiring-soon account");
+        assert_eq!(archive["expiry"]["horizon_state"], "beyond");
+        assert_ne!(
+            unmeasured["expiry"]["horizon_state"], archive["expiry"]["horizon_state"],
+            "UNKNOWN must never be encoded as the reassuring 'not expiring' verdict — that is the \
+             silent false-calm issue #886 exists to prevent"
+        );
+        // …and the deadline is an EXPLICIT null inside a PRESENT object, not an omitted key: the
+        // two absences are different facts (never-polled vs polled-with-no-deadline), and only the
+        // explicit null says which one this is.
+        assert!(
+            unmeasured["expiry"]
+                .as_object()
+                .expect("expiry is an object")
+                .contains_key("expires_at"),
+            "`expires_at` must be present-and-null, never omitted — an omitted key reads as \
+             'never observed' rather than 'observed, no deadline'"
+        );
+        assert!(unmeasured["expiry"]["expires_at"].is_null());
+
+        // The fleet half: the cohort names the two grouped rows and its denominator is the
+        // OBSERVED set (four), never the five-account roster.
+        assert_eq!(frame["expiry_cohort"]["size"], 2);
+        assert_eq!(frame["expiry_cohort"]["observed"], 4);
+        let grouped: Vec<&serde_json::Value> = accounts
+            .iter()
+            .filter(|a| a["expiry"].get("cohort_id").is_some())
+            .collect();
+        assert_eq!(
+            grouped.len(),
+            2,
+            "exactly the cohort's two members carry a `cohort_id`; the rest must omit the key"
         );
     }
 

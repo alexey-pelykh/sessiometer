@@ -527,6 +527,15 @@ final class PanelAccessibilityTreeTests: XCTestCase {
             "blind-ok": "AXButton:5 AXStaticText:3 AXUnknown:1",
             "blind-degraded": "AXButton:5 AXStaticText:3 AXUnknown:1",
             "blind-cornered": "AXButton:4 AXStaticText:2 AXUnknown:1",
+            // `expiry` (#886) carries `AXButton:6` — one more than `healthy` above — purely because its
+            // roster has FOUR rows rather than three; each account row is one focusable element. The
+            // expiry LINE itself adds NOTHING to this histogram, and that is the assertion worth having:
+            // `ExpiryLine` folds its text into the row's existing `rowAccessibilityLabel` and hides the
+            // visual pair (`StatusPanelRoster.swift`), so VoiceOver speaks one element per account rather
+            // than making an operator arrow through a second stop per row. A future change that
+            // accidentally exposed the line as its own element would show up here as `AXStaticText:4` on
+            // this fixture alone.
+            "expiry": "AXButton:6 AXStaticText:3 AXUnknown:1",
             "fault-keychain-locked": "AXButton:5 AXStaticText:4 AXUnknown:1",
             "fault-scrub-exhausted": "AXButton:5 AXStaticText:4 AXUnknown:1",
             "fault-systemic-refresh": "AXButton:5 AXStaticText:4 AXUnknown:1",

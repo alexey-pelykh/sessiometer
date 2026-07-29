@@ -11834,8 +11834,11 @@ spare  22222222-2222\n\
                 blind_active: None,
                 // No observed refresh-token deadline, so the issue #883 `EXPIRY` column elides on
                 // the empty-column rule and every committed CLI-render golden stays byte-identical.
-                // Populating it here would move all 23 files under `build/fixtures/cli-renders/`,
-                // which is issue #886's to do — with the rebaseline trailer that gate demands.
+                // Keep it that way: issue #886 settled this the OTHER way round — populating the
+                // shared base here would have moved every golden under `build/fixtures/cli-renders/`
+                // AND destroyed the elision coverage those goldens are the only proof of. It added
+                // [`expiry_roster`] beside this one instead, so the two directions are pinned
+                // separately. Read that fixture's doc before reaching for this line.
                 expiry: None,
             }
         }
@@ -11924,6 +11927,85 @@ spare  22222222-2222\n\
             })
         }
 
+        /// A REAL observed `refreshTokenExpiresAt` — 2026-07-31T12:10:02Z, from the credential of
+        /// the account whose id starts `94f27044`, folded from `1785499802819` ms to seconds at the
+        /// same boundary the poll path folds it. The SAME measured instant as
+        /// `snapshot_build::WIRE_GOLDEN_EXPIRY_AT`; they cannot share a constant across
+        /// `cfg(test)` module boundaries, so a correction to this provenance belongs in both.
+        /// Real rather than round for the reason
+        /// `the_measured_four_minute_cluster_of_four_accounts_is_one_cohort` gives: a fixture built
+        /// from invented values can encode a shape the field never produces. Sits 5d18h50m past
+        /// [`GOLDEN_NOW`], so the cell humanizes to fixed bytes.
+        const EXPIRY_WITHIN_AT: i64 = 1_785_499_802;
+
+        /// A roster carrying the REFRESH-token expiry modifier in ALL FOUR of its states (issue
+        /// #886), layered onto [`golden_roster`]'s existing rows so the new column is pinned against
+        /// the SAME heterogeneity the rest of the matrix already covers — an active row, a
+        /// wide-glyph label, a disabled row, a quarantined one.
+        ///
+        /// The base roster deliberately keeps `expiry: None` on every row (see [`quiet`]): that is
+        /// what makes the other eight `status` goldens pin the column's ELISION, which is a
+        /// load-bearing behaviour in its own right (issue #883 — a fleet whose credentials carry no
+        /// deadline must show no column rather than a wall of `—`). Populating the shared base would
+        /// have destroyed that coverage to gain this; a separate roster pins BOTH directions.
+        ///
+        /// - `work` and `世界` are the COHORT — deadlines an hour apart, so the fleet line below has
+        ///   members whose own cells a reader can check it against;
+        /// - `parked` is `Beyond`, the one state that legitimately means "not expiring soon";
+        /// - `stale` has already `Lapsed`;
+        /// - `unseen` was POLLED and its credential carried NO deadline, so it renders the GAP
+        ///   beside four real ones. That row is the whole reason this fixture exists: `unknown` must
+        ///   read as a pointed absence, never as the calm `Beyond` (issues #137/#876), and a golden
+        ///   is the only assertion that shows it SIDE BY SIDE with the states it must not resemble.
+        fn expiry_roster() -> Vec<AccountStatusLine> {
+            let observed = |at: i64, horizon: ExpiryHorizon, cohort_id: Option<u32>| {
+                Some(AccountExpiry {
+                    expires_at: Some(at),
+                    horizon_state: horizon,
+                    cohort_id,
+                })
+            };
+            let mut rows = golden_roster();
+            rows[0].expiry = observed(EXPIRY_WITHIN_AT, ExpiryHorizon::Within, Some(0));
+            rows[1].expiry = observed(EXPIRY_WITHIN_AT + 3_600, ExpiryHorizon::Within, Some(0));
+            rows[2].expiry = observed(GOLDEN_NOW + 30 * 86_400, ExpiryHorizon::Beyond, None);
+            rows[3].expiry = observed(GOLDEN_NOW - 86_400, ExpiryHorizon::Lapsed, None);
+            // Polled, no deadline in the credential — an explicit observation, not an absence.
+            rows[4].expiry = Some(AccountExpiry {
+                expires_at: None,
+                horizon_state: ExpiryHorizon::Unknown,
+                cohort_id: None,
+            });
+            rows
+        }
+
+        /// The fleet-level synchronized-expiry cohort (issue #879) naming [`expiry_roster`]'s two
+        /// grouped rows. `observed` is FOUR — the accounts with a known deadline — never the
+        /// five-account roster, so the rendered denominator states the coverage rather than letting
+        /// a reader assume the whole fleet was measured.
+        fn expiry_cohort() -> Option<ExpiryCohort> {
+            Some(ExpiryCohort {
+                size: 2,
+                observed: 4,
+                earliest: EXPIRY_WITHIN_AT,
+                span_secs: 3_600,
+            })
+        }
+
+        /// The full expiry response — [`expiry_roster`] under the fleet [`expiry_cohort`], with the
+        /// same next-swap footer every non-degenerate case carries.
+        ///
+        /// Named `_full` rather than the more obvious `expiry_response` because the enclosing
+        /// `tests` module already owns an `expiry_response(accounts)` and `use super::*` brings it
+        /// into scope here — a same-name, different-arity shadow is the kind of thing that reads
+        /// fine and resolves to the wrong helper.
+        fn expiry_full() -> StatusResponse {
+            StatusResponse {
+                expiry_cohort: expiry_cohort(),
+                ..response(expiry_roster(), to_spare())
+            }
+        }
+
         /// Every goldened `status` case, freshly rendered. The single source of truth for the
         /// case list: the comparison, the canary, and the emitter all consume THIS, so a case
         /// can never be asserted in one and skipped in another.
@@ -11993,6 +12075,34 @@ spare  22222222-2222\n\
                         false,
                     ),
                 ),
+                // The REFRESH-token expiry surfaces (issues #878/#882/#883/#879), pinned by #886.
+                // The eight cases above all carry `expiry: None`, so they pin the column's
+                // ELISION; these pin the POPULATED render — the four horizon cells side by side,
+                // the fleet cohort line, and the shed-first degradation.
+                Case::new(
+                    "status-expiry-wide-plain",
+                    render_status(&expiry_full(), GOLDEN_NOW, Some(WIDE_COLS), false),
+                ),
+                // Coloured, because the expiry cell carries its OWN per-cell overlay (red for
+                // lapsed, yellow for within, dim for beyond, none for unobserved) and so does the
+                // cohort line. Those tints are a *visual* claim about which row bites first; a
+                // plain golden cannot see them, and a `contains()` check on an SGR escape cannot
+                // see WHICH cell wears it.
+                Case::new(
+                    "status-expiry-wide-color",
+                    render_status(&expiry_full(), GOLDEN_NOW, Some(WIDE_COLS), true),
+                ),
+                // The shed-FIRST width: `EXPIRY` carries `priority: Some(1)`, so it must be the
+                // ONLY column gone here — the WEEKLY pair and `AUTH` both survive. Chosen at
+                // exactly that boundary rather than reusing `NARROW_COLS` (which sheds WEEKLY too,
+                // leaving the ORDER unobservable — two columns gone is equally consistent with the
+                // wrong priority). The cohort LINE is not a column, so it must SURVIVE a width
+                // that sheds the cells: the fleet fact is the half no row can carry, and losing it
+                // to a narrow terminal while keeping per-account deadlines would be backwards.
+                Case::new(
+                    "status-expiry-shed",
+                    render_status(&expiry_full(), GOLDEN_NOW, Some(EXPIRY_SHED_COLS), false),
+                ),
             ]
         }
 
@@ -12002,6 +12112,14 @@ spare  22222222-2222\n\
         const NARROW_COLS: usize = 40;
         /// Narrower than the `ACCOUNT · SESSION% · RESET` floor itself.
         const VERY_NARROW_COLS: usize = 12;
+        /// Wide enough for every column EXCEPT `EXPIRY` — the boundary that makes the priority
+        /// ORDER observable in a golden (issue #886). Asserted to shed exactly one column by
+        /// [`the_expiry_shed_case_drops_only_the_expiry_column`], so a layout change that moved
+        /// this width off the boundary fails loudly instead of silently degrading the case into a
+        /// duplicate of [`NARROW_COLS`]'s two-column drop — which is what the first draft of this
+        /// case did at 40 columns, shedding `EXPIRY` and the `WEEKLY` pair together and so proving
+        /// nothing about which of them goes FIRST.
+        const EXPIRY_SHED_COLS: usize = 56;
 
         /// The committed goldens, named by case. The macro derives each path from the name, so
         /// an entry cannot pair a case with someone else's bytes, and `include_str!` keeps every
@@ -12017,6 +12135,9 @@ spare  22222222-2222\n\
             "status-empty-roster",
             "status-single-account",
             "status-all-na",
+            "status-expiry-wide-plain",
+            "status-expiry-wide-color",
+            "status-expiry-shed",
         ];
 
         /// One-time emitter for the committed `status` render goldens (issue #767).
@@ -12066,6 +12187,103 @@ spare  22222222-2222\n\
                     Some(WIDE_COLS),
                     false,
                 ),
+            );
+        }
+
+        /// The expiry cases must actually COVER the four states they claim to (issue #886).
+        ///
+        /// A golden proves the bytes have not moved; it cannot tell you the bytes are the ones
+        /// worth pinning. Nothing in [`assert_matches_goldens`] would notice if `expiry_roster`
+        /// silently lost a state — the case would re-emit, match, and stay green while asserting
+        /// less. So the coverage claim is stated as a property of the render, which also keeps it
+        /// true across a re-baseline.
+        ///
+        /// The `unknown` row is asserted in BOTH directions on purpose. That it renders the GAP is
+        /// the positive claim; that it does NOT render like the `Beyond` row beside it is the one
+        /// that matters, because `beyond` is the only state that legitimately means "not expiring
+        /// soon" and reading an unmeasured credential as it is the silent false-calm this whole
+        /// item exists to prevent (issues #137/#876).
+        #[test]
+        fn the_expiry_goldens_cover_all_four_states_and_never_read_unknown_as_calm() {
+            let text = render_status(&expiry_full(), GOLDEN_NOW, Some(WIDE_COLS), false);
+            let row = |label: &str| {
+                text.lines()
+                    .find(|line| line.contains(label))
+                    .unwrap_or_else(|| panic!("`{label}` is not in the expiry render:\n{text}"))
+            };
+
+            // The `EXPIRY` column materialized at all — the elision rule's other direction, which
+            // the eight all-`None` cases pin and this one must not.
+            assert!(
+                text.lines()
+                    .next()
+                    .expect("a header row")
+                    .contains("EXPIRY"),
+                "a roster with observed deadlines must materialize the column:\n{text}"
+            );
+            // `Within` — a compact time-until, the same shape the RESET cells carry.
+            assert!(row("work").contains("5d18h"), "{}", row("work"));
+            // `Beyond` — further out, and still a real duration rather than a state word.
+            assert!(row("parked").contains("30d"), "{}", row("parked"));
+            // `Lapsed` — the bare state word, never a humanized negative remainder.
+            assert!(row("stale").contains("lapsed"), "{}", row("stale"));
+
+            // `Unknown` — the GAP, and NOT anything a reader could mistake for the calm verdict.
+            let unseen = row("unseen");
+            assert!(
+                unseen.contains(EXPIRY_GAP),
+                "a polled account with no observed deadline renders the gap: {unseen}"
+            );
+            assert!(
+                !unseen.contains("30d"),
+                "…and never borrows the calm `Beyond` cell beside it: {unseen}"
+            );
+            assert!(
+                !unseen.contains("lapsed"),
+                "…nor claims a lapse it cannot know: {unseen}"
+            );
+            // Stated at the CELL level as well, so the claim does not rest on substring luck: the
+            // two verdicts a reader must never confuse have to render DIFFERENTLY.
+            let rows = expiry_roster();
+            assert_eq!(expiry_cell(rows[4].expiry, GOLDEN_NOW), EXPIRY_GAP);
+            assert_ne!(
+                expiry_cell(rows[4].expiry, GOLDEN_NOW),
+                expiry_cell(rows[2].expiry, GOLDEN_NOW),
+                "UNKNOWN and BEYOND must never render the same cell"
+            );
+
+            // The fleet half rides the same render, below the table.
+            assert!(
+                text.contains("expiry cohort: 2 of 4 accounts with a known deadline"),
+                "the cohort line names its OBSERVED denominator, not the roster size:\n{text}"
+            );
+        }
+
+        /// The shed case must drop EXACTLY the `EXPIRY` column — the assertion that keeps
+        /// [`EXPIRY_SHED_COLS`] on its boundary.
+        ///
+        /// Without it, a layout change that widened any column would push this width past the
+        /// boundary, shed the WEEKLY pair as well, and quietly turn the case into a second copy of
+        /// the two-column drop — still green, but no longer showing the ORDER it was added for.
+        /// The cohort LINE is checked in the same breath: it is not a column, so no width may take
+        /// it away.
+        #[test]
+        fn the_expiry_shed_case_drops_only_the_expiry_column() {
+            let shed = render_status(&expiry_full(), GOLDEN_NOW, Some(EXPIRY_SHED_COLS), false);
+            let header = shed.lines().next().expect("the table has a header row");
+            assert!(
+                !header.contains("EXPIRY"),
+                "EXPIRY has priority 1 and must be the first to go at {EXPIRY_SHED_COLS} cols: \
+                 {header}"
+            );
+            assert!(
+                header.contains("WEEKLY%") && header.contains("AUTH"),
+                "…and it must be the ONLY one gone — the higher-priority WEEKLY pair and AUTH both \
+                 survive, which is what makes the ORDER visible: {header}"
+            );
+            assert!(
+                shed.contains("expiry cohort:"),
+                "the fleet line is not a column and survives every width:\n{shed}"
             );
         }
 
@@ -12155,13 +12373,33 @@ spare  22222222-2222\n\
                 "the coloured render does not reduce to the plain one — colour is changing the \
                  layout, not augmenting it (pad-before-colour is broken)"
             );
+
+            // The same property on the EXPIRY pair (issue #886). Not covered by the pair above:
+            // `golden_roster()` carries no observed deadline, so `status-wide-color` ELIDES the
+            // column entirely and cannot see a width bug in it. That column is the newest tinted
+            // one, which makes it the likeliest place for the bug — and a drift there would look
+            // like an ordinary golden move, get re-baselined with a trailer, and bake mis-padded
+            // colour output in.
+            let coloured_expiry = find("status-expiry-wide-color");
+            assert!(
+                coloured_expiry.contains("\x1b[33m"),
+                "the expiry colour case carries no YELLOW band, so it is not tinting the column \
+                 this pair was added for:\n{coloured_expiry}"
+            );
+            assert_eq!(
+                render_golden::strip_ansi(coloured_expiry)
+                    .expect("the coloured expiry render has escapes to strip"),
+                *find("status-expiry-wide-plain"),
+                "the coloured EXPIRY render does not reduce to the plain one — the tint is \
+                 entering that column's width math"
+            );
         }
     }
 
     /// The CLI half of the CROSS-SURFACE severity gate (issue #768) — see [`crate::cross_surface`]
     /// for why the contract exists and what the committed manifest is.
     ///
-    /// Three INDEPENDENT observers converge on the one manifest here, and the independence is the
+    /// Four INDEPENDENT observers converge on the one manifest here, and the independence is the
     /// point — any single one of them would leave a real gap:
     ///
     /// 1. **The declaration observer** — [`DaemonPayloadFault::ALL`] + `DaemonPayloadFault::
@@ -12174,6 +12412,13 @@ spare  22222222-2222\n\
     ///    declaration observer GREEN and reddens only this one.
     /// 3. **The per-account observer** — `StatusRow`'s own `session_severity` / `weekly_severity`,
     ///    the second axis issue #768's AC names.
+    /// 4. **The per-account EXPIRY observer** (issue #886) — `expiry_cell` / `expiry_severity`, the
+    ///    forward-looking axis carried ALONGSIDE `auth`. The only observer that pins cell TEXT as
+    ///    well as band, because `StatusPanelFormat.expiryCell` claims to be "byte-identical" to
+    ///    `expiry_cell` and a claim of byte-identity is worth asserting as one. It is also the only
+    ///    one whose payloads are RELATIVE — each case states its deadline as an offset, so what is
+    ///    pinned is a classification rule rather than an instant the two sides could read
+    ///    differently (the Swift consumer supplies its own `now`).
     ///
     /// What this module does NOT do is compare the two surfaces directly — it cannot; the panel is
     /// Swift. It pins the CLI to the committed manifest;
@@ -12186,20 +12431,26 @@ spare  22222222-2222\n\
             ObservedFault, UncoveredAxis,
         };
 
-        /// A fixed render instant. Nothing in this module reads a humanized cell, but
-        /// `render_status` needs one and a constant keeps every render in the module comparable.
+        /// A fixed render instant, shared by every observer in this module so their renders stay
+        /// comparable. The fault observers never read a humanized cell; the expiry observer does —
+        /// [`expiry_cases`] resolves each case's OFFSET against this instant — which is why it is a
+        /// module-level constant rather than a local in whichever observer happened to need one.
         const AT: i64 = 1_785_000_000;
 
-        /// The CLI's own band vocabulary, mapped to the manifest's medium-neutral one. `Dim` has
-        /// no manifest spelling on purpose — nothing this gate observes is ever `Dim`, so if one
-        /// ever reached here it would fail the manifest's band spell-check by name rather than be
-        /// quietly folded into a band somebody agreed on.
+        /// The CLI's own band vocabulary, mapped to the manifest's medium-neutral one. Total, and
+        /// deliberately so: a `Severity` with no spelling here would be silently unrepresentable in
+        /// the manifest, and the panel would have nothing to be pinned against.
+        ///
+        /// `Dim` reached this map with the expiry axis (issue #886) — it is what `Beyond`, the one
+        /// verdict that means "not expiring soon", renders as. It stays DISTINCT from `PLAIN`:
+        /// de-emphasized-because-calm and uncoloured-because-unobserved are different facts, and
+        /// collapsing them is exactly the #137 false-calm this axis refuses.
         fn band_of(severity: Option<Severity>) -> &'static str {
             match severity {
                 Some(Severity::Red) => band::RED,
                 Some(Severity::Yellow) => band::YELLOW,
                 Some(Severity::Green) => band::GREEN,
-                Some(Severity::Dim) => "dim",
+                Some(Severity::Dim) => band::DIM,
                 None => band::PLAIN,
             }
         }
@@ -12416,6 +12667,7 @@ spare  22222222-2222\n\
                     .collect(),
                 arbitration_edges: arbitration_edges(),
                 account_severity_cases: account_severity_cases(),
+                expiry_cases: expiry_cases(),
                 known_divergences: vec![
                     KnownDivergence {
                         id: "blind-degraded-tint".to_owned(),
@@ -12619,6 +12871,87 @@ spare  22222222-2222\n\
                         weekly_exhausted: *exhausted,
                         session_severity: row.session_severity.map(|s| band_of(Some(s)).to_owned()),
                         weekly_severity: row.weekly_severity.map(|s| band_of(Some(s)).to_owned()),
+                    }
+                })
+                .collect()
+        }
+
+        /// The REFRESH-token expiry cases, classified by the CLI's OWN `expiry_cell` /
+        /// `expiry_severity` — the same functions the table renders with, never a re-statement of
+        /// the rule (issue #886).
+        ///
+        /// Chosen to walk all four wire states AND every REACHABLE arm of the render-time re-check
+        /// that `expiry_view` and `StatusPanelFormat.expiryView` are documented as mirroring
+        /// "arm-for-arm, INCLUDING the arm ORDER". The order is the interesting part and the part
+        /// no per-state case can reach: three of these payloads are ones where the daemon's cached
+        /// classification and the client's clock DISAGREE, and the arms decide which wins. A
+        /// surface that reordered them would still pass a naive one-case-per-state set.
+        ///
+        /// Two arms are deliberately OUT of this set rather than silently missed. The
+        /// `expiry: None` arm — never polled at all — is not expressible here: an
+        /// [`cross_surface::ExpiryParityCase`] always builds a `Some(AccountExpiry { .. })`, which
+        /// is the right shape for a payload-classification contract and the wrong one for
+        /// "no payload". It is covered on its own surfaces instead — CLI
+        /// `the_expiry_column_elides_until_some_account_has_an_observed_deadline`, panel
+        /// `testUnpolledAccountOmitsTheExpiryKeyEntirely`. The defensive `(_, None)` arm — an
+        /// observed-but-deadline-less `Within`/`Beyond` — is unreachable by construction from the
+        /// daemon, so pinning it here would pin a shape no wire can carry.
+        fn expiry_cases() -> Vec<cross_surface::ExpiryParityCase> {
+            let day = 86_400;
+            // (name, deadline offset from `AT`, cached wire classification)
+            let inputs: &[(&str, Option<i64>, ExpiryHorizon)] = &[
+                // The three ordinary observed verdicts.
+                ("within", Some(3 * day), ExpiryHorizon::Within),
+                ("beyond", Some(29 * day), ExpiryHorizon::Beyond),
+                ("lapsed", Some(-day), ExpiryHorizon::Lapsed),
+                // The absent field — the issue #137 invariant, and the case issue #886 exists for.
+                ("unknown-no-deadline", None, ExpiryHorizon::Unknown),
+                // `unknown` is authoritative in the OTHER direction: the daemon found no parseable
+                // deadline, so a stray `expires_at` beside it must NOT be narrated into a duration.
+                (
+                    "unknown-outranks-a-stray-deadline",
+                    Some(3 * day),
+                    ExpiryHorizon::Unknown,
+                ),
+                // The render-time re-check: a snapshot is up to one poll interval old, so a
+                // deadline can pass between the daemon's classification and the draw. `within` on
+                // the wire plus a past deadline must read `lapsed` on BOTH surfaces — the one line
+                // built to warn must not read calm at exactly the moment it starts mattering.
+                (
+                    "within-but-already-past-at-render",
+                    Some(-60),
+                    ExpiryHorizon::Within,
+                ),
+                // The boundary of that same rule: at-the-instant counts as passed.
+                ("within-exactly-at-now", Some(0), ExpiryHorizon::Within),
+                // A DECLARED lapse outranks a missing deadline — the arm ORDER, and the one whose
+                // reversal is otherwise invisible: `lapsed` is a bare word that never reads the
+                // instant, so falling through to the gap would discard the strongest negative
+                // signal the wire carries and hide a dead login as no login problem at all.
+                ("lapsed-without-a-deadline", None, ExpiryHorizon::Lapsed),
+            ];
+            inputs
+                .iter()
+                .map(|(name, offset, horizon)| {
+                    let expiry = Some(AccountExpiry {
+                        expires_at: offset.map(|secs| AT + secs),
+                        horizon_state: *horizon,
+                        cohort_id: None,
+                    });
+                    cross_surface::ExpiryParityCase {
+                        name: (*name).to_owned(),
+                        offset_secs: *offset,
+                        // Taken through SERDE rather than the enum's own `as_str`, deliberately:
+                        // the manifest claims to name the WIRE spelling, and serde is what puts
+                        // the token on the wire. (The two agree — `snapshot_build`'s
+                        // `expiry_horizon_tokens_match_their_serde_spelling` pins that — but
+                        // agreeing is not the same as being the source.)
+                        horizon_state: serde_json::to_value(horizon)
+                            .ok()
+                            .and_then(|value| value.as_str().map(str::to_owned))
+                            .expect("ExpiryHorizon serializes to a bare string"),
+                        cell: expiry_cell(expiry, AT),
+                        severity: expiry_severity(expiry, AT).map(|s| band_of(Some(s)).to_owned()),
                     }
                 })
                 .collect()
@@ -12937,6 +13270,75 @@ spare  22222222-2222\n\
                     && live.iter().any(|c| c.session_severity.is_none()),
                 "the account-severity cases do not span all four session outcomes \
                  (green/yellow/red/no-reading), so a band mistake could hide in an uncovered arm"
+            );
+        }
+
+        // ---- Observer 4: the per-account REFRESH-token expiry axis (issue #886) -----------------
+
+        #[test]
+        fn the_committed_expiry_cases_still_match_the_cli_cell_and_tint() {
+            // The CLI half of the R-2 expiry contract. `expiry_cell` / `expiry_severity` are the
+            // real functions `StatusRow::new` renders the column with, so this compares the
+            // manifest against the SHIPPING classification rather than a restatement of it — and
+            // `CrossSurfaceSeverityParityTests` compares the same bytes against the panel's.
+            // Neither surface can move alone: change this one and the committed manifest goes
+            // stale; re-emit it and the panel's gate reddens until it follows.
+            let manifest = cross_surface::committed_manifest();
+            let live = expiry_cases();
+            assert_eq!(
+                manifest.expiry_cases,
+                live,
+                "the committed expiry parity cases no longer match `expiry_cell` / \
+                 `expiry_severity`.{}",
+                cross_surface::rebaseline_hint()
+            );
+
+            // Non-degeneracy: the set must span every OUTCOME, not merely every input state. Two
+            // different inputs can land on the same cell (three of these deliberately do — that IS
+            // the arm-order claim), so a case list could grow while the outcomes it distinguishes
+            // shrink.
+            let cells: std::collections::BTreeSet<&str> =
+                live.iter().map(|c| c.cell.as_str()).collect();
+            assert!(
+                cells.contains("3d") && cells.contains("29d") && cells.contains("lapsed"),
+                "the expiry cases do not span the observed outcomes (a duration, a far duration, \
+                 the lapse word): {cells:?}"
+            );
+            assert!(
+                cells.contains(EXPIRY_GAP),
+                "…nor the GAP, which is the unobserved-deadline outcome and the one that matters \
+                 most: {cells:?}"
+            );
+            let bands: std::collections::BTreeSet<Option<&str>> =
+                live.iter().map(|c| c.severity.as_deref()).collect();
+            assert_eq!(
+                bands,
+                [Some(band::RED), Some(band::YELLOW), Some(band::DIM), None]
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                "the expiry cases must span all four tint outcomes — red (lapsed), yellow \
+                 (within), dim (beyond), and UNCOLOURED (unobserved). An uncovered band is a band \
+                 the two surfaces can disagree on unobserved"
+            );
+
+            // The #137 invariant, asserted here as a claim about the CLI rather than only about
+            // the manifest: an unobserved deadline renders the gap, uncoloured — and the two
+            // states a reader must never confuse do not render alike.
+            let unknown = live
+                .iter()
+                .find(|c| c.name == "unknown-no-deadline")
+                .expect("the absent-field case is in the set");
+            assert_eq!(unknown.cell, EXPIRY_GAP);
+            assert_eq!(unknown.severity, None);
+            let beyond = live
+                .iter()
+                .find(|c| c.name == "beyond")
+                .expect("the beyond case is in the set");
+            assert_ne!(
+                (unknown.cell.as_str(), unknown.severity.as_deref()),
+                (beyond.cell.as_str(), beyond.severity.as_deref()),
+                "UNKNOWN must never render like the reassuring `Beyond` verdict — neither in text \
+                 nor in tint"
             );
         }
 
