@@ -30,8 +30,12 @@ protocol WatchConnection: Sendable {
     /// Write raw bytes (the `{"cmd":"watch"}\n` subscribe). Throws on a write failure, which the
     /// shell treats as a failed connect (the only write is the subscribe — `watch` is push-only
     /// thereafter, so the transport never writes again).
+    ///
+    /// Sending AFTER `close()` is not a supported call; how it fails is the implementation's business
+    /// (for the POSIX one, see `PosixSocketConnection.send` — issue #859 changed it).
     func send(_ bytes: [UInt8]) throws
-    /// Idempotently tear down: close the fd, which unblocks the blocked reader so `lines` finishes.
+    /// Idempotently tear down: disconnect the socket, which unblocks the blocked reader so `lines`
+    /// finishes. The descriptor itself is retired by the reader once it has stopped (issue #859).
     func close()
 }
 
@@ -112,53 +116,117 @@ struct PosixSocketConnector: WatchConnector {
     }
 }
 
+/// Sole owner of a connection's file descriptor (issue #859).
+///
+/// The descriptor NUMBER may only be released once nothing can still `read()` it. `close()` on a
+/// live fd does not give that guarantee: it frees the number immediately, and a reader thread that
+/// has not yet entered its `read()` then issues that syscall against whatever the process allocated
+/// the number to next — silently consuming another socket's bytes. That is not hypothetical here:
+/// `WatchTransport` tears a connection down and reconnects (`WatchTransport.swift` — close, then
+/// `connector.connect()`), and `socket()` hands back the lowest free number, which is the one just
+/// released. Nor is `close()` a reliable wake: on Darwin a `read()` already in flight holds its own
+/// reference to the file, so closing the descriptor beneath it need not return at all.
+///
+/// So teardown is split in two. `shutdown()` disconnects the socket — waking a blocked `read()`
+/// with EOF and making every later one return EOF too — while KEEPING the number reserved, so a
+/// late reader can only ever re-read this dead socket. `Darwin.close()` runs exactly once, from the
+/// reader itself, after it has stopped reading. Both syscalls run under the lock so they cannot be
+/// reordered against each other: a `shutdown()` can never land on a number already retired (and
+/// therefore possibly reissued).
+///
+/// The tradeoff this accepts is that release is LATER and has a single owner. Later: measured across
+/// 500 reconnects, the peak descriptor count was 13 against a baseline of 3, settling back to 3 with
+/// none leaked — the reader only has to wake and unwind. Single owner: nothing but the reader ever
+/// releases the number, so a reader thread that never ran at all would never release it. That needs
+/// `Thread.start()` itself to have failed, i.e. process-level resource exhaustion, which the
+/// measurement above does not and cannot speak to.
+private final class FileDescriptorOwner: @unchecked Sendable {
+    /// Valid until `retire()`; only the reader thread may act on it after teardown begins.
+    let raw: Int32
+    private let state = OSAllocatedUnfairLock(initialState: State())
+    private struct State {
+        var disconnected = false
+        var retired = false
+    }
+
+    init(_ raw: Int32) { self.raw = raw }
+
+    /// Wake and permanently silence the socket without releasing its number. Idempotent, and a
+    /// no-op once retired.
+    func disconnect() {
+        state.withLock { st in
+            guard !st.retired, !st.disconnected else { return }
+            st.disconnected = true
+            _ = Darwin.shutdown(raw, SHUT_RDWR)
+        }
+    }
+
+    /// Release the number. Called ONLY by the reader thread, and only after its loop has ended.
+    func retire() {
+        state.withLock { st in
+            guard !st.retired else { return }
+            st.retired = true
+            Darwin.close(raw)
+        }
+    }
+}
+
 /// A live POSIX UDS connection. `lines` bridges a blocking `read()` loop on a DEDICATED `Thread`
 /// (per ADR-0011 §4 — a blocking syscall on the cooperative pool would starve a shared thread) into
-/// an `AsyncStream<String>`; `close()` shuts the fd (exactly once), which unblocks the reader so its
-/// stream finishes. `@unchecked Sendable` is justified: every stored property is immutable or the
-/// `os` lock; the fd is closed at most once under that lock; the reader thread only yields to the
-/// Sendable continuation.
+/// an `AsyncStream<String>`; `close()` disconnects the socket, which unblocks the reader so its
+/// stream finishes and it then retires the descriptor. `@unchecked Sendable` is justified: every
+/// stored property is immutable or the `os` lock; descriptor lifetime is serialized by
+/// `FileDescriptorOwner`; the reader thread only yields to the Sendable continuation.
 final class PosixSocketConnection: WatchConnection, @unchecked Sendable {
-    private let fd: Int32
-    private let hasClosed = OSAllocatedUnfairLock(initialState: false)
+    private let descriptor: FileDescriptorOwner
     let lines: AsyncStream<String>
     private let linesContinuation: AsyncStream<String>.Continuation
 
     init(fd: Int32) {
-        self.fd = fd
+        self.descriptor = FileDescriptorOwner(fd)
         (self.lines, self.linesContinuation) = AsyncStream<String>.makeStream()
         startReader()
     }
 
     // Backstop: a connection dropped WITHOUT an explicit `close()` (e.g. a subscribe-write failure
-    // that discards it before attach) still closes its fd, which unblocks the reader thread so it
-    // exits. `close()` is idempotent, so the normal explicit-teardown path is unaffected.
+    // that discards it before attach) still disconnects its socket, which unblocks the reader thread
+    // so it exits and retires the descriptor — the reader holds the owner directly, so this stays
+    // leak-free even though `self` is already gone. `close()` is idempotent, so the normal
+    // explicit-teardown path is unaffected.
     deinit { close() }
 
     private func startReader() {
-        let fd = self.fd
+        // Held STRONGLY by the thread (not via `self`, which the deinit backstop above may outlive),
+        // so the descriptor is always retired by whoever actually stops reading it.
+        let descriptor = self.descriptor
         let continuation = self.linesContinuation
         let thread = Thread {
-            let reader = LineReader(fd)
+            let reader = LineReader(descriptor.raw)
             while let line = reader.nextLine() {
                 continuation.yield(line)   // blank-line filtering is the transport's contract (WatchTransport)
             }
             continuation.finish()   // EOF or read error → the stream ends
+            descriptor.retire()     // nothing reads this fd again → the number is safe to release
         }
         thread.name = "org.sessiometer.menubar.watch-reader"
         thread.stackSize = 512 * 1024
-        // When the stream terminates (finished, OR the consumer stops / cancels), close the fd —
-        // which unblocks a pending read() so the reader Thread exits.
+        // When the stream terminates (finished, OR the consumer stops / cancels), disconnect the
+        // socket — which unblocks a pending read() so the reader Thread exits.
         continuation.onTermination = { [weak self] _ in self?.close() }
         thread.start()
     }
 
+    /// Since issue #859 a send AFTER `close()` fails differently: the descriptor is shut down rather
+    /// than closed, so the write reports EPIPE where it used to report EBADF — and on a socket
+    /// WITHOUT `SO_NOSIGPIPE` it raises SIGPIPE, terminating the process instead of throwing. Every
+    /// production socket comes from `PosixSocketConnector.connect()`, which sets the option; anything
+    /// else handing an fd to this type (a test's `socketpair`) must set it too.
     func send(_ bytes: [UInt8]) throws {
         var off = 0
         try bytes.withUnsafeBytes { raw in
             guard let base = raw.baseAddress else { return }
             while off < bytes.count {
-                let n = Darwin.write(fd, base + off, bytes.count - off)
+                let n = Darwin.write(descriptor.raw, base + off, bytes.count - off)
                 if n < 0 {
                     if errno == EINTR { continue }              // EINTR-safe
                     throw TransportError.write(errnoString())
@@ -168,14 +236,7 @@ final class PosixSocketConnection: WatchConnection, @unchecked Sendable {
         }
     }
 
-    func close() {
-        let shouldClose: Bool = hasClosed.withLock { closed in
-            if closed { return false }
-            closed = true
-            return true
-        }
-        if shouldClose { Darwin.close(fd) }
-    }
+    func close() { descriptor.disconnect() }
 }
 
 /// Newline-delimited line reader over a blocking fd (adapted from the #321 spike): it (a) retries
@@ -211,8 +272,10 @@ private final class LineReader {
             let n = chunk.withUnsafeMutableBytes { Darwin.read(fd, $0.baseAddress, $0.count) }
             if n < 0 {
                 if errno == EINTR { continue }                  // (a) EINTR-safe
-                // EBADF is our own teardown close() racing an in-flight read — quiet. Any other read
-                // error is logged, then ends the stream.
+                // EBADF stays quiet, but should now be unreachable: since issue #859 teardown
+                // `shutdown()`s the socket (read → EOF) and only THIS thread closes the descriptor,
+                // after it has stopped reading — so no close can land under an in-flight read. Kept
+                // as a defensive guard. Any other read error is logged, then ends the stream.
                 let err = errno
                 if err != EBADF {
                     transportLog.error(

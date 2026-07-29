@@ -160,7 +160,8 @@ struct ControlCommandClient: Sendable {
 
     /// Read exactly one ack line, bounded by `timeout`, then close. The timeout is armed as a real
     /// `Task.sleep` that, on elapse, `close()`s the connection — which unblocks the reader so its
-    /// `lines` stream finishes (the same fd-close teardown the `watch` transport relies on). A
+    /// `lines` stream finishes (the same shutdown-then-reader-retires teardown the `watch` transport
+    /// relies on, issue #859; this per-command open/close is its highest-frequency caller). A
     /// `timedOut` flag then distinguishes a genuine timeout from a daemon that EOF'd before acking.
     private func readAck(from connection: WatchConnection) async -> Result<String, ControlCommandError> {
         let timedOut = OSAllocatedUnfairLock(initialState: false)
