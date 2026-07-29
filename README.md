@@ -376,12 +376,13 @@ account, and the only path that writes a fresh credential rather than renewing t
 one. It lands that credential in the rotation **without disturbing the active session**:
 logging in an account other than the active one adds or revives it and performs no swap.
 
-> **What is not yet established:** whether a fresh login lands a deadline *further out*
-> than the one it replaces. The client code computes the field on the login path, but what
-> the server actually sends is a separate question, and the deadline could be anchored to
-> something a re-login does not move. The "thirty days from login" figure sometimes quoted
-> is an inference, not a measurement, and `sessiometer` never assumes it — it reads
-> whatever deadline the credential carries and reports that. Tracking in
+> **What a fresh login does, measured:** it lands a *new* deadline rather than carrying the
+> old one forward — observed 2026-07-29, when a re-login moved one account from a
+> 2026-07-31 deadline to a 2026-08-26 one. What it does *not* do is land a **predictable**
+> one. That grant was not the "thirty days from login" figure sometimes quoted, and the
+> `now + 30 days` in the client is its fallback for a field the server omits rather than the
+> value the server sends. A single observation fixes no constant, so `sessiometer` assumes
+> none — it reads whatever deadline the credential carries and reports that. Recorded in
 > [issue #877](https://github.com/alexey-pelykh/sessiometer/issues/877).
 
 **`—` means not observed — it does not mean "not expiring."** The daemon found no usable
