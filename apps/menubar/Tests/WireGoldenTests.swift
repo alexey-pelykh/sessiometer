@@ -121,4 +121,21 @@ final class WireGoldenTests: XCTestCase {
                 + "landing with #446) in lockstep"
         )
     }
+
+    /// The all-four-states expiry frame (issues #878/#882/#879, pinned by #886): the Swift
+    /// `snapshotExpiryStates` fixture must be byte-identical to the Rust-emitted
+    /// `wire-snapshot-expiry.json` golden — this is what puts `AccountExpiry` AND the daemon-level
+    /// `ExpiryCohort` under the cross-language byte-drift guard. Every other golden carries
+    /// `expiry: None` and no cohort, so both objects are omitted from all of them and neither
+    /// encoder had any cross-language coverage before this.
+    func testExpiryStatesFixtureMatchesRustGolden() throws {
+        XCTAssertEqual(
+            Fixtures.snapshotExpiryStates,
+            try golden("wire-snapshot-expiry.json"),
+            "snapshotExpiryStates drifted from the Rust wire golden — the daemon's AccountExpiry or "
+                + "ExpiryCohort wire type changed; regenerate the golden (cargo test -- --ignored "
+                + "emit_wire_golden_fixtures) and update the Swift mirror (Sources/WireModel.swift) + "
+                + "this fixture in lockstep"
+        )
+    }
 }

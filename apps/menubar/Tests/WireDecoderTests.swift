@@ -592,6 +592,68 @@ final class WireDecoderTests: XCTestCase {
             "and a roster with nothing to say shows no expiry line at all — which is why the committed panel goldens are untouched by #884")
     }
 
+    // AC1/AC2 (#886): every one of the four expiry states decodes off the BYTE-PINNED golden — and
+    // the absent-field row asserts `.unknown` EXPLICITLY, never "not expiring".
+    //
+    // The tests above each pin one facet from a hand-written literal. This one walks the frame the
+    // Rust encoder actually emits (`Fixtures.snapshotExpiryStates` == `wire-snapshot-expiry.json`,
+    // asserted byte-for-byte by `WireGoldenTests`), so the coverage claim is made against the real
+    // daemon shape rather than against this file's own idea of it — and a state that stopped
+    // reaching the wire would fail HERE as well as Rust-side.
+    //
+    // The absent-field assertion is deliberately made in BOTH directions. `XCTAssertEqual(…, .unknown)`
+    // alone would still pass if `.unknown` were ever silently redefined as the calm verdict, so the
+    // `XCTAssertNotEqual(…, .beyond)` beside it pins the DISTINCTION that matters: `beyond` is the one
+    // state that legitimately means "not expiring soon", and an unmeasured credential must never be
+    // reported as it. Issue #876 is the record of that class of assumption rotting silently once.
+    func testEveryExpiryStateDecodesFromTheGoldenAndTheAbsentFieldIsUnknown() throws {
+        guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotExpiryStates) else {
+            return XCTFail("the four-state expiry golden must decode")
+        }
+        XCTAssertEqual(v.accounts.count, 5, "the whole roster decoded, not a truncated prefix")
+
+        let byLabel = Dictionary(uniqueKeysWithValues: v.accounts.map { ($0.label, $0) })
+        // Cardinality guard: the matrix must actually contain all four states. Without this, a
+        // fixture that quietly lost a case would pass every per-row assertion below that remained.
+        let states = Set(v.accounts.compactMap { $0.expiry?.horizonState })
+        XCTAssertEqual(states, [.within, .beyond, .lapsed, .unknown],
+                       "all four states must be exercised — got \(states)")
+
+        XCTAssertEqual(byLabel["work"]?.expiry,
+                       AccountExpiry(expiresAt: 1_785_499_802, horizonState: .within),
+                       "an observed deadline inside the horizon carries BOTH the instant and its band")
+        XCTAssertEqual(byLabel["archive"]?.expiry,
+                       AccountExpiry(expiresAt: 1_788_091_802, horizonState: .beyond))
+        XCTAssertEqual(byLabel["retired"]?.expiry,
+                       AccountExpiry(expiresAt: 1_782_907_802, horizonState: .lapsed))
+
+        // The load-bearing row: POLLED, and the credential carried no `refreshTokenExpiresAt`.
+        let unmeasured = try XCTUnwrap(byLabel["unmeasured"]?.expiry,
+                                       "a polled-but-deadline-less row is OBSERVED, not absent")
+        XCTAssertEqual(unmeasured.horizonState, .unknown,
+                       "an absent refreshTokenExpiresAt is UNKNOWN")
+        // Stated as a comparison between two rows of this same golden, NOT as
+        // `XCTAssertNotEqual(unmeasured.horizonState, .beyond)` beside the assertion above:
+        // `ExpiryHorizon` is a plain enum with synthesized `Equatable`, so distinct cases are never
+        // equal and that form can only ever pass. This one fails for real if the decoder ever
+        // collapses the two states onto one case.
+        XCTAssertNotEqual(unmeasured.horizonState, byLabel["archive"]?.expiry?.horizonState,
+                          "UNKNOWN must never decode as the reassuring 'not expiring' verdict")
+        XCTAssertNil(unmeasured.expiresAt, "and it narrates no deadline it never observed")
+
+        // R-2, the panel half: the states the CLI renders as a duration / `lapsed` / the gap must
+        // render the same way here. `now` is pinned a day before the soonest deadline, so the two
+        // observed-and-ahead rows humanize deterministically.
+        let now: Int64 = 1_785_499_802 - 86_400
+        XCTAssertEqual(StatusPanelFormat.expiryCell(byLabel["work"]?.expiry, now: now), "1d")
+        XCTAssertEqual(StatusPanelFormat.expiryCell(byLabel["retired"]?.expiry, now: now), "lapsed")
+        XCTAssertEqual(StatusPanelFormat.expiryCell(unmeasured, now: now), StatusPanelFormat.expiryGap,
+                       "UNKNOWN renders as the GAP — the panel narrates no verdict it does not have")
+        // …and a roster carrying real deadlines DOES show the line, the mirror of the
+        // `testUnpolledAccountOmitsTheExpiryKeyEntirely` assertion above.
+        XCTAssertTrue(StatusPanelFormat.rosterShowsExpiry(v.accounts.map(\.expiry), now: now))
+    }
+
     // AC (#412): a NEWER daemon's unrecognised `next_swap.reason.kind` is a forward-compat DECORATION
     // — it must degrade to `reason: nil` (the bare target label, the SAME path as a pre-#393 omitted
     // reason) and the frame must STILL decode, never be lost. This is the whole fix: one unknown

@@ -30,8 +30,8 @@
 //!
 //! 1. Rust — the canonical rank home per ADR-0026 § Decision 1 — EMITS
 //!    `build/fixtures/cross-surface-severity.json`, a byte-pinned manifest of the rank order, the
-//!    per-fault severity band, the arbitration edges, the per-account utilization bands, and the
-//!    ENUMERATED legitimate divergences.
+//!    per-fault severity band, the arbitration edges, the per-account utilization bands, the
+//!    per-account REFRESH-token expiry cells, and the ENUMERATED legitimate divergences.
 //! 2. The Rust gate asserts the manifest still describes `DaemonPayloadFault` *and* the text
 //!    `render_status` actually prints.
 //! 3. The Swift gate (`apps/menubar/Tests/CrossSurfaceSeverityParityTests.swift`) reads the SAME
@@ -83,7 +83,7 @@ pub(crate) fn committed_manifest() -> Manifest {
 /// field) — never for a content change, which is an ordinary re-baseline. Both consumers assert
 /// it, so a shape change that reaches only one language fails loudly instead of decoding to
 /// silent defaults.
-pub(crate) const MANIFEST_SCHEMA: u32 = 2;
+pub(crate) const MANIFEST_SCHEMA: u32 = 3;
 
 /// A severity BAND in the cross-surface vocabulary — deliberately neither surface's own spelling.
 /// The CLI renders these as SGR overlays (`Severity::Red` / `Severity::Yellow` / no escape); the
@@ -102,6 +102,13 @@ pub(crate) mod band {
     /// not be a fault — so this band appears in [`Manifest::account_severity_cases`] and nowhere
     /// else, which is why the fault-rank spell-check below deliberately rejects it.
     pub(crate) const GREEN: &str = "green";
+    /// De-emphasis: the CLI's `Severity::Dim` (SGR 2, faint) and the panel's `.neutral`. Expiry
+    /// only — it is the band a deadline BEYOND the operator's horizon gets, where there is nothing
+    /// to act on and a coloured cell would be noise. Kept DISTINCT from [`PLAIN`] even though both
+    /// render de-emphasised on the panel: they are different verdicts (`beyond` observed something
+    /// and said it is far off; `plain` observed nothing), the CLI does render them differently, and
+    /// collapsing them here would let a surface swap one for the other unnoticed.
+    pub(crate) const DIM: &str = "dim";
 }
 
 /// One daemon-payload fault's position in the single cross-surface rank.
@@ -157,6 +164,41 @@ pub(crate) struct AccountSeverityCase {
     pub(crate) weekly_severity: Option<String>,
 }
 
+/// One REFRESH-token expiry case: the wire payload both surfaces classify, and the cell TEXT and
+/// tint BAND they must both produce (issues #878/#882/#883/#884, pinned by #886).
+///
+/// The third half of the parity claim, and the one with the most surface area to drift: the daemon
+/// rank is fleet-wide, [`AccountSeverityCase`] is per-account utilization, and this is the
+/// per-account FORESIGHT axis. `src/cli.rs`'s `expiry_view` and `StatusPanelFormat.expiryView` are
+/// documented as mirroring each other "arm-for-arm, INCLUDING the arm ORDER" — which until now was
+/// prose governing runtime, defended on each side by its own hand-written expectations. That is the
+/// re-derive-independently shape ADR-0026 exists to refuse, and exactly what produced issue #575.
+///
+/// Unlike the fault ranks, this pins TEXT as well as band. R-2 is STATE-parity: for expiry the two
+/// surfaces deliberately share a vocabulary (`6d21h`, `lapsed`, `—`) rather than each rendering the
+/// state in its own idiom, and `StatusPanelFormat.expiryCell` is documented as "byte-identical to
+/// `src/cli.rs` `expiry_cell`". A claim of byte-identity is worth asserting as one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ExpiryParityCase {
+    pub(crate) name: String,
+    /// The observed deadline as an offset in SECONDS from the render instant, or `None` when the
+    /// credential carried no deadline at all.
+    ///
+    /// Relative rather than absolute so both surfaces evaluate the SAME payload against their own
+    /// `now` — which is the whole point, since the case set deliberately includes deadlines that
+    /// have already passed and the render-time re-check is what must fire on them.
+    pub(crate) offset_secs: Option<i64>,
+    /// The daemon's cached classification, in its WIRE spelling (`within` / `beyond` / `lapsed` /
+    /// `unknown`) — so the manifest names what the daemon actually sends rather than either
+    /// language's enum.
+    pub(crate) horizon_state: String,
+    /// The cell both surfaces must render, byte for byte.
+    pub(crate) cell: String,
+    /// One of [`band`], or `None` for an uncoloured cell — which is what an unobserved deadline
+    /// gets on both surfaces, never a fake calm.
+    pub(crate) severity: Option<String>,
+}
+
 /// A divergence between the two surfaces that is DELIBERATE — enumerated and justified here rather
 /// than asserted away, per issue #768 AC4. Each entry is PINNED by an assertion on both sides, so a
 /// documented divergence cannot silently become a different divergence: the register is a gate, not
@@ -203,6 +245,8 @@ pub(crate) struct Manifest {
     pub(crate) exclusive_groups: Vec<ExclusiveGroup>,
     pub(crate) arbitration_edges: Vec<ArbitrationEdge>,
     pub(crate) account_severity_cases: Vec<AccountSeverityCase>,
+    /// The REFRESH-token expiry cases (issue #886). Added at [`MANIFEST_SCHEMA`] 3.
+    pub(crate) expiry_cases: Vec<ExpiryParityCase>,
     pub(crate) known_divergences: Vec<KnownDivergence>,
     pub(crate) uncovered_axes: Vec<UncoveredAxis>,
 }
@@ -375,6 +419,65 @@ impl Manifest {
                         band::RED | band::YELLOW | band::GREEN | band::PLAIN
                     ),
                     "account case `{}` has unknown band `{severity}`",
+                    case.name
+                );
+            }
+        }
+        assert!(
+            !self.expiry_cases.is_empty(),
+            "cross-surface manifest has zero expiry cases — cardinality-zero is an automatic FAIL"
+        );
+        // The four wire states must ALL be exercised. A case set that quietly lost one — most
+        // consequentially `unknown`, the absent-`refreshTokenExpiresAt` verdict — would still pass
+        // every per-case comparison on both sides while covering less, which is exactly the
+        // degenerate-subject pass this manifest's other cardinality guards are here to refuse.
+        for state in ["within", "beyond", "lapsed", "unknown"] {
+            assert!(
+                self.expiry_cases
+                    .iter()
+                    .any(|case| case.horizon_state == state),
+                "cross-surface manifest pins no `{state}` expiry case — all four wire states must \
+                 be walked, or a surface can diverge on the missing one unobserved"
+            );
+        }
+        for case in &self.expiry_cases {
+            assert!(
+                matches!(
+                    case.horizon_state.as_str(),
+                    "within" | "beyond" | "lapsed" | "unknown"
+                ),
+                "expiry case `{}` has unknown horizon state `{}` — the manifest names the WIRE \
+                 spelling, not either language's enum",
+                case.name,
+                case.horizon_state
+            );
+            // `None` is legitimate (an unobserved deadline is uncoloured on both surfaces); only a
+            // present band is spell-checked. Two spellings are deliberately absent. `GREEN`,
+            // because no expiry verdict is ever reassuring-green — the calmest thing this axis can
+            // say is "far off", which is `DIM`. And `PLAIN`, because uncoloured is encoded here as
+            // `severity: None` rather than as a band token; admitting `"plain"` too would give
+            // "uncoloured" two spellings, and one of them would go untested.
+            if let Some(severity) = &case.severity {
+                assert!(
+                    matches!(severity.as_str(), band::RED | band::YELLOW | band::DIM),
+                    "expiry case `{}` has unknown band `{severity}`",
+                    case.name
+                );
+            }
+            // An unobserved deadline must never carry a band at all, and must render the gap. The
+            // #137 invariant, asserted on the ORACLE itself rather than only on the two surfaces
+            // that read it — a manifest that pinned `unknown` to a reassuring cell would make both
+            // gates enforce the wrong thing in perfect agreement.
+            if case.horizon_state == "unknown" {
+                assert_eq!(
+                    case.severity, None,
+                    "expiry case `{}` tints an UNOBSERVED deadline — absence of a reading is not a \
+                     verdict, and a colour would read as one",
+                    case.name
+                );
+                assert_eq!(
+                    case.cell, "—",
+                    "expiry case `{}` narrates a deadline it never observed",
                     case.name
                 );
             }

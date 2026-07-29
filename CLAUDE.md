@@ -141,7 +141,7 @@ the panel drifted.
 
 | If you touch | You must also | Enforced by |
 |---|---|---|
-| `STATUS_SCHEMA_VERSION` (minor bump) | Regenerate the four status/watch goldens, then update the current-daemon Swift fixtures and assertions — leave version-pinned compat fixtures alone. See § Schema versions below. | `swift` + `test` jobs |
+| `STATUS_SCHEMA_VERSION` (minor bump) | Regenerate the five status/watch goldens, then update the current-daemon Swift fixtures and assertions — leave version-pinned compat fixtures alone. See § Schema versions below. | `swift` + `test` jobs |
 | `apps/menubar/design/renders/panel-goldens/**` | `git commit --amend --trailer 'Panel-Goldens-Rebaselined: <what changed and why>'` | `scripts/check-panel-golden-rebaseline.sh` |
 | `build/fixtures/cli-renders/**` | `git commit --amend --trailer 'CLI-Goldens-Rebaselined: <what changed and why>'` | `scripts/check-cli-golden-rebaseline.sh` |
 | `.github/workflows/**`, top-level `scripts/**`, `.cargo/**`, `deny.toml` | `git commit --amend --trailer 'Gate-Change-Acknowledged: <why this is safe>'` | `scripts/check-gate-change-ack.sh` |
@@ -204,7 +204,7 @@ version proved keeps being tested.
 Regenerate the byte-pinned goldens rather than hand-editing them:
 
 ```sh
-cargo test -- --ignored emit_wire_golden_fixtures       # the 4 status/watch wire-*.json
+cargo test -- --ignored emit_wire_golden_fixtures       # the 5 status/watch wire-*.json
 cargo test -- --ignored emit_wire_stats_golden_fixture  # wire-stats-basic.json
 cargo test -- --ignored emit_cli_render_goldens         # build/fixtures/cli-renders/
 ```
