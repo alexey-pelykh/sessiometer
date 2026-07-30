@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Sessiometer — menubar popover · all 9 states</title>
+<title>Sessiometer — menubar popover · all 9 states + Settings window</title>
 <!--
   Sessiometer — menubar popover: ALL 9 launch-or-attach states in ONE polished surface.
   Canonical VISUAL build-reference for the SwiftUI menubar panel (alexey-pelykh/sessiometer#168/#169).
@@ -537,6 +537,118 @@
   /* stale-snapshot modifiers (mild — still connected) */
   .app-sub .sub-stale{ color:var(--ut-a); font-weight:600 }
   .pop-foot .fl2.stale{ color:var(--ut-a) }
+
+  /* ============================================================= *
+   *  SETTINGS WINDOW  (#763) — a SECOND surface, not the popover.  *
+   *  Deliberately its own component rather than a `.pop` variant:  *
+   *  it is a titled NSWindow, so it is OPAQUE (no vibrancy — it    *
+   *  sits over the desktop, not under the menu bar), 460 px wide   *
+   *  against the popover's 380, and its grouped Form SCROLLS       *
+   *  inside a FIXED 560 px content box. Every number below is the  *
+   *  shipped constant it is named for (`SettingsFormat`), so the   *
+   *  frame is measurable against the build, not merely evocative.  *
+   * ============================================================= */
+  /* A full-width row that overrides the gallery's own 40px column gap down to 12px: two 460px windows
+     need 932px of gutter-inclusive width and the gallery content box is exactly 932 (984 − 26 × 2).
+     At the gallery gap they would wrap one-per-row and double this group's height — which the render
+     no longer has room for (design/README.md § Regenerating the render). */
+  .settings-pair{
+    flex:1 1 100%; display:flex; flex-wrap:wrap; justify-content:center; align-items:flex-start; gap:14px 12px;
+  }
+  .win.theme-light{
+    --win-bg:#ececee; --win-chrome:#e4e4e7; --win-group:#fff; --win-group-border:rgba(0,0,0,.07);
+    --win-text:#1d1d1f; --win-text-2:rgba(60,60,67,.72); --win-text-3:rgba(60,60,67,.46);
+    --win-divider:rgba(0,0,0,.08); --win-field-bg:#fff; --win-field-border:rgba(0,0,0,.22);
+    --win-accent:#007aff; --win-track:rgba(120,120,128,.26);
+    --win-red:#c8261d; --win-dead:rgba(0,0,0,.16);
+  }
+  .win.theme-dark{
+    --win-bg:#1f1f22; --win-chrome:#2b2b2e; --win-group:#2c2c2e; --win-group-border:rgba(255,255,255,.08);
+    --win-text:#f5f5f7; --win-text-2:rgba(235,235,245,.62); --win-text-3:rgba(235,235,245,.4);
+    --win-divider:rgba(255,255,255,.09); --win-field-bg:rgba(255,255,255,.06); --win-field-border:rgba(255,255,255,.24);
+    --win-accent:#0a84ff; --win-track:rgba(255,255,255,.18);
+    --win-red:#ff6961; --win-dead:rgba(255,255,255,.16);
+  }
+  .win{
+    width:460px; border-radius:10px; overflow:hidden; color:var(--win-text); font-size:13px;
+    box-shadow:0 22px 48px -14px rgba(0,0,0,.5), 0 8px 18px -10px rgba(0,0,0,.4);
+    border:.5px solid var(--win-group-border);
+  }
+  /* title bar — `[.titled, .closable]`: close is LIVE, minimize + zoom are DEAD (grey), which is
+     `SettingsWindowController` omitting `.miniaturizable` on purpose (a minimized window never fires
+     `windowWillClose`, so it would strand the app in `.regular` with a lingering Dock icon). */
+  .win-bar{
+    height:28px; display:flex; align-items:center; gap:8px; padding:0 11px; background:var(--win-chrome);
+    border-bottom:.5px solid var(--win-divider); position:relative;
+  }
+  .win-lights{ display:flex; gap:8px; flex:0 0 auto }
+  .win-lights i{ width:11px; height:11px; border-radius:50%; display:block }
+  .win-lights i.live{ background:#ff5f57 }
+  .win-lights i.dead{ background:var(--win-dead) }
+  .win-title{
+    position:absolute; left:0; right:0; text-align:center; font-size:12.5px; font-weight:600;
+    color:var(--win-text-2); pointer-events:none;
+  }
+  /* the FIXED content box — `setContentSize(460 x 560)`, no `.resizable` in the style mask */
+  .win-body{ height:560px; display:flex; flex-direction:column; background:var(--win-bg) }
+  /* the grouped Form. `overflow:hidden` is the honest depiction: with the daemon zone loaded the form
+     is TALLER than the box, so the last section is cut by the viewport exactly as it is on screen —
+     the window scrolls. In the disconnected frames the form is SHORTER than the box and simply ends;
+     no padding is added to fake an overflow. */
+  .win-form{ flex:1 1 auto; overflow:hidden; padding:13px 15px 0; display:flex; flex-direction:column; gap:13px; position:relative }
+  .win-form::after{
+    content:""; position:absolute; left:0; right:0; bottom:0; height:26px; pointer-events:none;
+    background:linear-gradient(to bottom, transparent, var(--win-bg));
+  }
+  .fs-h{ font-size:11px; font-weight:700; letter-spacing:.04em; color:var(--win-text-2); margin:0 0 5px 3px }
+  .fs{ background:var(--win-group); border:.5px solid var(--win-group-border); border-radius:7px; overflow:hidden }
+  .fs-row{ display:flex; align-items:center; gap:10px; padding:7px 11px; min-height:32px }
+  .fs-row + .fs-row{ border-top:.5px solid var(--win-divider) }
+  .fs-row .lbl{ flex:1 1 auto; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
+  .fs-f{ font-size:11px; color:var(--win-text-3); line-height:1.36; margin:5px 3px 0 }
+  /* the tunable value cell — TRUE `SettingsFormat.tunableFieldWidth` (96 pt), trailing-aligned */
+  .fs-field{
+    flex:0 0 auto; width:96px; padding:3px 5px; border-radius:5px; text-align:right;
+    background:var(--win-field-bg); border:.5px solid var(--win-field-border);
+    font-variant-numeric:tabular-nums; color:var(--win-text);
+  }
+  /* No `.fs-label-field` rule here on purpose: the roster label cell (TRUE
+     `SettingsFormat.accountLabelFieldWidth` = 160 pt) sits in the Accounts section, which is
+     below the fixed 460×560 box in every frame — so a width no frame exercises would assert a
+     value this mock never demonstrates. That cell is authored in prose instead; see hq
+     § D-UX-SETTINGS and issue #846. */
+  .sw{ flex:0 0 auto; width:38px; height:22px; border-radius:11px; background:var(--win-track); position:relative }
+  .sw.on{ background:var(--win-accent) }
+  .sw::after{ content:""; position:absolute; top:2px; left:2px; width:18px; height:18px; border-radius:50%; background:#fff; box-shadow:0 1px 2px rgba(0,0,0,.3) }
+  .sw.on::after{ left:auto; right:2px }
+  /* the load-failure card (AC 7) — honest-disconnected, never a blank or fabricated form */
+  .fs-fail{ display:flex; flex-direction:column; align-items:center; text-align:center; padding:16px 18px 18px; gap:7px }
+  .fs-fail .ico{ color:var(--win-text-3) }
+  .fs-fail .hl{ font-size:14px; font-weight:600 }
+  .fs-fail .dt{ font-size:11.5px; color:var(--win-text-2); line-height:1.4; max-width:34ch }
+  .fs-btn{
+    font:inherit; font-size:12px; padding:4px 12px; border-radius:6px; margin-top:5px;
+    background:var(--win-field-bg); border:.5px solid var(--win-field-border); color:var(--win-text);
+  }
+  /* footer — `applyStatus | Spacer | Save`, `.padding(12)`, 12 pt inter-element gaps */
+  .win-foot{
+    flex:0 0 auto; display:flex; align-items:flex-start; gap:12px; padding:12px;
+    border-top:.5px solid var(--win-divider); background:var(--win-bg);
+  }
+  /* THE 328 pt SLOT (460 − 12·2 − 12·2 − 62 Save − 22 icon). The `.failed` / `.rejected` label is
+     CLAMPED to two lines here — the #763 ratified rule: bound the GEOMETRY, never the message. The
+     full daemon detail stays reachable via the hover tooltip + `accessibilityHelp`. */
+  .win-status{
+    flex:1 1 auto; min-width:0; display:flex; align-items:flex-start; gap:6px; font-size:12px; line-height:1.34;
+  }
+  .win-status .txt{
+    display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow:hidden;
+  }
+  .win-status.fail{ color:var(--win-red) }
+  .win-save{
+    flex:0 0 auto; font:inherit; font-size:12px; font-weight:500; padding:4px 14px; border-radius:6px;
+    background:var(--win-field-bg); border:.5px solid var(--win-field-border); color:var(--win-text-3);
+  }
 </style>
 </head>
 <body>
@@ -544,12 +656,14 @@
 
   <!-- ============ DOCUMENT HEAD ============ -->
   <header class="doc-head">
-    <h1>Sessiometer &mdash; menubar popover &middot; all 9 states</h1>
+    <h1>Sessiometer &mdash; menubar popover &middot; all 9 states + Settings window</h1>
     <p class="lede">
       The macOS status-bar popover across <b>every launch-or-attach state</b>, at true <b>380&nbsp;px</b> width, in the
       native macOS language &mdash; vibrancy, meters, drawn sparklines, label-primary identity. Each state is a
       <b>distinct panel message + affordance</b> under the shared <b>4-state glance glyph</b> (#524); the menubar never renders healthy on a degraded daemon.
       A visual build-reference for the SwiftUI panel (#168/#169) &mdash; it does not port to code.
+      <b>Group&nbsp;8 is a second surface</b>: the <b>Settings window</b> (#763), a titled 460&times;560 window rather than a
+      popover, so it is opaque, carries no glance glyph, and its grouped Form scrolls.
     </p>
   </header>
 
@@ -3052,6 +3166,249 @@
         </div>
       </div>
 
+      <!-- ===================================================================== -->
+      <!-- GROUP 8 · SETTINGS WINDOW (#763)                                       -->
+      <!-- ===================================================================== -->
+      <!-- A SECOND SURFACE, not a panel state — the window `⌘,` opens. Why four frames,
+           what they deliberately do NOT author, and why they carry no `STATES` row in
+           `build-comparison.py`: this directory's `README.md`, § The Settings window
+           (#763). The NORMATIVE decisions — zone order, the six-section tunable grouping,
+           the long-value geometry bound — are hq `strategy/design-menubar.md`
+           § D-UX-SETTINGS; these frames are the VISUAL half only, and the window is taller
+           than its own viewport, so no frame here shows all 15 tunables.
+
+           EDITING HERE — nothing below is eyeballed. Every tunable VALUE is the shipped
+           daemon default (`src/config.rs`), every LABEL and section title is a
+           `SettingsFormat` constant verbatim, and every WIDTH is the shipped constant it is
+           named for (460 / 560 / 96 pt, and the derived 328 pt footer slot). Change one
+           only to track the build, never to make a frame look better. The apply-failure
+           string is the one deliberate stand-in — see its own comment. -->
+      <!-- ===================================================================== -->
+      <div class="group-cap">
+        <span class="gc-t">8 &middot; Settings window</span><span class="gc-line"></span>
+        <span class="gc-note">a second surface &mdash; 460&times;560, fixed, no glance glyph</span>
+      </div>
+
+      <!-- LOADED · the three zones, the tunable grouping, and the bounded apply-failure footer -->
+      <div class="settings-pair">
+        <div class="frame">
+          <div class="fcap">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.6 1.6 0 0 0 .32 1.77l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.6 1.6 0 0 0-1.77-.32 1.6 1.6 0 0 0-1 1.47V21a2 2 0 1 1-4 0v-.1A1.6 1.6 0 0 0 9 19.4a1.6 1.6 0 0 0-1.77.32l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.6 1.6 0 0 0 .32-1.77 1.6 1.6 0 0 0-1.47-1H3a2 2 0 1 1 0-4h.1A1.6 1.6 0 0 0 4.6 9a1.6 1.6 0 0 0-.32-1.77l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.6 1.6 0 0 0 9 4.6a1.6 1.6 0 0 0 1-1.47V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.47 1.6 1.6 0 0 0 1.77-.32l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.6 1.6 0 0 0 19.4 9v0a1.6 1.6 0 0 0 1.47 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z"/></svg>
+            Settings &middot; Loaded &middot; Light
+          </div>
+          <div class="win theme-light" data-frame="settings-loaded-light">
+            <div class="win-bar">
+              <span class="win-lights"><i class="live"></i><i class="dead"></i><i class="dead"></i></span>
+              <span class="win-title">Sessiometer Settings</span>
+            </div>
+            <div class="win-body">
+              <div class="win-form">
+                <div>
+                  <div class="fs-h">General</div>
+                  <div class="fs"><div class="fs-row"><span class="lbl">Launch Sessiometer at login</span><span class="sw on"></span></div></div>
+                  <div class="fs-f">Start Sessiometer automatically when you log in. This launches the menu-bar app only &mdash; the background daemon is started separately.</div>
+                </div>
+                <div>
+                  <div class="fs-h">Notifications</div>
+                  <div class="fs"><div class="fs-row"><span class="lbl">Notify on account swaps and exhaustion</span><span class="sw on"></span></div></div>
+                  <div class="fs-f">A local macOS notification when the active account changes or every account is exhausted. This is an app preference &mdash; it isn&rsquo;t part of the daemon configuration below.</div>
+                </div>
+                <div>
+                  <div class="fs-h">Polling &amp; Cooldown</div>
+                  <div class="fs">
+                    <div class="fs-row"><span class="lbl">Poll interval (s)</span><span class="fs-field">300</span></div>
+                    <div class="fs-row"><span class="lbl">Exhausted poll (s)</span><span class="fs-field">3600</span></div>
+                    <div class="fs-row"><span class="lbl">Near-limit poll (s)</span><span class="fs-field">60</span></div>
+                    <div class="fs-row"><span class="lbl">Swap cooldown (s)</span><span class="fs-field">60</span></div>
+                  </div>
+                </div>
+                <div>
+                  <div class="fs-h">Reserve &amp; Ceilings</div>
+                  <div class="fs">
+                    <div class="fs-row"><span class="lbl">Target session usage (%)</span><span class="fs-field">80</span></div>
+                    <div class="fs-row"><span class="lbl">Session ceiling (%)</span><span class="fs-field">95</span></div>
+                    <div class="fs-row"><span class="lbl">Weekly ceiling (%)</span><span class="fs-field">98</span></div>
+                  </div>
+                </div>
+                <div>
+                  <div class="fs-h">Blind-Window Safety</div>
+                  <div class="fs">
+                    <div class="fs-row"><span class="lbl">Blind swap delay (s)</span><span class="fs-field">300</span></div>
+                  </div>
+                </div>
+              </div>
+              <div class="win-foot">
+                <!-- STAND-IN string, not the full envelope. The real #628 detail is serde's
+                     `deny_unknown_fields` error, which names EVERY expected tunable — measured at
+                     ~2 700 pt (`SettingsTextMetricsTests`, #762) against this 328 pt slot. It is
+                     elided here (the trailing `…`, which sits far past the clamp and never renders)
+                     only so the source stays readable. What the frame AUTHORS is the two-line clamp,
+                     which the CSS performs — not this string's length. The ratified rule bounds the
+                     geometry and never edits the message; shortening a datum for legibility in the
+                     MOCK is not the product doing so. -->
+                <span class="win-status fail">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex:0 0 auto;margin-top:1px"><circle cx="12" cy="12" r="9"/><path d="M8 12h3l1.5-2.5L14 14l1-2h1"/></svg>
+                  <span class="txt">Not saved &mdash; unknown field <code>session_ceiling_pct</code>, expected one of <code>poll_secs</code>, <code>exhausted_poll_secs</code>, <code>near_limit_poll_secs</code>, <code>cooldown_secs</code>, <code>target_max_session_usage</code>, <code>session_ceiling</code>, <code>weekly_ceiling</code>&hellip;</span>
+                </span>
+                <button class="win-save">Save</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="frame">
+          <div class="fcap">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.6 1.6 0 0 0 .32 1.77l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.6 1.6 0 0 0-1.77-.32 1.6 1.6 0 0 0-1 1.47V21a2 2 0 1 1-4 0v-.1A1.6 1.6 0 0 0 9 19.4a1.6 1.6 0 0 0-1.77.32l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.6 1.6 0 0 0 .32-1.77 1.6 1.6 0 0 0-1.47-1H3a2 2 0 1 1 0-4h.1A1.6 1.6 0 0 0 4.6 9a1.6 1.6 0 0 0-.32-1.77l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.6 1.6 0 0 0 9 4.6a1.6 1.6 0 0 0 1-1.47V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.47 1.6 1.6 0 0 0 1.77-.32l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.6 1.6 0 0 0 19.4 9v0a1.6 1.6 0 0 0 1.47 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z"/></svg>
+            Settings &middot; Loaded &middot; Dark
+          </div>
+          <div class="win theme-dark" data-frame="settings-loaded-dark">
+            <div class="win-bar">
+              <span class="win-lights"><i class="live"></i><i class="dead"></i><i class="dead"></i></span>
+              <span class="win-title">Sessiometer Settings</span>
+            </div>
+            <div class="win-body">
+              <div class="win-form">
+                <div>
+                  <div class="fs-h">General</div>
+                  <div class="fs"><div class="fs-row"><span class="lbl">Launch Sessiometer at login</span><span class="sw on"></span></div></div>
+                  <div class="fs-f">Start Sessiometer automatically when you log in. This launches the menu-bar app only &mdash; the background daemon is started separately.</div>
+                </div>
+                <div>
+                  <div class="fs-h">Notifications</div>
+                  <div class="fs"><div class="fs-row"><span class="lbl">Notify on account swaps and exhaustion</span><span class="sw on"></span></div></div>
+                  <div class="fs-f">A local macOS notification when the active account changes or every account is exhausted. This is an app preference &mdash; it isn&rsquo;t part of the daemon configuration below.</div>
+                </div>
+                <div>
+                  <div class="fs-h">Polling &amp; Cooldown</div>
+                  <div class="fs">
+                    <div class="fs-row"><span class="lbl">Poll interval (s)</span><span class="fs-field">300</span></div>
+                    <div class="fs-row"><span class="lbl">Exhausted poll (s)</span><span class="fs-field">3600</span></div>
+                    <div class="fs-row"><span class="lbl">Near-limit poll (s)</span><span class="fs-field">60</span></div>
+                    <div class="fs-row"><span class="lbl">Swap cooldown (s)</span><span class="fs-field">60</span></div>
+                  </div>
+                </div>
+                <div>
+                  <div class="fs-h">Reserve &amp; Ceilings</div>
+                  <div class="fs">
+                    <div class="fs-row"><span class="lbl">Target session usage (%)</span><span class="fs-field">80</span></div>
+                    <div class="fs-row"><span class="lbl">Session ceiling (%)</span><span class="fs-field">95</span></div>
+                    <div class="fs-row"><span class="lbl">Weekly ceiling (%)</span><span class="fs-field">98</span></div>
+                  </div>
+                </div>
+                <div>
+                  <div class="fs-h">Blind-Window Safety</div>
+                  <div class="fs">
+                    <div class="fs-row"><span class="lbl">Blind swap delay (s)</span><span class="fs-field">300</span></div>
+                  </div>
+                </div>
+              </div>
+              <div class="win-foot">
+                <!-- STAND-IN string, not the full envelope. The real #628 detail is serde's
+                     `deny_unknown_fields` error, which names EVERY expected tunable — measured at
+                     ~2 700 pt (`SettingsTextMetricsTests`, #762) against this 328 pt slot. It is
+                     elided here (the trailing `…`, which sits far past the clamp and never renders)
+                     only so the source stays readable. What the frame AUTHORS is the two-line clamp,
+                     which the CSS performs — not this string's length. The ratified rule bounds the
+                     geometry and never edits the message; shortening a datum for legibility in the
+                     MOCK is not the product doing so. -->
+                <span class="win-status fail">
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex:0 0 auto;margin-top:1px"><circle cx="12" cy="12" r="9"/><path d="M8 12h3l1.5-2.5L14 14l1-2h1"/></svg>
+                  <span class="txt">Not saved &mdash; unknown field <code>session_ceiling_pct</code>, expected one of <code>poll_secs</code>, <code>exhausted_poll_secs</code>, <code>near_limit_poll_secs</code>, <code>cooldown_secs</code>, <code>target_max_session_usage</code>, <code>session_ceiling</code>, <code>weekly_ceiling</code>&hellip;</span>
+                </span>
+                <button class="win-save">Save</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- HONEST-DISCONNECTED · the daemon is down; the app-local zones stay live (#573) -->
+      <div class="settings-pair">
+        <div class="frame">
+          <div class="fcap">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.6 1.6 0 0 0 .32 1.77l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.6 1.6 0 0 0-1.77-.32 1.6 1.6 0 0 0-1 1.47V21a2 2 0 1 1-4 0v-.1A1.6 1.6 0 0 0 9 19.4a1.6 1.6 0 0 0-1.77.32l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.6 1.6 0 0 0 .32-1.77 1.6 1.6 0 0 0-1.47-1H3a2 2 0 1 1 0-4h.1A1.6 1.6 0 0 0 4.6 9a1.6 1.6 0 0 0-.32-1.77l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.6 1.6 0 0 0 9 4.6a1.6 1.6 0 0 0 1-1.47V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.47 1.6 1.6 0 0 0 1.77-.32l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.6 1.6 0 0 0 19.4 9v0a1.6 1.6 0 0 0 1.47 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z"/></svg>
+            Settings &middot; Disconnected &middot; Light
+          </div>
+          <div class="win theme-light" data-frame="settings-disconnected-light">
+            <div class="win-bar">
+              <span class="win-lights"><i class="live"></i><i class="dead"></i><i class="dead"></i></span>
+              <span class="win-title">Sessiometer Settings</span>
+            </div>
+            <div class="win-body">
+              <div class="win-form">
+                <div>
+                  <div class="fs-h">General</div>
+                  <div class="fs"><div class="fs-row"><span class="lbl">Launch Sessiometer at login</span><span class="sw on"></span></div></div>
+                  <div class="fs-f">Start Sessiometer automatically when you log in. This launches the menu-bar app only &mdash; the background daemon is started separately.</div>
+                </div>
+                <div>
+                  <div class="fs-h">Notifications</div>
+                  <div class="fs"><div class="fs-row"><span class="lbl">Notify on account swaps and exhaustion</span><span class="sw on"></span></div></div>
+                  <div class="fs-f">A local macOS notification when the active account changes or every account is exhausted. This is an app preference &mdash; it isn&rsquo;t part of the daemon configuration below.</div>
+                </div>
+                <div>
+                  <div class="fs-h">Daemon Configuration</div>
+                  <div class="fs">
+                    <div class="fs-fail">
+                      <span class="ico"><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg></span>
+                      <span class="hl">Sessiometer isn&rsquo;t connected</span>
+                      <span class="dt">Start the sessiometer daemon, then try again. Settings edits the running daemon&rsquo;s configuration.</span>
+                      <button class="fs-btn">Try Again</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div class="win-foot">
+                <span class="win-status"></span>
+                <button class="win-save">Save</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="frame">
+          <div class="fcap">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3.2"/><path d="M19.4 15a1.6 1.6 0 0 0 .32 1.77l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.6 1.6 0 0 0-1.77-.32 1.6 1.6 0 0 0-1 1.47V21a2 2 0 1 1-4 0v-.1A1.6 1.6 0 0 0 9 19.4a1.6 1.6 0 0 0-1.77.32l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.6 1.6 0 0 0 .32-1.77 1.6 1.6 0 0 0-1.47-1H3a2 2 0 1 1 0-4h.1A1.6 1.6 0 0 0 4.6 9a1.6 1.6 0 0 0-.32-1.77l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.6 1.6 0 0 0 9 4.6a1.6 1.6 0 0 0 1-1.47V3a2 2 0 1 1 4 0v.1a1.6 1.6 0 0 0 1 1.47 1.6 1.6 0 0 0 1.77-.32l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.6 1.6 0 0 0 19.4 9v0a1.6 1.6 0 0 0 1.47 1H21a2 2 0 1 1 0 4h-.1a1.6 1.6 0 0 0-1.5 1z"/></svg>
+            Settings &middot; Disconnected &middot; Dark
+          </div>
+          <div class="win theme-dark" data-frame="settings-disconnected-dark">
+            <div class="win-bar">
+              <span class="win-lights"><i class="live"></i><i class="dead"></i><i class="dead"></i></span>
+              <span class="win-title">Sessiometer Settings</span>
+            </div>
+            <div class="win-body">
+              <div class="win-form">
+                <div>
+                  <div class="fs-h">General</div>
+                  <div class="fs"><div class="fs-row"><span class="lbl">Launch Sessiometer at login</span><span class="sw on"></span></div></div>
+                  <div class="fs-f">Start Sessiometer automatically when you log in. This launches the menu-bar app only &mdash; the background daemon is started separately.</div>
+                </div>
+                <div>
+                  <div class="fs-h">Notifications</div>
+                  <div class="fs"><div class="fs-row"><span class="lbl">Notify on account swaps and exhaustion</span><span class="sw on"></span></div></div>
+                  <div class="fs-f">A local macOS notification when the active account changes or every account is exhausted. This is an app preference &mdash; it isn&rsquo;t part of the daemon configuration below.</div>
+                </div>
+                <div>
+                  <div class="fs-h">Daemon Configuration</div>
+                  <div class="fs">
+                    <div class="fs-fail">
+                      <span class="ico"><svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg></span>
+                      <span class="hl">Sessiometer isn&rsquo;t connected</span>
+                      <span class="dt">Start the sessiometer daemon, then try again. Settings edits the running daemon&rsquo;s configuration.</span>
+                      <button class="fs-btn">Try Again</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div class="win-foot">
+                <span class="win-status"></span>
+                <button class="win-save">Save</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
     </div><!-- /gallery -->
   </div><!-- /stage -->
 
@@ -3072,7 +3429,8 @@
       <li><b>Per-row switch is discoverable, not loud (#448).</b> Every switchable row (non-active, viable) carries a <b>persistent quiet swap chip</b> in its trailing slot &mdash; neutral <code>--text-3</code> at rest so a first-time operator sees the row is actionable on a transient popover, brightening to <code>--text-2</code> when the row is <i>armed</i> (hover / focus). It stays neutral, never accent: the single accent action is the footer <b>Swap</b> hero (Von Restorff). The chip only <i>hints</i> at rest &mdash; the wash + pointer cursor still gate <i>arming</i>, so the persistent mark aids discovery without raising accidental-swap risk (the daemon re-validates every target, and a swap is reversible). The active row and a dropped/paused roster carry no chip.</li>
       <li><b>No-wrap by construction, every state.</b> Aliases own their line and truncate; badges, health glyphs, strip actions and swap buttons are fixed-width and can never be pushed off. Meters use a fixed 4-column grid so <b>%</b> and reset countdowns stay column-aligned.</li>
       <li><b>Pathological content has an oracle now (#752).</b> Group&nbsp;7 answers what a hostile <i>value</i> should look like, so the stress fixtures (#753) can be checked against a design instead of blessing whatever the renderer emits &mdash; the baseline trap that made #437&rsquo;s three render bugs read five times as &ldquo;the design fails distinctness&rdquo;. Every number in those four frames is <b>measured</b>, through the same CoreText primitives the shipped gate uses (<code>Tests/TextMetrics.swift</code>, #750), against the shipped budgets: roster label <b>171&nbsp;pt</b>, meter cells <b>52 / 40 / 52&nbsp;pt</b> (the <code>.meter</code> grid already carries those three verbatim). <b>Two premises did not survive measurement</b>, and the frames are gated at the measured boundary rather than the assumed one: a <b>CJK or RTL label does not elide</b> at the shipped budget (119&ndash;124&nbsp;pt of 171 &mdash; they render whole; only genuinely long labels elide), and <b><code>365d23h</code> does not overflow</b> the reset cell (48.32&nbsp;pt of 52 &mdash; as does every three-digit day count; overflow starts at four digits). Where a label <i>does</i> elide, the frame carries a <b>literal pre-elided string</b>, because CSS <code>text-overflow</code> is tail-only while the panel middle-elides &mdash; so the frame states the intended <i>result</i> rather than re-performing the elision, which is what makes it an oracle. <b>Monograms are the real resolved values</b> (including the mixed-script Hebrew&#8239;+&#8239;Latin pair, and the <code>?</code>&#8239;/&#8239;<code>?2</code> sentinels a degenerate roster escalates to); badge <b>colours stay illustrative</b>, as everywhere else here. An out-of-range percent is <b>rendered honestly and clamped only in the drawing</b>: the number is the wire value verbatim in its real band, the bar stops at its own track &mdash; the CLI and the panel already agree on this, and the design record ratifies it rather than inventing a third answer.</li>
-      <li><b>Light + dark hold uniformly.</b> <i>Every</i> frame carries both themes &mdash; 21 bases &times; 2 = 42, zero gaps (#778, extended by the four pathological-content bases of #752). Dark is a full oracle, not a spot-check: before #778 nine frames were light-only, so the states where a dark-surface contrast error is likeliest &mdash; three of the four fault ranks, stale-snapshot, version-skew &mdash; had nothing to check against. Every degraded token &mdash; strips, fault/attention badges and the amber stale modifiers &mdash; resolves through a theme-scoped custom property, and <code>.pop.theme-dark</code> redefines all 45 that <code>.pop.theme-light</code> defines, so no severity tint can inherit a light-surface value.</li>
+      <li><b>Light + dark hold uniformly.</b> <i>Every</i> frame carries both themes &mdash; 23 bases &times; 2 = 46, zero gaps (#778, extended by the four pathological-content bases of #752 and the two Settings bases of #763). Dark is a full oracle, not a spot-check: before #778 nine frames were light-only, so the states where a dark-surface contrast error is likeliest &mdash; three of the four fault ranks, stale-snapshot, version-skew &mdash; had nothing to check against. Every degraded token &mdash; strips, fault/attention badges and the amber stale modifiers &mdash; resolves through a theme-scoped custom property, and <code>.pop.theme-dark</code> redefines all 45 that <code>.pop.theme-light</code> defines, so no severity tint can inherit a light-surface value. The Settings window keeps the same discipline on its own token set (<code>.win.theme-dark</code> redefines all 14 that <code>.win.theme-light</code> defines).</li>
+      <li><b>The Settings window is a second surface, and the reference now exists (#763).</b> Group&nbsp;8 is <i>not</i> a panel state: it is a titled <code>NSWindow</code> at true <b>460&times;560</b> content, so it is <b>opaque</b> (no vibrancy &mdash; it sits over the desktop, not under the menu bar), it carries <b>no glance glyph</b> (nothing about it reaches the bar), and its grouped <code>Form</code> is <b>taller than the box</b> &mdash; the cut-off section in each frame is the honest depiction of a window that scrolls and cannot be resized. Three rules the frames author. <b>(1) Three zones, and the order is load-bearing:</b> the app-local <i>General</i> and <i>Notifications</i> sections sit ABOVE the daemon-config gate, so they stay usable with the daemon stopped &mdash; the daemon-down frame is the whole point of that placement (#573 fixed the opposite). <b>(2) Tunables group by daemon MECHANISM, not by operator intent</b>, which is what keeps each cross-field constraint <i>inside</i> one section (<code>exhausted_poll_secs&nbsp;&ge;&nbsp;poll_secs</code> in Polling&nbsp;&amp;&nbsp;Cooldown; <code>target_max_session_usage&nbsp;&le;&nbsp;session_ceiling</code> in Reserve&nbsp;&amp;&nbsp;Ceilings) rather than split across two headers. <b>(3) Long daemon text is bounded by GEOMETRY, never edited:</b> the footer status slot is 328&nbsp;pt and the daemon&rsquo;s <code>detail</code> can reach several thousand &mdash; so the label is <b>clamped to two lines</b> and the full text stays reachable via the hover tooltip and <code>accessibilityHelp</code>. Clamping the drawing, never the message, is the same call the <code>255%</code> meter already ratified (hq <code>design-menubar.md</code> R-8): a broken producer must stay visible at the surface meant to expose it.</li>
     </ul>
   </section>
 
