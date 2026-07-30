@@ -22,6 +22,23 @@ CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 # --- Locked design tokens (see brand/README.md) -----------------------------
 MARK_BONE="#EDE8DF"          # resting mark on the warm-graphite body
 
+# --- macOS app-icon grid (issue #952, see brand/README.md) ------------------
+# A macOS app icon is NOT full-bleed: its body occupies a fixed fraction of the
+# canvas and the system composites the margin around it. Ours shipped at 100 % on
+# every size until #952 — no margin at all. The grid is Apple's published template,
+# 824 of a 1024 canvas; README carries the peer measurement that corroborates it and
+# the alpha >= 128 threshold that measurement has to use.
+#
+# ⚠ DO NOT DROP icon.svg's rx="229" "because macOS masks it" — macOS is not iOS and
+# applies no mask of its own; peers bake their rounding into the artwork (every one
+# measured reads alpha 0 at its body-box corners), so dropping rx ships a
+# hard-cornered SQUARE. The issue's own acceptance criteria ask for that drop and are
+# wrong. The radius was never the defect: it rides APPICON_SCALE from 229 down to
+# 184.3 on an 824 body — 0.6 % under the template's 185.4 — so it needs no edit at
+# all. The icon read over-rounded because it was over-SIZED.
+APPICON_INSET=100            # (1024 - 824) / 2, per side
+APPICON_SCALE=0.8046875      # 824 / 1024
+
 NEEDLE_RESTING="M12 12 14.75 7.24"
 NEEDLE_HEALTHY="M12 12 8.18 8.18"     # full
 NEEDLE_WARNING="M12 12 12 6.6"        # half
@@ -183,24 +200,55 @@ derive() {
   sed -e "s|${5}|${3}|g" -e "s|M12 12 14.75 7.24|${4}|" "$1" > "$2"
 }
 
-echo "==> app icon (resting, warm graphite + bone)"
+# inset_app_icon(master, out.svg) — issue #952. Wrap the master's *drawn* content
+# (everything after </defs>) in the macOS app-icon grid transform, on an unchanged
+# 1024 canvas, so the surplus becomes transparent margin. Same class of move as
+# derive() above: a textual SVG transform, no new tooling. The <defs> gradient is
+# objectBoundingBox-relative, so it rescales with the body and needs no edit.
+#
+# ⚠ APP-ICON-ONLY, and that is the whole point. icon.svg stays a FULL-BLEED SHARED
+# MASTER because its other consumers must NOT be inset: apple-touch-icon.png is
+# full-bleed by Apple convention (the OS masks it), the derive() status variants are
+# the living-icon tile set, logo.png is circle-cropped by GitHub, and
+# icon-resting_512.png has to match its four full-bleed siblings. The obvious
+# single-source edit — insetting inside icon.svg — silently degrades all of them.
+inset_app_icon() {
+  # Without the anchor both substitutions are no-ops and this re-emits the master
+  # full-bleed — the original defect, silently, with nothing downstream to catch it.
+  grep -q '</defs>' "$1" || { echo "inset_app_icon: no </defs> in $1" >&2; exit 1; }
+  sed -e "s|</defs>|</defs><g transform=\"translate(${APPICON_INSET},${APPICON_INSET}) scale(${APPICON_SCALE})\">|" \
+      -e "s|</svg>|</g></svg>|" "$1" > "$2"
+}
+
+echo "==> full-bleed icon set (logo, living-icon resting tile)"
 for s in 16 32 64 128 256 512 1024; do
   rsvg-convert -w $s -h $s "${SRC}/icon.svg" -o "${DIST}/icon_${s}.png"
 done
 cp "${DIST}/icon_512.png" "${DIST}/logo.png"          # dot-github profile logo (512²)
 
+# Second pass over the SAME artwork, inset — rasterized from the inset SVG at every
+# size, not downscaled from the set above. Both macOS *app icon* surfaces read it:
+# the .appiconset, and the .icns that Finder and the DMG show. Nothing else does —
+# logo.png and the living-icon resting tile stay full-bleed, and apple-touch-icon.png
+# gets its own full-bleed render straight from the master further down.
+echo "==> app icon on the macOS grid (resting, warm graphite + bone — #952)"
+inset_app_icon "${SRC}/icon.svg" "${DIST}/_appicon.svg"
+for s in 16 32 64 128 256 512 1024; do
+  rsvg-convert -w $s -h $s "${DIST}/_appicon.svg" -o "${DIST}/appicon_${s}.png"
+done
+
 echo "==> AppIcon.appiconset"
 mkdir -p "${APPICON}"
-cp "${DIST}/icon_16.png"   "${APPICON}/icon_16x16.png"
-cp "${DIST}/icon_32.png"   "${APPICON}/icon_16x16@2x.png"
-cp "${DIST}/icon_32.png"   "${APPICON}/icon_32x32.png"
-cp "${DIST}/icon_64.png"   "${APPICON}/icon_32x32@2x.png"
-cp "${DIST}/icon_128.png"  "${APPICON}/icon_128x128.png"
-cp "${DIST}/icon_256.png"  "${APPICON}/icon_128x128@2x.png"
-cp "${DIST}/icon_256.png"  "${APPICON}/icon_256x256.png"
-cp "${DIST}/icon_512.png"  "${APPICON}/icon_256x256@2x.png"
-cp "${DIST}/icon_512.png"  "${APPICON}/icon_512x512.png"
-cp "${DIST}/icon_1024.png" "${APPICON}/icon_512x512@2x.png"
+cp "${DIST}/appicon_16.png"   "${APPICON}/icon_16x16.png"
+cp "${DIST}/appicon_32.png"   "${APPICON}/icon_16x16@2x.png"
+cp "${DIST}/appicon_32.png"   "${APPICON}/icon_32x32.png"
+cp "${DIST}/appicon_64.png"   "${APPICON}/icon_32x32@2x.png"
+cp "${DIST}/appicon_128.png"  "${APPICON}/icon_128x128.png"
+cp "${DIST}/appicon_256.png"  "${APPICON}/icon_128x128@2x.png"
+cp "${DIST}/appicon_256.png"  "${APPICON}/icon_256x256.png"
+cp "${DIST}/appicon_512.png"  "${APPICON}/icon_256x256@2x.png"
+cp "${DIST}/appicon_512.png"  "${APPICON}/icon_512x512.png"
+cp "${DIST}/appicon_1024.png" "${APPICON}/icon_512x512@2x.png"
 cat > "${APPICON}/Contents.json" <<'JSON'
 {
   "images" : [
@@ -221,13 +269,15 @@ JSON
 
 emit_status_symbolset
 
+# Inset, like the .appiconset — the same macOS app-icon surface. Left on the
+# full-bleed set, the DMG's Finder icon would disagree with the installed app's own.
 echo "==> .icns (DMG / Finder)"
 if command -v iconutil >/dev/null 2>&1; then
   ICONSET="${DIST}/Sessiometer.iconset"; mkdir -p "${ICONSET}"
   for pair in "16:icon_16x16" "32:icon_16x16@2x" "32:icon_32x32" "64:icon_32x32@2x" \
               "128:icon_128x128" "256:icon_128x128@2x" "256:icon_256x256" \
               "512:icon_256x256@2x" "512:icon_512x512" "1024:icon_512x512@2x"; do
-    cp "${DIST}/icon_${pair%%:*}.png" "${ICONSET}/${pair##*:}.png"
+    cp "${DIST}/appicon_${pair%%:*}.png" "${ICONSET}/${pair##*:}.png"
   done
   iconutil -c icns "${ICONSET}" -o "${DIST}/Sessiometer.icns"
   rm -rf "${ICONSET}"
@@ -243,7 +293,7 @@ for pair in "_ih:icon-healthy" "_iw:icon-warning" "_ic:icon-critical" "_is:icon-
     rsvg-convert -w $s -h $s "${DIST}/${pair%%:*}.svg" -o "${DIST}/${pair##*:}_${s}.png"
   done
 done
-cp "${DIST}/icon_512.png" "${DIST}/icon-resting_512.png"
+cp "${DIST}/icon_512.png" "${DIST}/icon-resting_512.png"   # full-bleed, like its four siblings above
 
 # --- No colour menu-bar glyph emission (issue #439) -------------------------
 # The menu-bar status item is a MONOCHROME TEMPLATE: state is carried by the glyph
