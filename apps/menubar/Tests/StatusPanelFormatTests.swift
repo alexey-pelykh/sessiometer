@@ -1958,6 +1958,195 @@ final class StatusPanelFormatTests: XCTestCase {
                        "glyph tints below the WCAG 1.4.11 non-text bar of 3:1: \(failures.sorted())")
     }
 
+    // MARK: AC-3 — the RESTING swap chip clears the non-text bar AS RENDERED (issue #956)
+    //
+    // Every assertion above measures a TOKEN. This one measures PIXELS, and it has to, for a reason that is
+    // specific to this chip rather than a stylistic preference.
+    //
+    // The resting chip was `.foregroundStyle(.tertiary)` — a hierarchical style, which is unresolvable BY
+    // CONSTRUCTION: `HierarchicalShapeStyle.resolve(in:)` returns `Never` on every OS version, and the macOS
+    // 13 deployment target has no `resolve` API at all. So no `assetRGB`-shaped test could ever read its
+    // value, and the gate that did exist (`PanelInteractionStateTests`) could only assert the RELATION
+    // `armedInk > restingInk` plus a 0.001 magnitude floor. A resting chip at 1.91:1 satisfies both and
+    // reports green — which is exactly what happened: issue #949 measured a BUILT panel and found resting
+    // FAILING the WCAG 1.4.11 non-text floor of 3:1 in BOTH appearances (1.91:1 light, 2.70:1 dark), with
+    // ZERO of 243 light / 433 dark chip pixels clearing it, while every gate in the tree stayed green.
+    //
+    // Reading the shipped raster sidesteps the whole problem: pixels resolve whatever the style would not.
+    // Issue #956 moved the token to an asset colour set, which IS readable — but a token assertion alone
+    // would re-introduce the same blind spot one indirection later (it proves the TOKEN's value, not that
+    // the chip is PAINTED with it), so the acceptance gate is the render and the token check below is only
+    // corroboration.
+    //
+    // NAMED HONESTLY: this is contrast IN THE REFERENCE RENDER, and it is never a claim about shipped
+    // appearance. WCAG 1.4.11 against a translucent vibrancy backdrop over arbitrary wallpaper is not a
+    // well-posed question — there is no single adjacent colour — so the repo measures against representative
+    // solids instead (`BarGlyphRenderer.swift:67`, and `surfaces` above). Same convention here, except that
+    // the background is not even assumed: it is read out of the ROI.
+
+    /// The swap chip's pixel box in a `healthy` render (760 × 898), pinned by measurement in issue #949
+    /// against `design/renders/panel-goldens/panel-healthy-{light,dark}.png`. `x` is the chip's own 32 px
+    /// column; the two `y` bands are the two switch-target rows — the ACTIVE row is not a switch target and
+    /// carries no chip, so including it would dilute the sample with plain background.
+    private static let swapChipColumn = 698..<730
+    private static let swapChipRows = [349..<375, 541..<567]
+
+    /// The chip's rendered INK and the surface it actually sits on, both read out of the ROI rather than
+    /// assumed: the BACKGROUND is the modal colour there (the row fill), and the INK is the colour furthest
+    /// from it in luminance — the glyph's opaque core, since antialiasing only ever blends BETWEEN the two
+    /// and therefore cannot overshoot either end.
+    ///
+    /// Deriving both ends from the render is what makes this an absolute measurement of shipped pixels
+    /// rather than a restatement of the token: it stays correct if the row fill moves, and it collapses to
+    /// a ratio of 1.0 (a loud fail) if the chip stops being drawn at all.
+    private func renderedChipInk(
+        _ raster: PanelRaster, file: StaticString = #filePath, line: UInt = #line
+    ) -> (ink: RGB, background: RGB, samples: Int)? {
+        guard raster.width >= Self.swapChipColumn.upperBound,
+              let lastRow = Self.swapChipRows.last, raster.height >= lastRow.upperBound else {
+            XCTFail("""
+                render is \(raster.width)×\(raster.height), too small for the chip ROI pinned in issue #949 \
+                (x \(Self.swapChipColumn), y \(Self.swapChipRows)). The panel's LAYOUT moved — re-derive the \
+                ROI against a fresh render before trusting any number from this gate.
+                """, file: file, line: line)
+            return nil
+        }
+        var counts: [UInt32: Int] = [:]
+        for band in Self.swapChipRows {
+            for y in band {
+                for x in Self.swapChipColumn {
+                    let o = (y * raster.width + x) * 4
+                    counts[UInt32(raster.bytes[o]) << 16
+                           | UInt32(raster.bytes[o + 1]) << 8
+                           | UInt32(raster.bytes[o + 2]), default: 0] += 1
+                }
+            }
+        }
+        guard let background = counts.max(by: { $0.value < $1.value }).map({ Self.srgb($0.key) }) else {
+            XCTFail("the chip ROI sampled no pixels at all", file: file, line: line)
+            return nil
+        }
+        let backgroundLuminance = relativeLuminance(background)
+        let ink = counts.keys
+            .map(Self.srgb)
+            .max { abs(relativeLuminance($0) - backgroundLuminance)
+                 < abs(relativeLuminance($1) - backgroundLuminance) }
+        guard let ink else { return nil }
+        return (ink, background, counts.values.reduce(0, +))
+    }
+
+    private static func srgb(_ packed: UInt32) -> RGB {
+        RGB(Int((packed >> 16) & 0xFF), Int((packed >> 8) & 0xFF), Int(packed & 0xFF))
+    }
+
+    /// Rasterize the `healthy` fixture through the SAME harness the panel goldens use, so this gate and the
+    /// drift gate are looking at the same pixels.
+    @MainActor
+    private func renderedHealthyPanel(
+        _ scheme: ColorScheme, file: StaticString = #filePath, line: UInt = #line
+    ) -> PanelRaster? {
+        let now = Int64(Date().timeIntervalSince1970)
+        guard let fixture = PanelRenderHarness.fixtures(now: now).first(where: { $0.name == "healthy" }) else {
+            XCTFail("no `healthy` fixture in the harness catalog", file: file, line: line)
+            return nil
+        }
+        guard let cg = PanelRenderHarness.render(fixture, scheme: scheme) else {
+            XCTFail("""
+                ImageRenderer returned nil for healthy/\(scheme == .light ? "light" : "dark"). If \
+                ImageRendererHeadlessProbeTests is ALSO red, a platform revision withdrew headless SwiftUI \
+                rasterization (issue #749) and this gate has lost its foundation.
+                """, file: file, line: line)
+            return nil
+        }
+        return PanelRaster.normalize(cg)
+    }
+
+    @MainActor
+    func testTheRestingSwapChipClearsTheWcagNonTextBarAsRendered() throws {
+        // 3.34:1 is the DESIGNED value, not a floor scraped: resting spans 1.93–2.07:1 across rows in a live
+        // panel as the backdrop varies, so aiming at a nominal 3.0 would leave the worst row near 2.8. The
+        // tokens (`#828282` light / `#808080` dark) were solved against the backgrounds this ROI actually
+        // measures — rgb(239,239,239) and rgb(48,48,48).
+        for (name, scheme) in [("light", ColorScheme.light), ("dark", ColorScheme.dark)] {
+            let raster = try XCTUnwrap(renderedHealthyPanel(scheme),
+                                       "could not rasterize healthy/\(name) into an sRGB RGBA8 buffer")
+            let measured = try XCTUnwrap(renderedChipInk(raster), "chip ROI unreadable in healthy/\(name)")
+            let ratio = contrast(measured.ink, measured.background)
+
+            XCTAssertNotEqual(measured.ink, measured.background,
+                              "the chip ROI in healthy/\(name) is a flat \(measured.background) — the chip "
+                              + "is not being drawn at all, so the ratio below is meaningless")
+            XCTAssertGreaterThanOrEqual(
+                ratio, 3.0,
+                "the RESTING swap chip measures \(String(format: "%.2f", ratio)):1 in healthy/\(name) "
+                + "(ink \(measured.ink) on \(measured.background), \(measured.samples) px sampled) — below "
+                + "the WCAG 1.4.11 non-text floor of 3:1. This is the regression issue #956 fixed: do NOT "
+                + "relax the bar, move `StatusPanelFormat.switchChipRestingTint` back over it.")
+            XCTAssertEqual(
+                ratio, 3.34, accuracy: 0.05,
+                "the resting chip drifted from its designed 3.34:1 in healthy/\(name) (now "
+                + "\(String(format: "%.4f", ratio)):1, ink \(measured.ink) on \(measured.background)). Still "
+                + "over 3:1 is not sufficient — re-derive the token against issue #949's measurements before "
+                + "moving this number, and leave `.armed` (4.73:1) alone: shrinking the rest→armed step is "
+                + "how the rejected candidate in #956 failed.")
+        }
+    }
+
+    func testTheRestingSwapChipTokenShipsAndResolves() throws {
+        // Corroboration for the render gate, and the precise error message when the colour set is the thing
+        // that broke: a missing/misnamed `SwapChipResting` would otherwise surface as an inscrutable
+        // low-contrast render. Deliberately NOT a substitute for the measurement above.
+        for surface in Self.surfaces {
+            let token = try assetRGB("SwapChipResting", surface.appearance)
+            XCTAssertGreaterThanOrEqual(
+                contrast(token, surface.base), 3.0,
+                "SwapChipResting@\(surface.name) is below the 3:1 non-text bar against the reference base")
+        }
+    }
+
+    @MainActor
+    func testTheRenderedChipContrastGateCanFail() throws {
+        // MUTATION, never inspection — the #437 lesson. Repaint the ROI with the exact pre-#956 pair issue
+        // #949 measured on a built panel, and watch THE GATE'S OWN predicate reject it. Without this, a
+        // green above could equally mean the ROI is mis-pinned onto flat background, which is the failure
+        // mode a pixel gate is most prone to.
+        for (name, scheme, ink, background) in [
+            ("light", ColorScheme.light, RGB(175, 175, 175), RGB(239, 239, 239)),
+            ("dark", ColorScheme.dark, RGB(113, 113, 113), RGB(48, 48, 48)),
+        ] {
+            let raster = try XCTUnwrap(renderedHealthyPanel(scheme))
+            let regressed = try XCTUnwrap(renderedChipInk(Self.repaintingChipROI(raster, ink: ink,
+                                                                                 background: background)))
+            XCTAssertEqual(regressed.ink, ink, "the ROI repaint did not land where the reader looks")
+            XCTAssertLessThan(
+                contrast(regressed.ink, regressed.background), 3.0,
+                "the pre-#956 \(name) chip (\(ink) on \(background), measured at "
+                + "\(name == "light" ? "1.91" : "2.70"):1 in issue #949) PASSES the 3:1 predicate — the gate "
+                + "cannot fail and proves nothing about the shipped chip.")
+        }
+    }
+
+    /// A copy of `raster` with the chip ROI repainted as `ink` strokes on `background` — the mutation the
+    /// canary drives the gate with. The stroke is a centred vertical band so it is unambiguously the
+    /// luminance extreme while `background` stays modal, mirroring how a real glyph sits in the box.
+    private static func repaintingChipROI(_ raster: PanelRaster, ink: RGB, background: RGB) -> PanelRaster {
+        var bytes = raster.bytes
+        let strokes = swapChipColumn.dropFirst(12).prefix(6)
+        for band in swapChipRows {
+            for y in band {
+                for x in swapChipColumn {
+                    let c = strokes.contains(x) ? ink : background
+                    let o = (y * raster.width + x) * 4
+                    bytes[o] = UInt8((c.red * 255).rounded())
+                    bytes[o + 1] = UInt8((c.green * 255).rounded())
+                    bytes[o + 2] = UInt8((c.blue * 255).rounded())
+                    bytes[o + 3] = 255
+                }
+            }
+        }
+        return PanelRaster(width: raster.width, height: raster.height, bytes: bytes)
+    }
+
     func testTheGlyphOnlyTintNeverReachesATextSite() {
         // HealthOK sits at 3.08:1 in light — fine for a glyph, BELOW AA for text. The only TINT-ROLE path
         // that could put it on a text run is the blind verdict, whose calm case is `.neutral`, not
