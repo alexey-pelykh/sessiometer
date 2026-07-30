@@ -458,6 +458,152 @@ final class PanelTextMetricsTests: XCTestCase {
                              "a four-digit day count must measure wider than a three-digit one")
     }
 
+    // MARK: - AC: the EXPIRY value cell is the MERGED meter tail, and it is wide enough for the bracket
+
+    /// The merged cell is DERIVED from the three constants it spans — never a fourth number (issue #951).
+    ///
+    /// This is the assertion that makes the constant's own doc comment falsifiable. `expiryValueCellWidth`
+    /// exists so the `EXPIRY` row's trailing edge coincides with `SESSION`/`WEEKLY`'s, and it can only keep
+    /// doing that if it stays composed of the same parts `UsageMeter` spends on its trailing pair. A literal
+    /// `101` would satisfy the arithmetic TODAY and silently stop tracking the moment any input moves —
+    /// which is the shape of the defect #951 was, one level up.
+    func testTheExpiryValueCellIsDerivedFromTheMeterTailItMerges() {
+        XCTAssertEqual(StatusPanelFormat.expiryValueCellWidth,
+                       StatusPanelFormat.meterPercentCellWidth
+                         + StatusPanelFormat.rowInterElementSpacing
+                         + StatusPanelFormat.meterResetCellWidth,
+                       accuracy: 0.001,
+                       "the expiry value cell stopped being the merged percent + gap + reset span — if it "
+                       + "is now written down rather than composed, the two rows' right edges can drift")
+
+        // …and the span it currently resolves to, recorded so a change to ANY input is visible in a diff
+        // rather than only in the derivation. 40 + 9 + 52.
+        XCTAssertEqual(StatusPanelFormat.expiryValueCellWidth, 101, accuracy: 0.001,
+                       "re-derive this from the three inputs above; do not re-tune it")
+    }
+
+    /// Every string `expiryLineCell` can DRAW fits the merged cell — **and the bracketed ones overflow a
+    /// bare `meterResetCellWidth`**, which is why the cell had to be merged rather than inherited (#951).
+    ///
+    /// The second half is the load-bearing one, and it is a LEVER, not decoration: it is the measured
+    /// reason the rejected alternative (a tight 52 pt reset-width cell) was rejected. Without it, "101 pt"
+    /// reads as an arbitrary generosity that a later tidy-up could shrink back to 52 and clip
+    /// `[2d 11h]` to `[2d 11…` — the exact regression, re-introduced by someone reasonably tidying.
+    ///
+    /// `expiryLineCell` brackets exactly when the deadline is WITHIN the operator's horizon (#934/#935),
+    /// so the bracketed set is reached through real `AccountExpiry` values here rather than by
+    /// hand-assembling the string — the brackets have to come from the shipped predicate, or this measures
+    /// a string the panel never draws.
+    func testEveryExpiryCellFitsTheMergedValueCellAndTheBracketOverflowsTheResetCell() {
+        let now: Int64 = 1_800_000_000
+        let day: Int64 = 86_400
+        var fitted = 0
+        var bracketed = 0
+
+        // Every SHAPE the cell can take, across all four horizon verdicts. The `.within` rows are the
+        // bracketed ones; `.beyond` / `.lapsed` / the unobserved gap are not.
+        let cases: [(name: String, expiry: AccountExpiry?)] = [
+            ("unobserved gap",      nil),
+            ("unknown deadline",    AccountExpiry(expiresAt: nil, horizonState: .unknown)),
+            ("lapsed",              AccountExpiry(expiresAt: now - day, horizonState: .lapsed)),
+            ("beyond the horizon",  AccountExpiry(expiresAt: now + 29 * day, horizonState: .beyond)),
+            ("within, minutes",     AccountExpiry(expiresAt: now + 45 * 60, horizonState: .within)),
+            ("within, widest hour", AccountExpiry(expiresAt: now + 23 * 3600 + 59 * 60,
+                                                  horizonState: .within)),
+            ("within, 3-digit day", AccountExpiry(expiresAt: now + 999 * day + 23 * 3600,
+                                                  horizonState: .within)),
+        ]
+
+        for (name, expiry) in cases {
+            let drawn = StatusPanelFormat.expiryLineCell(expiry, now: now)
+            assertFits(drawn, meterResetFont,
+                       budget: StatusPanelFormat.expiryValueCellWidth, "expiry value cell — \(name)")
+            fitted += 1
+
+            if drawn.hasPrefix("["), drawn.hasSuffix("]") { bracketed += 1 }
+            print(String(format: "[expiry-cell] %-20@ %-10@ %6.2f pt",
+                         name as NSString, drawn as NSString, width(drawn, meterResetFont)))
+        }
+
+        // Degenerate-subject guard: a green is evidence only if it evaluated the whole planned set, AND
+        // only if the bracketed forms — the variable-width case the cell was widened for — were reached.
+        XCTAssertEqual(fitted, cases.count, "expected \(cases.count) expiry measurements, ran \(fitted)")
+        XCTAssertEqual(bracketed, 3,
+                       "expected 3 BRACKETED expiry cells, saw \(bracketed) — the widths above cover "
+                       + "correspondingly less of the variable-width case")
+
+        // THE LEVER, and it is deliberately narrow: the WIDEST reachable bracketed form must overflow the
+        // 52 pt reset cell — i.e. the rejected alternative really would have clipped it.
+        //
+        // MEASURED CORRECTION, recorded rather than quietly rounded. This assertion was first written
+        // against EVERY bracketed form, on the assumption that adding two characters always overspends a
+        // cell sized for the bare duration. Measured, that is false: `[45m]` needs 32.15 pt and fits 52
+        // comfortably. Only the wide end overflows, so only the wide end is asserted — and the printed
+        // table above is what makes that re-checkable rather than a claim to trust. The narrow forms are
+        // not evidence for merging the cell and are no longer cited as if they were.
+        let widest = StatusPanelFormat.expiryLineCell(
+            AccountExpiry(expiresAt: now + 999 * day + 23 * 3600, horizonState: .within), now: now)
+        XCTAssertEqual(widest, "[999d23h]", "the widest three-digit-day bracketed form changed shape")
+        XCTAssertTrue(overflows(widest, meterResetFont, budget: StatusPanelFormat.meterResetCellWidth),
+                      "\"\(widest)\" needs "
+                      + String(format: "%.2f", width(widest, meterResetFont))
+                      + " pt and FITS the \(StatusPanelFormat.meterResetCellWidth) pt reset cell — if even "
+                      + "the widest bracketed form no longer overflows it, the documented reason for "
+                      + "merging the percent cell in has evaporated and this gate asserts nothing")
+        assertFits(widest, meterResetFont,
+                   budget: StatusPanelFormat.expiryValueCellWidth, "widest bracketed form, merged cell")
+    }
+
+    /// RR-6, end to end: the bracket and a full-width percent, taken from a real WIRE frame and measured
+    /// against the cells that actually lay them out (issue #951).
+    ///
+    /// The two tests above measure hand-built values. This one starts from bytes a daemon can send —
+    /// `Fixtures.snapshotExpiryBracketBesideWidePercent`, whose `work` row carries `session_pct: 255`
+    /// beside a WITHIN-horizon deadline — decodes them through the shipped `parseWatchFrame`, and measures
+    /// what the panel would draw. That closes the loop the other two leave open: a fixture set where the
+    /// bracket only ever appears beside a narrow percent cannot falsify the merged cell, and until #951
+    /// that was the only bracketed fixture the suite had.
+    ///
+    /// Both trailing cells are at their widest here AT THE SAME TIME, which is the row the merged cell
+    /// exists to hold and the one no prior fixture built.
+    func testTheWireBracketBesideAFullWidthPercentFitsBothTrailingCells() throws {
+        guard case .snapshot(let frame) =
+                try parseWatchFrame(Fixtures.snapshotExpiryBracketBesideWidePercent) else {
+            return XCTFail("the #951 widest-row frame must decode — it is a current-daemon shape")
+        }
+        let work = frame.accounts[0]
+        let now = try XCTUnwrap(frame.generatedAt, "the frame must carry the instant its durations are relative to")
+
+        // The premises this measurement rests on, asserted rather than assumed — a fixture edited to
+        // narrow either cell would otherwise silently turn this into a weaker test that still passes.
+        XCTAssertEqual(work.sessionPct, 255,
+                       "the RR-6 frame must carry the WIDEST wire-reachable percent, not the domain's 100")
+        XCTAssertEqual(work.expiry?.horizonState, .within,
+                       "the RR-6 frame's expiry must be WITHIN the horizon, or nothing brackets it")
+
+        let percent = StatusPanelFormat.pct(work.sessionPct)
+        let reset = StatusPanelFormat.humanizeUntil(try XCTUnwrap(work.weeklyResetsAt) - now)
+        let expiry = StatusPanelFormat.expiryLineCell(work.expiry, now: now)
+
+        XCTAssertEqual(percent, "255%")
+        XCTAssertTrue(expiry.hasPrefix("[") && expiry.hasSuffix("]"),
+                      "the RR-6 frame drew \"\(expiry)\" — unbracketed, so it is not exercising the "
+                      + "variable-width case the merged cell was widened for")
+
+        // Each string against the cell that lays it out.
+        assertFits(percent, meterPercentFont,
+                   budget: StatusPanelFormat.meterPercentCellWidth, "RR-6 percent cell")
+        assertFits(reset, meterResetFont,
+                   budget: StatusPanelFormat.meterResetCellWidth, "RR-6 reset cell")
+        assertFits(expiry, meterResetFont,
+                   budget: StatusPanelFormat.expiryValueCellWidth, "RR-6 expiry value cell")
+
+        // And the discriminating half: this exact drawn string would CLIP in the rejected 52 pt cell.
+        XCTAssertTrue(overflows(expiry, meterResetFont, budget: StatusPanelFormat.meterResetCellWidth),
+                      "\"\(expiry)\" fits the \(StatusPanelFormat.meterResetCellWidth) pt reset cell, so "
+                      + "this frame no longer demonstrates why the cell was merged")
+    }
+
     // MARK: - AC: an out-of-range percent is measured, and the bar fill is clamped
 
     // `WireModel` decodes `session_pct` / `weekly_pct` as a bare `UInt8` and applies NO clamp, so 255 is
