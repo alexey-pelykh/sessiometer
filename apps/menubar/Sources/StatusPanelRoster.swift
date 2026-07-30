@@ -449,9 +449,16 @@ struct AccountRowView: View {
                 case .hidden:
                     Color.clear
                 case .resting:
-                    // Quiet at rest — `.tertiary` ≈ the mock's `--text-3` decorative token. Never `.tint`:
-                    // the one accent action is the footer Swap (Von Restorff, one accent per panel).
-                    chipGlyph.foregroundStyle(.tertiary)
+                    // Quiet at rest, but an ASSET token rather than `.tertiary` (issue #956). `.tertiary`
+                    // measured 1.91:1 light / 2.70:1 dark on the panel's own backdrop — under the WCAG
+                    // 1.4.11 non-text floor of 3:1, and unassertable besides: `HierarchicalShapeStyle`
+                    // resolves to `Never`, so no test can ever read its value and the relational gate
+                    // (`armed > resting`) passes a below-floor rest. `SwapChipResting` is a zero-chroma
+                    // neutral that measures 3.34:1 in BOTH appearances and ships Increase-Contrast
+                    // variants a raw `Color` could not. Never `.tint`: the one accent action is the footer
+                    // Swap (Von Restorff, one accent per panel), and a zero-chroma chip makes no status
+                    // claim — brand `an honest gauge reserves colour for the reading`.
+                    chipGlyph.foregroundStyle(Color.panel(StatusPanelFormat.switchChipRestingTint))
                 case .armed:
                     // Brightened once armed — `.secondary` ≈ the mock's `--text-2`. A SEMANTIC tint step,
                     // not a hardcoded opacity (#388 / #448).
