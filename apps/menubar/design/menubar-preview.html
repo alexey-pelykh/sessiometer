@@ -157,8 +157,20 @@
     /* #969 glyph companions to the two tokens above: the shared opaque triplet, plus each token's alpha
        as a bare number. A multi-drawable SVG has to carry its alpha on the ELEMENT (`opacity` rasterises
        the group and fades it ONCE) rather than in the COLOUR (where every <path> composites separately,
-       so overlaps darken to 1-(1-a)^n). Same numbers as --text-2/--text-3 — move them together. */
+       so overlaps darken to 1-(1-a)^n). Same numbers as --text-2/--text-3 — move them together.
+       #956 left --text-3-a with NO consumer: its only two (.rowact, .rowact.inert) moved to --chip-a.
+       Kept rather than deleted, because #969's pairing is what makes the scheme legible and the next
+       multi-path glyph drawn at --text-3 needs this half back — but do NOT read an unused token as a
+       free one to grab: --text-3 is DECORATIVE, and reaching for it to paint something load-bearing is
+       exactly the mistake #956 had to undo. */
     --text-rgb:60,60,67; --text-2-a:.72; --text-3-a:.4;
+    /* #956: the swap chip's OWN resting alpha, split out of --text-3-a. --text-3 is decorative, but the
+       chip was the one thing spending it that is NOT: it is the sole at-rest carrier of row
+       discoverability, so it has to clear WCAG 1.4.11's 3:1 while --text-3's other user (the inactive
+       dot's ring, redundant with row tint AND fill-vs-ring shape) does not. Raising --text-3 globally
+       would have dragged that along. .6 is the ratified value; measured on a BUILT panel the old .4
+       chip ran 1.91:1 light / 2.70:1 dark. Armed stays --text-2-a — it already measures 4.73:1. */
+    --chip-a:.6;
     --divider:rgba(0,0,0,.08); --card-bg:rgba(120,120,128,.08);
     --active-bg:rgba(0,122,255,.08);
     --accent:#007aff; --accent-halo:rgba(0,122,255,.2);
@@ -181,6 +193,12 @@
     --pop-bg:rgba(38,38,43,.64); --pop-border:rgba(255,255,255,.12); --pop-hl:rgba(255,255,255,.09);
     --text:#f5f5f7; --text-2:rgba(235,235,245,.6); --text-3:rgba(235,235,245,.36);
     --text-rgb:235,235,245; --text-2-a:.6; --text-3-a:.36;   /* #969 — see the light block */
+    /* #956 — see the light block. NOT .6: this ramp is uniformly lower (near-white ink needs less alpha
+       on a dark ground), and .6 is what --text-2-a already spends, so copying the light value would
+       collapse rest INTO armed. .46 is the same TARGET carried onto this ramp — it composites to
+       rgb(129) over the dark base, matching the light token's rgb(130) — and keeps a 1.30x step to
+       armed, clear of the >=1.3x floor. */
+    --chip-a:.46;
     --divider:rgba(255,255,255,.09); --card-bg:rgba(255,255,255,.05);
     --active-bg:rgba(10,132,255,.15);
     --accent:#0a84ff; --accent-halo:rgba(10,132,255,.3);
@@ -252,20 +270,24 @@
      active still reads under colour-blindness and macOS monochrome. */
   .health{ display:inline-flex; color:var(--ok) }
   /* per-row manual-switch chip (#448 — persistent quiet, brightens when armed): #169's per-row swap made
-     DISCOVERABLE at rest. Neutral --text-3 at rest (never accent — the one accent action is the footer Swap,
+     DISCOVERABLE at rest. Neutral at rest (never accent — the one accent action is the footer Swap,
      Von Restorff), brightening to --text-2 when the row is armed (hover / focus). No wash / cursor at rest,
-     so it reads as a quiet HINT, not a loud control; the active row (not a switch target) omits it. Mirrors
-     SwiftUI `StatusPanelFormat.switchChipEmphasis` → `.tertiary` (rest) / `.secondary` (armed). */
+     so it reads as a quiet HINT, not a loud control; the active row (not a switch target) omits it.
+     #956: rest is --chip-a, NOT --text-3-a. This block used to declare the chip decorative and then ask it
+     to carry at-rest discoverability in the same breath — a token cannot be both, and the built panel
+     resolved that contradiction the wrong way (1.91:1 light / 2.70:1 dark, under the 3:1 non-text floor).
+     Mirrors SwiftUI `StatusPanelFormat.switchChipEmphasis` → `switchChipRestingTint` (rest, the
+     `SwapChipResting` asset) / `.secondary` (armed, unchanged and still passing at 4.73:1). */
   /* #969: the alpha rides `opacity` (the ELEMENT), never the colour — the swap arrows are four separate
      <path>s and round caps stack a disc at each arrowhead vertex, so a colour-borne alpha composited
      twice there (1-(1-.4)^2 = .64 against a nominal .40, on the glyph's most salient feature). */
-  .rowact{ flex:0 0 auto; display:grid; place-items:center; width:16px; height:16px; color:rgb(var(--text-rgb)); opacity:var(--text-3-a) }
+  .rowact{ flex:0 0 auto; display:grid; place-items:center; width:16px; height:16px; color:rgb(var(--text-rgb)); opacity:var(--chip-a) }
   .acct:hover .rowact{ opacity:var(--text-2-a) }   /* armed on hover (the steady state is the quiet rest above) */
   .rowact.armed{ opacity:var(--text-2-a) }          /* explicit armed modifier (preview the brighten statically) */
   /* `inert` carries what used to be a per-instance inline `opacity:.4` on the ⊘ no-viable-target chip.
      That inline value MULTIPLIED with the colour's alpha (.4 x .4 = .16); with the alpha now on the
      element it would OVERRIDE instead, so the product is folded in here — and stays theme-aware. */
-  .rowact.inert{ opacity:calc(var(--text-3-a) * .4) }
+  .rowact.inert{ opacity:calc(var(--chip-a) * .4) }
   .acct:hover .rowact.inert{ opacity:calc(var(--text-2-a) * .4) }
 
   .meters{ margin-top:9px; display:grid; gap:6px }
