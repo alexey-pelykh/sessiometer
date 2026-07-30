@@ -329,8 +329,12 @@ enum StatusPanelFormat {
     //
     //   * LINKED (the view reads this exact constant, so there is no second copy):
     //     `meterLabelCellWidth`, `meterPercentCellWidth`, `meterResetCellWidth` (the three `UsageMeter`
-    //     cells, also reused by `BlindMeter`), `rowHorizontalPadding`, `rowInterElementSpacing`,
-    //     `rowSpacerMinLength`, `statusDotWidth`, `monogramBadgeWidth`.
+    //     cells, also reused by `BlindMeter`), `expiryValueCellWidth`, `rowHorizontalPadding`,
+    //     `rowInterElementSpacing`, `rowSpacerMinLength`, `statusDotWidth`, `monogramBadgeWidth`.
+    //     `expiryValueCellWidth` is the one LINKED entry that is also DERIVED — the view lays out with it
+    //     exactly (so it is a pin, not a budget), but its value is composed from three of the pins above
+    //     rather than written down, which is what keeps the `EXPIRY` and `SESSION`/`WEEKLY` rows' trailing
+    //     edges from drifting apart when any of the three moves.
     //
     //   * ALLOWANCE (no view site exists to link — the element has no fixed frame and sizes to its own
     //     content, so this is a RESERVED budget, not a pin): `authColumnAllowance`,
@@ -359,6 +363,35 @@ enum StatusPanelFormat {
     /// (132.24 pt). So this cell is safe for every plausible reset instant and clips only on a wire value
     /// that is already nonsense — which is exactly what the gate reports rather than assumes.
     static let meterResetCellWidth: Double = 52
+
+    /// The `EXPIRY` line's trailing VALUE cell — `UsageMeter`'s percent and reset cells MERGED into one
+    /// right-aligned cell, so the expiry duration lands in the same right-hand value gutter as the reset
+    /// duration one line above (issue #951).
+    ///
+    /// WHY IT IS DERIVED AND NOT A FOURTH NUMBER. It is exactly the region `UsageMeter` spends on its
+    /// trailing pair — `meterPercentCellWidth` + one `rowInterElementSpacing` + `meterResetCellWidth` —
+    /// so both rows' last child ends at the same x BY CONSTRUCTION. Writing `101` here instead would be a
+    /// second copy of a number three other constants already determine, free to drift the moment any of
+    /// them moves; that drift is precisely the class of defect #951 was.
+    ///
+    /// WHY MERGED, and not the two cells inherited separately. Expiry has no percentage, so a
+    /// present-but-empty 40 pt percent cell would leave a permanent gap that reads as more broken than
+    /// the misplacement it fixed. And the reset cell's 52 pt ALONE is not enough: within the warning
+    /// horizon `expiryLineCell` wraps its duration in brackets (`[6d21h]`, issues #934/#935), so the cell
+    /// is variable-width and must absorb two extra characters without clipping.
+    ///
+    /// MEASURED, and narrower than the intuition: the brackets do NOT push every form past 52 pt —
+    /// `[45m]` needs 32.15 pt and would have fitted. It is the WIDE end that overflows (`[23h59m]`
+    /// 52.67 pt, `[999d23h]` 56.85 pt), which is enough — a cell that clips its widest reachable content
+    /// is a clipping cell. `PanelTextMetricsTests` prints the whole table and asserts the widest form both
+    /// fits HERE and overflows a bare `meterResetCellWidth`; re-derive from that run rather than from
+    /// these numbers.
+    ///
+    /// NOTE this cell has no bar to its left; the row is `label / flexible spacer / this`. The spacer is
+    /// what the bar's slot becomes, which is the whole point — the value moves OUT of it.
+    static var expiryValueCellWidth: Double {
+        meterPercentCellWidth + rowInterElementSpacing + meterResetCellWidth
+    }
 
     /// The leading status dot's diameter (`StatusDot`), on a roster row and on a Stats card's head row alike.
     static let statusDotWidth: Double = 8
