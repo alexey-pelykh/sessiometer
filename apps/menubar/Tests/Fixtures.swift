@@ -260,6 +260,39 @@ enum Fixtures {
     {"type":"snapshot","schema_version":{"major":1,"minor":13},"generated_at":1893456000,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":30,"weekly_pct":20,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":1893470000,"refresh_health":{"last_ok":true,"rotated":false,"consecutive_failures":0},"auth":"healthy","expiry":{"expires_at":1893800000,"horizon_state":"within"}},{"label":"spare","active":false,"enabled":true,"quarantined":false,"recovering":false,"session_pct":20,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy","expiry":{"expires_at":null,"horizon_state":"unknown"}}],"next_swap":{"state":"target","to":"spare","reason":{"kind":"only_candidate"}},"refresh_enabled":true,"systemic_refresh_failure":null}
     """#
 
+    /// The WIDEST-ROW frame (issue #951) — a within-horizon **bracketed** expiry standing beside a
+    /// **full-width percent**, in ONE roster.
+    ///
+    /// WHY A SEPARATE FIXTURE, when `snapshotExpiryModifier` above already carries a `within` row. That one
+    /// pairs its bracket with `session_pct: 30`, so the two widest things the row can hold have never been
+    /// asked to coexist — and coexisting is precisely what the merged `expiryValueCellWidth` cell exists
+    /// for. A roster where the bracket only ever appears beside a narrow percent cannot falsify the cell's
+    /// width, so a green run over it proves nothing about the case that motivated the cell.
+    ///
+    /// The percent is `255`, not `100`: `WireModel` decodes `session_pct` / `weekly_pct` as a bare `UInt8`
+    /// with NO clamp, so 255 is the widest value the WIRE can put in that cell — the same ceiling
+    /// `meterPercentCellWidth`'s own doc comment and `wire-hostile-numerics` are calibrated against. Taking
+    /// the domain's 100 instead would quietly test a narrower row than a daemon can actually send.
+    ///
+    /// `work` also carries a three-digit-day reset (`999d23h`, the measured widest reset form that still
+    /// fits its cell) so the row is at its true maximum across BOTH trailing cells at once, and `spare`
+    /// holds the unobserved-deadline gap so the frame keeps a `—` beside the bracket rather than becoming
+    /// uniformly wide.
+    ///
+    /// The `within` verdict on a 999-day deadline is deliberately UNREALISTIC and is not a modelling
+    /// mistake: `horizon_state` is the DAEMON's classification and the panel renders whatever it is told
+    /// (`expiryWithinHorizon` switches on the wire verdict, never on a threshold of its own), so pairing
+    /// the widest duration with the bracket is the only way to reach the widest string the cell can be
+    /// asked to draw. A realistic horizon would test a narrower row and prove less.
+    ///
+    /// NOT byte-pinned, and deliberately NOT a `PanelRenderHarness` fixture: adding a 23rd render fixture
+    /// would move `PanelGoldenParityTests`' asserted 44-cell / 22-fixture / 16-rival-less counts, which
+    /// measure the golden CATALOG rather than this row. The width claim is a MEASUREMENT, so it is asserted
+    /// where measurements live (`PanelTextMetricsTests`, `PanelExpiryGutterTests`) instead.
+    static let snapshotExpiryBracketBesideWidePercent = #"""
+    {"type":"snapshot","schema_version":{"major":1,"minor":13},"generated_at":1893456000,"accounts":[{"label":"work","active":true,"enabled":true,"quarantined":false,"recovering":false,"session_pct":255,"weekly_pct":255,"session_resets_at":1979852400,"weekly_resets_at":1979852400,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":{"last_ok":true,"rotated":false,"consecutive_failures":0},"auth":"healthy","expiry":{"expires_at":1979852400,"horizon_state":"within"}},{"label":"spare","active":false,"enabled":true,"quarantined":false,"recovering":false,"session_pct":20,"weekly_pct":10,"session_resets_at":null,"weekly_resets_at":null,"weekly_exhausted":false,"access_expires_at":null,"refresh_health":null,"auth":"healthy","expiry":{"expires_at":null,"horizon_state":"unknown"}}],"next_swap":{"state":"target","to":"spare","reason":{"kind":"only_candidate"}},"refresh_enabled":true,"systemic_refresh_failure":null}
+    """#
+
     /// The SYNCHRONIZED-EXPIRY COHORT (issue #879, schema 1.13) — a current-daemon frame carrying
     /// BOTH halves of the fact this build does not yet mirror: the per-account `expiry.cohort_id`
     /// grouping key, and the daemon-level `expiry_cohort` condition beside it.

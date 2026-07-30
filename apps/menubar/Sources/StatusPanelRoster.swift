@@ -590,18 +590,26 @@ private struct ExpiryLine: View {
     let now: Int64
 
     var body: some View {
-        HStack(spacing: 9 * scale) {
+        HStack(spacing: StatusPanelFormat.rowInterElementSpacing * scale) {
             Text(StatusPanelFormat.expiryRowLabel)
                 .font(.panel(10, .semibold, scale: scale))
                 .foregroundStyle(.secondary)
                 .frame(width: StatusPanelFormat.meterLabelCellWidth * scale, alignment: .leading)
 
+            // The bar's slot, vacated. Expiry is a CREDENTIAL fact and draws no bar (see the doc comment
+            // above), so what the bar would occupy becomes flexible space — and the value carries on PAST
+            // it to the gutter, rather than falling into it (issue #951).
+            Spacer(minLength: 0)
+
+            // The merged percent+reset region, right-aligned, so this value's trailing edge coincides with
+            // the reset duration's one line up. `UsageMeter` ends `… / 40 .trailing / 52 .trailing`; this
+            // ends on the single cell those two span. Both are their `HStack`'s LAST child at the same
+            // width, which is what makes the two rows share one right edge instead of merely looking close.
             Text(StatusPanelFormat.expiryLineCell(expiry, now: now))
                 .font(.panel(11, scale: scale)).monospacedDigit()
                 .foregroundStyle(valueColor)
+                .frame(width: StatusPanelFormat.expiryValueCellWidth * scale, alignment: .trailing)
                 .lineLimit(1)
-
-            Spacer(minLength: 0)
         }
         // One VoiceOver element already speaks this row (`rowAccessibilityLabel` carries the expiry
         // phrase), so the line's own text would be read twice.
