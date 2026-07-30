@@ -154,6 +154,11 @@
     /* --text-2 carries load-bearing secondary text (freshness age, reset countdowns): .72 clears
        WCAG AA 4.5:1 (4.53:1 over #f5f5f7); the prior .62 ran 3.50:1. --text-3 stays decorative. */
     --text:#1d1d1f; --text-2:rgba(60,60,67,.72); --text-3:rgba(60,60,67,.4);
+    /* #969 glyph companions to the two tokens above: the shared opaque triplet, plus each token's alpha
+       as a bare number. A multi-drawable SVG has to carry its alpha on the ELEMENT (`opacity` rasterises
+       the group and fades it ONCE) rather than in the COLOUR (where every <path> composites separately,
+       so overlaps darken to 1-(1-a)^n). Same numbers as --text-2/--text-3 — move them together. */
+    --text-rgb:60,60,67; --text-2-a:.72; --text-3-a:.4;
     --divider:rgba(0,0,0,.08); --card-bg:rgba(120,120,128,.08);
     --active-bg:rgba(0,122,255,.08);
     --accent:#007aff; --accent-halo:rgba(0,122,255,.2);
@@ -175,6 +180,7 @@
   .pop.theme-dark{
     --pop-bg:rgba(38,38,43,.64); --pop-border:rgba(255,255,255,.12); --pop-hl:rgba(255,255,255,.09);
     --text:#f5f5f7; --text-2:rgba(235,235,245,.6); --text-3:rgba(235,235,245,.36);
+    --text-rgb:235,235,245; --text-2-a:.6; --text-3-a:.36;   /* #969 — see the light block */
     --divider:rgba(255,255,255,.09); --card-bg:rgba(255,255,255,.05);
     --active-bg:rgba(10,132,255,.15);
     --accent:#0a84ff; --accent-halo:rgba(10,132,255,.3);
@@ -250,9 +256,17 @@
      Von Restorff), brightening to --text-2 when the row is armed (hover / focus). No wash / cursor at rest,
      so it reads as a quiet HINT, not a loud control; the active row (not a switch target) omits it. Mirrors
      SwiftUI `StatusPanelFormat.switchChipEmphasis` → `.tertiary` (rest) / `.secondary` (armed). */
-  .rowact{ flex:0 0 auto; display:grid; place-items:center; width:16px; height:16px; color:var(--text-3) }
-  .acct:hover .rowact{ color:var(--text-2) }   /* armed on hover (the steady state is the quiet rest above) */
-  .rowact.armed{ color:var(--text-2) }          /* explicit armed modifier (preview the brighten statically) */
+  /* #969: the alpha rides `opacity` (the ELEMENT), never the colour — the swap arrows are four separate
+     <path>s and round caps stack a disc at each arrowhead vertex, so a colour-borne alpha composited
+     twice there (1-(1-.4)^2 = .64 against a nominal .40, on the glyph's most salient feature). */
+  .rowact{ flex:0 0 auto; display:grid; place-items:center; width:16px; height:16px; color:rgb(var(--text-rgb)); opacity:var(--text-3-a) }
+  .acct:hover .rowact{ opacity:var(--text-2-a) }   /* armed on hover (the steady state is the quiet rest above) */
+  .rowact.armed{ opacity:var(--text-2-a) }          /* explicit armed modifier (preview the brighten statically) */
+  /* `inert` carries what used to be a per-instance inline `opacity:.4` on the ⊘ no-viable-target chip.
+     That inline value MULTIPLIED with the colour's alpha (.4 x .4 = .16); with the alpha now on the
+     element it would OVERRIDE instead, so the product is folded in here — and stays theme-aware. */
+  .rowact.inert{ opacity:calc(var(--text-3-a) * .4) }
+  .acct:hover .rowact.inert{ opacity:calc(var(--text-2-a) * .4) }
 
   .meters{ margin-top:9px; display:grid; gap:6px }
   .meter{ display:grid; grid-template-columns:52px 1fr 40px 52px; align-items:center; column-gap:9px }
@@ -274,8 +288,12 @@
      adds an at-risk ORANGE eye + orange verdict + an orange LEADING RULE; OK stays calm. The header + footer
      stay FRESH — the fault is THIS row's (locality), the AC-distinction from a whole-snapshot "stale". This
      mirrors SwiftUI `StatusPanelView.BlindMeter` / `authView` + `StatusPanelFormat` blind verdicts. */
-  .health.blind{ color:var(--text-2) }                        /* eye-slash — OK calm (SwiftUI `.neutral`→`.secondary`) */
-  .acct.blind-degraded .health.blind{ color:var(--ut-o) }     /* DEGRADED — at-risk orange */
+  /* #969: same element-borne alpha as `.rowact`, and the worst case in the mock — the slash crosses BOTH
+     the eye outline and the pupil, so a colour-borne alpha composited THREE deep at those crossings
+     (1-(1-.72)^3 = .98 against a nominal .72). The two escalations below restore `opacity:1`: their
+     colours are already fully opaque, so they must not inherit the calm state's fade. */
+  .health.blind{ color:rgb(var(--text-rgb)); opacity:var(--text-2-a) }   /* eye-slash — OK calm (SwiftUI `.neutral`→`.secondary`) */
+  .acct.blind-degraded .health.blind{ color:var(--ut-o); opacity:1 }     /* DEGRADED — at-risk orange */
   .acct.blind-degraded{ box-shadow:inset 3px 0 0 var(--ut-o) }/* orange leading rule (locality tell) */
   /* CORNERED (#572) — blind + DEGRADED + no viable target: auto-protection CANNOT ACT, the one bounded-
      blindness state the daemon can't self-resolve. Strictly worse than DEGRADED, so it escalates the same
@@ -283,7 +301,7 @@
      the CLI `render_cornered` (`src/cli.rs`, R-2 STATE-parity); the ⊘ glance already escalates via
      `hasNoViableTarget`. The remedy is UNCONDITIONAL (#666: cornered is always unresolvable), unlike the
      general all-exhausted footer whose "add an account" nudge is gated on a structural-vs-transient wait. */
-  .acct.blind-cornered .health.blind{ color:var(--ut-r) }     /* CORNERED — red eye-slash */
+  .acct.blind-cornered .health.blind{ color:var(--ut-r); opacity:1 }     /* CORNERED — red eye-slash */
   .acct.blind-cornered{ box-shadow:inset 3px 0 0 var(--ut-r) }/* red leading rule (worse than degraded's orange) */
   .bmeter{ margin-top:9px; display:grid; gap:5px }
   /* the held row reuses Session's 52 + pct's 40 columns; the trailing chip is 58 (vs reset's 52) so
@@ -2430,7 +2448,7 @@
                   <span class="dot"></span>
                   <span class="badge id-personal">PE</span>
                   <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
-                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" style="opacity:.4" title="No viable swap target — weekly-exhausted"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></svg></span></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact inert" title="No viable swap target — weekly-exhausted"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></svg></span></span>
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:14%"></span></span><span class="m-pct g">14%</span><span class="m-reset">2h</span></div>
@@ -2442,7 +2460,7 @@
                   <span class="dot"></span>
                   <span class="badge id-scratch">SC</span>
                   <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
-                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" style="opacity:.4" title="No viable swap target — weekly-exhausted"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></svg></span></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact inert" title="No viable swap target — weekly-exhausted"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></svg></span></span>
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:6%"></span></span><span class="m-pct g">6%</span><span class="m-reset">4h50m</span></div>
@@ -2493,7 +2511,7 @@
                   <span class="dot"></span>
                   <span class="badge id-personal">PE</span>
                   <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
-                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" style="opacity:.4" title="No viable swap target — weekly-exhausted"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></svg></span></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact inert" title="No viable swap target — weekly-exhausted"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></svg></span></span>
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:14%"></span></span><span class="m-pct g">14%</span><span class="m-reset">2h</span></div>
@@ -2505,7 +2523,7 @@
                   <span class="dot"></span>
                   <span class="badge id-scratch">SC</span>
                   <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
-                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" style="opacity:.4" title="No viable swap target — weekly-exhausted"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></svg></span></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact inert" title="No viable swap target — weekly-exhausted"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></svg></span></span>
                 </div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:6%"></span></span><span class="m-pct g">6%</span><span class="m-reset">4h50m</span></div>
