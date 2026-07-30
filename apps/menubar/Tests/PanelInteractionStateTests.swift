@@ -247,35 +247,63 @@ final class PanelInteractionStateTests: XCTestCase {
     /// makes it directional. It is also theme-agnostic without a luminance sign: a more opaque glyph departs
     /// further from its backdrop whether the ink is darkening on light or lightening on dark.
     ///
-    /// ALPHA IS IN THE SUM, and it is not a detail — an RGB-only version of this measure is structurally
-    /// BLIND to the very step it exists to detect. A bare row renders on a TRANSPARENT backdrop (a
-    /// non-active row's own background is `Color.clear`), and the normalized raster is premultiplied. In the
-    /// light scheme the chip's ink is near-black, and premultiplied black is `(0,0,0)` at *every* opacity —
-    /// so `.tertiary` and `.secondary` produce byte-identical RGB and differ ONLY in alpha. Measured: the
-    /// RGB-only form returned 21.168576104746318 for both, to the last digit, while `diffFraction` (which
-    /// does include alpha) saw 0.0019 of pixels change. `PanelRaster.inkCoverage` has that same RGB-only
-    /// shape — correct for the opaque full-panel rasters it was written for, wrong here; its doc comment
-    /// now carries this warning so the next caller meets it there rather than only here.
+    /// THE RASTER IS COMPOSITED ONTO AN OPAQUE BACKDROP FIRST, and that step is load-bearing rather than
+    /// cosmetic. A bare row renders on a TRANSPARENT backdrop (a non-active row's own background is
+    /// `Color.clear`) into a PREMULTIPLIED buffer, and measuring that buffer directly cannot work in either
+    /// naive form:
+    ///
+    ///   * RGB-only, uncomposited, is structurally BLIND to the step. In the light scheme the chip's ink is
+    ///     near-black, and premultiplied black is `(0,0,0)` at *every* opacity — so a translucent
+    ///     `.tertiary` and a translucent `.secondary` produce byte-identical RGB and differ ONLY in alpha.
+    ///     Measured: that form returned 21.168576104746318 for both, to the last digit.
+    ///   * Summing ALPHA alongside RGB fixes the blindness but measures COVERAGE, not contrast — and the two
+    ///     part company the moment one state's token is opaque and the other's is not. Issue #956 made
+    ///     exactly that change: `.resting` moved to the opaque `SwapChipResting` asset while `.armed` kept
+    ///     the translucent `.secondary`, so the resting chip contributed ~255 of alpha per glyph pixel
+    ///     against armed's ~128 and this predicate reported resting as the STRONGER of the two (light 42.21
+    ///     vs 41.49, dark 59.35 vs 59.24). That verdict was an artifact: on the surface the panel actually
+    ///     draws on, resting measures 3.34:1 and armed 4.73:1 — armed is higher-contrast by 1.42×, exactly
+    ///     the ratified relation. A metric that inverts on a correct change is not a guard, it is a trap.
+    ///
+    /// Compositing resolves both at once, because it is what the eye does: source-over onto the row backdrop
+    /// turns alpha back into the colour difference alpha was always standing in for, so a translucent glyph
+    /// and an opaque one are finally measured on one scale. The alpha term then drops out (every composited
+    /// pixel is opaque) without reopening the blindness above.
+    ///
+    /// `PanelRaster.inkCoverage` keeps the uncomposited RGB-only shape — correct for the opaque full-panel
+    /// rasters it was written for, wrong here; its doc comment carries that warning.
     ///
     /// The `4` stride is `PanelRaster`'s RGBA pixel width, restated because `PanelRaster.bytesPerPixel` is
     /// private to that type. It is asserted rather than assumed — `normalize` pins the layout, and the
     /// unit-consistency check below would break loudly if the stride were ever wrong.
-    private func inkMass(_ raster: PanelRaster) -> Double {
+    private func inkMass(_ raster: PanelRaster, on scheme: ColorScheme) -> Double {
         guard raster.width > 0, raster.height > 0, raster.bytes.count >= 4 else { return 0 }
         XCTAssertEqual(raster.bytes.count, raster.width * raster.height * 4,
                        "inkMass assumes 4-byte RGBA pixels; PanelRaster.normalize changed its layout")
-        let br = Int(raster.bytes[0]), bg = Int(raster.bytes[1])
-        let bb = Int(raster.bytes[2]), ba = Int(raster.bytes[3])
+        let base = Self.rowBackdrop(scheme)
         var total = 0
         raster.bytes.withUnsafeBufferPointer { p in
             var i = 0
             while i < p.count {
-                total += abs(Int(p[i]) - br) + abs(Int(p[i + 1]) - bg)
-                       + abs(Int(p[i + 2]) - bb) + abs(Int(p[i + 3]) - ba)
+                // Source-over. The buffer is PREMULTIPLIED, so the source term is already scaled by alpha
+                // and only the backdrop needs the (1 - alpha) weight.
+                let clear = 255 - Int(p[i + 3])
+                total += abs(Int(p[i]) + base.red * clear / 255 - base.red)
+                       + abs(Int(p[i + 1]) + base.green * clear / 255 - base.green)
+                       + abs(Int(p[i + 2]) + base.blue * clear / 255 - base.blue)
                 i += 4
             }
         }
         return Double(total) / Double(raster.width * raster.height)
+    }
+
+    /// The opaque surface a bare row is composited onto before its ink is measured — the panel's OWN row
+    /// backdrop, read off a built panel in issue #949 rather than assumed. Only the direction of the
+    /// comparison depends on it, and both sides are composited onto the same value, so this is a reference
+    /// surface in the sense `BarGlyphRenderer.swift:67` establishes: the live panel floats on translucent
+    /// vibrancy over arbitrary wallpaper, which has no single adjacent colour to measure against.
+    private static func rowBackdrop(_ scheme: ColorScheme) -> (red: Int, green: Int, blue: Int) {
+        scheme == .light ? (239, 239, 239) : (48, 48, 48)
     }
 
     // MARK: - AC-2: the armed row is VISIBLY different, not merely a different enum value
@@ -337,8 +365,8 @@ final class PanelInteractionStateTests: XCTestCase {
             // the inverse is a real, shippable regression: swap the view's two `foregroundStyle` cases and
             // arming DIMS the chip, which contradicts the ratified `--text-3` → `--text-2` relation while
             // every other test in this repo — panel goldens included — stays green.
-            let restingInk = inkMass(resting)
-            let armedInk = inkMass(armed)
+            let restingInk = inkMass(resting, on: scheme)
+            let armedInk = inkMass(armed, on: scheme)
             XCTAssertGreaterThan(armedInk, restingInk, """
                 the armed chip carries NO MORE ink than the resting one in \(scheme) \
                 (armed \(armedInk) vs resting \(restingInk)) — so arming either DIMS the chip or, if the \
@@ -362,7 +390,7 @@ final class PanelInteractionStateTests: XCTestCase {
         let resting = try stableRender(rowView(armed: false, switchState: blocked))
         let restingAgain = try stableRender(rowView(armed: false, switchState: blocked))
 
-        XCTAssertEqual(inkMass(resting), inkMass(restingAgain), accuracy: 0.0, """
+        XCTAssertEqual(inkMass(resting, on: .light), inkMass(restingAgain, on: .light), accuracy: 0.0, """
             two identical resting renders report different ink mass — the direction predicate is \
             nondeterministic, so `armed > resting` could be reporting noise rather than the tint step
             """)

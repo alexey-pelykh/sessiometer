@@ -512,10 +512,21 @@ enum StatusPanelFormat {
     /// The per-row swap chip's emphasis level. #169 revealed the trailing swap glyph ONLY on hover, so on a
     /// transient popover a first-time operator never saw a row was actionable. #448 makes it PERSISTENT: a
     /// quiet, low-emphasis mark shown AT REST on every switch target, that BRIGHTENS when the row is armed
-    /// (hover / focus). The view maps each level to a neutral SYSTEM tint — `.resting` → `.tertiary`
-    /// (≈ the mock's `--text-3` decorative token), `.armed` → `.secondary` (≈ `--text-2`) — a SEMANTIC tint
-    /// step, never a hardcoded opacity (the #388 "tints/opacities live in the testable layer" discipline).
-    /// Neutral at every level, never `.tint`: the one accent action is the footer Swap (Von Restorff).
+    /// (hover / focus). Neutral at every level, never `.tint`: the one accent action is the footer Swap
+    /// (Von Restorff).
+    ///
+    /// The two visible levels are tinted ASYMMETRICALLY, and the asymmetry is the point (issue #956).
+    /// `.armed` keeps the SYSTEM semantic `.secondary` (≈ the mock's `--text-2`): it measures 4.73:1 on the
+    /// panel's own backdrop, comfortably over the WCAG 1.4.11 non-text floor, so there is nothing to fix and
+    /// moving it would only shrink the rest→armed step. `.resting` used to be the matching semantic
+    /// `.tertiary` (≈ `--text-3`) and that FAILED: measured on a built panel it ran 1.91:1 in light and
+    /// 2.70:1 in dark — under the 3:1 floor in BOTH appearances. It could not even be caught, because a
+    /// hierarchical style is unresolvable BY CONSTRUCTION (`HierarchicalShapeStyle.resolve(in:)` returns
+    /// `Never`, and the macOS 13 deployment target has no `resolve` API at all), so the only assertable
+    /// property was the RELATION `armed > resting` — which a below-floor resting satisfies. Resting
+    /// therefore moves to `switchChipRestingTint` below: an ASSET token, not a raw pinned `Color`, so it
+    /// keeps the Increase-Contrast escalation and becomes numerically readable in tests today.
+    /// Still never a hardcoded opacity (the #388 "tints/opacities live in the testable layer" discipline).
     enum SwitchChipEmphasis: Equatable {
         /// No chip — the active row / a dropped connection (the row is not a switch target), left pure data.
         case hidden
@@ -535,6 +546,19 @@ enum StatusPanelFormat {
         guard offersSwitch else { return .hidden }
         return armed ? .armed : .resting
     }
+
+    /// The `.resting` chip's tint token (issue #956) — the ONE emphasis level that left the system semantic
+    /// family, for the reasons on `SwitchChipEmphasis` above. `.armed` deliberately has no counterpart here
+    /// and stays `.secondary` at its view site.
+    ///
+    /// A ZERO-CHROMA neutral, which is brand-correct rather than merely tolerated: `brand/README.md` —
+    /// "an honest gauge reserves colour for the reading" — so a chip that makes no status claim carries no
+    /// hue, and any accent tint would break the mock's Von Restorff constraint besides. The colour set ships
+    /// the same FOUR opaque variants the `#388` tokens do (Any / Dark / high-contrast / dark high-contrast);
+    /// per issue #832 AppKit selects the high-contrast pair from the SYSTEM Increase-Contrast setting rather
+    /// than from the `NSAppearance` name, so those two are real in the live app even though the test seam
+    /// cannot yet reach them. That escalation is exactly what a raw pinned `Color` would have forfeited.
+    static let switchChipRestingTint: PanelTint = .asset("SwapChipResting")
 
     // MARK: - Swap phase copy (issue #169 — the in-flight / settled swap states)
 
@@ -1136,7 +1160,14 @@ enum StatusPanelFormat {
     /// TINT roles (`PanelTint`): those are semantic FOREGROUND tints on contrast-safe asset colorsets
     /// (#406, Increase-Contrast-adaptive); these are DECORATIVE background fills (no text / WCAG 1.4.11
     /// role — the glyph or content on top carries meaning), carried as exact sRGB values so they are
-    /// unit-testable in the asset-catalog-free logic-test bundle (`MenubarTests` compiles no `.xcassets`).
+    /// unit-testable directly, with no asset-catalog round-trip.
+    ///
+    /// That last clause used to read "in the asset-catalog-free logic-test bundle (`MenubarTests` compiles
+    /// no `.xcassets`)", which was true when #388 wrote it and was falsified by #525: `project.yml` now puts
+    /// `Assets.xcassets` in the TEST target, and `StatusPanelFormatTests.assetRGB` resolves shipped colour
+    /// sets through the real `Color.panelAssets` seam. Corrected because the stale version reads as a
+    /// standing constraint — anyone reasoning from it concludes asset tokens are untestable and reaches for
+    /// a raw pinned `Color` instead, which is precisely the wrong turn issue #956 had to undo.
     enum NeutralFillRole: Equatable {
         /// The monogram badge + the header app-glyph badge — mock `--badge-bg`
         /// (gray(120,120,128) .16 light / white .10 dark).
