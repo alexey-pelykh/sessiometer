@@ -5,9 +5,10 @@ The canonical **visual** build-reference for the SwiftUI menubar panel (see #168
 (light + dark) in the intended native macOS language, plus a **capture-affordance interaction-states**
 reference card (pending / done / error) for the in-app "Capture active account" action (#360), plus
 the **pathological-content** group (#752) that is the oracle for hostile labels, percents and
-durations — see *Pathological content* below.
+durations — see *Pathological content* below — plus the **Settings window** group (#763), the one
+group that is not a panel state at all; see *The Settings window* below.
 
-![All 9 menubar states, light + dark](renders/all-states.png)
+![All 9 menubar states + the Settings window, light + dark](renders/all-states.png)
 
 ## Viewing it
 
@@ -23,18 +24,20 @@ blacks out the vibrancy). Run from this directory:
 ```sh
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
   --headless=new --hide-scrollbars --force-device-scale-factor=1.0 \
-  --window-size=1200,14000 --screenshot=renders/all-states.png \
+  --window-size=1200,15700 --screenshot=renders/all-states.png \
   menubar-preview.html
 ```
 
 (Bump the `--window-size` height if the page ever grows past it — but **not past the per-scale cap
-below**. The committed render is 1200×14000 — at the `1.0` device scale the PNG's pixel height is
-just this `--window-size` height, and a shorter one clips the notes. **`14000` is very nearly
-exhausted as of #752** — measured in the page itself, the document is **14039** CSS px and its
-deepest ink ends at **13993**, the 46 px difference being `body`'s `padding-bottom`. So the capture
-keeps every painted pixel with **~7 px** to spare and merely truncates 39 px of trailing padding.
-Adding one more frame clips real content: raise this height first — at this scale there is still
-~2380 px of genuine bump room.)
+below**. The committed render is 1200×15700 — at the `1.0` device scale the PNG's pixel height is
+just this `--window-size` height, and a shorter one clips the notes. **Re-measured at #763**, which
+added the four Settings frames: the document is **15698** CSS px and its deepest ink ends at
+**15652**, the 46 px difference being `body`'s `padding-bottom`. So the capture keeps every painted
+pixel with **~48 px** to spare and, unlike the #752 render, truncates nothing — the window is 2 px
+taller than the document itself. **Only ~686 px of genuine bump room is left at this scale**, and
+dropping the scale again is not the escape it was at #752: `1.0` is already the resolution floor
+this render is willing to pay (last paragraph of this section) — so the next group that needs
+frames should expect to trade: fewer frames, a shorter frame, or a second page.)
 
 **Why the scale dropped `1.25` → `1.0` at #752** — the render height in *device* pixels (CSS height ×
 scale) must stay under the GPU's 16384 px max texture dimension. Past it the GPU process dies
@@ -43,12 +46,16 @@ pathological-content bases took the mock from 34 frames / ~11050 CSS px to **42 
 px**, and 14039 × 1.25 = 17549 device px is over the limit — so this is the documented case of
 "growing the page eventually means lowering the scale, not just raising the height", not a
 preference. At `1.0` the same page needs 14039 and fits. Measured empirically at #778 (at
-`1.5`): 16350 device px renders, 17100 fails.
+`1.5`): 16350 device px renders, 17100 fails. #763's four Settings frames then took it to
+**46 frames / 15698 CSS px** — they cost more per frame than a panel frame (two 460 px windows fit
+the 932 px gallery only at a 12 px gutter, which is why `.settings-pair` overrides the gallery's own
+40 px for exactly that span; and each window is 588 px tall including its title bar, so a Settings
+row costs 662 px against a popover row's ~500), which is what spent most of the remaining room.
 
 In the units of the knob you actually turn — the maximum `--window-size` height is **16384** at
 `1.0`, **13107** at `1.25`, **10922** at `1.5` (16384 ÷ scale). Past that the bump *itself* kills
 the render. Both `1.5` and `1.25` are now unreachable: their 10922 and 13107 caps are below the
-mock's own 14039. The cost of the drop is resolution — the committed render is 1200 px wide where
+mock's own 15698. The cost of the drop is resolution — the committed render is 1200 px wide where
 it used to be 1500 — which is why the HTML, not this PNG, stays the faithful reference (*Viewing
 it*, above).
 
@@ -561,7 +568,8 @@ lifecycle, the `⌘S` key event, and runtime affordances (spinner, focus ring, h
 are listed here rather than left silent, since the issue's AC-4 is explicit that an untestable surface
 must be named as such. They expand to the five steps below because two of them have a stopped-daemon and
 a running-daemon half. Everything else the gate could not reach has a tracked owner instead: the
-accessibility tree is issue #840, the missing design reference is issue #763, and Dynamic Type is the
+accessibility tree is issue #840, the design reference is § The Settings window below (issue #763,
+landed), and Dynamic Type is the
 pinned defect issue #845.
 
 Run these with the daemon RUNNING (so the form loads) unless a step says otherwise:
@@ -1125,6 +1133,58 @@ something the fixture does not claim.
 The first two — the callout and the reset cell — are open questions, recorded in hq
 `strategy/design-menubar.md` (§ D-UX-PATHOLOGICAL) rather than guessed at here. The third is not an
 open question but a scoping line: the header sub-line simply has no budget to be an oracle against.
+
+## The Settings window (#763)
+
+**Group 8 is the one group that is not a panel state.** The Settings window is a titled `NSWindow`,
+not an `NSPopover`, so it is opaque (no vibrancy — it sits over the desktop, not under the menu bar),
+460 px wide against the popover's 380, and it carries **no glance glyph**: nothing about Settings
+reaches the menu bar, so the caption glyph on these four frames is a gear rather than one of the
+four attention shapes. Frames: `settings-loaded-{light,dark}` and `settings-disconnected-{light,dark}`.
+
+**These four frames pair with nothing, deliberately.** `design/build-comparison.py` has **no `STATES`
+row** for them, because `RenderPanelTool` renders the *panel* only — there is no Settings capture for
+`cap()` to load, and it fails loudly on a missing PNG. The comparison tool iterates `STATES`, so an
+unpaired frame is ignored by construction rather than breaking the tool. If a Settings render harness
+is ever built, that is when these earn `STATES` rows — the same sequence #752 → #753 followed for the
+pathological-content frames.
+
+**Why the `loaded` form is cut off, why the `disconnected` one is not, and why both are correct.**
+The window is a FIXED 460×560 content box (`setContentSize`, and the style mask carries no
+`.resizable`) whose grouped `Form` is taller than it *once the daemon zone loads*. The `loaded`
+frames therefore show the window scrolled to the top with the last section running past the viewport
+edge — the honest depiction of a window that scrolls. The `disconnected` frames do **not** cut off,
+and that is equally honest: with the daemon down the third zone collapses to a single failure card,
+so the form ends short of the footer and the frame shows bare window background rather than a
+manufactured overflow. Either way it means **no
+single frame can show all 15 tunables**, which is why the normative grouping is a table in hq
+`strategy/design-menubar.md` (§ D-UX-SETTINGS) and these frames are the *visual* half only.
+
+**What these frames deliberately do not author, so the silence is not read as authority.** The
+**Accounts section** is unrendered in all four — below the viewport in the `loaded` pair, absent
+entirely in the `disconnected` pair, where the whole daemon zone is the failure card. Its row
+anatomy — including the 160 pt label cell that issue #846 reports as too narrow — is therefore
+prose-only in hq; the mock carries no width rule for a cell no frame renders. Also unauthored, and named rather than guessed: the
+**loading placeholder** and the six remaining **apply-status arms** (a frame-budget call — the
+render's GPU height ceiling admits four frames, spent on the states that carry decisions), plus two
+surfaces an adversarial validation pass caught after the fact — the **launch-at-login approval
+sub-block** and the **inline per-field format-error row**, both routed to issue #946. The register
+that tracks all of these is R-11 in hq `strategy/design-menubar.md`.
+
+**What the four frames author.** The `loaded` pair carries the three-zone structure (the app-local
+**General** and **Notifications** sections above the daemon-config gate), the tunable row anatomy
+(label + a true 96 pt value cell), and — in the footer — the **two-line clamp** on a long daemon
+error. The `disconnected` pair is the reason the zone order matters: with the daemon stopped, the two
+app-local sections stay fully usable while the daemon surface shows its honest failure card, which is
+the defect #573 fixed and the arrangement this reference now locks.
+
+**The one rule to carry over when building against these frames:** long daemon text is bounded by
+**geometry, never edited**. The footer status slot is 328 pt (±10 — `SettingsModel.swift` derives it
+from two allowances and says to treat it as approximate) and the daemon's `detail` can reach
+several thousand, so the label clamps to two lines while the full message stays reachable through the
+hover tooltip and `accessibilityHelp`. That is the same call the `255%` meter already ratified —
+clamp the drawing, never the truth. The shipped window does **not** do this yet (issue #844, and its
+sibling on the `.rejected` arm); the frames show the target, not the current build.
 
 ## Design constraints the mock honors
 
