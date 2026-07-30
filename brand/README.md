@@ -28,6 +28,54 @@ An honest gauge reserves colour for the reading. Sessiometer does the same:
 
 Status is therefore **doubly encoded**: hue *and* needle position.
 
+## The app icon sits on the macOS grid — the master does not
+
+A macOS app icon is **not full-bleed**: its body occupies a fixed fraction of the
+canvas and the system composites the margin around it. Ours shipped at 100 % on
+every size until #952 — no margin at all — so it read visibly unlike its neighbours
+in the Login Items pane, a surface users treat as a legitimacy signal for a
+background login item.
+
+| Dimension | Value |
+|---|---|
+| Body | **824** of a 1024 canvas — **80.47 %** |
+| Inset | **100** px per side |
+| Scale applied to the master | **0.8046875** |
+| Corner radius after scaling | 184.3, against the template's 185.4 |
+
+Apple's published macOS app-icon template is a 1024 canvas carrying an 824×824 body
+with a 185.4 corner radius. Rather than take that on trust, it is corroborated by
+measurement: five shipping macOS apps — Calculator, Docker, Notes, Mail, Reminders —
+all land on 412×412 of a 512 canvas at the geometric edge, zero variance; a separate
+pass over six system apps reproduced the same 80.47 % at a 256 canvas. Two
+independent lines, the same number to the pixel.
+
+> **Measure at alpha ≥ 128, not any-alpha.** The any-alpha bounding box also catches
+> the antialiased shadow fringe every macOS icon carries, and reads 83.0–83.6 % for
+> those five — several points high, and high in a way that looks like a plausible
+> answer. The half-covered contour is the real geometric edge. Ours measured 100 % on
+> *both* thresholds, which is what made the defect unambiguous.
+
+> **The baked `rx` stays — macOS is not iOS.** Every peer measured reads alpha 0 at
+> its body-box corners: if macOS masked, a peer could ship square artwork, and none
+> does — the rounding lives in the *artwork*. Dropping `icon.svg`'s `rx="229"` would
+> ship a hard-cornered square. The radius was never the defect — 229/1024 = 22.36 %,
+> and it rides the scale above down to 184.3 on an 824 body. The icon read
+> over-rounded because it was over-**sized**.
+
+**`src/icon.svg` stays a full-bleed shared master.** The inset is applied by an
+app-icon-only stage in `generate.sh` (`inset_app_icon`, a textual SVG transform in
+the same spirit as `derive`), because only the *app-icon* surfaces want it:
+
+| Surface | Grid |
+|---|---|
+| `AppIcon.appiconset/`, `Sessiometer.icns` | **inset** — both are macOS app icons |
+| `apple-touch-icon.png` | full-bleed — Apple touch icons are full-bleed by convention; the OS masks them |
+| `logo.png` | full-bleed — GitHub circle-crops it |
+| `icon-<state>_512.png` | full-bleed — the resting tile has to match its four siblings |
+
+Insetting inside `icon.svg` instead would silently degrade every row below the first.
+
 ## Tokens
 
 **Body (resting / brand)** — warm graphite `#242320` (gradient `#2c2b27` → `#1b1a17`),
@@ -63,8 +111,8 @@ exactly one consumer, the free-standing colour bar glyph retired above.
 
 | File | Where it goes |
 |---|---|
-| `AppIcon.appiconset/` | written straight into `apps/menubar/Sources/Assets.xcassets/` |
-| `Sessiometer.icns` | DMG / Finder |
+| `AppIcon.appiconset/` | written straight into `apps/menubar/Sources/Assets.xcassets/` (**inset** — see the grid above) |
+| `Sessiometer.icns` | DMG / Finder (**inset**) |
 | `logo.png` (512²) | `sessiometer/.github` → `profile/assets/logo.png` |
 | `social-preview.png` (1200×630) | GitHub social preview + `profile/assets/` |
 | `og-image.png` (1200×630) | `sessiometer.github.io` → `public/` |
