@@ -202,7 +202,12 @@ STATES = [
               "(cornered is always unresolvable — CLI <code>render_cornered</code>, #666); the wording is the "
               "unified “Out of capacity”, not a weekly/session split (#665/#666). No swap-callout renders "
               "(<code>next_swap == no_viable_target</code> → <code>swapCalloutTarget</code> is nil); the siblings "
-              "are weekly-exhausted (the <code>nosign</code> chip). The menu-bar glance is <b>no-runway ⊘</b> "
+              "are weekly-exhausted, which the two sides now show DIFFERENTLY and on purpose: the mock draws a "
+              "muted <code>nosign</code> chip, the panel draws <b>no chip at all</b> plus a persistent reason "
+              "line (#955 added the line, #959 removed the chip — the chip and the swap arrow it negated were "
+              "at ink-mass parity and unreadable apart at rest). Authoring the matching mock frame is #957's "
+              "job — do not “fix” the panel to match the left-hand side here. The menu-bar glance is "
+              "<b>no-runway ⊘</b> "
               "(already wired via <code>hasNoViableTarget</code>). R-2 STATE-parity with the CLI’s "
               "<code>render_cornered</code>. Same mock-fidelity outline-vs-filled SF-Symbol limit as the OK frame."),
     dict(title="Modifier · Active blind — CORNERED (dark)", theme="dark", design="blind-cornered-dark", capture="panel-blind-cornered-dark.png",

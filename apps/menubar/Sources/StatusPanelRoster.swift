@@ -383,9 +383,12 @@ struct AccountRowView: View {
             if let cue = StatusPanelFormat.switchBlockedCue(blockReason) {
                 Text(cue)
                     .font(.panel(style: .caption1, scale: scale))
-                    // Zero-chroma, like the `nosign` chip it explains (#956): the block is a fact about
-                    // what the operator can DO, not a health verdict about the account, and the brand rule
-                    // `an honest gauge reserves colour for the reading` keeps tint off it.
+                    // Zero-chroma (#956): the block is a fact about what the operator can DO, not a health
+                    // verdict about the account, and the brand rule `an honest gauge reserves colour for the
+                    // reading` keeps tint off it. This line used to be described as matching the `nosign`
+                    // chip it explained; since #959 there is no chip on a blocked row to match — this cue is
+                    // now the row's ONLY at-rest block signal on the sighted side, which is exactly why #959
+                    // could remove the chip and why nothing may weaken this line without re-opening that.
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .accessibilityHidden(true)
@@ -447,11 +450,16 @@ struct AccountRowView: View {
         }
     }
 
-    /// The swap glyph the chip draws — a swap arrow, or a DISTINCT `nosign` on a wire-blocked target
-    /// ("you cannot switch here" is a different fact from "switch here", and shape carries it without
-    /// color). The tint is applied by `switchSlot` per emphasis level, so this stays tint-free.
+    /// The swap glyph the chip draws. UNCONDITIONAL since issue #959: this is drawn only where the emphasis
+    /// verdict is `.resting` / `.armed`, and since #959 that is a VIABLE target and nothing else — so there
+    /// is no second glyph to select between. It used to branch to a `nosign` on a wire-blocked row, which is
+    /// the defect #959 fixed: the affordance and its own negation sat in the same slot at the same size in
+    /// the same token, at measured ink-mass parity, and could not be told apart at rest. That branch is gone
+    /// rather than merely unreachable — left in, it would read as live intent to the next person.
+    ///
+    /// The tint is applied by `switchSlot` per emphasis level, so this stays tint-free.
     private var chipGlyph: some View {
-        Image(systemName: blockReason == nil ? "arrow.left.arrow.right" : "nosign")
+        Image(systemName: "arrow.left.arrow.right")
             .font(.panel(11, .semibold, scale: scale))
     }
 
@@ -461,24 +469,30 @@ struct AccountRowView: View {
     /// persistent-quiet chip makes the row discoverable without an always-loud control.
     ///
     /// The slot's WIDTH is laid out on every roster row, always — even where the chip is hidden (the active
-    /// row) — so NEITHER the chip's resting presence NOR its hover-brighten can REFLOW the row: the label's
-    /// available width is identical hidden / resting / armed, and so is its truncation (the issue's
-    /// row-width watch-out). The auth column also stays aligned across active and non-active rows. The
-    /// why-text never truncates either: the remedy-bearing full sentence is a native `.help` tooltip rather
-    /// than an inline label, and the resting cue #955 added is on its OWN line (`rowCueBudget`), so neither
-    /// form competes with the account label for width.
+    /// row, and since #959 a wire-BLOCKED row too) — so NEITHER the chip's resting presence, NOR its
+    /// hover-brighten, NOR its #959 absence can REFLOW the row: the label's available width is identical
+    /// hidden / resting / armed, and so is its truncation (the issue's row-width watch-out). The auth column
+    /// also stays aligned across active and non-active rows. The `.frame` sits on the enclosing `Group`
+    /// precisely so `Color.clear` still holds the full 28 pt open — #959 removes the blocked row's GLYPH and
+    /// deliberately NOT its slot; reclaiming that width for blocked rows would reflow the row and break this
+    /// invariant. The why-text never truncates either: the remedy-bearing full sentence is a native `.help`
+    /// tooltip rather than an inline label, and the resting cue #955 added is on its OWN line
+    /// (`rowCueBudget`), so neither form competes with the account label for width.
     ///
     /// The emphasis (hidden / resting / armed) is a pure `StatusPanelFormat.switchChipEmphasis` verdict, so
-    /// the resting-visible-vs-armed-brighten distinction is unit-asserted; the view only maps it to a
-    /// neutral system tint. ARMING (not the resting presence) is the mis-click guard — the full rationale
-    /// lives on `RowSwitchButtonStyle`.
+    /// both the resting-visible-vs-armed-brighten distinction AND the #959 blocked-is-hidden routing are
+    /// unit-asserted; the view only maps the verdict to a neutral system tint. Routing the block HERE rather
+    /// than as an inline `if` is what keeps it testable and consistent with how this file is built. ARMING
+    /// (not the resting presence) is the mis-click guard — the full rationale lives on `RowSwitchButtonStyle`.
     @ViewBuilder
     private var switchSlot: some View {
         Group {
             if isSwitching {
                 ProgressView().controlSize(PanelTypeScale.controlSize(for: scale))
             } else {
-                switch StatusPanelFormat.switchChipEmphasis(offersSwitch: offersSwitch, armed: isArmed) {
+                switch StatusPanelFormat.switchChipEmphasis(offersSwitch: offersSwitch,
+                                                            block: blockReason,
+                                                            armed: isArmed) {
                 case .hidden:
                     Color.clear
                 case .resting:

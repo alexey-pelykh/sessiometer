@@ -178,9 +178,14 @@ enum PanelRenderHarness {
                                                        autoProtectionDegraded: true)), rows[1], rows[2]]
         // CORNERED (#572): blind + DEGRADED + no viable target — last-known session 92% (red band), blind
         // 18m → RED eye-slash + red leading rule + red "CANNOT ACT" verdict + the "add or free an account"
-        // remedy. The siblings are BOTH weekly-exhausted (WHY there is no target), so each renders the
-        // `nosign` switch chip. The cornered-ness is composed at render from `blind_active` (degraded) +
-        // the fixture's `next_swap == .noViableTarget` — no new wire field.
+        // remedy. The siblings are BOTH weekly-exhausted (WHY there is no target), so each renders an EMPTY
+        // switch slot plus its #955 reason line — since #959 a blocked row carries no chip at all (it used
+        // to draw a `nosign` indistinguishable from the swap arrow it negated); the 28 pt slot stays
+        // reserved, so nothing reflows. This fixture renders the ONLY two goldens containing blocked rows
+        // (one fixture across light and dark), which makes them the pair that moves on any blocked-row
+        // presentation change. The cornered-ness is
+        // composed at render from `blind_active` (degraded) + the fixture's `next_swap == .noViableTarget`
+        // — no new wire field.
         let exhaustedPersonal = AccountRow(label: "Personal", isActive: false, isEnabled: true,
                                            isQuarantined: false, isRecovering: false, auth: .healthy,
                                            sessionPct: 14, weeklyPct: 100,
@@ -550,7 +555,9 @@ enum PanelRenderHarness {
     ///     `ImageRenderer` blank (see design/README.md).
     ///   • `AccountSwapModel` renders at `.idle`, so the fixtures capture the RESTING row (no hover, no
     ///     pending). As of #448 the per-row switch chip is PERSISTENT, so its resting glyph
-    ///     (`arrow.left.arrow.right`, or the `nosign` on a non-viable row) IS captured in a static render.
+    ///     (`arrow.left.arrow.right`) IS captured in a static render. Since #959 a wire-BLOCKED row renders
+    ///     NO chip — so what these fixtures capture on such a row is the empty slot itself, and its absence
+    ///     is as much a pinned property here as the glyph's presence is on a viable row.
     ///     This previously said "only the ARMED brighten and the in-flight `Switching…` spinner stay a
     ///     manual-check surface (#380)" — corrected per issue #766: those states are un-captured HERE
     ///     because these fixtures supply no input, not because the renderer cannot reach them. Given a

@@ -94,8 +94,9 @@ Light shown here:
   compact duration form too ("2h14m" / "3d"), not a day-name (#387)
 - the **Swap** button is LIVE as of #169 (it sends the displayed `next_swap` target over the daemon's
   `swap` command). Each non-active roster row is also a manual switch — as of #448 a **persistent, quiet
-  trailing chip** (neutral `.tertiary` at rest, brightening to `.secondary` when the row is armed on
-  hover/focus), which the mock now specs (the resting chip on every switchable row); at rest the row
+  trailing chip** (the neutral `SwapChipResting` asset token at rest since #956, brightening to
+  `.secondary` when the row is armed on hover/focus), which the mock now specs (the resting chip on
+  every switchable row); at rest the row
   keeps a trailing action slot for it, which is why the auth glyph sits ~37 pt further left than in the
   mock (the #448-widened 28 pt slot + its 9 pt spacing)
 - a **blocked** row (weekly-exhausted / quarantined) carries its reason as **persistent text on its own
@@ -108,6 +109,22 @@ Light shown here:
   (`docs/findings/0950-help-on-disabled-button.md`). The tooltip keeps the remedy sentence the resting
   line leaves off, so nothing was moved off hover — only added at rest. Authoring the matching mock frame
   is #957's job; do not "fix" the mock to match this
+- a **blocked** row also carries **no trailing chip at all** — an EMPTY slot, matching the active row's
+  existing chip-free treatment — where the mock draws a muted `nosign` inside
+  `<span class="rowact inert">` (`menubar-preview.html:2473,2485,2536,2548`) (#959). The mock speaks on
+  this axis, so this is again a deliberate divergence rather than an unauthored one. What forces it:
+  measured on a live 1:1 capture the swap chip and its own negation are at ink-mass **parity** — 18.2
+  over 70 px against `nosign`'s 19.5 over 82 px, the negation marginally the *quieter* of the two — in
+  the same slot, at the same 11 pt, in the same emphasis token, both strokes horizontal along the row's
+  dominant axis, drawing 1 px strokes at 1x entirely in the antialiasing regime. A reviewer could not
+  tell the affordance from its negation without ~9× magnification. The empty slot resolves that
+  maximally (actionable = a chip, blocked = no chip; no glyph is left to confuse) while adding no ring,
+  capsule or container, not touching the leading-edge inset rule that carries fault severity
+  (#485/#572), and *removing* an element rather than adding one that five of six rows would pay for.
+  This is safe only because #955 landed first: the reason text above is now the blocked row's at-rest
+  explanation, so the chip that went is a glyph nobody could read, not the explanation. The 28 pt slot
+  stays **reserved** — the row does not reflow and the auth column stays aligned. Authoring the matching
+  mock frame is #957's job; do not "fix" the mock to match this
 - the third fixture account is `Temp`, where the mock illustrates `Scratch` — re-picked (#709) so all
   three healthy labels hash to **distinct** #445 identity slots (the mock's `Personal` and `Scratch`
   both land on slot 5 / ochre under the shared 8-slot `label` hash, so the built roster would otherwise
@@ -164,8 +181,17 @@ Two measured facts from building that gate, recorded because they are easy to re
 **Harness limitation — the committed goldens capture only the RESTING frame.** `ImageRenderer` draws one
 frame, and the fixtures render every model at rest, so the committed `panel-*.png` are resting frames by
 construction. As of #448 the per-row manual-switch chip is PERSISTENT, so those renders do capture its
-resting glyph (`arrow.left.arrow.right`, or the `nosign` on a non-viable row) at its quiet `.tertiary`
-emphasis, on every switchable row.
+resting glyph (`arrow.left.arrow.right`) at its quiet resting emphasis, on every switchable row. Since
+#959 a wire-BLOCKED row draws no chip, so on those rows the goldens show an EMPTY slot. Only
+`panel-blind-cornered-{light,dark}` contain blocked rows, which is why a blocked-row presentation change
+moves those two and no others.
+
+They **record** that absence; they do not **gate** it, and the distinction is easy to lose. Removing both
+blocked rows' chips scores `0.000502` against the drift gate's `0.002` ceiling — 4× *under* it, because
+two 23×23 px regions in a 760×922 frame is a smaller change than a gate tuned to ignore antialiasing can
+see — and the comparison is env-gated off in the required `swift` job anyway (see *Panel golden drift
+gate* below). What actually holds the empty slot in place is the pure `switchChipEmphasis` verdict:
+`.hidden` maps to `Color.clear` and reaches no tint case at all, and that verdict is unit-asserted.
 
 **Corrected (issue #766): "not captured" was read as "not measurable", and that second claim is wrong.**
 This note previously routed the ARMED brighten, the row wash and the in-flight `Switching…` spinner to a
@@ -835,19 +861,41 @@ opposite shape (small area, high amplitude) and reads flat at every threshold.
 
 | Mutation applied to `Sources/` | Which test reddens |
 |---|---|
-| chip `.armed` case → `.tertiary` (brighten deleted) | chip-isolation **only** |
+| chip `.armed` case → resting tint (brighten deleted) | chip-isolation **only** |
 | chip `.resting`/`.armed` tints SWAPPED (arming DIMS) | chip-isolation **only**, via its DIRECTION half |
 | `RowSwitchButtonStyle.wash` → 0 (wash deleted) | whole-row arm **only** |
 | `offersSwitch` drops `rowFitsSwitchAffordance` | narrow-row mis-click guard |
 | row `ProgressView()` → `Color.clear` (spinner deleted) | in-flight render lane |
 | `isSwitching` / `isSwitchingToTarget` → `false` | both in-flight tests |
+| `switchChipEmphasis` drops its `block == nil` guard (pre-#959 behaviour restored) | blocked-row arm lane (#959) + both `AccountSwapTests` verdict tests |
+| active row's accent fill → `Color.clear` | active-vs-blocked distinctness (#959) |
+
+The `block == nil` row is **#959's own falsifier**, and it was run rather than reasoned about. #959 asserts
+an ABSENCE — a blocked row has no chip, so arming one moves nothing — and a gate for an absence is worth
+exactly what its demonstration that the *presence* would trip it is worth. Reverting the guard puts a chip
+back on the blocked row; arming it moves the chip again (`0.001350`/`0.001344`, ~2.7× the ceiling); the
+lane fails. Row 1 was also re-run after #959 re-homed the chip-isolation lane, confirming it still catches
+a deleted brighten from its new row state and still catches it alone.
+
+The **last** row is the falsifier for #959's distinctness gate, and it is recorded because the first
+version of that test could not fail at all. It compared two renders of *different heights* (the blocked
+row carries #955's cue line) and `PanelRaster.diffFraction` returns a flat `1` on a size mismatch — so
+`delta > armFloor` was `1.0 > 0.20`, a constant that would have stayed green with every row-level channel
+deleted. Cropping to the overlapping region made it a measurement again: with the accent fill mutated away
+the common region falls to `0.0844`/`0.0863`, under the floor, and it reddens. The uncropped version
+stayed green under the same mutation. Mismatched-size comparisons are a live trap in this file — the
+`firstRows` crop exists for exactly this one caller.
 
 Rows 1 and 3 are why there are **two** arm tests rather than one. They are not redundant — each is blind to
 the other's mutation. The whole-row measurement is dominated by the wash ~500:1, so deleting the chip
 brighten leaves it green; that hole was found by *running* the mutation, not by reading the code, and it is
 exactly the shape #437 warns about. The chip lane isolates the brighten without cropping to a hardcoded rect
-(which would rot on any layout change): a **blocked** row is not `live`, so its own guard holds the wash out
-while the chip still resolves through `switchChipEmphasis`.
+(which would rot on any layout change): a row that is not `live` has its wash held out by its own guard
+while the chip still resolves through `switchChipEmphasis`. Issue **#959 re-homed which row that is** —
+it used to be a **blocked** row, which no longer carries a chip at all, so the lane now uses a viable row
+with a **sibling swap in flight** (`live` is false either way, and both are equally `.disabled()`, so only
+the chip differs between the two frames). What is isolated did not change; the state producing the
+isolation did.
 
 Row 2 is why that lane carries **two** assertions. Every *magnitude* measurement here — this suite's and the
 committed goldens' alike — is blind to INVERSION: swapping the two tints so that arming *dims* the chip left
@@ -857,19 +905,27 @@ what produced). The mock ratifies
 a *directed* relation, `--text-3` at rest → `--text-2` armed, so shipping its inverse under a green suite is
 a real regression class, and the lane closes it with a strict direction comparison alongside the magnitude
 one. That comparison needs no threshold: the mutation only swaps which render carries which label, so the
-same pair of values is compared either way (41.4885 vs 41.4039 light, 59.2353 vs 58.8083 dark, settled via
-#760's `stableRender`).
+same pair of values is compared either way (armed 36.1164 vs resting 36.0771 light, 27.5343 vs 27.4091
+dark, settled via #760's `stableRender`; re-measured on #959's re-homed lane, where the pre-#959
+blocked-row one read 41.4885 vs 41.4039 and 59.2353 vs 58.8083 — a different row state carries a different
+absolute mass, and the assertion reads the sign, not the magnitude).
 
 ### Where every interaction surface went
 
-**27 rows: 10 covered by this item, 7 already covered elsewhere, 6 routed to the manual checklist below,
+**29 rows: 10 covered by this item, 9 already covered elsewhere, 6 routed to the manual checklist below,
 3 filed as defects, and 1 that structurally cannot exist.** Nothing is left silent. (Counted from the
 table, not from the suite's test count — several rows share one test function, and one test carries two
-rows because it asserts both the magnitude and the direction of the chip step.)
+rows because it asserts both the magnitude and the direction of the chip step. Rows 28 and 29 are #959's,
+added when that defect was fixed rather than left to drift: the blocked row's empty slot, and the
+active-vs-blocked identity question that removing the chip opened. Both are filed *elsewhere* rather than
+*this item* — they are #959's work landing in #766's suite, which is why their disposition text names
+`PanelInteractionStateTests` while the "this item" rows do not need to.)
 
 | Surface | Disposition |
 |---|---|
-| Chip resting glyph (`arrow.left.arrow.right` / `nosign`) | Already: panel goldens (#754), captured since #448 made the chip persistent |
+| Chip resting glyph (`arrow.left.arrow.right`) | Already: panel goldens (#754), captured since #448 made the chip persistent |
+| Blocked row's EMPTY chip slot (#959) | Already: `AccountSwapTests` (the `.hidden` verdict — `Color.clear` reaches no tint case, so absence follows by construction) + `PanelInteractionStateTests.testArmingABlockedRowMovesNothingBecauseItHasNoChip`. The `panel-blind-cornered-*` goldens *record* it but score 4× under the drift ceiling, so they do not gate it |
+| Active-vs-blocked row identity, now that neither carries a chip (#959) | Already: `PanelInteractionStateTests.testTheActiveAndBlockedRowsStayVisiblyDistinctThoughNeitherCarriesAChip` (height channel + overlapping-region separation). The accent row fill carries essentially all of that number; the leading dot's shape cue is structural, not pixel-gated |
 | `switchChipEmphasis` hidden/resting/armed value mapping | Already: `AccountSwapTests` |
 | `rowFitsSwitchAffordance` budget predicate | Already: `AccountSwapTests` |
 | Base row a11y label | Already: `StatusPanelFormatTests` (`rowAccessibilityLabel`) |
