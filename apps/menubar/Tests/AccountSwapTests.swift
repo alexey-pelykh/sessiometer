@@ -413,6 +413,84 @@ final class AccountSwapTests: XCTestCase {
                        + "test exists to state, and the premise the other channels compensate for")
     }
 
+    // MARK: - Which element owns the hover tooltip (issue #953)
+
+    // THE ONE INVARIANT WORTH PINNING, and it is a platform fact rather than a style rule: a `.help()` on
+    // the row-wrapping `Button` WINS over a `.help()` on a child inside it. Measured on macOS 26.5.2 across
+    // eight runs — with both attached, the ROW's tooltip answered even over the chip (239 pt wide, against
+    // the chip's own 38 pt); see `docs/findings/0953-help-nesting-inside-a-row-button.md` § The answer.
+    //
+    // So "keep a row-level fallback AND scope one to the chip" is not a safer belt-and-braces version of
+    // #953 — it is the #953 defect, rebuilt. Returning both non-nil means the chip's tooltip is DEAD and
+    // the row is answering everywhere again, which is exactly the state the issue exists to leave.
+    //
+    // This fails LOUDLY where the real regression would otherwise be SILENT: a tooltip is a hover
+    // affordance, so nothing crashes, no golden moves (they render at `.idle`), and no other test notices.
+    func testTheChipAndTheRowNeverBothClaimTheTooltip() {
+        let blocks: [StatusPanelFormat.SwitchBlock?] = [nil, .quarantined, .weeklyExhausted]
+        for offersSwitch in [true, false] {
+            for block in blocks {
+                for armed in [true, false] {
+                    for switching in [true, false] {
+                        let emphasis = StatusPanelFormat.switchChipEmphasis(offersSwitch: offersSwitch,
+                                                                            block: block, armed: armed)
+                        let chip = StatusPanelFormat.switchChipHelp(emphasis: emphasis,
+                                                                    switching: switching, label: "work")
+                        let row = StatusPanelFormat.switchRowHelp(block: block)
+                        XCTAssertFalse(chip != nil && row != nil,
+                                       "offersSwitch=\(offersSwitch) block=\(String(describing: block)) "
+                                       + "armed=\(armed) switching=\(switching): both claimed the tooltip, "
+                                       + "so the row's would win and the chip's is dead — the #953 defect")
+                    }
+                }
+            }
+        }
+    }
+
+    // A viable row: the invitation is the CHIP's, and the row stays silent so the chip can be reached at
+    // all. The chip's text is `switchHelpText` verbatim rather than a second copy of the sentence, so the
+    // tooltip and the spoken `.accessibilityHint` cannot drift apart.
+    func testAViableRowPutsTheInvitationOnTheChipAndNotOnTheRow() {
+        for armed in [true, false] {
+            let emphasis = StatusPanelFormat.switchChipEmphasis(offersSwitch: true, block: nil, armed: armed)
+            XCTAssertEqual(StatusPanelFormat.switchChipHelp(emphasis: emphasis, switching: false,
+                                                            label: "work"),
+                           StatusPanelFormat.switchHelpText(label: "work"),
+                           "the chip carries the switch invitation, armed or at rest")
+        }
+        XCTAssertNil(StatusPanelFormat.switchRowHelp(block: nil),
+                     "a viable row must NOT also answer — a row-level help wins and would kill the chip's")
+    }
+
+    // A blocked row keeps its tooltip at ROW level, because since #959 it renders no chip to hang one on
+    // (`switchChipEmphasis` → `.hidden`). The remedy sentence is the part that exists ONLY here — the
+    // reason's first sentence is already on-screen at rest via `switchBlockedCue` (#955).
+    func testABlockedRowKeepsItsTooltipOnTheRowBecauseItHasNoChip() {
+        for block in [StatusPanelFormat.SwitchBlock.quarantined, .weeklyExhausted] {
+            let emphasis = StatusPanelFormat.switchChipEmphasis(offersSwitch: true, block: block,
+                                                                armed: false)
+            XCTAssertEqual(emphasis, .hidden, "premise: #959 leaves a blocked row chip-free")
+            XCTAssertNil(StatusPanelFormat.switchChipHelp(emphasis: emphasis, switching: false,
+                                                          label: "work"),
+                         "there is no chip drawn, so nothing may claim to be one")
+            XCTAssertEqual(StatusPanelFormat.switchRowHelp(block: block),
+                           StatusPanelFormat.switchBlockedText(block),
+                           "the row carries the reason IN FULL, remedy included")
+        }
+    }
+
+    // An in-flight swap replaces the chip with a `ProgressView`. Nothing is drawn to hover, so nothing
+    // answers — the row is `.disabled()` and the spinner is the explanation.
+    func testAnInFlightSwapLeavesNoChipTooltip() {
+        let emphasis = StatusPanelFormat.switchChipEmphasis(offersSwitch: true, block: nil, armed: false)
+        XCTAssertNotNil(StatusPanelFormat.switchChipHelp(emphasis: emphasis, switching: false,
+                                                         label: "work"),
+                        "premise: this row would carry a chip tooltip when not switching")
+        XCTAssertNil(StatusPanelFormat.switchChipHelp(emphasis: emphasis, switching: true, label: "work"),
+                     "the chip is a spinner mid-swap — a stale invitation would describe a press that "
+                     + "cannot happen")
+    }
+
     // The slot widened 18 → 28 (#448) so the now-persistent chip sits comfortably; the shipped panel still
     // clears the layout budget with the wider slot — guarded against the REAL constants, so a future width
     // regression fails loudly rather than silently truncating the label.

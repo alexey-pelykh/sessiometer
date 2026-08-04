@@ -1,26 +1,81 @@
 # Finding #953 — does a `.help()` on a child inside a row `Button` surface on hover?
 
-**Verdict: NOT ESTABLISHED.** The question is open, and the fix it gates (#953 AC-1, scoping the switch
-tooltip to the chip) must not ship until it is answered. Two things *were* settled, and both matter:
+**Verdict: ANSWERED — YES**, superseding this document's original *NOT ESTABLISHED*. A `.help()` on a
+child inside a row `Button` **does** surface on hover, and it is correctly scoped to that child's rect:
+the child answers, and its siblings inside the same `Button` stay silent. The fix it gated (issue #953
+AC-1) shipped on that measurement.
 
-1. **There is no deterministic route to the answer.** SwiftUI's `.help()` does not materialize as an
-   AppKit `NSView.toolTip` on the view it is attached to, does not register a tooltip owner the hosting
-   view responds to, and does not expose a readable accessibility-help node in-process. A live hover is
-   the only route — which is what makes this expensive rather than a two-minute check.
-2. **One run produced a signal, and it points the wrong way for the fix**: a `.help()` on a child inside
-   a `Button` surfaced **nowhere**, while its row-level neighbours surfaced everywhere. That run's
-   geometry could not be validated, so it is **suggestive, not measured**. It is recorded here because
-   it is the reason the fix is blocked rather than merely unverified — if it holds, scoping the switch
-   invitation to the chip makes that copy **unreachable**, which is worse than the defect #953 fixes.
+**But the result that actually shaped the fix is the second one: a row-level `.help()` WINS over a
+child's.** With both attached, the ROW's copy answers everywhere — *including over the chip*. So the
+prescribed fix could never have been "scope one to the chip and keep a row-level fallback": that is not a
+belt-and-braces version of #953, it is the #953 defect rebuilt, with the chip's tooltip dead and the row
+answering for every element again. The invitation had to **move**, not be added. `switchChipHelp` /
+`switchRowHelp` return `String?` and are asserted mutually exclusive for exactly this reason.
 
-## Why this matters more than it looks
+Three further behaviours were measured because the fix rests on each, and each fails silently if assumed
+wrong:
 
-The switch invitation (`switchHelpText`) is today attached to the row-wrapping `Button`, which is why
-hovering the **health glyph** answers with the *switch* copy — the #953 defect. The prescribed fix moves
-that copy onto the chip. If a nested `.help()` does not surface, that move does not narrow the tooltip's
-scope; it **deletes** the tooltip. The failure mode is silent: no crash, no failing test, no golden
-moves (a tooltip is a hover affordance and the goldens render at `.idle`), and the panel looks correct
-in every static capture. Nothing in CI would catch it.
+| Assumption | Measured | Consequence for the fix |
+|---|---|---|
+| `.help("")` is an inert way to say "no tooltip" | **False** — an empty string still registers an owner and still wins, killing the chip's tooltip | the modifier must be applied **conditionally**, never with `""` |
+| `.disabled()` on the `Button` suppresses a nested child's tooltip | **False** — the chip still answers | a swap-pending row keeps its chip tooltip |
+| `.accessibilityHidden(true)` on the enclosing group suppresses the tooltip (`.help()` also sets an AX attribute) | **False** — the tooltip is unaffected | the chip stays a11y-hidden; the row remains ONE VoiceOver element |
+
+## Why this mattered more than it looked
+
+The switch invitation (`switchHelpText`) was attached to the row-wrapping `Button`, which is why hovering
+the **health glyph** answered with the *switch* copy — the #953 defect. The prescribed fix moved that copy
+onto the chip. Had a nested `.help()` not surfaced, that move would not have narrowed the tooltip's scope,
+it would have **deleted** the tooltip — and the failure mode is silent: no crash, no failing test, no
+golden moves (a tooltip is a hover affordance and the goldens render at `.idle`), and the panel looks
+correct in every static capture. Nothing in CI would have caught it. That is why the question gated the
+fix rather than being resolved by trying it.
+
+## The answer, and the rig that produced it
+
+Measured 2026-08-04, macOS 26.5.2, Xcode 26.6 (17F113), Swift 6.3.3. Eight runs across three harnesses
+(`probe8` ×3, `probe9` ×3 incl. two panel variants, `probe10` ×2); the load-bearing rows were identical in
+every one. Cases: **R** row-level help only (the shipped shape, and the positive control), **C** chip-level
+only (the question), **B** both, **N** none (negative control).
+
+| Case | body | health glyph | chip |
+|---|---|---|---|
+| **R** — row help only | SHOWN (row copy) | **SHOWN (row copy)** — the defect | SHOWN (row copy) |
+| **C** — chip help only | NONE | **NONE** | **SHOWN (chip copy)** |
+| **B** — both | SHOWN (row copy) | SHOWN (row copy) | **SHOWN (ROW copy)** — the chip loses |
+| **N** — neither | NONE | NONE | NONE |
+
+**What made this rig work where five earlier ones failed** — two changes, both structural:
+
+1. **Detection is not pixels.** A macOS tooltip is a real `NSWindow` owned by the app, so the probe reads
+   `CGWindowListCopyWindowInfo` for an on-screen window belonging to its own PID other than the main
+   window. That is deterministic, and it also returns the tooltip's **bounds** — which is what let the
+   *precedence* question be answered at all: the two help strings were given very different lengths, so
+   the tooltip's width names its owner (239 pt for the long row copy vs 38 pt for the short chip copy).
+   Every earlier rig tried to read a translucent tooltip out of a screen capture and drowned in
+   colour-space and hit-test problems.
+2. **Geometry that cannot be wrong.** The window is sized to `hosting.fittingSize`, so the hosting view's
+   bounds *equal* the content rect — this is `probe3`'s recorded failure, fixed at the source rather than
+   compensated for. Each landing is still verified against the live cursor position (`CGEvent(source:)`)
+   before its reading is trusted.
+
+The host reported `active=true key=true visible=true` on every reported run, and the negative control read
+NONE on every one, so no run needed discarding under #950's rule.
+
+**This refutes the `probe3` signal recorded below** (which found a nested `.help()` surfacing nowhere).
+That is the expected outcome, not a surprise: this document already recorded `probe3`'s geometry as
+unvalidated and its table as *suggestive, not measured*. The suggestive signal was wrong.
+
+**One residual stands, unchanged.** The shipped panel's `panelIsKey=true, appIsActive=false` combination
+(`StatusItemController.swift:296-307`) still could not be constructed: an `.accessory` activation policy
+with a `.nonactivatingPanel`, ordered front regardless and then sent `makeKey()`, reported
+`appIsActive=true` — including when activation was handed to Finder first. Three attempts, all reporting
+the same. So whether *any* tooltip surfaces in the shipped presentation remains capture-pending, exactly
+as `docs/findings/0950-help-on-disabled-button.md` left it. It does **not** gate this fix: the residual
+applies identically to the row-level tooltip that shipped before and the chip-level one that shipped
+after, so it cannot discriminate between them. Nothing load-bearing rides the tooltip either way — the
+blocked row's reason is on-screen at rest (`switchBlockedCue`, #955) and spoken
+(`rowSwitchAccessibilityLabel`).
 
 ## What was measured, and what was not
 
@@ -34,7 +89,12 @@ Every run carried a **negative control** (a row with no `.help()` anywhere) and 
 positive control reads NONE is discarded rather than reported: it cannot distinguish "this element has
 no tooltip" from "this rig cannot see tooltips".
 
-### The one run that produced a signal
+### The one run that produced a signal — since REFUTED
+
+> **Superseded.** This table was the reason the fix was blocked, and it was **wrong**: `C/chip` reads
+> SHOWN in the validated runs (§ The answer). It is kept because it is the record of *how* an unvalidated
+> rig produces a confident, wrong, decision-shaping answer — the failure this document exists to describe.
+> Do not cite it as evidence.
 
 `probe3`, macOS 26.5.2 (25F84), bare binary launched from a terminal holding the Accessibility grant:
 
@@ -92,386 +152,282 @@ a measurement that nesting fails.
 Console state was checked and is not the cause: `CGSessionCopyCurrentDictionary` reported
 `onConsole=1` with no `CGSSessionScreenIsLocked` key.
 
-## What would close this
+## What closed this
 
-The rig is inlined below so it survives this worktree. It needs two things this environment could not
-supply together: a host that becomes **active and key**, and a **confirmed synthetic cursor landing** on
-the probe point. It already asserts the first per probe; add the second before trusting a NONE — assert
-`NSEvent.mouseLocation` has reached the target *before* polling, and treat a miss as INVALID rather than
-as an absence. On a machine with an interactive session and Accessibility permission this is minutes.
+Both things this section previously asked for, plus one it did not think to ask for.
 
-Read the run like #950's: **if the positive control (`R/glyph`) reads NONE, discard the whole run** — the
-rig cannot see tooltips, and every other NONE in it is meaningless. Then the answer is `C/chip` and
-`E/chip`: a marker string means a nested `.help()` surfaces and #953 AC-1 can proceed; NONE on both, with
-the positive control SHOWN, means it does not and the fix needs a different mechanism (restructuring the
-row so the glyph sits outside the `Button`'s hit rect — a design decision, not an improvisation).
+1. **A host that becomes active and key** — supplied by running as an `.app` bundle, as this section
+   already prescribed.
+2. **A confirmed synthetic cursor landing** — supplied, and it is now asserted per probe from
+   `CGEvent(source:)?.location` before any reading is trusted. Every reported landing read LANDED. This is
+   what the earlier `.app`-bundle run could not show (its cursor sat parked at rest), and the difference
+   was environmental rather than a code fix: the session running this is an **Aqua session with
+   `HasGraphicAccess` but `IsOnConsole: False`** (switched out via fast user switching), so it owns a
+   window server and a cursor *independent of the physical mouse*. Warping that cursor is unobstructed and
+   does not disturb the console user.
+3. **A detection channel that is not pixels** — the one this section did not anticipate needing, and the
+   change that made the *precedence* question answerable at all. See § The answer above.
 
-Failing that, the cheapest honest answer is a **manual hover** against the built app with a chip-level
-`.help()` spiked in — one build, one hover, one screenshot.
+The rig inlined below is the one that worked, replacing the earlier non-working one; the narrative of the
+five rigs that failed is kept above, because knowing why each *looks* like it works is the expensive part.
 
 ## Reproducing this
 
-Self-contained: no project build, no daemon, no fixtures. Needs Accessibility permission (to post
-synthetic mouse-moved events) for whatever runs it.
+Self-contained: no project build, no daemon, no fixtures. This is the rig that produced § The answer —
+`probe10`, which carries every case including the three silent-failure assumptions. Needs Accessibility
+permission (to post synthetic mouse-moved events) for whatever runs it.
 
-Run it as an **`.app` bundle**, not as a bare binary — a bare binary did not become active or key here,
+Run it as an **`.app` bundle**, not as a bare binary — a bare binary does not become active or key here,
 and per #950 § The activation gate an inactive, non-key host shows no tooltip for any case:
 
 ```sh
-swiftc -O repro.swift -o repro
-mkdir -p Repro.app/Contents/MacOS && cp repro Repro.app/Contents/MacOS/
-cat > Repro.app/Contents/Info.plist <<'PLIST'
+swiftc -O probe10.swift -o probe10
+mkdir -p Probe10.app/Contents/MacOS && cp probe10 Probe10.app/Contents/MacOS/Probe10
+cat > Probe10.app/Contents/Info.plist <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>CFBundleExecutable</key><string>repro</string>
+  <key>CFBundleExecutable</key><string>Probe10</string>
   <key>CFBundleIdentifier</key><string>com.example.tooltipprobe</string>
-  <key>CFBundleName</key><string>TooltipProbe</string>
+  <key>CFBundleName</key><string>Probe10</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>NSPrincipalClass</key><string>NSApplication</string>
 </dict></plist>
 PLIST
-open Repro.app --stdout "$PWD/run.log" --stderr "$PWD/run.err" && sleep 150 && cat run.log
+./Probe10.app/Contents/MacOS/Probe10 "$PWD/out.txt"      # ~60s; results also stream to stderr
 ```
 
+**How to read a run.** Per #950's rule, check the controls FIRST and discard the whole run if either
+fails — a rig that cannot see tooltips reports NONE for everything, which is indistinguishable from a
+real absence:
+
+- `HOST` must read `appIsActive=true key=true visible=true`.
+- Every line must read `cursor=LANDED`. A `PARKED` line is INVALID, not an absence.
+- **Positive control**: `R/glyph` must be SHOWN (that is the #953 defect itself).
+- **Negative control**: all three `N/` lines must be NONE.
+
+Then the answers are `C/chip` (does a nested `.help()` surface — SHOWN means yes), `B/chip` (precedence —
+the tooltip WIDTH names the winner, wide=row, narrow=chip), `E/chip` (is `.help("")` inert — NONE means
+no, it still wins), `D/chip` (does `.disabled()` suppress a nested help), and `H`/`G` (does an
+accessibility-hidden enclosing group suppress the tooltip, for either placement).
+
 ```swift
-// Reproduces sessiometer #953: does a `.help()` on a CHILD inside a row `Button` surface on hover,
-// and how does it compose with a `.help()` on the Button itself?
+// probe10 — the two assumptions the #953 fix would otherwise rest on untested.
 //
-// swiftc -O repro.swift -o repro && ./repro          # see § Reproducing this for the .app-bundle step
-import Cocoa
+// E: row `.help("")` + chip `.help("CHIP")`. Applying `.help` unconditionally with an empty string is
+//    the tidiest way to write "row help only when blocked". But probe9 proved a ROW-level help WINS
+//    over a chip's, so if an EMPTY row help still registers an owner it wins and shows nothing — the
+//    chip tooltip would vanish, silently. If E/chip reads CHIP-help, `.help("")` is inert and the tidy
+//    form is safe; if it reads NONE, the modifier must be applied conditionally.
+//
+// D: `.disabled(true)` on the Button + chip `.help("CHIP")`, no row help. A swap-pending row IS
+//    disabled and DOES still render a chip, so whether a nested help survives disabling is load-bearing.
+//    (#950 answered this for ROW-level help; a nested child is a different question.)
+//
+// R / C / B / N carry over from probe8-9 unchanged as controls.
+
+import AppKit
 import SwiftUI
 
-let rowTints: [String: (Double, Double, Double)] = [
-    "R": (1, 0, 0), "C": (0, 1, 0), "B": (0, 0, 1), "K": (1, 1, 0),
-    "E": (1, 0, 1), "P": (0, 1, 1), "N": (1, 0.5, 0),
-]
-let glyphTint = (1.0, 1.0, 1.0)
-let chipTint  = (0.5, 0.0, 1.0)
+let ROW_HELP  = "ROW-tooltip-deliberately-very-long-so-its-width-is-unmistakable"
+let CHIP_HELP = "CHIP"
 
-func color(_ t: (Double, Double, Double)) -> Color { Color(red: t.0, green: t.1, blue: t.2) }
+// H / G mirror the REAL switchSlot: the chip lives in a Group carrying `.frame(width: 28)` and
+// `.accessibilityHidden(true)`. `.help()` also sets an AX help attribute, so whether a11y-hiding the
+// enclosing Group also kills the TOOLTIP is a third assumption worth measuring, not asserting.
+//   H = .help() on the inner glyph (hit rect = the glyph, most faithful to the mock's chip span)
+//   G = .help() on the outer Group (hit rect = the full 28pt slot)
+let CASES = ["R", "C", "B", "N", "E", "D", "H", "G"]
+let rowH: CGFloat = 60
 
-struct RowStyle: ButtonStyle {
-    let tint: Color
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label.frame(width: 300, height: 60).background(tint)
-    }
-}
-
-struct OptionalHelp: ViewModifier {
-    let text: String?
-    @ViewBuilder func body(content: Content) -> some View {
-        if let text { content.help(text) } else { content }
-    }
-}
-
-/// The swap-chip slot stand-in, mirroring the shipped `switchSlot` composition — `Group` around the
-/// glyph, then `.frame`, then (optionally) `.help`, then `.accessibilityHidden(true)` — because SwiftUI
-/// modifier ORDER is semantically load-bearing (the same reason #950 carried a reversed-order case).
-struct ChipSlot: View {
-    var help: String? = nil
-    var clear = false
-    var body: some View {
-        Group {
-            if clear { Color.clear } else { Image(systemName: "arrow.left.arrow.right") }
-        }
-        .frame(width: 40, height: 24, alignment: .trailing)
-        .background(clear ? Color.clear : color(chipTint))
-        .modifier(OptionalHelp(text: help))
-        .accessibilityHidden(true)
-    }
-}
-
-struct Row: View {
-    var chip = ChipSlot()
-    var body: some View {
-        HStack(spacing: 8) {
-            Spacer()
-            color(glyphTint).frame(width: 30, height: 24)      // the health-glyph stand-in
-            chip
+struct RowView: View {
+    let kase: String
+    var rowHelp: String? {
+        switch kase {
+        case "R", "B": return ROW_HELP
+        case "E":      return ""          // the assumption under test
+        default:       return nil
         }
     }
-}
+    var chipHelp: String? { (kase == "C" || kase == "B" || kase == "E" || kase == "D") ? CHIP_HELP : nil }
+    var disabled: Bool { kase == "D" }
 
-struct Cases: View {
     var body: some View {
-        VStack(spacing: 20) {
-            // R — row-level help only: today's shipped shape, and the #953 defect.
-            Button(action: {}) { Row() }
-                .buttonStyle(RowStyle(tint: color(rowTints["R"]!))).disabled(true).help("MARKER-ROW-ONLY")
-            // C — chip-level help only, DISABLED row.
-            Button(action: {}) { Row(chip: ChipSlot(help: "MARKER-CHIP-C")) }
-                .buttonStyle(RowStyle(tint: color(rowTints["C"]!))).disabled(true)
-            // B — BOTH row-level and chip-level: the composition question.
-            Button(action: {}) { Row(chip: ChipSlot(help: "MARKER-CHIP-B")) }
-                .buttonStyle(RowStyle(tint: color(rowTints["B"]!))).disabled(true).help("MARKER-ROW-B")
-            // K — row-level help over a CLEAR slot: the shipped BLOCKED row post-#959.
-            Button(action: {}) { Row(chip: ChipSlot(clear: true)) }
-                .buttonStyle(RowStyle(tint: color(rowTints["K"]!))).disabled(true).help("MARKER-ROW-K")
-            // E — chip help only on an ENABLED row: isolates "child help inside a Button" from
-            //     disabled-ness, so a C failure cannot be blamed on `.disabled()`.
-            Button(action: {}) { Row(chip: ChipSlot(help: "MARKER-CHIP-E")) }
-                .buttonStyle(RowStyle(tint: color(rowTints["E"]!)))
-            // P — POSITIVE control for the mechanism: chip help on a PLAIN (non-Button) row. Without
-            //     it, a C/E failure cannot be attributed to the Button wrap rather than to child-help
-            //     generally.
-            Row(chip: ChipSlot(help: "MARKER-CHIP-P"))
-                .frame(width: 300, height: 60).background(color(rowTints["P"]!))
-            // N — NEGATIVE control: no .help() anywhere. A tooltip here invalidates the run.
-            Button(action: {}) { Row() }
-                .buttonStyle(RowStyle(tint: color(rowTints["N"]!)))
-        }.padding(20)
-    }
-}
-
-let screenH = NSScreen.screens[0].frame.height
-let source = CGEventSource(stateID: .hidSystemState)
-
-/// Sleep on the CALLING (background) thread. The main thread must stay inside `NSApp.run()` — two
-/// substitutes were tried and both produced runs in which even the positive control read NONE:
-/// `RunLoop.run(mode:before:)` fires run-loop sources but never dequeues AppKit events, and a manual
-/// `nextEvent`/`sendEvent` pump did not surface tooltips either. Only the real `NSApp.run()` loop does.
-func spin(_ seconds: Double) { Thread.sleep(forTimeInterval: seconds) }
-
-func hover(_ p: NSPoint) {
-    for dx in [CGFloat(0), 3, -2, 1] {
-        CGEvent(mouseEventSource: source, mouseType: .mouseMoved,
-                mouseCursorPosition: CGPoint(x: p.x + dx, y: screenH - p.y),
-                mouseButton: .left)?.post(tap: .cghidEventTap)
-        spin(0.06)
-    }
-}
-
-func tooltipWindows() -> [NSWindow] {
-    NSApp.windows.filter { String(describing: type(of: $0)).contains("ToolTip") && $0.isVisible }
-}
-
-var dumped = false
-func tooltipText() -> String? {
-    for w in tooltipWindows() {
-        guard let root = w.contentView else { continue }
-        if !dumped {
-            dumped = true
-            var stack = [(root, 0)]
-            print("  [tooltip panel = \(String(describing: type(of: w)))]")
-            while let (v, d) = stack.popLast() {
-                print("  \(String(repeating: "  ", count: d))\(String(describing: type(of: v)))")
-                for s in v.subviews { stack.append((s, d + 1)) }
+        let btn = Button(action: {}) {
+            HStack(spacing: 0) {
+                Color(nsColor: bodyColor).frame(width: 200, height: rowH)
+                Color(nsColor: glyphColor).frame(width: 100, height: rowH)
+                chip
             }
         }
-        var stack = [root]
-        while let v = stack.popLast() {
-            if let f = v as? NSTextField, !f.stringValue.isEmpty { return f.stringValue }
-            if let t = v as? NSText, !t.string.isEmpty { return t.string }
-            for key in ["stringValue", "string", "displayString", "toolTipString", "title"]
-            where v.responds(to: NSSelectorFromString(key)) {
-                if let s = v.value(forKey: key) as? String, !s.isEmpty { return s }
-                if let a = v.value(forKey: key) as? NSAttributedString, !a.string.isEmpty { return a.string }
-            }
-            if let s = v.accessibilityLabel(), !s.isEmpty { return s }
-            if let s = v.accessibilityValue() as? String, !s.isEmpty { return s }
-            stack.append(contentsOf: v.subviews)
+        .buttonStyle(.plain)
+        .disabled(disabled)
+        if let rowHelp { btn.help(rowHelp) } else { btn }
+    }
+
+    @ViewBuilder var chip: some View {
+        let c = Color(nsColor: chipColor).frame(width: 120, height: rowH)
+        switch kase {
+        case "H":
+            // .help() INSIDE an accessibility-hidden, width-framed Group — the real switchSlot shape.
+            Group { c.help(CHIP_HELP) }
+                .frame(width: 120, alignment: .trailing)
+                .accessibilityHidden(true)
+        case "G":
+            Group { c }
+                .frame(width: 120, alignment: .trailing)
+                .accessibilityHidden(true)
+                .help(CHIP_HELP)
+        default:
+            if let chipHelp { c.help(chipHelp) } else { c }
         }
     }
-    return nil
+
+    var idx: Int { CASES.firstIndex(of: kase)! }
+    var bodyColor: NSColor  { NSColor(calibratedHue: CGFloat(idx) * 0.16 + 0.00, saturation: 0.95, brightness: 0.95, alpha: 1) }
+    var glyphColor: NSColor { NSColor(calibratedHue: CGFloat(idx) * 0.16 + 0.04, saturation: 0.95, brightness: 0.95, alpha: 1) }
+    var chipColor: NSColor  { NSColor(calibratedHue: CGFloat(idx) * 0.16 + 0.08, saturation: 0.95, brightness: 0.95, alpha: 1) }
 }
 
-final class Rig {
-    let window: NSWindow
-    let hosting: NSHostingView<Cases>
-    var snapshot: NSBitmapImageRep!
-    var invalid = 0
+struct Root: View {
+    var body: some View { VStack(spacing: 0) { ForEach(CASES, id: \.self) { RowView(kase: $0) } }.frame(width: 420) }
+}
 
-    init() {
-        hosting = NSHostingView(rootView: Cases())
-        let size = hosting.fittingSize
-        window = NSWindow(contentRect: NSRect(x: 200, y: 100, width: size.width, height: size.height),
+final class Probe: NSObject, NSApplicationDelegate {
+    var window: NSWindow!
+    var mainWindowNumber: CGWindowID = 0
+    var results: [String] = []
+
+    func applicationDidFinishLaunching(_ n: Notification) {
+        UserDefaults.standard.register(defaults: ["NSInitialToolTipDelay": 150])
+        let hosting = NSHostingView(rootView: Root())
+        window = NSWindow(contentRect: NSRect(origin: .zero, size: hosting.fittingSize),
                           styleMask: [.titled], backing: .buffered, defer: false)
         window.contentView = hosting
-        window.acceptsMouseMovedEvents = true
+        window.setFrameOrigin(NSPoint(x: 200, y: 150))
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        mainWindowNumber = CGWindowID(window.windowNumber)
+        Thread.detachNewThread { [weak self] in self?.run() }
     }
 
-    /// The rendered HUE at a hosting-coordinate point — the sample normalised by its own max channel,
-    /// so uniform dimming (from `.disabled()` or the capture's colour space) cannot change attribution.
-    func hue(_ p: NSPoint) -> (Double, Double, Double)? {
-        let sx = Double(snapshot.pixelsWide) / Double(hosting.bounds.width)
-        let sy = Double(snapshot.pixelsHigh) / Double(hosting.bounds.height)
-        guard let c = snapshot.colorAt(x: Int(p.x * sx), y: Int(p.y * sy)),
-              let rgb = c.usingColorSpace(.deviceRGB) else { return nil }
-        let m = max(rgb.redComponent, rgb.greenComponent, rgb.blueComponent)
-        guard m > 0.05 else { return nil }
-        return (rgb.redComponent / m, rgb.greenComponent / m, rgb.blueComponent / m)
-    }
-
-    func matches(_ got: (Double, Double, Double)?, _ want: (Double, Double, Double)) -> Bool {
-        guard let got else { return false }
-        let m = max(want.0, want.1, want.2)
-        let w = (want.0 / m, want.1 / m, want.2 / m)
-        let d = (got.0 - w.0) * (got.0 - w.0) + (got.1 - w.1) * (got.1 - w.1) + (got.2 - w.2) * (got.2 - w.2)
-        return d.squareRoot() < 0.25
-    }
-
-    func probe(_ name: String, expect: (Double, Double, Double), hosting hp: NSPoint, screen p: NSPoint) {
-        let window = self.window
-        guard matches(hue(hp), expect) else {
-            invalid += 1
-            let g = hue(hp).map { String(format: "(%.2f,%.2f,%.2f)", $0.0, $0.1, $0.2) } ?? "black/nil"
-            print("INVALID \(name) — hue at \(hp) is \(g), expected \(expect)")
-            return
+    func auxWindows() -> [[String: Any]] {
+        let pid = ProcessInfo.processInfo.processIdentifier
+        guard let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements],
+                                                    kCGNullWindowID) as? [[String: Any]] else { return [] }
+        return list.filter {
+            ($0[kCGWindowOwnerPID as String] as? Int32) == pid &&
+            ($0[kCGWindowNumber as String] as? CGWindowID) != mainWindowNumber
         }
-        // Re-assert activation before every probe. Tooltip display is gated on the app being active and
-        // the window key (docs/findings/0950-help-on-disabled-button.md § The activation gate measured
-        // that an inactive, non-key host shows NOTHING — the enabled control included), so a probe run
-        // while inactive produces a NONE that says nothing about the element under the cursor.
-        DispatchQueue.main.sync {                       // AppKit activation is main-thread only
-            window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-            NSRunningApplication.current.activate(options: [.activateAllWindows])
-        }
-        Thread.sleep(forTimeInterval: 0.6)
-        var live = false
-        DispatchQueue.main.sync { live = NSApp.isActive && window.isKeyWindow }
-        guard live else {
-            invalid += 1
-            var a = false, k = false
-            DispatchQueue.main.sync { a = NSApp.isActive; k = window.isKeyWindow }
-            print("INVALID \(name) — host not active/key (active=\(a) key=\(k)); "
-                  + "a NONE here would be the activation gate, not the element")
-            return
-        }
-        hover(p)
-        // Preconditions for a tooltip to be possible AT ALL. Without these a NONE is uninterpretable:
-        // a blocked CGEvent post (no Accessibility permission ⇒ the cursor never moves) and an inactive
-        // app both produce silence that looks exactly like "this element has no tooltip".
-        let loc = NSEvent.mouseLocation
-        let moved = abs(loc.x - p.x) < 6 && abs((screenH - loc.y) - p.y) < 6
-        print("  [pre] active=\(NSApp.isActive) key=\(window.isKeyWindow) visible=\(window.isVisible) "
-              + "cursorAtTarget=\(moved) cursor=(\(Int(loc.x)),\(Int(screenH - loc.y))) "
-              + "target=(\(Int(p.x)),\(Int(p.y)))")
-        var seen: String? = nil
-        var any = false
-        let deadline = Date().addingTimeInterval(6)     // generous: a NONE must not be impatience
-        while Date() < deadline, !any {
-            any = !tooltipWindows().isEmpty
-            if any { seen = tooltipText() }
-            spin(0.12)
-        }
-        print("RESULT \(name) -> \(any ? (seen ?? "<SHOWN, text unreadable>") : "NONE")")
-        hover(NSPoint(x: 1700, y: 1000))
-        spin(2.0)                                       // let the panel dismiss before the next probe
-    }
-}
-
-setvbuf(stdout, nil, _IONBF, 0)                         // unbuffered: partial results survive a hang
-
-/// The whole probe sequence, run on a background thread while the main thread stays in `NSApp.run()`.
-func sequence(_ rig: Rig) {
-    spin(2.0)
-    DispatchQueue.main.sync {
-        rig.hosting.layoutSubtreeIfNeeded()
-        let rep = rig.hosting.bitmapImageRepForCachingDisplay(in: rig.hosting.bounds)!
-        rig.hosting.cacheDisplay(in: rig.hosting.bounds, to: rep)
-        rig.snapshot = rep
-    }
-    // CLEAN START — a cursor resting on a cell from a previous run contaminates the first probe.
-    DispatchQueue.main.sync { hover(NSPoint(x: 1700, y: 1000)) }
-    spin(3.0)
-    var pre = 0, b = NSRect.zero, f = NSRect.zero, px = 0, py = 0
-    DispatchQueue.main.sync {
-        pre = tooltipWindows().count; b = rig.hosting.bounds; f = rig.window.frame
-        px = rig.snapshot.pixelsWide; py = rig.snapshot.pixelsHigh
-    }
-    print("PRECONDITION tooltips=\(pre)  (must be 0)")
-    print("hosting.bounds=\(b) window.frame=\(f) snapshot=\(px)x\(py)")
-
-    let contentTop = screenH - (f.origin.y + f.size.height) + (f.size.height - b.size.height)
-    // Row content spans hosting x 20…320: body/Spacer 20…234, glyph 242…272, chip slot 280…320 (the
-    // chip's own glyph is trailing-aligned, so x=286 samples the slot's own background).
-    let bodyX = 120.0, glyphX = 257.0, chipX = 286.0
-    let order = ["R", "C", "B", "K", "E", "P", "N"]
-
-    func go(_ name: String, _ row: String, _ region: String, expectRowTint: Bool = false) {
-        let x = region == "body" ? bodyX : (region == "glyph" ? glyphX : chipX)
-        let want = expectRowTint || region == "body" ? rowTints[row]!
-                 : (region == "glyph" ? glyphTint : chipTint)
-        let i = order.firstIndex(of: row)!
-        rig.probe(name, expect: want,
-                  hosting: NSPoint(x: x, y: 20 + Double(i) * 80 + 30),
-                  screen: NSPoint(x: f.origin.x + x, y: contentTop + 20 + Double(i) * 80 + 30))
     }
 
-    // NEGATIVE control first, so a spuriously-firing detector is caught before any case.
-    go("N/chip  (neg. control, no help anywhere — expect NONE)", "N", "chip")
-    // POSITIVE control for the rig: the #953 defect itself — the row's copy answering over the glyph.
-    // If this reads NONE the rig cannot see tooltips and the whole run must be discarded.
-    go("R/glyph (row help only — the #953 DEFECT)", "R", "glyph")
-    // POSITIVE control for the mechanism: does a child `.help()` surface OUTSIDE a Button?
-    go("P/chip  (child help, NO Button — expect CHIP-P)", "P", "chip")
-    // THE QUESTION: does a child `.help()` surface INSIDE a Button?
-    go("C/chip  (chip help, DISABLED Button)", "C", "chip")
-    go("E/chip  (chip help, ENABLED Button)", "E", "chip")
-    go("E/glyph (chip help, ENABLED Button — the glyph must stay silent)", "E", "glyph")
-    // COMPOSITION: when both exist, which answers where?
-    go("B/chip  (BOTH — CHIP-B, or shadowed by ROW-B?)", "B", "chip")
-    go("B/body  (BOTH — expect ROW-B)", "B", "body")
-    // The blocked-row shape: the row's help must still reach a `Color.clear` slot.
-    go("K/slot  (row help over Color.clear — expect ROW-K)", "K", "chip", expectRowTint: true)
-
-    print("INVALID probes: \(rig.invalid)  (an INVALID voids that probe, not the run)")
-    DispatchQueue.main.async { NSApp.terminate(nil) }
-}
-
-final class Delegate: NSObject, NSApplicationDelegate {
-    var rig: Rig!
-    func applicationDidFinishLaunching(_ n: Notification) {
-        rig = Rig()
-        // Watchdog: never let a wedged rig hold the turn open. A truncated result set is readable;
-        // a hang is not.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 210) {
-            print("WATCHDOG fired — terminating with the results printed so far")
-            NSApp.terminate(nil)
+    func moveCursor(to p: CGPoint) {
+        for pt in [CGPoint(x: p.x - 6, y: p.y - 6), p] {
+            CGWarpMouseCursorPosition(pt)
+            CGAssociateMouseAndMouseCursorPosition(1)
+            CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: pt, mouseButton: .left)?
+                .post(tap: .cghidEventTap)
+            usleep(60_000)
         }
-        DispatchQueue.global().async { sequence(self.rig) }
+    }
+
+    func emit(_ s: String) { FileHandle.standardError.write((s + "\n").data(using: .utf8)!); results.append(s) }
+
+    func run() {
+        usleep(900_000)
+        var state = "?"
+        DispatchQueue.main.sync {
+            state = "appIsActive=\(NSApp.isActive) key=\(self.window.isKeyWindow) visible=\(self.window.isVisible)"
+        }
+        emit("HOST \(state)")
+
+        var frame = NSRect.zero
+        DispatchQueue.main.sync { frame = self.window.frame }
+        let screenH = CGDisplayBounds(CGMainDisplayID()).height
+
+        for (i, kase) in CASES.enumerated() {
+            for (regionName, xOff) in [("body", CGFloat(100)), ("glyph", CGFloat(250)), ("chip", CGFloat(360))] {
+                let cocoaY = frame.maxY - (CGFloat(i) * rowH + rowH / 2) - 28
+                let pt = CGPoint(x: frame.minX + xOff, y: screenH - cocoaY)
+                moveCursor(to: CGPoint(x: frame.minX - 120, y: screenH - frame.maxY - 60))
+                usleep(450_000)
+                moveCursor(to: pt)
+                usleep(1_300_000)
+
+                var cursorNow = CGPoint.zero
+                var aux: [[String: Any]] = []
+                DispatchQueue.main.sync {
+                    cursorNow = CGEvent(source: nil)?.location ?? .zero
+                    aux = self.auxWindows()
+                }
+                let landed = abs(cursorNow.x - pt.x) < 3 && abs(cursorNow.y - pt.y) < 3
+                let w = (aux.first?[kCGWindowBounds as String] as? [String: Any])
+                    .map { Int($0["Width"] as? Double ?? 0) } ?? 0
+                let whose = aux.isEmpty ? "—" : (w > 150 ? "ROW-help" : "CHIP-help")
+                emit("\(kase)/\(regionName)\tcursor=\(landed ? "LANDED" : "PARKED")\ttooltip=\(aux.isEmpty ? "NONE" : "SHOWN")\twidth=\(w)\twinner=\(whose)")
+            }
+        }
+        try? (results.joined(separator: "\n") + "\n")
+            .write(toFile: CommandLine.arguments[1], atomically: true, encoding: .utf8)
+        DispatchQueue.main.async { NSApp.terminate(nil) }
     }
 }
 
 let app = NSApplication.shared
-let delegate = Delegate()
-app.delegate = delegate
 app.setActivationPolicy(.regular)
+let d = Probe()
+app.delegate = d
 app.run()
 ```
 
+
 ## Consequences for #953
 
-- **AC-1 (scope the switch tooltip to the chip) — BLOCKED.** Not implemented. The mechanism it depends
-  on is unverified, its failure mode is silent, and the one available signal points at failure.
+- **AC-1 (scope the switch tooltip to the chip) — DELIVERED**, on the measurement above. The invitation
+  MOVED from the row-wrapping `Button` to the chip's slot (`switchSlot`); the row keeps a tooltip only
+  when blocked, where since #959 there is no chip to carry one. The routing is
+  `StatusPanelFormat.switchChipHelp` / `switchRowHelp`, and their mutual exclusivity — the platform fact,
+  not a preference — is asserted by `testTheChipAndTheRowNeverBothClaimTheTooltip`.
 - **AC-2 (the health glyph's tooltip-less state) — settled and recorded**, independently of this
   question: #955 decided it deliberately, and the decision now lives at `authView` in
   `apps/menubar/Sources/StatusPanelRoster.swift`. The build reference agrees — `title=` sits on
-  `.rowact` and on **zero** of the 78 `.health` spans in `design/menubar-preview.html`.
-- **AC-3 (the row body still explains itself) — currently satisfied by the status quo**, since the
-  switch copy has not moved off the row. The non-target rows' silence is now a recorded decision at the
-  `else` branch. Should AC-1 ever land, AC-3 needs re-reading: scoping the invitation to the chip leaves
-  a viable row's *body* silent, and that absence has to be argued or a fallback kept.
-- **The #950 residual is inherited and still open.** Whether **any** tooltip surfaces in the shipped
-  panel's `panelIsKey=true, appIsActive=false` presentation is capture-pending. Nothing load-bearing may
-  ride the tooltip channel — which is why #955 made the blocked-row reason persistent on-screen text.
+  `.rowact` and on **zero** of the 78 `.health` spans in `design/menubar-preview.html`. AC-1 landing
+  *strengthens* this: the glyph no longer answers with the switch copy either, so it is now silent in
+  fact and not merely un-annotated.
+- **AC-3 (the row body still explains itself) — satisfied as a RECORDED DECISION, not as a fallback.**
+  A viable row's body is now silent, and that is deliberate: the measurement forecloses the alternative,
+  because a row-level fallback would win over the chip and re-create the defect. The spec's bar is "some
+  tooltip appears, or the absence is a recorded decision; but not silently nothing"
+  (`docs/specs/tooltip-scope.feature.md`, Cap-3.1), and the absence is argued at `switchButton`: the row
+  is fully self-describing at rest, the chip is the affordance being described, the mock authors exactly
+  this scoping, and the spoken channel is *unchanged* — `.accessibilityHint` still carries the invitation
+  on the row, so VoiceOver loses nothing.
+- **The #950 residual is inherited and still open**, and three further attempts to construct
+  `panelIsKey=true, appIsActive=false` failed (§ The answer). Nothing load-bearing may ride the tooltip
+  channel — which is why #955 made the blocked-row reason persistent on-screen text. The residual does
+  not discriminate between the old shape and the new one, so it did not gate this fix.
 
 ## Provenance
 
-Method: purpose-built minimal SwiftUI harnesses (12 iterations, `.tmp/tooltip-probe/`), macOS 26.5.2
-(25F84), Xcode 26.6, Apple Silicon, single 1920×1080 display, 2026-08-04. Synthetic `CGEvent`
-mouse-moved hovers; detection by a visible in-process `NSToolTipPanel`. A negative control (no `.help()`)
-and a positive control (the #953 defect) rode in every hover run.
+Method: purpose-built minimal SwiftUI harnesses, macOS 26.5.2 (25F84), Xcode 26.6 (17F113), Swift 6.3.3,
+Apple Silicon, single 1920×1080 display, 2026-08-04. Twelve early iterations under `.tmp/tooltip-probe/`
+established only that the question needed a live hover; the answer came from `probe8` / `probe9` /
+`probe10` (eight runs), which detect the tooltip as an **`NSWindow` via `CGWindowListCopyWindowInfo`**
+rather than by reading pixels, and validate every cursor landing before trusting its reading. A negative
+control (no `.help()`) and a positive control (the #953 defect) rode in every hover run.
 
-Boundary: **measured** — `.help()` does not materialize as `NSView.toolTip`, and the hosting view does
-not respond to the tooltip-owner selector, on macOS 26.5.2. **Not measured** — whether a nested
-`.help()` surfaces on hover (the question this finding was opened to answer); macOS 13.0, the deployment
-target, on any question here; and the shipped panel's own activation state at hover time (inherited from
-#950). The `probe3` table is **suggestive, not measured**, for the reasons above.
+Boundary: **measured** — that a nested `.help()` surfaces and is scoped to its child; that a row-level
+`.help()` takes precedence over a child's; that `.help("")` still registers an owner; that `.disabled()`
+and `.accessibilityHidden(true)` suppress neither; and that `.help()` does not materialize as
+`NSView.toolTip` nor make the hosting view respond to the tooltip-owner selector. All on macOS 26.5.2,
+in a **switched-out Aqua session** (`HasGraphicAccess` true, `IsOnConsole` false) — a caveat worth
+carrying, since that session owns a window server and cursor of its own.
+
+**Not measured** — macOS 13.0, the deployment target, on any question here (every reading is from 26.5.2,
+and `.help()` precedence is not a documented API contract, so a future OS may differ); the shipped
+panel's own activation state at hover time (inherited from #950, three further attempts failed); and the
+roster's own wiring, which is asserted by unit test rather than by hover. The `probe3` table below is
+**suggestive, not measured**, and has been **refuted** by the runs above.
 
 No credentials read, no network call, no daemon state consulted. Related: #950 (`.help()` on a disabled
 Button), #955 (affordance coverage; the auth-glyph decision), #959 (the blocked row's chip).
