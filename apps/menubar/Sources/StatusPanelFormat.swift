@@ -221,13 +221,57 @@ enum StatusPanelFormat {
         case blocked(SwitchBlock)
     }
 
-    /// Why a non-viable row cannot be switched to — shown as its hover tooltip and spoken by VoiceOver
-    /// (a `dimmed` trait alone never tells the operator WHY).
-    static func switchBlockedText(_ block: SwitchBlock) -> String {
+    /// The PERSISTENT on-screen reason a row cannot be switched to (issue #955) — the WHY, without the
+    /// remedy sentence — or `nil` for a row that is not blocked. Shaped exactly like `authCue`: the string
+    /// lives here where it is testable, the `Text` that draws it lives in `StatusPanelRoster`.
+    ///
+    /// WHY IT IS PERSISTENT AT ALL. This reason used to reach a sighted operator ONLY on hover, while
+    /// `rowSwitchAccessibilityLabel` spoke it unconditionally — so the spoken row was strictly MORE
+    /// actionable than the visual one. That is the parity defect `rowAccessibilityLabel` names at length
+    /// ("spoken and visual say the same thing or the pair is a bug"), in the direction people check least:
+    /// a keyboard-only or touch operator saw a dead row and was told nothing at all. Of the ten row states
+    /// this is the only one carrying a load-bearing reason no resting visual conveys — the other nine are
+    /// either self-describing at rest or transient, so this is one cue, not a tooltip sweep.
+    ///
+    /// A DELIBERATE DIVERGENCE from the build-reference mock, which delivers this hover-only via `title=`
+    /// on a dimmed `.rowact` (`design/menubar-preview.html`) — recorded under design/README.md
+    /// § Expected reconciliations, so it is not a mock/Swift mismatch to "fix" in passing.
+    ///
+    /// WHY SHORTER THAN `switchBlockedText`. The full sentence also carries the remedy, which overruns
+    /// `rowCueBudget` at the roster caption size; the § Switch-affordance layout budget watch-out is
+    /// "never truncate to something uninformative", so the resting line carries the WHY and the tooltip /
+    /// spoken label keep the remedy. The two cannot drift — `switchBlockedText` is COMPOSED from this
+    /// sentence plus `blockedRemedy`, rather than being a second copy of it.
+    static func switchBlockedCue(_ block: SwitchBlock?) -> String? {
+        block.map(blockedWhy)
+    }
+
+    /// The WHY half of a block — the sentence the persistent cue, the tooltip and the spoken label all open
+    /// with, so the three channels can never disagree about the reason itself.
+    private static func blockedWhy(_ block: SwitchBlock) -> String {
         switch block {
-        case .quarantined:     return "Can’t switch — credential is quarantined. Run sessiometer poke to refresh it."
+        case .quarantined:     return "Can’t switch — credential is quarantined."
         case .weeklyExhausted: return "Can’t switch — weekly limit reached."
         }
+    }
+
+    /// The REMEDY half, or `nil` where the operator has no action to take at all — a weekly window is not
+    /// something you fix, it resets. Never invent one for that case: a remedy the operator cannot perform
+    /// reads as a failure on their part.
+    private static func blockedRemedy(_ block: SwitchBlock) -> String? {
+        switch block {
+        case .quarantined:     return "Run sessiometer poke to refresh it."
+        case .weeklyExhausted: return nil
+        }
+    }
+
+    /// Why a non-viable row cannot be switched to, IN FULL — its hover tooltip and the reason spoken by
+    /// VoiceOver (a `dimmed` trait alone never tells the operator WHY). The resting on-screen cue is this
+    /// string's first sentence (`switchBlockedCue`), so the remedy is the ONLY part these two channels add
+    /// over what the row now says at rest.
+    static func switchBlockedText(_ block: SwitchBlock) -> String {
+        guard let remedy = blockedRemedy(block) else { return blockedWhy(block) }
+        return "\(blockedWhy(block)) \(remedy)"
     }
 
     /// The viable row's (and the footer Swap button's) hover tooltip / accessibility hint.
@@ -440,6 +484,18 @@ enum StatusPanelFormat {
             - rowSpacerMinLength
             - authColumnAllowance
     }
+
+    /// The width available to a roster row's FULL-WIDTH cue line — today the persistent blocked-reason cue
+    /// (issue #955). The row's whole content box, because the line is a child of the row `VStack` rather
+    /// than a column inside the identity `HStack`: `defaultRowWidth` minus both row paddings, so on the
+    /// shipped 380 pt panel that is 364 − 16 = **348 pt**.
+    ///
+    /// THAT PLACEMENT IS THE POINT, not a layout preference. The identity row's width is already spent down
+    /// to `rosterLabelBudget`, so hosting the cue inline beside the auth cue would take its width straight
+    /// out of the account label — the exact truncation the § Switch-affordance layout budget watch-out
+    /// forbids. On its own line the cue costs the label nothing and gets ~2× the room, which is what lets
+    /// the reason read as a sentence rather than an elided fragment.
+    static var rowCueBudget: Double { defaultRowWidth - 2 * rowHorizontalPadding }
 
     /// The Stats head row's trailing signal-pill allowance, in points — like `authColumnAllowance`, a
     /// reserved budget rather than a `.frame(width:)` pin (the pill `.fixedSize()`s to its own label).

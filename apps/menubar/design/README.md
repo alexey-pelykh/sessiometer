@@ -98,6 +98,16 @@ Light shown here:
   hover/focus), which the mock now specs (the resting chip on every switchable row); at rest the row
   keeps a trailing action slot for it, which is why the auth glyph sits ~37 pt further left than in the
   mock (the #448-widened 28 pt slot + its 9 pt spacing)
+- a **blocked** row (weekly-exhausted / quarantined) carries its reason as **persistent text on its own
+  line**, where the mock delivers that reason hover-only via `title=` on the dimmed `.rowact` (#955). The
+  mock genuinely speaks here — `title=` sits on `.rowact` 42 times and on `.health` 0 — so this is a
+  deliberate divergence, not an unauthored axis. Two facts force it: the row's spoken label
+  (`rowSwitchAccessibilityLabel`) already states the reason unconditionally, so hover-only made the
+  spoken row strictly *more* actionable than the sighted one; and whether a `.help` tooltip surfaces at
+  all in the shipped panel's `panelIsKey` / `!appIsActive` presentation is still capture-pending
+  (`docs/findings/0950-help-on-disabled-button.md`). The tooltip keeps the remedy sentence the resting
+  line leaves off, so nothing was moved off hover — only added at rest. Authoring the matching mock frame
+  is #957's job; do not "fix" the mock to match this
 - the third fixture account is `Temp`, where the mock illustrates `Scratch` — re-picked (#709) so all
   three healthy labels hash to **distinct** #445 identity slots (the mock's `Personal` and `Scratch`
   both land on slot 5 / ochre under the shared 8-slot `label` hash, so the built roster would otherwise

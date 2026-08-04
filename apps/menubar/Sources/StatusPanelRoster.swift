@@ -273,9 +273,17 @@ struct AccountRowView: View {
                 Button(action: submit) { rowContent }
                     .buttonStyle(RowSwitchButtonStyle(hovering: isArmed, live: isLiveSwitch, scale: scale))
                     .disabled(blockReason != nil || swap.phase.isPending)
+                    // The SECONDARY channel for a blocked row since #955 — it carries the remedy sentence
+                    // the resting cue leaves off, and it is the only channel for the plain "Switch to …"
+                    // invitation on a viable row. It is deliberately not the only place the REASON lives:
+                    // whether a `.help` tooltip surfaces at all in the shipped panel's
+                    // `panelIsKey / !appIsActive` presentation is still capture-pending
+                    // (docs/findings/0950-help-on-disabled-button.md), so nothing load-bearing rides it.
                     .help(hoverText)
                     // The button trait + `dimmed` come from `Button` + `.disabled()`; the label carries
                     // the row's facts and, when blocked, WHY it is dimmed (a trait alone never says why).
+                    // Unchanged by #955 — that issue closed the parity gap by ADDING visual text, never by
+                    // trimming what the row speaks.
                     .accessibilityLabel(StatusPanelFormat.rowSwitchAccessibilityLabel(
                         base: accessibilityLabel, block: blockReason))
                     .accessibilityHint(blockReason == nil
@@ -306,7 +314,9 @@ struct AccountRowView: View {
         Task { await swap.swap(to: row.label) }
     }
 
-    /// The hover tooltip: the block reason for a non-viable row, otherwise the switch invitation.
+    /// The hover tooltip: the block reason IN FULL (reason + remedy) for a non-viable row, otherwise the
+    /// switch invitation. Since #955 the reason's first sentence is also on-screen at rest, so this text
+    /// deliberately overlaps it — the tooltip's remaining job is the remedy, not the reason.
     private var hoverText: String {
         blockReason.map(StatusPanelFormat.switchBlockedText)
             ?? StatusPanelFormat.switchHelpText(label: row.label)
@@ -358,6 +368,27 @@ struct AccountRowView: View {
 
                 authView
                 switchSlot
+            }
+
+            // The PERSISTENT blocked-reason cue (issue #955) — a row that cannot be switched to now SAYS
+            // why at rest, instead of only whispering it to a hovering pointer and to VoiceOver. Before
+            // this, `rowSwitchAccessibilityLabel` spoke the reason while the visual row carried it on
+            // `.help` alone, so a keyboard-only or touch operator got a dead row and no explanation — the
+            // parity defect in the direction people check least. The tooltip and the spoken label are
+            // UNCHANGED; this is an addition on the sighted side, never a subtraction on the spoken one.
+            //
+            // On its own line rather than beside `authCue`, and `accessibilityHidden` — see
+            // `StatusPanelFormat.rowCueBudget` for the width reason, and `ExpiryLine` for the same
+            // read-it-twice reason (the row is ONE VoiceOver element and its label already carries this).
+            if let cue = StatusPanelFormat.switchBlockedCue(blockReason) {
+                Text(cue)
+                    .font(.panel(style: .caption1, scale: scale))
+                    // Zero-chroma, like the `nosign` chip it explains (#956): the block is a fact about
+                    // what the operator can DO, not a health verdict about the account, and the brand rule
+                    // `an honest gauge reserves colour for the reading` keeps tint off it.
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .accessibilityHidden(true)
             }
 
             if let blind = row.blindActive {
@@ -433,7 +464,9 @@ struct AccountRowView: View {
     /// row) — so NEITHER the chip's resting presence NOR its hover-brighten can REFLOW the row: the label's
     /// available width is identical hidden / resting / armed, and so is its truncation (the issue's
     /// row-width watch-out). The auth column also stays aligned across active and non-active rows. The
-    /// why-text never truncates: it is a native `.help` tooltip, not an inline label.
+    /// why-text never truncates either: the remedy-bearing full sentence is a native `.help` tooltip rather
+    /// than an inline label, and the resting cue #955 added is on its OWN line (`rowCueBudget`), so neither
+    /// form competes with the account label for width.
     ///
     /// The emphasis (hidden / resting / armed) is a pure `StatusPanelFormat.switchChipEmphasis` verdict, so
     /// the resting-visible-vs-armed-brighten distinction is unit-asserted; the view only maps it to a
