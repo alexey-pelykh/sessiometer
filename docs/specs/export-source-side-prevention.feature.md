@@ -41,7 +41,11 @@ target — only preventable at the source*. There is currently zero source-side 
     Given an artifact exported on one machine and imported on another
     When both events are read
     Then a common artifact digest identifies them as the same artifact
-    And each carries the scope the operator requested
+    And the import event carries the scope the operator requested
     But neither carries a label, token, or email
+    But not by requiring a requested-scope field on the export event
 
     # The requested scope, never the artifact's claimed scope (AD-6).
+    # Import-only, and deliberately: `export` takes no narrowing flag (R-9c, AD-5, Cap-7.5), so it has
+    # no operator-requested scope to log. Asserting one there forces either an inert constant or an
+    # export scope flag that violates R-9c in the same change. Export correlates on the digest alone.

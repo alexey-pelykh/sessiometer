@@ -56,3 +56,17 @@ selection answers *what was asked for*; this answers *what is permitted*.
     But no refusal line contains a token or an email
 
     # A silently dropped claude_bin is indistinguishable from one that was never present.
+
+## Scenario: default-deny holds for a key nobody carved out  · Cap-8.6
+
+    Given an artifact carrying a non-roster key that has no portability classification
+    When the operator runs `import --settings`
+    Then the key is not adopted
+    And the refusal is reported
+    But not by relying on the key being one of claude_bin, kdf_*, or conflict_policy
+
+> R-11's own assertion is **default-deny over an arbitrary key**, and it is the one the other
+> scenarios do not make. Cap-8.1/8.2/8.3 each pin a *named* carve-out and Cap-8.4 pins the add-time
+> guard; all four pass while an unclassified key sails through at runtime, because none of them
+> exercises the default branch. `--settings` is in the *When* deliberately: the operator's widest
+> flag must still not widen past the allowlist — the flag is a ceiling, never a floor (R-9a).

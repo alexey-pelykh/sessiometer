@@ -13,9 +13,18 @@ Tracked as **issue #1004**. Requirements: PRD R-5, R-5a. Design § 4.4, AD-3.
 
 **Rule under test**: `classify()` computes `rotated` as `seeded_rt != after_rt`
 (`src/refresh.rs:434-437`) *before* the outcome is known. A `dead` outcome sets
-`after_rt = Some("")`, and an empty token never equals the seeded one — so `rotated=true` is
-**guaranteed by construction** on every dead line. The fix is to make that state unrepresentable,
-not merely unprinted.
+`after_rt = Some("")`, so whenever the seeded blob carries a **parseable, non-empty** refresh token
+the comparison is `non-empty != ""` and `rotated=true` is **guaranteed by construction** on that dead
+line. The fix is to make that state unrepresentable, not merely unprinted.
+
+> **Not *every* dead line — the two exceptions do not weaken the fix.** `rotated` falls through to
+> `_ => false` when `refresh_token(seeded)` is `None` (an unparseable seeded blob), and an empty
+> seeded token yields `"" != ""` → false. `Dead` is decided solely from `after_rt`
+> (`src/refresh.rs:445`), so those dead lines carry `rotated=false`. An earlier draft said "on every
+> dead line", which is the kind of absolute a test author checks and disproves in one case. The
+> chosen remedy — move `rotated` into the `refreshed` variant so the state cannot be represented
+> (AD-3, Cap-4.1) — is unaffected: it removes the field from *all* dead lines regardless of which
+> value they would have carried.
 
 ## Scenario: a dead refresh emits no rotation claim  · Cap-4.1
 

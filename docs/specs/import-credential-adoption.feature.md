@@ -39,7 +39,15 @@ report plain success.
     Given a target machine with a readable canonical Claude Code-credentials item
     When import runs to completion
     Then the canonical item is byte-identical to what it was before the import
-    And no swap lock was acquired by the import path
+    And the canonical item was never written by the import path
+
+> **Do not assert that import takes no lock — it does, and always has.** `import` resolves the #64
+> swap lock (`src/cli.rs:4616`), hands it to `apply_import` (`:4631`), which acquires it whenever the
+> artifact carries secrets (`:4765`) and holds it across the stash writes. AD-1's claim is that import
+> adds no writer of the **canonical** item, which is a different statement. An earlier draft of this
+> scenario asserted "no swap lock was acquired"; implemented literally, the fix is to strip the lock
+> from the import path — deleting the single-writer guarantee (C-2, issue #64) on the very writes it
+> protects.
 
 ## Scenario: parked accounts are staged without any canonical interaction  · Cap-1.2
 

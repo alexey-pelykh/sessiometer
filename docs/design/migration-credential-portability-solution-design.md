@@ -102,7 +102,7 @@ force for the same reason, or it inherits the same no-op.
 | Option | Verdict |
 |---|---|
 | (a) `import` writes canonical directly | **Rejected** — violates C-2; races the reconciler; duplicates a proven 5-step sequence |
-| (b) `import` reports + names `use --force` | **CHOSEN** — smallest change, no new writer, no lock surface. The unqualified `use` variant of this option is **not viable** (see correction above) |
+| (b) `import` reports + names `use --force` | **CHOSEN** — smallest change, no new **canonical** writer, no *additional* lock surface (import already takes the #64 lock around its stash writes — see § 11 Concurrency). The unqualified `use` variant of this option is **not viable** (see correction above) |
 | (c) `import` always auto-activates | **Rejected** — the operator asked to import, not to switch accounts. Surprising and irreversible-ish |
 | (d) `--activate <label>` opt-in | **Accepted as additive** to (b), forcing |
 
@@ -176,12 +176,21 @@ Two separable pieces:
 
 | Option | Consequence |
 |---|---|
-| (i) `enable`/`disable` refuse like `use` | Consistent and safe; breaks any operator muscle-memory relying on first-match |
-| (ii) `use` takes first like `enable` | Consistent; but silently switching to the *wrong account* is a credential-level mistake, not a config one |
-| (iii) Both accept an `--account-uuid` disambiguator; label path refuses | Most explicit; largest surface |
+| (i) `enable` / `disable` / `remove` refuse like `use` | Consistent and safe; breaks any operator muscle-memory relying on first-match |
+| (ii) `use` takes first like the other three | Consistent; but silently switching to the *wrong account* is a credential-level mistake, not a config one — and under `remove` it silently **deletes** the wrong account's stash |
+| (iii) All four accept an `--account-uuid` disambiguator; label path refuses | Most explicit; largest surface |
 
-**Design lean: (i)** — it moves the *cheaper* command toward the *safer* one. Refusing an
-`enable` costs a re-run; silently switching credentials costs an incident. Not chosen here.
+**Design lean: (i)** — it moves the *cheaper* commands toward the *safer* one. Refusing an
+`enable` costs a re-run; silently switching credentials costs an incident, and silently removing them
+costs an unrecoverable one. Not chosen here.
+
+> **The fourth command is `remove`, and leaving it out of this table was the defect.** *Corrected
+> 2026-08-04 (third pass).* Options (i)/(ii) were framed over `use` vs `enable`/`disable` only, which
+> makes (ii) look symmetric with (i) — a wash between two reversible behaviours. It is not: `remove`
+> shares the first-match-wins path (`apply_remove`, `src/cli.rs:5219-5227`) and is the only one of the
+> four that cannot be undone (`remove_account` deletes the keychain stash, `src/cli.rs:5195-5211`).
+> Read with `remove` present, (ii) is not a muscle-memory trade — it standardises on silent
+> irreversible deletion. OQ-1 decides this; the table must not pre-frame it as symmetric.
 
 ### 4.4 `rotated` telemetry (R-5, R-5a) — **suppress on non-`refreshed`, treat as a contract change**
 
@@ -380,7 +389,7 @@ the full-artifact case needs the same treatment deliberately.
 | `src/cli.rs::apply_import` | duplicate-label collision check; staleness warning emission | R-4, R-6 |
 | `src/refresh.rs::classify` | move `rotated` inside the `refreshed` variant | R-5 |
 | `src/daemon/snapshot_build.rs` + status render | provenance legibility | R-7 |
-| `src/use_account.rs` / `src/cli.rs::apply_enabled` | consistency per OQ-1 | R-6a |
+| `src/use_account.rs` / `src/cli.rs::apply_enabled` / `src/cli.rs::apply_remove` | consistency per OQ-1 across all four label-resolving commands | R-6a |
 | `docs/findings/0262-*.md` | new | R-1, R-1a |
 | `docs/*` runbook + command help | new | R-8 |
 
@@ -396,7 +405,7 @@ rows, including the entire security core:*
 | `src/cli.rs::parse_export` | **remove** `--no-secrets`; strict-usage error naming the replacement | R-10 (form is OQ-4-gated) |
 | `src/cli.rs::export` | daemon-liveness probe via `daemon_liveness()` (`src/cli.rs:1885`) before writing | R-13 |
 | `src/migration.rs` | `PLAINTEXT_WARNING` wording (`src/migration.rs:538`); `[credential]` forward-tolerance + version-floor message | R-10b, R-16 |
-| `src/observability.rs` | sha256 artifact digest + applied scope on the export/import events; allowlist-refusal signal | R-14, R-14a |
+| `src/observability.rs` | sha256 artifact digest + requested scope on the export/import events; allowlist-refusal signal | R-14, R-14a |
 | `src/config.rs::Account` | `account_uuid` shape validation before it reaches `stash()` | R-15 |
 
 **Untouched by design**: `src/swap.rs` (reused, not modified).
@@ -414,10 +423,10 @@ rows, including the entire security core:*
 SOURCE (A)                                   TARGET (B)
   stop daemon              ── R-8 ──►  (source no longer rotates)
   export
-   ├─ PROBES daemon liveness; REFUSES/WARNS if still live      (R-13)
+   ├─ PROBES daemon liveness; WARNS if live, never blocks      (R-13)
    ├─ WARNS on --plaintext (reworded)                          (R-10b)
    ├─ no --no-secrets flag — removed, strict-usage error       (R-10; OQ-4)
-   └─ LOGS sha256 digest + scope                               (R-14)
+   └─ LOGS sha256 digest (export has no operator scope)        (R-14)
          │
       artifact ──────────────────────►  import [--accounts | --settings] [--shred]
                                           │   (default = everything: today's behaviour, byte-identical)
@@ -431,10 +440,10 @@ SOURCE (A)                                   TARGET (B)
                                           ├─ writes stashes + roster
                                           ├─ WARNS: source must not refresh after export       (R-4)
                                           ├─ WARNS: duplicate label created, if any            (R-6)
-                                          ├─ LOGS digest + APPLIED scope                       (R-14)
+                                          ├─ LOGS digest + REQUESTED scope                       (R-14)
                                           ├─ REPORTS: active acct staged, run
                                           │           `use --force <label>`                    (R-2)
-                                          └─ --shred: overwrite + unlink the artifact          (R-12)
+                                          └─ --shred: unlink the artifact (rm with intent, not erasure)          (R-12)
                               use --force <label> ──► swap engine (#64 lock) ──► canonical
                                     status ──► EXPIRY with legible provenance                  (R-7)
 ```
@@ -478,8 +487,19 @@ its absence reads as by-design.
 **Security.** Every warning, report, and findings note is a credential-adjacent surface. C-3 is
 enforced by the existing redaction test; new output lines must be covered by it or an equivalent.
 
-**Concurrency.** § 4.1's central choice is *not to add a writer*. The only lock interaction is the
-one `use` already performs.
+**Concurrency.** § 4.1's central choice is *not to add a **canonical** writer*. `import` already
+takes the #64 swap lock — `import` resolves it (`src/cli.rs:4616`), passes it to `apply_import`
+(`:4631`), which acquires it whenever the artifact carries secrets (`:4765`) and holds it across the
+stash writes. What § 4.1 declines to add is a second writer of the canonical
+`Claude Code-credentials` item; the lock guarding the *stash* writes is pre-existing and stays.
+
+> **"Adds no canonical writer" is not "takes no lock" — corrected 2026-08-04 (third pass).** This
+> paragraph previously read *"The only lock interaction is the one `use` already performs"*, and the
+> Cap-1.2 scenario asserted *"no swap lock was acquired by the import path"*. Both were false and
+> corroborated each other. The danger was not the failing test: it is that an implementer trusting
+> two agreeing documents would **remove** the lock from the import path to make the assertion pass,
+> deleting the single-writer discipline of hard constraint C-2 on the exact keychain writes #64
+> added it for.
 
 ### Master Test Plan
 
@@ -491,7 +511,7 @@ one `use` already performs.
 | Cap-2.2 | Warning fires even when derived deadlines are unreadable (fail-closed) | unit | R-4, P2 |
 | Cap-2.3 | An already-expired artifact additionally reports expiry | unit | R-4a |
 | Cap-3.1 | Same-label/different-uuid import warns — with a target that is **not** a clone of the source | unit | R-6 |
-| Cap-3.2 | `use` / `enable` / `disable` agree on duplicate-label resolution | unit | R-6a |
+| Cap-3.2 | `use` / `enable` / `disable` / **`remove`** agree on duplicate-label resolution — `remove` is not optional: it is the only irreversible one (deletes a keychain stash), so a test omitting it passes while the case that motivated R-6a stays unasserted | unit | R-6a |
 | Cap-4.1 | `rotated` is unrepresentable on `dead` / `error` | unit (type-level) | R-5 |
 | Cap-5.1 | `status` distinguishes canonical-sourced from stash-sourced EXPIRY | unit | R-7 |
 | Cap-6.1 | No import output line contains a token or email | unit (extend existing) | C-3 |
@@ -506,12 +526,13 @@ one `use` already performs.
 | Cap-8.1 | `[refresh].claude_bin` from an artifact is **never** written to the target config, even with `--settings` | integration | R-11a |
 | Cap-8.2 | A weaker incoming `kdf_*` is refused; a stronger one is accepted | unit | R-11b |
 | Cap-8.3 | `[migration].conflict_policy` is not adopted | unit | R-11c |
-| Cap-8.4 | **Adding a `Config` key without a portability classification fails the build** | compile-fail / completeness test | R-11d |
+| Cap-8.4 | **Adding a `Config` key without a portability classification fails the build** | compile-fail / completeness test | R-11d, **R-11** |
+| Cap-8.6 | **An unclassified / unknown non-roster key is not adopted, `--settings` notwithstanding** — the allowlist's default-deny asserted over an *arbitrary* key, not one of the three named carve-outs | unit | **R-11** |
 | Cap-8.5 | Every refusal is reported on stdout | unit | R-11e |
 | Cap-9.1 | `import --shred` removes the source artifact after a successful apply | integration | R-12 |
 | Cap-9.2 | Shred is not claimed as secure erase in help or docs | unit (text assertion) | R-12 |
 | Cap-10.1 | `export` warns **only** when the local daemon is live | unit | R-13 |
-| Cap-10.2 | Export and import events carry a matching artifact digest + requested scope | unit | R-14, R-14a |
+| Cap-10.2 | Export and import events carry a **matching artifact digest**; the **import** event additionally carries the operator-**requested** scope (export has none to carry — R-9c/AD-5) | unit | R-14, R-14a |
 | Cap-11.1 | A malformed / empty `account_uuid` is rejected before a stash name is derived | unit | R-15 |
 | Cap-11.2 | The `[credential]`-block import failure names the version floor | unit | R-16 |
 
@@ -649,10 +670,9 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
 | R-9c | 4.7 / AD-5 | Cap-7.5 | covered |
 | R-9d | 4.7 / AD-10 | — (naming; asserted by Cap-7.1's flag surface) | covered |
 | R-10 | 4.7 | Cap-7.7 | covered — **corrected 2026-08-04**: was Cap-7.5, which asserts only that `export` grows no *scope* flag (R-9c) and never reaches `--no-secrets`. R-10 is the scope's only breaking CLI change; it needs its own capability |
-| | | | > **Cap-7.7 covers R-10 only, and presumes OQ-4 resolves to hard-remove.** *Corrected 2026-08-04 (second pass).* Cap-7.7 previously also claimed R-10a, contradicting this table's own R-10a row and § 16b, which both record R-10a as decision-gated with no capability. R-10 (*the flag goes away*) is decided and assertable now; R-10a (*by which path* — hard-remove vs deprecate-then-remove) is **not**, and a capability cannot assert an undecided requirement. Cap-7.7's strict-usage-error form is the hard-remove branch: **if OQ-4 resolves to deprecate-then-remove, Cap-7.7 must be re-derived** to assert a deprecation warning and a zero exit for at least one release. Do not implement Cap-7.7 as written until OQ-4 is closed. |
-| R-10a | — | — | **decision-gated** (OQ-4) |
+| R-10a | — | — | **decision-gated** (OQ-4) — see the Cap-7.7 note below this table |
 | R-10b | 4.9 | Cap-7.8 | covered — **corrected 2026-08-04**: was Cap-9.2, which asserts the *shred* help text makes no secure-erase claim (R-12). Adjacent wording concern, different string |
-| R-11 | 4.8 / AD-7 | Cap-8.1 … Cap-8.5 | covered |
+| R-11 | 4.8 / AD-7 | Cap-8.4, Cap-8.6 (default-deny over an arbitrary key); Cap-8.1 … Cap-8.3 cover the named carve-outs | covered |
 | R-11a | 4.8 / AD-8 | Cap-8.1 | covered |
 | R-11b | 4.8 | Cap-8.2 | covered |
 | R-11c | 4.8 / AD-11 | Cap-8.3 | covered (over a recorded dissent) |
@@ -666,11 +686,23 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
 | R-16 | 4.9 | Cap-7.4, Cap-11.2 | **partly decision-gated** (OQ-5) |
 | R-8 | 4.6 | — (document) | covered |
 
+> **Cap-7.7 covers R-10 only, and presumes OQ-4 resolves to hard-remove.** *Corrected 2026-08-04
+> (second pass); relocated out of a table cell (third pass) — block quotes do not nest inside table
+> cells, so GitHub rendered a literal `>` and crammed this whole paragraph into one column.* Cap-7.7
+> previously also claimed R-10a, contradicting this table's own R-10a row and § 16b, which both
+> record R-10a as decision-gated with no capability. R-10 (*the flag goes away*) is decided and
+> assertable now; R-10a (*by which path* — hard-remove vs deprecate-then-remove) is **not**, and a
+> capability cannot assert an undecided requirement. Cap-7.7's strict-usage-error form is the
+> hard-remove branch: **if OQ-4 resolves to deprecate-then-remove, Cap-7.7 must be re-derived** to
+> assert a deprecation warning and a zero exit for at least one release, and **PRD AC-10 must be
+> re-derived with it** (AC-10 carries the same OQ-4 caveat). Do not implement Cap-7.7 as written
+> until OQ-4 is closed.
+
 ## 16b. Backward-Coverage Matrix
 
 Every capability traces to a requirement: Cap-1.x→R-2/R-2a/AC-2a, Cap-2.x→R-4/R-4a, Cap-3.x→R-6/R-6a,
 Cap-4.1→R-5, Cap-5.1→R-7, Cap-6.1→C-3, Cap-7.1-7.6→R-9/R-9a-d, **Cap-7.7→R-10**,
-**Cap-7.8→R-10b**, Cap-8.x→R-11/R-11a-e, Cap-9.x→R-12, Cap-10.x→R-13/R-14/R-14a,
+**Cap-7.8→R-10b**, Cap-8.x→R-11/R-11a-e (Cap-8.6→R-11), Cap-9.x→R-12, Cap-10.x→R-13/R-14/R-14a,
 Cap-11.x→R-15/R-16. **No orphan capabilities.**
 
 > **This matrix checks only one direction, and that is why it missed two gaps (corrected 2026-08-04).**
@@ -696,7 +728,7 @@ their absence from the Cap-list does not read as a coverage gap:
 
 **R-10a** has neither, because it is undecided (OQ-4).
 
-> **One capability has no spec scenario: Cap-7.7** — 28 of the 29 are pinned by a scenario in
+> **One capability has no spec scenario: Cap-7.7** — 29 of the 30 are pinned by a scenario in
 > `docs/specs/`. This one is left unpinned **deliberately**, because its assertion is the hard-remove
 > branch of the still-open OQ-4 (see the R-10 row in § 16). Writing the scenario now would pin the
 > undecided outcome in the place a test author reads first. Close OQ-4, then add it to

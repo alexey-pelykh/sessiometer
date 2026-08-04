@@ -93,7 +93,7 @@ Three branches, all live, all confirmed against the code:
   never requests a swap. So the imported bytes are parked, not adopted — and the account the operator
   is *currently using* is the one account the import cannot reach.
 - **(ii) The staleness is unrepresentable.** `Payload` carries exactly two fields — `config_toml` and
-  `accounts` (`src/migration.rs:200-232`). There is **no export timestamp**, and `FORMAT_VERSION` is
+  `accounts` (`src/migration.rs:199-210`). There is **no export timestamp**, and `FORMAT_VERSION` is
   frozen at `1` (`src/migration.rs:97`; ADR-0006 pins v1 as the tested baseline). The artifact
   therefore cannot state when it was minted, and the importer cannot compute how far the source has
   rotated past it. Anthropic's token endpoint rotates the refresh token on every exchange (#262), so
@@ -325,7 +325,7 @@ silently. `Origin: AI-inferred-expansion`.
 `Ratification: user-ratified 2026-08-04 (scope-membership B/first-pass, item I2)`.
 
 **R-6a** — *Where* a duplicate-label roster exists, the system **shall** handle it **consistently**
-across **all three** label-resolving commands. It does not today: `use <label>` refuses with
+across **all four** label-resolving commands — `use`, `enable`, `disable` and `remove`. It does not today: `use <label>` refuses with
 `Error::UseTargetAmbiguous` (`src/use_account.rs:453`, exit code 6 per `src/error.rs:955`), while
 `apply_enabled` backing `enable`/`disable` silently resolves to the earliest entry
 (`src/cli.rs:5150-5163`). Which behaviour is correct is a decision, not a design.
@@ -335,7 +335,7 @@ across **all three** label-resolving commands. It does not today: `use <label>` 
 > **R-6a's command set was corrected on 2026-08-04.** The original wording named only two commands and
 > framed the choice as "one of the two is wrong". Both halves were defective:
 >
-> - **`remove` was omitted, and it is the load-bearing case.** `apply_remove` → `remove_account`
+> - **`remove` was omitted, and it is the load-bearing case.** `remove_account` → `apply_remove`
 >   (`src/cli.rs:5219-5227`, `src/cli.rs:5195-5211`) resolves a label and **deletes the keychain stash**. It is
 >   the only one of the three whose first-match-wins behaviour is **irreversible** — `use` picks the
 >   wrong active account (recoverable in one command) and `enable`/`disable` flips the wrong flag
@@ -490,10 +490,21 @@ refusal, so it cannot answer the tri-state question this requirement asks.
 `Origin: council-added` (`security-architect`).
 `Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item E12)`.
 
-**R-14** — *Where* `export` and `import` emit observability events, they **shall** carry a **sha256
-digest** of the artifact and the **operator-requested scope**, so an export and its corresponding
-import can be correlated after the fact. This fits the existing aggregate-only redaction discipline of
+**R-14** — *Where* `export` and `import` emit observability events, they **shall** both carry a
+**sha256 digest** of the artifact, so an export and its corresponding import can be correlated after
+the fact; and the `import` event **shall** additionally carry the **operator-requested scope**. This
+fits the existing aggregate-only redaction discipline of
 `Event::Export` / `Event::Import` (`src/observability.rs:1426-1442`) — no label, no token, no email.
+
+> **The scope field is import-only, and the export half had no constructible value.** *Corrected
+> 2026-08-04 (third pass).* This requirement previously demanded the operator-requested scope on
+> **both** events, but there is no operator-requestable scope on `export` — R-9c, AD-5, AC-9c and
+> Cap-7.5 all require `export` to gain no narrowing flag, and the one scope-ish export field
+> (`mode: ExportMode`, `src/observability.rs:1429`) is driven by `no_secrets`, which R-10 removes,
+> leaving it the constant `Full`. An implementer had only two readings, both wrong: log an inert
+> constant (a field that gates nothing — the design's own ceremony anti-pattern, carrying none of the
+> correlation value claimed), or add an export scope flag and violate R-9c/AD-5/Cap-7.5 in the same
+> change. **Export-side correlation rides on the digest alone**, which is sufficient for it.
 `Origin: council-added`. `Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item E13)`.
 
 **R-14a** — *Where* R-14 logs a scope, it **shall** log the scope the operator **requested**, never the
@@ -558,6 +569,7 @@ name `use <label>` unqualified. No such document exists.
 > because that sweep searched the *design* for the claim; R-8 states it as **runbook prose in the
 > PRD**, and R-8 is the one requirement with **no capability** gating it (§ 16 records it as
 > `— (document)`), so no test could have caught it either.
+
 `Ratification: user-ratified 2026-08-04 (scope-membership B/first-pass, item M1)`.
 
 ## 4. Acceptance Criteria (GWT + BUT NOT)
@@ -605,9 +617,15 @@ runs `import --accounts`, *Then* the roster and credentials are applied and **no
 widen the operator's selection; **BUT NOT** naming the flag `--config`, which is reserved for #24's
 directory-override ladder.
 
-**AC-9b (R-9b)** — *Given* a roster-only artifact, *When* it is imported by a binary whose `RawConfig`
-would reject an unknown block, *Then* the import succeeds. **BUT NOT** by relaxing
-`deny_unknown_fields` on the full-parse path; **BUT NOT** by removing `RawAccount`'s own strictness.
+**AC-9b (R-9b)** — *Given* a roster-only artifact, *When* it is imported **with `--accounts`** by a
+binary whose `RawConfig` would reject an unknown block, *Then* the import succeeds. **BUT NOT** by
+relaxing `deny_unknown_fields` on the full-parse path; **BUT NOT** by removing `RawAccount`'s own
+strictness; **BUT NOT** by asserting this on the default path, where the full parse still runs and
+`deny_unknown_fields` (`src/config.rs:1378`) still rejects — that is OQ-5's question, not this AC's.
+
+> *`--accounts` added to the* When *2026-08-04 (third pass).* R-9b scopes narrow-parse to
+> `--accounts`; without the flag in the precondition this AC is unsatisfiable as literally written.
+> The spec scenario had it right (`docs/specs/import-scope-selection.feature.md`); the AC did not.
 
 **AC-9c (R-9c)** — *Given* the scope feature ships, *When* `export --help` is read, *Then* it offers no
 config/roster narrowing flag. **BUT NOT** justified as symmetry with import — export scope is
@@ -619,6 +637,15 @@ the attacker minted.
 been re-checked against the fact that every artifact now carries credentials.
 **BUT NOT** silently accepting-and-ignoring the flag; **BUT NOT** leaving the warning advising a
 deletion the tool provides no mechanism for (R-12).
+
+> **The strict-usage-error half of this AC is gated on OQ-4 — do not implement it until OQ-4 closes.**
+> *Added 2026-08-04 (third pass).* R-10a records the removal **path** as undecided (hard-remove vs
+> deprecate-then-remove), and design § 16 gives Cap-7.7 the same caveat and withholds its spec
+> scenario for it. This AC did not carry the caveat, and an AC is *upstream* of the capability: if
+> OQ-4 resolves to deprecate-then-remove, Cap-7.7 gets re-derived per its note and AC-10 would not,
+> leaving an acceptance criterion demanding a non-zero usage error while the shipped behaviour is a
+> deprecation warning with exit 0. The `PLAINTEXT_WARNING` half (R-10b) is **not** gated and stands
+> as written.
 
 **AC-11 (R-11, R-11a, R-11b, R-11c, R-11e)** — *Given* an artifact whose config sets
 `[refresh].claude_bin = "./x"`, *When* it is imported **with `--settings`**, *Then* the target's saved
@@ -649,9 +676,11 @@ unconditionally regardless of daemon state, which trains dismissal; **BUT NOT** 
 the operator may have a reason.
 
 **AC-14 (R-14, R-14a)** — *Given* an export and its later import, *When* their events are read, *Then*
-a common artifact digest correlates them and each carries the operator-requested scope.
-**BUT NOT** logging a label, token, or email — the aggregate-only redaction discipline of
-`Event::Export` / `Event::Import` holds; **BUT NOT** logging the scope the artifact claims.
+a common artifact digest correlates them, *And* the **import** event carries the operator-requested
+scope. **BUT NOT** logging a label, token, or email — the aggregate-only redaction discipline of
+`Event::Export` / `Event::Import` holds; **BUT NOT** logging the scope the artifact claims;
+**BUT NOT** requiring a requested-scope field on the **export** event, which has no operator-
+requestable scope to carry (R-9c, AD-5).
 
 **AC-15 (R-15)** — *Given* a roster entry whose `account_uuid` is empty or malformed, *When* it is
 imported, *Then* it is rejected before a keychain service name is derived from it.
@@ -677,9 +706,12 @@ lines (0465 checked: clean).
 
 **AC-6 (R-6, R-6a)** — *Given* a target roster carrying label `L` under uuid `X`, and an artifact
 carrying label `L` under uuid `Y`, *When* `import` runs, *Then* the operator is warned that a
-duplicate label was created. *And* `use L`, `enable L`, and `disable L` thereafter agree on whether a
-duplicate label is resolvable. **BUT NOT** by enforcing label uniqueness — that contradicts the
-documented design position; **BUT NOT** by leaving `use` refusing while `enable` silently picks first.
+duplicate label was created. *And* `use L`, `enable L`, `disable L` **and `remove L`** thereafter agree
+on whether a duplicate label is resolvable. **BUT NOT** by enforcing label uniqueness — that
+contradicts the documented design position; **BUT NOT** by leaving `use` refusing while `enable`
+silently picks first; **BUT NOT** by omitting `remove`, whose first-match-wins deletes a keychain
+stash irreversibly (`apply_remove`, `src/cli.rs:5219-5227`) and is therefore the case that should
+drive the policy, not the one left untested.
 **Test-coverage criterion (M2)**: a case whose target roster is **not** a clone of the source config —
 `the_migration_conflict_policy_default_drives_import_behaviour` builds its target as
 `src_config.clone()` (`src/cli.rs:10741`), so every uuid matches by construction and this branch is
@@ -746,7 +778,7 @@ PAST:    < 1.0 — true-by-construction on every `dead` line (src/refresh.rs:434
 | A-2 | Anthropic rotates the refresh token on every exchange | 🟢 | Resolved by spike #262; corroborated by this incident's `window_secs=25246` then `window_secs=0` pair |
 | A-3 | No family revocation on replay of a superseded token | 🔴 | **n=1 only.** A refreshed normally ~7 h after B's replay. One observation; the endpoint may change. R-1 must not overstate it |
 | A-4 | Grace window < 4 m 14 s | 🔴 | **n=1 only.** Derived from one interval, not a swept bound. The true window may be far smaller |
-| A-5 | A freshness signal is derivable without a `format_version` bump | 🔴 | **Unvalidated** — R-4a exists to settle it. `Payload` has no timestamp (`src/migration.rs:200-232`) |
+| A-5 | A freshness signal is derivable without a `format_version` bump | 🔴 | **Unvalidated** — R-4a exists to settle it. `Payload` has no timestamp (`src/migration.rs:199-210`) |
 | A-6 | Promoting to canonical can reuse the #64 swap lock | 🟡 | Plausible — `src/daemon/canonical.rs` already reconciles out-of-band canonical writes — but unverified against the import path's lock scope |
 
 ### Premortem (de-anchored — failure modes the requirement list does not enumerate)
@@ -832,11 +864,16 @@ by symbol against `HEAD` on 2026-08-04 before this document was committed.
 > The superseded wording said "+52 in the 4400–5300 band and **+97 above 10600**". The +52 band was
 > right by accident; the +97 boundary was wrong at **both** ends — it begins at 8226, not 10600, and
 > ends at 11507, above which the shift is +193. That mis-stated floor is the direct cause of the
-> second residue round: citations at 10180–10566 sit *below* the claimed 10600 threshold, so the
-> stated rule marked them exempt and they were left alone, when in fact they were in the +97 band and
-> all six were stale. **A rule of thumb about a diff is not the diff.** The durable fix is not a
-> better rule — it is not citing lines at all where a symbol will do: the seven-test row in the table
-> below now names its tests, which no rebase can invalidate.
+> second residue round, though not its whole cause: **five** of the six stale entries (10180, 10217,
+> 10357, 10522, 10566) sit *below* the claimed 10600 threshold, so the stated rule marked them exempt
+> and they were left alone when they were in fact in the +97 band. The sixth, **10636, sits above
+> 10600** — the superseded rule should have caught it and did not; it lands inside
+> `a_config_only_artifact_imports_accounts_as_roster_entries_without_a_stash` (declared 10619) rather
+> than the test it named. And the seventh entry, 10201, was correct throughout. So the bad threshold
+> explains most of the residue but not all of it, which is the more useful lesson: **a rule of thumb
+> about a diff is not the diff, and a rule that explains most of the evidence is still wrong.** The
+> durable fix is not a better rule — it is not citing lines at all where a symbol will do: the
+> seven-test row in the table below now names its tests, which no rebase can invalidate.
 >
 > Three citations were not merely offset but pointed at unrelated code that reads plausibly:
 > `resolve_target` was cited to `src/cli.rs:438-455` (that is `parse_config`; the function lives in
@@ -848,8 +885,19 @@ by symbol against `HEAD` on 2026-08-04 before this document was committed.
 > silently, because nothing re-checked it when the tree moved underneath. A verification claim is
 > itself a claim with a timestamp, and a document that asserts its own freshness is asserting
 > something it cannot know about the future. Every citation in this file and the design doc has now
-> been re-resolved **by symbol** — the durable form, since a symbol survives a rebase and a line
-> number does not. Caught by the pre-submit external review gate, not by this document's authors.
+> been re-resolved **by symbol lookup** on 2026-08-04 — each was checked by reading the symbol it
+> names, and an independent third review pass re-resolved all 137 and found them correct.
+>
+> **But the recorded form is still `path:line`, and it will drift again.** *Stated plainly
+> 2026-08-04 (third pass), because the earlier wording claimed otherwise.* This paragraph previously
+> said the citations "have been re-resolved **by symbol** — the durable form, since a symbol survives
+> a rebase and a line number does not," which conflates the *method* with the *form*. Symbol lookup
+> was the method; line numbers are still what is written down. Exactly one row in this document —
+> the seven-test row below — was actually converted to the durable form, and `d1c5f30` shows what the
+> next `src/cli.rs` commit does to the other 137. A reader who trusts the durability claim skips the
+> re-resolution these citations will need. **Verify before relying on any line number here**; the
+> claim that survives is the *symbol names*, not the offsets. Caught by the pre-submit external
+> review gate, not by this document's authors — for the third consecutive round.
 
 | Claim | Evidence |
 |---|---|
@@ -860,7 +908,7 @@ by symbol against `HEAD` on 2026-08-04 before this document was committed.
 | Whole-config merge is acknowledged future work | `src/cli.rs:4737-4741` (verbatim in-code comment) |
 | Labels are non-unique by design | `src/cli.rs:5148-5149` |
 | `use` refuses on ambiguity; `enable`/`disable` take first | `src/use_account.rs:453`; `src/error.rs:955` (exit 6); `src/cli.rs:5150-5163` |
-| `Payload` has no timestamp; `FORMAT_VERSION = 1` | `src/migration.rs:200-232`; `src/migration.rs:97` |
+| `Payload` has no timestamp; `FORMAT_VERSION = 1` | `src/migration.rs:199-210`; `src/migration.rs:97` |
 | Existing migration test coverage (7 tests, all in `src/cli.rs`) | `export_encrypted_round_trips_gathered_state_and_hides_it`, `export_no_secrets_omits_every_credential_blob`, `export_plaintext_round_trips_and_carries_secrets_in_the_clear`, `import_round_trips_an_encrypted_export_and_restores_every_account_byte_faithfully`, `a_config_only_artifact_imports_accounts_as_roster_entries_without_a_stash`, `the_import_report_names_labels_only_never_a_token_or_email`, `the_migration_conflict_policy_default_drives_import_behaviour` |
 | Conflict test's target is a clone of the source | `src/cli.rs:10741` |
 
@@ -969,8 +1017,10 @@ that explains every symptom; a falsified claim is recorded rather than buried.
    constrains how they may be stated; a reader who strengthens them later has broken the requirement.
 2. **R-4a is unresolved and gates R-4's ambition.** Stage 2 must either find a v1-derivable signal or
    surface the `format_version` question as an ADR-0006 decision.
-3. **R-6a's resolution is a decision, not a design.** Whether `use` or `enable`/`disable` is the
-   correct behaviour is a product call the pipeline must not settle silently.
+3. **R-6a's resolution is a decision, not a design.** Which of the four label-resolving commands'
+   behaviours is correct — `use`'s refusal or `enable`/`disable`/`remove`'s first-match-wins — is a
+   product call the pipeline must not settle silently, and `remove`'s irreversibility is the argument
+   that should drive it (OQ-1).
 4. **Ratification asymmetry.** R-5 … R-8 were ratified as *in-scope*; their mechanisms were not. R-2a,
    R-4a, R-5a, R-6a are all `pending-user` and each is reversible.
 

@@ -47,7 +47,16 @@ command must agree on whether it resolves.
     When the operator invokes use with L
     And the operator invokes enable with L
     And the operator invokes disable with L
-    Then all three agree on whether L is resolvable
+    And the operator invokes remove with L
+    Then all four agree on whether L is resolvable
+    But not by asserting only the three non-destructive commands
+
+> `remove` is the load-bearing one and the easiest to drop. `apply_remove` resolves by
+> `position(|account| account.label == label)` (`src/cli.rs:5219-5227`) — first-match-wins, like
+> `enable`/`disable` — but it is the only one of the four that is **irreversible**: `remove_account`
+> deletes the resolved account's keychain stash (`src/cli.rs:5195-5211`). A test that asserts the
+> other three agree passes with `remove` still silently deleting the wrong account's credentials,
+> which is the case OQ-1 says should drive the policy.
 
     # Today they do NOT: use refuses with UseTargetAmbiguous (exit 6, src/use_account.rs:453) while
     # apply_enabled silently takes the earliest entry (src/cli.rs:5150-5163). Which one is correct
