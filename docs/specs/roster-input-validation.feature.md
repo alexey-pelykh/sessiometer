@@ -44,6 +44,15 @@ keychain service name. Under scope selection the roster becomes the payload ever
 ## Scenario: the `[credential]` incompatibility is legible  · Cap-11.2
 
     Given an artifact carrying a `[credential]` block
-    When it is read by a parser predating that block
-    Then the failure names the version floor
-    But is not a bare deny_unknown_fields parse error
+    When it is read by the current binary on the artifact-config parse path
+    Then the unknown block is tolerated rather than rejected
+    And the documented version floor states which releases cannot read it
+    But not by asserting anything about an already-shipped binary's message
+
+> **The half you cannot test — do not write a test for it.** An earlier draft's *When* read "by a
+> parser **predating** that block", which no test in this tree can realize: that parser is in a
+> released binary we cannot patch (design § 4.9, § 14 R-16 — *"the released-binary half is
+> unfixable"*). The **current** binary parses `[credential]` fine (`src/config.rs:1395`), and
+> forward-tolerance is designed to keep it that way — so neither side of the boundary produces the
+> asserted failure. **OQ-5** decides whether the tolerance + documented floor above is the whole
+> deliverable; until it closes, assert only what this scenario now names.

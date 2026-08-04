@@ -360,20 +360,45 @@ exists: on a fresh target the artifact's whole config is adopted unconditionally
 `Ratification: n/a` (maintainer-proposed).
 
 **R-9a** — *Where* an artifact's scope is determined, it **shall** be derived from payload **presence**
-(`config_toml` empty, `accounts` empty) and **shall not** be read from any scope field the artifact
-declares about itself. On a `--plaintext` export nothing is authenticated (`src/cli.rs:4471-4479`), so
+— the **accounts** axis from the `[[account]]` entries parsed out of `config_toml` (credentials
+additionally from `Payload.accounts`), the **settings** axis from the non-roster blocks parsed out of
+`config_toml` — and **shall not** be read from any scope field the artifact declares about itself. On a `--plaintext` export nothing is authenticated (`src/cli.rs:4471-4479`), so
 a declared scope is attacker-controlled: a hostile artifact would assert full scope and the control
 would evaporate. The operator's flag is a **ceiling, never a floor** — `import --accounts` against an
 artifact containing config ignores that config regardless of what the artifact claims.
 `Origin: council-added` (3/3 convergent). `Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item E5)`.
 
-> **The two presence tests are not symmetric.** `accounts` empty is export-reachable (the config-only
-> artifact); `config_toml` empty is **not** — `export` writes `config.render()` unconditionally
-> (`src/cli.rs:4532`) and `render()` always emits `[tunables]` (`src/config/render.rs:370`), and AD-5
-> deliberately gives `export` no narrowing flag. A roster-only artifact is therefore hand-constructed
-> or third-party, never self-minted; `docs/specs/import-scope-selection.feature.md` § `--settings` on
-> a roster-only artifact records what the Cap-7.6 test must build. This does **not** trip R-9's
-> circuit breaker: scope is still derived from presence and no declared field is required.
+> **Both axes live in `config_toml`; `Payload.accounts` is secrets only.** *Corrected 2026-08-04
+> (fourth pass) — the previous wording of this requirement, and the note that defended it, were both
+> wrong.* R-9a used to name the presence test as "(`config_toml` empty, `accounts` empty)", which
+> mis-maps **both** axes:
+>
+> - **`accounts` empty ⇏ no roster.** `Payload.accounts` carries per-account *secret material* keyed
+>   by uuid — `ManagedAccount` is `{account_uuid, credential, oauth_account}` (`src/migration.rs:220-232`)
+>   with **no label and no `enabled`**, so a roster entry is not reconstructible from it. The roster
+>   travels inside `config_toml` as `[[account]]` entries (`src/migration.rs:199-210`), and
+>   `apply_import` iterates `incoming.roster` parsed from there (`src/cli.rs:4735`, `:4770`). The
+>   committed test `a_config_only_artifact_imports_accounts_as_roster_entries_without_a_stash`
+>   (`src/cli.rs:10619-10638`) builds a payload with **empty `accounts`** and asserts **two** roster
+>   entries import. Deriving "the accounts axis is unavailable" from `accounts.is_empty()` would make
+>   `import --accounts` skip a roster the tool imports today — a regression against a committed test.
+> - **`config_toml` empty ⇏ roster-only.** Roster *and* settings both live there, so an empty
+>   `config_toml` means **neither** is available. The artifact an earlier draft of Cap-7.6's spec
+>   asked an author to hand-build was roster-**less**, not roster-only.
+>
+> **An earlier note here also argued the asymmetry was "not a defect" because `accounts` empty is
+> export-reachable. That premise is retired by this very scope**: `gather_payload` produces an empty
+> `accounts` only under `no_secrets` (`src/cli.rs:4533-4534`), and R-10 removes that flag — R-10b says
+> it outright ("every artifact carries live credentials"). After R-10, neither field is empty on a
+> self-minted artifact.
+>
+> **What survives.** R-9's circuit breaker still does not trip — scope is derived from parsed
+> *content*, not from a field the artifact declares, and the operator's flag remains a ceiling. But
+> the **settings axis cannot be reliably presence-derived**, for R-9c's own reason: a defaulted block
+> is indistinguishable from a withheld one (`src/config.rs:1377-1396`), so `available(artifact).settings`
+> is effectively always true for any self-minted artifact. That is tracked as **OQ-6** and must be
+> settled before #1046 is implemented; it does not require a declared scope field, so it is a
+> precision question, not a breaker.
 
 **R-9b** — *Where* `--accounts` is selected, the config **shall** be **narrow-parsed** — deserialized
 into a struct carrying only `account` — rather than fully parsed and then filtered. This is not an
@@ -396,12 +421,22 @@ attacker-supplied artifact — because the attacker controls the export.
 
 **R-9d** — *Where* the scope flags are named, they **shall** be `--accounts` and `--settings`.
 `--config` is unavailable on two independent grounds: it is **reserved and value-bearing** for issue
-#24's directory-override ladder (`src/paths.rs:439`, "The CLI flag itself is not wired yet"), and it is
+#24's directory-override ladder (`src/paths.rs:443-444`, "The CLI flag itself is not wired yet"), and it is
 **semantically wrong** — `account` is a field of `RawConfig`, so accounts *are* config and
 `sessiometer config show` prints them. `--accounts` matches the vocabulary the tool already uses on
 this surface: `IMPORT_USAGE` opens "rehydrate **accounts** from a migration artifact"
 (`src/cli.rs:1290`). `roster` is internal Rust vocabulary and barely surfaces to operators.
-`Origin: user-stated` (maintainer asked the question; evidence settled it). `Ratification: n/a`.
+`Origin: user-stated` (maintainer asked the question; evidence settled it).
+`Ratification: user-ratified 2026-08-04 — the maintainer **ruled on the naming**, per § 3's preamble.`
+
+> **R-9d's provenance was recorded three incompatible ways; this is the reconciliation.** *Corrected
+> 2026-08-04 (fourth pass).* § 3's preamble says the maintainer *ruled on naming*; this requirement
+> said `Ratification: n/a` (evidence settled it); § 11 says *no mechanism in the amendment set is
+> user-ratified*. A later reader asking "may `--accounts`/`--settings` be renamed?" got three answers.
+> The reconciliation: the **name is maintainer-ruled and is not a free pipeline call** — the evidence
+> (`--config` is reserved for #24, and `account` is a `RawConfig` field so accounts *are* config)
+> informed the ruling rather than replacing it. § 11's "mechanisms remain reversible" therefore
+> carries **one carve-out: this flag name**. Renaming needs the maintainer, not a pipeline decision.
 
 **R-10** — The system **shall** remove the shipped `export --no-secrets` flag
 (`src/cli.rs`, `EXPORT_USAGE`). Roster-without-secrets is not a state this product supports. The
@@ -535,8 +570,13 @@ full-artifact case is unresolved. `Origin: council-added` (`rust-architect`, sur
 
 **R-5** — *Where* a refresh outcome is not `refreshed`, the system **shall not** emit a `rotated` value
 that reads as a meaningful observation. `classify()` computes `rotated` as
-`seeded_rt != after_rt` (`src/refresh.rs:434-437`); a `dead` outcome sets `after_rt = Some("")`, so
-`rotated=true` is **true by construction** on every dead line and carries no information.
+`seeded_rt != after_rt` (`src/refresh.rs:434-437`) **before** the outcome is known; `Dead` is then
+*derived* from `after_rt` being `Some("")` (`src/refresh.rs:445`), not the other way round. So on any
+dead line whose seeded blob carries a parseable, non-empty refresh token, `rotated=true` is **true by
+construction** and carries no information. (It is **not** every dead line: `rotated` falls through to
+`_ => false` when the seeded blob is unparseable, and an empty seeded token gives `"" != ""` → false.
+The remedy is unaffected — making the field unrepresentable removes it from *all* dead lines
+regardless of which value they would have carried.)
 `Origin: AI-inferred-expansion`.
 `Ratification: user-ratified 2026-08-04 (scope-membership B/first-pass, item I1)`.
 
@@ -687,11 +727,12 @@ imported, *Then* it is rejected before a keychain service name is derived from i
 **BUT NOT** stated or filed as a path-traversal finding — `stash()` reaches no filesystem path, and
 overstating it would manufacture a severity the evidence does not support.
 
-**AC-16 (R-16)** — *Given* an artifact carrying a `[credential]` block, *When* a binary built before
-commit `6fe3457` imports it, *Then* the outcome is **decided and documented** — either it succeeds, or
-it fails with a message naming the version floor. **BUT NOT** left as today's bare
-`deny_unknown_fields` parse error; **BUT NOT** considered closed by R-9b, which repairs only the
-roster-only case.
+**AC-16 (R-16)** — *Given* an artifact carrying a `[credential]` block, *When* the **current** binary
+imports it, *Then* the unknown block is tolerated on the artifact-config parse path, *And* the
+**version floor** — which released binaries cannot read such an artifact — is documented.
+**BUT NOT** left as today's bare `deny_unknown_fields` parse error; **BUT NOT** considered closed by
+R-9b, which repairs only the roster-only case; **BUT NOT** asserting what an *already-shipped* binary
+prints, which is unfixable by construction (design § 4.9, § 14) — that half is bounded by **OQ-5**.
 
 **AC-4 (R-4, R-4a)** — *Given* any credential-bearing import, *When* it runs, *Then* the operator is
 warned that a source refresh after export invalidates the artifact, and is given the safe sequence.
@@ -758,8 +799,9 @@ TAG:     RotationSignalFidelity
 SCALE:   fraction of emitted `rotated` values that carry information
 METER:   unit test over classify() across {refreshed, dead, error}
 MUST:    1.0
-PAST:    < 1.0 — true-by-construction on every `dead` line (src/refresh.rs:434-437); 6 such
-         lines in the local log from 2026-07-14 onward
+PAST:    < 1.0 — true-by-construction on any `dead` line with a parseable non-empty
+         seeded token (src/refresh.rs:434-437); 6 such lines in the local log
+         from 2026-07-14 onward
 ```
 
 ## 6. Success Criteria
@@ -886,7 +928,7 @@ by symbol against `HEAD` on 2026-08-04 before this document was committed.
 > itself a claim with a timestamp, and a document that asserts its own freshness is asserting
 > something it cannot know about the future. Every citation in this file and the design doc has now
 > been re-resolved **by symbol lookup** on 2026-08-04 — each was checked by reading the symbol it
-> names, and an independent third review pass re-resolved all 137 and found them correct.
+> names, and independent review passes re-resolved them and found them correct — 178 citation targets across all twelve files (162 `path:line` plus 16 bare `:NNN` continuations inside a shared backtick span; the bare-continuation form is the same regex blind spot that produced two residue rounds, so it is counted explicitly here rather than left implicit).
 >
 > **But the recorded form is still `path:line`, and it will drift again.** *Stated plainly
 > 2026-08-04 (third pass), because the earlier wording claimed otherwise.* This paragraph previously
@@ -894,7 +936,7 @@ by symbol against `HEAD` on 2026-08-04 before this document was committed.
 > a rebase and a line number does not," which conflates the *method* with the *form*. Symbol lookup
 > was the method; line numbers are still what is written down. Exactly one row in this document —
 > the seven-test row below — was actually converted to the durable form, and `d1c5f30` shows what the
-> next `src/cli.rs` commit does to the other 137. A reader who trusts the durability claim skips the
+> next `src/cli.rs` commit does to the rest. A reader who trusts the durability claim skips the
 > re-resolution these citations will need. **Verify before relying on any line number here**; the
 > claim that survives is the *symbol names*, not the offsets. Caught by the pre-submit external
 > review gate, not by this document's authors — for the third consecutive round.
@@ -903,7 +945,7 @@ by symbol against `HEAD` on 2026-08-04 before this document was committed.
 |---|---|
 | Import never writes canonical / `~/.claude.json` / requests a swap | `src/cli.rs:4601-4663` — the body reaches `config.save()` + `notify_daemon_roster_reload()` and nothing else |
 | Active `EXPIRY` reads canonical; parked reads stash | `src/daemon/snapshot_build.rs:45-53` |
-| `rotated` is true-by-construction on `dead` | `src/refresh.rs:434-437` |
+| `rotated` is true-by-construction on `dead` (parseable non-empty seeded token) | `src/refresh.rs:434-437` |
 | Conflict match is uuid-only | `src/cli.rs:4771-4774` |
 | Whole-config merge is acknowledged future work | `src/cli.rs:4737-4741` (verbatim in-code comment) |
 | Labels are non-unique by design | `src/cli.rs:5148-5149` |
@@ -929,7 +971,7 @@ carried from the council transcripts), and every line citation re-resolved by sy
 | `stash()` reaches **no** filesystem path — bounding R-15's severity | grep of every `stash()` call site against path/join/file/dir: zero matches |
 | `use` short-circuits on service-name equality, never contents | `src/use_account.rs:325-326`; test `src/use_account.rs:2490-2502` asserts `canonical == b"A-token"`, `calls == 0` |
 | `remove` deletes the keychain stash — the only irreversible label-resolving command | `src/cli.rs:5219-5227`, `src/cli.rs:5195-5211` |
-| `--config` is reserved and value-bearing for #24, not yet wired | `src/paths.rs:439` (`config_dir_with_override`, `allow(dead_code)` off the test path) |
+| `--config` is reserved and value-bearing for #24, not yet wired | `src/paths.rs:443-444` (the quoted phrase; `config_dir_with_override` at `:448`, `allow(dead_code)` off the test path) |
 | `IMPORT_USAGE` uses "accounts" as the operator-facing noun | `src/cli.rs:1290` |
 | ADR-0030 governs `claude` resolution **order**, not value provenance — the R-11a refusal does not contradict it, and `CLAUDE_BIN=…` is a documented local escape hatch | `docs/adr/0030-one-resolution-policy-cli-included.md` |
 | `import` leaves the source artifact on disk | `src/cli.rs:4602` |
@@ -943,7 +985,21 @@ change as costing "the frozen baseline, a golden-fixture regeneration, and an AD
 **The justification is wrong.** It priced a **payload** field at the **header** rate. ADR-0006
 § BREAKING(3) explicitly carves out the opposite: *"Ordinary, non-load-bearing additive payload growth
 via `Option`/`#[serde(default)]` stays additive."* And `src/migration.rs` carries **zero**
-`deny_unknown_fields`, so an added payload field is not breaking at all.
+`deny_unknown_fields`, so a **non-load-bearing** payload field is additive, not breaking.
+
+> **Read BREAKING(3)'s rule, not only its parenthetical — corrected 2026-08-04 (fourth pass).** An
+> earlier wording here said the absent `deny_unknown_fields` makes an added payload field *"not
+> breaking at all"*, which inverts ADR-0006's reasoning: the ADR uses that **same fact** to reach the
+> opposite classification for *load-bearing* fields — *"Because unknown payload fields are ignored (no
+> `deny_unknown_fields`), an older reader silently **drops** any field it doesn't know … so adding one
+> MUST bump `format_version`"* (`docs/adr/0006-migration-schema-evolution-policy.md:127-132`). Silent
+> drop is precisely what makes a load-bearing addition breaking. The sentence F-3 quotes is the
+> *exception*; the rule it excepts is the one that governs. **Whether a staleness field would be
+> load-bearing is the whole question, and it is not asked here** — a mint timestamp the importer
+> reasons about is load-bearing on its face, so it would need the bump. This does not disturb F-3's
+> finding (AD-2's *stated cost reason* is still wrong) or its conclusion (AD-2 survives on the
+> false-assurance argument, § 4.2) — it removes a general licence an implementer could read as
+> permission to add any payload field without a version bump.
 
 **AD-2's conclusion survives; its stated reason does not.** The correct argument against a staleness
 field is the one round 1 identified independently — a mint timestamp buys a heuristic that **cannot

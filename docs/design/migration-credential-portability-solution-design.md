@@ -194,9 +194,13 @@ costs an unrecoverable one. Not chosen here.
 
 ### 4.4 `rotated` telemetry (R-5, R-5a) — **suppress on non-`refreshed`, treat as a contract change**
 
-`classify()` computes `rotated` before the outcome is known
-(`src/refresh.rs:434-437`), so a `dead` outcome — which sets `after_rt = Some("")` — always yields
-`rotated=true`. The field is true-by-construction on every dead line.
+`classify()` computes `rotated` before the outcome is known (`src/refresh.rs:434-437`); `Dead` is
+then *derived* from `after_rt` being `Some("")` (`:445`) — the outcome does not set the token, the
+token decides the outcome. So a dead line whose seeded blob carries a parseable, non-empty refresh
+token always yields `rotated=true`: the field is true-by-construction there and carries no
+information. It is **not** every dead line — `rotated` is `_ => false` for an unparseable seeded blob,
+and `"" != ""` → false for an empty seeded token — but that only strengthens the case, since the field
+is then *arbitrary* rather than merely uninformative.
 
 **Chosen**: make `rotated` structurally unrepresentable on non-`refreshed` outcomes rather than
 merely omitted at the log-formatting layer — carry it *inside* the `refreshed` variant of
@@ -428,7 +432,7 @@ SOURCE (A)                                   TARGET (B)
    ├─ no --no-secrets flag — removed, strict-usage error       (R-10; OQ-4)
    └─ LOGS sha256 digest (export has no operator scope)        (R-14)
          │
-      artifact ──────────────────────►  import [--accounts | --settings] [--shred]
+      artifact ──────────────────────►  import [--accounts] [--settings] [--shred]
                                           │   (default = everything: today's behaviour, byte-identical)
                                           ├─ scope from PAYLOAD PRESENCE, never self-declared  (R-9a)
                                           ├─ VALIDATES account_uuid shape before stash()       (R-15)
@@ -534,12 +538,24 @@ stash writes. What § 4.1 declines to add is a second writer of the canonical
 | Cap-10.1 | `export` warns **only** when the local daemon is live | unit | R-13 |
 | Cap-10.2 | Export and import events carry a **matching artifact digest**; the **import** event additionally carries the operator-**requested** scope (export has none to carry — R-9c/AD-5) | unit | R-14, R-14a |
 | Cap-11.1 | A malformed / empty `account_uuid` is rejected before a stash name is derived | unit | R-15 |
-| Cap-11.2 | The `[credential]`-block import failure names the version floor | unit | R-16 |
+| Cap-11.2 | The **current** binary tolerates an unknown non-roster block on the artifact-config parse path, and the documented **version floor** states which releases cannot read a `[credential]`-bearing artifact | unit + doc assertion | R-16 (assertable half — **OQ-5**; see note below the Master Test Plan) |
 
 **Coverage gap this closes** (PRD § 4 M2 criterion): the existing
 `the_migration_conflict_policy_default_drives_import_behaviour` builds its target as
 `src_config.clone()` (`src/cli.rs:10741`), so every uuid matches by construction. Cap-3.1 explicitly
 requires a non-clone target.
+
+> **Cap-11.2 asserts only R-16's *assertable* half — the other half is unfixable, and was previously
+> asserted anyway.** *Corrected 2026-08-04 (fourth pass).* This row used to read "The
+> `[credential]`-block import failure names the version floor", and the Cap-11.2 scenario said *"When
+> it is read by a parser **predating that block**"*. **No test in this tree can satisfy that**: the
+> failing parser lives in an already-**shipped** binary, which § 4.9 and § 14 both say we cannot
+> patch. And the *current* binary parses `[credential]` fine (`src/config.rs:1395`), while
+> forward-tolerance (§ 4.9(b)) is designed to make it not fail at all — so neither side of the
+> version boundary can produce the asserted failure. What is assertable today is exactly what the row
+> now says: the current binary's tolerance, and a documented version floor. **OQ-5 decides whether
+> that is the whole deliverable** — the same treatment Cap-7.7 gets for OQ-4. Do not write a test
+> against an unpatched historical binary.
 
 ## 12. Architecture Decisions
 
@@ -587,7 +603,9 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
 | R-10 | ✅ **Yes** — but it is the scope's **only breaking CLI change** | Removal is trivial; the *path* is a product call (OQ-4) |
 | R-11 / R-11a / R-11b / R-11c | ✅ **Yes** | Classification is a pure function over the config; no new I/O |
 | R-11d | ⚠️ **Yes, but mechanism-dependent** | An exhaustive `match` (compile-error) is preferred and may not fit the current type shape; the completeness-test fallback is weaker but sufficient (§ 4.8) |
+| R-11e | ✅ **Yes** | A refusal line per refused key on stdout; Cap-8.5 |
 | R-11f | ✅ **Yes** | ADR; conventions exist |
+| R-10b | ✅ **Yes** | `PLAINTEXT_WARNING` is a string constant (`src/migration.rs:538`); Cap-7.8 |
 | R-12 | ⚠️ **Yes as unlink; NOT as secure erase** | APFS gives no reliable overwrite-in-place. Deliverable must not claim more (§ 4.9) |
 | R-13 | ✅ **Yes** | `daemon_liveness()` (`src/cli.rs:1885`) already gives a read-only tri-state answer; reuse it rather than the best-effort notify at `src/capture.rs:335` |
 | R-14 / R-14a | ✅ **Yes** | Additive event fields; digest is a pure function over the artifact bytes |
@@ -635,6 +653,20 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
   a version floor and making the failure legible, (b) also making the artifact-config parse path
   tolerant so the next added block does not re-break it, or both? Lean: both — (a) alone leaves the
   defect free to recur.
+- **OQ-6 (bounds R-9/R-9a)** — **can the *settings* axis be presence-derived at all?** R-9c's own
+  argument says no: every `RawConfig` field is `#[serde(default)]` (`src/config.rs:1377-1396`), so a
+  block the operator left at its default is byte-indistinguishable from one the artifact withheld,
+  making `available(artifact).settings` effectively always true for a self-minted artifact. The
+  *accounts* axis is fine — `[[account]]` entries are present or they are not. So is the deliverable
+  (a) accept the asymmetry and define `--settings` as "apply the portable non-roster values that are
+  there", with no availability test on that axis, or (b) derive settings-availability from something
+  narrower (e.g. blocks differing from default), which re-introduces exactly the guesswork R-9a
+  exists to avoid? Lean: **(a)** — it is honest about what presence can tell us, and the allowlist
+  (R-11) already bounds what may be adopted, so nothing is lost. **This does not trip R-9's circuit
+  breaker** (no declared scope field is required, the operator's flag stays a ceiling), but it must
+  be settled before #1046 is implemented, because Cap-7.6 and the `--settings` reporting behaviour
+  both depend on the answer. *Raised 2026-08-04 by the fourth review pass, which found R-9a's
+  presence test naming the wrong carrier for both axes.*
 - **OQ-2 (shapes R-2)** — should `--activate` exist at all in the first increment, or should the
   reported-and-named-command form ship alone and earn it? Lean: ship (b) alone first.
 - **OQ-3 (bounds R-1)** — is a single non-revocation worth recording at all, given A-3's n=1? Lean:
@@ -701,7 +733,7 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
 ## 16b. Backward-Coverage Matrix
 
 Every capability traces to a requirement: Cap-1.x→R-2/R-2a/AC-2a, Cap-2.x→R-4/R-4a, Cap-3.x→R-6/R-6a,
-Cap-4.1→R-5, Cap-5.1→R-7, Cap-6.1→C-3, Cap-7.1-7.6→R-9/R-9a-d, **Cap-7.7→R-10**,
+Cap-4.1→R-5, Cap-5.1→R-7, Cap-6.1→C-3, Cap-7.1-7.6→R-9/R-9a-c + R-16 (Cap-7.4); R-9d has no capability of its own, **Cap-7.7→R-10**,
 **Cap-7.8→R-10b**, Cap-8.x→R-11/R-11a-e (Cap-8.6→R-11), Cap-9.x→R-12, Cap-10.x→R-13/R-14/R-14a,
 Cap-11.x→R-15/R-16. **No orphan capabilities.**
 

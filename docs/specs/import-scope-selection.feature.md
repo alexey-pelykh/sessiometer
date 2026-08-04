@@ -33,12 +33,21 @@ floor**.
 
 ## Scenario: an artifact cannot widen the operator's selection  · Cap-7.3
 
-    Given an artifact that asserts, by any means, that it should be applied in full
+    Given an artifact whose config carries every non-roster block populated
     When the operator runs `import --accounts`
     Then the non-roster blocks are still ignored
 
     # AD-6: on a --plaintext export nothing is authenticated, so any scope the artifact declares is
     # attacker-controlled. This scenario must stay meaningful even if a scope field is never added.
+
+> **The *Given* names a buildable artifact, not an unrealizable one.** *Corrected 2026-08-04 (fourth
+> pass).* It used to read *"an artifact that asserts, **by any means**, that it should be applied in
+> full"* — which has no realization: `Payload` has exactly two fields with nowhere to assert scope
+> (`src/migration.rs:199-210`); an invented `[scope]` block is rejected by `deny_unknown_fields`
+> (`src/config.rs:1378`) on the default path and ignored by narrow-parse under `--accounts`. Any test
+> written to it collapses into Cap-7.1. The assertion that *is* meaningful and buildable is the one
+> above: a **maximally-populated** artifact still cannot widen `--accounts`. The ceiling-never-floor
+> property is what Cap-7.3 exists to pin, and it does not need a declarable scope field to be real.
 
 ## Scenario: a roster-only artifact survives an unknown block  · Cap-7.4
 
@@ -65,16 +74,27 @@ floor**.
     Then the command reports that the artifact contains no configuration
     But does not fail, and does not silently do nothing
 
-> **Where a roster-only artifact comes from — `export` cannot mint one.** `export` writes
-> `config.render()` unconditionally (`src/cli.rs:4532`) and `render()` always emits at least
-> `[tunables]` (`src/config/render.rs:370`), so `config_toml` is never empty on an artifact this
-> product produced — and AD-5 keeps it that way by giving `export` no narrowing flag (scenario
-> above). The precondition is therefore reachable only from a **hand-constructed `Payload`** (which
-> is what the Cap-7.6 unit test must build), or from a third-party or future producer. State that in
-> the test; do not try to reach it through `export`, and do not "fix" the un-emptiable `config_toml`.
+> **"Roster-only" means a `config_toml` carrying only `[[account]]` blocks — not an empty one, and
+> not an empty `Payload.accounts`.** *Corrected 2026-08-04 (fourth pass); an earlier note here had
+> this wrong in both directions.* The roster lives **inside** `config_toml`
+> (`src/migration.rs:199-210`); `Payload.accounts` carries only per-account secrets keyed by uuid
+> (`ManagedAccount` = `{account_uuid, credential, oauth_account}`, `:220-232` — no label). So:
 >
-> This is an asymmetry in R-9a's presence rule, not a defect in it: the `accounts`-empty half **is**
-> export-reachable (`a_config_only_artifact_imports_accounts_as_roster_entries_without_a_stash`
-> covers it), and R-9's circuit breaker — *stop if scope needs a declared field* — stays untripped,
-> because nothing here requires the artifact to declare anything. The operator's flag remains a
-> ceiling, never a floor.
+> - an **empty `config_toml`** is roster-*less*, not roster-only — it withholds both axes;
+> - an **empty `Payload.accounts`** withholds only the *credentials*: the committed test
+>   `a_config_only_artifact_imports_accounts_as_roster_entries_without_a_stash`
+>   (`src/cli.rs:10619-10638`) builds exactly that and still imports **two roster entries**.
+>
+> **What the Cap-7.6 test must build** is a `Payload` whose `config_toml` contains `[[account]]`
+> entries and **no non-roster block**. That parses — every `RawConfig` field is `#[serde(default)]`
+> including `account` (`src/config.rs:1377-1396`) — so it is constructible by hand. `export` cannot
+> mint one, because it writes `config.render()` unconditionally (`src/cli.rs:4532`) and `render()`
+> always emits `[tunables]` (`src/config/render.rs:370`), and AD-5 keeps it that way by giving
+> `export` no narrowing flag (scenario above). Do not try to reach this precondition through
+> `export`, and do not "fix" `render()` to make it reachable.
+>
+> **Open (OQ-6):** because a defaulted block is indistinguishable from a withheld one, the *settings*
+> axis cannot be reliably presence-derived at all — `available(artifact).settings` is effectively
+> always true for a self-minted artifact. That is a precision question, not R-9's circuit breaker:
+> nothing here requires the artifact to declare anything, and the operator's flag remains a ceiling,
+> never a floor. It must be settled before this scenario's sibling behaviour is implemented.
