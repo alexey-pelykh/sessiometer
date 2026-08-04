@@ -24,6 +24,7 @@ decision, and gives the fix items a stable citation for *why*.
 | [0476](0476-keep-warm-scrub-risk-tradeoff.md) | The scrub-risk cost of gating proactive keep-warm | #476 | #463 |
 | [0777](0777-manual-restart-under-conditional-keepalive.md) | Does a manual `Restart…` mean anything under conditional `KeepAlive`? | #777 | — |
 | [0950](0950-help-on-disabled-button.md) | Does `.help()` surface a tooltip on a `.disabled()` Button? | #950 | — |
+| [0953](0953-help-nesting-inside-a-row-button.md) | Does a `.help()` on a child inside a row `Button` surface on hover? (**not established**) | #953 | — |
 
 ## Conventions
 

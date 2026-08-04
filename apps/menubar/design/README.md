@@ -125,6 +125,15 @@ Light shown here:
   explanation, so the chip that went is a glyph nobody could read, not the explanation. The 28 pt slot
   stays **reserved** — the row does not reflow and the auth column stays aligned. Authoring the matching
   mock frame is #957's job; do not "fix" the mock to match this
+- the switch tooltip is scoped to the **whole row**, where the mock scopes it to the **chip**
+  (`<span class="rowact" title="Switch to this account">`). This one is a **known defect, not a ratified
+  divergence** (#953): the invitation sits on the row-wrapping `Button`, so hovering the health glyph
+  answers with the *switch* copy. It is still open because the obvious fix is unverified — whether a
+  `.help()` on a child inside that `Button` surfaces at all is **not established**
+  (`docs/findings/0953-help-nesting-inside-a-row-button.md`), and if it does not, moving the copy to the
+  chip deletes it rather than narrowing it, silently. The **health glyph** carrying no tooltip is by
+  contrast a settled decision (#955) that the mock **agrees** with — `title=` sits on `.rowact` and on
+  **zero** of the 78 `.health` spans — so do not "fix" that one either
 - the third fixture account is `Temp`, where the mock illustrates `Scratch` — re-picked (#709) so all
   three healthy labels hash to **distinct** #445 identity slots (the mock's `Personal` and `Scratch`
   both land on slot 5 / ochre under the shared 8-slot `label` hash, so the built roster would otherwise
