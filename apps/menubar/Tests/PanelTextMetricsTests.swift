@@ -113,6 +113,13 @@ final class PanelTextMetricsTests: XCTestCase {
     /// `.font(.system(size: 13, weight: .semibold))` — `StatStripRow`'s handle.
     private let statsHandleFont = NSFont.systemFont(ofSize: 13, weight: .semibold)
 
+    /// `.font(.panel(style: .caption1, …))` — the row's persistent blocked-reason cue (issue #955). Read
+    /// from the text style for the same reason `rosterLabelFont` is: `Font.panel(style:scale:)` sizes off
+    /// `NSFont.preferredFont(forTextStyle:)`, so hardcoding a number here would assert against a value that
+    /// could quietly stop being what `.caption1` means.
+    private let rowCueFont = NSFont.systemFont(
+        ofSize: NSFont.preferredFont(forTextStyle: .caption1).pointSize)
+
     // MARK: - The gate predicate (ONE definition, used by every assertion AND by the canary)
 
     // The predicate itself lives in `TextMetrics` (issue #762) — shared with `SettingsTextMetricsTests`,
@@ -195,6 +202,40 @@ final class PanelTextMetricsTests: XCTestCase {
         //     − 85 (signal-pill allowance)
         XCTAssertEqual(StatusPanelFormat.statsHandleBudget, 198, accuracy: 0.001,
                        "the Stats handle budget derivation changed — this is the ~198 pt issue #700 bought")
+        // 364 − 16 (row padding). A full-width row line spends NOTHING on the identity row's columns —
+        // that is the whole reason issue #955's cue sits on its own line rather than beside `authCue`.
+        XCTAssertEqual(StatusPanelFormat.rowCueBudget, 348, accuracy: 0.001,
+                       "the row cue budget derivation changed — re-derive, do not re-tune the tests")
+        XCTAssertGreaterThan(StatusPanelFormat.rowCueBudget, StatusPanelFormat.rosterLabelBudget,
+                             "an own-line cue must have MORE room than an inline one would have had")
+    }
+
+    // MARK: - AC: issue #955's persistent blocked-reason cue fits its line
+
+    // The reason a blocked row cannot be switched to is on-screen at REST now, so it is measured like every
+    // other shipped cell. The § Switch-affordance layout budget watch-out is "never truncate to something
+    // uninformative", and the view draws this `.lineLimit(1)` — an overrun would elide the very sentence the
+    // line exists to deliver, which is the failure this assertion exists to catch at authoring time.
+    //
+    // Measured against the CUE, deliberately not against `switchBlockedText`: the full text carries the
+    // remedy too and DOES overrun this budget, which is exactly why the two were split. The companion
+    // assertion that the cue stays the tooltip's prefix lives in `AccountSwapTests`.
+    func testEveryPersistentBlockedCueFitsItsRowLine() throws {
+        var checked = 0
+        for block in [StatusPanelFormat.SwitchBlock.quarantined, .weeklyExhausted] {
+            let cue = try XCTUnwrap(StatusPanelFormat.switchBlockedCue(block))
+            assertFits(cue, rowCueFont, budget: StatusPanelFormat.rowCueBudget, "row blocked-reason cue")
+            checked += 1
+        }
+        // Degenerate-subject guard: a green is evidence only if it evaluated every reachable block.
+        XCTAssertEqual(checked, 2, "expected both `SwitchBlock` cases measured, ran \(checked)")
+
+        // The split earns its keep only if the unsplit sentence really would NOT have fitted — otherwise
+        // the shorter form is gratuitous copy divergence. Pin that, so a future re-wording that brings the
+        // full text under budget reddens here and invites collapsing the two back into one string.
+        XCTAssertTrue(overflows(StatusPanelFormat.switchBlockedText(.quarantined), rowCueFont,
+                                budget: StatusPanelFormat.rowCueBudget),
+                      "the remedy-bearing sentence overruns the line — the reason the cue is shorter")
     }
 
     // MARK: - AC: every fixed meter cell fits its widest REACHABLE content

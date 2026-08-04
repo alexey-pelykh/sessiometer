@@ -370,6 +370,47 @@ final class AccountSwapTests: XCTestCase {
         }
     }
 
+    // Issue #955: a blocked row's reason is PERSISTENT on-screen text, not hover-only. Both blocked
+    // variants produce a cue; a viable row produces none — the `nil` case is what keeps the line from
+    // appearing under every healthy row, and it is asserted rather than assumed because the view renders
+    // straight off this optional.
+    func testEveryBlockedVariantHasAPersistentCueAndAViableRowHasNone() throws {
+        XCTAssertNil(StatusPanelFormat.switchBlockedCue(nil),
+                     "a row that is not blocked shows no cue line at all")
+        for block in [StatusPanelFormat.SwitchBlock.quarantined, .weeklyExhausted] {
+            let cue = try XCTUnwrap(StatusPanelFormat.switchBlockedCue(block),
+                                    "\(block) is a load-bearing reason and must show at rest")
+            XCTAssertFalse(cue.isEmpty)
+            XCTAssertFalse(cue.contains("weekly-exhausted"), "never the raw machine tag: \(cue)")
+        }
+        XCTAssertNotEqual(StatusPanelFormat.switchBlockedCue(.quarantined),
+                          StatusPanelFormat.switchBlockedCue(.weeklyExhausted),
+                          "the two blocks read distinctly at rest, not just in the tooltip")
+    }
+
+    // The three channels must not drift: the resting cue is the OPENING of the hover/spoken text, so the
+    // only thing hover and VoiceOver add is the remedy. Composed rather than copied in the source — this
+    // pins that composition, so re-wording one channel cannot silently desynchronize the others.
+    func testTheRestingCueIsThePrefixOfTheHoverAndSpokenText() throws {
+        for block in [StatusPanelFormat.SwitchBlock.quarantined, .weeklyExhausted] {
+            let cue = try XCTUnwrap(StatusPanelFormat.switchBlockedCue(block))
+            let full = StatusPanelFormat.switchBlockedText(block)
+            XCTAssertTrue(full.hasPrefix(cue),
+                          "the tooltip must open with what the row already says at rest: \(full)")
+            let spoken = StatusPanelFormat.rowSwitchAccessibilityLabel(base: "Scratch", block: block)
+            XCTAssertTrue(spoken.contains(cue), "VoiceOver speaks the same reason: \(spoken)")
+        }
+        // The remedy is the ONLY hover/spoken-only part, and only where a remedy exists at all: a weekly
+        // window is not something the operator fixes, so its cue and its tooltip are the same sentence.
+        let quarantinedCue = try XCTUnwrap(StatusPanelFormat.switchBlockedCue(.quarantined))
+        XCTAssertGreaterThan(StatusPanelFormat.switchBlockedText(.quarantined).count,
+                             quarantinedCue.count,
+                             "the quarantine tooltip adds its refresh remedy")
+        XCTAssertEqual(StatusPanelFormat.switchBlockedText(.weeklyExhausted),
+                       StatusPanelFormat.switchBlockedCue(.weeklyExhausted),
+                       "a weekly exhaustion has no operator remedy, so nothing is held back for hover")
+    }
+
     func testDoneTextNamesWhatActuallyHappened() {
         XCTAssertEqual(StatusPanelFormat.swapDoneText(.swapped(from: "Work", to: "Scratch")),
                        "Switched Work → Scratch")
