@@ -44,6 +44,7 @@ issue threads is consolidated here in a stable, discoverable place.
 | [0029](0029-macos-is-the-only-supported-build-target.md) | macOS is the only supported build target; cross-platform support is tracked, not claimed | Accepted |
 | [0030](0030-one-resolution-policy-cli-included.md) | One `claude`-resolution policy for every caller — `poke` / `login` resolve via the login-shell `PATH` too | Accepted |
 | [0031](0031-ui-verification-tiers-bounded-by-structural-blindness.md) | UI verification is a tier stack bounded by structural blindness; no gate ships without a proven falsifier | Accepted |
+| [0032](0032-login-is-daemon-routable-tty-gate-is-ours.md) | `login` is daemon-routable; the TTY gate is sessiometer's own conservatism, not a Claude Code requirement | Accepted |
 
 ## Conventions
 
