@@ -270,24 +270,7 @@ struct AccountRowView: View {
                 // remove), this wrap MUST be undone — nested interactive children inside a `Button` do
                 // not receive their own events. Hoist the secondary control into a trailing accessory or
                 // a context menu and shrink the button to the identity region.
-                Button(action: submit) { rowContent }
-                    .buttonStyle(RowSwitchButtonStyle(hovering: isArmed, live: isLiveSwitch, scale: scale))
-                    .disabled(blockReason != nil || swap.phase.isPending)
-                    // The SECONDARY channel for a blocked row since #955 — it carries the remedy sentence
-                    // the resting cue leaves off, and it is the only channel for the plain "Switch to …"
-                    // invitation on a viable row. It is deliberately not the only place the REASON lives:
-                    // whether a `.help` tooltip surfaces at all in the shipped panel's
-                    // `panelIsKey / !appIsActive` presentation is still capture-pending
-                    // (docs/findings/0950-help-on-disabled-button.md), so nothing load-bearing rides it.
-                    .help(hoverText)
-                    // The button trait + `dimmed` come from `Button` + `.disabled()`; the label carries
-                    // the row's facts and, when blocked, WHY it is dimmed (a trait alone never says why).
-                    // Unchanged by #955 — that issue closed the parity gap by ADDING visual text, never by
-                    // trimming what the row speaks.
-                    .accessibilityLabel(StatusPanelFormat.rowSwitchAccessibilityLabel(
-                        base: accessibilityLabel, block: blockReason))
-                    .accessibilityHint(blockReason == nil
-                                       ? StatusPanelFormat.switchHelpText(label: row.label) : "")
+                switchButton
             } else {
                 // NO TOOLTIP HERE, DELIBERATELY (issue #953 AC-3) — a recorded decision, not an
                 // oversight, because "some tooltip appears, or the absence is a recorded decision;
@@ -336,31 +319,44 @@ struct AccountRowView: View {
         Task { await swap.swap(to: row.label) }
     }
 
-    /// The hover tooltip: the block reason IN FULL (reason + remedy) for a non-viable row, otherwise the
-    /// switch invitation. Since #955 the reason's first sentence is also on-screen at rest, so this text
-    /// deliberately overlaps it — the tooltip's remaining job is the remedy, not the reason.
+    /// The row-wrapping `Button`, and the ROW-level half of the #953 tooltip split.
     ///
-    /// SCOPED TO THE WHOLE ROW, AND THAT IS A KNOWN DEFECT (issue #953). The design mock scopes the
-    /// switch invitation to the CHIP (`<span class="rowact" title="Switch to this account">`); this is
-    /// on the row-wrapping `Button`, so the invitation's hit area is the entire row and hovering the
-    /// health glyph answers with the *switch* copy — the wrong element explaining itself.
+    /// The row now answers on hover ONLY when it is blocked, carrying the reason + remedy that a blocked
+    /// row has nowhere else to put: since #959 it renders no chip at all (`switchChipEmphasis` → `.hidden`,
+    /// a `Color.clear` slot), so there is no chip view to attach it to. On a VIABLE row the row is silent
+    /// and the chip answers instead (`switchSlot`) — which is what #953 asked for, and the only shape that
+    /// works: a row-level `.help()` WINS over a child's, so keeping one here "as a fallback" would delete
+    /// the chip's tooltip rather than back it up (`StatusPanelFormat.switchChipHelp` carries the
+    /// measurement; `docs/findings/0953-help-nesting-inside-a-row-button.md` § The answer carries the runs).
     ///
-    /// It is NOT fixed by moving `switchHelpText` onto `switchSlot`, however obvious that looks. Whether
-    /// a `.help()` on a child INSIDE this `Button` surfaces at all is unestablished — measured against
-    /// in `docs/findings/0953-help-nesting-inside-a-row-button.md`, which also records why a
-    /// deterministic check is not available and what the one suggestive run found (a nested `.help()`
-    /// surfacing nowhere). If that holds, scoping the invitation to the chip does not narrow it, it
-    /// DELETES it, and the failure is silent: nothing crashes, no test fails, and no golden moves,
-    /// because a tooltip is a hover affordance and the goldens render at `.idle`. Answer the platform
-    /// question first.
+    /// The modifier is applied CONDITIONALLY rather than with an empty string, because `.help("")` still
+    /// registers a tooltip owner and still wins — measured, and silent when wrong.
     ///
-    /// The blocked-row branch below must stay at ROW level regardless of how that resolves: since #959
-    /// a blocked row renders no chip at all (`switchChipEmphasis` → `.hidden`, a `Color.clear` slot), so
-    /// there is no chip view to attach it to, and the remedy sentence would become unreachable for a
-    /// sighted operator. VoiceOver keeps it either way via `rowSwitchAccessibilityLabel`.
-    private var hoverText: String {
-        blockReason.map(StatusPanelFormat.switchBlockedText)
-            ?? StatusPanelFormat.switchHelpText(label: row.label)
+    /// Nothing load-bearing rides the tooltip either way: whether a `.help` surfaces at all in the shipped
+    /// panel's `panelIsKey / !appIsActive` presentation is still capture-pending
+    /// (`docs/findings/0950-help-on-disabled-button.md` — three further attempts to construct that state
+    /// failed, so the residual stands). The blocked row's reason is on-screen at rest via `switchBlockedCue`
+    /// and spoken via `rowSwitchAccessibilityLabel`; the tooltip only adds the remedy sentence.
+    @ViewBuilder
+    private var switchButton: some View {
+        let button = Button(action: submit) { rowContent }
+            .buttonStyle(RowSwitchButtonStyle(hovering: isArmed, live: isLiveSwitch, scale: scale))
+            .disabled(blockReason != nil || swap.phase.isPending)
+            // The button trait + `dimmed` come from `Button` + `.disabled()`; the label carries
+            // the row's facts and, when blocked, WHY it is dimmed (a trait alone never says why).
+            // Unchanged by #955 and by #953 — the tooltip moved to the chip, but the SPOKEN invitation
+            // stays on the row, because the row is the single VoiceOver element (the chip is
+            // `.accessibilityHidden`). Sighted and spoken channels still carry the same sentence.
+            .accessibilityLabel(StatusPanelFormat.rowSwitchAccessibilityLabel(
+                base: accessibilityLabel, block: blockReason))
+            .accessibilityHint(blockReason == nil
+                               ? StatusPanelFormat.switchHelpText(label: row.label) : "")
+
+        if let rowHelp = StatusPanelFormat.switchRowHelp(block: blockReason) {
+            button.help(rowHelp)
+        } else {
+            button
+        }
     }
 
     /// Push / pop the `pointingHand` cursor to match whether a click here would do anything.
@@ -525,15 +521,33 @@ struct AccountRowView: View {
     /// unit-asserted; the view only maps the verdict to a neutral system tint. Routing the block HERE rather
     /// than as an inline `if` is what keeps it testable and consistent with how this file is built. ARMING
     /// (not the resting presence) is the mis-click guard — the full rationale lives on `RowSwitchButtonStyle`.
+    ///
+    /// SINCE #953 THE CHIP OWNS THE SWITCH TOOLTIP. It used to sit on the row-wrapping `Button`, so the
+    /// invitation's hit area was the whole row and hovering the health glyph answered with the *switch*
+    /// copy — the wrong element explaining itself. The `.help()` goes on the OUTER group, after the
+    /// `.frame`, so the hover target is the full 28 pt slot rather than the ~11 pt glyph inside it; both
+    /// placements were measured to work, and the slot is the more forgiving target. It is applied
+    /// conditionally, so the `.hidden` (blocked) and in-flight-swap cases attach nothing and the row's own
+    /// blocked tooltip is free to answer there.
+    ///
+    /// `.accessibilityHidden(true)` below does NOT suppress the tooltip — measured, because `.help()` also
+    /// sets an AX help attribute and it was reasonable to fear it would. The chip stays a11y-hidden and the
+    /// invitation is spoken by the row's `.accessibilityHint` instead, so the row remains ONE VoiceOver
+    /// element.
+    /// The chip's emphasis verdict, resolved ONCE so the glyph that is drawn and the tooltip that explains
+    /// it cannot disagree: both read this, rather than each calling `switchChipEmphasis` with its own copy
+    /// of the arguments.
+    private var chipEmphasis: StatusPanelFormat.SwitchChipEmphasis {
+        StatusPanelFormat.switchChipEmphasis(offersSwitch: offersSwitch, block: blockReason, armed: isArmed)
+    }
+
     @ViewBuilder
     private var switchSlot: some View {
-        Group {
+        let slot = Group {
             if isSwitching {
                 ProgressView().controlSize(PanelTypeScale.controlSize(for: scale))
             } else {
-                switch StatusPanelFormat.switchChipEmphasis(offersSwitch: offersSwitch,
-                                                            block: blockReason,
-                                                            armed: isArmed) {
+                switch chipEmphasis {
                 case .hidden:
                     Color.clear
                 case .resting:
@@ -556,6 +570,14 @@ struct AccountRowView: View {
         }
         .frame(width: CGFloat(StatusPanelFormat.switchAffordanceSlotWidth) * scale, alignment: .trailing)
         .accessibilityHidden(true)
+
+        if let chipHelp = StatusPanelFormat.switchChipHelp(emphasis: chipEmphasis,
+                                                          switching: isSwitching,
+                                                          label: row.label) {
+            slot.help(chipHelp)
+        } else {
+            slot
+        }
     }
 
     /// The auth glyph (modern path) or the legacy tag text (pre-#119), plus the DEAD/`disabled` cue.
@@ -579,11 +601,11 @@ struct AccountRowView: View {
     /// authored position, not an unauthored axis (repo `CLAUDE.md`: the mock is the oracle only for what
     /// it authors).
     ///
-    /// Note what this decision is NOT about: the glyph today ALSO answers with the *switch* copy,
-    /// because that tooltip is attached to the row-wrapping `Button` and the glyph sits inside its hit
-    /// rect. That is the #953 defect, and it is still open — see `hoverText` and
-    /// `docs/findings/0953-help-nesting-inside-a-row-button.md`. Adding a glyph tooltip is not the fix;
-    /// it would contradict this decision.
+    /// Note what this decision is NOT about: the glyph used to ALSO answer with the *switch* copy, because
+    /// that tooltip was attached to the row-wrapping `Button` and the glyph sits inside its hit rect. That
+    /// was the #953 defect and it is now FIXED at the source — the invitation moved to the chip
+    /// (`switchSlot`), so the glyph answers with nothing on a viable row. Adding a glyph tooltip was never
+    /// the fix and still is not; it would contradict this decision and re-create reason 3 above.
     ///
     /// The `.accessibilityHidden(true)` below is likewise deliberate and stays: the row collapses to ONE
     /// VoiceOver element whose `rowAccessibilityLabel` → `authSpoken` speaks every glyph's meaning in
