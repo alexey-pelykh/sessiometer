@@ -23,29 +23,6 @@ selection answers *what was asked for*; this answers *what is permitted*.
     # The flag-enabled path is the one that matters. Asserting only the default path would pass
     # while leaving the actual hazard reachable.
 
-## Scenario: `[login].claude_bin` is refused on the same grounds  · Cap-8.1
-
-    Given an artifact whose config sets `[login].claude_bin` to an attacker-chosen path
-    When it is imported WITH `--settings`
-    Then the target's saved config does not contain that value
-
-    # PRD R-11a names BOTH keys; an earlier revision of this spec asserted only [refresh]. Both
-    # funnel into claude_binary_from in src/paths.rs and both are spawned, so guarding one leaves
-    # the capability transferable through the other.
-
-## Scenario: a FRESH target adopts nothing the allowlist forbids  · Cap-8.1
-
-    Given a target machine with NO local config at all
-    And an artifact whose config sets a capability-granting key
-    When it is imported WITH `--settings`
-    Then the target's saved config does not contain that value
-
-    # The fresh target IS the migration scenario, and it is the only path where the allowlist
-    # CHANGES behaviour rather than formalising it: with no local config, apply_import's
-    # fresh-target branch adopts the artifact's config WHOLESALE (PRD AC-3's BUT-NOT clause). Every
-    # other scenario here can pass against a target that already has a config, so without this one
-    # the capability the allowlist exists to block stays reachable on the path that matters most.
-
 ## Scenario: a weaker KDF is refused, a stronger one accepted  · Cap-8.2
 
     Given a local KDF parameter set

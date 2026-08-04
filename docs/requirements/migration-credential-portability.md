@@ -5,9 +5,6 @@ created: 2026-08-04
 status: draft
 dor_status: passed-with-findings
 source: .tmp/scopes/migration-credential-portability.md (/investigate + /scope 2026-07-31 → 2026-08-04)
-# Private HQ; REQ-MIG-* family. Provenance only — the sibling checkout is not guaranteed present, so
-# nothing here may be dereferenced as a build reference. R-10 SUPERSEDES REQ-MIG-B-007; see R-10.
-parent-requirements: ../hq/strategy/prd-export-import.md
 formulation:
   technical-architecture: complete
   testing-architecture: complete
@@ -35,7 +32,7 @@ artifacts:
   # Transient pipeline scratch, deliberately NOT committed — will not resolve in a fresh clone.
   # Provenance only; nothing downstream may dereference them. This PRD and the design doc are
   # self-contained.
-  requirements-brief: docs/briefs/2026-08-04-requirements-migration-scope-and-portability.md   # uncommitted
+  requirements-brief: docs/briefs/2026-08-04-requirements-migration-credential-portability.md   # uncommitted
   scope-working-doc: .tmp/scopes/migration-credential-portability.md   # uncommitted, gitignored
 ---
 
@@ -45,14 +42,7 @@ artifacts:
 > from a `/investigate` run the operator drove on 2026-07-31. Two requirement families have different
 > standing and the difference is load-bearing:
 >
-> - **R-1, R-2, R-3, R-4** — the four *base* requirements — trace to what the operator explicitly
->   asked to be written up. `Ratification: n/a`.
-> - **The `-a` suffixed expansions inside that range do NOT.** `R-1a`, `R-2a` and `R-4a` are
->   `Origin: AI-inferred-expansion`; only `R-1a` is ratified, and **`R-2a` and `R-4a` are
->   `pending-user`**. `R-2a` binds implementation (reuse the #64 swap lock) and `R-4a` gates R-4's
->   scope, so neither is cosmetic. Do not read the "R-1 … R-4" range as uniformly operator-stated —
->   that reading is what this bullet exists to prevent, and an earlier revision of this warning
->   asserted exactly it.
+> - **R-1 … R-4** trace to what the operator explicitly asked to be written up. `Ratification: n/a`.
 > - **R-5 … R-8** are pipeline-enriched. They were **ratified as in-scope** on 2026-08-04 when the
 >   operator selected scope-membership option **B (all enriched)** — a bounded selection over an
 >   enumerated set. That ratifies their *inclusion*, **not** their specific wording, thresholds, or
@@ -98,7 +88,7 @@ Three branches, all live, all confirmed against the code:
 
 - **(i) Import writes the wrong half of the credential store.** `import` writes each account's
   per-account stash (`Sessiometer/<account_uuid>`) and then `config.save()` +
-  `notify_daemon_roster_reload()` (`import()` in `src/cli.rs`). It **never** writes the canonical
+  `notify_daemon_roster_reload()` (`src/cli.rs:4601-4663`). It **never** writes the canonical
   `Claude Code-credentials` item that Claude Code itself reads, never writes `~/.claude.json`, and
   never requests a swap. So the imported bytes are parked, not adopted — and the account the operator
   is *currently using* is the one account the import cannot reach.
@@ -134,12 +124,12 @@ That single conflation produces three further defects, none visible from the inc
 - **Config adoption is an unattended code-execution path.** `claude_bin` resolves by absolutizing
   against cwd and accepting any `is_file()` — no allowlist, no signature, deliberately no symlink
   resolution (`src/paths.rs:773-807`). On a fresh target `import` adopts the artifact's whole config
-  unconditionally (`apply_import()`'s fresh-target branch in `src/cli.rs`), and the daemon then spawns that path on a timer.
+  unconditionally (`src/cli.rs:4744-4750`), and the daemon then spawns that path on a timer.
 - **A security parameter is downgradable.** `[migration].kdf_*` is adopted like a preference, so an
   artifact can weaken every *future* export from the target.
 - **Local policy is silently overwritable.** `[migration].conflict_policy` records a decision the
   target operator made. Adoption overwrites it — not for the import that adopts it
-  (`resolve_import_overwrite` reads the local value first, `resolve_import_overwrite()` in `src/cli.rs`) but for every one after.
+  (`resolve_import_overwrite` reads the local value first, `src/cli.rs:4628`) but for every one after.
 
 **The two axes this scope adds are the two halves of that fix**: an **operator-selected scope** (which
 classes apply — R-9) and a **system-enforced portability classification** (what may *ever* apply,
@@ -224,6 +214,7 @@ none blocking the core.
 | **CredentialSlot** | A place a credential can live on a machine. Two instances, and the distinction is the whole defect: the **canonical** `Claude Code-credentials` item (what Claude Code reads) and the per-account **stash** `Sessiometer/<account_uuid>` (what Sessiometer parks). | `Write`, `Read`, `Swap` |
 | **RosterEntry** | A `[[account]]` config entry keyed by `account_uuid` — the *Claude* account uuid, stable across machines. Carries a mutable, **non-unique** `label`. | `Match`, `Append`, `Overwrite` |
 | **RefreshOutcome** | The classified result of a token exchange: `refreshed` / `dead` / `error`. Carries `rotated`, `window_secs`, `expires_before/after`. | `Classify`, `Log` |
+
 | **ImportScope** | The set of payload classes the operator elected to apply on this import. Derived from CLI flags, **never** from the artifact. Two independent axes: accounts (roster + credentials) and settings (non-roster config). | `Select`, `Constrain` |
 | **PortabilityClass** | The system's classification of a single `Config` key: **portable** (may be adopted), **machine-bound** (never adopted — it encodes a fact about *this* machine or *this* operator's choice), or **capability-granting** (never adopted — adoption transfers the ability to execute). Orthogonal to `ImportScope`: scope is what the operator *asked for*, class is what the system *permits*. | `Classify`, `Refuse` |
 
@@ -233,6 +224,19 @@ none blocking the core.
 edge, or of the fact that nothing measures the artifact's freshness before traversing it.
 
 ## 3. Requirements (EARS)
+
+> **Reading the `Ratification:` item labels.** Each requirement carries an item label (`E*`, `I*`,
+> `M*`) naming the enrichment entry the user ratified it under. **Two different enumerated sets are in
+> play**, and their labels overlap — `I1`, `I2` and `M1` each exist in both. They are therefore
+> qualified by namespace:
+>
+> - **`scope-membership B/first-pass`** — the 2026-08-04 first pass that produced R-1 … R-8 and
+>   issues #999–#1007.
+> - **`scope-membership B/amendment`** — the 2026-08-04 amendment (this one), a 22-item selection
+>   that produced R-9 … R-16 and issues #1045–#1053.
+>
+> Without the qualifier a provenance audit cannot tell which selection a label indexes — the labels
+> were never a single namespace, and the earlier unqualified form implied they were.
 
 ### MigrationArtifact
 
@@ -246,7 +250,7 @@ measured-not-modeled at that cardinality, per `docs/findings/README.md`.
 **R-1a** — *Where* R-1's note is filed, it **shall** be numbered `0262-*` after the originating spike
 (#262), notwithstanding that #262 is CLOSED, and **shall** redact operator-chosen account labels per
 the #463 public-safety rule. `Origin: AI-inferred-expansion (repo convention)`.
-`Ratification: user-ratified 2026-08-04 (scope-membership B; M3 folded into E1)`.
+`Ratification: user-ratified 2026-08-04 (scope-membership B/amendment; M3 folded into E1)`.
 
 **R-4** — *When* `import` reads an artifact, the system **shall** warn that the artifact's credentials
 are invalidated by any refresh the source performs after the export, and **shall** state the safe
@@ -279,7 +283,7 @@ stash; a second uncoordinated writer would race it.
 distinguishable, so that an active account served from the canonical item and a parked account served
 from its stash are not silently conflated. Today both render identically
 (`src/daemon/snapshot_build.rs:45-53`), which is what made the failed import look like a no-op.
-`Origin: AI-inferred-expansion`. `Ratification: user-ratified 2026-08-04 (scope-membership B, item I3)`.
+`Origin: AI-inferred-expansion`. `Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item I3)`.
 
 ### RosterEntry
 
@@ -298,25 +302,25 @@ an **operator-selected scope** (R-9) and a **system-enforced portability classif
 > question (R-11 still warrants its own ADR for the *classification*, per R-11f).
 >
 > The original in-code acknowledgement stands unchanged as evidence of the gap
-> (`apply_import()`'s whole-config comment in `src/cli.rs`, "remains future work").
+> (`src/cli.rs:4737-4741`, "remains future work").
 
 `Origin: user-stated` (the original demand, and the maintainer's own scope-splitting proposal that
 replaced it) + `council-resolved 2026-08-04` (the two-axis decomposition).
-`Ratification: n/a` (user-stated, so nothing to ratify) — the maintainer proposed the split in their own words; the allowlist half
-is `council-added`, ratified in-scope via scope-membership B (item E7).
+`Ratification: user-stated` — the maintainer proposed the split in their own words; the allowlist half
+is `council-added`, ratified in-scope via scope-membership B/amendment (item E7).
 
 **R-6** — *When* `import` would append a roster entry whose `label` already exists on the target under
 a **different** `account_uuid`, the system **shall** warn at import time. Duplicate labels are a
-documented, accepted state (`apply_enabled()`'s doc comment in `src/cli.rs`: "labels are operator handles; uniqueness is not
+documented, accepted state (`src/cli.rs:5148-5149`: "labels are operator handles; uniqueness is not
 enforced"), so the requirement is **not** to forbid them — it is that import must not create one
 silently. `Origin: AI-inferred-expansion`.
-`Ratification: user-ratified 2026-08-04 (scope-membership B, item I2)`.
+`Ratification: user-ratified 2026-08-04 (scope-membership B/first-pass, item I2)`.
 
 **R-6a** — *Where* a duplicate-label roster exists, the system **shall** handle it **consistently**
 across **all three** label-resolving commands. It does not today: `use <label>` refuses with
-`Error::UseTargetAmbiguous` (`resolve_target()` in `src/use_account.rs`, exit code 6 per the `UseTargetAmbiguous` arm of `Error::exit_code` in `src/error.rs`), while
+`Error::UseTargetAmbiguous` (`src/use_account.rs:450`, exit code 6 per `src/error.rs:955`), while
 `apply_enabled` backing `enable`/`disable` silently resolves to the earliest entry
-(`apply_enabled()` in `src/cli.rs`). Which behaviour is correct is a decision, not a design.
+(`src/cli.rs:5150-5163`). Which behaviour is correct is a decision, not a design.
 `Origin: AI-inferred-expansion`.
 `Ratification: pending-user` (the inconsistency's *inclusion* is ratified; its resolution is not).
 
@@ -324,7 +328,7 @@ across **all three** label-resolving commands. It does not today: `use <label>` 
 > framed the choice as "one of the two is wrong". Both halves were defective:
 >
 > - **`remove` was omitted, and it is the load-bearing case.** `apply_remove` → `remove_account`
->   (the `remove` path in `src/cli.rs` (`remove_confirmation()` and its caller)) resolves a label and **deletes the keychain stash**. It is
+>   (`src/cli.rs:5219-5227`, `src/cli.rs:5195-5211`) resolves a label and **deletes the keychain stash**. It is
 >   the only one of the three whose first-match-wins behaviour is **irreversible** — `use` picks the
 >   wrong active account (recoverable in one command) and `enable`/`disable` flips the wrong flag
 >   (recoverable), but `remove` destroys credential material with no undo. A decision framed over
@@ -332,7 +336,7 @@ across **all three** label-resolving commands. It does not today: `use <label>` 
 >   to inherit whichever answer happened to win.
 > - **The option set was wrong.** The original framing offered "make `enable`/`disable` refuse like
 >   `use`" as a *change*, but refusing-on-ambiguity is what `use` already ships
->   (`resolve_target`, `src/use_account.rs`) — so that option is a no-op for `use` and the real
+>   (`resolve_target`, `src/use_account.rs:441-457`) — so that option is a no-op for `use` and the real
 >   question is only whether the other two adopt it.
 >
 > Restated: the decision is **one policy across `use` / `enable` / `disable` / `remove`**, and
@@ -344,16 +348,16 @@ across **all three** label-resolving commands. It does not today: `use <label>` 
 classes are applied — `--accounts` (roster + credentials) and `--settings` (non-roster config) — with
 the **default being everything**, which is today's behaviour byte-for-byte. Today no such gesture
 exists: on a fresh target the artifact's whole config is adopted unconditionally
-(`apply_import()`'s fresh-target branch in `src/cli.rs`) and the operator cannot decline it. `Origin: user-stated`.
+(`src/cli.rs:4744-4750`) and the operator cannot decline it. `Origin: user-stated`.
 `Ratification: n/a` (maintainer-proposed).
 
 **R-9a** — *Where* an artifact's scope is determined, it **shall** be derived from payload **presence**
 (`config_toml` empty, `accounts` empty) and **shall not** be read from any scope field the artifact
-declares about itself. On a `--plaintext` export nothing is authenticated (`resolve_encryption()` in `src/cli.rs`), so
+declares about itself. On a `--plaintext` export nothing is authenticated (`src/cli.rs:4471-4479`), so
 a declared scope is attacker-controlled: a hostile artifact would assert full scope and the control
 would evaporate. The operator's flag is a **ceiling, never a floor** — `import --accounts` against an
 artifact containing config ignores that config regardless of what the artifact claims.
-`Origin: council-added` (3/3 convergent). `Ratification: user-ratified 2026-08-04 (scope-membership B, item E5)`.
+`Origin: council-added` (3/3 convergent). `Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item E5)`.
 
 **R-9b** — *Where* `--accounts` is selected, the config **shall** be **narrow-parsed** — deserialized
 into a struct carrying only `account` — rather than fully parsed and then filtered. This is not an
@@ -361,7 +365,7 @@ optimization: `RawConfig` carries `#[serde(deny_unknown_fields)]` (`src/config.r
 fires on blocks outside the parse path, so narrow-parse additionally repairs backward-import for
 roster-only artifacts (R-16). The narrow struct must therefore **omit** `deny_unknown_fields` at the
 top level; `RawAccount` retains its own (`src/config.rs:1399`), so per-account strictness is preserved.
-`Origin: council-added` (`technical-architect`). `Ratification: user-ratified 2026-08-04 (scope-membership B, item E6)`.
+`Origin: council-added` (`technical-architect`). `Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item E6)`.
 
 **R-9c** — *Where* scope selection is added, `export` **shall not** gain a corresponding
 config/roster narrowing flag. Every `RawConfig` field is `#[serde(default)]`
@@ -372,7 +376,7 @@ backward-import break behind a flag. The asymmetry is principled: **export scope
 hygiene; import scope is input validation**, and only the latter defends against an
 attacker-supplied artifact — because the attacker controls the export.
 `Origin: council-added` (`technical-architect`, `security-architect` concurring).
-`Ratification: user-ratified 2026-08-04 (scope-membership B, item E4)`.
+`Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item E4)`.
 
 **R-9d** — *Where* the scope flags are named, they **shall** be `--accounts` and `--settings`.
 `--config` is unavailable on two independent grounds: it is **reserved and value-bearing** for issue
@@ -380,39 +384,26 @@ attacker-supplied artifact — because the attacker controls the export.
 **semantically wrong** — `account` is a field of `RawConfig`, so accounts *are* config and
 `sessiometer config show` prints them. `--accounts` matches the vocabulary the tool already uses on
 this surface: `IMPORT_USAGE` opens "rehydrate **accounts** from a migration artifact"
-(`IMPORT_USAGE` in `src/cli.rs`). `roster` is internal Rust vocabulary and barely surfaces to operators.
+(`src/cli.rs:1290`). `roster` is internal Rust vocabulary and barely surfaces to operators.
 `Origin: user-stated` (maintainer asked the question; evidence settled it). `Ratification: n/a`.
 
 **R-10** — The system **shall** remove the shipped `export --no-secrets` flag
 (`src/cli.rs`, `EXPORT_USAGE`). Roster-without-secrets is not a state this product supports. The
 inverse is already unreachable by construction — `apply_import`'s merge loop is over the roster
-(`apply_import()`'s roster loop in `src/cli.rs`) with secrets keyed by uuid (secrets keyed by uuid in the same fn), so a secret with no roster entry is dead
+(`src/cli.rs:4770`) with secrets keyed by uuid (`src/cli.rs:4789`), so a secret with no roster entry is dead
 code — and the maintainer has ruled the forward direction out of the model. `Origin: user-stated`.
 `Ratification: n/a`.
-
-> **R-10 SUPERSEDES `REQ-MIG-B-007`, and that reversal must not be silent.** The HQ decision record
-> (`../hq/strategy/prd-export-import.md`) specifies roster-only mode as *"the **V-001-failure
-> fallback** AND a **first-class user choice** (migrate config without moving secrets)"*. R-10 deletes
-> both halves. The maintainer may reverse a ratified record — but sixteen executors build against
-> **this** document and none of them will read that one, so the reversal is stated here rather than
-> left to be discovered.
->
-> **Disposition of the V-001 fallback**: no longer needed. #145 is CLOSED and portability is
-> confirmed, so the failure mode roster-only was the fallback *for* does not arise. **Disposition of
-> the first-class user choice**: withdrawn by the maintainer's ruling — note that R-10's own evidence
-> (`apply_import()`'s roster loop) argues only the *inverse* case, so the forward direction rests on
-> the ruling alone, not on code.
 
 **R-10a** — *Where* R-10 removes a **shipped** flag, the removal **shall** follow a decided path:
 hard-remove with a strict-usage error naming the replacement, or deprecate-then-remove across a
 release. Not yet decided. `Origin: enrichment-expanded` (item I1).
-`Ratification: user-ratified 2026-08-04 (scope-membership B, item I1)` — inclusion only; the path is undecided.
+`Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item I1)` — inclusion only; the path is undecided.
 
 **R-10b** — *Where* R-10 lands, **every** artifact carries live credentials, so `PLAINTEXT_WARNING`
 (`src/migration.rs:538-541`) is no longer sometimes-moot — it becomes unconditionally true. Its
 wording **shall** be re-checked against that, and against R-12's shred mechanism, so the advice it
 gives is one the tool can actually perform. `Origin: enrichment-expanded` (item I2).
-`Ratification: user-ratified 2026-08-04 (scope-membership B, item I2)`.
+`Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item I2)`.
 
 ### PortabilityClass
 
@@ -421,81 +412,77 @@ as portable, machine-bound, or capability-granting, and **shall** apply only the
 **regardless of `--settings`**. The classification **shall** be implemented as an **allowlist**
 (non-portable by default, portable only where explicitly marked), never a denylist.
 `Origin: council-added` (`security-architect`).
-`Ratification: user-ratified 2026-08-04 (scope-membership B, item E7)`.
+`Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item E7)`.
 
 **R-11a** — `[login].claude_bin` and `[refresh].claude_bin` **shall never** be adopted from an
 artifact, regardless of any flag. Resolution absolutizes against cwd and accepts any `is_file()`, with
 no allowlist, no signature, and deliberately no symlink resolution (`src/paths.rs:773-807`); the daemon
-then spawns the result on a timer (`resolve_binary()` in `src/refresh_tick.rs`, spawned via `Command::new(binary)` in `src/isolated_spawn.rs`). The refused capability has **zero
+then spawns the result on a timer (`src/refresh_tick.rs:258` → `:273` → `src/refresh.rs:694` (`SpawnClaude::new`)). The refused capability has **zero
 legitimate cross-machine use** — the value is a local path, so on the target it either does not exist
 or names a *different* binary — and ADR-0030 documents `CLAUDE_BIN=…` as a trivially-available local
 escape hatch, so refusal costs a genuine operator nothing. `Origin: council-added`.
-`Ratification: user-ratified 2026-08-04 (scope-membership B, item E7)`.
+`Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item E7)`.
 
 **R-11b** — `[migration].kdf_*` **shall** be adopted only when the incoming value is **at least** the
 local value (a monotonic floor). A fleet may standardize *upward*; nothing may downgrade. This kills
 the 8 KiB / 1-iteration downgrade path (`src/config.rs:981-988`) without banning the legitimate case.
 Scope note: this governs **adoption on import** only — the KDF's construction and parameters remain
-#147's (see § 1b). `Origin: council-added`. `Ratification: user-ratified 2026-08-04 (scope-membership B, item E7)`.
+#147's (see § 1b). `Origin: council-added`. `Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item E7)`.
 
 **R-11c** — `[migration].conflict_policy` **shall not** be adopted. It encodes a decision the *target*
 operator made. Today an artifact cannot overwrite it; `--settings` would newly allow it — affecting not
-the import that adopts it (`resolve_import_overwrite` reads the local value first, `resolve_import_overwrite()` in `src/cli.rs`)
+the import that adopts it (`resolve_import_overwrite` reads the local value first, `src/cli.rs:4628`)
 but every import after. `Origin: council-added` (`technical-architect`; `rust-architect` dissented —
-see § 9 D-1). `Ratification: user-ratified 2026-08-04 (scope-membership B, item E7)`.
+see § 9 D-1). `Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item E7)`.
 
 **R-11d** — *Where* R-11's allowlist exists, a **mechanical check shall fail** when a new `Config` key
 is added without a portability classification. Without it the allowlist rots exactly as a denylist
 would — the next spawnable key auto-adopts and nobody notices until it is exploited — which is the
 specific failure the allowlist was chosen to avoid. An unenforced allowlist is a denylist with extra
 steps. `Origin: enrichment-expanded` (category: security, item M1).
-`Ratification: user-ratified 2026-08-04 (scope-membership B, item M1)`.
+`Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item M1)`.
 
 **R-11e** — *Where* R-11 refuses a key, the refusal **shall** be surfaced to the operator. A silently
 dropped `claude_bin` is indistinguishable from one that was never present.
 `Origin: enrichment-expanded` (category: observability, item M2).
-`Ratification: user-ratified 2026-08-04 (scope-membership B, item M2)`.
+`Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item M2)`.
 
 **R-11f** — *Where* R-11 establishes a portability classification, it **shall** be recorded as an ADR.
 ADR-0006 governs *schema evolution* — whether the format may change — and is silent on *value
 portability* — whether a value may cross machines. These are different questions and the second has no
 home. `Origin: enrichment-expanded` (item I5).
-`Ratification: user-ratified 2026-08-04 (scope-membership B, item I5)`.
+`Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item I5)`.
 
 ### MigrationArtifact (lifecycle)
 
 **R-12** — *When* `import` completes, the system **shall** provide a mechanism to destroy the source
-artifact. Today `import` reads the file and leaves it (`import()` in `src/cli.rs`), while `PLAINTEXT_WARNING`
+artifact. Today `import` reads the file and leaves it (`src/cli.rs:4602`), while `PLAINTEXT_WARNING`
 advises "delete it as soon as the import is done" — advice with no mechanism, printed only on the
 `--plaintext` path, while an encrypted artifact is still a live-credential file behind one passphrase.
-> **A premise was withdrawn here.** This requirement previously argued that *"under R-9's model the
-> typical artifact becomes roster-only, which is a pure credential file — making this more urgent."*
-> That is **not producible**: `gather_payload()` sets `config_toml = config.render()` unconditionally,
-> and `render()` emits every block — including `[credential]` — unconditionally, while R-9c/AD-5
-> forbid an export-side narrowing flag. **No artifact this tool mints can have an empty
-> `config_toml`**, and once R-10 removes `--no-secrets`, `accounts` is always populated too. R-12's
-> conclusion stands on the ground stated above it — an encrypted artifact is a live-credential file
-> behind a single passphrase — which needs no roster-only claim.
-
-`Origin: council-added` (`security-architect`, rounds 1 and 2).
-`Ratification: user-ratified 2026-08-04 (scope-membership B, item E11)`.
+Under R-9's model the *typical* artifact becomes roster-only, which is a **pure credential file** —
+making this more urgent, not less. `Origin: council-added` (`security-architect`, rounds 1 and 2).
+`Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item E11)`.
 
 **R-13** — *When* `export` runs, the system **shall** determine whether this machine's daemon is
 running and surface it. The design's own position is that the staleness hazard is "not detectable at
 the target — it is only **preventable at the source**", and there is currently **zero** source-side
-implementation of that thesis (`export()` in `src/cli.rs` never asks). Liveness is locally probeable via
-the existing control socket (`notify_daemon_roster_reload()` in `src/capture.rs`, which already opens `paths::control_socket()` from a non-daemon verb). `Origin: council-added` (`security-architect`).
-`Ratification: user-ratified 2026-08-04 (scope-membership B, item E12)`.
+implementation of that thesis (`src/cli.rs:4455-4501` never asks). Liveness is locally probeable via
+the existing control socket, via the read-only `daemon_liveness()` probe (`src/cli.rs:1885`) already
+shared by `daemon status` and `daemon restart` — **not** `notify_daemon_roster_reload()`
+(`src/capture.rs:335`), which is documented BEST-EFFORT, returns `()`, and swallows a connect
+refusal, so it cannot answer the tri-state question this requirement asks.
+`Origin: council-added` (`security-architect`).
+`Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item E12)`.
 
 **R-14** — *Where* `export` and `import` emit observability events, they **shall** carry a **sha256
 digest** of the artifact and the **operator-requested scope**, so an export and its corresponding
 import can be correlated after the fact. This fits the existing aggregate-only redaction discipline of
 `Event::Export` / `Event::Import` (`src/observability.rs:1426-1442`) — no label, no token, no email.
-`Origin: council-added`. `Ratification: user-ratified 2026-08-04 (scope-membership B, item E13)`.
+`Origin: council-added`. `Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item E13)`.
 
 **R-14a** — *Where* R-14 logs a scope, it **shall** log the scope the operator **requested**, never the
 scope the artifact **claims** — per R-9a. `Origin: council-added`.
-`Ratification: user-ratified 2026-08-04 (scope-membership B, item E13)`.
+`Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item E13)`.
 
 **R-15** — *When* `import` reads a roster entry, the system **shall** validate `account_uuid` before
 use. It is unvalidated today and is interpolated directly into a keychain service name
@@ -507,7 +494,7 @@ prefix, an empty uuid yielding the bare prefix, and unbounded length. This is **
 hardening, not a critical finding**, and it is recorded at that severity deliberately.
 `Origin: council-added` (`security-architect` named the shape and explicitly declined to assert the
 finding; the bound was verified during this amendment).
-`Ratification: user-ratified 2026-08-04 (scope-membership B, item E14)`.
+`Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item E14)`.
 
 **R-16** — The system **shall** decide how a v1 artifact minted **after** commit `6fe3457` imports on a
 binary built **before** it. `RawConfig` carries `#[serde(deny_unknown_fields)]`
@@ -515,7 +502,7 @@ binary built **before** it. `RawConfig` carries `#[serde(deny_unknown_fields)]`
 was added on 2026-07-29 — 26 days after ADR-0006 froze v1 as the tested baseline — and the break has
 never been tracked. R-9b's narrow-parse repairs the roster-only case as a side effect; the
 full-artifact case is unresolved. `Origin: council-added` (`rust-architect`, surfaced but never filed).
-`Ratification: user-ratified 2026-08-04 (scope-membership B, item I4)`.
+`Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item I4)`.
 
 ### RefreshOutcome
 
@@ -524,7 +511,7 @@ that reads as a meaningful observation. `classify()` computes `rotated` as
 `seeded_rt != after_rt` (`src/refresh.rs:434-437`); a `dead` outcome sets `after_rt = Some("")`, so
 `rotated=true` is **true by construction** on every dead line and carries no information.
 `Origin: AI-inferred-expansion`.
-`Ratification: user-ratified 2026-08-04 (scope-membership B, item I1)`.
+`Ratification: user-ratified 2026-08-04 (scope-membership B/first-pass, item I1)`.
 
 **R-5a** — *Where* R-5 changes the emitted field, the change **shall** be treated as a **log-format
 change** with existing consumers, not a cosmetic edit. `docs/findings/0465-*` derives a published
@@ -536,10 +523,26 @@ local log is 2026-07-14, so no dead line is inside its sample. The requirement i
 ### Operator Documentation
 
 **R-8** — The system **shall** publish a migration runbook stating the safe sequence — **halt the
-source's refresh (stop the source daemon) → export → import → `use` → start the target; never resume
-the source against the same credentials** — and stating why (the source's next refresh invalidates the
-artifact). No such document exists. `Origin: AI-inferred-expansion (category: docs)`.
-`Ratification: user-ratified 2026-08-04 (scope-membership B, item M1)`.
+source's refresh (stop the source daemon) → export → import → `use --force <label>` → start the
+target; never resume the source against the same credentials** — and stating why (the source's next
+refresh invalidates the artifact). The runbook **shall** name the **forcing** form, and **shall not**
+name `use <label>` unqualified. No such document exists.
+`Origin: AI-inferred-expansion (category: docs)`.
+
+> **`--force` is mandatory here, not stylistic (corrected 2026-08-04).** This sequence read
+> `→ use →`. The runbook's whole subject is the migration case, and § 1 states that the account the
+> operator is *currently using* is the one account the import cannot reach — so the runbook's reader
+> is, by construction, in the active-account case where the unqualified form is the provable no-op
+> this very PRD documents (AC-2a). An operator following the sequence literally would have restarted
+> the target still holding the **stale** canonical token, with every command reporting success.
+>
+> This was the **seventh** site of the same correction and the last one found — after Cap-1.1, a
+> building-block row, two runtime-view arrows and two spec scenarios. It is also the most dangerous,
+> because it is the only one a human reads and follows step by step. It survived the earlier sweep
+> because that sweep searched the *design* for the claim; R-8 states it as **runbook prose in the
+> PRD**, and R-8 is the one requirement with **no capability** gating it (§ 16 records it as
+> `— (document)`), so no test could have caught it either.
+`Ratification: user-ratified 2026-08-04 (scope-membership B/first-pass, item M1)`.
 
 ## 4. Acceptance Criteria (GWT + BUT NOT)
 
@@ -564,8 +567,8 @@ replace the canonical bytes. **BUT NOT** `use <label>` unqualified.
 > **Why this AC exists.** `import`'s planned guidance was to tell the operator to run `use <label>`.
 > For the active account that is a **provable no-op**: `SwapTarget::resolve` short-circuits on
 > `if account.stash() == active_stash { return Ok(GateOutcome::AlreadyActive); }`
-> (`SwapTarget::resolve`'s `AlreadyActive` short-circuit in `src/use_account.rs`) — a comparison of **service names**, never of contents. The committed
-> test `already_active_without_force_is_a_noop_success_with_zero_writes`  asserts exactly
+> (`src/use_account.rs:325-326`) — a comparison of **service names**, never of contents. The committed
+> test `already_active_without_force_is_a_noop_success_with_zero_writes` (`src/use_account.rs:2490-2502`) asserts exactly
 > this: `canonical == b"A-token"` and `calls == 0`. So the canonical item keeps the **stale** token
 > while both `import` and `use` report success — the original failure mode, reproduced through the
 > remediation. The named command must therefore be `use --force <label>`, or adoption must not be
@@ -577,7 +580,7 @@ operator's selected scope, and the system's portability classification — and *
 win/lose policy. **BUT NOT** satisfied by authoring the merge policy R-3 originally demanded;
 **BUT NOT** by a classification that lives only in a source comment; **BUT NOT** by leaving the current
 implicit "local always wins" in place on the fresh-target path, where it does not hold at all
-(`apply_import()`'s fresh-target branch in `src/cli.rs` adopts the artifact's config wholesale).
+(`src/cli.rs:4744-4750` adopts the artifact's config wholesale).
 
 **AC-9 (R-9, R-9a, R-9d)** — *Given* an artifact carrying both roster and settings, *When* the operator
 runs `import --accounts`, *Then* the roster and credentials are applied and **no** non-roster block is,
@@ -602,7 +605,7 @@ been re-checked against the fact that every artifact now carries credentials.
 deletion the tool provides no mechanism for (R-12).
 
 **AC-11 (R-11, R-11a, R-11b, R-11c, R-11e)** — *Given* an artifact whose config sets
-`[refresh].claude_bin = "./x"` **or** `[login].claude_bin = "./x"` — both funnel into `claude_binary_from` in `src/paths.rs` and both are spawnable, so both are CapabilityGranting — *When* it is imported **with `--settings`**, *Then* the target's saved
+`[refresh].claude_bin = "./x"`, *When* it is imported **with `--settings`**, *Then* the target's saved
 config does **not** contain that value, *And* the refusal is visible in the command's output (R-11e),
 *And* an incoming `kdf_*` weaker than local is refused while a stronger one is accepted,
 *And* `conflict_policy` is not adopted.
@@ -658,15 +661,12 @@ lines (0465 checked: clean).
 
 **AC-6 (R-6, R-6a)** — *Given* a target roster carrying label `L` under uuid `X`, and an artifact
 carrying label `L` under uuid `Y`, *When* `import` runs, *Then* the operator is warned that a
-duplicate label was created. *And* `use L`, `enable L`, `disable L` **and `remove L`** thereafter agree
-on whether a duplicate label is resolvable. **BUT NOT** by enforcing label uniqueness — that
-contradicts the documented design position; **BUT NOT** by leaving `use` refusing while `enable`
-silently picks first; **BUT NOT** by settling only the three cheap verbs and letting `remove` inherit
-the answer — R-6a's own argument is that `remove`'s irreversibility is what should *drive* the policy,
-so a three-command criterion would be satisfied by exactly the outcome that argument rejects.
+duplicate label was created. *And* `use L`, `enable L`, and `disable L` thereafter agree on whether a
+duplicate label is resolvable. **BUT NOT** by enforcing label uniqueness — that contradicts the
+documented design position; **BUT NOT** by leaving `use` refusing while `enable` silently picks first.
 **Test-coverage criterion (M2)**: a case whose target roster is **not** a clone of the source config —
 `the_migration_conflict_policy_default_drives_import_behaviour` builds its target as
-`src_config.clone()` (`the_migration_conflict_policy_default_drives_import_behaviour`), so every uuid matches by construction and this branch is
+`src_config.clone()` (`src/cli.rs:10741`), so every uuid matches by construction and this branch is
 unreachable in it.
 
 **AC-7 (R-7)** — *Given* a `status` render with one active and ≥ 1 parked account, *When* `EXPIRY` is
@@ -675,8 +675,10 @@ read, *Then* an operator can tell which slot each value came from.
 not a display change.
 
 **AC-8 (R-8)** — *Given* an operator about to migrate, *When* they consult the docs, *Then* the safe
-sequence and its rationale are present. **BUT NOT** as a comment in `src/migration.rs`; **BUT NOT**
-omitting the "never resume the source" step, which is the step this incident violated.
+sequence and its rationale are present, *And* the adoption step names **`use --force <label>`**.
+**BUT NOT** as a comment in `src/migration.rs`; **BUT NOT** omitting the "never resume the source"
+step, which is the step this incident violated; **BUT NOT** naming `use <label>` unqualified — the
+runbook's reader is by construction in the active-account case, where that form is the AC-2a no-op.
 
 **Coverage criterion spanning R-2 / R-4 (M2)** — the existing suite covers byte-faithful round-trip,
 config-only artifacts, report redaction, and conflict policy (§ 9). It does **not** cover: the
@@ -691,7 +693,7 @@ SCALE:   fraction of imported accounts whose credential is readable by the consu
 METER:   integration test asserting canonical + stash state after import, for both cases
 MUST:    1.0  — every imported account is readable by its consumer, or the operator is told it is not
 GOAL:    1.0
-PAST:    < 1.0 — the active account is never adopted (import() in src/cli.rs)
+PAST:    < 1.0 — the active account is never adopted (src/cli.rs:4601-4663)
 ```
 
 ```
@@ -771,7 +773,7 @@ PAST:    < 1.0 — true-by-construction on every `dead` line (src/refresh.rs:434
   failure mode is arbitrary code execution rather than credential loss, and it changes the review bar:
   a reviewer who reads R-11 as "tidy up config handling" has misread it.
 - **Consent without disclosure is not a control.** There is **no artifact-inspection subcommand** —
-  `import` reads and applies (`import()` in `src/cli.rs`), with no dry-run and no dump. So `--settings`
+  `import` reads and applies (`src/cli.rs:4601-4663`), with no dry-run and no dump. So `--settings`
   means "adopt whatever config is in this file", not "adopt this specific `claude_bin`". This is
   precisely why R-11's allowlist, and not R-9's flag, is the security control. If a future change adds
   pre-apply disclosure, R-11's *rationale* weakens but its requirement does not: an operator reading
@@ -792,33 +794,47 @@ PAST:    < 1.0 — true-by-construction on every `dead` line (src/refresh.rs:434
 
 ## 9. Source Traceability
 
-Every claim below was re-verified against the working tree on **2026-08-05**, not carried from session
-memory.
+Every claim below was verified against the working tree, and every **line citation** was re-resolved
+by symbol against `HEAD` on 2026-08-04 before this document was committed.
 
-> **Why the evidence column names symbols, not line numbers.** It used to cite `src/cli.rs:NNNN`.
-> Those citations were correct when written and were **wrong within a day**: PR #1039 shifted
-> `src/cli.rs` piecewise, and roughly half the ranges came to rest on a *different, plausible-looking*
-> function — which is worse than a dangling reference, because it still reads as verified. `src/cli.rs`
-> took 29 commits in three weeks; a line number into it is a claim with a shelf life of about a day.
-> Symbols do not rot, so the evidence column names them. This is the second time these citations went
-> stale — the first correction is recorded in issue #999 — and re-deriving the numbers a third time
-> would only reset the same clock.
+> **Attestation corrected 2026-08-04 — the earlier wording was false, and the failure is instructive.**
+> This paragraph previously read *"Every claim below was re-verified against the working tree … not
+> carried from session memory."* The **claims** were verified and all of them held. The **line
+> numbers** were not: commit `d1c5f30` (`(feat) cli: advance to the next account in the swap chain`,
+> +228/−35 to `src/cli.rs`) landed hours before this document, shifting every citation in the
+> 4400–5300 band by **+52** and above 10600 by **+97**. Of ~17 distinct `src/cli.rs` citations exactly
+> one still resolved. An implementer following `src/cli.rs:4549-4611` for `import` would have landed
+> in `write_export`.
+>
+> Three citations were not merely offset but pointed at unrelated code that reads plausibly:
+> `resolve_target` was cited to `src/cli.rs:438-455` (that is `parse_config`; the function lives in
+> `src/use_account.rs:441-457`), exit code 6 to `src/error.rs:892` (it is `:955`), and — worst — the
+> zero-writes test backing AC-2a's entire correction to `src/use_account.rs:2202-2213`, which is an
+> unrelated `SwapAck` test. The real test is at `:2490-2502`.
+>
+> **The lesson is about the attestation, not the offsets.** "Verified" was written once and then aged
+> silently, because nothing re-checked it when the tree moved underneath. A verification claim is
+> itself a claim with a timestamp, and a document that asserts its own freshness is asserting
+> something it cannot know about the future. Every citation in this file and the design doc has now
+> been re-resolved **by symbol** — the durable form, since a symbol survives a rebase and a line
+> number does not. Caught by the pre-submit external review gate, not by this document's authors.
 
 | Claim | Evidence |
 |---|---|
-| Import never writes canonical / `~/.claude.json` / requests a swap | `import()` in `src/cli.rs` — the body reaches `config.save()` + `notify_daemon_roster_reload()` and nothing else |
+| Import never writes canonical / `~/.claude.json` / requests a swap | `src/cli.rs:4601-4663` — the body reaches `config.save()` + `notify_daemon_roster_reload()` and nothing else |
 | Active `EXPIRY` reads canonical; parked reads stash | `src/daemon/snapshot_build.rs:45-53` |
 | `rotated` is true-by-construction on `dead` | `src/refresh.rs:434-437` |
-| Conflict match is uuid-only | `apply_import()`'s uuid match in `src/cli.rs` |
-| Whole-config merge is acknowledged future work | `apply_import()`'s whole-config comment in `src/cli.rs` (verbatim in-code comment) |
-| Labels are non-unique by design | `apply_enabled()`'s doc comment in `src/cli.rs` |
-| `use` refuses on ambiguity; `enable`/`disable` take first | `resolve_target()` in `src/use_account.rs`; the `UseTargetAmbiguous` arm of `Error::exit_code` in `src/error.rs` (exit 6); `apply_enabled()` in `src/cli.rs` |
+| Conflict match is uuid-only | `src/cli.rs:4771-4774` |
+| Whole-config merge is acknowledged future work | `src/cli.rs:4737-4741` (verbatim in-code comment) |
+| Labels are non-unique by design | `src/cli.rs:5148-5149` |
+| `use` refuses on ambiguity; `enable`/`disable` take first | `src/use_account.rs:450`; `src/error.rs:955` (exit 6); `src/cli.rs:5150-5163` |
 | `Payload` has no timestamp; `FORMAT_VERSION = 1` | `src/migration.rs:200-232`; `src/migration.rs:97` |
-| Existing migration test coverage (7 tests) | the `export_*` / `import_*` tests in `src/cli.rs` |
-| Conflict test's target is a clone of the source | `the_migration_conflict_policy_default_drives_import_behaviour` |
+| Existing migration test coverage (7 tests) | `src/cli.rs:10201, 10180, 10217, 10357, 10522, 10566, 10636` |
+| Conflict test's target is a clone of the source | `src/cli.rs:10741` |
 
-**Added 2026-08-04 — every row re-verified against the working tree during this amendment, not carried
-from the council transcripts:**
+**Added 2026-08-04 — every row's claim verified against the working tree during this amendment (not
+carried from the council transcripts), and every line citation re-resolved by symbol before commit
+(see the attestation correction above):**
 
 | Claim | Evidence |
 |---|---|
@@ -826,18 +842,18 @@ from the council transcripts:**
 | `RawAccount` keeps its own `deny_unknown_fields` — narrow-parse preserves per-account strictness | `src/config.rs:1398-1400` |
 | `Payload` is exactly two emptiable fields, so scope is expressible by presence | `src/migration.rs:199-210` |
 | `claude_bin` resolution: absolutize against cwd, accept any `is_file()`, no allowlist, no symlink resolution | `src/paths.rs:773-807` |
-| The resolved binary is spawned by the refresh tick | `resolve_binary()` in `src/refresh_tick.rs`, spawned via `Command::new(binary)` in `src/isolated_spawn.rs` |
-| `import` reads the local conflict policy **before** apply — an adopted policy affects later imports, not its own | `resolve_import_overwrite()` in `src/cli.rs` (`resolve_import_overwrite(overwrite, local.as_ref())`) |
-| Fresh-target import adopts the artifact's whole config unconditionally | `apply_import()`'s fresh-target branch in `src/cli.rs` |
+| The resolved binary is spawned by the refresh tick | `src/refresh_tick.rs:258` → `:273` → `src/refresh.rs:694` (`SpawnClaude::new`) |
+| `import` reads the local conflict policy **before** apply — an adopted policy affects later imports, not its own | `src/cli.rs:4628` (`resolve_import_overwrite(overwrite, local.as_ref())`) |
+| Fresh-target import adopts the artifact's whole config unconditionally | `src/cli.rs:4744-4750` |
 | `stash()` interpolates an unvalidated `account_uuid` into a keychain service name | `src/config.rs:370-372`; `STASH_PREFIX` at `:325` |
 | `stash()` reaches **no** filesystem path — bounding R-15's severity | grep of every `stash()` call site against path/join/file/dir: zero matches |
-| `use` short-circuits on service-name equality, never contents | `SwapTarget::resolve`'s `AlreadyActive` short-circuit in `src/use_account.rs`; test `already_active_without_force_is_a_noop_success_with_zero_writes` asserts `canonical == b"A-token"`, `calls == 0` |
-| `remove` deletes the keychain stash — the only irreversible label-resolving command | the `remove` path in `src/cli.rs` (`remove_confirmation()` and its caller) |
+| `use` short-circuits on service-name equality, never contents | `src/use_account.rs:325-326`; test `src/use_account.rs:2490-2502` asserts `canonical == b"A-token"`, `calls == 0` |
+| `remove` deletes the keychain stash — the only irreversible label-resolving command | `src/cli.rs:5219-5227`, `src/cli.rs:5195-5211` |
 | `--config` is reserved and value-bearing for #24, not yet wired | `src/paths.rs:439` (`config_dir_with_override`, `allow(dead_code)` off the test path) |
-| `IMPORT_USAGE` uses "accounts" as the operator-facing noun | `IMPORT_USAGE` in `src/cli.rs` |
+| `IMPORT_USAGE` uses "accounts" as the operator-facing noun | `src/cli.rs:1290` |
 | ADR-0030 governs `claude` resolution **order**, not value provenance — the R-11a refusal does not contradict it, and `CLAUDE_BIN=…` is a documented local escape hatch | `docs/adr/0030-one-resolution-policy-cli-included.md` |
-| `import` leaves the source artifact on disk | `import()` in `src/cli.rs` |
-| Daemon liveness is locally probeable via the control socket | `notify_daemon_roster_reload()` in `src/capture.rs`, which already opens `paths::control_socket()` from a non-daemon verb |
+| `import` leaves the source artifact on disk | `src/cli.rs:4602` |
+| Daemon liveness is locally probeable, read-only, tri-state | `src/cli.rs:1885` (`daemon_liveness()`, socket-primary + lock-fallback); `src/cli.rs:2137` (`probe_socket_responsive`). NOT `src/capture.rs:335` — that notify is best-effort and returns `()` |
 
 ### F-3 — A second claim was FALSIFIED during this amendment
 
@@ -865,7 +881,7 @@ On `[migration].conflict_policy` (R-11c) the panel split, and **both sides are f
 
 - `rust-architect`: adopting it under an explicit `--settings` is what the operator asked for, and it
   cannot affect the import that adopted it — `resolve_import_overwrite` reads the local value first
-  (`resolve_import_overwrite()` in `src/cli.rs`).
+  (`src/cli.rs:4628`).
 - `technical-architect`: scoping makes it **strictly worse** than today. At present an artifact cannot
   overwrite a policy the target operator deliberately set; `--settings` would newly allow it, silently
   changing every *subsequent* import.

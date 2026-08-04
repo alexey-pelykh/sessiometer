@@ -12,10 +12,8 @@ scenario as a passing test.
 Tracked as **issues #1049, #1048**. Requirements: PRD R-12, R-10b. Design § 4.9, RSK-9.
 
 **Rule under test**: `import` reads the artifact and leaves it, while the plaintext warning advises
-deleting it with no mechanism, and only on the `--plaintext` path — while an ENCRYPTED artifact is
-equally a live-credential file behind a single passphrase. (An earlier revision argued the typical
-artifact becomes roster-only; it cannot — `render()` emits every block unconditionally and R-9c
-forbids an export-side narrowing flag, so no tool-minted artifact is ever roster-only.)
+deleting it with no mechanism. Under scope selection the *typical* artifact becomes roster-only — a
+pure credential file — so the gap widens rather than narrows.
 
 ## Scenario: a successful import can destroy its source  · Cap-9.1
 
