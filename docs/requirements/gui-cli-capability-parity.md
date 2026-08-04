@@ -5,8 +5,12 @@ created: 2026-07-31
 workflow: /capture-requirements
 source: operator ruling 2026-07-31; audit of menubar/CLI login parity 2026-07-31; 5-lens council
   2026-07-31; empirical spike against Claude Code 2.1.220 2026-07-31 (recorded publicly as ADR-0032).
-  Working notes were transient under .tmp/scopes/ and are not part of the repo. This PRD is
-  self-contained — nothing downstream needs to dereference that path.
+  Working notes were transient under .tmp/scopes/ and are not part of the repo — nothing downstream
+  needs to dereference that path.
+decision_record: "`../hq/strategy/gui-capability-parity.md` — the canonical ruling this PRD
+  implements. It supersedes the in-UI-`login` exclusion, re-scopes REQ-MBR-C-005 as
+  origination-only, and records the three bounds in § 1b. The public-facing half of the same
+  decision is ADR-0032."
 dor_status: passed-with-findings
 formulation: {}
 features: {}
@@ -57,7 +61,9 @@ Three things converged:
    sessiometer's own conservatism for the *slash-command* shape, not a Claude Code requirement.
    Recorded as **ADR-0032**.
 3. **The operator ruled.** 2026-07-31: an operator on the GUI must reach the same capabilities as an
-   operator on the CLI. Choosing a surface is not accepting reduced capability.
+   operator on the CLI. Choosing a surface is not accepting reduced capability. Canonical record:
+   `../hq/strategy/gui-capability-parity.md`, which carries the ruling's own falsifier and the
+   four-times-superseded history of the clause it replaces.
 
 ### 1.4 Framing provenance
 
@@ -345,7 +351,8 @@ The concurrency defect it identified is real; only the remedy direction was wron
 **9.1 Security** — The governing invariant (REQ-MBR-C-005) is that the GUI client originates **no
 new credential/keychain/API seam**. It is a constraint on *origination*, not on capability, and
 **daemon-routing satisfies it** — `src/daemon/socket.rs:32-33` already names routed `capture` as
-satisfying it. What stays permanently forbidden, and is **not** made reachable by this PRD: an
+satisfying it. The invariant's normative home, and the rider generalizing routing-as-compliance from
+`swap` to every credential-touching verb, are `../hq/strategy/design-menubar.md`. What stays permanently forbidden, and is **not** made reachable by this PRD: an
 embedded browser, a native OAuth implementation, a token entry field, or any app code path that
 reads or writes a credential. The test is *who originates*, never *what the operator can accomplish*.
 R-17 hardens the mechanical gate against the specific APIs that would breach this.

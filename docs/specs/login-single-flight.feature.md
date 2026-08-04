@@ -77,10 +77,11 @@ Scenario: keying the login dir by an ephemeral id is rejected
   Given a proposal to make isolated_login_dir() ephemeral-id-keyed
    When it is reviewed against the reaper's targeting
    Then it is REJECTED
-    # An early design note specified exactly this, and a 2026-07-31 design council judged it the
-    # safer side. It is backwards. The path's hash NAMES the suffixed isolated keychain item, which
-    # is how the #133 reaper targets precisely rather than by scanning. Ephemeral keying forfeits
-    # that on a credential-bearing item. The concurrency defect is real; the remedy is this lock.
+    # `../hq/strategy/design-login.md` C1 specified exactly this, and a 2026-07-31 design council
+    # judged it the safer side. It is backwards, and C1 now carries the as-built correction. The
+    # path's hash NAMES the suffixed isolated keychain item, which is how the #133 reaper targets
+    # precisely rather than by scanning. Ephemeral keying forfeits that on a credential-bearing
+    # item. The concurrency defect is real; the remedy is this lock.
 
 Scenario: there is nothing to key on anyway
   Given a fresh login capture
