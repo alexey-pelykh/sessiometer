@@ -12,10 +12,11 @@
 //
 // THE THREE PIECES, and why each is where it is:
 //
-//   1. ARMED vs RESTING is a RENDER question. `switchChipEmphasis(offersSwitch:armed:)` is already
+//   1. ARMED vs RESTING is a RENDER question. `switchChipEmphasis(offersSwitch:block:armed:)` is already
 //      unit-asserted as a value mapping (`AccountSwapTests`), which is exactly what AC-2 says is not
 //      enough — a `.resting`/`.armed` enum pair proves the DECISION differs, never that the PIXELS do. So
-//      this suite renders both and measures.
+//      this suite renders both and measures. The same split applies to #959's blocked-is-`.hidden`
+//      routing: the verdict is unit-asserted there, the pixels are asserted here.
 //   2. IN-FLIGHT is reachable IN-PROCESS. Issue #761's spike measured it as XCUITest-reachable and priced
 //      a UI-test target for it. Issue #758 (`PanelAccessibilityTreeTests`) then proved the accessibility
 //      tree is walkable from THIS headless bundle, and `AccountSwapModel.pendingPreview` pins the phase
@@ -60,8 +61,37 @@
 //   canary          0.000000  0.000000  0.000000  0.000000  0.000000  0.000000
 //   non-target      0.000000  0.000000  0.000000  0.000000  0.000000  0.000000
 //
-// plus, at the T=4 the suite runs at, the chip step measured in ISOLATION (a blocked row, whose `live`
-// guard holds the wash out): 0.001914 light / 0.001929 dark.
+// plus, at the T=4 the suite runs at, the chip step measured in ISOLATION (a row whose `live` guard holds
+// the wash out): 0.001666 light / 0.001659 dark.
+//
+// Issue #959 RE-HOMED that isolation lane without changing what it isolates, and the two numbers above are
+// its RE-MEASUREMENT, not the old ones carried forward. The lane used to run on a BLOCKED row; a blocked
+// row now has no chip at all, so it runs on a viable row with a SIBLING swap in flight instead — `live` is
+// false either way, so the wash is held out identically and both rows are equally `.disabled()`.
+//
+// The old blocked-row lane read 0.001914 / 0.001929, so the headline is ~13 % lower — but these two
+// fractions are NOT like-for-like, and the decomposition matters more than the headline. Measured:
+//
+//   lane                                  raster     fraction    changed px
+//   pre-#959 `nosign` on a blocked row    728×232    0.001914    323.3
+//   arrow on a blocked row (mutation)     728×232    0.001350    228.0
+//   arrow on a viable row (this lane)     728×188    0.001666    228.0
+//
+// The changed-pixel COUNT is identical across the last two rows, which decomposes the headline cleanly:
+// the glyph swap alone costs −29.5 % (this raster's `nosign` moves 323.3 px against the arrow's 228.0),
+// and the move to a shorter raster gives +23.4 % back because the denominator lost #955's cue line
+// (232 → 188 rows). Net −13 %. Read the fractions as fractions OF DIFFERENT FRAMES, not as one signal
+// weakening.
+//
+// That −29.5 % is NOT the ink-mass parity #959 rests on, and conflating the two would be easy: this is a
+// count of pixels a TINT STEP moves on a 2× raster at T=4, whereas #959's parity is an ink DENSITY on a
+// 1× capture (arrow 18.2 over 70 px = 0.260, `nosign` 19.5 over 82 px = 0.238 — the negation marginally
+// the quieter). Different quantities over different areas at different scales; neither measurement bears
+// on the other, and the fix's rationale rests only on the second.
+//
+// `chipOnlyFloor` was NOT lowered to suit. Its margin under the measurement narrows from ~1.9× to ~1.67×;
+// the floor-to-`unchangedCeiling` ratio is unchanged at 2× (0.001 / 0.0005 — that pair never moved), while
+// measurement-to-ceiling eases from 3.83× to 3.33×. Still a floor the signal clears and noise does not.
 //
 // Read the signals, because they are shaped differently and one threshold cannot serve them all naively:
 //
@@ -90,12 +120,31 @@
 //
 //   Mutation applied to Sources/                          | Which test reddens
 //   ------------------------------------------------------|--------------------------------------------
-//   chip `.armed` case → `.tertiary` (brighten deleted)    | chip-isolation ONLY
+//   chip `.armed` case → resting tint (brighten deleted)   | chip-isolation ONLY
 //   chip `.resting`/`.armed` tints SWAPPED (arming DIMS)   | chip-isolation ONLY, via its DIRECTION half
 //   `RowSwitchButtonStyle.wash` → 0 (wash deleted)         | whole-row arm ONLY
 //   `offersSwitch` drops `rowFitsSwitchAffordance`         | narrow-row mis-click guard
 //   row `ProgressView()` → `Color.clear` (spinner deleted) | in-flight render lane
 //   `isSwitching` / `isSwitchingToTarget` → `false`        | both in-flight tests
+//   `switchChipEmphasis` drops its `block == nil` guard    | blocked-row arm lane (#959), plus the two
+//     (i.e. the pre-#959 behaviour is restored)            |   verdict tests in `AccountSwapTests`
+//   active row's accent fill → `Color.clear`               | active-vs-blocked distinctness (#959)
+//
+// The `block == nil` row is #959's own falsifier and it was run, not reasoned about: reverting the guard
+// restores a chip to the blocked row, arming it moves the chip again (0.001350 / 0.001344, ~2.7× the
+// ceiling), and the lane that asserts "nothing moves" fails. A gate for an ABSENCE is worth exactly as
+// much as its demonstration that the PRESENCE would trip it — so the check is that the detector FAILS the
+// pre-fix code, not merely that it passes the fixed code. Row 1 was re-run after #959 re-homed the
+// chip-isolation lane, confirming it still catches a deleted brighten from its new row state and still
+// catches it ALONE (the whole-row arm test stays green).
+//
+// The LAST row is the falsifier for the distinctness gate, and it exists because the first version of that
+// test could not fail. It compared two renders of DIFFERENT heights (the blocked row carries #955's cue
+// line), and `diffFraction` returns a flat 1 on a size mismatch — so `delta > armFloor` was `1.0 > 0.20`,
+// a constant that would have stayed green with every row-level channel deleted. Cropping to the
+// overlapping region turned it back into a measurement: with the accent fill mutated away the common
+// region falls to 0.0844 / 0.0863, under the floor, and the test reddens. Against the uncropped version
+// the same mutation stayed green.
 //
 // Read the arm rows together, because they are the reason there are two arm tests rather than one, and
 // two assertions inside the chip one. Each is blind to the others' mutation:
@@ -110,8 +159,11 @@
 //     under a green suite, which is why the chip lane also asserts direction via `inkMass`. That
 //     predicate needs no threshold — the mutation only swaps which raster carries which label, so the
 //     two ink masses are the same pair either way and the comparison is a strict `>` over deterministic
-//     (`stableRender`-settled) values. Measured margins: 41.4885 vs 41.4039 light, 59.2353 vs 58.8083
-//     dark. Note `inkMass` sums ALPHA as well as RGB, and that is load-bearing rather than incidental —
+//     (`stableRender`-settled) values. Measured margins on the #959 lane: armed 36.1164 vs resting
+//     36.0771 light, 27.5343 vs 27.4091 dark (the pre-#959 blocked-row lane read 41.4885 vs 41.4039 and
+//     59.2353 vs 58.8083 — a different row state, so a different absolute mass; what the assertion reads
+//     is the sign of the difference, and that is unchanged).
+//     Note `inkMass` sums ALPHA as well as RGB, and that is load-bearing rather than incidental —
 //     see its own doc comment for the measured reason an RGB-only form (which is what
 //     `PanelRaster.inkCoverage` is) cannot see this step at all.
 //
@@ -122,6 +174,24 @@
 import AppKit
 import SwiftUI
 import XCTest
+
+extension PanelRaster {
+    /// The first `rows` raster rows, as a raster in its own right.
+    ///
+    /// Exists for ONE caller — the #959 active-vs-blocked comparison, whose two renders are legitimately
+    /// different heights (the blocked row carries #955's extra cue line). `PanelRaster.diffFraction`
+    /// returns a flat 1 for mismatched sizes, so comparing them uncropped would score a constant 1.0 and
+    /// pass any floor no matter what the pixels did. Cropping to the common region is what turns that
+    /// comparison back into a measurement; the size difference is asserted separately at the call site.
+    ///
+    /// Rows are whole `width * 4`-byte spans, so this is a prefix of `bytes` — no re-packing, and the
+    /// result stays in the same normalized RGBA layout every predicate in this file expects.
+    func firstRows(_ rows: Int) -> PanelRaster {
+        let clamped = max(0, min(rows, height))
+        return PanelRaster(width: width, height: clamped,
+                           bytes: Array(bytes.prefix(width * clamped * 4)))
+    }
+}
 
 @MainActor
 final class PanelInteractionStateTests: XCTestCase {
@@ -140,10 +210,18 @@ final class PanelInteractionStateTests: XCTestCase {
     /// antialiasing without ever tolerating a deleted arm treatment.
     private let armFloor = 0.20
 
-    /// The share the CHIP BRIGHTEN alone must move, measured on a blocked row where the wash is held out.
-    /// Measured 0.001914 (light) / 0.001929 (dark) — small because the chip is a 13 pt glyph in a 728×188
-    /// raster (its whole slot is only ~0.005 of the frame), so read it as "~39 % of the slot's ink moved",
-    /// not as a weak signal. ~1.9× margin under the measurement, 2× over `unchangedCeiling`.
+    /// The share the CHIP BRIGHTEN alone must move, measured on a row whose wash is held out by its `live`
+    /// guard (since #959, a viable row with a SIBLING swap in flight). Measured 0.001666 (light) /
+    /// 0.001659 (dark) — small because the chip is an 11 pt glyph in a 728×188 raster (its whole slot is only
+    /// ~0.005 of the frame), so read it as "about a third of the slot's ink moved", not as a weak signal.
+    /// ~1.67× margin under the measurement; the floor still sits 2× over `unchangedCeiling`, as it always
+    /// did (that pair did not move — what narrowed is measurement-to-ceiling, 3.83× → 3.33×).
+    ///
+    /// The floor is UNCHANGED across #959 even though the headline fraction fell ~13 % — a drop that is
+    /// mostly a DENOMINATOR change, not a weaker signal (see the header's decomposition: the changed-pixel
+    /// count is identical to arrow-on-a-blocked-row; the new lane's raster is simply 188 rows rather than
+    /// 232). Lowering a floor to preserve a margin would buy back the appearance of headroom while
+    /// weakening the gate — the honest record is a narrower margin over the same floor, which it clears.
     private let chipOnlyFloor = 0.001
 
     /// The share the IN-FLIGHT change must move. A separate, much smaller floor because the spinner is a
@@ -151,6 +229,17 @@ final class PanelInteractionStateTests: XCTestCase {
     /// `armFloor` here would demand the spinner repaint a fifth of the row, which is not what it does or
     /// should do. Measured a flat 0.007482 at every threshold; this floor keeps a ~1.9× margin under it.
     private let inFlightFloor = 0.004
+
+    /// The share that must separate the ACTIVE row from a BLOCKED one over their overlapping region
+    /// (issue #959) — the risk that arrives once neither carries a chip. Measured 0.9608 (light) /
+    /// 0.9653 (dark); mutating the accent row fill to `Color.clear` drops it to 0.0844 / 0.0863, which is
+    /// what proves the floor sits between a healthy row-identity encoding and a collapsed one.
+    ///
+    /// Numerically equal to `armFloor` and deliberately NOT the same constant — the two gates are
+    /// calibrated to different measurements (0.93 vs 0.96) and answer different questions, so re-tuning
+    /// the arm treatment's floor must not silently move this one. Same reasoning `unchangedCeiling` gives
+    /// below for staying separate from the floors.
+    private let rowIdentityFloor = 0.20
 
     /// The ceiling the CANARY (a resting-vs-resting pair — what a deleted arm treatment renders) and the
     /// LIVENESS control (arming a non-target row) must both stay under. Both measure exactly 0.000000, so
@@ -172,6 +261,16 @@ final class PanelInteractionStateTests: XCTestCase {
                    isRecovering: false, auth: .healthy, sessionPct: 31, weeklyPct: 71,
                    sessionResetsAt: Self.now + 3_600, weeklyResetsAt: Self.now + 3 * 86_400,
                    weeklyExhausted: false, isNextSwapTarget: false, blindActive: nil)
+    }
+
+    /// A swap in flight targeting a DIFFERENT account than the row under test.
+    ///
+    /// This is the wash-held-out seam the chip-isolation lane runs on since issue #959 (see that test for
+    /// why it is no longer a blocked row). The target must not be `"Personal"` — the row `account()`
+    /// builds — or `isSwitching` becomes true and the slot renders the `Switching…` spinner instead of the
+    /// chip, which is a different lane entirely (`testTheInFlightRowRendersDifferentlyFromTheRestingRow`).
+    private static func siblingSwapInFlight() -> AccountSwapModel {
+        .pendingPreview(target: "Temp")
     }
 
     /// One roster row, wired through the same environment seam the panel uses. `switchState` and
@@ -227,6 +326,10 @@ final class PanelInteractionStateTests: XCTestCase {
     /// through — the arm lanes, the in-flight lane and the liveness control alike. Single-sourced
     /// deliberately, because a canary that exercises a parallel copy of the comparison proves nothing
     /// about the comparison the real assertion uses.
+    ///
+    /// Callers must hand it SAME-SIZED rasters. `diffFraction` returns a flat 1 on a size mismatch, which
+    /// silently satisfies any `> floor` assertion — see `firstRows` for the one comparison here that comes
+    /// from differently-sized renders and has to crop before it can measure anything.
     private func pixelDelta(_ a: PanelRaster, _ b: PanelRaster) -> Double {
         PanelRaster.diffFraction(a, b, channelThreshold: deltaChannelThreshold)
     }
@@ -340,25 +443,35 @@ final class PanelInteractionStateTests: XCTestCase {
     /// (`--text-3` → `--text-2`, naming those exact SwiftUI roles); the wash is a native interaction
     /// treatment the static mock has no state for at all.
     ///
-    /// Isolated without cropping to a hardcoded rect (which would rot on any layout change): a BLOCKED row
-    /// is not `live`, so `RowSwitchButtonStyle.wash` is 0 whatever the hover state, while `offersSwitch`
-    /// stays true so the chip still resolves through `switchChipEmphasis`. Arming one therefore moves the
-    /// chip and nothing else — the same production code path, a different row state.
+    /// Isolated without cropping to a hardcoded rect (which would rot on any layout change): a row whose
+    /// `live` guard is off has `RowSwitchButtonStyle.wash == 0` whatever the hover state, while
+    /// `offersSwitch` stays true so the chip still resolves through `switchChipEmphasis`. Arming one
+    /// therefore moves the chip and nothing else — the same production code path, a different row state.
+    ///
+    /// WHICH non-live row, and why it changed (issue #959). This lane used to use a BLOCKED row. That row no
+    /// longer has a chip at all — #959 removed it, because the chip and its own negation were at ink-mass
+    /// parity in the same slot and could not be told apart at rest — so arming one now moves nothing and
+    /// this lane would measure 0 against its own floor. The substitute is a VIABLE row with a SIBLING swap
+    /// in flight: `isLiveSwitch` is false (`swap.phase.isPending`), so the wash is held out identically,
+    /// while `blockReason == nil` and `isSwitching == false` keep the chip present and armable. Both rows
+    /// are equally `.disabled()`, so the only thing that differs between the two frames is still the chip.
+    /// The isolation property is unchanged; only the row state that produces it moved.
     func testTheChipBrightenIsMeasurableWithTheRowWashHeldOut() throws {
-        let blocked = StatusPanelFormat.RowSwitchState.blocked(.weeklyExhausted)
         var checked = 0
         for scheme in [ColorScheme.light, .dark] {
-            let resting = try stableRender(rowView(armed: false, switchState: blocked, scheme: scheme))
-            let armed = try stableRender(rowView(armed: true, switchState: blocked, scheme: scheme))
+            let resting = try stableRender(rowView(armed: false, swap: Self.siblingSwapInFlight(),
+                                                   scheme: scheme))
+            let armed = try stableRender(rowView(armed: true, swap: Self.siblingSwapInFlight(),
+                                                 scheme: scheme))
 
             // MAGNITUDE — something moved.
             let delta = pixelDelta(resting, armed)
             XCTAssertGreaterThan(delta, chipOnlyFloor, """
                 the switch chip does not visibly brighten when armed in \(scheme) (\(delta), floor \
-                \(chipOnlyFloor)). Measured on a BLOCKED row, where the row wash is held out by its own \
-                `live` guard — so this is the chip step alone, and it is the half `menubar-preview.html` \
-                ratifies (--text-3 at rest → --text-2 armed). The whole-row test cannot see this: the \
-                wash dominates it ~500:1
+                \(chipOnlyFloor)). Measured on a row whose wash is held out by its own `live` guard (a \
+                SIBLING swap is in flight) — so this is the chip step alone, and it is the half \
+                `menubar-preview.html` ratifies (--text-3 at rest → --text-2 armed). The whole-row test \
+                cannot see this: the wash dominates it ~500:1
                 """)
 
             // DIRECTION — it moved the RIGHT WAY. Magnitude alone passes identically on the inverse, and
@@ -386,9 +499,10 @@ final class PanelInteractionStateTests: XCTestCase {
     /// equal. Two RESTING renders must therefore come out EXACTLY equal — same bytes, same mass — which
     /// both proves the measure is deterministic and pins the floor the directional claim stands on.
     func testTheDirectionPredicateReportsNoIncreaseBetweenTwoIdenticalRenders() throws {
-        let blocked = StatusPanelFormat.RowSwitchState.blocked(.weeklyExhausted)
-        let resting = try stableRender(rowView(armed: false, switchState: blocked))
-        let restingAgain = try stableRender(rowView(armed: false, switchState: blocked))
+        // The SAME row state the direction assertion above runs on (#959 moved it off a blocked row) — a
+        // canary that exercised a different lane would prove nothing about the lane that carries the claim.
+        let resting = try stableRender(rowView(armed: false, swap: Self.siblingSwapInFlight()))
+        let restingAgain = try stableRender(rowView(armed: false, swap: Self.siblingSwapInFlight()))
 
         XCTAssertEqual(inkMass(resting, on: .light), inkMass(restingAgain, on: .light), accuracy: 0.0, """
             two identical resting renders report different ink mass — the direction predicate is \
@@ -435,6 +549,118 @@ final class PanelInteractionStateTests: XCTestCase {
             clicked now reads as pressable) or the measurement is picking up render nondeterminism, which \
             would make the arm floor unattributable
             """)
+    }
+
+    // MARK: - #959: the blocked row's EMPTY chip slot
+
+    /// Issue #959: a wire-BLOCKED row carries NO chip, so arming one must move nothing.
+    ///
+    /// This is the exact INVERSION of what this suite asserted before #959 — the chip-isolation lane above
+    /// used to run on a blocked row precisely because arming it moved the chip and only the chip, and it
+    /// measured 0.0019 (~4× the ceiling asserted here). So this is not a vacuous "nothing happened" claim:
+    /// the same predicate, on the same row state, scored decisively ABOVE this ceiling until the chip was
+    /// removed, which is what makes the null result evidence.
+    ///
+    /// What it does and does not prove. It proves the blocked row has no ARMABLE chip; it does not by
+    /// itself prove the slot is empty of ink — a chip pinned at one FIXED tint would also not brighten.
+    /// What closes that is the pure verdict: `.hidden` maps to `Color.clear` and reaches no tint case at
+    /// all, and the verdict is unit-asserted (`AccountSwapTests.testAWireBlockedTargetRendersNoChipAtAll`),
+    /// so given the verdict the absence follows by construction rather than by measurement. Nor is a
+    /// globally-dead chip an escape: the isolation lane above proves the chip still brightens where it
+    /// does exist, so both cannot be green at once.
+    ///
+    /// The committed `panel-blind-cornered-{light,dark}` goldens RECORD the empty slot but do not GATE it,
+    /// and the difference is worth stating rather than blurring: removing both blocked rows' chips scores
+    /// 0.000502 against the drift gate's 0.002 ceiling — 4× UNDER it — because two 23×23 px regions in a
+    /// 760×922 frame is a smaller change than that gate is tuned to see. The comparison is also env-gated
+    /// off in the required `swift` job and runs only in the non-required, `continue-on-error`
+    /// `panel-goldens` job. Treat those PNGs as the human-readable record of what shipped, never as the
+    /// thing that would catch a regression here.
+    func testArmingABlockedRowMovesNothingBecauseItHasNoChip() throws {
+        let blocked = StatusPanelFormat.RowSwitchState.blocked(.weeklyExhausted)
+        var checked = 0
+        for scheme in [ColorScheme.light, .dark] {
+            let resting = try stableRender(rowView(armed: false, switchState: blocked, scheme: scheme))
+            let armed = try stableRender(rowView(armed: true, switchState: blocked, scheme: scheme))
+
+            let delta = pixelDelta(resting, armed)
+            XCTAssertLessThan(delta, unchangedCeiling, """
+                arming a BLOCKED row moved \(delta) of its pixels in \(scheme) (ceiling \
+                \(unchangedCeiling)) — since #959 a blocked row has no chip to brighten and its wash is \
+                held out by the `live` guard, so nothing should arm. Either the chip came back (the \
+                affordance and its own negation are interchangeable at rest again) or the wash escaped its \
+                guard
+                """)
+            checked += 1
+        }
+        XCTAssertEqual(checked, 2, "expected 2 (light + dark) blocked-row arm checks, ran \(checked)")
+    }
+
+    /// The risk #959 introduces, measured rather than argued: the ACTIVE row and a BLOCKED row now BOTH
+    /// render an empty trailing slot, so the chip axis can no longer distinguish them. They must still be
+    /// distinguishable. The row-level encoding has two halves — a FILLED leading dot against a ring (a
+    /// SHAPE cue, which is what makes the active row legible under monochrome and colour-vision
+    /// deficiency) plus the accent row fill — while the blocked row carries #955's persistent reason line
+    /// and `.disabled()` dimming.
+    ///
+    /// WHAT THIS TEST CAN AND CANNOT SEE, because the failure message has to send the next reader
+    /// somewhere true. It measures AGGREGATE separation, and at that scale the accent fill is essentially
+    /// the whole signal: `StatusDot` is 8 pt wide inside a 14 pt halo, so at `scale = 2` the dot occupies
+    /// at most 28×28 px of a 728×188 frame — ≤ 0.0057, against a 0.20 floor ~35× coarser. The mutation
+    /// confirms it from the other side: deleting the accent fill ALONE drops the measurement from 0.9608
+    /// to 0.0844. So a dot-only regression cannot move this number, and the message must not send anyone
+    /// hunting for one.
+    ///
+    /// The dot's fill-vs-ring cue has no dedicated pixel assertion anywhere — it is a structural property
+    /// of `StatusDot` (`fill(isActive ? .panelAccent : .clear)` over `strokeBorder(lineWidth: isActive ?
+    /// 0 : 1.5)`) and is captured, not gated, by the panel goldens. Stated rather than papered over: #959
+    /// leans on that cue in its rationale, so the honest record is that this test does not carry it.
+    ///
+    /// THE SIZE SHORT-CIRCUIT, and why this test asserts two things rather than one. The two rows do not
+    /// rasterize to the same height — the blocked one is taller because #955's cue line is a whole extra
+    /// line (728×232 against the active row's 728×188). `PanelRaster.diffFraction` returns a flat 1 for
+    /// mismatched sizes ("the size itself is asserted separately", per its own doc comment), so a single
+    /// `pixelDelta(active, blocked) > armFloor` here would reduce to `1.0 > 0.20` — TRUE for any two
+    /// differently-sized rasters, and true even if every other channel had collapsed. That gate would be a
+    /// constant wearing a measurement's clothes, so:
+    ///
+    ///   1. the HEIGHT difference is asserted DIRECTLY, as the real signal it is (the cue line, #959's own
+    ///      precondition — if it vanished, the rows would become the same height and this would catch it);
+    ///   2. the overlapping region is then compared on its own, so distinctness does not rest on height
+    ///      alone. Measured 0.9608 light / 0.9653 dark — the active row's tint fill repaints nearly all of
+    ///      it — so the ARM floor is the honest bar: a separation failing to clear it would mean the
+    ///      row-level encoding had collapsed, not merely dimmed.
+    ///
+    /// `AccountSwapTests` carries the enum-level half; this is the pixel half.
+    func testTheActiveAndBlockedRowsStayVisiblyDistinctThoughNeitherCarriesAChip() throws {
+        var checked = 0
+        for scheme in [ColorScheme.light, .dark] {
+            let active = try stableRender(rowView(switchState: .notATarget, isActive: true, scheme: scheme))
+            let blocked = try stableRender(rowView(switchState: .blocked(.weeklyExhausted), scheme: scheme))
+
+            // 1. The size channel, asserted rather than relied on implicitly.
+            XCTAssertEqual(active.width, blocked.width, "the two rows are laid out at the same width")
+            XCTAssertGreaterThan(blocked.height, active.height, """
+                the BLOCKED row (\(blocked.height)px) is no taller than the ACTIVE one (\(active.height)px) \
+                in \(scheme) — #955's persistent reason line is what makes #959 safe to ship, so if it \
+                stopped occupying its own line the blocked row lost the explanation that replaced its chip
+                """)
+
+            // 2. The overlapping region, so the verdict does not rest on the height difference alone.
+            let common = min(active.height, blocked.height)
+            let delta = pixelDelta(active.firstRows(common), blocked.firstRows(common))
+            XCTAssertGreaterThan(delta, rowIdentityFloor, """
+                over their overlapping \(common) rows the ACTIVE and BLOCKED rows differ by only \(delta) \
+                in \(scheme) (floor \(rowIdentityFloor)). Neither carries a chip since #959, so if the \
+                row-level encoding has collapsed too, the two states are no longer tellable apart. At this \
+                scale the channel to check is the ACCENT ROW FILL — the leading dot is ≤0.0057 of the \
+                frame and cannot move this number either way. The fix is NOT a new blocked-row marker \
+                (#959 rejected that: five of six rows carry a mark, so an added element pays its cost five \
+                times)
+                """)
+            checked += 1
+        }
+        XCTAssertEqual(checked, 2, "expected 2 (light + dark) active-vs-blocked comparisons, ran \(checked)")
     }
 
     // MARK: - AC-3: the mis-click guard, at the INTERACTION layer, at NARROW widths specifically
