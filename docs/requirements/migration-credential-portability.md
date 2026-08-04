@@ -230,13 +230,21 @@ edge, or of the fact that nothing measures the artifact's freshness before trave
 > play**, and their labels overlap — `I1`, `I2` and `M1` each exist in both. They are therefore
 > qualified by namespace:
 >
-> - **`scope-membership B/first-pass`** — the 2026-08-04 first pass that produced R-1 … R-8 and
+> - **`scope-membership B/first-pass`** — the 2026-08-04 first pass, which opened R-1 … R-8 and
 >   issues #999–#1007.
 > - **`scope-membership B/amendment`** — the 2026-08-04 amendment (this one), a 22-item selection
->   that produced R-9 … R-16 and issues #1045–#1053.
+>   that added R-9 … R-16 and issues #1045–#1053.
 >
 > Without the qualifier a provenance audit cannot tell which selection a label indexes — the labels
 > were never a single namespace, and the earlier unqualified form implied they were.
+>
+> **The namespace is not a number range, and reading it as one misattributes three requirements.**
+> *Corrected 2026-08-04.* The qualifier records the selection a requirement was **ratified under**,
+> which is not always the one that opened its number. **R-1a, R-3 and R-7 carry `B/amendment`
+> despite sitting in the first pass's numeric range**, because the amendment re-opened them — most
+> visibly R-3, whose original demand for a documented config-merge policy the amendment *replaced*
+> with scope selection plus a portability allowlist. Read each requirement's own `Ratification:`
+> line; do not infer provenance from where its number falls.
 
 ### MigrationArtifact
 
@@ -318,7 +326,7 @@ silently. `Origin: AI-inferred-expansion`.
 
 **R-6a** — *Where* a duplicate-label roster exists, the system **shall** handle it **consistently**
 across **all three** label-resolving commands. It does not today: `use <label>` refuses with
-`Error::UseTargetAmbiguous` (`src/use_account.rs:450`, exit code 6 per `src/error.rs:955`), while
+`Error::UseTargetAmbiguous` (`src/use_account.rs:453`, exit code 6 per `src/error.rs:955`), while
 `apply_enabled` backing `enable`/`disable` silently resolves to the earliest entry
 (`src/cli.rs:5150-5163`). Which behaviour is correct is a decision, not a design.
 `Origin: AI-inferred-expansion`.
@@ -358,6 +366,14 @@ a declared scope is attacker-controlled: a hostile artifact would assert full sc
 would evaporate. The operator's flag is a **ceiling, never a floor** — `import --accounts` against an
 artifact containing config ignores that config regardless of what the artifact claims.
 `Origin: council-added` (3/3 convergent). `Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item E5)`.
+
+> **The two presence tests are not symmetric.** `accounts` empty is export-reachable (the config-only
+> artifact); `config_toml` empty is **not** — `export` writes `config.render()` unconditionally
+> (`src/cli.rs:4532`) and `render()` always emits `[tunables]` (`src/config/render.rs:370`), and AD-5
+> deliberately gives `export` no narrowing flag. A roster-only artifact is therefore hand-constructed
+> or third-party, never self-minted; `docs/specs/import-scope-selection.feature.md` § `--settings` on
+> a roster-only artifact records what the Cap-7.6 test must build. This does **not** trip R-9's
+> circuit breaker: scope is still derived from presence and no declared field is required.
 
 **R-9b** — *Where* `--accounts` is selected, the config **shall** be **narrow-parsed** — deserialized
 into a struct carrying only `account` — rather than fully parsed and then filtered. This is not an
@@ -801,10 +817,26 @@ by symbol against `HEAD` on 2026-08-04 before this document was committed.
 > This paragraph previously read *"Every claim below was re-verified against the working tree … not
 > carried from session memory."* The **claims** were verified and all of them held. The **line
 > numbers** were not: commit `d1c5f30` (`(feat) cli: advance to the next account in the swap chain`,
-> +228/−35 to `src/cli.rs`) landed hours before this document, shifting every citation in the
-> 4400–5300 band by **+52** and above 10600 by **+97**. Of ~17 distinct `src/cli.rs` citations exactly
-> one still resolved. An implementer following `src/cli.rs:4549-4611` for `import` would have landed
-> in `write_export`.
+> +228/−35 to `src/cli.rs`) landed hours before this document and shifted nearly every citation. Of
+> the 21 distinct `src/cli.rs` citations in this file exactly one still resolved. An implementer
+> following `src/cli.rs:4549-4611` for `import` would have landed in `write_export`.
+>
+> **The shift is a cumulative step function, not a two-band rule** — and the earlier attempt to state
+> it as one is what let a second round of stale citations survive. `d1c5f30`'s eight hunks on
+> `src/cli.rs`, with the running shift applied to every *old* line above each:
+>
+> | hunk @ old line | 108 | 503 | 514 | 818 | 1081 | 2873 | 8226 | 11507 |
+> |---|---|---|---|---|---|---|---|---|
+> | shift above it | +7 | +12 | +30 | +34 | +38 | **+52** | **+97** | +193 |
+>
+> The superseded wording said "+52 in the 4400–5300 band and **+97 above 10600**". The +52 band was
+> right by accident; the +97 boundary was wrong at **both** ends — it begins at 8226, not 10600, and
+> ends at 11507, above which the shift is +193. That mis-stated floor is the direct cause of the
+> second residue round: citations at 10180–10566 sit *below* the claimed 10600 threshold, so the
+> stated rule marked them exempt and they were left alone, when in fact they were in the +97 band and
+> all six were stale. **A rule of thumb about a diff is not the diff.** The durable fix is not a
+> better rule — it is not citing lines at all where a symbol will do: the seven-test row in the table
+> below now names its tests, which no rebase can invalidate.
 >
 > Three citations were not merely offset but pointed at unrelated code that reads plausibly:
 > `resolve_target` was cited to `src/cli.rs:438-455` (that is `parse_config`; the function lives in
@@ -827,9 +859,9 @@ by symbol against `HEAD` on 2026-08-04 before this document was committed.
 | Conflict match is uuid-only | `src/cli.rs:4771-4774` |
 | Whole-config merge is acknowledged future work | `src/cli.rs:4737-4741` (verbatim in-code comment) |
 | Labels are non-unique by design | `src/cli.rs:5148-5149` |
-| `use` refuses on ambiguity; `enable`/`disable` take first | `src/use_account.rs:450`; `src/error.rs:955` (exit 6); `src/cli.rs:5150-5163` |
+| `use` refuses on ambiguity; `enable`/`disable` take first | `src/use_account.rs:453`; `src/error.rs:955` (exit 6); `src/cli.rs:5150-5163` |
 | `Payload` has no timestamp; `FORMAT_VERSION = 1` | `src/migration.rs:200-232`; `src/migration.rs:97` |
-| Existing migration test coverage (7 tests) | `src/cli.rs:10201, 10180, 10217, 10357, 10522, 10566, 10636` |
+| Existing migration test coverage (7 tests, all in `src/cli.rs`) | `export_encrypted_round_trips_gathered_state_and_hides_it`, `export_no_secrets_omits_every_credential_blob`, `export_plaintext_round_trips_and_carries_secrets_in_the_clear`, `import_round_trips_an_encrypted_export_and_restores_every_account_byte_faithfully`, `a_config_only_artifact_imports_accounts_as_roster_entries_without_a_stash`, `the_import_report_names_labels_only_never_a_token_or_email`, `the_migration_conflict_policy_default_drives_import_behaviour` |
 | Conflict test's target is a clone of the source | `src/cli.rs:10741` |
 
 **Added 2026-08-04 — every row's claim verified against the working tree during this amendment (not

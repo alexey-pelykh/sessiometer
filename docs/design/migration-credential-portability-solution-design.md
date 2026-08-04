@@ -384,16 +384,16 @@ the full-artifact case needs the same treatment deliberately.
 | `docs/findings/0262-*.md` | new | R-1, R-1a |
 | `docs/*` runbook + command help | new | R-8 |
 
-*Rows below added 2026-08-04 — the amendment's 17 requirements (R-9 … R-16) had no building-block
+*Rows below added 2026-08-04 — the amendment's 21 requirements (R-9 … R-16, counting sub-letters) had no building-block
 rows, including the entire security core:*
 
 | Block | Change | Requirements |
 |---|---|---|
 | `src/cli.rs::parse_import` | accept `--accounts` / `--settings`; default (neither) is byte-identical to today | R-9, R-9c, R-9d |
 | `src/cli.rs::import` | narrow-parse under `--accounts`; "artifact contains no configuration" notice under `--settings` against a roster-only artifact; `--shred` | R-9a, R-9b, R-12 |
-| `src/cli.rs::apply_import` | apply the portability allowlist before adopting any non-roster value; emit a refusal line per refused key | R-11, R-11a … R-11c, R-11f |
-| **new** `src/config.rs::portability` | the allowlist itself (non-portable by default) + the `kdf_*` monotonic-floor comparator + the compile-time rot-guard that fails when a new `Config` key carries no classification | R-11, R-11b, R-11e |
-| `src/cli.rs::parse_export` | **remove** `--no-secrets`; strict-usage error naming the replacement | R-10, R-10a |
+| `src/cli.rs::apply_import` | apply the portability allowlist before adopting any non-roster value; emit a refusal line per refused key | R-11, R-11a … R-11c, R-11e |
+| **new** `src/config.rs::portability` | the allowlist itself (non-portable by default) + the `kdf_*` monotonic-floor comparator + the compile-time rot-guard that fails when a new `Config` key carries no classification | R-11, R-11b, R-11d |
+| `src/cli.rs::parse_export` | **remove** `--no-secrets`; strict-usage error naming the replacement | R-10 (form is OQ-4-gated) |
 | `src/cli.rs::export` | daemon-liveness probe via `daemon_liveness()` (`src/cli.rs:1885`) before writing | R-13 |
 | `src/migration.rs` | `PLAINTEXT_WARNING` wording (`src/migration.rs:538`); `[credential]` forward-tolerance + version-floor message | R-10b, R-16 |
 | `src/observability.rs` | sha256 artifact digest + applied scope on the export/import events; allowlist-refusal signal | R-14, R-14a |
@@ -403,7 +403,7 @@ rows, including the entire security core:*
 
 > **Correction 2026-08-04.** This line previously also listed `src/migration.rs` as untouched, on the
 > C-1 "no format change" rationale. C-1 still holds — `FORMAT_VERSION` does not move — but R-10b,
-> AC-10 and Cap-9.2 require `PLAINTEXT_WARNING`'s **wording** to change, and R-16 adds
+> AC-10 and Cap-7.8 require `PLAINTEXT_WARNING`'s **wording** to change, and R-16 adds
 > forward-tolerance for the `[credential]` block. Those are edits to `src/migration.rs` that are not
 > format changes. "No format change" and "file untouched" are different claims, and only the first
 > one was ever true.
@@ -416,7 +416,7 @@ SOURCE (A)                                   TARGET (B)
   export
    ├─ PROBES daemon liveness; REFUSES/WARNS if still live      (R-13)
    ├─ WARNS on --plaintext (reworded)                          (R-10b)
-   ├─ no --no-secrets flag — removed, strict-usage error       (R-10, R-10a)
+   ├─ no --no-secrets flag — removed, strict-usage error       (R-10; OQ-4)
    └─ LOGS sha256 digest + scope                               (R-14)
          │
       artifact ──────────────────────►  import [--accounts | --settings] [--shred]
@@ -427,7 +427,7 @@ SOURCE (A)                                   TARGET (B)
                                           │     claude_bin      ─► REFUSED, no flag overrides  (R-11a)
                                           │     kdf_*           ─► adopt iff incoming >= local (R-11b)
                                           │     conflict_policy ─► machine-bound, not adopted  (R-11c)
-                                          │     each refusal REPORTED on stdout                (R-11f)
+                                          │     each refusal REPORTED on stdout                (R-11e)
                                           ├─ writes stashes + roster
                                           ├─ WARNS: source must not refresh after export       (R-4)
                                           ├─ WARNS: duplicate label created, if any            (R-6)
@@ -501,7 +501,7 @@ one `use` already performs.
 | Cap-7.4 | A roster-only artifact round-trips through narrow-parse, incl. under an unknown block | unit | R-9b, R-16 |
 | Cap-7.5 | `export` exposes no config/roster narrowing flag | unit (usage assertion) | R-9c |
 | Cap-7.6 | `import --settings` on a roster-only artifact reports "no configuration", not an error | unit | R-9 |
-| Cap-7.7 | `export --no-secrets` exits with a **strict-usage error that names the replacement** — asserted on both halves: non-zero exit AND the replacement named. Explicitly asserts the flag is **not** silently accepted-and-ignored | unit (usage assertion) | R-10, R-10a |
+| Cap-7.7 | `export --no-secrets` exits with a **strict-usage error that names the replacement** — asserted on both halves: non-zero exit AND the replacement named. Explicitly asserts the flag is **not** silently accepted-and-ignored | unit (usage assertion) | R-10 (**not** R-10a — see note) |
 | Cap-7.8 | `PLAINTEXT_WARNING` reflects that **every** artifact now carries credentials, and advises no deletion the tool provides no mechanism for | unit (text assertion) | R-10b |
 | Cap-8.1 | `[refresh].claude_bin` from an artifact is **never** written to the target config, even with `--settings` | integration | R-11a |
 | Cap-8.2 | A weaker incoming `kdf_*` is refused; a stronger one is accepted | unit | R-11b |
@@ -649,6 +649,7 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
 | R-9c | 4.7 / AD-5 | Cap-7.5 | covered |
 | R-9d | 4.7 / AD-10 | — (naming; asserted by Cap-7.1's flag surface) | covered |
 | R-10 | 4.7 | Cap-7.7 | covered — **corrected 2026-08-04**: was Cap-7.5, which asserts only that `export` grows no *scope* flag (R-9c) and never reaches `--no-secrets`. R-10 is the scope's only breaking CLI change; it needs its own capability |
+| | | | > **Cap-7.7 covers R-10 only, and presumes OQ-4 resolves to hard-remove.** *Corrected 2026-08-04 (second pass).* Cap-7.7 previously also claimed R-10a, contradicting this table's own R-10a row and § 16b, which both record R-10a as decision-gated with no capability. R-10 (*the flag goes away*) is decided and assertable now; R-10a (*by which path* — hard-remove vs deprecate-then-remove) is **not**, and a capability cannot assert an undecided requirement. Cap-7.7's strict-usage-error form is the hard-remove branch: **if OQ-4 resolves to deprecate-then-remove, Cap-7.7 must be re-derived** to assert a deprecation warning and a zero exit for at least one release. Do not implement Cap-7.7 as written until OQ-4 is closed. |
 | R-10a | — | — | **decision-gated** (OQ-4) |
 | R-10b | 4.9 | Cap-7.8 | covered — **corrected 2026-08-04**: was Cap-9.2, which asserts the *shred* help text makes no secure-erase claim (R-12). Adjacent wording concern, different string |
 | R-11 | 4.8 / AD-7 | Cap-8.1 … Cap-8.5 | covered |
@@ -668,7 +669,7 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
 ## 16b. Backward-Coverage Matrix
 
 Every capability traces to a requirement: Cap-1.x→R-2/R-2a/AC-2a, Cap-2.x→R-4/R-4a, Cap-3.x→R-6/R-6a,
-Cap-4.1→R-5, Cap-5.1→R-7, Cap-6.1→C-3, Cap-7.1-7.6→R-9/R-9a-d, **Cap-7.7→R-10/R-10a**,
+Cap-4.1→R-5, Cap-5.1→R-7, Cap-6.1→C-3, Cap-7.1-7.6→R-9/R-9a-d, **Cap-7.7→R-10**,
 **Cap-7.8→R-10b**, Cap-8.x→R-11/R-11a-e, Cap-9.x→R-12, Cap-10.x→R-13/R-14/R-14a,
 Cap-11.x→R-15/R-16. **No orphan capabilities.**
 
@@ -694,6 +695,14 @@ their absence from the Cap-list does not read as a coverage gap:
 | R-11f | a document (the portability ADR) | — |
 
 **R-10a** has neither, because it is undecided (OQ-4).
+
+> **One capability has no spec scenario: Cap-7.7** — 28 of the 29 are pinned by a scenario in
+> `docs/specs/`. This one is left unpinned **deliberately**, because its assertion is the hard-remove
+> branch of the still-open OQ-4 (see the R-10 row in § 16). Writing the scenario now would pin the
+> undecided outcome in the place a test author reads first. Close OQ-4, then add it to
+> `docs/specs/artifact-lifetime.feature.md`, which already carries R-10b. *Recorded 2026-08-04 — a
+> gap named is not a gap fixed; this one is deferred on purpose and the reason is the decision, not
+> the effort.*
 
 > **Corrected 2026-08-04 — this paragraph said "two", and the miscount hid a real gap.** It named
 > R-11f and R-9d only, omitting R-1/R-1a, R-5a and — the one that matters — **R-8**. R-8 is the
@@ -734,7 +743,7 @@ their absence from the Cap-list does not read as a coverage gap:
    `use --force <label>`, and **§ 4.1 has been re-derived against the correction** — including its
    option table and the `--activate` sugar, which inherits the same requirement.
 
-   > **The correction initially reached § 4.1 only — swept repo-wide 2026-08-04.** Four downstream
+   > **The correction initially reached § 4.1 only — swept repo-wide 2026-08-04.** Six downstream
    > surfaces still carried the falsified unqualified form after § 4.1 was fixed, and the most
    > damaging was **Cap-1.1**, the sole capability gating R-2: it asserted the report "names `use`",
    > which a verbatim implementation satisfies with the no-op form. The gating test encoded the very
@@ -742,5 +751,7 @@ their absence from the Cap-list does not read as a coverage gap:
    > arrows, and two scenarios in `docs/specs/import-credential-adoption.feature.md` (one asserted
    > only that *some* command was named; the other dropped the currently-active precondition without
    > which the scenario passes trivially on a parked account). Cap-1.1 now asserts on the `--force`
-   > token specifically. **A correction applied at the site that raised it is not a correction —
+   > token specifically. A **seventh** site sat outside this document — the PRD's R-8 runbook, the
+   > most dangerous of all because it is operator-facing with no capability gating it (PRD § 9).
+   > **A correction applied at the site that raised it is not a correction —
    > the claim has to be swept, not the named site.**

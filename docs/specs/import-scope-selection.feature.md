@@ -64,3 +64,17 @@ floor**.
     When the operator runs `import --settings`
     Then the command reports that the artifact contains no configuration
     But does not fail, and does not silently do nothing
+
+> **Where a roster-only artifact comes from — `export` cannot mint one.** `export` writes
+> `config.render()` unconditionally (`src/cli.rs:4532`) and `render()` always emits at least
+> `[tunables]` (`src/config/render.rs:370`), so `config_toml` is never empty on an artifact this
+> product produced — and AD-5 keeps it that way by giving `export` no narrowing flag (scenario
+> above). The precondition is therefore reachable only from a **hand-constructed `Payload`** (which
+> is what the Cap-7.6 unit test must build), or from a third-party or future producer. State that in
+> the test; do not try to reach it through `export`, and do not "fix" the un-emptiable `config_toml`.
+>
+> This is an asymmetry in R-9a's presence rule, not a defect in it: the `accounts`-empty half **is**
+> export-reachable (`a_config_only_artifact_imports_accounts_as_roster_entries_without_a_stash`
+> covers it), and R-9's circuit breaker — *stop if scope needs a declared field* — stays untripped,
+> because nothing here requires the artifact to declare anything. The operator's flag remains a
+> ceiling, never a floor.

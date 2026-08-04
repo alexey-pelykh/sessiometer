@@ -49,6 +49,6 @@ command must agree on whether it resolves.
     And the operator invokes disable with L
     Then all three agree on whether L is resolvable
 
-    # Today they do NOT: use refuses with UseTargetAmbiguous (exit 6, src/use_account.rs:450) while
+    # Today they do NOT: use refuses with UseTargetAmbiguous (exit 6, src/use_account.rs:453) while
     # apply_enabled silently takes the earliest entry (src/cli.rs:5150-5163). Which one is correct
     # is open question OQ-1 and is not settled by this spec.

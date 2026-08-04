@@ -38,7 +38,7 @@ pure credential file — so the gap widens rather than narrows.
     # On APFS, overwrite-in-place does not reliably destroy the prior extent. Claiming erasure we do
     # not deliver is the same false-assurance failure AD-2 declines for staleness.
 
-## Scenario: the plaintext warning matches what the tool can do  · Cap-9.2
+## Scenario: the plaintext warning matches what the tool can do  · Cap-7.8
 
     Given `--no-secrets` has been removed, so every artifact carries credentials
     When PLAINTEXT_WARNING is read
