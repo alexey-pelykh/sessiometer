@@ -323,25 +323,94 @@ final class AccountSwapTests: XCTestCase {
 
     // MARK: - StatusPanelFormat: the persistent swap chip (issue #448 — visible at rest, brightens when armed)
 
-    // The chip is HIDDEN only where the row is not a switch target at all (the active row, a dropped
-    // connection): `offersSwitch: false` → `.hidden`, whatever the hover state.
+    // The chip is HIDDEN wherever the row does not offer a switch: `offersSwitch: false` → `.hidden`,
+    // whatever the hover state and whatever the block.
+    //
+    // The block half is not a throwaway case. `offersSwitch` is `switchState != .notATarget &&
+    // rowFitsSwitchAffordance(rowWidth:)`, so it is false for TWO different rows — the active row / a
+    // dropped connection, AND a genuinely blocked row that sits below the width budget. The second really
+    // does carry a block, and this pins that the width gate short-circuits AHEAD of it: such a row is
+    // `.hidden` for the width reason, and would still be `.hidden` if the block were lifted.
     func testSwitchChipIsHiddenOnANonSwitchTargetRow() {
-        XCTAssertEqual(StatusPanelFormat.switchChipEmphasis(offersSwitch: false, armed: false), .hidden)
-        XCTAssertEqual(StatusPanelFormat.switchChipEmphasis(offersSwitch: false, armed: true), .hidden)
+        for armed in [false, true] {
+            XCTAssertEqual(
+                StatusPanelFormat.switchChipEmphasis(offersSwitch: false, block: nil, armed: armed), .hidden)
+            XCTAssertEqual(
+                StatusPanelFormat.switchChipEmphasis(offersSwitch: false, block: .weeklyExhausted,
+                                                     armed: armed), .hidden)
+        }
     }
 
-    // The load-bearing #448 change: a switch target's chip is PERSISTENT — VISIBLE at rest (`.resting`, no
-    // longer `.hidden` as #169's hover-reveal left it), and it BRIGHTENS to `.armed` when the row is armed
-    // (hover / focus). The resting-visible state is what makes a row discoverable as actionable on a
-    // transient popover — the exact gap #448 closes.
+    // The load-bearing #448 change: a VIABLE switch target's chip is PERSISTENT — VISIBLE at rest
+    // (`.resting`, no longer `.hidden` as #169's hover-reveal left it), and it BRIGHTENS to `.armed` when the
+    // row is armed (hover / focus). The resting-visible state is what makes a row discoverable as actionable
+    // on a transient popover — the exact gap #448 closes. #959 narrowed this to VIABLE targets only (below);
+    // it did not touch the persistence that #448 bought.
     func testSwitchChipIsPersistentAtRestAndBrightensWhenArmed() {
-        XCTAssertEqual(StatusPanelFormat.switchChipEmphasis(offersSwitch: true, armed: false), .resting,
-                       "a switch target's chip must be VISIBLE (not hidden) at rest — the #448 discoverability fix")
-        XCTAssertEqual(StatusPanelFormat.switchChipEmphasis(offersSwitch: true, armed: true), .armed,
+        XCTAssertEqual(StatusPanelFormat.switchChipEmphasis(offersSwitch: true, block: nil, armed: false),
+                       .resting,
+                       "a viable switch target's chip must be VISIBLE (not hidden) at rest — the #448 fix")
+        XCTAssertEqual(StatusPanelFormat.switchChipEmphasis(offersSwitch: true, block: nil, armed: true),
+                       .armed,
                        "the chip brightens (arms) when the row is hovered/focused")
         // The resting state is explicitly NOT hidden — the whole point of #448 (a regression back to
         // hover-only would flip this to `.hidden` and fail loudly).
-        XCTAssertNotEqual(StatusPanelFormat.switchChipEmphasis(offersSwitch: true, armed: false), .hidden)
+        XCTAssertNotEqual(StatusPanelFormat.switchChipEmphasis(offersSwitch: true, block: nil, armed: false),
+                          .hidden)
+    }
+
+    // Issue #959: a WIRE-BLOCKED target renders NO chip. Before this, the affordance and its own negation
+    // shared one slot at one size in one token, discriminated by glyph SHAPE alone — and measured on a live
+    // 1:1 capture `arrow.left.arrow.right` and `nosign` are at ink-mass parity (18.2 over 70 px vs 19.5 over
+    // 82 px, the negation marginally the QUIETER), both strokes horizontal along the row's dominant axis.
+    // The two were not tellable apart at rest without ~9× magnification.
+    //
+    // The routing lives HERE, in the pure verdict, rather than as an `if` at the view's render site: that is
+    // what makes it assertable at all, and it is how the rest of this file is built. A regression that moved
+    // the decision back into SwiftUI would leave this test green while the panel changed — which is why the
+    // render suite carries the pixel half (`PanelInteractionStateTests`).
+    func testAWireBlockedTargetRendersNoChipAtAll() {
+        for block in [StatusPanelFormat.SwitchBlock.quarantined, .weeklyExhausted] {
+            for armed in [false, true] {
+                XCTAssertEqual(
+                    StatusPanelFormat.switchChipEmphasis(offersSwitch: true, block: block, armed: armed),
+                    .hidden, """
+                    a \(block) row still renders a chip (armed: \(armed)) — #959 removed it because the chip \
+                    and its own negation were interchangeable at rest. Blocking is carried by #955's \
+                    persistent reason line, `.disabled()` dimming and the spoken label, never by a glyph
+                    """)
+            }
+        }
+    }
+
+    // The one real risk #959 introduces, pinned rather than assumed: the ACTIVE row and a BLOCKED row now
+    // agree on the chip axis (both `.hidden`), so that axis can no longer tell them apart. THIS test's job
+    // is that collapse — asserting it explicitly, so the compensating channels below are documented against
+    // a stated premise rather than an implied one. Those channels are covered where each can be:
+    //
+    //   • the blocked row has a persistent REASON LINE and the active row none — copy covered in depth by
+    //     `testEveryBlockedVariantHasAPersistentCueAndAViableRowHasNone` below (both variants, and that
+    //     they read distinctly), so it is not re-asserted here;
+    //   • the active row carries a FILLED leading dot against a ring on every non-active row — a SHAPE cue,
+    //     so it survives monochrome and colour-vision deficiency — plus the accent-tint row fill
+    //     (`StatusDot`, and the row background in `StatusPanelRoster`). `PanelInteractionStateTests`
+    //     renders the two rows and measures their separation; note there that the FILL carries essentially
+    //     all of that number and the dot is ≤0.0057 of the frame, so the shape cue is structural rather
+    //     than pixel-gated;
+    //   • the blocked row is `.disabled()` and speaks its reason (`testABlockedRowSpeaksItsReason`, below).
+    //
+    // If this ever fails, the answer is NOT to add a new blocked-row marker — #959 rejected that explicitly
+    // (five of six rows carry a mark, so an added element pays its cost five times). It is to re-open which
+    // of the channels above regressed.
+    func testTheActiveAndBlockedRowsAgreeOnTheChipAxisSoTheOthersMustCarryIt() {
+        let activeRowChip = StatusPanelFormat.switchChipEmphasis(offersSwitch: false, block: nil,
+                                                                 armed: false)
+        let blockedRowChip = StatusPanelFormat.switchChipEmphasis(offersSwitch: true,
+                                                                  block: .weeklyExhausted, armed: false)
+        XCTAssertEqual(activeRowChip, .hidden)
+        XCTAssertEqual(blockedRowChip, .hidden,
+                       "post-#959 a blocked row is as chip-free as the active row — the collapse this "
+                       + "test exists to state, and the premise the other channels compensate for")
     }
 
     // The slot widened 18 → 28 (#448) so the now-persistent chip sits comfortably; the shipped panel still

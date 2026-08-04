@@ -584,10 +584,12 @@ enum StatusPanelFormat {
     /// keeps the Increase-Contrast escalation and becomes numerically readable in tests today.
     /// Still never a hardcoded opacity (the #388 "tints/opacities live in the testable layer" discipline).
     enum SwitchChipEmphasis: Equatable {
-        /// No chip — the active row / a dropped connection (the row is not a switch target), left pure data.
+        /// No chip at all — the active row and a dropped connection (not switch targets, left pure data), a
+        /// row too narrow to host the affordance, and, since issue #959, a WIRE-BLOCKED target.
         case hidden
-        /// Visible but quiet — the steady state on a switch target (viable OR wire-blocked; the glyph SHAPE,
-        /// arrow vs `nosign`, carries the block, not the emphasis).
+        /// Visible but quiet — the steady state on a VIABLE switch target. Since #959 that is the only state
+        /// the chip renders in, so the glyph no longer needs a shape to carry the block: a chip present means
+        /// "you can switch here", full stop.
         case resting
         /// Brightened — the row is armed (hovered / focused), inviting the press.
         case armed
@@ -596,10 +598,35 @@ enum StatusPanelFormat {
     /// The chip emphasis for a row (issue #448). Kept HERE (not decided inline in the view) so the
     /// resting-visible-vs-armed-brighten distinction is unit-asserted against the design intent rather than
     /// buried in SwiftUI. `offersSwitch` is the view's own gate (a non-active row that fits the width);
-    /// `armed` is whether the row is currently hovered/focused. A non-target row is `.hidden`; a switch
-    /// target is `.resting` at rest and `.armed` once armed — the persistent-quiet → brighten behavior.
-    static func switchChipEmphasis(offersSwitch: Bool, armed: Bool) -> SwitchChipEmphasis {
-        guard offersSwitch else { return .hidden }
+    /// `block` is the row's wire-visible reason it cannot be switched to, if any; `armed` is whether the row
+    /// is currently hovered/focused. A non-target row is `.hidden`; so is a BLOCKED one (#959, below); a
+    /// viable target is `.resting` at rest and `.armed` once armed — the persistent-quiet → brighten behavior.
+    ///
+    /// WHY A BLOCKED ROW IS `.hidden` (issue #959). The chip and its own NEGATION used to occupy the same
+    /// slot at the same size in the same emphasis token, discriminated by glyph SHAPE alone
+    /// (`arrow.left.arrow.right` vs `nosign`) — and measured on a live 1:1 capture the two are at ink-mass
+    /// parity (18.2 over 70 px vs 19.5 over 82 px, the negation marginally the QUIETER of the two). Both
+    /// strokes run horizontal, along the row's dominant axis, so there is no orientation contrast either, and
+    /// at 1x an 11 pt glyph draws 1 px strokes entirely in the antialiasing regime. A reviewer could not tell
+    /// the affordance from its negation without ~9× magnification.
+    ///
+    /// Of the treatments considered, the ratified one is the EMPTY SLOT: an actionable row carries a chip, a
+    /// blocked row carries none, and there is no glyph left to confuse. The rejected alternatives were each
+    /// rejected for a reason worth keeping — a ring / capsule / filled-circle container is a container on a
+    /// chip that must stay a quiet hint; the leading-edge inset rule is spoken for (it carries per-row fault
+    /// severity, #485/#572); and ADDING an element costs its price on all five marked rows rather than one.
+    /// Removing an element pays none of those.
+    ///
+    /// This is safe ONLY because #955 landed first: a blocked row now states its reason as PERSISTENT
+    /// on-screen text (`switchBlockedCue`, rendered on its own line), so deleting the chip deletes a glyph
+    /// nobody could read and not the explanation. Do not re-introduce a blocked-row mark without re-opening
+    /// that dependency — and note the `.help` tooltip cannot substitute, because whether it surfaces at all
+    /// in the shipped `panelIsKey` / `!appIsActive` presentation is still capture-pending
+    /// (`docs/findings/0950-help-on-disabled-button.md`).
+    static func switchChipEmphasis(offersSwitch: Bool,
+                                   block: SwitchBlock?,
+                                   armed: Bool) -> SwitchChipEmphasis {
+        guard offersSwitch, block == nil else { return .hidden }
         return armed ? .armed : .resting
     }
 
