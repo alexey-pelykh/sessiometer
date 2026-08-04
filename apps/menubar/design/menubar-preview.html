@@ -180,6 +180,10 @@
        accent EXCLUDED, monogram glyph a high-contrast neutral ON the fill. A DELIBERATE deviation from the
        monochrome --badge-bg badge; a generic identity cue, never provider branding (#173). */
     --id-work-bg:#4e4070; --id-personal-bg:#743a62; --id-scratch-bg:#266058; --id-mono:#f5f5f7;
+    /* A FOURTH illustrative slot, for the expiry frames' `Unmeasured` row only. Same rules as the three
+       above (low-chroma, accent excluded); a fourth hue rather than a repeat so the four rows stay
+       pairwise distinguishable, which is the whole job of the #445 cue. */
+    --id-unmeasured-bg:#4a5626;
     --seg-bg:rgba(120,120,128,.12); --seg-border:rgba(0,0,0,.05); --seg-on:#ffffff;
     --btn-bg:rgba(255,255,255,.72); --btn-border:rgba(0,0,0,.14); --code-bg:rgba(120,120,128,.15);
     --ok:#2ba24a; --spark:rgba(60,60,67,.55);
@@ -207,6 +211,7 @@
     /* #445 per-account identity colours (dark): the same hues INVERTED to a muted mid-LIGHT tone so a near-
        black monogram reads on them and they clear the near-black panel (WCAG-AA both themes). */
     --id-work-bg:#beb0d8; --id-personal-bg:#daa8c8; --id-scratch-bg:#94ccc2; --id-mono:#1c1c1e;
+    --id-unmeasured-bg:#c3d19a;   /* the fourth slot, inverted on the same rule as its three siblings */
     --seg-bg:rgba(255,255,255,.08); --seg-border:rgba(255,255,255,.06); --seg-on:rgba(255,255,255,.18);
     --btn-bg:rgba(255,255,255,.10); --btn-border:rgba(255,255,255,.16); --code-bg:rgba(255,255,255,.10);
     --ok:#30d158; --spark:rgba(235,235,245,.5);
@@ -235,6 +240,19 @@
   /* ---- account cards (Status) ---- */
   .accts{ padding:6px 8px 2px; display:flex; flex-direction:column; gap:2px }
   .acct{ padding:9px 8px 10px; border-radius:9px }
+  /* The ACTIVE row. It carries NO switch chip and NO tooltip, and BOTH absences are decisions (#957).
+     The row is not a switch target — you cannot switch to where you already are — so:
+       - No chip. The operator never infers "active" from a MISSING chip, which would be a cue you have
+         to notice the absence of. They read two POSITIVE cues instead: the FILLED leading dot (against a
+         ring on every other row — a SHAPE difference, so it survives monochrome and colour-vision
+         deficiency) and this accent-tint fill.
+       - No tooltip. A tooltip here could only say something like "switch to this account", which is
+         FALSE for this row — it would teach that the row behaves like its siblings. Silence is the
+         honest answer, not a gap.
+     NOTE this is the same empty-trailing-slot treatment a BLOCKED row now uses (#959) — two different
+     reasons ("already here" vs "cannot go there") landing on one drawing. That is intended: both mean
+     "not a switch target", and the rows are told apart by the cues each carries POSITIVELY (this one's
+     filled dot + tint; the blocked row's persistent reason line), never by the shared blank slot. */
   .acct.active{ background:var(--active-bg) } /* accent-tint fill only; ring dropped (#387 M5) */
 
   .acct-id{ display:flex; align-items:center; gap:9px }
@@ -253,6 +271,7 @@
   .badge.id-work{ background:var(--id-work-bg); color:var(--id-mono) }
   .badge.id-personal{ background:var(--id-personal-bg); color:var(--id-mono) }
   .badge.id-scratch{ background:var(--id-scratch-bg); color:var(--id-mono) }
+  .badge.id-unmeasured{ background:var(--id-unmeasured-bg); color:var(--id-mono) }
   .id-meta{ flex:1 1 auto; min-width:0 }
   .id-name{ font-size:13px; font-weight:600; letter-spacing:.01em; white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
   /* A genuinely EMPTY label (#752's degenerate frames) collapses this div to zero height, which lets the
@@ -268,6 +287,19 @@
      ~56px (pill + gap) came straight out of `.id-name`, truncating near-identical fleet emails. The
      WCAG 1.4.1 non-colour cue survives without it: the dot's fill-vs-ring is a SHAPE difference, so
      active still reads under colour-blindness and macOS monochrome. */
+  /* The AUTH / health glyph. DELIBERATELY INERT — no tooltip, no hover treatment, and that silence is a
+     DECISION (#955/#957), not an axis nobody got to. The mock has been consistent about it all along
+     (`title=` sits on `.rowact` 42 times and on ZERO of the 78 `.health` spans); what was missing was
+     anyone SAYING so, which is exactly the ambiguity #957 closes. Three reasons it stays inert:
+       1. The glyph vocabulary is six deliberately distinct SHAPES, chosen so health survives colour loss
+          (WCAG 1.4.1). A shape that needs a tooltip to be legible has already failed that test.
+       2. The two states that actually demand an operator action already carry it as PERSISTENT text via
+          `authCue` — a tooltip would be a second, worse copy of a cue the row already states at rest.
+       3. A tooltip here would land a second tracking rect INSIDE the row Button's hit rect. That is the
+          same nesting whose behaviour is unresolved in #953 — adding one deliberately, to a glyph that
+          needs no help, would be buying that problem for nothing.
+     So: do not add a `title=` to `.health`. If a future change makes one seem necessary, the thing to
+     re-open is the glyph's SHAPE legibility, not this. */
   .health{ display:inline-flex; color:var(--ok) }
   /* per-row manual-switch chip (#448 — persistent quiet, brightens when armed): #169's per-row swap made
      DISCOVERABLE at rest. Neutral at rest (never accent — the one accent action is the footer Swap,
@@ -289,6 +321,24 @@
      element it would OVERRIDE instead, so the product is folded in here — and stays theme-aware. */
   .rowact.inert{ opacity:calc(var(--chip-a) * .4) }
   .acct:hover .rowact.inert{ opacity:calc(var(--text-2-a) * .4) }
+  /* #959: a WIRE-BLOCKED row draws NO chip — the slot stays RESERVED and renders empty, so the row does
+     not reflow and the auth column stays aligned. `switchChipEmphasis` returns `.hidden` (a `Color.clear`
+     of `switchAffordanceSlotWidth`) and the `nosign` branch is DELETED from the Swift. Measured on a live
+     1:1 capture, the swap chip and its own negation sit at ink-mass PARITY (18.2 over 70 px vs 19.5 over
+     82 px) in the same slot at the same size — a reviewer could not tell the affordance from its negation
+     without ~9x magnification, so the negation was carrying no information the empty slot does not.
+     Keeping the box (rather than dropping the element) is the whole point: it reserves, it does not draw. */
+  .rowact.empty{ opacity:0 }
+
+  /* #955: the PERSISTENT blocked-reason cue. A row that cannot be switched to SAYS why at rest, on its own
+     line, instead of only whispering it to a hovering pointer. Zero-chroma by decision (#956) — the block
+     is a fact about what the operator can DO, not a health verdict about the account, and the brand rule
+     `an honest gauge reserves colour for the reading` keeps tint off it. Carries the WHY only; the REMEDY
+     ("Run sessiometer poke to refresh it.") stays in the tooltip and the spoken label, because the full
+     sentence overruns `rowCueBudget` at this size. Since #959 removed the chip, this line is the blocked
+     row's ONLY at-rest block signal on the sighted side — nothing may weaken it without re-opening that. */
+  .blockcue{ margin-top:5px; font-size:11px; line-height:1.25; color:var(--text-2);
+             white-space:nowrap; overflow:hidden; text-overflow:ellipsis }
 
   .meters{ margin-top:9px; display:grid; gap:6px }
   .meter{ display:grid; grid-template-columns:52px 1fr 40px 52px; align-items:center; column-gap:9px }
@@ -301,6 +351,33 @@
   .m-pct{ font-size:12px; font-weight:600; letter-spacing:-.01em; text-align:right; font-variant-numeric:tabular-nums }
   .m-pct.g{ color:var(--ut-g) } .m-pct.a{ color:var(--ut-a) } .m-pct.r{ color:var(--ut-r) }
   .m-reset{ font-size:11px; color:var(--text-2); text-align:right; font-variant-numeric:tabular-nums }
+
+  /* ---- the EXPIRY line (#951 / #934 / #935) ----
+     A credential fact, not a usage window, so it draws NO BAR. The bar's slot becomes flexible space and
+     the value carries PAST it to the gutter rather than falling into it — the misplacement #951 fixed.
+     Grid is `label / spacer / value`, and the value cell is the meter rows' trailing PAIR merged into one
+     right-aligned cell, so `EXPIRY`'s value and the reset durations one line up share ONE right edge by
+     construction: 40px (m-pct) + 9px (column-gap) + 52px (m-reset) = 101px. That derivation is the point —
+     `StatusPanelFormat.expiryValueCellWidth` is likewise DERIVED from the same three constants and never
+     written as a literal, precisely so it cannot drift when one of them moves.
+     Merged rather than inherited as two cells because expiry has no percentage: a present-but-empty 40px
+     percent cell would leave a permanent gap that reads as more broken than the misplacement. And 52px
+     alone will not do — within the horizon the value wraps in brackets and must absorb two more
+     characters without clipping (`[23h59m]` measures 52.67 pt, `[999d23h]` 56.85 pt).
+     The line is a SIBLING of `.meters`, not a third row inside it: the Swift row is a `VStack(spacing: 9)`
+     whose meter pair is its own `VStack(spacing: 6)`, so expiry sits 9px below the pair rather than 6px —
+     it is a different KIND of fact, and the spacing says so. */
+  .meter.expiry{ grid-template-columns:52px 1fr 101px; margin-top:9px }
+  .m-expiry{ font-size:11px; color:var(--text-2); text-align:right; font-variant-numeric:tabular-nums;
+             white-space:nowrap }
+  /* Tints mirror `expirySeverity` arm-for-arm: `.a` = WITHIN the configured horizon (amber, and the
+     bracketed form below), `.r` = already lapsed (only an operator `sessiometer login` recovers it).
+     BEYOND the horizon and UNOBSERVED both stay `--text-2` — matching the CLI, where `Dim` and uncoloured
+     are likewise both de-emphasised. That collapse is safe because the TEXT distinguishes them (`29d` vs
+     `—`), never the colour alone. An unobserved deadline is deliberately uncoloured rather than green:
+     absence of a reading is not a false healthy signal. */
+  .m-expiry.a{ color:var(--ut-a) }
+  .m-expiry.r{ color:var(--ut-r) }
 
   /* ---- active-account bounded-blindness row (#479 / #485; oracle for the harness, #571) ----
      The ACTIVE account's /usage poll is 429'd: the daemon holds a bounded anchor and pushes `blind_active`.
@@ -1025,6 +1102,205 @@
               <span class="signal balanced"><span class="sig-dot"></span>balanced</span>
               <span class="signal saturated"><span class="sig-dot"></span>saturated</span>
               <span class="lg-note">descriptive &middot; equal weight &middot; no action implied</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ===================================================================== -->
+      <!-- EXPIRY LINE (#951 / #934 / #935 / #957)                                -->
+      <!--                                                                        -->
+      <!-- The credential-FORESIGHT line, and the four verdicts it can carry. This -->
+      <!-- pairs with the committed `panel-expiry-{light,dark}.png` goldens, whose  -->
+      <!-- roster is the harness's `expiryRows` fixture: one deadline WITHIN the    -->
+      <!-- operator's horizon, one already LAPSED, one BEYOND it, and one account   -->
+      <!-- polled successfully that carried NO deadline at all.                     -->
+      <!--                                                                          -->
+      <!-- The fourth row is the one the fixture exists for. It sits directly under  -->
+      <!-- the calm `29d` on purpose: `—` (an OBSERVED ABSENCE) must not be readable -->
+      <!-- as either a healthy reading or a failed poll. It is deliberately NOT      -->
+      <!-- `n/a`, which this panel already spends on a failed poll — filing an       -->
+      <!-- observed absence under transient failure would misreport it.              -->
+      <!--                                                                          -->
+      <!-- WHY THE VALUE SITS IN THE RIGHT-HAND GUTTER and not in the bar column:    -->
+      <!-- expiry is a credential fact, not a usage window, so it draws no bar; the  -->
+      <!-- bar's slot becomes flexible space and the value carries PAST it. That     -->
+      <!-- misplacement is exactly the defect #951 fixed, and the absence of any     -->
+      <!-- expiry frame here is what let it ship. See `.meter.expiry` in the CSS for -->
+      <!-- the 101px derivation.                                                    -->
+      <!-- ===================================================================== -->
+      <div class="group-cap">
+        <span class="gc-t">1b &middot; Expiry</span><span class="gc-line"></span>
+        <span class="gc-note">within horizon &middot; lapsed &middot; beyond &middot; unobserved</span>
+      </div>
+
+      <!-- EXPIRY · LIGHT -->
+      <div class="frame">
+        <div class="fcap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg>
+          Expiry &middot; four verdicts &middot; Light
+        </div>
+        <div class="pop-wrap">
+          <div class="pop theme-light" data-frame="expiry-light">
+            <div class="pop-head">
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
+              <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">4 accounts &middot; Work active</span></span>
+              <span class="seg"><button class="on">Status</button><button>Stats</button></span>
+            </div>
+            <div class="div"></div>
+            <div class="accts">
+              <!-- WITHIN the horizon → bracketed + amber. The brackets are the mark that survives colour
+                   loss (WCAG 1.4.1): the horizon's width is an operator config the reader cannot know, so
+                   a bare duration cannot carry "act on this". Panel and notifier share ONE predicate
+                   (`expiryWithinHorizon`), so a notification that fires while the panel says nothing is
+                   unreachable by construction. -->
+              <div class="acct active">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-work">WO</span>
+                  <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:88%"></span></span><span class="m-pct a">88%</span><span class="m-reset">3d</span></div>
+                </div>
+                <div class="meter expiry"><span class="m-label">Expiry</span><span></span><span class="m-expiry a">[5d18h]</span></div>
+              </div>
+              <!-- LAPSED → the bare state word, red. Present-tense STATE, never an imperative: the remedy
+                   (`sessiometer login`) is deliberately not named here — this line reports a fact, and the
+                   auth glyph already owns the actionable cue once the credential actually fails. -->
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-personal">PE</span>
+                  <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h2m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:71%"></span></span><span class="m-pct g">71%</span><span class="m-reset">3d</span></div>
+                </div>
+                <div class="meter expiry"><span class="m-label">Expiry</span><span></span><span class="m-expiry r">lapsed</span></div>
+              </div>
+              <!-- BEYOND the horizon → de-emphasised. The one verdict that legitimately means "not
+                   expiring soon", and it gets the same quiet the far-off resets get: there is nothing
+                   to act on. -->
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-scratch">SC</span>
+                  <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:4%"></span></span><span class="m-pct g">4%</span><span class="m-reset">5h20m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:18%"></span></span><span class="m-pct g">18%</span><span class="m-reset">3d</span></div>
+                </div>
+                <div class="meter expiry"><span class="m-label">Expiry</span><span></span><span class="m-expiry">29d</span></div>
+              </div>
+              <!-- UNOBSERVED → the gap, uncoloured. Absence of a reading is not a false healthy signal. -->
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-unmeasured">UN</span>
+                  <span class="id-meta"><div class="id-name">Unmeasured</div><div class="id-prov">Claude Code</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:12%"></span></span><span class="m-pct g">12%</span><span class="m-reset">4h30m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:24%"></span></span><span class="m-pct g">24%</span><span class="m-reset">3d</span></div>
+                </div>
+                <div class="meter expiry"><span class="m-label">Expiry</span><span></span><span class="m-expiry">&mdash;</span></div>
+              </div>
+            </div>
+            <div class="swap-row">
+              <span class="swap-txt"><div class="lead">&rarr; <b>Scratch</b></div><div class="why">weekly resets soonest</div></span>
+              <button class="swap-btn">Swap</button>
+            </div>
+            <div class="pop-foot">
+              <span class="fl1">Last swap <b>Work &rarr; Personal</b> &middot; session-cap &middot; 18m ago</span>
+              <span class="fl2"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg>snapshot 12s old</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- EXPIRY · DARK -->
+      <div class="frame">
+        <div class="fcap">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg>
+          Expiry &middot; four verdicts &middot; Dark
+        </div>
+        <div class="pop-wrap">
+          <div class="pop theme-dark" data-frame="expiry-dark">
+            <div class="pop-head">
+              <span class="app-glyph"><svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M 7.76 18.78 A 8 8 0 1 1 16.24 18.78" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/><path d="M14.04 20.16 17.30 20.48 15.18 17.08 Z" fill="currentColor"/><path d="M12 12 14.75 7.24" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/></svg></span>
+              <span class="app-meta"><span class="app-name">Sessiometer</span><span class="app-sub">4 accounts &middot; Work active</span></span>
+              <span class="seg"><button class="on">Status</button><button>Stats</button></span>
+            </div>
+            <div class="div"></div>
+            <div class="accts">
+              <div class="acct active">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-work">WO</span>
+                  <span class="id-meta"><div class="id-name">Work</div><div class="id-prov">Claude Code</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:42%"></span></span><span class="m-pct g">42%</span><span class="m-reset">2h14m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill a" style="width:88%"></span></span><span class="m-pct a">88%</span><span class="m-reset">3d</span></div>
+                </div>
+                <div class="meter expiry"><span class="m-label">Expiry</span><span></span><span class="m-expiry a">[5d18h]</span></div>
+              </div>
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-personal">PE</span>
+                  <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:31%"></span></span><span class="m-pct g">31%</span><span class="m-reset">1h2m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:71%"></span></span><span class="m-pct g">71%</span><span class="m-reset">3d</span></div>
+                </div>
+                <div class="meter expiry"><span class="m-label">Expiry</span><span></span><span class="m-expiry r">lapsed</span></div>
+              </div>
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-scratch">SC</span>
+                  <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:4%"></span></span><span class="m-pct g">4%</span><span class="m-reset">5h20m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:18%"></span></span><span class="m-pct g">18%</span><span class="m-reset">3d</span></div>
+                </div>
+                <div class="meter expiry"><span class="m-label">Expiry</span><span></span><span class="m-expiry">29d</span></div>
+              </div>
+              <div class="acct">
+                <div class="acct-id">
+                  <span class="dot"></span>
+                  <span class="badge id-unmeasured">UN</span>
+                  <span class="id-meta"><div class="id-name">Unmeasured</div><div class="id-prov">Claude Code</div></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact" title="Switch to this account"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3l4 4-4 4"/><path d="M4 7h16"/><path d="M8 13l-4 4 4 4"/><path d="M20 17H4"/></svg></span></span>
+                </div>
+                <div class="meters">
+                  <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:12%"></span></span><span class="m-pct g">12%</span><span class="m-reset">4h30m</span></div>
+                  <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill g" style="width:24%"></span></span><span class="m-pct g">24%</span><span class="m-reset">3d</span></div>
+                </div>
+                <div class="meter expiry"><span class="m-label">Expiry</span><span></span><span class="m-expiry">&mdash;</span></div>
+              </div>
+            </div>
+            <div class="swap-row">
+              <span class="swap-txt"><div class="lead">&rarr; <b>Scratch</b></div><div class="why">weekly resets soonest</div></span>
+              <button class="swap-btn">Swap</button>
+            </div>
+            <div class="pop-foot">
+              <span class="fl1">Last swap <b>Work &rarr; Personal</b> &middot; session-cap &middot; 18m ago</span>
+              <span class="fl2"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3 2"/><circle cx="12" cy="12" r="9"/></svg>snapshot 12s old</span>
             </div>
           </div>
         </div>
@@ -2464,14 +2740,19 @@
                   <div class="bm-remedy">Out of capacity, resets in 2d4h &middot; add or free an account</div>
                 </div>
               </div>
-              <!-- exhausted siblings — WHY there is no viable target: both weekly-exhausted, so the switch chip is a muted nosign (nowhere to swap) -->
+              <!-- exhausted siblings — WHY there is no viable target: both weekly-exhausted, so each is
+                   BLOCKED. A blocked row draws no chip at all (#959, the 28pt slot stays reserved and
+                   empty) and says why at rest on its own line (#955); the remedy half of the sentence is
+                   deliberately absent here because a weekly window is not something the operator can fix,
+                   it resets — inventing a remedy for it would read as a failure on their part. -->
               <div class="acct">
                 <div class="acct-id">
                   <span class="dot"></span>
                   <span class="badge id-personal">PE</span>
                   <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
-                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact inert" title="No viable swap target — weekly-exhausted"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></svg></span></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact empty" aria-hidden="true"></span></span>
                 </div>
+                <div class="blockcue">Can’t switch — weekly limit reached.</div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:14%"></span></span><span class="m-pct g">14%</span><span class="m-reset">2h</span></div>
                   <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill r" style="width:100%"></span></span><span class="m-pct r">100%</span><span class="m-reset">2d4h</span></div>
@@ -2482,8 +2763,9 @@
                   <span class="dot"></span>
                   <span class="badge id-scratch">SC</span>
                   <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
-                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact inert" title="No viable swap target — weekly-exhausted"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></svg></span></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact empty" aria-hidden="true"></span></span>
                 </div>
+                <div class="blockcue">Can’t switch — weekly limit reached.</div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:6%"></span></span><span class="m-pct g">6%</span><span class="m-reset">4h50m</span></div>
                   <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill r" style="width:97%"></span></span><span class="m-pct r">97%</span><span class="m-reset">3d1h</span></div>
@@ -2533,8 +2815,9 @@
                   <span class="dot"></span>
                   <span class="badge id-personal">PE</span>
                   <span class="id-meta"><div class="id-name">Personal</div><div class="id-prov">Codex</div></span>
-                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact inert" title="No viable swap target — weekly-exhausted"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></svg></span></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact empty" aria-hidden="true"></span></span>
                 </div>
+                <div class="blockcue">Can’t switch — weekly limit reached.</div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:14%"></span></span><span class="m-pct g">14%</span><span class="m-reset">2h</span></div>
                   <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill r" style="width:100%"></span></span><span class="m-pct r">100%</span><span class="m-reset">2d4h</span></div>
@@ -2545,8 +2828,9 @@
                   <span class="dot"></span>
                   <span class="badge id-scratch">SC</span>
                   <span class="id-meta"><div class="id-name">Scratch</div><div class="id-prov">Gemini</div></span>
-                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact inert" title="No viable swap target — weekly-exhausted"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></svg></span></span>
+                  <span class="id-trail"><span class="health"><svg width="14" height="14" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.4" stroke="currentColor" stroke-width="1.5" opacity=".85"/><path d="M6.4 10.2l2.4 2.3 4.7-4.9" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span><span class="rowact empty" aria-hidden="true"></span></span>
                 </div>
+                <div class="blockcue">Can’t switch — weekly limit reached.</div>
                 <div class="meters">
                   <div class="meter"><span class="m-label">Session</span><span class="m-track"><span class="m-fill g" style="width:6%"></span></span><span class="m-pct g">6%</span><span class="m-reset">4h50m</span></div>
                   <div class="meter"><span class="m-label">Weekly</span><span class="m-track"><span class="m-fill r" style="width:97%"></span></span><span class="m-pct r">97%</span><span class="m-reset">3d1h</span></div>
@@ -3466,11 +3750,18 @@
       <li><b>Empty-roster is distinct from daemon-down.</b> First-run uses a calm accent-tinted <i>add</i> mark and inviting copy &mdash; unmistakable from the broken-link disconnected shape or the fault triangle.</li>
       <li><b>Provider-neutral, minimal identifiers, every state.</b> Wherever accounts render, each account gets a per-account IDENTITY colour + smart monogram (a generic, low-chroma disambiguation cue &mdash; #445 below) and a plain text label, never a brand colour or logo. The operator-chosen label leads and the secondary line is provider-only; with no custom label an account's label defaults to its account UUID (the roster stores no email — it lives only in the encrypted credential). The footer swap-history now reads by alias (<code>Work &rarr; Personal</code>).</li>
       <li><b>Same-local-part accounts stay distinguishable (#445).</b> A roster of accounts sharing a local-part (<code>work-alice</code>, <code>work-bob</code>, …) would collapse to one badge letter under <code>label.first</code> + tail-truncation. The disambiguation kit restores legibility with THREE cues, none alone sufficient: a per-account <b>colour</b> (a fixed low-chroma palette, <b>accent hue excluded</b>, seeded client-side from the wire <code>label</code> &mdash; the one identity handle, R-2; there is no <code>account_uuid</code> on the wire), a smart <b>2-char monogram</b> from the label's distinguishing token (collision-escalating, so two similar labels never share a pair), and <b>middle-</b>truncation (not tail) so the distinguishing suffix / domain survives elision. The colour is <b>never colour-alone</b> &mdash; always paired with the monogram glyph + the label text (WCAG 1.4.1) &mdash; and clears WCAG-AA in both themes (badge fill &ge;3:1, monogram &ge;4.5:1). The per-account colour is a <b>deliberate deviation</b> from this mock's former monochrome badge; a faithful real-popover screenshot vs this updated oracle (both themes) + an owner eyeball is the pre-lock check (render re-baseline is #440).</li>
-      <li><b>Per-row switch is discoverable, not loud (#448).</b> Every switchable row (non-active, viable) carries a <b>persistent quiet swap chip</b> in its trailing slot &mdash; neutral <code>--text-3</code> at rest so a first-time operator sees the row is actionable on a transient popover, brightening to <code>--text-2</code> when the row is <i>armed</i> (hover / focus). It stays neutral, never accent: the single accent action is the footer <b>Swap</b> hero (Von Restorff). The chip only <i>hints</i> at rest &mdash; the wash + pointer cursor still gate <i>arming</i>, so the persistent mark aids discovery without raising accidental-swap risk (the daemon re-validates every target, and a swap is reversible). The active row and a dropped/paused roster carry no chip.</li>
+      <li><b>Per-row switch is discoverable, not loud (#448).</b> Every switchable row (non-active, viable) carries a <b>persistent quiet swap chip</b> in its trailing slot &mdash; at rest a zero-chroma neutral of its <i>own</i> token (<code>--chip-a</code>, the mock&rsquo;s stand-in for the <code>SwapChipResting</code> asset) so a first-time operator sees the row is actionable on a transient popover, brightening to <code>--text-2</code> when the row is <i>armed</i> (hover / focus). <b>That resting token is not <code>--text-3</code>, and the split was forced (#956/#949):</b> measured on a BUILT panel the old decorative <code>--text-3</code> chip ran <b>1.91:1</b> light / <b>2.70:1</b> dark, under WCAG&nbsp;1.4.11&rsquo;s 3:1 floor for a non-text control &mdash; and it is the sole at-rest carrier of row discoverability, so it cannot spend a token meant for decoration. Raising <code>--text-3</code> globally would have dragged its other user (the inactive dot&rsquo;s ring, redundant with both the row tint and the fill-vs-ring shape) along for no reason. It stays neutral, never accent: the single accent action is the footer <b>Swap</b> hero (Von Restorff). The chip only <i>hints</i> at rest &mdash; the wash + pointer cursor still gate <i>arming</i>, so the persistent mark aids discovery without raising accidental-swap risk (the daemon re-validates every target, and a swap is reversible). <b>Three kinds of row carry no chip at all</b>, and the empty slot is always <i>reserved</i> so nothing reflows: the <b>active</b> row (you cannot switch to where you are), a <b>blocked</b> row (#959 &mdash; which says why at rest instead, on its own line), and a dropped/paused roster.</li>
       <li><b>No-wrap by construction, every state.</b> Aliases own their line and truncate; badges, health glyphs, strip actions and swap buttons are fixed-width and can never be pushed off. Meters use a fixed 4-column grid so <b>%</b> and reset countdowns stay column-aligned.</li>
       <li><b>Pathological content has an oracle now (#752).</b> Group&nbsp;7 answers what a hostile <i>value</i> should look like, so the stress fixtures (#753) can be checked against a design instead of blessing whatever the renderer emits &mdash; the baseline trap that made #437&rsquo;s three render bugs read five times as &ldquo;the design fails distinctness&rdquo;. Every number in those four frames is <b>measured</b>, through the same CoreText primitives the shipped gate uses (<code>Tests/TextMetrics.swift</code>, #750), against the shipped budgets: roster label <b>171&nbsp;pt</b>, meter cells <b>52 / 40 / 52&nbsp;pt</b> (the <code>.meter</code> grid already carries those three verbatim). <b>Two premises did not survive measurement</b>, and the frames are gated at the measured boundary rather than the assumed one: a <b>CJK or RTL label does not elide</b> at the shipped budget (119&ndash;124&nbsp;pt of 171 &mdash; they render whole; only genuinely long labels elide), and <b><code>365d23h</code> does not overflow</b> the reset cell (48.32&nbsp;pt of 52 &mdash; as does every three-digit day count; overflow starts at four digits). Where a label <i>does</i> elide, the frame carries a <b>literal pre-elided string</b>, because CSS <code>text-overflow</code> is tail-only while the panel middle-elides &mdash; so the frame states the intended <i>result</i> rather than re-performing the elision, which is what makes it an oracle. <b>Monograms are the real resolved values</b> (including the mixed-script Hebrew&#8239;+&#8239;Latin pair, and the <code>?</code>&#8239;/&#8239;<code>?2</code> sentinels a degenerate roster escalates to); badge <b>colours stay illustrative</b>, as everywhere else here. An out-of-range percent is <b>rendered honestly and clamped only in the drawing</b>: the number is the wire value verbatim in its real band, the bar stops at its own track &mdash; the CLI and the panel already agree on this, and the design record ratifies it rather than inventing a third answer.</li>
-      <li><b>Light + dark hold uniformly.</b> <i>Every</i> frame carries both themes &mdash; 23 bases &times; 2 = 46, zero gaps (#778, extended by the four pathological-content bases of #752 and the two Settings bases of #763). Dark is a full oracle, not a spot-check: before #778 nine frames were light-only, so the states where a dark-surface contrast error is likeliest &mdash; three of the four fault ranks, stale-snapshot, version-skew &mdash; had nothing to check against. Every degraded token &mdash; strips, fault/attention badges and the amber stale modifiers &mdash; resolves through a theme-scoped custom property, and <code>.pop.theme-dark</code> redefines all 45 that <code>.pop.theme-light</code> defines, so no severity tint can inherit a light-surface value. The Settings window keeps the same discipline on its own token set (<code>.win.theme-dark</code> redefines all 14 that <code>.win.theme-light</code> defines).</li>
+      <li><b>Light + dark hold uniformly.</b> <i>Every</i> frame carries both themes &mdash; 24 bases &times; 2 = 48, zero gaps (#778, extended by the four pathological-content bases of #752, the two Settings bases of #763, and the expiry base of #957). Dark is a full oracle, not a spot-check: before #778 nine frames were light-only, so the states where a dark-surface contrast error is likeliest &mdash; three of the four fault ranks, stale-snapshot, version-skew &mdash; had nothing to check against. Every degraded token &mdash; strips, fault/attention badges and the amber stale modifiers &mdash; resolves through a theme-scoped custom property, and <code>.pop.theme-dark</code> redefines all 45 that <code>.pop.theme-light</code> defines, so no severity tint can inherit a light-surface value. The Settings window keeps the same discipline on its own token set (<code>.win.theme-dark</code> redefines all 14 that <code>.win.theme-light</code> defines).</li>
       <li><b>The Settings window is a second surface, and the reference now exists (#763).</b> Group&nbsp;8 is <i>not</i> a panel state: it is a titled <code>NSWindow</code> at true <b>460&times;560</b> content, so it is <b>opaque</b> (no vibrancy &mdash; it sits over the desktop, not under the menu bar), it carries <b>no glance glyph</b> (nothing about it reaches the bar), and its grouped <code>Form</code> is <b>taller than the box</b> &mdash; the cut-off section in each frame is the honest depiction of a window that scrolls and cannot be resized. Three rules the frames author. <b>(1) Three zones, and the order is load-bearing:</b> the app-local <i>General</i> and <i>Notifications</i> sections sit ABOVE the daemon-config gate, so they stay usable with the daemon stopped &mdash; the daemon-down frame is the whole point of that placement (#573 fixed the opposite). <b>(2) Tunables group by daemon MECHANISM, not by operator intent</b>, which is what keeps each cross-field constraint <i>inside</i> one section (<code>exhausted_poll_secs&nbsp;&ge;&nbsp;poll_secs</code> in Polling&nbsp;&amp;&nbsp;Cooldown; <code>target_max_session_usage&nbsp;&le;&nbsp;session_ceiling</code> in Reserve&nbsp;&amp;&nbsp;Ceilings) rather than split across two headers. <b>(3) Long daemon text is bounded by GEOMETRY, never edited:</b> the footer status slot is 328&nbsp;pt and the daemon&rsquo;s <code>detail</code> can reach several thousand &mdash; so the label is <b>clamped to two lines</b> and the full text stays reachable via the hover tooltip and <code>accessibilityHelp</code>. Clamping the drawing, never the message, is the same call the <code>255%</code> meter already ratified (hq <code>design-menubar.md</code> R-8): a broken producer must stay visible at the surface meant to expose it.</li>
+      <li id="unauthored"><b>What this reference deliberately does NOT author &mdash; so silence stops being ambiguous (#957).</b> This mock is the oracle <i>only for what it authors</i>, and that scoping is only honest if the gaps are NAMED. Otherwise a builder reading silence cannot tell &ldquo;<b>decided to be nothing</b>&rdquo; from &ldquo;<b>nobody decided</b>&rdquo; &mdash; and ships the difference as whatever the layout code happened to do. That is not hypothetical: it is how the expiry value came to land in the bar column (#951), with no frame to catch it. Three classes, and the class is the actionable part:
+        <ul>
+          <li><b>Decided to be nothing</b> &mdash; the treatment IS the absence, and a future change may not quietly fill it in. The <b>auth / health glyph</b> takes no tooltip and no hover treatment (see the <code>.health</code> CSS comment for the three reasons); the <b>active row</b> carries no chip and no tooltip (see <code>.acct.active</code>); a <b>blocked row</b> carries no chip either, its reserved slot rendering empty (#959). Changing any of these is re-opening a decision, not filling a gap.</li>
+          <li><b>Out of this mock&rsquo;s scope entirely</b> &mdash; real surfaces, deliberately not oracled HERE, each with its own home. <b>Dynamic Type</b> (all 12 classes) and the <b>appearance variants</b> &mdash; Increase Contrast, Reduce Transparency, Reduce Motion &mdash; are verified by measurement and by the accessibility checklist rather than by a static frame, because a browser raster cannot settle any of them; see the README&rsquo;s accessibility sections. Note the <b>Settings window is NOT in this class</b>: it IS authored, as Group&nbsp;8 (#763).</li>
+          <li><b>Genuinely open &mdash; nobody has decided yet</b>, and these are the ones to go and settle rather than guess. They are named, with their homes, in the README&rsquo;s per-group blocks (the pathological-content group&rsquo;s three, and the Settings group&rsquo;s register R-11 in hq <code>strategy/design-menubar.md</code>) &mdash; plus the fault-family canary frames still owed to the harness (#571).</li>
+        </ul>
+        The rule this list exists to enforce: <b>if you cannot find an axis in one of the three classes above, it is unclassified &mdash; and an unclassified silence is not authority to invent.</b> Classify it (here or in the README) before you build against it.</li>
     </ul>
   </section>
 

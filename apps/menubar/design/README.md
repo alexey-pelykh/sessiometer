@@ -5,8 +5,13 @@ The canonical **visual** build-reference for the SwiftUI menubar panel (see #168
 (light + dark) in the intended native macOS language, plus a **capture-affordance interaction-states**
 reference card (pending / done / error) for the in-app "Capture active account" action (#360), plus
 the **pathological-content** group (#752) that is the oracle for hostile labels, percents and
-durations — see *Pathological content* below — plus the **Settings window** group (#763), the one
-group that is not a panel state at all; see *The Settings window* below.
+durations — see *Pathological content* below — plus the **expiry** group (#957), the credential-foresight
+line and its four verdicts, plus the **Settings window** group (#763), the one group that is not a panel
+state at all; see *The Settings window* below.
+
+**Before you build against a silence in this mock, read *What this reference does not author* below.**
+The mock is the oracle *only for what it authors* — and that scoping is only usable if the gaps are
+named, so that block classifies them. An unclassified silence is not authority to invent.
 
 ![All 9 menubar states + the Settings window, light + dark](renders/all-states.png)
 
@@ -99,20 +104,25 @@ Light shown here:
   every switchable row); at rest the row
   keeps a trailing action slot for it, which is why the auth glyph sits ~37 pt further left than in the
   mock (the #448-widened 28 pt slot + its 9 pt spacing)
-- a **blocked** row (weekly-exhausted / quarantined) carries its reason as **persistent text on its own
-  line**, where the mock delivers that reason hover-only via `title=` on the dimmed `.rowact` (#955). The
-  mock genuinely speaks here — `title=` sits on `.rowact` 42 times and on `.health` 0 — so this is a
-  deliberate divergence, not an unauthored axis. Two facts force it: the row's spoken label
-  (`rowSwitchAccessibilityLabel`) already states the reason unconditionally, so hover-only made the
-  spoken row strictly *more* actionable than the sighted one; and whether a `.help` tooltip surfaces at
-  all in the shipped panel's `panelIsKey` / `!appIsActive` presentation is still capture-pending
-  (`docs/findings/0950-help-on-disabled-button.md`). The tooltip keeps the remedy sentence the resting
-  line leaves off, so nothing was moved off hover — only added at rest. Authoring the matching mock frame
-  is #957's job; do not "fix" the mock to match this
-- a **blocked** row also carries **no trailing chip at all** — an EMPTY slot, matching the active row's
-  existing chip-free treatment — where the mock draws a muted `nosign` inside
-  `<span class="rowact inert">` (`menubar-preview.html:2473,2485,2536,2548`) (#959). The mock speaks on
-  this axis, so this is again a deliberate divergence rather than an unauthored one. What forces it:
+- ~~a **blocked** row carries its reason as persistent text where the mock delivered it hover-only~~ —
+  **RECONCILED in #957, no longer a divergence.** A blocked row (weekly-exhausted / quarantined) carries
+  its reason as **persistent text on its own line**, and the mock now draws exactly that (`.blockcue`, at
+  the four blocked rows in the `blind-cornered` pair). *Why the panel does this, retained because it is
+  what the mock is now agreeing WITH*: the row's spoken label (`rowSwitchAccessibilityLabel`) already
+  stated the reason unconditionally, so hover-only made the spoken row strictly *more* actionable than
+  the sighted one — the parity defect in the direction people check least; and whether a `.help` tooltip
+  surfaces at all in the shipped panel's `panelIsKey` / `!appIsActive` presentation is still
+  capture-pending (`docs/findings/0950-help-on-disabled-button.md`), so hover was never a safe sole
+  channel. The tooltip and spoken label still keep the **remedy** sentence (`Run sessiometer poke to
+  refresh it.`) that the resting line leaves off — the resting line carries the WHY only, because the
+  full sentence overruns `rowCueBudget` at caption size. So nothing was moved off hover; it was added at
+  rest, on both surfaces now. The cue is zero-chroma on both: the block is a fact about what the operator
+  can DO, not a health verdict about the account
+- ~~a **blocked** row carries no trailing chip where the mock draws a muted `nosign`~~ — **RECONCILED in
+  #957, no longer a divergence.** A blocked row carries **no trailing chip at all** — an EMPTY but
+  RESERVED slot, matching the active row's existing chip-free treatment — and the mock now draws that
+  too (`.rowact.empty` at the same four rows; the `nosign` markup is gone). *Why the panel does this,
+  retained because it is what the mock is now agreeing WITH*:
   measured on a live 1:1 capture the swap chip and its own negation are at ink-mass **parity** — 18.2
   over 70 px against `nosign`'s 19.5 over 82 px, the negation marginally the *quieter* of the two — in
   the same slot, at the same 11 pt, in the same emphasis token, both strokes horizontal along the row's
@@ -123,8 +133,10 @@ Light shown here:
   (#485/#572), and *removing* an element rather than adding one that five of six rows would pay for.
   This is safe only because #955 landed first: the reason text above is now the blocked row's at-rest
   explanation, so the chip that went is a glyph nobody could read, not the explanation. The 28 pt slot
-  stays **reserved** — the row does not reflow and the auth column stays aligned. Authoring the matching
-  mock frame is #957's job; do not "fix" the mock to match this
+  stays **reserved** — the row does not reflow and the auth column stays aligned. Note the active row
+  now shares this exact drawing for a *different* reason ("already here" vs "cannot go there"); the two
+  are told apart by what each carries **positively** — the active row's filled dot + accent tint, the
+  blocked row's persistent reason line — never by the shared blank slot
 - the switch tooltip is scoped to the **whole row**, where the mock scopes it to the **chip**
   (`<span class="rowact" title="Switch to this account">`). This one is a **known defect, not a ratified
   divergence** (#953): the invitation sits on the row-wrapping `Button`, so hovering the health glyph
@@ -132,8 +144,10 @@ Light shown here:
   `.help()` on a child inside that `Button` surfaces at all is **not established**
   (`docs/findings/0953-help-nesting-inside-a-row-button.md`), and if it does not, moving the copy to the
   chip deletes it rather than narrowing it, silently. The **health glyph** carrying no tooltip is by
-  contrast a settled decision (#955) that the mock **agrees** with — `title=` sits on `.rowact` and on
-  **zero** of the 78 `.health` spans — so do not "fix" that one either
+  contrast a settled decision (#955/#957) that the mock **agrees** with — `title=` sits on `.rowact` 44
+  times and on **zero** of the 86 `.health` spans — so do not "fix" that one either. Since #957 the mock
+  also *states* that inertness rather than merely exhibiting it (the `.health` CSS comment gives the
+  three reasons), so the agreement is now checkable rather than inferred from a count
 - the third fixture account is `Temp`, where the mock illustrates `Scratch` — re-picked (#709) so all
   three healthy labels hash to **distinct** #445 identity slots (the mock's `Personal` and `Scratch`
   both land on slot 5 / ochre under the shared 8-slot `label` hash, so the built roster would otherwise
@@ -1034,6 +1048,54 @@ Six now exist, each owning a disjoint surface. Read the one matching what you ch
 | Status item + app entry | `NSStatusBar` chrome, click routing, the lifecycle menu, sleep/wake, agent shape | #764 |
 | Capture + notification | Live-panel key routing, the OS authorization prompt, Notification Center rendering | #765 |
 | Interaction states | Hover arming, the press wash, cursor push/pop, the real-popover swap round-trip | #766 |
+
+## What this reference does not author (#957)
+
+This mock is the oracle **only for what it authors**. That scoping is correct, but on its own it is not
+usable: a builder who meets a silence cannot tell **"decided to be nothing"** from **"nobody decided"**,
+and ships the difference as whatever the layout code happened to do. This section is the register that
+makes the difference readable. It is panel-wide; the two per-group registers (*Pathological content* →
+*What these frames do not author*, and *The Settings window* → *What these frames deliberately do not
+author*) stay where they are and are not repeated here.
+
+**This is not hypothetical.** The mock authored no expiry surface at all, so nothing existed to catch the
+expiry value landing in the bar column (#951) — a defect a single frame would have made obvious. The
+frames are the mechanism; *this* classification is the point.
+
+### Decided to be nothing — the treatment IS the absence
+
+Changing one of these re-opens a decision. It is not filling a gap.
+
+| Axis | Treatment | Where the reasoning lives |
+|---|---|---|
+| **auth / health glyph** hover + tooltip | none, deliberately | `.health` CSS comment in the mock — three reasons: the glyph vocabulary is six distinct SHAPES (WCAG 1.4.1), the two action-demanding states already carry persistent `authCue` text, and a tooltip here would nest a second tracking rect inside the row `Button` (the unresolved #953 nesting) |
+| **active row** trailing chip | none; slot reserved, empty | `.acct.active` CSS comment — the operator reads two POSITIVE cues (filled dot vs ring, a shape difference that survives monochrome; plus the accent tint), never the absence of a chip |
+| **active row** tooltip | none, deliberately | same — the only copy it could carry ("switch to this account") is FALSE for the row you are already on |
+| **blocked row** trailing chip | none; slot reserved, empty | #959, and *Expected reconciliations* above — the chip and its own negation measured at ink-mass parity, so the negation carried no information |
+
+### Out of this mock's scope — real surfaces, oracled elsewhere
+
+Named so that "not here" is not misread as "not decided anywhere".
+
+| Surface | Why not a frame | Where it IS covered |
+|---|---|---|
+| **Dynamic Type** (12 classes) | a static browser frame cannot express a type-scale sweep | measured — `PanelTextMetricsTests` / `PanelCaptureCardTests` metrics lane; § Accessibility |
+| **Increase Contrast · Reduce Transparency · Reduce Motion** | not reachable from a raster; Reduce Transparency is doubly unreachable (get-only, and the renderer reports `false`) | § *Appearance variants* (#760) + its manual checklist |
+| **Settings window** | **NOT in this class — it IS authored**, as Group 8 (#763). Listed here only because it is the one people expect to be missing | § *The Settings window* |
+
+### Genuinely open — nobody has decided yet
+
+Go and settle these; do not infer them from the mock.
+
+| Open axis | Home |
+|---|---|
+| the next-swap callout for a *degenerate* target; the reset cell past three digits of days | hq `strategy/design-menubar.md` § D-UX-PATHOLOGICAL |
+| Settings **Accounts** section row anatomy (incl. the 160 pt label cell of #846); loading placeholder; six remaining apply-status arms; launch-at-login approval sub-block; inline per-field format-error row | register R-11, hq `strategy/design-menubar.md` — routed to #946 |
+| the four **canary** fault ranks — no matching mock frames, so the harness has nothing to pair | #571 |
+
+**The rule this register enforces:** if an axis is in none of the three classes above, it is
+*unclassified* — and an unclassified silence is not authority to invent. Classify it (here, or in a
+per-group register) before building against it.
 
 ## It's a mock, not code
 
