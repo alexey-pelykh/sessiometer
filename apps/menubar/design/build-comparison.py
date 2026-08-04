@@ -124,6 +124,26 @@ STATES = [
     dict(title="1 · Healthy — Stats (dark)", theme="dark", design="healthy-stats-dark", capture="panel-stats-dark.png",
          note="Same state, dark appearance — system semantic colours and the dark <code>--spark</code> / "
               "<code>--sig-*</code> tokens, not the mock’s hex."),
+    # The expiry pair EARNED these rows in #957. Until then the `expiry` capture was rendered but
+    # deliberately unpaired — the mock authored no expiry surface, so there was nothing to compare it
+    # against, and an unpaired capture is simply never fetched. That absence is what let the #951
+    # misplacement (the value landing in the bar column) ship without a visual oracle to catch it.
+    dict(title="1b · Expiry — four verdicts", theme="light", design="expiry-light", capture="panel-expiry-light.png",
+         note="The credential-foresight line, on the roster the <code>expiryRows</code> fixture builds: "
+              "WITHIN the horizon (<code>[5d18h]</code>, bracketed + amber), LAPSED, BEYOND "
+              "(<code>29d</code>, de-emphasised), and an account polled with NO deadline "
+              "(<code>—</code>). Check the RIGHT EDGE first: the expiry value shares one gutter with the "
+              "reset durations above it, because its cell is the meter rows’ trailing pair merged "
+              "(40 + 9 + 52). The brackets are the horizon mark and must survive greyscale — the "
+              "horizon’s width is operator config, so a bare duration cannot carry “act on this”. "
+              "Expected divergences are the usual three: the mock’s provider line (#173), its "
+              "<code>Scratch</code> label for the fixture’s <code>Temp</code> (#709), and its "
+              "illustrative “snapshot 12s old” footer against the panel’s CLI-mirroring "
+              "“updated &lt;1m ago”."),
+    dict(title="1b · Expiry — four verdicts (dark)", theme="dark", design="expiry-dark", capture="panel-expiry-dark.png",
+         note="Same four verdicts, dark appearance. The amber and red verdict tints are asset tokens "
+              "(<code>UtilAmber</code> / the red util token) with their own dark variants, not the "
+              "mock’s hex — compare the RANKING of the four rows, not the exact hues."),
     dict(title="2 · Connecting / daemon-starting", theme="light", design="daemon-starting-light", capture="panel-connecting-light.png",
          note="Awaiting the first snapshot: an honest banner, no roster — never a false “healthy”. The panel "
               "draws this, <b>not-running</b>, and <b>crash-looping</b> (both below) on ONE shared “no "

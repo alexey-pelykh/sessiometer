@@ -320,10 +320,14 @@ enum PanelRenderHarness {
             // as NEITHER, so a frame showing the line under a calm header is the CORRECT render, not an
             // omission (see `StatusPanelFormat`'s expiry section for the rationale).
             //
-            // The mock authors no expiry surface, so this fixture has no `.pop` counterpart and is
-            // deliberately absent from `design/build-comparison.py`'s `STATES` — an unpaired capture is
-            // simply never fetched, so nothing there needed changing. That is the documented scope of
-            // the oracle ("only for what it authors"), not a missing frame.
+            // This fixture is PAIRED as of #957: the mock now authors the expiry line
+            // (`expiry-{light,dark}`) and `design/build-comparison.py` carries the matching `STATES`
+            // rows, so the render finally has a design oracle to be compared against.
+            //
+            // It previously had none — the mock authored no expiry surface at all, so the capture was
+            // rendered and never fetched. That gap is not a footnote: it is why #951 (the expiry value
+            // landing in the bar column instead of the right-hand gutter) could ship. A visual claim
+            // with no visual oracle is only ever checked by whoever happens to look.
             PanelRenderFixture(name: "expiry", state: .connected, rows: expiryRows,
                                nextSwap: nextSwap, generatedAt: fresh),
         // …plus the four daemon-level FAULT ranks (#592) — appended rather than inlined because they vary a
