@@ -279,6 +279,40 @@ enum StatusPanelFormat {
         "Switch to \(label)"
     }
 
+    // MARK: - Which element owns the hover tooltip (issue #953)
+
+    /// WHO answers on hover — routed here rather than as an inline `if` in the view, for the same reason
+    /// `switchChipEmphasis` is: an inline branch is untestable, and this one encodes a platform fact that
+    /// is expensive to re-derive.
+    ///
+    /// **The two are mutually exclusive, and that is measured, not stylistic.** A `.help()` on the
+    /// row-wrapping `Button` WINS over a `.help()` on a child inside it: with both present, the ROW's copy
+    /// answers everywhere, *including over the chip*
+    /// (`docs/findings/0953-help-nesting-inside-a-row-button.md` § The answer — the row's tooltip measured
+    /// 239 pt over the chip where the chip's own measured 38 pt). So a row-level "fallback" alongside a
+    /// chip tooltip does not ADD a fallback — it silently DELETES the chip's. Returning both non-nil is
+    /// therefore a bug, not a preference; `StatusPanelFormatSwitchTooltipScopeTests` asserts it cannot
+    /// happen for any input.
+    ///
+    /// An empty string is not a way to say "no tooltip" either: `.help("")` still registers an owner and
+    /// still wins, so the view must apply the modifier CONDITIONALLY rather than pass `""`. That is why
+    /// these return `String?` and not `String`.
+
+    /// The chip's tooltip — the switch invitation, scoped to the affordance it describes (the mock's
+    /// `<span class="rowact" title="Switch to this account">`). `nil` wherever no chip is drawn: a blocked
+    /// row renders none since #959, and an in-flight swap replaces it with a `ProgressView`.
+    static func switchChipHelp(emphasis: SwitchChipEmphasis, switching: Bool, label: String) -> String? {
+        guard !switching, emphasis != .hidden else { return nil }
+        return switchHelpText(label: label)
+    }
+
+    /// The row's tooltip — the block reason IN FULL (reason + remedy), and ONLY that. It stays at row level
+    /// because a blocked row has no chip to carry it, and it is `nil` on a viable row precisely so the chip
+    /// above can answer at all.
+    static func switchRowHelp(block: SwitchBlock?) -> String? {
+        block.map(switchBlockedText)
+    }
+
     /// A row's spoken label, plus — for a non-viable switch target — the reason it is disabled.
     static func rowSwitchAccessibilityLabel(base: String, block: SwitchBlock?) -> String {
         guard let block else { return base }
