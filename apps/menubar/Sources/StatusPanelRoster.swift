@@ -289,6 +289,28 @@ struct AccountRowView: View {
                     .accessibilityHint(blockReason == nil
                                        ? StatusPanelFormat.switchHelpText(label: row.label) : "")
             } else {
+                // NO TOOLTIP HERE, DELIBERATELY (issue #953 AC-3) — a recorded decision, not an
+                // oversight, because "some tooltip appears, or the absence is a recorded decision;
+                // but not silently nothing" is exactly what the #953 spec asks of this branch
+                // (docs/specs/tooltip-scope.feature.md, Cap-3.1).
+                //
+                // This branch is the ACTIVE row, a row on a DROPPED connection, and a row too narrow
+                // to host the affordance. None of the three wants hover copy:
+                //   * The ACTIVE row (#955): a user does not infer "active" from the ABSENCE of a
+                //     chip — they read two positive cues, the filled-vs-ring leading dot (`StatusDot`)
+                //     and the accent-tint row fill. A tooltip here would teach "this row behaves like
+                //     its siblings", which is false: it is not a switch target and a press does
+                //     nothing.
+                //   * A DROPPED connection is a PANEL-scope fault that already carries a banner. Per
+                //     row it would repeat one whole-snapshot fact up to six times, and #485/#572
+                //     reserve the per-row channel (the leading rule) for faults that really are THIS
+                //     row's.
+                //   * A row below the affordance budget is non-interactive by the same mis-click
+                //     reasoning as `RowSwitchButtonStyle` — explaining an action it does not offer
+                //     would invite the press the width check exists to prevent.
+                // In all three the row is already fully self-describing at rest: every fact it holds
+                // is printed (label, meters, resets, expiry, auth cue). A tooltip would repeat
+                // visible text — and the row's spoken label carries the same facts for VoiceOver.
                 rowContent
                     .accessibilityElement(children: .ignore)
                     .accessibilityLabel(accessibilityLabel)
@@ -317,6 +339,25 @@ struct AccountRowView: View {
     /// The hover tooltip: the block reason IN FULL (reason + remedy) for a non-viable row, otherwise the
     /// switch invitation. Since #955 the reason's first sentence is also on-screen at rest, so this text
     /// deliberately overlaps it — the tooltip's remaining job is the remedy, not the reason.
+    ///
+    /// SCOPED TO THE WHOLE ROW, AND THAT IS A KNOWN DEFECT (issue #953). The design mock scopes the
+    /// switch invitation to the CHIP (`<span class="rowact" title="Switch to this account">`); this is
+    /// on the row-wrapping `Button`, so the invitation's hit area is the entire row and hovering the
+    /// health glyph answers with the *switch* copy — the wrong element explaining itself.
+    ///
+    /// It is NOT fixed by moving `switchHelpText` onto `switchSlot`, however obvious that looks. Whether
+    /// a `.help()` on a child INSIDE this `Button` surfaces at all is unestablished — measured against
+    /// in `docs/findings/0953-help-nesting-inside-a-row-button.md`, which also records why a
+    /// deterministic check is not available and what the one suggestive run found (a nested `.help()`
+    /// surfacing nowhere). If that holds, scoping the invitation to the chip does not narrow it, it
+    /// DELETES it, and the failure is silent: nothing crashes, no test fails, and no golden moves,
+    /// because a tooltip is a hover affordance and the goldens render at `.idle`. Answer the platform
+    /// question first.
+    ///
+    /// The blocked-row branch below must stay at ROW level regardless of how that resolves: since #959
+    /// a blocked row renders no chip at all (`switchChipEmphasis` → `.hidden`, a `Color.clear` slot), so
+    /// there is no chip view to attach it to, and the remedy sentence would become unreachable for a
+    /// sighted operator. VoiceOver keeps it either way via `rowSwitchAccessibilityLabel`.
     private var hoverText: String {
         blockReason.map(StatusPanelFormat.switchBlockedText)
             ?? StatusPanelFormat.switchHelpText(label: row.label)
@@ -520,6 +561,33 @@ struct AccountRowView: View {
     /// The auth glyph (modern path) or the legacy tag text (pre-#119), plus the DEAD/`disabled` cue.
     /// A blind active account (#485) shows the eye-slash blind glyph HERE instead — the credential may be
     /// fine; what's lost is usage visibility, so the health slot reports that, not a false auth verdict.
+    ///
+    /// **NO TOOLTIP ON THE HEALTH GLYPH, DELIBERATELY** (issues #955, #953 AC-2) — a recorded decision,
+    /// not an unconsidered gap. #955 argued it both ways and decided against, for three reasons worth
+    /// keeping:
+    ///   1. the glyph vocabulary is SIX deliberately distinct SHAPES chosen for WCAG 1.4.1
+    ///      (`checkmark.circle.fill` / `questionmark.circle` / `clock.badge.exclamationmark` /
+    ///      `exclamationmark.triangle.fill` / `arrow.clockwise.circle.fill` / `xmark.octagon.fill`), so
+    ///      the shape already carries the state without relying on colour;
+    ///   2. the two states that demand an ACTION already carry it as persistent on-screen text via
+    ///      `authCue` — documented there as action-only, so hover adds nothing an operator must act on;
+    ///   3. a glyph tooltip would land a SECOND tracking rect inside the row `Button`'s hit rect — the
+    ///      #953 defect in the opposite direction, trading "the wrong element explains itself" for "two
+    ///      elements compete to".
+    /// The build reference agrees rather than being silent here: `title=` sits on `.rowact` (the chip)
+    /// and on ZERO of the 78 `.health` spans in `design/menubar-preview.html`, so this is the mock's
+    /// authored position, not an unauthored axis (repo `CLAUDE.md`: the mock is the oracle only for what
+    /// it authors).
+    ///
+    /// Note what this decision is NOT about: the glyph today ALSO answers with the *switch* copy,
+    /// because that tooltip is attached to the row-wrapping `Button` and the glyph sits inside its hit
+    /// rect. That is the #953 defect, and it is still open — see `hoverText` and
+    /// `docs/findings/0953-help-nesting-inside-a-row-button.md`. Adding a glyph tooltip is not the fix;
+    /// it would contradict this decision.
+    ///
+    /// The `.accessibilityHidden(true)` below is likewise deliberate and stays: the row collapses to ONE
+    /// VoiceOver element whose `rowAccessibilityLabel` → `authSpoken` speaks every glyph's meaning in
+    /// prose. Exposing the glyph would fragment the row into unlabeled images and read the state twice.
     ///
     /// The glyphs below carry an EXPLICIT `.font` (issue #756) where they previously carried none, which is
     /// an ADDITION rather than a substitution. An `Image(systemName:)` sizes off the ambient font, and the
