@@ -472,11 +472,72 @@ pub(crate) enum Error {
     // abort (which now carries its own exit code — see [`Error::exit_code`]). All
     // are secret-free: each names only the operator's non-secret query/label
     // (issue #15), never a token or email.
-    /// `sessiometer use` was invoked without the required `<account>`. There is
-    /// deliberately no "cycle to the next account" fallback (out of scope, #63);
-    /// a missing target is an error that names the usage.
-    #[error("a target is required: `sessiometer use <account>`")]
+    /// `sessiometer use` was invoked with neither an `<account>` nor `--next`. There is
+    /// deliberately no IMPLICIT "cycle to the next account" fallback (out of scope, #63):
+    /// a bare `use` still names the usage rather than guessing. Issue #960 makes that
+    /// advance OPT-IN as `--next` — which resolves the target from the daemon's own
+    /// published `next_swap` — so this error now names both ways to supply one.
+    #[error("a target is required: `sessiometer use <account>`, or `--next` to advance to the daemon's own next-swap candidate")]
     UseTargetRequired,
+
+    /// `use --next` (issue #960) could not ask the daemon which account comes next: no
+    /// daemon is reachable. A NAMED target still works with no daemon (the standalone
+    /// write path), but `--next` CANNOT — the candidate it advances to is the daemon's
+    /// published `next_swap`, and a client cannot re-derive it (the session trigger /
+    /// floor `pick_target` consumes are daemon-only, never on the wire). So `--next`
+    /// fails CLEANLY here rather than falling through to the standalone write path with
+    /// a guessed or unresolved target. ZERO writes.
+    ///
+    /// Generic exit `1`: an inability to RUN the resolution, not a gate refusal, so it
+    /// stays out of the exit-`7` refusal taxonomy — the same distinction
+    /// [`Error::UseViabilityUnverifiable`] draws for the un-runnable viability gate.
+    /// Secret-free.
+    #[error(
+        "`--next` needs a running daemon to know which account comes next — \
+         start it with `sessiometer run`, or name the target: `sessiometer use <account>`"
+    )]
+    UseNextRequiresDaemon,
+
+    /// `use --next` (issue #960) asked the daemon for its next-swap candidate and the
+    /// daemon answered that there ISN'T one: `pick_target` excluded every account
+    /// (weekly-exhausted #11/#37, session-saturated, quarantined #42, disabled #36, or
+    /// inside the weekly tail-margin band). `detail` carries the daemon's own #405
+    /// fleet-capacity RELIEF hint — WHEN capacity returns, and whether the shortage is
+    /// structural enough to warrant adding an account — composed by the SAME
+    /// [`crate::cli::out_of_capacity_phrase`] the `status` next-swap footer renders, so
+    /// the two surfaces can never drift on the relief instant or the nudge threshold. A
+    /// pre-#405 daemon carries no hint, and `detail` then degrades to the bare "no viable
+    /// target" that footer also falls back to. ZERO writes; secret-free (a duration and a
+    /// fixed phrase, never a label — issue #15).
+    ///
+    /// Exit `7`, the gate-refused class: this is the FLEET-WIDE instance of exactly the
+    /// per-target refusals that already own `7` (weekly-exhausted / quarantined /
+    /// cooldown). The gate RAN and refused — which is what `7` means — and a supervisor
+    /// re-running `use --next` on a timer needs "no capacity, back off" distinguishable
+    /// from a generic `1`. Unlike its exit-`7` siblings, `--force` does NOT override it:
+    /// there is no target to force ONTO. The remedy is to name one.
+    #[error(
+        "refusing to swap: {detail} — name a target to override: `sessiometer use <account> --force`"
+    )]
+    UseNextNoViableTarget { detail: String },
+
+    /// `use --next` (issue #960) reached the daemon but could not get an answer it can
+    /// act on: the staggered poll loop (#80) has not read the rotation yet
+    /// (`next_swap: awaiting_data`), the daemon published no candidate at all (no active
+    /// account to anchor a swap FROM, or a pre-#88 daemon that omits the field), or the
+    /// exchange itself failed (a timeout, or a reply this build cannot read — including
+    /// a daemon whose contract MAJOR has moved on, issue #164). `detail` names which.
+    /// Every case fails CLOSED with ZERO writes: `--next` never guesses a target.
+    ///
+    /// Generic exit `1`: an inability to RUN the resolution, not a gate refusal, so it
+    /// stays out of the exit-`7` refusal taxonomy — the same distinction
+    /// [`Error::UseViabilityUnverifiable`] draws for the un-runnable viability gate.
+    /// Secret-free: `detail` is one of a fixed set of authored phrases (issue #15).
+    #[error(
+        "cannot pick the next account: {detail} — retry shortly, or name the target: \
+         `sessiometer use <account>`"
+    )]
+    UseNextUnresolved { detail: String },
 
     /// `use <query>` matched no roster account by label OR account-uuid. The
     /// resolver never guesses (issue #17): an unresolvable target is a hard error
@@ -877,9 +938,11 @@ impl Error {
     /// one-shot `use` verb (issue #63) EXTENDS this same taxonomy — no parallel
     /// scheme — so a caller (or supervisor) can tell its distinct outcomes apart:
     /// a locked keychain (`4`, the always-enforced abort), an unresolvable (`5`)
-    /// or ambiguous (`6`) target, and a pre-swap gate refusal without `--force`
-    /// (`7`). Every other error is a generic failure (`1`). The mapping lives here
-    /// so the `main` exit-code branch stays a thin lookup.
+    /// or ambiguous (`6`) target, and a gate refusal (`7` — the pre-swap gate
+    /// refusing a NAMED target without `--force`, or, since issue #960, `use
+    /// --next` finding the whole fleet gated). Every other error is a generic
+    /// failure (`1`). The mapping lives here so the `main` exit-code branch stays a
+    /// thin lookup.
     pub(crate) fn exit_code(&self) -> u8 {
         match self {
             Error::AlreadyRunning => 3,
@@ -890,12 +953,20 @@ impl Error {
             Error::KeychainLocked { .. } | Error::SwapLockBusy | Error::UsageStoreBusy => 4,
             Error::UseTargetNotFound { .. } => 5,
             Error::UseTargetAmbiguous { .. } => 6,
-            // The pre-swap gate refused without `--force` — weekly-exhausted,
-            // cooldown, or quarantined all share one "gate-refused" code, each
-            // with its own specific message.
+            // The gate refused — weekly-exhausted, cooldown, or quarantined all share
+            // one "gate-refused" code, each with its own specific message. Issue #960
+            // adds the FLEET-WIDE instance of the same verdict: `use --next` asked the
+            // daemon for a candidate and `pick_target` excluded every account, for
+            // exactly these reasons. The gate RAN and refused, so it belongs here rather
+            // than in the generic `1` — a supervisor re-running `use --next` on a timer
+            // needs "no capacity, back off" told apart from a malformed invocation. Note
+            // the one asymmetry inside the family: `--force` overrides the three
+            // per-target refusals but CANNOT override the fleet-wide one, because there
+            // is no target to force onto (the remedy is to name one).
             Error::UseTargetWeeklyExhausted { .. }
             | Error::UseCooldownActive
-            | Error::UseTargetQuarantined { .. } => 7,
+            | Error::UseTargetQuarantined { .. }
+            | Error::UseNextNoViableTarget { .. } => 7,
             _ => 1,
         }
     }
@@ -1063,6 +1134,37 @@ mod tests {
         // errors, not part of the named new taxonomy → generic `1`.
         assert_eq!(Error::UseTargetRequired.exit_code(), 1);
         assert_eq!(Error::ActiveAccountUnresolved.exit_code(), 1);
+        // Issue #960: `use --next` joins the SAME taxonomy rather than adding a code.
+        // The daemon RAN its selection and refused (every account gated) → the exit-`7`
+        // gate-refused class its per-target siblings above already own, so a supervisor
+        // re-running `use --next` on a timer reads "no capacity, back off" rather than a
+        // generic failure.
+        assert_eq!(
+            Error::UseNextNoViableTarget {
+                detail: "out of capacity; resets in 2d4h — add an account".into()
+            }
+            .exit_code(),
+            7
+        );
+        // …but an INABILITY to run the selection is not a refusal by it, so both of these
+        // stay a generic `1` — the same line `UseViabilityUnverifiable` draws for the
+        // un-runnable viability gate. Collapsing them into `7` would report "no capacity"
+        // when the daemon was merely absent or had not polled yet.
+        assert_eq!(Error::UseNextRequiresDaemon.exit_code(), 1);
+        assert_eq!(
+            Error::UseNextUnresolved {
+                detail: "the daemon has not polled the rotation yet".into()
+            }
+            .exit_code(),
+            1
+        );
+        assert_eq!(
+            Error::UseViabilityUnverifiable {
+                label: "spare".into()
+            }
+            .exit_code(),
+            1
+        );
     }
 
     #[test]
@@ -1092,6 +1194,17 @@ mod tests {
             .to_string(),
             Error::UseViabilityUnverifiable {
                 label: "spare".into(),
+            }
+            .to_string(),
+            // Issue #960: the `--next` trio carries a duration and fixed authored prose —
+            // never a label, so never an operator-authored email (#444/#447) either.
+            Error::UseNextRequiresDaemon.to_string(),
+            Error::UseNextNoViableTarget {
+                detail: "out of capacity; resets in 2d4h — add an account".into(),
+            }
+            .to_string(),
+            Error::UseNextUnresolved {
+                detail: "the daemon has not polled the rotation yet".into(),
             }
             .to_string(),
         ];

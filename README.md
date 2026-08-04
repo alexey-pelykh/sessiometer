@@ -701,6 +701,9 @@ sessiometer use spare
 
 # Force the switch, overriding the pre-swap checks below:
 sessiometer use spare --force
+
+# Advance to the next account in the swap chain without naming it:
+sessiometer use --next
 ```
 
 By default `use` runs a **pre-swap gate** and refuses — with a specific reason
@@ -726,10 +729,27 @@ unlock and retry), or any other read failure — still aborts here, writing noth
 *Could not read* is not *gone*, so a swap is never written blind over a credential
 that could not be read.
 
-`use` works whether or not the daemon is running: when one is up, the pre-swap gate
-reads the **cached** usage the daemon already polled — so `use` makes no usage
-request of its own and won't trip a rate limit — and with no daemon it falls back to
-a single live check.
+`--next` swaps you along the chain **without naming a target**: it takes the account
+the daemon has already chosen as its next swap candidate — the very one
+[`status`](#checking-status) prints on its `next swap:` line, picked by the
+same rules the automatic rotation uses. It prints which account that turned out to be,
+and why, before it swaps. Pass `--force` alongside it and the two compose exactly as
+they do for a named target: `--next` only supplies the handle, and adds no gate of its
+own. `--next` and an explicit `<account>` are mutually exclusive — naming one
+contradicts the flag, so the pair is rejected rather than silently resolved one way.
+
+Because the candidate is the **daemon's** choice, `--next` needs a daemon running: it
+is not something the CLI can work out for itself, so with none reachable it says so and
+exits without writing, rather than guessing a target. It also stands down — again
+writing nothing — when the daemon reports **no** viable candidate, and then tells you
+why the fleet is blocked and when capacity returns, the same relief hint `status`
+shows. To override that, name a target and force it: `sessiometer use <account>
+--force`.
+
+Otherwise `use` works whether or not the daemon is running: when one is up, the
+pre-swap gate reads the **cached** usage the daemon already polled — so `use` makes no
+usage request of its own and won't trip a rate limit — and with no daemon it falls back
+to a single live check.
 
 ## Parking an account
 

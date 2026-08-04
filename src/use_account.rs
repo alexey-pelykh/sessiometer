@@ -71,8 +71,11 @@ use std::time::{Duration, SystemTime};
 use crate::active;
 use crate::canary::{self, CanaryOutcome, InconclusiveReason, ProbeGate};
 use crate::config::{Account, Config};
+#[cfg(test)]
+use crate::daemon::NoTargetCause;
 use crate::daemon::{
-    AccountStatusLine, RealRosterPoller, RosterPoller, StatusResponse, SwapAck, SwapRejection,
+    AccountStatusLine, NextSwap, NextSwapReason, RealRosterPoller, RosterPoller, StatusResponse,
+    SwapAck, SwapRejection,
 };
 use crate::error::{Error, Result};
 use crate::keychain::{CredentialStore, RealCredentialStore};
@@ -897,15 +900,29 @@ where
     Ok(())
 }
 
-/// `sessiometer use <account> [--force]` — wire the REAL seams into [`run_use`].
+/// `sessiometer use <account> [--force]` / `use --next [--force]` — wire the REAL seams
+/// into [`run_use`].
 ///
-/// A missing `<account>` is [`Error::UseTargetRequired`] (there is deliberately no
-/// "cycle to the next account" fallback — out of scope, #63). Loads the real config
-/// (a friendly empty-state if nothing is captured), derives the cooldown verdict
-/// from the durable event log, and drives the swap over the live keychain
-/// (`apple-tool:` CLI path) and `~/.claude.json`.
-pub(crate) async fn use_account(query: Option<String>, force: bool) -> Result<()> {
-    let query = query.ok_or(Error::UseTargetRequired)?;
+/// A bare `use` — neither `<account>` nor `--next` — is [`Error::UseTargetRequired`]:
+/// there is deliberately no IMPLICIT "cycle to the next account" fallback (out of scope,
+/// #63). Issue #960 makes that advance OPT-IN as `--next`, which fills exactly this slot
+/// by READING the target from the daemon's published `next_swap` ([`resolve_next_target`])
+/// rather than re-deriving selection here. Loads the real config (a friendly empty-state if
+/// nothing is captured), derives the cooldown verdict from the durable event log, and drives
+/// the swap over the live keychain (`apple-tool:` CLI path) and `~/.claude.json`.
+///
+/// `--next` composes with `--force` exactly as a named target does, and adds NO gate of its
+/// own: it only supplies the handle, after which the path is byte-identical to a named
+/// swap — so `--force` keeps overriding precisely the POLICY verdicts it always did
+/// (quarantined / weekly-exhausted / cooldown) and keeps NOT overriding the SAFETY aborts
+/// (locked keychain, contended swap lock) it never could.
+pub(crate) async fn use_account(query: Option<String>, force: bool, next: bool) -> Result<()> {
+    // Raised BEFORE any config load, exactly where it always was, so a bare `use`'s
+    // ordering against the empty-roster empty-state is unchanged (issue #960 adds a way to
+    // SUPPLY the target, and changes nothing about its absence).
+    if query.is_none() && !next {
+        return Err(Error::UseTargetRequired);
+    }
     let config = Config::load()?;
     // Nothing to swap to if the roster is empty — the same friendly empty-state the
     // offline `list` view reports.
@@ -935,9 +952,27 @@ pub(crate) async fn use_account(query: Option<String>, force: bool) -> Result<()
 
     let claude_json = paths::claude_json()?;
     let lock_path = paths::swap_lock()?;
-    // Both control-socket clients (the cached-reading query #75 and the manual-hold
-    // notify #64) speak to the same daemon socket; resolve it once.
+    // All three control-socket clients (the cached-reading query #75, the manual-hold
+    // notify #64, and the `--next` resolution #960) speak to the same daemon socket;
+    // resolve it once.
     let control_socket = paths::control_socket()?;
+
+    // `--next` (issue #960) is exactly the slot that supplies the target the operator did
+    // not name — and it is READ from the daemon, never re-derived here. `NextSwap::Target`'s
+    // own doc comment is why: the choice is DAEMON-AUTHORITATIVE, because the session
+    // trigger and floor that `pick_target` consumes are daemon-only and never on the wire,
+    // so a client-side re-implementation would be structurally unable to match the daemon's
+    // pick and would silently diverge from the candidate `status` shows.
+    //
+    // Resolved HERE — after the roster check, so an empty roster still gets its friendly
+    // empty-state rather than a daemon complaint, and before the swap, because the daemon's
+    // answer IS the target the rest of this function operates on. `query` is `None` only
+    // when `next` is set: the top-of-function guard returned for neither, and the parser
+    // rejects both together.
+    let query = match query {
+        Some(target) => target,
+        None => resolve_next_target(&control_socket).await?,
+    };
 
     // Route THROUGH the daemon when one is up (issue #167): a SINGLE writer and a single place for
     // the lock, write-ordering, and redaction. `request_swap` carries only the target handle + the
@@ -984,6 +1019,136 @@ pub(crate) async fn use_account(query: Option<String>, force: bool) -> Result<()
         &mut log,
     )
     .await
+}
+
+/// The note `use --next` prints once it knows WHICH account it is advancing to (issue #960),
+/// carrying the daemon's own selection rationale ([`crate::daemon::NextSwapReason`], issue #393)
+/// when it sent one. The operator did NOT name this target, so an outcome line that simply
+/// mentions it — "switched: primary → spare", or worse "refusing to swap to `spare`" — reads as a
+/// non-sequitur; this line is what makes both readable. Deliberately the SAME rationale wording
+/// `cli::render_next_swap` puts in the `status` footer, so the account `status` predicts and the
+/// account `--next` takes are visibly the same decision. Names only the non-secret handle (issue
+/// #15); a pre-#393 daemon sends no reason and gets the bare label, the honest fallback.
+fn note_next_target(label: &str, reason: Option<NextSwapReason>) -> String {
+    let why = match reason {
+        Some(NextSwapReason::SoonestReset { .. }) => " (weekly resets soonest)",
+        Some(NextSwapReason::OnlyCandidate) => " (only viable target)",
+        Some(NextSwapReason::RosterOrder) => " (first eligible; no reset times known)",
+        None => "",
+    };
+    format!("note: --next advancing to `{label}`{why}")
+}
+
+/// Resolve `use --next`'s target (issue #960) from the daemon's PUBLISHED `next_swap`, and tell
+/// the operator which account that turned out to be ([`note_next_target`]) before the swap runs.
+///
+/// This READS the daemon's choice; it never re-derives one. `NextSwap::Target`'s own doc comment
+/// is the reason: the pick is DAEMON-AUTHORITATIVE, because the session trigger and floor
+/// `pick_target` consumes are daemon-only and never on the wire — so a client-side
+/// re-implementation could not match it and would silently diverge from the candidate `status`
+/// shows. Every non-`Target` outcome fails CLOSED with ZERO writes: `--next` never guesses.
+async fn resolve_next_target(socket: &Path) -> Result<String> {
+    let response = query_next_swap(socket).await?;
+    let (label, reason) = next_swap_target(response.next_swap.as_ref(), now_epoch())?;
+    eprintln!("{}", note_next_target(&label, reason));
+    Ok(label)
+}
+
+/// One `status` request/reply over the control socket for [`resolve_next_target`] (issue #960),
+/// bounded by [`CONTROL_SOCKET_TIMEOUT`] so a wedged daemon can never hang `use`.
+///
+/// Unlike its sibling [`ControlSocketCache::query_status`] — whose caller degrades EVERY failure
+/// to a cache MISS and falls back to a live poll — `--next` has no fallback to degrade to, so the
+/// failures are split by what the operator can actually do about them. A refused / absent socket
+/// is "no daemon" ([`Error::UseNextRequiresDaemon`]: start one, or name a target). Anything else —
+/// a mid-exchange I/O error, a timeout after connecting, or a reply this build cannot decode
+/// (including a daemon whose contract MAJOR has moved on, issue #164) — is a reached-but-unusable
+/// daemon ([`Error::UseNextUnresolved`]: retry, or name a target). Both fail closed.
+async fn query_next_swap(socket: &Path) -> Result<StatusResponse> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    let exchange = async {
+        let stream = tokio::net::UnixStream::connect(socket)
+            .await
+            .map_err(|err| {
+                match err.kind() {
+                    // No socket file, or a stale one with no listener → no live daemon.
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
+                        Error::UseNextRequiresDaemon
+                    }
+                    _ => Error::UseNextUnresolved {
+                        detail: "the daemon's control socket could not be reached".to_owned(),
+                    },
+                }
+            })?;
+        let mut buffered = tokio::io::BufReader::new(stream);
+        buffered.write_all(b"{\"cmd\":\"status\"}\n").await?;
+        buffered.flush().await?;
+        let mut line = String::new();
+        buffered.read_line(&mut line).await?;
+        serde_json::from_str::<StatusResponse>(line.trim_end()).map_err(|_| {
+            Error::UseNextUnresolved {
+                detail: "the daemon's status reply could not be read".to_owned(),
+            }
+        })
+    };
+    match tokio::time::timeout(CONTROL_SOCKET_TIMEOUT, exchange).await {
+        Ok(result) => result,
+        Err(_) => Err(Error::UseNextUnresolved {
+            detail: "the daemon did not answer in time".to_owned(),
+        }),
+    }
+}
+
+/// Current wall-clock time as epoch seconds, for humanizing the #405 relief instant. A pre-1970
+/// clock degrades to `0` rather than panicking — the same tolerant projection
+/// [`crate::observability`] and the `status` client's own `now_epoch` use.
+fn now_epoch() -> i64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The target `use --next` should swap to, plus the daemon's rationale for it — or the typed
+/// [`Error`] explaining why there isn't one (issue #960). Pure over the wire value and `now`, so
+/// every branch is unit-tested without a socket or a clock, the same shape as its siblings
+/// [`ack_falls_back_to_standalone`] and [`swap_rejection_error`].
+///
+/// The four wire cases split across exactly two error classes, and the split is the exit code:
+///   - [`NextSwap::Target`] — the daemon picked one. The rationale rides along for the note.
+///   - [`NextSwap::NoViableTarget`] — the daemon RAN its selection and refused: `pick_target`
+///     excluded every account. A genuine gate refusal ⇒ exit `7`, carrying the #405 relief hint
+///     verbatim (WHY the fleet is blocked and WHEN capacity returns) rather than throwing it away.
+///     A pre-#405 daemon sends no `cause` and degrades to the bare "no viable target" that the
+///     `status` footer also falls back to — say only what the wire substantiates. The hint itself
+///     is composed by [`crate::cli::out_of_capacity_phrase`], shared with that footer.
+///   - [`NextSwap::AwaitingData`] — the staggered poll loop (#80) has not read the rotation yet.
+///   - `None` — no candidate published at all: a current daemon with no active account to anchor a
+///     swap FROM, or (via `#[serde(default)]`) a pre-#88 daemon that omits the field.
+///
+/// The last two are an inability to RUN the selection, NOT a refusal by it, so they take the
+/// generic exit `1` — the same distinction [`Error::UseViabilityUnverifiable`] draws for the
+/// un-runnable viability gate, and the reason they are not folded into the exit-`7` class.
+fn next_swap_target(
+    next_swap: Option<&NextSwap>,
+    now: i64,
+) -> Result<(String, Option<NextSwapReason>)> {
+    match next_swap {
+        Some(NextSwap::Target { to, reason }) => Ok((to.clone(), *reason)),
+        Some(NextSwap::NoViableTarget { cause, resets_at }) => Err(Error::UseNextNoViableTarget {
+            detail: match cause {
+                None => "no viable target".to_owned(),
+                Some(_) => crate::cli::out_of_capacity_phrase(*resets_at, now),
+            },
+        }),
+        Some(NextSwap::AwaitingData) => Err(Error::UseNextUnresolved {
+            detail: "the daemon has not polled the rotation yet".to_owned(),
+        }),
+        None => Err(Error::UseNextUnresolved {
+            detail: "the daemon published no next-swap candidate".to_owned(),
+        }),
+    }
 }
 
 /// Whether a reachable daemon's `swap` ack should FALL THROUGH to the standalone write path
@@ -1040,7 +1205,10 @@ fn report_swap_ack(ack: SwapAck, query: &str) -> Result<()> {
 /// dead / exhausted / cooled-down target is the gate-refused exit `7`, a locked keychain / contended
 /// swap lock the retry-shortly exit `4`, an unknown / ambiguous handle exits `5` / `6`, and the
 /// no-active + generic-failure cases the generic exit `1`. The rejection carries no label (redaction
-/// #15), so the operator's own `query` names the target in the message (non-secret operator input).
+/// #15), so `query` names the target in the message instead. `query` is non-secret on BOTH paths
+/// that reach here: the operator's own argv for a named target, and — since issue #960's `--next` —
+/// the roster label the daemon itself published on `next_swap`, which [`crate::daemon::NextSwap`]
+/// is non-secret by construction (a label or a bare reason, never a token or email).
 fn swap_rejection_error(reason: SwapRejection, query: &str) -> Error {
     match reason {
         SwapRejection::UnknownTarget => Error::UseTargetNotFound {
@@ -2125,6 +2293,126 @@ mod tests {
         // target in the surfaced message — non-secret operator input, never a daemon-side echo.
         let err = swap_rejection_error(SwapRejection::UnknownTarget, "my-target");
         assert!(err.to_string().contains("my-target"), "got {err}");
+    }
+
+    #[test]
+    fn next_swap_target_takes_the_daemons_published_pick_and_carries_its_reason() {
+        // Issue #960's load-bearing claim: `--next` READS the daemon's `next_swap`; it never
+        // re-derives selection. So the resolved label is whatever the wire said — verbatim — and
+        // the daemon's own rationale rides along for the note, including the pre-#393 `None`.
+        const NOW: i64 = 1_800_000_000;
+        for reason in [
+            Some(NextSwapReason::SoonestReset {
+                resets_at: NOW + 3_600,
+            }),
+            Some(NextSwapReason::OnlyCandidate),
+            Some(NextSwapReason::RosterOrder),
+            None,
+        ] {
+            let picked = NextSwap::Target {
+                to: "spare".to_owned(),
+                reason,
+            };
+            assert_eq!(
+                next_swap_target(Some(&picked), NOW).unwrap(),
+                ("spare".to_owned(), reason),
+                "the wire's own pick, carried through unchanged: {reason:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn next_swap_target_reports_the_relief_hint_rather_than_a_bare_no_target() {
+        // Issue #960 AC: when every candidate is excluded, do NOT throw away the #405 hint —
+        // report WHY the fleet is blocked and WHEN capacity returns. A genuine gate refusal, so
+        // it takes the exit-`7` gate-refused code its per-target siblings already own.
+        const NOW: i64 = 1_800_000_000;
+        let blocked = NextSwap::NoViableTarget {
+            cause: Some(NoTargetCause::Weekly),
+            resets_at: Some(NOW + 2 * 86_400),
+        };
+        let err = next_swap_target(Some(&blocked), NOW).unwrap_err();
+        assert_eq!(err.exit_code(), 7, "a fleet-wide gate refusal is exit 7");
+        let message = err.to_string();
+        assert!(
+            message.contains("out of capacity") && message.contains("resets in 2d"),
+            "carries the relief hint, not a content-free 'no target': {message}",
+        );
+        assert!(
+            message.contains("add an account"),
+            "a multi-day wait is a STRUCTURAL shortage, so the nudge fires: {message}",
+        );
+        // A pre-#405 daemon sends no `cause` — say only what the wire substantiates, exactly as
+        // the `status` footer's bare fallback does. Still a refusal, so still exit `7`.
+        let bare = NextSwap::NoViableTarget {
+            cause: None,
+            resets_at: None,
+        };
+        let err = next_swap_target(Some(&bare), NOW).unwrap_err();
+        assert_eq!(err.exit_code(), 7);
+        assert!(
+            err.to_string().contains("no viable target"),
+            "bare fallback: {err}",
+        );
+    }
+
+    #[test]
+    fn next_swap_target_separates_an_unrunnable_selection_from_a_refused_one() {
+        // Issue #960: the daemon being UNABLE to answer is not the daemon REFUSING. Both fail
+        // closed with zero writes, but only the refusal is exit `7` — an inability takes the
+        // generic `1`, the same distinction `UseViabilityUnverifiable` draws for the un-runnable
+        // viability gate. Collapsing them would tell a supervisor "no capacity, back off" when
+        // the daemon had merely not polled yet.
+        const NOW: i64 = 1_800_000_000;
+        let awaiting = NextSwap::AwaitingData;
+        let err = next_swap_target(Some(&awaiting), NOW).unwrap_err();
+        assert_eq!(
+            err.exit_code(),
+            1,
+            "not-yet-polled is an inability, not a refusal"
+        );
+        assert!(
+            err.to_string().contains("has not polled the rotation yet"),
+            "names WHICH inability: {err}",
+        );
+        // No candidate published at all: a current daemon with no active account to anchor a swap
+        // FROM, or a pre-#88 daemon that omits the field. Distinct message, same generic `1`.
+        let err = next_swap_target(None, NOW).unwrap_err();
+        assert_eq!(err.exit_code(), 1);
+        assert!(
+            err.to_string().contains("published no next-swap candidate"),
+            "names WHICH inability: {err}",
+        );
+    }
+
+    #[test]
+    fn the_next_target_note_names_the_account_and_the_daemons_reason() {
+        // Issue #960 AC: the operator did NOT name this target, so an ack that does not say which
+        // account it moved to is unreadable. The note carries the label plus the daemon's own
+        // rationale — the SAME wording the `status` footer uses, so `status`' prediction and
+        // `--next`'s action are visibly one decision.
+        assert_eq!(
+            note_next_target(
+                "spare",
+                Some(NextSwapReason::SoonestReset {
+                    resets_at: 1_800_003_600
+                })
+            ),
+            "note: --next advancing to `spare` (weekly resets soonest)",
+        );
+        assert_eq!(
+            note_next_target("spare", Some(NextSwapReason::OnlyCandidate)),
+            "note: --next advancing to `spare` (only viable target)",
+        );
+        assert_eq!(
+            note_next_target("spare", Some(NextSwapReason::RosterOrder)),
+            "note: --next advancing to `spare` (first eligible; no reset times known)",
+        );
+        // A pre-#393 daemon sends no reason → the bare label, the honest fallback.
+        assert_eq!(
+            note_next_target("spare", None),
+            "note: --next advancing to `spare`",
+        );
     }
 
     #[test]
