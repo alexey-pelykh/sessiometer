@@ -108,8 +108,15 @@ enum Command {
     },
     /// `list` — the offline roster view.
     List,
-    /// `use <account> [--force]` — switch the active account now.
-    Use { target: Option<String>, force: bool },
+    /// `use <account> [--force]` / `use --next [--force]` — switch the active account now.
+    /// `target` and `next` are mutually exclusive and the parser rejects both together
+    /// (issue #960): `--next` means "the account the operator did NOT name", resolved
+    /// from the daemon's published `next_swap`.
+    Use {
+        target: Option<String>,
+        force: bool,
+        next: bool,
+    },
     /// `disable`/`enable <label>` — flip an account's rotation flag (`enabled`).
     SetEnabled {
         label: Option<String>,
@@ -503,10 +510,15 @@ fn parse_status(parser: &mut lexopt::Parser) -> Result<Command> {
 fn parse_use(parser: &mut lexopt::Parser) -> Result<Command> {
     let mut target = None;
     let mut force = false;
+    let mut next = false;
     while let Some(arg) = parser.next()? {
         match arg {
             Short('h') | Long("help") => return Ok(Command::Help(HelpTopic::Use)),
             Long("force") => force = true,
+            // Set in the same flag loop as `--force` (issue #960), so `--next` is
+            // ORDER-INDEPENDENT for free: `use --next --force` and `use --force --next`
+            // parse identically, exactly as the two `--force` orders already do.
+            Long("next") => next = true,
             Value(value) if target.is_none() => {
                 target = Some(value.to_string_lossy().into_owned());
             }
@@ -514,7 +526,25 @@ fn parse_use(parser: &mut lexopt::Parser) -> Result<Command> {
             other => return Err(unexpected(other, HelpTopic::Use)),
         }
     }
-    Ok(Command::Use { target, force })
+    // Mutually exclusive, checked AFTER the loop so BOTH orders (`use spare --next` and
+    // `use --next spare`) are rejected identically (issue #960). Silently preferring one
+    // would swap to an account the operator did not ask for; the flag says "I am not
+    // naming a target", so naming one contradicts it. The message names neither the
+    // target nor a label — the operator can see their own argv, and a roster label may be
+    // an operator-authored email (#444/#447) that has no business in a usage error (#15).
+    if next && target.is_some() {
+        return Err(Error::CliUsage {
+            message: "`--next` and an explicit target are mutually exclusive: `--next` asks \
+                      the daemon which account comes next, so naming one contradicts it"
+                .to_owned(),
+            usage_hint: HelpTopic::Use.hint(),
+        });
+    }
+    Ok(Command::Use {
+        target,
+        force,
+        next,
+    })
 }
 
 /// Parse `stats [<account>...] [--period …] [--since …] [--json] [--no-color] [--ascii]`
@@ -818,7 +848,11 @@ async fn execute(command: Command) -> Result<()> {
             verbose,
         } => status(json, no_color, verbose).await,
         Command::List => list().await,
-        Command::Use { target, force } => crate::use_account::use_account(target, force).await,
+        Command::Use {
+            target,
+            force,
+            next,
+        } => crate::use_account::use_account(target, force, next).await,
         Command::SetEnabled { label, enabled } => set_enabled(label, enabled).await,
         Command::Remove { label } => remove_account(label).await,
         Command::Poke { target } => crate::poke::poke(target).await,
@@ -1081,8 +1115,12 @@ const USE_USAGE: &str = "sessiometer use — switch the active account now
 
 USAGE:
     sessiometer use <account> [--force]
+    sessiometer use --next [--force]
 
     <account>   the target account (its label or account-uuid)
+    --next      advance to the next account in the swap chain without naming it —
+                the daemon's own next-swap candidate (the one `sessiometer status`
+                shows). Needs a running daemon, and cannot be combined with <account>.
     --force     override the pre-swap gate; also adopts the target when the active
                 credential is gone/rotated (a forced logout), a locked keychain aside
     -h, --help  print this help
@@ -2873,40 +2911,54 @@ fn render_next_swap(next_swap: Option<&NextSwap>, now: i64) -> String {
         }
         // When the daemon carries the fleet-capacity relief hint, tell a stranded operator (a DEAD
         // active whose 🔴 row sits above this, AND every spare exhausted) that the fleet is OUT OF
-        // CAPACITY and WHEN it returns — not a content-free "no viable target". Rendered WITHOUT the
-        // pre-#666 false universal: on a MIXED fleet the daemon's `cause` names the gating dimension
-        // of the SOONEST-returning spare (issue #665), NOT a fleet-wide property, so "every account
-        // is weekly-exhausted" / "… over its session limit" was literally inaccurate (some spares are
-        // blocked the other way). Say only what the wire substantiates. The "add an account" remedy
-        // is gated on the actual WAIT (issue #666, [`ADD_ACCOUNT_NUDGE_WAIT_SECS`]), not the `cause`
-        // label: a block clearing within one session window is transient (the reset is the remedy —
-        // wait it out); a longer or unknown-duration wait is a structural shortage (add capacity).
-        // This makes `cause` render-irrelevant except the pre-#405 `None` bare fallback. `resets_at`
-        // humanizes with the same `humanize_until` the per-account "resets in" cells use.
+        // CAPACITY and WHEN it returns — not a content-free "no viable target". The phrase itself
+        // is composed by [`out_of_capacity_phrase`], shared with `use --next`'s refusal (issue
+        // #960) so the two surfaces cannot drift; only the pre-#405 `None`-cause fallback (no hint
+        // on the wire ⇒ say only what it substantiates) is decided here.
         Some(NextSwap::NoViableTarget { cause, resets_at }) => match cause {
             None => "next swap: none (no viable target)\n".to_owned(),
-            Some(_) => {
-                let relief = match resets_at {
-                    Some(at) => format!("; resets in {}", humanize_until(at - now)),
-                    None => String::new(),
-                };
-                // Nudge unless capacity is KNOWN to return within one session window: a sub-window
-                // wait is transient (no nudge); a longer OR unknown-duration wait is structural.
-                let structural_shortage = match resets_at {
-                    Some(at) => at - now > ADD_ACCOUNT_NUDGE_WAIT_SECS,
-                    None => true,
-                };
-                let nudge = if structural_shortage {
-                    " — add an account"
-                } else {
-                    ""
-                };
-                format!("next swap: none — out of capacity{relief}{nudge}\n")
-            }
+            Some(_) => format!(
+                "next swap: none — {}\n",
+                out_of_capacity_phrase(*resets_at, now)
+            ),
         },
         Some(NextSwap::AwaitingData) => "next swap: none (awaiting usage data)\n".to_owned(),
         None => "next swap: none\n".to_owned(),
     }
+}
+
+/// The fleet-capacity RELIEF phrase (issue #405): WHEN capacity returns, plus the "add an
+/// account" nudge when the wait is STRUCTURAL rather than transient. Rendered WITHOUT the
+/// pre-#666 false universal — on a MIXED fleet the daemon's `cause` names the gating dimension of
+/// the SOONEST-returning spare (issue #665), NOT a fleet-wide property, so "every account is
+/// weekly-exhausted" was literally inaccurate (some spares are blocked the other way). Say only
+/// what the wire substantiates; that is why `cause` is render-irrelevant here and only its
+/// presence (a pre-#405 daemon sends none) is consulted by the callers.
+///
+/// Shared by BOTH surfaces that report a blocked fleet: [`render_next_swap`]'s `status` footer and
+/// — since issue #960 — `use --next`'s [`Error::UseNextNoViableTarget`] refusal. ONE composer, so
+/// the two can never drift on the relief instant or on the nudge threshold, the same R-2
+/// STATE-parity discipline that keeps [`ADD_ACCOUNT_NUDGE_WAIT_SECS`] in lockstep with its menubar
+/// twin. Pure over (`resets_at`, `now`), so it is unit-tested without a clock, and secret-free —
+/// a duration and fixed prose, never a label (issue #15).
+pub(crate) fn out_of_capacity_phrase(resets_at: Option<i64>, now: i64) -> String {
+    // `resets_at` humanizes with the same `humanize_until` the per-account "resets in" cells use.
+    let relief = match resets_at {
+        Some(at) => format!("; resets in {}", humanize_until(at - now)),
+        None => String::new(),
+    };
+    // Nudge unless capacity is KNOWN to return within one session window: a sub-window
+    // wait is transient (no nudge); a longer OR unknown-duration wait is structural.
+    let structural_shortage = match resets_at {
+        Some(at) => at - now > ADD_ACCOUNT_NUDGE_WAIT_SECS,
+        None => true,
+    };
+    let nudge = if structural_shortage {
+        " — add an account"
+    } else {
+        ""
+    };
+    format!("out of capacity{relief}{nudge}")
 }
 
 /// The systemic refresh-failure indicator (issue #378): the daemon reports the refresh MECHANISM is
@@ -8227,6 +8279,51 @@ spare  22222222-2222\n\
     }
 
     #[test]
+    fn the_out_of_capacity_phrase_is_shared_by_the_status_footer_and_use_next() {
+        // Issue #960: `use --next`'s no-target refusal reports the SAME #405 relief hint the
+        // `status` footer does — one composer, so the relief instant and the "add an account"
+        // nudge threshold cannot drift between the two surfaces (R-2 STATE-parity). Assert the
+        // parity structurally, by deriving the footer's own tail from the shared composer rather
+        // than by restating a literal, so a future edit to either wording cannot pass this test
+        // while splitting the surfaces apart.
+        let response = StatusResponse {
+            systemic_refresh_failure: None,
+            systemic_refresh_source: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            canary: None,
+            expiry_cohort: None,
+            recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
+            refresh_enabled: None,
+            accounts: vec![status_line("work", true, Some(50), Some(25))],
+            next_swap: Some(NextSwap::NoViableTarget {
+                cause: Some(NoTargetCause::Weekly),
+                resets_at: Some(NOW + 2 * 86_400),
+            }),
+        };
+        let footer = render_status(&response, NOW, None, false)
+            .lines()
+            .last()
+            .unwrap()
+            .to_owned();
+        let phrase = out_of_capacity_phrase(Some(NOW + 2 * 86_400), NOW);
+        assert_eq!(footer, format!("next swap: none — {phrase}"));
+        // …and that phrase is exactly what the `--next` error carries, so the operator reads one
+        // story whichever verb surfaced it.
+        assert_eq!(
+            Error::UseNextNoViableTarget {
+                detail: phrase.clone()
+            }
+            .to_string(),
+            format!(
+                "refusing to swap: {phrase} — name a target to override: \
+                 `sessiometer use <account> --force`"
+            )
+        );
+    }
+
+    #[test]
     fn render_status_footer_is_plain_even_under_color() {
         // The candidate footer (#88) carries no SGR even when the color gate is open —
         // per-cell health coloring is #84, orthogonal; the footer stays uncolored.
@@ -11507,22 +11604,118 @@ spare  22222222-2222\n\
             parse_argv(&["use", "spare", "--force"]).unwrap(),
             Command::Use {
                 target: Some("spare".to_owned()),
-                force: true
+                force: true,
+                next: false
             }
         );
         assert_eq!(
             parse_argv(&["use", "--force", "spare"]).unwrap(),
             Command::Use {
                 target: Some("spare".to_owned()),
-                force: true
+                force: true,
+                next: false
             }
         );
         assert_eq!(
             parse_argv(&["use", "spare"]).unwrap(),
             Command::Use {
                 target: Some("spare".to_owned()),
-                force: false
+                force: false,
+                next: false
             }
+        );
+    }
+
+    #[test]
+    fn use_parses_next_and_force_in_either_order() {
+        // Issue #960 AC: `--next` is ORDER-INDEPENDENT exactly as `--force` already is —
+        // both orders parse to the same command, and `--next` alone leaves `force` off.
+        assert_eq!(
+            parse_argv(&["use", "--next", "--force"]).unwrap(),
+            Command::Use {
+                target: None,
+                force: true,
+                next: true
+            }
+        );
+        assert_eq!(
+            parse_argv(&["use", "--force", "--next"]).unwrap(),
+            Command::Use {
+                target: None,
+                force: true,
+                next: true
+            }
+        );
+        assert_eq!(
+            parse_argv(&["use", "--next"]).unwrap(),
+            Command::Use {
+                target: None,
+                force: false,
+                next: true
+            }
+        );
+    }
+
+    #[test]
+    fn use_next_and_an_explicit_target_are_mutually_exclusive_in_either_order() {
+        // Issue #960 AC: `--next` says "I am not naming a target", so naming one contradicts
+        // it. BOTH orders must be rejected identically — silently preferring one would swap
+        // to an account the operator did not ask for.
+        for argv in [
+            ["use", "spare", "--next"].as_slice(),
+            ["use", "--next", "spare"].as_slice(),
+        ] {
+            match parse_argv(argv).unwrap_err() {
+                Error::CliUsage {
+                    message,
+                    usage_hint,
+                } => {
+                    assert!(
+                        message.contains("--next") && message.contains("mutually exclusive"),
+                        "names the conflict for {argv:?}: {message}"
+                    );
+                    assert_eq!(usage_hint, "sessiometer use --help");
+                }
+                other => panic!("expected a CliUsage error for {argv:?}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn use_next_never_leaks_a_secret_sigil_or_echoes_the_offending_target() {
+        // Issue #15: the mutual-exclusion message names neither a token nor an email — and
+        // deliberately does NOT echo the target either, since a roster label may itself be an
+        // operator-authored email (#444/#447) with no business in a usage error.
+        let message = parse_argv(&["use", "someone@example.com", "--next"])
+            .unwrap_err()
+            .to_string();
+        assert!(!message.contains('@'), "no email: {message}");
+        assert!(
+            !message.to_lowercase().contains("token"),
+            "no token: {message}"
+        );
+        assert!(
+            message.contains("run `sessiometer use --help` for usage"),
+            "points at the right help: {message}"
+        );
+    }
+
+    #[test]
+    fn use_help_advertises_next_so_the_flag_is_discoverable() {
+        // Issue #960: a flag absent from `--help` is undiscoverable, which defeats the point
+        // of the request — the page must show the `--next` form AND that it needs a daemon.
+        let help = HelpTopic::Use.help();
+        assert!(
+            help.contains("sessiometer use --next"),
+            "help shows the --next usage form: {help}"
+        );
+        assert!(
+            help.contains("--next      advance to the next account in the swap chain"),
+            "help describes --next: {help}"
+        );
+        assert!(
+            help.contains("Needs a running daemon"),
+            "help states the daemon precondition: {help}"
         );
     }
 
