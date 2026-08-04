@@ -1,6 +1,10 @@
 # Solution Design: GUI/CLI Capability Parity
 
 **Source PRD**: `docs/requirements/gui-cli-capability-parity.md` (`dor_status: passed-with-findings`)
+**Decision records**: `../hq/strategy/gui-capability-parity.md` (the ruling) · ADR-0032 (the
+empirical result that unblocked it) · `../hq/strategy/design-menubar.md` (REQ-MBR-C-005 + its
+routing-as-compliance rider) · `../hq/strategy/design-login.md` (C1 as-built correction — read
+before touching `src/paths.rs`)
 **Status**: `draft` — one load-bearing open question remains (§ 14, OQ-1). Locks when OQ-1 is decided.
 **Date**: 2026-07-31
 
