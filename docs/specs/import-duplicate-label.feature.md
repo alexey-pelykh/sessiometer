@@ -83,3 +83,35 @@ command must agree on whether it resolves.
 > label against `local`'s roster. On a fresh target `apply_import` starts from an empty roster
 > (`src/cli.rs:4744-4750`), `local` is `None`, the check is skipped, and both entries are appended —
 > creating in one shot precisely the state R-6 exists to prevent, with both scenarios above green.
+
+## Scenario: every label-resolving site agrees on a duplicate  · Cap-3.2
+
+    Given a roster carrying label L under two different account_uuids
+    When each label-resolving site is given L
+    Then `use`, `poke` and the daemon's control-socket swap all refuse identically
+    And `enable`, `disable` and `remove` do not silently act on the first match
+    But not by asserting only the four commands R-6a used to name
+    But not by treating this as one policy over one resolver — there are two mechanisms
+
+> **Two mechanisms, six call sites — and `remove` is the one that does damage.** *Added 2026-08-05
+> (twelfth pass); every surface said "all four label-resolving commands" (`use`, `enable`, `disable`,
+> `remove`), which is wrong on the count and on the substance.* Derived from source, not sampled —
+> re-run `.tmp/enumerate.py`:
+>
+> | Mechanism | Matches | On a duplicate | Call sites |
+> |---|---|---|---|
+> | `use_account::resolve_target` (`src/use_account.rs:441-459`) | `label` **or** `account_uuid` | `UseTargetAmbiguous` — refuses; its doc says it *"NEVER guesses"* | `use` (`src/use_account.rs:607`), `poke` (`src/poke.rs:290`), daemon control-socket swap (`src/daemon/commands.rs:99`) |
+> | exact-label `.find()` / `.position()` | `label` only | **silently takes the first match** | `enable` / `disable` (`src/cli.rs:5152`), `remove` (`src/cli.rs:5221`) |
+>
+> The harm is concrete and it is on `remove`: on the duplicate label the scenarios above say `import`
+> can create, `remove L` deletes the **first** match's roster entry and then its **keychain stash**
+> (`src/cli.rs:5195-5211`) with no ambiguity check anywhere in that path — while `use L` on the same
+> roster refuses. An operator resolving the duplicate warning by removing "the extra one" can destroy
+> the wrong account's credential.
+>
+> "Make the four consistent" is not implementable as written either: `enable`/`disable`/`remove` do
+> not apply a *different policy* at the shared resolver, they never call it. Consistency means routing
+> them through `resolve_target` or deliberately not — a code change with its own blast radius, since
+> `AccountLabelNotFound` and `UseTargetNotFound` are distinct errors with distinct exit codes
+> (`src/error.rs:954-955`). **That is the decision OQ-1 owes, and neither `poke` nor the daemon path
+> appeared on any surface before this pass.**

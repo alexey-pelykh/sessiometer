@@ -455,7 +455,7 @@ the full-artifact case needs the same treatment deliberately.
 | `src/refresh.rs::classify` | reshape `RefreshOutcome` so `rotated` rides inside `Refreshed` — **necessary, not sufficient**; the three renders read a sibling field, see the note below | R-5 |
 | `src/refresh.rs::RefreshReport` + the three renders in `src/observability.rs` | **remove the field from the non-`refreshed` renders** — see the note below; reshaping `RefreshOutcome` alone does not do it | R-5 |
 | `src/daemon/snapshot_build.rs` + status render | provenance legibility | R-7 |
-| `src/use_account.rs` / `src/cli.rs::apply_enabled` / `src/cli.rs::apply_remove` | consistency per OQ-1 across all four label-resolving commands | R-6a |
+| `src/use_account.rs::resolve_target` / `src/poke.rs` / `src/daemon/commands.rs` / `src/cli.rs::apply_enabled` / `src/cli.rs::apply_remove` | consistency per OQ-1 — **across two different mechanisms and six call sites**, not one policy over four verbs; see the note below | R-6a |
 | `docs/findings/0262-*.md` | new | R-1, R-1a |
 | `docs/*` runbook + command help | new | R-8 |
 
@@ -474,6 +474,26 @@ rows, including the entire security core:*
 | `src/observability.rs` | sha256 artifact digest on **both** events + requested scope on the **`import`** event only (export has none — R-9c/AD-5); allowlist-refusal signal | R-14, R-14a |
 | `src/config.rs::Account` | `account_uuid` shape validation before it reaches `stash()` | R-15 |
 
+> **There are TWO label-resolution mechanisms in this tree, and OQ-1 is the question of which one
+> wins.** *Corrected 2026-08-05 (twelfth pass); every surface said "all four label-resolving commands"
+> — naming `use`, `enable`, `disable`, `remove` — which is wrong on both the count and the substance.*
+> Derived from source rather than sampled (`.tmp/enumerate.py`):
+>
+> | Mechanism | Matches | On a duplicate label | Call sites |
+> |---|---|---|---|
+> | `use_account::resolve_target` (`src/use_account.rs:441-459`) | `label` **or** `account_uuid` | `Error::UseTargetAmbiguous { count }` — **refuses**; its doc says the resolver *"NEVER guesses"* | `use` (`src/use_account.rs:607`), **`poke`** (`src/poke.rs:290`), **the daemon control-socket swap** (`src/daemon/commands.rs:99`) |
+> | exact-label `.find()` / `.position()` | `label` only | **silently takes the first match** | `enable` / `disable` (`apply_enabled`, `src/cli.rs:5152`), `remove` (`apply_remove`, `src/cli.rs:5221`) |
+>
+> So on the duplicated label R-6 says `import` can create, `use` and `poke` **refuse** while `remove`
+> **silently deletes the first match's keychain stash**. That divergence — not a missing verb — is
+> what OQ-1 has to settle, and neither `poke` nor the daemon path appeared on any surface.
+> `enable`/`disable`/`remove` do not merely *differ in policy*; they never reach the ambiguity-capable
+> resolver at all, so "make the four consistent" is not implementable as written.
+>
+> **How this was found matters.** Three prior passes each reported one more member of this set
+> (a fourth enum variant, a fourth outcome, a fifth verb) because an adversarial reader *samples* a
+> set. This table is *derived* — re-run `.tmp/enumerate.py` rather than trusting the count here.
+
 **Untouched by design**: `src/swap.rs` (reused, not modified).
 
 > **`rotated=` is emitted from three modules onto three log lines, and reshaping `RefreshOutcome`
@@ -485,6 +505,22 @@ rows, including the entire security core:*
 > (`event=keep_warm`), fed from `src/refresh_tick.rs`, `src/daemon/refresh_fold.rs` and
 > `src/daemon/keep_warm.rs`. The code states the multiplicity in terms: *"three separate refresh
 > mechanisms, three separate event names"* (`src/observability.rs:2187`).
+>
+> **And a FOURTH surface, which is not a log line at all.** *Added 2026-08-05 (twelfth pass).*
+> `refresh_fold` also folds the value into daemon state on **every** outcome — its comment says
+> *"Armed for EVERY outcome, including `Dead` / `Error`"* (`src/daemon/refresh_fold.rs:557`) — and
+> `refresh_health_view` projects it onto the **versioned `status`/`watch` wire**:
+> `rotated: health.refresh_token_rotated.unwrap_or(false)` (`src/daemon/snapshot.rs:1403`). Its
+> consumer is **Swift**: `apps/menubar/Sources/WireModel.swift:98`, asserted in
+> `apps/menubar/Tests/WireDecoderTests.swift` and pinned in committed JSON fixtures.
+>
+> This changes what R-5 costs. The three log lines are free to fix. The wire is not: `.unwrap_or(false)`
+> means the cheapest repair leaves `"rotated": false` on every `dead` / `no_change` / `error` account —
+> the exact uninformative value R-5 removes, now on a **versioned** surface — while actually dropping
+> the field is a `STATUS_SCHEMA_VERSION` change carrying the status/watch goldens plus the Swift
+> fixtures and `WireDecoderTests` assertions. **Neither consequence appeared in R-5a's consumer list
+> (which names only `docs/findings/0465-*`), § 8's Interface-Change table, the risk register, or
+> #1004** — the whole artifact set costed R-5 as a log-format change.
 >
 > So AD-3's reshape and Cap-4.1 — *"Given the `RefreshOutcome` type / When a non-`refreshed` outcome
 > is constructed / Then no rotated value can be attached to it"* — are both **satisfiable with all
@@ -560,10 +596,11 @@ documents. No migration of on-disk state; no `format_version` change (§ 4.2).
 | `import` stdout | new warning + report lines | additive; C-3 forbids any credential in them |
 | `import` flags | optional `--activate <label>` | additive, opt-in |
 | `refresh` / `poll_refresh` / `keep_warm` log lines | `rotated` absent on non-`refreshed` — **three lines, not one** (`src/observability.rs:2155`, `:2173`, `:2191`) | **contract change on all three**; consumer 0465 checked for `dead` only — its 141-count derives from *event type* (86 `refresh` + 31 `keep_warm` + 24 `poll_refresh`), so a `no_change` line would still re-baseline it (open, tracked on #1004) |
+| `status` / `watch` wire | `RefreshHealth.rotated` — **a versioned surface with a Swift consumer** (`src/daemon/snapshot.rs:1403` → `apps/menubar/Sources/WireModel.swift:98`) | **contract change, and the expensive one**: dropping the field is a `STATUS_SCHEMA_VERSION` bump carrying the status/watch goldens and the Swift fixtures; keeping it means `.unwrap_or(false)` still renders the value R-5 removes |
 | artifact format | **none** | v1 preserved (C-1, C-4) |
 | `import` flags | `--accounts`, `--settings`, `--shred` | additive, opt-in; **default unchanged** (AD-9) |
 | `export` flags | **`--no-secrets` REMOVED** | **breaking** — the only breaking CLI change in this scope. Path undecided (OQ-4) |
-| `export` stdout | daemon-liveness warning when the local daemon is live | additive; conditional, never unconditional (R-13) |
+| `export` **stderr** | daemon-liveness warning when the local daemon is live | additive; conditional, never unconditional (R-13). **stderr, never stdout** — with `PATH` omitted `export` writes the artifact itself to stdout (`src/cli.rs:4559-4565`), and the existing `PLAINTEXT_WARNING` already takes this rule with the reason stated in the code: *"Warn on stderr — never stdout, which may carry the artifact"* (`src/cli.rs:4472-4474`). A warning on stdout prepends its bytes to the artifact, which then fails `preamble.magic != MAGIC` (`src/migration.rs:360`) — the warning built to save the migration destroys it, and only on the branch where it fires |
 | `import` stdout | per-key refusal lines from the portability allowlist | additive; C-3 applies |
 | config adoption | **on an existing-config target**: non-portable keys were already dropped (`apply_import` keeps `local` wholesale) → now refused **and reported**. **On a fresh target**: they were **adopted** → now **refused**, a real behaviour change, not just a new line | **behaviour change** on the fresh-target path (`src/cli.rs:4744-4750`). Reading the Change cell as "only a new report line" is exactly the misreading Cap-8.7 exists to catch |
 | `Event::Export` | `+ artifact_sha256` | additive; aggregate-only redaction preserved. **No `+ scope`** — export takes no narrowing flag (R-9c/AD-5), so it has none to log |
@@ -604,7 +641,7 @@ stash writes. What § 4.1 declines to add is a second writer of the canonical
 | Cap-2.3 | An already-expired artifact additionally reports expiry | unit | R-4a |
 | Cap-3.1 | Same-label/different-uuid import warns — with a target that is **not** a clone of the source | unit | R-6 |
 | Cap-3.2 | `use` / `enable` / `disable` / **`remove`** agree on duplicate-label resolution — `remove` is not optional: it is the only irreversible one (deletes a keychain stash), so a test omitting it passes while the case that motivated R-6a stays unasserted | unit | R-6a |
-| Cap-4.2 | **All three rotation-emitting lines drop the field** — `event=refresh` (`src/observability.rs:2155`), `event=poll_refresh` (`:2173`) and `event=keep_warm` (`:2191`). The renders read `RefreshReport.refresh_token_rotated` (`src/refresh.rs:284`), a **sibling of** `outcome` — so Cap-4.1 and AD-3's reshape are both satisfiable with all three untouched. Assert the rendered line, not the type | unit (render) | R-5 |
+| Cap-4.2 | **All four rotation-emitting surfaces drop the field** — `event=refresh` (`src/observability.rs:2155`), `event=poll_refresh` (`:2173`), `event=keep_warm` (`:2191`), and the **versioned `status`/`watch` wire** (`src/daemon/snapshot.rs:1403`, `rotated: health.refresh_token_rotated.unwrap_or(false)`), whose consumer is Swift (`apps/menubar/Sources/WireModel.swift:98`). The renders read `RefreshReport.refresh_token_rotated` (`src/refresh.rs:284`), a **sibling of** `outcome` — so Cap-4.1 and AD-3's reshape are both satisfiable with all three untouched. Assert the rendered line, not the type | unit (render) | R-5 |
 | Cap-4.1 | `rotated` is unrepresentable on **every non-`Refreshed` outcome** — `NoChange`, `Dead`, `Error` (all three, `src/refresh.rs:225-240`). Asserting only `Dead`/`Error` lets an implementation keep `rotated` on `NoChange`, a live outcome (`src/observability.rs:180`) whose `rotated` is derived independently of its expiry test. Excludes `refreshed_not_restashed`, an *event* outcome mapped from `Refreshed` where `rotated` is meaningful | unit (type-level) | R-5 |
 | Cap-5.1 | `status` distinguishes canonical-sourced from stash-sourced EXPIRY | unit | R-7 |
 | Cap-6.1 | No import output line contains a token or email | unit (extend existing) | C-3 |
@@ -615,6 +652,7 @@ stash writes. What § 4.1 declines to add is a second writer of the canonical
 | Cap-7.4 | An artifact whose roster is the payload of interest round-trips through narrow-parse **even when it carries an unknown non-roster block**. Not "a roster-only artifact under an unknown block": *roster-only* is pinned to `[[account]]` entries **and no non-roster block** (`import-scope-selection.feature.md`), which an unknown block contradicts | unit | R-9b, R-16 |
 | Cap-7.5 | `export` exposes no config/roster narrowing flag | unit (usage assertion) | R-9c |
 | Cap-7.6 | `import --settings` on a roster-only artifact reports "no configuration", not an error | unit | R-9 — **OQ-6-gated**, see § 4.7 |
+| Cap-7.11 | **`import --accounts --settings` given together** applies the union both flags name, not whichever the parser assigned last — the fourth cell of the scope 2×2, and the one that does not fail safe: `lexopt` does not reject a combined flag for free, so last-flag-wins silently discards the roster the operator asked for while every other Cap-7.x still passes | unit (flag parse + `apply_import` outcome) | R-9, R-9a |
 | Cap-7.10 | `import --accounts` on an artifact with **no `[[account]]` entries** reports it, rather than erroring or silently succeeding having applied nothing — the accounts-axis mirror of Cap-7.6, and **not** OQ-6-gated: the accounts axis *is* presence-derivable (OQ-6's own wording) | unit | R-9 |
 | Cap-7.7 | `export --no-secrets` exits with a **strict-usage error stating that roster-without-secrets is no longer supported** — asserted on both halves: non-zero exit AND the explanation present. **Not "names the replacement"**: nothing replaces the flag (R-9c/AD-5 forbid any export-side narrowing flag, and `import --accounts` narrows what is *applied*, not what the file *contains*), so a "replacement named" assertion has no referent. Explicitly asserts the flag is **not** silently accepted-and-ignored | unit (usage assertion) | R-10 (**not** R-10a — see note) |
 | Cap-7.8 | `PLAINTEXT_WARNING` reflects that every artifact **with a non-empty roster** now carries credentials, and advises no deletion the tool provides no mechanism for. **Not "every artifact"** unqualified — an empty roster yields zero credentials (`src/cli.rs:4535-4546`), so the guard must be re-expressed over the artifact's credential count, not deleted with the flag | unit (text assertion) | R-10b |
@@ -634,7 +672,14 @@ stash writes. What § 4.1 declines to add is a second writer of the canonical
 > documents as *"**always** at the platform's fixed native location — **never** an env-var override"*,
 > deliberately (issue #7). There are currently **zero** tests over it. So none of the four branches is
 > hermetically constructible: `Responsive` needs a real listener at the native socket path,
-> `AliveUnresponsive` needs the real lock flocked, `Err` is not reachable at all, and even
+> `AliveUnresponsive` needs the real lock flocked, `Err` is reachable but not from a *hermetic* test
+> without the seam (**corrected 2026-08-05, twelfth pass — this read "`Err` is not reachable at all",
+> which is false against source and contradicted Cap-10.1 seven lines above**: `daemon_liveness()`
+> has three `?` sites — `control_socket()?`, `daemon_lock()?` and `is_held(…)?`, `src/cli.rs:1886-1888`
+> — and `is_held` returns `Err(Error::Io(..))` on a non-`NotFound` open error
+> (`src/daemon/seams.rs:393`) and a non-`EWOULDBLOCK` flock error (`:408`). Once the seam this same
+> note mandates exists, a stub returns `Err` trivially. Reading it as unreachable retires the fourth
+> branch the eighth pass added precisely because it was being dropped), and even
 > `NotRunning` passes or fails according to whether the developer's own daemon happens to be running.
 >
 > Implementing R-13 therefore includes **introducing the seam** — take the probe as a parameter (or a
@@ -833,7 +878,7 @@ recorded so the call is visible, not because it is pending.
 | R-6 | 4.3 | Cap-3.1 | covered |
 | R-6a | 4.3 | Cap-3.2 | **decision-gated** (OQ-1) |
 | R-7 | 4.5 | Cap-5.1 | covered |
-| R-9 | 4.7 | Cap-7.1 (`--accounts`), **Cap-7.9 (`--settings` — the mirror)**, Cap-7.2 (default), Cap-7.6, **Cap-7.10 (roster-less `--accounts`)** | **partly decision-gated** (OQ-6 — the `--settings` availability report; OQ-7 — Cap-7.9's target state) |
+| R-9 | 4.7 | Cap-7.1 (`--accounts`), **Cap-7.9 (`--settings` — the mirror)**, Cap-7.2 (default), Cap-7.6, **Cap-7.10 (roster-less `--accounts`)**, **Cap-7.11 (both flags together)** | **partly decision-gated** (OQ-6 — the `--settings` availability report; OQ-7 — Cap-7.9's target state) |
 | R-9a | 4.7 / AD-6 | Cap-7.3 | **partly decision-gated** (OQ-6 — the settings-axis presence test) |
 | R-9b | 4.7 | Cap-7.4 | covered |
 | R-9c | 4.7 / AD-5 | Cap-7.5 | covered |
@@ -872,7 +917,10 @@ recorded so the call is visible, not because it is pending.
 Every capability traces to a requirement: Cap-1.x→R-2/R-2a/AC-2a, Cap-2.x→R-4/R-4a, Cap-3.x→R-6/R-6a,
 Cap-4.1→R-5, Cap-5.1→R-7, Cap-6.1→C-3, Cap-7.1-7.6→R-9/R-9a-c + R-16 (Cap-7.4); R-9d has no capability of its own, **Cap-7.7→R-10**,
 **Cap-7.8→R-10b**, **Cap-7.9→R-9 (the `--settings` mirror)**, Cap-8.x→R-11/R-11a-e (Cap-8.6→R-11, **Cap-8.7→R-11/R-11a**), Cap-9.x→R-12, Cap-10.x→R-13/R-14/R-14a,
-Cap-11.x→R-15/R-16. **No orphan capabilities.**
+Cap-11.x→R-15/R-16, **Cap-4.2→R-5**, **Cap-7.10→R-9**, **Cap-7.11→R-9/R-9a**. **No orphan capabilities — all 35.**
+*Corrected 2026-08-05 (twelfth pass); this enumerated 32 and omitted exactly the two capabilities
+added to close the eleventh pass's findings, so the sentence asserting completeness was the one
+place the additions did not reach.*
 
 > **This matrix checks only one direction, and that is why it missed two gaps (corrected 2026-08-04).**
 > "No orphan capabilities" asks *does every capability trace to a requirement* — it can never detect a
@@ -897,7 +945,7 @@ their absence from the Cap-list does not read as a coverage gap:
 
 **R-10a** has neither, because it is undecided (OQ-4).
 
-> **One capability has no spec scenario: Cap-7.7** — 33 of the 34 are pinned by a scenario in
+> **One capability has no spec scenario: Cap-7.7** — 34 of the 35 are pinned by a scenario in
 > `docs/specs/`. This one is left unpinned **deliberately**, because its assertion is the hard-remove
 > branch of the still-open OQ-4 (see the R-10 row in § 16). Writing the scenario now would pin the
 > undecided outcome in the place a test author reads first. Close OQ-4, then add it to

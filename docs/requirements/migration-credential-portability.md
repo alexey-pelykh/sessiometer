@@ -298,8 +298,24 @@ the #463 public-safety rule. `Origin: AI-inferred-expansion (repo convention)`.
 **R-4** — *When* `import` reads an artifact, the system **shall** warn that the artifact's credentials
 are invalidated by any refresh the source performs after the export, and **shall** state the safe
 sequence — **naming the forcing form `use --force <label>`, and never `use <label>` unqualified**.
-The warning **shall** fire on **every** credential-bearing import — not conditionally — until
-a freshness signal exists to gate it on.
+The warning **shall** fire on **every** credential-bearing import **that actually applies a
+credential** — not conditionally on a freshness heuristic, which does not exist — until a freshness
+signal exists to gate it on.
+
+> **`--settings` applies no credential, so the warning has no referent there.** *Corrected 2026-08-05
+> (twelfth pass); this read "every credential-bearing import", which the artifact's contents decide,
+> not the operator's scope.* R-9a makes the flag a ceiling in both directions: `--accounts` ignores
+> the artifact's config, and symmetrically `--settings` applies no roster entry and no credential
+> (Cap-7.9). On `import --settings` against a credential-bearing artifact the artifact *bears*
+> credentials, so R-4 as previously written fires verbatim and instructs `use --force <label>` — but
+> nothing was imported, and on a fresh target the roster is empty, so that command returns
+> `UseTargetNotFound` (`src/use_account.rs:449`). **The one warning this PRD treats as load-bearing
+> would name a command that cannot succeed**, which is the dismissal-training failure RSK-1 exists to
+> prevent, on the surface the whole scope is built around.
+>
+> The gate is *"did this import write a credential"*, which `apply_import` knows for free — not a
+> freshness signal, which is R-4a's separate and still-open question. Neither R-9/R-9a-c, AC-9,
+> Cap-7.9 nor R-4/AC-4/Cap-2.1 mentioned the other before this pass.
 
 > **`--force` is mandatory in this string, and this is the highest-traffic site of that correction.**
 > *Added 2026-08-05 (tenth pass); `--force` appeared in R-4, AC-4, § 4.2, Cap-2.1 and the spec **zero**
@@ -386,10 +402,32 @@ silently — **including when both colliding entries arrive in the same artifact
 > scenarios green.
 
 **R-6a** — *Where* a duplicate-label roster exists, the system **shall** handle it **consistently**
-across **all four** label-resolving commands — `use`, `enable`, `disable` and `remove`. It does not today: `use <label>` refuses with
-`Error::UseTargetAmbiguous` (`src/use_account.rs:453`, exit code 6 per `src/error.rs:955`), while
-`apply_enabled` backing `enable`/`disable` silently resolves to the earliest entry
-(`src/cli.rs:5150-5163`). Which behaviour is correct is a decision, not a design.
+across every site that resolves an operator label — which is **two different mechanisms over six call
+sites**, not four commands. It does not today: `use` refuses with
+`Error::UseTargetAmbiguous` (`src/use_account.rs:453`, exit code 6 per `src/error.rs:955`), and so do
+**`poke`** (`src/poke.rs:290`) and **the daemon's control-socket swap** (`src/daemon/commands.rs:99`),
+because all three share `resolve_target` — whose doc states it *"NEVER guesses"*
+(`src/use_account.rs:438-441`). `enable`/`disable` (`apply_enabled`, `src/cli.rs:5152`) and `remove`
+(`apply_remove`, `src/cli.rs:5221`) do not reach that resolver **at all**: each does an exact-label
+`.find()`/`.position()` and silently takes the **first** match. Which behaviour is correct is a
+decision, not a design.
+
+> **The count and the mechanism were both wrong, and the mechanism is what matters.**
+> *Corrected 2026-08-05 (twelfth pass); this read "all four label-resolving commands — `use`,
+> `enable`, `disable` and `remove`".* On the duplicate label R-6 says `import` can create, `use` and
+> `poke` refuse — while **`remove L` deletes the first match's roster entry and then its keychain
+> stash** (`src/cli.rs:5195-5211`), silently, with no ambiguity check anywhere in that path. That is
+> the concrete harm OQ-1 has to price, and no surface stated it.
+>
+> "Make the four consistent" is also not implementable as written: `enable`/`disable`/`remove` do not
+> merely apply a *different policy* at the resolver, they never call it. Consistency here means
+> routing them through `resolve_target` (or deliberately not), which is a code change with its own
+> blast radius — `AccountLabelNotFound` and `UseTargetNotFound` are distinct errors with distinct exit
+> codes.
+>
+> Enumerated from source rather than sampled — re-run `.tmp/enumerate.py`. Three prior passes each
+> reported one more member of this set, which is what sampling a finite set looks like.
+
 `Origin: AI-inferred-expansion`.
 `Ratification: pending-user` (the inconsistency's *inclusion* is ratified; its resolution is not).
 
@@ -635,7 +673,19 @@ Under R-9's model the applied payload *can* narrow to the roster, but the defaul
 `Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item E11)`.
 
 **R-13** — *When* `export` runs, the system **shall** determine whether this machine's daemon is
-running and surface it. The design's own position is that the staleness hazard is "not detectable at
+running and surface it **on stderr**.
+
+> **stderr, never stdout — the stream is load-bearing, not a detail.** *Added 2026-08-05 (twelfth
+> pass); no surface named a stream, and the design's Interface-Change table said `export` **stdout**.*
+> With `PATH` omitted, `export` writes the **artifact itself** to stdout
+> (`src/cli.rs:4559-4565`; `EXPORT_USAGE` at `:1282` documents *"stdout if omitted"*). The existing
+> `PLAINTEXT_WARNING` already takes this rule with the reason stated in the code: *"Warn on stderr —
+> never stdout, which may carry the artifact"* (`src/cli.rs:4472-4474`). A liveness warning on stdout
+> prepends its bytes to the artifact stream, which then fails `preamble.magic != MAGIC`
+> (`src/migration.rs:360`) on import. The warning written to save the migration would destroy it —
+> and only on the branch where it fires, so every no-daemon test stays green.
+
+The design's own position is that the staleness hazard is "not detectable at
 the target — it is only **preventable at the source**", and there is currently **zero** source-side
 implementation of that thesis (`src/cli.rs:4455-4501` never asks). Liveness is locally probeable via
 the existing control socket, via the read-only `daemon_liveness()` probe (`src/cli.rs:1885`) already
@@ -718,9 +768,29 @@ regardless of which value they would have carried.)
 `Origin: AI-inferred-expansion`.
 `Ratification: user-ratified 2026-08-04 (scope-membership B/first-pass, item I1)`.
 
-**R-5a** — *Where* R-5 changes the emitted field, the change **shall** be treated as a **log-format
-change** with existing consumers, not a cosmetic edit. `docs/findings/0465-*` derives a published
+**R-5a** — *Where* R-5 changes the emitted field, the change **shall** be treated as a change with
+existing consumers on **four** surfaces — three log lines **and one versioned wire** — not a
+log-format change and not a cosmetic edit. `docs/findings/0465-*` derives a published
 headline count (`141 rotated=true, 0 rotated=false`) from this field.
+
+> **The fourth consumer is a versioned wire with a cross-language client, and it prices R-5
+> differently from the other three.** *Added 2026-08-05 (twelfth pass); this requirement named
+> `docs/findings/0465-*` as the consumer, and the whole artifact set costed R-5 as a log-format
+> change.* `refresh_fold` folds the value into daemon state on **every** outcome — its own comment
+> says *"Armed for EVERY outcome, including `Dead` / `Error`"* (`src/daemon/refresh_fold.rs:557`) —
+> and `refresh_health_view` projects it onto the `status`/`watch` wire as
+> `rotated: health.refresh_token_rotated.unwrap_or(false)` (`src/daemon/snapshot.rs:1403`). The
+> consumer is Swift: `apps/menubar/Sources/WireModel.swift:98`, asserted in
+> `apps/menubar/Tests/WireDecoderTests.swift` and pinned in committed JSON fixtures.
+>
+> The three log lines are free to fix. This one is not, and both available paths cost something:
+> `.unwrap_or(false)` means the cheapest repair leaves `"rotated": false` on every `dead` /
+> `no_change` / `error` account — **the exact uninformative value R-5 removes, now on a versioned
+> surface** — while genuinely dropping the field is a `STATUS_SCHEMA_VERSION` change carrying the
+> status/watch goldens plus the Swift fixtures and decoder assertions. **Which path is taken is a
+> decision this scope has not made**; it is not resolvable by an implementer choosing the compiling
+> one.
+
 **Partially verified: 0465 carries no `dead` line** — its window ends ~2026-07-11 and the first `dead` line in the
 local log is 2026-07-14, so no dead line is inside its sample. The requirement is forward-looking.
 `Origin: AI-inferred-expansion (premortem P1)`. `Ratification: pending-user`.
@@ -938,7 +1008,8 @@ of the *version-floor* half only.
 > Cap-11.2's first half are unsatisfiable. The version-floor clause is **not** gated and stands as
 > written. This mirrors the treatment AC-10 already carries for OQ-4.
 
-**AC-4 (R-4, R-4a)** — *Given* any credential-bearing import, *When* it runs, *Then* the operator is
+**AC-4 (R-4, R-4a)** — *Given* an import that **actually applies a credential** (so: not
+`import --settings`, which applies none — Cap-7.9), *When* it runs, *Then* the operator is
 warned that a source refresh after export invalidates the artifact, and is given the safe sequence
 **naming `use --force <label>`**.
 **BUT NOT** naming `use <label>` unqualified — a provable no-op against the already-active account
@@ -949,8 +1020,10 @@ incident it exists to prevent;
 
 **AC-5 (R-5, R-5a)** — *Given* a refresh that classifies as anything other than `Refreshed` — that is
 `NoChange`, `Dead` **or** `Error`, the three non-`Refreshed` variants of `RefreshOutcome`
-(`src/refresh.rs:225-240`) — *When* the event is logged, *Then* the line does not present `rotated` as
-an observation.
+(`src/refresh.rs:225-240`) — *When* the event is logged, *Then* **none of the four emitting surfaces**
+presents `rotated` as an observation: the `refresh`, `poll_refresh` and `keep_warm` lines
+(`src/observability.rs:2155`, `:2173`, `:2191`) **and the versioned `status`/`watch` wire**
+(`src/daemon/snapshot.rs:1403`).
 **BUT NOT** by deleting the field on the `refreshed` path, where it is meaningful; **BUT NOT** by
 enumerating only `dead` and `error`, which silently exempts `NoChange`; **BUT NOT** without
 checking whether any committed findings note's counts are drawn from a window containing non-`refreshed`
@@ -970,8 +1043,9 @@ lines — **0465 is checked for `dead` only, which is NOT the whole criterion** 
 
 **AC-6 (R-6, R-6a)** — *Given* a target roster carrying label `L` under uuid `X`, and an artifact
 carrying label `L` under uuid `Y`, *When* `import` runs, *Then* the operator is warned that a
-duplicate label was created. *And* `use L`, `enable L`, `disable L` **and `remove L`** thereafter agree
-on whether a duplicate label is resolvable. **BUT NOT** by enforcing label uniqueness — that
+duplicate label was created. *And* `use L`, `poke L`, `enable L`, `disable L`, `remove L` **and the daemon's
+control-socket swap** thereafter agree on whether a duplicate label is resolvable — all six sites,
+across both resolution mechanisms. **BUT NOT** by enforcing label uniqueness — that
 contradicts the documented design position; **BUT NOT** by leaving `use` refusing while `enable`
 silently picks first; **BUT NOT** by omitting `remove`, whose first-match-wins deletes a keychain
 stash irreversibly (`apply_remove`, `src/cli.rs:5219-5227`) and is therefore the case that should
@@ -1020,9 +1094,16 @@ PAST:    0.0  — no warning exists on any path
 ```
 TAG:     RotationSignalFidelity
 SCALE:   fraction of emitted `rotated` values that carry information
-METER:   unit test over classify() across all four returns
-         {refreshed, no_change, dead, error} -- omitting no_change exempts
-         a live outcome (src/observability.rs:180) whose rotated value is
+METER:   assertion on each of the FOUR EMITTED surfaces, for every non-refreshed
+         outcome: event=refresh (observability.rs:2155), event=poll_refresh
+         (:2173), event=keep_warm (:2191), and the versioned status/watch wire
+         (daemon/snapshot.rs:1403 -> WireModel.swift:98).
+         NOT a unit test over classify(): the SCALE above is the EMITTED values,
+         and classify() is the type. Measuring the type reads 1.0 with three of
+         the four surfaces still emitting -- which is exactly what Cap-4.2 exists
+         to catch, so the meter that certifies R-5 must not be blind to it.
+         Outcome coverage {refreshed, no_change, dead, error}: omitting no_change
+         exempts a live outcome (src/observability.rs:180) whose rotated value is
          derived independently of its expiry test (refresh.rs:434-437 vs :448-452)
 MUST:    1.0
 PAST:    < 1.0 — true-by-construction on any `dead` line with a parseable non-empty

@@ -88,12 +88,14 @@ line. The fix is to make that state unrepresentable, not merely unprinted.
 ## Scenario: all three rotation-emitting lines drop the field, not just `event=refresh`  · Cap-4.2
 
     Given a non-refreshed outcome on each of the three refresh mechanisms
-    When each mechanism's event is rendered
+    When each mechanism's event is rendered, and the status/watch wire is built
     Then no `rotated=` appears on the `refresh` line
     And none appears on the `poll_refresh` line
     And none appears on the `keep_warm` line
+    And the versioned `status`/`watch` wire presents no rotation claim either
     But not by asserting only the type
     But not by asserting only `event=refresh`
+    But not by treating the wire as a log line — it is versioned, with a Swift consumer
 
 > **`rotated=` is emitted from three modules onto three lines, and reshaping `RefreshOutcome` removes
 > it from none of them.** *Added 2026-08-05 (eleventh pass); every R-5 artifact scoped the fix to

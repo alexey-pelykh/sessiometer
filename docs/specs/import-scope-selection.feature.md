@@ -163,3 +163,37 @@ floor**.
 > yields an empty `accounts` (`src/cli.rs:4536-4546`). R-10b's own guard argument relies on all of
 > this. An operator who removes their last account, exports, and runs `import --accounts` on the
 > target to be conservative gets the exact "silently no-op" outcome § 4.7 forbids for the sibling axis.
+
+## Scenario: both scope flags given together  · Cap-7.11
+
+    Given an artifact carrying both a roster and non-roster config
+    When the operator runs `import --accounts --settings`
+    Then the applied scope is everything both flags name together, not the last one parsed
+    But not by silently letting one flag win
+    But not by leaving the combination to whichever assignment the parser happens to make last
+
+> **The 2×2 had three cells written and the fourth blank.** *Added 2026-08-05 (twelfth pass); a
+> canaried grep for the combination across all 12 docs and all 19 issues returned zero.* Cap-7.1
+> covers `--accounts`, Cap-7.9 covers `--settings`, Cap-7.2 covers neither (AD-9's "everything") —
+> and nothing covers both.
+>
+> This does not fail safe. The CLI parses with `lexopt`, not `clap`, so a repeated-or-combined scope
+> flag is not rejected for free. The natural implementation — `match arg { "accounts" => scope =
+> Accounts, "settings" => scope = Settings }` — makes the **last flag win**, so
+> `import --accounts --settings` silently imports settings only and **discards the roster and
+> credentials the operator explicitly asked for**. Every written capability still passes: the applied
+> scope is a subset, so R-9's "ceiling, never a floor" holds; AD-9's default is untouched.
+>
+> Whether the union is the right answer, or the combination should be a usage error, is a genuine
+> call — but leaving it to the parser's assignment order is not one.
+
+> **Cap-7.10 forbids behaviour that ships today, in two functions no surface cites.** *Added
+> 2026-08-05 (twelfth pass).* "Silently succeeding having applied nothing" is exactly what happens
+> now: `import_report(&[])` renders *"import complete: 0 imported, 0 skipped, 0 overwritten, 0
+> failed"* (`src/cli.rs:4909-4923`), and `ImportRollup::from_counts(0,0,0,0)` returns `Ok` —
+> documented as deliberate at `src/observability.rs:709`: *"No account failed (all imported /
+> skipped / overwritten, **or an empty artifact**)"*.
+>
+> So satisfying Cap-7.10 means changing the rollup, which changes the redacted `event=import` line —
+> **a log-format change of the R-5a class**, on a surface R-5a's consumer analysis never covered. It
+> is not a green-field addition, and it should not be costed as one.

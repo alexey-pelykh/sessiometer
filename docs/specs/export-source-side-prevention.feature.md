@@ -18,8 +18,19 @@ target — only preventable at the source*. There is currently zero source-side 
 
     Given the local daemon is running
     When the operator runs `export`
-    Then the command warns that the daemon's next refresh will invalidate the artifact
+    Then the command warns on STDERR that the daemon's next refresh will invalidate the artifact
     But does not block the export
+    But not on stdout, which may carry the artifact itself
+
+> **The stream is the assertion, not a detail.** *Added 2026-08-05 (twelfth pass); no scenario, no
+> criterion and no issue named a stream, and the design's Interface-Change table said `export`
+> **stdout**.* With `PATH` omitted, `export` writes the artifact to stdout
+> (`src/cli.rs:4559-4565`; `EXPORT_USAGE` documents *"stdout if omitted"* at `:1282`). The existing
+> `PLAINTEXT_WARNING` already takes this rule, with the reason in the code: *"Warn on stderr — never
+> stdout, which may carry the artifact"* (`src/cli.rs:4472-4474`). A warning on stdout prepends its
+> bytes to the artifact, which then fails `preamble.magic != MAGIC` on import
+> (`src/migration.rs:360`). Assert the stream, or the warning written to save the migration destroys
+> it — on the branch where it fires, so every no-daemon test stays green.
 
 ## Scenario: export is quiet when the daemon is not running  · Cap-10.1
 

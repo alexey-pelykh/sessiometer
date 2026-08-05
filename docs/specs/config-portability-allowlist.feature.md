@@ -49,12 +49,22 @@ selection answers *what was asked for*; this answers *what is permitted*.
 
 ## Scenario: a weaker KDF is refused, a stronger one accepted  · Cap-8.2
 
-    Given a local KDF parameter set
+    Given a target with NO existing config, so the artifact's config would otherwise be adopted
+    And a local KDF parameter set
     When an artifact carrying weaker parameters is imported with `--settings`
     Then the weaker values are refused
     But an artifact carrying stronger values is adopted
+    And the refusal is reported
     But an artifact stronger on one knob and weaker on the other is refused as a block
     But not by comparing `kdf_memory_kib` alone
+    But not by running against a target that already has a config
+
+> **Cap-8.2 was the one allowlist scenario the tenth pass's fresh-target fix skipped.** *Added
+> 2026-08-05 (twelfth pass).* That pass pinned Cap-8.1 and Cap-8.3 and its note named only "Cap-8.1
+> carries the same defect" — Cap-8.2 sits between them and got neither the target-state *Given* nor a
+> reported-refusal *Then*. On a target that already has a config, `apply_import` discards the incoming
+> non-roster blocks entirely (`src/cli.rs:4744-4750`), so "the weaker values are refused" is true with
+> no KDF comparison written at all.
 
 > **"Stronger" is a partial order over two knobs, and only the incomparable case discriminates.**
 > *Added 2026-08-05 (eleventh pass); this fed uniformly-weaker and uniformly-stronger pairs only.*
