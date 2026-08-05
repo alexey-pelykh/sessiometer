@@ -44,6 +44,28 @@ line. The fix is to make that state unrepresentable, not merely unprinted.
     When the outcome is classified
     Then the emitted event carries no rotated value
 
+## Scenario: a no-change refresh emits no rotation claim  · Cap-4.1
+
+    Given a refresh whose response returns a non-empty token but does not slide the expiry
+    When the outcome is classified
+    Then the outcome is no_change
+    And the emitted event carries no rotated value
+
+> **The variant this file used to omit, and the omission is the failure mode Cap-4.1 names.**
+> *Added 2026-08-05 (eighth pass).* The three scenarios around this one enumerated `dead`, `error` and
+> `refreshed` — which is precisely the three-of-four shape Cap-4.1 warns against, on the file that
+> pins Cap-4.1. `RefreshOutcome` has **four** variants (`src/refresh.rs:225-240`) and `NoChange` is
+> live-emitted as `"no_change"` (`src/observability.rs:180`).
+>
+> It is not benign: `rotated` is decided by the **token** compare (`src/refresh.rs:434-437`) while
+> `NoChange` is decided by the **expiry** failing to move past the seeded marker (`:448-452`) — two
+> independent comparisons, so a `no_change` line can carry `rotated=true` for exactly the reason a
+> `dead` line can. An implementation that suppresses `rotated` on `Dead`/`Error` only passes every
+> other scenario here and leaves the field meaningless on a live log path.
+>
+> Do **not** add a `refreshed_not_restashed` scenario alongside it: that is an *event* outcome mapped
+> from `Refreshed` (`src/refresh_tick.rs:843`), where `rotated` is real.
+
 ## Scenario: a successful refresh still reports rotation  · Cap-4.1
 
     Given a refresh that returns a new refresh token differing from the seeded one

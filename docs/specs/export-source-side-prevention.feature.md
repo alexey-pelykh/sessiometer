@@ -44,11 +44,26 @@ target — only preventable at the source*. There is currently zero source-side 
 > running'"*. A two-state test that maps this to the quiet branch ships silence at the moment the
 > warning matters.
 
-## Scenario: a probe failure does not fail the export  · Cap-10.1
+## Scenario: a probe failure warns, and does not fail the export  · Cap-10.1
 
-    Given the liveness probe cannot reach a conclusive answer
+    Given the liveness probe returns an error rather than a liveness verdict
     When the operator runs `export`
-    Then the export still completes
+    Then the command warns, exactly as it does for a responsive daemon
+    And the export still completes
+    But not by leaving the warn-or-quiet choice to the implementer
+
+> **`daemon_liveness()` has four outcomes, not three.** *Added 2026-08-05 (eighth pass).* Its
+> signature is `Result<DaemonLiveness>` (`src/cli.rs:1885`), so the `Err` branch sits alongside the
+> three `Ok` variants. The sixth pass corrected every AC and scenario here from two-state to the
+> tri-state of `DaemonLiveness` — and assigned no behaviour to `Err`, leaving the same gap one level
+> down. An unassigned branch is decided by whoever implements it, at the point where being wrong is
+> silent.
+>
+> **Fail closed, as the tri-state does.** A probe that errors has not established the daemon is
+> absent; if it is in fact running, it will refresh and invalidate the artifact. Warning on an
+> inconclusive probe costs a redundant line; staying quiet costs the artifact. This does **not** make
+> the warning unconditional — `NotRunning` remains the quiet branch, which is what keeps RSK-1's
+> dismissal-training failure closed.
 
 ## Scenario: an export and its import can be correlated  · Cap-10.2
 

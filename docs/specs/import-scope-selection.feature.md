@@ -58,11 +58,12 @@ floor**.
 > above: a **maximally-populated** artifact still cannot widen `--accounts`. The ceiling-never-floor
 > property is what Cap-7.3 exists to pin, and it does not need a declarable scope field to be real.
 
-## Scenario: a roster-only artifact survives an unknown block  · Cap-7.4
+## Scenario: an artifact whose roster is the payload of interest survives an unknown block  · Cap-7.4
 
-    Given a roster-only artifact that also carries a block the parser does not know
+    Given an artifact carrying `[[account]]` entries plus a non-roster block the parser does not know
     When it is imported with `--accounts`
     Then the import succeeds
+    But not by calling this a roster-only artifact
 
     # Narrow-parse, not parse-then-filter: deny_unknown_fields never fires on blocks outside the
     # parse path. This is also the roster-only half of #1053.

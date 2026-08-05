@@ -151,8 +151,10 @@ still unable to say "roster only".
 
 ### Appetite
 
-**1 week (small batch)** for R-1, R-5, R-6, R-7, R-8 — each is local, evidenced, and independently
-shippable.
+**1 week (small batch)** for R-1, **R-2**, **R-4**, R-5, R-6, R-7, R-8 — each is local, evidenced, and
+independently shippable. R-2 and R-4 join this batch now that AD-1 and AD-2 have closed their gates
+(below): R-2 is the `use --force` gesture plus its swap-semantics note, R-4 an unconditional warning
+string with no format change. Both are pure-output work, which is why they fit the same week.
 
 **Not sized**: none. R-2 and R-4 were decision-gated when this section was written; **both gates
 closed inside this PR**, so both are now sizeable.
@@ -165,7 +167,11 @@ closed inside this PR**, so both are now sizeable.
 *Corrected 2026-08-05 (seventh pass); this read "**Not sized**: R-2, R-4 … sizing them before their
 decision would fabricate precision." The adjacent R-3 bullet below was updated for exactly this reason
 and its two siblings were not — a delivery planner reading the stale line defers the two requirements
-that actually explain § 1's incident branches (i) and (ii) out of the first wave.*
+that actually explain § 1's incident branches (i) and (ii) out of the first wave.* **Amended
+2026-08-05 (eighth pass): declaring them *sizeable* did not size them.** The first correction closed
+the gates and left both out of every appetite bucket, so the planner it was written to protect still
+had no appetite for either — the same defect one step along. They are now in the small-batch week
+above.
 
 **R-3 is now sized** — it was decision-gated on a merge policy that no longer needs authoring, and
 its appetite **is** the 2-week R-9 + R-11 core below: scope selection plus the portability allowlist
@@ -239,8 +245,13 @@ edge, or of the fact that nothing measures the artifact's freshness before trave
 > **Reading the `Ratification:` item labels.** Each requirement ratified **through an enumerated
 > selection** carries an item label (`E*`, `I*`, `M*`) naming the entry the user ratified it under.
 > Two classes carry none, and their absence is meaningful rather than missing: the `user-stated`
-> requirements (R-1, R-2, R-4, R-9, R-9d, R-10) read `Ratification: n/a` because the maintainer
-> stated them directly rather than selecting them off a list, and R-2a / R-4a / R-5a / R-6a read
+> requirements R-1, R-2, R-4, R-9 and R-10 read `Ratification: n/a` because the maintainer stated
+> them directly rather than selecting them off a list. **R-9d is `user-stated` but reads
+> `user-ratified`** — the maintainer did not merely state it, they *ruled on the naming*, which is a
+> ratification; see R-9d's own reconciliation note. *(Corrected 2026-08-05: this sentence listed R-9d
+> among the `n/a` requirements while R-9d itself reads `user-ratified` and cites this preamble as its
+> authority — a fourth incompatibility inside the note written to reconcile the first three.)*
+> R-2a / R-4a / R-5a / R-6a read
 > `pending-user` because they are not ratified at all yet. **Two different enumerated sets are in
 > play**, and their labels overlap — `I1`, `I2`, `M1` and `M2` each exist in both. They are therefore
 > qualified by namespace:
@@ -714,7 +725,10 @@ implicit "local always wins" in place on the fresh-target path, where it does no
 
 **AC-9 (R-9, R-9a, R-9d)** — *Given* an artifact carrying both roster and settings, *When* the operator
 runs `import --accounts`, *Then* the roster and credentials are applied and **no** non-roster block is,
-*And* running `import` with no scope flag applies everything exactly as it does today.
+*And* running `import` with no scope flag applies **the same payload classes** it applies today.
+**BUT NOT** asserting byte-identity with the pre-change target state — R-11's allowlist binds
+regardless of the flag and independently changes the fresh-target outcome (§ 8, `config adoption`);
+this AC's scope-equivalence is on the *scope-selection axis only*, exactly as Cap-7.2 now reads;
 **BUT NOT** reading any scope declaration from inside the artifact; **BUT NOT** letting an artifact
 widen the operator's selection; **BUT NOT** naming the flag `--config`, which is reserved for #24's
 directory-override ladder.

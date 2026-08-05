@@ -572,7 +572,7 @@ stash writes. What § 4.1 declines to add is a second writer of the canonical
 | Cap-7.5 | `export` exposes no config/roster narrowing flag | unit (usage assertion) | R-9c |
 | Cap-7.6 | `import --settings` on a roster-only artifact reports "no configuration", not an error | unit | R-9 — **OQ-6-gated**, see § 4.7 |
 | Cap-7.7 | `export --no-secrets` exits with a **strict-usage error stating that roster-without-secrets is no longer supported** — asserted on both halves: non-zero exit AND the explanation present. **Not "names the replacement"**: nothing replaces the flag (R-9c/AD-5 forbid any export-side narrowing flag, and `import --accounts` narrows what is *applied*, not what the file *contains*), so a "replacement named" assertion has no referent. Explicitly asserts the flag is **not** silently accepted-and-ignored | unit (usage assertion) | R-10 (**not** R-10a — see note) |
-| Cap-7.8 | `PLAINTEXT_WARNING` reflects that **every** artifact now carries credentials, and advises no deletion the tool provides no mechanism for | unit (text assertion) | R-10b |
+| Cap-7.8 | `PLAINTEXT_WARNING` reflects that every artifact **with a non-empty roster** now carries credentials, and advises no deletion the tool provides no mechanism for. **Not "every artifact"** unqualified — an empty roster yields zero credentials (`src/cli.rs:4535-4546`), so the guard must be re-expressed over the artifact's credential count, not deleted with the flag | unit (text assertion) | R-10b |
 | Cap-8.1 | `[refresh].claude_bin` from an artifact is **never** written to the target config, even with `--settings` | integration | R-11a |
 | Cap-8.2 | A weaker incoming `kdf_*` is refused; a stronger one is accepted | unit | R-11b |
 | Cap-8.3 | `[migration].conflict_policy` is not adopted | unit | R-11c |
@@ -758,8 +758,8 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
 | R-10 | 4.7 | Cap-7.7 | covered — **corrected 2026-08-04**: was Cap-7.5, which asserts only that `export` grows no *scope* flag (R-9c) and never reaches `--no-secrets`. R-10 is the scope's only breaking CLI change; it needs its own capability |
 | R-10a | — | — | **decision-gated** (OQ-4) — see the Cap-7.7 note below this table |
 | R-10b | 4.9 | Cap-7.8 | covered — **corrected 2026-08-04**: was Cap-9.2, which asserts the *shred* help text makes no secure-erase claim (R-12). Adjacent wording concern, different string |
-| R-11 | 4.8 / AD-7 | Cap-8.4, Cap-8.6 (default-deny over an arbitrary key); Cap-8.1 … Cap-8.3 cover the named carve-outs | covered |
-| R-11a | 4.8 / AD-8 | Cap-8.1 | covered |
+| R-11 | 4.8 / AD-7 | Cap-8.4, Cap-8.6 (default-deny over an arbitrary key), **Cap-8.7 (the allowlist binds with no flag at all — the shipped, default path)**; Cap-8.1 … Cap-8.3 cover the named carve-outs | covered |
+| R-11a | 4.8 / AD-8 | Cap-8.1 (with `--settings`), **Cap-8.7 (no flag, fresh target)** | covered |
 | R-11b | 4.8 | Cap-8.2 | covered |
 | R-11c | 4.8 / AD-11 | Cap-8.3 | covered (over a recorded dissent) |
 | R-11d | 4.8 | Cap-8.4 | covered |
@@ -788,7 +788,7 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
 
 Every capability traces to a requirement: Cap-1.x→R-2/R-2a/AC-2a, Cap-2.x→R-4/R-4a, Cap-3.x→R-6/R-6a,
 Cap-4.1→R-5, Cap-5.1→R-7, Cap-6.1→C-3, Cap-7.1-7.6→R-9/R-9a-c + R-16 (Cap-7.4); R-9d has no capability of its own, **Cap-7.7→R-10**,
-**Cap-7.8→R-10b**, Cap-8.x→R-11/R-11a-e (Cap-8.6→R-11), Cap-9.x→R-12, Cap-10.x→R-13/R-14/R-14a,
+**Cap-7.8→R-10b**, Cap-8.x→R-11/R-11a-e (Cap-8.6→R-11, **Cap-8.7→R-11/R-11a**), Cap-9.x→R-12, Cap-10.x→R-13/R-14/R-14a,
 Cap-11.x→R-15/R-16. **No orphan capabilities.**
 
 > **This matrix checks only one direction, and that is why it missed two gaps (corrected 2026-08-04).**
@@ -814,7 +814,7 @@ their absence from the Cap-list does not read as a coverage gap:
 
 **R-10a** has neither, because it is undecided (OQ-4).
 
-> **One capability has no spec scenario: Cap-7.7** — 29 of the 30 are pinned by a scenario in
+> **One capability has no spec scenario: Cap-7.7** — 30 of the 31 are pinned by a scenario in
 > `docs/specs/`. This one is left unpinned **deliberately**, because its assertion is the hard-remove
 > branch of the still-open OQ-4 (see the R-10 row in § 16). Writing the scenario now would pin the
 > undecided outcome in the place a test author reads first. Close OQ-4, then add it to
