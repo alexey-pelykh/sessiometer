@@ -12,10 +12,9 @@ scenario as a passing test.
 Tracked as **issues #1049, #1048**. Requirements: PRD R-12, R-10b. Design § 4.9, RSK-9.
 
 **Rule under test**: `import` reads the artifact and leaves it, while the plaintext warning advises
-deleting it with no mechanism, and only on the `--plaintext` path — while an ENCRYPTED artifact is
-equally a live-credential file behind a single passphrase. (An earlier revision argued the typical
-artifact becomes roster-only; it cannot — `render()` emits every block unconditionally and R-9c
-forbids an export-side narrowing flag, so no tool-minted artifact is ever roster-only.)
+deleting it with no mechanism. Scope selection narrows what an import *applies*, not what the file
+*contains* — `export` gains no narrowing flag (R-9c/AD-5) — and the artifact carries live credentials
+regardless, so the gap does not narrow.
 
 ## Scenario: a successful import can destroy its source  · Cap-9.1
 
@@ -40,8 +39,51 @@ forbids an export-side narrowing flag, so no tool-minted artifact is ever roster
     # On APFS, overwrite-in-place does not reliably destroy the prior extent. Claiming erasure we do
     # not deliver is the same false-assurance failure AD-2 declines for staleness.
 
-## Scenario: the plaintext warning matches what the tool can do  · Cap-9.2
+> **OQ-4 gates the *Given* above, and the capability that asserts the removal itself has no scenario
+> here.** *Added 2026-08-05 (eleventh pass); OQ-4 appeared in the design, the PRD and three issues,
+> and in **zero** spec files — the surface a test author opens.* These two scenarios take
+> `--no-secrets` removal as a premise; the assertion that removal *happens*, and in what form, is
+> **Cap-7.7**, which is the one capability of the thirty-four with no scenario in this directory —
+> deliberately, because its strict-usage-error form is the **hard-remove** branch of OQ-4. If OQ-4
+> resolves to deprecate-then-remove, Cap-7.7 must be re-derived and the *Given* above with it. Do not
+> write a Cap-7.7 scenario until OQ-4 closes, and do not read these two as covering it.
 
-    Given `--no-secrets` has been removed, so every artifact carries credentials
+## Scenario: the plaintext warning matches what the tool can do  · Cap-7.8
+
+    Given `--no-secrets` has been removed, so every artifact with a non-empty roster carries credentials
     When PLAINTEXT_WARNING is read
     Then its advice corresponds to a mechanism the tool actually provides
+
+## Scenario: an empty-roster export does not claim to carry credentials  · Cap-7.8
+
+    Given a config whose roster is empty
+    When the operator runs `export --plaintext`
+    Then the plaintext warning is not printed
+    But not by removing the warning for the ordinary non-empty case
+
+> **R-10 deletes the condition, not the hazard.** `export` prints the warning today as
+> `if !no_secrets { … }` (`src/cli.rs:4475`), whose in-code reason is *"nothing to protect, so the
+> warning would misinform"*. R-10 removes `no_secrets` — but an **empty roster** also yields zero
+> credentials: `gather_payload`'s roster loop builds one entry per roster account
+> (`src/cli.rs:4535-4546`, the `else` branch; `:4533-4534` is the `if no_secrets` arm returning
+> `Vec::new()`). A roster-less config is first-class (`require_roster()` binds only at
+> `run`, `src/config.rs:1145-1158`; test `accepts_a_roster_less_config_and_preserves_tunables`,
+> `src/config/validate.rs:1089`) and `export` calls no roster guard — reachable by removing the last
+> account. Re-express the guard over the artifact's credential count; do not let it vanish with the
+> flag.
+
+## Scenario: shred is not restricted to the plaintext path  · Cap-9.1
+
+    Given an ENCRYPTED artifact that imports successfully
+    When the operator asked for it to be destroyed
+    Then it is destroyed, exactly as a plaintext artifact is
+    But not by branching on whether the artifact was encrypted
+
+> **AC-12's second `BUT NOT` was asserted by no capability and no scenario.** *Added 2026-08-05
+> (eleventh pass).* AC-12 carries *"**BUT NOT** restricted to the `--plaintext` path, since an
+> encrypted artifact is still a live-credential file behind one passphrase"*, and #1049 carries it as
+> an acceptance criterion — but Cap-9.1, Cap-9.2 and every scenario above are encryption-agnostic in
+> their *Given*, which means none of them would fail an implementation that gated `--shred` on
+> `--plaintext`. This is the § 16b class the design names itself: a requirement whose capability does
+> not assert its criterion. Low-risk in practice — no plausible `--shred` implementation branches on
+> encryption — but the criterion is either asserted somewhere or it is not a criterion.
