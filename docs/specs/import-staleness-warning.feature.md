@@ -22,7 +22,18 @@ all-clear.
     When import runs
     Then the output warns that a source refresh after export invalidates the artifact
     And it states the safe sequence including "never resume the source"
+    And the sequence names `use --force <label>`
+    But not by naming `use <label>` unqualified
     But not gated on any freshness computation
+
+> **Assert the `--force` token.** *Added 2026-08-05 (tenth pass).* The *And* clause above used to
+> enumerate one element of the sequence ("never resume the source"), so a test author could emit
+> `… → import → sessiometer use <label> → start` and pass. That string is a provable no-op against the
+> already-active account (`src/use_account.rs:325-326`, pinned by
+> `already_active_without_force_is_a_noop_success_with_zero_writes` at `:2490-2502`) — the operator
+> restarts still holding the **stale** token, with `import` and `use` both reporting success. This is
+> the 2026-07-31 incident, reproduced by the warning written to prevent it, on **every**
+> credential-bearing import.
 
 ## Scenario: the warning fails closed when deadlines are unreadable  · Cap-2.2
 

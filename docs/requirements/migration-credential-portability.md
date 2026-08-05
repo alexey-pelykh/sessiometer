@@ -294,9 +294,21 @@ the #463 public-safety rule. `Origin: AI-inferred-expansion (repo convention)`.
 
 **R-4** — *When* `import` reads an artifact, the system **shall** warn that the artifact's credentials
 are invalidated by any refresh the source performs after the export, and **shall** state the safe
-sequence. The warning **shall** fire on **every** credential-bearing import — not conditionally — until
-a freshness signal exists to gate it on. `Origin: user-stated` ("warns on staleness").
-`Ratification: n/a`.
+sequence — **naming the forcing form `use --force <label>`, and never `use <label>` unqualified**.
+The warning **shall** fire on **every** credential-bearing import — not conditionally — until
+a freshness signal exists to gate it on.
+
+> **`--force` is mandatory in this string, and this is the highest-traffic site of that correction.**
+> *Added 2026-08-05 (tenth pass); `--force` appeared in R-4, AC-4, § 4.2, Cap-2.1 and the spec **zero**
+> times.* `use <label>` against the already-active account is a provable no-op — `SwapTarget::resolve`
+> short-circuits on service-name equality (`src/use_account.rs:325-326`), pinned by
+> `already_active_without_force_is_a_noop_success_with_zero_writes` (`:2490-2502`, asserting
+> `canonical == b"A-token"`, `calls == 0`). R-8 makes the same demand for the *runbook*; this is the
+> **runtime** string, emitted on every credential-bearing import, so an operator meets it far more
+> often than the document. A warning written to prevent the incident must not instruct the operator to
+> reproduce it.
+
+`Origin: user-stated` ("warns on staleness"). `Ratification: n/a`.
 
 **R-4a** — *Before* R-4 is implemented as anything richer than an unconditional warning, the system
 **shall** determine whether a freshness signal is derivable from **v1 data already carried**.
@@ -682,8 +694,12 @@ name `use <label>` unqualified. No such document exists.
 > this very PRD documents (AC-2a). An operator following the sequence literally would have restarted
 > the target still holding the **stale** canonical token, with every command reporting success.
 >
-> This was the **seventh** site of the same correction and the last one found — after Cap-1.1, a
-> building-block row, two runtime-view arrows and two spec scenarios. It is also the most dangerous,
+> This was the **seventh** site of the same correction found at the time — **not the last, and not the
+> most dangerous**. *Corrected 2026-08-05 (tenth pass).* The R-4 chain (R-4, AC-4, design § 4.2,
+> Cap-2.1, `import-staleness-warning.feature.md`) carried the unqualified form on **five** further
+> surfaces, and that chain produces a **runtime string on every credential-bearing import** — an
+> operator meets it far more often than this document, which a human must go find. Both superlatives
+> are struck; the sweep is a claim to re-run, not a state to assert. It remains dangerous,
 > because it is the only one a human reads and follows step by step. It survived the earlier sweep
 > because that sweep searched the *design* for the claim; R-8 states it as **runbook prose in the
 > PRD**, and R-8 is the one requirement with **no capability** gating it (§ 16 records it as
@@ -778,14 +794,24 @@ deletion the tool provides no mechanism for (R-12).
 > deprecation warning with exit 0. The `PLAINTEXT_WARNING` half (R-10b) is **not** gated and stands
 > as written.
 
-**AC-11 (R-11, R-11a, R-11b, R-11c, R-11e)** — *Given* an artifact whose config sets
-`[refresh].claude_bin = "./x"`, *When* it is imported **with `--settings`**, *Then* the target's saved
-config does **not** contain that value, *And* the refusal is visible in the command's output (R-11e),
-*And* an incoming `kdf_*` weaker than local is refused while a stronger one is accepted,
-*And* `conflict_policy` is not adopted.
+**AC-11 (R-11, R-11a, R-11b, R-11c, R-11e)** — *Given* **a target with no existing config** and an
+artifact whose config sets `[refresh].claude_bin = "./x"`, *When* it is imported **with `--settings`**,
+*Then* the target's saved config does **not** contain that value, *And* the refusal is visible in the
+command's output (R-11e), *And* an incoming `kdf_*` weaker than local is refused while a stronger one
+is accepted, *And* `conflict_policy` is not adopted.
+**BUT NOT** asserted against a target that **already has a config** — `apply_import` then keeps the
+local config and discards the incoming non-roster blocks entirely (`src/cli.rs:4744-4750`), so every
+clause above holds with **no allowlist implemented at all**. The fresh-target path is where adoption
+happens and therefore the only one where a refusal is observable.
 **BUT NOT** gated behind a second confirmation flag — an escalation flag becomes the exploit
 instruction the error message hands the operator; **BUT NOT** implemented as a denylist;
 **BUT NOT** relying on strip-on-export as the control, since the attacker controls the export.
+
+> **The free-green trap, on the requirement resting on a recorded dissent.** *Added 2026-08-05 (tenth
+> pass).* Cap-8.3 is R-11c's **sole** capability and R-11c is the clause D-1's dissent is about, so an
+> assertion that passes with nothing built is worst here. This is the same class the docs caught four
+> times elsewhere — R-15's empty uuid, AC-2a's `use` no-op, Cap-11.2's `[credential]`, Cap-7.4's
+> roster-only — and missed on the allowlist's own criteria.
 
 **AC-11d (R-11d)** — *Given* a new key is added to `Config` with no portability classification,
 *When* the test suite runs, *Then* it **fails**. **BUT NOT** a lint that warns and passes;
@@ -801,14 +827,24 @@ doc-comment on the allowlist constant, which records what was decided but not wh
 destroyed, *Then* it is. **BUT NOT** advice printed without a mechanism; **BUT NOT** restricted to the
 `--plaintext` path, since an encrypted artifact is still a live-credential file behind one passphrase.
 
-**AC-13 (R-13)** — *Given* the source daemon is **`Responsive` or `AliveUnresponsive`**, *When*
+**AC-13 (R-13)** — *Given* the source daemon is **`Responsive` or `AliveUnresponsive`, or the probe
+returns `Err`** — three of `daemon_liveness()`'s **four** outcomes; it is `Result<DaemonLiveness>`
+(`src/cli.rs:1885`) over a tri-state enum (`:1870-1878`) — *When*
 `export` runs, *Then* the operator is told, because the artifact will be invalidated by the next
 refresh. **BUT NOT** a warning printed unconditionally regardless of daemon state, which trains
 dismissal; **BUT NOT** blocking the export — the operator may have a reason; **BUT NOT** treating
-`AliveUnresponsive` as "not running" — see below.
+`AliveUnresponsive` as "not running"; **BUT NOT** mapping the `Err` arm to the quiet branch — see below.
 
-> **`daemon_liveness()` is tri-state and this AC fails closed on the middle state.** *Added
-> 2026-08-04 (sixth pass); every AC, capability and scenario here was previously two-state.*
+> **The probe has FOUR outcomes, and this AC fails closed on the two that are not `NotRunning`.**
+> *`Err` added 2026-08-05 (tenth pass); the eighth pass added it to the spec and #1050 and left this
+> AC — and an AC is upstream of its capability, the rule this doc already applies to AC-10/OQ-4 and
+> AC-16/OQ-5.* `daemon_liveness()` returns `Result<DaemonLiveness>` (`src/cli.rs:1885`), so the `Err`
+> arm sits alongside the three `Ok` variants. An errored probe has **not** established the daemon is
+> absent; if it is in fact running it will refresh and invalidate the artifact — so it warns, on the
+> same fail-closed reasoning this note already makes for `AliveUnresponsive`. Only `NotRunning` is
+> quiet, which is what keeps RSK-1's dismissal-training failure closed.
+>
+> *Original note (sixth pass); every AC, capability and scenario here was previously two-state:*
 > `DaemonLiveness` (`src/cli.rs:1870-1878`) is `Responsive` / `AliveUnresponsive` / `NotRunning`, and
 > the middle variant's own doc says it is *"a live daemon not answering yet (starting up, or wedged).
 > Reported honestly, NOT as 'not running'"*. A wedged or still-starting daemon **holds the lock and
@@ -854,7 +890,11 @@ of the *version-floor* half only.
 > written. This mirrors the treatment AC-10 already carries for OQ-4.
 
 **AC-4 (R-4, R-4a)** — *Given* any credential-bearing import, *When* it runs, *Then* the operator is
-warned that a source refresh after export invalidates the artifact, and is given the safe sequence.
+warned that a source refresh after export invalidates the artifact, and is given the safe sequence
+**naming `use --force <label>`**.
+**BUT NOT** naming `use <label>` unqualified — a provable no-op against the already-active account
+(`src/use_account.rs:325-326`), which would make this warning instruct the operator to reproduce the
+incident it exists to prevent;
 **BUT NOT** gated on a freshness computation that does not yet exist; **BUT NOT** implemented via a
 `format_version` bump absorbed as an implementation detail rather than decided against ADR-0006.
 

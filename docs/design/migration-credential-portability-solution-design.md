@@ -2,7 +2,7 @@
 
 **Requirements**: `docs/requirements/migration-credential-portability.md`
 **Status**: `draft` — **five** requirements are decision-gated (R-6a, R-9, R-9a, R-10a, R-16 — see § 16),
-by **four** open questions (OQ-1, OQ-4, OQ-5, OQ-6). Both are surfaced, not settled, here.
+by **five** open questions (OQ-1, OQ-4, OQ-5, OQ-6, OQ-7). Both are surfaced, not settled, here.
 **Date**: 2026-08-04
 
 ## 1. Goals and Drivers
@@ -173,7 +173,9 @@ current silence, because an operator who sees a freshness check pass will trust 
 
 **Chosen**:
 1. **Unconditional warning** on every credential-bearing import, naming the hazard and the safe
-   sequence. This is the MUST and it ships without touching the format.
+   sequence — **including the forcing form `use --force <label>`, never `use <label>` unqualified**
+   (the unqualified form is a provable no-op against the already-active account,
+   `src/use_account.rs:325-326`). This is the MUST and it ships without touching the format.
 2. **Additive, supplementary**: if a derived deadline shows an account's access token *already*
    expired, say so too — a genuinely different and genuinely detectable failure (an artifact left on
    a USB stick for a day). Must be framed as **an extra symptom, never as an all-clear.**
@@ -230,7 +232,7 @@ merely omitted at the log-formatting layer — carry it *inside* the `refreshed`
 reintroduce it.
 
 **Treat as a log-format contract change** (R-5a): `docs/findings/0465-*` derives a published headline
-(`141 rotated=true, 0 rotated=false`) from this field. **0465 is verified clean** — its window ends
+(`141 rotated=true, 0 rotated=false`) from this field. **0465 is verified for `dead` only — NOT for the whole criterion.** Its window ends
 ~2026-07-11; the earliest `dead` line is 2026-07-14 — so this is remediation of a forward-looking
 trap, not a correction of a published count.
 
@@ -517,7 +519,7 @@ documents. No migration of on-disk state; no `format_version` change (§ 4.2).
 |---|---|---|
 | `import` stdout | new warning + report lines | additive; C-3 forbids any credential in them |
 | `import` flags | optional `--activate <label>` | additive, opt-in |
-| refresh log line | `rotated` absent on non-`refreshed` | **contract change**; consumer 0465 verified unaffected |
+| refresh log line | `rotated` absent on non-`refreshed` | **contract change**; consumer 0465 checked for `dead` only — its 141-count derives from *event type*, so a `no_change` line would still re-baseline it (open, tracked on #1004) |
 | artifact format | **none** | v1 preserved (C-1, C-4) |
 | `import` flags | `--accounts`, `--settings`, `--shred` | additive, opt-in; **default unchanged** (AD-9) |
 | `export` flags | **`--no-secrets` REMOVED** | **breaking** — the only breaking CLI change in this scope. Path undecided (OQ-4) |
@@ -557,7 +559,7 @@ stash writes. What § 4.1 declines to add is a second writer of the canonical
 |---|---|---|---|
 | Cap-1.1 | Import of the target's **active** account reports non-adoption and names **`use --force <label>`** — asserted on the `--force` token, since the unqualified form is the AC-2a defect and a test that accepts it would pass while shipping the no-op | unit (`apply_import` outcome) | R-2, AC-2a |
 | Cap-1.2 | Import adds no canonical writer — canonical byte-unchanged across import | integration | R-2a, C-2 |
-| Cap-2.1 | Every credential-bearing import emits the staleness warning | unit | R-4 |
+| Cap-2.1 | Every credential-bearing import emits the staleness warning, and its safe sequence names **`use --force <label>`** — **asserted on the `--force` token**, since the unqualified form is a provable no-op and a test that accepts it passes while shipping guidance that reproduces the incident | unit | R-4 |
 | Cap-2.2 | Warning fires even when derived deadlines are unreadable (fail-closed) | unit | R-4, P2 |
 | Cap-2.3 | An already-expired artifact additionally reports expiry | unit | R-4a |
 | Cap-3.1 | Same-label/different-uuid import warns — with a target that is **not** a clone of the source | unit | R-6 |
@@ -574,9 +576,9 @@ stash writes. What § 4.1 declines to add is a second writer of the canonical
 | Cap-7.6 | `import --settings` on a roster-only artifact reports "no configuration", not an error | unit | R-9 — **OQ-6-gated**, see § 4.7 |
 | Cap-7.7 | `export --no-secrets` exits with a **strict-usage error stating that roster-without-secrets is no longer supported** — asserted on both halves: non-zero exit AND the explanation present. **Not "names the replacement"**: nothing replaces the flag (R-9c/AD-5 forbid any export-side narrowing flag, and `import --accounts` narrows what is *applied*, not what the file *contains*), so a "replacement named" assertion has no referent. Explicitly asserts the flag is **not** silently accepted-and-ignored | unit (usage assertion) | R-10 (**not** R-10a — see note) |
 | Cap-7.8 | `PLAINTEXT_WARNING` reflects that every artifact **with a non-empty roster** now carries credentials, and advises no deletion the tool provides no mechanism for. **Not "every artifact"** unqualified — an empty roster yields zero credentials (`src/cli.rs:4535-4546`), so the guard must be re-expressed over the artifact's credential count, not deleted with the flag | unit (text assertion) | R-10b |
-| Cap-8.1 | `[refresh].claude_bin` from an artifact is **never** written to the target config, even with `--settings` | integration | R-11a |
+| Cap-8.1 | `[refresh].claude_bin` from an artifact is **never** written to the target config, even with `--settings` — **asserted on a target with no existing config**, since an existing one makes `apply_import` discard the incoming blocks anyway (`src/cli.rs:4744-4750`) and the assertion passes with nothing built | integration | R-11a |
 | Cap-8.2 | A weaker incoming `kdf_*` is refused; a stronger one is accepted | unit | R-11b |
-| Cap-8.3 | `[migration].conflict_policy` is not adopted | unit | R-11c |
+| Cap-8.3 | `[migration].conflict_policy` is not adopted — **on a fresh target**, and with the refusal reported. R-11c's **sole** capability, and it rests on the D-1 dissent, so a free green here is the worst place for one: on an existing-config target every *Then* holds with no allowlist written | unit | R-11c |
 | Cap-8.4 | **Adding a `Config` key without a portability classification fails the build** | compile-fail / completeness test | R-11d, **R-11** |
 | Cap-8.5 | Every refusal is reported on stdout | unit | R-11e |
 | Cap-8.6 | **A non-portable key outside the three named carve-outs is not adopted, `--settings` notwithstanding** — the allowlist's default-deny asserted over an *ordinary* key classified non-portable. **The subject is chosen when the classification table is built**: § 4.8 fixes three carve-out keys and leaves the rest to implementation, so no block is classified non-portable at design time. `[jitter]` and `[credential]` are the two candidates PRD § 1 neither calls freely portable nor carves out — **neither is decided here**. If the built table leaves no non-carve-out block non-portable, **this capability has no subject — escalate to the ADR (#1003)**; a purpose-built fixture key does *not* work (`deny_unknown_fields` rejects it before the allowlist runs — see the spec note), and **never reclassify a real block to green this test** (R-11f puts that call in the ADR) | unit | **R-11** |
@@ -659,7 +661,7 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
 | R-3 | ✅ **Yes** | Its merge-policy demand is withdrawn; feasibility now rides entirely on R-9 + R-11 (§ 4.7 + § 4.8), both feasible below |
 | R-4 | ✅ **Yes**, no format change | Unconditional warning is pure output |
 | R-4a | ⚠️ **Partly — and the derivable part misses the target case** | `credential_clocks` gives both deadlines from v1 bytes, but supersession is invisible in the blob (§ 4.2) |
-| R-5 / R-5a | ✅ **Yes**; 0465 verified unaffected | `src/refresh.rs:434-437`; 0465 window ends before the first dead line |
+| R-5 / R-5a | ✅ **Yes**; 0465 checked for `dead` only | `src/refresh.rs:434-437`; 0465's window ends before the first `dead` line — but its 141-count derives from *event type*, not outcome, so the `no_change` question is **open** and tracked as a pre-landing check on #1004 |
 | R-6 | ✅ **Yes** | Local check inside an existing loop |
 | R-6a | 🚧 **Blocked on a decision**, not on feasibility | OQ-1 |
 | R-7 | ✅ **Yes**, display-only | § 4.5 |
@@ -724,6 +726,21 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
   **(b)** — (a) alone leaves the defect free to recur. *(Restated 2026-08-05: this was written as three
   options — "(a), (b) also …, or both" — but (b)'s "also" already subsumes (a), so "both" was a
   duplicate of (b). AC-16 and Cap-11.2 gate their tolerance clause on this landing at (b).)*
+- **OQ-7 (bounds R-9 / R-11c / AD-11)** — **what does `--settings` do on a target that already has a
+  config?** The two things this document says are mutually exclusive. § 4.7 models scope as a
+  **lattice meet** over `ImportScope { accounts, settings }` with both-true ≡ today's behaviour, and
+  "the flag can only ever *remove*" — under which `--settings` cannot cause an adoption the no-flag
+  default does not already perform, and today an existing local config makes `apply_import` discard
+  the incoming non-roster blocks entirely (`src/cli.rs:4744-4750`). But § 4.8, R-11c and Cap-7.9 all
+  say `--settings` **applies** non-roster config and "would newly allow" the `conflict_policy`
+  overwrite AD-11 and the D-1 dissent exist to prevent. Both cannot hold: either (a) `--settings` only
+  ever *filters*, in which case R-11c prevents nothing on this path and Cap-7.9 is unsatisfiable
+  there, or (b) `--settings` adopts over an existing local config — a genuine behaviour addition,
+  which then needs its own conflict semantics and re-opens whether the no-flag default does it too
+  (AD-9). **Lean: (b)**, since R-11's whole purpose presupposes an adoption to constrain — but it is
+  not decided here, and the implementer of #1046 must not decide it by writing code. *Raised
+  2026-08-05 (tenth pass).* **OQ-6 does not cover this** — that asks only whether the settings axis is
+  presence-*derivable*, not what the flag *does* once selected.
 - **OQ-6 (bounds R-9/R-9a)** — **can the *settings* axis be presence-derived at all?** R-9c's own
   argument says no: every `RawConfig` field is `#[serde(default)]` (`src/config.rs:1377-1396`), so a
   block the operator left at its default is byte-indistinguishable from one the artifact withheld,
@@ -738,6 +755,12 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
   be settled before #1046 is implemented, because Cap-7.6 and the `--settings` reporting behaviour
   both depend on the answer. *Raised 2026-08-04 by the fourth review pass, which found R-9a's
   presence test naming the wrong carrier for both axes.*
+**The two below are not counted in the header's "five".** *Added 2026-08-05 (tenth pass); the list
+ran seven bullets under a header claiming five, with nothing marking the split.* OQ-1/4/5/6/7 each
+**gate** a requirement or an issue — nothing may be implemented against them until they are settled.
+OQ-2 and OQ-3 carry leans that are already good enough to build on and block nothing; they are
+recorded so the call is visible, not because it is pending.
+
 - **OQ-2 (shapes R-2)** — should `--activate` exist at all in the first increment, or should the
   reported-and-named-command form ship alone and earn it? Lean: ship (b) alone first.
 - **OQ-3 (bounds R-1)** — is a single non-revocation worth recording at all, given A-3's n=1? Lean:
@@ -763,7 +786,7 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
 | R-4 | 4.2 | Cap-2.1, Cap-2.2 | covered |
 | R-4a | 4.2 / AD-2 | Cap-2.3 | covered (resolved as a decline) |
 | R-5 | 4.4 | Cap-4.1 | covered |
-| R-5a | 4.4 | — (verification, done) | covered |
+| R-5a | 4.4 | — (verification, **partly done** — `dead` checked, `no_change` open, #1004) | covered |
 | R-6 | 4.3 | Cap-3.1 | covered |
 | R-6a | 4.3 | Cap-3.2 | **decision-gated** (OQ-1) |
 | R-7 | 4.5 | Cap-5.1 | covered |
@@ -824,7 +847,7 @@ their absence from the Cap-list does not read as a coverage gap:
 | Requirement | Covered by | Note |
 |---|---|---|
 | R-1, R-1a | a document (`docs/findings/0262-*`) | § 16 row reads `— (document)` |
-| R-5a | a verification already performed | § 16 row reads `— (verification, done)` |
+| R-5a | a verification, **partly performed** | § 16 row reads `— (verification, partly done)`; the `dead` half is checked, the `no_change` half is open and tracked on #1004 |
 | **R-8** | a document (the migration runbook) | § 16 row reads `— (document)` — **see the warning below** |
 | R-9d | nothing of its own | flag naming has no behaviour; asserted incidentally by Cap-7.1's flag surface |
 | R-11f | a document (the portability ADR) | — |

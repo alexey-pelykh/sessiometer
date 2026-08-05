@@ -16,13 +16,19 @@ selection answers *what was asked for*; this answers *what is permitted*.
 
 ## Scenario: `claude_bin` is refused even when settings were requested  · Cap-8.1
 
-    Given an artifact whose config sets `[refresh].claude_bin` to an attacker-chosen path
+    Given a target with NO existing config, so the artifact's config would otherwise be adopted
+    And an artifact whose config sets `[refresh].claude_bin` to an attacker-chosen path
     When it is imported WITH `--settings`
     Then the target's saved config does not contain that value
+    And the refusal is reported
+    But not by running against a target that already has a config
 
     # `--settings` is the widest flag: the operator's explicit "yes, take the config" must still not
     # widen past the allowlist. This is the ceiling case, not the shipped one — Cap-8.7 below covers
-    # the path that is actually reachable today.
+    # the no-flag path that is the default.
+    # The fresh-target Given is load-bearing: with an existing local config, apply_import discards
+    # the incoming non-roster blocks anyway (src/cli.rs:4744-4750), so the Then passes with nothing
+    # implemented. See Cap-8.3's note.
 
 ## Scenario: the allowlist binds with no flag at all, on a fresh target  · Cap-8.7
 
@@ -50,12 +56,25 @@ selection answers *what was asked for*; this answers *what is permitted*.
 
 ## Scenario: the target operator's conflict policy survives  · Cap-8.3
 
-    Given a target whose `[migration].conflict_policy` was deliberately set
-    When an artifact carrying a different policy is imported with `--settings`
-    Then the target's policy is unchanged
+    Given a target with NO existing config, so the artifact's config would otherwise be adopted
+    And an artifact carrying a `[migration].conflict_policy` different from the default
+    When it is imported with `--settings`
+    Then the target's saved policy is not the artifact's
+    And the refusal is reported
+    But not by running against a target that already has a config
 
-    # AD-11, resolved over a recorded dissent (PRD § 9 D-1). Today this cannot happen at all;
-    # --settings is what would newly allow it.
+> **The *Given* must be a fresh target, or every *Then* is already true with nothing built.**
+> *Corrected 2026-08-05 (tenth pass); the Given read "a target whose `conflict_policy` was
+> deliberately set".* A deliberately-set policy means `local` is `Some`, and `apply_import` then keeps
+> the local config and **discards the incoming non-roster blocks entirely**
+> (`src/cli.rs:4744-4750`) — so "the target's policy is unchanged" passes with **no allowlist code
+> written at all**. The old comment stated the premise ("Today this cannot happen at all") and never
+> drew the conclusion, and there was no report clause or `BUT NOT` to bite.
+>
+> The fresh-target path is where adoption actually happens and therefore where a refusal is
+> observable. **Cap-8.1 carries the same defect and the same fix**; only Cap-8.7 pinned the target
+> state before this pass. AD-11 and the D-1 dissent are unaffected — what changes is that the
+> scenario can now fail.
 
 ## Scenario: an unclassified key fails the build  · Cap-8.4
 
