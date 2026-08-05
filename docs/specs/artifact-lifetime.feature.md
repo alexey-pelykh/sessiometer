@@ -40,6 +40,23 @@ pure credential file — so the gap widens rather than narrows.
 
 ## Scenario: the plaintext warning matches what the tool can do  · Cap-7.8
 
-    Given `--no-secrets` has been removed, so every artifact carries credentials
+    Given `--no-secrets` has been removed, so every artifact with a non-empty roster carries credentials
     When PLAINTEXT_WARNING is read
     Then its advice corresponds to a mechanism the tool actually provides
+
+## Scenario: an empty-roster export does not claim to carry credentials  · Cap-7.8
+
+    Given a config whose roster is empty
+    When the operator runs `export --plaintext`
+    Then the plaintext warning is not printed
+    But not by removing the warning for the ordinary non-empty case
+
+> **R-10 deletes the condition, not the hazard.** `export` prints the warning today as
+> `if !no_secrets { … }` (`src/cli.rs:4475`), whose in-code reason is *"nothing to protect, so the
+> warning would misinform"*. R-10 removes `no_secrets` — but an **empty roster** also yields zero
+> credentials: `gather_payload`'s `else` branch builds one entry per roster account
+> (`src/cli.rs:4533-4534`). A roster-less config is first-class (`require_roster()` binds only at
+> `run`, `src/config.rs:1145-1158`; test `accepts_a_roster_less_config_and_preserves_tunables`,
+> `src/config/validate.rs:1089`) and `export` calls no roster guard — reachable by removing the last
+> account. Re-express the guard over the artifact's credential count; do not let it vanish with the
+> flag.

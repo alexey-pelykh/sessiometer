@@ -59,14 +59,25 @@ selection answers *what was asked for*; this answers *what is permitted*.
 
 ## Scenario: default-deny holds for a key nobody carved out  · Cap-8.6
 
-    Given an artifact carrying a non-roster key that has no portability classification
+    Given an artifact carrying a non-roster key classified non-portable
+    And that key is none of claude_bin, kdf_*, or conflict_policy
     When the operator runs `import --settings`
     Then the key is not adopted
     And the refusal is reported
-    But not by relying on the key being one of claude_bin, kdf_*, or conflict_policy
+    But not by relying on the key being one of the three named carve-outs
 
-> R-11's own assertion is **default-deny over an arbitrary key**, and it is the one the other
+> R-11's own assertion is **default-deny over a key nobody carved out**, and it is the one the other
 > scenarios do not make. Cap-8.1/8.2/8.3 each pin a *named* carve-out and Cap-8.4 pins the add-time
-> guard; all four pass while an unclassified key sails through at runtime, because none of them
-> exercises the default branch. `--settings` is in the *When* deliberately: the operator's widest
-> flag must still not widen past the allowlist — the flag is a ceiling, never a floor (R-9a).
+> guard; all four pass while an ordinary non-portable key sails through at runtime, because none of
+> them exercises the default branch. Any `[tunables]`, `[jitter]` or `[stats]` field will do.
+> `--settings` is in the *When* deliberately: the operator's widest flag must still not widen past the
+> allowlist — the flag is a ceiling, never a floor (R-9a).
+>
+> **The *Given* says "classified non-portable", not "unclassified" — that distinction is the
+> scenario.** *Corrected 2026-08-04 (fifth pass).* An earlier draft said *unclassified*, which is not
+> buildable in either reading: a **known** `Config` key with no classification is a **compile error**
+> by R-11d (Cap-8.4 asserts exactly that — there is no binary in which to run this test), and a key
+> **not** in `Config` is rejected by `RawConfig`'s `deny_unknown_fields` (`src/config.rs:1378`) on the
+> full-parse path that `--settings` uses, before the allowlist is ever consulted — so no refusal line
+> could be emitted to observe. The default branch is reached by a key that *is* classified, and
+> classified **non-portable**.

@@ -1,7 +1,8 @@
 # Solution Design: Migration Credential Portability
 
 **Requirements**: `docs/requirements/migration-credential-portability.md`
-**Status**: `draft` — three requirements are decision-gated and are surfaced, not settled, here.
+**Status**: `draft` — four requirements are decision-gated (OQ-1, OQ-4, OQ-5, OQ-6) and are surfaced,
+not settled, here.
 **Date**: 2026-08-04
 
 ## 1. Goals and Drivers
@@ -42,7 +43,7 @@ covered only the first row and is superseded*:
 | **Config portability** | the allowlist, `claude_bin` refusal, `kdf_*` monotonic floor, `conflict_policy`, rot-guard | R-11 … R-11f |
 | **Artifact lifetime** | `import --shred` | R-12 |
 | **Source-side prevention** | export-time daemon-liveness probe | R-13 |
-| **Observability** | artifact digest + scope on export/import events; refusal signal | R-14, R-14a |
+| **Observability** | artifact digest on both events + requested scope on the `import` event; refusal signal | R-14, R-14a |
 | **Input validation** | `account_uuid` shape | R-15 |
 | **Backward-import break** | the `[credential]` block vs `deny_unknown_fields` | R-16 |
 | Documents | `docs/findings/0262-*`, the migration runbook | R-1, R-8 |
@@ -96,6 +97,16 @@ existing lock.
 **Optional, additive**: an `--activate <label>` flag on `import` that invokes the same forcing `use`
 path after the import completes. Sugar over the sanctioned sequence, not a new writer — and it must
 force for the same reason, or it inherits the same no-op.
+
+> **For the #1001 implementer: adoption leaves the *stash* stale, and that is not a bug.** When
+> `use --force <label>` targets the **already-active** account, `outgoing_stash == incoming_stash`,
+> so step 2's re-stash writes the *pre-import* canonical blob back over the freshly-imported stash
+> (`src/swap.rs:838`). **Adoption still succeeds**: `incoming` is read at `:807`, *before* that write,
+> so `:849` writes the imported credential to canonical — which is the outcome AC-2a asserts. The
+> #211 identity guard (`:829-833`) does not fire either, because with identical stashes its condition
+> reduces to `!X && X`. Consequence for a test author: **assert post-adoption *canonical* contents,
+> not stash contents** — a Cap-1.1/Cap-1.2 test that checks the stash will read the stale token and
+> look like a failure when the behaviour is correct.
 
 **Alternatives considered:**
 
@@ -270,6 +281,13 @@ only ever *remove*. `import --accounts` against a settings-bearing artifact igno
 regardless of what the artifact says; `import --settings` against a roster-only artifact reports
 "artifact contains no configuration" rather than erroring or silently no-op'ing.
 
+> **The `available(artifact).settings` operand may not be computable — OQ-6.** A block left at its
+> default is byte-indistinguishable from one the artifact withheld (`src/config.rs:1377-1396`), so
+> the settings half of this meet is effectively always true for a self-minted artifact, and under
+> OQ-6's lean (a) the "artifact contains no configuration" report above is unreachable. The
+> *accounts* half is sound (`[[account]]` entries are present or they are not). **Settle OQ-6 before
+> implementing #1046** — this paragraph and the § 5 row below both depend on the answer.
+
 **`--accounts` narrow-parses** (R-9b) rather than parse-then-filter. This is not an optimization:
 `RawConfig` carries `deny_unknown_fields` (`src/config.rs:1378`), which never fires on blocks outside
 the parse path — so narrow-parse *additionally repairs* backward-import for roster-only artifacts
@@ -365,8 +383,10 @@ connect refusal is indistinguishable from a live daemon. Design:
 Warning **only** when live, never unconditionally, so it does not train dismissal (RSK-1's failure
 mode).
 
-**R-14 — correlation.** `Event::Export` / `Event::Import` gain a sha256 artifact digest and the
-operator-**requested** scope (never the artifact's claimed scope, per R-9a). Both fit the existing
+**R-14 — correlation.** `Event::Export` and `Event::Import` both gain a sha256 artifact digest; the
+**`import`** event additionally gains the operator-**requested** scope (never the artifact's claimed
+scope, per R-9a). `export` has no operator-requested scope to carry — it takes no narrowing flag
+(R-9c, AD-5, Cap-7.5) — so export-side correlation rides on the digest alone. Both fit the existing
 aggregate-only redaction discipline (`src/observability.rs:1426-1442`) — no label, no token, no email.
 
 **R-15 — input validation.** `account_uuid` is unvalidated and interpolated into a keychain service
@@ -403,13 +423,13 @@ rows, including the entire security core:*
 | Block | Change | Requirements |
 |---|---|---|
 | `src/cli.rs::parse_import` | accept `--accounts` / `--settings`; default (neither) is byte-identical to today | R-9, R-9c, R-9d |
-| `src/cli.rs::import` | narrow-parse under `--accounts`; "artifact contains no configuration" notice under `--settings` against a roster-only artifact; `--shred` | R-9a, R-9b, R-12 |
+| `src/cli.rs::import` | narrow-parse under `--accounts`; "artifact contains no configuration" notice under `--settings` against a roster-only artifact (**OQ-6-gated** — settle before building this notice); `--shred` | R-9a, R-9b, R-12 |
 | `src/cli.rs::apply_import` | apply the portability allowlist before adopting any non-roster value; emit a refusal line per refused key | R-11, R-11a … R-11c, R-11e |
 | **new** `src/config.rs::portability` | the allowlist itself (non-portable by default) + the `kdf_*` monotonic-floor comparator + the compile-time rot-guard that fails when a new `Config` key carries no classification | R-11, R-11b, R-11d |
 | `src/cli.rs::parse_export` | **remove** `--no-secrets`; strict-usage error naming the replacement | R-10 (form is OQ-4-gated) |
 | `src/cli.rs::export` | daemon-liveness probe via `daemon_liveness()` (`src/cli.rs:1885`) before writing | R-13 |
 | `src/migration.rs` | `PLAINTEXT_WARNING` wording (`src/migration.rs:538`); `[credential]` forward-tolerance + version-floor message | R-10b, R-16 |
-| `src/observability.rs` | sha256 artifact digest + requested scope on the export/import events; allowlist-refusal signal | R-14, R-14a |
+| `src/observability.rs` | sha256 artifact digest on **both** events + requested scope on the **`import`** event only (export has none — R-9c/AD-5); allowlist-refusal signal | R-14, R-14a |
 | `src/config.rs::Account` | `account_uuid` shape validation before it reaches `stash()` | R-15 |
 
 **Untouched by design**: `src/swap.rs` (reused, not modified).
@@ -479,7 +499,8 @@ documents. No migration of on-disk state; no `format_version` change (§ 4.2).
 | `export` stdout | daemon-liveness warning when the local daemon is live | additive; conditional, never unconditional (R-13) |
 | `import` stdout | per-key refusal lines from the portability allowlist | additive; C-3 applies |
 | config adoption | non-portable keys silently dropped → **now refused and reported** | **behaviour change** on the fresh-target path, where the artifact's config was previously adopted wholesale |
-| `Event::Export` / `Event::Import` | `+ artifact_sha256`, `+ scope` | additive; aggregate-only redaction preserved |
+| `Event::Export` | `+ artifact_sha256` | additive; aggregate-only redaction preserved. **No `+ scope`** — export takes no narrowing flag (R-9c/AD-5), so it has none to log |
+| `Event::Import` | `+ artifact_sha256`, `+ scope` | additive; aggregate-only redaction preserved |
 
 ## 9. UX Architecture / 10. UI Strategy
 
@@ -524,14 +545,14 @@ stash writes. What § 4.1 declines to add is a second writer of the canonical
 | Cap-7.3 | A scope flag can only narrow — an artifact cannot widen it | unit | R-9a |
 | Cap-7.4 | A roster-only artifact round-trips through narrow-parse, incl. under an unknown block | unit | R-9b, R-16 |
 | Cap-7.5 | `export` exposes no config/roster narrowing flag | unit (usage assertion) | R-9c |
-| Cap-7.6 | `import --settings` on a roster-only artifact reports "no configuration", not an error | unit | R-9 |
+| Cap-7.6 | `import --settings` on a roster-only artifact reports "no configuration", not an error | unit | R-9 — **OQ-6-gated**, see § 4.7 |
 | Cap-7.7 | `export --no-secrets` exits with a **strict-usage error that names the replacement** — asserted on both halves: non-zero exit AND the replacement named. Explicitly asserts the flag is **not** silently accepted-and-ignored | unit (usage assertion) | R-10 (**not** R-10a — see note) |
 | Cap-7.8 | `PLAINTEXT_WARNING` reflects that **every** artifact now carries credentials, and advises no deletion the tool provides no mechanism for | unit (text assertion) | R-10b |
 | Cap-8.1 | `[refresh].claude_bin` from an artifact is **never** written to the target config, even with `--settings` | integration | R-11a |
 | Cap-8.2 | A weaker incoming `kdf_*` is refused; a stronger one is accepted | unit | R-11b |
 | Cap-8.3 | `[migration].conflict_policy` is not adopted | unit | R-11c |
 | Cap-8.4 | **Adding a `Config` key without a portability classification fails the build** | compile-fail / completeness test | R-11d, **R-11** |
-| Cap-8.6 | **An unclassified / unknown non-roster key is not adopted, `--settings` notwithstanding** — the allowlist's default-deny asserted over an *arbitrary* key, not one of the three named carve-outs | unit | **R-11** |
+| Cap-8.6 | **A non-portable key outside the three named carve-outs is not adopted, `--settings` notwithstanding** — the allowlist's default-deny asserted over an *ordinary* key (any `[tunables]`/`[jitter]`/`[stats]` field), which is what reaches the default branch | unit | **R-11** |
 | Cap-8.5 | Every refusal is reported on stdout | unit | R-11e |
 | Cap-9.1 | `import --shred` removes the source artifact after a successful apply | integration | R-12 |
 | Cap-9.2 | Shred is not claimed as secure erase in help or docs | unit (text assertion) | R-12 |
@@ -597,7 +618,7 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
 | R-6a | 🚧 **Blocked on a decision**, not on feasibility | OQ-1 |
 | R-7 | ✅ **Yes**, display-only | § 4.5 |
 | R-1 / R-1a / R-8 | ✅ **Yes** | Documents; conventions already exist |
-| R-9 / R-9a / R-9c | ✅ **Yes, and free at the format layer** | Every `RawConfig` field is `#[serde(default)]` incl. `account`; `Payload`'s two fields are both emptiable (§ 4.7) |
+| R-9 / R-9a / R-9c | ✅ **Yes, and free at the format layer** — but the *settings*-axis availability test is **OQ-6-gated** | Every `RawConfig` field is `#[serde(default)]` incl. `account`; `Payload`'s two fields are both emptiable (§ 4.7) |
 | R-9b | ✅ **Yes**, and it repairs R-16's roster-only case as a side effect | Narrow struct omits top-level `deny_unknown_fields`; `RawAccount` keeps its own |
 | R-9d | ✅ **Yes** | `--config` collision verified at `src/paths.rs:439` |
 | R-10 | ✅ **Yes** — but it is the scope's **only breaking CLI change** | Removal is trivial; the *path* is a product call (OQ-4) |
@@ -696,8 +717,8 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
 | R-6 | 4.3 | Cap-3.1 | covered |
 | R-6a | 4.3 | Cap-3.2 | **decision-gated** (OQ-1) |
 | R-7 | 4.5 | Cap-5.1 | covered |
-| R-9 | 4.7 | Cap-7.1, Cap-7.2, Cap-7.6 | covered |
-| R-9a | 4.7 / AD-6 | Cap-7.3 | covered |
+| R-9 | 4.7 | Cap-7.1, Cap-7.2, Cap-7.6 | **partly decision-gated** (OQ-6 — the `--settings` availability report) |
+| R-9a | 4.7 / AD-6 | Cap-7.3 | **partly decision-gated** (OQ-6 — the settings-axis presence test) |
 | R-9b | 4.7 | Cap-7.4 | covered |
 | R-9c | 4.7 / AD-5 | Cap-7.5 | covered |
 | R-9d | 4.7 / AD-10 | — (naming; asserted by Cap-7.1's flag surface) | covered |
@@ -799,7 +820,9 @@ their absence from the Cap-list does not read as a coverage gap:
 4. **AD-11 rests on a recorded dissent** (PRD § 9 D-1), not a convergence. Two panelists reached
    opposite conclusions from the same verified facts; the resolution is conservative and defensible but
    not evidence-forced.
-5. **OQ-4 (R-10's deprecation path) and OQ-5 (R-16's deliverable) are open.** Neither blocks
+5. **OQ-4 (R-10's deprecation path), OQ-5 (R-16's deliverable) and OQ-6 (whether the settings axis
+   can be presence-derived at all) are open.** OQ-6 gates #1046's `--settings` reporting behaviour
+   and Cap-7.6, so it must close before that item is implemented. Otherwise neither blocks
    implementation of anything else, and both are product calls rather than design ones.
 6. **AC-2 was found defective and corrected** (PRD AC-2a): the planned "run `use <label>`" guidance is
    a provable no-op for the active account, which would have reproduced the original failure through

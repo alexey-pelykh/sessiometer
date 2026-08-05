@@ -157,8 +157,9 @@ shippable.
 **Not sized**: R-2, R-4. Each is decision-gated (R-2 on swap semantics, R-4 on whether a format bump
 is acceptable). Sizing them before their decision would fabricate precision.
 
-**R-3 is now sized** — it was decision-gated on a merge policy that no longer needs authoring. See
-below.
+**R-3 is now sized** — it was decision-gated on a merge policy that no longer needs authoring, and
+its appetite **is** the 2-week R-9 + R-11 core below: scope selection plus the portability allowlist
+are exactly what replaced its demand for a merge policy, so R-3 carries no separate bucket.
 
 **2 weeks (the security core)** for **R-9 + R-11** together. These two ship as one unit or not at all:
 R-9 without R-11 hands the operator a flag that adopts a code-execution path on request, and R-11
@@ -168,7 +169,8 @@ a strictly worse intermediate state than shipping neither.
 **1 week (the hardening tail)** for R-10, R-12 … R-16 — each local, independently shippable, and
 none blocking the core.
 
-**Additional circuit breakers**:
+**Additional circuit breakers** — these extend the base list under § 1b's *Circuit breakers* heading
+below (hit one, the item converts to a spike):
 
 - **R-9**: if scope selection cannot be expressed by payload *presence* and requires a declared scope
   field, **stop**. A declared scope is attacker-controlled on the `--plaintext` path, which converts
@@ -227,7 +229,7 @@ edge, or of the fact that nothing measures the artifact's freshness before trave
 
 > **Reading the `Ratification:` item labels.** Each requirement carries an item label (`E*`, `I*`,
 > `M*`) naming the enrichment entry the user ratified it under. **Two different enumerated sets are in
-> play**, and their labels overlap — `I1`, `I2` and `M1` each exist in both. They are therefore
+> play**, and their labels overlap — `I1`, `I2`, `M1` and `M2` each exist in both. They are therefore
 > qualified by namespace:
 >
 > - **`scope-membership B/first-pass`** — the 2026-08-04 first pass, which opened R-1 … R-8 and
@@ -335,12 +337,13 @@ across **all four** label-resolving commands — `use`, `enable`, `disable` and 
 > **R-6a's command set was corrected on 2026-08-04.** The original wording named only two commands and
 > framed the choice as "one of the two is wrong". Both halves were defective:
 >
-> - **`remove` was omitted, and it is the load-bearing case.** `remove_account` → `apply_remove`
->   (`src/cli.rs:5219-5227`, `src/cli.rs:5195-5211`) resolves a label and **deletes the keychain stash**. It is
->   the only one of the three whose first-match-wins behaviour is **irreversible** — `use` picks the
+> - **`remove` was omitted, and it is the load-bearing case.** `remove_account`
+>   (`src/cli.rs:5195-5211`) → `apply_remove` (`src/cli.rs:5219-5227`) resolves a label and **deletes
+>   the keychain stash**. It is
+>   the only one of the four whose first-match-wins behaviour is **irreversible** — `use` picks the
 >   wrong active account (recoverable in one command) and `enable`/`disable` flips the wrong flag
 >   (recoverable), but `remove` destroys credential material with no undo. A decision framed over
->   `use` vs `enable`/`disable` alone would settle the two cheap cases and leave the expensive one
+>   `use` vs `enable`/`disable` alone would settle the three cheap cases and leave the expensive one
 >   to inherit whichever answer happened to win.
 > - **The option set was wrong.** The original framing offered "make `enable`/`disable` refuse like
 >   `use`" as a *change*, but refusing-on-ambiguity is what `use` already ships
@@ -389,8 +392,10 @@ artifact containing config ignores that config regardless of what the artifact c
 > **An earlier note here also argued the asymmetry was "not a defect" because `accounts` empty is
 > export-reachable. That premise is retired by this very scope**: `gather_payload` produces an empty
 > `accounts` only under `no_secrets` (`src/cli.rs:4533-4534`), and R-10 removes that flag — R-10b says
-> it outright ("every artifact carries live credentials"). After R-10, neither field is empty on a
-> self-minted artifact.
+> it outright ("every artifact **with a non-empty roster** carries live credentials"). After R-10,
+> neither field is empty on a self-minted artifact **whose roster is non-empty**; an empty roster
+> still yields an empty `accounts`, because `gather_payload`'s `else` branch builds one entry per
+> roster account and a roster-less config is a supported state (see R-10b's note).
 >
 > **What survives.** R-9's circuit breaker still does not trip — scope is derived from parsed
 > *content*, not from a field the artifact declares, and the operator's flag remains a ceiling. But
@@ -450,11 +455,28 @@ hard-remove with a strict-usage error naming the replacement, or deprecate-then-
 release. Not yet decided. `Origin: enrichment-expanded` (item I1).
 `Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item I1)` — inclusion only; the path is undecided.
 
-**R-10b** — *Where* R-10 lands, **every** artifact carries live credentials, so `PLAINTEXT_WARNING`
-(`src/migration.rs:538-541`) is no longer sometimes-moot — it becomes unconditionally true. Its
-wording **shall** be re-checked against that, and against R-12's shred mechanism, so the advice it
-gives is one the tool can actually perform. `Origin: enrichment-expanded` (item I2).
+**R-10b** — *Where* R-10 lands, every artifact **with a non-empty roster** carries live credentials, so
+`PLAINTEXT_WARNING` (`src/migration.rs:538-541`) is no longer moot for the flag reason. Its wording
+**shall** be re-checked against that, and against R-12's shred mechanism, so the advice it gives is
+one the tool can actually perform. **And** *where* R-10 removes `no_secrets`, the existing warning
+guard **shall** be re-expressed over the artifact's actual credential count rather than deleted with
+the flag. `Origin: enrichment-expanded` (item I2).
 `Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item I2)`.
+
+> **R-10 deletes the condition that keeps this warning honest — do not let it delete the guard.**
+> *Added 2026-08-04 (fifth pass).* `export` today prints the warning as
+> `if !no_secrets { eprintln!("{PLAINTEXT_WARNING}"); }` (`src/cli.rs:4475`), with the in-code reason
+> *"nothing to protect, so the warning would misinform"*. Removing `no_secrets` removes the
+> condition, not the hazard: **an empty roster also yields zero credentials**. `gather_payload`'s
+> `else` branch builds one entry per roster account (`src/cli.rs:4533-4534`), so an empty roster
+> produces an empty `accounts` with `no_secrets == false`. A roster-less config is a first-class
+> supported state — `require_roster()` is enforced only at `run` (`src/config.rs:1145-1158`) and the
+> committed test `accepts_a_roster_less_config_and_preserves_tunables`
+> (`src/config/validate.rs:1089`) pins it — and `export` calls neither guard. Reached by removing the
+> last account, or on a #58 capture-bootstrap file. The operator then gets *"it contains usable
+> Claude Code account credentials in the clear"* over an artifact containing **none** — exactly the
+> misinformation the existing comment was written to prevent. The guard must survive R-10 in the form
+> *"warn iff the artifact carries at least one credential"*.
 
 ### PortabilityClass
 
@@ -674,7 +696,9 @@ the attacker minted.
 
 **AC-10 (R-10, R-10a, R-10b)** — *Given* `--no-secrets` is removed, *When* an operator passes it,
 *Then* they get a strict-usage error naming what replaced it, *And* `PLAINTEXT_WARNING`'s wording has
-been re-checked against the fact that every artifact now carries credentials.
+been re-checked against the fact that every artifact with a non-empty roster now carries
+credentials, *And* the warning guard is re-expressed over the artifact's credential count rather than
+deleted along with the flag.
 **BUT NOT** silently accepting-and-ignoring the flag; **BUT NOT** leaving the warning advising a
 deletion the tool provides no mechanism for (R-12).
 
@@ -853,7 +877,8 @@ PAST:    < 1.0 — true-by-construction on any `dead` line with a parseable non-
   is additive; R-3's policy must state what happens to an artifact whose blocks predate the policy.
 - **Observability.** R-5 changes an emitted log field. `src/observability.rs` enumerates the event
   vocabulary; the change is a contract change with at least one documented consumer (0465). R-14 adds
-  a digest + scope to the export/import events; R-11e adds a refusal signal. All three must hold the
+  a digest to both the export and import events, plus a requested scope to the **import** event
+  only; R-11e adds a refusal signal. All three must hold the
   existing aggregate-only redaction discipline.
 
 **Added 2026-08-04 (amendment pass):**
@@ -1110,4 +1135,6 @@ findings, none blocking Stage 2:
 words). R-9a/b/c, R-11 … R-16 are `council-added`, ratified **in-scope** via a second
 scope-membership **B** selection over an enumerated 22-item set on 2026-08-04. R-10a, R-10b, R-11d,
 R-11e, R-11f are `enrichment-expanded` and carry the same in-scope-only ratification. **No mechanism
-in the amendment set is user-ratified**; each remains a reversible pipeline call.
+in the amendment set is user-ratified** — *with one carve-out: **R-9d's flag names***, which the
+maintainer ruled on and which a pipeline may not reverse (see R-9d). Every other mechanism remains a
+reversible pipeline call.
