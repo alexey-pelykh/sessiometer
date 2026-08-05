@@ -55,8 +55,9 @@ regardless, so the gap does not narrow.
 > **R-10 deletes the condition, not the hazard.** `export` prints the warning today as
 > `if !no_secrets { … }` (`src/cli.rs:4475`), whose in-code reason is *"nothing to protect, so the
 > warning would misinform"*. R-10 removes `no_secrets` — but an **empty roster** also yields zero
-> credentials: `gather_payload`'s `else` branch builds one entry per roster account
-> (`src/cli.rs:4533-4534`). A roster-less config is first-class (`require_roster()` binds only at
+> credentials: `gather_payload`'s roster loop builds one entry per roster account
+> (`src/cli.rs:4535-4546`, the `else` branch; `:4533-4534` is the `if no_secrets` arm returning
+> `Vec::new()`). A roster-less config is first-class (`require_roster()` binds only at
 > `run`, `src/config.rs:1145-1158`; test `accepts_a_roster_less_config_and_preserves_tunables`,
 > `src/config/validate.rs:1089`) and `export` calls no roster guard — reachable by removing the last
 > account. Re-express the guard over the artifact's credential count; do not let it vanish with the

@@ -22,14 +22,23 @@ floor**.
     Then the roster and its credentials are applied
     But no non-roster block reaches the target config
 
-## Scenario: the default is unchanged  · Cap-7.2
+## Scenario: the default narrows nothing  · Cap-7.2
 
     Given the same artifact
     When the operator runs `import` with no scope flag
-    Then the resulting target state is byte-identical to the pre-change behaviour
+    Then the same payload classes are applied as before the scope flags existed
+    But not by asserting byte-identity with the pre-change target state
 
-    # Regression, not a new assertion. AD-9 keeps the shipped default; the safety case for
-    # defaulting narrow is absorbed by the allowlist (#1045).
+> **Scope-equivalence, NOT byte-identity — the distinction is the scenario.** AD-9 keeps the shipped
+> default, so *scope selection* adds no narrowing here. But R-11's allowlist binds **regardless of the
+> flag** (`design § 4.8`), and on a **fresh target** today's `import` adopts the artifact's config
+> wholesale (`src/cli.rs:4744-4750`) — so a non-portable key that used to be adopted is now refused
+> and reported. The design records this as a behaviour change on exactly this path (§ 8, `config
+> adoption` row), and RSK-6 ships R-9 and R-11 as one unit, so a reader never sees the flags without
+> the allowlist. A verbatim byte-identity assertion therefore goes **red**, and the cheapest repair is
+> to exempt the no-flag path from the allowlist — which silently reinstates the unattended
+> code-execution path PRD § 1 opens on. Assert the payload classes; leave the config outcome to
+> Cap-8.1 and Cap-8.7.
 
 ## Scenario: an artifact cannot widen the operator's selection  · Cap-7.3
 

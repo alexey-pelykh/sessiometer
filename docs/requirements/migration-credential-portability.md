@@ -154,8 +154,18 @@ still unable to say "roster only".
 **1 week (small batch)** for R-1, R-5, R-6, R-7, R-8 — each is local, evidenced, and independently
 shippable.
 
-**Not sized**: R-2, R-4. Each is decision-gated (R-2 on swap semantics, R-4 on whether a format bump
-is acceptable). Sizing them before their decision would fabricate precision.
+**Not sized**: none. R-2 and R-4 were decision-gated when this section was written; **both gates
+closed inside this PR**, so both are now sizeable.
+
+- **R-2** (swap semantics) is settled by **AD-1 / design § 4.1**: `import` adds no canonical writer and
+  names `use --force` as the gesture. Design § 14 rates it "✅ **Yes**, and cheaper than assumed".
+- **R-4** (whether a `format_version` bump is acceptable) is settled by **AD-2 / design § 4.2**: no
+  bump. Design § 16 marks R-4a "covered (resolved as a decline)".
+
+*Corrected 2026-08-05 (seventh pass); this read "**Not sized**: R-2, R-4 … sizing them before their
+decision would fabricate precision." The adjacent R-3 bullet below was updated for exactly this reason
+and its two siblings were not — a delivery planner reading the stale line defers the two requirements
+that actually explain § 1's incident branches (i) and (ii) out of the first wave.*
 
 **R-3 is now sized** — it was decision-gated on a merge policy that no longer needs authoring, and
 its appetite **is** the 2-week R-9 + R-11 core below: scope selection plus the portability allowlist
@@ -215,7 +225,7 @@ below (hit one, the item converts to a spike):
 | **ManagedAccount** | One account's restorable secret material inside the artifact: `account_uuid`, `credential` blob, `oauth_account` block. | `Restore`, `Promote` |
 | **CredentialSlot** | A place a credential can live on a machine. Two instances, and the distinction is the whole defect: the **canonical** `Claude Code-credentials` item (what Claude Code reads) and the per-account **stash** `Sessiometer/<account_uuid>` (what Sessiometer parks). | `Write`, `Read`, `Swap` |
 | **RosterEntry** | A `[[account]]` config entry keyed by `account_uuid` — the *Claude* account uuid, stable across machines. Carries a mutable, **non-unique** `label`. | `Match`, `Append`, `Overwrite` |
-| **RefreshOutcome** | The classified result of a token exchange: `refreshed` / `dead` / `error`. Carries `rotated`, `window_secs`, `expires_before/after`. | `Classify`, `Log` |
+| **RefreshOutcome** | The classified result of a token exchange: `refreshed` / `no_change` / `dead` / `error` (`src/refresh.rs:225-240`; the `RefreshEventOutcome` log vocabulary adds a fifth, `refreshed_not_restashed`, mapped from `refreshed`). Carries `rotated`, `window_secs`, `expires_before/after`. | `Classify`, `Log` |
 | **ImportScope** | The set of payload classes the operator elected to apply on this import. Derived from CLI flags, **never** from the artifact. Two independent axes: accounts (roster + credentials) and settings (non-roster config). | `Select`, `Constrain` |
 | **PortabilityClass** | The system's classification of a single `Config` key: **portable** (may be adopted), **machine-bound** (never adopted — it encodes a fact about *this* machine or *this* operator's choice), or **capability-granting** (never adopted — adoption transfers the ability to execute). Orthogonal to `ImportScope`: scope is what the operator *asked for*, class is what the system *permits*. | `Classify`, `Refuse` |
 
@@ -226,8 +236,12 @@ edge, or of the fact that nothing measures the artifact's freshness before trave
 
 ## 3. Requirements (EARS)
 
-> **Reading the `Ratification:` item labels.** Each requirement carries an item label (`E*`, `I*`,
-> `M*`) naming the enrichment entry the user ratified it under. **Two different enumerated sets are in
+> **Reading the `Ratification:` item labels.** Each requirement ratified **through an enumerated
+> selection** carries an item label (`E*`, `I*`, `M*`) naming the entry the user ratified it under.
+> Two classes carry none, and their absence is meaningful rather than missing: the `user-stated`
+> requirements (R-1, R-2, R-4, R-9, R-9d, R-10) read `Ratification: n/a` because the maintainer
+> stated them directly rather than selecting them off a list, and R-2a / R-4a / R-5a / R-6a read
+> `pending-user` because they are not ratified at all yet. **Two different enumerated sets are in
 > play**, and their labels overlap — `I1`, `I2`, `M1` and `M2` each exist in both. They are therefore
 > qualified by namespace:
 >
@@ -356,9 +370,12 @@ across **all four** label-resolving commands — `use`, `enable`, `disable` and 
 
 **R-9** — *When* `import` applies an artifact, the operator **shall** be able to select which payload
 classes are applied — `--accounts` (roster + credentials) and `--settings` (non-roster config) — with
-the **default being everything**, which is today's behaviour byte-for-byte. Today no such gesture
-exists: on a fresh target the artifact's whole config is adopted unconditionally
-(`src/cli.rs:4744-4750`) and the operator cannot decline it. `Origin: user-stated`.
+the **default being everything** — no narrowing on the scope axis, so this requirement alone leaves
+today's behaviour intact. That is **scope-equivalence, not end-to-end byte-identity**: R-11's
+allowlist binds regardless of the flag and independently changes the fresh-target outcome. Today no
+such gesture exists: on a fresh target the artifact's whole config is adopted unconditionally
+(`src/cli.rs:4744-4750`) and the operator cannot decline it — which is precisely the adoption R-11
+now constrains. `Origin: user-stated`.
 `Ratification: n/a` (maintainer-proposed).
 
 **R-9a** — *Where* an artifact's scope is determined, it **shall** be derived from payload **presence**
@@ -393,7 +410,7 @@ artifact containing config ignores that config regardless of what the artifact c
 > `accounts` only under `no_secrets` (`src/cli.rs:4533-4534`), and R-10 removes that flag — R-10b says
 > it outright ("every artifact **with a non-empty roster** carries live credentials"). After R-10,
 > neither field is empty on a self-minted artifact **whose roster is non-empty**; an empty roster
-> still yields an empty `accounts`, because `gather_payload`'s `else` branch builds one entry per
+> still yields an empty `accounts`, because `gather_payload`'s roster loop builds one entry per
 > roster account and a roster-less config is a supported state (see R-10b's note).
 >
 > **What survives.** R-9's circuit breaker still does not trip — scope is derived from parsed
@@ -450,8 +467,11 @@ code — and the maintainer has ruled the forward direction out of the model. `O
 `Ratification: n/a`.
 
 **R-10a** — *Where* R-10 removes a **shipped** flag, the removal **shall** follow a decided path:
-hard-remove with a strict-usage error naming the replacement, or deprecate-then-remove across a
-release. Not yet decided. `Origin: enrichment-expanded` (item I1).
+hard-remove with a strict-usage error stating that roster-without-secrets is no longer supported, or
+deprecate-then-remove across a release. Not yet decided. **There is no replacement to name** — R-9c
+and AD-5 forbid any export-side narrowing flag, and `import --accounts` narrows what is *applied*,
+not what the file *contains*, so it does not yield a secret-free artifact. Any wording that promises
+one is unsatisfiable. `Origin: enrichment-expanded` (item I1).
 `Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item I1)` — inclusion only; the path is undecided.
 
 **R-10b** — *Where* R-10 lands, every artifact **with a non-empty roster** carries live credentials, so
@@ -467,7 +487,8 @@ the flag. `Origin: enrichment-expanded` (item I2).
 > `if !no_secrets { eprintln!("{PLAINTEXT_WARNING}"); }` (`src/cli.rs:4475`), with the in-code reason
 > *"nothing to protect, so the warning would misinform"*. Removing `no_secrets` removes the
 > condition, not the hazard: **an empty roster also yields zero credentials**. `gather_payload`'s
-> `else` branch builds one entry per roster account (`src/cli.rs:4533-4534`), so an empty roster
+> roster loop builds one entry per roster account (`src/cli.rs:4535-4546`, the `else` branch;
+> `:4533-4534` is the `if no_secrets` arm that returns `Vec::new()`), so an empty roster
 > produces an empty `accounts` with `no_secrets == false`. A roster-less config is a first-class
 > supported state — `require_roster()` is enforced only at `run` (`src/config.rs:1145-1158`) and the
 > committed test `accepts_a_roster_less_config_and_preserves_tunables`
@@ -531,8 +552,9 @@ home. `Origin: enrichment-expanded` (item I5).
 artifact. Today `import` reads the file and leaves it (`src/cli.rs:4602`), while `PLAINTEXT_WARNING`
 advises "delete it as soon as the import is done" — advice with no mechanism, printed only on the
 `--plaintext` path, while an encrypted artifact is still a live-credential file behind one passphrase.
-Under R-9's model the *typical* **applied payload** narrows to the roster; the file on disk is
-unchanged, because scope selection is import-side only (R-9c/AD-5). Either way the artifact is a
+Under R-9's model the applied payload *can* narrow to the roster, but the default is everything
+(AD-9) — and the file on disk is unchanged regardless, because scope selection is import-side only
+(R-9c/AD-5). Whatever the operator selects, the artifact is a
 **live-credential file**, which is what makes this urgent. `Origin: council-added` (`security-architect`, rounds 1 and 2).
 `Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item E11)`.
 
@@ -562,6 +584,7 @@ fits the existing aggregate-only redaction discipline of
 > constant (a field that gates nothing — the design's own ceremony anti-pattern, carrying none of the
 > correlation value claimed), or add an export scope flag and violate R-9c/AD-5/Cap-7.5 in the same
 > change. **Export-side correlation rides on the digest alone**, which is sufficient for it.
+
 `Origin: council-added`. `Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item E13)`.
 
 **R-14a** — *Where* R-14 logs a scope, it **shall** log the scope the operator **requested**, never the
@@ -589,8 +612,10 @@ unbounded length.
 > keychain service name today. Specifying it as work to do would produce a test that is **green over
 > unimplemented work** — the same failure class as the original `use <label>` no-op. Note also that
 > shipped behaviour rejects the **whole artifact** with `ConfigInvalid`, not the offending entry, so
-> an AC promising per-entry rejection would describe a behaviour change nobody scoped. This is **input-validation
-hardening, not a critical finding**, and it is recorded at that severity deliberately.
+> an AC promising per-entry rejection would describe a behaviour change nobody scoped.
+
+This is **input-validation hardening, not a critical finding**, and it is recorded at that severity
+deliberately.
 `Origin: council-added` (`security-architect` named the shape and explicitly declined to assert the
 finding; the bound was verified during this amendment).
 `Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item E14)`.
@@ -694,9 +719,12 @@ runs `import --accounts`, *Then* the roster and credentials are applied and **no
 widen the operator's selection; **BUT NOT** naming the flag `--config`, which is reserved for #24's
 directory-override ladder.
 
-**AC-9b (R-9b)** — *Given* a roster-only artifact **that also carries a block the parser does not
-know**, *When* it is imported **with `--accounts`** by a binary whose `RawConfig` would reject that
-block, *Then* the import succeeds. **BUT NOT** by
+**AC-9b (R-9b)** — *Given* an artifact whose **only payload of interest is its roster**, carrying
+`[[account]]` entries plus a non-roster block the parser does not know, *When* it is imported **with
+`--accounts`** by a binary whose `RawConfig` would reject that block, *Then* the import succeeds.
+**BUT NOT** by calling it a *roster-only artifact* — `import-scope-selection.feature.md` pins that
+term to `[[account]]` entries and **no** non-roster block, and an unknown block *is* a non-roster
+block, so the two cannot both hold. **BUT NOT** by
 relaxing `deny_unknown_fields` on the full-parse path; **BUT NOT** by removing `RawAccount`'s own
 strictness; **BUT NOT** by asserting this on the default path, where the full parse still runs and
 `deny_unknown_fields` (`src/config.rs:1378`) still rejects — that is OQ-5's question, not this AC's.
@@ -711,7 +739,8 @@ disclosure hygiene, import scope is input validation, and only the latter defend
 the attacker minted.
 
 **AC-10 (R-10, R-10a, R-10b)** — *Given* `--no-secrets` is removed, *When* an operator passes it,
-*Then* they get a strict-usage error naming what replaced it, *And* `PLAINTEXT_WARNING`'s wording has
+*Then* they get a strict-usage error stating that roster-without-secrets is no longer supported,
+*And* `PLAINTEXT_WARNING`'s wording has
 been re-checked against the fact that every artifact with a non-empty roster now carries
 credentials, *And* the warning guard is re-expressed over the artifact's credential count rather than
 deleted along with the flag.
@@ -782,26 +811,51 @@ unimplemented work;
 overstating it would manufacture a severity the evidence does not support.
 
 **AC-16 (R-16)** — *Given* an artifact carrying a non-roster block the **current** parser does not
-know, *When* the current binary imports it, *Then* that block is tolerated on the artifact-config
-parse path rather than aborting the import, *And* the **version floor** — which released binaries
-cannot read a `[credential]`-bearing artifact — is documented.
+know, *When* the current binary imports it, *Then* the **version floor** — which released binaries
+cannot read a `[credential]`-bearing artifact — is documented, *And* **— gated on OQ-5 —** that block
+is tolerated on the artifact-config parse path rather than aborting the import.
 **BUT NOT** left as today's bare `deny_unknown_fields` parse error; **BUT NOT** considered closed by
 R-9b, which repairs only the roster-only case; **BUT NOT** asserting what an *already-shipped* binary
-prints, which is unfixable by construction (design § 4.9, § 14) — that half is bounded by **OQ-5**;
-**BUT NOT** using `[credential]` as the unknown block — `RawConfig` carries `credential:
-RawCredential` (`src/config.rs:1395`), so the current parser **knows** it and a test built that way is
-green over unimplemented work. `[credential]` is the subject of the *version-floor* half only.
+prints — that half is **unfixable by construction** (design § 4.9, § 14), not undecided, so no
+decision will ever make it assertable; **BUT NOT** using `[credential]` as the unknown block —
+`RawConfig` carries `credential: RawCredential` (`src/config.rs:1395`), so the current parser
+**knows** it and a test built that way is green over unimplemented work. `[credential]` is the subject
+of the *version-floor* half only.
+
+> **The forward-tolerance clause is the OQ-5-gated half — do not implement it until OQ-5 closes.**
+> *Corrected 2026-08-05 (seventh pass); this AC previously required tolerance unconditionally and hung
+> its only OQ-5 caveat on the released-binary clause.* Those are two different things: the
+> released-binary half is **unfixable** (we cannot patch shipped binaries), while OQ-5 decides the
+> **in-reach** half — § 14's R-16 row scopes it to "the version-floor message and forward-tolerance".
+> OQ-5's option (a) is a version floor **without** tolerance; under (a) this AC's tolerance clause and
+> Cap-11.2's first half are unsatisfiable. The version-floor clause is **not** gated and stands as
+> written. This mirrors the treatment AC-10 already carries for OQ-4.
 
 **AC-4 (R-4, R-4a)** — *Given* any credential-bearing import, *When* it runs, *Then* the operator is
 warned that a source refresh after export invalidates the artifact, and is given the safe sequence.
 **BUT NOT** gated on a freshness computation that does not yet exist; **BUT NOT** implemented via a
 `format_version` bump absorbed as an implementation detail rather than decided against ADR-0006.
 
-**AC-5 (R-5, R-5a)** — *Given* a refresh that classifies as `dead` or `error`, *When* the event is
-logged, *Then* the line does not present `rotated` as an observation.
-**BUT NOT** by deleting the field on the `refreshed` path, where it is meaningful; **BUT NOT** without
+**AC-5 (R-5, R-5a)** — *Given* a refresh that classifies as anything other than `Refreshed` — that is
+`NoChange`, `Dead` **or** `Error`, the three non-`Refreshed` variants of `RefreshOutcome`
+(`src/refresh.rs:225-240`) — *When* the event is logged, *Then* the line does not present `rotated` as
+an observation.
+**BUT NOT** by deleting the field on the `refreshed` path, where it is meaningful; **BUT NOT** by
+enumerating only `dead` and `error`, which silently exempts `NoChange`; **BUT NOT** without
 checking whether any committed findings note's counts are drawn from a window containing non-`refreshed`
 lines (0465 checked: clean).
+
+> **`NoChange` is the variant this AC most easily loses, and it is not benign.** `rotated` is decided
+> by the *token* differing (`src/refresh.rs:434-437`) while `NoChange` is decided by the *expiry*
+> failing to move past the seeded marker (`:448-452`) — two independent comparisons, so a `no_change`
+> line can carry `rotated=true` for exactly the same reason a `dead` line can. It is a live emitted
+> outcome: `src/observability.rs:180` renders it as `"no_change"`.
+>
+> Do **not** extend this to `refreshed_not_restashed`. That is an *event* outcome
+> (`RefreshEventOutcome`, `src/observability.rs:160`) mapped **from** `RefreshOutcome::Refreshed`
+> (`src/refresh_tick.rs:843`) — the token did rotate and was simply not re-stashed, so `rotated`
+> carries real information there. The event vocabulary has five values; the classification has four;
+> this AC scopes to the three non-`Refreshed` *classifications*.
 
 **AC-6 (R-6, R-6a)** — *Given* a target roster carrying label `L` under uuid `X`, and an artifact
 carrying label `L` under uuid `Y`, *When* `import` runs, *Then* the operator is warned that a
@@ -855,7 +909,10 @@ PAST:    0.0  — no warning exists on any path
 ```
 TAG:     RotationSignalFidelity
 SCALE:   fraction of emitted `rotated` values that carry information
-METER:   unit test over classify() across {refreshed, dead, error}
+METER:   unit test over classify() across all four returns
+         {refreshed, no_change, dead, error} -- omitting no_change exempts
+         a live outcome (src/observability.rs:180) whose rotated value is
+         derived independently of its expiry test (refresh.rs:434-437 vs :448-452)
 MUST:    1.0
 PAST:    < 1.0 — true-by-construction on any `dead` line with a parseable non-empty
          seeded token (src/refresh.rs:434-437); 6 such lines in the local log
@@ -1170,6 +1227,20 @@ findings, none blocking Stage 2:
 words). R-9a/b/c, R-11 … R-16 are `council-added`, ratified **in-scope** via a second
 scope-membership **B** selection over an enumerated 22-item set on 2026-08-04. R-10a, R-10b, R-11d,
 R-11e, R-11f are `enrichment-expanded` and carry the same in-scope-only ratification. **No mechanism
-in the amendment set is user-ratified** — *with one carve-out: **R-9d's flag names***, which the
-maintainer ruled on and which a pipeline may not reverse (see R-9d). Every other mechanism remains a
-reversible pipeline call.
+in the amendment set is user-ratified** — *with three carve-outs: **R-9's scope-splitting**, **R-9d's
+flag names**, and **R-10's `--no-secrets` removal***, which a pipeline may not reverse. Every other
+mechanism remains a reversible pipeline call.
+
+> **The carve-out list is three, not one.** *Corrected 2026-08-05 (seventh pass); this paragraph
+> previously named only R-9d.* § 3's own preamble records all three as `user-stated` — "the maintainer
+> **proposed scope-splitting**, ruled on naming, and **directed the `--no-secrets` removal** in their
+> own words" — and R-3's ratification line repeats it. Scope-splitting (R-9) and the `--no-secrets`
+> removal (R-10) are mechanisms, maintainer-originated by that same account, so R-9d's own logic
+> applies to them identically. Left as written, a reader asking "may the pipeline drop `--settings`?"
+> got "yes, reversible" here and "no, the maintainer proposed it" from § 3. This is the
+> three-ways-recorded defect the fourth pass fixed for R-9d, unswept to its two siblings.
+>
+> **What the carve-out does and does not cover**: it protects the mechanism the maintainer originated
+> — that scope selection exists, what the flags are called, that `--no-secrets` goes. It does **not**
+> freeze the details the pipeline supplied around them: R-9a's presence-derivation, R-9c's no-export-
+> flag rule, R-10a's removal *path* (explicitly undecided, OQ-4). Those remain reversible.

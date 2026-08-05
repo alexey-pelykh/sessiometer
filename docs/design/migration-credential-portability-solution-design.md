@@ -1,8 +1,8 @@
 # Solution Design: Migration Credential Portability
 
 **Requirements**: `docs/requirements/migration-credential-portability.md`
-**Status**: `draft` — four requirements are decision-gated (OQ-1, OQ-4, OQ-5, OQ-6) and are surfaced,
-not settled, here.
+**Status**: `draft` — **five** requirements are decision-gated (R-6a, R-9, R-9a, R-10a, R-16 — see § 16),
+by **four** open questions (OQ-1, OQ-4, OQ-5, OQ-6). Both are surfaced, not settled, here.
 **Date**: 2026-08-04
 
 ## 1. Goals and Drivers
@@ -313,13 +313,21 @@ defaults, an omitted block is indistinguishable from a default-valued one, so a 
 artifact irreversible, and mask R-16's break behind a flag.
 
 **Naming** (R-9d): `--accounts` / `--settings`. `--config` is doubly unavailable — reserved and
-value-bearing for issue #24's directory-override ladder (`src/paths.rs:439`), and semantically wrong,
+value-bearing for issue #24's directory-override ladder (`src/paths.rs:443-444`, the quoted phrase;
+`config_dir_with_override` at `:448`), and semantically wrong,
 since `account` is a `RawConfig` field and `sessiometer config show` prints the roster. `--accounts`
 is the vocabulary `IMPORT_USAGE` already uses ("rehydrate **accounts**", `src/cli.rs:1290`).
 
-**Default stays everything** — today's behaviour byte-for-byte. The safety argument for defaulting to
-`--accounts` is real but is **absorbed by § 4.8**: with the capability keys refused unconditionally,
-the residual delta is a KDF downgrade, and changing a shipped command's default costs more than that
+**Default stays everything** — on the *scope-selection axis* the default adds no narrowing, so nothing
+this section introduces changes what a no-flag `import` applies. That is the **only** axis on which
+"today's behaviour" holds: § 4.8's allowlist binds **regardless of the flag**, so on a fresh target —
+where the artifact's config was previously adopted wholesale (`src/cli.rs:4744-4750`) — a non-portable
+key that used to be adopted is now refused and reported. § 8's `config adoption` row records that as a
+behaviour change on exactly this path; do not read "default unchanged" as end-to-end byte-identity.
+The safety argument for defaulting to `--accounts` is real but is **absorbed by § 4.8**: with the
+capability keys refused unconditionally and `kdf_*` held to a monotonic floor (R-11b — adopt only if
+`incoming >= local`), the delta a narrow default would have closed is already closed, and changing a
+shipped command's default costs more than that
 delta is worth. The two decisions are coupled and § 4.8 is decided first.
 
 ### 4.8 Portability classification (R-11 … R-11f) — **allowlist, not denylist**
@@ -376,9 +384,10 @@ question with no current home, and it is the one a future contributor will need 
 **R-12 — artifact lifetime.** `import` reads the file and leaves it (`src/cli.rs:4602`);
 `PLAINTEXT_WARNING` advises deleting it with **no mechanism**, and only on the `--plaintext` path,
 while an encrypted artifact is still a live-credential file behind one passphrase. Under § 4.7 the
-*typical* **applied payload** narrows to the roster, while the file on disk is unchanged — scope
-selection is import-side only (R-9c/AD-5), so `export` still writes the full rendered config. The
-artifact is a live-credential file either way, which is what makes this urgent. Design: `import --shred` unlinks the source after a successful apply.
+applied payload *can* narrow to the roster, but AD-9 keeps the default at everything — and the file on
+disk is unchanged regardless, because scope selection is import-side only (R-9c/AD-5), so `export`
+still writes the full rendered config. The artifact is a live-credential file whatever the operator
+selects, which is what makes this urgent. Design: `import --shred` unlinks the source after a successful apply.
 **Stated honestly**: on APFS, overwrite-in-place does not reliably destroy the prior extent, so this is
 `rm` with intent, not forensic erasure. It must be documented as such — claiming secure-erase we do not
 deliver is the same false-assurance failure AD-2 declines.
@@ -401,11 +410,15 @@ scope, per R-9a). `export` has no operator-requested scope to carry — it takes
 (R-9c, AD-5, Cap-7.5) — so export-side correlation rides on the digest alone. Both fit the existing
 aggregate-only redaction discipline (`src/observability.rs:1426-1442`) — no label, no token, no email.
 
-**R-15 — input validation.** `account_uuid` is unvalidated and interpolated into a keychain service
-name (`src/config.rs:370-372`). **Severity is bounded and the bound is verified**: `stash()` reaches no
+**R-15 — input validation.** `account_uuid` is validated for **non-emptiness and uniqueness only**
+(`src/config/validate.rs:281-293`, reached from `apply_import`'s parse at `src/cli.rs:4735`) and is
+otherwise interpolated into a keychain service name (`src/config.rs:370-372`) with its **shape and
+length unchecked**. **Severity is bounded and the bound is verified**: `stash()` reaches no
 filesystem path, and keychain service names are opaque strings rather than hierarchical paths, so
-`Sessiometer/../x` is a literal name and not a traversal. Residue is namespace squatting, an empty uuid
-yielding the bare prefix, and unbounded length. Validate on parse; **do not file or fix this as a
+`Sessiometer/../x` is a literal name and not a traversal. Residue is **shape and length only** —
+namespace squatting (`"../x"` and `" x "` both pass `validate`) and unbounded length. **The empty case
+already ships**, so specifying it would be green over unimplemented work (PRD R-15's note).
+Validate shape on parse; **do not file or fix this as a
 traversal**, which would manufacture a severity the evidence does not support.
 
 **R-16 — the `[credential]` backward-import break.** `RawConfig` carries `deny_unknown_fields`, so a
@@ -434,11 +447,11 @@ rows, including the entire security core:*
 
 | Block | Change | Requirements |
 |---|---|---|
-| `src/cli.rs::parse_import` | accept `--accounts` / `--settings`; default (neither) is byte-identical to today | R-9, R-9c, R-9d |
+| `src/cli.rs::parse_import` | accept `--accounts` / `--settings`; default (neither) narrows nothing — the flag surface alone leaves today's behaviour intact (§ 4.8's allowlist applies independently) | R-9, R-9c, R-9d |
 | `src/cli.rs::import` | narrow-parse under `--accounts`; "artifact contains no configuration" notice under `--settings` against a roster-only artifact (**OQ-6-gated** — settle before building this notice); `--shred` | R-9a, R-9b, R-12 |
 | `src/cli.rs::apply_import` | apply the portability allowlist before adopting any non-roster value; emit a refusal line per refused key | R-11, R-11a … R-11c, R-11e |
 | **new** `src/config.rs::portability` | the allowlist itself (non-portable by default) + the `kdf_*` monotonic-floor comparator + the compile-time rot-guard that fails when a new `Config` key carries no classification | R-11, R-11b, R-11d |
-| `src/cli.rs::parse_export` | **remove** `--no-secrets`; strict-usage error naming the replacement | R-10 (form is OQ-4-gated) |
+| `src/cli.rs::parse_export` | **remove** `--no-secrets`; strict-usage error stating roster-without-secrets is no longer supported (there is no replacement to name — R-9c/AD-5) | R-10 (form is OQ-4-gated) |
 | `src/cli.rs::export` | daemon-liveness probe via `daemon_liveness()` (`src/cli.rs:1885`) before writing | R-13 |
 | `src/migration.rs` | `PLAINTEXT_WARNING` wording (`src/migration.rs:538`); `[credential]` forward-tolerance + version-floor message | R-10b, R-16 |
 | `src/observability.rs` | sha256 artifact digest on **both** events + requested scope on the **`import`** event only (export has none — R-9c/AD-5); allowlist-refusal signal | R-14, R-14a |
@@ -465,7 +478,7 @@ SOURCE (A)                                   TARGET (B)
    └─ LOGS sha256 digest (export has no operator scope)        (R-14)
          │
       artifact ──────────────────────►  import [--accounts] [--settings] [--shred]
-                                          │   (default = everything: today's behaviour, byte-identical)
+                                          │   (default = everything: no narrowing; § 4.8 still binds)
                                           ├─ scope from PAYLOAD PRESENCE, never self-declared  (R-9a)
                                           ├─ VALIDATES account_uuid shape before stash()       (R-15)
                                           ├─ ALLOWLIST gate on every non-roster value:         (R-11)
@@ -549,29 +562,30 @@ stash writes. What § 4.1 declines to add is a second writer of the canonical
 | Cap-2.3 | An already-expired artifact additionally reports expiry | unit | R-4a |
 | Cap-3.1 | Same-label/different-uuid import warns — with a target that is **not** a clone of the source | unit | R-6 |
 | Cap-3.2 | `use` / `enable` / `disable` / **`remove`** agree on duplicate-label resolution — `remove` is not optional: it is the only irreversible one (deletes a keychain stash), so a test omitting it passes while the case that motivated R-6a stays unasserted | unit | R-6a |
-| Cap-4.1 | `rotated` is unrepresentable on `dead` / `error` | unit (type-level) | R-5 |
+| Cap-4.1 | `rotated` is unrepresentable on **every non-`Refreshed` outcome** — `NoChange`, `Dead`, `Error` (all three, `src/refresh.rs:225-240`). Asserting only `Dead`/`Error` lets an implementation keep `rotated` on `NoChange`, a live outcome (`src/observability.rs:180`) whose `rotated` is derived independently of its expiry test. Excludes `refreshed_not_restashed`, an *event* outcome mapped from `Refreshed` where `rotated` is meaningful | unit (type-level) | R-5 |
 | Cap-5.1 | `status` distinguishes canonical-sourced from stash-sourced EXPIRY | unit | R-7 |
 | Cap-6.1 | No import output line contains a token or email | unit (extend existing) | C-3 |
 | Cap-7.1 | `import --accounts` applies roster + secrets and **no** non-roster block | unit (`apply_import` outcome) | R-9 |
-| Cap-7.2 | Default `import` (no scope flag) is byte-identical to today's behaviour | integration (regression) | R-9, AD-9 |
+| Cap-7.2 | Default `import` (no scope flag) applies the same payload classes today's `import` applies — **modulo § 4.8's allowlist, which binds on this path too**. Assert scope-equivalence, NOT end-to-end byte-identity: on a fresh target a non-portable key that used to be adopted is now refused (§ 8, `config adoption`). A byte-identity assertion here goes red, and the cheapest way to green it is to exempt the no-flag path from the allowlist — reinstating the § 1 code-execution path | integration (regression) | R-9, AD-9 |
 | Cap-7.3 | A scope flag can only narrow — an artifact cannot widen it | unit | R-9a |
-| Cap-7.4 | A roster-only artifact round-trips through narrow-parse, incl. under an unknown block | unit | R-9b, R-16 |
+| Cap-7.4 | An artifact whose roster is the payload of interest round-trips through narrow-parse **even when it carries an unknown non-roster block**. Not "a roster-only artifact under an unknown block": *roster-only* is pinned to `[[account]]` entries **and no non-roster block** (`import-scope-selection.feature.md`), which an unknown block contradicts | unit | R-9b, R-16 |
 | Cap-7.5 | `export` exposes no config/roster narrowing flag | unit (usage assertion) | R-9c |
 | Cap-7.6 | `import --settings` on a roster-only artifact reports "no configuration", not an error | unit | R-9 — **OQ-6-gated**, see § 4.7 |
-| Cap-7.7 | `export --no-secrets` exits with a **strict-usage error that names the replacement** — asserted on both halves: non-zero exit AND the replacement named. Explicitly asserts the flag is **not** silently accepted-and-ignored | unit (usage assertion) | R-10 (**not** R-10a — see note) |
+| Cap-7.7 | `export --no-secrets` exits with a **strict-usage error stating that roster-without-secrets is no longer supported** — asserted on both halves: non-zero exit AND the explanation present. **Not "names the replacement"**: nothing replaces the flag (R-9c/AD-5 forbid any export-side narrowing flag, and `import --accounts` narrows what is *applied*, not what the file *contains*), so a "replacement named" assertion has no referent. Explicitly asserts the flag is **not** silently accepted-and-ignored | unit (usage assertion) | R-10 (**not** R-10a — see note) |
 | Cap-7.8 | `PLAINTEXT_WARNING` reflects that **every** artifact now carries credentials, and advises no deletion the tool provides no mechanism for | unit (text assertion) | R-10b |
 | Cap-8.1 | `[refresh].claude_bin` from an artifact is **never** written to the target config, even with `--settings` | integration | R-11a |
 | Cap-8.2 | A weaker incoming `kdf_*` is refused; a stronger one is accepted | unit | R-11b |
 | Cap-8.3 | `[migration].conflict_policy` is not adopted | unit | R-11c |
 | Cap-8.4 | **Adding a `Config` key without a portability classification fails the build** | compile-fail / completeness test | R-11d, **R-11** |
-| Cap-8.6 | **A non-portable key outside the three named carve-outs is not adopted, `--settings` notwithstanding** — the allowlist's default-deny asserted over an *ordinary* key classified non-portable — **`[jitter]`**, the one block PRD § 1 does not call freely portable — which is what reaches the default branch | unit | **R-11** |
 | Cap-8.5 | Every refusal is reported on stdout | unit | R-11e |
+| Cap-8.6 | **A non-portable key outside the three named carve-outs is not adopted, `--settings` notwithstanding** — the allowlist's default-deny asserted over an *ordinary* key classified non-portable. **The subject is chosen when the classification table is built**: § 4.8 fixes three carve-out keys and leaves the rest to implementation, so no block is classified non-portable at design time. `[jitter]` and `[credential]` are the two candidates PRD § 1 neither calls freely portable nor carves out — **neither is decided here**. If the built table leaves no non-carve-out block non-portable, use a purpose-built fixture key; **never reclassify a real block to green this test** (R-11f puts that call in the ADR) | unit | **R-11** |
+| Cap-8.7 | **The allowlist binds with no scope flag at all, on a fresh target** — the shipped hazard and the *default* path (AD-9). Cap-8.1/8.2/8.3 all put `--settings` in their *When*, so an implementation hanging the allowlist off the `--settings` branch passes all three while leaving § 1's code-execution path reachable by default | integration | **R-11**, R-11a, AD-9 |
 | Cap-9.1 | `import --shred` removes the source artifact after a successful apply | integration | R-12 |
 | Cap-9.2 | Shred is not claimed as secure erase in help or docs | unit (text assertion) | R-12 |
 | Cap-10.1 | `export` warns on **`Responsive` and `AliveUnresponsive`**, and is quiet **only** on `NotRunning` — the tri-state of `daemon_liveness()` (`src/cli.rs:1870-1878`) mapped explicitly; a wedged daemon still holds the lock and still refreshes, so it fails **closed** | unit | R-13 |
 | Cap-10.2 | Export and import events carry a **matching artifact digest**; the **import** event additionally carries the operator-**requested** scope (export has none to carry — R-9c/AD-5) | unit | R-14, R-14a |
 | Cap-11.1 | A **malformed or over-length** `account_uuid` is rejected before a stash name is derived — **not** the empty case, which `src/config/validate.rs:281-284` already rejects on the import parse path (asserting it would be green over unimplemented work) | unit | R-15 |
-| Cap-11.2 | The **current** binary tolerates an unknown non-roster block on the artifact-config parse path, and the documented **version floor** states which releases cannot read a `[credential]`-bearing artifact | unit + doc assertion | R-16 (assertable half — **OQ-5**; see note below the Master Test Plan) |
+| Cap-11.2 | The documented **version floor** states which releases cannot read a `[credential]`-bearing artifact (**not** OQ-gated), **and — gated on OQ-5 landing at (b) —** the **current** binary tolerates an unknown non-roster block on the artifact-config parse path. Under OQ-5(a) the tolerance half is not a deliverable at all; do not build it until OQ-5 closes | unit + doc assertion | R-16 (assertable half; see note below the Master Test Plan) |
 
 **Coverage gap this closes** (PRD § 4 M2 criterion): the existing
 `the_migration_conflict_policy_default_drives_import_behaviour` builds its target as
@@ -586,9 +600,11 @@ requires a non-clone target.
 > patch. And the *current* binary parses `[credential]` fine (`src/config.rs:1395`), while
 > forward-tolerance (§ 4.9(b)) is designed to make it not fail at all — so neither side of the
 > version boundary can produce the asserted failure. What is assertable today is exactly what the row
-> now says: the current binary's tolerance, and a documented version floor. **OQ-5 decides whether
-> that is the whole deliverable** — the same treatment Cap-7.7 gets for OQ-4. Do not write a test
-> against an unpatched historical binary.
+> now says: a documented version floor, and — **if OQ-5 lands at (b)** — the current binary's
+> tolerance. **OQ-5 decides whether the tolerance half is a deliverable at all**, not merely whether
+> it is the whole one: option (a) is a version floor *without* tolerance, under which this row's
+> second clause is unsatisfiable. The version-floor clause is ungated. Same treatment Cap-7.7 gets for
+> OQ-4. Do not write a test against an unpatched historical binary.
 
 ## 12. Architecture Decisions
 
@@ -602,7 +618,7 @@ requires a non-clone target.
 | AD-6 | **Scope is derived from payload presence; the artifact carries no scope field** | A declared scope is attacker-controlled on the unauthenticated `--plaintext` path, which would convert the control into theatre. Also keeps AD-2 coherent — see § 4.7 |
 | AD-7 | **Portability is an allowlist, not a denylist** | A denylist rots: the next spawnable key auto-adopts. The allowlist forces the decision at add-time, and R-11d makes it fail closed (§ 4.8) |
 | AD-8 | **`claude_bin` is refused unconditionally — no flag overrides it** | It is a capability grant, not config; the refused capability has zero legitimate cross-machine use, and ADR-0030 already documents a local escape hatch. A second confirmation flag was rejected: the error message becomes the exploit instruction |
-| AD-9 | **Default import scope stays "everything"** | Today's behaviour byte-for-byte. The safety case for defaulting narrow is absorbed by AD-8 — with capability keys refused, the residual delta is a KDF downgrade. Explicitly **coupled to AD-8**: if AD-8 were reversed, this must be re-decided first |
+| AD-9 | **Default import scope stays "everything"** | No narrowing on the scope axis — the flag surface alone leaves today's behaviour intact. It is **not** end-to-end byte-identity: AD-7's allowlist binds regardless of the flag and changes the fresh-target outcome (§ 8, `config adoption`). The safety case for defaulting narrow is absorbed by AD-8 + R-11b — capability keys refused, `kdf_*` held to a monotonic floor — which closes the delta a narrow default would have closed. Explicitly **coupled to AD-8**: if AD-8 were reversed, this must be re-decided first |
 | AD-10 | **Flags are `--accounts` / `--settings`** | `--config` is reserved and value-bearing for #24, and semantically wrong — accounts *are* config (§ 4.7) |
 | AD-11 | **`[migration].conflict_policy` is non-portable** | Resolved conservatively **over a recorded dissent** (PRD § 9 D-1): two panelists reached opposite conclusions from the same verified facts. Normative, not evidence-forced |
 
@@ -623,6 +639,7 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
 | Requirement | Feasible? | Evidence |
 |---|---|---|
 | R-2 / R-2a | ✅ **Yes**, and cheaper than assumed | Reuses `use`; no new writer (§ 4.1) |
+| R-3 | ✅ **Yes** | Its merge-policy demand is withdrawn; feasibility now rides entirely on R-9 + R-11 (§ 4.7 + § 4.8), both feasible below |
 | R-4 | ✅ **Yes**, no format change | Unconditional warning is pure output |
 | R-4a | ⚠️ **Partly — and the derivable part misses the target case** | `credential_clocks` gives both deadlines from v1 bytes, but supersession is invisible in the blob (§ 4.2) |
 | R-5 / R-5a | ✅ **Yes**; 0465 verified unaffected | `src/refresh.rs:434-437`; 0465 window ends before the first dead line |
@@ -632,8 +649,9 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
 | R-1 / R-1a / R-8 | ✅ **Yes** | Documents; conventions already exist |
 | R-9 / R-9a / R-9c | ✅ **Yes, and free at the format layer** — but the *settings*-axis availability test is **OQ-6-gated** | Every `RawConfig` field is `#[serde(default)]` incl. `account`; `Payload`'s two fields are both emptiable (§ 4.7) |
 | R-9b | ✅ **Yes**, and it repairs R-16's roster-only case as a side effect | Narrow struct omits top-level `deny_unknown_fields`; `RawAccount` keeps its own |
-| R-9d | ✅ **Yes** | `--config` collision verified at `src/paths.rs:439` |
+| R-9d | ✅ **Yes** | `--config` collision verified at `src/paths.rs:443-444` (`config_dir_with_override` at `:448`) |
 | R-10 | ✅ **Yes** — but it is the scope's **only breaking CLI change** | Removal is trivial; the *path* is a product call (OQ-4) |
+| R-10a | 🚧 **Blocked on a decision**, not on feasibility | OQ-4 — both paths (hard-remove, deprecate-then-remove) are cheap; the choice is a product call on a shipped flag |
 | R-11 / R-11a / R-11b / R-11c | ✅ **Yes** | Classification is a pure function over the config; no new I/O |
 | R-11d | ⚠️ **Yes, but mechanism-dependent** | An exhaustive `match` (compile-error) is preferred and may not fit the current type shape; the completeness-test fallback is weaker but sufficient (§ 4.8) |
 | R-11e | ✅ **Yes** | A refusal line per refused key on stdout; Cap-8.5 |
@@ -682,10 +700,13 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
   replacement, or deprecated across one release then removed? It is a **shipped** flag. Lean: hard
   remove, since the repo has one operator and a usage error is self-documenting — but this is a
   product call, not a design one, and R-10a records it as undecided.
-- **OQ-5 (bounds R-16)** — we cannot fix already-released binaries, so is the deliverable (a) documenting
-  a version floor and making the failure legible, (b) also making the artifact-config parse path
-  tolerant so the next added block does not re-break it, or both? Lean: both — (a) alone leaves the
-  defect free to recur.
+- **OQ-5 (bounds R-16)** — we cannot fix already-released binaries, so that half is out of reach
+  whatever we decide. The question is the **in-reach** half, and it is a **two-way** choice: (a) a
+  documented version floor that makes the failure legible, **or** (b) that floor **plus** forward-
+  tolerance on the artifact-config parse path, so the next added block does not re-break it. Lean:
+  **(b)** — (a) alone leaves the defect free to recur. *(Restated 2026-08-05: this was written as three
+  options — "(a), (b) also …, or both" — but (b)'s "also" already subsumes (a), so "both" was a
+  duplicate of (b). AC-16 and Cap-11.2 gate their tolerance clause on this landing at (b).)*
 - **OQ-6 (bounds R-9/R-9a)** — **can the *settings* axis be presence-derived at all?** R-9c's own
   argument says no: every `RawConfig` field is `#[serde(default)]` (`src/config.rs:1377-1396`), so a
   block the operator left at its default is byte-indistinguishable from one the artifact withheld,
