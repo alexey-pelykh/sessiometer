@@ -12,8 +12,9 @@ scenario as a passing test.
 Tracked as **issues #1049, #1048**. Requirements: PRD R-12, R-10b. Design § 4.9, RSK-9.
 
 **Rule under test**: `import` reads the artifact and leaves it, while the plaintext warning advises
-deleting it with no mechanism. Under scope selection the *typical* artifact becomes roster-only — a
-pure credential file — so the gap widens rather than narrows.
+deleting it with no mechanism. Scope selection narrows what an import *applies*, not what the file
+*contains* — `export` gains no narrowing flag (R-9c/AD-5) — and the artifact carries live credentials
+regardless, so the gap does not narrow.
 
 ## Scenario: a successful import can destroy its source  · Cap-9.1
 

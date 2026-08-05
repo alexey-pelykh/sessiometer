@@ -69,7 +69,9 @@ selection answers *what was asked for*; this answers *what is permitted*.
 > R-11's own assertion is **default-deny over a key nobody carved out**, and it is the one the other
 > scenarios do not make. Cap-8.1/8.2/8.3 each pin a *named* carve-out and Cap-8.4 pins the add-time
 > guard; all four pass while an ordinary non-portable key sails through at runtime, because none of
-> them exercises the default branch. Any `[tunables]`, `[jitter]` or `[stats]` field will do.
+> them exercises the default branch. Use a **`[jitter]`** field: PRD § 1 calls `[tunables]` and
+> `[stats]` *freely portable*, so an implementer building the allowlist from it classifies those
+> `Portable` and they cannot satisfy this Given — `[jitter]` is the one of the three that can.
 > `--settings` is in the *When* deliberately: the operator's widest flag must still not widen past the
 > allowlist — the flag is a ceiling, never a floor (R-9a).
 >

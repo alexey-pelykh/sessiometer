@@ -11,15 +11,23 @@ scenario as a passing test.
 
 Tracked as **issues #1052, #1053**. Requirements: PRD R-15, R-16. Design § 4.9, RSK-11, OQ-5.
 
-**Rule under test**: `account_uuid` arrives from the artifact unvalidated and is interpolated into a
-keychain service name. Under scope selection the roster becomes the payload every import touches.
+**Rule under test**: `account_uuid` arrives from the artifact validated for **non-emptiness and
+uniqueness only** (`src/config/validate.rs:281-293`, reached via `apply_import`'s parse at
+`src/cli.rs:4735`) and is otherwise interpolated into a keychain service name — its **shape and length
+are unchecked**. Under scope selection the roster becomes the payload every import touches.
 
 ## Scenario: a malformed uuid is rejected before a stash name is derived  · Cap-11.1
 
-    Given a roster entry whose `account_uuid` is empty or malformed
+    Given a roster entry whose `account_uuid` is malformed or over-length
     When the artifact is imported
-    Then the entry is rejected
+    Then it is rejected before a stash name is derived from it
     And the error names the offending entry without printing credential material
+    But not by asserting the empty-uuid case, which already ships
+
+> The empty case is **already rejected** (`src/config/validate.rs:281-284`), so asserting it yields a
+> test that is green over unimplemented work. Note the shipped rejection aborts the **whole artifact**
+> with `ConfigInvalid` rather than naming one entry; the per-entry wording above is the *target*
+> behaviour for #1052, not a description of today.
 
 ## Scenario: existing valid rosters still parse  · Cap-11.1
 
@@ -43,10 +51,11 @@ keychain service name. Under scope selection the roster becomes the payload ever
 
 ## Scenario: the `[credential]` incompatibility is legible  · Cap-11.2
 
-    Given an artifact carrying a `[credential]` block
+    Given an artifact carrying a non-roster block the current parser does not know
     When it is read by the current binary on the artifact-config parse path
-    Then the unknown block is tolerated rather than rejected
-    And the documented version floor states which releases cannot read it
+    Then that block is tolerated rather than aborting the import
+    And the documented version floor states which releases cannot read a `[credential]`-bearing artifact
+    But not by using `[credential]` as the unknown block — the current parser knows it
     But not by asserting anything about an already-shipped binary's message
 
 > **The half you cannot test — do not write a test for it.** An earlier draft's *When* read "by a

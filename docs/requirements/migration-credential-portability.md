@@ -216,7 +216,6 @@ below (hit one, the item converts to a spike):
 | **CredentialSlot** | A place a credential can live on a machine. Two instances, and the distinction is the whole defect: the **canonical** `Claude Code-credentials` item (what Claude Code reads) and the per-account **stash** `Sessiometer/<account_uuid>` (what Sessiometer parks). | `Write`, `Read`, `Swap` |
 | **RosterEntry** | A `[[account]]` config entry keyed by `account_uuid` — the *Claude* account uuid, stable across machines. Carries a mutable, **non-unique** `label`. | `Match`, `Append`, `Overwrite` |
 | **RefreshOutcome** | The classified result of a token exchange: `refreshed` / `dead` / `error`. Carries `rotated`, `window_secs`, `expires_before/after`. | `Classify`, `Log` |
-
 | **ImportScope** | The set of payload classes the operator elected to apply on this import. Derived from CLI flags, **never** from the artifact. Two independent axes: accounts (roster + credentials) and settings (non-roster config). | `Select`, `Constrain` |
 | **PortabilityClass** | The system's classification of a single `Config` key: **portable** (may be adopted), **machine-bound** (never adopted — it encodes a fact about *this* machine or *this* operator's choice), or **capability-granting** (never adopted — adoption transfers the ability to execute). Orthogonal to `ImportScope`: scope is what the operator *asked for*, class is what the system *permits*. | `Classify`, `Refuse` |
 
@@ -532,8 +531,9 @@ home. `Origin: enrichment-expanded` (item I5).
 artifact. Today `import` reads the file and leaves it (`src/cli.rs:4602`), while `PLAINTEXT_WARNING`
 advises "delete it as soon as the import is done" — advice with no mechanism, printed only on the
 `--plaintext` path, while an encrypted artifact is still a live-credential file behind one passphrase.
-Under R-9's model the *typical* artifact becomes roster-only, which is a **pure credential file** —
-making this more urgent, not less. `Origin: council-added` (`security-architect`, rounds 1 and 2).
+Under R-9's model the *typical* **applied payload** narrows to the roster; the file on disk is
+unchanged, because scope selection is import-side only (R-9c/AD-5). Either way the artifact is a
+**live-credential file**, which is what makes this urgent. `Origin: council-added` (`security-architect`, rounds 1 and 2).
 `Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item E11)`.
 
 **R-13** — *When* `export` runs, the system **shall** determine whether this machine's daemon is
@@ -569,12 +569,27 @@ scope the artifact **claims** — per R-9a. `Origin: council-added`.
 `Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item E13)`.
 
 **R-15** — *When* `import` reads a roster entry, the system **shall** validate `account_uuid` before
-use. It is unvalidated today and is interpolated directly into a keychain service name
-(`src/config.rs:370-372`, `format!("{STASH_PREFIX}{}", self.account_uuid)`).
+use. Today it is validated for **non-emptiness and uniqueness only**
+(`src/config/validate.rs:281-293`) and is otherwise interpolated directly into a keychain service name
+(`src/config.rs:370-372`, `format!("{STASH_PREFIX}{}", self.account_uuid)`) — its **shape and length
+are unchecked**.
 **Bounded, and the bound is verified**: `stash()` never reaches a filesystem path (no call site joins
 it into one), and keychain service names are opaque strings rather than hierarchical paths — so
-`Sessiometer/../x` is a literal name, not a traversal. The residue is namespace squatting inside the
-prefix, an empty uuid yielding the bare prefix, and unbounded length. This is **input-validation
+`Sessiometer/../x` is a literal name, not a traversal. The residue is **shape and length only**:
+namespace squatting inside the prefix (`account_uuid = "../x"` and `" x "` both pass `validate`) and
+unbounded length.
+
+> **The empty-uuid case is already handled — do not re-specify it.** *Corrected 2026-08-04 (sixth
+> pass); this requirement used to say `account_uuid` is "unvalidated today" and list "an empty uuid
+> yielding the bare prefix" as residue.* `apply_import` parses the incoming roster through
+> `Config::from_toml_str` (`src/cli.rs:4735`) → `Config::validate`, which rejects an empty-or-
+> whitespace uuid at `src/config/validate.rs:281-284` and duplicates at `:289-293`; `apply_import`'s
+> own comment states the invariant (*"unique non-empty account_uuid"*, `src/cli.rs:4733-4734`), and
+> the first `.stash()` call is at `:4790`, **after** that parse. So the empty case cannot reach a
+> keychain service name today. Specifying it as work to do would produce a test that is **green over
+> unimplemented work** — the same failure class as the original `use <label>` no-op. Note also that
+> shipped behaviour rejects the **whole artifact** with `ConfigInvalid`, not the offending entry, so
+> an AC promising per-entry rejection would describe a behaviour change nobody scoped. This is **input-validation
 hardening, not a critical finding**, and it is recorded at that severity deliberately.
 `Origin: council-added` (`security-architect` named the shape and explicitly declined to assert the
 finding; the bound was verified during this amendment).
@@ -679,8 +694,9 @@ runs `import --accounts`, *Then* the roster and credentials are applied and **no
 widen the operator's selection; **BUT NOT** naming the flag `--config`, which is reserved for #24's
 directory-override ladder.
 
-**AC-9b (R-9b)** — *Given* a roster-only artifact, *When* it is imported **with `--accounts`** by a
-binary whose `RawConfig` would reject an unknown block, *Then* the import succeeds. **BUT NOT** by
+**AC-9b (R-9b)** — *Given* a roster-only artifact **that also carries a block the parser does not
+know**, *When* it is imported **with `--accounts`** by a binary whose `RawConfig` would reject that
+block, *Then* the import succeeds. **BUT NOT** by
 relaxing `deny_unknown_fields` on the full-parse path; **BUT NOT** by removing `RawAccount`'s own
 strictness; **BUT NOT** by asserting this on the default path, where the full parse still runs and
 `deny_unknown_fields` (`src/config.rs:1378`) still rejects — that is OQ-5's question, not this AC's.
@@ -734,10 +750,21 @@ doc-comment on the allowlist constant, which records what was decided but not wh
 destroyed, *Then* it is. **BUT NOT** advice printed without a mechanism; **BUT NOT** restricted to the
 `--plaintext` path, since an encrypted artifact is still a live-credential file behind one passphrase.
 
-**AC-13 (R-13)** — *Given* the source daemon is running, *When* `export` runs, *Then* the operator is
-told, because the artifact will be invalidated by the next refresh. **BUT NOT** a warning printed
-unconditionally regardless of daemon state, which trains dismissal; **BUT NOT** blocking the export —
-the operator may have a reason.
+**AC-13 (R-13)** — *Given* the source daemon is **`Responsive` or `AliveUnresponsive`**, *When*
+`export` runs, *Then* the operator is told, because the artifact will be invalidated by the next
+refresh. **BUT NOT** a warning printed unconditionally regardless of daemon state, which trains
+dismissal; **BUT NOT** blocking the export — the operator may have a reason; **BUT NOT** treating
+`AliveUnresponsive` as "not running" — see below.
+
+> **`daemon_liveness()` is tri-state and this AC fails closed on the middle state.** *Added
+> 2026-08-04 (sixth pass); every AC, capability and scenario here was previously two-state.*
+> `DaemonLiveness` (`src/cli.rs:1870-1878`) is `Responsive` / `AliveUnresponsive` / `NotRunning`, and
+> the middle variant's own doc says it is *"a live daemon not answering yet (starting up, or wedged).
+> Reported honestly, NOT as 'not running'"*. A wedged or still-starting daemon **holds the lock and
+> will still refresh**, so it invalidates the artifact exactly as a responsive one does: it **warns**.
+> Leaving the variant unassigned would make an implementer invent the fail-open choice at the one
+> point where being wrong is silent — the operator ships a migration the source is about to
+> invalidate. This is the decision, recorded rather than left to the implementer.
 
 **AC-14 (R-14, R-14a)** — *Given* an export and its later import, *When* their events are read, *Then*
 a common artifact digest correlates them, *And* the **import** event carries the operator-requested
@@ -746,17 +773,24 @@ scope. **BUT NOT** logging a label, token, or email — the aggregate-only redac
 **BUT NOT** requiring a requested-scope field on the **export** event, which has no operator-
 requestable scope to carry (R-9c, AD-5).
 
-**AC-15 (R-15)** — *Given* a roster entry whose `account_uuid` is empty or malformed, *When* it is
-imported, *Then* it is rejected before a keychain service name is derived from it.
+**AC-15 (R-15)** — *Given* a roster entry whose `account_uuid` is **malformed or over-length** (the
+empty case is already rejected — `src/config/validate.rs:281-284`), *When* it is imported, *Then* it is
+rejected before a keychain service name is derived from it.
+**BUT NOT** by re-asserting the empty-uuid check that already ships, which would be green over
+unimplemented work;
 **BUT NOT** stated or filed as a path-traversal finding — `stash()` reaches no filesystem path, and
 overstating it would manufacture a severity the evidence does not support.
 
-**AC-16 (R-16)** — *Given* an artifact carrying a `[credential]` block, *When* the **current** binary
-imports it, *Then* the unknown block is tolerated on the artifact-config parse path, *And* the
-**version floor** — which released binaries cannot read such an artifact — is documented.
+**AC-16 (R-16)** — *Given* an artifact carrying a non-roster block the **current** parser does not
+know, *When* the current binary imports it, *Then* that block is tolerated on the artifact-config
+parse path rather than aborting the import, *And* the **version floor** — which released binaries
+cannot read a `[credential]`-bearing artifact — is documented.
 **BUT NOT** left as today's bare `deny_unknown_fields` parse error; **BUT NOT** considered closed by
 R-9b, which repairs only the roster-only case; **BUT NOT** asserting what an *already-shipped* binary
-prints, which is unfixable by construction (design § 4.9, § 14) — that half is bounded by **OQ-5**.
+prints, which is unfixable by construction (design § 4.9, § 14) — that half is bounded by **OQ-5**;
+**BUT NOT** using `[credential]` as the unknown block — `RawConfig` carries `credential:
+RawCredential` (`src/config.rs:1395`), so the current parser **knows** it and a test built that way is
+green over unimplemented work. `[credential]` is the subject of the *version-floor* half only.
 
 **AC-4 (R-4, R-4a)** — *Given* any credential-bearing import, *When* it runs, *Then* the operator is
 warned that a source refresh after export invalidates the artifact, and is given the safe sequence.
@@ -922,11 +956,12 @@ by symbol against `HEAD` on 2026-08-04 before this document was committed.
 >
 > **The shift is a cumulative step function, not a two-band rule** — and the earlier attempt to state
 > it as one is what let a second round of stale citations survive. `d1c5f30`'s eight hunks on
-> `src/cli.rs`, with the running shift applied to every *old* line above each:
+> `src/cli.rs`, with the running shift applied to every *old* line **below** each (a line takes the
+> shift of the nearest hunk **above** it):
 >
 > | hunk @ old line | 108 | 503 | 514 | 818 | 1081 | 2873 | 8226 | 11507 |
 > |---|---|---|---|---|---|---|---|---|
-> | shift above it | +7 | +12 | +30 | +34 | +38 | **+52** | **+97** | +193 |
+> | cumulative shift below it | +7 | +12 | +30 | +34 | +38 | **+52** | **+97** | +193 |
 >
 > The superseded wording said "+52 in the 4400–5300 band and **+97 above 10600**". The +52 band was
 > right by accident; the +97 boundary was wrong at **both** ends — it begins at 8226, not 10600, and
@@ -953,7 +988,7 @@ by symbol against `HEAD` on 2026-08-04 before this document was committed.
 > itself a claim with a timestamp, and a document that asserts its own freshness is asserting
 > something it cannot know about the future. Every citation in this file and the design doc has now
 > been re-resolved **by symbol lookup** on 2026-08-04 — each was checked by reading the symbol it
-> names, and independent review passes re-resolved them and found them correct — 178 citation targets across all twelve files (162 `path:line` plus 16 bare `:NNN` continuations inside a shared backtick span; the bare-continuation form is the same regex blind spot that produced two residue rounds, so it is counted explicitly here rather than left implicit).
+> names, and independent review passes re-resolved them and found them correct — across all twelve files, counting both `path:line` forms and the bare `:NNN` continuations that share a backtick span with an earlier path. **No total is quoted here deliberately**: every commit changes it, and an attestation carrying a stale self-count is the exact failure § 9 exists to record. The bare-continuation form is called out because it is the regex blind spot that produced two residue rounds — a sweep that matches only the first entry in a span is not a sweep.
 >
 > **But the recorded form is still `path:line`, and it will drift again.** *Stated plainly
 > 2026-08-04 (third pass), because the earlier wording claimed otherwise.* This paragraph previously

@@ -150,7 +150,18 @@ current silence, because an operator who sees a freshness check pass will trust 
 > regeneration, and an ADR." **That priced a *payload* field at the *header* rate.** ADR-0006
 > § BREAKING(3) carves out the opposite in terms: *"Ordinary, non-load-bearing additive payload growth
 > via `Option`/`#[serde(default)]` stays additive."* And `src/migration.rs` carries **zero**
-> `deny_unknown_fields`, so an added payload field is not a breaking change at all — it is nearly free.
+> `deny_unknown_fields`, so a **non-load-bearing** payload field is additive, not breaking.
+>
+> **Read BREAKING(3)'s rule, not only its parenthetical.** *Corrected 2026-08-04 (sixth pass); this
+> sentence used to end "not a breaking change at all — it is nearly free", which inverts the ADR.*
+> ADR-0006 uses that **same** absent-`deny_unknown_fields` fact to reach the *opposite* classification
+> for load-bearing fields: *"Because unknown payload fields are ignored … an older reader silently
+> **drops** any field it doesn't know … so adding one MUST bump `format_version`"*
+> (`docs/adr/0006-migration-schema-evolution-policy.md:127-132`). Silent drop is exactly what makes a
+> load-bearing addition breaking; the "stays additive" clause is the *exception*, not the rule. **A
+> mint timestamp — the field actually under discussion here — is load-bearing on its face**, so it is
+> precisely the case that MUST bump. This does not disturb AD-2's conclusion, which § 4.2 already
+> rests on false assurance alone (PRD § 9 F-3 carries the same correction).
 >
 > **The conclusion survives; the reason did not.** AD-2 stands on false assurance alone, which is the
 > only leg it ever actually had — and that leg is strong, because it is a claim about what the signal
@@ -298,7 +309,7 @@ the parse path — so narrow-parse *additionally repairs* backward-import for ro
 import scope is input validation.** Only the latter defends against a hostile artifact, because the
 attacker mints the export. Narrowing export would also be actively harmful — since every block
 defaults, an omitted block is indistinguishable from a default-valued one, so a receiver cannot tell
-*withheld* from *stock*; it would break `Payload`'s losslessness invariant (`:203-206`), make the
+*withheld* from *stock*; it would break `Payload`'s losslessness invariant (`src/migration.rs:203-206`), make the
 artifact irreversible, and mask R-16's break behind a flag.
 
 **Naming** (R-9d): `--accounts` / `--settings`. `--config` is doubly unavailable — reserved and
@@ -365,8 +376,9 @@ question with no current home, and it is the one a future contributor will need 
 **R-12 — artifact lifetime.** `import` reads the file and leaves it (`src/cli.rs:4602`);
 `PLAINTEXT_WARNING` advises deleting it with **no mechanism**, and only on the `--plaintext` path,
 while an encrypted artifact is still a live-credential file behind one passphrase. Under § 4.7 the
-*typical* artifact becomes roster-only — a **pure credential file** — so this gets more urgent, not
-less. Design: `import --shred` unlinks the source after a successful apply.
+*typical* **applied payload** narrows to the roster, while the file on disk is unchanged — scope
+selection is import-side only (R-9c/AD-5), so `export` still writes the full rendered config. The
+artifact is a live-credential file either way, which is what makes this urgent. Design: `import --shred` unlinks the source after a successful apply.
 **Stated honestly**: on APFS, overwrite-in-place does not reliably destroy the prior extent, so this is
 `rm` with intent, not forensic erasure. It must be documented as such — claiming secure-erase we do not
 deliver is the same false-assurance failure AD-2 declines.
@@ -552,13 +564,13 @@ stash writes. What § 4.1 declines to add is a second writer of the canonical
 | Cap-8.2 | A weaker incoming `kdf_*` is refused; a stronger one is accepted | unit | R-11b |
 | Cap-8.3 | `[migration].conflict_policy` is not adopted | unit | R-11c |
 | Cap-8.4 | **Adding a `Config` key without a portability classification fails the build** | compile-fail / completeness test | R-11d, **R-11** |
-| Cap-8.6 | **A non-portable key outside the three named carve-outs is not adopted, `--settings` notwithstanding** — the allowlist's default-deny asserted over an *ordinary* key (any `[tunables]`/`[jitter]`/`[stats]` field), which is what reaches the default branch | unit | **R-11** |
+| Cap-8.6 | **A non-portable key outside the three named carve-outs is not adopted, `--settings` notwithstanding** — the allowlist's default-deny asserted over an *ordinary* key classified non-portable — **`[jitter]`**, the one block PRD § 1 does not call freely portable — which is what reaches the default branch | unit | **R-11** |
 | Cap-8.5 | Every refusal is reported on stdout | unit | R-11e |
 | Cap-9.1 | `import --shred` removes the source artifact after a successful apply | integration | R-12 |
 | Cap-9.2 | Shred is not claimed as secure erase in help or docs | unit (text assertion) | R-12 |
-| Cap-10.1 | `export` warns **only** when the local daemon is live | unit | R-13 |
+| Cap-10.1 | `export` warns on **`Responsive` and `AliveUnresponsive`**, and is quiet **only** on `NotRunning` — the tri-state of `daemon_liveness()` (`src/cli.rs:1870-1878`) mapped explicitly; a wedged daemon still holds the lock and still refreshes, so it fails **closed** | unit | R-13 |
 | Cap-10.2 | Export and import events carry a **matching artifact digest**; the **import** event additionally carries the operator-**requested** scope (export has none to carry — R-9c/AD-5) | unit | R-14, R-14a |
-| Cap-11.1 | A malformed / empty `account_uuid` is rejected before a stash name is derived | unit | R-15 |
+| Cap-11.1 | A **malformed or over-length** `account_uuid` is rejected before a stash name is derived — **not** the empty case, which `src/config/validate.rs:281-284` already rejects on the import parse path (asserting it would be green over unimplemented work) | unit | R-15 |
 | Cap-11.2 | The **current** binary tolerates an unknown non-roster block on the artifact-config parse path, and the documented **version floor** states which releases cannot read a `[credential]`-bearing artifact | unit + doc assertion | R-16 (assertable half — **OQ-5**; see note below the Master Test Plan) |
 
 **Coverage gap this closes** (PRD § 4 M2 criterion): the existing

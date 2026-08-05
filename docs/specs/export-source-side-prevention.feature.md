@@ -30,9 +30,23 @@ target — only preventable at the source*. There is currently zero source-side 
     # Warning unconditionally trains dismissal — RSK-1's failure mode reproduced on a second
     # surface, and it would destroy the signal exactly where it matters.
 
+## Scenario: a live-but-unresponsive daemon still warns  · Cap-10.1
+
+    Given the control socket does not answer but the single-instance lock is held
+    When the operator runs `export`
+    Then the command warns, exactly as it does for a responsive daemon
+    But not by reporting the daemon as not running
+
+> The middle state of `daemon_liveness()`'s tri-state (`src/cli.rs:1870-1878`), and the one an
+> implementer must not invent an answer for. A daemon that is starting up or wedged **holds the lock
+> and will still refresh**, so it invalidates the artifact just as a responsive one does — fail
+> **closed** and warn. The variant's own doc comment says it is *"Reported honestly, NOT as 'not
+> running'"*. A two-state test that maps this to the quiet branch ships silence at the moment the
+> warning matters.
+
 ## Scenario: a probe failure does not fail the export  · Cap-10.1
 
-    Given the control socket is absent or unresponsive
+    Given the liveness probe cannot reach a conclusive answer
     When the operator runs `export`
     Then the export still completes
 
