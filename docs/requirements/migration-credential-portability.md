@@ -5,6 +5,9 @@ created: 2026-08-04
 status: draft
 dor_status: passed-with-findings
 source: .tmp/scopes/migration-credential-portability.md (/investigate + /scope 2026-07-31 → 2026-08-04)
+# Private HQ; REQ-MIG-* family. Provenance only — the sibling checkout is not guaranteed present, so
+# nothing here may be dereferenced as a build reference. R-10 SUPERSEDES REQ-MIG-B-007; see R-10.
+parent-requirements: ../hq/strategy/prd-export-import.md
 formulation:
   technical-architecture: complete
   testing-architecture: complete
@@ -508,6 +511,24 @@ inverse is already unreachable by construction — `apply_import`'s merge loop i
 (`src/cli.rs:4770`) with secrets keyed by uuid (`src/cli.rs:4789`), so a secret with no roster entry is dead
 code — and the maintainer has ruled the forward direction out of the model. `Origin: user-stated`.
 `Ratification: n/a`.
+
+> **R-10 SUPERSEDES `REQ-MIG-B-007`, and that reversal must not be silent.** The HQ decision record
+> (`../hq/strategy/prd-export-import.md`) specifies roster-only mode as *"the **V-001-failure
+> fallback** AND a **first-class user choice** (migrate config without moving secrets)"*. R-10 deletes
+> both halves. The maintainer may reverse a ratified record — but sixteen executors build against
+> **this** document and none of them will read that one, so the reversal is stated here rather than
+> left to be discovered.
+>
+> **Disposition of the V-001 fallback**: no longer needed. #145 is CLOSED and portability is
+> confirmed, so the failure mode roster-only was the fallback *for* does not arise. **Disposition of
+> the first-class user choice**: withdrawn by the maintainer's ruling — note that R-10's own evidence
+> (`apply_import`'s roster loop) argues only the *inverse* case, so the forward direction rests on
+> the ruling alone, not on code.
+>
+> *Recovered 2026-08-05 (twelfth pass) from PR #1057, which authored these twelve files in parallel
+> from the same `/scope` run and merged first. That branch carried the HQ provenance layer; this one
+> had lost it. Everything else #1057 held is present here or superseded by a later review pass — the
+> reconciliation is recorded in the PR body.*
 
 **R-10a** — *Where* R-10 removes a **shipped** flag, the removal **shall** follow a decided path:
 hard-remove with a strict-usage error stating that roster-without-secrets is no longer supported, or
