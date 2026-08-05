@@ -60,7 +60,27 @@ floor**.
 
 ## Scenario: `--settings` on a roster-only artifact is not an error  · Cap-7.6
 
-    Given a roster-only artifact
+    Given a HAND-CRAFTED roster-only artifact
     When the operator runs `import --settings`
     Then the command reports that the artifact contains no configuration
     But does not fail, and does not silently do nothing
+
+    # "Hand-crafted" is load-bearing: this tool CANNOT mint a roster-only artifact. gather_payload
+    # sets config_toml = config.render() unconditionally and render() emits [credential]
+    # unconditionally, while R-9c/AD-5 forbid an export-side narrowing flag. So this scenario is a
+    # hostile/third-party-artifact case under the design's own threat model, not a shape export can
+    # produce. An earlier revision justified it as "the typical artifact" — that premise was false.
+
+## Scenario: `export --no-secrets` is refused with a usage error  · Cap-7.7
+
+    Given the removal in R-10 has shipped
+    When the operator runs `export --no-secrets`
+    Then the command exits with a strict-usage error
+    And the error names what replaced the flag
+    But not by silently ignoring the flag and exporting normally
+
+    # R-10's acceptance criterion had NO capability and NO scenario: § 16 mapped it to Cap-7.5,
+    # which asserts export has no CONFIG/ROSTER narrowing flag (that is R-9c). --no-secrets is a
+    # SECRETS flag, and § 4.7 states secrets are not a third axis — so Cap-7.5 passed green while
+    # --no-secrets still shipped. The exact path is still open (hard-remove vs deprecate-then-remove,
+    # R-10a / OQ-4); this scenario pins the end state either path must reach.

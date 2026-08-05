@@ -30,13 +30,30 @@
 
 ## 3. Context and Scope
 
-**In scope**: `sessiometer import` (`src/cli.rs:4549-4611`), `apply_import` (`:4674-4761`), the
-`rotated` field in `classify()` (`src/refresh.rs:432-472`), `status`'s EXPIRY provenance
-(`src/daemon/snapshot_build.rs:40-58`), duplicate-label resolution across `use` / `enable` / `disable`,
-and two documents (`docs/findings/0262-*`, a migration runbook).
+> **Amended 2026-08-04 for R-9 … R-16.** This section, § 5 and § 7 were written against R-1 … R-8 and
+> are brought forward here. If a statement in them conflicts with § 8, § 11, § 12, § 14 or § 16, those
+> sections are newer and win.
 
-**Out of scope**: the artifact envelope and KDF (#147), cross-platform migration (#965/#980), the
-swap decision loop, `[refresh]` cadence and the keep-warm gate (#468).
+**In scope**: `sessiometer import` (`import()` in `src/cli.rs`), `apply_import()`, the
+`rotated` field in `classify()` (`src/refresh.rs:432-472`), `status`'s EXPIRY provenance
+(`src/daemon/snapshot_build.rs:40-58`), duplicate-label resolution across `use` / `enable` / `disable` / `remove`,
+and two documents from the original scope (`docs/findings/0262-*`, a migration runbook).
+
+**Also in scope, added by the R-9 … R-16 amendment**: `sessiometer export` (scope selection R-9, the
+`--no-secrets` removal R-10, and the source-side liveness probe R-13); **config adoption** governed by
+the portability allowlist (R-11, § 4.8); migration **observability** fields (R-14); roster input
+validation (R-15); and a **third** document — the portability-classification ADR (R-11f, issue #1003).
+
+**Out of scope**: the artifact envelope, and the KDF's *construction, parameters and envelope
+security* (#147); cross-platform migration (#965/#980); the swap decision loop; `[refresh]` cadence
+and the keep-warm gate (#468).
+
+> **The KDF boundary was NARROWED, and § 4.8 depends on the narrowing.** It previously read
+> "Encryption, KDF, and envelope security" and excluded KDF outright. **R-11b now governs whether an
+> artifact's `[migration].kdf_*` may be ADOPTED on import** — the monotonic-floor rule that closes the
+> 8 KiB / 1-iteration downgrade. How the KDF is *built* stays #147's; whether an incoming one may be
+> *adopted* is decided here. An executor who reads the old exclusion and skips R-11b/Cap-8.2 leaves
+> that downgrade open.
 
 **The system boundary that matters**: two machines that **cannot see each other**. Machine B has no
 channel to learn that machine A refreshed 4 minutes ago. Any design that implies B can detect this is
@@ -61,9 +78,9 @@ existing lock.
 > **Corrected 2026-08-04 — `--force` is load-bearing, not decoration.** This section previously named
 > `sessiometer use <label>`. For the **active** account that is a **provable no-op**:
 > `SwapTarget::resolve` short-circuits on `if account.stash() == active_stash { return
-> Ok(GateOutcome::AlreadyActive); }` (`src/use_account.rs:322-324`) — a comparison of **service
+> Ok(GateOutcome::AlreadyActive); }` (`SwapTarget::resolve`'s `AlreadyActive` short-circuit in `src/use_account.rs`) — a comparison of **service
 > names**, never of contents. The committed test
-> `already_active_without_force_is_a_noop_success_with_zero_writes` (`:2202-2213`) asserts exactly the
+> `already_active_without_force_is_a_noop_success_with_zero_writes` asserts exactly the
 > outcome: `canonical == b"A-token"`, `calls == 0`.
 >
 > So the original guidance would have left the canonical item holding the **stale** token while both
@@ -152,18 +169,25 @@ Two separable pieces:
   `account_uuid` is local and cheap. No new state.
 - **R-6a (consistency)** — a **product decision this design does not settle**. Today `use <label>`
   refuses (`Error::UseTargetAmbiguous`, exit 6) while `apply_enabled` silently takes the earliest
-  entry (`src/cli.rs:5098-5111`). Both behaviours are defensible in isolation; having both is not.
+  entry (`apply_enabled()` in `src/cli.rs`). Both behaviours are defensible in isolation; having both is not.
+
+**The policy spans FOUR commands, not three.** `remove` also resolves a label first-match, and it
+**deletes the keychain stash** — the only one of the four whose first-match behaviour is
+*irreversible*. Settling `use` / `enable` / `disable` and letting `remove` inherit the result gets the
+argument backwards: `remove`'s irreversibility is the strongest reason to pick a policy at all, so it
+belongs in the decision rather than downstream of it (PRD § R-6a; OQ-1 is stated over all four).
 
 **Options for R-6a**, surfaced for decision (§ 14 Open Questions, OQ-1):
 
 | Option | Consequence |
 |---|---|
-| (i) `enable`/`disable` refuse like `use` | Consistent and safe; breaks any operator muscle-memory relying on first-match |
-| (ii) `use` takes first like `enable` | Consistent; but silently switching to the *wrong account* is a credential-level mistake, not a config one |
-| (iii) Both accept an `--account-uuid` disambiguator; label path refuses | Most explicit; largest surface |
+| (i) `enable`/`disable`/`remove` refuse like `use` | Consistent and safe; breaks any operator muscle-memory relying on first-match. Strongest for `remove`, where first-match deletes the wrong stash |
+| (ii) `use` takes first like `enable` | Consistent; but silently switching to the *wrong account* is a credential-level mistake, not a config one — and it would make `remove` silently delete the wrong stash, which is unrecoverable |
+| (iii) All four accept an `--account-uuid` disambiguator; label path refuses | Most explicit; largest surface |
 
-**Design lean: (i)** — it moves the *cheaper* command toward the *safer* one. Refusing an
-`enable` costs a re-run; silently switching credentials costs an incident. Not chosen here.
+**Design lean: (i)** — it moves the *cheaper* commands toward the *safer* one. Refusing an `enable`
+costs a re-run; silently switching credentials costs an incident; silently removing the wrong stash
+costs the credential outright. Not chosen here.
 
 ### 4.4 `rotated` telemetry (R-5, R-5a) — **suppress on non-`refreshed`, treat as a contract change**
 
@@ -213,7 +237,7 @@ the format layer: `FORMAT_VERSION` does not move, golden fixtures do not regener
 reached.
 
 **Scope is derived from presence, never declared** (R-9a). The artifact must **not** gain a scope
-field. On a `--plaintext` export nothing is authenticated (`src/cli.rs:4419-4427`), so a declared
+field. On a `--plaintext` export nothing is authenticated (`resolve_encryption()` in `src/cli.rs`), so a declared
 scope is attacker-controlled: a hostile artifact would assert full scope and the control would
 evaporate — converting the feature from a control into theatre. Presence cannot lie, because you
 cannot claim content you do not carry.
@@ -230,7 +254,7 @@ struct ImportScope { accounts: bool, settings: bool }   // both true = today's b
 ```
 
 Secrets are **not** a third axis. They are contained by `accounts`: `apply_import`'s merge loop is
-over the roster (`src/cli.rs:4718`) with secrets keyed by uuid (`:4737`), so a secret with no roster
+over the roster (`apply_import()`'s roster loop in `src/cli.rs`) with secrets keyed by uuid (secrets keyed by uuid in the same fn), so a secret with no roster
 entry is unreachable code — and R-10 removes the opposite case (`--no-secrets`) from the product.
 A flat three-axis model would advertise two states the data model cannot hold.
 
@@ -255,7 +279,7 @@ artifact irreversible, and mask R-16's break behind a flag.
 **Naming** (R-9d): `--accounts` / `--settings`. `--config` is doubly unavailable — reserved and
 value-bearing for issue #24's directory-override ladder (`src/paths.rs:439`), and semantically wrong,
 since `account` is a `RawConfig` field and `sessiometer config show` prints the roster. `--accounts`
-is the vocabulary `IMPORT_USAGE` already uses ("rehydrate **accounts**", `src/cli.rs:1290`).
+is the vocabulary `IMPORT_USAGE` already uses ("rehydrate **accounts**", `IMPORT_USAGE` in `src/cli.rs`).
 
 **Default stays everything** — today's behaviour byte-for-byte. The safety argument for defaulting to
 `--accounts` is real but is **absorbed by § 4.8**: with the capability keys refused unconditionally,
@@ -281,8 +305,8 @@ complete):
 
 | Key | Class | Why |
 |---|---|---|
-| `[login].claude_bin`, `[refresh].claude_bin` | **CapabilityGranting** — never adopted | Resolution absolutizes against cwd and accepts any `is_file()`, with no allowlist, no signature, and deliberately no symlink resolution (`src/paths.rs:773-807`); the refresh tick then spawns it (`src/refresh_tick.rs:239,259`). Adoption is arbitrary code execution, unattended, on a timer. |
-| `[migration].conflict_policy` | **MachineBound** | Encodes the *target* operator's decision. Today an artifact cannot overwrite it; `--settings` would newly allow it — not for the import that adopts it (`resolve_import_overwrite` reads local first, `src/cli.rs:4576`) but for every one after. Resolved conservatively over a recorded dissent (PRD § 9 D-1). |
+| `[login].claude_bin`, `[refresh].claude_bin` | **CapabilityGranting** — never adopted | Resolution absolutizes against cwd and accepts any `is_file()`, with no allowlist, no signature, and deliberately no symlink resolution (`src/paths.rs:773-807`); the refresh tick then spawns it (`resolve_binary()` in `src/refresh_tick.rs`, spawned via `Command::new(binary)` in `src/isolated_spawn.rs`). Adoption is arbitrary code execution, unattended, on a timer. |
+| `[migration].conflict_policy` | **MachineBound** | Encodes the *target* operator's decision. Today an artifact cannot overwrite it; `--settings` would newly allow it — not for the import that adopts it (`resolve_import_overwrite` reads local first, `resolve_import_overwrite()` in `src/cli.rs`) but for every one after. Resolved conservatively over a recorded dissent (PRD § 9 D-1). |
 | `[migration].kdf_*` | **Portable, monotonic floor** | Adopt only if `incoming >= local`. A fleet may standardize upward; nothing may downgrade (`src/config.rs:981-988`). |
 
 **Refusing `claude_bin` costs nothing**, which is what makes it easy: the value is a local path, so on
@@ -313,19 +337,23 @@ question with no current home, and it is the one a future contributor will need 
 
 ### 4.9 Lifetime, source-side prevention, and legibility (R-12 … R-16)
 
-**R-12 — artifact lifetime.** `import` reads the file and leaves it (`src/cli.rs:4550`);
+**R-12 — artifact lifetime.** `import` reads the file and leaves it (`import()` in `src/cli.rs`);
 `PLAINTEXT_WARNING` advises deleting it with **no mechanism**, and only on the `--plaintext` path,
-while an encrypted artifact is still a live-credential file behind one passphrase. Under § 4.7 the
-*typical* artifact becomes roster-only — a **pure credential file** — so this gets more urgent, not
-less. Design: `import --shred` unlinks the source after a successful apply.
+while an encrypted artifact is still a live-credential file behind one passphrase — which is the whole
+argument, and it needs no further premise. **A stronger claim was withdrawn**: this paragraph used to
+add that under § 4.7 the *typical* artifact becomes roster-only. It cannot. `gather_payload()` sets
+`config_toml = config.render()` unconditionally and `render()` emits `[credential]` unconditionally,
+while R-9c/AD-5 forbid an export-side narrowing flag — so no tool-minted artifact is ever roster-only,
+and artifact scope is not derivable from block presence for anything this tool produces.
+Design: `import --shred` unlinks the source after a successful apply.
 **Stated honestly**: on APFS, overwrite-in-place does not reliably destroy the prior extent, so this is
 `rm` with intent, not forensic erasure. It must be documented as such — claiming secure-erase we do not
 deliver is the same false-assurance failure AD-2 declines.
 
 **R-13 — source-side prevention.** The design's own thesis is that the hazard is *"not detectable at
 the target — only preventable at the source"*, and there is currently **zero** source-side
-implementation: `export` never asks whether this machine's daemon is running (`src/cli.rs:4403-4449`).
-Liveness is locally probeable via the existing control socket (`src/capture.rs:335-348`). Design:
+implementation: `export` never asks whether this machine's daemon is running (`export()` in `src/cli.rs`).
+Liveness is locally probeable via the existing control socket (`notify_daemon_roster_reload()` in `src/capture.rs`, which already opens `paths::control_socket()` from a non-daemon verb). Design:
 `export` probes, and warns when the daemon is live — the one moment the operator can still act.
 Warning **only** when live, never unconditionally, so it does not train dismissal (RSK-1's failure
 mode).
@@ -354,16 +382,29 @@ the full-artifact case needs the same treatment deliberately.
 
 | Block | Change | Requirements |
 |---|---|---|
-| `src/cli.rs::import` | report non-adoption + name `use`; optional `--activate` | R-2 |
+| `src/cli.rs::import` | report non-adoption + name `use --force <label>`; optional `--activate` (which must force too) | R-2 |
 | `src/cli.rs::apply_import` | duplicate-label collision check; staleness warning emission | R-4, R-6 |
 | `src/refresh.rs::classify` | move `rotated` inside the `refreshed` variant | R-5 |
 | `src/daemon/snapshot_build.rs` + status render | provenance legibility | R-7 |
 | `src/use_account.rs` / `src/cli.rs::apply_enabled` | consistency per OQ-1 | R-6a |
 | `docs/findings/0262-*.md` | new | R-1, R-1a |
 | `docs/*` runbook + command help | new | R-8 |
+| `src/cli.rs::import` scope flags (`--accounts` / `--settings`) + narrow-parse | R-9, R-9a, R-9b |
+| `src/cli.rs::export` — remove `--no-secrets`; add the daemon-liveness probe | R-10, R-10a, R-13 |
+| **new** portability-allowlist module — classify every `Config` key, fail closed on an unclassified one | R-11, R-11a … R-11e |
+| `src/cli.rs::import` — `--shred` | R-12 |
+| `src/migration.rs::PLAINTEXT_WARNING` — re-word for the `--shred` mechanism | R-10b |
+| `src/observability.rs` — artifact-identity fields on `Event::Export` / `Event::Import` | R-14, R-14a |
+| roster input validation on `account_uuid` before `stash()` interpolation | R-15 |
+| a new ADR under `docs/adr/`, numbered on creation — the config-portability classification | new | R-11f (issue #1003) |
 
-**Untouched by design**: `src/migration.rs` (C-1 preserved — no format change), `src/swap.rs`
-(reused, not modified).
+**Untouched by design**: `src/swap.rs` (reused, not modified).
+
+> **`src/migration.rs` is no longer untouched.** This row previously listed it, on the grounds that
+> C-1 is preserved and no format change occurs. Both remain true, but **R-10b / Cap-9.2 require
+> re-wording `PLAINTEXT_WARNING`**, which is defined there. The file's *format* is untouched; the file
+> is not. An executor on #1049 reading the old row would ship `--shred` and leave the warning still
+> advising a deletion the tool now performs.
 
 ## 6. Runtime View — the corrected migration flow
 
@@ -374,8 +415,8 @@ SOURCE (A)                          TARGET (B)
                                       ├─ writes stashes + roster
                                       ├─ WARNS: source must not refresh after export   (R-4)
                                       ├─ WARNS: duplicate label created, if any        (R-6)
-                                      └─ REPORTS: active account staged, run `use <label>`  (R-2)
-                                    use <label>  ──► swap engine (#64 lock) ──► canonical
+                                      └─ REPORTS: active account staged, run `use --force <label>` (R-2)
+                              use --force <label>  ──► swap engine (#64 lock) ──► canonical
                                     status ──► EXPIRY with legible provenance          (R-7)
 ```
 
@@ -384,8 +425,17 @@ refreshed 4 minutes before B replayed.
 
 ## 7. Deployment View
 
-No new processes, files, or IPC. All changes are in the existing CLI binary and two new markdown
-documents. No migration of on-disk state; no `format_version` change (§ 4.2).
+No new processes and no migration of on-disk state; no `format_version` change (§ 4.2). All code
+changes are in the existing CLI binary.
+
+**Two corrections from the R-9 … R-16 amendment**, because this section previously said "no new
+processes, files, or IPC … and two new markdown documents":
+
+- **Three** new documents, not two — R-11f adds the portability-classification ADR (issue #1003).
+- **R-13 adds new IPC.** `export` today never opens a socket; the daemon-liveness probe makes it a
+  control-socket client. The socket and its client pattern already exist
+  (`notify_daemon_roster_reload()` in `src/capture.rs`), so this is a new *caller* on an existing
+  path rather than a new transport — but "no new IPC" is no longer accurate for `export`.
 
 ## 8. Interface Contracts
 
@@ -419,22 +469,23 @@ one `use` already performs.
 
 | Cap | Capability under test | Type | Requirement |
 |---|---|---|---|
-| Cap-1.1 | Import of the target's **active** account reports non-adoption and names `use` | unit (`apply_import` outcome) | R-2 |
+| Cap-1.1 | Import of the target's **active** account reports non-adoption and names `use --force <label>` — **not** bare `use`, which is a provable no-op on the active account (PRD AC-2a) | unit (`apply_import` outcome) | R-2 |
 | Cap-1.2 | Import adds no canonical writer — canonical byte-unchanged across import | integration | R-2a, C-2 |
 | Cap-2.1 | Every credential-bearing import emits the staleness warning | unit | R-4 |
 | Cap-2.2 | Warning fires even when derived deadlines are unreadable (fail-closed) | unit | R-4, P2 |
 | Cap-2.3 | An already-expired artifact additionally reports expiry | unit | R-4a |
 | Cap-3.1 | Same-label/different-uuid import warns — with a target that is **not** a clone of the source | unit | R-6 |
-| Cap-3.2 | `use` / `enable` / `disable` agree on duplicate-label resolution | unit | R-6a |
+| Cap-3.2 | `use` / `enable` / `disable` / **`remove`** agree on duplicate-label resolution | unit | R-6a |
 | Cap-4.1 | `rotated` is unrepresentable on `dead` / `error` | unit (type-level) | R-5 |
 | Cap-5.1 | `status` distinguishes canonical-sourced from stash-sourced EXPIRY | unit | R-7 |
 | Cap-6.1 | No import output line contains a token or email | unit (extend existing) | C-3 |
 | Cap-7.1 | `import --accounts` applies roster + secrets and **no** non-roster block | unit (`apply_import` outcome) | R-9 |
 | Cap-7.2 | Default `import` (no scope flag) is byte-identical to today's behaviour | integration (regression) | R-9, AD-9 |
 | Cap-7.3 | A scope flag can only narrow — an artifact cannot widen it | unit | R-9a |
-| Cap-7.4 | A roster-only artifact round-trips through narrow-parse, incl. under an unknown block | unit | R-9b, R-16 |
+| Cap-7.4 | A roster-only artifact round-trips through narrow-parse, incl. under an unknown block — a **hand-crafted or hostile** artifact, since this tool cannot mint one | unit | R-9b, R-16 |
 | Cap-7.5 | `export` exposes no config/roster narrowing flag | unit (usage assertion) | R-9c |
-| Cap-7.6 | `import --settings` on a roster-only artifact reports "no configuration", not an error | unit | R-9 |
+| Cap-7.6 | `import --settings` on a roster-only artifact reports "no configuration", not an error — same hand-crafted-artifact case as Cap-7.4, **not** a shape `export` can produce | unit | R-9 |
+| Cap-7.7 | `export --no-secrets` is rejected with a strict-usage error naming what replaced it | unit (usage assertion) | **R-10** |
 | Cap-8.1 | `[refresh].claude_bin` from an artifact is **never** written to the target config, even with `--settings` | integration | R-11a |
 | Cap-8.2 | A weaker incoming `kdf_*` is refused; a stronger one is accepted | unit | R-11b |
 | Cap-8.3 | `[migration].conflict_policy` is not adopted | unit | R-11c |
@@ -449,7 +500,7 @@ one `use` already performs.
 
 **Coverage gap this closes** (PRD § 4 M2 criterion): the existing
 `the_migration_conflict_policy_default_drives_import_behaviour` builds its target as
-`src_config.clone()` (`src/cli.rs:10644`), so every uuid matches by construction. Cap-3.1 explicitly
+`src_config.clone()` (`the_migration_conflict_policy_default_drives_import_behaviour`), so every uuid matches by construction. Cap-3.1 explicitly
 requires a non-clone target.
 
 ## 12. Architecture Decisions
@@ -500,7 +551,7 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
 | R-11d | ⚠️ **Yes, but mechanism-dependent** | An exhaustive `match` (compile-error) is preferred and may not fit the current type shape; the completeness-test fallback is weaker but sufficient (§ 4.8) |
 | R-11f | ✅ **Yes** | ADR; conventions exist |
 | R-12 | ⚠️ **Yes as unlink; NOT as secure erase** | APFS gives no reliable overwrite-in-place. Deliverable must not claim more (§ 4.9) |
-| R-13 | ✅ **Yes** | Control socket already exposes liveness (`src/capture.rs:335-348`) |
+| R-13 | ✅ **Yes** | Control socket already exposes liveness (`notify_daemon_roster_reload()` in `src/capture.rs`, which already opens `paths::control_socket()` from a non-daemon verb) |
 | R-14 / R-14a | ✅ **Yes** | Additive event fields; digest is a pure function over the artifact bytes |
 | R-15 | ✅ **Yes**, and cheaper than assumed | Parse-time validation; severity bounded — `stash()` reaches no filesystem path |
 | R-16 | 🚧 **Partly — the released-binary half is unfixable** | We cannot patch already-shipped binaries; only the version-floor message and forward-tolerance are in reach (OQ-5) |
@@ -530,12 +581,12 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
 
   > The original asked whether `enable`/`disable` should "refuse like `use`, or `use` take first like
   > `enable`", and it was wrong twice. **(a)** It omitted **`remove`**, which resolves a label and then
-  > **deletes the keychain stash** (`src/cli.rs:5167-5175`, `:5143-5159`) — the only one of the four
+  > **deletes the keychain stash** (the `remove` path in `src/cli.rs` (`remove_confirmation()` and its caller)) — the only one of the four
   > whose first-match-wins outcome is **irreversible**. `use` picks the wrong active account and
   > `enable`/`disable` flips the wrong flag; both are recoverable in one command. A decision taken over
   > the three cheap cases would have settled them and left the expensive one to inherit the answer.
   > **(b)** Its second option was a no-op: refuse-on-ambiguity is what `use` **already ships**
-  > (`resolve_target`, `src/cli.rs:438-455`), so "should `use` take first" was proposing a *regression*
+  > (`resolve_target`, `src/use_account.rs`), so "should `use` take first" was proposing a *regression*
   > as if it were a symmetric alternative. `remove`'s irreversibility should drive the answer.
 
 - **OQ-4 (shapes R-10)** — is `--no-secrets` hard-removed with a strict-usage error naming the
@@ -580,7 +631,7 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
 | R-9b | 4.7 | Cap-7.4 | covered |
 | R-9c | 4.7 / AD-5 | Cap-7.5 | covered |
 | R-9d | 4.7 / AD-10 | — (naming; asserted by Cap-7.1's flag surface) | covered |
-| R-10 | 4.7 | Cap-7.5 | covered |
+| R-10 | 4.7 | **Cap-7.7** | covered — was mapped to Cap-7.5, which asserts `export` has no *config/roster* narrowing flag (R-9c). `--no-secrets` is a *secrets* flag, and § 4.7 states secrets are not a third axis, so Cap-7.5 passed green while `--no-secrets` still shipped. |
 | R-10a | — | — | **decision-gated** (OQ-4) |
 | R-10b | 4.9 | Cap-9.2 | covered |
 | R-11 | 4.8 / AD-7 | Cap-8.1 … Cap-8.5 | covered |
@@ -601,7 +652,7 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
 
 Every capability traces to a requirement: Cap-1.x→R-2/R-2a, Cap-2.x→R-4/R-4a, Cap-3.x→R-6/R-6a,
 Cap-4.1→R-5, Cap-5.1→R-7, Cap-6.1→C-3, Cap-7.x→R-9/R-9a-d/R-10, Cap-8.x→R-11/R-11a-e,
-Cap-9.x→R-12/R-10b, Cap-10.x→R-13/R-14/R-14a, Cap-11.x→R-15/R-16. **No orphan capabilities.**
+Cap-7.7→R-10, Cap-9.x→R-12/R-10b, Cap-10.x→R-13/R-14/R-14a, Cap-11.x→R-15/R-16. **No orphan capabilities.**
 
 Two requirements are covered by a **deliverable rather than a capability**, recorded explicitly so
 their absence from the Cap-list does not read as a coverage gap: **R-11f** (the portability ADR) and
@@ -632,5 +683,5 @@ flag surface). **R-10a** has neither, because it is undecided (OQ-4).
 6. **AC-2 was found defective and corrected** (PRD AC-2a): the planned "run `use <label>`" guidance is
    a provable no-op for the active account, which would have reproduced the original failure through
    its own remediation. § 4.1's choice to reuse `use` stands; the named invocation is now
-   `use --force <label>`, and **§ 4.1 has been re-derived against the correction** — including its
+   `use --force <label>`, and **§ 4.1, § 5, § 6 and Cap-1.1 have all been re-derived against the correction** — including § 4.1's
    option table and the `--activate` sugar, which inherits the same requirement.

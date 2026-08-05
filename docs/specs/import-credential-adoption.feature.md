@@ -22,8 +22,17 @@ report plain success.
     And a migration artifact containing a credential for account A
     When import runs
     Then the report states that A's credential is staged but not adopted
-    And it names the command that completes the adoption
+    And it names `use --force <label>` as the command that completes the adoption
     But not by reporting plain success as though A were usable
+    But not by naming `use <label>` unqualified
+
+    # The --force is load-bearing, not decoration, and this is PRD AC-2a. For the account that is
+    # ALREADY active, SwapTarget::resolve short-circuits on service-name equality and returns
+    # AlreadyActive without comparing contents — the committed test
+    # already_active_without_force_is_a_noop_success_with_zero_writes asserts canonical == b"A-token"
+    # and calls == 0. So naming a bare `use` would leave the canonical item holding the STALE token
+    # while both import and use report success: the original failure reproduced through its own
+    # remediation. A scenario that only says "names the command" is satisfied by that bug.
 
 ## Scenario: import adds no second writer to the canonical item  · Cap-1.2
 
@@ -42,7 +51,11 @@ report plain success.
 ## Scenario: adoption through the sanctioned path leaves the canonical correct  · Cap-1.1
 
     Given an import has staged a credential for account A
-    When the operator runs the command the report named
+    And A is the target machine's currently active account
+    When the operator runs `use --force <label>` as the report named
     Then the swap engine performs the transition under the #64 lock
     And the canonical item reflects A's imported credential
     But not by a writer introduced in the import path
+
+    # The Given is deliberately the ALREADY-ACTIVE case. Any other target makes this scenario pass
+    # without --force and stops discriminating the defect AC-2a exists to catch.
