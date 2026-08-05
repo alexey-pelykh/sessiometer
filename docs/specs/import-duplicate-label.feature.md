@@ -61,3 +61,25 @@ command must agree on whether it resolves.
 > deletes the resolved account's keychain stash (`src/cli.rs:5195-5211`). A test that asserts the
 > other three agree passes with `remove` still silently deleting the wrong account's credentials,
 > which is the case OQ-1 says should drive the policy.
+
+## Scenario: an artifact carrying its own duplicate warns on a fresh target  · Cap-3.1
+
+    Given a target with NO existing roster
+    And an artifact carrying label L twice, under account_uuid X and account_uuid Y
+    When import runs
+    Then the operator is warned that a duplicate label was created
+    But not by comparing the incoming labels only against the target's roster
+    But not by refusing the import
+
+> **The collision can arrive inside one artifact, and on a fresh target that is the only way it
+> can.** *Added 2026-08-05 (eleventh pass); both scenarios above put the collision between the target
+> roster and the artifact, and Cap-3.1 pinned the same shape.* `Config::validate` rejects an empty
+> label and a duplicate `account_uuid` but **never** a duplicate label
+> (`src/config/validate.rs:281-293`), and `render` writes `label =` per account
+> (`src/config/render.rs:808`) — so a roster already carrying the documented, accepted collision
+> (`src/cli.rs:5148-5149`) mints an artifact carrying it internally.
+>
+> An implementer who reads R-6's "already exists **on the target**" literally checks each incoming
+> label against `local`'s roster. On a fresh target `apply_import` starts from an empty roster
+> (`src/cli.rs:4744-4750`), `local` is `None`, the check is skipped, and both entries are appended —
+> creating in one shot precisely the state R-6 exists to prevent, with both scenarios above green.

@@ -39,6 +39,15 @@ regardless, so the gap does not narrow.
     # On APFS, overwrite-in-place does not reliably destroy the prior extent. Claiming erasure we do
     # not deliver is the same false-assurance failure AD-2 declines for staleness.
 
+> **OQ-4 gates the *Given* above, and the capability that asserts the removal itself has no scenario
+> here.** *Added 2026-08-05 (eleventh pass); OQ-4 appeared in the design, the PRD and three issues,
+> and in **zero** spec files — the surface a test author opens.* These two scenarios take
+> `--no-secrets` removal as a premise; the assertion that removal *happens*, and in what form, is
+> **Cap-7.7**, which is the one capability of the thirty-four with no scenario in this directory —
+> deliberately, because its strict-usage-error form is the **hard-remove** branch of OQ-4. If OQ-4
+> resolves to deprecate-then-remove, Cap-7.7 must be re-derived and the *Given* above with it. Do not
+> write a Cap-7.7 scenario until OQ-4 closes, and do not read these two as covering it.
+
 ## Scenario: the plaintext warning matches what the tool can do  · Cap-7.8
 
     Given `--no-secrets` has been removed, so every artifact with a non-empty roster carries credentials
@@ -62,3 +71,19 @@ regardless, so the gap does not narrow.
 > `src/config/validate.rs:1089`) and `export` calls no roster guard — reachable by removing the last
 > account. Re-express the guard over the artifact's credential count; do not let it vanish with the
 > flag.
+
+## Scenario: shred is not restricted to the plaintext path  · Cap-9.1
+
+    Given an ENCRYPTED artifact that imports successfully
+    When the operator asked for it to be destroyed
+    Then it is destroyed, exactly as a plaintext artifact is
+    But not by branching on whether the artifact was encrypted
+
+> **AC-12's second `BUT NOT` was asserted by no capability and no scenario.** *Added 2026-08-05
+> (eleventh pass).* AC-12 carries *"**BUT NOT** restricted to the `--plaintext` path, since an
+> encrypted artifact is still a live-credential file behind one passphrase"*, and #1049 carries it as
+> an acceptance criterion — but Cap-9.1, Cap-9.2 and every scenario above are encryption-agnostic in
+> their *Given*, which means none of them would fail an implementation that gated `--shred` on
+> `--plaintext`. This is the § 16b class the design names itself: a requirement whose capability does
+> not assert its criterion. Low-risk in practice — no plausible `--shred` implementation branches on
+> encryption — but the criterion is either asserted somewhere or it is not a criterion.

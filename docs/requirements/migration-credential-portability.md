@@ -321,7 +321,9 @@ implementation detail. `Origin: AI-inferred-expansion (feasibility, § 9 F-2)`.
 
 **R-2** — *When* `import` restores an account that is the target machine's **active** account, the
 system **shall** promote the imported credential to the canonical `Claude Code-credentials` item, or
-**shall** refuse and tell the operator which command completes the adoption. Silently parking bytes
+**shall** refuse and tell the operator which command completes the adoption — **the forcing form
+`use --force <label>`, never `use <label>` unqualified**, which is a provable no-op against the
+already-active account (AC-2a). Silently parking bytes
 the active slot will never read is the defect.
 `Origin: user-stated` ("import does not promote to canonical"). `Ratification: n/a`.
 
@@ -365,8 +367,20 @@ is `council-added`, ratified in-scope via scope-membership B/amendment (item E7)
 a **different** `account_uuid`, the system **shall** warn at import time. Duplicate labels are a
 documented, accepted state (`src/cli.rs:5148-5149`: "labels are operator handles; uniqueness is not
 enforced"), so the requirement is **not** to forbid them — it is that import must not create one
-silently. `Origin: AI-inferred-expansion`.
+silently — **including when both colliding entries arrive in the same artifact**. `Origin: AI-inferred-expansion`.
 `Ratification: user-ratified 2026-08-04 (scope-membership B/first-pass, item I2)`.
+
+> **The collision can be inside the artifact, and on a fresh target that is the only place it can
+> be.** *Added 2026-08-05 (eleventh pass); this said "already exists **on the target**", and every
+> criterion and scenario put the collision between the target roster and the artifact.*
+> `Config::validate` rejects an empty label and a duplicate `account_uuid` but **never** a duplicate
+> label (`src/config/validate.rs:281-293`), and `render` writes `label =` per account
+> (`src/config/render.rs:808`) — so a roster that already carries the documented, accepted collision
+> mints an artifact carrying it internally. On a fresh target `apply_import` starts from an empty
+> roster (`src/cli.rs:4744-4750`) and appends both. An implementer who reads "on the target"
+> literally checks the incoming label against `local`'s roster, finds `local` is `None`, skips the
+> check, and creates in one shot exactly the state R-6 exists to prevent — with all three Cap-3.1
+> scenarios green.
 
 **R-6a** — *Where* a duplicate-label roster exists, the system **shall** handle it **consistently**
 across **all four** label-resolving commands — `use`, `enable`, `disable` and `remove`. It does not today: `use <label>` refuses with
@@ -546,12 +560,24 @@ escape hatch, so refusal costs a genuine operator nothing. `Origin: council-adde
 `Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item E7)`.
 
 **R-11b** — `[migration].kdf_*` **shall** be adopted only when the incoming value is **at least** the
-local value (a monotonic floor). A fleet may standardize *upward*; nothing may downgrade. This kills
+local value **on every knob** (a monotonic floor, applied per knob); an incoming block that is
+stronger on one knob and weaker on another **shall** be refused whole and reported, not adopted in
+part. A fleet may standardize *upward*; nothing may downgrade. This kills
 the 8 KiB / 1-iteration downgrade path (`src/config.rs:981-988`) without banning the legitimate case.
+
+> **`kdf_*` is two knobs, so "at least" is a partial order.** *Added 2026-08-05 (eleventh pass); this
+> read as one scalar comparison.* `kdf_memory_kib` (`8..=1_048_576`) and `kdf_iterations` (`1..=16`)
+> are independent `u32`s (`src/config.rs:985`, `:988`). `1_048_576 / 1` against the shipped defaults
+> `65536 / 3` (`:998-999`) is neither weaker nor stronger; a comparator written on the memory knob
+> alone — the knob this very sentence foregrounds — adopts it and downgrades iterations 3 → 1 through
+> the requirement written to prevent downgrades.
+
 Scope note: this governs **adoption on import** only — the KDF's construction and parameters remain
 #147's (see § 1b). `Origin: council-added`. `Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item E7)`.
 
-**R-11c** — `[migration].conflict_policy` **shall not** be adopted. It encodes a decision the *target*
+**R-11c** — `[migration].conflict_policy` **shall not** be adopted. **Decision-gated on OQ-7** (design
+§ 14): whether `--settings` adopts over an existing local config at all decides whether this clause
+protects a live path or a hypothetical one — do not settle it by writing code. It encodes a decision the *target*
 operator made. Today an artifact cannot overwrite it; `--settings` would newly allow it — affecting not
 the import that adopts it (`resolve_import_overwrite` reads the local value first, `src/cli.rs:4628`)
 but every import after. `Origin: council-added` (`technical-architect`; `rust-architect` dissented —
@@ -797,8 +823,10 @@ deletion the tool provides no mechanism for (R-12).
 **AC-11 (R-11, R-11a, R-11b, R-11c, R-11e)** — *Given* **a target with no existing config** and an
 artifact whose config sets `[refresh].claude_bin = "./x"`, *When* it is imported **with `--settings`**,
 *Then* the target's saved config does **not** contain that value, *And* the refusal is visible in the
-command's output (R-11e), *And* an incoming `kdf_*` weaker than local is refused while a stronger one
-is accepted, *And* `conflict_policy` is not adopted.
+command's output (R-11e), *And* an incoming `kdf_*` weaker than local **on any knob** is refused
+while one stronger on every knob is accepted, *And* `conflict_policy` is not adopted (**R-11c is
+OQ-7-gated** — this criterion asserts the fresh-target path, which is the only one where adoption
+happens today; what `--settings` does on an existing-config target is undecided).
 **BUT NOT** asserted against a target that **already has a config** — `apply_import` then keeps the
 local config and discards the incoming non-roster blocks entirely (`src/cli.rs:4744-4750`), so every
 clause above holds with **no allowlist implemented at all**. The fresh-target path is where adoption
@@ -1208,6 +1236,15 @@ The disagreement is **normative, not factual** — whether silently altering fut
 an acceptable consequence of an explicit flag. R-11c resolves it conservatively (non-portable) on the
 grounds that the key's entire purpose is to encode *this* operator's choice. Recorded here because the
 resolution is a judgement call, not a finding, and a later reader may reasonably revisit it.
+
+> **OQ-7 is upstream of this dissent and can dissolve it.** *Added 2026-08-05 (eleventh pass).* Both
+> positions above presuppose that `--settings` adopts over an **existing** local config — which is
+> exactly what OQ-7 asks and does not answer. Under OQ-7(a) (`--settings` never adopts over an
+> existing config, the reading § 4.7's "the flag can only ever *remove*" supports) `technical-architect`'s
+> "strictly worse than today" cannot arise, `rust-architect`'s "what the operator asked for" has no
+> occasion, and R-11c protects a path that cannot be reached. Under (b) the split stands as recorded.
+> **Settle OQ-7 before re-litigating D-1**; a reader who revisits this dissent without noticing the
+> gate will argue a normative question whose factual premise is still open.
 
 ### F-1 — A carried claim was FALSIFIED during authoring
 

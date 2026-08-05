@@ -42,11 +42,22 @@ floor**.
 
 ## Scenario: `--settings` applies no roster entry and no credential  · Cap-7.9
 
-    Given an artifact carrying both a roster and non-roster config
+    Given a target with NO existing config
+    And an artifact carrying both a roster and non-roster config
     When the operator runs `import --settings`
     Then the allowlist-filtered non-roster config is applied
     But no roster entry is created or modified
     And no credential is written to the keychain
+    But not by leaving the target's config state unstated
+
+> **The *Given* must pin the target state, and OQ-7 is why.** *Added 2026-08-05 (eleventh pass); it
+> read "an artifact carrying both a roster and non-roster config" with no target state.* On a target
+> that **already has a config**, `apply_import` keeps the local config and discards the incoming
+> non-roster blocks entirely (`src/cli.rs:4744-4750`), so the first *Then* — "the filtered config is
+> applied" — is **unsatisfiable** there under OQ-7(a) and would make this scenario a red test over
+> correct behaviour. The fresh-target path is where adoption happens. **OQ-7 decides whether a second
+> scenario is owed on the existing-config target**; do not write one, or decide the question by
+> implementing one, until it closes.
 
 > **The mirror of Cap-7.1, and nothing else asserted it.** *Added 2026-08-05 (ninth pass).* R-9
 > defines `--settings` as "(non-roster config)" and § 4.7 makes the flag a lattice meet that clears
@@ -128,3 +139,27 @@ floor**.
 > always true for a self-minted artifact. That is a precision question, not R-9's circuit breaker:
 > nothing here requires the artifact to declare anything, and the operator's flag remains a ceiling,
 > never a floor. It must be settled before this scenario's sibling behaviour is implemented.
+
+## Scenario: `--accounts` against a roster-less artifact reports rather than no-ops  · Cap-7.10
+
+    Given an artifact carrying non-roster config and NO `[[account]]` entries
+    When the operator runs `import --accounts`
+    Then the command reports that the artifact contains no accounts
+    But not by erroring
+    But not by silently reporting success having applied nothing
+
+> **The mirror of the one case § 4.7 does specify, on the axis that is actually derivable.**
+> *Added 2026-08-05 (eleventh pass); no requirement, criterion, capability, scenario or issue said
+> what this does.* § 4.7 fixes the settings direction by name — *`import --settings` against a
+> roster-only artifact reports "artifact contains no configuration" **rather than erroring or
+> silently no-op'ing**"* — and that case is **OQ-6-gated**, because the settings axis may not be
+> presence-derivable at all. The accounts axis is: OQ-6 itself says so (*"`[[account]]` entries are
+> present or they are not"*), so this scenario is **not** OQ-6-gated and can be written today.
+>
+> The subject is reachable and first-class, not hypothetical: `require_roster()` binds only where it
+> is called (`src/config.rs:1152-1158`), the committed
+> `accepts_a_roster_less_config_and_preserves_tunables` (`src/config/validate.rs:1089`) pins the
+> roster-less config as valid, `export` calls no roster guard, and `gather_payload`'s roster loop then
+> yields an empty `accounts` (`src/cli.rs:4536-4546`). R-10b's own guard argument relies on all of
+> this. An operator who removes their last account, exports, and runs `import --accounts` on the
+> target to be conservative gets the exact "silently no-op" outcome § 4.7 forbids for the sibling axis.

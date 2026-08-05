@@ -1,7 +1,7 @@
 # Solution Design: Migration Credential Portability
 
 **Requirements**: `docs/requirements/migration-credential-portability.md`
-**Status**: `draft` — **five** requirements are decision-gated (R-6a, R-9, R-9a, R-10a, R-16 — see § 16),
+**Status**: `draft` — **six** requirements are decision-gated (R-6a, R-9, R-9a, R-10a, R-11c, R-16 — see § 16),
 by **five** open questions (OQ-1, OQ-4, OQ-5, OQ-6, OQ-7). Both are surfaced, not settled, here.
 **Date**: 2026-08-04
 
@@ -327,8 +327,9 @@ where the artifact's config was previously adopted wholesale (`src/cli.rs:4744-4
 key that used to be adopted is now refused and reported. § 8's `config adoption` row records that as a
 behaviour change on exactly this path; do not read "default unchanged" as end-to-end byte-identity.
 The safety argument for defaulting to `--accounts` is real but is **absorbed by § 4.8**: with the
-capability keys refused unconditionally and `kdf_*` held to a monotonic floor (R-11b — adopt only if
-`incoming >= local`), the delta a narrow default would have closed is already closed, and changing a
+capability keys refused unconditionally and `kdf_*` held to a monotonic floor (R-11b — adopt a knob
+only if `incoming >= local` for that knob, both required), the delta a narrow default would have
+closed is already closed, and changing a
 shipped command's default costs more than that
 delta is worth. The two decisions are coupled and § 4.8 is decided first.
 
@@ -353,7 +354,20 @@ complete):
 |---|---|---|
 | `[login].claude_bin`, `[refresh].claude_bin` | **CapabilityGranting** — never adopted | Resolution absolutizes against cwd and accepts any `is_file()`, with no allowlist, no signature, and deliberately no symlink resolution (`src/paths.rs:773-807`); the refresh tick then spawns it (`src/refresh_tick.rs:258` → `:273` → `src/refresh.rs:694` (`SpawnClaude::new`)). Adoption is arbitrary code execution, unattended, on a timer. |
 | `[migration].conflict_policy` | **MachineBound** | Encodes the *target* operator's decision. Today an artifact cannot overwrite it; `--settings` would newly allow it — not for the import that adopts it (`resolve_import_overwrite` reads local first, `src/cli.rs:4628`) but for every one after. Resolved conservatively over a recorded dissent (PRD § 9 D-1). |
-| `[migration].kdf_*` | **Portable, monotonic floor** | Adopt only if `incoming >= local`. A fleet may standardize upward; nothing may downgrade (`src/config.rs:981-988`). |
+| `[migration].kdf_*` | **Portable, monotonic floor — per knob** | Adopt a knob only if `incoming >= local` **for that knob**, and refuse the block unless **both** knobs pass. `kdf_*` is **two independent `u32`s** — `kdf_memory_kib` (`8..=1_048_576`) and `kdf_iterations` (`1..=16`), `src/config.rs:985`/`:988` — so "stronger" is a **partial** order, not a total one, and the incomparable case is reachable. A fleet may standardize upward; nothing may downgrade. |
+
+> **"Stronger" is not a total order, and the incomparable case downgrades through the requirement
+> written to prevent downgrades.** *Added 2026-08-05 (eleventh pass); every surface stated one scalar
+> `incoming >= local`.* `[migration]` carries exactly two independent cost knobs, so an artifact can
+> be stronger on one and weaker on the other: `kdf_memory_kib = 1_048_576, kdf_iterations = 1`
+> against the shipped defaults `65536 / 3` (`src/config.rs:998-999`) is neither weaker nor stronger.
+> A comparator written on the memory knob alone — the knob the prose foregrounds, since it is what
+> kills the 8 KiB downgrade path — adopts that block and lands `kdf_iterations = 1`, a downgrade from
+> 3. **Compare per knob and require both**; on an incomparable pair, refuse the block and report it
+> (R-11e) rather than adopting the half that improved. Cap-8.2 and its scenario stay green through
+> this either way, because both only ever feed uniformly-weaker or uniformly-stronger pairs — which
+> is why the case has to be written down rather than left to the comparator's author. R-11d exists
+> because unenumerated branches rot; this is an unenumerated branch **inside** a carve-out.
 
 **Refusing `claude_bin` costs nothing**, which is what makes it easy: the value is a local path, so on
 the target it either does not exist or names a *different* binary — there is no workflow in which
@@ -438,7 +452,8 @@ the full-artifact case needs the same treatment deliberately.
 |---|---|---|
 | `src/cli.rs::import` | report non-adoption + name `use --force <label>` (the unqualified form is a no-op on the active account — AC-2a); optional `--activate` | R-2 |
 | `src/cli.rs::apply_import` | duplicate-label collision check; staleness warning emission | R-4, R-6 |
-| `src/refresh.rs::classify` | move `rotated` inside the `refreshed` variant | R-5 |
+| `src/refresh.rs::classify` | reshape `RefreshOutcome` so `rotated` rides inside `Refreshed` — **necessary, not sufficient**; the three renders read a sibling field, see the note below | R-5 |
+| `src/refresh.rs::RefreshReport` + the three renders in `src/observability.rs` | **remove the field from the non-`refreshed` renders** — see the note below; reshaping `RefreshOutcome` alone does not do it | R-5 |
 | `src/daemon/snapshot_build.rs` + status render | provenance legibility | R-7 |
 | `src/use_account.rs` / `src/cli.rs::apply_enabled` / `src/cli.rs::apply_remove` | consistency per OQ-1 across all four label-resolving commands | R-6a |
 | `docs/findings/0262-*.md` | new | R-1, R-1a |
@@ -460,6 +475,30 @@ rows, including the entire security core:*
 | `src/config.rs::Account` | `account_uuid` shape validation before it reaches `stash()` | R-15 |
 
 **Untouched by design**: `src/swap.rs` (reused, not modified).
+
+> **`rotated=` is emitted from three modules onto three log lines, and reshaping `RefreshOutcome`
+> removes it from none of them.** *Added 2026-08-05 (eleventh pass); this table listed
+> `classify` alone and closed with the completeness line above.* The field the renders read is
+> **`RefreshReport.refresh_token_rotated`** (`src/refresh.rs:284`) — declared a **sibling of**
+> `outcome`, not a payload inside it — and it is interpolated unconditionally at
+> `src/observability.rs:2155` (`event=refresh`), `:2173` (`event=poll_refresh`) and `:2191`
+> (`event=keep_warm`), fed from `src/refresh_tick.rs`, `src/daemon/refresh_fold.rs` and
+> `src/daemon/keep_warm.rs`. The code states the multiplicity in terms: *"three separate refresh
+> mechanisms, three separate event names"* (`src/observability.rs:2187`).
+>
+> So AD-3's reshape and Cap-4.1 — *"Given the `RefreshOutcome` type / When a non-`refreshed` outcome
+> is constructed / Then no rotated value can be attached to it"* — are both **satisfiable with all
+> three renders untouched**, and R-5's Planguage meter (*"unit test over `classify()` across all four
+> returns"*) measures the type, never the emitted line. An implementer who builds exactly this ships
+> `outcome=dead rotated=false` on every keep-warm and poll-refresh line, which is the defect R-5
+> exists to remove.
+>
+> **`keep_warm` is the worst of the three**: its own doc says it renders
+> `refreshed_not_restashed` on a real mint and *"never renders `refreshed`"*
+> (`src/observability.rs:1282-1284`), so on that line `rotated` is meaningless on **every** outcome
+> R-5 targets — while AC-5's carve-out (`refreshed_not_restashed` keeps `rotated`) exempts the one
+> outcome where it is real. **R-5 is satisfied only when all three renders drop the field**; assert
+> on the rendered line, not on the type.
 
 > **Correction 2026-08-04.** This line previously also listed `src/migration.rs` as untouched, on the
 > C-1 "no format change" rationale. C-1 still holds — `FORMAT_VERSION` does not move — but R-10b,
@@ -485,7 +524,8 @@ SOURCE (A)                                   TARGET (B)
                                           ├─ VALIDATES account_uuid shape before stash()       (R-15)
                                           ├─ ALLOWLIST gate on every non-roster value:         (R-11)
                                           │     claude_bin      ─► REFUSED, no flag overrides  (R-11a)
-                                          │     kdf_*           ─► adopt iff incoming >= local (R-11b)
+                                          │     kdf_*           ─► adopt iff incoming >= local per knob,
+                                          │                        both required; else refuse (R-11b)
                                           │     conflict_policy ─► machine-bound, not adopted  (R-11c)
                                           │     each refusal REPORTED on stdout                (R-11e)
                                           ├─ writes stashes + roster
@@ -519,7 +559,7 @@ documents. No migration of on-disk state; no `format_version` change (§ 4.2).
 |---|---|---|
 | `import` stdout | new warning + report lines | additive; C-3 forbids any credential in them |
 | `import` flags | optional `--activate <label>` | additive, opt-in |
-| refresh log line | `rotated` absent on non-`refreshed` | **contract change**; consumer 0465 checked for `dead` only — its 141-count derives from *event type*, so a `no_change` line would still re-baseline it (open, tracked on #1004) |
+| `refresh` / `poll_refresh` / `keep_warm` log lines | `rotated` absent on non-`refreshed` — **three lines, not one** (`src/observability.rs:2155`, `:2173`, `:2191`) | **contract change on all three**; consumer 0465 checked for `dead` only — its 141-count derives from *event type* (86 `refresh` + 31 `keep_warm` + 24 `poll_refresh`), so a `no_change` line would still re-baseline it (open, tracked on #1004) |
 | artifact format | **none** | v1 preserved (C-1, C-4) |
 | `import` flags | `--accounts`, `--settings`, `--shred` | additive, opt-in; **default unchanged** (AD-9) |
 | `export` flags | **`--no-secrets` REMOVED** | **breaking** — the only breaking CLI change in this scope. Path undecided (OQ-4) |
@@ -564,20 +604,22 @@ stash writes. What § 4.1 declines to add is a second writer of the canonical
 | Cap-2.3 | An already-expired artifact additionally reports expiry | unit | R-4a |
 | Cap-3.1 | Same-label/different-uuid import warns — with a target that is **not** a clone of the source | unit | R-6 |
 | Cap-3.2 | `use` / `enable` / `disable` / **`remove`** agree on duplicate-label resolution — `remove` is not optional: it is the only irreversible one (deletes a keychain stash), so a test omitting it passes while the case that motivated R-6a stays unasserted | unit | R-6a |
+| Cap-4.2 | **All three rotation-emitting lines drop the field** — `event=refresh` (`src/observability.rs:2155`), `event=poll_refresh` (`:2173`) and `event=keep_warm` (`:2191`). The renders read `RefreshReport.refresh_token_rotated` (`src/refresh.rs:284`), a **sibling of** `outcome` — so Cap-4.1 and AD-3's reshape are both satisfiable with all three untouched. Assert the rendered line, not the type | unit (render) | R-5 |
 | Cap-4.1 | `rotated` is unrepresentable on **every non-`Refreshed` outcome** — `NoChange`, `Dead`, `Error` (all three, `src/refresh.rs:225-240`). Asserting only `Dead`/`Error` lets an implementation keep `rotated` on `NoChange`, a live outcome (`src/observability.rs:180`) whose `rotated` is derived independently of its expiry test. Excludes `refreshed_not_restashed`, an *event* outcome mapped from `Refreshed` where `rotated` is meaningful | unit (type-level) | R-5 |
 | Cap-5.1 | `status` distinguishes canonical-sourced from stash-sourced EXPIRY | unit | R-7 |
 | Cap-6.1 | No import output line contains a token or email | unit (extend existing) | C-3 |
 | Cap-7.1 | `import --accounts` applies roster + secrets and **no** non-roster block | unit (`apply_import` outcome) | R-9 |
 | Cap-7.2 | Default `import` (no scope flag) applies the same payload classes today's `import` applies — **modulo § 4.8's allowlist, which binds on this path too**. Assert scope-equivalence, NOT end-to-end byte-identity: on a fresh target a non-portable key that used to be adopted is now refused (§ 8, `config adoption`). A byte-identity assertion here goes red, and the cheapest way to green it is to exempt the no-flag path from the allowlist — reinstating the § 1 code-execution path | integration (regression) | R-9, AD-9 |
-| Cap-7.9 | **`import --settings` applies allowlist-filtered config and writes NO roster entry and NO credential** — the mirror of Cap-7.1, and the only assertion of the `--settings` narrowing | unit (`apply_import` outcome) | R-9 |
+| Cap-7.9 | **`import --settings` applies allowlist-filtered config and writes NO roster entry and NO credential** — the mirror of Cap-7.1, and the only assertion of the `--settings` narrowing. **OQ-7-gated on target state**: its *Then* is satisfiable on a **fresh** target today; on a target that **already has a config** it is unsatisfiable under OQ-7(a), because `apply_import` discards the incoming non-roster blocks entirely (`src/cli.rs:4744-4750`) and there is nothing to apply. Pin the target state in the scenario | unit (`apply_import` outcome) | R-9 |
 | Cap-7.3 | A scope flag can only narrow — an artifact cannot widen it | unit | R-9a |
 | Cap-7.4 | An artifact whose roster is the payload of interest round-trips through narrow-parse **even when it carries an unknown non-roster block**. Not "a roster-only artifact under an unknown block": *roster-only* is pinned to `[[account]]` entries **and no non-roster block** (`import-scope-selection.feature.md`), which an unknown block contradicts | unit | R-9b, R-16 |
 | Cap-7.5 | `export` exposes no config/roster narrowing flag | unit (usage assertion) | R-9c |
 | Cap-7.6 | `import --settings` on a roster-only artifact reports "no configuration", not an error | unit | R-9 — **OQ-6-gated**, see § 4.7 |
+| Cap-7.10 | `import --accounts` on an artifact with **no `[[account]]` entries** reports it, rather than erroring or silently succeeding having applied nothing — the accounts-axis mirror of Cap-7.6, and **not** OQ-6-gated: the accounts axis *is* presence-derivable (OQ-6's own wording) | unit | R-9 |
 | Cap-7.7 | `export --no-secrets` exits with a **strict-usage error stating that roster-without-secrets is no longer supported** — asserted on both halves: non-zero exit AND the explanation present. **Not "names the replacement"**: nothing replaces the flag (R-9c/AD-5 forbid any export-side narrowing flag, and `import --accounts` narrows what is *applied*, not what the file *contains*), so a "replacement named" assertion has no referent. Explicitly asserts the flag is **not** silently accepted-and-ignored | unit (usage assertion) | R-10 (**not** R-10a — see note) |
 | Cap-7.8 | `PLAINTEXT_WARNING` reflects that every artifact **with a non-empty roster** now carries credentials, and advises no deletion the tool provides no mechanism for. **Not "every artifact"** unqualified — an empty roster yields zero credentials (`src/cli.rs:4535-4546`), so the guard must be re-expressed over the artifact's credential count, not deleted with the flag | unit (text assertion) | R-10b |
 | Cap-8.1 | `[refresh].claude_bin` from an artifact is **never** written to the target config, even with `--settings` — **asserted on a target with no existing config**, since an existing one makes `apply_import` discard the incoming blocks anyway (`src/cli.rs:4744-4750`) and the assertion passes with nothing built | integration | R-11a |
-| Cap-8.2 | A weaker incoming `kdf_*` is refused; a stronger one is accepted | unit | R-11b |
+| Cap-8.2 | A weaker incoming `kdf_*` is refused; a stronger one is accepted; **an incomparable pair — stronger on one knob, weaker on the other — is refused as a block**. All three cases, or the third goes unwritten and a one-knob comparator passes the first two | unit | R-11b |
 | Cap-8.3 | `[migration].conflict_policy` is not adopted — **on a fresh target**, and with the refusal reported. R-11c's **sole** capability, and it rests on the D-1 dissent, so a free green here is the worst place for one: on an existing-config target every *Then* holds with no allowlist written | unit | R-11c |
 | Cap-8.4 | **Adding a `Config` key without a portability classification fails the build** | compile-fail / completeness test | R-11d, **R-11** |
 | Cap-8.5 | Every refusal is reported on stdout | unit | R-11e |
@@ -671,7 +713,8 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
 | R-9d | ✅ **Yes** | `--config` collision verified at `src/paths.rs:443-444` (`config_dir_with_override` at `:448`) |
 | R-10 | ✅ **Yes** — but it is the scope's **only breaking CLI change** | Removal is trivial; the *path* is a product call (OQ-4) |
 | R-10a | 🚧 **Blocked on a decision**, not on feasibility | OQ-4 — both paths (hard-remove, deprecate-then-remove) are cheap; the choice is a product call on a shipped flag |
-| R-11 / R-11a / R-11b / R-11c | ✅ **Yes** | Classification is a pure function over the config; no new I/O |
+| R-11 / R-11a / R-11b | ✅ **Yes** | Classification is a pure function over the config; no new I/O |
+| R-11c | 🚧 **Feasible, but decision-gated** | OQ-7 — classification is free, but *whether `--settings` adopts over an existing local config at all* decides whether R-11c protects a live path or a hypothetical one |
 | R-11d | ⚠️ **Yes, but mechanism-dependent** | An exhaustive `match` (compile-error) is preferred and may not fit the current type shape; the completeness-test fallback is weaker but sufficient (§ 4.8) |
 | R-11e | ✅ **Yes** | A refusal line per refused key on stdout; Cap-8.5 |
 | R-11f | ✅ **Yes** | ADR; conventions exist |
@@ -785,12 +828,12 @@ recorded so the call is visible, not because it is pending.
 | R-3 | 4.7 + 4.8 | Cap-7.x, Cap-8.x | **now covered** — was "NOT covered" while R-3 demanded a merge policy; the demand is withdrawn and replaced by scope × class (PRD § 3, R-3) |
 | R-4 | 4.2 | Cap-2.1, Cap-2.2 | covered |
 | R-4a | 4.2 / AD-2 | Cap-2.3 | covered (resolved as a decline) |
-| R-5 | 4.4 | Cap-4.1 | covered |
+| R-5 | 4.4 | Cap-4.1 (type), **Cap-4.2 (all three rendered lines)** | covered — Cap-4.1 alone is necessary but not sufficient; see § 5 |
 | R-5a | 4.4 | — (verification, **partly done** — `dead` checked, `no_change` open, #1004) | covered |
 | R-6 | 4.3 | Cap-3.1 | covered |
 | R-6a | 4.3 | Cap-3.2 | **decision-gated** (OQ-1) |
 | R-7 | 4.5 | Cap-5.1 | covered |
-| R-9 | 4.7 | Cap-7.1 (`--accounts`), **Cap-7.9 (`--settings` — the mirror)**, Cap-7.2 (default), Cap-7.6 | **partly decision-gated** (OQ-6 — the `--settings` availability report) |
+| R-9 | 4.7 | Cap-7.1 (`--accounts`), **Cap-7.9 (`--settings` — the mirror)**, Cap-7.2 (default), Cap-7.6, **Cap-7.10 (roster-less `--accounts`)** | **partly decision-gated** (OQ-6 — the `--settings` availability report; OQ-7 — Cap-7.9's target state) |
 | R-9a | 4.7 / AD-6 | Cap-7.3 | **partly decision-gated** (OQ-6 — the settings-axis presence test) |
 | R-9b | 4.7 | Cap-7.4 | covered |
 | R-9c | 4.7 / AD-5 | Cap-7.5 | covered |
@@ -801,7 +844,7 @@ recorded so the call is visible, not because it is pending.
 | R-11 | 4.8 / AD-7 | Cap-8.4, Cap-8.6 (default-deny over an arbitrary key), **Cap-8.7 (the allowlist binds with no flag at all — the shipped, default path)**; Cap-8.1 … Cap-8.3 cover the named carve-outs | covered |
 | R-11a | 4.8 / AD-8 | Cap-8.1 (with `--settings`), **Cap-8.7 (no flag, fresh target)** | covered |
 | R-11b | 4.8 | Cap-8.2 | covered |
-| R-11c | 4.8 / AD-11 | Cap-8.3 | covered (over a recorded dissent) |
+| R-11c | 4.8 / AD-11 | Cap-8.3 | covered (over a recorded dissent) — **and OQ-7-gated**: Cap-8.3 pins a fresh target, which is the only state where adoption happens today. If OQ-7 resolves to (a) (`--settings` never adopts over an existing config), R-11c protects a path that cannot be reached and the dissent D-1 records is moot; if (b), it protects a path this scope newly opens |
 | R-11d | 4.8 | Cap-8.4 | covered |
 | R-11e | 4.8 | Cap-8.5 | covered |
 | R-11f | 4.8 | — (ADR deliverable) | covered |
@@ -854,7 +897,7 @@ their absence from the Cap-list does not read as a coverage gap:
 
 **R-10a** has neither, because it is undecided (OQ-4).
 
-> **One capability has no spec scenario: Cap-7.7** — 31 of the 32 are pinned by a scenario in
+> **One capability has no spec scenario: Cap-7.7** — 33 of the 34 are pinned by a scenario in
 > `docs/specs/`. This one is left unpinned **deliberately**, because its assertion is the hard-remove
 > branch of the still-open OQ-4 (see the R-10 row in § 16). Writing the scenario now would pin the
 > undecided outcome in the place a test author reads first. Close OQ-4, then add it to
@@ -893,9 +936,11 @@ their absence from the Cap-list does not read as a coverage gap:
 4. **AD-11 rests on a recorded dissent** (PRD § 9 D-1), not a convergence. Two panelists reached
    opposite conclusions from the same verified facts; the resolution is conservative and defensible but
    not evidence-forced.
-5. **OQ-4 (R-10's deprecation path), OQ-5 (R-16's deliverable) and OQ-6 (whether the settings axis
-   can be presence-derived at all) are open.** OQ-6 gates #1046's `--settings` reporting behaviour
-   and Cap-7.6, so it must close before that item is implemented. Otherwise neither blocks
+5. **OQ-4 (R-10's deprecation path), OQ-5 (R-16's deliverable), OQ-6 (whether the settings axis
+   can be presence-derived at all) and OQ-7 (what `--settings` does on a target that already has a
+   config) are open.** OQ-6 gates #1046's `--settings` reporting behaviour and Cap-7.6, and **OQ-7
+   gates the same item's `--settings` semantics plus R-11c, Cap-7.9 and Cap-8.3** — both must close
+   before that item is implemented. Otherwise neither blocks
    implementation of anything else, and both are product calls rather than design ones.
 6. **AC-2 was found defective and corrected** (PRD AC-2a): the planned "run `use <label>`" guidance is
    a provable no-op for the active account, which would have reproduced the original failure through

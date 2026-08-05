@@ -81,4 +81,34 @@ line. The fix is to make that state unrepresentable, not merely unprinted.
     Then no rotated value can be attached to it
 
     # Type-level, not formatting-level: a formatting-layer suppression can be reintroduced by a
-    # later emitter change; moving rotated inside the refreshed variant cannot.
+    # later emitter change. But the type-level move is NECESSARY AND NOT SUFFICIENT: it passes with
+    # every emitted line unchanged, because the field the three renders read is a sibling of outcome,
+    # not inside it (src/refresh.rs:284). See the next scenario, which asserts the rendered lines.
+
+## Scenario: all three rotation-emitting lines drop the field, not just `event=refresh`  · Cap-4.2
+
+    Given a non-refreshed outcome on each of the three refresh mechanisms
+    When each mechanism's event is rendered
+    Then no `rotated=` appears on the `refresh` line
+    And none appears on the `poll_refresh` line
+    And none appears on the `keep_warm` line
+    But not by asserting only the type
+    But not by asserting only `event=refresh`
+
+> **`rotated=` is emitted from three modules onto three lines, and reshaping `RefreshOutcome` removes
+> it from none of them.** *Added 2026-08-05 (eleventh pass); every R-5 artifact scoped the fix to
+> `classify` and this file asserted the type.* The renders read
+> **`RefreshReport.refresh_token_rotated`** (`src/refresh.rs:284`) — a **sibling of** `outcome`, not a
+> payload inside it — and interpolate it unconditionally at `src/observability.rs:2155`
+> (`event=refresh`), `:2173` (`event=poll_refresh`) and `:2191` (`event=keep_warm`), fed from
+> `src/refresh_tick.rs`, `src/daemon/refresh_fold.rs` and `src/daemon/keep_warm.rs`. The code states
+> the multiplicity in terms: *"three separate refresh mechanisms, three separate event names"*
+> (`src/observability.rs:2187`).
+>
+> Build AD-3 exactly as written — `RefreshOutcome::Refreshed { rotated }` — and Cap-4.1, the
+> `classify()` unit tests and R-5's Planguage meter all pass while
+> `outcome=dead rotated=false` keeps shipping on every keep-warm and poll-refresh line. **`keep_warm`
+> is the worst of the three**: its own doc says it renders `refreshed_not_restashed` on a real mint
+> and *"never renders `refreshed`"* (`src/observability.rs:1282-1284`), so there the field is
+> meaningless on **every** outcome R-5 targets — while AC-5's carve-out (`refreshed_not_restashed`
+> keeps `rotated`) exempts the one outcome where it is real. Assert on the rendered line.

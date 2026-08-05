@@ -53,6 +53,18 @@ selection answers *what was asked for*; this answers *what is permitted*.
     When an artifact carrying weaker parameters is imported with `--settings`
     Then the weaker values are refused
     But an artifact carrying stronger values is adopted
+    But an artifact stronger on one knob and weaker on the other is refused as a block
+    But not by comparing `kdf_memory_kib` alone
+
+> **"Stronger" is a partial order over two knobs, and only the incomparable case discriminates.**
+> *Added 2026-08-05 (eleventh pass); this fed uniformly-weaker and uniformly-stronger pairs only.*
+> `kdf_memory_kib` (`8..=1_048_576`) and `kdf_iterations` (`1..=16`) are independent `u32`s
+> (`src/config.rs:985`, `:988`), so `1_048_576 / 1` against the shipped defaults `65536 / 3`
+> (`:998-999`) is neither. A comparator written on the memory knob alone — the knob the requirement
+> prose foregrounds, since it is what kills the 8 KiB downgrade path — passes both clauses above and
+> then adopts that block, landing `kdf_iterations = 1`. That is a downgrade through R-11b, the clause
+> written to forbid downgrades. Refuse the block and report it (R-11e); do not adopt the half that
+> improved.
 
 ## Scenario: the target operator's conflict policy survives  · Cap-8.3
 
