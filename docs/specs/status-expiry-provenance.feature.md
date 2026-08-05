@@ -28,8 +28,23 @@ indistinguishable from a no-op.
     When status renders that account
     Then the disagreement is visible rather than silent
 
-    # This is exactly the post-import staged-not-adopted state, so surfacing it converts the
-    # 2026-07-31 symptom ("others updated and active did not") into a diagnostic.
+    But not by presenting the disagreement itself as evidence of non-adoption
+
+> **A migration that went perfectly renders the same disagreement as one that did not.** *Corrected
+> 2026-08-05 (twelfth pass); this comment read "This is exactly the post-import staged-not-adopted
+> state", which is true and incomplete — the runbook's own adoption step produces it on SUCCESS.*
+> `swap()` writes the pre-swap canonical into the outgoing stash (`src/swap.rs:838`) and the incoming
+> stash into canonical (`:849`); on `use --force A` where A is already the active account, outgoing
+> and incoming are the same account, so A's stash is left holding the target's **pre-import**
+> credential while canonical holds the imported one. The daemon heals this only on an observed
+> canonical *change*, and a daemon started **after** adoption — which is exactly runbook step 5 —
+> primes its baseline instead (`src/daemon/canonical.rs:240-242`, `CanonicalChange::Primed` ⇒ prime
+> the baseline, detect nothing).
+>
+> So the signal persists for the life of that daemon run on a healthy target. Surfacing the
+> disagreement is still right — it converts the 2026-07-31 symptom into something visible — but the
+> rendering must not assert *why*, or a successful migration reads as a failed one and the operator
+> re-runs `use --force` or opens an incident against a target that is fine.
 
 ## Scenario: authority is unchanged  · Cap-5.1
 
