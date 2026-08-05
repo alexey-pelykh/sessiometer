@@ -40,6 +40,26 @@ floor**.
 > code-execution path PRD § 1 opens on. Assert the payload classes; leave the config outcome to
 > Cap-8.1 and Cap-8.7.
 
+## Scenario: `--settings` applies no roster entry and no credential  · Cap-7.9
+
+    Given an artifact carrying both a roster and non-roster config
+    When the operator runs `import --settings`
+    Then the allowlist-filtered non-roster config is applied
+    But no roster entry is created or modified
+    And no credential is written to the keychain
+
+> **The mirror of Cap-7.1, and nothing else asserted it.** *Added 2026-08-05 (ninth pass).* R-9
+> defines `--settings` as "(non-roster config)" and § 4.7 makes the flag a lattice meet that clears
+> the accounts axis — but every capability asserted only the `--accounts` direction. The one
+> `--settings`-plus-roster capability was **Cap-7.6**, which asserts the *empty-artifact report* and
+> is **OQ-6-gated**, so under OQ-6(a) it may not be built at all.
+>
+> Without this scenario, `--settings` can ship as "apply everything, then allowlist-filter the config"
+> with the roster branch untouched, and Cap-7.1, Cap-7.2, Cap-7.3 and every Cap-8.x still pass. An
+> operator running `import --settings` to pick up tunables would get every credential in the artifact
+> written to their keychain and every roster entry appended — under `--overwrite`, replacing live
+> stashes. § 16b's orphan-capability check cannot see a *missing* assertion; only the forward read can.
+
 ## Scenario: an artifact cannot widen the operator's selection  · Cap-7.3
 
     Given an artifact whose config carries every non-roster block populated

@@ -523,7 +523,7 @@ documents. No migration of on-disk state; no `format_version` change (§ 4.2).
 | `export` flags | **`--no-secrets` REMOVED** | **breaking** — the only breaking CLI change in this scope. Path undecided (OQ-4) |
 | `export` stdout | daemon-liveness warning when the local daemon is live | additive; conditional, never unconditional (R-13) |
 | `import` stdout | per-key refusal lines from the portability allowlist | additive; C-3 applies |
-| config adoption | non-portable keys silently dropped → **now refused and reported** | **behaviour change** on the fresh-target path, where the artifact's config was previously adopted wholesale |
+| config adoption | **on an existing-config target**: non-portable keys were already dropped (`apply_import` keeps `local` wholesale) → now refused **and reported**. **On a fresh target**: they were **adopted** → now **refused**, a real behaviour change, not just a new line | **behaviour change** on the fresh-target path (`src/cli.rs:4744-4750`). Reading the Change cell as "only a new report line" is exactly the misreading Cap-8.7 exists to catch |
 | `Event::Export` | `+ artifact_sha256` | additive; aggregate-only redaction preserved. **No `+ scope`** — export takes no narrowing flag (R-9c/AD-5), so it has none to log |
 | `Event::Import` | `+ artifact_sha256`, `+ scope` | additive; aggregate-only redaction preserved |
 
@@ -567,6 +567,7 @@ stash writes. What § 4.1 declines to add is a second writer of the canonical
 | Cap-6.1 | No import output line contains a token or email | unit (extend existing) | C-3 |
 | Cap-7.1 | `import --accounts` applies roster + secrets and **no** non-roster block | unit (`apply_import` outcome) | R-9 |
 | Cap-7.2 | Default `import` (no scope flag) applies the same payload classes today's `import` applies — **modulo § 4.8's allowlist, which binds on this path too**. Assert scope-equivalence, NOT end-to-end byte-identity: on a fresh target a non-portable key that used to be adopted is now refused (§ 8, `config adoption`). A byte-identity assertion here goes red, and the cheapest way to green it is to exempt the no-flag path from the allowlist — reinstating the § 1 code-execution path | integration (regression) | R-9, AD-9 |
+| Cap-7.9 | **`import --settings` applies allowlist-filtered config and writes NO roster entry and NO credential** — the mirror of Cap-7.1, and the only assertion of the `--settings` narrowing | unit (`apply_import` outcome) | R-9 |
 | Cap-7.3 | A scope flag can only narrow — an artifact cannot widen it | unit | R-9a |
 | Cap-7.4 | An artifact whose roster is the payload of interest round-trips through narrow-parse **even when it carries an unknown non-roster block**. Not "a roster-only artifact under an unknown block": *roster-only* is pinned to `[[account]]` entries **and no non-roster block** (`import-scope-selection.feature.md`), which an unknown block contradicts | unit | R-9b, R-16 |
 | Cap-7.5 | `export` exposes no config/roster narrowing flag | unit (usage assertion) | R-9c |
@@ -578,11 +579,27 @@ stash writes. What § 4.1 declines to add is a second writer of the canonical
 | Cap-8.3 | `[migration].conflict_policy` is not adopted | unit | R-11c |
 | Cap-8.4 | **Adding a `Config` key without a portability classification fails the build** | compile-fail / completeness test | R-11d, **R-11** |
 | Cap-8.5 | Every refusal is reported on stdout | unit | R-11e |
-| Cap-8.6 | **A non-portable key outside the three named carve-outs is not adopted, `--settings` notwithstanding** — the allowlist's default-deny asserted over an *ordinary* key classified non-portable. **The subject is chosen when the classification table is built**: § 4.8 fixes three carve-out keys and leaves the rest to implementation, so no block is classified non-portable at design time. `[jitter]` and `[credential]` are the two candidates PRD § 1 neither calls freely portable nor carves out — **neither is decided here**. If the built table leaves no non-carve-out block non-portable, use a purpose-built fixture key; **never reclassify a real block to green this test** (R-11f puts that call in the ADR) | unit | **R-11** |
+| Cap-8.6 | **A non-portable key outside the three named carve-outs is not adopted, `--settings` notwithstanding** — the allowlist's default-deny asserted over an *ordinary* key classified non-portable. **The subject is chosen when the classification table is built**: § 4.8 fixes three carve-out keys and leaves the rest to implementation, so no block is classified non-portable at design time. `[jitter]` and `[credential]` are the two candidates PRD § 1 neither calls freely portable nor carves out — **neither is decided here**. If the built table leaves no non-carve-out block non-portable, **this capability has no subject — escalate to the ADR (#1003)**; a purpose-built fixture key does *not* work (`deny_unknown_fields` rejects it before the allowlist runs — see the spec note), and **never reclassify a real block to green this test** (R-11f puts that call in the ADR) | unit | **R-11** |
 | Cap-8.7 | **The allowlist binds with no scope flag at all, on a fresh target** — the shipped hazard and the *default* path (AD-9). Cap-8.1/8.2/8.3 all put `--settings` in their *When*, so an implementation hanging the allowlist off the `--settings` branch passes all three while leaving § 1's code-execution path reachable by default | integration | **R-11**, R-11a, AD-9 |
 | Cap-9.1 | `import --shred` removes the source artifact after a successful apply | integration | R-12 |
 | Cap-9.2 | Shred is not claimed as secure erase in help or docs | unit (text assertion) | R-12 |
-| Cap-10.1 | `export` warns on **`Responsive` and `AliveUnresponsive`**, and is quiet **only** on `NotRunning` — the tri-state of `daemon_liveness()` (`src/cli.rs:1870-1878`) mapped explicitly; a wedged daemon still holds the lock and still refreshes, so it fails **closed** | unit | R-13 |
+| Cap-10.1 | `export` warns on **`Responsive`, `AliveUnresponsive` and the `Err` arm**, and is quiet **only** on `NotRunning` — **four** branches. `daemon_liveness()` is `Result<DaemonLiveness>` (`src/cli.rs:1885`) over a tri-state enum (`:1870-1878`), so `Err` sits alongside the three `Ok` variants and must be mapped, not left to the implementer. A wedged daemon still holds the lock and still refreshes; an errored probe has not established the daemon is absent — both fail **closed** | integration (see note) | R-13 |
+> **Cap-10.1 needs a seam, and the design must name it.** *Added 2026-08-05 (ninth pass); the row was
+> typed `unit`.* `daemon_liveness()` takes **no parameters** (`src/cli.rs:1885`) and resolves
+> `paths::control_socket()` / `paths::daemon_lock()` from `support_dir()`, which `src/paths.rs:531-532`
+> documents as *"**always** at the platform's fixed native location — **never** an env-var override"*,
+> deliberately (issue #7). There are currently **zero** tests over it. So none of the four branches is
+> hermetically constructible: `Responsive` needs a real listener at the native socket path,
+> `AliveUnresponsive` needs the real lock flocked, `Err` is not reachable at all, and even
+> `NotRunning` passes or fails according to whether the developer's own daemon happens to be running.
+>
+> Implementing R-13 therefore includes **introducing the seam** — take the probe as a parameter (or a
+> trait object) at the `export` call site, rather than calling `daemon_liveness()` directly. Do **not**
+> weaken `support_dir()` to make this testable: its non-overridability is a deliberate decision (#7),
+> and reversing it to serve a test is the same test-pressure-decides-design failure Cap-8.6 warns
+> about. Without a seam the test author writes a machine-state-dependent test or silently drops
+> branches — losing the four-branch enumeration that IS this capability.
+
 | Cap-10.2 | Export and import events carry a **matching artifact digest**; the **import** event additionally carries the operator-**requested** scope (export has none to carry — R-9c/AD-5) | unit | R-14, R-14a |
 | Cap-11.1 | A **malformed or over-length** `account_uuid` is rejected before a stash name is derived — **not** the empty case, which `src/config/validate.rs:281-284` already rejects on the import parse path (asserting it would be green over unimplemented work) | unit | R-15 |
 | Cap-11.2 | The documented **version floor** states which releases cannot read a `[credential]`-bearing artifact (**not** OQ-gated), **and — gated on OQ-5 landing at (b) —** the **current** binary tolerates an unknown non-roster block on the artifact-config parse path. Under OQ-5(a) the tolerance half is not a deliverable at all; do not build it until OQ-5 closes | unit + doc assertion | R-16 (assertable half; see note below the Master Test Plan) |
@@ -658,7 +675,7 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
 | R-11f | ✅ **Yes** | ADR; conventions exist |
 | R-10b | ✅ **Yes** | `PLAINTEXT_WARNING` is a string constant (`src/migration.rs:538`); Cap-7.8 |
 | R-12 | ⚠️ **Yes as unlink; NOT as secure erase** | APFS gives no reliable overwrite-in-place. Deliverable must not claim more (§ 4.9) |
-| R-13 | ✅ **Yes** | `daemon_liveness()` (`src/cli.rs:1885`) already gives a read-only tri-state answer; reuse it rather than the best-effort notify at `src/capture.rs:335` |
+| R-13 | ✅ **Yes** for the probe; ⚠️ **the capability needs a seam** | `daemon_liveness()` (`src/cli.rs:1885`) already gives a read-only tri-state answer (plus its `Err` arm); reuse it rather than the best-effort notify at `src/capture.rs:335`. But it takes **no parameters** and resolves `paths::control_socket()` / `paths::daemon_lock()` from `support_dir()`, which is *deliberately* never env-overridable (`src/paths.rs:531-532`, issue #7) — so Cap-10.1 is not hermetically constructible as written (see its note) |
 | R-14 / R-14a | ✅ **Yes** | Additive event fields; digest is a pure function over the artifact bytes |
 | R-15 | ✅ **Yes**, and cheaper than assumed | Parse-time validation; severity bounded — `stash()` reaches no filesystem path |
 | R-16 | 🚧 **Partly — the released-binary half is unfixable** | We cannot patch already-shipped binaries; only the version-floor message and forward-tolerance are in reach (OQ-5) |
@@ -750,7 +767,7 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
 | R-6 | 4.3 | Cap-3.1 | covered |
 | R-6a | 4.3 | Cap-3.2 | **decision-gated** (OQ-1) |
 | R-7 | 4.5 | Cap-5.1 | covered |
-| R-9 | 4.7 | Cap-7.1, Cap-7.2, Cap-7.6 | **partly decision-gated** (OQ-6 — the `--settings` availability report) |
+| R-9 | 4.7 | Cap-7.1 (`--accounts`), **Cap-7.9 (`--settings` — the mirror)**, Cap-7.2 (default), Cap-7.6 | **partly decision-gated** (OQ-6 — the `--settings` availability report) |
 | R-9a | 4.7 / AD-6 | Cap-7.3 | **partly decision-gated** (OQ-6 — the settings-axis presence test) |
 | R-9b | 4.7 | Cap-7.4 | covered |
 | R-9c | 4.7 / AD-5 | Cap-7.5 | covered |
@@ -788,7 +805,7 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
 
 Every capability traces to a requirement: Cap-1.x→R-2/R-2a/AC-2a, Cap-2.x→R-4/R-4a, Cap-3.x→R-6/R-6a,
 Cap-4.1→R-5, Cap-5.1→R-7, Cap-6.1→C-3, Cap-7.1-7.6→R-9/R-9a-c + R-16 (Cap-7.4); R-9d has no capability of its own, **Cap-7.7→R-10**,
-**Cap-7.8→R-10b**, Cap-8.x→R-11/R-11a-e (Cap-8.6→R-11, **Cap-8.7→R-11/R-11a**), Cap-9.x→R-12, Cap-10.x→R-13/R-14/R-14a,
+**Cap-7.8→R-10b**, **Cap-7.9→R-9 (the `--settings` mirror)**, Cap-8.x→R-11/R-11a-e (Cap-8.6→R-11, **Cap-8.7→R-11/R-11a**), Cap-9.x→R-12, Cap-10.x→R-13/R-14/R-14a,
 Cap-11.x→R-15/R-16. **No orphan capabilities.**
 
 > **This matrix checks only one direction, and that is why it missed two gaps (corrected 2026-08-04).**
@@ -814,7 +831,7 @@ their absence from the Cap-list does not read as a coverage gap:
 
 **R-10a** has neither, because it is undecided (OQ-4).
 
-> **One capability has no spec scenario: Cap-7.7** — 30 of the 31 are pinned by a scenario in
+> **One capability has no spec scenario: Cap-7.7** — 31 of the 32 are pinned by a scenario in
 > `docs/specs/`. This one is left unpinned **deliberately**, because its assertion is the hard-remove
 > branch of the still-open OQ-4 (see the R-10 row in § 16). Writing the scenario now would pin the
 > undecided outcome in the place a test author reads first. Close OQ-4, then add it to

@@ -95,9 +95,15 @@ selection answers *what was asked for*; this answers *what is permitted*.
 > candidates (`RawConfig` has eight: `account`, `tunables`, `jitter`, `refresh`, `login`, `stats`,
 > `migration`, `credential`, `src/config.rs:1379-1396`): **`[jitter]`** and **`[credential]`** are the
 > two PRD § 1 neither calls freely portable nor carves out. Neither is *decided* — do not read this
-> scenario as deciding either. Take whichever the built table classifies `NonPortable`; if the table
-> as built classifies every non-carve-out block `Portable`, add a purpose-built fixture key rather
-> than reclassifying a real block to make this test green. **Deciding a portability question by test
+> scenario as deciding either. Take whichever the built table classifies `NonPortable`.
+>
+> **If the built table leaves no such block, this scenario has no subject — escalate to the ADR
+> (#1003); do not invent one.** *Corrected 2026-08-05 (ninth pass); this offered "add a purpose-built
+> fixture key" as the fallback.* That does not work, for the reason stated ten lines below: a key
+> **not** in `Config` is rejected by `RawConfig`'s `deny_unknown_fields` (`src/config.rs:1378`) on the
+> very `--settings` full-parse path this scenario uses, **before the allowlist is consulted** — so it
+> yields `ConfigInvalid`, not the refusal line the *Then* observes. And adding a *real* `Config` field
+> to serve a test is the same failure as reclassifying one. **Deciding a portability question by test
 > pressure is the failure this scenario exists to prevent** — R-11f requires that call to be made in
 > the ADR, not in a red test. `--settings` is in the *When* deliberately: the operator's widest flag
 > must still not widen past the allowlist — the flag is a ceiling, never a floor (R-9a).

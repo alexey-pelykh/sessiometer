@@ -73,7 +73,8 @@ artifacts:
 **Affected users.** Every operator who moves a roster between machines — the single use case
 `export`/`import` exists to serve (#145, #146, #148).
 
-**Why now.** The export half shipped and is well-tested (seven migration tests, § 9). The import half
+**Why now.** The export half shipped and is well-tested (**45** migration tests — 16 in `src/cli.rs`'s
+#148/#149/#150 sections and 29 in `src/migration.rs`; § 9 names the seven this scope reasons about). The import half
 was completed to the point of *restoring bytes* and stopped there. Nothing since has exercised it
 against a **live, still-running source** — which is the only configuration a real migration ever has.
 
@@ -127,9 +128,14 @@ That single conflation produces three further defects, none visible from the inc
   unconditionally (`src/cli.rs:4744-4750`), and the daemon then spawns that path on a timer.
 - **A security parameter is downgradable.** `[migration].kdf_*` is adopted like a preference, so an
   artifact can weaken every *future* export from the target.
-- **Local policy is silently overwritable.** `[migration].conflict_policy` records a decision the
-  target operator made. Adoption overwrites it — not for the import that adopts it
-  (`resolve_import_overwrite` reads the local value first, `src/cli.rs:4628`) but for every one after.
+- **Local policy would become silently overwritable.** `[migration].conflict_policy` records a
+  decision the target operator made. **Today it cannot be overwritten at all**: with an existing local
+  config `apply_import` keeps that config and discards the incoming non-roster blocks entirely
+  (`src/cli.rs:4744-4750`). `--settings` is what would newly allow adoption to overwrite it — and even
+  then not for the import that adopts it (`resolve_import_overwrite` reads the local value first,
+  `src/cli.rs:4628`) but for every one after. *(Corrected 2026-08-05: this read "is silently
+  overwritable", describing a live defect. R-11c prevents a regression `--settings` would introduce;
+  the distinction materially changes how D-1's recorded dissent reads.)*
 
 **The two axes this scope adds are the two halves of that fix**: an **operator-selected scope** (which
 classes apply — R-9) and a **system-enforced portability classification** (what may *ever* apply,
@@ -656,7 +662,7 @@ regardless of which value they would have carried.)
 **R-5a** — *Where* R-5 changes the emitted field, the change **shall** be treated as a **log-format
 change** with existing consumers, not a cosmetic edit. `docs/findings/0465-*` derives a published
 headline count (`141 rotated=true, 0 rotated=false`) from this field.
-**Verified: 0465 is NOT contaminated** — its window ends ~2026-07-11 and the first `dead` line in the
+**Partially verified: 0465 carries no `dead` line** — its window ends ~2026-07-11 and the first `dead` line in the
 local log is 2026-07-14, so no dead line is inside its sample. The requirement is forward-looking.
 `Origin: AI-inferred-expansion (premortem P1)`. `Ratification: pending-user`.
 
@@ -725,6 +731,8 @@ implicit "local always wins" in place on the fresh-target path, where it does no
 
 **AC-9 (R-9, R-9a, R-9d)** — *Given* an artifact carrying both roster and settings, *When* the operator
 runs `import --accounts`, *Then* the roster and credentials are applied and **no** non-roster block is,
+*And* — the mirror — when the operator runs `import --settings`, the allowlist-filtered non-roster
+config is applied and **no roster entry and no credential** is,
 *And* running `import` with no scope flag applies **the same payload classes** it applies today.
 **BUT NOT** asserting byte-identity with the pre-change target state — R-11's allowlist binds
 regardless of the flag and independently changes the fresh-target outcome (§ 8, `config adoption`);
@@ -857,7 +865,7 @@ an observation.
 **BUT NOT** by deleting the field on the `refreshed` path, where it is meaningful; **BUT NOT** by
 enumerating only `dead` and `error`, which silently exempts `NoChange`; **BUT NOT** without
 checking whether any committed findings note's counts are drawn from a window containing non-`refreshed`
-lines (0465 checked: clean).
+lines — **0465 is checked for `dead` only, which is NOT the whole criterion** (see R-5a's note).
 
 > **`NoChange` is the variant this AC most easily loses, and it is not benign.** `rotated` is decided
 > by the *token* differing (`src/refresh.rs:434-437`) while `NoChange` is decided by the *expiry*
@@ -954,8 +962,9 @@ PAST:    < 1.0 — true-by-construction on any `dead` line with a parseable non-
 
 ### Premortem (de-anchored — failure modes the requirement list does not enumerate)
 
-- **P1 — A `rotated` fix silently re-baselines a published finding.** Mitigated: 0465 verified clean
-  (R-5a). Any *future* count over a window containing `dead` lines repeats 0465's methodology onto
+- **P1 — A `rotated` fix silently re-baselines a published finding.** Mitigated **only for `dead`**:
+  0465 carries no `dead` line (R-5a), but its 141-count is derived from *event type*, not outcome, so
+  a `no_change` line inside it would still re-baseline. Tracked on #1004 as a pre-implementation check. Any *future* count over a window containing `dead` lines repeats 0465's methodology onto
   contaminated data.
 - **P2 — R-4's unconditional warning becomes noise and is tuned out.** The operator migrates rarely;
   a warning on every import is cheap. But if R-4a later gates it on a computed signal, the gate must
@@ -1082,7 +1091,7 @@ by symbol against `HEAD` on 2026-08-04 before this document was committed.
 | Labels are non-unique by design | `src/cli.rs:5148-5149` |
 | `use` refuses on ambiguity; `enable`/`disable` take first | `src/use_account.rs:453`; `src/error.rs:955` (exit 6); `src/cli.rs:5150-5163` |
 | `Payload` has no timestamp; `FORMAT_VERSION = 1` | `src/migration.rs:199-210`; `src/migration.rs:97` |
-| Existing migration test coverage (7 tests, all in `src/cli.rs`) | `export_encrypted_round_trips_gathered_state_and_hides_it`, `export_no_secrets_omits_every_credential_blob`, `export_plaintext_round_trips_and_carries_secrets_in_the_clear`, `import_round_trips_an_encrypted_export_and_restores_every_account_byte_faithfully`, `a_config_only_artifact_imports_accounts_as_roster_entries_without_a_stash`, `the_import_report_names_labels_only_never_a_token_or_email`, `the_migration_conflict_policy_default_drives_import_behaviour` |
+| Existing migration test coverage — the **7 this scope reasons about**, of **45** total (16 in `src/cli.rs`'s #148/#149/#150 sections, 29 in `src/migration.rs` incl. the frozen-fixture gates C-1 depends on, `src/migration.rs:1730`, `:1767`) | `export_encrypted_round_trips_gathered_state_and_hides_it`, `export_no_secrets_omits_every_credential_blob`, `export_plaintext_round_trips_and_carries_secrets_in_the_clear`, `import_round_trips_an_encrypted_export_and_restores_every_account_byte_faithfully`, `a_config_only_artifact_imports_accounts_as_roster_entries_without_a_stash`, `the_import_report_names_labels_only_never_a_token_or_email`, `the_migration_conflict_policy_default_drives_import_behaviour` |
 | Conflict test's target is a clone of the source | `src/cli.rs:10741` |
 
 **Added 2026-08-04 — every row's claim verified against the working tree during this amendment (not
@@ -1106,7 +1115,7 @@ carried from the council transcripts), and every line citation re-resolved by sy
 | `IMPORT_USAGE` uses "accounts" as the operator-facing noun | `src/cli.rs:1290` |
 | ADR-0030 governs `claude` resolution **order**, not value provenance — the R-11a refusal does not contradict it, and `CLAUDE_BIN=…` is a documented local escape hatch | `docs/adr/0030-one-resolution-policy-cli-included.md` |
 | `import` leaves the source artifact on disk | `src/cli.rs:4602` |
-| Daemon liveness is locally probeable, read-only, tri-state | `src/cli.rs:1885` (`daemon_liveness()`, socket-primary + lock-fallback); `src/cli.rs:2137` (`probe_socket_responsive`). NOT `src/capture.rs:335` — that notify is best-effort and returns `()` |
+| Daemon liveness is locally probeable, read-only, tri-state — **plus a fourth, `Err`, outcome** (`daemon_liveness()` returns `Result<DaemonLiveness>`) | `src/cli.rs:1885` (`daemon_liveness()`, socket-primary + lock-fallback); `src/cli.rs:2137` (`probe_socket_responsive`). NOT `src/capture.rs:335` — that notify is best-effort and returns `()` |
 
 ### F-3 — A second claim was FALSIFIED during this amendment
 
@@ -1135,7 +1144,9 @@ via `Option`/`#[serde(default)]` stays additive."* And `src/migration.rs` carrie
 **AD-2's conclusion survives; its stated reason does not.** The correct argument against a staleness
 field is the one round 1 identified independently — a mint timestamp buys a heuristic that **cannot
 detect this failure** (the token was superseded, not expired; § F-2) and therefore manufactures false
-assurance. Stage 2 must re-argue AD-2 on those grounds and delete the cost sentence.
+assurance. Stage 2 must re-argue AD-2 on those grounds and delete the cost sentence. **Done** —
+the design deletes it rather than softening it (§ 4.2; the AD-2 row records "Rationale corrected
+2026-08-04"), so this instruction is closed, not outstanding.
 
 **Second-order, and it constrains the design**: if scope were carried as a payload *field*, AD-2's cost
 argument would have to be deleted regardless — you cannot price a payload field as prohibitive while
@@ -1232,10 +1243,13 @@ findings, none blocking Stage 2:
    backward-import break predates every requirement here — it was introduced 26 days after ADR-0006
    froze v1 and was never tracked. R-9b repairs only the roster-only path. Filing it here is correct;
    *closing* it here would be scope creep, and leaving it unfiled would lose it entirely.
-9. **AD-2 must be re-argued before Stage 2 closes.** § 9 F-3 falsified its cost reasoning while
-   leaving its conclusion standing. A design doc that keeps the falsified sentence is worse than one
-   that never made the argument — a reader who checks it against ADR-0006 will find the carve-out and
-   reasonably conclude the whole decision is unsound.
+9. **AD-2 was re-argued — CLOSED.** § 9 F-3 falsified its cost reasoning while leaving its conclusion
+   standing, and a design doc that keeps a falsified sentence is worse than one that never made the
+   argument: a reader who checks it against ADR-0006 finds the carve-out and reasonably concludes the
+   whole decision is unsound. The design in this same commit range **deletes** the sentence rather
+   than softening it (§ 4.2), and its AD-2 row records "Rationale corrected 2026-08-04". *Recorded as
+   closed 2026-08-05 (ninth pass): it was still listed among the open findings, sending a reader of
+   this list to chase work already done.*
 
 **Provenance summary for the amendment set** — R-9, R-9d, R-10 are `user-stated` (maintainer's own
 words). R-9a/b/c, R-11 … R-16 are `council-added`, ratified **in-scope** via a second
