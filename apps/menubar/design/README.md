@@ -94,6 +94,14 @@ Light shown here:
 **Expected reconciliations** — the built panel intentionally differs from the mock in these spots:
 
 - no provider secondary line — the wire carries no `provider` field yet (#173)
+- the Stats aggregate callout has a **second, mock-unauthored form**. When the daemon had no
+  configured roster the census degraded to whoever held samples, and the panel says so by narrowing
+  the subject — `All sampled accounts ≥95% at once …` rather than `All accounts …`, which in that
+  regime would be false (#866, the panel half of the CLI's own `, sampled accounts` qualifier from
+  #836). The mock draws only the configured form, so this is a state it does not author rather than
+  one it disagrees with; the goldens likewise pin only the configured render. Drawing the frame is
+  tracked on **#1037** (*the panel mock depicts only the happy path*) — as its own row, because the
+  regime is an axis orthogonal to that issue's three *measurability* frames, and the two axes cross
 - the footer reads "updated <1m ago" — the panel mirrors the `status` CLI (R-2 state-parity), not
   the mock's illustrative "snapshot 12s old". Resets no longer diverge: the mock now uses the CLI's
   compact duration form too ("2h14m" / "3d"), not a day-name (#387)

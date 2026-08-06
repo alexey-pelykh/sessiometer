@@ -366,7 +366,8 @@ final class StatsTests: XCTestCase {
     func testAggregateTextSingularEpisode() {
         let roster = StatsRoster(swapCount: 28,
                                  swaps: StatsSwaps(session: 20, weekly: 4, manual: 3, forced: 1, emergency: 0),
-                                 allHighEpisodes: 1, allHighSecs: 6000, allHighThreshold: 0.95)
+                                 allHighEpisodes: 1, allHighSecs: 6000, allHighThreshold: 0.95,
+                                 censusOverRoster: true)
         XCTAssertEqual(StatusPanelFormat.statsAggregateText(roster: roster, window: window(period: "week")),
                        "All accounts ≥95% at once — 1 episode (1h40m) · swaps 28 · last 7 days")
     }
@@ -413,7 +414,8 @@ final class StatsTests: XCTestCase {
             StatusPanelFormat.statsAggregateText(
                 roster: StatsRoster(swapCount: 0,
                                     swaps: StatsSwaps(session: 0, weekly: 0, manual: 0, forced: 0, emergency: 0),
-                                    allHighEpisodes: 0, allHighSecs: 0, allHighThreshold: water),
+                                    allHighEpisodes: 0, allHighSecs: 0, allHighThreshold: water,
+                                    censusOverRoster: true),
                 window: window(period: "week"))
         }
         XCTAssertTrue(label(0.95).hasPrefix("All accounts ≥95% at once"))
@@ -427,7 +429,8 @@ final class StatsTests: XCTestCase {
     func testAbsentWaterDropsTheQualifierInsteadOfFabricatingOne() {
         let roster = StatsRoster(swapCount: 28,
                                  swaps: StatsSwaps(session: 20, weekly: 4, manual: 3, forced: 1, emergency: 0),
-                                 allHighEpisodes: 1, allHighSecs: 6000, allHighThreshold: nil)
+                                 allHighEpisodes: 1, allHighSecs: 6000, allHighThreshold: nil,
+                                 censusOverRoster: true)
         let text = StatusPanelFormat.statsAggregateText(roster: roster, window: window(period: "week"))
         XCTAssertEqual(text, "All accounts high at once — 1 episode (1h40m) · swaps 28 · last 7 days")
         // The counted fact survives; only the unknown water is withheld. No digit-then-% may appear
@@ -442,6 +445,92 @@ final class StatsTests: XCTestCase {
         let roster = try JSONDecoder().decode(StatsRoster.self, from: Data(line.utf8))
         XCTAssertNil(roster.allHighThreshold, "an absent additive key is nil, never a decode error")
         XCTAssertEqual(roster.allHighEpisodes, 3, "the rest of the roster decodes unchanged")
+    }
+
+    // MARK: - The census set is READ, never assumed (issue #866)
+
+    /// The rendered callout over a roster differing ONLY in the census regime — and, where a test
+    /// asks, its water — so every assertion below isolates the one axis it names.
+    private func censusText(_ censusOverRoster: Bool?, threshold: Double? = 0.95) -> String {
+        let roster = StatsRoster(swapCount: 28,
+                                 swaps: StatsSwaps(session: 20, weekly: 4, manual: 3, forced: 1, emergency: 0),
+                                 allHighEpisodes: 3, allHighSecs: 6000, allHighThreshold: threshold,
+                                 censusOverRoster: censusOverRoster)
+        return StatusPanelFormat.statsAggregateText(roster: roster, window: window(period: "week"))
+    }
+
+    /// THE REPORTED DEFECT, asserted directly: the two regimes used to render IDENTICAL bytes over
+    /// identical data, so a reader could not tell whether the daemon intersected the configured
+    /// roster or degraded to whoever held samples. Everything else in this section pins the copy;
+    /// this pins the property the copy exists to provide, and would fail for any wording that
+    /// happened to collapse the two again.
+    func testTheTwoCensusRegimesDoNotRenderIdentically() {
+        XCTAssertNotEqual(censusText(true), censusText(false),
+                          "the configured and degraded censuses must be distinguishable on the panel")
+    }
+
+    /// The degraded census names its set by narrowing the SUBJECT — in that regime "All accounts" is
+    /// not merely unqualified, it is false: the census demonstrably did not see them all.
+    func testDegradedCensusNamesItsSampledSet() {
+        XCTAssertEqual(censusText(false),
+                       "All sampled accounts ≥95% at once — 3 episodes (1h40m) · swaps 28 · last 7 days")
+    }
+
+    /// The configured regime is the unqualified sentence — it already states that the census covered
+    /// the roster, so a qualifier there would be noise on the overwhelmingly common render.
+    func testConfiguredCensusRendersUnqualified() {
+        XCTAssertEqual(censusText(true),
+                       "All accounts ≥95% at once — 3 episodes (1h40m) · swaps 28 · last 7 days")
+        XCTAssertFalse(censusText(true).contains("sampled"),
+                       "a census that DID cover the roster must not be annotated as sampled")
+    }
+
+    /// A pre-#866 daemon never sent the set. The panel must then DROP the qualifier — the same rule
+    /// the `nil` water follows. Asserting equality with the CONFIGURED render (rather than against a
+    /// restated literal) is what makes this a drop rather than a coincidence: it fails both if the
+    /// absent key were read as degraded — fabricating a regime the daemon never reported, the very
+    /// defect issue #866 exists to end — and if it grew any other qualifier of its own.
+    func testAbsentCensusSetDropsTheQualifierInsteadOfAssumingARegime() {
+        XCTAssertEqual(censusText(nil), censusText(true),
+                       "an unreported set must render exactly as the unqualified sentence")
+        XCTAssertFalse(censusText(nil).contains("sampled"),
+                       "no set may be named when none was reported")
+    }
+
+    /// The two honesty rules compose rather than compete: an unknown WATER and a degraded SET are
+    /// independent facts, and a daemon old enough to send neither still renders both drops.
+    func testTheSetAndTheWaterDegradeIndependently() {
+        XCTAssertEqual(censusText(false, threshold: nil),
+                       "All sampled accounts high at once — 3 episodes (1h40m) · swaps 28 · last 7 days")
+        XCTAssertEqual(censusText(nil, threshold: nil),
+                       "All accounts high at once — 3 episodes (1h40m) · swaps 28 · last 7 days")
+    }
+
+    /// THE CROSS-LANGUAGE KEY GATE, the `census_over_roster` sibling of
+    /// `testRenderedLabelStatesTheAggregatorsOwnWater`, riding that test's chain rather than
+    /// restating it: `Fixtures.statsBasic` is byte-pinned to the Rust-emitted golden
+    /// (`WireGoldenTests`), so decoding the regime out of it proves the Swift `CodingKey` matches
+    /// the name the Rust `RosterWire` actually serializes. A misspelled key would decode as `nil`
+    /// and silently drop the qualifier on EVERY payload, which is indistinguishable from the
+    /// pre-#866 daemon path and therefore invisible to every other test in this section.
+    func testTheGoldenFixtureCarriesTheCensusSetItWasBuiltUnder() throws {
+        guard case .ok(let wire) = try decodeStatsReply(Fixtures.statsBasic) else {
+            return XCTFail("expected a StatsWire document")
+        }
+        XCTAssertEqual(wire.summary.roster.censusOverRoster, true,
+                       "the current daemon always sends census_over_roster (issue #866), and the "
+                       + "golden report is built under the CONFIGURED regime")
+        // Series buckets carry the same regime — one report, one census, one set.
+        XCTAssertEqual(wire.series.first?.roster.censusOverRoster, true)
+    }
+
+    /// The pre-#866 wire shape decodes rather than throwing — the compat half of the drop above.
+    func testPre866RosterWithoutTheCensusSetStillDecodes() throws {
+        let line = #"{"swap_count":2,"swaps":{"session":1,"weekly":1,"manual":0,"forced":0,"emergency":0},"# +
+                   #""all_high_episodes":3,"all_high_secs":600,"all_high_threshold":0.95}"#
+        let roster = try JSONDecoder().decode(StatsRoster.self, from: Data(line.utf8))
+        XCTAssertNil(roster.censusOverRoster, "an absent additive key is nil, never a decode error")
+        XCTAssertEqual(roster.allHighThreshold, 0.95, "the rest of the roster decodes unchanged")
     }
 
     // MARK: - Failure copy (StatsFailure → the honest one-line Stats-tab message)

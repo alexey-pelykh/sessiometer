@@ -1013,7 +1013,8 @@ struct StatsDim: Decodable, Equatable {
 }
 
 /// Roster-wide statistics for a window (`src/stats.rs` `RosterWire`): swap frequency and the
-/// all-accounts-high water — the source of the Stats tab's aggregate callout.
+/// all-accounts-high census with the water and the set it was taken under — the source of the
+/// Stats tab's aggregate callout.
 struct StatsRoster: Decodable, Equatable {
     let swapCount: UInt32
     let swaps: StatsSwaps
@@ -1033,12 +1034,27 @@ struct StatsRoster: Decodable, Equatable {
     /// forward-compat path the snapshot mirror uses for its additive fields.
     let allHighThreshold: Double?
 
+    /// WHICH SET the census above intersected over (issue #866): `true` when the daemon had the
+    /// CONFIGURED roster, `false` when it did not and the census degraded to whoever held samples
+    /// — where an unsampled account cannot withhold the metric, so it fires on strictly less
+    /// evidence. Carried for the same reason the water above is: without it the two regimes render
+    /// as identical bytes and a reader cannot tell which number they hold.
+    ///
+    /// OPTIONAL only for the pre-#866 daemon that never sent the key. The CURRENT daemon always
+    /// sends it (`RosterWire` deliberately does NOT `skip_serializing_if` it — eliding the `false`
+    /// would collapse the degraded regime into this very `nil`), so `nil` here means "an older
+    /// daemon, which never told us its set" — NOT "the census was degraded". The renderer must
+    /// therefore DROP the qualifier rather than name a regime
+    /// (`StatusPanelFormat.statsAllHighLabel`), the same rule the `nil` water already follows.
+    let censusOverRoster: Bool?
+
     private enum CodingKeys: String, CodingKey {
         case swapCount = "swap_count"
         case swaps
         case allHighEpisodes = "all_high_episodes"
         case allHighSecs = "all_high_secs"
         case allHighThreshold = "all_high_threshold"
+        case censusOverRoster = "census_over_roster"
     }
 }
 
