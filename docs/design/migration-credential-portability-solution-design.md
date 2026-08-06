@@ -522,6 +522,28 @@ rows, including the entire security core:*
 > (which names only `docs/findings/0465-*`), § 8's Interface-Change table, the risk register, or
 > #1004** — the whole artifact set costed R-5 as a log-format change.
 >
+> **RESOLVED 2026-08-06 by issue #1070 — the wire took a third path, not either costed one.**
+> *Added 2026-08-06; the paragraph above is preserved as the statement of the problem.* #1004 shipped
+> the three log lines plus the wire's `.unwrap_or(false)` and stopped there, exactly as R-5a
+> reserved. #1070 then made `RefreshHealth.rotated` an `Option<bool>` carrying
+> `skip_serializing_if`, so the key is present with a real value where an exchange ran and ABSENT
+> everywhere else — AC-5 now holds across all four emitting surfaces, and the wire follows the same
+> rule AD-3 gave the log path rather than a fourth rule of its own. Paid: a MINOR
+> `STATUS_SCHEMA_VERSION` bump 1.13 → 1.14, the five status/watch goldens regenerated, and the Swift
+> mirror + fixtures + decoder assertions swept in lockstep.
+>
+> Note what the reshape does and does not buy, since AD-3's parallel is close but not exact. On the
+> log path the payload moved INSIDE `RefreshOutcome::Refreshed`, so a non-refreshed outcome has no
+> field to render — a type-level guarantee. Here `last_ok` and `rotated` remain sibling fields, so
+> the LITERAL `RefreshHealth { last_ok: false, rotated: true }` this issue named stops type-checking,
+> but `rotated: Some(_)` beside `last_ok: false` is still expressible by a hand-written construction.
+> The guarantee is therefore a **constructor** invariant — `refresh_health_view` reads both off one
+> outcome — pinned exhaustively across every `RefreshEventOutcome` variant by
+> `refresh_health_view_never_pairs_a_rotation_with_a_non_refreshed_outcome`, so a sixth variant
+> cannot reach the wire without that test being reopened. Recorded here rather than left implied,
+> because Cap-4.1 rejects suppressions a later emitter change can reintroduce and this one is a
+> narrower guarantee than AD-3's.
+>
 > So AD-3's reshape and Cap-4.1 — *"Given the `RefreshOutcome` type / When a non-`refreshed` outcome
 > is constructed / Then no rotated value can be attached to it"* — are both **satisfiable with all
 > three renders untouched**, and R-5's Planguage meter (*"unit test over `classify()` across all four
@@ -596,7 +618,7 @@ documents. No migration of on-disk state; no `format_version` change (§ 4.2).
 | `import` stdout | new warning + report lines | additive; C-3 forbids any credential in them |
 | `import` flags | optional `--activate <label>` | additive, opt-in |
 | `refresh` / `poll_refresh` / `keep_warm` log lines | `rotated` absent on non-`refreshed` — **three lines, not one** (`src/observability.rs:2155`, `:2173`, `:2191`) | **contract change on all three**; consumer 0465 checked for `dead` only — its 141-count derives from *event type* (86 `refresh` + 31 `keep_warm` + 24 `poll_refresh`), so a `no_change` line would still re-baseline it (open, tracked on #1004) |
-| `status` / `watch` wire | `RefreshHealth.rotated` — **a versioned surface with a Swift consumer** (`src/daemon/snapshot.rs:1403` → `apps/menubar/Sources/WireModel.swift:98`) | **contract change, and the expensive one**: dropping the field is a `STATUS_SCHEMA_VERSION` bump carrying the status/watch goldens and the Swift fixtures; keeping it means `.unwrap_or(false)` still renders the value R-5 removes |
+| `status` / `watch` wire | `RefreshHealth.rotated` — **a versioned surface with a Swift consumer** (`src/daemon/snapshot.rs` `RefreshHealth` → `apps/menubar/Sources/WireModel.swift` `RefreshHealth`) | **contract change, and the expensive one.** *Costed here as a binary — drop the field (a `STATUS_SCHEMA_VERSION` bump carrying the status/watch goldens and the Swift fixtures) or keep `.unwrap_or(false)` and go on rendering the value R-5 removes. **RESOLVED 2026-08-06 by issue #1070, which took neither branch**: the field became `Option<bool>` with `skip_serializing_if`, so it is present with a real value where an exchange ran and ABSENT elsewhere — the rotation signal is kept, only the fabricated value is dropped. Paid at `STATUS_SCHEMA_VERSION` **1.13 → 1.14** (minor) with the five status/watch goldens regenerated and the Swift mirror re-typed to `Bool?`. **Forward-compat is asymmetric and this is the operationally consequential fact**: a pre-#1070 menubar build typed the key as required, so it DROPS a 1.14 non-refreshed line — daemon and app must be updated together. The Rust `status` client is immune (same binary as the daemon). The reverse is clean: a 1.14 client decodes a ≤1.13 daemon's always-present key as `Some(_)`.* |
 | artifact format | **none** | v1 preserved (C-1, C-4) |
 | `import` flags | `--accounts`, `--settings`, `--shred` | additive, opt-in; **default unchanged** (AD-9) |
 | `export` flags | **`--no-secrets` REMOVED** | **breaking** — the only breaking CLI change in this scope. Path undecided (OQ-4) |

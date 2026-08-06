@@ -2336,7 +2336,7 @@ mod tests {
                 access_expires_at: Some(1_782_777_600),
                 refresh_health: Some(RefreshHealth {
                     last_ok: true,
-                    rotated: true,
+                    rotated: Some(true),
                     consecutive_failures: 0,
                 }),
                 health: CredentialHealth::Stale,
