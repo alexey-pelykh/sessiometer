@@ -203,7 +203,7 @@ against every frontmatter key present in `docs/` today:
 
 | Keys | Class |
 |---|---|
-| `design-doc`, `design-brief`, `requirements-brief`, `scope-brief`, `prd`, `design` | **Pointer** — must hold a tracked root-relative path |
+| `design-doc`, `design-brief`, `requirements-brief`, `scope-brief`, `prd`, `design`, `scope-working-doc` | **Pointer** — must hold a tracked root-relative path |
 | `source`, `parent-requirements` | **Pointer-or-note** — a path must be tracked; a note is legal |
 | `type`, `date`, `status`, `workflow`, `umbrella`, `items`, `scope`, `title`, `created`, `tracks`, `dor_status` | **Ignored** — never a path |
 
@@ -211,6 +211,14 @@ against every frontmatter key present in `docs/` today:
 third row is enumerated rather than assumed: each would be misread by a scan-everything implementation,
 and `scope:` would additionally trip a naive path-shape test. **Unknown keys are ignored, not failed**
 (see Risk R-5) — the allowlist is the contract, and adding to it is the deliberate act R-12 registers.
+
+**`scope-working-doc` is in the list because omitting it hid a defect.** An earlier allowlist was built
+by surveying `docs/briefs/` and `docs/requirements/`'s known keys; it missed this one, and the site it
+guards — a committed PRD citing gitignored `.tmp/` scratch — was therefore absent from the scoped
+defect table. The lesson is structural, not clerical: **an allowlist built from a partial survey has a
+blind spot exactly the size of what the survey missed**, and a check built on it reports clean over
+that blind spot. The allowlist above is derived from a sweep of *every* frontmatter key in *all* of
+`docs/` (64 distinct keys, 9 of them path-valued), not from the keys the defect table happened to name.
 
 ### CI wiring
 
@@ -273,6 +281,26 @@ the exact defect, committed deliberately.
 Plus two hygiene fixes: drop the stale `# Stage 2, not yet written` at
 `stats-honesty-cross-surface.md:20` (R-16), and complete that file's `artifacts:` block (R-17).
 
+### Two further sites the scoped table missed — found by sweeping, not by reading it
+
+| # | Site | Now | Action |
+|---|---|---|---|
+| 9 | `migration-credential-portability.md:39` | `scope-working-doc:` → gitignored `.tmp/` | **DELETE the key** |
+| 10 | `docs/design/stats-honesty-cross-surface-solution-design.md:3` | `source:` → document-relative | **REBASE** to repo-root-relative |
+
+Neither was a clerical oversight; each names a way a sweep's *subject* can be smaller than its *claim*:
+
+- **Site 9 was invisible to the key list.** `scope-working-doc` was not recognised as path-valued, so
+  the sweep never asked about it. A survey iterating a key list cannot see a defect on a key absent
+  from that list — the allowlist blind spot described in § 5.
+- **Site 10 was invisible to the directory scope.** The original sweep covered `docs/requirements/`;
+  `docs/design/` frontmatter was never examined at all. The finding "8 sites" was true of the subject
+  actually evaluated and false of the population it was reported about.
+
+Both are why the check scans **all of `docs/`** by construction rather than a curated file list, and
+why AC-4 reports the evaluated count: a number the reader can compare against the corpus is the only
+thing that distinguishes "swept clean" from "swept narrowly."
+
 ## 7. Brief Migration
 
 The 14 briefs live in `/Users/alexey-pelykh/Sessiometer/sessiometer/docs/briefs/` (main working tree).
@@ -284,7 +312,7 @@ own citations must satisfy the invariant first. Surveyed state of the 14:
 
 | Group | Count | Action |
 |---|---|---|
-| Path-shaped, **document-relative** (`../design/…`, `../requirements/…`) | 6 citations across 4 files | **Rebase to repo-root-relative** before committing |
+| Path-shaped, **document-relative** (`../design/…`, `../requirements/…`) | 6 citations across 5 files, on `source` / `prd` / `design` | **Rebase to repo-root-relative** before committing |
 | Path-shaped, repo-root-relative | 2 | Already conformant |
 | Prose notes (`session /investigate …`, `session context (#817 thread)`) | 2 | Already conformant — legal on `source` |
 | No frontmatter at all | 2 files | Nothing to check; contribute 0 citations |
