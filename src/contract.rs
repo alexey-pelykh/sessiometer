@@ -271,15 +271,16 @@ pub(crate) struct RefreshObservation {
 }
 
 /// The non-secret refresh-health signal from one completed refresh cycle (issue #119):
-/// the classification plus whether the refresh token rotated. The expiry slide lives in
+/// the classification, which since issue #1004 carries whether the refresh token rotated as
+/// a payload on its two refreshed variants. The expiry slide lives in
 /// [`RefreshObservation::expires_at_ms`]; this is the "did it work / did the token value
 /// change" half the rollup's at-risk / dead inputs key off.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct RefreshDelta {
-    /// The cycle's non-secret classification (the same one the [`Event::Refresh`] carries).
+    /// The cycle's non-secret classification (the same one the [`Event::Refresh`] carries),
+    /// including its rotation payload where the outcome admits one — so this struct cannot
+    /// pair a rotation with an outcome that never exchanged a token.
     pub(crate) outcome: RefreshEventOutcome,
-    /// Whether CC rotated the refresh token value this cycle (the AC-3 durability signal).
-    pub(crate) token_rotated: bool,
 }
 
 #[cfg(test)]

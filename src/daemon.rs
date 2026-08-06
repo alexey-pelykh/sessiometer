@@ -873,7 +873,8 @@ fn stats_events_for_poll(
 /// fresh token was PROMOTED to the canonical item, plus the cycle's non-secret classification
 /// (issue #643). The reactive caller reads only [`promoted`](Self::promoted); the proactive caller
 /// discards the result entirely; the `use`-activate recovery re-probe additionally folds
-/// [`outcome`](Self::outcome) / [`token_rotated`](Self::token_rotated) into the credential-health
+/// [`outcome`](Self::outcome) — which since issue #1004 carries the rotation signal on its
+/// refreshed variants — into the credential-health
 /// verdict via [`fold_recovery_outcome`](Daemon::fold_recovery_outcome). A dead / absent refresh
 /// token (the `!has_live_refresh_token` short-circuit) maps to `outcome = Dead` — its absence IS the
 /// dead signal — so the recovery path keeps an honest 🔴 without a doomed spawn.
@@ -881,11 +882,10 @@ struct KeepWarmPromote {
     /// Whether a fresh token was actually written to the canonical item this cycle.
     promoted: bool,
     /// The cycle's non-secret [`RefreshEventOutcome`] — `Dead` for the empty-refresh-token
-    /// short-circuit, else the classified mint result (`Error` on a could-not-run).
+    /// short-circuit, else the classified mint result (`Error` on a could-not-run). Since issue
+    /// #1004 it carries the AC-3 rotation signal on its refreshed arms, so the short-circuit and
+    /// the could-not-run have no way to report a rotation they could not have observed.
     outcome: RefreshEventOutcome,
-    /// Whether CC rotated the refresh token value this cycle (the AC-3 durability signal;
-    /// `false` for the short-circuit / could-not-run).
-    token_rotated: bool,
 }
 
 /// Current wall-clock as epoch SECONDS, the unit the #119 credential rollup and wire use
@@ -1140,10 +1140,10 @@ pub(crate) struct AccountHealth {
     /// (a cleared refresh token) check and the `--json` `last_ok` projection. `None` until
     /// a refresh has been observed. Stored as the full enum (not the reduced `last_ok`)
     /// because the rollup must distinguish a terminal `Dead` from a transient `Error`.
+    /// (Since issue #1004 this also carries the AC-3 rotation signal, on the two refreshed
+    /// variants that can have one — there is no separate `refresh_token_rotated` field to fall
+    /// out of step with it, and no way to record a rotation against a `Dead` / `Error` refresh.)
     last_refresh_outcome: Option<RefreshEventOutcome>,
-    /// Whether CC rotated the refresh-token value on the last observed refresh (issue #119,
-    /// the AC-3 durability signal). `None` until a refresh has been observed.
-    refresh_token_rotated: Option<bool>,
     /// Consecutive refresh FAILURES (`Dead` / `Error` outcomes) carried across sweeps (issue
     /// #119), reset to 0 by the next alive refresh — the rollup's `AtRisk` input.
     consecutive_refresh_failures: u32,
@@ -5426,7 +5426,7 @@ mod tests {
     use crate::keychain::FakeCredentialStore;
     // `Verbosity` is named only in test code here (the diagnostic SINK gating lives
     // in `cli`); import it test-scoped so a non-test build sees no unused import.
-    use crate::observability::{RefreshEventOutcome, Verbosity};
+    use crate::observability::{RefreshEventOutcomeKind, Verbosity};
     use crate::stash::{FakeAccountStash, StashedAccount};
     use crate::timing::Jitter;
     use std::cell::{Cell, RefCell};
@@ -6443,7 +6443,7 @@ mod tests {
                 // A fresh credential to promote ONLY on a real refresh; every other outcome
                 // hands back `None` and the daemon leaves the canonical item untouched.
                 let credential = match self.outcome {
-                    RefreshOutcome::Refreshed => self.fresh.clone(),
+                    RefreshOutcome::Refreshed { .. } => self.fresh.clone(),
                     _ => None,
                 };
                 Ok((
@@ -6451,7 +6451,6 @@ mod tests {
                         outcome: self.outcome,
                         expires_at_delta_secs: None,
                         // Only a real exchange rotates the RT; NoChange / Dead / Error never do.
-                        refresh_token_rotated: matches!(self.outcome, RefreshOutcome::Refreshed),
                         // A keep-warm PROMOTES rather than re-stashes — never `re_stashed`.
                         re_stashed: false,
                     },
@@ -14868,11 +14867,11 @@ mod tests {
         vec![
             crate::cli::AuthSubset {
                 expires_at_ms: Some((now + 7_200) * 1000),
-                last_refresh: Some(RefreshEventOutcome::Refreshed),
+                last_refresh: Some(RefreshEventOutcomeKind::Refreshed),
             },
             crate::cli::AuthSubset {
                 expires_at_ms: Some((now - 3_600) * 1000),
-                last_refresh: Some(RefreshEventOutcome::Dead),
+                last_refresh: Some(RefreshEventOutcomeKind::Dead),
             },
             crate::cli::AuthSubset {
                 expires_at_ms: None,
@@ -15221,10 +15220,9 @@ mod tests {
         corpus.push_str(
             &Event::Refresh {
                 account: B.1.to_owned(),
-                outcome: RefreshEventOutcome::Refreshed,
+                outcome: RefreshEventOutcome::Refreshed { rotated: true },
                 expires_before: Some(1_782_777_600_000),
                 expires_after: Some(1_782_784_800_000),
-                refresh_token_rotated: true, // the #279 field joins the #15 all-channels corpus
                 reason: None,
                 backoff_secs: None,
             }

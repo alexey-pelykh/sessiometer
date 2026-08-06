@@ -207,7 +207,6 @@ where
             return KeepWarmPromote {
                 promoted: false,
                 outcome: RefreshEventOutcome::Dead,
-                token_rotated: false,
             };
         }
         // Stamp the attempt up front so BOTH the proactive throttle and the
@@ -220,7 +219,6 @@ where
                 return KeepWarmPromote {
                     promoted: false,
                     outcome: RefreshEventOutcome::Error,
-                    token_rotated: false,
                 }
             }
         };
@@ -233,9 +231,11 @@ where
         // an external write is the one direction that would corrupt issue #877's answer.
         self.note_own_credential_refresh(i);
         // The cycle's non-secret classification, computed once and reused by the event + the return.
-        let (outcome, token_rotated) = match &minted {
-            Ok((report, _)) => (refresh_event_outcome(report), report.refresh_token_rotated),
-            Err(_) => (RefreshEventOutcome::Error, false),
+        // Since issue #1004 it also CARRIES the rotation flag on its refreshed arms, so there is no
+        // second value to keep in step — a keep-warm that did not exchange a token cannot report one.
+        let outcome = match &minted {
+            Ok((report, _)) => refresh_event_outcome(report),
+            Err(_) => RefreshEventOutcome::Error,
         };
         // Durably record the keep-warm ACTION (issue #282), for EVERY firing — the forensic trail
         // mirroring `refresh_retry`'s `PollRefresh`. A completed cycle maps through the shared
@@ -244,18 +244,13 @@ where
             account: self.roster[i].label.clone(),
             trigger,
             outcome,
-            refresh_token_rotated: token_rotated,
         });
         // Promote ONLY a real mint; NoChange / Dead / Error / could-not-run leave canonical as-is.
         let promoted = match minted {
             Ok((_, Some(cred))) => self.promote_canonical(i, &cred).await.unwrap_or(false),
             _ => false,
         };
-        KeepWarmPromote {
-            promoted,
-            outcome,
-            token_rotated,
-        }
+        KeepWarmPromote { promoted, outcome }
     }
 
     /// Promote a freshly-minted `cred` to the canonical `Claude Code-credentials` item for the
@@ -339,7 +334,7 @@ mod tests {
         // partition a 401 by active-ness, so a 401 takes exactly one refresh path.
         let (mut daemon, _outcomes, _calls) = keep_warm_daemon(
             Scripted::Unauthorized,
-            RefreshOutcome::Refreshed,
+            RefreshOutcome::Refreshed { rotated: true },
             None,
             Some(cred(b"FRESH-A")),
             warm_canonical(FAR_FUTURE_MS, "rt-live"),
@@ -388,7 +383,7 @@ mod tests {
         // canonical now holds the FRESH token a live session reads.
         let (mut daemon, _outcomes, calls) = keep_warm_daemon(
             Scripted::Unauthorized,
-            RefreshOutcome::Refreshed,
+            RefreshOutcome::Refreshed { rotated: true },
             Some(reading(0.10, 0.10)), // the mint REVIVES the active token
             Some(cred(b"FRESH-A")),
             warm_canonical(FAR_FUTURE_MS, "rt-live"),
@@ -419,8 +414,7 @@ mod tests {
                 account: "work".to_owned(),
                 trigger: KeepWarmTrigger::Reactive,
                 // A keep-warm promotes, so a real refresh renders `refreshed_not_restashed`.
-                outcome: RefreshEventOutcome::RefreshedNotReStashed,
-                refresh_token_rotated: true,
+                outcome: RefreshEventOutcome::RefreshedNotReStashed { rotated: true },
             }],
             "one durable keep_warm event records the reactive mint",
         );
@@ -434,7 +428,7 @@ mod tests {
         // quarantines; the escape to a live spare is preserved.
         let (mut daemon, _outcomes, calls) = keep_warm_daemon(
             Scripted::Unauthorized,
-            RefreshOutcome::Refreshed,
+            RefreshOutcome::Refreshed { rotated: true },
             Some(reading(0.10, 0.10)), // would revive IF the mint ever ran — it must not
             Some(cred(b"FRESH-A")),
             warm_canonical(FAR_FUTURE_MS, ""), // EMPTY refresh token → dead
@@ -507,7 +501,6 @@ mod tests {
                 account: "work".to_owned(),
                 trigger: KeepWarmTrigger::Reactive,
                 outcome: RefreshEventOutcome::Dead,
-                refresh_token_rotated: false,
             }],
         );
     }
@@ -520,7 +513,7 @@ mod tests {
         // one. The mint fired once (no storm) and the canonical carries the fresh token.
         let (mut daemon, _outcomes, calls) = keep_warm_daemon(
             Scripted::Unauthorized,
-            RefreshOutcome::Refreshed,
+            RefreshOutcome::Refreshed { rotated: true },
             Some(reading(0.10, 0.10)),
             Some(cred(b"FRESH-A")),
             warm_canonical(FAR_FUTURE_MS, "rt-live"),
@@ -566,7 +559,7 @@ mod tests {
         let canonical = warm_canonical(now_ms + 60_000, "rt-live");
         let (mut daemon, _outcomes, calls) = keep_warm_daemon(
             Scripted::Ok(reading(0.10, 0.10)),
-            RefreshOutcome::Refreshed,
+            RefreshOutcome::Refreshed { rotated: true },
             None,
             Some(cred(b"FRESH-A")),
             canonical.clone(),
@@ -599,8 +592,7 @@ mod tests {
             vec![Event::KeepWarm {
                 account: "work".to_owned(),
                 trigger: KeepWarmTrigger::Proactive,
-                outcome: RefreshEventOutcome::RefreshedNotReStashed,
-                refresh_token_rotated: true,
+                outcome: RefreshEventOutcome::RefreshedNotReStashed { rotated: true },
             }],
         );
     }
@@ -622,7 +614,7 @@ mod tests {
         let fresh_expiry_ms = now_ms + 7 * 3_600_000;
         let (mut daemon, _outcomes, calls) = keep_warm_daemon(
             Scripted::Ok(reading(0.10, 0.10)),
-            RefreshOutcome::Refreshed,
+            RefreshOutcome::Refreshed { rotated: true },
             None,
             Some(warm_canonical(fresh_expiry_ms, "rt-live")),
             canonical.clone(),
@@ -687,7 +679,7 @@ mod tests {
         let canonical = warm_canonical(now_ms + 60_000, "");
         let (mut daemon, _outcomes, calls) = keep_warm_daemon(
             Scripted::Ok(reading(0.10, 0.10)),
-            RefreshOutcome::Refreshed,
+            RefreshOutcome::Refreshed { rotated: true },
             None,
             Some(warm_canonical(now_ms + 7 * 3_600_000, "rt-live")),
             canonical.clone(),
@@ -731,7 +723,7 @@ mod tests {
         let canonical = warm_canonical(now_ms + 60_000, "rt-live"); // near expiry…
         let (mut daemon, _outcomes, calls) = keep_warm_daemon(
             Scripted::Ok(reading(0.10, 0.10)),
-            RefreshOutcome::Refreshed,
+            RefreshOutcome::Refreshed { rotated: true },
             None,
             Some(cred(b"FRESH-A")),
             canonical.clone(),
@@ -774,7 +766,7 @@ mod tests {
         let canonical = warm_canonical(now_ms + 60_000, "rt-live");
         let (daemon, _outcomes, calls) = keep_warm_daemon(
             Scripted::Ok(reading(0.10, 0.10)),
-            RefreshOutcome::Refreshed,
+            RefreshOutcome::Refreshed { rotated: true },
             None,
             Some(cred(b"FRESH-A")),
             canonical.clone(),
@@ -828,7 +820,7 @@ mod tests {
         let canonical = warm_canonical(now_ms + 60_000, "rt-live");
         let (mut daemon, _outcomes, calls) = keep_warm_daemon(
             Scripted::Ok(reading(0.10, 0.10)),
-            RefreshOutcome::Refreshed,
+            RefreshOutcome::Refreshed { rotated: true },
             None,
             Some(cred(b"FRESH-A")),
             canonical.clone(),
@@ -865,7 +857,7 @@ mod tests {
         // — never clobbering the concurrent swap.
         let (mut daemon, _outcomes, _calls) = keep_warm_daemon(
             Scripted::Ok(reading(0.10, 0.10)),
-            RefreshOutcome::Refreshed,
+            RefreshOutcome::Refreshed { rotated: true },
             None,
             Some(cred(b"FRESH-A")),
             warm_canonical(FAR_FUTURE_MS, "rt-live"),
@@ -898,7 +890,7 @@ mod tests {
         // emits nothing (no ReStash / UncapturedLogin).
         let (mut daemon, _outcomes, _calls) = keep_warm_daemon(
             Scripted::Ok(reading(0.10, 0.10)),
-            RefreshOutcome::Refreshed,
+            RefreshOutcome::Refreshed { rotated: true },
             None,
             Some(cred(b"FRESH-A")),
             warm_canonical(FAR_FUTURE_MS, "rt-live"),
@@ -969,7 +961,7 @@ mod tests {
         let near = wall_clock_now_ms() + 60_000; // 60 s to expiry → inside the horizon
         let (mut daemon, _outcomes, calls) = keep_warm_daemon(
             Scripted::Unauthorized, // the active account 401s this tick
-            RefreshOutcome::Refreshed,
+            RefreshOutcome::Refreshed { rotated: true },
             Some(reading(0.10, 0.10)), // the reactive mint revives it
             Some(cred(b"FRESH-A")),
             warm_canonical(near, "rt-live"),
@@ -999,7 +991,7 @@ mod tests {
         // 401ing even after the promote.
         let (mut daemon, _outcomes, calls) = keep_warm_daemon(
             Scripted::Unauthorized,
-            RefreshOutcome::Refreshed,
+            RefreshOutcome::Refreshed { rotated: true },
             None, // the mint promotes a fresh token but does NOT revive the poll outcome
             Some(cred(b"FRESH-A")),
             warm_canonical(FAR_FUTURE_MS, "rt-live"),
@@ -1036,7 +1028,7 @@ mod tests {
         let lock_dir = tempfile::tempdir().unwrap();
         let (mut daemon, _outcomes, _calls) = keep_warm_daemon(
             Scripted::Ok(reading(0.10, 0.10)),
-            RefreshOutcome::Refreshed,
+            RefreshOutcome::Refreshed { rotated: true },
             None,
             Some(cred(b"FRESH-A")),
             warm_canonical(FAR_FUTURE_MS, "rt-live"),

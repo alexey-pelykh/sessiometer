@@ -225,7 +225,17 @@ const MINIMAL_CLAUDE_JSON: &[u8] = b"{}\n";
 pub(crate) enum RefreshOutcome {
     /// CC slid the expiry forward past the back-dated marker — a fresh token, which
     /// is re-stashed (CAS-permitting).
-    Refreshed,
+    ///
+    /// Carries `rotated` — whether the after refresh token DIFFERS from the seeded one
+    /// (the AC-3 durability signal) — as a PAYLOAD rather than a sibling field, because
+    /// the compare is only meaningful where an exchange actually happened (issue #1004).
+    /// On every other variant there is no exchange to have rotated anything: the compare
+    /// still *evaluates* (`Dead` clears the token in place, so it trivially "differs"),
+    /// which is exactly how a `dead` line came to claim `rotated=true` while its own
+    /// `window_secs=0` proved no exchange occurred. Making the pairing a variant payload
+    /// removes the state from the type rather than merely leaving it unprinted, so no
+    /// downstream emitter can reintroduce it at the formatting layer.
+    Refreshed { rotated: bool },
     /// CC returned the seeded token unchanged — no refresh happened. Not re-stashed.
     NoChange,
     /// CC cleared the refresh token in place (`refreshToken == ""`) — it is dead and
@@ -277,8 +287,10 @@ pub(crate) enum RefreshErrorReason {
 /// Every field is **non-secret** (a classification, an integer delta in seconds,
 /// booleans), so it is safe to hand a caller to log; the redaction-METER test below
 /// proves a cycle handling a known secret leaks none of it into this report. The
-/// `expires_at_delta_secs` + `refresh_token_rotated` pair is the AC-3 durable-TTL
-/// telemetry (the module docs).
+/// `expires_at_delta_secs` + [`RefreshOutcome::Refreshed`]'s `rotated` payload pair is the
+/// AC-3 durable-TTL telemetry (the module docs). Both live where they are MEANINGFUL: the
+/// delta is `None` off the refreshed path, and the rotation flag is not reachable at all
+/// there (issue #1004) — it is a field of the `Refreshed` variant, not of this struct.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RefreshReport {
@@ -289,10 +301,6 @@ pub(crate) struct RefreshReport {
     /// cycles ⇒ sliding window; shrinking toward zero ⇒ a cap). `None` for any
     /// non-`Refreshed` outcome, or when no usable before/after expiry was read.
     pub(crate) expires_at_delta_secs: Option<i64>,
-    /// Whether CC **rotated** the refresh token (the after RT differs from the seeded
-    /// RT) — the other half of the AC-3 durability signal. Carries only the boolean,
-    /// never either token value.
-    pub(crate) refresh_token_rotated: bool,
     /// Whether the CAS re-stash actually wrote (only on `Refreshed`, and only when the
     /// account's stored credential was unchanged since the cycle began).
     pub(crate) re_stashed: bool,
@@ -307,7 +315,6 @@ impl RefreshReport {
         Self {
             outcome: RefreshOutcome::Error(RefreshErrorReason::Malformed),
             expires_at_delta_secs: None,
-            refresh_token_rotated: false,
             re_stashed: false,
         }
     }
@@ -424,17 +431,14 @@ fn backdate(blob: &[u8], now_ms: i64) -> Option<Zeroizing<Vec<u8>>> {
 
 /// Classify one cycle (issue #102 step 6) and compute the AC-3 telemetry, reading
 /// `original` (the pre-refresh stored blob), `seeded` (the back-dated blob handed to
-/// CC) and `after` (the read-back). Returns `(outcome, expires_at_delta_secs,
-/// refresh_token_rotated)`.
+/// CC) and `after` (the read-back). Returns `(outcome, expires_at_delta_secs)` — the
+/// rotation flag rides INSIDE [`RefreshOutcome::Refreshed`], the only classification
+/// for which it means anything (issue #1004).
 ///
 /// The refresh-token VALUES never escape this function — they live only in `Zeroizing`
 /// temporaries used for the emptiness check (the DEAD signal) and the rotation compare.
-fn classify(original: &[u8], seeded: &[u8], after: &[u8]) -> (RefreshOutcome, Option<i64>, bool) {
+fn classify(original: &[u8], seeded: &[u8], after: &[u8]) -> (RefreshOutcome, Option<i64>) {
     let after_rt = refresh_token(after);
-    let rotated = match (refresh_token(seeded), &after_rt) {
-        (Some(seeded_rt), Some(after_rt)) => seeded_rt.as_slice() != after_rt.as_slice(),
-        _ => false,
-    };
     let after_exp = expires_at(after);
     let seeded_exp = expires_at(seeded);
 
@@ -445,9 +449,22 @@ fn classify(original: &[u8], seeded: &[u8], after: &[u8]) -> (RefreshOutcome, Op
         Some(rt) if rt.is_empty() => RefreshOutcome::Dead,
         // A non-empty refresh token: did the expiry slide forward past our back-dated
         // marker (CC refreshed) or stay at it (no refresh)?
-        Some(_) => match (after_exp, seeded_exp) {
+        Some(after_rt) => match (after_exp, seeded_exp) {
             (Some(after_exp), Some(seeded_exp)) if after_exp > seeded_exp => {
-                RefreshOutcome::Refreshed
+                // An exchange DEMONSTRABLY happened (the expiry slid past the marker), so
+                // here — and only here — a seeded-vs-after refresh-token difference is
+                // EVIDENCE of a rotation rather than an artifact of something else having
+                // rewritten the token (issue #1004). Computed inside this arm so the
+                // meaningless combination is never even constructed: `Dead` clears the
+                // token in place and would compare as "different" every single time.
+                RefreshOutcome::Refreshed {
+                    rotated: match refresh_token(seeded) {
+                        Some(seeded_rt) => seeded_rt.as_slice() != after_rt.as_slice(),
+                        // No parseable seeded token to compare against — no evidence of a
+                        // rotation, so claim none.
+                        None => false,
+                    },
+                }
             }
             (Some(_), Some(_)) => RefreshOutcome::NoChange,
             // The expiry was unreadable on one side — cannot tell refreshed from not; the
@@ -459,7 +476,7 @@ fn classify(original: &[u8], seeded: &[u8], after: &[u8]) -> (RefreshOutcome, Op
     // The sliding-vs-cap delta (#101 AC-3) is meaningful only on a successful refresh:
     // how far the REAL window moved, measured against the original (pre-back-date)
     // expiry, in seconds.
-    let delta = if outcome == RefreshOutcome::Refreshed {
+    let delta = if matches!(outcome, RefreshOutcome::Refreshed { .. }) {
         match (after_exp, expires_at(original)) {
             (Some(after_exp), Some(original_exp)) => Some((after_exp - original_exp) / 1000),
             _ => None,
@@ -468,7 +485,7 @@ fn classify(original: &[u8], seeded: &[u8], after: &[u8]) -> (RefreshOutcome, Op
         None
     };
 
-    (outcome, delta, rotated)
+    (outcome, delta)
 }
 
 /// Current wall-clock as epoch milliseconds (the unit CC's `expiresAt` uses). A
@@ -511,7 +528,7 @@ async fn mint_isolated<K, R>(
     spawner: &R,
     seed: &[u8],
     original: &[u8],
-) -> Result<(RefreshOutcome, Option<i64>, bool, Option<Credential>)>
+) -> Result<(RefreshOutcome, Option<i64>, Option<Credential>)>
 where
     K: IsolatedKeychain,
     R: ClaudeRefresh,
@@ -528,7 +545,6 @@ where
         return Ok((
             RefreshOutcome::Error(RefreshErrorReason::SpawnFailed),
             None,
-            false,
             None,
         ));
     }
@@ -542,15 +558,14 @@ where
             return Ok((
                 RefreshOutcome::Error(RefreshErrorReason::ReadbackUnreadable),
                 None,
-                false,
                 None,
             ))
         }
     };
 
     // STEP 6: classify before/after (the secret RT/blob never escape `classify`).
-    let (outcome, delta, rotated) = classify(original, seed, after.expose());
-    Ok((outcome, delta, rotated, Some(after)))
+    let (outcome, delta) = classify(original, seed, after.expose());
+    Ok((outcome, delta, Some(after)))
 }
 
 /// Steps 3b–7 of the parked cycle, run while the [`IsolatedSession`] guard is armed so a
@@ -574,7 +589,7 @@ where
     R: ClaudeRefresh,
 {
     // STEPS 3b–6 (shared mint): seed → spawn → read-back → classify.
-    let (outcome, delta, rotated, after) =
+    let (outcome, delta, after) =
         mint_isolated(session, spawner, seed, snapshot.credential.expose()).await?;
 
     // STEP 7 (lock held only here): CAS re-stash. ONLY on a fresh token, and ONLY if the
@@ -582,7 +597,7 @@ where
     // login re-stashed it and is authoritative, so discard. Identity is preserved from
     // the snapshot; the real stash is the LAST write. (Dead/NoChange/Error ⇒ no write.)
     let re_stashed = match (outcome, after) {
-        (RefreshOutcome::Refreshed, Some(after)) => {
+        (RefreshOutcome::Refreshed { .. }, Some(after)) => {
             let _lock = acquire_swap_lock(lock).await?;
             let current = stash.read(stash_service).await?;
             if current.credential.matches(&snapshot.credential) {
@@ -606,7 +621,6 @@ where
     Ok(RefreshReport {
         outcome,
         expires_at_delta_secs: delta,
-        refresh_token_rotated: rotated,
         re_stashed,
     })
 }
@@ -757,19 +771,18 @@ where
     // STEPS 3b–6 (shared mint), then teardown ALWAYS — even on the `?` hard-error path.
     let result = mint_isolated(&session, spawner, &seed, canonical).await;
     session.teardown().await;
-    let (outcome, delta, rotated, after) = result?;
+    let (outcome, delta, after) = result?;
 
     // Hand the fresh token back ONLY on a real refresh; the daemon promotes it to canonical.
     // NoChange / Dead / Error yield no credential and the canonical item is left as-is.
     let credential = match outcome {
-        RefreshOutcome::Refreshed => after,
+        RefreshOutcome::Refreshed { .. } => after,
         _ => None,
     };
     Ok((
         RefreshReport {
             outcome,
             expires_at_delta_secs: delta,
-            refresh_token_rotated: rotated,
             // Keep-warm never re-stashes: the daemon promotes the returned token to canonical.
             re_stashed: false,
         },
@@ -1386,20 +1399,46 @@ mod tests {
         let seeded = backdate(&original, NOW_MS).unwrap();
         // Refreshed: a non-empty RT and the expiry slid forward past the seed.
         let refreshed = blob(NOW_MS + 3_600_000, "sk-ant-ort-NEW");
-        let (o, delta, rotated) = classify(&original, &seeded, &refreshed);
-        assert_eq!(o, RefreshOutcome::Refreshed);
+        let (o, delta) = classify(&original, &seeded, &refreshed);
+        assert_eq!(o, RefreshOutcome::Refreshed { rotated: true });
         assert!(delta.is_some());
-        assert!(rotated);
-        // Dead: the RT was cleared in place.
-        let (o, _, _) = classify(&original, &seeded, &blob(NOW_MS, ""));
+        // Dead: the RT was cleared in place. The cleared token is TRIVIALLY "different" from
+        // the seeded one, which is precisely why `Dead` carries no rotation flag to be wrong
+        // about (issue #1004) — the compare is not reached on this arm at all.
+        let (o, _) = classify(&original, &seeded, &blob(NOW_MS, ""));
         assert_eq!(o, RefreshOutcome::Dead);
         // NoChange: a valid RT but the expiry did not move past the seed.
-        let (o, delta, _) = classify(&original, &seeded, &seeded);
+        let (o, delta) = classify(&original, &seeded, &seeded);
         assert_eq!(o, RefreshOutcome::NoChange);
         assert_eq!(delta, None, "no delta unless refreshed");
         // Error: the read-back is unparseable → a malformed read-back blob (#377).
-        let (o, _, _) = classify(&original, &seeded, b"garbage");
+        let (o, _) = classify(&original, &seeded, b"garbage");
         assert_eq!(o, RefreshOutcome::Error(RefreshErrorReason::Malformed));
+    }
+
+    /// Issue #1004: a DEAD cycle carries no rotation claim, even though the underlying
+    /// seeded-vs-after token compare it used to run would have said "rotated" — CC clears the
+    /// refresh token in place, so the after value differs from the seeded one every time.
+    ///
+    /// This is the regression this whole change exists to prevent, and it is asserted on the
+    /// TYPE rather than on a rendered string: `RefreshOutcome::Dead` has no field to hold the
+    /// flag, so a future edit that wants to re-introduce it has to change the enum — which is
+    /// the review conversation the old `let rotated = ...` above the match never triggered.
+    #[test]
+    fn a_dead_cycle_carries_no_rotation_claim_though_the_raw_compare_would_differ() {
+        let original = blob(NOW_MS + 300_000, "sk-ant-ort-ORIG");
+        let seeded = backdate(&original, NOW_MS).unwrap();
+        // The read-back clears the RT in place: "" != "sk-ant-ort-ORIG", so a compare run
+        // before the outcome is known reports a rotation on a cycle that exchanged nothing.
+        let (o, delta) = classify(&original, &seeded, &blob(NOW_MS, ""));
+        assert_eq!(o, RefreshOutcome::Dead);
+        assert_eq!(delta, None, "a dead cycle slid no window");
+        // The rotation flag is reachable ONLY through the `Refreshed` variant, so there is no
+        // value here to assert against — its ABSENCE is the guarantee.
+        assert!(
+            !matches!(o, RefreshOutcome::Refreshed { .. }),
+            "a dead cycle must not classify as refreshed"
+        );
     }
 
     #[test]
@@ -1408,9 +1447,12 @@ mod tests {
         let seeded = backdate(&original, NOW_MS).unwrap();
         // Same RT, slid expiry → refreshed but NOT rotated.
         let refreshed = blob(NOW_MS + 3_600_000, "sk-ant-ort-SAME");
-        let (o, _, rotated) = classify(&original, &seeded, &refreshed);
-        assert_eq!(o, RefreshOutcome::Refreshed);
-        assert!(!rotated, "an unchanged refresh token is not a rotation");
+        let (o, _) = classify(&original, &seeded, &refreshed);
+        assert_eq!(
+            o,
+            RefreshOutcome::Refreshed { rotated: false },
+            "an unchanged refresh token is not a rotation"
+        );
     }
 
     // --- the engine, end to end (hermetic, fakes) --------------------------------
@@ -1430,9 +1472,8 @@ mod tests {
 
         let report = run_cycle(&stash, keychain, &spawner).await.unwrap();
 
-        assert_eq!(report.outcome, RefreshOutcome::Refreshed);
+        assert_eq!(report.outcome, RefreshOutcome::Refreshed { rotated: true });
         assert!(report.re_stashed);
-        assert!(report.refresh_token_rotated);
         assert!(report.expires_at_delta_secs.unwrap() > 0);
         // The stash now holds the FRESH token, and the identity is preserved.
         let restashed = stash.read(STASH).await.unwrap();
@@ -1575,7 +1616,7 @@ mod tests {
             .unwrap();
 
         // The cycle SAW a refresh, but the CAS guard discarded the re-stash…
-        assert_eq!(report.outcome, RefreshOutcome::Refreshed);
+        assert_eq!(report.outcome, RefreshOutcome::Refreshed { rotated: true });
         assert!(
             !report.re_stashed,
             "a concurrently-changed stash must win the CAS"
@@ -1625,7 +1666,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(report.outcome, RefreshOutcome::Refreshed);
+        assert_eq!(report.outcome, RefreshOutcome::Refreshed { rotated: true });
         assert_eq!(
             *observed.borrow(),
             Some(true),
@@ -2063,7 +2104,7 @@ mod tests {
         );
 
         let report = run_cycle(&stash, keychain, &spawner).await.unwrap();
-        assert_eq!(report.outcome, RefreshOutcome::Refreshed);
+        assert_eq!(report.outcome, RefreshOutcome::Refreshed { rotated: true });
 
         // Channel 1 — the engine's in-process output: the RefreshReport's full Debug rendering.
         crate::redaction::meter::assert_clean(&format!("{report:?}"), &secrets, &[]);

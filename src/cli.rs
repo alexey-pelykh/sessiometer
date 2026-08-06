@@ -33,7 +33,7 @@ use crate::keychain::{Credential, CredentialStore, RealCredentialStore};
 use crate::migration::{ManagedAccount, MigrationArtifact, Passphrase, Payload, PLAINTEXT_WARNING};
 use crate::observability::{
     CredentialHealth, Diagnostic, DiagnosticLog, Event, EventLog, ExpiryHorizon, ExportMode,
-    RefreshEventOutcome, Verbosity,
+    RefreshEventOutcomeKind, Verbosity,
 };
 use crate::paths;
 use crate::refresh;
@@ -5118,10 +5118,10 @@ pub(crate) struct AuthSubset {
     /// access token, or `None` when the stash is unreadable (locked keychain, absent
     /// item) or carries no parseable expiry.
     pub(crate) expires_at_ms: Option<i64>,
-    /// The account's most recent persisted [`RefreshEventOutcome`], or `None` when the
+    /// The account's most recent persisted [`RefreshEventOutcomeKind`], or `None` when the
     /// event log records no refresh for it (the common case while the opt-in `[refresh]`
     /// tick, #105, is off).
-    pub(crate) last_refresh: Option<RefreshEventOutcome>,
+    pub(crate) last_refresh: Option<RefreshEventOutcomeKind>,
 }
 
 /// Read the offline auth subset for each roster account (issue #120), returned PARALLEL
@@ -5247,14 +5247,14 @@ fn expiry_tag(expires_at_ms: Option<i64>, now_secs: i64) -> Option<String> {
 
 /// The last-persisted refresh-outcome tag for one account (issue #120), or `None` when
 /// no refresh was ever recorded (so [`auth_tags`] omits it). Rendered in the SAME token
-/// the event log writes ([`RefreshEventOutcome::as_str`]) so it cross-references a
+/// the event log writes ([`RefreshEventOutcomeKind::as_str`]) so it cross-references a
 /// `sessiometer.log` the operator may grep. A `dead` outcome trails the actionable
 /// `claude /login` cue — the offline echo of `status`'s dead-credential cue (#119) —
 /// since a daemon-down `list` is exactly where an operator meets a dead refresh token.
-fn refresh_tag(last_refresh: Option<RefreshEventOutcome>) -> Option<String> {
+fn refresh_tag(last_refresh: Option<RefreshEventOutcomeKind>) -> Option<String> {
     let outcome = last_refresh?;
     let mut tag = format!("last refresh: {}", outcome.as_str());
-    if outcome == RefreshEventOutcome::Dead {
+    if outcome == RefreshEventOutcomeKind::Dead {
         // The exact command `status`'s health cell prints (#119), so both views point
         // an operator at the same fix.
         tag.push_str(" — claude /login");
@@ -5421,7 +5421,10 @@ mod tests {
     }
 
     /// One known auth subset, for the issue-#120 tag tests.
-    fn auth(expires_at_ms: Option<i64>, last_refresh: Option<RefreshEventOutcome>) -> AuthSubset {
+    fn auth(
+        expires_at_ms: Option<i64>,
+        last_refresh: Option<RefreshEventOutcomeKind>,
+    ) -> AuthSubset {
         AuthSubset {
             expires_at_ms,
             last_refresh,
@@ -5547,7 +5550,7 @@ personal  22222222-2222-2222-2222-222222222222\n\
         // value, not a leak — see issue #69.)
         let out = render_roster(
             &[acct("work", "11111111-1111-1111-1111-111111111111")],
-            &[auth(Some(7_200_000), Some(RefreshEventOutcome::Dead))],
+            &[auth(Some(7_200_000), Some(RefreshEventOutcomeKind::Dead))],
             1,
         );
         assert!(
@@ -5586,7 +5589,10 @@ spare  22222222-2222\n\
         // now=0; expiry 7200s out → "2h"; a `refreshed` outcome.
         let out = render_roster(
             &[acct("work", "11111111-1111")],
-            &[auth(Some(7_200_000), Some(RefreshEventOutcome::Refreshed))],
+            &[auth(
+                Some(7_200_000),
+                Some(RefreshEventOutcomeKind::Refreshed),
+            )],
             0,
         );
         assert_eq!(
@@ -5611,7 +5617,10 @@ spare  22222222-2222\n\
         work.enabled = false;
         let out = render_roster(
             &[work],
-            &[auth(Some(7_200_000), Some(RefreshEventOutcome::NoChange))],
+            &[auth(
+                Some(7_200_000),
+                Some(RefreshEventOutcomeKind::NoChange),
+            )],
             0,
         );
         assert_eq!(
@@ -5640,15 +5649,15 @@ spare  22222222-2222\n\
         // The tag reuses the event log's token (so it cross-references `sessiometer.log`),
         // and a `dead` outcome trails the actionable `claude /login` cue (#119 parity).
         assert_eq!(
-            refresh_tag(Some(RefreshEventOutcome::Refreshed)).as_deref(),
+            refresh_tag(Some(RefreshEventOutcomeKind::Refreshed)).as_deref(),
             Some("last refresh: refreshed")
         );
         assert_eq!(
-            refresh_tag(Some(RefreshEventOutcome::RefreshedNotReStashed)).as_deref(),
+            refresh_tag(Some(RefreshEventOutcomeKind::RefreshedNotReStashed)).as_deref(),
             Some("last refresh: refreshed_not_restashed")
         );
         assert_eq!(
-            refresh_tag(Some(RefreshEventOutcome::Dead)).as_deref(),
+            refresh_tag(Some(RefreshEventOutcomeKind::Dead)).as_deref(),
             Some("last refresh: dead — claude /login")
         );
         assert_eq!(refresh_tag(None), None);
