@@ -104,11 +104,11 @@ pub(crate) struct StatusSnapshot {
 /// The non-secret refresh-health inputs `status` surfaces in `--json` (issue #119): the
 /// daemon's reduced projection of the refresh observations its per-account health state
 /// carries — whether the last refresh kept the credential alive, whether CC rotated the
-/// refresh-token VALUE, and the consecutive-failure streak. `None` (the whole struct) until
-/// the refresh engine has observed the account at least once (e.g. the `[refresh]` feature
-/// is off, or the account has not yet been swept). Every field is a boolean / count — never
-/// a token or expiry (the #15 discipline). Derives `Deserialize` so the `status` client can
-/// read it back; `#[serde(default)]` on the carrying field handles a pre-#119 daemon.
+/// refresh-token VALUE where an exchange ran at all, and the consecutive-failure streak. `None`
+/// (the whole struct) until the refresh engine has observed the account at least once (e.g. the
+/// `[refresh]` feature is off, or the account has not yet been swept). Every field is a boolean /
+/// count — never a token or expiry (the #15 discipline). Derives `Deserialize` so the `status`
+/// client can read it back; `#[serde(default)]` on the carrying field handles a pre-#119 daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RefreshHealth {
     /// Whether the LAST observed refresh kept the credential ALIVE (`refreshed` /
@@ -119,7 +119,27 @@ pub(crate) struct RefreshHealth {
     /// signal) — the boolean only, never either token value. Named `rotated` (not
     /// `token_rotated`) so the `--json` field carries no `token` substring that a coarse
     /// #15 leak-proxy (`!contains("token")`) could false-positive on.
-    pub(crate) rotated: bool,
+    ///
+    /// `None`, and OMITTED from the wire, on every outcome that ran no token exchange —
+    /// `no_change`, `dead`, `error` (issue #1070). Rotation is decided by comparing the seeded
+    /// refresh token against the one that came back, so an outcome with no exchange has no such
+    /// pair to compare and any value here would be fabricated, not observed. `Some(false)` is
+    /// therefore a real measurement ("an exchange ran and returned the same token"), which is
+    /// exactly what absence is not — the distinction the pre-#1070 `bool` could not draw, and the
+    /// reason R-5a called the derived `false` "the exact uninformative value R-5 removes, now on a
+    /// versioned surface".
+    ///
+    /// The sole constructor is [`refresh_health_view`], which reads it off
+    /// [`RefreshEventOutcome::rotated`] — the same accessor the three log lines use, so the wire
+    /// and the log cannot disagree about which outcomes carry the signal. Note what the shape does
+    /// and does not buy: the LITERAL `RefreshHealth { last_ok: false, rotated: true }` the issue
+    /// names no longer type-checks, but `last_ok` and `rotated` remain independent fields, so
+    /// `rotated: Some(_)` beside `last_ok: false` is still expressible by a hand-written
+    /// construction. Nothing in the daemon writes one — and
+    /// `refresh_health_view_never_pairs_a_rotation_with_a_non_refreshed_outcome` pins that across
+    /// every variant — but the guarantee is a constructor invariant, not a type-level one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) rotated: Option<bool>,
     /// Consecutive refresh FAILURES (`dead` / `error` outcomes), reset to 0 by the next
     /// alive refresh — the rollup's at-risk input.
     pub(crate) consecutive_failures: u32,
@@ -496,9 +516,28 @@ pub(crate) struct SchemaVersion {
 /// `canonical_scrub`, both likewise fleet-wide). Takes the omit-when-absent pattern: via
 /// `skip_serializing_if` an ungrouped roster's bytes are unchanged, so a fleet with no synchronized
 /// deadlines still serializes exactly as it did at 1.12. A pre-#879 client ignores both keys.
+/// `1.14` made the per-account [`RefreshHealth::rotated`] OPTIONAL and (via `skip_serializing_if`)
+/// omitted entirely on every outcome that ran no token exchange (issue #1070, closing the fourth
+/// surface #1004 deferred). The three log lines already carry `rotated=` only where an exchange
+/// happened, because #1004 moved the payload INSIDE the refreshed variants; this brings the wire to
+/// the same rule, so the uninformative `"rotated": false` R-5a objected to on a versioned surface is
+/// gone. A refreshed account still carries the AC-3 durability signal in both directions
+/// (`"rotated": true` / `false`) — the signal is preserved, only the fabricated value is dropped.
+///
+/// **This is the one entry that RESHAPES an existing key rather than adding a new one, so its
+/// forward-compat is asymmetric — deliberately, and unlike the omit-when-absent siblings above.** A
+/// pre-#1070 client typed the key as REQUIRED, so a 1.14 daemon's non-refreshed frame does not
+/// decode against it (Swift `WatchStatusStore` drops the line). The Rust `status` client is immune
+/// by construction — it ships in the same binary as the daemon it reads — so the exposure is exactly
+/// one consumer, the separately-installed menubar app, which this bump updates in lockstep. The
+/// bump is MINOR because [`SchemaVersion`] support gates on the MAJOR and the reshape is the
+/// narrowest one that removes the false value; an operator running a 1.14 daemon against a
+/// pre-#1070 app must update the app, which is the same lockstep every wire change here already
+/// assumes. The reverse direction is clean: a 1.14 client reading a ≤1.13 daemon decodes the
+/// always-present key as `Some(_)`.
 pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion {
     major: 1,
-    minor: 13,
+    minor: 14,
 };
 
 /// The control socket's `status` reply PAYLOAD — handles + percentages + the forward-looking
@@ -1400,25 +1439,22 @@ pub(crate) fn refresh_health_view(health: &AccountHealth) -> Option<RefreshHealt
                 | RefreshEventOutcome::RefreshedNotReStashed { .. }
                 | RefreshEventOutcome::NoChange
         ),
-        // Derived from the outcome rather than carried beside it (issue #1004): an outcome that
-        // exchanged no token reports no rotation, so `rotated` is `false` here by construction
-        // instead of the `true`-by-construction value the old sibling field supplied. The wire
-        // keeps its SHAPE (a plain bool, always present), so this is a value correction, not a
-        // schema change — no `STATUS_SCHEMA_VERSION` bump, no golden or Swift-fixture churn.
+        // Read straight off the carried outcome, `None` and all (issue #1070) — the SAME accessor
+        // the three `rotated=` log lines use, so no fourth rule exists for the wire to drift from.
+        // #1004 removed the FALSE claim here by deriving the value instead of carrying it beside
+        // the outcome, but stopped at `.unwrap_or(false)`: R-5a reserved the bump-or-keep call
+        // ("which path is taken is a decision this scope has not made; it is not resolvable by an
+        // implementer choosing the compiling one"), and the surviving `false` on every
+        // `no_change` / `dead` / `error` account was "the exact uninformative value R-5 removes,
+        // now on a versioned surface".
         //
-        // PARTIAL against AC-5, DELIBERATELY. AC-5 asks that none of the FOUR emitting surfaces
-        // "presents `rotated` as an observation", and R-5a reads the surviving `false` here as
-        // "the exact uninformative value R-5 removes, now on a versioned surface". Fully clearing
-        // it means dropping the field, which is a `STATUS_SCHEMA_VERSION` change carrying the
-        // status/watch goldens plus the Swift fixtures and `WireDecoderTests` assertions
-        // (`apps/menubar/Sources/WireModel.swift` decodes `rotated` as a NON-optional `Bool`, so
-        // omitting it is a breaking decode change, not an additive one).
-        //
-        // R-5a states in terms that "which path is taken is a decision this scope has not made;
-        // it is not resolvable by an implementer choosing the compiling one" — so this stops at
-        // the change that is unambiguously an improvement (the FALSE claim is gone from all four
-        // surfaces) and leaves the bump-or-keep call to its owner rather than settling it here.
-        rotated: outcome.rotated().unwrap_or(false),
+        // That decision was made on 2026-08-06 (issue #1070): make it optional, present only where
+        // an exchange ran. Dropping the `.unwrap_or` is the whole of it here — the accessor already
+        // returns exactly the `Option` the wire now wants — and it completes AC-5 across all four
+        // emitting surfaces. The cost is a MINOR `STATUS_SCHEMA_VERSION` bump (1.13 → 1.14) with
+        // the five status/watch goldens regenerated and the Swift mirror re-typed to `Bool?`; see
+        // [`STATUS_SCHEMA_VERSION`] for why minor, and for the one asymmetric consequence.
+        rotated: outcome.rotated(),
         consecutive_failures: health.consecutive_refresh_failures,
     })
 }
