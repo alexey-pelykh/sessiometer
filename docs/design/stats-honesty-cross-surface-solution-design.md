@@ -1,6 +1,6 @@
 ---
 title: Stats Honesty — Solution Design
-source: ../requirements/stats-honesty-cross-surface.md
+source: docs/requirements/stats-honesty-cross-surface.md
 created: 2026-08-04
 status: locked   # operator-ratified; dual-lens gate was single-actor (see § Design Lock)
 tracks:

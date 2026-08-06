@@ -4,7 +4,7 @@ scope: menubar-panel-presentation
 created: 2026-07-30
 status: draft
 dor_status: passed-with-findings
-source: .tmp/findings-for-scope.md (/investigate 2026-07-30)
+source: /investigate 2026-07-30; findings were transient scratch, not retained
 formulation:
   technical-architecture: complete
   ux-ia: complete
@@ -18,11 +18,9 @@ features:
   axis-disposition-gate: {stage: design, tracks: {testing-architecture: complete}}
 artifacts:
   design-doc: docs/design/panel-presentation-reference-coverage-solution-design.md
-  # The two briefs below are TRANSIENT pipeline scratch and are deliberately NOT committed --
-  # they will not resolve in a fresh clone. Recorded as provenance only; nothing downstream
-  # may dereference them. This PRD and the design doc are self-contained.
-  design-brief: docs/briefs/2026-07-30-design-presentation-reference-coverage.md   # uncommitted, provenance only
-  requirements-brief: docs/briefs/2026-07-30-requirements-panel-presentation-reference-coverage.md   # uncommitted, provenance only
+  # No design-brief or requirements-brief keys: this PRD's pipeline run never wrote them. The keys
+  # previously here named files that have never existed anywhere, in this repo or on any disk —
+  # a pointer with no referent is not provenance, it is a claim of provenance (issue #1063).
 ---
 
 # PRD — Panel & Brand Presentation Reference Coverage

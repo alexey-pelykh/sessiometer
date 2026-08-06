@@ -4,10 +4,10 @@ scope: migration-export-import
 created: 2026-08-04
 status: draft
 dor_status: passed-with-findings
-source: .tmp/scopes/migration-credential-portability.md (/investigate + /scope 2026-07-31 → 2026-08-04)
-# Private HQ; REQ-MIG-* family. Provenance only — the sibling checkout is not guaranteed present, so
-# nothing here may be dereferenced as a build reference. R-10 SUPERSEDES REQ-MIG-B-007; see R-10.
-parent-requirements: ../hq/strategy/prd-export-import.md
+source: /investigate + /scope, 2026-07-31 → 2026-08-04; working notes were transient scratch, not retained
+# Provenance note, not a path: the HQ is a private repo-root sibling that no clone of this repository
+# contains, so no depth correction makes it resolvable. R-10 SUPERSEDES REQ-MIG-B-007; see R-10.
+parent-requirements: private HQ, REQ-MIG-* family (prd-export-import) — not dereferenceable from here
 formulation:
   technical-architecture: complete
   testing-architecture: complete
@@ -32,11 +32,7 @@ features:
   credential-block-compat: {stage: requirements, tracks: {technical-architecture: complete}}
 artifacts:
   design-doc: docs/design/migration-credential-portability-solution-design.md
-  # Transient pipeline scratch, deliberately NOT committed — will not resolve in a fresh clone.
-  # Provenance only; nothing downstream may dereference them. This PRD and the design doc are
-  # self-contained.
-  requirements-brief: docs/briefs/2026-08-04-requirements-migration-credential-portability.md   # uncommitted
-  scope-working-doc: .tmp/scopes/migration-credential-portability.md   # uncommitted, gitignored
+  requirements-brief: docs/briefs/2026-08-04-requirements-migration-scope-and-portability.md
 ---
 
 # PRD — Migration Credential Portability

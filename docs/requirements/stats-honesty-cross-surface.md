@@ -5,7 +5,7 @@ created: 2026-08-04
 status: draft
 dor_status: passed-with-findings
 source: session-context investigation (`/investigate` 2026-08-03), re-grounded at cb3eaca
-parent-requirements: ../../hq/strategy/prd-stats.md   # private HQ; REQ-STA-* family. Provenance only — see § 0.
+parent-requirements: private HQ, REQ-STA-* family (prd-stats) — not dereferenceable from here; see § 0
 formulation: {}
 features:
   census-coverage-gate: {stage: requirements, tracks: {}}
@@ -17,8 +17,10 @@ features:
   stats-parity-coverage: {stage: requirements, tracks: {}}
   gap-state-reference: {stage: requirements, tracks: {}}
 artifacts:
-  design-doc: docs/design/stats-honesty-cross-surface-solution-design.md   # Stage 2, not yet written
-  requirements-brief: docs/briefs/2026-08-04-requirements-stats-honesty-cross-surface.md   # uncommitted, provenance only
+  design-doc: docs/design/stats-honesty-cross-surface-solution-design.md
+  requirements-brief: docs/briefs/2026-08-04-requirements-stats-honesty-cross-surface.md
+  design-brief: docs/briefs/2026-08-04-design-stats-honesty-cross-surface.md
+  scope-brief: docs/briefs/2026-08-04-scope-stats-honesty-cross-surface.md
 ---
 
 # PRD — Stats Honesty: Coverage Gating, Runway Degeneracy, and Cross-Surface Parity
