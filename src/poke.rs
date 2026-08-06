@@ -368,11 +368,11 @@ fn is_near_expiry(expires_at_ms: Option<i64>, now_ms: i64, horizon_ms: i64) -> b
 /// the cycle's outcome, never a token).
 fn outcome_label(report: &RefreshReport) -> &'static str {
     match report.outcome {
-        RefreshOutcome::Refreshed if report.re_stashed => "refreshed",
+        RefreshOutcome::Refreshed { .. } if report.re_stashed => "refreshed",
         // A refresh the CAS step discarded: a concurrent swap / login changed the stash
         // since the cycle began, so that credential is authoritative (issue #102 step 7)
         // and the fresh token was not stored. Surfaced honestly.
-        RefreshOutcome::Refreshed => {
+        RefreshOutcome::Refreshed { .. } => {
             "refreshed but not re-stashed (a concurrent change took precedence)"
         }
         RefreshOutcome::NoChange => "no change",
@@ -397,7 +397,7 @@ fn outcome_label(report: &RefreshReport) -> &'static str {
 /// points at `claude /login`.
 fn should_restore(report: &RefreshReport, quarantined_per_daemon: bool) -> bool {
     quarantined_per_daemon
-        && matches!(report.outcome, RefreshOutcome::Refreshed)
+        && matches!(report.outcome, RefreshOutcome::Refreshed { .. })
         && report.re_stashed
 }
 
@@ -574,7 +574,6 @@ mod tests {
         RefreshReport {
             outcome,
             expires_at_delta_secs: None,
-            refresh_token_rotated: false,
             re_stashed,
         }
     }
@@ -761,11 +760,11 @@ mod tests {
     #[test]
     fn outcome_label_maps_every_classification() {
         assert_eq!(
-            outcome_label(&report(RefreshOutcome::Refreshed, true)),
+            outcome_label(&report(RefreshOutcome::Refreshed { rotated: true }, true)),
             "refreshed"
         );
         assert_eq!(
-            outcome_label(&report(RefreshOutcome::Refreshed, false)),
+            outcome_label(&report(RefreshOutcome::Refreshed { rotated: true }, false)),
             "refreshed but not re-stashed (a concurrent change took precedence)"
         );
         assert_eq!(
@@ -867,18 +866,18 @@ mod tests {
     fn should_restore_only_on_a_quarantined_verdict_plus_a_restashed_refresh() {
         // The one firing case (issue #428): daemon-quarantined + a fresh, re-stashed token.
         assert!(should_restore(
-            &report(RefreshOutcome::Refreshed, true),
+            &report(RefreshOutcome::Refreshed { rotated: true }, true),
             true
         ));
         // Same cycle, but the daemon does NOT mark it quarantined → nothing to clear.
         assert!(!should_restore(
-            &report(RefreshOutcome::Refreshed, true),
+            &report(RefreshOutcome::Refreshed { rotated: true }, true),
             false
         ));
         // A quarantined verdict, but the cycle did not PROVE the refresh token, so it never fires:
         // - a refresh a concurrent change kept from re-stashing (no fresh stash to re-poll),
         assert!(!should_restore(
-            &report(RefreshOutcome::Refreshed, false),
+            &report(RefreshOutcome::Refreshed { rotated: true }, false),
             true
         ));
         // - no refresh happened (the refresh token was never exercised),
@@ -900,7 +899,7 @@ mod tests {
 
     #[test]
     fn poke_outcome_maps_each_restore_state() {
-        let refreshed = report(RefreshOutcome::Refreshed, true);
+        let refreshed = report(RefreshOutcome::Refreshed { rotated: true }, true);
         // A DELIVERED restore → the cleared-quarantine confirmation, never the bare wording.
         assert_eq!(
             poke_outcome(&refreshed, Restore::Cleared),
@@ -915,7 +914,10 @@ mod tests {
         // A SKIPPED restore → the cycle's own plain classification, unchanged.
         assert_eq!(poke_outcome(&refreshed, Restore::Skipped), "refreshed");
         assert_eq!(
-            poke_outcome(&report(RefreshOutcome::Refreshed, false), Restore::Skipped),
+            poke_outcome(
+                &report(RefreshOutcome::Refreshed { rotated: true }, false),
+                Restore::Skipped
+            ),
             "refreshed but not re-stashed (a concurrent change took precedence)"
         );
         assert_eq!(
@@ -951,7 +953,7 @@ mod tests {
             false,
         )]);
         let account = acct("work", "u-A");
-        let report = report(RefreshOutcome::Refreshed, true);
+        let report = report(RefreshOutcome::Refreshed { rotated: true }, true);
         let notifier = FakeRestoreNotifier::new();
         let restore = resolve_restore(
             &account,
@@ -988,7 +990,7 @@ mod tests {
             false,
         )]);
         let account = acct("work", "u-A");
-        let report = report(RefreshOutcome::Refreshed, true);
+        let report = report(RefreshOutcome::Refreshed { rotated: true }, true);
         let notifier = FakeRestoreNotifier::new();
         let restore = resolve_restore(
             &account,
@@ -1024,7 +1026,7 @@ mod tests {
             false,
         )]);
         let account = acct("work", "u-A");
-        let report = report(RefreshOutcome::Refreshed, true);
+        let report = report(RefreshOutcome::Refreshed { rotated: true }, true);
         let notifier = FakeRestoreNotifier::failing();
         let restore = resolve_restore(
             &account,
@@ -1050,7 +1052,7 @@ mod tests {
             false,
         )]);
         let account = acct("work", "u-A");
-        let report = report(RefreshOutcome::Refreshed, true);
+        let report = report(RefreshOutcome::Refreshed { rotated: true }, true);
         let notifier = FakeRestoreNotifier::new();
         let restore = resolve_restore(
             &account,
@@ -1071,7 +1073,7 @@ mod tests {
     async fn unknown_or_absent_daemon_never_restores_nor_fabricates_a_verdict() {
         // AC-3: no daemon reachable (None) → no restore, plain wording; no crash, no claim.
         let account = acct("work", "u-A");
-        let refreshed = report(RefreshOutcome::Refreshed, true);
+        let refreshed = report(RefreshOutcome::Refreshed { rotated: true }, true);
         let notifier = FakeRestoreNotifier::new();
         let restore = resolve_restore(
             &account,
@@ -1137,7 +1139,7 @@ mod tests {
         let roster = vec![acct("work", "u-A"), acct("spare", "u-B")];
         let engine = FakePokeEngine::new().with_result(
             "u-B",
-            FakeRefresh::Report(report(RefreshOutcome::Refreshed, true)),
+            FakeRefresh::Report(report(RefreshOutcome::Refreshed { rotated: true }, true)),
         );
         let snap = status_snapshot(vec![status_line(
             "spare",
@@ -1173,7 +1175,7 @@ mod tests {
             .with_expiry("u-B", Some(soon))
             .with_result(
                 "u-B",
-                FakeRefresh::Report(report(RefreshOutcome::Refreshed, true)),
+                FakeRefresh::Report(report(RefreshOutcome::Refreshed { rotated: true }, true)),
             );
         let snap = status_snapshot(vec![status_line(
             "spare",
@@ -1357,7 +1359,7 @@ mod tests {
         let roster = vec![acct("work", "u-A"), acct("spare", "u-B")];
         let engine = FakePokeEngine::new().with_result(
             "u-B",
-            FakeRefresh::Report(report(RefreshOutcome::Refreshed, true)),
+            FakeRefresh::Report(report(RefreshOutcome::Refreshed { rotated: true }, true)),
         );
         // Active is u-A; we name the parked u-B by its label.
         run_poke(
@@ -1517,7 +1519,7 @@ mod tests {
             .with_result("u-A", FakeRefresh::HardError)
             .with_result(
                 "u-B",
-                FakeRefresh::Report(report(RefreshOutcome::Refreshed, true)),
+                FakeRefresh::Report(report(RefreshOutcome::Refreshed { rotated: true }, true)),
             );
         run_poke(
             &roster,

@@ -3512,10 +3512,9 @@ mod tests {
         let mut ticker = OnceRefreshTicker::returning(SweepOutcome {
             events: vec![Event::Refresh {
                 account: "spare".to_owned(),
-                outcome: RefreshEventOutcome::Refreshed,
+                outcome: RefreshEventOutcome::Refreshed { rotated: true },
                 expires_before: Some(1_000_000),
                 expires_after: Some(1_003_600),
-                refresh_token_rotated: false,
                 reason: None,
                 backoff_secs: None,
             }],

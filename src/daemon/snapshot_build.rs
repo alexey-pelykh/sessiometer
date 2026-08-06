@@ -1341,7 +1341,14 @@ mod tests {
         // Healthy — not quarantined, no refresh failure, token not yet expired; the refresh
         // telemetry + a future expiry are the positive-liveness signal (no reading needed).
         assert_eq!(
-            credential_health(false, Some(Refreshed), 0, Some(NOW + 60), false, NOW),
+            credential_health(
+                false,
+                Some(Refreshed { rotated: true }),
+                0,
+                Some(NOW + 60),
+                false,
+                NOW
+            ),
             CredentialHealth::Healthy
         );
         // A fresh successful usage reading is ALSO a positive-liveness signal (#137): even
@@ -1359,7 +1366,14 @@ mod tests {
             CredentialHealth::Stale
         );
         assert_eq!(
-            credential_health(false, Some(Refreshed), 0, Some(NOW - 1), false, NOW),
+            credential_health(
+                false,
+                Some(Refreshed { rotated: true }),
+                0,
+                Some(NOW - 1),
+                false,
+                NOW
+            ),
             CredentialHealth::Stale
         );
 
@@ -1486,7 +1500,7 @@ mod tests {
             None,
             Some(RefreshEventOutcome::Error),
             Some(RefreshEventOutcome::NoChange),
-            Some(RefreshEventOutcome::Refreshed),
+            Some(RefreshEventOutcome::Refreshed { rotated: true }),
         ] {
             assert_eq!(
                 credential_health(true, refresh, 0, None, false, NOW),

@@ -609,9 +609,9 @@ impl<E: RefreshEngine, K: Clock> RefreshTick<E, K> {
             // swap/login changed the stash and is authoritative — it OWNS the un-quarantine (the #42
             // poll once it polls active, or #107's re-login), so we do not second-guess its credential.
             if is_quarantined
-                && report
-                    .as_ref()
-                    .is_some_and(|r| r.outcome == RefreshOutcome::Refreshed && r.re_stashed)
+                && report.as_ref().is_some_and(|r| {
+                    matches!(r.outcome, RefreshOutcome::Refreshed { .. }) && r.re_stashed
+                })
             {
                 outcome.restored.push(account.account_uuid.clone());
             }
@@ -653,7 +653,6 @@ impl<E: RefreshEngine, K: Clock> RefreshTick<E, K> {
                         expires_at_ms: expires_after(before_ms, &report),
                         refresh: Some(RefreshDelta {
                             outcome: event_outcome,
-                            token_rotated: report.refresh_token_rotated,
                         }),
                     },
                 ),
@@ -669,7 +668,6 @@ impl<E: RefreshEngine, K: Clock> RefreshTick<E, K> {
                         expires_at_ms: before_ms,
                         refresh: Some(RefreshDelta {
                             outcome: RefreshEventOutcome::Error,
-                            token_rotated: false,
                         }),
                     },
                 ),
@@ -787,8 +785,8 @@ pub(crate) fn refresh_event(
         outcome: refresh_event_outcome(report),
         expires_before: before_ms,
         expires_after: expires_after(before_ms, report),
-        // The already-computed AC-3 rotation flag, threaded straight through (issue #279).
-        refresh_token_rotated: report.refresh_token_rotated,
+        // The AC-3 rotation flag rides inside `outcome` now (issue #1004), so there is no
+        // separate field here to thread — or to get wrong on a non-refreshed classification.
         // The non-secret error sub-class (issue #377): `Some` iff the completed cycle
         // classified `Error`, mapped from the engine's `RefreshErrorReason`; `None` otherwise.
         reason: refresh_event_reason(report),
@@ -821,9 +819,9 @@ fn error_refresh_event(
         outcome: RefreshEventOutcome::Error,
         expires_before: before_ms,
         expires_after: before_ms,
-        // No completed cycle, so no report to source a rotation from (issue #279): a hard
-        // engine `Err` / whole-cycle timeout renders `rotated=false`.
-        refresh_token_rotated: false,
+        // No completed cycle, so no report to source a rotation from (issue #279) — and since
+        // issue #1004 nowhere to put one: an `Error` outcome renders NO `rotated=` at all,
+        // rather than a `false` that would imply a compare had been performed.
         reason,
         // The per-account back-off this error armed (issue #408).
         backoff_secs,
@@ -837,10 +835,20 @@ fn error_refresh_event(
 /// `pub(crate)` so the #162 poll-path refresh ([`crate::daemon`], issue #255) maps its own
 /// cycle's report to the SAME event vocabulary through this one function — the periodic sweep
 /// and the poll path never drift on how a report becomes an `outcome=` token.
+///
+/// The engine's `rotated` payload travels with the split (issue #1004): BOTH refreshed arms
+/// carry it, because the re-stash is a separate question from whether the exchange rotated the
+/// token — a lost CAS does not un-rotate anything. The other three arms have nowhere to put it,
+/// which is the guarantee: an engine outcome that observed no exchange cannot produce an event
+/// outcome that claims one.
 pub(crate) fn refresh_event_outcome(report: &RefreshReport) -> RefreshEventOutcome {
     match report.outcome {
-        RefreshOutcome::Refreshed if report.re_stashed => RefreshEventOutcome::Refreshed,
-        RefreshOutcome::Refreshed => RefreshEventOutcome::RefreshedNotReStashed,
+        RefreshOutcome::Refreshed { rotated } if report.re_stashed => {
+            RefreshEventOutcome::Refreshed { rotated }
+        }
+        RefreshOutcome::Refreshed { rotated } => {
+            RefreshEventOutcome::RefreshedNotReStashed { rotated }
+        }
         RefreshOutcome::NoChange => RefreshEventOutcome::NoChange,
         RefreshOutcome::Dead => RefreshEventOutcome::Dead,
         // The `outcome=` token folds every error sub-cause to `error`; the sub-reason rides the
@@ -861,7 +869,7 @@ pub(crate) fn refresh_event_outcome(report: &RefreshReport) -> RefreshEventOutco
 fn refresh_event_reason(report: &RefreshReport) -> Option<RefreshEventReason> {
     let reason = match report.outcome {
         RefreshOutcome::Error(reason) => reason,
-        RefreshOutcome::Refreshed | RefreshOutcome::NoChange | RefreshOutcome::Dead => {
+        RefreshOutcome::Refreshed { .. } | RefreshOutcome::NoChange | RefreshOutcome::Dead => {
             return None;
         }
     };
@@ -934,7 +942,6 @@ mod tests {
         RefreshReport {
             outcome,
             expires_at_delta_secs: None,
-            refresh_token_rotated: false,
             re_stashed,
         }
     }
@@ -1115,7 +1122,7 @@ mod tests {
                 Some(FakeRefresh::Unresolved) => Err(crate::error::Error::ClaudeBinaryNotFound),
                 Some(FakeRefresh::Hang) => {
                     tokio::time::sleep(Duration::from_secs(10_000)).await;
-                    Ok(report(RefreshOutcome::Refreshed, true))
+                    Ok(report(RefreshOutcome::Refreshed { rotated: true }, true))
                 }
                 None => Ok(report(RefreshOutcome::NoChange, false)),
             }
@@ -1640,7 +1647,7 @@ mod tests {
             .with_result("u-A", FakeRefresh::HardError) // first errors hard…
             .with_result(
                 "u-B",
-                FakeRefresh::Report(report(RefreshOutcome::Refreshed, true)),
+                FakeRefresh::Report(report(RefreshOutcome::Refreshed { rotated: true }, true)),
             );
         let mut t = tick(roster, cfg(3600, 60, &[]), engine);
         t.sweep(&[], &[]).await; // …the sweep must still reach the second.
@@ -1658,7 +1665,7 @@ mod tests {
             .with_result("u-A", FakeRefresh::Hang) // sleeps far past the timeout…
             .with_result(
                 "u-B",
-                FakeRefresh::Report(report(RefreshOutcome::Refreshed, true)),
+                FakeRefresh::Report(report(RefreshOutcome::Refreshed { rotated: true }, true)),
             );
         // timeout_secs = 5; the hang sleeps 10_000 s, so the bound fires (auto-advanced).
         let mut config = cfg(3600, 60, &[]);
@@ -1704,9 +1711,8 @@ mod tests {
             .with_result(
                 "u-A",
                 FakeRefresh::Report(RefreshReport {
-                    outcome: RefreshOutcome::Refreshed,
+                    outcome: RefreshOutcome::Refreshed { rotated: true },
                     expires_at_delta_secs: Some(7200), // +2h slide
-                    refresh_token_rotated: true,       // rotated — must reach the event
                     re_stashed: true,
                 }),
             );
@@ -1716,10 +1722,9 @@ mod tests {
             outcome.events,
             vec![Event::Refresh {
                 account: "work".to_owned(),
-                outcome: RefreshEventOutcome::Refreshed,
+                outcome: RefreshEventOutcome::Refreshed { rotated: true },
                 expires_before: Some(soon),
                 expires_after: Some(soon + 7_200_000), // before + 7200 s in ms
-                refresh_token_rotated: true,           // sourced from the report above (#279)
                 reason: None,       // a successful refresh carries no reason (#377)
                 backoff_secs: None, // a success clears any back-off (#408)
             }]
@@ -1742,9 +1747,8 @@ mod tests {
             .with_result(
                 "u-A",
                 FakeRefresh::Report(RefreshReport {
-                    outcome: RefreshOutcome::Refreshed,
+                    outcome: RefreshOutcome::Refreshed { rotated: true },
                     expires_at_delta_secs: Some(7200),
-                    refresh_token_rotated: false,
                     re_stashed: false,
                 }),
             );
@@ -1754,10 +1758,9 @@ mod tests {
             outcome.events,
             vec![Event::Refresh {
                 account: "work".to_owned(),
-                outcome: RefreshEventOutcome::RefreshedNotReStashed,
+                outcome: RefreshEventOutcome::RefreshedNotReStashed { rotated: true },
                 expires_before: Some(soon),
                 expires_after: Some(soon), // unchanged — the CAS discarded the fresh token
-                refresh_token_rotated: false, // this cycle's report did not rotate
                 reason: None,              // not an error outcome — no reason (#377)
                 backoff_secs: None, // RefreshedNotReStashed is not an error — no back-off (#408)
             }]
@@ -1787,7 +1790,6 @@ mod tests {
                 expires_before: Some(soon),
                 expires_after: Some(soon),
                 // A hard `Err` has no report to source a rotation from → `false` (#279).
-                refresh_token_rotated: false,
                 reason: None, // unclassified hard `Err`: no sub-class → no `reason=` (#377)
                 // This FIRST error arms the #408 per-account back-off: streak 1, base = idle_after
                 // (60 s) × 2^1 = 120 s (below the 3600 s cap), surfaced on the error event.
@@ -1819,7 +1821,6 @@ mod tests {
                 outcome: RefreshEventOutcome::Error,
                 expires_before: Some(soon),
                 expires_after: Some(soon),
-                refresh_token_rotated: false,
                 reason: Some(RefreshEventReason::Timeout), // the whole-cycle bound fired (#377)
                 // A timeout is an `error` too → the #408 back-off arms: streak 1 × 60 s base = 120 s.
                 backoff_secs: Some(120),
@@ -1851,7 +1852,6 @@ mod tests {
                 outcome: RefreshEventOutcome::Error,
                 expires_before: Some(soon),
                 expires_after: Some(soon),
-                refresh_token_rotated: false,
                 reason: Some(RefreshEventReason::Unresolved),
                 // An unresolved binary is an `error` too → the #408 back-off arms unchanged.
                 backoff_secs: Some(120),
@@ -1880,7 +1880,6 @@ mod tests {
                 outcome: RefreshEventOutcome::Error,
                 expires_before: Some(soon),
                 expires_after: Some(soon),
-                refresh_token_rotated: false,
                 reason: None, // STILL unclassified — #786 did not widen to this cause
                 backoff_secs: Some(120),
             }]
@@ -1914,7 +1913,6 @@ mod tests {
                 outcome: RefreshEventOutcome::Error,
                 expires_before: Some(soon),
                 expires_after: Some(soon),
-                refresh_token_rotated: false,
                 reason: Some(RefreshEventReason::SpawnFailed),
                 backoff_secs: Some(120),
             }]
@@ -2134,9 +2132,8 @@ mod tests {
             .with_result(
                 "u-B",
                 FakeRefresh::Report(RefreshReport {
-                    outcome: RefreshOutcome::Refreshed,
+                    outcome: RefreshOutcome::Refreshed { rotated: true },
                     expires_at_delta_secs: Some(7200), // +2h slide
-                    refresh_token_rotated: true,       // the AC-3 durability signal
                     re_stashed: true,
                 }),
             );
@@ -2151,8 +2148,7 @@ mod tests {
                     account_uuid: "u-B".to_owned(),
                     expires_at_ms: Some(soon + 7_200_000),
                     refresh: Some(RefreshDelta {
-                        outcome: RefreshEventOutcome::Refreshed,
-                        token_rotated: true,
+                        outcome: RefreshEventOutcome::Refreshed { rotated: true },
                     }),
                 },
                 // The read-only account: just its (unchanged) expiry, no refresh-health delta.
@@ -2179,7 +2175,7 @@ mod tests {
         let roster = vec![acct("dead", "u-Q")];
         let engine = FakeEngine::new().with_expiry("u-Q", Some(far)).with_result(
             "u-Q",
-            FakeRefresh::Report(report(RefreshOutcome::Refreshed, true)),
+            FakeRefresh::Report(report(RefreshOutcome::Refreshed { rotated: true }, true)),
         );
         let mut t = tick(roster, cfg(3600, 60, &[]), engine);
         let outcome = t.sweep(&[], &["u-Q".to_owned()]).await;
@@ -2201,7 +2197,7 @@ mod tests {
         let roster = vec![acct("dead", "u-Q")];
         let engine = FakeEngine::new().with_expiry("u-Q", Some(far)).with_result(
             "u-Q",
-            FakeRefresh::Report(report(RefreshOutcome::Refreshed, true)),
+            FakeRefresh::Report(report(RefreshOutcome::Refreshed { rotated: true }, true)),
         );
         let mut t = RefreshTick::new(roster, cfg(3600, 60, &[]), true, engine, TokioClock);
         // A refresh just ran: without the recovery bypass the cadence would defer the sweep ~1 h.
@@ -2260,7 +2256,7 @@ mod tests {
         let roster = vec![acct("dead", "u-Q")];
         let engine = FakeEngine::new().with_expiry("u-Q", Some(far)).with_result(
             "u-Q",
-            FakeRefresh::Report(report(RefreshOutcome::Refreshed, false)),
+            FakeRefresh::Report(report(RefreshOutcome::Refreshed { rotated: true }, false)),
         );
         let mut t = tick(roster, cfg(3600, 60, &[]), engine);
         let outcome = t.sweep(&[], &["u-Q".to_owned()]).await;
@@ -2272,7 +2268,7 @@ mod tests {
         assert!(matches!(
             outcome.events.as_slice(),
             [Event::Refresh {
-                outcome: RefreshEventOutcome::RefreshedNotReStashed,
+                outcome: RefreshEventOutcome::RefreshedNotReStashed { rotated: true },
                 ..
             }]
         ));
@@ -2289,7 +2285,7 @@ mod tests {
             .with_expiry("u-A", Some(soon))
             .with_result(
                 "u-A",
-                FakeRefresh::Report(report(RefreshOutcome::Refreshed, true)),
+                FakeRefresh::Report(report(RefreshOutcome::Refreshed { rotated: true }, true)),
             );
         let mut t = tick(roster, cfg(3600, 60, &[]), engine);
         let outcome = t.sweep(&["u-A".to_owned()], &["u-A".to_owned()]).await;
@@ -2461,7 +2457,7 @@ mod tests {
                 "u-A",
                 vec![
                     FakeRefresh::HardError,
-                    FakeRefresh::Report(report(RefreshOutcome::Refreshed, true)),
+                    FakeRefresh::Report(report(RefreshOutcome::Refreshed { rotated: true }, true)),
                     FakeRefresh::HardError,
                 ],
             );

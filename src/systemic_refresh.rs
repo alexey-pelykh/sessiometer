@@ -380,7 +380,7 @@ mod tests {
             SweepHealth::Working
         );
         assert_eq!(
-            SweepHealth::classify([RefreshEventOutcome::Refreshed]),
+            SweepHealth::classify([RefreshEventOutcome::Refreshed { rotated: true }]),
             SweepHealth::Working
         );
         assert_eq!(
@@ -514,7 +514,7 @@ mod tests {
         let mut detector = SystemicRefreshHealth::default();
         let one_at_risk = SweepHealth::classify([
             RefreshEventOutcome::Error,
-            RefreshEventOutcome::Refreshed,
+            RefreshEventOutcome::Refreshed { rotated: true },
             RefreshEventOutcome::NoChange,
         ]);
         assert_eq!(one_at_risk, SweepHealth::Working);
