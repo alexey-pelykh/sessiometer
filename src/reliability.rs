@@ -227,7 +227,12 @@ pub(crate) const LANDING_WINDOW_SECS: i64 = 15 * 60;
 /// every swap SLI reads, so not one prior figure moves. That is the issue #881 acceptance ("the
 /// existing swap-out SLI partition is unchanged in meaning") holding BY CONSTRUCTION rather than by
 /// a filter — diff a schema:9 and a schema:10 readout of one log and only the added key differs.
-const JSON_SCHEMA_VERSION: u32 = 10;
+///
+/// `pub(crate)` so the number [`crate::cli`]'s `RELIABILITY_USAGE` advertises to script authors is
+/// held against this one by a test instead of by hand (issue #913) — tied so the two cannot drift,
+/// the way [`LANDING_WINDOW_SECS`] ties the offline window to the runtime detector's. Nothing else
+/// outside this module reads it.
+pub(crate) const JSON_SCHEMA_VERSION: u32 = 10;
 
 /// Parsed `reliability` options (issues #455/#494). A plain comparable value so the CLI parser
 /// is unit-testable by value, like `StatsArgs`.
@@ -2210,7 +2215,7 @@ fn render_human(r: &Report) -> String {
     out
 }
 
-// --- rendering: JSON wire (schema:2) ----------------------------------------
+// --- rendering: JSON wire (schema:10) ---------------------------------------
 
 /// The stable `--json` document. Field names are OWNED by this wire contract (decoupled from
 /// the internal aggregate types), so an internal refactor cannot silently break the schema.
