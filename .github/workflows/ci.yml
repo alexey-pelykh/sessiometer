@@ -335,6 +335,30 @@ jobs:
       - name: Assert ci-ok.needs covers every job
         run: ./scripts/check-ci-ok-needs.sh
 
+  # Documentation gates (issue #1060). Plural on purpose: this hosts whole-tree checks
+  # over `docs/**`, and issue #1056's acceptance criteria already commit a second one, so
+  # it lands here as a step rather than as another job needing its own `ci-ok.needs` entry.
+  #
+  # NO PATH FILTER, deliberately, and this is the load-bearing part. `ci-ok` counts a
+  # `skipped` job as a PASS (only `failure`/`cancelled` fail its rollup), so a filtered
+  # gate that misses is indistinguishable from one that ran clean — the gate would report
+  # green having evaluated nothing, which is precisely the failure the check guards against
+  # inside itself by treating a zero citation count as fatal. There is no `docs` filter to
+  # reuse in any case; the `changes` job only publishes `rust`/`swift`/`formula`. The check
+  # is a bash pass over `docs/`, so filtering it would buy nothing and risk exactly the
+  # silence it exists to break.
+  #
+  # Not hosted in `gate-change-ack`: that job is PR-range-scoped (`fetch-depth: 0`, BASE/HEAD)
+  # because trailer guards diff a commit range. This check inspects the TREE, needs neither,
+  # and hosting it there would silently disable it on `push` builds.
+  doc-gates:
+    name: doc-gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Assert every committed doc citation resolves in a fresh clone
+        run: ./scripts/check-doc-citations.sh
+
   # Gate-integrity acknowledgment (issue #317). `ci-ok` and the invariants it rolls
   # up live in PR-mutable files — this workflow, `scripts/**`, `deny.toml`, `.cargo/**`.
   # `main-protection` has no bypass actors and GitHub forbids self-approval, so a
@@ -396,7 +420,7 @@ jobs:
     # gate step is `continue-on-error`, so the job's conclusion is always success and it cannot block a
     # merge while it is soft-landing (issue #754). Promoting it to a real gate is a change in THAT job,
     # not here.
-    needs: [changes, test, msrv, deny, swift, formula, panel-goldens, ci-ok-needs-complete, gate-change-ack]
+    needs: [changes, test, msrv, deny, swift, formula, panel-goldens, ci-ok-needs-complete, gate-change-ack, doc-gates]
     runs-on: ubuntu-latest
     steps:
       # `needs.*.result` auto-covers every job in `needs:` above — and the `ci-ok-needs-complete`
