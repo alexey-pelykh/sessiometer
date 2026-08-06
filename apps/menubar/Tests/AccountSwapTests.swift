@@ -232,6 +232,24 @@ final class AccountSwapTests: XCTestCase {
         XCTAssertFalse(model.phase.isPending, "a reattempt ran — the failed phase never blocked the model")
     }
 
+    // MARK: - waitUntil: where the suite's own poll runs (issue #948)
+
+    // Guards the two waits above, and issue #948 with them: `waitUntil` reads `@MainActor`-isolated
+    // state, so the poll has to RUN there (why, at the helper itself, below). Asserting the property
+    // directly rather than by timing makes this deterministic in BOTH directions — it passes on the
+    // main-actor helper and fails on any nonisolated regression of it.
+    @MainActor
+    func testTheWaitObservesPhaseOnTheMainActor() async throws {
+        var observedOffMainActor = false
+        try await waitUntil({
+            if !Thread.isMainThread { observedOffMainActor = true }
+            return true          // settles on the first check; only WHERE it ran is under test
+        }, "an immediately-true predicate")
+
+        XCTAssertFalse(observedOffMainActor,
+                       "the poll must read @MainActor-isolated phase on the main actor, never off it")
+    }
+
     // MARK: - StatusPanelFormat: row viability (the CLIENT-VISIBLE subset of `swap_command_verdict`)
 
     func testViableRowHasNoSwitchBlock() {
@@ -636,12 +654,37 @@ final class AccountSwapTests: XCTestCase {
         ControlCommandClient(connector: CommandFakeConnector(.succeed(connection)), timeout: .seconds(5))
     }
 
+    // Poll ON THE MAIN ACTOR, bounded by WALL CLOCK — the two things a `Task.yield()` count on a
+    // nonisolated helper is not, and between them the whole of issue #948.
+    //
+    // `AccountSwapModel` is `@MainActor`, so `phase` may only be read there — and a nonisolated async
+    // helper does not stay: it runs on the global cooperative executor (SE-0338), so the poll read
+    // actor-isolated state from a pool thread. `@MainActor` also makes the wait DETERMINISTIC rather
+    // than merely likely: `swap`'s `Task {}` inherits the main actor, so it is already queued behind
+    // this task and runs the moment the poll suspends.
+    //
+    // The bound is a deadline because `Task.yield()` grants no real time — "10 000 yields" was however
+    // long 10 000 reschedules happened to take (~10 ms on an idle host, and SHORTER the faster the
+    // host), so any main-thread hiccup outlasting that window timed the poll out. That is how this
+    // reddened unrelated PRs on CI while never failing locally. `StatsTests.waitUntil` already carries
+    // the wall-clock half of this reasoning; the main-actor half is what is new here.
+    //
+    // What keeps a budget this large honest is not its size but an ORDERING: every phase this suite
+    // waits on is assigned before its model reaches a suspension point (`AccountSwapModel.swap` sets
+    // `.pending` before its first `await`), so the budget can only ever absorb SCHEDULING delay — there
+    // is no product latency here for it to hide. Put an `await` ahead of one of those assignments and
+    // that stops being true, and this number would start masking the thing it is meant to expose. That
+    // argument covers THIS suite's waits, which is why the budget is fixed rather than per-call.
+    @MainActor
     private func waitUntil(_ predicate: () -> Bool, _ label: String) async throws {
-        for _ in 0..<10_000 {
-            if predicate() { return }
-            await Task.yield()
+        let budget: Duration = .seconds(5)
+        let deadline = ContinuousClock.now.advanced(by: budget)
+        while !predicate() {
+            guard ContinuousClock.now < deadline else {
+                return XCTFail("timed out waiting for \(label) after \(budget)")
+            }
+            try await Task.sleep(for: .milliseconds(1))
         }
-        XCTFail("timed out waiting for \(label)")
     }
 }
 
