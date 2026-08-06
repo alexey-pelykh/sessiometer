@@ -116,7 +116,7 @@ use crate::observability::{
 use crate::refresh::{CredentialClocks, RefreshOutcome, RefreshReport};
 use crate::refresh_tick::{refresh_event_outcome, RealRefreshEngine, RefreshEngine};
 use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
-use crate::stats::FleetRunway;
+use crate::stats::{FleetRunway, FleetRunwayState, FLEET_RUNWAY_PLAUSIBLE_MAX_SECS};
 use crate::swap::{self, SwapDecision, SwapLock, SWAP_LOCK_MAX_WAIT};
 use crate::systemic_refresh::{PreflightHealth, SweepHealth, SystemicRefreshHealth};
 use crate::timing::{Jitter, Rng, SplitMix64, Strategy};
@@ -2169,14 +2169,20 @@ where
     ///   bounded to at most one call per [`FLEET_RUNWAY_WARN_CHECK_SECS`] (mirroring
     ///   [`StatsState::last_roll`]); the window is consumed BEFORE the read so a persistent
     ///   store error retries at the cadence, never once per poll (fail-open).
-    /// - **UNKNOWN holds prior state (issue #650 D4).** Three degradation shapes are all
-    ///   UNKNOWN — the seam unset (hermetic-test default, #315), a `None` aggregate (unreadable
-    ///   store / nothing observed / nothing counted), or a counted-but-FLAT fleet
-    ///   (`runway_secs == None`, zero measurable drain) — and each HOLDS the guard: neither
-    ///   fire nor re-arm, so a momentary store hiccup or flat-burn reading never fabricates a
-    ///   crossing or a recovery.
+    /// - **UNKNOWN holds prior state (issue #650 D4).** The seam unset (hermetic-test default,
+    ///   #315), a `None` aggregate (unreadable store / nothing observed / nothing counted), a
+    ///   counted-but-FLAT fleet, and an `Unmeasurable` one all HOLD the guard: neither fire nor
+    ///   re-arm, so a momentary store hiccup or flat-burn reading never fabricates a crossing or a
+    ///   recovery.
+    /// - **`BeyondWeeklyWindow` is NOT one of those unknowns for the recovery question**
+    ///   (issue #1028). It states no figure — so it can never FIRE — but it does establish that the
+    ///   pool outlasts a week, which settles "is the fleet at/above the line?" for any threshold at
+    ///   or below [`crate::stats::FLEET_RUNWAY_PLAUSIBLE_MAX_SECS`], and re-arms accordingly. The
+    ///   recovered regime (head-room refilled at the reset, moderate burn) lands in exactly this
+    ///   state, so folding it in with the unknowns would leave the guard permanently set after one
+    ///   crossing and silence every later one.
     /// - **Edge-triggered.** A KNOWN runway below the line emits `fleet_runway_low` exactly ONCE
-    ///   on the downward crossing (held silent while it stays below); a KNOWN runway back
+    ///   on the downward crossing (held silent while it stays below); a runway demonstrably back
     ///   at/over the line emits the [`Event::FleetRunwayRecovered`] LEAVE marker once and
     ///   re-arms, so a later crossing fires afresh — the `all_exhausted` / `all_exhausted_cleared`
     ///   bracket exactly. BOTH edges land on the durable event log since issue #827, so an
@@ -2201,30 +2207,38 @@ where
         let Some(probe) = self.fleet_runway_probe.as_ref() else {
             return; // seam unwired (hermetic default) → UNKNOWN, hold prior state
         };
-        // The destructure's two `Some` layers ARE the two UNKNOWN shapes that HOLD prior state: the
-        // outer failing is a `None` aggregate (unreadable store / nothing observed / nothing
-        // counted), the inner `runway_secs` failing is a counted-but-FLAT fleet (zero drain). A
-        // KNOWN reading binds its runway + the `n of m` cardinality carried through to the payload.
-        let Some(FleetRunway {
-            runway_secs: Some(runway_secs),
-            counted,
-            observed,
-        }) = probe()
-        else {
+        // A `None` aggregate is UNKNOWN (unreadable store / nothing observed / nothing counted) and
+        // holds. A counted fleet is then classified by its state, below.
+        let Some(fleet) = probe() else {
             return;
         };
         let threshold_secs = self.fleet_runway_warn_secs as i64;
-        if runway_secs < threshold_secs {
-            if !self.state.signaled_fleet_runway_low {
-                events.push(Event::FleetRunwayLow {
-                    runway_secs,
-                    threshold_secs,
-                    counted,
-                    observed,
-                });
-                self.state.signaled_fleet_runway_low = true;
+        // Whether the fleet is DEMONSTRABLY at/above the line — a NARROWER question than "what is
+        // the runway", and answering only the latter is what made issue #1028's plausibility bound
+        // a regression here (the doc's `BeyondWeeklyWindow` bullet carries the why). The comparison
+        // in that arm is the bullet's boundary made literal: the state establishes one week and no
+        // more, so it settles the question only for a threshold at or under that window — above it
+        // the reading answers nothing and must hold, like any unknown.
+        //
+        // KNOWN LIMITATION, tracked as issue #1076 — a threshold ABOVE one weekly window is now
+        // unserviceable, and this match is where that surfaces. `fleet_runway_warn_secs` validates
+        // to `60..=2_592_000` (30 d), but `Known` is capped at the window by the plausibility bound,
+        // so for a threshold in `604_801..=2_592_000` the `Known` arm is unsatisfiable, and
+        // `BeyondWeeklyWindow` cannot establish it either: the alarm fires on the first measurable
+        // reading and never clears. Deliberately NOT papered over by treating
+        // `BeyondWeeklyWindow` as recovery for every threshold — that would assert the pool outlasts
+        // 20 days on evidence that only establishes one week, which is the same fabrication this
+        // whole issue exists to remove. Reconciling the config band with the bound is a product
+        // decision (narrow the band, or re-base the warning on something the model can still rank),
+        // so it is tracked rather than settled here.
+        let at_or_above_line = match fleet.state {
+            FleetRunwayState::Known(secs) => secs >= threshold_secs,
+            FleetRunwayState::BeyondWeeklyWindow => {
+                threshold_secs <= FLEET_RUNWAY_PLAUSIBLE_MAX_SECS
             }
-        } else {
+            FleetRunwayState::Flat | FleetRunwayState::Unmeasurable => false,
+        };
+        if at_or_above_line {
             // KNOWN recovery: emit the LEAVE marker BEFORE the reset so a re-crossing signals
             // afresh, mirroring the `AllExhaustedCleared` bracket — and, since issue #827, onto
             // the SAME durable sink as its ENTER, so the episode closes in the log and not merely
@@ -2233,6 +2247,28 @@ where
                 events.push(Event::FleetRunwayRecovered);
             }
             self.state.signaled_fleet_runway_low = false;
+            return;
+        }
+        // Only a KNOWN runway may FIRE — the payload states a figure, so an unknown must never
+        // fabricate one. This is the asymmetry that keeps the saturated-`i64::MAX` defect fixed:
+        // an implausible reading can no longer clear a genuine signal, and cannot raise one either.
+        // Issue #1036 filed that exposure against this function; its own deliverable — RECORDING an
+        // implausible computation as a fault, at the aggregation boundary rather than here — is
+        // deliberately not part of this change.
+        let FleetRunwayState::Known(runway_secs) = fleet.state else {
+            return; // UNKNOWN → hold the guard: neither fire nor re-arm
+        };
+        // The comparison is already implied here (a `Known` state at/above the line took the branch
+        // above), and is restated so the fire edge names its own condition rather than inheriting it
+        // from the match.
+        if runway_secs < threshold_secs && !self.state.signaled_fleet_runway_low {
+            events.push(Event::FleetRunwayLow {
+                runway_secs,
+                threshold_secs,
+                counted: fleet.counted,
+                observed: fleet.observed,
+            });
+            self.state.signaled_fleet_runway_low = true;
         }
     }
 
@@ -13113,7 +13149,21 @@ mod tests {
     /// carries the cardinality through so the emitted event states how much fleet stood behind it.
     fn known_runway(runway_secs: i64) -> Option<FleetRunway> {
         Some(FleetRunway {
-            runway_secs: Some(runway_secs),
+            state: FleetRunwayState::Known(runway_secs),
+            counted: 2,
+            observed: 2,
+        })
+    }
+
+    /// A counted fleet in one of the states that states NO figure (issue #1028) — the input class
+    /// the edge logic must classify without ever fabricating a runway.
+    ///
+    /// Deliberately not called `unknown_runway`: figureless is NOT the same as uninformative here,
+    /// and the whole point of #1028's daemon arm is that `BeyondWeeklyWindow` states no figure yet
+    /// still answers the recovery question.
+    fn figureless_runway(state: FleetRunwayState) -> Option<FleetRunway> {
+        Some(FleetRunway {
+            state,
             counted: 2,
             observed: 2,
         })
@@ -13223,6 +13273,126 @@ mod tests {
     }
 
     #[test]
+    fn fleet_runway_warn_rearms_on_a_pool_that_outlasts_the_window() {
+        // Issue #1028 regression. The plausibility bound refuses any runway past one weekly window,
+        // and the RECOVERED regime — head-room refilled at the weekly reset, burn moderate — lands
+        // there by construction. Folding `BeyondWeeklyWindow` in with the unknowns would leave the
+        // guard set forever after one crossing and silence every later one, so the fix to the CLI's
+        // honesty would have cost the operator the alarm.
+        //
+        // Threshold 86400 (one day — the value the config doc's own example uses) is at or below
+        // the window, so "the pool outlasts a week" settles the recovery question outright.
+        let (probe, _calls) = scripted_fleet_probe(vec![
+            known_runway(40_000), // below the line → fires, guard set
+            figureless_runway(FleetRunwayState::BeyondWeeklyWindow), // recovered → LEAVE, re-arm
+            known_runway(30_000), // a GENUINE second crossing → must fire afresh
+        ]);
+        let mut daemon = probed_runway_daemon(86_400);
+        daemon.fleet_runway_probe = Some(probe);
+
+        let mut events = vec![];
+        daemon.check_fleet_runway_warn(RUNWAY_T0, &mut events);
+        assert_eq!(
+            events,
+            vec![Event::FleetRunwayLow {
+                runway_secs: 40_000,
+                threshold_secs: 86_400,
+                counted: 2,
+                observed: 2,
+            }],
+        );
+        assert!(daemon.state.signaled_fleet_runway_low);
+
+        // The recovery closes the episode on the durable log even though no FIGURE is stateable.
+        events.clear();
+        daemon.check_fleet_runway_warn(RUNWAY_T0 + FLEET_RUNWAY_WARN_CHECK_SECS, &mut events);
+        assert_eq!(
+            events,
+            vec![Event::FleetRunwayRecovered],
+            "a pool outlasting a week is a KNOWN recovery, not an unknown"
+        );
+        assert!(!daemon.state.signaled_fleet_runway_low, "the guard re-arms");
+
+        // The point of the whole test: the next real crossing is not swallowed.
+        events.clear();
+        daemon.check_fleet_runway_warn(RUNWAY_T0 + 2 * FLEET_RUNWAY_WARN_CHECK_SECS, &mut events);
+        assert_eq!(
+            events,
+            vec![Event::FleetRunwayLow {
+                runway_secs: 30_000,
+                threshold_secs: 86_400,
+                counted: 2,
+                observed: 2,
+            }],
+            "a genuine second crossing still signals after an out-of-window recovery",
+        );
+    }
+
+    #[test]
+    fn fleet_runway_warn_holds_an_out_of_window_pool_when_the_threshold_exceeds_it() {
+        // The other side of the same boundary: a threshold ABOVE one weekly window cannot be
+        // answered by "the pool outlasts a week" — a 10-day pool is below a 20-day line, and the
+        // reading is not precise enough to say. So it HOLDS rather than fabricating a recovery.
+        // Threshold 1_728_000 s = 20 days, inside the config band (60..=2_592_000).
+        //
+        // This pins the NON-fabrication, NOT that the resulting behaviour is desirable. Because
+        // `Known` is capped at the window, no reading can clear a threshold above it, so such a
+        // threshold latches the alarm on permanently — the KNOWN LIMITATION tracked as issue #1076
+        // (see `check_fleet_runway_warn`). Read this test as "it does not lie", not as "this band
+        // works"; when #1076 reconciles the config band with the bound, this test should change.
+        let (probe, _calls) = scripted_fleet_probe(vec![
+            known_runway(600_000), // below a 20-day line → fires
+            figureless_runway(FleetRunwayState::BeyondWeeklyWindow), // cannot answer → HOLD
+        ]);
+        let mut daemon = probed_runway_daemon(1_728_000);
+        daemon.fleet_runway_probe = Some(probe);
+
+        let mut events = vec![];
+        daemon.check_fleet_runway_warn(RUNWAY_T0, &mut events);
+        assert!(daemon.state.signaled_fleet_runway_low, "the crossing fired");
+
+        events.clear();
+        daemon.check_fleet_runway_warn(RUNWAY_T0 + FLEET_RUNWAY_WARN_CHECK_SECS, &mut events);
+        assert!(
+            events.is_empty(),
+            "an out-of-window pool below the line answers nothing → no fabricated recovery"
+        );
+        assert!(
+            daemon.state.signaled_fleet_runway_low,
+            "the guard is HELD, not re-armed"
+        );
+    }
+
+    #[test]
+    fn fleet_runway_warn_never_fires_on_a_reading_that_states_no_figure() {
+        // The `FleetRunwayLow` payload carries a `runway_secs` figure, so a state that refuses to
+        // state one must never raise the alarm — the asymmetry that keeps issue #1028's saturated
+        // `i64::MAX` from being able to fabricate a crossing as well as clear one. Every unknown is
+        // probed against a threshold so high that a real figure would certainly cross it.
+        for state in [
+            FleetRunwayState::Flat,
+            FleetRunwayState::Unmeasurable,
+            FleetRunwayState::BeyondWeeklyWindow,
+        ] {
+            let (probe, _calls) = scripted_fleet_probe(vec![figureless_runway(state)]);
+            let mut daemon = probed_runway_daemon(2_592_000); // 30 d, the band maximum
+            daemon.fleet_runway_probe = Some(probe);
+            let mut events = vec![];
+            daemon.check_fleet_runway_warn(RUNWAY_T0, &mut events);
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, Event::FleetRunwayLow { .. })),
+                "{state:?} states no figure → it must never fire: {events:?}"
+            );
+            assert!(
+                !daemon.state.signaled_fleet_runway_low,
+                "{state:?} must not set the guard"
+            );
+        }
+    }
+
+    #[test]
     fn fleet_runway_warn_is_inert_when_disabled_or_unwired() {
         // AC5: with `fleet_runway_warn_secs = 0` (the default) the check is FULLY inert — no probe
         // call, no event, no cadence-state churn — even with a probe wired that WOULD cross hard.
@@ -13259,14 +13429,13 @@ mod tests {
     #[test]
     fn fleet_runway_warn_holds_prior_state_on_unknown_readings() {
         // AC6 / D4: an UNKNOWN reading — a `None` aggregate (unreadable store / nothing observed /
-        // nothing counted) OR a counted-but-FLAT fleet (`runway_secs == None`, zero measurable
-        // drain) — neither fires nor re-arms; it HOLDS the prior signaled state, so a momentary
-        // store hiccup or flat burn never fabricates a crossing or a recovery.
-        let flat = Some(FleetRunway {
-            runway_secs: None,
-            counted: 2,
-            observed: 2,
-        });
+        // nothing counted) OR a counted fleet that states no figure and carries no evidence about
+        // its position (FLAT, or `Unmeasurable` since issue #1028) — neither fires nor re-arms; it
+        // HOLDS the prior signaled state, so a momentary store hiccup or flat burn never fabricates
+        // a crossing or a recovery. (`BeyondWeeklyWindow` is deliberately NOT in this class — it
+        // states no figure either, but it DOES establish the fleet is not near exhaustion; its own
+        // behaviour is pinned in `fleet_runway_warn_rearms_on_a_pool_that_outlasts_the_window`.)
+        let flat = figureless_runway(FleetRunwayState::Flat);
         let (probe, _calls) = scripted_fleet_probe(vec![
             known_runway(1800), // below → fires (guard set)
             None,               // unknown aggregate → HOLD (no recovery, guard stays set)
