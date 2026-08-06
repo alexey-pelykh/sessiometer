@@ -340,6 +340,18 @@ struct Report {
     /// re-derived: a render that recomputes the regime from a second source (the caller's own
     /// `Config`, one hop earlier) would keep printing a claim about the census after the
     /// census's input stopped agreeing with it.
+    ///
+    /// Issue #836 deliberately added no wire field, which left the panel's aggregate callout with
+    /// the same blindness the human render had just lost — issue #866. It now also rides the wire
+    /// as [`RosterWire::census_over_roster`], read from this one field, so the two surfaces cannot
+    /// disagree about the REGIME ITSELF.
+    ///
+    /// Their RENDERS still can, deliberately: [`roster_line`] below suppresses the qualifier when
+    /// the census was never measurable (`all_high_covered_secs == 0`), and the panel cannot mirror
+    /// that half because it does not decode that key (issue #1029). The divergence and its
+    /// reasoning are documented where a panel reader will meet them, on
+    /// `StatusPanelFormat.statsAllHighLabel` — do not read the parity above as extending to the
+    /// rendered strings.
     census_over_roster: bool,
 }
 
@@ -2074,14 +2086,14 @@ struct DimWire {
 /// The roster-wide block of the `--json` / socket wire.
 ///
 /// `all_high_threshold` and `all_high_covered_secs` are ADDITIVE (issue #804), as are the seven
-/// `capacity_*` fields (issue #803) — no existing field changed type or meaning, so
-/// `JSON_SCHEMA_VERSION` does not move and a reader that ignores them decodes exactly as before
-/// (the Swift `StatsRoster` names its keys explicitly and ignores the rest). All are ALWAYS
-/// present rather than `skip_serializing_if`-elided, following #804's rationale: they are always
-/// known, and a surface that found a threshold or a denominator ABSENT would fall back to a
-/// hardcoded literal or to reading a bare count as calm — precisely what carrying them is meant to
-/// end. Eliding them would make "not measurable" and "field not sent" indistinguishable, which is
-/// the one distinction the capacity readout must preserve.
+/// `capacity_*` fields (issue #803) and `census_over_roster` (issue #866) — no existing field
+/// changed type or meaning, so `JSON_SCHEMA_VERSION` does not move and a reader that ignores them
+/// decodes exactly as before (the Swift `StatsRoster` names its keys explicitly and ignores the
+/// rest). All are ALWAYS present rather than `skip_serializing_if`-elided, following #804's
+/// rationale: they are always known, and a surface that found a threshold or a denominator ABSENT
+/// would fall back to a hardcoded literal or to reading a bare count as calm — precisely what
+/// carrying them is meant to end. Eliding them would make "not measurable" and "field not sent"
+/// indistinguishable, which is the one distinction the capacity readout must preserve.
 ///
 /// Read `all_high_episodes` ONLY against `all_high_covered_secs`. Zero jointly-covered
 /// seconds means the census was never measurable, and the accompanying `0` is UNKNOWN, not
@@ -2099,6 +2111,29 @@ struct RosterWire {
     /// Seconds of the window during which EVERY rostered account was simultaneously
     /// covered — the denominator the two figures above were measured over.
     all_high_covered_secs: i64,
+    /// The census's SET, beside its water and its denominator (issue #866): `true` when the census
+    /// intersected the CONFIGURED roster, `false` when no roster was known and it degraded to
+    /// whoever held samples — where an unsampled account cannot withhold the metric, so it fires on
+    /// strictly less evidence. Carried for the same reason `all_high_threshold` is — issue #804
+    /// put the water on the wire because three surfaces were each giving a different answer for
+    /// it, and a surface that has to re-derive a census parameter answers from a second source
+    /// that can drift. The set is the same shape of fact: the panel's aggregate callout
+    /// otherwise renders both regimes as identical bytes (the defect issue #866 reports), and
+    /// re-deriving the regime panel-side would keep asserting it after the census's own input
+    /// stopped agreeing.
+    ///
+    /// ALWAYS present, and here that is load-bearing rather than merely consistent with the block's
+    /// rule above. Eliding the `false` — the one value a reader acts on — would make the DEGRADED
+    /// regime indistinguishable from a pre-#866 daemon that never sent the key, and those two
+    /// demand opposite renders: name the set, versus drop the qualifier (a claim about a set the
+    /// daemon never reported is the fabrication this field exists to end). That is exactly the
+    /// "not measurable" / "field not sent" collapse the block rule forbids, on the one field where
+    /// the elided value is the informative one.
+    ///
+    /// This is the census's set ONLY. The capacity-holds figures below degrade over the SAME
+    /// `roster` and carry no equivalent flag — issue #864 tracks that asymmetry CLI-side; a
+    /// consumer must not read this field as annotating them.
+    census_over_roster: bool,
     /// Maximal intervals in which EVERY rostered account was simultaneously non-viable at the
     /// daemon's own boundary, so swapping could not have restored capacity (issue #803).
     ///
@@ -2227,13 +2262,13 @@ fn stats_wire<'a>(report: &'a Report, config_unreadable: Option<&'a str>) -> Sta
             .map(|r| BucketWire {
                 start: r.period.start,
                 end: r.period.end,
-                roster: roster_wire(&r.roster),
+                roster: roster_wire(&r.roster, report.census_over_roster),
                 // Series buckets carry no velocity — it is a CURRENT-rate readout, not per-bucket.
                 accounts: accounts_wire(&r.per_account, None),
             })
             .collect(),
         summary: PeriodWire {
-            roster: roster_wire(&report.summary.roster),
+            roster: roster_wire(&report.summary.roster, report.census_over_roster),
             accounts: accounts_wire(&report.summary.per_account, Some(&report.velocity)),
             // The fleet/roster runway aggregate (issue #544) — summary-only, from the SAME built
             // report the CLI and daemon socket both serialize, so the fleet figure keeps R-2 parity
@@ -2335,7 +2370,11 @@ fn dim_wire(d: &crate::usage_stats::DimStats) -> DimWire {
     }
 }
 
-fn roster_wire(r: &RosterStats) -> RosterWire {
+/// `census_over_roster` is [`Report::census_over_roster`], passed in rather than read off
+/// `RosterStats`: the regime is a property of the aggregation the whole report came from, not of
+/// the per-window roster block, so both the summary and every series bucket carry the SAME value —
+/// the one [`Report`] recorded from the very `roster` [`aggregate_with_roster`] consumed.
+fn roster_wire(r: &RosterStats, census_over_roster: bool) -> RosterWire {
     RosterWire {
         swap_count: r.swap_count,
         swaps: SwapsWire {
@@ -2349,6 +2388,7 @@ fn roster_wire(r: &RosterStats) -> RosterWire {
         all_high_secs: r.all_high_secs,
         all_high_threshold: r.high_threshold,
         all_high_covered_secs: r.all_high_covered_secs,
+        census_over_roster,
         capacity_holds: r.capacity_holds,
         capacity_holds_session: r.capacity_holds_session,
         capacity_holds_weekly: r.capacity_holds_weekly,
@@ -5698,6 +5738,49 @@ mod tests {
         assert_eq!(v["series"][0]["roster"]["all_high_threshold"], 0.95);
     }
 
+    /// The census's SET rides the wire beside its water (issue #866), so the panel can make the
+    /// same distinction the human render makes without re-deriving it from a second source.
+    ///
+    /// Asserts BOTH values. The committed golden pins only `true`, and a field that is hardwired
+    /// to the constant the golden happens to hold passes every single-value assertion — this is
+    /// the assertion that actually reaches the wiring, in the same shape
+    /// `roster_line`'s own regime pair does.
+    #[test]
+    fn the_wire_carries_the_census_set_under_both_regimes() {
+        fn roster_of(census_over_roster: bool) -> serde_json::Value {
+            let report = Report {
+                census_over_roster,
+                ..wire_golden_report()
+            };
+            serde_json::from_str::<serde_json::Value>(&render_json(&report, None).unwrap())
+                .expect("the wire is valid JSON")
+        }
+
+        let configured = roster_of(true);
+        assert_eq!(configured["summary"]["roster"]["census_over_roster"], true);
+
+        // The `false` doubles as the ALWAYS-present gate, which is why no separate presence
+        // assertion follows: an elided key reads back as `Null`, and `Null != false`. `false` is
+        // the value a consumer acts on, so eliding it would make the degraded regime
+        // indistinguishable from a pre-#866 daemon, and those two demand OPPOSITE renders (name
+        // the set / drop the qualifier).
+        let degraded = roster_of(false);
+        assert_eq!(
+            degraded["summary"]["roster"]["census_over_roster"], false,
+            "the degraded regime must be SENT, not elided: {}",
+            degraded["summary"]["roster"]
+        );
+
+        // Additive: `schema` does not move, and a per-bucket reader gets the same regime as the
+        // summary — one report, one census, one set.
+        assert_eq!(degraded["schema"], 1);
+        assert_eq!(degraded["series"][0]["roster"]["census_over_roster"], false);
+        assert_eq!(
+            configured["series"][0]["roster"]["census_over_roster"],
+            true
+        );
+    }
+
     #[test]
     fn empty_window_still_renders_an_echo_and_roster_line() {
         let now = 1_000_000;
@@ -6628,7 +6711,8 @@ mod tests {
     /// The frozen schema:1 wire. #160 is HUMAN-render only — it adds no field, no
     /// recommendation, no glyph — so this is the #158/#159 contract plus, since issue #804,
     /// the roster block's two ADDITIVE census fields (`all_high_threshold` +
-    /// `all_high_covered_secs`). Additive is why `schema` still reads `1`: no existing field
+    /// `all_high_covered_secs`), and since issue #866 its third (`census_over_roster`, the
+    /// census's SET). Additive is why `schema` still reads `1`: no existing field
     /// changed type, name, order or meaning, so every pre-#804 reader decodes these bytes
     /// exactly as before.
     const WIRE_GOLDEN: &str = r#"{
@@ -6657,6 +6741,7 @@ mod tests {
         "all_high_secs": 0,
         "all_high_threshold": 0.95,
         "all_high_covered_secs": 21600,
+        "census_over_roster": true,
         "capacity_holds": 0,
         "capacity_holds_session": 0,
         "capacity_holds_weekly": 0,
@@ -6702,6 +6787,7 @@ mod tests {
       "all_high_secs": 0,
       "all_high_threshold": 0.95,
       "all_high_covered_secs": 21600,
+      "census_over_roster": true,
       "capacity_holds": 0,
       "capacity_holds_session": 0,
       "capacity_holds_weekly": 0,

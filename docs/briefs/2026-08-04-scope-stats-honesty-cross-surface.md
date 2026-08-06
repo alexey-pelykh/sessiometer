@@ -30,8 +30,8 @@ Three independent defects, not one:
 
 1. **The panel fabricates a zero.** `all_high_covered_secs` was `0` — the *denominator*. The census
    was never once able to observe the whole roster. The CLI gates on this correctly; the Swift
-   `StatsRoster` decodes five keys and this is not among them, so the panel renders `0 episodes (0s)`
-   for a measurement that never happened. Identical in shape to #804 → #805.
+   `StatsRoster` does not decode it, so the panel renders `0 episodes (0s)` for a measurement that
+   never happened. Identical in shape to #804 → #805.
 
 2. **The runway saturates.** `(total_rate > 0.0).then(|| (total_headroom / total_rate).round() as i64)`
    — a guard testing for *exactly* zero against an EMA that decays toward zero and never arrives, feeding

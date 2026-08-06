@@ -2275,16 +2275,19 @@ enum StatusPanelFormat {
     ///
     /// The water is READ FROM THE WIRE (`allHighThreshold`), never assumed: it is `session_ceiling`,
     /// which the operator can retune, so a literal here would silently lie the moment it is retuned
-    /// (issue #805 — the label had been pinned at `≥90%` while the aggregator censused at 95).
+    /// (issue #805 — the label had been pinned at `≥90%` while the aggregator censused at 95). Its
+    /// SET is read the same way (`censusOverRoster`, issue #866) and for the same reason.
     static func statsAggregateText(roster: StatsRoster, window: StatsWindow) -> String {
         let episodes = roster.allHighEpisodes
         let epWord = episodes == 1 ? "episode" : "episodes"
-        return "\(statsAllHighLabel(roster.allHighThreshold)) — \(episodes) \(epWord)"
+        let label = statsAllHighLabel(roster.allHighThreshold, censusOverRoster: roster.censusOverRoster)
+        return "\(label) — \(episodes) \(epWord)"
             + " (\(statsDuration(roster.allHighSecs)))"
             + " · swaps \(roster.swapCount) · \(statsWindowPhrase(window))"
     }
 
-    /// The aggregate callout's leading clause, stating the water the census actually used.
+    /// The aggregate callout's leading clause, stating the two parameters of the census it heads:
+    /// the WATER it counted at (issue #805) and the SET it counted over (issue #866).
     ///
     /// A `nil` water (a pre-#804 daemon that never sent `all_high_threshold` — see `StatsRoster`)
     /// DROPS the qualifier rather than substituting a number: naming a threshold the daemon never
@@ -2293,9 +2296,31 @@ enum StatusPanelFormat {
     /// degraded line still says WHAT was counted, only not the water it was counted at. This is the
     /// panel's standing honesty rule on the read-only Stats surface (never a fabricated number),
     /// applied to a label rather than to a magnitude.
-    static func statsAllHighLabel(_ threshold: Double?) -> String {
-        guard let threshold else { return "All accounts high at once" }
-        return "All accounts ≥\(statsPercent(threshold))% at once"
+    ///
+    /// `censusOverRoster == false` — no configured roster was known, so the census intersected
+    /// whoever held samples — narrows the SUBJECT, "All accounts" → "All sampled accounts", rather
+    /// than appending a parenthetical the way the CLI does (`all-accounts-high (≥95%, sampled
+    /// accounts)`, `src/stats.rs` `roster_line`). Same fact, same vocabulary, different grammar,
+    /// because the two surfaces are different parts of speech: the CLI's is the metric's NAME, a
+    /// fixed identifier it can only annotate, while this one is a sentence — and in the degraded
+    /// regime "All accounts" is not a heading to qualify but a claim that is false, since the
+    /// census demonstrably did not see them all. `nil` (a pre-#866 daemon) drops the qualifier by
+    /// the same rule the `nil` water above follows, and `true` needs no qualifier because the
+    /// unqualified sentence already states it.
+    ///
+    /// DIVERGENCE FROM THE CLI, stated rather than inherited: `roster_line` also suppresses the
+    /// qualifier when the census was never measurable (`all_high_covered_secs == 0`), because
+    /// naming a set there would describe a measurement that never happened. This surface cannot
+    /// mirror that half — `StatsRoster` does not decode `all_high_covered_secs` at all (issue
+    /// #1029), so the panel has no way to know a census was untaken, and it currently renders that
+    /// case as a confident `0 episodes (0s)` rather than the CLI's `—` sentinel. Given it IS
+    /// showing a number, naming the set that produced it is the honest reading of the two, so the
+    /// qualifier is stated unconditionally on `false`. When #1029 lands and the denominator
+    /// arrives, this is the second suppression to add — not a rule that was overlooked.
+    static func statsAllHighLabel(_ threshold: Double?, censusOverRoster: Bool?) -> String {
+        let subject = censusOverRoster == false ? "All sampled accounts" : "All accounts"
+        guard let threshold else { return "\(subject) high at once" }
+        return "\(subject) ≥\(statsPercent(threshold))% at once"
     }
 
     /// A whole-second span as the compact coarse duration the aggregate callout uses — the two-largest-unit
