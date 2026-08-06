@@ -2518,6 +2518,104 @@ mod tests {
         );
     }
 
+    /// Issue #1001 / PRD AC-2a — `use --force <active-label>` really does replace the
+    /// canonical bytes when the account's stash has DIVERGED from them, which is precisely
+    /// the state a `migration import` leaves behind: the imported credential staged into
+    /// `Sessiometer/u-A` while the canonical still holds the pre-import token.
+    ///
+    /// The sibling above cannot show this. It runs on the shared fixture where the stash and
+    /// the canonical BOTH hold `A-token`, so its `canonical == b"A-token"` is satisfied by a
+    /// no-op just as well as by a real adoption — it distinguishes `--force` from the
+    /// unqualified form only by the logged event, never by the bytes. Import's report tells
+    /// the operator to run this command; without this test, that instruction's *effect* is
+    /// documented and unasserted.
+    ///
+    /// The blobs are WELL-FORMED Claude Code credentials, and that is a fidelity
+    /// requirement rather than decoration. Staging over A's stash leaves the canonical
+    /// matching NO stash, which routes the #730 canary to `NoStashMatch` — and there the
+    /// shape-check decides: a well-formed orphan fails OPEN (a benign not-yet-restashed CC
+    /// token) and the swap proceeds, while an unparseable one is refused with
+    /// `CanaryUnparseableCanonical` to protect an unrelated secret from the `-U` clobber.
+    /// A production canonical is real CC JSON, so it is the well-formed branch this must
+    /// exercise; the shared fixture's bare `b"A-token"` takes the refusal branch instead and
+    /// would make this test assert the opposite of the shipped behaviour.
+    ///
+    /// There is deliberately NO stash assertion here — read design § 4.1's implementer note
+    /// before adding one. With `outgoing_stash == incoming_stash`, step 2 re-stashes the
+    /// outgoing canonical blob back over the freshly-imported stash, so the stash ends up
+    /// holding the STALE token. Adoption still succeeds — `incoming` is read BEFORE that
+    /// write — which is why the canonical is the only thing worth asserting, and why a stash
+    /// assertion would read as a failure while the behaviour is correct.
+    #[tokio::test]
+    async fn force_adopts_a_freshly_imported_credential_for_the_already_active_account() {
+        /// A well-formed CC credential carrying `access` as its bearer — the
+        /// `{"claudeAiOauth":{accessToken,refreshToken,expiresAt}}` shape #730 recognizes.
+        fn cc_credential(access: &str) -> Vec<u8> {
+            format!(
+                r#"{{"claudeAiOauth":{{"accessToken":"{access}","refreshToken":"sk-ant-ort-RT","expiresAt":1700000000000}}}}"#
+            )
+            .into_bytes()
+        }
+        let pre_import = cc_credential("sk-ant-oat-STALE");
+        let imported = cc_credential("sk-ant-oat-IMPORTED");
+
+        let config = config_ab();
+        let store = FakeCredentialStore::empty();
+        store.write(&cred(&pre_import)).await.unwrap();
+        let stash = FakeAccountStash::empty();
+        // The state `import` leaves: A's own stash now holds the artifact's credential,
+        // while the canonical — the only item Claude Code reads — still holds the old one.
+        stash
+            .write("Sessiometer/u-A", &stashed(&imported, "u-A"))
+            .await
+            .unwrap();
+        stash
+            .write("Sessiometer/u-B", &stashed(b"B-token", "u-B"))
+            .await
+            .unwrap();
+        assert_eq!(
+            canonical(&store).await,
+            pre_import,
+            "precondition: the canonical is STALE relative to the staged stash"
+        );
+
+        let (_json_dir, json) = claude_json_for("u-A");
+        let log_dir = tempfile::tempdir().unwrap();
+        let log_path = log_dir.path().join("sessiometer.log");
+        let mut log = EventLog::at(&log_path).unwrap();
+        let poller = FakePoller::new(Probe::Live { weekly: 0.10 });
+        let lock_dir = tempfile::tempdir().unwrap();
+        let lock_path = lock_dir.path().join("swap.lock");
+        let notifier = FakeNotifier::ok();
+
+        let result = run_use(
+            &config,
+            "work",
+            true, // --force — the token import's report names, and the reason it works
+            false,
+            Seams {
+                cache: &FakeCache::miss(),
+                poller: &poller,
+                store: &store,
+                stash: &stash,
+                claude_json: &json,
+                lock_path: &lock_path,
+                notifier: &notifier,
+            },
+            &mut log,
+        )
+        .await;
+
+        assert!(result.is_ok(), "the named command must succeed: {result:?}");
+        assert_eq!(
+            canonical(&store).await,
+            imported,
+            "AC-2a: the command the import report names must actually replace the canonical \
+             bytes — this is the assertion the unqualified `use work` fails, since it \
+             short-circuits on service-name equality and writes nothing"
+        );
+    }
+
     // --- acceptance: keychain locked, always (even with --force) (#63) -------
 
     #[tokio::test]

@@ -29,7 +29,7 @@ use crate::daemon::{
     STATUS_SCHEMA_VERSION,
 };
 use crate::error::{Error, Result};
-use crate::keychain::{Credential, RealCredentialStore};
+use crate::keychain::{Credential, CredentialStore, RealCredentialStore};
 use crate::migration::{ManagedAccount, MigrationArtifact, Passphrase, Payload, PLAINTEXT_WARNING};
 use crate::observability::{
     CredentialHealth, Diagnostic, DiagnosticLog, Event, EventLog, ExpiryHorizon, ExportMode,
@@ -4627,11 +4627,32 @@ async fn import(path: PathBuf, overwrite: bool, passphrase: PassphraseSource) ->
     // behaviour unchanged). Resolved from `local` before it is moved into `apply_import`.
     let overwrite = resolve_import_overwrite(overwrite, local.as_ref());
 
+    let stash = RealAccountStash::new();
+
+    // Which roster account is this machine currently logged into (issue #1001)? Resolved
+    // BEFORE `apply_import`, because "active" is a PRE-import fact: the import is about to
+    // overwrite that account's stash, after which the token-first signal below no longer
+    // matches. A fresh target (`local` is `None`) has an empty roster, so no roster account
+    // can resolve as active and the read is skipped entirely.
+    let active_uuid = match local.as_ref() {
+        Some(config) => {
+            resolve_active_uuid_for_import(
+                &config.roster,
+                &RealCredentialStore::new(),
+                &stash,
+                &paths::claude_json()?,
+            )
+            .await
+        }
+        None => None,
+    };
+
     let (config, outcomes) = apply_import(
         Some((&swap_lock, SWAP_LOCK_MAX_WAIT)),
         &payload,
         local,
-        &RealAccountStash::new(),
+        active_uuid.as_deref(),
+        &stash,
         overwrite,
     )
     .await?;
@@ -4675,6 +4696,52 @@ fn resolve_import_overwrite(cli_overwrite: bool, local: Option<&Config>) -> bool
         .map(|config| config.migration.conflict_policy)
         .unwrap_or_default()
         == ConflictPolicy::Overwrite
+}
+
+/// Resolve WHICH roster account this machine is currently logged into, for `import`'s
+/// non-adoption report (issue #1001) — token-first, through the SAME shared resolver
+/// ([`crate::active`]) the daemon's poll loop and the `use` swap consult, so all three
+/// verbs agree on what "active" means rather than each deriving its own answer.
+///
+/// BEST-EFFORT and never fatal, deliberately UNLIKE `use`. Nothing is written on the
+/// strength of this answer: it decides only whether one advisory line prints. So a
+/// canonical the keychain will not hand over (locked, ACL-denied, or the scrubbed
+/// `CredentialNotFound` item) degrades to the `~/.claude.json` DISPLAY signal —
+/// [`crate::active::resolve_via_display`], the same degradation the daemon's
+/// locked-keychain poll takes — rather than aborting an import the operator asked for.
+/// `use` treats a locked keychain as a safety abort instead, because it is about to WRITE
+/// the canonical and a wrong answer there loses a credential (#211/#212). When BOTH signals
+/// are unavailable the answer is `None` and no notice prints — strictly the behaviour that
+/// shipped before this issue, never worse.
+///
+/// It is also the ONLY canonical read on the `import` path, and that item belongs to Claude
+/// Code rather than to sessiometer, so on a UI session where trust was never granted
+/// `security` may raise a modal prompt here ([`crate::keychain`] documents the general case).
+/// Failing open above is what keeps that from being a regression: a refused prompt, a
+/// headless session and an SSH session all continue the import on the display signal — and a
+/// FRESH target (`local` is `None`, the primary migration path) never reaches this at all.
+///
+/// The caller runs this BEFORE `apply_import` acquires the #64 swap lock, which leaves a
+/// window where a concurrent `use` invalidates the answer. Two separate reasons, worth
+/// keeping apart: it MUST precede the stash WRITES (once import overwrites the active
+/// account's stash, the token no longer matches it and resolution silently changes answer),
+/// and it merely HAPPENS to precede the lock, because moving it inside would mean handing a
+/// [`CredentialStore`] to [`apply_import`] — and `apply_import` holding no such seam is
+/// exactly what makes "import adds no canonical writer" (R-2a, C-2) structural rather than a
+/// convention. A stale advisory line is the cheaper failure.
+async fn resolve_active_uuid_for_import<C: CredentialStore, S: AccountStash>(
+    roster: &[Account],
+    store: &C,
+    stash: &S,
+    claude_json: &Path,
+) -> Option<String> {
+    let index = match store.read().await {
+        Ok(canonical) => {
+            crate::active::resolve_account_for(roster, stash, claude_json, &canonical).await
+        }
+        Err(_) => crate::active::resolve_via_display(roster, claude_json),
+    }?;
+    Some(roster[index].account_uuid.clone())
 }
 
 /// Tally the per-account import outcomes into `(imported, skipped, overwritten, failed)` — the four
@@ -4723,10 +4790,22 @@ fn emit_import_event(imported: u32, skipped: u32, overwritten: u32, failed: u32)
 /// the caller's `config.save()` runs unlocked; it is skipped entirely for a config-only
 /// artifact (no keychain write to serialize). A `lock` of `None` is the hermetic test
 /// path.
+///
+/// `active_uuid` is the account this machine is currently logged into
+/// ([`resolve_active_uuid_for_import`]; `None` when nothing resolves), and it changes only
+/// the REPORT (issue #1001). Every account's credential lands in its own per-account stash
+/// `Sessiometer/<uuid>` — but the ACTIVE account's live credential is served from the
+/// canonical `Claude Code-credentials` item, which this function does not, and must not,
+/// write: `src/swap.rs` owns that transition under the #64 single-writer lock and
+/// `src/daemon/canonical.rs` reconciles out-of-band changes to it, so a second writer here
+/// would race the reconciler (design § 4.1 / AD-1, PRD R-2a, C-2). Import therefore stays a
+/// stage-and-roster operation and closes the gap by SAYING so — see
+/// [`non_adoption_notice`].
 async fn apply_import<S: AccountStash>(
     lock: Option<(&Path, Duration)>,
     payload: &Payload,
     local: Option<Config>,
+    active_uuid: Option<&str>,
     stash: &S,
     overwrite: bool,
 ) -> Result<(Config, Vec<AccountImport>)> {
@@ -4786,6 +4865,7 @@ async fn apply_import<S: AccountStash>(
         // an unstashed account), reported `failed`, and the remaining accounts continue.
         // A config-only account (no secret) writes nothing and lands as a roster entry
         // only → "needs re-login".
+        let mut staged = false;
         if let Some(managed) = secrets.get(incoming_account.account_uuid.as_str()) {
             if write_and_verify(stash, &incoming_account.stash(), managed)
                 .await
@@ -4794,6 +4874,7 @@ async fn apply_import<S: AccountStash>(
                 outcomes.push(AccountImport::failed(&incoming_account.label));
                 continue;
             }
+            staged = true;
         }
 
         let outcome = match existing {
@@ -4806,7 +4887,19 @@ async fn apply_import<S: AccountStash>(
                 AccountImport::imported(&incoming_account.label)
             }
         };
-        outcomes.push(outcome);
+        // Issue #1001: a credential was STAGED into this account's own stash, and it is the
+        // account the machine is live on — so the bytes just written are in a slot nothing
+        // reads, and the canonical item still holds the pre-import token. Gated on `staged`
+        // deliberately: a SKIPPED account (conflict policy left it byte-for-byte untouched)
+        // and a config-only account (no secret in the artifact) both wrote nothing, so there
+        // is nothing pending adoption and the notice would be a false alarm.
+        outcomes.push(
+            if staged && active_uuid == Some(incoming_account.account_uuid.as_str()) {
+                outcome.staged_not_adopted()
+            } else {
+                outcome
+            },
+        );
     }
 
     Ok((result, outcomes))
@@ -4874,6 +4967,14 @@ impl ImportOutcome {
 struct AccountImport {
     label: String,
     outcome: ImportOutcome,
+    /// This account is the target machine's ACTIVE one, and the import STAGED a credential
+    /// into its per-account stash without adopting it into the canonical item (issue #1001).
+    ///
+    /// Orthogonal to [`outcome`](Self::outcome) rather than a fifth variant of it: the
+    /// account genuinely WAS imported or overwritten — the roster entry and the stash both
+    /// landed — so the four-way tally [`count_import_outcomes`] feeds the exit code stays
+    /// exactly as it was. What this flag adds is that the landing is not the whole story.
+    staged_not_adopted: bool,
 }
 
 impl AccountImport {
@@ -4881,31 +4982,81 @@ impl AccountImport {
         Self {
             label: label.to_owned(),
             outcome: ImportOutcome::Imported,
+            staged_not_adopted: false,
         }
     }
     fn skipped(label: &str) -> Self {
         Self {
             label: label.to_owned(),
             outcome: ImportOutcome::Skipped,
+            staged_not_adopted: false,
         }
     }
     fn overwritten(label: &str) -> Self {
         Self {
             label: label.to_owned(),
             outcome: ImportOutcome::Overwritten,
+            staged_not_adopted: false,
         }
     }
     fn failed(label: &str) -> Self {
         Self {
             label: label.to_owned(),
             outcome: ImportOutcome::Failed,
+            staged_not_adopted: false,
         }
+    }
+
+    /// Mark this row as the target's active account whose credential was staged but not
+    /// adopted (issue #1001) — see the field docs for why this is a flag, not a variant.
+    fn staged_not_adopted(mut self) -> Self {
+        self.staged_not_adopted = true;
+        self
     }
 }
 
+/// The non-adoption notice (issue #1001): the artifact carried the account this machine is
+/// currently logged into, so its credential was written to that account's own stash — which
+/// is NOT the item Claude Code reads for the live session.
+///
+/// Calls that item "the shared login" — the operator-facing noun `status`'s fault lines
+/// ([`render_canonical_scrub`] / [`render_keychain_locked`]) and the menu-bar panel use, and
+/// the surfaces an operator acting on this note meets next. Not "canonical": that name is for
+/// [`crate::error`]'s canary refusals, which address someone inspecting the keychain item.
+///
+/// Names the FORCING form, `use --force <label>`, and that is load-bearing rather than
+/// decorative. Unqualified `use <label>` short-circuits on service-name equality —
+/// `if account.stash() == active_stash { return Ok(GateOutcome::AlreadyActive); }` in
+/// `SwapTarget::resolve` — a comparison of service NAMES, never of contents, pinned by
+/// `already_active_without_force_is_a_noop_success_with_zero_writes` in
+/// [`crate::use_account`] (`canonical` unchanged, zero writes). Naming it would leave the
+/// canonical holding the stale token while both `import` and `use` reported success:
+/// the original defect, reproduced through its own remediation (PRD AC-2a).
+///
+/// Deliberately does NOT assert what that item currently holds. The obvious wording — "the
+/// shared login still holds the pre-import token" — is FALSE in a state this path genuinely
+/// reaches: when the canonical has been scrubbed, [`resolve_active_uuid_for_import`]
+/// still resolves the active account from the `~/.claude.json` display, so the notice fires
+/// with no canonical item to hold anything. The instruction survives that state unchanged
+/// (`use --force` adopts against an absent canonical through the #212 recovery path), so the
+/// line says what was and was not written, and leaves the canonical's contents to `status`.
+///
+/// Non-secret by construction: the account's LABEL only, never a token, uuid, or email
+/// (issue #15 / C-3).
+fn non_adoption_notice(label: &str) -> String {
+    format!(
+        "note: `{label}` is this machine's active account. Its credential was staged into \
+         its own stash, but NOT adopted into the shared login — and the shared login is the \
+         one Claude Code reads, so the live session is unchanged.\n      \
+         Run `sessiometer use --force {label}` to adopt it. `--force` is required: without \
+         it, `use` sees the account is already active and writes nothing."
+    )
+}
+
 /// Render the per-account import report: one `outcome \`label\`` line per account, then a
-/// count summary. Labels only (non-secret); no token or email ever appears. Returned as a
-/// String so it is unit-testable and the caller prints it.
+/// count summary, then the non-adoption notice for the active account when the import
+/// staged one (issue #1001). Labels only (non-secret); no token or email ever appears.
+/// Returned as a String so it is unit-testable and the caller prints it.
 fn import_report(outcomes: &[AccountImport]) -> String {
     let mut out = String::new();
     for entry in outcomes {
@@ -4919,6 +5070,14 @@ fn import_report(outcomes: &[AccountImport]) -> String {
         count(ImportOutcome::Overwritten),
         count(ImportOutcome::Failed),
     ));
+    // Set off from the tally by a BLANK line (as the `status` verbose block separates itself):
+    // this is the one line of the report the operator has to act on, and butted against the
+    // counts it reads as more tally. At most one account can be active, but the loop keeps the
+    // renderer total rather than making it assert a cardinality the type does not carry.
+    for entry in outcomes.iter().filter(|entry| entry.staged_not_adopted) {
+        out.push_str("\n\n");
+        out.push_str(&non_adoption_notice(&entry.label));
+    }
     out
 }
 
@@ -10471,7 +10630,7 @@ spare  22222222-2222\n\
             .decrypt(&pp)
             .unwrap();
         let target = crate::stash::FakeAccountStash::empty();
-        let (config, outcomes) = apply_import(None, &restored, None, &target, false)
+        let (config, outcomes) = apply_import(None, &restored, None, None, &target, false)
             .await
             .unwrap();
 
@@ -10515,9 +10674,10 @@ spare  22222222-2222\n\
         let service = local.roster[0].stash();
 
         // Default: SKIP — reported skipped, stash untouched.
-        let (config, outcomes) = apply_import(None, &payload, Some(local.clone()), &target, false)
-            .await
-            .unwrap();
+        let (config, outcomes) =
+            apply_import(None, &payload, Some(local.clone()), None, &target, false)
+                .await
+                .unwrap();
         assert_eq!(config.roster.len(), 1);
         assert_eq!(outcomes[0].outcome, ImportOutcome::Skipped);
         assert_eq!(
@@ -10527,9 +10687,10 @@ spare  22222222-2222\n\
         );
 
         // `--overwrite`: REPLACE — reported overwritten, stash now the incoming credential.
-        let (config, outcomes) = apply_import(None, &payload, Some(local.clone()), &target, true)
-            .await
-            .unwrap();
+        let (config, outcomes) =
+            apply_import(None, &payload, Some(local.clone()), None, &target, true)
+                .await
+                .unwrap();
         assert_eq!(config.roster.len(), 1);
         assert_eq!(outcomes[0].outcome, ImportOutcome::Overwritten);
         assert_eq!(
@@ -10580,9 +10741,10 @@ spare  22222222-2222\n\
     #[tokio::test]
     async fn a_credential_write_failure_is_surfaced_not_swallowed() {
         let payload = import_payload(&[("alice", UUID_A, TOKEN_A, EMAIL_A)]);
-        let (config, outcomes) = apply_import(None, &payload, None, &FailingWriteStash, false)
-            .await
-            .unwrap();
+        let (config, outcomes) =
+            apply_import(None, &payload, None, None, &FailingWriteStash, false)
+                .await
+                .unwrap();
 
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].outcome, ImportOutcome::Failed);
@@ -10603,7 +10765,7 @@ spare  22222222-2222\n\
     #[tokio::test]
     async fn a_write_that_does_not_persist_is_caught_by_read_back_verification() {
         let payload = import_payload(&[("alice", UUID_A, TOKEN_A, EMAIL_A)]);
-        let (config, outcomes) = apply_import(None, &payload, None, &LyingReadStash, false)
+        let (config, outcomes) = apply_import(None, &payload, None, None, &LyingReadStash, false)
             .await
             .unwrap();
         assert_eq!(outcomes[0].outcome, ImportOutcome::Failed);
@@ -10622,7 +10784,7 @@ spare  22222222-2222\n\
             Vec::new(),
         );
         let target = crate::stash::FakeAccountStash::empty();
-        let (config, outcomes) = apply_import(None, &payload, None, &target, false)
+        let (config, outcomes) = apply_import(None, &payload, None, None, &target, false)
             .await
             .unwrap();
 
@@ -10666,7 +10828,7 @@ spare  22222222-2222\n\
             .await
             .unwrap();
         let target = crate::stash::FakeAccountStash::empty();
-        let (_config, outcomes) = apply_import(None, &payload, None, &target, false)
+        let (_config, outcomes) = apply_import(None, &payload, None, None, &target, false)
             .await
             .unwrap();
         let report = import_report(&outcomes);
@@ -10687,6 +10849,347 @@ spare  22222222-2222\n\
                 "no account email may appear in the report"
             );
         }
+    }
+
+    // --- non-adoption of the active account (issue #1001) -------------------
+
+    /// The token the TARGET machine is live on before the import — what the canonical
+    /// `Claude Code-credentials` item holds, and what the active account's stash holds too
+    /// (the state a swap leaves behind), so token-first resolution identifies it as active.
+    const TOKEN_PRE_IMPORT: &[u8] = b"CREDENTIAL-TOKEN-PRE-IMPORT-0f0f0f0f0f";
+    /// A third roster account, used where the machine must be active on an account the
+    /// artifact does NOT carry.
+    const UUID_C: &str = "33333333-3333-3333-3333-333333333333";
+
+    /// Cap-1.1 (R-2, AC-2, AC-2a) — importing the target's **active** account reports that
+    /// the credential was staged and NOT adopted, and names the command that actually
+    /// completes the adoption.
+    ///
+    /// The assertion is on the **`--force` token**, not on "a command is named". Unqualified
+    /// `use <label>` short-circuits on service-name equality in `SwapTarget::resolve`
+    /// (`if account.stash() == active_stash { … AlreadyActive }`) and writes nothing — the
+    /// committed `already_active_without_force_is_a_noop_success_with_zero_writes` in
+    /// [`crate::use_account`] pins exactly that. A test that accepted the unqualified form
+    /// would pass while shipping guidance that leaves the canonical holding the stale token:
+    /// the defect, reproduced through its own remediation (PRD AC-2a).
+    #[tokio::test]
+    async fn importing_the_targets_active_account_reports_non_adoption_and_names_use_force() {
+        // `alice` is the account this machine is logged into; `bob` is parked.
+        let local = config_with(vec![acct("alice", UUID_A), acct("bob", UUID_B)]);
+        let target = crate::stash::FakeAccountStash::empty();
+        let payload = import_payload(&[
+            ("alice", UUID_A, TOKEN_A, EMAIL_A),
+            ("bob", UUID_B, TOKEN_B, EMAIL_B),
+        ]);
+
+        let (_config, outcomes) =
+            apply_import(None, &payload, Some(local), Some(UUID_A), &target, true)
+                .await
+                .unwrap();
+
+        let row = |label: &str| {
+            outcomes
+                .iter()
+                .find(|o| o.label == label)
+                .unwrap_or_else(|| panic!("`{label}` must appear in the report"))
+        };
+        assert!(
+            row("alice").staged_not_adopted,
+            "the ACTIVE account's credential lands in a slot nothing reads — say so"
+        );
+        assert!(
+            !row("bob").staged_not_adopted,
+            "a PARKED account's own stash IS the slot that is read — nothing is pending for it"
+        );
+
+        let report = import_report(&outcomes);
+        assert!(
+            report.contains("sessiometer use --force alice"),
+            "the report must name the FORCING form for the active account; got {report}"
+        );
+        // The `--force` assertion above is only worth something if the report cannot ALSO be
+        // naming the unqualified no-op somewhere: pin that every `use` it names is the forcing
+        // one, and that it names exactly the one account that is actually active. This count is
+        // the AC-2a guard, not incidental tidiness — sibling scope R-4 / Cap-2.1
+        // (`docs/specs/import-staleness-warning.feature.md`) also emits a `use --force <label>`
+        // line from `import`, so if that one lands inside `import_report` this goes red.
+        // Relaxing the count is then the cheapest green AND the wrong fix, since it deletes the
+        // only assertion stopping the unqualified form from creeping back in: print the
+        // staleness warning from `import()` alongside this report instead, or re-scope this to
+        // the notice substring.
+        assert_eq!(
+            report.matches("sessiometer use ").count(),
+            1,
+            "exactly one adoption command is named; got {report}"
+        );
+        assert!(
+            !report.contains("--force bob"),
+            "the parked account must not be offered for adoption; got {report}"
+        );
+        // C-3 / issue #15: the new line is a credential-adjacent surface like every other.
+        for token in [TOKEN_A, TOKEN_B, TOKEN_PRE_IMPORT] {
+            assert!(
+                !contains_bytes(report.as_bytes(), token),
+                "no credential token may appear in the non-adoption notice"
+            );
+        }
+        for email in [EMAIL_A, EMAIL_B] {
+            assert!(
+                !report.contains(email),
+                "no account email may appear in the non-adoption notice"
+            );
+        }
+        assert!(
+            !report.contains(UUID_A),
+            "the notice names the LABEL, never the account uuid"
+        );
+    }
+
+    /// Cap-1.2 (R-2a, C-2) — import adds no canonical writer: the canonical item is
+    /// BYTE-UNCHANGED across a full import that overwrites the active account's stash.
+    ///
+    /// The store is wired into the path under test (import reads it to resolve who is
+    /// active), so this is an assertion about a seam the code actually touches rather than
+    /// one it merely lacks. What it pins is the divergence the notice exists to report: the
+    /// stash moves to the imported token, the canonical does not move at all.
+    #[tokio::test]
+    async fn import_stages_the_active_accounts_credential_and_leaves_the_canonical_untouched() {
+        let local = config_with(vec![acct("alice", UUID_A), acct("bob", UUID_B)]);
+        let target = crate::stash::FakeAccountStash::empty();
+        // Target state: logged in as `alice` — the canonical and her stash both hold the
+        // pre-import token, which is what a completed swap leaves behind.
+        target
+            .write(
+                &local.roster[0].stash(),
+                &export_stashed(TOKEN_PRE_IMPORT, UUID_A, EMAIL_A),
+            )
+            .await
+            .unwrap();
+        let store = crate::keychain::FakeCredentialStore::empty();
+        store
+            .write(&Credential::new(TOKEN_PRE_IMPORT.to_vec()))
+            .await
+            .unwrap();
+        // No `~/.claude.json` on this path: resolution must succeed on the TOKEN alone, so
+        // the display fallback cannot be what makes the test pass.
+        let dir = tempfile::tempdir().unwrap();
+        let claude_json = dir.path().join("absent-claude.json");
+
+        let active =
+            resolve_active_uuid_for_import(&local.roster, &store, &target, &claude_json).await;
+        assert_eq!(
+            active.as_deref(),
+            Some(UUID_A),
+            "token-first resolution identifies the active account"
+        );
+
+        let payload = import_payload(&[
+            ("alice", UUID_A, TOKEN_A, EMAIL_A),
+            ("bob", UUID_B, TOKEN_B, EMAIL_B),
+        ]);
+        let (_config, outcomes) = apply_import(
+            None,
+            &payload,
+            Some(local.clone()),
+            active.as_deref(),
+            &target,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            target
+                .read(&local.roster[0].stash())
+                .await
+                .unwrap()
+                .credential
+                .expose(),
+            TOKEN_A,
+            "the imported credential IS staged into the active account's own stash"
+        );
+        assert_eq!(
+            store.read().await.unwrap().expose(),
+            TOKEN_PRE_IMPORT,
+            "import must not write the canonical item — `use --force` owns that transition \
+             under the #64 lock (R-2a, C-2)"
+        );
+        assert!(
+            import_report(&outcomes).contains("sessiometer use --force alice"),
+            "and the report must name the command that closes the gap it just left"
+        );
+    }
+
+    /// Cap-1.2, the parked half — when NO imported account is the active one, every stash
+    /// holds its imported credential, the canonical is untouched, and nothing is reported as
+    /// pending adoption. A parked account's own stash IS the slot that will be read, so
+    /// staging it there is the whole job; the notice must stay silent.
+    #[tokio::test]
+    async fn parked_accounts_are_staged_with_no_canonical_interaction_and_no_notice() {
+        // The machine is logged into a THIRD account that the artifact does not carry.
+        let local = config_with(vec![
+            acct("alice", UUID_A),
+            acct("bob", UUID_B),
+            acct("carol", UUID_C),
+        ]);
+        let target = crate::stash::FakeAccountStash::empty();
+        target
+            .write(
+                &local.roster[2].stash(),
+                &export_stashed(TOKEN_PRE_IMPORT, UUID_C, "carol@example.com"),
+            )
+            .await
+            .unwrap();
+        let store = crate::keychain::FakeCredentialStore::empty();
+        store
+            .write(&Credential::new(TOKEN_PRE_IMPORT.to_vec()))
+            .await
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let claude_json = dir.path().join("absent-claude.json");
+
+        let active =
+            resolve_active_uuid_for_import(&local.roster, &store, &target, &claude_json).await;
+        assert_eq!(
+            active.as_deref(),
+            Some(UUID_C),
+            "carol is the active account"
+        );
+
+        // The artifact carries only the two PARKED accounts.
+        let payload = import_payload(&[
+            ("alice", UUID_A, TOKEN_A, EMAIL_A),
+            ("bob", UUID_B, TOKEN_B, EMAIL_B),
+        ]);
+        let (_config, outcomes) = apply_import(
+            None,
+            &payload,
+            Some(local.clone()),
+            active.as_deref(),
+            &target,
+            true,
+        )
+        .await
+        .unwrap();
+
+        for (idx, token) in [(0, TOKEN_A), (1, TOKEN_B)] {
+            assert_eq!(
+                target
+                    .read(&local.roster[idx].stash())
+                    .await
+                    .unwrap()
+                    .credential
+                    .expose(),
+                token,
+                "each parked account's own stash holds its imported credential"
+            );
+        }
+        assert_eq!(
+            store.read().await.unwrap().expose(),
+            TOKEN_PRE_IMPORT,
+            "the canonical item is untouched"
+        );
+        let report = import_report(&outcomes);
+        assert!(
+            !report.contains("--force"),
+            "no account is pending adoption — the notice must stay silent; got {report}"
+        );
+    }
+
+    /// The notice fires only when a credential was ACTUALLY staged for the active account.
+    /// Two ways nothing is staged, both of which leave the canonical consistent with the
+    /// stash and so have nothing pending adoption: the conflict policy SKIPPED the account
+    /// (its stash is byte-for-byte untouched), and a config-only artifact carries no secret
+    /// at all. A notice in either case is a false alarm telling the operator to force a swap
+    /// that would change nothing.
+    #[tokio::test]
+    async fn non_adoption_is_silent_when_the_active_accounts_credential_was_never_staged() {
+        let local = config_with(vec![acct("alice", UUID_A)]);
+
+        // (a) Skipped: the artifact carries `alice`, but the default conflict policy leaves
+        //     her untouched.
+        let target = crate::stash::FakeAccountStash::empty();
+        let payload = import_payload(&[("alice", UUID_A, TOKEN_A, EMAIL_A)]);
+        let (_config, outcomes) = apply_import(
+            None,
+            &payload,
+            Some(local.clone()),
+            Some(UUID_A),
+            &target,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcomes[0].outcome, ImportOutcome::Skipped);
+        assert!(
+            !outcomes[0].staged_not_adopted,
+            "a skipped account wrote nothing — there is nothing to adopt"
+        );
+        assert!(!import_report(&outcomes).contains("--force"));
+
+        // (b) Config-only artifact (an `export --no-secrets`): a roster entry lands, no
+        //     stash is written, and the account is a `login` away — not a `use --force`.
+        let config_only = Payload::new(
+            config_with(vec![acct("alice", UUID_A)]).render(),
+            Vec::new(),
+        );
+        let (_config, outcomes) =
+            apply_import(None, &config_only, Some(local), Some(UUID_A), &target, true)
+                .await
+                .unwrap();
+        assert_eq!(outcomes[0].outcome, ImportOutcome::Overwritten);
+        assert!(
+            !outcomes[0].staged_not_adopted,
+            "a config-only import carries no credential — there is nothing to adopt"
+        );
+        assert!(!import_report(&outcomes).contains("--force"));
+    }
+
+    /// Active-account resolution is BEST-EFFORT for this path: a canonical the keychain will
+    /// not hand over degrades to the `~/.claude.json` display signal rather than aborting an
+    /// import the operator asked for — nothing is written on the strength of the answer.
+    /// Both unreadable classes are covered, because they reach `read` by different arms:
+    /// the LOCKED keychain and the scrubbed, confirmed-absent item.
+    #[tokio::test]
+    async fn active_resolution_falls_back_to_the_display_when_the_canonical_is_unreadable() {
+        let local = config_with(vec![acct("alice", UUID_A), acct("bob", UUID_B)]);
+        let stash = crate::stash::FakeAccountStash::empty();
+        let dir = tempfile::tempdir().unwrap();
+        let claude_json = dir.path().join("claude.json");
+        std::fs::write(
+            &claude_json,
+            format!(r#"{{"oauthAccount":{{"accountUuid":"{UUID_B}"}}}}"#),
+        )
+        .unwrap();
+
+        // Each state is built where it is named, so a third one cannot be added without
+        // giving it its own setup (a `match` with a catch-all arm would silently absorb it).
+        let locked = crate::keychain::FakeCredentialStore::empty();
+        locked.set_locked(true);
+        let not_found = crate::keychain::FakeCredentialStore::empty();
+        not_found.set_not_found(true);
+        for (state, store) in [("locked", &locked), ("not_found", &not_found)] {
+            assert_eq!(
+                resolve_active_uuid_for_import(&local.roster, store, &stash, &claude_json)
+                    .await
+                    .as_deref(),
+                Some(UUID_B),
+                "a {state} canonical leaves the display as the only signal — use it"
+            );
+        }
+
+        // No signal at all (the SAME unreadable canonical, now with no display) resolves to
+        // nothing, and no notice prints — the behaviour that shipped before #1001, never worse.
+        assert_eq!(
+            resolve_active_uuid_for_import(
+                &local.roster,
+                &locked,
+                &stash,
+                &dir.path().join("absent.json")
+            )
+            .await,
+            None
+        );
     }
 
     // --- [migration] tunable wiring (issue #150) ----------------------------
@@ -10749,6 +11252,7 @@ spare  22222222-2222\n\
             None,
             &payload,
             Some(overwrite_target),
+            None,
             &crate::stash::FakeAccountStash::empty(),
             resolved,
         )
@@ -10772,6 +11276,7 @@ spare  22222222-2222\n\
             None,
             &payload,
             Some(skip_target),
+            None,
             &crate::stash::FakeAccountStash::empty(),
             resolved,
         )
