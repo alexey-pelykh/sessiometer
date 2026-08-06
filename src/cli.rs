@@ -1196,7 +1196,7 @@ USAGE:
     --since <d> bound all four indicators to events at/after now - <duration>. <duration> is a
                 non-negative integer with a unit: s, m, h, d, w (e.g. 30m, 24h, 7d, 2w). Omit for
                 the whole-log aggregate (the default).
-    --json      print the readout as JSON (schema:2, for scripts) instead of the text view
+    --json      print the readout as JSON (schema:10, for scripts) instead of the text view
     -h, --help  print this help
 
 READ-ONLY: it reads ~/Library/Logs/sessiometer/sessiometer.log and makes no live call, so it
@@ -12458,6 +12458,52 @@ spare  22222222-2222\n\
         // A stray positional or flag the readout does not accept → strict-usage error.
         let err = parse_argv(&["reliability", "--period"]).unwrap_err();
         assert!(matches!(err, Error::CliUsage { .. }));
+    }
+
+    /// Issue #913: `RELIABILITY_USAGE`'s `--json` line advertises a schema version to script
+    /// authors, and nothing structurally coupled that hand-typed number to the constant the wire
+    /// actually emits — so every bump since 3 silently widened the gap until the help read
+    /// `schema:2` against a live `schema:10`. This is that coupling.
+    ///
+    /// Deliberately a PARSE of the advertised token rather than a
+    /// `contains(&format!("schema:{JSON_SCHEMA_VERSION}"))`: `"schema:10"` is a substring of
+    /// `"schema:100"`, so a containment guard stays green whenever the help runs AHEAD of the
+    /// constant — which is also the direction no reader catches by eye. Parsing survives rewording
+    /// of the surrounding sentence too, where a comma-anchored literal would fail spuriously.
+    ///
+    /// Scoped to `RELIABILITY_USAGE` on purpose. `LOG_USAGE` carries its own `schema:2` twenty-five
+    /// lines away, and that one is CORRECT against [`crate::log`]'s separate `JSON_SCHEMA_VERSION`.
+    /// The two wires version independently and agree today only by coincidence, so a guard sweeping
+    /// both would bind `log`'s help to `reliability`'s constant and fail the moment either moves.
+    #[test]
+    fn reliability_usage_advertises_the_live_json_schema_version() {
+        let advertised: Vec<&str> = RELIABILITY_USAGE
+            .match_indices("schema:")
+            .map(|(at, marker)| {
+                let rest = &RELIABILITY_USAGE[at + marker.len()..];
+                let end = rest
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(rest.len());
+                &rest[..end]
+            })
+            .collect();
+
+        // Exactly one, so the lockstep cannot be satisfied by a correct mention sitting beside a
+        // stale one — the shape this defect would take if the line were ever duplicated.
+        assert_eq!(
+            advertised.len(),
+            1,
+            "RELIABILITY_USAGE must advertise the JSON schema version exactly once; found \
+             {advertised:?}"
+        );
+        assert_eq!(
+            advertised[0].parse::<u32>().ok(),
+            Some(crate::reliability::JSON_SCHEMA_VERSION),
+            "RELIABILITY_USAGE advertises `schema:{}` but the wire emits `schema:{}` — carry the \
+             help text with the constant (issue #913)",
+            advertised[0],
+            crate::reliability::JSON_SCHEMA_VERSION,
+        );
     }
 
     #[test]
