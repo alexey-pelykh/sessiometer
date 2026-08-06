@@ -636,7 +636,7 @@ mod tests {
         assert_eq!(refresh_health_view(&AccountHealth::default()), None);
 
         // A real refresh reduces to `last_ok: true` AND carries its rotation flag (the AC-3
-        // durability signal) onto the wire — the signal itself is not lost by issue #1004.
+        // durability signal) onto the wire — the signal itself is not lost by issue #1004/#1070.
         let refreshed = AccountHealth {
             last_refresh_outcome: Some(RefreshEventOutcome::Refreshed { rotated: true }),
             consecutive_refresh_failures: 0,
@@ -646,14 +646,33 @@ mod tests {
             refresh_health_view(&refreshed),
             Some(RefreshHealth {
                 last_ok: true,
-                rotated: true,
+                rotated: Some(true),
                 consecutive_failures: 0,
             })
         );
 
-        // `no_change` is ALIVE but exchanged nothing, so it is `last_ok: true` with
-        // `rotated: false` (issue #1004). Before the fix these two fields were independent —
-        // the wire could, and did, pair a rotation with an outcome that never ran an exchange.
+        // A refresh that exchanged and got the SAME token back is `Some(false)` — a real
+        // measurement, and the case that makes absence mean something different from `false`
+        // (issue #1070). Both directions of the signal survive; only the fabricated value went.
+        let refreshed_same_token = AccountHealth {
+            last_refresh_outcome: Some(RefreshEventOutcome::Refreshed { rotated: false }),
+            consecutive_refresh_failures: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            refresh_health_view(&refreshed_same_token),
+            Some(RefreshHealth {
+                last_ok: true,
+                rotated: Some(false),
+                consecutive_failures: 0,
+            })
+        );
+
+        // `no_change` is ALIVE but exchanged nothing, so it is `last_ok: true` with `rotated:
+        // None` — ABSENT from the wire (issue #1070), not `false`. Before #1004 these two fields
+        // were independent, and the wire could (and did) pair a rotation with an outcome that
+        // never ran an exchange; #1004 derived the value, and #1070 stopped derivation from
+        // manufacturing a `false` where there was nothing to measure.
         let alive = AccountHealth {
             last_refresh_outcome: Some(RefreshEventOutcome::NoChange),
             consecutive_refresh_failures: 0,
@@ -663,7 +682,7 @@ mod tests {
             refresh_health_view(&alive),
             Some(RefreshHealth {
                 last_ok: true,
-                rotated: false,
+                rotated: None,
                 consecutive_failures: 0,
             })
         );
@@ -680,7 +699,7 @@ mod tests {
             refresh_health_view(&dead),
             Some(RefreshHealth {
                 last_ok: false,
-                rotated: false,
+                rotated: None,
                 consecutive_failures: 1,
             })
         );
@@ -696,10 +715,162 @@ mod tests {
             refresh_health_view(&failing),
             Some(RefreshHealth {
                 last_ok: false,
-                rotated: false,
+                rotated: None,
                 consecutive_failures: 3,
             })
         );
+    }
+
+    /// The invariant issue #1070 buys, asserted where it actually holds. Making `rotated` an
+    /// `Option` stops the LITERAL `RefreshHealth { last_ok: false, rotated: true }` from
+    /// type-checking, but the two fields stay independent, so `rotated: Some(_)` beside
+    /// `last_ok: false` remains *expressible* by a hand-written construction — the guarantee is a
+    /// property of the sole constructor, not of the type. So pin it on the constructor, and pin it
+    /// EXHAUSTIVELY: a `match` over every [`RefreshEventOutcome`] variant, so a sixth variant added
+    /// later cannot join the wire without this test being reopened.
+    ///
+    /// Deliberately stronger than "the daemon happens not to write one today": AC-5 warns against
+    /// partial enumeration (it is how `NoChange` went missing upstream), and Cap-4.1 rejects
+    /// suppressions that a later emitter change can reintroduce. This is the honest form of the
+    /// guarantee — a gate, not a comment claiming the shape already forbids it.
+    #[test]
+    fn refresh_health_view_never_pairs_a_rotation_with_a_non_refreshed_outcome() {
+        let cases = [
+            RefreshEventOutcome::Refreshed { rotated: true },
+            RefreshEventOutcome::Refreshed { rotated: false },
+            RefreshEventOutcome::RefreshedNotReStashed { rotated: true },
+            RefreshEventOutcome::RefreshedNotReStashed { rotated: false },
+            RefreshEventOutcome::NoChange,
+            RefreshEventOutcome::Dead,
+            RefreshEventOutcome::Error,
+        ];
+
+        // The `match` below forces a new variant to be CLASSIFIED, but not to be EXERCISED — the
+        // cheapest change that compiles is a new match arm with no new entry in `cases`, which
+        // would leave the variant never run through `refresh_health_view` while this test still
+        // passes. So gate the list itself: every outcome token the vocabulary admits must appear.
+        // Compared via `as_str()` (the `outcome=` token) rather than the enum, because the kind
+        // projection carries no `Ord`/`Hash` and this test is not a reason to widen a wire type.
+        // Counting DISTINCT tokens, not cases: the two payload-carrying variants contribute one each.
+        let covered: std::collections::BTreeSet<&str> =
+            cases.iter().map(|o| o.kind().as_str()).collect();
+        assert_eq!(
+            covered.len(),
+            5,
+            "every RefreshEventOutcome kind must be EXERCISED here, not merely classified by the \
+             match below; covered: {covered:?}"
+        );
+
+        for outcome in cases {
+            let view = refresh_health_view(&AccountHealth {
+                last_refresh_outcome: Some(outcome),
+                ..Default::default()
+            })
+            .expect("an observed outcome always yields a view");
+
+            // The exhaustive `match` is the point: it names every variant, so adding one to
+            // `RefreshEventOutcome` fails to compile here until its rotation semantics are stated.
+            let exchange_ran = match outcome {
+                RefreshEventOutcome::Refreshed { .. }
+                | RefreshEventOutcome::RefreshedNotReStashed { .. } => true,
+                RefreshEventOutcome::NoChange
+                | RefreshEventOutcome::Dead
+                | RefreshEventOutcome::Error => false,
+            };
+
+            assert_eq!(
+                view.rotated.is_some(),
+                exchange_ran,
+                "`rotated` is present exactly where an exchange ran: {outcome:?} → {view:?}"
+            );
+            // The pairing the issue names, stated directly rather than inferred from the two
+            // assertions around it: a non-alive outcome can never be carrying a rotation.
+            assert!(
+                view.last_ok || view.rotated.is_none(),
+                "a non-refreshed outcome must carry no rotation: {outcome:?} → {view:?}"
+            );
+
+            // …and the SERIALIZED form, in the same walk. The invariant issue #1070 actually buys
+            // is a property of the BYTES ("absent, not `null`"), and `skip_serializing_if` is the
+            // only thing delivering it — an attribute no other gate in either language reads. The
+            // five wire goldens all carry `"refresh_health":null`, so they never serialize this
+            // struct at all and cannot witness a regression here; asserting the value alone would
+            // leave `#[serde(default)]` (which emits `"rotated":null`) passing every test.
+            let json = serde_json::to_string(&view).expect("RefreshHealth serializes");
+            assert_eq!(
+                json.contains("\"rotated\""),
+                exchange_ran,
+                "the KEY is emitted exactly where an exchange ran: {outcome:?} → {json}"
+            );
+            assert!(
+                !json.contains("\"rotated\":null"),
+                "absent, never null — a null would re-assert the uninformative value #1070 removed: \
+                 {outcome:?} → {json}"
+            );
+        }
+    }
+
+    /// The byte-exact companion to the walk above, kept separate because it pins WHOLE payloads
+    /// rather than a predicate over them: a partial-match assertion cannot see a neighbouring key
+    /// being dropped or renamed alongside the one under test.
+    ///
+    /// Both directions are asserted from the SAME constructor, because only their contrast carries
+    /// the meaning. `{"last_ok":true,"rotated":false,…}` and `{"last_ok":false,…}` differ by a key,
+    /// and that difference IS the fix: the first says an exchange ran and returned the same token,
+    /// the second says nothing was measured. Before #1070 both serialized `"rotated":false` and the
+    /// wire could not tell an operator which had happened.
+    #[test]
+    fn refresh_health_serializes_rotated_as_a_present_value_or_no_key_at_all() {
+        let wire = |outcome, failures| {
+            serde_json::to_string(
+                &refresh_health_view(&AccountHealth {
+                    last_refresh_outcome: Some(outcome),
+                    consecutive_refresh_failures: failures,
+                    ..Default::default()
+                })
+                .expect("an observed outcome always yields a view"),
+            )
+            .expect("RefreshHealth serializes")
+        };
+
+        // An exchange ran and rotated the token — the AC-3 signal, carried.
+        assert_eq!(
+            wire(RefreshEventOutcome::Refreshed { rotated: true }, 0),
+            r#"{"last_ok":true,"rotated":true,"consecutive_failures":0}"#
+        );
+        // An exchange ran and returned the SAME token — a real measurement, so a present `false`.
+        assert_eq!(
+            wire(RefreshEventOutcome::Refreshed { rotated: false }, 0),
+            r#"{"last_ok":true,"rotated":false,"consecutive_failures":0}"#
+        );
+        // Alive, but no exchange ran: the key is GONE, not `null`.
+        assert_eq!(
+            wire(RefreshEventOutcome::NoChange, 0),
+            r#"{"last_ok":true,"consecutive_failures":0}"#
+        );
+        // The 2026-07-31 incident's outcome — the one that shipped `"rotated": true` before #1004
+        // and `"rotated": false` between #1004 and #1070. Now it says nothing, which is correct.
+        assert_eq!(
+            wire(RefreshEventOutcome::Dead, 1),
+            r#"{"last_ok":false,"consecutive_failures":1}"#
+        );
+        assert_eq!(
+            wire(RefreshEventOutcome::Error, 3),
+            r#"{"last_ok":false,"consecutive_failures":3}"#
+        );
+
+        // Round-trip: the omitted key must decode back to `None` rather than failing, which is what
+        // makes `#[serde(default)]` load-bearing beside `skip_serializing_if` — the Rust `status`
+        // client reads these bytes back with this same type.
+        let decoded: RefreshHealth =
+            serde_json::from_str(r#"{"last_ok":false,"consecutive_failures":1}"#).unwrap();
+        assert_eq!(decoded.rotated, None);
+        // …and a ≤1.13 daemon's always-present key still decodes, as `Some`, not as absent. The
+        // Rust mirror of the Swift `snapshotPre1070AlwaysPresentRotated` pin.
+        let legacy: RefreshHealth =
+            serde_json::from_str(r#"{"last_ok":false,"rotated":false,"consecutive_failures":1}"#)
+                .unwrap();
+        assert_eq!(legacy.rotated, Some(false));
     }
 
     #[tokio::test]

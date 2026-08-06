@@ -89,15 +89,35 @@ enum CredentialHealth: String, Decodable, Equatable {
 }
 
 /// The non-secret refresh-health inputs (`src/daemon/snapshot.rs` `RefreshHealth`): whether
-/// the last refresh kept the credential alive, whether the refresh token VALUE rotated, and
-/// the consecutive-failure streak. All three fields are required when the object is present
-/// (the Rust struct carries no per-field default); the CARRYING field on the account is
-/// optional, so a whole absent / null `refresh_health` is tolerated.
+/// the last refresh kept the credential alive, whether the refresh token VALUE rotated where an
+/// exchange ran at all, and the consecutive-failure streak. `lastOk` and `consecutiveFailures` are
+/// required when the object is present (the Rust struct carries no default for either); the
+/// CARRYING field on the account is optional, so a whole absent / null `refresh_health` is
+/// tolerated.
+///
+/// `rotated` is the ONE optional member, since schema 1.14 (issue #1070). The daemon omits it on
+/// every outcome that ran no token exchange — `no_change`, `dead`, `error` — because rotation is
+/// decided by comparing the seeded refresh token against the one that came back, and an outcome
+/// with no exchange has no such pair. So the three states are distinct and all meaningful:
+/// `true` = an exchange returned a NEW token, `false` = an exchange returned the SAME token, `nil`
+/// = no exchange, nothing measured. Reading `nil` as `false` would re-introduce exactly the
+/// uninformative value #1070 removed.
+///
+/// This mirror is `Bool?` rather than defaulted, and that is load-bearing in BOTH directions: a
+/// ≤1.13 daemon always sends the key (including the derived `false` on dead accounts) and decodes
+/// to `Some`, which is the backward tolerance `Fixtures.snapshotPre1070AlwaysPresentRotated` pins;
+/// a 1.14 daemon's non-refreshed frame omits it and decodes to `nil`. Note the reverse is NOT
+/// tolerated — a pre-#1070 build of this app typed the key as required and drops the whole line on
+/// a 1.14 non-refreshed frame — which is why the Rust reshape and this mirror ship together.
 struct RefreshHealth: Decodable, Equatable {
     let lastOk: Bool
-    let rotated: Bool
+    let rotated: Bool?
     let consecutiveFailures: UInt32
 
+    /// No hand-written `init(from:)`, unlike `AccountExpiry` below: the SYNTHESIZED decoder already
+    /// reaches for `decodeIfPresent` on an optional member, so an absent `rotated` lands as `nil`
+    /// while a missing `last_ok` still throws — exactly the split wanted here. `AccountExpiry` needs
+    /// its custom decoder only because its fail-safe (`.unknown`) sits on a NON-optional member.
     private enum CodingKeys: String, CodingKey {
         case lastOk = "last_ok"
         case rotated

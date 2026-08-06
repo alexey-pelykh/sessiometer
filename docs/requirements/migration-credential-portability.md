@@ -786,6 +786,30 @@ headline count (`141 rotated=true, 0 rotated=false`) from this field.
 > status/watch goldens plus the Swift fixtures and decoder assertions. **Which path is taken is a
 > decision this scope has not made**; it is not resolvable by an implementer choosing the compiling
 > one.
+>
+> **DECIDED 2026-08-06 (issue #1070): make it optional, present only where an exchange ran.**
+> *Added 2026-08-06; the paragraph above is preserved as the statement of the open question, not
+> because it is still open.* The reserved call was taken as a third path rather than either of the
+> two costed above: `RefreshHealth.rotated` became `Option<bool>` with `skip_serializing_if`, so a
+> refreshed account still carries the AC-3 signal in BOTH directions (`true` / `false`) while every
+> `no_change` / `dead` / `error` account omits the key entirely. `false` therefore stops meaning
+> "nothing was measured" and starts meaning "an exchange ran and returned the same token" — a
+> distinction the always-present `bool` could not draw, and the reason dropping the field outright
+> was rejected: it would have discarded the data class 0465's headline count is built from, when
+> the uninformative value was only ever the `false`-on-a-dead-account case.
+>
+> **The Swift-consumer cost, stated as this requirement asks.** It is identical to the drop path —
+> `apps/menubar/Sources/WireModel.swift` typed `rotated` as a non-optional `Bool`, so optional and
+> absent break the decode by the same amount — which is why cost did not discriminate and the choice
+> was made on merit. Paid in full: a MINOR `STATUS_SCHEMA_VERSION` bump 1.13 → 1.14, the five
+> status/watch goldens regenerated, the mirror re-typed to `Bool?`, and the current-minor Swift
+> fixtures + `WireDecoderTests` assertions swept. One consequence is asymmetric and is recorded at
+> `STATUS_SCHEMA_VERSION`'s own doc comment rather than only here: a pre-#1070 build of the menubar
+> drops a 1.14 non-refreshed line, so the daemon and the app must be updated together. The Rust
+> `status` client is immune by construction — it ships in the same binary as the daemon it reads.
+>
+> The full decision record, including why the two costed paths were rejected, is the operator's
+> comment on issue #1070.
 
 **Partially verified: 0465 carries no `dead` line** — its window ends ~2026-07-11 and the first `dead` line in the
 local log is 2026-07-14, so no dead line is inside its sample. The requirement is forward-looking.
