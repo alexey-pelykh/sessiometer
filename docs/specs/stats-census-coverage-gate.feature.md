@@ -8,10 +8,10 @@ Example Mapping: 🟦 4 rules · 🟩 9 examples · 🟥 0 open
 > never once able to observe the whole roster. `all_high_covered_secs` was `0` — the denominator, not
 > the numerator. Zero coverage means *unmeasurable*, and the panel renders it as *calm*.
 >
-> The CLI already gets this right. The gap is one field: `StatsRoster` decodes five keys and
-> `all_high_covered_secs` is not among them, so the Swift side cannot gate on a denominator it never
-> reads. This is the identical shape of #804 → #805, which carried `all_high_threshold` over the same
-> boundary for the same reason — *"a fabricated threshold is the very defect #805 exists to end"*.
+> The CLI already gets this right. The gap is one field: `all_high_covered_secs` is not among the
+> keys `StatsRoster` decodes, so the Swift side cannot gate on a denominator it never reads. This is
+> the identical shape of #804 → #805, which carried `all_high_threshold` over the same boundary
+> for the same reason — *"a fabricated threshold is the very defect #805 exists to end"*.
 
 ## Rule 1 — a zero coverage denominator renders UNKNOWN, never a number
 
