@@ -146,6 +146,8 @@ the panel drifted.
 | `build/fixtures/cli-renders/**` | `git commit --amend --trailer 'CLI-Goldens-Rebaselined: <what changed and why>'` | `scripts/check-cli-golden-rebaseline.sh` |
 | `.github/workflows/**`, top-level `scripts/**`, `.cargo/**`, `deny.toml` | `git commit --amend --trailer 'Gate-Change-Acknowledged: <why this is safe>'` | `scripts/check-gate-change-ack.sh` |
 | Add a job to `ci.yml` | Add it to `ci-ok.needs` | `scripts/check-ci-ok-needs.sh` |
+| A path-shaped frontmatter value in `docs/**` | Make it a **git-tracked, repo-root-relative** path — or, on `source` / `parent-requirements` only, replace it with a prose note naming the referent. See § Doc citations below. | `scripts/check-doc-citations.sh` |
+| The `doc-gates` job | Leave it **unfiltered**. `ci-ok` counts a `skipped` job as a pass, so a path filter converts a filter miss into a silent green. | Not enforced |
 | Add a file to `apps/menubar/Sources/` that a **test** compiles against | Add an explicit `- path: Sources/NewFile.swift` under the `MenubarTests` target in `apps/menubar/project.yml`, then re-run `xcodegen generate` | Test-compile failure (`cannot find X in scope`) |
 | Panel UI in `apps/menubar/Sources/` | Check it against the design mock — see § The design mock below | Not enforced |
 | Add a dependency | Confirm its licence is on the `deny.toml` allow-list and it resolves from crates.io | `cargo deny check advisories sources licenses` |
@@ -159,6 +161,32 @@ history: GitHub inserts the fatal blank line there.
 
 Path scopes are narrower than they look: it is `.github/workflows/**`, not `.github/**`; and
 `scripts/**` is anchored at top level, so `apps/menubar/scripts/**` does not trigger it.
+
+### Doc citations
+
+A committed document may only point at something a fresh clone has. The rule, in one line:
+
+> A frontmatter value that is **path-shaped** must be a **git-tracked, repo-root-relative** path.
+> A value that is not path-shaped is a provenance note, legal only on `source` and
+> `parent-requirements`.
+
+Path-shaped is decided by the value's **first whitespace-delimited token** — so a note may still name
+its referent (`parent-requirements: private HQ (prd-stats), REQ-STA-* family`) without the check
+demanding that file exist. That is what makes converting to a note a real option rather than a
+euphemism for deleting the information.
+
+Three things that look like fixes and are not:
+
+- **Annotating a broken pointer** (`# uncommitted`, `# provenance only`) does not repair it. That
+  annotation is what made a fabricated referent indistinguishable from a real one for four months.
+- **Correcting the depth** on a pointer into the private HQ. It is a repo-root *sibling*; no `../`
+  count reaches it from inside a clone. Write a note.
+- **Deleting the pointer and leaving the reasoning that depended on it.** If a committed document's
+  argument rests on a value from an unreachable source, replicate that value in-band at the point of
+  use. A note names its referent; it does not carry its content.
+
+If a referent genuinely never existed, **delete the key**. A pointer with no referent is not
+provenance — it is a claim of provenance.
 
 ### Schema versions are four independent wires
 
