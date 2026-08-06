@@ -1396,11 +1396,29 @@ pub(crate) fn refresh_health_view(health: &AccountHealth) -> Option<RefreshHealt
     Some(RefreshHealth {
         last_ok: matches!(
             outcome,
-            RefreshEventOutcome::Refreshed
-                | RefreshEventOutcome::RefreshedNotReStashed
+            RefreshEventOutcome::Refreshed { .. }
+                | RefreshEventOutcome::RefreshedNotReStashed { .. }
                 | RefreshEventOutcome::NoChange
         ),
-        rotated: health.refresh_token_rotated.unwrap_or(false),
+        // Derived from the outcome rather than carried beside it (issue #1004): an outcome that
+        // exchanged no token reports no rotation, so `rotated` is `false` here by construction
+        // instead of the `true`-by-construction value the old sibling field supplied. The wire
+        // keeps its SHAPE (a plain bool, always present), so this is a value correction, not a
+        // schema change — no `STATUS_SCHEMA_VERSION` bump, no golden or Swift-fixture churn.
+        //
+        // PARTIAL against AC-5, DELIBERATELY. AC-5 asks that none of the FOUR emitting surfaces
+        // "presents `rotated` as an observation", and R-5a reads the surviving `false` here as
+        // "the exact uninformative value R-5 removes, now on a versioned surface". Fully clearing
+        // it means dropping the field, which is a `STATUS_SCHEMA_VERSION` change carrying the
+        // status/watch goldens plus the Swift fixtures and `WireDecoderTests` assertions
+        // (`apps/menubar/Sources/WireModel.swift` decodes `rotated` as a NON-optional `Bool`, so
+        // omitting it is a breaking decode change, not an additive one).
+        //
+        // R-5a states in terms that "which path is taken is a decision this scope has not made;
+        // it is not resolvable by an implementer choosing the compiling one" — so this stops at
+        // the change that is unambiguously an improvement (the FALSE claim is gone from all four
+        // surfaces) and leaves the bump-or-keep call to its owner rather than settling it here.
+        rotated: outcome.rotated().unwrap_or(false),
         consecutive_failures: health.consecutive_refresh_failures,
     })
 }

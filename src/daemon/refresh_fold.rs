@@ -180,20 +180,19 @@ where
         // (`Err`) is an `Error` outcome — mirroring `refresh_tick`'s `error_refresh_event`.
         events.push(Event::PollRefresh {
             account: self.roster[i].label.clone(),
+            // The AC-3 rotation flag on the poll path (issue #279) now rides INSIDE the outcome
+            // (issue #1004): the completed cycle's own signal on a refreshed classification, and
+            // structurally absent otherwise — including an engine that could not even run (`Err`).
             outcome: match &refreshed {
                 Ok(report) => refresh_event_outcome(report),
                 Err(_) => RefreshEventOutcome::Error,
             },
-            // The AC-3 rotation flag on the poll path (issue #279): the completed cycle's
-            // own signal; an engine that could not even run (`Err`) renders `false`.
-            refresh_token_rotated: match &refreshed {
-                Ok(report) => report.refresh_token_rotated,
-                Err(_) => false,
-            },
         });
         match refreshed {
             // The refresh token was cleared in place → genuinely dead: let the 401 stand.
-            Ok(report) if report.outcome == RefreshOutcome::Dead => Err(Error::UsageUnauthorized),
+            Ok(report) if matches!(report.outcome, RefreshOutcome::Dead) => {
+                Err(Error::UsageUnauthorized)
+            }
             // A fresh token may now be stashed → probe liveness through the stash.
             Ok(_) => self
                 .poller
@@ -350,9 +349,9 @@ where
             // Unreachable given the caller's `poll_refresh.is_some()` gate; treat as could-not-run.
             None => return Vec::new(),
         };
-        let (outcome, rotated) = match &refreshed {
-            Ok(report) => (refresh_event_outcome(report), report.refresh_token_rotated),
-            Err(_) => (RefreshEventOutcome::Error, false),
+        let outcome = match &refreshed {
+            Ok(report) => refresh_event_outcome(report),
+            Err(_) => RefreshEventOutcome::Error,
         };
         // Durably record the isolated-refresh ACTION (issue #255 vocabulary), for EVERY firing —
         // the forensic trail the transient `diag=` line alone did not leave, exactly as the #162
@@ -360,7 +359,6 @@ where
         let mut events = vec![Event::PollRefresh {
             account: self.roster[idx].label.clone(),
             outcome,
-            refresh_token_rotated: rotated,
         }];
         // Read the freshly re-stashed access-token expiry (the sweep reads it the same way) so the
         // rollup's staleness clock tracks the revived credential. `fold_recovery_outcome` applies it
@@ -368,7 +366,7 @@ where
         // regardless of the expiry, so the update is inert there.
         let expires_at_ms =
             crate::refresh::stored_expires_at(&self.stash, &self.roster[idx].stash()).await;
-        events.extend(self.fold_recovery_outcome(idx, outcome, rotated, expires_at_ms));
+        events.extend(self.fold_recovery_outcome(idx, outcome, expires_at_ms));
         events
     }
 
@@ -398,15 +396,15 @@ where
         &mut self,
         idx: usize,
         outcome: RefreshEventOutcome,
-        rotated: bool,
         expires_at_ms: Option<i64>,
     ) -> Vec<Event> {
         let mut events = Vec::new();
-        // The refresh-health fold (`last_refresh_outcome` + rotated + the at-risk streak + the #261
-        // latch), shared with the sweep. Any `CredentialUnrecoverable` edge it returns is LOGGED
-        // (via the caller's `emit_best_effort`) but never NOTIFIED — a login-triggered re-probe must
-        // not spawn a "run claude /login" macOS toast the instant the operator just DID.
-        if let Some(event) = self.note_refresh_outcome(idx, outcome, rotated) {
+        // The refresh-health fold (`last_refresh_outcome`, which since issue #1004 carries the
+        // rotation flag, + the at-risk streak + the #261 latch), shared with the sweep. Any
+        // `CredentialUnrecoverable` edge it returns is LOGGED (via the caller's
+        // `emit_best_effort`) but never NOTIFIED — a login-triggered re-probe must not spawn a
+        // "run claude /login" macOS toast the instant the operator just DID.
+        if let Some(event) = self.note_refresh_outcome(idx, outcome) {
             events.push(event);
         }
         // Staleness clock: parked passes the fresh stash expiry; active passes `None` (promote owns
@@ -417,7 +415,7 @@ where
         // Quarantine membership by definitiveness (see the doc ladder): a confirmed-`Dead` credential
         // STAYS quarantined (out of rotation, honest 🔴); every other outcome un-quarantines — a live
         // one to 🟢, an inconclusive `Error` to 🟡 (the #275 un-quarantine guarantee).
-        if outcome != RefreshEventOutcome::Dead {
+        if !matches!(outcome, RefreshEventOutcome::Dead) {
             let uuid = self.roster[idx].account_uuid.clone();
             if let Some(event) = self.apply_refresh_restore(&uuid) {
                 events.push(event);
@@ -473,16 +471,12 @@ where
         // `.promoted` is deliberately unused here (the `..`): a promote either landed a fresh token
         // for the fold's live outcome to clear, or it didn't and the fold keeps the honest 🔴 — the
         // recovery verdict keys on `outcome`, not on whether the canonical was rewritten.
-        let KeepWarmPromote {
-            outcome,
-            token_rotated,
-            ..
-        } = self
+        let KeepWarmPromote { outcome, .. } = self
             .keep_warm_and_promote(idx, &canonical, KeepWarmTrigger::Recovery, &mut events)
             .await;
         // `None` expiry: a real mint's `promote_canonical` already reconciled `access_expires_at`
         // (issue #477); the active path must not clobber it to `None` and false-fire `Stale`.
-        events.extend(self.fold_recovery_outcome(idx, outcome, token_rotated, None));
+        events.extend(self.fold_recovery_outcome(idx, outcome, None));
         events
     }
 
@@ -519,10 +513,11 @@ where
             observation.expires_at_ms.map(|ms| ms / 1000);
         // The refresh-health fields update only when the sweep actually refreshed the account.
         let delta = observation.refresh?;
-        self.note_refresh_outcome(idx, delta.outcome, delta.token_rotated)
+        self.note_refresh_outcome(idx, delta.outcome)
     }
 
-    /// Fold ONE refresh cycle's non-secret `outcome` (+ whether the refresh token rotated) into
+    /// Fold ONE refresh cycle's non-secret `outcome` (which since issue #1004 carries whether the
+    /// refresh token rotated, where the classification admits one) into
     /// account `idx`'s carried refresh-health — the shared core of the #119 sweep observation
     /// ([`apply_refresh_observation`](Self::apply_refresh_observation)) and the issue #643 manual-
     /// recovery re-probe ([`fold_recovery_outcome`](Self::fold_recovery_outcome)), so
@@ -542,7 +537,6 @@ where
         &mut self,
         idx: usize,
         outcome: RefreshEventOutcome,
-        token_rotated: bool,
     ) -> Option<Event> {
         // Issue #880: a refresh the DAEMON drove just wrote this account's credential, so arm the
         // `my_refresh` provenance latch for the next deadline observation. Placed on this shared
@@ -553,15 +547,17 @@ where
         // that to an external write is the one direction that would corrupt issue #877's answer.
         self.note_own_credential_refresh(idx);
         let health = &mut self.state.accounts[idx].health;
+        // The rotation flag is NOT stored alongside: it is part of `last_refresh_outcome` now
+        // (issue #1004), so the two cannot drift out of agreement and the wire view derives one
+        // from the other rather than carrying a second copy.
         health.last_refresh_outcome = Some(outcome);
-        health.refresh_token_rotated = Some(token_rotated);
         match outcome {
             RefreshEventOutcome::Dead | RefreshEventOutcome::Error => {
                 health.consecutive_refresh_failures =
                     health.consecutive_refresh_failures.saturating_add(1);
             }
-            RefreshEventOutcome::Refreshed
-            | RefreshEventOutcome::RefreshedNotReStashed
+            RefreshEventOutcome::Refreshed { .. }
+            | RefreshEventOutcome::RefreshedNotReStashed { .. }
             | RefreshEventOutcome::NoChange => {
                 health.consecutive_refresh_failures = 0;
             }
@@ -571,7 +567,7 @@ where
         // re-quarantine in `note_poll_outcome`) suppresses the re-probe repeats and the `Dead`↔`Error`
         // flap. Keyed on the latch, deliberately NOT on the prior `last_refresh_outcome`, which is
         // orthogonal to the quarantine lifecycle.
-        let signal = outcome == RefreshEventOutcome::Dead
+        let signal = matches!(outcome, RefreshEventOutcome::Dead)
             && health.quarantined
             && !health.unrecoverable_signaled;
         if signal {
@@ -639,16 +635,15 @@ mod tests {
         // omits the field rather than fabricating a verdict.
         assert_eq!(refresh_health_view(&AccountHealth::default()), None);
 
-        // An alive outcome reduces to `last_ok: true`, carrying the rotation flag (the AC-3
-        // durability signal) and the failure streak.
-        let alive = AccountHealth {
-            last_refresh_outcome: Some(RefreshEventOutcome::NoChange),
-            refresh_token_rotated: Some(true),
+        // A real refresh reduces to `last_ok: true` AND carries its rotation flag (the AC-3
+        // durability signal) onto the wire — the signal itself is not lost by issue #1004.
+        let refreshed = AccountHealth {
+            last_refresh_outcome: Some(RefreshEventOutcome::Refreshed { rotated: true }),
             consecutive_refresh_failures: 0,
             ..Default::default()
         };
         assert_eq!(
-            refresh_health_view(&alive),
+            refresh_health_view(&refreshed),
             Some(RefreshHealth {
                 last_ok: true,
                 rotated: true,
@@ -656,11 +651,44 @@ mod tests {
             })
         );
 
+        // `no_change` is ALIVE but exchanged nothing, so it is `last_ok: true` with
+        // `rotated: false` (issue #1004). Before the fix these two fields were independent —
+        // the wire could, and did, pair a rotation with an outcome that never ran an exchange.
+        let alive = AccountHealth {
+            last_refresh_outcome: Some(RefreshEventOutcome::NoChange),
+            consecutive_refresh_failures: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            refresh_health_view(&alive),
+            Some(RefreshHealth {
+                last_ok: true,
+                rotated: false,
+                consecutive_failures: 0,
+            })
+        );
+
+        // `dead` is the outcome from the 2026-07-31 incident, and it is enumerated explicitly
+        // rather than left to share `Error`'s arms — AC-5 names three non-refreshed outcomes and
+        // warns against partial enumeration, which is how `NoChange` went missing upstream.
+        let dead = AccountHealth {
+            last_refresh_outcome: Some(RefreshEventOutcome::Dead),
+            consecutive_refresh_failures: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            refresh_health_view(&dead),
+            Some(RefreshHealth {
+                last_ok: false,
+                rotated: false,
+                consecutive_failures: 1,
+            })
+        );
+
         // A dead/error outcome reduces to `last_ok: false`, surfacing the failure streak the
         // rollup's at-risk input keys off.
         let failing = AccountHealth {
             last_refresh_outcome: Some(RefreshEventOutcome::Error),
-            refresh_token_rotated: Some(false),
             consecutive_refresh_failures: 3,
             ..Default::default()
         };
@@ -680,13 +708,10 @@ mod tests {
         // `RefreshDelta` lives in `contract` and is not imported at module scope (only
         // the daemon's fold consumes it); name it in full here.
         use crate::contract::RefreshDelta;
-        let observe = |outcome, rotated, ms| RefreshObservation {
+        let observe = |outcome, ms| RefreshObservation {
             account_uuid: "u-A".to_owned(),
             expires_at_ms: Some(ms),
-            refresh: Some(RefreshDelta {
-                outcome,
-                token_rotated: rotated,
-            }),
+            refresh: Some(RefreshDelta { outcome }),
         };
 
         // A read-only observation (`refresh: None`) updates ONLY the expiry — folded from
@@ -707,20 +732,12 @@ mod tests {
         );
 
         // Failing refreshes advance the consecutive-failure streak and record the outcome.
-        daemon.apply_refresh_observation(&observe(
-            RefreshEventOutcome::Error,
-            false,
-            1_782_777_600_000,
-        ));
+        daemon.apply_refresh_observation(&observe(RefreshEventOutcome::Error, 1_782_777_600_000));
         assert_eq!(
             daemon.state.accounts[0].health.consecutive_refresh_failures,
             1
         );
-        daemon.apply_refresh_observation(&observe(
-            RefreshEventOutcome::Dead,
-            false,
-            1_782_777_600_000,
-        ));
+        daemon.apply_refresh_observation(&observe(RefreshEventOutcome::Dead, 1_782_777_600_000));
         assert_eq!(
             daemon.state.accounts[0].health.consecutive_refresh_failures,
             2
@@ -733,16 +750,20 @@ mod tests {
         // Any alive refresh resets the streak to zero — so the at-risk input counts only
         // CONSECUTIVE failures — and slides the expiry forward.
         daemon.apply_refresh_observation(&observe(
-            RefreshEventOutcome::Refreshed,
-            true,
+            RefreshEventOutcome::Refreshed { rotated: true },
             1_782_784_800_000,
         ));
         assert_eq!(
             daemon.state.accounts[0].health.consecutive_refresh_failures,
             0
         );
+        // The rotation signal is read off the carried outcome (issue #1004) — there is no
+        // second field to check, and none to disagree with it.
         assert_eq!(
-            daemon.state.accounts[0].health.refresh_token_rotated,
+            daemon.state.accounts[0]
+                .health
+                .last_refresh_outcome
+                .and_then(RefreshEventOutcome::rotated),
             Some(true)
         );
         assert_eq!(
@@ -819,10 +840,7 @@ mod tests {
         let obs = |uuid: &str, outcome| RefreshObservation {
             account_uuid: uuid.to_owned(),
             expires_at_ms: Some(1_782_777_600_000),
-            refresh: Some(RefreshDelta {
-                outcome,
-                token_rotated: false,
-            }),
+            refresh: Some(RefreshDelta { outcome }),
         };
 
         // A non-quarantined account's dead sweep-refresh does NOT notify — that is the #119
@@ -875,7 +893,6 @@ mod tests {
             expires_at_ms: Some(1_782_777_600_000),
             refresh: Some(RefreshDelta {
                 outcome: RefreshEventOutcome::Dead,
-                token_rotated: false,
             }),
         };
         let mut events = Vec::new();
@@ -1177,8 +1194,7 @@ mod tests {
                     // A rotation only happens when CC actually performed the exchange (a real
                     // `Refreshed`); NoChange / Dead / Error never rotate. Lets the #279
                     // poll-refresh event test observe a `true` threaded from the report.
-                    refresh_token_rotated: matches!(self.outcome, RefreshOutcome::Refreshed),
-                    re_stashed: matches!(self.outcome, RefreshOutcome::Refreshed),
+                    re_stashed: matches!(self.outcome, RefreshOutcome::Refreshed { .. }),
                 })
             })
         }
@@ -1249,7 +1265,7 @@ mod tests {
         // death streak never advances. This is the false death the fix eliminates.
         let (mut daemon, _outcomes, calls) = seam_daemon(
             Scripted::Unauthorized,
-            RefreshOutcome::Refreshed,
+            RefreshOutcome::Refreshed { rotated: true },
             Some(reading(0.10, 0.10)), // the refresh REVIVES the spare's token
             false,
             3,
@@ -1281,7 +1297,7 @@ mod tests {
         // most ONCE per episode, not on every poll.
         let (mut daemon, _outcomes, calls) = seam_daemon(
             Scripted::Unauthorized,
-            RefreshOutcome::Refreshed, // the refresh "succeeds" but does NOT revive (no flip)
+            RefreshOutcome::Refreshed { rotated: true }, // the refresh "succeeds" but does NOT revive (no flip)
             None,
             false,
             3,
@@ -1357,7 +1373,7 @@ mod tests {
         // the episode; a LATER 401 opens a fresh episode allowed one more refresh.
         let (mut daemon, outcomes, calls) = seam_daemon(
             Scripted::Unauthorized,
-            RefreshOutcome::Refreshed, // succeeds but does not auto-revive
+            RefreshOutcome::Refreshed { rotated: true }, // succeeds but does not auto-revive
             None,
             false,
             3,
@@ -1394,7 +1410,7 @@ mod tests {
         // `claude -p` spawn) and never quarantines, so the fix costs the common case nothing.
         let (mut daemon, _outcomes, calls) = seam_daemon(
             Scripted::Ok(reading(0.20, 0.10)), // spare polls healthy from the start
-            RefreshOutcome::Refreshed,
+            RefreshOutcome::Refreshed { rotated: true },
             None,
             false,
             3,
@@ -1428,7 +1444,7 @@ mod tests {
         // `work` and reset its streak); WITH the fix the refresh never fires, so it is inert.
         let (mut daemon, outcomes, calls) = seam_daemon(
             Scripted::Ok(reading(0.10, 0.10)), // spare stays healthy — isolate the active path
-            RefreshOutcome::Refreshed,
+            RefreshOutcome::Refreshed { rotated: true },
             Some(reading(0.10, 0.10)), // would (wrongly) revive `work` IF it were refreshed
             false,
             3,
@@ -1472,8 +1488,8 @@ mod tests {
         //     torn / stale one. There is no in-tick ordering that promotes the account FIRST and
         //     then reactively refreshes its now-live canonical.
         let (mut daemon, outcomes, calls) = seam_daemon(
-            Scripted::Unauthorized,    // spare (u-B): parked, its access token 401s…
-            RefreshOutcome::Refreshed, // …the isolated refresh succeeds…
+            Scripted::Unauthorized, // spare (u-B): parked, its access token 401s…
+            RefreshOutcome::Refreshed { rotated: true }, // …the isolated refresh succeeds…
             Some(reading(0.10, 0.20)), // …reviving it to a VIABLE, below-floor swap target.
             false,
             3,
@@ -1553,9 +1569,9 @@ mod tests {
         let cases = [
             // (fake engine report outcome, hard engine error?, expected evented outcome)
             (
-                RefreshOutcome::Refreshed,
+                RefreshOutcome::Refreshed { rotated: true },
                 false,
-                RefreshEventOutcome::Refreshed,
+                RefreshEventOutcome::Refreshed { rotated: true },
             ),
             (
                 RefreshOutcome::NoChange,
@@ -1571,7 +1587,11 @@ mod tests {
             // The engine could not even RUN (spawn / lock failure): the fail-safe `Error`
             // outcome, mirroring `refresh_tick`'s `error_refresh_event`. The report `outcome`
             // is unused on this path, so any value stands in.
-            (RefreshOutcome::Refreshed, true, RefreshEventOutcome::Error),
+            (
+                RefreshOutcome::Refreshed { rotated: true },
+                true,
+                RefreshEventOutcome::Error,
+            ),
         ];
         for (report_outcome, hard_error, expected) in cases {
             let events = poll_refresh_tick_events(report_outcome, hard_error).await;
@@ -1580,20 +1600,19 @@ mod tests {
                 .filter(|e| matches!(e, Event::PollRefresh { .. }))
                 .cloned()
                 .collect::<Vec<_>>();
-            // The rotation flag threads from the cycle's report on the Ok path (a real
-            // `Refreshed` rotates in the seam fake), and is forced `false` when the engine
-            // could not even run (`hard_error` → the `Err(_) => false` branch of #279).
-            let expected_rotated =
-                matches!(report_outcome, RefreshOutcome::Refreshed) && !hard_error;
+            // The rotation flag rides INSIDE `expected` (issue #1004): the `Refreshed` case
+            // expects `{ rotated: true }` threaded from the report, and the `hard_error` case
+            // expects a bare `Error`, which has nowhere to put a rotation at all. Asserting the
+            // whole outcome therefore also asserts the flag — no separate expectation needed.
             assert_eq!(
                 poll_refreshes,
                 vec![Event::PollRefresh {
                     account: "spare".to_owned(),
                     outcome: expected,
-                    refresh_token_rotated: expected_rotated,
                 }],
                 "report {report_outcome:?} (hard_error={hard_error}) must emit exactly one \
-                 poll_refresh event with the redacted handle + mapped outcome + rotation flag",
+                 poll_refresh event with the redacted handle + mapped outcome (rotation \
+                 included, where the outcome admits one)",
             );
         }
     }
@@ -1619,7 +1638,7 @@ mod tests {
         const NOW: i64 = 1_782_777_600;
         let (mut daemon, _outcomes, calls) = seam_daemon(
             Scripted::Ok(reading(0.10, 0.10)),
-            RefreshOutcome::Refreshed,
+            RefreshOutcome::Refreshed { rotated: true },
             None,
             false,
             3,
@@ -1664,8 +1683,7 @@ mod tests {
             vec![
                 Event::PollRefresh {
                     account: "spare".to_owned(),
-                    outcome: RefreshEventOutcome::Refreshed,
-                    refresh_token_rotated: true,
+                    outcome: RefreshEventOutcome::Refreshed { rotated: true },
                 },
                 Event::CredentialRestored {
                     account: "spare".to_owned(),
@@ -1684,7 +1702,7 @@ mod tests {
         const NOW: i64 = 1_782_777_600;
         let (mut daemon, _outcomes, calls) = seam_daemon(
             Scripted::Ok(reading(0.10, 0.10)),
-            RefreshOutcome::Refreshed,
+            RefreshOutcome::Refreshed { rotated: true },
             None,
             false,
             3,
@@ -1715,8 +1733,7 @@ mod tests {
             events,
             vec![Event::PollRefresh {
                 account: "spare".to_owned(),
-                outcome: RefreshEventOutcome::Refreshed,
-                refresh_token_rotated: true,
+                outcome: RefreshEventOutcome::Refreshed { rotated: true },
             }],
             "no CredentialRestored — there was no quarantine to lift (Case B)",
         );
@@ -1770,7 +1787,6 @@ mod tests {
             vec![Event::PollRefresh {
                 account: "spare".to_owned(),
                 outcome: RefreshEventOutcome::Dead,
-                refresh_token_rotated: false,
             }],
             "the action is logged; the #261 operator signal does NOT re-fire (already latched)",
         );
@@ -1786,7 +1802,7 @@ mod tests {
         const NOW: i64 = 1_782_777_600;
         let (mut daemon, _outcomes, calls) = seam_daemon(
             Scripted::Ok(reading(0.10, 0.10)),
-            RefreshOutcome::Refreshed, // ignored: `hard_error` returns Err before reading it
+            RefreshOutcome::Refreshed { rotated: true }, // ignored: `hard_error` returns Err before reading it
             None,
             true, // hard_error → the isolated refresh cannot even run
             3,
@@ -1823,7 +1839,6 @@ mod tests {
                 Event::PollRefresh {
                     account: "spare".to_owned(),
                     outcome: RefreshEventOutcome::Error,
-                    refresh_token_rotated: false,
                 },
                 Event::CredentialRestored {
                     account: "spare".to_owned(),
@@ -1840,7 +1855,7 @@ mod tests {
         // over-refresh: only the terminal 🔴 `Dead` verdict warrants the re-probe.
         let (mut daemon, _outcomes, calls) = seam_daemon(
             Scripted::Ok(reading(0.10, 0.10)),
-            RefreshOutcome::Refreshed,
+            RefreshOutcome::Refreshed { rotated: true },
             None,
             false,
             3,
@@ -1878,7 +1893,7 @@ mod tests {
         // instead).
         let (mut daemon, _outcomes, calls) = seam_daemon(
             Scripted::Ok(reading(0.10, 0.10)),
-            RefreshOutcome::Refreshed,
+            RefreshOutcome::Refreshed { rotated: true },
             None,
             false,
             3,
@@ -1921,7 +1936,7 @@ mod tests {
         let fresh = warm_canonical(fresh_expiry_ms, "rt-live2");
         let (mut daemon, _outcomes, calls) = keep_warm_daemon(
             Scripted::Ok(reading(0.10, 0.10)),
-            RefreshOutcome::Refreshed,
+            RefreshOutcome::Refreshed { rotated: true },
             None,
             Some(fresh.clone()),
             warm_canonical(FAR_FUTURE_MS, "rt-live"),
@@ -1973,8 +1988,7 @@ mod tests {
                     account: "work".to_owned(),
                     trigger: KeepWarmTrigger::Recovery,
                     // A keep-warm PROMOTES rather than re-stashes → refreshed_not_restashed.
-                    outcome: RefreshEventOutcome::RefreshedNotReStashed,
-                    refresh_token_rotated: true,
+                    outcome: RefreshEventOutcome::RefreshedNotReStashed { rotated: true },
                 },
                 Event::CredentialRestored {
                     account: "work".to_owned(),
@@ -2038,7 +2052,6 @@ mod tests {
                 account: "work".to_owned(),
                 trigger: KeepWarmTrigger::Recovery,
                 outcome: RefreshEventOutcome::Dead,
-                refresh_token_rotated: false,
             }],
         );
     }
@@ -2051,7 +2064,7 @@ mod tests {
         const NOW: i64 = 1_782_777_600;
         let (mut daemon, _outcomes, calls) = keep_warm_daemon(
             Scripted::Ok(reading(0.10, 0.10)),
-            RefreshOutcome::Refreshed,
+            RefreshOutcome::Refreshed { rotated: true },
             None,
             Some(cred(b"FRESH-A")),
             warm_canonical(FAR_FUTURE_MS, ""), // EMPTY refresh token → dead
@@ -2100,14 +2113,15 @@ mod tests {
         // (a normal `use` swap onto a live spare) is left entirely to the normal tick — no mint.
         let (mut daemon, _outcomes, calls) = keep_warm_daemon(
             Scripted::Ok(reading(0.10, 0.10)),
-            RefreshOutcome::Refreshed,
+            RefreshOutcome::Refreshed { rotated: true },
             None,
             Some(cred(b"FRESH-A")),
             warm_canonical(FAR_FUTURE_MS, "rt-live"),
         )
         .await;
         daemon.state.active = Some(0);
-        daemon.state.accounts[0].health.last_refresh_outcome = Some(RefreshEventOutcome::Refreshed);
+        daemon.state.accounts[0].health.last_refresh_outcome =
+            Some(RefreshEventOutcome::Refreshed { rotated: true });
 
         let events = daemon.reprobe_active_if_dead().await;
 
@@ -2127,7 +2141,7 @@ mod tests {
         // `poll_refresh` engine against the live canonical.
         let (mut daemon, _outcomes, calls) = seam_daemon(
             Scripted::Ok(reading(0.10, 0.10)),
-            RefreshOutcome::Refreshed,
+            RefreshOutcome::Refreshed { rotated: true },
             None,
             false,
             3,
@@ -2161,7 +2175,7 @@ mod tests {
         // `apply_refresh_restore`) would leave `spare` latched 🔴 and fail this test.
         let (mut daemon, _outcomes, calls) = seam_daemon(
             Scripted::Ok(reading(0.10, 0.10)),
-            RefreshOutcome::Refreshed,
+            RefreshOutcome::Refreshed { rotated: true },
             None,
             false,
             3,
@@ -2229,7 +2243,7 @@ mod tests {
         let fresh = warm_canonical(FAR_FUTURE_MS, "rt-live2");
         let (mut daemon, _outcomes, calls) = keep_warm_daemon(
             Scripted::Ok(reading(0.10, 0.10)),
-            RefreshOutcome::Refreshed,
+            RefreshOutcome::Refreshed { rotated: true },
             None,
             Some(fresh.clone()),
             // FAR-future canonical → the proactive near-expiry path stays inert, isolating the
@@ -2321,7 +2335,7 @@ mod tests {
         .with_keep_warm_engine(
             Box::new(SeamKeepWarm {
                 outcomes: Rc::new(RefCell::new(HashMap::new())),
-                outcome: RefreshOutcome::Refreshed,
+                outcome: RefreshOutcome::Refreshed { rotated: true },
                 revive_to: None,
                 fresh: Some(fresh.clone()),
                 calls: calls.clone(),
