@@ -2,17 +2,20 @@
 title: Committed-Citation Integrity
 scope: doc-citation-integrity
 created: 2026-08-05
-status: draft
+status: locked
 dor_status: passed-with-findings
 source: issue #1060 (+2 amendment comments); repo-wide frontmatter sweep at `efa1a3e`
 appetite: small batch — 2 days
-formulation: {}
+formulation: {technical-architecture: complete, testing-architecture: complete, infrastructure: complete}
 features:
-  citation-rule: {stage: requirements, tracks: {}}
-  citation-check: {stage: requirements, tracks: {}}
-  brief-durability: {stage: requirements, tracks: {}}
-  existing-defect-repair: {stage: requirements, tracks: {}}
-artifacts: {}
+  citation-rule: {stage: work-items, tracks: {technical-architecture: complete}}
+  citation-check: {stage: work-items, tracks: {technical-architecture: complete, testing-architecture: complete}}
+  brief-durability: {stage: work-items, tracks: {technical-architecture: complete}}
+  existing-defect-repair: {stage: work-items, tracks: {technical-architecture: complete}}
+artifacts:
+  design-doc: docs/design/committed-citation-integrity-solution-design.md
+  design-brief: docs/briefs/2026-08-06-design-committed-citation-integrity.md
+  scope-brief: docs/briefs/2026-08-06-scope-citation-integrity.md
 ---
 
 # PRD — Committed-Citation Integrity

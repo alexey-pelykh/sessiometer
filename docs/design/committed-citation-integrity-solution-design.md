@@ -123,9 +123,33 @@ The invariant turns on "is this value path-shaped?", so that test is load-bearin
 belongs to a slash-command name. The repo holds a second instance (`scope: GUI/CLI capability
 parity — …`), so this is a class, not a one-off.
 
-**Rule**: a value is path-shaped iff it contains **no whitespace** AND ends in a **file extension**
-(`.md`, `.yml`, `.yaml`, `.toml`, `.json`, `.sh`, `.rs`, `.swift`). Both false positives above carry
-spaces; every real citation in the repo satisfies both conditions. § 10 T11 pins this.
+**Rule**: strip any trailing `#` comment, then take the value's **first whitespace-delimited token**.
+The value is path-shaped iff that token ends in a known **file extension** (`.md`, `.yml`, `.yaml`,
+`.toml`, `.json`, `.sh`, `.rs`, `.swift`).
+
+**Why the first token and not the whole value.** A first draft of this rule said *"no whitespace in the
+value AND ends in an extension."* Tested against the real corpus, it **missed 2 of the 8 defect sites** —
+because their values are a real path followed by parenthetical prose:
+
+```
+source: .tmp/scopes/migration-credential-portability.md (/investigate + /scope 2026-07-31 → 2026-08-04)
+source: .tmp/findings-for-scope.md (/investigate 2026-07-30)
+```
+
+Both contain whitespace, so the whole-value rule would classify them as legal notes — a 25% false
+negative rate on the exact set the gate exists to catch, and silently, in the permissive direction.
+
+The first-token rule was then run against all 8 `source:` / `parent-requirements:` values in
+`docs/requirements/` and **discriminates perfectly**: the 4 defective ones classify as PATH-SHAPED
+(`.tmp/scopes/…`, `.tmp/findings-for-scope.md`, `../hq/…`, `../../hq/…`), the 4 legitimate notes as
+notes (first tokens `issue`, `operator`, `session`, `session-context`).
+
+It also buys the ergonomics the note form needs: **a note may name its referent without the check
+demanding the file be tracked**, because the filename is not the first token —
+`parent-requirements: private HQ (prd-stats.md), REQ-STA-* family` is a legal note. That is what makes
+"convert to a note" a real option rather than a euphemism for deleting the information.
+
+§ 10 T11 and T15 pin both directions.
 
 ### In-band replication (R-5)
 
@@ -323,11 +347,15 @@ site repairs and the brief migration still deliver independently — R-15/R-16/R
 | T12 | document with **no frontmatter** | exit 0, contributes 0 to the count |
 | T13 | zero documents | **exit 1** — degenerate subject |
 | T14 | `---` horizontal rule inside prose body | exit 0 — frontmatter boundary not confused |
+| T15 | gitignored path **followed by parenthetical prose** (`.tmp/x.md (/investigate 2026-07-30)`) | exit 1, `gitignored` — *falsifies the whole-value path-shape rule, which missed 2 of the 8 real defect sites this way* |
+| T16 | note whose **later** token is a filename (`private HQ (prd-stats.md), REQ-STA-*`) | exit 0 — a note may name its referent without the file having to be tracked |
 
-**Four tests carry the design's load, and each falsifies a specific wrong implementation**: T2 kills
-path-existence; T6 kills the note-only rule this design's first draft got wrong; T11 kills the
-contains-a-slash path detector; T13 kills a gate that passes on nothing. A suite without them goes
-green on every defect this design exists to prevent — including two that were live in its own draft.
+**Five tests carry the design's load, and each falsifies a specific wrong implementation**: T2 kills
+path-existence; T6 kills the note-only rule for `source`; T11 kills the contains-a-slash detector;
+**T15 kills the whole-value detector**; T13 kills a gate that passes on nothing. A suite without them
+goes green on every defect this design exists to prevent — including **three** that were live in its
+own drafts, two of which were caught only by running the candidate rule against the real corpus rather
+than reasoning about it. Test the detector against the corpse, not against the fix.
 
 **Quality gate**: `doc-gates` in `ci-ok.needs`, unfiltered.
 
