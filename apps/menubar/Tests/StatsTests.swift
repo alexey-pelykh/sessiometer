@@ -23,6 +23,10 @@ import Foundation
 import os
 import XCTest
 
+/// Seven days in seconds — the span `window(period:)` builds, and the denominator every coverage
+/// assertion in this file divides by (issue #1029).
+private let weekSecs: Int64 = 604_800
+
 final class StatsTests: XCTestCase {
 
     // MARK: - StatsCommand: the wire request
@@ -358,16 +362,23 @@ final class StatsTests: XCTestCase {
             return XCTFail("expected a StatsWire document")
         }
         // The golden roster: 0 all-high episodes (0s), swap_count 1, over a `day` window, censused
-        // at the golden's own 0.95 water.
+        // at the golden's own 0.95 water — and jointly covered for 21600 s of that window's 43200,
+        // so it is a PARTLY-measured report and says so (issue #1029). The share is derived from
+        // the golden's own numbers rather than restated, so a regenerated fixture cannot leave this
+        // expectation asserting a stale percent.
+        let covered = try XCTUnwrap(wire.summary.roster.allHighCoveredSecs,
+                                    "the current daemon always sends all_high_covered_secs (issue #804)")
+        let share = Int((Double(covered) / Double(wire.window.end - wire.window.start) * 100).rounded())
         XCTAssertEqual(StatusPanelFormat.statsAggregateText(roster: wire.summary.roster, window: wire.window),
-                       "All accounts ≥95% at once — 0 episodes (0s) · swaps 1 · last 24h")
+                       "All accounts ≥95% at once — 0 episodes (0s, all in view \(share)% of the window)"
+                       + " · swaps 1 · last 24h")
     }
 
     func testAggregateTextSingularEpisode() {
         let roster = StatsRoster(swapCount: 28,
                                  swaps: StatsSwaps(session: 20, weekly: 4, manual: 3, forced: 1, emergency: 0),
                                  allHighEpisodes: 1, allHighSecs: 6000, allHighThreshold: 0.95,
-                                 censusOverRoster: true)
+                                 allHighCoveredSecs: weekSecs, censusOverRoster: true)
         XCTAssertEqual(StatusPanelFormat.statsAggregateText(roster: roster, window: window(period: "week")),
                        "All accounts ≥95% at once — 1 episode (1h40m) · swaps 28 · last 7 days")
     }
@@ -415,7 +426,7 @@ final class StatsTests: XCTestCase {
                 roster: StatsRoster(swapCount: 0,
                                     swaps: StatsSwaps(session: 0, weekly: 0, manual: 0, forced: 0, emergency: 0),
                                     allHighEpisodes: 0, allHighSecs: 0, allHighThreshold: water,
-                                    censusOverRoster: true),
+                                    allHighCoveredSecs: weekSecs, censusOverRoster: true),
                 window: window(period: "week"))
         }
         XCTAssertTrue(label(0.95).hasPrefix("All accounts ≥95% at once"))
@@ -430,7 +441,7 @@ final class StatsTests: XCTestCase {
         let roster = StatsRoster(swapCount: 28,
                                  swaps: StatsSwaps(session: 20, weekly: 4, manual: 3, forced: 1, emergency: 0),
                                  allHighEpisodes: 1, allHighSecs: 6000, allHighThreshold: nil,
-                                 censusOverRoster: true)
+                                 allHighCoveredSecs: weekSecs, censusOverRoster: true)
         let text = StatusPanelFormat.statsAggregateText(roster: roster, window: window(period: "week"))
         XCTAssertEqual(text, "All accounts high at once — 1 episode (1h40m) · swaps 28 · last 7 days")
         // The counted fact survives; only the unknown water is withheld. No digit-then-% may appear
@@ -451,11 +462,13 @@ final class StatsTests: XCTestCase {
 
     /// The rendered callout over a roster differing ONLY in the census regime — and, where a test
     /// asks, its water — so every assertion below isolates the one axis it names.
-    private func censusText(_ censusOverRoster: Bool?, threshold: Double? = 0.95) -> String {
+    private func censusText(_ censusOverRoster: Bool?,
+                            threshold: Double? = 0.95,
+                            coveredSecs: Int64? = weekSecs) -> String {
         let roster = StatsRoster(swapCount: 28,
                                  swaps: StatsSwaps(session: 20, weekly: 4, manual: 3, forced: 1, emergency: 0),
                                  allHighEpisodes: 3, allHighSecs: 6000, allHighThreshold: threshold,
-                                 censusOverRoster: censusOverRoster)
+                                 allHighCoveredSecs: coveredSecs, censusOverRoster: censusOverRoster)
         return StatusPanelFormat.statsAggregateText(roster: roster, window: window(period: "week"))
     }
 
@@ -531,6 +544,222 @@ final class StatsTests: XCTestCase {
         let roster = try JSONDecoder().decode(StatsRoster.self, from: Data(line.utf8))
         XCTAssertNil(roster.censusOverRoster, "an absent additive key is nil, never a decode error")
         XCTAssertEqual(roster.allHighThreshold, 0.95, "the rest of the roster decodes unchanged")
+    }
+
+    // MARK: - The census's DENOMINATOR is READ, never assumed (issue #1029)
+
+    /// The rendered callout over a roster differing ONLY in how much of the window the census could
+    /// see the whole set at one moment. `episodes` / `secs` are parameters because the three states
+    /// this section pins are not all reachable from one pair: an unmeasurable census necessarily
+    /// counts zero, and a genuinely quiet week counts zero too — which is the entire problem.
+    private func coverageText(_ coveredSecs: Int64?, episodes: UInt32 = 0, secs: Int64 = 0) -> String {
+        let roster = StatsRoster(swapCount: 39,
+                                 swaps: StatsSwaps(session: 30, weekly: 5, manual: 3, forced: 1, emergency: 0),
+                                 allHighEpisodes: episodes, allHighSecs: secs, allHighThreshold: 0.95,
+                                 allHighCoveredSecs: coveredSecs, censusOverRoster: true)
+        return StatusPanelFormat.statsAggregateText(roster: roster, window: window(period: "week"))
+    }
+
+    /// THE REPORTED DEFECT, asserted directly. A week in which no instant existed with the whole
+    /// roster observable rendered as `0 episodes (0s)` — a confident calm, on a week when no account
+    /// was usable for days. `RosterWire`'s own doc states the contract this violated (*"Read
+    /// `all_high_episodes` ONLY against `all_high_covered_secs`"*), and the producer states it twice
+    /// in the imperative (`src/usage_stats.rs`).
+    func testAnUnmeasurableCensusIsNotRenderedAsACalmZero() {
+        let unmeasurable = coverageText(0)
+        XCTAssertEqual(unmeasurable,
+                       "All accounts ≥95% at once — not measurable: never all in view at the same moment"
+                       + " · swaps 39 · last 7 days")
+        XCTAssertFalse(unmeasurable.contains("0 episodes"),
+                       "a bare `0` reads as a genuinely quiet week — the reading REQ-STA-B-008 forbids")
+    }
+
+    /// A NEGATIVE denominator is that same unmeasurable state, not a fourth one — which is why the
+    /// gate is `<= 0` and not the `== 0` its prose shorthand names, mirroring the CLI's own `> 0`.
+    /// Nothing should put one on the wire, but this surface does not take "the daemon would never
+    /// send that" as a standard (the reason `statsWindowSeconds` overflow-checks), and the failure
+    /// mode is far from inert: tightened to `== 0`, a negative falls through to the count branch,
+    /// where `statsPercent` clamps its negative share to `0` and the `<1` case then renders
+    /// `0 episodes (0s, all in view <1% of the window)` — a FABRICATED coverage claim on a payload
+    /// that measured nothing, which is worse than the bare zero this issue set out to fix.
+    func testANegativeDenominatorIsUnmeasurableRatherThanATraceOfCoverage() {
+        XCTAssertEqual(coverageText(-1), coverageText(0),
+                       "a negative denominator is no more measurable than a zero one")
+    }
+
+    /// THE PROPERTY THE COPY EXISTS TO PROVIDE, pinned independently of the copy: unmeasurable,
+    /// genuinely quiet, and barely-measured must be THREE distinguishable renders. Every one of them
+    /// carried `0` episodes before this change and so rendered identical bytes. This test would fail
+    /// for any rewording that collapsed any pair of them again, which the equality assertions above
+    /// and below would not.
+    func testTheThreeCensusStatesRenderDistinguishably() {
+        let unmeasurable = coverageText(0)
+        let quiet = coverageText(weekSecs)
+        let barely = coverageText(weekSecs / 100)
+        XCTAssertNotEqual(unmeasurable, quiet, "an unmeasurable week must not read as a quiet one")
+        XCTAssertNotEqual(unmeasurable, barely, "no coverage must not read as a trace of coverage")
+        XCTAssertNotEqual(quiet, barely, "a wholly-measured week must not read as a barely-measured one")
+    }
+
+    /// A WHOLLY measured week is the terse, unannotated form — the common case stays clean, and the
+    /// annotation's mere presence is itself the low-coverage signal.
+    func testAWhollyMeasuredWeekCarriesNoCoverageClause() {
+        XCTAssertEqual(coverageText(weekSecs, episodes: 3, secs: 6000),
+                       "All accounts ≥95% at once — 3 episodes (1h40m) · swaps 39 · last 7 days")
+        XCTAssertFalse(coverageText(weekSecs).contains("in view"),
+                       "a fully-measured census is not annotated")
+    }
+
+    /// A PARTLY measured week states the share it was measured over — the conservative
+    /// no-covered-second bar alone would still print a confident calm for a week the metric barely
+    /// saw (REQ-STA-B-008: "low-coverage periods SHALL be annotated").
+    func testAPartlyMeasuredCensusStatesTheShareItWasMeasuredOver() {
+        XCTAssertEqual(coverageText(weekSecs / 2, episodes: 3, secs: 6000),
+                       "All accounts ≥95% at once — 3 episodes (1h40m, all in view 50% of the window)"
+                       + " · swaps 39 · last 7 days")
+    }
+
+    /// Rounding must not manufacture a whole the share is NOT, at EITHER end — both of these windows
+    /// are strictly partly measured, which is the one thing the annotation exists to say, so a `0%`
+    /// or a `100%` would deny it. The clamp is COPIED from the CLI (`src/stats.rs` `roster_line`)
+    /// rather than re-decided, so the two surfaces cannot disagree by a percent.
+    func testTheShareNeverRoundsToAFalseZeroOrAFalseHundred() {
+        XCTAssertTrue(coverageText(60).contains("all in view <1% of the window"),
+                      "a trace of coverage renders `<1%`, never a false `0%`: \(coverageText(60))")
+        let nearly = coverageText(weekSecs - 60)
+        XCTAssertTrue(nearly.contains("all in view >99% of the window"),
+                      "near-total coverage renders `>99%`, never a false `100%`: \(nearly)")
+        // `100%` is reachable ONLY by the wholly-measured branch, which prints no clause at all —
+        // so `>99%` can never be mistaken for it.
+        XCTAssertFalse(nearly.contains("100%"))
+    }
+
+    /// The annotation says what the share MEASURES, not the field that carries it. `covered` names
+    /// `all_high_covered_secs` and answers *covered by what?* with nothing — the second defect issue
+    /// #1029 reports, and one the CLI had too.
+    func testTheCoverageClauseDoesNotLeakTheFieldName() {
+        XCTAssertFalse(coverageText(weekSecs / 2, episodes: 3, secs: 6000).contains("covered"),
+                       "no field name may reach an operator-facing string")
+        XCTAssertFalse(coverageText(0).contains("covered"))
+    }
+
+    /// A pre-#804 daemon never sent the denominator. The panel must then DROP the coverage clause —
+    /// it must not read the silence as unmeasurability, which would assert a fact the daemon never
+    /// reported: the same fabrication class issue #805 ended one field over. Asserting equality with
+    /// the WHOLLY-measured render is what makes this a drop rather than a coincidence.
+    func testAnAbsentDenominatorDropsTheClauseInsteadOfClaimingUnmeasurable() {
+        XCTAssertEqual(coverageText(nil, episodes: 3, secs: 6000),
+                       coverageText(weekSecs, episodes: 3, secs: 6000),
+                       "an unreported denominator must render exactly as the unannotated sentence")
+        XCTAssertFalse(coverageText(nil).contains("not measurable"),
+                       "unmeasurability may not be claimed from a silence")
+        XCTAssertFalse(coverageText(nil).contains("in view"),
+                       "no share may be stated when no denominator was reported")
+    }
+
+    /// The UNMEASURABLE census also drops the SET qualifier — naming the set a census intersected
+    /// over describes a measurement that never happened. This is the second suppression
+    /// `statsAllHighLabel`'s own doc said #1029 would add, and it restores agreement with the CLI's
+    /// `roster_line`, which suppresses on `census_over_roster || all_high_covered_secs == 0`.
+    func testAnUnmeasurableCensusAlsoDropsTheSetQualifier() {
+        XCTAssertEqual(censusText(false, coveredSecs: 0),
+                       "All accounts ≥95% at once — not measurable: never all in view at the same moment"
+                       + " · swaps 28 · last 7 days")
+        XCTAssertFalse(censusText(false, coveredSecs: 0).contains("sampled"),
+                       "a census that was never taken has no set to name")
+        // The WATER survives the drop, matching the CLI exactly: it is a parameter the daemon
+        // carried regardless of whether the census could be taken, so `roster_line` states it on `—`
+        // too. One parameter of the label degrades and the other does not, deliberately.
+        XCTAssertTrue(censusText(false, coveredSecs: 0).hasPrefix("All accounts ≥95% at once"))
+        // A nil denominator keeps the pre-#1029 behaviour: an older daemon's silence is not
+        // unmeasurability, so a degraded census it DID report still names its set.
+        XCTAssertTrue(censusText(false, coveredSecs: nil).hasPrefix("All sampled accounts"))
+    }
+
+    /// THE CROSS-LANGUAGE KEY GATE for the denominator — the `all_high_covered_secs` sibling of
+    /// `testTheGoldenFixtureCarriesTheCensusSetItWasBuiltUnder`, and load-bearing for the same
+    /// reason: a misspelled `CodingKey` decodes as `nil` and silently drops the gate on EVERY
+    /// payload, which is indistinguishable from the pre-#804 daemon path and therefore invisible to
+    /// every other test in this section. `Fixtures.statsBasic` is byte-pinned to the Rust-emitted
+    /// golden (`WireGoldenTests`), so reading the key out of it proves the name matches what
+    /// `RosterWire` actually serializes.
+    func testTheGoldenFixtureCarriesTheDenominatorItWasMeasuredOver() throws {
+        guard case .ok(let wire) = try decodeStatsReply(Fixtures.statsBasic) else {
+            return XCTFail("expected a StatsWire document")
+        }
+        let covered = try XCTUnwrap(wire.summary.roster.allHighCoveredSecs,
+                                    "the current daemon always sends all_high_covered_secs (issue #804)")
+        XCTAssertGreaterThan(covered, 0)
+        XCTAssertLessThan(covered, wire.window.end - wire.window.start,
+                          "the golden report is PARTLY measured — it exercises the annotated branch")
+        XCTAssertNotNil(wire.series.first?.roster.allHighCoveredSecs,
+                        "series buckets carry the denominator too — one report, one census")
+    }
+
+    /// A WIRE-HOSTILE window neither crashes nor invents a share. The span is the annotation's
+    /// denominator and is subtracted from two `Int64`s decoded straight off the socket — and Swift's
+    /// `-` TRAPS on overflow in release as well as debug, where the Rust original merely wraps. So
+    /// `statsWindowSeconds` clamps and overflow-checks, and this pins both halves: an inverted or
+    /// degenerate window takes the same no-annotation branch the CLI's `(end - start).max(0)` gives
+    /// it, and an `Int64`-overflowing one degrades the same way instead of terminating the app.
+    func testAHostileWindowSpanNeitherTrapsNorInventsAShare() {
+        XCTAssertEqual(StatusPanelFormat.statsWindowSeconds(window(period: "week")), weekSecs)
+        XCTAssertEqual(StatusPanelFormat.statsWindowSeconds(
+            StatsWindow(start: 500, end: 100, label: "l", period: "week", since: nil)), 0,
+            "an inverted window clamps to zero, mirroring Rust's `.max(0)`")
+        XCTAssertEqual(StatusPanelFormat.statsWindowSeconds(
+            StatsWindow(start: .min, end: .max, label: "l", period: "week", since: nil)), 0,
+            "an overflowing span is not a window — it degrades, it does not trap")
+        // And the render that divides by it stays honest: a partly-covered roster over a degenerate
+        // window states its count with NO share, because no share was measurable.
+        let roster = StatsRoster(swapCount: 39,
+                                 swaps: StatsSwaps(session: 30, weekly: 5, manual: 3, forced: 1, emergency: 0),
+                                 allHighEpisodes: 3, allHighSecs: 6000, allHighThreshold: 0.95,
+                                 allHighCoveredSecs: 600, censusOverRoster: true)
+        let degenerate = StatusPanelFormat.statsAggregateText(
+            roster: roster, window: StatsWindow(start: 0, end: 0, label: "l", period: "week", since: nil))
+        XCTAssertEqual(degenerate,
+                       "All accounts ≥95% at once — 3 episodes (1h40m) · swaps 39 · last 7 days")
+        XCTAssertFalse(degenerate.contains("in view"), "no share may be stated over a zero-length window")
+    }
+
+    /// THE EMPTY ROSTER, end to end from the wire — `stats-census-coverage-gate.feature.md` Rule 4.
+    /// It earns a test of its own rather than riding the `coverageText(0)` assertion above because a
+    /// gate that passes on a cardinality-zero subject is not evidence the gate works: an empty roster
+    /// trivially has no instant at which "all accounts" were high, and the whole question is whether
+    /// that renders as UNKNOWN or as a measured calm. The CLI already answers it — `—`, pinned in
+    /// `build/fixtures/cli-renders/stats-empty-roster.txt` — and this is the panel's half.
+    ///
+    /// Driven through `decodeStatsReply` rather than a hand-built `StatsRoster` so it also proves the
+    /// gate survives the DECODE: a misnamed `CodingKey` yields `nil`, which takes the drop path and
+    /// would render this exact payload as a confident `0 episodes (0s)`.
+    func testAnEmptyRosterReportsUnknownRatherThanAMeasuredZero() throws {
+        let line = #"{"schema":1,"window":{"start":0,"end":604800,"label":"last 7 days","period":"week"},"# +
+                   #""accounts":[],"series":[],"summary":{"roster":{"swap_count":0,"# +
+                   #""swaps":{"session":0,"weekly":0,"manual":0,"forced":0,"emergency":0},"# +
+                   #""all_high_episodes":0,"all_high_secs":0,"all_high_threshold":0.95,"# +
+                   #""all_high_covered_secs":0,"census_over_roster":true},"accounts":{}}}"#
+        guard case .ok(let wire) = try decodeStatsReply(line) else {
+            return XCTFail("expected a StatsWire document")
+        }
+        XCTAssertTrue(wire.summary.accounts.isEmpty, "the subject really is empty — cardinality zero")
+        let text = StatusPanelFormat.statsAggregateText(roster: wire.summary.roster, window: wire.window)
+        XCTAssertEqual(text,
+                       "All accounts ≥95% at once — not measurable: never all in view at the same moment"
+                       + " · swaps 0 · last 7 days")
+        XCTAssertFalse(text.contains("0 episodes"),
+                       "an empty roster is unmeasurable, not calm")
+    }
+
+    /// The pre-#804 wire shape decodes rather than throwing — the compat half of the drop above, and
+    /// the shape a daemon predating BOTH the water and the denominator sends.
+    func testPre804RosterWithoutTheDenominatorStillDecodes() throws {
+        let line = #"{"swap_count":2,"swaps":{"session":1,"weekly":1,"manual":0,"forced":0,"emergency":0},"# +
+                   #""all_high_episodes":3,"all_high_secs":600}"#
+        let roster = try JSONDecoder().decode(StatsRoster.self, from: Data(line.utf8))
+        XCTAssertNil(roster.allHighCoveredSecs, "an absent additive key is nil, never a decode error")
+        XCTAssertNil(roster.allHighThreshold)
+        XCTAssertEqual(roster.allHighEpisodes, 3, "the rest of the roster decodes unchanged")
     }
 
     // MARK: - Failure copy (StatsFailure → the honest one-line Stats-tab message)
@@ -751,8 +980,15 @@ final class StatsTests: XCTestCase {
         ControlCommandClient(connector: CommandFakeConnector(.succeed(connection)), timeout: .seconds(5))
     }
 
+    /// A window whose SPAN is real, not just its `period` label. The span is the denominator the
+    /// census's coverage annotation divides by (issue #1029), so a zero-length one — what this
+    /// helper used to build, back when only the phrase was ever read off it — would make every
+    /// coverage assertion in this file vacuously unannotated. It is always a WEEK, whatever
+    /// `period` says (that argument drives only the rendered phrase), so a roster carrying
+    /// `allHighCoveredSecs: weekSecs` reads as WHOLLY measured; a test needing a span of its own
+    /// builds `StatsWindow` directly, as the hostile-span one does.
     private func window(period: String) -> StatsWindow {
-        StatsWindow(start: 0, end: 0, label: "l", period: period, since: nil)
+        StatsWindow(start: 0, end: weekSecs, label: "l", period: period, since: nil)
     }
 
     private func waitUntil(_ predicate: () -> Bool, _ label: String) async throws {
