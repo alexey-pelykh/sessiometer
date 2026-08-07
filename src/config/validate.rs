@@ -9,7 +9,9 @@
 //! cross-field rule cannot be enforced on one path and skipped on another. Its rejection
 //! ORDER is observable (a multi-invalid file reports its first offending field), so the
 //! checks below are sequenced deliberately; the field-naming helpers it emits through
-//! ([`range`], [`parse_jitter`], [`non_negative`]) live here with it.
+//! ([`range`], [`parse_jitter`], [`non_negative`]) live here with it, alongside
+//! [`account_uuid_violation`] — which returns a bare rule rather than an error, so its
+//! two callers can each frame it for the file they read.
 
 use super::*;
 
@@ -283,6 +285,16 @@ impl Config {
                     "account_uuid must not be empty".into(),
                 ));
             }
+            // Shape sits HERE in the observable rejection order (this module's contract)
+            // to group the uuid's own constraints together, before the check moves on to
+            // `label` (issue #1052). Note what this position does NOT buy: the duplicate
+            // error below interpolates the uuid with no delimiter, but it is safe from a
+            // hostile value regardless of ordering — a duplicate is by definition a string
+            // already seen, so the entry that introduced it was shape-checked on an earlier
+            // pass through this same loop.
+            if let Some(rule) = account_uuid_violation(&account.account_uuid) {
+                return Err(Error::ConfigInvalid(format!("account_uuid {rule}")));
+            }
             if account.label.trim().is_empty() {
                 return Err(Error::ConfigInvalid("label must not be empty".into()));
             }
@@ -435,6 +447,70 @@ impl Config {
             credential,
         })
     }
+}
+
+/// The upper bound on an `account_uuid`, in bytes (issue #1052).
+///
+/// 128 leaves roughly 3.5x headroom over the only shape that occurs in practice — the
+/// canonical 36-byte `8-4-4-4-12` uuid Claude issues, which is what every account in a
+/// real roster carries — without presuming that shape. That headroom is deliberate: the
+/// uuid is opaque to this tool, so the bound exists to reject the absurd (a pasted blob
+/// becoming a keychain service name), not to adjudicate an operator's identifier scheme.
+/// A roster whose uuids genuinely exceed 128 bytes is rejected, and would need this raised.
+const ACCOUNT_UUID_MAX_LEN: usize = 128;
+
+/// Reject an `account_uuid` whose length or charset would make a malformed keychain
+/// service name (issue #1052). Non-emptiness is NOT checked here — the caller already
+/// enforces it, and re-asserting it would only duplicate a shipped rule.
+///
+/// This is input-validation HYGIENE, not a traversal guard, and the distinction is
+/// load-bearing for whoever reads this next: [`Account::stash`] reaches no filesystem
+/// path, and a keychain service name is an opaque string rather than a hierarchical one,
+/// so `Sessiometer/../x` is a literal name and not an escape. What the constraint actually
+/// buys is that the `Sessiometer/` prefix stays a real namespace — no `../x` squatting
+/// inside it, no leading/trailing whitespace smuggled into the derived name — and that the
+/// name stays bounded.
+///
+/// Length is checked BEFORE charset deliberately: the charset error names the offending
+/// value, so it must only ever be reachable for a value already known to be small. A
+/// megabyte of pasted junk is rejected by length rather than echoed back. The charset
+/// error interpolates with `{:?}` so a value carrying newlines or control bytes is
+/// escaped to one printable line instead of reformatting the operator's terminal.
+///
+/// Deliberately NOT canonical-UUID shape. The roster's uuids are opaque here, and this
+/// crate's own fixtures use short identifiers (`u-1`, `fixture-2`, `abc-123`) that a
+/// canonical constraint would reject for no benefit.
+///
+/// `pub(crate)` because validating on the PARSE path alone would be a half-measure:
+/// `capture` / `login` build an `Account` from the harvested `~/.claude.json` without
+/// going through [`Config::validate`], so the write side calls this directly
+/// ([`crate::capture`]) to keep from persisting a roster its own next load would reject.
+///
+/// Returns the bare RULE rather than an [`Error`] precisely because it has those two
+/// callers reading two different files. Each frames the rule for its own source — the
+/// parse path as `invalid config:`, the capture path as a malformed `~/.claude.json`
+/// field — so neither sends the operator to a file that is not the one at fault.
+///
+/// Distinct from [`crate::keychain`]'s `is_well_formed_acct`, which admits `.` because it
+/// replicates Claude Code's own `acct` charset. This one excludes `.` deliberately — `.`
+/// is what makes the `../x` shape in issue #1052 expressible. The two are NOT the same
+/// class and must not be harmonised into one.
+pub(crate) fn account_uuid_violation(uuid: &str) -> Option<String> {
+    if uuid.len() > ACCOUNT_UUID_MAX_LEN {
+        return Some(format!(
+            "must be at most {ACCOUNT_UUID_MAX_LEN} bytes, got {}",
+            uuid.len()
+        ));
+    }
+    if !uuid
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Some(format!(
+            "must be ASCII letters, digits, `-` or `_`, got {uuid:?}"
+        ));
+    }
+    None
 }
 
 /// Reject `value` if it falls outside `lo..=hi`, naming `field` in the error.
@@ -1123,6 +1199,171 @@ mod tests {
     // from `account_uuid`, so duplicate stashes cannot occur independently of
     // duplicate uuids — the check, and its test, are gone. See
     // `stash_is_derived_from_account_uuid` and `legacy_stash_field_is_ignored`.)
+
+    // --- `account_uuid` shape and length (issue #1052) ------------------------
+    //
+    // The uuid is interpolated into a keychain service name by `Account::stash`
+    // (`Sessiometer/<account_uuid>`), so its shape is constrained at parse. These cover
+    // the constraint #1052 ADDED — length and charset. Emptiness is deliberately NOT
+    // re-tested: it has shipped since long before, so a test over it would pass without
+    // this change having done anything.
+
+    #[test]
+    fn rejects_a_uuid_that_squats_inside_the_stash_prefix() {
+        // #1052's first named threat. `Sessiometer/../x` is NOT a filesystem escape — a
+        // keychain service name is an opaque string, not a hierarchical path — but it does
+        // let a roster entry derive a name that reads as though it sits outside the
+        // `Sessiometer/` namespace. Hygiene, not traversal.
+        let toml = "[[account]]\naccount_uuid = \"../x\"\nlabel = \"l\"\n";
+        assert!(matches!(Config::parse(toml), Err(Error::ConfigInvalid(_))));
+    }
+
+    #[test]
+    fn rejects_a_uuid_padded_with_whitespace() {
+        // #1052's second named threat, and the reason the check runs on the RAW value:
+        // the shipped empty check TRIMS before testing, so `" x "` is non-empty by that
+        // rule and passed — while the stored value keeps its padding and derives
+        // `Sessiometer/ x `.
+        let toml = "[[account]]\naccount_uuid = \" x \"\nlabel = \"l\"\n";
+        assert!(matches!(Config::parse(toml), Err(Error::ConfigInvalid(_))));
+    }
+
+    #[test]
+    fn bounds_uuid_length_at_the_documented_ceiling() {
+        // Asserted as a PAIR so the boundary is pinned, rather than merely proving that
+        // something enormous is rejected — which a cap anywhere below it would also satisfy.
+        let at = "a".repeat(ACCOUNT_UUID_MAX_LEN);
+        let over = "a".repeat(ACCOUNT_UUID_MAX_LEN + 1);
+        assert!(
+            Config::parse(&format!(
+                "[[account]]\naccount_uuid = \"{at}\"\nlabel = \"l\"\n"
+            ))
+            .is_ok(),
+            "a uuid exactly at the cap must parse"
+        );
+        assert!(matches!(
+            Config::parse(&format!(
+                "[[account]]\naccount_uuid = \"{over}\"\nlabel = \"l\"\n"
+            )),
+            Err(Error::ConfigInvalid(_))
+        ));
+    }
+
+    #[test]
+    fn accepts_the_uuid_shapes_that_actually_occur() {
+        // AC-4, and the reason the constraint is a lax charset rather than canonical-UUID
+        // shape. The canonical 8-4-4-4-12 form is what a real roster carries; the short
+        // forms are what this crate's own fixtures use across a dozen modules. A
+        // canonical-shape constraint would reject every one of the latter and force a
+        // fixture rewrite that buys nothing.
+        for uuid in [
+            "11111111-1111-1111-1111-111111111111", // canonical — a real roster's shape
+            "u",
+            "u1",
+            "u-1",
+            "u-GONE",
+            "u-cap",
+            "abc-123",
+            "fixture-2",
+            "same",            // shapes this crate's fixtures already use
+            "with_underscore", // `_` is in the accepted set
+            "MiXeDcAsE09",     // case and digits are not narrowed
+        ] {
+            let toml = format!("[[account]]\naccount_uuid = \"{uuid}\"\nlabel = \"l\"\n");
+            assert!(
+                Config::parse(&toml).is_ok(),
+                "`{uuid}` must keep parsing — it is a shape that occurs in practice"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_uuid_is_rejected_before_any_stash_is_derived() {
+        // AC-2. `Config::validate` is the single gate every entry point crosses, and it
+        // constructs the `Account` — the only thing `stash()` can be called on — only
+        // AFTER this check, so no parsed account ever carries a malformed uuid for a stash
+        // to be derived from. The accepted half keeps this from being vacuous: it proves a
+        // stash really is derived on the path that succeeds.
+        assert!(Config::parse("[[account]]\naccount_uuid = \"../x\"\nlabel = \"l\"\n").is_err());
+        let ok = Config::parse("[[account]]\naccount_uuid = \"u-1\"\nlabel = \"l\"\n").unwrap();
+        assert_eq!(ok.roster[0].stash(), "Sessiometer/u-1");
+    }
+
+    #[test]
+    fn the_shape_rejection_echoes_nothing_but_the_offending_value() {
+        // AC-3. The error names the offending uuid — an account identifier, which the
+        // shipped duplicate rejection already echoes — and must pull in nothing else from
+        // the artifact.
+        let toml = "[[account]]\naccount_uuid = \"bad/value\"\nlabel = \"my-label\"\n\
+                    [[account]]\naccount_uuid = \"other-account\"\nlabel = \"second\"\n";
+        let Err(Error::ConfigInvalid(msg)) = Config::parse(toml) else {
+            panic!("precondition — this config must fail to validate");
+        };
+        // Asserted as the WHOLE message rather than a few `contains` probes: the point is
+        // that nothing else from the artifact rides along, and a containment check can only
+        // rule out the strings it happens to name.
+        assert_eq!(
+            msg,
+            "account_uuid must be ASCII letters, digits, `-` or `_`, got \"bad/value\""
+        );
+    }
+
+    #[test]
+    fn the_shape_rejection_escapes_a_hostile_value_onto_one_line() {
+        // The error names the offending value, so a value carrying a newline or a terminal
+        // escape must not reach the operator's terminal raw. `{:?}` escapes it.
+        let toml = "[[account]]\naccount_uuid = \"a\\nb\\u001b[31m\"\nlabel = \"l\"\n";
+        let Err(Error::ConfigInvalid(msg)) = Config::parse(toml) else {
+            panic!("precondition — this config must fail to validate");
+        };
+        assert!(
+            !msg.contains('\n'),
+            "the rejection must stay one line: {msg}"
+        );
+        assert!(
+            !msg.contains('\u{1b}'),
+            "no raw escape byte may reach the terminal: {msg}"
+        );
+        // Escaping EXPANDS — `\n` becomes two characters, a control byte becomes six — so
+        // the worst case is a value at the cap made entirely of control bytes. Bound it,
+        // since the length error's own bound does not cover this path.
+        // Written as TOML `` escapes, not raw bytes: TOML forbids a raw control
+        // character in a basic string, so a raw one fails as a PARSE error and never
+        // reaches this check at all. Each escape decodes to one byte, so this lands
+        // exactly at the cap — past the length check, into the charset error.
+        let hostile = "\\u0001".repeat(ACCOUNT_UUID_MAX_LEN);
+        let toml = format!("[[account]]\naccount_uuid = \"{hostile}\"\nlabel = \"l\"\n");
+        let Err(Error::ConfigInvalid(msg)) = Config::parse(&toml) else {
+            panic!("precondition — this config must fail to validate");
+        };
+        assert!(
+            msg.len() < 1_024,
+            "even a fully-escaped value at the cap must stay printable: {} bytes",
+            msg.len()
+        );
+    }
+
+    #[test]
+    fn an_oversized_value_is_summarised_rather_than_echoed() {
+        // Why length is checked BEFORE charset. The charset error names the value, so it
+        // must be unreachable for a huge one — a pasted blob is reported by its size
+        // instead of being quoted back into the operator's terminal.
+        let blob = "@".repeat(10_000);
+        let toml = format!("[[account]]\naccount_uuid = \"{blob}\"\nlabel = \"l\"\n");
+        let Err(Error::ConfigInvalid(msg)) = Config::parse(&toml) else {
+            panic!("precondition — this config must fail to validate");
+        };
+        assert!(!msg.contains(&blob), "the blob must not be echoed back");
+        assert!(
+            msg.contains("10000"),
+            "the error should report the size: {msg}"
+        );
+        assert!(
+            msg.len() < 200,
+            "the rejection must stay small: {} bytes",
+            msg.len()
+        );
+    }
 
     #[test]
     fn rejects_empty_label() {
