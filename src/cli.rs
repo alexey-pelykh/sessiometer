@@ -117,13 +117,15 @@ enum Command {
         force: bool,
         next: bool,
     },
-    /// `disable`/`enable <label>` — flip an account's rotation flag (`enabled`).
+    /// `disable`/`enable <account>` — flip an account's rotation flag (`enabled`).
+    /// `target` is a label OR an account-uuid, as `use`/`poke` take (issue #1005).
     SetEnabled {
-        label: Option<String>,
+        target: Option<String>,
         enabled: bool,
     },
-    /// `remove <label>` — drop an account and erase its stash.
-    Remove { label: Option<String> },
+    /// `remove <account>` — drop an account and erase its stash. `target` is a label OR
+    /// an account-uuid (issue #1005).
+    Remove { target: Option<String> },
     /// `poke [<account>]` — refresh a parked account's credential once.
     Poke { target: Option<String> },
     /// `stats [<account>...] [--period …] [--since …] [--json] [--no-color] [--ascii]`.
@@ -780,15 +782,17 @@ fn parse_subcommand(name: &OsStr, parser: &mut lexopt::Parser) -> Result<Command
         "status" => parse_status(parser),
         "list" => parse_list(parser),
         "use" => parse_use(parser),
-        "disable" => parse_positional(parser, HelpTopic::Disable, |label| Command::SetEnabled {
-            label,
+        "disable" => parse_positional(parser, HelpTopic::Disable, |target| Command::SetEnabled {
+            target,
             enabled: false,
         }),
-        "enable" => parse_positional(parser, HelpTopic::Enable, |label| Command::SetEnabled {
-            label,
+        "enable" => parse_positional(parser, HelpTopic::Enable, |target| Command::SetEnabled {
+            target,
             enabled: true,
         }),
-        "remove" => parse_positional(parser, HelpTopic::Remove, |label| Command::Remove { label }),
+        "remove" => parse_positional(parser, HelpTopic::Remove, |target| Command::Remove {
+            target,
+        }),
         "poke" => parse_positional(parser, HelpTopic::Poke, |target| Command::Poke { target }),
         "stats" => parse_stats(parser),
         "reliability" => parse_reliability(parser),
@@ -853,8 +857,8 @@ async fn execute(command: Command) -> Result<()> {
             force,
             next,
         } => crate::use_account::use_account(target, force, next).await,
-        Command::SetEnabled { label, enabled } => set_enabled(label, enabled).await,
-        Command::Remove { label } => remove_account(label).await,
+        Command::SetEnabled { target, enabled } => set_enabled(target, enabled).await,
+        Command::Remove { target } => remove_account(target).await,
         Command::Poke { target } => crate::poke::poke(target).await,
         Command::Stats(args) => crate::stats::run(args).await,
         Command::Reliability(args) => crate::reliability::run(args),
@@ -916,9 +920,9 @@ COMMANDS:
     status [--json] [--no-color] [-v|--verbose]  Show each account's usage + resets-in, and the next swap (-v adds each access token's expiry)
     list       List captured accounts
     use <account> [--force]  Switch the active account now (--force overrides the pre-swap gate)
-    disable <label>      Park an account: keep it but take it out of the rotation
-    enable <label>       Return a parked account to the rotation
-    remove <label>       Delete an account: drop it from the rotation and erase its stash
+    disable <account>    Park an account: keep it but take it out of the rotation
+    enable <account>     Return a parked account to the rotation
+    remove <account>     Delete an account: drop it from the rotation and erase its stash
     poke [<account>]     Run Claude Code once in an isolated config dir so it refreshes a parked account's credential (all near-expiry if omitted)
     stats [<account>...] [--period day|week|month|lifetime] [--since <when>] [--json]  Show usage over a period, offline (reads the sample store directly)
     reliability [--json]  Swap-out overshoot SLO readout, offline (reads the event log): swap-out session_pct P50/P95/P100 vs targets, time-blind, false-preempt proxy, 429 counts
@@ -1130,18 +1134,18 @@ const DISABLE_USAGE: &str =
     "sessiometer disable — park an account: keep it but take it out of the rotation
 
 USAGE:
-    sessiometer disable <label>
+    sessiometer disable <account>
 
-    <label>     the account to park (its label)
+    <account>   the account to park (its label or account-uuid)
     -h, --help  print this help
 ";
 
 const ENABLE_USAGE: &str = "sessiometer enable — return a parked account to the rotation
 
 USAGE:
-    sessiometer enable <label>
+    sessiometer enable <account>
 
-    <label>     the parked account to re-enable (its label)
+    <account>   the parked account to re-enable (its label or account-uuid)
     -h, --help  print this help
 ";
 
@@ -1149,9 +1153,9 @@ const REMOVE_USAGE: &str =
     "sessiometer remove — delete an account: drop it from the rotation and erase its stash
 
 USAGE:
-    sessiometer remove <label>
+    sessiometer remove <account>
 
-    <label>     the account to delete (its label)
+    <account>   the account to delete (its label or account-uuid)
     -h, --help  print this help
 ";
 
@@ -4779,6 +4783,18 @@ fn emit_import_event(imported: u32, skipped: u32, overwritten: u32, failed: u32)
     }
 }
 
+/// How many roster accounts carry each label (issue #1005). Labels are operator handles and are
+/// not required to be unique, so a count above one is a legal — if unresolvable — state; taking
+/// this before and after a merge is what lets [`apply_import`] tell an ambiguity it CREATED from
+/// one that was already there or that a relabel merely passed through.
+fn label_bearers(roster: &[Account]) -> std::collections::HashMap<String, usize> {
+    let mut bearers = std::collections::HashMap::new();
+    for account in roster {
+        *bearers.entry(account.label.clone()).or_insert(0) += 1;
+    }
+    bearers
+}
+
 /// Merge a migration [`Payload`] into the local roster under the conflict policy —
 /// PURE of the real config path, generic over the stash so tests drive it with a fake
 /// in-memory `FakeAccountStash` (mirrors [`gather_payload`] on the export side).
@@ -4827,6 +4843,11 @@ async fn apply_import<S: AccountStash>(
             ..incoming.clone()
         },
     };
+
+    // Issue #1005: how many accounts carried each label BEFORE the merge — the baseline the
+    // duplicate-label check compares the finished roster against, captured here because the loop
+    // below mutates the roster it is taken from.
+    let bearers_before = label_bearers(&result.roster);
 
     // Per-account secret material, indexed by uuid — EMPTY for a config-only artifact,
     // in which case every account below imports as a roster-only "needs re-login" (#135).
@@ -4877,7 +4898,7 @@ async fn apply_import<S: AccountStash>(
             staged = true;
         }
 
-        let outcome = match existing {
+        let mut outcome = match existing {
             Some(idx) => {
                 result.roster[idx] = incoming_account.clone();
                 AccountImport::overwritten(&incoming_account.label)
@@ -4893,14 +4914,69 @@ async fn apply_import<S: AccountStash>(
         // deliberately: a SKIPPED account (conflict policy left it byte-for-byte untouched)
         // and a config-only account (no secret in the artifact) both wrote nothing, so there
         // is nothing pending adoption and the notice would be a false alarm.
-        outcomes.push(
-            if staged && active_uuid == Some(incoming_account.account_uuid.as_str()) {
-                outcome.staged_not_adopted()
+        if staged && active_uuid == Some(incoming_account.account_uuid.as_str()) {
+            outcome = outcome.staged_not_adopted();
+        }
+        outcomes.push(outcome);
+    }
+
+    // Issue #1005: flag every row whose label this import pushed INTO ambiguity — more than one
+    // bearer at the end, and MORE bearers than the target started with. Duplicate labels stay an
+    // ACCEPTED state, so this neither refuses the import nor renames anything; it only makes the
+    // creation audible.
+    //
+    // Measured as a before/after comparison over the WHOLE merge rather than per-write, and both
+    // halves of that are load-bearing:
+    //
+    // - Reading the FINAL roster — rather than the roster as each write lands — does two things.
+    //   It covers a collision arriving inside a single artifact on a fresh target, where `local` is
+    //   `None` and a check written against the target's roster finds it empty and stays silent
+    //   while both entries append (the exact state R-6 exists to prevent, created with every other
+    //   criterion green — nothing rejects the duplicate on the way in, since `Config::validate`
+    //   checks empty uuid, empty label and duplicate uuid and has no duplicate-label arm). And it
+    //   is what suppresses a collision the merge only PASSES THROUGH: importing a label SWAP
+    //   between two accounts the target already has (`a`/`b` becoming `b`/`a`) is transiently
+    //   `b`/`b` mid-loop, but each label ends at one bearer, so `after > 1` is false for both.
+    // - Comparing against the BEFORE count covers the remaining case, and only that one: a
+    //   duplicate the target ALREADY had, overwritten in place. There `after > 1` holds — the label
+    //   really does have two bearers — but the count did not move, so this import did not create
+    //   the ambiguity and the operator was already warned when something did.
+    //
+    // The two clauses are therefore NOT interchangeable and neither is redundant: dropping
+    // `after > 1` warns on every ordinary new account, and dropping `after > before` re-warns about
+    // a pre-existing duplicate on every subsequent import. Each failure is the same one the
+    // ordinary cross-machine import would be — `account_uuid` is stable across machines, so
+    // same-label/same-uuid is the COMMON case, and a warning that fires where nothing was created
+    // trains dismissal of the one that matters (PRD § P5).
+    //
+    // KNOWN LIMIT, deliberate. The rule is a count, so a count-PRESERVING substitution of bearers
+    // is invisible to it: a target `[dup/A, dup/B, solo/C]` overwritten by `[solo/A, dup/C]` ends
+    // as `[solo/A, dup/B, dup/C]` — `dup/C` is genuinely a new same-label/different-uuid entry, and
+    // `count(dup)` is 2 either side, so nothing is said. Accepted rather than fixed: `dup` was
+    // unresolvable before this import and is unresolvable after, so the operator's actionable state
+    // is unchanged, and a warning there would re-open the § P5 dismissal problem to tell them
+    // something they already knew. "The import did not create that one" is true at the level of the
+    // count, which is the level this rule reasons at — not at the level of identity.
+    let bearers_after = label_bearers(&result.roster);
+    let outcomes = outcomes
+        .into_iter()
+        .map(|outcome| {
+            let after = bearers_after.get(&outcome.label).copied().unwrap_or(0);
+            let before = bearers_before.get(&outcome.label).copied().unwrap_or(0);
+            let created_ambiguity = after > 1 && after > before;
+            // Only rows this import actually WROTE. A skipped or failed account left the roster
+            // untouched, so whatever its label's count is, this row did not move it.
+            let wrote = matches!(
+                outcome.outcome,
+                ImportOutcome::Imported | ImportOutcome::Overwritten
+            );
+            if created_ambiguity && wrote {
+                outcome.duplicate_label()
             } else {
                 outcome
-            },
-        );
-    }
+            }
+        })
+        .collect();
 
     Ok((result, outcomes))
 }
@@ -4975,42 +5051,57 @@ struct AccountImport {
     /// landed — so the four-way tally [`count_import_outcomes`] feeds the exit code stays
     /// exactly as it was. What this flag adds is that the landing is not the whole story.
     staged_not_adopted: bool,
+    /// This import left the row's LABEL on more accounts than the target started with, and on
+    /// more than one — so it CREATED (or deepened) a duplicate-label roster (issue #1005).
+    ///
+    /// Set after the whole merge rather than per-write, because "created" is a property of the
+    /// finished roster: a per-write reading also fires on a collision the merge only passes
+    /// through, such as an import that swaps two labels between accounts the target already has.
+    ///
+    /// A flag rather than a fifth [`ImportOutcome`] variant, for the same reason as
+    /// [`staged_not_adopted`](Self::staged_not_adopted): the account genuinely WAS imported
+    /// or overwritten — nothing was refused and nothing was renamed, because duplicate
+    /// labels are an accepted state — so the four-way tally is untouched. What the flag adds
+    /// is that the label the row names no longer resolves.
+    duplicate_label: bool,
 }
 
 impl AccountImport {
-    fn imported(label: &str) -> Self {
+    /// One report row in its plain form: an outcome and the label it happened to, with every
+    /// orthogonal flag off. The flags are opt-in builders below, so a new one cannot be
+    /// silently forgotten by one of the four constructors.
+    fn new(label: &str, outcome: ImportOutcome) -> Self {
         Self {
             label: label.to_owned(),
-            outcome: ImportOutcome::Imported,
+            outcome,
             staged_not_adopted: false,
+            duplicate_label: false,
         }
+    }
+    fn imported(label: &str) -> Self {
+        Self::new(label, ImportOutcome::Imported)
     }
     fn skipped(label: &str) -> Self {
-        Self {
-            label: label.to_owned(),
-            outcome: ImportOutcome::Skipped,
-            staged_not_adopted: false,
-        }
+        Self::new(label, ImportOutcome::Skipped)
     }
     fn overwritten(label: &str) -> Self {
-        Self {
-            label: label.to_owned(),
-            outcome: ImportOutcome::Overwritten,
-            staged_not_adopted: false,
-        }
+        Self::new(label, ImportOutcome::Overwritten)
     }
     fn failed(label: &str) -> Self {
-        Self {
-            label: label.to_owned(),
-            outcome: ImportOutcome::Failed,
-            staged_not_adopted: false,
-        }
+        Self::new(label, ImportOutcome::Failed)
     }
 
     /// Mark this row as the target's active account whose credential was staged but not
     /// adopted (issue #1001) — see the field docs for why this is a flag, not a variant.
     fn staged_not_adopted(mut self) -> Self {
         self.staged_not_adopted = true;
+        self
+    }
+
+    /// Mark this row as the one that put a second bearer of its label on the roster
+    /// (issue #1005) — see the field docs for why this is a flag, not a variant.
+    fn duplicate_label(mut self) -> Self {
+        self.duplicate_label = true;
         self
     }
 }
@@ -5053,10 +5144,50 @@ fn non_adoption_notice(label: &str) -> String {
     )
 }
 
+/// The duplicate-label notice (issue #1005): this import put a second account under a label
+/// that another account already carries, so the label no longer resolves.
+///
+/// Says what happened, why it is not an error, and exactly how to act — in that order, because
+/// an operator who reads only the first clause must not conclude the import failed. Duplicate
+/// labels are an accepted state (`Config::validate` has no duplicate-label arm, deliberately),
+/// so nothing was refused and nothing was renamed; what changed is that every label-resolving
+/// site now REFUSES this label rather than guessing (`Error::UseTargetAmbiguous`).
+///
+/// Names the account-uuid as the remedy rather than a flag, because there is no
+/// disambiguator flag: `resolve_target` matches label OR account-uuid, and passing the uuid
+/// is the whole mechanism by which a refusal is actionable (design § 4.3, option (iii) not
+/// chosen). Points at `list` rather than printing a uuid here — `list` shows the FULL uuid for
+/// exactly this copy-into-the-next-command purpose (issue #69), and this way the notice stays
+/// one line per label instead of enumerating every bearer.
+///
+/// Says "your own handles" where the docs say "operator handles": the reader of this line IS
+/// the operator, and the second half already addresses them as `you`. The rest of the CLI's
+/// output never uses the word "operator" at all.
+///
+/// Non-secret by construction: the account's LABEL only, never a token, uuid, or email
+/// (issue #15 / C-3).
+fn duplicate_label_notice(label: &str) -> String {
+    format!(
+        "note: `{label}` now labels more than one account. Labels are your own handles and are \
+         not required to be unique, so the import neither refused anything nor renamed anything \
+         — but a label matching more than one account no longer RESOLVES: `use`, `poke`, \
+         `enable`, `disable` and `remove` all refuse it rather than guess.\n      \
+         Run `sessiometer list` to see the bearers with their account-uuids, then pass an \
+         account-uuid anywhere you would have passed `{label}`."
+    )
+}
+
 /// Render the per-account import report: one `outcome \`label\`` line per account, then a
-/// count summary, then the non-adoption notice for the active account when the import
-/// staged one (issue #1001). Labels only (non-secret); no token or email ever appears.
-/// Returned as a String so it is unit-testable and the caller prints it.
+/// count summary, then the trailing notices — the duplicate-label notice for each label this
+/// import duplicated (issue #1005), then the non-adoption notice for the active account when
+/// the import staged one (issue #1001). Labels only (non-secret); no token or email ever
+/// appears. Returned as a String so it is unit-testable and the caller prints it.
+///
+/// Duplicate-label FIRST, and the order is load-bearing rather than cosmetic: the non-adoption
+/// notice instructs `use --force <label>`, and when that same label is one this import
+/// duplicated, that instruction is itself now a refusal. Reading the duplicate notice first is
+/// what makes the following instruction legible — it is the notice that says to substitute an
+/// account-uuid *anywhere* the label would have gone, which includes the line below it.
 fn import_report(outcomes: &[AccountImport]) -> String {
     let mut out = String::new();
     for entry in outcomes {
@@ -5071,9 +5202,24 @@ fn import_report(outcomes: &[AccountImport]) -> String {
         count(ImportOutcome::Failed),
     ));
     // Set off from the tally by a BLANK line (as the `status` verbose block separates itself):
-    // this is the one line of the report the operator has to act on, and butted against the
-    // counts it reads as more tally. At most one account can be active, but the loop keeps the
-    // renderer total rather than making it assert a cardinality the type does not carry.
+    // these are the lines of the report the operator has to act on, and butted against the
+    // counts they read as more tally.
+    //
+    // Issue #1005: one notice per DISTINCT duplicated label. A three-way collision flags two
+    // rows carrying the same label, and that is one problem for the operator, not two — while a
+    // single import that duplicates two different labels is genuinely two. Dedupe on
+    // `HashSet::insert`'s was-it-new return — the primitive `Config::validate` already uses for
+    // its duplicate-uuid check. The SET is unordered but the iteration is not: it walks
+    // `outcomes`, so the notices still come out in roster order.
+    let mut warned = std::collections::HashSet::new();
+    for entry in outcomes.iter().filter(|entry| entry.duplicate_label) {
+        if warned.insert(entry.label.as_str()) {
+            out.push_str("\n\n");
+            out.push_str(&duplicate_label_notice(&entry.label));
+        }
+    }
+    // At most one account can be active, but the loop keeps the renderer total rather than
+    // making it assert a cardinality the type does not carry.
     for entry in outcomes.iter().filter(|entry| entry.staged_not_adopted) {
         out.push_str("\n\n");
         out.push_str(&non_adoption_notice(&entry.label));
@@ -5262,7 +5408,7 @@ fn refresh_tag(last_refresh: Option<RefreshEventOutcomeKind>) -> Option<String> 
     Some(tag)
 }
 
-/// `disable`/`enable <label>` — take an account out of the rotation, or return it
+/// `disable`/`enable <account>` — take an account out of the rotation, or return it
 /// (issue #36). A reversible park, distinct from removal (#13): the account keeps
 /// its roster entry and its stash; only its `enabled` flag flips. Resolve the
 /// account by its non-secret label, set the flag, and persist via [`Config::save`]
@@ -5270,14 +5416,17 @@ fn refresh_tag(last_refresh: Option<RefreshEventOutcomeKind>) -> Option<String> 
 /// notified to reload (#139), so the flip takes effect in the live rotation without
 /// a restart (best-effort — no daemon running is a no-op, the next start loads it).
 ///
-/// A missing `<label>` is [`Error::RotationLabelRequired`]; a label that matches no
-/// account is [`Error::AccountLabelNotFound`]. `enabled` selects the verb so one
-/// body serves both subcommands; the `verb` it derives names the usage in errors.
-async fn set_enabled(label: Option<String>, enabled: bool) -> Result<()> {
+/// A missing `<account>` is [`Error::RotationLabelRequired`]; one matching no account is
+/// [`Error::UseTargetNotFound`] and one matching several (a duplicated label) is
+/// [`Error::UseTargetAmbiguous`] — the shared `use`/`poke`/daemon taxonomy, since issue #1005
+/// routed this verb through [`resolve_target`](crate::use_account::resolve_target). `enabled`
+/// selects the verb so one body serves both subcommands; the `verb` it derives names the usage
+/// in errors.
+async fn set_enabled(query: Option<String>, enabled: bool) -> Result<()> {
     let verb = if enabled { "enable" } else { "disable" };
-    let label = label.ok_or(Error::RotationLabelRequired { verb })?;
+    let query = query.ok_or(Error::RotationLabelRequired { verb })?;
     let mut config = Config::load()?;
-    let outcome = apply_enabled(&mut config.roster, &label, enabled)?;
+    let (outcome, label) = apply_enabled(&mut config.roster, &query, enabled)?;
     // Only rewrite config.toml when the flag actually changed — re-disabling an
     // already-parked account is a friendly no-op, not a needless disk write.
     if matches!(outcome, FlipOutcome::Changed) {
@@ -5300,24 +5449,39 @@ enum FlipOutcome {
     Unchanged,
 }
 
-/// Resolve `label` in `roster` and set its `enabled` flag, reporting whether the
+/// Resolve `query` in `roster` and set its `enabled` flag, reporting whether the
 /// value actually changed. Pure (no I/O) so the resolve-and-flip policy is unit-
 /// testable without touching `config.toml`; the caller persists only on
-/// [`FlipOutcome::Changed`]. `Err(AccountLabelNotFound)` when no account carries
-/// the label. The first match wins (labels are operator handles; uniqueness is not
-/// enforced, so a duplicate label resolves to the earliest roster entry).
-fn apply_enabled(roster: &mut [Account], label: &str, enabled: bool) -> Result<FlipOutcome> {
-    let account = roster
-        .iter_mut()
-        .find(|account| account.label == label)
-        .ok_or_else(|| Error::AccountLabelNotFound {
-            label: label.to_owned(),
-        })?;
+/// [`FlipOutcome::Changed`].
+///
+/// Resolution is [`resolve_target`](crate::use_account::resolve_target) — the SAME resolver
+/// `use`, `poke` and the daemon's control-socket swap use (issue #1005, OQ-1). So `query` is a
+/// label OR an account-uuid, an unmatched one is [`Error::UseTargetNotFound`], and a
+/// DUPLICATED label is [`Error::UseTargetAmbiguous`] rather than a silent first-match.
+///
+/// Labels are still operator handles and uniqueness is still not enforced — duplicate labels
+/// remain an accepted roster state. What changed is that this verb no longer GUESSES which
+/// bearer was meant: it refuses, and the account-uuid `query` also accepts is the remedy. That
+/// this verb previously took the earliest entry while `use` refused was the inconsistency #1005
+/// closes, and `remove` — which shared this shape and deletes keychain material — is why it was
+/// closed toward refusing.
+///
+/// Returns the resolved account's LABEL alongside the outcome, so the caller's confirmation
+/// names the account rather than echoing `query` back — which since #1005 may be an
+/// account-uuid. `use` already reads its confirmation off the resolved account rather than the
+/// query; this keeps the four verbs saying the same thing.
+fn apply_enabled(
+    roster: &mut [Account],
+    query: &str,
+    enabled: bool,
+) -> Result<(FlipOutcome, String)> {
+    let account = &mut roster[crate::use_account::resolve_target(roster, query)?];
+    let label = account.label.clone();
     if account.enabled == enabled {
-        Ok(FlipOutcome::Unchanged)
+        Ok((FlipOutcome::Unchanged, label))
     } else {
         account.enabled = enabled;
-        Ok(FlipOutcome::Changed)
+        Ok((FlipOutcome::Changed, label))
     }
 }
 
@@ -5331,7 +5495,7 @@ fn flip_confirmation(outcome: FlipOutcome, label: &str, enabled: bool) -> String
     }
 }
 
-/// `remove <label>` — the DESTRUCTIVE sibling of `disable` (issue #13): drop the
+/// `remove <account>` — the DESTRUCTIVE sibling of `disable` (issue #13): drop the
 /// account from the roster AND delete its keychain stash, so it is gone for good
 /// (vs `disable`, which keeps both and only flips the rotation flag). Resolve by
 /// label, then persist the roster without the entry FIRST and delete the stash
@@ -5344,17 +5508,20 @@ fn flip_confirmation(outcome: FlipOutcome, label: &str, enabled: bool) -> String
 /// read. The stash delete is idempotent (an already-absent half is success), so a
 /// re-run after a partial failure still converges.
 ///
-/// A missing `<label>` is [`Error::RotationLabelRequired`]; a label that matches no
-/// account is [`Error::AccountLabelNotFound`]. A running daemon is notified to reload
+/// A missing `<account>` is [`Error::RotationLabelRequired`]; one matching no account is
+/// [`Error::UseTargetNotFound`] and one matching several (a duplicated label) is
+/// [`Error::UseTargetAmbiguous`] — since issue #1005 this verb resolves through the shared
+/// [`resolve_target`](crate::use_account::resolve_target), so it REFUSES a duplicated label
+/// rather than deleting the earliest bearer's stash. A running daemon is notified to reload
 /// (#139), so the removal takes effect in the live rotation without a restart
 /// (best-effort). Removing the ACTIVE account is
 /// allowed and self-heals: this touches only sessiometer's roster entry and stash,
 /// never the canonical credential, so the daemon simply polls-only (resolving no
 /// active account) until another account is captured or the operator `/login`s.
-async fn remove_account(label: Option<String>) -> Result<()> {
-    let label = label.ok_or(Error::RotationLabelRequired { verb: "remove" })?;
+async fn remove_account(query: Option<String>) -> Result<()> {
+    let query = query.ok_or(Error::RotationLabelRequired { verb: "remove" })?;
     let mut config = Config::load()?;
-    let removed = apply_remove(&mut config.roster, &label)?;
+    let removed = apply_remove(&mut config.roster, &query)?;
     // Config FIRST (see the doc): persist the roster without the entry before the
     // destructive stash delete, so any failure past here orphans a harmless stash
     // rather than dangling a roster entry at a deleted one.
@@ -5365,23 +5532,30 @@ async fn remove_account(label: Option<String>) -> Result<()> {
     // Tell a running daemon to drop the removed account from its live rotation now
     // (#139) — best-effort, so it never swaps to an account whose stash is gone.
     crate::capture::notify_daemon_roster_reload().await;
-    println!("{}", remove_confirmation(&label));
+    // Name the REMOVED account's label, not `query` — which since #1005 may be an
+    // account-uuid, and echoing that back would not tell the operator which handle went.
+    println!("{}", remove_confirmation(&removed.label));
     Ok(())
 }
 
-/// Resolve `label` in `roster` and REMOVE its entry, returning the removed account
+/// Resolve `query` in `roster` and REMOVE its entry, returning the removed account
 /// (whose `stash` name the caller needs to delete the keychain stash). Pure (no
 /// I/O) so the resolve-and-remove policy is unit-testable without touching
-/// `config.toml`. `Err(AccountLabelNotFound)` when no account carries the label.
-/// The first match wins (labels are operator handles; uniqueness is not enforced,
-/// so a duplicate label removes the earliest roster entry).
-fn apply_remove(roster: &mut Vec<Account>, label: &str) -> Result<Account> {
-    let idx = roster
-        .iter()
-        .position(|account| account.label == label)
-        .ok_or_else(|| Error::AccountLabelNotFound {
-            label: label.to_owned(),
-        })?;
+/// `config.toml`.
+///
+/// Resolution is [`resolve_target`](crate::use_account::resolve_target), shared with `use`,
+/// `poke`, the daemon's control-socket swap and [`apply_enabled`] (issue #1005, OQ-1): `query`
+/// is a label OR an account-uuid, an unmatched one is [`Error::UseTargetNotFound`], and a
+/// DUPLICATED label is [`Error::UseTargetAmbiguous`].
+///
+/// This verb is WHY OQ-1 resolved toward refusing. It is the only label-resolving site whose
+/// wrong resolution is irreversible — [`remove_account`] follows this call by deleting the
+/// resolved account's keychain stash — so under the previous first-match-wins an operator
+/// clearing up a duplicate label by removing "the extra one" could destroy the wrong account's
+/// credential material, with no undo, while `use` on that same roster refused. The other three
+/// verbs' wrong resolutions cost one command to reverse; this one costs a re-login.
+fn apply_remove(roster: &mut Vec<Account>, query: &str) -> Result<Account> {
+    let idx = crate::use_account::resolve_target(roster, query)?;
     Ok(roster.remove(idx))
 }
 
@@ -7761,17 +7935,18 @@ spare  22222222-2222\n\
     #[test]
     fn apply_enabled_flips_the_resolved_account_and_reports_change() {
         let mut roster = vec![acct("work", "u1"), acct("spare", "u2")];
-        // Resolve `spare` by label and disable it; the other account is untouched.
+        // Resolve `spare` by label and disable it; the other account is untouched. The
+        // returned label is the RESOLVED account's, which is what the confirmation names.
         assert_eq!(
             apply_enabled(&mut roster, "spare", false).unwrap(),
-            FlipOutcome::Changed
+            (FlipOutcome::Changed, "spare".to_owned())
         );
         assert!(roster[0].enabled, "the unaddressed account is left alone");
         assert!(!roster[1].enabled);
         // Re-enable flips it back.
         assert_eq!(
             apply_enabled(&mut roster, "spare", true).unwrap(),
-            FlipOutcome::Changed
+            (FlipOutcome::Changed, "spare".to_owned())
         );
         assert!(roster[1].enabled);
     }
@@ -7782,7 +7957,7 @@ spare  22222222-2222\n\
         // Already enabled → Unchanged, so the caller skips the config rewrite.
         assert_eq!(
             apply_enabled(&mut roster, "work", true).unwrap(),
-            FlipOutcome::Unchanged
+            (FlipOutcome::Unchanged, "work".to_owned())
         );
         assert!(roster[0].enabled);
     }
@@ -7792,14 +7967,120 @@ spare  22222222-2222\n\
         let mut roster = vec![acct("work", "u1")];
         let err =
             apply_enabled(&mut roster, "ghost", false).expect_err("an unmatched label is an error");
+        // Issue #1005: the shared `use`/`poke`/daemon taxonomy, not the retired
+        // `AccountLabelNotFound` — an observable change, since this exits 5 rather than 1.
         assert!(
-            matches!(err, Error::AccountLabelNotFound { ref label } if label == "ghost"),
+            matches!(err, Error::UseTargetNotFound { ref query } if query == "ghost"),
             "got {err:?}"
+        );
+        assert_eq!(
+            err.exit_code(),
+            5,
+            "and it exits 5, where it used to exit 1"
         );
         assert!(
             roster[0].enabled,
             "a failed resolve leaves the roster intact"
         );
+    }
+
+    // --- duplicate-label resolution consistency (issue #1005, OQ-1) ---------
+    //
+    // OQ-1 settled on refuse-on-ambiguity across all six label-resolving sites. `use`, `poke`
+    // and the daemon's control-socket swap already refused (they share `resolve_target`); the
+    // three below did not — they took the earliest bearer, and `remove` did so while deleting
+    // keychain material. These pin the half that changed.
+
+    #[test]
+    fn apply_enabled_refuses_a_duplicate_label_without_touching_the_roster() {
+        let mut roster = vec![acct("dup", "u1"), acct("dup", "u2")];
+        let err = apply_enabled(&mut roster, "dup", false)
+            .expect_err("a duplicated label must not resolve");
+        assert!(
+            matches!(err, Error::UseTargetAmbiguous { count: 2, ref query } if query == "dup"),
+            "got {err:?}"
+        );
+        // The refusal is total: neither bearer's flag moved. Previously the FIRST flipped.
+        assert!(
+            roster.iter().all(|account| account.enabled),
+            "an ambiguous resolve flips nothing"
+        );
+    }
+
+    #[test]
+    fn apply_remove_refuses_a_duplicate_label_without_touching_the_roster() {
+        let mut roster = vec![acct("dup", "u1"), acct("dup", "u2"), acct("solo", "u3")];
+        let err =
+            apply_remove(&mut roster, "dup").expect_err("a duplicated label must not resolve");
+        assert!(
+            matches!(err, Error::UseTargetAmbiguous { count: 2, ref query } if query == "dup"),
+            "got {err:?}"
+        );
+        // The load-bearing assertion of this whole issue: nothing was removed, so
+        // `remove_account` never reaches the stash delete. Previously `u1` went, irreversibly.
+        assert_eq!(roster.len(), 3, "an ambiguous resolve removes nothing");
+        assert_eq!(roster[0].account_uuid, "u1");
+    }
+
+    #[test]
+    fn the_label_resolving_verbs_accept_an_account_uuid_so_a_refusal_is_actionable() {
+        // There is no `--account-uuid` disambiguator flag (design § 4.3 option (iii) was not
+        // chosen), so the uuid `resolve_target` also matches IS the remedy for the refusals
+        // above. Without this the refusal would be a dead end — a worse defect than the
+        // first-match-wins it replaced.
+        let mut roster = vec![acct("dup", "u1"), acct("dup", "u2")];
+        assert_eq!(
+            apply_enabled(&mut roster, "u2", false).unwrap(),
+            (FlipOutcome::Changed, "dup".to_owned()),
+            "the uuid resolves, and the confirmation names the account's LABEL"
+        );
+        assert!(roster[0].enabled, "only the named bearer flipped");
+        assert!(!roster[1].enabled);
+
+        let removed = apply_remove(&mut roster, "u1").expect("the uuid resolves for remove too");
+        assert_eq!(removed.account_uuid, "u1");
+        assert_eq!(roster.len(), 1);
+        assert_eq!(
+            roster[0].account_uuid, "u2",
+            "the OTHER bearer survives — the operator picked one and got it"
+        );
+    }
+
+    #[test]
+    fn every_label_resolving_site_shares_one_resolver() {
+        // R-6a spans two mechanisms over six call sites, and the property that makes them
+        // agree is that all six reach `resolve_target` — not that six sampled behaviours
+        // happen to match today. `use` (src/use_account.rs), `poke` (src/poke.rs) and the
+        // daemon's control-socket swap (src/daemon/commands.rs) call it directly and always
+        // did; `apply_enabled` and `apply_remove` are the two that were routed to it here.
+        // Assert the shared resolver's verdict IS what these two return, on the same roster,
+        // rather than restating its behaviour independently — an independent restatement
+        // would drift the moment the resolver's policy changed.
+        let roster = vec![acct("dup", "u1"), acct("dup", "u2")];
+        let shared = crate::use_account::resolve_target(&roster, "dup")
+            .expect_err("the shared resolver refuses a duplicate");
+
+        let mut for_enable = roster.clone();
+        let enable = apply_enabled(&mut for_enable, "dup", false).expect_err("enable refuses");
+        let mut for_remove = roster.clone();
+        let remove = apply_remove(&mut for_remove, "dup").expect_err("remove refuses");
+
+        for (verb, err) in [("enable/disable", &enable), ("remove", &remove)] {
+            assert_eq!(
+                err.to_string(),
+                shared.to_string(),
+                "{verb} must refuse with the shared resolver's own error"
+            );
+            assert_eq!(
+                err.exit_code(),
+                shared.exit_code(),
+                "{verb} must carry the shared resolver's exit code"
+            );
+            // …and pin the literal code, not just its equality with the resolver's. Asserting
+            // only the equality would stay green if `resolve_target`'s taxonomy moved, which is
+            // exactly the operator-visible contract a script keys on.
+            assert_eq!(err.exit_code(), 6, "{verb} exits 6 on an ambiguous target");
+        }
     }
 
     #[test]
@@ -7846,9 +8127,15 @@ spare  22222222-2222\n\
     fn apply_remove_rejects_an_unknown_label_without_touching_the_roster() {
         let mut roster = vec![acct("work", "u1")];
         let err = apply_remove(&mut roster, "ghost").expect_err("an unmatched label is an error");
+        // Issue #1005: the shared taxonomy, so this exits 5 where it used to exit 1.
         assert!(
-            matches!(err, Error::AccountLabelNotFound { ref label } if label == "ghost"),
+            matches!(err, Error::UseTargetNotFound { ref query } if query == "ghost"),
             "got {err:?}"
+        );
+        assert_eq!(
+            err.exit_code(),
+            5,
+            "and it exits 5, where it used to exit 1"
         );
         assert_eq!(roster.len(), 1, "a failed resolve leaves the roster intact");
     }
@@ -11298,6 +11585,365 @@ spare  22222222-2222\n\
         );
     }
 
+    // ---- import must not silently create a duplicate-label roster (#1005) ----
+    //
+    // Every test below builds its target EXPLICITLY rather than as `src_config.clone()`.
+    // That clone is why the branch is unreachable in the conflict-policy test above: it makes
+    // every `account_uuid` match by construction, so `existing` is always `Some` and no
+    // same-label/different-uuid entry can ever be created (AC-3).
+
+    /// A config-only migration artifact carrying `roster` — the hermetic path into
+    /// [`apply_import`] (#135's roster-only "needs re-login" shape). No stash, no keychain,
+    /// no swap lock: the roster-merge policy under test is independent of credential staging,
+    /// and a config-only artifact exercises it without any of that plumbing.
+    fn config_only_artifact(roster: Vec<Account>) -> Payload {
+        Payload::new(config_with(roster).render(), Vec::new())
+    }
+
+    /// Merge a config-only artifact into `local` and hand back the merged config + report.
+    async fn import_config_only(
+        incoming: Vec<Account>,
+        local: Option<Config>,
+        overwrite: bool,
+    ) -> (Config, Vec<AccountImport>) {
+        apply_import(
+            None,
+            &config_only_artifact(incoming),
+            local,
+            None,
+            &crate::stash::FakeAccountStash::empty(),
+            overwrite,
+        )
+        .await
+        .expect("a config-only import over a valid roster succeeds")
+    }
+
+    /// The label-INDEPENDENT core of the duplicate-label notice — what a NEGATIVE assertion
+    /// searches for, since its claim is "no notice at all", not "none for this one label".
+    ///
+    /// [`duplicate_notice_for`] is built from it on purpose. Reword [`duplicate_label_notice`]
+    /// and the positive assertions go red, which forces this constant to move with it; spell
+    /// the string out separately in each place and that reword instead leaves every negative
+    /// assertion hunting text the notice no longer contains — passing forever, proving nothing.
+    const DUPLICATE_NOTICE: &str = "now labels more than one account";
+
+    /// The duplicate-label notice's opening clause FOR ONE LABEL, as the operator reads it —
+    /// the search key for a positive assertion.
+    fn duplicate_notice_for(label: &str) -> String {
+        format!("`{label}` {DUPLICATE_NOTICE}")
+    }
+
+    #[tokio::test]
+    async fn apply_import_warns_when_it_creates_a_same_label_different_uuid_entry() {
+        // R-6: the target already labels UUID_A `work`; the artifact carries a DIFFERENT
+        // Anthropic account under the same handle (the operator relabelled, or reused it).
+        let local = config_with(vec![acct("work", UUID_A)]);
+        let (merged, outcomes) =
+            import_config_only(vec![acct("work", UUID_B)], Some(local), false).await;
+
+        // The BUT-NOTs first: not refused, and not renamed. Duplicate labels stay accepted.
+        assert_eq!(
+            count_import_outcomes(&outcomes),
+            (1, 0, 0, 0),
+            "the account still imports — the warning does not refuse it"
+        );
+        assert_eq!(merged.roster.len(), 2, "both entries are kept");
+        assert!(
+            merged.roster.iter().all(|account| account.label == "work"),
+            "neither entry was renamed to make the label unique"
+        );
+
+        assert!(outcomes[0].duplicate_label, "the creating row is flagged");
+        let report = import_report(&outcomes);
+        assert!(
+            report.contains(&duplicate_notice_for("work")),
+            "the operator is warned: {report}"
+        );
+        assert!(
+            report.contains("imported `work`") && report.contains("1 imported"),
+            "the row and the tally read as an ordinary success: {report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_import_stays_quiet_on_the_ordinary_same_label_same_uuid_case() {
+        // `account_uuid` is the Claude account uuid and is STABLE across machines, so
+        // same-label/same-uuid is the ordinary cross-machine import — the common case. A
+        // warning here would train dismissal of the one above (PRD § P5, risk P5).
+        //
+        // Silent under BOTH conflict policies, for two different reasons: `skip` returns
+        // before the roster is touched at all, while `overwrite` replaces the entry in place
+        // and an account does not collide with itself. Asserting only one policy would leave
+        // the other's reason unproven.
+        for overwrite in [false, true] {
+            let local = config_with(vec![acct("work", UUID_A)]);
+            let (merged, outcomes) =
+                import_config_only(vec![acct("work", UUID_A)], Some(local), overwrite).await;
+            assert_eq!(merged.roster.len(), 1, "overwrite={overwrite}");
+            assert!(
+                outcomes.iter().all(|entry| !entry.duplicate_label),
+                "the ordinary cross-machine import must not warn (overwrite={overwrite})"
+            );
+            let report = import_report(&outcomes);
+            assert!(
+                !report.contains(DUPLICATE_NOTICE),
+                "overwrite={overwrite}: {report}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_import_warns_when_one_artifact_carries_its_own_duplicate_on_a_fresh_target() {
+        // The case an implementer gets wrong. Reading R-6's "already exists ON THE TARGET"
+        // literally means checking each incoming label against `local` — and here `local` is
+        // `None`, so that check is skipped entirely, both entries append in one shot, and the
+        // exact state R-6 exists to prevent is created with every other criterion green.
+        //
+        // On a fresh target this is the ONLY way the collision can arrive: nothing rejects a
+        // duplicate label on the way in (`Config::validate` checks empty uuid, empty label and
+        // duplicate uuid, and has no duplicate-label arm), so a roster already carrying the
+        // accepted collision mints an artifact carrying it internally.
+        let (merged, outcomes) =
+            import_config_only(vec![acct("dup", UUID_A), acct("dup", UUID_B)], None, false).await;
+
+        assert_eq!(
+            count_import_outcomes(&outcomes),
+            (2, 0, 0, 0),
+            "both import — the warning does not refuse either"
+        );
+        assert_eq!(merged.roster.len(), 2, "uniqueness is not enforced");
+        assert!(
+            outcomes.iter().all(|entry| entry.duplicate_label),
+            "both bearers this import wrote are part of the ambiguity it created"
+        );
+        let report = import_report(&outcomes);
+        assert!(
+            report.contains(&duplicate_notice_for("dup")),
+            "the operator is warned on a fresh target too"
+        );
+        assert_eq!(
+            report.matches(&duplicate_notice_for("dup")).count(),
+            1,
+            "two flagged rows, one label, one notice: {report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_import_stays_quiet_on_an_ordinary_import_of_distinct_labels() {
+        // The most ordinary import there is: new accounts, new labels, nothing ambiguous. It has
+        // to be asserted rather than assumed, because it is what gates the `after > 1` half of the
+        // rule — with only `after > before`, every brand-new label (0 → 1 bearers) would warn, and
+        // the notice would appear on essentially every import ever run.
+        let (merged, outcomes) = import_config_only(
+            vec![acct("alpha", UUID_A), acct("beta", UUID_B)],
+            None,
+            false,
+        )
+        .await;
+
+        assert_eq!(merged.roster.len(), 2);
+        assert!(
+            outcomes.iter().all(|entry| !entry.duplicate_label),
+            "0 → 1 bearers is not an ambiguity"
+        );
+        let report = import_report(&outcomes);
+        assert!(
+            !report.contains(DUPLICATE_NOTICE),
+            "the most ordinary import there is must say nothing: {report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_import_stays_quiet_when_an_import_swaps_two_labels_between_accounts() {
+        // The operator swapped the two handles on machine 1 and exported. Machine 2 already has
+        // both accounts, so both are overwritten in place and the finished roster carries each
+        // label exactly once — nothing to warn about.
+        //
+        // A per-write check reads the roster MID-MERGE and gets this wrong: replacing the first
+        // entry's label with `b` leaves the roster transiently `[b, b]`, which looks exactly like
+        // a collision until the second replacement makes it `[b, a]`. The warning would then name
+        // a label that resolves perfectly well, and tell the operator to go substitute a uuid for
+        // a handle that works — training dismissal of the warning that matters (PRD § P5).
+        let local = config_with(vec![acct("a", UUID_A), acct("b", UUID_B)]);
+        let (merged, outcomes) = import_config_only(
+            vec![acct("b", UUID_A), acct("a", UUID_B)],
+            Some(local),
+            true,
+        )
+        .await;
+
+        assert_eq!(
+            merged
+                .roster
+                .iter()
+                .map(|account| account.label.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "a"],
+            "the labels swapped; neither is duplicated"
+        );
+        assert!(
+            outcomes.iter().all(|entry| !entry.duplicate_label),
+            "a transient mid-merge collision is not a created one"
+        );
+        let report = import_report(&outcomes);
+        assert!(
+            !report.contains(DUPLICATE_NOTICE),
+            "a swap the merge only passed through must say nothing: {report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_import_stays_quiet_when_a_duplicate_the_target_already_had_is_overwritten() {
+        // AC-1 is "warns when it would CREATE" a duplicate-label entry. Re-importing an
+        // already-duplicated roster onto a machine that already carries it replaces both entries
+        // in place and creates nothing: the count goes 2 → 2. The operator was warned when the
+        // duplicate was actually made; repeating it on every subsequent import is the same
+        // dismissal-training failure as the swap case above.
+        let local = config_with(vec![acct("dup", UUID_A), acct("dup", UUID_B)]);
+        let (merged, outcomes) = import_config_only(
+            vec![acct("dup", UUID_A), acct("dup", UUID_B)],
+            Some(local),
+            true,
+        )
+        .await;
+
+        assert_eq!(merged.roster.len(), 2, "both replaced in place");
+        assert_eq!(count_import_outcomes(&outcomes), (0, 0, 2, 0));
+        assert!(
+            outcomes.iter().all(|entry| !entry.duplicate_label),
+            "the import did not create this duplicate — it was already there"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_import_warns_when_it_deepens_a_duplicate_the_target_already_had() {
+        // The mirror of the test above, and the reason its rule is "more bearers than before"
+        // rather than "the duplicate is new": a target already ambiguous at two bearers, made
+        // WORSE by a third, is a change the operator has to know about.
+        let local = config_with(vec![acct("dup", UUID_A), acct("dup", UUID_B)]);
+        let (merged, outcomes) =
+            import_config_only(vec![acct("dup", UUID_C)], Some(local), false).await;
+
+        assert_eq!(merged.roster.len(), 3);
+        assert_eq!(count_import_outcomes(&outcomes), (1, 0, 0, 0));
+        assert!(outcomes[0].duplicate_label, "2 → 3 bearers is a creation");
+    }
+
+    #[tokio::test]
+    async fn apply_import_warns_when_an_overwrite_relabels_onto_an_existing_label() {
+        // The collision need not arrive by APPEND. Here the artifact re-labels UUID_B `work`,
+        // which UUID_A already carries: the overwrite replaces B's entry IN PLACE, so the
+        // roster gains a second `work` without gaining an entry. That is what rules out the
+        // tempting shortcut of flagging the append branch (`existing.is_none()`) — it would
+        // stay silent right here. Counting bearers catches it because the count is what moved:
+        // `work` goes 1 → 2 while the roster stays at 2.
+        let local = config_with(vec![acct("work", UUID_A), acct("spare", UUID_B)]);
+        let (merged, outcomes) =
+            import_config_only(vec![acct("work", UUID_B)], Some(local), true).await;
+
+        assert_eq!(
+            count_import_outcomes(&outcomes),
+            (0, 0, 1, 0),
+            "replaced in place, not appended"
+        );
+        assert_eq!(merged.roster.len(), 2, "no entry added or dropped");
+        assert!(
+            outcomes[0].duplicate_label,
+            "the relabel created the collision"
+        );
+        let report = import_report(&outcomes);
+        assert!(
+            report.contains(&duplicate_notice_for("work")),
+            "a collision that arrives by REPLACEMENT is still warned about: {report}"
+        );
+    }
+
+    #[test]
+    fn the_import_report_warns_once_per_duplicated_label_before_the_non_adoption_notice() {
+        let outcomes = vec![
+            AccountImport::imported("solo"),
+            AccountImport::imported("dup").duplicate_label(),
+            // A three-way collision flags a SECOND row under the same label. That is one
+            // problem for the operator, so it must read as one notice.
+            AccountImport::imported("dup").duplicate_label(),
+            // A different duplicated label in the same import is genuinely a second problem.
+            AccountImport::imported("other").duplicate_label(),
+            // And this row is both the machine's active account and a duplicate bearer.
+            AccountImport::imported("live")
+                .staged_not_adopted()
+                .duplicate_label(),
+        ];
+        let report = import_report(&outcomes);
+
+        assert_eq!(
+            report.matches(&duplicate_notice_for("dup")).count(),
+            1,
+            "one notice per DISTINCT label: {report}"
+        );
+        for label in ["other", "live"] {
+            assert!(
+                report.contains(&duplicate_notice_for(label)),
+                "a second duplicated label is a second notice: {report}"
+            );
+        }
+
+        // Ordering is load-bearing rather than cosmetic. The non-adoption notice instructs
+        // `use --force live` — and `live` is a label this same import just made ambiguous, so
+        // that instruction is itself now a refusal. The duplicate notice is the one that says
+        // to substitute an account-uuid anywhere the label would have gone, which includes the
+        // line below it, so it has to be read first.
+        let duplicate_at = report
+            .find(&duplicate_notice_for("live"))
+            .expect("the active account's duplicate notice is present");
+        let non_adoption_at = report
+            .find("is this machine's active account")
+            .expect("the non-adoption notice is present");
+        assert!(
+            duplicate_at < non_adoption_at,
+            "the duplicate notice must precede the non-adoption one: {report}"
+        );
+
+        // Neither notice disturbs the four-way tally — every account genuinely imported.
+        assert!(
+            report.contains("5 imported, 0 skipped, 0 overwritten, 0 failed"),
+            "{report}"
+        );
+    }
+
+    #[test]
+    fn the_duplicate_label_notice_names_the_remedy_and_only_the_label() {
+        let notice = duplicate_label_notice("work");
+        // It must not read as a failure: the import kept both entries.
+        // True on BOTH import paths — an append keeps every entry, while an overwrite replaces
+        // one in place. A body that claimed "kept both entries and changed neither" would be
+        // false in the very report whose row above it reads `overwritten`.
+        assert!(
+            notice.contains("neither refused anything nor renamed anything"),
+            "{notice}"
+        );
+        // The remedy is the account-uuid, because there is no disambiguator flag — a refusal
+        // with no stated way out would be worse than the first-match-wins it replaced.
+        assert!(
+            notice.contains("account-uuid"),
+            "the remedy must be named: {notice}"
+        );
+        assert!(
+            notice.contains("sessiometer list"),
+            "and where to read one off: {notice}"
+        );
+        // Issue #15: the operator's own handle, and nothing else. No uuid is printed here —
+        // `list` is where the full uuids live. Two assertions, not one `&&`, so a failure says
+        // WHICH kind of identifier leaked.
+        assert!(
+            !notice.contains(UUID_A),
+            "the notice names the LABEL, never an account uuid: {notice}"
+        );
+        assert!(
+            !notice.contains('@'),
+            "no account email may appear in the notice: {notice}"
+        );
+    }
+
     // ---- CLI argv parser (issue #175) ------------------------------------
     //
     // `parse` is the pure, I/O-free half of the argv layer: it maps the argument vector
@@ -12327,20 +12973,20 @@ spare  22222222-2222\n\
         assert_eq!(
             parse_argv(&["remove", "work"]).unwrap(),
             Command::Remove {
-                label: Some("work".to_owned())
+                target: Some("work".to_owned())
             }
         );
         assert_eq!(
             parse_argv(&["disable", "work"]).unwrap(),
             Command::SetEnabled {
-                label: Some("work".to_owned()),
+                target: Some("work".to_owned()),
                 enabled: false
             }
         );
         assert_eq!(
             parse_argv(&["enable", "work"]).unwrap(),
             Command::SetEnabled {
-                label: Some("work".to_owned()),
+                target: Some("work".to_owned()),
                 enabled: true
             }
         );

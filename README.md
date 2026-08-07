@@ -766,10 +766,13 @@ sessiometer disable work
 sessiometer enable work
 ```
 
-Accounts resolve by their `list` label. The state is stored in `config.toml`, so
+Accounts resolve by their `list` label **or** their account-uuid, exactly as `use` and
+`poke` do. Labels are your own handles and are not required to be unique — if two
+accounts share one, `disable`/`enable` refuse rather than guess which you meant, and you
+disambiguate with the account-uuid `list` shows. The state is stored in `config.toml`, so
 it persists across daemon restarts; `list` and `status` mark a parked account as
-`disabled`. A running daemon picks up the change in its live rotation right away —
-no restart needed.
+`disabled`. A running daemon picks up the change in its live rotation right away — no
+restart needed.
 
 ## Removing an account
 
@@ -783,11 +786,14 @@ so it is gone for good:
 sessiometer remove work
 ```
 
-Accounts resolve by their `list` label. The roster entry is removed from
-`config.toml` **first**, then the stash is deleted — so an interrupted removal
-leaves at most an unreferenced (harmless) keychain item, never a roster entry
-pointing at a missing stash. A running daemon picks up the removal in its live
-rotation right away — no restart needed.
+Accounts resolve by their `list` label **or** their account-uuid, exactly as `use` and
+`poke` do. If two accounts share a label, `remove` **refuses** rather than guessing which
+you meant — pass the account-uuid `list` shows for the one you want. That refusal matters
+most here: removing the wrong account costs a re-login, and nothing in `sessiometer` puts
+it back. The roster entry is removed from `config.toml` **first**, then the stash is
+deleted — so an interrupted removal leaves at most an unreferenced (harmless) keychain
+item, never a roster entry pointing at a missing stash. A running daemon picks up the
+removal in its live rotation right away — no restart needed.
 
 Removing the **active** account is allowed: it touches only `sessiometer`'s
 roster entry and stash, never the live `Claude Code-credentials` item, so the
@@ -1307,8 +1313,12 @@ Claude Code:
 
    ```sh
    sessiometer list               # see the captured accounts
-   sessiometer remove <label>     # repeat for each; erases that account's stash
+   sessiometer remove <account>   # repeat for each; erases that account's stash
    ```
+
+   `<account>` is a label or an account-uuid. If two accounts happen to share a label,
+   `remove` refuses rather than guessing which you meant — pass the account-uuid `list`
+   shows for the one you want.
 
    `remove` never touches the live `Claude Code-credentials` item — even for the
    active account — so your Claude Code session keeps working throughout.

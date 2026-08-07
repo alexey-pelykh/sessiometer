@@ -15186,9 +15186,6 @@ mod tests {
                 field: "accountUuid",
             },
             Error::RotationLabelRequired { verb: "disable" },
-            Error::AccountLabelNotFound {
-                label: "work".to_owned(),
-            },
             Error::StashIncomplete {
                 service: "Sessiometer/11111111-1111-1111-1111-111111111111".to_owned(),
             },

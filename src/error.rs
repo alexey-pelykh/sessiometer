@@ -308,24 +308,34 @@ pub(crate) enum Error {
     OauthAccountFieldMissing { field: &'static str },
 
     // --- Account enable/disable (issue #36) ----------------------------------
-    /// `sessiometer disable`/`enable` was invoked without the required `<label>`.
-    /// Carries the subcommand (a static, secret-free string) so the message names
-    /// the exact usage.
-    #[error("a label is required: `sessiometer {verb} <label>`")]
+    /// `sessiometer disable`/`enable`/`remove` was invoked without the required
+    /// `<account>`. Carries the subcommand (a static, secret-free string) so the message
+    /// names the exact usage.
+    ///
+    /// Says `<account>`, not `<label>`: since issue #1005 these verbs resolve through
+    /// [`resolve_target`](crate::use_account::resolve_target) and accept a label OR an
+    /// account-uuid, so naming a label as *required* would both contradict their `--help` and
+    /// be untrue. The variant keeps its `Rotation…` name — renaming a variant nothing else
+    /// reads would churn call sites without changing a word the operator sees.
+    #[error("an account is required: `sessiometer {verb} <account>`")]
     RotationLabelRequired { verb: &'static str },
 
-    /// `sessiometer disable`/`enable` was given a `<label>` that matches no roster
-    /// account. The label is the operator's non-secret handle (issue #15), safe to
-    /// quote; the message points at `list` to show the valid handles.
-    #[error("no account labelled `{label}` — run `sessiometer list` to see the roster")]
-    AccountLabelNotFound { label: String },
-
+    // `AccountLabelNotFound` lived here until issue #1005. `disable`/`enable`/`remove`
+    // resolved a label with their own exact-match `.find()`/`.position()` and raised it when
+    // nothing matched — a private taxonomy that also silently took the FIRST match on a
+    // duplicated label, while `use`/`poke`/the daemon refused. OQ-1 settled that toward
+    // refusing, so all six now resolve through `use_account::resolve_target` and the not-found
+    // case is [`UseTargetNotFound`](Error::UseTargetNotFound) (exit 5), the ambiguous one
+    // [`UseTargetAmbiguous`](Error::UseTargetAmbiguous) (exit 6). Retiring the variant is
+    // forced rather than chosen: with both constructors routed away, a never-constructed
+    // variant is `dead_code`, which is a build failure under `-D warnings`.
     /// A `config-set` (issue #268) label edit named an `account_uuid` that matches no
     /// roster account — a stale settings client (the account was `remove`d between its
     /// `config-get` read and the edit) or a client bug. The uuid is a non-secret roster
-    /// key (issue #15), safe to quote. Distinct from [`AccountLabelNotFound`](Error::AccountLabelNotFound)
-    /// (a `<label>` lookup): the settings path keys label edits by the immutable uuid, not
-    /// the mutable label, so a duplicate-label roster stays unambiguous.
+    /// key (issue #15), safe to quote. Distinct from
+    /// [`UseTargetNotFound`](Error::UseTargetNotFound) (a `<account>` lookup, which resolves
+    /// by label OR uuid): the settings path keys label edits by the immutable uuid ALONE, so
+    /// it stays unambiguous on a duplicate-label roster where the shared resolver refuses.
     #[error("no account with account_uuid `{account_uuid}` in the roster")]
     AccountUuidNotFound { account_uuid: String },
 
@@ -539,15 +549,28 @@ pub(crate) enum Error {
     )]
     UseNextUnresolved { detail: String },
 
-    /// `use <query>` matched no roster account by label OR account-uuid. The
+    /// A `<query>` matched no roster account by label OR account-uuid. The
     /// resolver never guesses (issue #17): an unresolvable target is a hard error
     /// with ZERO writes. `query` is the operator's non-secret input.
+    ///
+    /// Raised by every site that resolves an operator-supplied account: `use`, `poke`, the
+    /// daemon's control-socket swap, and — since issue #1005 routed them through the shared
+    /// [`resolve_target`](crate::use_account::resolve_target) — `enable`, `disable` and
+    /// `remove`. Those three previously raised their own `AccountLabelNotFound`, which carried
+    /// no entry in [`exit_code`](Error::exit_code) and so exited a generic `1`; they now exit
+    /// `5` with the rest.
     #[error("no account matches `{query}` — run `sessiometer list` to see the roster")]
     UseTargetNotFound { query: String },
 
-    /// `use <query>` matched MORE THAN ONE roster account (a duplicated label).
+    /// A `<query>` matched MORE THAN ONE roster account (a duplicated label).
     /// The resolver refuses to guess (issue #17): disambiguate with the
     /// account-uuid. ZERO writes. `query` is the operator's non-secret input.
+    ///
+    /// Raised by the same six sites as [`UseTargetNotFound`](Error::UseTargetNotFound). For
+    /// `enable`, `disable` and `remove` this outcome did not exist before issue #1005 — each
+    /// silently took the earliest bearer of the label, which on `remove` meant deleting a
+    /// keychain stash the operator had not named. That is the harm OQ-1 resolved by routing
+    /// them here.
     #[error("`{query}` is ambiguous: {count} accounts match — disambiguate with the account-uuid")]
     UseTargetAmbiguous { query: String, count: usize },
 
@@ -1093,6 +1116,18 @@ mod tests {
         );
     }
 
+    // Issue #1005 / OQ-1 note: `enable`, `disable` and `remove` now route through
+    // `use_account::resolve_target`, so their failures are `UseTargetNotFound` (5) and
+    // `UseTargetAmbiguous` (6) rather than the retired `AccountLabelNotFound` — which appeared
+    // nowhere in `exit_code` and so fell through to the generic `_ => 1`. The mapping asserted
+    // below is UNCHANGED by that routing; what changed is which verbs reach it. A test here
+    // restating these two codes would therefore pass against the pre-fix tree and gate nothing.
+    // The observable move (1 → 5, and 6 becoming reachable at all) is gated where the verbs
+    // actually produce the errors: `apply_enabled_rejects_an_unknown_label_without_touching_the_roster`,
+    // `apply_remove_rejects_an_unknown_label_without_touching_the_roster` and
+    // `every_label_resolving_site_shares_one_resolver` in `crate::cli`, each asserting the
+    // literal code off a real verb path.
+
     #[test]
     fn use_verb_extends_the_exit_code_taxonomy_with_distinct_codes() {
         // Issue #63: the `use` verb's new conditions each get their own code,
@@ -1229,8 +1264,8 @@ mod tests {
         // `redaction::meter::unauthored_emails`).
         let authored = "alice@example.com";
         for message in [
-            Error::AccountLabelNotFound {
-                label: authored.into(),
+            Error::UseTargetNotFound {
+                query: authored.into(),
             }
             .to_string(),
             Error::UseTargetQuarantined {
