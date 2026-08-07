@@ -102,6 +102,19 @@ Light shown here:
   one it disagrees with; the goldens likewise pin only the configured render. Drawing the frame is
   tracked on **#1037** (*the panel mock depicts only the happy path*) — as its own row, because the
   regime is an axis orthogonal to that issue's three *measurability* frames, and the two axes cross
+- the same callout has **two further mock-unauthored forms**, on the MEASURABILITY axis (#1029). The
+  census is meaningless without its denominator — with no instant at which the whole set was
+  simultaneously observed there was nothing to count — so the panel now says
+  `All accounts ≥95% at once — not measurable: never all in view at the same moment` instead of the
+  `0 episodes (0s)` it used to print, which read as a calm week on a week the metric could see
+  nothing. A partly-observed window annotates its measured share:
+  `3 episodes (1h40m, all in view 64% of the window)`. The mock draws only the wholly-observed form,
+  and the `--render-panel` `stats` fixture pins a FULL denominator to match it, so `build-comparison.py`
+  never renders these two and the goldens pin neither. **Drawing them is exactly #1037's three
+  measurability frames** — this row records the forms and the copy so the built panel can be read
+  against the mock before those frames exist. The CLI diverges here deliberately and is not a bug:
+  it renders its own `—` gap sentinel, shared with the `signal` / `velocity` / `runway` cells, which
+  is R-2 STATE-parity — same state, per-medium vocabulary — not glyph-parity
 - the footer reads "updated <1m ago" — the panel mirrors the `status` CLI (R-2 state-parity), not
   the mock's illustrative "snapshot 12s old". Resets no longer diverge: the mock now uses the CLI's
   compact duration form too ("2h14m" / "3d"), not a day-name (#387)

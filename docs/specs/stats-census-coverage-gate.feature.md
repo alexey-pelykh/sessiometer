@@ -1,3 +1,14 @@
+<!--
+SPECIFICATION STUB — not executable.
+This repo has no Gherkin runner; the executable gates are the Rust test suite and the Swift
+XCTest bundle. These scenarios pin each acceptance criterion in scenario form; do not read a
+written scenario as a passing test.
+
+Each scenario below now NAMES the test that binds it. That name is the executable gate; this file
+is the statement of intent it satisfies. One scenario is named by no *Binds* line, deliberately:
+Rule 4's first, whose renders ARE asserted but whose build-reference frames belong to issue #1037.
+-->
+
 # Feature: the census reports UNKNOWN when it could never have measured
 
 Issue #1029 · PRD R-1 / R-2 / R-8 / R-21 · design D-C / D-E
@@ -42,6 +53,20 @@ Scenario: the CLI's existing behaviour is the reference
     # its own (#1028).
 ```
 
+*Binds*: `testAnUnmeasurableCensusIsNotRenderedAsACalmZero` and
+`testAPartlyMeasuredCensusStatesTheShareItWasMeasuredOver` /
+`testTheShareNeverRoundsToAFalseZeroOrAFalseHundred` (`apps/menubar/Tests/StatsTests.swift`) for the
+first two scenarios; `an_unmeasurable_census_renders_the_gap_sentinel_never_a_bare_zero` and
+`a_barely_covered_census_annotates_its_share_instead_of_reading_as_calm` (`src/stats.rs`) for the CLI
+half of the third.
+
+> **The decode is gated separately, as the first scenario's comment demands.**
+> `testTheGoldenFixtureCarriesTheDenominatorItWasMeasuredOver` reads `all_high_covered_secs` out of
+> `Fixtures.statsBasic` — byte-pinned to the Rust-emitted `build/fixtures/wire-stats-basic.json` — so
+> a misspelled `CodingKey` fails there. Without it the gate is untestable by construction: a missing
+> key decodes to `nil`, `nil` takes the drop path, and every render assertion below would still pass
+> while the gate measured nothing.
+
 ## Rule 2 — UNKNOWN is distinguishable from a measured zero *and* from a quiet week
 
 ```gherkin
@@ -62,6 +87,20 @@ Scenario: a bare dash is not sufficient on the panel
     # is defensible in a dense line-oriented render; the panel has neither that constraint nor that
     # convention. STATE-parity permits this divergence — it is per-medium vocabulary, same state.
 ```
+
+*Binds*: `testTheThreeCensusStatesRenderDistinguishably` (`apps/menubar/Tests/StatsTests.swift`) for
+the first scenario — it pins the PROPERTY rather than the copy, so it would fail for any rewording
+that collapsed a pair of states again, which the equality assertions around it would not.
+`testAnUnmeasurableCensusIsNotRenderedAsACalmZero` binds the second: it asserts the rendered sentence,
+so a regression to a bare sentinel reddens it.
+
+> **The second scenario is where the two surfaces deliberately part, and the CLI keeps `—`.** This
+> spec scopes "a bare dash is not sufficient" to the PANEL in its own title and says why in its
+> comment; §7's state matrix carries no defect marker on the CLI's `—` for `covered_secs == 0`; and
+> D-D says in as many words that "the CLI keeps its joined line and its existing degradation
+> discipline." So the CLI's change under this issue is R-21's wording only. Read D-C's copy table —
+> which heads its column "Both surfaces" — as the panel proposal it marks freely correctable, not as
+> a licence to replace the sentinel the `signal` / `velocity` / `runway` cells share.
 
 ## Rule 3 — no implementation vocabulary in a user-facing string
 
@@ -84,6 +123,19 @@ Scenario: the CLI has the same defect and is in scope for it
     # correctness property it otherwise leads on.
 ```
 
+*Binds*: `testTheCoverageClauseDoesNotLeakTheFieldName` (`apps/menubar/Tests/StatsTests.swift`) and,
+for the CLI, the `!sliver.contains("% covered")` assertion inside
+`a_barely_covered_census_annotates_its_share_instead_of_reading_as_calm` (`src/stats.rs`). Both are
+absence assertions on the word itself, so they hold under any rewording that keeps the field name out.
+
+> **Both surfaces now render the same clause**: `, all in view {n}% of the window`. It says what the
+> share measures — how much of the window the census could see the whole set at one moment — and
+> "all" is bound to the set the label beside it already named, so it stays correct under the
+> sampled-accounts fallback without naming a set twice. No roster SIZE is stated, though D-C's
+> illustrative copy carried one ("all 6"): the census's set is not the document's account map under
+> that fallback, so a count taken from it would be a second, driftable definition of the set — the
+> re-derivation `RosterWire`'s own doc gives as the reason the water and the set ride the wire at all.
+
 ## Rule 4 — the render survives the states the mock never depicted
 
 ```gherkin
@@ -102,3 +154,18 @@ Scenario: the gate does not regress when the roster is empty
     # A cardinality-zero subject passing a gate is not evidence the gate works. An empty roster
     # trivially has "no instant where all accounts were high" — which is unmeasurable, not calm.
 ```
+
+*Binds*: `testAnEmptyRosterReportsUnknownRatherThanAMeasuredZero`
+(`apps/menubar/Tests/StatsTests.swift`) for the second scenario, driven through `decodeStatsReply` so
+it exercises the decode as well as the gate; the CLI's half is already pinned by
+`build/fixtures/cli-renders/stats-empty-roster.txt`, which renders `—`.
+
+> **The first scenario is NOT bound, and that is the honest state.** All three census states have a
+> defined render in code (`StatusPanelFormat.statsCensusReading`) and each is asserted above — but
+> `apps/menubar/design/menubar-preview.html` still depicts only the happy path, so the panel remains
+> FAITHFUL to a reference that never covered the degraded cases. That is a Reference Defect, not an
+> implementation defect, and **issue #1037 owns the frames**; this issue deliberately does not add
+> them. Until it lands, `panel-stats-{light,dark}.png` rasterizes the wholly-measured state only —
+> which is why the `stats` preview fixture carries a FULL denominator (`all_high_covered_secs`
+> = its own 604800-second window) rather than a partial one that would silently rebaseline the
+> goldens away from the mock.

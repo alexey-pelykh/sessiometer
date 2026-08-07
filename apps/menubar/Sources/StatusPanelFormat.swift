@@ -2276,14 +2276,119 @@ enum StatusPanelFormat {
     /// The water is READ FROM THE WIRE (`allHighThreshold`), never assumed: it is `session_ceiling`,
     /// which the operator can retune, so a literal here would silently lie the moment it is retuned
     /// (issue #805 — the label had been pinned at `≥90%` while the aggregator censused at 95). Its
-    /// SET is read the same way (`censusOverRoster`, issue #866) and for the same reason.
+    /// SET is read the same way (`censusOverRoster`, issue #866), and since issue #1029 so is its
+    /// DENOMINATOR (`allHighCoveredSecs`) — all three for the same reason: a census parameter this
+    /// surface re-derives is a second definition that can drift from the one that was measured.
     static func statsAggregateText(roster: StatsRoster, window: StatsWindow) -> String {
-        let episodes = roster.allHighEpisodes
-        let epWord = episodes == 1 ? "episode" : "episodes"
-        let label = statsAllHighLabel(roster.allHighThreshold, censusOverRoster: roster.censusOverRoster)
-        return "\(label) — \(episodes) \(epWord)"
-            + " (\(statsDuration(roster.allHighSecs)))"
+        let label = statsAllHighLabel(roster.allHighThreshold,
+                                      censusOverRoster: roster.censusOverRoster,
+                                      coveredSecs: roster.allHighCoveredSecs)
+        return "\(label) — \(statsCensusReading(roster, window: window))"
             + " · swaps \(roster.swapCount) · \(statsWindowPhrase(window))"
+    }
+
+    /// The census's READING — the clause between the label and the swap count. THREE states, and the
+    /// whole point of issue #1029 is that they stay mutually distinguishable:
+    ///
+    ///   • **never measurable** (`allHighCoveredSecs == 0`) — no instant existed at which the whole
+    ///     set was observable, so there was nothing to count. Renders a sentence saying so.
+    ///   • **partly measurable** (`0 < covered < window`) — a real count, annotated with how much of
+    ///     the window it was measured over, because one covered second in a week otherwise reads as
+    ///     a confident calm (REQ-STA-B-008's "low-coverage periods SHALL be annotated").
+    ///   • **genuinely quiet** (fully covered, no episodes) — `0 episodes (0s)`, terse and unqualified.
+    ///
+    /// The panel used to render ALL THREE as `0 episodes (0s)`, which is the reported defect: a week
+    /// on which no account was usable for days read as a calm one, and REQ-STA-B-008's rationale is
+    /// normative about why that matters — *"a daemon-down week must not read as 'underused →
+    /// cancel'"*.
+    ///
+    /// DELIBERATE DIVERGENCE FROM THE CLI, on words but NOT on state. `roster_line`
+    /// (`src/stats.rs`) renders the unmeasurable case as the bare `—` it shares with the `signal` /
+    /// `velocity` / `runway` cells — one UNKNOWN vocabulary across that surface. This one says it in
+    /// a sentence, because the panel has no such neighbouring vocabulary to lean on: a lone `—` in
+    /// this callout reads as "all quiet", which is the exact misreading being fixed. `design-menubar`
+    /// R-2 licenses precisely this — re-ratified as STATE-parity, not glyph-parity, so the two
+    /// surfaces may choose different words for one state but never a different state. The
+    /// divergence is scoped to THAT ONE state: the coverage clause below is the CLI's own wording,
+    /// byte for byte, because it annotates a count both surfaces already print alike.
+    ///
+    /// The `<1` / `>99` clamp is COPIED from the CLI rather than re-decided, for the reason stated
+    /// there: rounding must not manufacture a whole the share is not. In here coverage is strictly
+    /// between nothing and everything — the one thing the annotation exists to say — so a rendered
+    /// `0%` or `100%` would deny it. `statsPercent` already mirrors Rust's rounding rule, so the two
+    /// surfaces cannot disagree by a percent either.
+    ///
+    /// A `nil` denominator (a pre-#804 daemon — see `StatsRoster`) DROPS the coverage clause and
+    /// renders the count bare, exactly as this surface did before #1029. It must NOT claim "not
+    /// measurable": that would read a silence as a fact, which is the fabrication class #805 exists
+    /// to end. Against such a daemon the defect stays reachable, knowingly — an unsent denominator
+    /// cannot be consulted.
+    ///
+    /// NO ROSTER SIZE is named, deliberately, though the design's illustrative copy carried one
+    /// ("never saw all 6 at once", `docs/design/stats-honesty-cross-surface-solution-design.md` D-C,
+    /// whose strings it marks freely correctable). The census's SET is not this document's account
+    /// map: under the sampled-accounts fallback the census intersects whoever held samples, so a
+    /// count taken from `summary.accounts` would be a SECOND definition of the set — right in the
+    /// configured regime and wrong in the degraded one, and driftable in both. That is the same
+    /// re-derivation `RosterWire`'s own doc gives as the reason the water and the set are carried
+    /// rather than recomputed. The sentence is true without the number.
+    ///
+    /// THE RESIDUAL, stated rather than implied — and the one asymmetry with the CLI's SIGNATURE.
+    /// `roster_line` takes the whole `UsageReport` "so the coverage annotation's denominator … is
+    /// read from the SAME report as the numerator and cannot be mismatched by a caller"
+    /// (`src/stats.rs`); this one takes `roster` and `window` SEPARATELY and carries no such
+    /// guarantee — pairing a SERIES BUCKET's roster with the document's window would compile and
+    /// render a wrong share. `StatsWire` is decode-only with no memberwise initializer, so taking
+    /// the whole document would cost every string assertion a seven-field fixture, and the hazard
+    /// is latent: `StatsAggregate` (`StatusPanelStats.swift`) is the ONE production call site and
+    /// reads both from a single decoded document. A second call site is where this stops being
+    /// acceptable.
+    static func statsCensusReading(_ roster: StatsRoster, window: StatsWindow) -> String {
+        let covered = roster.allHighCoveredSecs
+        if let covered, covered <= 0 {
+            return "not measurable: never all in view at the same moment"
+        }
+        var detail = statsDuration(roster.allHighSecs)
+        let windowSecs = statsWindowSeconds(window)
+        if let covered, covered < windowSecs {
+            // Safe without a zero guard, by the CLI's own argument: this branch has `covered >= 1`
+            // AND `covered < windowSecs`, which together force `windowSecs >= 2`.
+            let share = Double(covered) / Double(windowSecs)
+            let shown: String
+            switch statsPercent(share) {
+            case 0: shown = "<1"
+            case 100: shown = ">99"
+            case let whole: shown = String(whole)
+            }
+            // Says what the share MEASURES, never the field that carries it — `covered` answers
+            // *covered by what?* with nothing, and is the second half of issue #1029. "all" is the
+            // set the label immediately before it already named, so this reads correctly under the
+            // sampled-accounts fallback without naming a set twice.
+            detail += ", all in view \(shown)% of the window"
+        }
+        let episodes = roster.allHighEpisodes
+        return "\(episodes) \(episodes == 1 ? "episode" : "episodes") (\(detail))"
+    }
+
+    /// A window's span in seconds, the MIRROR of Rust's `Period::duration` — `(end - start).max(0)`,
+    /// clamped so an empty or inverted window reads as zero rather than negative
+    /// (`src/usage_stats.rs`). Both halves of that are load-bearing here.
+    ///
+    /// The CLAMP is what makes a degenerate window take the same branch on both surfaces: nothing can
+    /// be jointly covered inside a zero-length window, so `covered < 0` is false, no share is
+    /// computed, and the divide the caller relies on is never reached.
+    ///
+    /// The OVERFLOW CHECK has no Rust counterpart because it needs none — Rust's `-` wraps in release
+    /// while Swift's TRAPS in both configurations, so the same subtraction that merely computes a
+    /// nonsense number there terminates the menu-bar app here. `start` and `end` are decoded straight
+    /// off the socket, and while the daemon writes epoch seconds and the peer is authenticated, this
+    /// is the only place in `apps/menubar/Sources` that subtracts two wire-supplied `Int64`s; the
+    /// repo keeps a `wire-hostile-numerics` render fixture precisely because "the daemon would never
+    /// send that" is not the standard this surface holds itself to. An overflowing span is not a
+    /// window at all, so it degrades to the same zero a degenerate one does.
+    static func statsWindowSeconds(_ window: StatsWindow) -> Int64 {
+        let (span, overflowed) = window.end.subtractingReportingOverflow(window.start)
+        return overflowed ? 0 : max(0, span)
     }
 
     /// The aggregate callout's leading clause, stating the two parameters of the census it heads:
@@ -2308,17 +2413,27 @@ enum StatusPanelFormat {
     /// the same rule the `nil` water above follows, and `true` needs no qualifier because the
     /// unqualified sentence already states it.
     ///
-    /// DIVERGENCE FROM THE CLI, stated rather than inherited: `roster_line` also suppresses the
-    /// qualifier when the census was never measurable (`all_high_covered_secs == 0`), because
-    /// naming a set there would describe a measurement that never happened. This surface cannot
-    /// mirror that half — `StatsRoster` does not decode `all_high_covered_secs` at all (issue
-    /// #1029), so the panel has no way to know a census was untaken, and it currently renders that
-    /// case as a confident `0 episodes (0s)` rather than the CLI's `—` sentinel. Given it IS
-    /// showing a number, naming the set that produced it is the honest reading of the two, so the
-    /// qualifier is stated unconditionally on `false`. When #1029 lands and the denominator
-    /// arrives, this is the second suppression to add — not a rule that was overlooked.
-    static func statsAllHighLabel(_ threshold: Double?, censusOverRoster: Bool?) -> String {
-        let subject = censusOverRoster == false ? "All sampled accounts" : "All accounts"
+    /// THE SECOND SUPPRESSION, added by issue #1029 as the previous revision of this comment said it
+    /// would be: an UNMEASURABLE census (`coveredSecs == 0`) drops the set qualifier too, because
+    /// naming the set a census intersected over describes a measurement that never happened. Until
+    /// the denominator was decoded, this surface could not know a census was untaken and rendered it
+    /// as a confident `0 episodes (0s)`; while it WAS showing a number, naming the set that produced
+    /// it was the honest reading of the two, so the qualifier was stated unconditionally on `false`.
+    /// It no longer shows one — `statsCensusReading` says "not measurable" — so the CLI's rule
+    /// (`roster_line`, `src/stats.rs`) now applies here unchanged, and the two surfaces agree on WHEN
+    /// the set is named. `nil` keeps the pre-#1029 behaviour deliberately: an older daemon never sent
+    /// a denominator, and treating its silence as unmeasurability would suppress a qualifier on a
+    /// reading that may well have been taken.
+    ///
+    /// The WATER is NOT suppressed alongside it, matching the CLI exactly: `—` there still states the
+    /// threshold, because the water is a parameter the daemon carried regardless of whether the
+    /// census could be taken. One parameter of this label is stated on a non-reading and the other is
+    /// not, deliberately, on both surfaces.
+    static func statsAllHighLabel(_ threshold: Double?,
+                                  censusOverRoster: Bool?,
+                                  coveredSecs: Int64?) -> String {
+        let measurable = (coveredSecs ?? 1) > 0
+        let subject = (censusOverRoster == false && measurable) ? "All sampled accounts" : "All accounts"
         guard let threshold else { return "\(subject) high at once" }
         return "\(subject) ≥\(statsPercent(threshold))% at once"
     }

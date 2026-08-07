@@ -346,12 +346,13 @@ struct Report {
     /// as [`RosterWire::census_over_roster`], read from this one field, so the two surfaces cannot
     /// disagree about the REGIME ITSELF.
     ///
-    /// Their RENDERS still can, deliberately: [`roster_line`] below suppresses the qualifier when
-    /// the census was never measurable (`all_high_covered_secs == 0`), and the panel cannot mirror
-    /// that half because it does not decode that key (issue #1029). The divergence and its
-    /// reasoning are documented where a panel reader will meet them, on
-    /// `StatusPanelFormat.statsAllHighLabel` — do not read the parity above as extending to the
-    /// rendered strings.
+    /// Their RENDERS still can, deliberately, though no longer on THIS axis: [`roster_line`] below
+    /// suppresses the qualifier when the census was never measurable
+    /// (`all_high_covered_secs == 0`), and since issue #1029 the panel decodes that key and
+    /// suppresses it too (`StatusPanelFormat.statsAllHighLabel`), so the two surfaces now agree on
+    /// WHEN the set is named. What they still render differently is the UNKNOWN reading itself —
+    /// `—` here, a sentence on the panel — which is R-2 STATE-parity, not glyph-parity. Do not read
+    /// the parity above as extending to the rendered strings.
     census_over_roster: bool,
 }
 
@@ -1628,7 +1629,16 @@ fn roster_line(report: &UsageReport, census_over_roster: bool) -> String {
                 100 => ">99".to_owned(),
                 whole => whole.to_string(),
             };
-            detail.push_str(&format!(", {shown}% covered"));
+            // SAYS WHAT THE SHARE MEASURES, in the reader's words. This annotation used to read
+            // `, {n}% covered`, which is the field's NAME (`all_high_covered_secs`) leaking onto
+            // an operator-facing surface: it never answers *covered by what?*, and a reader who
+            // cannot answer that cannot use the number. What it measures is how much of the
+            // window the census could see the whole set at ONE moment — so that is what it now
+            // says (issue #1029). "all" is the set the label beside it already named, so the
+            // sampled-accounts fallback needs no second wording: `(≥95%, sampled accounts):
+            // 0 episodes (0s, all in view 8% of the window)` reads correctly for whichever set
+            // was censused, which naming a set here a second time would not.
+            detail.push_str(&format!(", all in view {shown}% of the window"));
         }
         format!(
             "{} episode{} ({detail})",
@@ -5469,22 +5479,35 @@ mod tests {
         // period says so (REQ-STA-B-008's annotation clause).
         let sliver = census_line(0, 0, 7_200, 0.95); // 2 h of a day
         assert!(
-            sliver.contains("all-accounts-high (≥95%): 0 episodes (0s, 8% covered) ·"),
+            sliver.contains(
+                "all-accounts-high (≥95%): 0 episodes (0s, all in view 8% of the window) ·"
+            ),
             "a partly-covered census annotates its measured share: {sliver}"
+        );
+        // And it does so in the READER's words, never the field's. `covered` names
+        // `all_high_covered_secs` and leaves *covered by what?* unanswered, which is the second
+        // half of issue #1029; the annotation must say what the share measures instead.
+        assert!(
+            !sliver.contains("% covered"),
+            "the annotation must not leak the field name `covered`: {sliver}"
         );
 
         // Rounding must not manufacture a whole the share is NOT, at EITHER end: both of
         // these windows are strictly partly covered, and a `0%` or a `100%` would deny it.
         let trace = census_line(0, 0, 60, 0.95); // 1 min of a day ≈ 0.07%
         assert!(
-            trace.contains("all-accounts-high (≥95%): 0 episodes (0s, <1% covered) ·"),
+            trace.contains(
+                "all-accounts-high (≥95%): 0 episodes (0s, all in view <1% of the window) ·"
+            ),
             "a trace of coverage renders `<1%`, never a false `0%`: {trace}"
         );
         // A day covered but for its last 5 min rounds to 100 — reachable whenever one account
         // joins the roster (or its daemon restarts) a sliver into the window.
         let nearly = census_line(0, 0, CENSUS_WINDOW - 300, 0.95); // ≈ 99.65%
         assert!(
-            nearly.contains("all-accounts-high (≥95%): 0 episodes (0s, >99% covered) ·"),
+            nearly.contains(
+                "all-accounts-high (≥95%): 0 episodes (0s, all in view >99% of the window) ·"
+            ),
             "near-total coverage renders `>99%`, never a false `100%`: {nearly}"
         );
 
@@ -5492,7 +5515,7 @@ mod tests {
         // the annotation's presence is itself the low-coverage signal. That is the ONLY way
         // to read `100%`, so the `>99%` above can never be mistaken for it.
         assert!(
-            !census_line(2, 600, CENSUS_WINDOW, 0.95).contains("covered"),
+            !census_line(2, 600, CENSUS_WINDOW, 0.95).contains("in view"),
             "a fully-covered census is not annotated"
         );
 
@@ -5500,7 +5523,9 @@ mod tests {
         // both what was seen and how much of the window it was seen over.
         let partial = census_line(2, 600, CENSUS_WINDOW / 2, 0.95);
         assert!(
-            partial.contains("all-accounts-high (≥95%): 2 episodes (10m, 50% covered) ·"),
+            partial.contains(
+                "all-accounts-high (≥95%): 2 episodes (10m, all in view 50% of the window) ·"
+            ),
             "a measured episode over half a window reports both: {partial}"
         );
 
