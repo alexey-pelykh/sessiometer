@@ -1054,6 +1054,29 @@ struct StatsRoster: Decodable, Equatable {
     /// forward-compat path the snapshot mirror uses for its additive fields.
     let allHighThreshold: Double?
 
+    /// THE DENOMINATOR the two figures above were measured over (issue #804): seconds of the window
+    /// during which EVERY account in the census set was SIMULTANEOUSLY covered.
+    ///
+    /// `0` means the census was never measurable at all — no instant existed at which the whole set
+    /// was observable — so the accompanying `0 episodes` is UNKNOWN, not calm. `RosterWire`'s own
+    /// doc states the contract for every consumer: *"Read `all_high_episodes` ONLY against
+    /// `all_high_covered_secs`"*, and the producer repeats it in the imperative
+    /// (`src/usage_stats.rs`: *"Surfaces MUST consult the denominator and render UNKNOWN rather than
+    /// a bare `0` — an unmeasurable period is not a calm one"*). The panel did not decode this key
+    /// at all until issue #1029, so it rendered a week the metric could never see as a confident
+    /// `0 episodes (0s)` — the very reading REQ-STA-B-008 forbids. `statsCensusReading` is where the
+    /// gate now lives.
+    ///
+    /// OPTIONAL only for the pre-#804 daemon that never sent the key — the same forward-compat rule
+    /// the water above follows, and the same consequence: `nil` means "an older daemon, which never
+    /// told us its denominator", NOT "the census was unmeasurable". The renderer must therefore DROP
+    /// the coverage clause rather than substitute a verdict — claiming "not measurable" from a
+    /// silence would fabricate exactly the fact this field exists to establish, and it is the same
+    /// class of error as #805's fabricated threshold, one field over. The residual is real and
+    /// accepted: against such a daemon the reported defect stays reachable, because a denominator
+    /// nobody sent cannot be consulted.
+    let allHighCoveredSecs: Int64?
+
     /// WHICH SET the census above intersected over (issue #866): `true` when the daemon had the
     /// CONFIGURED roster, `false` when it did not and the census degraded to whoever held samples
     /// — where an unsampled account cannot withhold the metric, so it fires on strictly less
@@ -1074,6 +1097,7 @@ struct StatsRoster: Decodable, Equatable {
         case allHighEpisodes = "all_high_episodes"
         case allHighSecs = "all_high_secs"
         case allHighThreshold = "all_high_threshold"
+        case allHighCoveredSecs = "all_high_covered_secs"
         case censusOverRoster = "census_over_roster"
     }
 }
