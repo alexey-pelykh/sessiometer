@@ -67,11 +67,17 @@ Scenario: a runway beyond one weekly window is impossible
   Given the computed runway exceeds one weekly quota window
    When the runway is evaluated for plausibility
    Then it is UNKNOWN
-    And the implausible computation is recorded as a fault
     # The bound is derivable, not arbitrary: weekly quotas reset. A runway longer than one weekly
     # window asserts the fleet drains with no reset intervening — which cannot happen. This is why
     # the bound is result-side; an input-side epsilon on the rate would be a magic number in units
     # nobody can reason about.
+    #
+    # AMENDED as delivered: this scenario originally also required "the implausible computation is
+    # recorded as a fault". It does not, and should not. Exceeding the bound is NOT evidence the
+    # computation broke — an ordinary fleet with ample head-room and a modest burn exceeds it
+    # routinely, because the bound is on the RATIO. Recording that as a fault would raise a defect
+    # signal on a healthy fleet. The delivered state (`BeyondWeeklyWindow`) is therefore a benign
+    # bound, not a fault; recording a fault for the genuinely broken case stays with #1036.
 
 Scenario: the bound does not scale with roster size
   Given a roster of six accounts
@@ -98,19 +104,27 @@ Scenario: an unknown runway still prints its line
    When the roster block is rendered
    Then the runway line is printed, stating that it is unknown
     And the counted set is still stated
-    # `fleet_line` today emits the runway only under `Some(FleetRunway { runway_secs: Some(_), .. })`
-    # (stats.rs:1729, doc: "Rendered ONLY when the pool has a finite runway"). So Rule 1's floor,
-    # shipped alone, would make this line VANISH MORE OFTEN than it does today — the corrective work
-    # would make the surface quieter rather than more honest. That is premortem P2 landing in reality.
+    # Before this issue, the render emitted the runway only under
+    # `Some(FleetRunway { runway_secs: Some(_), .. })` — doc: "Rendered ONLY when the pool has a
+    # finite runway". So Rule 1's floor, shipped alone, would have made this line VANISH MORE OFTEN
+    # than before: the corrective work would have made the surface quieter rather than more honest.
+    # That is premortem P2 landing in reality, and it is why this rule shipped in the same change.
 
 Scenario: the reason for refusing is distinguishable
   Given the runway is UNKNOWN because no measurable burn was observed
     And separately, a run where it is UNKNOWN because the result was implausible
    When each is rendered
    Then the two renders are distinguishable
-    # A reader who sees "unknown" twice for different reasons learns nothing. The no-burn case is
-    # benign (a quiet fleet); the implausible case means the computation broke and a fault was
-    # recorded (#1036). Collapsing them hides a defect behind a normal state.
+    # A reader who sees "unknown" twice for different reasons learns nothing. Collapsing them hides
+    # one state behind another.
+    #
+    # AMENDED as delivered: this comment used to gloss the second case as "the computation broke and
+    # a fault was recorded (#1036)". Both halves were wrong. Exceeding the bound usually means the
+    # fleet is simply not on course to exhaust before the reset — benign, and NOT a broken
+    # computation — so no fault is recorded for it. What ships distinguishes FOUR states, and the
+    # renders are correspondingly distinct: a known figure; "no combined usage measured" (flat);
+    # "more than a week at the current combined rate" (the bound); and "no combined rate could be
+    # read" (malformed inputs only, which a well-formed report cannot produce).
 
 Scenario: both surfaces obey this rule
   Given the menubar panel reports the fleet runway

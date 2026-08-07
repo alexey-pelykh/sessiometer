@@ -937,6 +937,12 @@ fn replay_velocity_ema(series: &[(i64, f64)], alpha: f64) -> Option<f64> {
 /// `(trigger − current) / rate`. `None` — NEVER a sentinel — when the rate is unknown or
 /// non-positive (an idle / flat dimension has no finite runway) or the reading is already at/over
 /// the trigger (no positive head-room left to state as a neutral fact).
+///
+/// KNOWN DEFECT, tracked as issue #1075: this is the PER-ACCOUNT sibling of the fleet quotient and
+/// still carries BOTH faults issue #1028 removed from [`fleet_runway_state`] — `rate <= 0.0` admits
+/// a decayed EMA (measured: `1e-11` → 925,925 days), and `as i64` SATURATES rather than failing
+/// (measured: `1e-300` → `i64::MAX`). #1028 scoped itself to the fleet site on purpose; do not read
+/// the bounded sibling as evidence that this expression is bounded too.
 fn runway_secs(rate: Option<f64>, current: f64, trigger: f64) -> Option<i64> {
     let rate = rate?;
     if rate <= 0.0 || current >= trigger {
@@ -1033,18 +1039,80 @@ fn with_velocity(
 /// cannot drift into a parallel metric. The WIRE shape stays [`FleetWire`]; this is internal.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct FleetRunway {
-    /// Approximate whole seconds until the roster's COMBINED weekly head-room is exhausted at its
-    /// combined weekly burn — `Σ head-room ÷ Σ rate` over the counted accounts. `None` when no
-    /// counted account has a measurable burn (`Σ rate == 0`): honest degradation, never an infinite
-    /// or sentinel figure. Days-scale in practice — the weekly window is the days horizon (the
-    /// session dimension resets every few hours, so it is not the "how long do I last" figure).
-    pub(crate) runway_secs: Option<i64>,
+    /// What the pooled computation yielded — the figure, or WHY there is none.
+    ///
+    /// The single source of truth for both: [`Self::runway_secs`] derives the wire figure from it, so
+    /// a state and a figure cannot disagree. Carrying the reason (rather than re-deriving it at each
+    /// surface from the pooled rate) is what lets a surface STATE its unknown (R-3 / R-20) and lets
+    /// the daemon's warn edge tell "demonstrably not near exhaustion" apart from "genuinely
+    /// unknown" — two questions a bare `Option` cannot answer.
+    ///
+    /// NOT on the wire — [`fleet_wire`] carries the derived `Option<i64>` and the cardinality only,
+    /// so `stats`' `JSON_SCHEMA_VERSION` is untouched.
+    pub(crate) state: FleetRunwayState,
     /// Accounts that CONTRIBUTED to the aggregate — those with a KNOWN weekly velocity (the
     /// honest-degradation gate). The `n` of the surfaced `n of m`.
     pub(crate) counted: usize,
     /// Accounts OBSERVED in the window (`seen > 0`) — the `m` of `n of m`. `observed − counted` were
     /// EXCLUDED for an unknown / stale weekly velocity: surfaced as a fact, never silently dropped.
     pub(crate) observed: usize,
+}
+
+/// What pooling the roster's weekly head-room over its weekly burn yielded — a figure, or WHY there
+/// is none (issue #1028).
+///
+/// The three unknowns are kept DISTINCT rather than collapsed into one `None` because two consumers
+/// must tell them apart. A surface states the reader-meaningful condition it represents (R-3 / R-20 —
+/// an unknown fact is stated, never omitted); the daemon's warn edge treats only ONE of them as
+/// evidence about the fleet's actual position. Collapsing them forces each consumer to re-derive the
+/// reason from the pooled rate, which is both a second implementation of the decision and unable to
+/// distinguish [`Self::BeyondWeeklyWindow`] from [`Self::Unmeasurable`] at all.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum FleetRunwayState {
+    /// A PLAUSIBLE finite runway, in whole seconds — the only state that yields a figure.
+    Known(i64),
+    /// Every counted account is FLAT: measured, and none of it burning, so there is no drain to
+    /// divide the pooled head-room by. Honest degradation, not a fault.
+    Flat,
+    /// The pooled head-room outlasts one weekly window at the pooled burn
+    /// ([`FLEET_RUNWAY_PLAUSIBLE_MAX_SECS`]).
+    ///
+    /// Not a figure to state — the computation ignores replenishment, so any horizon past the first
+    /// reset asserts a drain no reset interrupts, which cannot happen. But it IS positive evidence
+    /// about the fleet: the drain is slower than one reset cycle, which answers "is the fleet near
+    /// exhaustion?" with a definite NO for any threshold at or below that window. That is why the
+    /// daemon's warn edge can act on this state while it must hold on [`Self::Unmeasurable`].
+    BeyondWeeklyWindow,
+    /// The INPUTS yielded nothing usable — a non-finite or negative rate or head-room. No figure,
+    /// and no evidence about the fleet's position either.
+    ///
+    /// Inputs only. A non-finite QUOTIENT is [`Self::BeyondWeeklyWindow`], not this: it comes from
+    /// a burn that was measured and merely tiny, so it still says the pool outlasts a week. The
+    /// checked conversion in [`fleet_runway_state`] also falls back here, but the gates above make
+    /// that arm unreachable — it is a fail-closed backstop, not a fifth classification.
+    Unmeasurable,
+}
+
+impl FleetRunway {
+    /// The figure for the WIRE: `Some` ONLY for a plausible [`Known`] runway.
+    ///
+    /// Derived from [`Self::state`] rather than stored beside it, so the two can never disagree —
+    /// a fixture cannot pair a `Some` figure with a state that says there is none.
+    ///
+    /// A DECISION should read [`Self::state`] instead, as `check_fleet_runway_warn` does. This
+    /// projection collapses all three unknowns into one `None`, which is right for a wire that has
+    /// no field to carry the reason and wrong for anything that must tell "demonstrably not near
+    /// exhaustion" from "genuinely unknown".
+    ///
+    /// [`Known`]: FleetRunwayState::Known
+    pub(crate) fn runway_secs(self) -> Option<i64> {
+        match self.state {
+            FleetRunwayState::Known(secs) => Some(secs),
+            FleetRunwayState::Flat
+            | FleetRunwayState::BeyondWeeklyWindow
+            | FleetRunwayState::Unmeasurable => None,
+        }
+    }
 }
 
 /// Aggregate the per-account weekly velocity + head-room (the issue #543 overlay) into ONE fleet
@@ -1083,9 +1151,12 @@ pub(crate) struct FleetRunway {
 ///
 /// Returns `None` (no fleet figure at all) when the per-account overlay never ran (a bare
 /// [`build_report`], so the wire stays byte-identical to pre-#544), when no account was observed, or
-/// when no account could be counted. A `Some` with `runway_secs == None` is the counted-but-not-
-/// burning case (every counted account is flat): the cardinality is still surfaced, the runway is an
-/// explicit unknown.
+/// when no account could be counted — there is then no counted fleet to state anything ABOUT, and no
+/// cardinality to state it with.
+///
+/// A `Some` whose [`FleetRunwayState`] is not `Known` is a COUNTED fleet whose runway is an explicit
+/// unknown ([`fleet_runway_state`] classifies which). Every such state still surfaces the cardinality
+/// and is STATED rather than omitted at the render (R-3 / R-20).
 fn fleet_runway(report: &Report) -> Option<FleetRunway> {
     if report.velocity.is_empty() {
         return None; // the per-account overlay never ran — a bare aggregate carries no fleet
@@ -1114,14 +1185,92 @@ fn fleet_runway(report: &Report) -> Option<FleetRunway> {
     if counted == 0 {
         return None; // nothing to aggregate — no fleet figure to state
     }
-    // `None` when the combined burn is zero (every counted account is flat) — no measurable drain, so
-    // no finite runway to state (honest degradation, never an infinite / sentinel figure).
-    let runway_secs = (total_rate > 0.0).then(|| (total_headroom / total_rate).round() as i64);
     Some(FleetRunway {
-        runway_secs,
+        state: fleet_runway_state(total_headroom, total_rate),
         counted,
         observed,
     })
+}
+
+/// The plausibility bound on a fleet runway: ONE weekly window.
+///
+/// `weekly_headroom` is a usage FRACTION and `weekly_rate` is fraction-per-SECOND, so their quotient
+/// is SECONDS. That computation ignores replenishment entirely — it asks "how long to drain the
+/// pooled head-room at the pooled burn" as if no window ever reset. But every account's weekly quota
+/// resets on its own ~7-day cycle, so **any runway exceeding one weekly window asserts the fleet
+/// drains with no reset intervening, which cannot happen.**
+///
+/// The bound is INDEPENDENT of roster size: pooling head-room across N accounts does not push the
+/// horizon past the first reset, because the resets are what refill the pool.
+pub(crate) const FLEET_RUNWAY_PLAUSIBLE_MAX_SECS: i64 = 7 * DAY_SECS;
+
+/// Pool the head-room over the burn and classify the result (issue #1028).
+///
+/// Four gates, in this order, each load-bearing:
+///
+/// 1. **A zero burn is FLAT**, not a fault — every counted account was measured and none of it was
+///    burning, so there is simply no drain to divide by.
+/// 2. **The inputs must otherwise be finite and sane.** Anything else is
+///    [`Unmeasurable`](FleetRunwayState::Unmeasurable): no figure, and no evidence either way.
+/// 3. **The quotient must fall within one weekly window** ([`FLEET_RUNWAY_PLAUSIBLE_MAX_SECS`]),
+///    compared in `f64` BEFORE converting — a `f64 as i64` cast would saturate the very overflow
+///    being rejected. Past the window, AND on an overflow to `inf`, the answer is
+///    [`BeyondWeeklyWindow`](FleetRunwayState::BeyondWeeklyWindow): both are the same statement, that
+///    the pool outlasts a week, and an infinite quotient is merely the emphatic form of it. That is
+///    distinct from `Unmeasurable`, because it still tells a decision-maker the drain is slower than
+///    one reset cycle.
+/// 4. **The conversion must succeed**, or there is no whole-second figure to state.
+///
+/// Note what gate 1 does NOT do: it does not reject a merely SMALL rate. A decayed EMA of `1e-11` is
+/// finite and positive, so it passes — and yields ~787,000 days, the order of the `~648427 days`
+/// this issue reported. The prior guard was written for the flat case (`total_rate > 0.0`) and so
+/// read a vanishing burn as a real one. What refuses it is the RESULT bound at gate 3, which is the
+/// point: the bound is expressed in the unit an operator can check, not in the EMA's native
+/// fraction-per-second (where a "small" constant is unreadable and drifts if the unit ever changes —
+/// the input-side epsilon this issue explicitly rejected).
+///
+/// The corollary is that `Unmeasurable` is a statement about the INPUTS only. Nothing about a
+/// well-formed pooled reading lands there, however extreme — a slower burn must never be read as
+/// carrying LESS information than a faster one.
+///
+/// The conversion is CHECKED, never `as i64`: since Rust 1.45 a float→int `as` cast SATURATES rather
+/// than trapping, which is exactly how an overflowing quotient reached the surface as `i64::MAX`
+/// (106,751,991,167,300 days) instead of failing. Widening to `i128` first cannot launder that — a
+/// saturated `i128::MAX` is still out of `i64` range, so [`i64::try_from`] rejects it. That makes
+/// gate 4 total on its own, independent of gate 3: the semantic bound and the structural one fail
+/// closed separately, so relaxing either later cannot silently reintroduce saturation (R-4).
+///
+/// Deliberately NOT a clamp. Clamping an absurd figure to a large plausible one converts an
+/// obviously-wrong number into a CREDIBLE one, which is strictly harder to notice — refusal is the fix.
+fn fleet_runway_state(headroom: f64, rate: f64) -> FleetRunwayState {
+    if rate == 0.0 {
+        return FleetRunwayState::Flat;
+    }
+    // Only the INPUTS can be unmeasurable. Once they are known good, every outcome below is a
+    // statement about the fleet, including the overflowing one.
+    if !rate.is_finite() || rate < 0.0 || !headroom.is_finite() || headroom < 0.0 {
+        return FleetRunwayState::Unmeasurable;
+    }
+    let secs = (headroom / rate).round();
+    // A non-finite quotient here can ONLY be `+inf`, and only from overflow: the guards above leave
+    // `headroom` finite and non-negative and `rate` finite and strictly positive, so `0/0` and
+    // `inf/inf` — the only routes to `NaN` — are both unreachable, and the sign is necessarily
+    // positive. Overflow happens for a real, MEASURED burn once the EMA decays subnormal (with the
+    // fleet's pooled head-room, below ~6.6e-309), and an infinite quotient is the STRONGEST evidence
+    // the pool outlasts a week — so it belongs with the other out-of-window readings, not with the
+    // unmeasurable ones. Filing it as unmeasurable would tell an operator their burn "could not be
+    // measured" when it was measured and merely tiny, and would deny the daemon's warn edge the
+    // recovery evidence it is entitled to (see `check_fleet_runway_warn`).
+    if !secs.is_finite() || secs > FLEET_RUNWAY_PLAUSIBLE_MAX_SECS as f64 {
+        return FleetRunwayState::BeyondWeeklyWindow;
+    }
+    // `secs` is now finite, inside the window, and non-negative (non-negative numerator, strictly
+    // positive denominator), so BOTH guards below already hold: the `Unmeasurable` arm is a
+    // fail-closed backstop that outlives any later relaxation of gate 3, not a reachable outcome.
+    match i64::try_from(secs as i128) {
+        Ok(secs) if secs >= 0 => FleetRunwayState::Known(secs),
+        _ => FleetRunwayState::Unmeasurable,
+    }
 }
 
 /// The CURRENT #544 fleet-runway aggregate, read fresh from the on-disk store — the daemon's
@@ -1734,23 +1883,64 @@ fn render_summary(report: &Report) -> String {
     // The FLEET/roster runway aggregate (issue #544): ONE approximate figure for "across all my
     // accounts, how long do I last?" — the roster's combined weekly head-room drained at its
     // combined weekly burn, days-scale (`fmt_runway_days`). NEUTRAL and APPROXIMATE (a `~` figure,
-    // framed "at the current combined rate"), so it clears the amended #542 guard. Rendered ONLY
-    // when the pool has a finite runway; the counted-account cardinality `(n of m counted)` is
-    // ALWAYS shown alongside it, so an excluded (unknown / stale) account is surfaced as a fact,
-    // not silently folded in as zero-burn.
+    // framed "at the current combined rate"), so it clears the amended #542 guard. The
+    // counted-account cardinality `(n of m counted)` is ALWAYS shown alongside it, so an excluded
+    // (unknown / stale) account is surfaced as a fact, not silently folded in as zero-burn.
+    //
+    // Printed in EVERY state of a counted fleet, including both unknowns (R-3 / R-20, issue #1028).
+    // It previously rendered only under `runway_secs: Some(_)`, which made tightening the
+    // plausibility guard *quieter* rather than more honest: the absurd figure would vanish and
+    // leave nothing in its place, so an operator could not tell "the fleet is fine" from "we could
+    // not measure it". An unknown fact is STATED, never omitted by dropping its line.
+    //
+    // The two unknowns are worded as the reader-meaningful condition each represents, not as the
+    // internal cause (R-21 — no implementation vocabulary on a user-facing stat string), and both
+    // stay descriptive of what WAS measured, with no forecast verb (REQ-STA-B-006 / REQ-STA-SUR-001).
     if let Some(FleetRunway {
-        runway_secs: Some(secs),
+        state,
         counted,
         observed,
     }) = fleet_runway(report)
     {
         lines.push(format!(
-            "  accounts last {} at the current combined rate ({counted} of {observed} counted)",
-            fmt_runway_days(secs),
+            "  accounts last {} ({counted} of {observed} counted)",
+            fleet_runway_phrase(state)
         ));
     }
 
     lines.join("\n")
+}
+
+/// The fleet runway's clause for the roster band — the figure, or the STATED unknown that stands in
+/// for it (issue #1028). The caller wraps it with `accounts last …` and the `n of m` cardinality.
+///
+/// Split out from the render so every arm is reachable from a test. The unknown arms are otherwise
+/// gated behind constructing a whole [`Report`] whose pooled arithmetic lands in each state, and one
+/// of them ([`FleetRunwayState::Unmeasurable`]) cannot be reached that way at all — it is a
+/// statement about malformed INPUTS, which a well-formed report by definition does not carry. A
+/// string that only a degenerate input can produce is exactly the one that ships mis-worded.
+///
+/// Each unknown names the condition a READER can act on, not the internal cause (R-21), and each
+/// stays a description of what WAS measured — carrying the same "at the current combined rate"
+/// descriptor framing the known figure uses to clear the §D-STA-6 forecast firewall.
+fn fleet_runway_phrase(state: FleetRunwayState) -> String {
+    match state {
+        FleetRunwayState::Known(secs) => {
+            format!("{} at the current combined rate", fmt_runway_days(secs))
+        }
+        FleetRunwayState::Flat => "unknown — no combined usage measured".to_owned(),
+        // A BOUND, not a figure: what was measured is that the pooled head-room outlasts a week's
+        // drain. Naming the rate "too small" here would misattribute it — the gate is on the RATIO,
+        // so an entirely ordinary burn trips this whenever head-room is ample, and an operator would
+        // read it as a broken measurement rather than an unremarkable fleet. The bound is also the
+        // SAFER claim: the computation is invalid because it ignores replenishment, and
+        // replenishment only ADDS head-room, so a lower bound survives the very effect that
+        // invalidates the point figure.
+        FleetRunwayState::BeyondWeeklyWindow => {
+            "unknown — more than a week at the current combined rate".to_owned()
+        }
+        FleetRunwayState::Unmeasurable => "unknown — no combined rate could be read".to_owned(),
+    }
 }
 
 /// A usage rate in the sample's native fraction-per-SECOND, scaled to percent-per-minute
@@ -2019,14 +2209,23 @@ struct PeriodWire {
 
 /// The fleet/roster weekly runway aggregate on the `--json` wire (issue #544) — the machine peer of
 /// the human band's fleet-runway line. `runway_secs` is explicit `null` (NEVER a sentinel like `0` /
-/// `999`) when the counted accounts have no combined burn; `counted` / `observed` carry the `n of m`
+/// `999`) whenever there is no plausible figure to state; `counted` / `observed` carry the `n of m`
 /// cardinality so a reader sees exactly how many accounts the figure rests on — and that
 /// `observed − counted` accounts were EXCLUDED for an unknown / stale velocity (honest degradation,
 /// never silently zero-burned).
+///
+/// **`null` does NOT imply an idle fleet** (issue #1028). It covers three distinct outcomes — a flat
+/// roster, a pooled head-room that outlasts one weekly window, and an unmeasurable computation — and
+/// this wire carries NO discriminator between them, so a reader cannot tell which occurred and must
+/// not infer "idle". The human surface states the distinction in prose; a machine reader wanting it
+/// on the wire is a schema change, deliberately not made here. Before #1028 the first outcome was the
+/// only one that produced `null` (an over-long quotient instead SATURATED to `i64::MAX`), which is
+/// what made the old equivalence look safe to assert.
 #[derive(Serialize)]
 struct FleetWire {
     /// Approximate whole seconds until the roster's COMBINED weekly head-room is exhausted at its
-    /// combined weekly burn, or `null` when no counted account has a measurable burn.
+    /// combined weekly burn, or `null` when no plausible figure could be stated — see the type doc:
+    /// `null` is NOT specifically "no measurable burn".
     runway_secs: Option<i64>,
     /// Accounts that CONTRIBUTED to the aggregate (a known weekly velocity) — the `n` of `n of m`.
     counted: usize,
@@ -2345,12 +2544,14 @@ fn velocity_wire(v: &AccountVelocity) -> Option<VelocityWire> {
     })
 }
 
-/// The wire form of the fleet/roster runway aggregate (issue #544). A plain field copy — the honest
-/// degradation (unknown runway → `null`, the `n of m` cardinality) is already resolved in
-/// [`fleet_runway`]; this only reshapes it for `serde`.
+/// The wire form of the fleet/roster runway aggregate (issue #544). The honest degradation (unknown
+/// runway → `null`, the `n of m` cardinality) is already resolved in [`fleet_runway`]; this only
+/// reshapes it for `serde`, PROJECTING [`FleetRunway::state`] down to the wire's `Option<i64>` via
+/// [`FleetRunway::runway_secs`]. That projection is lossy on purpose — carrying the reason would be a
+/// schema change (issue #1028), so the three unknown states all serialise as `null`.
 fn fleet_wire(f: FleetRunway) -> FleetWire {
     FleetWire {
-        runway_secs: f.runway_secs,
+        runway_secs: f.runway_secs(),
         counted: f.counted,
         observed: f.observed,
     }
@@ -6558,7 +6759,7 @@ mod tests {
             (2, 3),
             "stale is observed but not counted"
         );
-        let secs = fleet.runway_secs.expect("a finite pooled runway");
+        let secs = fleet.runway_secs().expect("a finite pooled runway");
         assert!(
             (secs - 164_400).abs() <= 2,
             "pooled runway ≈ 164 400 s: {secs}"
@@ -6629,7 +6830,8 @@ mod tests {
         let clean = fleet_runway(&velocity_report(two, now)).expect("countable");
         let mixed = fleet_runway(&velocity_report(with_stale, now)).expect("countable");
         assert_eq!(
-            clean.runway_secs, mixed.runway_secs,
+            clean.runway_secs(),
+            mixed.runway_secs(),
             "a stale account must not change the pooled runway (excluded, not zero-burned)"
         );
         assert_eq!((clean.counted, clean.observed), (2, 2));
@@ -6645,9 +6847,10 @@ mod tests {
         let now = epoch("2026-07-01T12:00:00Z");
 
         // (a) Every counted account is FLAT (a known ZERO burn) → no combined drain → the runway is an
-        // explicit unknown, but the cardinality is still surfaced (counted > 0). The human omits the
-        // line (no figure to state); the wire carries the object with a `null` runway (never a
-        // sentinel), so a machine reader still learns "2 accounts, no measurable burn".
+        // explicit unknown, but the cardinality is still surfaced (counted > 0). The human STATES the
+        // unknown on its own line (R-3 / R-20 — never omits it, issue #1028); the wire carries the
+        // object with a `null` runway (never a sentinel), so a machine reader still learns
+        // "2 accounts, no measurable burn".
         let flat = velocity_report(
             vec![
                 sample(now - 900, "work", 0.60, 0.60),
@@ -6662,12 +6865,22 @@ mod tests {
         let fleet = fleet_runway(&flat).expect("counted-but-not-burning is still a fleet");
         assert_eq!((fleet.counted, fleet.observed), (2, 2));
         assert!(
-            fleet.runway_secs.is_none(),
+            fleet.runway_secs().is_none(),
             "no combined burn → unknown runway"
         );
+        // The line is PRESENT and states the unknown + the cardinality. (The prior assertion here
+        // scanned for `"fleet  "`, a string this render never emits — it passed on every input,
+        // including the absurd figure the issue reported. Assert the line the surface really prints.)
+        let flat_text = render_text(&flat, None);
         assert!(
-            !render_text(&flat, None).contains("fleet  "),
-            "no fleet line without a figure"
+            flat_text
+                .contains("accounts last unknown — no combined usage measured (2 of 2 counted)"),
+            "a flat fleet STATES its unknown rather than omitting the line: {flat_text}"
+        );
+        assert_eq!(
+            scan_banned(&flat_text),
+            None,
+            "the stated unknown is neutral — no forecast verb, no acquisitive call"
         );
         let v: serde_json::Value =
             serde_json::from_str(&render_json(&flat, None).unwrap()).unwrap();
@@ -6684,7 +6897,10 @@ mod tests {
         );
 
         // (b) Every account is UNDER-SAMPLED (a single reading → no interval → no velocity) → NOTHING
-        // is countable → no fleet at all, on either surface (the wire OMITS the object).
+        // is countable → no fleet at all, on either surface (the wire OMITS the object). Distinct
+        // from (a): R-3 / R-20 make an unknown RUNWAY state itself, but here there is no counted
+        // fleet to state one ABOUT — no cardinality, no pooled rate, and the wire has never carried
+        // the object. That degradation predates #1028 and is deliberately left as it was.
         let thin = velocity_report(
             vec![
                 sample(now - 300, "work", 0.60, 0.30),
@@ -6696,13 +6912,385 @@ mod tests {
             fleet_runway(&thin).is_none(),
             "nothing countable → no fleet"
         );
-        assert!(!render_text(&thin, None).contains("fleet  "));
+        assert!(
+            !render_text(&thin, None).contains("accounts last"),
+            "no counted fleet → no runway line to state at all"
+        );
         let v2: serde_json::Value =
             serde_json::from_str(&render_json(&thin, None).unwrap()).unwrap();
         assert!(
             v2["summary"].get("fleet").is_none(),
             "the wire omits an empty fleet: {}",
             v2["summary"]
+        );
+    }
+
+    // --- AC: the fleet runway refuses an implausible figure (issue #1028) ------------
+
+    #[test]
+    fn fleet_runway_state_refuses_the_quotient_of_a_vanishing_burn() {
+        // The REPORTED defect. A decayed EMA is not zero, so the old `total_rate > 0.0` guard let it
+        // through and printed the quotient. The fix still DIVIDES — an input-side epsilon on the
+        // rate was the rejected alternative — and refuses the RESULT, which is why both of the
+        // issue's own reproductions land in `BeyondWeeklyWindow` and NOT in `Flat`: the burn was
+        // real, it was the RATIO that was absurd.
+        assert_eq!(
+            fleet_runway_state(0.5, 1e-11),
+            FleetRunwayState::BeyondWeeklyWindow,
+            "1e-11 fraction/sec yielded ~787,000 days — the same order as the reported ~648427"
+        );
+        assert_eq!(
+            fleet_runway_state(0.5, 1e-300),
+            FleetRunwayState::BeyondWeeklyWindow,
+            "1e-300 overflowed i64 and SATURATED to i64::MAX (9223372036854775807)"
+        );
+
+        // R-4: whatever this refuses, it must never be reachable as a saturated sentinel — on the
+        // state, and on the `Option` every consumer actually reads.
+        for rate in [1e-11, 1e-300, f64::MIN_POSITIVE, 5e-324] {
+            let state = fleet_runway_state(0.5, rate);
+            assert_ne!(
+                state,
+                FleetRunwayState::Known(i64::MAX),
+                "a saturating conversion must be unreachable (rate {rate:e})"
+            );
+            let fleet = FleetRunway {
+                state,
+                counted: 1,
+                observed: 1,
+            };
+            assert_eq!(fleet.runway_secs(), None, "and it states no figure");
+        }
+    }
+
+    #[test]
+    fn fleet_runway_state_bounds_the_result_at_one_weekly_window() {
+        // The bound is on the RESULT, in seconds, and is exactly one weekly window: a longer runway
+        // asserts the fleet drains with no weekly reset intervening, which cannot happen. Probe both
+        // sides of the boundary by choosing a rate that lands the quotient on it exactly.
+        let bound = FLEET_RUNWAY_PLAUSIBLE_MAX_SECS;
+        assert_eq!(bound, 604_800, "one weekly window in seconds");
+
+        let headroom = 0.5;
+        assert_eq!(
+            fleet_runway_state(headroom, headroom / bound as f64),
+            FleetRunwayState::Known(bound),
+            "exactly one weekly window is still plausible — the bound is inclusive"
+        );
+        assert_eq!(
+            fleet_runway_state(headroom, headroom / (bound + 1) as f64),
+            FleetRunwayState::BeyondWeeklyWindow,
+            "one second past the window is refused, not clamped back to the bound"
+        );
+
+        // NOT a clamp: nothing past the bound yields a figure — least of all a large
+        // plausible-looking stand-in at the boundary itself.
+        for rate in [1e-11, 1e-300] {
+            let fleet = FleetRunway {
+                state: fleet_runway_state(headroom, rate),
+                counted: 1,
+                observed: 1,
+            };
+            assert_eq!(fleet.runway_secs(), None);
+            assert_ne!(fleet.runway_secs(), Some(bound), "refused, never clamped");
+        }
+
+        // An ordinary drain is untouched — 0.5 head-room at 1e-5 /sec is 50,000 s (~14 h).
+        assert_eq!(
+            fleet_runway_state(0.5, 1e-5),
+            FleetRunwayState::Known(50_000)
+        );
+    }
+
+    #[test]
+    fn fleet_runway_state_separates_flat_from_unmeasurable_from_out_of_window() {
+        // The three unknowns are DISTINCT, and the distinction is load-bearing: the daemon's warn
+        // edge acts on `BeyondWeeklyWindow` and holds on the other two, so collapsing them would
+        // either strand the guard or fabricate a recovery.
+
+        // Gate 1 — a zero burn is FLAT: measured, and none of it burning. Not a fault.
+        for rate in [0.0, -0.0] {
+            assert_eq!(fleet_runway_state(0.5, rate), FleetRunwayState::Flat);
+        }
+        // Gate 2 — anything else non-finite or negative is unmeasurable: no figure, and no evidence
+        // about the fleet's position either. `Unmeasurable` is a statement about the INPUTS ONLY.
+        for rate in [-1e-5, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                fleet_runway_state(0.5, rate),
+                FleetRunwayState::Unmeasurable,
+                "rate {rate:?} is not a measurable burn"
+            );
+        }
+
+        // ...and correspondingly, NO well-formed reading lands there however extreme. A burn small
+        // enough to overflow the quotient to `inf` is still a MEASURED burn, and an infinite
+        // quotient is the strongest possible evidence the pool outlasts a week — so it must be
+        // classified with the other out-of-window readings.
+        //
+        // This is reachable, not theoretical: `replay_velocity_ema` halves the weekly EMA on each
+        // flat sample, so a fleet that stops burning walks down through this band. Classifying it as
+        // unmeasurable would tell the operator their rate "could not be read" when it was read and
+        // merely tiny, AND would deny the daemon's warn edge its recovery evidence.
+        let headroom = 1.18_f64; // the goldens' pooled head-room
+        assert!(
+            (headroom / 1e-310).is_infinite(),
+            "precondition: this rate really does overflow the quotient"
+        );
+        assert_eq!(
+            fleet_runway_state(headroom, 1e-310),
+            FleetRunwayState::BeyondWeeklyWindow,
+            "an overflowing quotient is the emphatic form of out-of-window, not unmeasurable"
+        );
+        // Monotonicity, stated as the property rather than the two points: a SLOWER burn can never
+        // be read as carrying LESS information about the fleet than a faster one.
+        for rate in [1e-11, 1e-300, 1e-310, f64::MIN_POSITIVE, 5e-324] {
+            assert_eq!(
+                fleet_runway_state(headroom, rate),
+                FleetRunwayState::BeyondWeeklyWindow,
+                "rate {rate:e} is measured and slight — out-of-window, never unmeasurable"
+            );
+        }
+        for headroom in [f64::NAN, f64::INFINITY, -0.1] {
+            assert_eq!(
+                fleet_runway_state(headroom, 1e-5),
+                FleetRunwayState::Unmeasurable
+            );
+        }
+        // `0.0 / 0.0` is NaN, and `NaN as i64` is 0 — a silent, plausible-looking zero if the
+        // finite check did not precede the conversion. Classified FLAT by gate 1 (the zero rate is
+        // the more specific truth), so the NaN quotient is never reached.
+        assert_eq!(fleet_runway_state(0.0, 0.0), FleetRunwayState::Flat);
+        // Zero head-room at a real burn is a genuine, plausible zero — refusal is for the
+        // UNMEASURABLE, not for a measured "already exhausted".
+        assert_eq!(fleet_runway_state(0.0, 1e-5), FleetRunwayState::Known(0));
+    }
+
+    #[test]
+    fn every_fleet_runway_state_has_a_neutral_stated_phrase() {
+        // R-3 / R-20 across ALL FOUR states, including the one no `Report` can produce
+        // (`Unmeasurable` is a statement about malformed inputs) — which is precisely the arm that
+        // would otherwise ship unread. Properties, not a second copy of the strings, so a reworded
+        // phrase does not have to be edited in two places to stay honest.
+        let phrases = [
+            FleetRunwayState::Known(50_000),
+            FleetRunwayState::Flat,
+            FleetRunwayState::BeyondWeeklyWindow,
+            FleetRunwayState::Unmeasurable,
+        ]
+        .map(|s| (s, fleet_runway_phrase(s)));
+
+        for (state, phrase) in &phrases {
+            assert_eq!(
+                scan_banned(phrase),
+                None,
+                "{state:?} must stay neutral: {phrase}"
+            );
+            assert!(
+                !phrase.is_empty() && !phrase.ends_with(' '),
+                "{state:?} renders a clause the caller can wrap: {phrase:?}"
+            );
+            // R-21: no implementation vocabulary reaches a user-facing stat string.
+            for jargon in [
+                "None", "null", "i64", "f64", "NaN", "inf", "saturat", "overflow", "EMA",
+                "quotient", "fault",
+            ] {
+                assert!(
+                    !phrase.contains(jargon),
+                    "{state:?} leaks implementation vocabulary {jargon:?}: {phrase}"
+                );
+            }
+        }
+
+        // Only the KNOWN state states a figure; every unknown says so in the operator's word.
+        assert!(!phrases[0].1.contains("unknown"));
+        for (state, phrase) in &phrases[1..] {
+            assert!(
+                phrase.starts_with("unknown — "),
+                "{state:?} leads with the unknown: {phrase}"
+            );
+        }
+
+        // Each state says something DIFFERENT — otherwise the distinction the model exists to carry
+        // would be invisible on the surface that reports it.
+        let distinct: std::collections::HashSet<_> = phrases.iter().map(|(_, p)| p).collect();
+        assert_eq!(distinct.len(), 4, "each state states its own condition");
+    }
+
+    #[test]
+    fn fleet_runway_figure_is_derived_from_the_state_so_the_two_cannot_disagree() {
+        // `runway_secs()` is a projection, not a stored twin — the property that makes a fixture
+        // pairing "a figure" with "there is no figure" unrepresentable.
+        let known = FleetRunway {
+            state: FleetRunwayState::Known(1234),
+            counted: 1,
+            observed: 1,
+        };
+        assert_eq!(known.runway_secs(), Some(1234));
+        for state in [
+            FleetRunwayState::Flat,
+            FleetRunwayState::BeyondWeeklyWindow,
+            FleetRunwayState::Unmeasurable,
+        ] {
+            let fleet = FleetRunway {
+                state,
+                counted: 1,
+                observed: 1,
+            };
+            assert_eq!(
+                fleet.runway_secs(),
+                None,
+                "{state:?} states no figure on the wire"
+            );
+        }
+    }
+
+    #[test]
+    fn fleet_runway_states_its_unknown_on_the_cli_when_the_burn_is_too_slight() {
+        // End-to-end through the real aggregation: a fleet that moves by the smallest representable
+        // step over the window has a positive-but-vanishing pooled rate — the intermittent case the
+        // issue describes, where landing on exactly 0.0 hid the defect and anything else exposed it.
+        let now = epoch("2026-07-01T12:00:00Z");
+        let creeping = velocity_report(
+            vec![
+                sample(now - 900, "work", 0.60, 0.50),
+                sample(now - 600, "work", 0.60, 0.50),
+                sample(now - 300, "work", 0.60, 0.50 + f64::EPSILON),
+                sample(now - 900, "home", 0.40, 0.30),
+                sample(now - 600, "home", 0.40, 0.30),
+                sample(now - 300, "home", 0.40, 0.30 + f64::EPSILON),
+            ],
+            now,
+        );
+        let fleet = fleet_runway(&creeping).expect("a counted fleet");
+        assert_eq!(
+            fleet.state,
+            FleetRunwayState::BeyondWeeklyWindow,
+            "a real but slight burn is OUT-OF-WINDOW, not flat and not unmeasurable"
+        );
+        assert_eq!(fleet.runway_secs(), None, "so it states no figure");
+
+        // R-20: the fact is STATED, not omitted — as a BOUND on what was measured, worded as the
+        // reader-meaningful condition rather than the internal cause (R-21). Deliberately NOT "the
+        // rate is too small": the gate is on the RATIO, so that wording would misattribute an
+        // ordinary burn with ample head-room to a broken measurement.
+        let text = render_text(&creeping, None);
+        assert!(
+            text.contains(
+                "accounts last unknown — more than a week at the current combined rate \
+                 (2 of 2 counted)"
+            ),
+            "the out-of-window unknown is stated with its cardinality: {text}"
+        );
+        assert_eq!(scan_banned(&text), None, "the stated unknown stays neutral");
+
+        // REQ-STA-B-006 / REQ-STA-SUR-001: no absurd magnitude can be read as a forecast, and no
+        // saturated sentinel reaches the wire. `fmt_runway_days` is the ONLY source of `day`/`days`
+        // in this render (the per-account `runway` cell is hours-scale), so its absence is exactly
+        // "no days-scale figure was stated" — the class the reported `~648427 days` belonged to.
+        assert!(
+            !text.contains("day"),
+            "an out-of-window burn states no days-scale figure: {text}"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&render_json(&creeping, None).unwrap()).unwrap();
+        assert!(
+            v["summary"]["fleet"]["runway_secs"].is_null(),
+            "the wire states the unknown as null, never i64::MAX: {}",
+            v["summary"]["fleet"]
+        );
+        assert_eq!(v["summary"]["fleet"]["counted"].as_i64().unwrap(), 2);
+    }
+
+    #[test]
+    fn fleet_runway_line_is_printed_in_every_state_of_a_counted_fleet() {
+        // R-20 as a single sweep: each state of a COUNTED fleet renders exactly one runway line
+        // carrying the `n of m` cardinality. Regression guard for the shape of the defect — the fix
+        // to the guard must not make the surface quieter (premortem P2 in
+        // `docs/requirements/stats-honesty-cross-surface.md`).
+        let now = epoch("2026-07-01T12:00:00Z");
+
+        let known = velocity_report(
+            vec![
+                sample(now - 900, "work", 0.60, 0.50),
+                sample(now - 600, "work", 0.65, 0.60),
+                sample(now - 300, "work", 0.70, 0.70),
+            ],
+            now,
+        );
+        let flat = velocity_report(
+            vec![
+                sample(now - 900, "work", 0.60, 0.60),
+                sample(now - 600, "work", 0.60, 0.60),
+                sample(now - 300, "work", 0.60, 0.60),
+            ],
+            now,
+        );
+        let creeping = velocity_report(
+            vec![
+                sample(now - 900, "work", 0.60, 0.50),
+                sample(now - 600, "work", 0.60, 0.50),
+                sample(now - 300, "work", 0.60, 0.50 + f64::EPSILON),
+            ],
+            now,
+        );
+
+        for (label, report) in [
+            ("known", &known),
+            ("flat", &flat),
+            ("out-of-window burn", &creeping),
+        ] {
+            let fleet = fleet_runway(report).expect("a counted fleet");
+            assert!(fleet.counted > 0, "{label}: precondition — counted fleet");
+            let text = render_text(report, None);
+            let lines: Vec<&str> = text
+                .lines()
+                .filter(|l| l.contains("accounts last"))
+                .collect();
+            assert_eq!(
+                lines.len(),
+                1,
+                "{label}: exactly one runway line in every state, got {lines:?}"
+            );
+            assert!(
+                lines[0].contains(&format!(
+                    "({} of {} counted)",
+                    fleet.counted, fleet.observed
+                )),
+                "{label}: the cardinality survives every state: {}",
+                lines[0]
+            );
+            assert_eq!(scan_banned(&text), None, "{label}: neutral in every state");
+        }
+
+        // The three states are genuinely distinct — the sweep is not passing on one shape thrice.
+        assert!(matches!(
+            fleet_runway(&known).unwrap().state,
+            FleetRunwayState::Known(_)
+        ));
+        assert_eq!(fleet_runway(&flat).unwrap().state, FleetRunwayState::Flat);
+        assert_eq!(
+            fleet_runway(&creeping).unwrap().state,
+            FleetRunwayState::BeyondWeeklyWindow
+        );
+
+        // ...and each renders a DIFFERENT line, so "one line per state" is not one line thrice.
+        let rendered: Vec<String> = [&known, &flat, &creeping]
+            .iter()
+            .map(|r| {
+                render_text(r, None)
+                    .lines()
+                    .find(|l| l.contains("accounts last"))
+                    .expect("a runway line")
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(
+            rendered
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3,
+            "each state states its own condition: {rendered:?}"
         );
     }
 
@@ -7921,6 +8509,45 @@ mod tests {
             wire_config_reason(&Error::ConfigParse("golden".into()))
         }
 
+        /// The same roster whose pooled weekly burn is REAL but slight enough that the pooled
+        /// head-room outlasts one weekly window — [`FleetRunwayState::BeyondWeeklyWindow`], the
+        /// state issue #1028's plausibility bound introduced.
+        ///
+        /// Goldened because this is where the reported defect SURFACED: the old guard divided by
+        /// the vanishing rate and printed `accounts last ~648427 days`. The unit tests assert the
+        /// replacement string; only a whole-output golden pins how it SITS in the band — that the
+        /// substantially longer clause neither wraps nor perturbs the blocks around it.
+        ///
+        /// `alpha` is the only burning account (`beta` is KNOWN-flat), so dropping its weekly rate
+        /// to `1e-6` against the pooled head-room of `0.47 + 0.71` takes the quotient to ~13.7 d —
+        /// past the window, well short of the absurd. Only `weekly_rate` moves (the per-account
+        /// `runway` cell is the SESSION runway, so no row changes), which is why the diff against
+        /// `stats-wide-unicode-plain` is exactly the fleet line.
+        fn report_beyond_weekly_window() -> Report {
+            let base = golden_report();
+            let mut velocity = base.velocity.clone();
+            let alpha = velocity.get_mut("alpha").expect("`alpha` is in the roster");
+            alpha.weekly_rate = Some(0.000_001);
+            Report { velocity, ..base }
+        }
+
+        /// The same roster with EVERY counted account KNOWN-flat — [`FleetRunwayState::Flat`].
+        ///
+        /// The other unknown the band can state, and the one that already existed before issue
+        /// #1028 yet was never goldened: `render_summary` used to omit the line entirely, so the
+        /// corpus pinned an ABSENCE that no case distinguished from "the fleet is fine". Zeroing
+        /// `alpha`'s weekly rate leaves both counted accounts measured and not burning.
+        ///
+        /// (The requirements and design docs call that render site `fleet_line`; it has never been
+        /// a Rust item, so grep `render_summary` when arriving from them.)
+        fn report_flat_fleet() -> Report {
+            let base = golden_report();
+            let mut velocity = base.velocity.clone();
+            let alpha = velocity.get_mut("alpha").expect("`alpha` is in the roster");
+            alpha.weekly_rate = Some(0.0);
+            Report { velocity, ..base }
+        }
+
         /// The same roster with the velocity overlay ABSENT — a "sparse fleet". Every
         /// `velocity` and `runway` cell is then uniformly `—`, which fires the EMPTY-COLUMN
         /// ELISION pre-pass: both columns are dropped entirely rather than rendered as a wall
@@ -8183,6 +8810,17 @@ mod tests {
                     "stats-sparse-fleet",
                     render_human(&report_without_velocity(), WIDE_UNICODE_PLAIN, None),
                 ),
+                // The fleet runway's two STATED unknowns (issue #1028). Every case above pins the
+                // KNOWN figure, so without these the corpus would never see either replacement
+                // string — and the defect that motivated them lived on exactly this line.
+                Case::new(
+                    "stats-fleet-beyond-window",
+                    render_human(&report_beyond_weekly_window(), WIDE_UNICODE_PLAIN, None),
+                ),
+                Case::new(
+                    "stats-fleet-flat",
+                    render_human(&report_flat_fleet(), WIDE_UNICODE_PLAIN, None),
+                ),
                 // Degenerate rosters.
                 Case::new(
                     "stats-empty-roster",
@@ -8239,6 +8877,8 @@ mod tests {
             "stats-narrow",
             "stats-very-narrow",
             "stats-sparse-fleet",
+            "stats-fleet-beyond-window",
+            "stats-fleet-flat",
             "stats-empty-roster",
             "stats-single-account",
             "stats-all-na",
