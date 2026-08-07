@@ -114,21 +114,30 @@ the panel drifted.
 
 ## Commit and issue conventions [override]
 
-> **Override rationale**: the global `/git-commit` directs that issue/PR numbers stay out of commit
-> messages and that linking happens in the PR body via `Closes #N`. This repo inverts both,
-> deliberately. Squash-merge means the PR body is not preserved in `main`'s history, so the issue
-> link must live in the commit subject to survive. And the interposed literal word `issue` is
-> load-bearing: `Closes issue #806` renders as a cross-reference but is **not** a GitHub auto-close
-> keyword, so merging never silently closes an issue whose acceptance criteria nobody verified.
+> **Override rationale**: the global `/git-commit` directs that issue numbers stay out of commit
+> messages and that linking happens in the PR body. This repo inverts that, deliberately:
+> squash-merge does not preserve the PR body in `main`'s history, so the issue link must live in the
+> commit subject to survive. The linking keyword itself is **not** overridden — the body form below
+> is the ordinary auto-closing one.
 
 - **Subject**: `(type) scope: imperative summary (issue #NNN)` — the common types are `feat`, `fix`,
   `test`, `refactor`, `docs`, `chore`. GitHub appends the PR number on squash-merge; do not write it
   yourself.
-- **Body**, when the commit completes the issue: `Closes issue #NNN.` Never `Closes #NNN` or
-  `Fixes #NNN` — those auto-close.
-- **Closing is a separate, explicit act**: `gh issue close NNN`.
+- **Body**, when the commit completes the issue: `Closes #NNN.` It auto-closes on merge, which is
+  the intent — acceptance criteria are a precursor to merging, so a merge *is* the verification
+  event. The trailing period is safe; GitHub's parser stops at the number.
 
-↳ Convention only — not enforced. Verify with `git log --format='%s%n%b' -20`.
+Through 2026-08-07 this section mandated a deliberately non-auto-close `Closes issue #NNN.` form and
+a separate `gh issue close NNN`; that is withdrawn — it defended against unverified merges by
+weakening the link rather than the gate. **Do not infer the convention from `main`'s history, in
+either direction.** The withdrawn form ran from 2026-07-22 to 2026-08-07 inclusive — 74 commits,
+including all three merged on the final day — and the restored form is the repo's *original* one, 83
+commits ending 2026-07-22. Both appear in deep history and neither is marked. Do not rewrite either.
+
+↳ Convention only — nothing parses the commit message. `git log --format='%s%n%b' -20` verifies the
+**subject** rule only: of the 20 it returns, the 16 carrying a body link all use the withdrawn form
+and none uses the mandated one. Widening the window does not help — the last commit using the
+mandated form predates `HEAD` by 126.
 
 ## Branch naming
 
