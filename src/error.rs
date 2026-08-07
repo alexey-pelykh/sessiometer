@@ -307,6 +307,20 @@ pub(crate) enum Error {
     #[error("the logged-in account is missing its `{field}` — cannot key the roster")]
     OauthAccountFieldMissing { field: &'static str },
 
+    /// The logged-in account's `oauthAccount` carries a `field` that is PRESENT but
+    /// malformed — the value counterpart of [`Error::OauthAccountFieldMissing`], raised
+    /// when `capture`/`login` would key the roster on it (issue #1052).
+    ///
+    /// Distinct from [`Error::ConfigInvalid`] on purpose: on this path the offending value
+    /// came from `~/.claude.json`, not `config.toml`, and reporting it as an invalid config
+    /// would send the operator to a file that is not at fault — and on a first capture, to
+    /// one that does not exist yet. `rule` is the constraint that failed; it echoes the
+    /// offending value escaped, exactly as the parse-side rejection does. That is within
+    /// the issue #15 redaction discipline this variant's sibling states in terms of field
+    /// names: an `account_uuid` is an account identifier, not credential material.
+    #[error("the logged-in account's `{field}` is malformed: it {rule} — cannot key the roster")]
+    OauthAccountFieldMalformed { field: &'static str, rule: String },
+
     // --- Account enable/disable (issue #36) ----------------------------------
     /// `sessiometer disable`/`enable`/`remove` was invoked without the required
     /// `<account>`. Carries the subcommand (a static, secret-free string) so the message

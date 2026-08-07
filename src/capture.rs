@@ -51,8 +51,8 @@
 
 use crate::claude_state::{read_oauth_account_from, write_oauth_account, OauthAccount};
 use crate::config::{
-    Account, Config, CredentialConfig, LoginConfig, MigrationConfig, RefreshConfig, StatsConfig,
-    Tunables,
+    account_uuid_violation, Account, Config, CredentialConfig, LoginConfig, MigrationConfig,
+    RefreshConfig, StatsConfig, Tunables,
 };
 use crate::error::{Error, Result};
 use crate::keychain::{Credential, CredentialStore, RealCredentialStore};
@@ -509,6 +509,22 @@ fn plan_capture(
     account_uuid: &str,
     label: Option<&str>,
 ) -> Result<(String, CaptureOutcome)> {
+    // The uuid is harvested from `~/.claude.json`, which checks only non-emptiness — so
+    // this path never crossed `Config::validate` and derived a stash from whatever it
+    // found. Gate it here, BEFORE the stash below and before the roster is persisted:
+    // the parse path now rejects a malformed uuid (issue #1052), so capturing one would
+    // otherwise write a `config.toml` that the very next load refuses, with no in-tool
+    // way back. Validating on read but not on write is what makes that brick possible.
+    //
+    // Reported against `~/.claude.json`, NOT as an invalid config: that is where the value
+    // came from, and `config.toml` may be blameless here — or, on a first capture, absent.
+    if let Some(rule) = account_uuid_violation(account_uuid) {
+        return Err(Error::OauthAccountFieldMalformed {
+            field: "accountUuid",
+            rule,
+        });
+    }
+
     let provided = label.map(str::trim).filter(|l| !l.is_empty());
 
     if let Some(existing) = roster.iter_mut().find(|a| a.account_uuid == account_uuid) {
@@ -869,6 +885,59 @@ mod tests {
     }
 
     // --- plan_capture (pure) ---
+
+    #[test]
+    fn refuses_to_plan_a_capture_whose_uuid_the_parse_path_would_reject() {
+        // Issue #1052. The uuid arrives from `~/.claude.json`, which checks only
+        // non-emptiness, and this path does not cross `Config::validate` — so without
+        // this gate `capture` would mint a stash and persist a roster that its own next
+        // load refuses, bricking the config with no in-tool way back. The roster must be
+        // left untouched: nothing planned, nothing to write.
+        let mut roster = Vec::new();
+        let err = plan_capture(&mut roster, "../x", Some("work")).unwrap_err();
+        assert!(roster.is_empty(), "a rejected capture must plan nothing");
+        // Reported against `~/.claude.json`, which is where the value came from — NOT as
+        // `invalid config:`, which would send the operator to a blameless `config.toml`
+        // (on a first capture, one that does not exist yet).
+        assert!(
+            matches!(
+                err,
+                Error::OauthAccountFieldMalformed {
+                    field: "accountUuid",
+                    ..
+                }
+            ),
+            "a `~/.claude.json` fault must not be reported as an invalid config: {err}"
+        );
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains("invalid config"),
+            "must not name config.toml: {rendered}"
+        );
+        assert!(
+            rendered.contains("../x"),
+            "the operator must learn WHICH value: {rendered}"
+        );
+
+        // And the round-trip the gate exists to protect: what capture DOES plan is a
+        // roster the parse path accepts. Without the assertion below this test would
+        // pass on a gate that merely rejected everything.
+        let mut roster = Vec::new();
+        plan_capture(
+            &mut roster,
+            "11111111-1111-1111-1111-111111111111",
+            Some("w"),
+        )
+        .unwrap();
+        let toml = format!(
+            "[[account]]\naccount_uuid = \"{}\"\nlabel = \"{}\"\n",
+            roster[0].account_uuid, roster[0].label
+        );
+        assert!(
+            Config::from_toml_str(&toml).is_ok(),
+            "capture must only ever plan a roster the next load can parse"
+        );
+    }
 
     #[test]
     fn plans_a_new_account_into_an_empty_roster() {

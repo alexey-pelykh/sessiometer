@@ -171,6 +171,12 @@ const ACCT_FALLBACK: &str = "claude-code-user";
 /// is what CC's test does to the same names once decoded. The `+` makes the empty
 /// name a non-match, and the anchors mean an embedded newline or space is rejected
 /// too (JS `$` without the `m` flag matches only the true end of input).
+///
+/// NOT to be unified with `config::account_uuid_violation`, the crate's other hand-rolled
+/// ASCII-class check over a keychain-addressing identifier. This one admits `.` because
+/// CC's `xGh` does and this must match CC byte for byte; that one excludes `.` precisely
+/// because `.` is what makes the `../x` shape in issue #1052 expressible. Same technique,
+/// different authorities — the divergence is deliberate.
 fn is_well_formed_acct(name: &OsStr) -> bool {
     let bytes = name.as_bytes();
     !bytes.is_empty()

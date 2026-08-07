@@ -404,8 +404,9 @@ struct ConfigFault {
     /// `config.toml`, so no scrubber has to anticipate every shape a parser error can take. That
     /// matters because the shapes are genuinely unbounded — the TOML span echo re-prints the whole
     /// offending line, serde's `invalid type: string "…"` quotes the VALUE, and validation errors
-    /// interpolate values with no delimiter at all (`duplicate account_uuid: …`). `label` and
-    /// `account_uuid` are exactly where an operator's e-mail address lives (`src/config.rs`), and
+    /// interpolate the offending value (`duplicate account_uuid: …`). `label` is exactly where an
+    /// operator's e-mail address lives (`src/config.rs`) — `account_uuid` no longer can, since
+    /// issue #1052 constrained it to `[A-Za-z0-9_-]{1,128}`, but `label` stays free-form — and
     /// #642 moves this string from the log onto three WIDER surfaces: `stats --json` on stdout
     /// (piped into files and dashboards), the control socket, and a screenshot-able panel. Sanitising
     /// an adversarial string for those is a losing game; not deriving it from the config wins outright.
@@ -8047,7 +8048,7 @@ mod tests {
         // THE #642 REDACTION INVARIANT, swept across the failure classes rather than asserted on
         // one input. Each case plants the SAME e-mail in a different place a config error is known
         // to echo it: the TOML span echo re-prints the whole offending line; serde's `invalid type`
-        // quotes the VALUE; validation errors interpolate values with no delimiter at all; and an
+        // quotes the VALUE; validation errors interpolate the offending value; and an
         // unknown KEY is echoed verbatim. That variety is exactly why the wire reason is a
         // `&'static str` rather than a scrubbed copy of the message — there is no sanitiser that
         // could be trusted to anticipate all of these, and more arrive with every dependency bump.
@@ -8060,12 +8061,16 @@ mod tests {
                 "quoted value / wrong type",
                 format!("[tunables]\npoll_secs = \"{planted}\"\n"),
             ),
+            // Reaches the `account_uuid` SHAPE rejection (issue #1052), which names the
+            // offending value. It used to reach the duplicate-uuid rejection instead — hence
+            // the two accounts this case originally carried — but shape is now checked first,
+            // and an e-mail cannot pass its charset. That reordering also closed the
+            // un-delimited variant of this class at the source: the duplicate error still
+            // interpolates with no delimiter, but can now only ever echo a value already
+            // constrained to `[A-Za-z0-9_-]{1,128}`, which no e-mail or newline can satisfy.
             (
-                "unquoted validation interpolation",
-                format!(
-                    "[[account]]\nlabel = \"a\"\naccount_uuid = \"{planted}\"\n\
-                     [[account]]\nlabel = \"b\"\naccount_uuid = \"{planted}\"\n"
-                ),
+                "validation interpolation",
+                format!("[[account]]\nlabel = \"a\"\naccount_uuid = \"{planted}\"\n"),
             ),
             ("unknown key", format!("[tunables]\n\"{planted}\" = 1\n")),
             ("unknown table", format!("[\"{planted}\"]\nx = 1\n")),

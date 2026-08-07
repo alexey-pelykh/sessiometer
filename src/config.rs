@@ -58,6 +58,8 @@ mod settings;
 mod test_support;
 mod validate;
 
+pub(crate) use validate::account_uuid_violation;
+
 /// Default seconds between re-polling a given account — the per-account cadence.
 /// Issue #38 lengthened this from the original fixed 60 s to a longer base that the
 /// normal poll jitter then decorrelates across accounts/cycles; issue #76 confirmed
