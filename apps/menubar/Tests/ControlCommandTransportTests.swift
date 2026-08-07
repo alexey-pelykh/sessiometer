@@ -76,6 +76,22 @@ final class ControlCommandTransportTests: XCTestCase {
     // MARK: - Transport: bounded error paths
 
     // AC: a daemon that accepts but never replies is bounded — the exchange times out rather than hangs.
+    //
+    // The close is AWAITED, not sampled (issue #912). `send` has two paths to `.timedOut` and they tear
+    // down on different schedules: a READ-phase timeout closes in `readAck`'s `defer`, before `send`
+    // returns, whereas a CONNECT-phase timeout returns at once and hands the close to a detached sweep.
+    // This test means to drive the read path — but the SAME `timeout` bounds both phases, and the fake's
+    // instant connect+write still has to be SCHEDULED onto a detached task, so under load that scheduling
+    // can miss the 150 ms window and the exchange silently takes the connect path instead. `.timedOut`
+    // asserts either way; `closeCount` read on the next line does not, and that is the whole of #912.
+    // Which path a run took is decidable after the fact, and STRUCTURALLY rather than statistically:
+    // `readAck`'s `defer` closes before `send` returns, and `CommandFakeConnection.close()` increments
+    // `closeCount` before it finishes `lines`, so a read-phase timeout can never return with
+    // `closeCount == 0`. That reading is the connect path necessarily, not probably — which is why no
+    // measurement is quoted here. Awaiting the close covers both paths and keeps the assertion at `>= 1`
+    // — relaxing it would delete the coverage rather than repair it. The connect path's own sweep is
+    // pinned deterministically by `testSlowConnectIsBoundedByTimeout` below, so misrouting costs fidelity
+    // here but not coverage.
     func testSilentDaemonTimesOut() async throws {
         let conn = CommandFakeConnection(ackOnSend: nil)  // accepts the command, never answers
         let client = ControlCommandClient(connector: CommandFakeConnector(.succeed(conn)), timeout: .milliseconds(150))
@@ -83,6 +99,7 @@ final class ControlCommandTransportTests: XCTestCase {
         let result = try await awaitSend(client, SwapCommandRequest(target: "x", force: false))
 
         XCTAssertEqual(result, .failure(.timedOut))
+        try await awaitClose(conn)
         XCTAssertGreaterThanOrEqual(conn.closeCount, 1, "a timed-out exchange still closes the connection")
     }
 
@@ -110,6 +127,16 @@ final class ControlCommandTransportTests: XCTestCase {
     // AC (bounded): even a blocking connect() (a saturated / wedged accept) is bounded — `send` returns
     // `.timedOut` on the CONNECT phase without waiting for the connect to complete. Proves the bound
     // covers connect+write, not only the read.
+    //
+    // The sweep assertion pins the OTHER half of that bargain, and pins it deterministically because a
+    // 1 s blocking connect against a 150 ms budget cannot resolve any other way: abandoning the connect
+    // is only safe if the connection it eventually yields is still closed, so `send` hands that close to
+    // a detached sweep (`readAck`'s `defer` never runs on this path — there is no `readAck`). Untested
+    // until issue #912, whose root cause turns on exactly this: the deferred close is what can leave
+    // `closeCount` at 0 when `send` returns, and the sweep is what keeps that a synchronisation gap
+    // rather than a leaked connection per timed-out command. Asserted as eventually-closed rather than
+    // still-open-then-closed — a `closeCount == 0` probe here would be a negative timing assertion, i.e.
+    // a fresh flake of precisely the kind this issue exists to remove.
     func testSlowConnectIsBoundedByTimeout() async throws {
         let conn = CommandFakeConnection(ackOnSend: nil)
         let client = ControlCommandClient(
@@ -124,6 +151,10 @@ final class ControlCommandTransportTests: XCTestCase {
 
         XCTAssertEqual(result, .failure(.timedOut))
         XCTAssertLessThan(elapsed, .milliseconds(700), "the connect phase must be bounded, not wait the full connect")
+        // Budget generous against the 1 s the connect deliberately blocks for — this waits out that
+        // sleep, not a product latency, and only a genuinely missing sweep should ever exhaust it.
+        try await awaitClose(conn, within: .seconds(10))
+        XCTAssertGreaterThanOrEqual(conn.closeCount, 1, "an abandoned connect is swept closed, not leaked")
     }
 
     // MARK: - SwapAck decoder: the redacted variants (mirror of src/daemon/socket.rs)
@@ -223,7 +254,7 @@ final class ControlCommandTransportTests: XCTestCase {
         }
     }
 
-    // MARK: - Send-call awaiting helper (timeout-guarded so a wiring bug fails instead of hanging)
+    // MARK: - Awaiting helpers (timeout-guarded so a wiring bug fails instead of hanging)
 
     private enum WaitError: Error { case timeout }
 
@@ -239,6 +270,25 @@ final class ControlCommandTransportTests: XCTestCase {
             let result = try await group.next()!
             group.cancelAll()
             return result
+        }
+    }
+
+    /// Await the transport's `close()` on `connection` instead of racing it, failing the test (via a
+    /// thrown timeout) if it never lands. ONE helper serves both `.timedOut` paths because `closes`
+    /// buffers (see its doc on `CommandFakeConnection`): a close that already landed and one still in
+    /// flight are awaited identically (issue #912).
+    ///
+    /// Deliberately not a `waitUntil`-shaped poll. The suite's other copies of that helper are a
+    /// separate concern (issue #1078), and a signal beats a poll here anyway: nothing to sample, and
+    /// `budget` bounds only how long a MISSING close is waited for — it can never miss one that landed.
+    private func awaitClose(
+        _ connection: CommandFakeConnection, within budget: Duration = .seconds(5)
+    ) async throws {
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask { for await _ in connection.closes { return } }
+            group.addTask { try await Task.sleep(for: budget); throw WaitError.timeout }
+            try await group.next()!
+            group.cancelAll()
         }
     }
 }
@@ -295,7 +345,17 @@ struct SlowConnectConnector: WatchConnector {
 /// lets a test assert the transport closes the connection after the exchange.
 final class CommandFakeConnection: WatchConnection, @unchecked Sendable {
     let lines: AsyncStream<String>
+
+    /// One element per `close()`, so a test can AWAIT the teardown rather than sample `closeCount` and
+    /// hope it has landed (issue #912). Buffered and never finished, which is the point: a close that
+    /// already happened is still delivered to a consumer that only starts awaiting afterwards, so the
+    /// same await serves the read-phase teardown (before `send` returns) and the connect-phase sweep
+    /// (after it). Yielded outside the lock but after the count is incremented, so any consumer this
+    /// resumes already reads the new `closeCount`.
+    let closes: AsyncStream<Void>
+
     private let continuation: AsyncStream<String>.Continuation
+    private let closesContinuation: AsyncStream<Void>.Continuation
     private let state = OSAllocatedUnfairLock(initialState: State())
     private struct State { var sent: [[UInt8]] = []; var closeCount = 0; var finished = false }
 
@@ -309,6 +369,7 @@ final class CommandFakeConnection: WatchConnection, @unchecked Sendable {
         self.ackOnSend = ackOnSend
         self.eofOnSend = eofOnSend
         (lines, continuation) = AsyncStream<String>.makeStream()
+        (closes, closesContinuation) = AsyncStream<Void>.makeStream()
     }
 
     func send(_ bytes: [UInt8]) throws {
@@ -324,6 +385,7 @@ final class CommandFakeConnection: WatchConnection, @unchecked Sendable {
             st.finished = true
             return true
         }
+        closesContinuation.yield(())  // count already incremented — an awaiter reads the new value
         if shouldFinish { continuation.finish() }
     }
 
