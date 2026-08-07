@@ -278,7 +278,7 @@ pub(crate) struct AccountStats {
     /// a day reports 7 200 s here against 86 400 s there. Both figures are honest under their own
     /// rule and `stats` prints them side by side. Widening this one was deliberately out of
     /// #1030's scope (it would move `time_at_cap_secs` for every account, which is a separate
-    /// ratified metric with its own consumers); reconciling the two is tracked separately.
+    /// ratified metric with its own consumers); reconciling the two is issue #1098.
     pub(crate) time_at_cap_secs: i64,
     /// The fraction of the period's observations made while THIS account was the active
     /// (swapped-in) credential, from the swap-active spans. Across all accounts these
@@ -819,7 +819,9 @@ type Windows = Vec<(i64, i64)>;
 /// `on_the_replay_corpus_the_utilisation_census_is_unknown_because_the_drain_was_weekly`, which
 /// pins that as a SEPARATE fact from this one. The alternative is not better coverage, it is
 /// fabricated calm over unobserved time, so coverage is restored where the guarantee reaches and
-/// nowhere else.
+/// nowhere else. Whether that class can carry a session guarantee at all is issue #1097, which also
+/// carries the correction that the ratified rationale for this asymmetry — "a low peer is the one
+/// in rotation" — is not true of it.
 ///
 /// # Why the WEEKLY reset is deliberately NOT consulted
 ///
