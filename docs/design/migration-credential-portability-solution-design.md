@@ -208,6 +208,37 @@ Two separable pieces:
 `enable` costs a re-run; silently switching credentials costs an incident, and silently removing them
 costs an unrecoverable one. Not chosen here.
 
+> **CHOSEN: (i), by the operator on 2026-08-06. Delivered under issue #1005.** `apply_enabled` and
+> `apply_remove` now resolve through `use_account::resolve_target`, so all six sites share one
+> resolver and one policy. Two implementation notes the option table did not price, both of which
+> fall out of routing rather than being separable choices:
+>
+> - **`Error::AccountLabelNotFound` is retired, and the exit codes move with it.** It appeared
+>   nowhere in `Error::exit_code`, so it fell through to the generic `_ => 1`: an unmatched
+>   `enable`/`disable`/`remove` target now exits **5** (`UseTargetNotFound`) and **6**
+>   (`UseTargetAmbiguous`) becomes reachable where nothing previously failed. The retirement is
+>   forced, not chosen — with both constructors routed away, a never-constructed variant is
+>   `dead_code` and fails `-D warnings`.
+> - **Option (iii)'s disambiguator arrives anyway, without its flag.** `resolve_target` matches label
+>   **or** account-uuid, so the three verbs now accept a uuid. That is not a tolerated side effect —
+>   it is the mechanism by which a refusal is actionable at all. Had (i) been implemented against a
+>   label-only resolver, an operator facing a duplicate would have had a refusal and no way to act on
+>   it, which is worse than the first-match-wins it replaces. (iii)'s explicit flag remains
+>   unimplemented and unneeded.
+>
+> The import-side half (R-6) landed alongside: a duplicate-label flag on the per-account report row,
+> computed by counting each label's bearers **before and after the whole merge** and warning where a
+> label ends with more than one bearer AND more than it started with. Both halves of that are
+> load-bearing, and they cover different cases. Reading the FINISHED roster (rather than each write)
+> catches a collision arriving inside a single artifact on a fresh target, where the target's roster
+> is empty and a check written against it finds nothing — and it is also what suppresses a collision
+> the merge only passes THROUGH, such as an import that swaps two labels between accounts the target
+> already has: mid-loop both are briefly the same, but each ends at one bearer, so `after > 1` is
+> false. Comparing against the BEFORE count covers the remaining case and only that one — a duplicate
+> the target ALREADY had, overwritten in place, where the label really does have two bearers but the
+> count did not move. Each omission produces a false warning of the same class as warning on the
+> ordinary cross-machine import, and § P5 says any of them trains dismissal.
+
 > **The fourth command is `remove`, and leaving it out of this table was the defect.** *Corrected
 > 2026-08-04 (third pass).* Options (i)/(ii) were framed over `use` vs `enable`/`disable` only, which
 > makes (ii) look symmetric with (i) — a wash between two reversible behaviours. It is not: `remove`
@@ -455,7 +486,7 @@ the full-artifact case needs the same treatment deliberately.
 | `src/refresh.rs::classify` | reshape `RefreshOutcome` so `rotated` rides inside `Refreshed` — **necessary, not sufficient**; the three renders read a sibling field, see the note below | R-5 |
 | `src/refresh.rs::RefreshReport` + the three renders in `src/observability.rs` | **remove the field from the non-`refreshed` renders** — see the note below; reshaping `RefreshOutcome` alone does not do it | R-5 |
 | `src/daemon/snapshot_build.rs` + status render | provenance legibility | R-7 |
-| `src/use_account.rs::resolve_target` / `src/poke.rs` / `src/daemon/commands.rs` / `src/cli.rs::apply_enabled` / `src/cli.rs::apply_remove` | consistency per OQ-1 — **across two different mechanisms and six call sites**, not one policy over four verbs; see the note below | R-6a |
+| `src/use_account.rs::resolve_target` / `src/poke.rs` / `src/daemon/commands.rs` / `src/cli.rs::apply_enabled` / `src/cli.rs::apply_remove` | consistency per OQ-1 — **across two different mechanisms and six call sites**, not one policy over four verbs; see the note below. **Done (#1005)**: the last two now call `resolve_target`, collapsing the two mechanisms into one | R-6a |
 | `docs/findings/0262-*.md` | new | R-1, R-1a |
 | `docs/*` runbook + command help | new | R-8 |
 
@@ -474,19 +505,22 @@ rows, including the entire security core:*
 | `src/observability.rs` | sha256 artifact digest on **both** events + requested scope on the **`import`** event only (export has none — R-9c/AD-5); allowlist-refusal signal | R-14, R-14a |
 | `src/config.rs::Account` | `account_uuid` shape validation before it reaches `stash()` | R-15 |
 
-> **There are TWO label-resolution mechanisms in this tree, and OQ-1 is the question of which one
+> **There WERE two label-resolution mechanisms in this tree, and OQ-1 was the question of which one
 > wins.** *Corrected 2026-08-05 (twelfth pass); every surface said "all four label-resolving commands"
 > — naming `use`, `enable`, `disable`, `remove` — which is wrong on both the count and the substance.*
+> **Superseded 2026-08-06 by #1005: OQ-1 resolved toward the first row, and the second row's two call
+> sites were routed into it — there is now ONE mechanism over six sites.** The table below records the
+> pre-fix state, which is what makes the divergence it describes legible; read it in the past tense.
 > Derived from source rather than sampled (`.tmp/enumerate.py`):
 >
 > | Mechanism | Matches | On a duplicate label | Call sites |
 > |---|---|---|---|
 > | `use_account::resolve_target` (`src/use_account.rs:441-459`) | `label` **or** `account_uuid` | `Error::UseTargetAmbiguous { count }` — **refuses**; its doc says the resolver *"NEVER guesses"* | `use` (`src/use_account.rs:607`), **`poke`** (`src/poke.rs:290`), **the daemon control-socket swap** (`src/daemon/commands.rs:99`) |
-> | exact-label `.find()` / `.position()` | `label` only | **silently takes the first match** | `enable` / `disable` (`apply_enabled`, `src/cli.rs:5152`), `remove` (`apply_remove`, `src/cli.rs:5221`) |
+> | exact-label `.find()` / `.position()` — **retired by #1005** | `label` only | **silently took the first match** | `enable` / `disable` (`apply_enabled`), `remove` (`apply_remove`) — both now call `resolve_target` |
 >
-> So on the duplicated label R-6 says `import` can create, `use` and `poke` **refuse** while `remove`
-> **silently deletes the first match's keychain stash**. That divergence — not a missing verb — is
-> what OQ-1 has to settle, and neither `poke` nor the daemon path appeared on any surface.
+> So on the duplicated label R-6 says `import` can create, `use` and `poke` **refused** while `remove`
+> **silently deleted the first match's keychain stash**. That divergence — not a missing verb — is
+> what OQ-1 had to settle, and neither `poke` nor the daemon path appeared on any surface.
 > `enable`/`disable`/`remove` do not merely *differ in policy*; they never reach the ambiguity-capable
 > resolver at all, so "make the four consistent" is not implementable as written.
 >
@@ -772,7 +806,7 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
 | R-4a | ⚠️ **Partly — and the derivable part misses the target case** | `credential_clocks` gives both deadlines from v1 bytes, but supersession is invisible in the blob (§ 4.2) |
 | R-5 / R-5a | ✅ **Yes**; 0465 checked for `dead` only | `src/refresh.rs:434-437`; 0465's window ends before the first `dead` line — but its 141-count derives from *event type*, not outcome, so the `no_change` question is **open** and tracked as a pre-landing check on #1004 |
 | R-6 | ✅ **Yes** | Local check inside an existing loop |
-| R-6a | 🚧 **Blocked on a decision**, not on feasibility | OQ-1 |
+| R-6a | ✅ **Yes** — OQ-1 resolved 2026-08-06 (refuse on ambiguity); delivered under #1005 | § 4.3; route `apply_enabled` / `apply_remove` through `resolve_target` |
 | R-7 | ✅ **Yes**, display-only | § 4.5 |
 | R-1 / R-1a / R-8 | ✅ **Yes** | Documents; conventions already exist |
 | R-9 / R-9a / R-9c | ✅ **Yes, and free at the format layer** — but the *settings*-axis availability test is **OQ-6-gated** | Every `RawConfig` field is `#[serde(default)]` incl. `account`; `Payload`'s two fields are both emptiable (§ 4.7) |
@@ -810,7 +844,13 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
 
 ### Open Questions
 
-- **OQ-1 (blocks R-6a)** — **restated 2026-08-04; the original framing was defective on both halves.**
+- **OQ-1 (blocked R-6a) — RESOLVED 2026-08-06 by the operator: refuse on ambiguity, everywhere.**
+  Delivered under issue #1005; see § 4.3 for what routing through `resolve_target` entails, including
+  the exit-code change and the retirement of `Error::AccountLabelNotFound`. The question and its
+  correction history are kept below because the *framing* was twice defective, and that is the
+  reusable lesson — not the answer.
+
+  **The question, as asked** — restated 2026-08-04; the original framing was defective on both halves.
   What is the **single** duplicate-label resolution policy across `use`, `enable`, `disable`, **and
   `remove`**? Design lean is refuse-on-ambiguity; **not settled here** — it changes CLI behaviour
   operators may rely on.
@@ -898,7 +938,7 @@ recorded so the call is visible, not because it is pending.
 | R-5 | 4.4 | Cap-4.1 (type), **Cap-4.2 (all three rendered lines)** | covered — Cap-4.1 alone is necessary but not sufficient; see § 5 |
 | R-5a | 4.4 | — (verification, **partly done** — `dead` checked, `no_change` open, #1004) | covered |
 | R-6 | 4.3 | Cap-3.1 | covered |
-| R-6a | 4.3 | Cap-3.2 | **decision-gated** (OQ-1) |
+| R-6a | 4.3 | Cap-3.2 | covered — OQ-1 resolved, delivered under #1005 |
 | R-7 | 4.5 | Cap-5.1 | covered |
 | R-9 | 4.7 | Cap-7.1 (`--accounts`), **Cap-7.9 (`--settings` — the mirror)**, Cap-7.2 (default), Cap-7.6, **Cap-7.10 (roster-less `--accounts`)**, **Cap-7.11 (both flags together)** | **partly decision-gated** (OQ-6 — the `--settings` availability report; OQ-7 — Cap-7.9's target state) |
 | R-9a | 4.7 / AD-6 | Cap-7.3 | **partly decision-gated** (OQ-6 — the settings-axis presence test) |
