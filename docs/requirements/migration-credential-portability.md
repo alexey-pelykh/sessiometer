@@ -399,14 +399,15 @@ silently — **including when both colliding entries arrive in the same artifact
 
 **R-6a** — *Where* a duplicate-label roster exists, the system **shall** handle it **consistently**
 across every site that resolves an operator label — which is **two different mechanisms over six call
-sites**, not four commands. It does not today: `use` refuses with
-`Error::UseTargetAmbiguous` (`src/use_account.rs:453`, exit code 6 per `src/error.rs:955`), and so do
+sites**, not four commands. **It did not, until #1005 — read this paragraph in the past tense; the
+resolution is the "RESOLVED 2026-08-06" note below.** `use` refused with
+`Error::UseTargetAmbiguous` (`resolve_target`, `src/use_account.rs`; exit code 6 per `Error::exit_code`, `src/error.rs`), and so did
 **`poke`** (`src/poke.rs:290`) and **the daemon's control-socket swap** (`src/daemon/commands.rs:99`),
 because all three share `resolve_target` — whose doc states it *"NEVER guesses"*
-(`src/use_account.rs:438-441`). `enable`/`disable` (`apply_enabled`, `src/cli.rs:5152`) and `remove`
-(`apply_remove`, `src/cli.rs:5221`) do not reach that resolver **at all**: each does an exact-label
-`.find()`/`.position()` and silently takes the **first** match. Which behaviour is correct is a
-decision, not a design.
+(`src/use_account.rs:438-441`). `enable`/`disable` (`apply_enabled`) and `remove`
+(`apply_remove`) did not reach that resolver **at all**: each did an exact-label
+`.find()`/`.position()` and silently took the **first** match. Which behaviour was correct was a
+decision, not a design — and it was taken.
 
 > **The count and the mechanism were both wrong, and the mechanism is what matters.**
 > *Corrected 2026-08-05 (twelfth pass); this read "all four label-resolving commands — `use`,
@@ -425,7 +426,27 @@ decision, not a design.
 > reported one more member of this set, which is what sampling a finite set looks like.
 
 `Origin: AI-inferred-expansion`.
-`Ratification: pending-user` (the inconsistency's *inclusion* is ratified; its resolution is not).
+`Ratification: user-ratified 2026-08-06 (OQ-1 resolved — refuse on ambiguity, everywhere)`.
+
+> **RESOLVED 2026-08-06, and DELIVERED under issue #1005.** OQ-1 settled on the design lean, option
+> (i): `enable`, `disable` and `remove` now resolve through `use_account::resolve_target`, the same
+> resolver `use`, `poke` and the daemon's control-socket swap already used. All six sites therefore
+> share one policy — refuse on ambiguity — one refusal (`Error::UseTargetAmbiguous`, exit 6) and one
+> not-found error (`Error::UseTargetNotFound`, exit 5). Option (ii) was not implemented: it was a
+> *regression*, not a symmetric alternative.
+>
+> Three consequences are recorded here because each is observable and none is incidental:
+>
+> 1. **Exit codes moved.** `Error::AccountLabelNotFound` appeared nowhere in `Error::exit_code`, so it
+>    fell through to the generic `_ => 1`. An unmatched `enable`/`disable`/`remove` target now exits
+>    **5**, and **6** is reachable where nothing previously failed at all.
+> 2. **`AccountLabelNotFound` is retired.** With both its constructors routed away its only remaining
+>    uses were in tests, and a never-constructed variant is `dead_code` — a build failure under
+>    `-D warnings`. The retirement is forced by the change rather than chosen alongside it.
+> 3. **The three verbs now accept an account-uuid**, because `resolve_target` matches label OR uuid.
+>    That widening is not a side effect to tolerate — it is the *only* way an operator can act on a
+>    refusal, since option (iii)'s `--account-uuid` flag was not chosen and does not exist. Their
+>    usage strings moved from `<label>` to `<account>` to say so.
 
 > **R-6a's command set was corrected on 2026-08-04.** The original wording named only two commands and
 > framed the choice as "one of the two is wrong". Both halves were defective:
@@ -1068,12 +1089,46 @@ control-socket swap** thereafter agree on whether a duplicate label is resolvabl
 across both resolution mechanisms. **BUT NOT** by enforcing label uniqueness — that
 contradicts the documented design position; **BUT NOT** by leaving `use` refusing while `enable`
 silently picks first; **BUT NOT** by omitting `remove`, whose first-match-wins deletes a keychain
-stash irreversibly (`apply_remove`, `src/cli.rs:5219-5227`) and is therefore the case that should
+stash irreversibly (`apply_remove`, `src/cli.rs`) and is therefore the case that should
 drive the policy, not the one left untested.
 **Test-coverage criterion (M2)**: a case whose target roster is **not** a clone of the source config —
 `the_migration_conflict_policy_default_drives_import_behaviour` builds its target as
-`src_config.clone()` (`src/cli.rs:10741`), so every uuid matches by construction and this branch is
+`src_config.clone()`, so every uuid matches by construction and this branch is
 unreachable in it.
+
+> **SATISFIED under issue #1005.** The warning is an orthogonal flag on the per-account report row
+> (the shape `staged_not_adopted` established), so the import still succeeds, nothing is renamed and
+> the four-way tally is unchanged. It fires where a label ends the merge with more than one bearer
+> AND more than it started with — a before/after count over the whole merge, not a per-write check.
+> "More than one", read on the FINISHED roster, is what catches a collision arriving inside a single
+> artifact on a fresh target — and equally what keeps a mere label SWAP quiet, since a swap ends with
+> each label on one bearer however it looked mid-merge. "More than before" covers the remaining case
+> and only that one: a duplicate the target already had, overwritten in place (§ P5). The rule
+> reasons about counts, so a count-preserving substitution of bearers under an already-ambiguous
+> label is a known, accepted blind spot — the label was unresolvable before and after, so nothing
+> actionable changed. Resolution consistency is delivered by routing `apply_enabled` and
+> `apply_remove` through `use_account::resolve_target` — see R-6a for OQ-1's resolution and its
+> observable consequences.
+>
+> Binding tests, each building its target explicitly rather than as a clone:
+> `apply_import_warns_when_it_creates_a_same_label_different_uuid_entry`,
+> `apply_import_stays_quiet_on_the_ordinary_same_label_same_uuid_case`,
+> `apply_import_warns_when_one_artifact_carries_its_own_duplicate_on_a_fresh_target`,
+> `apply_import_warns_when_an_overwrite_relabels_onto_an_existing_label`,
+> `apply_import_stays_quiet_when_an_import_swaps_two_labels_between_accounts`,
+> `apply_import_stays_quiet_when_a_duplicate_the_target_already_had_is_overwritten`,
+> `apply_import_warns_when_it_deepens_a_duplicate_the_target_already_had`,
+> `apply_enabled_refuses_a_duplicate_label_without_touching_the_roster`,
+> `apply_remove_refuses_a_duplicate_label_without_touching_the_roster`,
+> `every_label_resolving_site_shares_one_resolver`,
+> `the_label_resolving_verbs_accept_an_account_uuid_so_a_refusal_is_actionable`.
+>
+> The last two are not decoration. `every_label_resolving_site_shares_one_resolver` asserts the
+> *property* that makes six sites agree — that they reach one resolver — rather than sampling six
+> behaviours that happen to match today; sampling a finite set one member at a time is what produced
+> three successive corrections to this AC's own command list. And
+> `the_label_resolving_verbs_accept_an_account_uuid_so_a_refusal_is_actionable` pins the remedy: a
+> refusal with no way to act on it would be a worse defect than the first-match-wins it replaced.
 
 **AC-7 (R-7)** — *Given* a `status` render with one active and ≥ 1 parked account, *When* `EXPIRY` is
 read, *Then* an operator can tell which slot each value came from.
@@ -1249,7 +1304,7 @@ by symbol against `HEAD` on 2026-08-04 before this document was committed.
 >
 > Three citations were not merely offset but pointed at unrelated code that reads plausibly:
 > `resolve_target` was cited to `src/cli.rs:438-455` (that is `parse_config`; the function lives in
-> `src/use_account.rs:441-457`), exit code 6 to `src/error.rs:892` (it is `:955`), and — worst — the
+> `src/use_account.rs:441-457`), exit code 6 to `src/error.rs:892` (it is in `Error::exit_code`; the line number this note originally gave has itself since moved, which is the point), and — worst — the
 > zero-writes test backing AC-2a's entire correction to `src/use_account.rs:2202-2213`, which is an
 > unrelated `SwapAck` test. The real test is at `:2490-2502`.
 >
@@ -1276,13 +1331,13 @@ by symbol against `HEAD` on 2026-08-04 before this document was committed.
 | Import never writes canonical / `~/.claude.json` / requests a swap | `src/cli.rs:4601-4663` — the body reaches `config.save()` + `notify_daemon_roster_reload()` and nothing else |
 | Active `EXPIRY` reads canonical; parked reads stash | `src/daemon/snapshot_build.rs:45-53` |
 | `rotated` is true-by-construction on `dead` (parseable non-empty seeded token) | `src/refresh.rs:434-437` |
-| Conflict match is uuid-only | `src/cli.rs:4771-4774` |
-| Whole-config merge is acknowledged future work | `src/cli.rs:4737-4741` (verbatim in-code comment) |
-| Labels are non-unique by design | `src/cli.rs:5148-5149` |
-| `use` refuses on ambiguity; `enable`/`disable` take first | `src/use_account.rs:453`; `src/error.rs:955` (exit 6); `src/cli.rs:5150-5163` |
+| Conflict match is uuid-only | `apply_import`'s `existing` binding (`src/cli.rs`) — `.position(\|account\| account.account_uuid == incoming_account.account_uuid)` |
+| Whole-config merge is acknowledged future work | `apply_import`'s "Base config" comment (`src/cli.rs`) — verbatim in-code |
+| Labels are non-unique by design | `Config::validate` (`src/config/validate.rs`) checks empty uuid, empty label and duplicate uuid — and has no duplicate-label arm |
+| ~~`use` refuses on ambiguity; `enable`/`disable` take first~~ — **no longer true; superseded by #1005.** All six sites now share `use_account::resolve_target` and refuse | `resolve_target` (`src/use_account.rs`); `apply_enabled` / `apply_remove` (`src/cli.rs`); `Error::exit_code` (`src/error.rs`) — pinned by `every_label_resolving_site_shares_one_resolver` |
 | `Payload` has no timestamp; `FORMAT_VERSION = 1` | `src/migration.rs:199-210`; `src/migration.rs:97` |
 | Existing migration test coverage — the **7 this scope reasons about**, of **45** total (16 in `src/cli.rs`'s #148/#149/#150 sections, 29 in `src/migration.rs` incl. the frozen-fixture gates C-1 depends on, `src/migration.rs:1730`, `:1767`) | `export_encrypted_round_trips_gathered_state_and_hides_it`, `export_no_secrets_omits_every_credential_blob`, `export_plaintext_round_trips_and_carries_secrets_in_the_clear`, `import_round_trips_an_encrypted_export_and_restores_every_account_byte_faithfully`, `a_config_only_artifact_imports_accounts_as_roster_entries_without_a_stash`, `the_import_report_names_labels_only_never_a_token_or_email`, `the_migration_conflict_policy_default_drives_import_behaviour` |
-| Conflict test's target is a clone of the source | `src/cli.rs:10741` |
+| Conflict test's target is a clone of the source | `the_migration_conflict_policy_default_drives_import_behaviour` (`src/cli.rs`) — still a clone, deliberately: it tests the conflict policy. The duplicate-label branch it cannot reach is covered by the `apply_import_warns_*` tests #1005 added, each building its target explicitly |
 
 **Added 2026-08-04 — every row's claim verified against the working tree during this amendment (not
 carried from the council transcripts), and every line citation re-resolved by symbol before commit
@@ -1414,12 +1469,17 @@ that explains every symptom; a falsified claim is recorded rather than buried.
    constrains how they may be stated; a reader who strengthens them later has broken the requirement.
 2. **R-4a is unresolved and gates R-4's ambition.** Stage 2 must either find a v1-derivable signal or
    surface the `format_version` question as an ADR-0006 decision.
-3. **R-6a's resolution is a decision, not a design.** Which of the four label-resolving commands'
+3. **R-6a's resolution is a decision, not a design.** ~~Which of the four label-resolving commands'
    behaviours is correct — `use`'s refusal or `enable`/`disable`/`remove`'s first-match-wins — is a
-   product call the pipeline must not settle silently, and `remove`'s irreversibility is the argument
-   that should drive it (OQ-1).
+   product call the pipeline must not settle silently~~, and `remove`'s irreversibility is the
+   argument that should drive it (OQ-1). **Settled by the operator on 2026-08-06 and delivered under
+   issue #1005: refuse on ambiguity, everywhere** — driven by `remove`'s irreversibility exactly as
+   this finding said it should be. The finding is kept rather than deleted because it records that the
+   call was escalated rather than absorbed; see R-6a above for the resolution and its three
+   observable consequences.
 4. **Ratification asymmetry.** R-5 … R-8 were ratified as *in-scope*; their mechanisms were not. R-2a,
-   R-4a, R-5a, R-6a are all `pending-user` and each is reversible.
+   R-4a, R-5a, R-6a were all `pending-user` and each is reversible. **R-6a is no longer pending** —
+   the operator resolved OQ-1 on 2026-08-06 and #1005 delivered it; R-2a, R-4a and R-5a still are.
 
 ### Amendment findings (2026-08-04, R-9 … R-16)
 
