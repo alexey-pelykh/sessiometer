@@ -3305,6 +3305,79 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
         }
     }
 
+    /// The REAL-data half of #1030's magnitude evidence: what the anchoring moves, per account, on
+    /// the frozen corpus. The gate above pins the DIRECTION (`gain > 0` on the two accounts that
+    /// saturate) because a per-account second-count would be a golden on a fixture that must never
+    /// be regenerated; this prints the magnitudes the direction is hiding.
+    ///
+    /// `#[ignore]` — NOT part of the suite, and a companion to
+    /// [`census_joint_coverage_over_the_issues_regime`], which does the same job for the synthetic
+    /// regime:
+    ///   `cargo test -- --ignored --nocapture per_account_anchoring_movement_on_the_replay_corpus`
+    ///
+    /// Run it before quoting a per-account coverage figure for this corpus. It also shows, in one
+    /// table, why the six-fold census still reads UNKNOWN here: `a3`..`a6` move by exactly nothing
+    /// because they never reach the water at all, and `a4`..`a6` sit at ~7.6 % coverage while being
+    /// session-LOW — the population #1097 is about.
+    #[test]
+    #[ignore = "magnitude probe — prints per-account movement; run it when a coverage claim needs a witness"]
+    fn per_account_anchoring_movement_on_the_replay_corpus() {
+        let samples = replay_samples();
+        let period = Period::new(CORPUS_START, CORPUS_END);
+        let span = (CORPUS_END - CORPUS_START) as f64;
+        let sum = |iv: &[(i64, i64)]| iv.iter().map(|(lo, hi)| hi - lo).sum::<i64>();
+
+        println!(
+            "\nfrozen corpus `capacity-replay-corpus.tsv` — {} h, {} accounts, real\n\
+             covered = per-account validity coverage of the window; high = time at/above the \
+             census water\n\n\
+             \x20account   covered (cadence)   covered (anchored)      high (cadence)  \
+             high (anchored)",
+            (CORPUS_END - CORPUS_START) / 3_600,
+            REPLAY_ROSTER.len(),
+        );
+
+        let mut moved = 0_u32;
+        for handle in REPLAY_ROSTER {
+            let group: Vec<&Sample> = samples.iter().filter(|s| s.acct == handle).collect();
+            let stripped: Vec<Sample> = group
+                .iter()
+                .map(|s| Sample::new(s.ts, "claude", &s.acct, s.session, s.weekly))
+                .collect();
+            let cadence_group: Vec<&Sample> = stripped.iter().collect();
+
+            let (anchored_high, anchored_cov) =
+                high_windows(&group, period, 300, params().high_threshold);
+            let (cadence_high, cadence_cov) =
+                high_windows(&cadence_group, period, 300, params().high_threshold);
+            moved += u32::from(sum(&anchored_cov) > sum(&cadence_cov));
+
+            println!(
+                "      {handle}   {:>8} s ({:>4.1} %)   {:>8} s ({:>4.1} %)   {:>10} s   {:>10} s",
+                sum(&cadence_cov),
+                sum(&cadence_cov) as f64 * 100.0 / span,
+                sum(&anchored_cov),
+                sum(&anchored_cov) as f64 * 100.0 / span,
+                sum(&cadence_high),
+                sum(&anchored_high),
+            );
+        }
+
+        // The degenerate-subject guard, and the only assertion here: a table printed off a
+        // truncated or mis-parsed corpus would read as a measurement while witnessing nothing.
+        assert_eq!(
+            samples.len(),
+            data_rows(REPLAY_CORPUS).count(),
+            "the corpus lost rows between parse and print, so the table above is not this fixture"
+        );
+        assert!(
+            moved >= 2,
+            "fewer than two accounts moved under anchoring. The corpus is frozen INPUT, so this \
+             cannot drift — `a1` and `a2` are the two that saturate, and if they stopped moving \
+             the anchoring has stopped reaching real data"
+        );
+    }
+
     // --- #806 roster-size scaling (T2) ------------------------------------------
 
     /// A fully-blocked roster of `n` accounts sampled on a shared cadence, each account's readings
