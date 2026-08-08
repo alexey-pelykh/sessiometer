@@ -94,7 +94,7 @@ Scenario: the extension is bounded by the reporting period
 
 > ⚠ **The rationale below is contradicted on this repo's own corpus — see #1097.** The rule stands;
 > its *reason* does not. "The low peer is the one IN rotation, polled at the normal cadence" is not
-> true of the class that dominates `build/fixtures/capacity-replay-corpus.tsv`: `a4`/`a5`/`a6` are
+> true of half the roster in `build/fixtures/capacity-replay-corpus.tsv`: `a4`/`a5`/`a6` are
 > session-**low** and polled on the **widened** exhausted cadence at the same time, held out of
 > rotation by their weekly dimension — 44 / 44 / 43 readings across 172 800 s at session peaks of
 > 0.03 / 0.15 / 0.00, about 7.6 % coverage each. So a low peer can be exactly as sparsely polled as
