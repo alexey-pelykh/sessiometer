@@ -45,13 +45,24 @@
 //! * every per-account metric is computed over that account's OBSERVED samples only;
 //! * each reading "covers" only a bounded window forward — `[ts, min(next_ts,
 //!   ts + stale_after))` — so a gap wider than `stale_after` leaves genuinely UNKNOWN
-//!   time that no metric fills (this drives `time_at_cap_secs` and the all-high
-//!   episodes);
+//!   time that no metric fills (this is what drives `time_at_cap_secs`);
 //! * `coverage = seen ÷ expected` is reported per account/period so a consumer can
 //!   annotate a sparsely-sampled period rather than misread it as calm;
 //! * an all-high episode requires every rostered account to be KNOWN-and-high at the
 //!   instant — if any account has no covering sample there, the instant is UNKNOWN and
 //!   is NOT part of an episode.
+//!
+//! Both CENSUSES refine that forward window rather than take it as written, because the
+//! cadence alone makes them unmeasurable in exactly the conditions they exist to report:
+//! an out-of-rotation peer is polled at `exhausted_poll_secs` (3600) against a `poll_secs`
+//! (300) horizon, so a cadence-anchored reading covers ~8 % of the clock — and a census
+//! INTERSECTS those windows across the whole roster. So a reading that carries its own
+//! expiry is valid until that expiry: the capacity census anchors a BLOCKED reading to the
+//! reset of whichever dimension blocks it ([`blocked_windows`], REQ-STA-B-010), and the
+//! utilisation census anchors a HIGH reading to its own `session_resets_at`
+//! ([`high_windows`], issue #1030). Both REFINE gap honesty and neither repeals it: an
+//! anchor is reachable only FROM a reading that exists and states its own bound, so
+//! un-sampled time is still UNKNOWN and a dead daemon still reports nothing covered.
 //!
 //! # Time discipline
 //!
@@ -184,6 +195,14 @@ pub(crate) struct AggregateParams {
     /// UNKNOWN (gap honesty). A reading at `ts` is valid over `[ts, min(next_ts,
     /// ts + stale_after_secs))`; a gap wider than this leaves genuinely unknown time.
     /// Defaults to `poll_interval_secs` in [`AggregateParams::new`].
+    ///
+    /// This is the floor the ANCHORING lifts from, not the whole rule: a reading that carries its
+    /// own expiry is anchored to it where that expiry is later, while the `next_ts` and period-end
+    /// clamps still cap the result — so both censuses stay measurable against the widened
+    /// `exhausted_poll_secs` cadence (see the module's gap-honesty note, [`blocked_windows`] and
+    /// [`high_windows`]). Widening this knob GLOBALLY is the rejected alternative to that anchoring
+    /// — it weakens what "covered" means for every account uniformly, so a genuinely dead daemon
+    /// starts reading as covered.
     pub(crate) stale_after_secs: i64,
     /// The daemon's viability boundary (issue #803), when the caller knows it — the pair of
     /// lines at/above which an account cannot be swapped TO. Supplied by the caller from
@@ -250,6 +269,16 @@ pub(crate) struct AccountStats {
     pub(crate) cap_hits: u32,
     /// Sampled seconds spent at/above the session cap — the summed forward-coverage
     /// windows of the cap-hit samples (gap-honest: a gap adds nothing).
+    ///
+    /// Still purely CADENCE-anchored ([`validity_windows`]), unlike the two censuses, which anchor
+    /// a qualifying reading to its own carried expiry. Since issue #1030 that is an observable
+    /// divergence rather than a bookkeeping detail: production runs `session_cap ==
+    /// high_threshold`, so the SAME readings at the SAME water can report a small
+    /// `time_at_cap_secs` beside a large `all_high_secs` — one saturated account polled hourly for
+    /// a day reports 7 200 s here against 86 400 s there. Both figures are honest under their own
+    /// rule and `stats` prints them side by side. Widening this one was deliberately out of
+    /// #1030's scope (it would move `time_at_cap_secs` for every account, which is a separate
+    /// ratified metric with its own consumers); reconciling the two is issue #1098.
     pub(crate) time_at_cap_secs: i64,
     /// The fraction of the period's observations made while THIS account was the active
     /// (swapped-in) credential, from the swap-active spans. Across all accounts these
@@ -299,6 +328,13 @@ pub(crate) struct RosterStats {
     /// `0` means the census was never measurable at all: no instant existed at which the
     /// whole roster was observable, so "0 episodes" is UNKNOWN, not calm. That zero is a
     /// measured quantity, not a sentinel — jointly-covered time really was nil.
+    ///
+    /// Measured over the SESSION-EXPIRY-ANCHORED windows since issue #1030 ([`high_windows`]):
+    /// a high reading is covering until its own carried reset, not merely for one poll cadence.
+    /// A zero here is therefore a much stronger statement than it used to be — before that
+    /// anchoring this figure shrank with every account added to a saturated roster and reached
+    /// exactly zero at the six-account roster the live corpus records, whatever the fleet was
+    /// actually doing, which is the one condition the census exists to report.
     pub(crate) all_high_covered_secs: i64,
     /// The session-utilisation water an account had to be at/above to count toward an
     /// episode — [`AggregateParams::high_threshold`], carried through so every surface can
@@ -656,6 +692,12 @@ fn swap_breakdown(swaps: &[SwapEvent], period: Period) -> SwapBreakdown {
 /// Because a gap produces no covering interval, an instant where any account is unsampled
 /// cannot be part of an episode — gaps are UNKNOWN, never high.
 ///
+/// Both interval sets come from [`high_windows`], which anchors a HIGH reading to its own
+/// carried `session_resets_at` rather than to the poll cadence (issue #1030) — without which
+/// this census cannot be taken at all on the saturated roster it exists to report. Taking both
+/// sets from ONE function is what keeps `highs ⊆ covering` true per account, and hence what lets
+/// the short-circuit below trust an emptied covering intersection.
+///
 /// The census set is `roster` when the caller knows it, else the sampled accounts (see
 /// [`aggregate_with_roster`]). A rostered account with NO samples therefore keeps its
 /// (empty) place in the intersection instead of vanishing from it. An EMPTY census set —
@@ -692,16 +734,12 @@ fn all_high(
         // A rostered account absent from the period's samples covers NOTHING — it stays in
         // the intersection and empties it, rather than silently leaving it.
         let group: &[&Sample] = by_acct.get(handle).map_or(&[], Vec::as_slice);
-        let windows = validity_windows(group, period, params.stale_after_secs);
-        let highs = merge_intervals(
-            windows
-                .iter()
-                .zip(group.iter())
-                .filter(|(_, s)| s.session >= params.high_threshold)
-                .map(|(&w, _)| w)
-                .collect(),
+        let (highs, covering) = high_windows(
+            group,
+            period,
+            params.stale_after_secs,
+            params.high_threshold,
         );
-        let covering = merge_intervals(windows);
 
         high_acc = Some(match high_acc {
             None => highs,
@@ -729,6 +767,111 @@ fn all_high(
         episodes.iter().map(|(lo, hi)| hi - lo).sum(),
         covered.iter().map(|(lo, hi)| hi - lo).sum(),
     )
+}
+
+/// A merged, sorted, disjoint list of half-open `[lo, hi)` second-spans. Named for the same reason
+/// [`HoldSpan`] is — a PAIR of these is the natural return of a function computing a predicate's
+/// spans alongside the covered spans they sit in, and spelled out twice that pair trips
+/// `clippy::type_complexity`. The single-list helpers ([`validity_windows`], [`merge_intervals`],
+/// [`intersect`]) keep the explicit type; only [`high_windows`] returns the pair.
+type Windows = Vec<(i64, i64)>;
+
+/// One account's SESSION-EXPIRY-ANCHORED high windows and its covering windows, both merged into
+/// sorted disjoint lists — the utilisation census's counterpart to [`blocked_windows`], and the
+/// reason [`all_high`] can be taken at all on a saturated roster (issue #1030).
+///
+/// A HIGH reading covers `[ts, min(next_ts, max(ts + stale_after, session_resets_at)))`, clamped
+/// into the period exactly as [`validity_windows`] clamps its own; a LOW reading, or a high one
+/// carrying no session reset, keeps the plain cadence horizon [`validity_windows`] uses.
+///
+/// # Why anchoring is what makes this census measurable
+///
+/// An out-of-rotation saturated peer is polled at `exhausted_poll_secs` (default 3600) against a
+/// `poll_secs` (300) staleness horizon, so a cadence-anchored reading covers ~8 % of the wall clock
+/// — and the census INTERSECTS those windows across the whole roster. Six independently-phased 8 %
+/// windows share no instant at all, so the census went blind precisely when the roster was
+/// saturated: the one condition it exists to report — not as a near-miss but as an exact zero.
+/// This is the same anchoring REQ-STA-B-010 already ratified for capacity holds, applied to the
+/// requirement (REQ-STA-B-005) that never received it.
+///
+/// The gate is `under_real_poll_sparsity_session_anchoring_is_what_keeps_the_census_measurable`,
+/// which runs the two arms against each other over one code path. It is SYNTHETIC deliberately:
+/// the frozen live corpus cannot host this gate, because its drain is WEEKLY and four of its six
+/// accounts never reach the census's water at all — see
+/// `on_the_replay_corpus_the_utilisation_census_is_unknown_because_the_drain_was_weekly`, which
+/// pins that reason and carries what real data DOES witness here (the per-account coverage this
+/// anchoring buys on the two accounts that do saturate).
+///
+/// # Why only a HIGH reading is anchored
+///
+/// Session utilisation only ever climbs within a session window and drops at the reset, so a
+/// reading at/above the water is a statement that stays TRUE until `session_resets_at` — the
+/// account cannot quietly fall back under it first. A reading BELOW the water carries no such
+/// guarantee: it can cross the water at any instant, so extending it would assert
+/// known-and-not-high over time nobody observed. The asymmetry is therefore not a convenience, it
+/// is the direction in which the guarantee actually holds.
+///
+/// It does have a cost, and the frozen corpus is where that cost shows rather than hides: an
+/// account can be BOTH low and polled at `exhausted_poll_secs`, held out of rotation by its WEEKLY
+/// dimension while its session reading sits near zero, and nothing here widens its window. Three of
+/// that corpus's six accounts sit there for the whole window and a fourth for its first 36 h; not
+/// one of the four ever reaches the water, which is why the corpus still reports UNKNOWN — see
+/// `on_the_replay_corpus_the_utilisation_census_is_unknown_because_the_drain_was_weekly`, which
+/// pins that as a SEPARATE fact from this one. The alternative is not better coverage, it is
+/// fabricated calm over unobserved time, so coverage is restored where the guarantee reaches and
+/// nowhere else. Whether that class can carry a session guarantee at all is issue #1097, which also
+/// carries the correction that the ratified rationale for this asymmetry — "a low peer is the one
+/// in rotation" — is not true of it.
+///
+/// # Why the WEEKLY reset is deliberately NOT consulted
+///
+/// Replayed over the live store, honouring `weekly_resets_at` as well returns 97.8 % joint coverage
+/// against session-only's 39.9 % — a 2.5× swing, in the flattering direction, on this one choice. A
+/// weekly reset sitting six days out does not make a SESSION reading valid for six days: the
+/// session percentage moves in minutes, and the session dimension is what this census measures.
+/// Consulting it would manufacture coverage across long stretches where nothing was observed, which
+/// is the fabrication REQ-STA-B-008 exists to forbid. This narrows REQ-STA-B-010's own text, which
+/// names both fields — deliberately, because that requirement governs BLOCKED-ness, where the
+/// later of the two windows really does gate relief (see [`relief_of`]).
+///
+/// The covering list extends over the SAME anchored windows, because "high until its stated reset"
+/// is knowledge about the account's state over that span, not a gap in it. That also keeps
+/// `highs ⊆ covering` true by construction — the relation [`all_high`]'s short-circuit relies on
+/// and `prop_all_high_time_never_exceeds_the_jointly_covered_time` gates.
+///
+/// UNKNOWN is refined here, never repealed: the extension is reachable only FROM a reading that
+/// exists and carries its own expiry, so an account with no samples still contributes no window and
+/// a genuinely dead daemon still reports zero jointly-covered seconds.
+fn high_windows(
+    group: &[&Sample],
+    period: Period,
+    stale_after: i64,
+    high_threshold: f64,
+) -> (Windows, Windows) {
+    let mut highs: Windows = Vec::new();
+    let mut covering: Windows = Vec::with_capacity(group.len());
+    for (i, s) in group.iter().enumerate() {
+        let high = s.session >= high_threshold;
+
+        let next = group.get(i + 1).map_or(period.end, |n| n.ts);
+        let cadence_hi = s.ts + stale_after.max(0);
+        // `max`, never a bare replacement: the anchor may only ever EXTEND a reading's horizon, so
+        // a reset already in the past leaves the plain cadence window untouched. And the `next`
+        // clamp above still wins, so no window outlives the reading that supersedes it.
+        let anchored_hi = if high {
+            s.session_resets_at
+                .map_or(cadence_hi, |at| cadence_hi.max(at))
+        } else {
+            cadence_hi
+        };
+        let hi = next.min(anchored_hi).min(period.end).max(s.ts);
+
+        covering.push((s.ts, hi));
+        if high {
+            highs.push((s.ts, hi));
+        }
+    }
+    (merge_intervals(highs), merge_intervals(covering))
 }
 
 /// Which window's reset gates a hold's relief — the daemon's own `cause=` vocabulary, so a
@@ -1691,6 +1834,317 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
         }
     }
 
+    // --- #1030 session-expiry anchoring of the census -------------------------
+    //
+    // MUTATION CATALOGUE for `high_windows`. Every guard below was verified by MUTATING the
+    // function and re-running the suite, not by inspection — so the claim "these tests gate the
+    // anchoring" is re-runnable rather than asserted. Each row is one edit to `high_windows`; the
+    // named test is the one whose failure names the defect most directly (several rows fail more).
+    //
+    //   drop `.min(period.end)` from `hi` ................ SURVIVES (see below)
+    //   drop the `next` clamp from `hi` .................. no_window_extends..carry, case (d)
+    //   `map_or(cadence_hi, |at| at)` — substitute, not
+    //     extend ......................................... no_window_extends..carry, case (b)
+    //   `map_or(period.end, ..)` — extend a reading that
+    //     carries no expiry .............................. no_window_extends..carry, case (a)
+    //   drop the `if high` gate — anchor low readings
+    //     too ............................................ a_low_reading_is_not_anchored_even_
+    //                                                      when_it_carries_a_session_reset
+    //   `.or(s.weekly_resets_at)` — fall back to the
+    //     weekly field ................................... the_census_never_anchors_to_the_
+    //                                                      weekly_reset
+    //   push the CADENCE window into `covering` while
+    //     `highs` keeps the anchored one (breaks the
+    //     `highs ⊆ covering` relation) ................... prop_all_high_time_never_exceeds_
+    //                                                      the_jointly_covered_time
+    //   drop the `.max(s.ts)` floor from `hi` ............ SURVIVES (see below)
+    //
+    // TWO SURVIVORS, both deliberate and both the same shape: a clamp that cannot currently bind.
+    // `next` is bounded by `period.end` on both of its branches and `cadence_hi >= s.ts` always,
+    // so neither `.min(period.end)` nor `.max(s.ts)` can change `hi` as the function stands. They
+    // are kept because `validity_windows` carries the identical pair — defensive symmetry across
+    // the three window builders is worth more than the two lines, and a lone divergence between
+    // them would read as a decision somebody made. Recorded here so the next reader meets them as
+    // a known property rather than rediscovering them as a finding. They are NOT evidence of a
+    // coverage gap: no behaviour depends on either.
+
+    /// A reading carrying ONLY a session reset — the shape the anchoring consults. Deliberately
+    /// distinct from [`dated`], which carries both and so cannot tell the two fields apart.
+    fn session_dated(ts: i64, acct: &str, session: f64, session_reset: i64) -> Sample {
+        sample(ts, acct, session, 0.10).with_resets(Some(session_reset), None)
+    }
+
+    #[test]
+    fn a_saturated_peer_stays_covered_to_its_own_session_reset() {
+        // The mechanism, at its smallest. One account polled at `exhausted_poll_secs` (3600)
+        // against a `poll_secs` (300) staleness horizon — the regime a saturated out-of-rotation
+        // peer is actually polled in. Cadence-anchored it is observable for 300 s of every 3600;
+        // anchored to the reset it carries, its window runs to the next reading instead.
+        let period = Period::new(0, 7_200);
+
+        let undated = vec![sample(0, "a", 0.90, 0.1), sample(3_600, "a", 0.90, 0.1)];
+        assert_eq!(
+            aggregate(&undated, &[], period, &params())
+                .roster
+                .all_high_covered_secs,
+            600,
+            "antecedent: with no carried expiry the two readings cover 300 s each — the 8 % \
+             visibility that makes the census unmeasurable across a roster"
+        );
+
+        // Same two readings, each stating that its session window runs past the next poll.
+        let dated = vec![
+            session_dated(0, "a", 0.90, 6_000),
+            session_dated(3_600, "a", 0.90, 9_000),
+        ];
+        let r = aggregate(&dated, &[], period, &params()).roster;
+        assert_eq!(
+            (
+                r.all_high_covered_secs,
+                r.all_high_secs,
+                r.all_high_episodes
+            ),
+            (7_200, 7_200, 1),
+            "the first reading covers [0, 3600) — clamped by the NEXT reading, not by its 6000 s \
+             reset — and the second [3600, 7200), clamped by the period end rather than by its \
+             9000 s reset. One unbroken episode across the whole window"
+        );
+    }
+
+    #[test]
+    fn the_census_never_anchors_to_the_weekly_reset() {
+        // The trap issue #1030 records because the wrong choice looks better on the dashboard:
+        // honouring `weekly_resets_at` too returned 97.8 % joint coverage against session-only's
+        // 39.9 % on the live store. A weekly reset six days out does not make a SESSION reading
+        // valid for six days — the session percentage moves in minutes, and the session dimension
+        // is what this census measures.
+        let period = Period::new(0, 7_200);
+        let weekly_only = vec![
+            sample(0, "a", 0.90, 0.99).with_resets(None, Some(600_000)),
+            sample(3_600, "a", 0.90, 0.99).with_resets(None, Some(600_000)),
+        ];
+        assert_eq!(
+            aggregate(&weekly_only, &[], period, &params())
+                .roster
+                .all_high_covered_secs,
+            600,
+            "a far-future WEEKLY reset extended the census window. That is the 2.5x flattering \
+             swing #1030 forecloses: it manufactures coverage across long stretches in which \
+             nothing was observed, which is what REQ-STA-B-008 exists to forbid"
+        );
+    }
+
+    #[test]
+    fn a_low_reading_is_not_anchored_even_when_it_carries_a_session_reset() {
+        // The asymmetry, and the direction the guarantee actually runs in. Session utilisation
+        // only climbs within a window, so a HIGH reading stays true until its reset; a LOW one may
+        // cross the water at any instant. Extending it would assert known-and-not-high over
+        // unobserved time — a fabricated calm, which is strictly worse than an honest UNKNOWN.
+        let period = Period::new(0, 7_200);
+        let low = vec![
+            session_dated(0, "a", 0.10, 6_000),
+            session_dated(3_600, "a", 0.10, 9_000),
+        ];
+        let r = aggregate(&low, &[], period, &params()).roster;
+        assert_eq!(
+            r.all_high_covered_secs, 600,
+            "a reading BELOW the water was extended to its session reset — the census is now \
+             claiming to know an account stayed calm across 55 minutes it never observed"
+        );
+        assert_eq!(r.all_high_episodes, 0, "nothing here is high");
+    }
+
+    #[test]
+    fn no_window_extends_past_an_expiry_the_reading_did_not_itself_carry() {
+        // The invariant stated verbatim in the issue. FOUR ways a window could overreach, each
+        // checked against the ONE reading that is supposed to bound it — but NOT four distinct
+        // clamps, and the difference matters to anyone editing `high_windows`:
+        //
+        //   (a) the `map_or(cadence_hi, ..)` default — no expiry carried, so nothing to anchor to
+        //   (b) the `cadence_hi.max(at)` — a past expiry may not SHORTEN the cadence window
+        //   (c) `next`, taking its `map_or(period.end, ..)` default because the reading is the
+        //       group's last
+        //   (d) `next`, taking the following reading's `ts`
+        //
+        // (c) and (d) are therefore ONE expression under two values, not two clamps. The explicit
+        // `.min(period.end)` beside it is redundant — `next` is already bounded by `period.end`
+        // on both branches, since `aggregate_with_roster` admits only samples with
+        // `period.contains(s.ts)` — and deleting it passes this whole suite. It is kept anyway,
+        // because `validity_windows` and `blocked_windows` clamp identically and a lone divergence
+        // reads as a decision; see the mutation catalogue above, which records it as a KNOWN
+        // survivor rather than leaving the next reader to rediscover it as a finding.
+        let period = Period::new(0, 10_000);
+
+        // (a) No carried expiry at all -> the plain cadence horizon, never a borrowed one.
+        let bare = vec![sample(0, "a", 0.90, 0.1), sample(5_000, "a", 0.90, 0.1)];
+        assert_eq!(
+            aggregate(&bare, &[], period, &params())
+                .roster
+                .all_high_covered_secs,
+            600,
+            "a reading with no `session_resets_at` was extended anyway — it has no expiry to \
+             anchor to, so its horizon can only be the cadence"
+        );
+
+        // (b) A reset ALREADY IN THE PAST must not shorten the cadence window either: the anchor
+        // may only ever extend, which is why the implementation takes a `max` rather than
+        // replacing the horizon outright.
+        let stale_reset = vec![session_dated(5_000, "a", 0.90, 1_000)];
+        assert_eq!(
+            aggregate(&stale_reset, &[], period, &params())
+                .roster
+                .all_high_covered_secs,
+            300,
+            "a reset that has already passed changed the window — anchoring is an extension, not \
+             a substitution"
+        );
+
+        // (c) A far-future reset must still yield to the period end — the window the caller asked
+        // about. An anchored `hi` that escaped it would inflate the census's own denominator and
+        // quietly flatter every coverage figure derived from it.
+        let to_period_end = vec![session_dated(0, "a", 0.90, 900_000)];
+        assert_eq!(
+            aggregate(&to_period_end, &[], period, &params())
+                .roster
+                .all_high_covered_secs,
+            10_000,
+            "a 900 000 s reset escaped the 10 000 s period"
+        );
+
+        // (d) …and must yield to the NEXT reading, which is newer evidence about the same account.
+        // Asserted through `all_high_secs` rather than through covered time, because the covered
+        // figure CANNOT see this clamp: both windows are covering either way, so they merge to
+        // `[0, 10000)` whether or not the first one stops at the second reading. Only a
+        // superseding LOW reading separates the two — and only the HIGH total reports it.
+        //
+        // This clamp became load-bearing with issue #1030 and is the one place the anchoring can
+        // fabricate rather than merely over-extend. Before it, `hi = next.min(ts + 300)` and the
+        // 300 s horizon almost always bound first, so `next` was a rarely-binding second clamp;
+        // now `anchored_hi` is routinely hours out and `next` is the only thing holding the
+        // window in. Drop it and the high window swallows the low reading that supersedes it: the
+        // census would report the account at/above the water across 9000 s in which the daemon
+        // OBSERVED IT BELOW — a fabricated hot period, the mirror of the fabricated calm that
+        // REQ-STA-B-008 exists to forbid, and the more dangerous of the two because it invents an
+        // episode rather than hiding one.
+        let superseded = vec![
+            session_dated(0, "a", 0.90, 900_000),
+            session_dated(1_000, "a", 0.10, 900_000),
+        ];
+        let r = aggregate(&superseded, &[], period, &params()).roster;
+        assert_eq!(
+            (r.all_high_secs, r.all_high_episodes),
+            (1_000, 1),
+            "the high window did not stop at the superseding reading (1000). The account was \
+             observed BELOW the water from there on, so every second past it that this census \
+             calls high is invented"
+        );
+        assert_eq!(
+            r.all_high_covered_secs, 1_300,
+            "covered time here is [0,1000) from the high reading — clamped by the reading that \
+             supersedes it, NOT by its 900 000 s reset — plus [1000,1300) from the low one, which \
+             gets the plain cadence horizon because it is low. Not 10 000: the low reading carries \
+             a far-future reset too, and if the census ever runs it out to the period end then \
+             `high` has stopped gating the anchor and case (b) of \
+             `a_low_reading_is_not_anchored_even_when_it_carries_a_session_reset` is next to fall"
+        );
+    }
+
+    #[test]
+    fn anchoring_refines_unknown_without_repealing_it() {
+        // REQ-STA-B-008 is REFINED here, never repealed — the relationship REQ-STA-B-010 already
+        // states for holds. The extension is reachable only FROM a reading that exists, so no
+        // amount of anchoring can make un-sampled time read as covered.
+        let period = Period::new(0, 7_200);
+        let set = roster(&["a", "b"]);
+
+        // A genuinely dead daemon: no samples at all. Still UNKNOWN, not calm.
+        let dead = aggregate_with_roster(&[], &[], period, &params(), Some(&set)).roster;
+        assert_eq!(
+            (dead.all_high_covered_secs, dead.all_high_episodes),
+            (0, 0),
+            "a window with no samples reported covered time — anchoring has started inventing \
+             readings rather than extending them"
+        );
+
+        // One account saturated and dated across the whole window, the other never sampled. The
+        // dated account's own coverage is now total, which is exactly the condition under which a
+        // roster-shaped defect would be easiest to miss: `b` must still empty the intersection.
+        let half = vec![
+            session_dated(0, "a", 0.90, 6_000),
+            session_dated(3_600, "a", 0.90, 9_000),
+        ];
+        let r = aggregate_with_roster(&half, &[], period, &params(), Some(&set)).roster;
+        assert_eq!(
+            (r.all_high_covered_secs, r.all_high_episodes),
+            (0, 0),
+            "`b` was never observed, so no instant had the roster jointly visible. A non-zero \
+             figure here means an absent account is being dropped from the intersection instead \
+             of emptying it"
+        );
+        assert_eq!(
+            aggregate_with_roster(&half, &[], period, &params(), Some(&roster(&["a"])))
+                .roster
+                .all_high_covered_secs,
+            7_200,
+            "positive witness: over a roster of just `a` the same readings ARE fully covered, so \
+             the zero above is `b`'s absence and not a broken anchoring"
+        );
+    }
+
+    #[test]
+    fn anchoring_restores_the_census_on_a_saturated_roster_at_the_real_poll_cadences() {
+        // The magnitude gate, stated at the roster size and the two real cadences where the
+        // blindness bites. Issue #1030 replaces "greater than zero" as the acceptance signal: a
+        // run that lands the anchoring and yields a few seconds of joint coverage has not worked.
+        //
+        // Six accounts, each saturated and carrying its own session expiry, polled hourly against
+        // the 300 s horizon and staggered 600 s apart so their phases are genuinely independent —
+        // the shape in which six 8 % windows share no instant at all.
+        let period = Period::new(0, 86_400);
+        let mut cadence_only = Vec::new();
+        let mut anchored = Vec::new();
+        for (i, handle) in REPLAY_ROSTER.iter().enumerate() {
+            for k in 0..24 {
+                let ts = k * 3_600 + (i as i64) * 600;
+                cadence_only.push(sample(ts, handle, 0.95, 0.10));
+                // Each reading states that its own session window outlives the next poll, which
+                // is what a saturated peer's reading actually says.
+                anchored.push(session_dated(ts, handle, 0.95, ts + 18_000));
+            }
+        }
+        let set = roster(&REPLAY_ROSTER);
+        let blind = aggregate_with_roster(&cadence_only, &[], period, &params(), Some(&set)).roster;
+        let seeing = aggregate_with_roster(&anchored, &[], period, &params(), Some(&set)).roster;
+
+        assert_eq!(
+            (blind.all_high_covered_secs, blind.all_high_episodes),
+            (0, 0),
+            "antecedent: cadence-anchored, this roster must be exactly blind — not merely sparse. \
+             The `0.00 %` in issue #1030 is exact, and if this arm can see, the corpus has stopped \
+             reproducing the condition the fix is for"
+        );
+
+        // The band, not a bare `> 0`. On the live store the same anchoring returned 39.9 % of a
+        // 168 h window; this corpus is denser in high readings, so it sits higher. A figure in the
+        // single digits would mean the anchoring reached the EPISODE fold but not the COVERAGE
+        // one — the specific mis-wiring #1030 warns to check before rebaselining anything.
+        let covered_pct = 100.0 * seeing.all_high_covered_secs as f64 / period.duration() as f64;
+        assert!(
+            covered_pct > 90.0,
+            "joint coverage is {covered_pct:.1} % on a roster that is saturated and dated \
+             throughout, where the readings abut. Anything short of near-total here means the \
+             anchored window is not the one being folded into `cov_acc`"
+        );
+        assert_eq!(
+            (seeing.all_high_episodes, seeing.all_high_secs),
+            (1, 83_400),
+            "the restored census figures moved. The corpus is deterministic (6 accounts x 24 \
+             readings at 3600 s, staggered 600 s, each carrying an 18 000 s session expiry), so \
+             the input did not move and the aggregator did. One unbroken episode spanning [3000, \
+             86400) — it opens when the LAST account's first reading lands, which is the stagger"
+        );
+    }
+
     // --- month-length / DST boundaries (UTC epoch discipline) -----------------
 
     #[test]
@@ -2004,13 +2458,38 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
         let accounts = ["work", "play", "spare"];
         let mut covered_zero_iters = 0_u32;
         let mut covered_positive_iters = 0_u32;
+        // Issue #1030 EXTENSION (not a replacement — the invariant and both witnesses below are
+        // unchanged). The pre-#1030 corpus carried NO resets at all, so every window it produced
+        // was cadence-anchored and the ⊆ relation was only ever tested on the one branch that
+        // cannot break it. Session-expiry anchoring makes a high reading's window OUTLIVE its
+        // cadence horizon, which is exactly the shape that could push `highs` past `covering` if
+        // the two lists were ever computed from different bounds. So the corpus now carries
+        // resets, and the guard below proves it actually reached the anchored branch.
+        let mut anchored_readings = 0_u32;
         for _ in 0..300 {
             let period = Period::new(0, 50_000);
             let n = 1 + rng.below(40);
             let samples: Vec<Sample> = (0..n)
                 .map(|_| {
                     let acct = accounts[rng.below(3) as usize];
-                    sample(rng.below(50_000) as i64, acct, rng.frac(), rng.frac())
+                    let ts = rng.below(50_000) as i64;
+                    let (session, weekly) = (rng.frac(), rng.frac());
+                    // Roughly three readings in four carry a session reset — the order the frozen
+                    // in-repo corpus actually shows (1270 of 1734, 73.2 %), rather than a round
+                    // number. Both resets are drawn so the WEEKLY one is also present and also far
+                    // out: a corpus carrying only the field the census consults could not catch the
+                    // census starting to consult the other.
+                    let carried = rng.below(4) > 0;
+                    let reset = ts + 1_000 + rng.below(20_000) as i64;
+                    if carried && session >= params().high_threshold {
+                        anchored_readings += 1;
+                    }
+                    let s = sample(ts, acct, session, weekly);
+                    if carried {
+                        s.with_resets(Some(reset), Some(reset + 100_000))
+                    } else {
+                        s
+                    }
                 })
                 .collect();
             // Over the FULL three-account roster, so a never-sampled account really can empty
@@ -2049,6 +2528,19 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
         assert!(
             covered_positive_iters > 0,
             "every iteration was unmeasurable — a `return (0, 0, 0)` stub would pass 300/300"
+        );
+        // Degenerate-subject guard for the #1030 extension itself. Every assertion above passes
+        // just as happily over a corpus of un-dated readings — which is precisely the corpus this
+        // test ran on before, and precisely the one that cannot exercise the anchored branch. So
+        // the corpus must be shown to REACH it: a high reading that carries a session reset is the
+        // only input for which `highs` and `covering` are extended past the cadence horizon.
+        assert!(
+            anchored_readings > 0,
+            "no generated reading was both high and reset-carrying in 300 iterations — the \
+             session-expiry-anchored branch is never executed, so this property is being proved \
+             only over cadence-anchored windows. This seed reaches it exactly 945 times; the \
+             expectation is ~920 — 300 iterations x E[n] = 20.5 readings x 0.75 carrying a reset \
+             x P(session >= 0.80) = 0.20"
         );
     }
 
@@ -2725,30 +3217,164 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
     }
 
     #[test]
-    fn on_the_replay_corpus_the_utilisation_census_is_unknown_where_the_capacity_census_measures() {
-        // The shipped blindness, frozen — and stated as the fact it is rather than as a bare
-        // inequality. On this window the two readouts do not merely differ: the cadence-anchored
-        // utilisation census cannot be TAKEN AT ALL (zero jointly-covered seconds, the documented
-        // UNKNOWN sentinel), while the reset-anchored capacity census measures a real drain over
-        // the very same samples. One cannot see; the other can. That asymmetry is the entire
-        // reason issue #803 made capacity its own readout instead of a parameterisation of the
-        // utilisation water.
+    fn on_the_replay_corpus_the_utilisation_census_is_unknown_because_the_drain_was_weekly() {
+        // This corpus still reports UNKNOWN after issue #1030 — and the REASON changed, which is
+        // the whole point of restating the test rather than leaving a passing assertion under a
+        // stale explanation. Through 2026-08-07 the zero here was read as the cadence blindness
+        // #1030 removes. It is not, and it never was: these 48 h are a WEEKLY drain. Four of the
+        // six accounts — `a3`..`a6` — peak at 0.10, 0.03, 0.15 and 0.00 session utilisation, so not
+        // one of them ever reaches the census's own water. `a4`..`a6` get there the obvious way:
+        // weekly-pinned at 0.97-1.00 for every reading they carry, and polled at
+        // `exhausted_poll_secs` throughout. `a3` gets there by a second route worth knowing about —
+        // weekly-pinned at 1.00 and hourly-polled at session 0.00 for the first ~36 h, then its
+        // weekly window resets and it returns to ~100 s polling with its session climbing only to
+        // 0.10. Densely sampled for the second half and still an order of magnitude below the water.
         //
-        // Pinning the UNKNOWN rather than asserting `!=` is the stronger gate in both directions:
-        // it fails if #804's gap honesty is ever repealed into a fabricated calm zero, AND it
-        // fails if the two censuses are conflated onto one predicate. It asserts nothing about
-        // whether either figure is individually right, and touches no existing all-high test.
+        // Session-expiry anchoring cannot help them, deliberately: it extends a reading that is
+        // KNOWN HIGH, because session utilisation only climbs within a window and so a high
+        // reading stays true until its reset. A LOW reading carries no such guarantee — it may
+        // cross the water at any instant — so extending it would assert known-and-not-high over
+        // time nobody observed, which is the fabrication REQ-STA-B-008 forbids and the reason the
+        // globally-widened `stale_after_secs` was rejected. The residual blindness on a
+        // low-and-out-of-rotation peer is therefore a SEPARATE fact from #1030, not a shortfall
+        // of it.
+        //
+        // So the assertion below is pinned to its real cause, and the movement that #1030 DID
+        // produce on this same real corpus is pinned beside it — otherwise this file would carry
+        // no evidence at all that the anchoring reaches live data, only synthetic proof.
         let r = replay_at(300);
         assert_eq!(
             (r.all_high_covered_secs, r.all_high_episodes),
             (0, 0),
-            "the utilisation census reports jointly-covered time on this corpus — either gap \
-             honesty moved, or the two censuses now share one anchoring"
+            "the utilisation census now reports jointly-covered time on this corpus. That is not \
+             automatically wrong, but it cannot be right for the reason #1030 gives: four of these \
+             six accounts never reach the water, so no anchoring of HIGH readings can make the \
+             roster jointly visible. Check whether a LOW reading is being anchored"
         );
         assert!(
             r.capacity_hold_covered_secs > 0 && r.capacity_holds > 0,
             "the capacity census went UNKNOWN alongside the utilisation one, so this window now \
              has no readout at all — which is the state issue #803 exists to prevent"
+        );
+
+        // The stated cause, asserted rather than left as prose: it is what makes the zero above
+        // mean "wrong regime" instead of "#1030 regressed". A future corpus edit that raised these
+        // sessions past the water would otherwise silently turn the assertion above into a real
+        // failure whose message points at the anchoring instead of at the fixture.
+        let samples = replay_samples();
+        let never_high: BTreeSet<&str> = REPLAY_ROSTER
+            .iter()
+            .copied()
+            .filter(|h| {
+                samples
+                    .iter()
+                    .filter(|s| s.acct == *h)
+                    .all(|s| s.session < params().high_threshold)
+            })
+            .collect();
+        assert_eq!(
+            never_high,
+            ["a3", "a4", "a5", "a6"]
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            "the set of accounts that never reach the census water changed — the corpus is frozen \
+             INPUT, so this can only move if the fixture itself was edited, and if it did move the \
+             UNKNOWN above is no longer explained by a weekly-only drain"
+        );
+
+        // #1030's real-data witness. The anchoring cannot rescue the 6-fold intersection here, but
+        // it must still be reaching the coverage fold — and on the two accounts that DO saturate it
+        // demonstrably does. Without this, the only evidence that the anchoring works on anything
+        // but synthetic input would be the absence of a failure.
+        let anchored_gain = |handle: &str| -> (i64, i64) {
+            let group: Vec<&Sample> = samples.iter().filter(|s| s.acct == handle).collect();
+            let period = Period::new(CORPUS_START, CORPUS_END);
+            let (highs, covering) = high_windows(&group, period, 300, params().high_threshold);
+            let plain = merge_intervals(validity_windows(&group, period, 300));
+            let sum = |iv: &[(i64, i64)]| iv.iter().map(|(lo, hi)| hi - lo).sum::<i64>();
+            (sum(&covering) - sum(&plain), sum(&highs))
+        };
+        for handle in ["a1", "a2"] {
+            let (gain, high) = anchored_gain(handle);
+            assert!(
+                gain > 0 && high > 0,
+                "`{handle}` saturates on this corpus, yet anchoring bought it {gain} extra covered \
+                 seconds over {high} s of high time — a non-positive gain means high readings that \
+                 carry `session_resets_at` are not being extended on real data"
+            );
+        }
+    }
+
+    /// The REAL-data half of #1030's magnitude evidence: what the anchoring moves, per account, on
+    /// the frozen corpus. The gate above pins the DIRECTION (`gain > 0` on the two accounts that
+    /// saturate) because a per-account second-count would be a golden on a fixture that must never
+    /// be regenerated; this prints the magnitudes the direction is hiding.
+    ///
+    /// `#[ignore]` — NOT part of the suite, and a companion to
+    /// [`census_joint_coverage_over_the_issues_regime`], which does the same job for the synthetic
+    /// regime:
+    ///   `cargo test -- --ignored --nocapture per_account_anchoring_movement_on_the_replay_corpus`
+    ///
+    /// Run it before quoting a per-account coverage figure for this corpus. It also shows, in one
+    /// table, why the six-fold census still reads UNKNOWN here: `a3`..`a6` move by exactly nothing
+    /// because they never reach the water at all, and `a4`..`a6` sit at ~7.6 % coverage while being
+    /// session-LOW — the population #1097 is about.
+    #[test]
+    #[ignore = "magnitude probe — prints per-account movement; run it when a coverage claim needs a witness"]
+    fn per_account_anchoring_movement_on_the_replay_corpus() {
+        let samples = replay_samples();
+        let period = Period::new(CORPUS_START, CORPUS_END);
+        let span = (CORPUS_END - CORPUS_START) as f64;
+        let sum = |iv: &[(i64, i64)]| iv.iter().map(|(lo, hi)| hi - lo).sum::<i64>();
+
+        println!(
+            "\nfrozen corpus `capacity-replay-corpus.tsv` — {} h, {} accounts, real\n\
+             covered = per-account validity coverage of the window; high = time at/above the \
+             census water\n\n\
+             \x20account   covered (cadence)   covered (anchored)      high (cadence)  \
+             high (anchored)",
+            (CORPUS_END - CORPUS_START) / 3_600,
+            REPLAY_ROSTER.len(),
+        );
+
+        let mut moved = 0_u32;
+        for handle in REPLAY_ROSTER {
+            let group: Vec<&Sample> = samples.iter().filter(|s| s.acct == handle).collect();
+            let stripped: Vec<Sample> = group
+                .iter()
+                .map(|s| Sample::new(s.ts, "claude", &s.acct, s.session, s.weekly))
+                .collect();
+            let cadence_group: Vec<&Sample> = stripped.iter().collect();
+
+            let (anchored_high, anchored_cov) =
+                high_windows(&group, period, 300, params().high_threshold);
+            let (cadence_high, cadence_cov) =
+                high_windows(&cadence_group, period, 300, params().high_threshold);
+            moved += u32::from(sum(&anchored_cov) > sum(&cadence_cov));
+
+            println!(
+                "      {handle}   {:>8} s ({:>4.1} %)   {:>8} s ({:>4.1} %)   {:>10} s   {:>10} s",
+                sum(&cadence_cov),
+                sum(&cadence_cov) as f64 * 100.0 / span,
+                sum(&anchored_cov),
+                sum(&anchored_cov) as f64 * 100.0 / span,
+                sum(&cadence_high),
+                sum(&anchored_high),
+            );
+        }
+
+        // The degenerate-subject guard, and the only assertion here: a table printed off a
+        // truncated or mis-parsed corpus would read as a measurement while witnessing nothing.
+        assert_eq!(
+            samples.len(),
+            data_rows(REPLAY_CORPUS).count(),
+            "the corpus lost rows between parse and print, so the table above is not this fixture"
+        );
+        assert!(
+            moved >= 2,
+            "fewer than two accounts moved under anchoring. The corpus is frozen INPUT, so this \
+             cannot drift — `a1` and `a2` are the two that saturate, and if they stopped moving \
+             the anchoring has stopped reaching real data"
         );
     }
 
@@ -2772,13 +3398,25 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
         out
     }
 
-    /// A [`scaling_corpus`] aggregated over the fixed sweep window, at the default boundary — the
-    /// synthetic twin of [`replay_at`]. The window is 100 000 s, comfortably longer than either
-    /// regime's own span, so every arm is bounded by the coverage being probed rather than by the
-    /// period clipping it.
+    /// A [`scaling_corpus`] aggregated over the sweep's fixed window — the synthetic twin of
+    /// [`replay_at`]. See [`scaling_over`] for the window and roster it is measured over.
     fn scaling_at(n: usize, jitter: i64, cadence: i64, readings: i64) -> RosterStats {
+        scaling_over(&scaling_corpus(n, jitter, cadence, readings), n)
+    }
+
+    /// The aggregation half of [`scaling_at`], over caller-supplied samples: the fixed 100 000 s
+    /// window at the default boundary, over the first `n` handles of `REPLAY_ROSTER`. The window is
+    /// comfortably longer than either regime's own span, so every arm is bounded by the coverage
+    /// being probed rather than by the period clipping it.
+    ///
+    /// Shared rather than repeated so the differential in
+    /// `under_real_poll_sparsity_session_anchoring_is_what_keeps_the_census_measurable` cannot drift
+    /// into comparing its two arms over different windows or rosters. That test's premise is that
+    /// the arms differ ONLY in whether the readings carry their own expiry, and routing both through
+    /// here is what makes the premise structurally true rather than merely conventional.
+    fn scaling_over(samples: &[Sample], n: usize) -> RosterStats {
         aggregate_with_roster(
-            &scaling_corpus(n, jitter, cadence, readings),
+            samples,
             &[],
             Period::new(0, 100_000),
             &hold_params(),
@@ -2852,11 +3490,14 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
                         "the roster grew and FRAGMENTED the hold at {case}"
                     );
 
-                    // The utilisation census is cadence-anchored, so in the UNDER-COVERED regime it
-                    // legitimately goes blind as the roster grows — that is REQ-STA-B-008 gap
-                    // honesty, not a defect, and it is exactly why issue #803 gave capacity its own
-                    // readout. What it must NEVER do is fabricate a calm zero: an unmeasurable
-                    // census has to say so through a zero denominator (issue #804).
+                    // Since issue #1030 the utilisation census is anchored too — to a HIGH reading's
+                    // own `session_resets_at` — and every account in this corpus is high and dated,
+                    // so the UNDER-COVERED regime no longer blinds it and the branch below is not
+                    // expected to be taken at all. It is KEPT rather than deleted because it states
+                    // the one thing that must hold however the anchoring evolves: an unmeasurable
+                    // census must say so through a zero denominator and must never fabricate a calm
+                    // zero (issue #804, REQ-STA-B-008). If it ever fires again, the second assertion
+                    // names the regime that reached it.
                     if r.all_high_covered_secs == 0 {
                         assert_eq!(
                             r.all_high_episodes, 0,
@@ -2881,44 +3522,240 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
         }
     }
 
+    /// [`scaling_at`] over the same corpus with every carried reset STRIPPED — the readings a poll
+    /// records when the provider reports no reset instant. With nothing to anchor to, both censuses
+    /// fall back to the cadence horizon, which is what EVERY reading did before issue #1030.
+    ///
+    /// This is the counterfactual arm of the differential below, and it is deliberately produced by
+    /// changing the INPUT rather than by adding a knob: a `bool` that switches anchoring off would
+    /// be a second code path that only tests run, and a differential across two code paths proves
+    /// nothing about the one that ships.
+    fn undated_scaling_at(n: usize, jitter: i64, cadence: i64, readings: i64) -> RosterStats {
+        let samples: Vec<Sample> = scaling_corpus(n, jitter, cadence, readings)
+            .into_iter()
+            .map(|s| s.with_resets(None, None))
+            .collect();
+        scaling_over(&samples, n)
+    }
+
     #[test]
-    fn under_real_poll_sparsity_a_growing_roster_blinds_the_census_but_not_the_capacity_readout() {
-        // The shipped defect, reproduced synthetically at the roster size and in the sampling
-        // regime where it actually bit — the companion to the frozen live corpus above, and the
-        // single clearest statement of why these are two readouts and not one.
+    fn under_real_poll_sparsity_session_anchoring_is_what_keeps_the_census_measurable() {
+        // Issue #1030's central gate, and the direct successor of the test that stood here through
+        // 2026-08-07. That one PINNED `(0 episodes, 0 covered)` as the expected reading and said in
+        // its own message that measurability here "would mean the regime has changed". #1030
+        // changed the regime deliberately, so this is that change's gate — NOT a figure rebaselined
+        // because it drifted.
         //
-        // Six accounts, every one of them blocked for the whole window, polled at
+        // Six accounts, every one session-saturated for the whole window, polled at
         // `exhausted_poll_secs` (3600) against a `poll_secs` (300) staleness horizon and staggered
-        // 60 s apart as a real sequential poll staggers them. Each account is observable for 300 s
-        // out of every 3600, and the six 300 s windows walk apart until, at the sixth account, they
-        // no longer share a single instant.
+        // 60 s apart as a real sequential poll staggers them. Each cadence-anchored reading is
+        // observable for 300 s out of every 3600, and the six windows walk apart until, at the
+        // sixth account, they no longer share a single instant — the exact structural blindness
+        // #1030 names, at the exact roster size where it bites.
         //
-        // This is the sweep's under-covered / jitter-60 / n=6 arm, and deliberately not only that:
-        // the sweep pins held time RELATIVELY (`first` minus the stagger), which a uniform scaling
-        // of every figure would survive intact. The absolute pin below is what closes that door,
-        // so this is not the sweep restated.
-        let six = scaling_at(6, 60, 3_600, 12);
+        // Stated as a DIFFERENTIAL over one code path rather than as a bare pin. The only
+        // difference between the two arms is whether the readings carry their own session expiry,
+        // so a passing `anchored` arm cannot be explained by anything except the anchoring — and
+        // the `undated` arm keeps proving that the blindness is real and still one field away.
+        let anchored = scaling_at(6, 60, 3_600, 12);
+        let undated = undated_scaling_at(6, 60, 3_600, 12);
 
         assert_eq!(
-            (six.all_high_episodes, six.all_high_covered_secs),
+            (undated.all_high_episodes, undated.all_high_covered_secs),
             (0, 0),
-            "the cadence-anchored utilisation census still has joint visibility here — if this \
-             ever becomes measurable the regime has changed and the comparison below is no longer \
-             the one this test was written to make"
+            "antecedent: without a carried expiry these six saturated accounts must STILL be \
+             jointly invisible. If this arm can see, the corpus has stopped reproducing the \
+             blindness and the differential below no longer isolates the anchoring"
         );
         assert!(
-            six.capacity_hold_covered_secs > 0 && six.capacity_hold_secs_lower_bound > 0,
-            "the RESET-anchored capacity census went blind in the same breath as the utilisation \
-             one — reset-anchoring is the only reason it can see here, and this is the regression \
-             that would resurrect `all-accounts-high: 0 episodes` as the fleet's only answer while \
-             the daemon sits cornered"
+            anchored.all_high_covered_secs > 0 && anchored.all_high_episodes > 0,
+            "the census is blind on a fully-saturated roster — the one condition it exists to \
+             report. The readings carry `session_resets_at` and the undated arm differs only in \
+             that, so the anchoring is not reaching `all_high`'s coverage fold"
         );
         assert_eq!(
-            six.capacity_hold_secs_lower_bound, 82_500,
-            "held time under real poll sparsity moved. This corpus is synthetic and fully \
-             deterministic (6 accounts x 12 readings at 3600 s, staggered 60 s), so the input did \
-             not move and the aggregator did — and the sweep's relative pin is blind to a uniform \
-             rescale, which is exactly why this figure is spelled out here"
+            (
+                anchored.all_high_episodes,
+                anchored.all_high_secs,
+                anchored.all_high_covered_secs
+            ),
+            (1, 82_500, 82_500),
+            "the anchored census figures moved. This corpus is synthetic and fully deterministic \
+             (6 accounts x 12 readings at 3600 s, staggered 60 s, each carrying its own session \
+             expiry), so the input did not move and the aggregator did. Order is (episodes, \
+             all_high_secs, all_high_covered_secs); the two seconds figures coincide because every \
+             account is high across the whole of its own covered span, which is what a saturated \
+             roster means"
+        );
+
+        // The capacity readout is on a SEPARATE anchoring (its own carried expiry for whichever
+        // dimension BLOCKS it, `relief_of`) and #1030 did not touch it. Pinned here so a future
+        // edit to the shared window machinery cannot move it silently — and so the two censuses
+        // stay visibly distinct facts rather than one predicate wearing two names.
+        assert_eq!(
+            (
+                anchored.capacity_hold_secs_lower_bound,
+                undated.capacity_hold_secs_lower_bound
+            ),
+            (82_500, 0),
+            "capacity held time moved. Order is (with resets, resets stripped); the left figure is \
+             the one the pre-#1030 test pinned and #1030 must leave untouched. The right one is \
+             ZERO — strip the carried expiries and the capacity census cannot see this drain at \
+             all, which is the same structural blindness on the same corpus, one requirement over"
+        );
+    }
+
+    // --- #1030 magnitude probe --------------------------------------------------
+
+    /// The regime issue #1030 states its acceptance signal over: a 7-day period, 6 accounts, each
+    /// polled hourly on `exhausted_poll_secs` against the 300 s staleness horizon, with 5 h
+    /// session windows. Stated as constants so the probe below cannot be read as measuring some
+    /// other shape.
+    const REGIME_WEEK: i64 = 604_800;
+    const REGIME_SESSION: i64 = 18_000;
+    const REGIME_POLL: i64 = 3_600;
+    /// Accounts are visited in sequence by one poll, not simultaneously — the same 60 s stagger
+    /// [`scaling_corpus`] uses, and the reason six 300 s cadence windows share no instant.
+    const REGIME_STAGGER: i64 = 60;
+
+    /// One 7-day corpus in that regime, over the whole [`REPLAY_ROSTER`].
+    ///
+    /// `saturation` is the fraction of each session window an account spends at or above the
+    /// census water: it reads high across the window's final `saturation` and low before it. The
+    /// crossing is only ever OBSERVED at the first high poll after it, so the poll grid quantises
+    /// what the census can see — which is the point, not an artefact.
+    ///
+    /// `phase_spread` is the parameter the issue's own figure never states, and the reason this
+    /// probe sweeps two axes rather than one. Account `i`'s session windows are offset by
+    /// `i * phase_spread * REGIME_SESSION / 6`, so `0.0` puts all six on ONE shared 5 h boundary
+    /// and `1.0` spreads them evenly across it. The census is a six-fold INTERSECTION of anchored
+    /// windows, so where the six accounts' windows sit relative to each other dominates the
+    /// answer — a roster that saturates in lockstep is jointly visible for most of each window,
+    /// and the same accounts at the same saturation with staggered windows can be jointly visible
+    /// for almost none of it.
+    ///
+    /// Every reading carries its own `session_resets_at` and no weekly reset, so the corpus cannot
+    /// exercise the weekly field the anchoring deliberately ignores.
+    fn issue_regime_corpus(saturation: f64, phase_spread: f64) -> Vec<Sample> {
+        let mut out = Vec::new();
+        for (i, handle) in REPLAY_ROSTER.iter().enumerate() {
+            let phase = (i as f64 * phase_spread * REGIME_SESSION as f64
+                / REPLAY_ROSTER.len() as f64) as i64;
+            let mut ts = i as i64 * REGIME_STAGGER;
+            while ts < REGIME_WEEK {
+                let pos = (ts - phase).rem_euclid(REGIME_SESSION);
+                let high = pos as f64 >= (1.0 - saturation) * REGIME_SESSION as f64;
+                out.push(
+                    sample(ts, handle, if high { 0.95 } else { 0.10 }, 0.50)
+                        .with_resets(Some(ts - pos + REGIME_SESSION), None),
+                );
+                ts += REGIME_POLL;
+            }
+        }
+        out
+    }
+
+    /// The census over one [`issue_regime_corpus`], as `(session-anchored, cadence-anchored)`.
+    ///
+    /// The cadence arm is the SAME corpus with every carried reset stripped, exactly as
+    /// [`undated_scaling_at`] builds its counterfactual: the difference between the two arms is
+    /// one input field, not a second code path that only the probe runs.
+    fn issue_regime_census(saturation: f64, phase_spread: f64) -> (RosterStats, RosterStats) {
+        let over = |samples: &[Sample]| {
+            aggregate_with_roster(
+                samples,
+                &[],
+                Period::new(0, REGIME_WEEK),
+                &params(),
+                Some(&roster(&REPLAY_ROSTER)),
+            )
+            .roster
+        };
+        let cadence: Vec<Sample> = issue_regime_corpus(saturation, phase_spread)
+            .into_iter()
+            .map(|s| s.with_resets(None, None))
+            .collect();
+        (
+            over(&issue_regime_corpus(saturation, phase_spread)),
+            over(&cadence),
+        )
+    }
+
+    /// The in-repo witness for any MAGNITUDE claim about issue #1030's regime — the acceptance
+    /// signal the issue states as a fraction rather than as a sign.
+    ///
+    /// `#[ignore]` — NOT part of the suite. It PRINTS a sweep and pins only what would make the
+    /// print meaningless; the figures themselves are deliberately not asserted, because a probe
+    /// that pins its own output is a golden, and this exists to be re-run and READ:
+    ///   `cargo test -- --ignored --nocapture census_joint_coverage_over_the_issues_regime`
+    ///
+    /// Run it before quoting a coverage percentage for this regime anywhere, and quote the CELL —
+    /// saturation AND phase spread — rather than the sweep's range. At `phase_spread = 1/3` the
+    /// sweep reads 21.96 % → 60.82 % across saturations 0.60 → 0.90 (36.9 h → 102.2 h of 168 h,
+    /// mean 41.3 %), which is the band #1096's body published. At `phase_spread = 1.0` the SAME
+    /// six accounts at the SAME saturations read 2.96 % → 10.90 %. A magnitude quoted for "six
+    /// saturated accounts, hourly polls, 5 h windows, 7 d" is therefore under-determined by a
+    /// factor of ~7 until the phase spread is stated with it.
+    ///
+    /// What this probe cannot produce is the issue's own 39.9 %. That came from a replay over the
+    /// operator's live `usage-samples.jsonl`, which is not committed and cannot be; the arithmetic
+    /// agreement between it and the `phase_spread = 1/3` column is a synthetic regime landing near
+    /// a real one, NOT a reproduction of it. Issue #1099 records that gap.
+    #[test]
+    #[ignore = "magnitude probe — prints a coverage sweep; run it when a coverage claim needs a witness"]
+    fn census_joint_coverage_over_the_issues_regime() {
+        let pct = |secs: i64| secs as f64 * 100.0 / REGIME_WEEK as f64;
+        println!(
+            "\n#1030 regime: {} accounts · {REGIME_POLL} s polls (staggered {REGIME_STAGGER} s) · \
+             {} s staleness horizon · {REGIME_SESSION} s session windows · {REGIME_WEEK} s period\n\
+             joint census coverage = all_high_covered_secs as % of the period ({} h)\n\n\
+             \x20saturation  phase spread  cadence-anchored  session-anchored   covered h  \
+             high secs  episodes",
+            REPLAY_ROSTER.len(),
+            params().stale_after_secs,
+            REGIME_WEEK / 3_600,
+        );
+
+        let mut cells = 0_u32;
+        let mut anchored_positive = 0_u32;
+        let mut cadence_nonzero = 0_u32;
+        for &saturation in &[0.60_f64, 0.70, 0.80, 0.90] {
+            for &spread in &[0.0_f64, 1.0 / 3.0, 2.0 / 3.0, 1.0] {
+                let (anchored, cadence) = issue_regime_census(saturation, spread);
+                cells += 1;
+                anchored_positive += u32::from(anchored.all_high_covered_secs > 0);
+                cadence_nonzero += u32::from(cadence.all_high_covered_secs > 0);
+                println!(
+                    "       {saturation:.2}          {spread:.2}          {:>7.2} %          \
+                     {:>7.2} %  {:>9.1}  {:>9}  {:>8}",
+                    pct(cadence.all_high_covered_secs),
+                    pct(anchored.all_high_covered_secs),
+                    anchored.all_high_covered_secs as f64 / 3_600.0,
+                    anchored.all_high_secs,
+                    anchored.all_high_episodes,
+                );
+            }
+        }
+
+        // The degenerate-subject guards, and the only assertions here. A sweep that silently ran
+        // fewer cells, or one whose anchored arm is uniformly zero, prints a table that LOOKS like
+        // a measurement and witnesses nothing — which is the exact failure this probe was added to
+        // stop being possible.
+        assert_eq!(
+            cells, 16,
+            "the sweep did not run its full 4x4 grid, so the printed range is not the swept range"
+        );
+        assert!(
+            anchored_positive > 0,
+            "every anchored cell read zero — the corpus is not reaching the coverage fold at all, \
+             so nothing above is a measurement of the anchoring"
+        );
+        assert_eq!(
+            cadence_nonzero, 0,
+            "the cadence-anchored arm saw something in {cadence_nonzero} of {cells} cells. It is \
+             the antecedent: if these six hourly-polled accounts are jointly visible WITHOUT a \
+             carried expiry, this corpus has stopped reproducing #1030's blindness and the \
+             anchored column is no longer attributable to the anchoring"
         );
     }
 
