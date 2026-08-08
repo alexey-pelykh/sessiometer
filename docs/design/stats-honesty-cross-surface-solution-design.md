@@ -197,6 +197,16 @@ to its **own carried expiry** where it carries one, exactly as REQ-STA-B-010 rat
 carries no equivalent guarantee but is in rotation and polled every `poll_secs`, so it was never blind.
 Coverage extends exactly where it was lost.
 
+> ⚠ **The second clause of that rationale is contradicted by the frozen replay corpus — see #1097.**
+> A peer can be session-low *and* polled on the widened exhausted cadence simultaneously, held out
+> of rotation by its **weekly** dimension: `a4`/`a5`/`a6` in `build/fixtures/capacity-replay-corpus.tsv`
+> carry 44 / 44 / 43 readings across 172 800 s at session peaks 0.03 / 0.15 / 0.00 — low **and**
+> ~7.6 % covered. The decision stands on the physics recorded in `high_windows`'s own doc (only a
+> high reading carries a guarantee that survives to its reset); the "never blind" justification for
+> it does not. Whether that class can carry a session guarantee is #1097, and it is the spec
+> author's call. Marked in-band so this section is not read as ratifying the premise, and mirrored
+> at `docs/specs/census-validity-anchoring.feature.md` Rule 3.
+
 **Invariants that must survive**: UNKNOWN is refined, never repealed — a genuinely dead daemon still
 reads UNKNOWN; `all_high_secs ≤ all_high_covered_secs` still holds; no window extends past an expiry
 the reading did not itself carry.

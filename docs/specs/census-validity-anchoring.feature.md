@@ -92,6 +92,20 @@ Scenario: the extension is bounded by the reporting period
 
 ## Rule 3 — the asymmetry is intended, and is stated
 
+> ⚠ **The rationale below is contradicted on this repo's own corpus — see #1097.** The rule stands;
+> its *reason* does not. "The low peer is the one IN rotation, polled at the normal cadence" is not
+> true of the class that dominates `build/fixtures/capacity-replay-corpus.tsv`: `a4`/`a5`/`a6` are
+> session-**low** and polled on the **widened** exhausted cadence at the same time, held out of
+> rotation by their weekly dimension — 44 / 44 / 43 readings across 172 800 s at session peaks of
+> 0.03 / 0.15 / 0.00, about 7.6 % coverage each. So a low peer can be exactly as sparsely polled as
+> a saturated one, and that population is what pins that corpus's census at UNKNOWN.
+>
+> The asymmetry is still right on the physics stated in the code — session utilisation only climbs
+> within a window, so only a high reading carries a guarantee that survives to its reset. Whether
+> the low-and-out-of-rotation class can carry a session guarantee at all is #1097's question, and
+> it is the spec author's call, not the implementer's. Marked here rather than only in #1097 so a
+> reader of this file alone does not take the premise as ratified.
+
 ```gherkin
 Scenario: only readings that carry a guarantee are extended
   Given a low-utilisation account in rotation, polled every poll_secs
