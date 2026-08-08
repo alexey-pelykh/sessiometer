@@ -205,7 +205,8 @@ Coverage extends exactly where it was lost.
 > high reading carries a guarantee that survives to its reset); the "never blind" justification for
 > it does not. Whether that class can carry a session guarantee is #1097, and it is the spec
 > author's call. Marked in-band so this section is not read as ratifying the premise, and mirrored
-> at `docs/specs/census-validity-anchoring.feature.md` Rule 3.
+> at `docs/specs/census-validity-anchoring.feature.md` Rule 3 and
+> `docs/requirements/stats-honesty-cross-surface.md` § R-18.
 
 **Invariants that must survive**: UNKNOWN is refined, never repealed — a genuinely dead daemon still
 reads UNKNOWN; `all_high_secs ≤ all_high_covered_secs` still holds; no window extends past an expiry
