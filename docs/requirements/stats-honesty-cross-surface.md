@@ -317,6 +317,17 @@ stays valid until that instant — the case that is currently blind. A *low* pee
 guarantee, but it is the account in rotation, polled every `poll_secs`, whose cadence coverage was never
 the problem. R-18 therefore extends coverage exactly where coverage is lost, and nowhere else.
 
+> ⚠ **The second clause of that rationale is contradicted by the frozen replay corpus — see #1097.**
+> A peer can be session-low *and* polled on the widened exhausted cadence simultaneously, held out
+> of rotation by its **weekly** dimension: `a4`/`a5`/`a6` in `build/fixtures/capacity-replay-corpus.tsv`
+> carry 44 / 44 / 43 readings across 172 800 s at session peaks 0.03 / 0.15 / 0.00 — low **and**
+> ~7.6 % covered. The decision stands on the physics recorded in `high_windows`'s own doc (only a
+> high reading carries a guarantee that survives to its reset); the "never blind" justification for
+> it does not. Whether that class can carry a session guarantee is #1097, and it is the spec
+> author's call. Marked in-band so this section is not read as ratifying the premise, and mirrored
+> at `docs/design/stats-honesty-cross-surface-solution-design.md` § D-I and
+> `docs/specs/census-validity-anchoring.feature.md` Rule 3.
+
 **R-18 shall not weaken UNKNOWN.** It refines what "covered" means for a reading that carries its own
 validity bound; it **shall not** make a genuinely dead daemon read as covered. REQ-STA-B-008's UNKNOWN
 survives R-18 intact, exactly as REQ-STA-B-010's anchoring *"refines REQ-STA-B-008's UNKNOWN … it does
