@@ -1835,6 +1835,38 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
     }
 
     // --- #1030 session-expiry anchoring of the census -------------------------
+    //
+    // MUTATION CATALOGUE for `high_windows`. Every guard below was verified by MUTATING the
+    // function and re-running the suite, not by inspection — so the claim "these tests gate the
+    // anchoring" is re-runnable rather than asserted. Each row is one edit to `high_windows`; the
+    // named test is the one whose failure names the defect most directly (several rows fail more).
+    //
+    //   drop `.min(period.end)` from `hi` ................ SURVIVES (see below)
+    //   drop the `next` clamp from `hi` .................. no_window_extends..carry, case (d)
+    //   `map_or(cadence_hi, |at| at)` — substitute, not
+    //     extend ......................................... no_window_extends..carry, case (b)
+    //   `map_or(period.end, ..)` — extend a reading that
+    //     carries no expiry .............................. no_window_extends..carry, case (a)
+    //   drop the `if high` gate — anchor low readings
+    //     too ............................................ a_low_reading_is_not_anchored_even_
+    //                                                      when_it_carries_a_session_reset
+    //   `.or(s.weekly_resets_at)` — fall back to the
+    //     weekly field ................................... the_census_never_anchors_to_the_
+    //                                                      weekly_reset
+    //   push the CADENCE window into `covering` while
+    //     `highs` keeps the anchored one (breaks the
+    //     `highs ⊆ covering` relation) ................... prop_all_high_time_never_exceeds_
+    //                                                      the_jointly_covered_time
+    //   drop the `.max(s.ts)` floor from `hi` ............ SURVIVES (see below)
+    //
+    // TWO SURVIVORS, both deliberate and both the same shape: a clamp that cannot currently bind.
+    // `next` is bounded by `period.end` on both of its branches and `cadence_hi >= s.ts` always,
+    // so neither `.min(period.end)` nor `.max(s.ts)` can change `hi` as the function stands. They
+    // are kept because `validity_windows` carries the identical pair — defensive symmetry across
+    // the three window builders is worth more than the two lines, and a lone divergence between
+    // them would read as a decision somebody made. Recorded here so the next reader meets them as
+    // a known property rather than rediscovering them as a finding. They are NOT evidence of a
+    // coverage gap: no behaviour depends on either.
 
     /// A reading carrying ONLY a session reset — the shape the anchoring consults. Deliberately
     /// distinct from [`dated`], which carries both and so cannot tell the two fields apart.
@@ -1924,9 +1956,23 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
 
     #[test]
     fn no_window_extends_past_an_expiry_the_reading_did_not_itself_carry() {
-        // The invariant stated verbatim in the issue. Three ways a window could overreach, each
-        // shut by a different clamp in `high_windows`, and each checked against the ONE reading
-        // that is supposed to bound it.
+        // The invariant stated verbatim in the issue. FOUR ways a window could overreach, each
+        // checked against the ONE reading that is supposed to bound it — but NOT four distinct
+        // clamps, and the difference matters to anyone editing `high_windows`:
+        //
+        //   (a) the `map_or(cadence_hi, ..)` default — no expiry carried, so nothing to anchor to
+        //   (b) the `cadence_hi.max(at)` — a past expiry may not SHORTEN the cadence window
+        //   (c) `next`, taking its `map_or(period.end, ..)` default because the reading is the
+        //       group's last
+        //   (d) `next`, taking the following reading's `ts`
+        //
+        // (c) and (d) are therefore ONE expression under two values, not two clamps. The explicit
+        // `.min(period.end)` beside it is redundant — `next` is already bounded by `period.end`
+        // on both branches, since `aggregate_with_roster` admits only samples with
+        // `period.contains(s.ts)` — and deleting it passes this whole suite. It is kept anyway,
+        // because `validity_windows` and `blocked_windows` clamp identically and a lone divergence
+        // reads as a decision; see the mutation catalogue above, which records it as a KNOWN
+        // survivor rather than leaving the next reader to rediscover it as a finding.
         let period = Period::new(0, 10_000);
 
         // (a) No carried expiry at all -> the plain cadence horizon, never a borrowed one.
@@ -3483,6 +3529,160 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
              the one the pre-#1030 test pinned and #1030 must leave untouched. The right one is \
              ZERO — strip the carried expiries and the capacity census cannot see this drain at \
              all, which is the same structural blindness on the same corpus, one requirement over"
+        );
+    }
+
+    // --- #1030 magnitude probe --------------------------------------------------
+
+    /// The regime issue #1030 states its acceptance signal over: a 7-day period, 6 accounts, each
+    /// polled hourly on `exhausted_poll_secs` against the 300 s staleness horizon, with 5 h
+    /// session windows. Stated as constants so the probe below cannot be read as measuring some
+    /// other shape.
+    const REGIME_WEEK: i64 = 604_800;
+    const REGIME_SESSION: i64 = 18_000;
+    const REGIME_POLL: i64 = 3_600;
+    /// Accounts are visited in sequence by one poll, not simultaneously — the same 60 s stagger
+    /// [`scaling_corpus`] uses, and the reason six 300 s cadence windows share no instant.
+    const REGIME_STAGGER: i64 = 60;
+
+    /// One 7-day corpus in that regime, over the whole [`REPLAY_ROSTER`].
+    ///
+    /// `saturation` is the fraction of each session window an account spends at or above the
+    /// census water: it reads high across the window's final `saturation` and low before it. The
+    /// crossing is only ever OBSERVED at the first high poll after it, so the poll grid quantises
+    /// what the census can see — which is the point, not an artefact.
+    ///
+    /// `phase_spread` is the parameter the issue's own figure never states, and the reason this
+    /// probe sweeps two axes rather than one. Account `i`'s session windows are offset by
+    /// `i * phase_spread * REGIME_SESSION / 6`, so `0.0` puts all six on ONE shared 5 h boundary
+    /// and `1.0` spreads them evenly across it. The census is a six-fold INTERSECTION of anchored
+    /// windows, so where the six accounts' windows sit relative to each other dominates the
+    /// answer — a roster that saturates in lockstep is jointly visible for most of each window,
+    /// and the same accounts at the same saturation with staggered windows can be jointly visible
+    /// for almost none of it.
+    ///
+    /// Every reading carries its own `session_resets_at` and no weekly reset, so the corpus cannot
+    /// exercise the weekly field the anchoring deliberately ignores.
+    fn issue_regime_corpus(saturation: f64, phase_spread: f64) -> Vec<Sample> {
+        let mut out = Vec::new();
+        for (i, handle) in REPLAY_ROSTER.iter().enumerate() {
+            let phase = (i as f64 * phase_spread * REGIME_SESSION as f64
+                / REPLAY_ROSTER.len() as f64) as i64;
+            let mut ts = i as i64 * REGIME_STAGGER;
+            while ts < REGIME_WEEK {
+                let pos = (ts - phase).rem_euclid(REGIME_SESSION);
+                let high = pos as f64 >= (1.0 - saturation) * REGIME_SESSION as f64;
+                out.push(
+                    sample(ts, handle, if high { 0.95 } else { 0.10 }, 0.50)
+                        .with_resets(Some(ts - pos + REGIME_SESSION), None),
+                );
+                ts += REGIME_POLL;
+            }
+        }
+        out
+    }
+
+    /// The census over one [`issue_regime_corpus`], as `(session-anchored, cadence-anchored)`.
+    ///
+    /// The cadence arm is the SAME corpus with every carried reset stripped, exactly as
+    /// [`undated_scaling_at`] builds its counterfactual: the difference between the two arms is
+    /// one input field, not a second code path that only the probe runs.
+    fn issue_regime_census(saturation: f64, phase_spread: f64) -> (RosterStats, RosterStats) {
+        let over = |samples: &[Sample]| {
+            aggregate_with_roster(
+                samples,
+                &[],
+                Period::new(0, REGIME_WEEK),
+                &params(),
+                Some(&roster(&REPLAY_ROSTER)),
+            )
+            .roster
+        };
+        let cadence: Vec<Sample> = issue_regime_corpus(saturation, phase_spread)
+            .into_iter()
+            .map(|s| s.with_resets(None, None))
+            .collect();
+        (
+            over(&issue_regime_corpus(saturation, phase_spread)),
+            over(&cadence),
+        )
+    }
+
+    /// The in-repo witness for any MAGNITUDE claim about issue #1030's regime — the acceptance
+    /// signal the issue states as a fraction rather than as a sign.
+    ///
+    /// `#[ignore]` — NOT part of the suite. It PRINTS a sweep and pins only what would make the
+    /// print meaningless; the figures themselves are deliberately not asserted, because a probe
+    /// that pins its own output is a golden, and this exists to be re-run and READ:
+    ///   `cargo test -- --ignored --nocapture census_joint_coverage_over_the_issues_regime`
+    ///
+    /// Run it before quoting a coverage percentage for this regime anywhere, and quote the CELL —
+    /// saturation AND phase spread — rather than the sweep's range. At `phase_spread = 1/3` the
+    /// sweep reads 21.96 % → 60.82 % across saturations 0.60 → 0.90 (36.9 h → 102.2 h of 168 h,
+    /// mean 41.3 %), which is the band #1096's body published. At `phase_spread = 1.0` the SAME
+    /// six accounts at the SAME saturations read 2.96 % → 10.90 %. A magnitude quoted for "six
+    /// saturated accounts, hourly polls, 5 h windows, 7 d" is therefore under-determined by a
+    /// factor of ~7 until the phase spread is stated with it.
+    ///
+    /// What this probe cannot produce is the issue's own 39.9 %. That came from a replay over the
+    /// operator's live `usage-samples.jsonl`, which is not committed and cannot be; the arithmetic
+    /// agreement between it and the `phase_spread = 1/3` column is a synthetic regime landing near
+    /// a real one, NOT a reproduction of it. Issue #1099 records that gap.
+    #[test]
+    #[ignore = "magnitude probe — prints a coverage sweep; run it when a coverage claim needs a witness"]
+    fn census_joint_coverage_over_the_issues_regime() {
+        let pct = |secs: i64| secs as f64 * 100.0 / REGIME_WEEK as f64;
+        println!(
+            "\n#1030 regime: {} accounts · {REGIME_POLL} s polls (staggered {REGIME_STAGGER} s) · \
+             {} s staleness horizon · {REGIME_SESSION} s session windows · {REGIME_WEEK} s period\n\
+             joint census coverage = all_high_covered_secs as % of the period ({} h)\n\n\
+             \x20saturation  phase spread  cadence-anchored  session-anchored   covered h  \
+             high secs  episodes",
+            REPLAY_ROSTER.len(),
+            params().stale_after_secs,
+            REGIME_WEEK / 3_600,
+        );
+
+        let mut cells = 0_u32;
+        let mut anchored_positive = 0_u32;
+        let mut cadence_nonzero = 0_u32;
+        for &saturation in &[0.60_f64, 0.70, 0.80, 0.90] {
+            for &spread in &[0.0_f64, 1.0 / 3.0, 2.0 / 3.0, 1.0] {
+                let (anchored, cadence) = issue_regime_census(saturation, spread);
+                cells += 1;
+                anchored_positive += u32::from(anchored.all_high_covered_secs > 0);
+                cadence_nonzero += u32::from(cadence.all_high_covered_secs > 0);
+                println!(
+                    "       {saturation:.2}          {spread:.2}          {:>7.2} %          \
+                     {:>7.2} %  {:>9.1}  {:>9}  {:>8}",
+                    pct(cadence.all_high_covered_secs),
+                    pct(anchored.all_high_covered_secs),
+                    anchored.all_high_covered_secs as f64 / 3_600.0,
+                    anchored.all_high_secs,
+                    anchored.all_high_episodes,
+                );
+            }
+        }
+
+        // The degenerate-subject guards, and the only assertions here. A sweep that silently ran
+        // fewer cells, or one whose anchored arm is uniformly zero, prints a table that LOOKS like
+        // a measurement and witnesses nothing — which is the exact failure this probe was added to
+        // stop being possible.
+        assert_eq!(
+            cells, 16,
+            "the sweep did not run its full 4x4 grid, so the printed range is not the swept range"
+        );
+        assert!(
+            anchored_positive > 0,
+            "every anchored cell read zero — the corpus is not reaching the coverage fold at all, \
+             so nothing above is a measurement of the anchoring"
+        );
+        assert_eq!(
+            cadence_nonzero, 0,
+            "the cadence-anchored arm saw something in {cadence_nonzero} of {cells} cells. It is \
+             the antecedent: if these six hourly-polled accounts are jointly visible WITHOUT a \
+             carried expiry, this corpus has stopped reproducing #1030's blindness and the \
+             anchored column is no longer attributable to the anchoring"
         );
     }
 
