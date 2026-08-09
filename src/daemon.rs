@@ -2180,7 +2180,10 @@ where
     ///   or below [`crate::stats::FLEET_RUNWAY_PLAUSIBLE_MAX_SECS`], and re-arms accordingly. The
     ///   recovered regime (head-room refilled at the reset, moderate burn) lands in exactly this
     ///   state, so folding it in with the unknowns would leave the guard permanently set after one
-    ///   crossing and silence every later one.
+    ///   crossing and silence every later one. Since issue #1076 that bound is ALSO the config
+    ///   band's ceiling, so this state settles the question for every threshold an operator can
+    ///   configure — which is what makes the LEAVE edge reachable across the whole band rather
+    ///   than only its lower part.
     /// - **Edge-triggered.** A KNOWN runway below the line emits `fleet_runway_low` exactly ONCE
     ///   on the downward crossing (held silent while it stays below); a runway demonstrably back
     ///   at/over the line emits the [`Event::FleetRunwayRecovered`] LEAVE marker once and
@@ -2220,17 +2223,26 @@ where
         // more, so it settles the question only for a threshold at or under that window — above it
         // the reading answers nothing and must hold, like any unknown.
         //
-        // KNOWN LIMITATION, tracked as issue #1076 — a threshold ABOVE one weekly window is now
-        // unserviceable, and this match is where that surfaces. `fleet_runway_warn_secs` validates
-        // to `60..=2_592_000` (30 d), but `Known` is capped at the window by the plausibility bound,
-        // so for a threshold in `604_801..=2_592_000` the `Known` arm is unsatisfiable, and
-        // `BeyondWeeklyWindow` cannot establish it either: the alarm fires on the first measurable
-        // reading and never clears. Deliberately NOT papered over by treating
-        // `BeyondWeeklyWindow` as recovery for every threshold — that would assert the pool outlasts
-        // 20 days on evidence that only establishes one week, which is the same fabrication this
-        // whole issue exists to remove. Reconciling the config band with the bound is a product
-        // decision (narrow the band, or re-base the warning on something the model can still rank),
-        // so it is tracked rather than settled here.
+        // The comparison is retained even though `fleet_runway_warn_secs` now validates to
+        // `60..=FLEET_RUNWAY_PLAUSIBLE_MAX_SECS` (issue #1076), which makes it hold for every
+        // CONFIGURABLE threshold. It is the local guarantee, not a redundant one: this helper takes
+        // its threshold from a field, and a threshold that reached here WITHOUT crossing
+        // `Config::validate` — a directly-constructed daemon, a future caller — must still be
+        // unable to fabricate a recovery. Read it as "answer only what this state settles",
+        // enforced here regardless of who supplied the number.
+        //
+        // What #1076 fixed was the CONTRADICTION above this line, not the line itself. The band ran
+        // to 2_592_000 (30 d) while `Known` is capped at the window, so a threshold in
+        // `604_801..=2_592_000` had NO reading that could reach it: `Known` was unsatisfiable by
+        // construction and `BeyondWeeklyWindow` correctly declined, so the alarm fired on the first
+        // measurable reading and `Event::FleetRunwayRecovered` was unreachable. The fix narrowed
+        // the config band to the bound (deriving one from the other, so they cannot drift apart
+        // again) rather than widening this arm to recover on any threshold — widening would assert
+        // the pool outlasts 20 days on evidence that only establishes one week, the same
+        // fabrication issue #1028 exists to remove. That was a product call on a validated config
+        // surface: it costs an operator any warn line beyond a week, and buys back an alarm that
+        // can close. `fleet_runway_warn_band_is_serviceable_at_every_configurable_threshold`
+        // pins the resulting invariant.
         let at_or_above_line = match fleet.state {
             FleetRunwayState::Known(secs) => secs >= threshold_secs,
             FleetRunwayState::BeyondWeeklyWindow => {
@@ -13333,13 +13345,19 @@ mod tests {
         // The other side of the same boundary: a threshold ABOVE one weekly window cannot be
         // answered by "the pool outlasts a week" — a 10-day pool is below a 20-day line, and the
         // reading is not precise enough to say. So it HOLDS rather than fabricating a recovery.
-        // Threshold 1_728_000 s = 20 days, inside the config band (60..=2_592_000).
         //
-        // This pins the NON-fabrication, NOT that the resulting behaviour is desirable. Because
-        // `Known` is capped at the window, no reading can clear a threshold above it, so such a
-        // threshold latches the alarm on permanently — the KNOWN LIMITATION tracked as issue #1076
-        // (see `check_fleet_runway_warn`). Read this test as "it does not lie", not as "this band
-        // works"; when #1076 reconciles the config band with the bound, this test should change.
+        // Threshold 1_728_000 s = 20 days, which `Config::validate` now REFUSES (issue #1076
+        // narrowed the band to `60..=FLEET_RUNWAY_PLAUSIBLE_MAX_SECS`). That is deliberate, and it
+        // is what this test is now for: it constructs the daemon directly, so the threshold reaches
+        // the helper WITHOUT crossing validation, and pins that the helper does not lie even then.
+        // Two independent layers, and this is the inner one — the config band keeps an operator
+        // from ever reaching this state, and the helper stays honest if anything else does.
+        //
+        // Read it as "it does not lie", never as "this threshold works": permanently holding the
+        // guard is exactly the latch #1076 removed, and the removal is the BAND's doing, not this
+        // arm's. The companion
+        // `fleet_runway_warn_band_is_serviceable_at_every_configurable_threshold` pins the other
+        // layer — that inside the band, the LEAVE edge is always reachable.
         let (probe, _calls) = scripted_fleet_probe(vec![
             known_runway(600_000), // below a 20-day line → fires
             figureless_runway(FleetRunwayState::BeyondWeeklyWindow), // cannot answer → HOLD
@@ -13364,6 +13382,86 @@ mod tests {
     }
 
     #[test]
+    fn fleet_runway_warn_band_is_serviceable_at_every_configurable_threshold() {
+        // Issue #1076, the invariant the narrowed band buys: for EVERY threshold `Config::validate`
+        // admits, the alarm can both fire and CLEAR. Before the narrowing that held only up to the
+        // plausibility bound, while the band ran to 2_592_000 (30 d) — so a threshold above the
+        // bound fired on its first measurable reading and then had no reading that could clear it:
+        // `Known` is capped at the bound (unsatisfiable), and `BeyondWeeklyWindow` establishes one
+        // week and correctly declines to claim more. `Event::FleetRunwayRecovered` was unreachable
+        // and the operator kept a lit warning with no closing edge in the durable log.
+        //
+        // The candidates are NOT a hand-picked list of thresholds known to work — that would pass
+        // just as happily against the broken band, since every value at or below the bound always
+        // worked. They are a ladder spanning WELL PAST the bound, each offered to the REAL
+        // validation gate, and every one the gate ACCEPTS is then required to clear. So the
+        // property under test is the two layers agreeing — "whatever config admits, the helper can
+        // close" — rather than a restatement of the fix. Run against the pre-#1076 band this FAILS
+        // at 1_728_000 and 2_592_000, which is the point: re-widen the band and this test reports
+        // it, on the threshold that actually broke, without needing to be updated.
+        let ladder = [
+            60u64,     // the floor
+            3_600,     // an hour of lead time
+            86_400,    // one day, the config doc's own example
+            604_800,   // one weekly window: the bound, and the ceiling since #1076
+            604_801,   // the first second past it
+            1_728_000, // 20 d, the issue's worked example
+            2_592_000, // 30 d, the OLD ceiling
+        ];
+        let mut serviced = 0;
+        for threshold in ladder {
+            // A load through the REAL validation gate. A REJECTED threshold is not a failure — it
+            // is config doing its half, and the daemon is never asked about it.
+            let loaded = Config::from_toml_str(&format!(
+                "[tunables]\nfleet_runway_warn_secs = {threshold}\n\
+                 [[account]]\naccount_uuid = \"u-A\"\nlabel = \"work\"\n"
+            ));
+            if loaded.is_err() {
+                continue;
+            }
+            serviced += 1;
+
+            let (probe, _calls) = scripted_fleet_probe(vec![
+                // Strictly below the line → the FIRE edge is reachable at this threshold.
+                known_runway(threshold as i64 - 1),
+                // The recovered regime: head-room refilled at the reset, burn slow enough that the
+                // pool outlasts a week. This is the reading that had no answer above the bound.
+                figureless_runway(FleetRunwayState::BeyondWeeklyWindow),
+            ]);
+            let mut daemon = probed_runway_daemon(threshold);
+            daemon.fleet_runway_probe = Some(probe);
+
+            let mut events = vec![];
+            daemon.check_fleet_runway_warn(RUNWAY_T0, &mut events);
+            assert!(
+                daemon.state.signaled_fleet_runway_low,
+                "threshold {threshold}: the crossing must fire",
+            );
+
+            events.clear();
+            daemon.check_fleet_runway_warn(RUNWAY_T0 + FLEET_RUNWAY_WARN_CHECK_SECS, &mut events);
+            assert_eq!(
+                events,
+                vec![Event::FleetRunwayRecovered],
+                "threshold {threshold}: the LEAVE edge must reach the durable log",
+            );
+            assert!(
+                !daemon.state.signaled_fleet_runway_low,
+                "threshold {threshold}: the guard must re-arm, so a later crossing fires afresh",
+            );
+        }
+        // A validator that rejected the whole ladder would satisfy every assertion above by
+        // evaluating nothing, so the count is asserted rather than assumed. Four of the seven rungs
+        // are inside the band at the bound this file was written against.
+        assert_eq!(
+            serviced,
+            4,
+            "the ladder must exercise the band, not skip past it — {serviced} of {} rungs loaded",
+            ladder.len(),
+        );
+    }
+
+    #[test]
     fn fleet_runway_warn_never_fires_on_a_reading_that_states_no_figure() {
         // The `FleetRunwayLow` payload carries a `runway_secs` figure, so a state that refuses to
         // state one must never raise the alarm — the asymmetry that keeps issue #1028's saturated
@@ -13375,7 +13473,9 @@ mod tests {
             FleetRunwayState::BeyondWeeklyWindow,
         ] {
             let (probe, _calls) = scripted_fleet_probe(vec![figureless_runway(state)]);
-            let mut daemon = probed_runway_daemon(2_592_000); // 30 d, the band maximum
+            // The band maximum, spelled as the constant rather than a literal so it tracks the
+            // bound the config band is derived from (issue #1076).
+            let mut daemon = probed_runway_daemon(FLEET_RUNWAY_PLAUSIBLE_MAX_SECS as u64);
             daemon.fleet_runway_probe = Some(probe);
             let mut events = vec![];
             daemon.check_fleet_runway_warn(RUNWAY_T0, &mut events);
