@@ -243,25 +243,32 @@ lossy numeric conversion.
 **R-5** — *Where* the fleet runway is computed from a proper subset of the roster, every surface
 reporting it **shall** state the counted set.
 `Origin: enrichment-expanded (F3).` `Traces to: counted/observed are already carried on the wire
-("counted":2,"observed":6).` **Already satisfied on the CLI** — `fleet_line` prints
-`({counted} of {observed} counted)` alongside the figure (`stats.rs:1735`). The open surface is the
-panel (R-17). `Ratification: user-ratified (scope membership 2026-08-04)`
+("counted":2,"observed":6).` **Already satisfied on the CLI** — `render_summary` prints
+`({counted} of {observed} counted)` alongside the figure. The open surface is the panel (R-17).
+*(Sibling docs call the CLI render `fleet_line`, a name that has never been a Rust item; tracked as
+#1105.)* `Ratification: user-ratified (scope membership 2026-08-04)`
 
 **R-20** — Every roster-block fact **shall** be printed in every state, on every surface that reports
 it. A fact whose value is UNKNOWN **shall not** be rendered by omitting its line.
 `Origin: user-stated 2026-08-04` ("for CLI this line needs to be printed").
 **This is the generalisation of R-3's stated-not-omitted clause to the whole roster block**, and it is
-load-bearing *because* of the other fixes: `fleet_line` currently emits the runway only under
-`if let Some(FleetRunway { runway_secs: Some(secs), .. })` (`stats.rs:1729`, doc: *"Rendered ONLY when
-the pool has a finite runway"*), so R-3's meaningful-rate floor would make the line **disappear more
-often** — the corrective work would make the surface quieter rather than more honest, which is
-premortem P2 exactly. `Ratification: n/a (operator-stated)`
+load-bearing *because* of the other fixes: `render_summary` then emitted the runway line only when the
+figure was finite, so R-3's meaningful-rate floor would have made the line **disappear more often** —
+the corrective work would have made the surface quieter rather than more honest, which is premortem P2
+exactly. **Since delivered on the CLI (issue #1028)**: `render_summary` no longer gates on a finite
+figure, and `fleet_runway_phrase` returns a stated unknown for every runway state that is not a known
+figure, so the line is printed in every state of a counted fleet.
+`Ratification: n/a (operator-stated)`
 
 **R-21** — User-facing stat strings **shall not** carry implementation vocabulary. The census's
 denominator **shall** be stated as the reader-meaningful condition it represents — that the census
 could observe the whole roster at one moment — not as the field name `covered`.
-`Origin: user-stated 2026-08-04` ("0 covered — covered WHAT?"). Applies to **both** surfaces: the CLI
-renders `, {n}% covered` today (`stats.rs:1453`), which has the same defect. `Ratification: n/a (operator-stated)`
+`Origin: user-stated 2026-08-04` ("0 covered — covered WHAT?"). Applies to **both** surfaces: the
+CLI's `roster_line` then rendered `, {n}% covered`, which had the same defect. **Since delivered on
+both surfaces (issue #1029)**: `roster_line` renders `, all in view {n}% of the window` and a test
+asserts the annotation no longer contains `% covered`; the panel's `StatusPanelFormat` renders the
+same phrasing, and reports a census that could never observe the whole roster as not measurable
+rather than as nought. `Ratification: n/a (operator-stated)`
 
 **R-6** — *When* the counted subset excludes every account at or near its weekly ceiling, the system
 **shall not** report a runway figure.
@@ -592,10 +599,19 @@ correct or says it does not know.* Nothing in between.
 
 ## 7. State Matrix — measurement × precondition × surface
 
+**A snapshot, not a live view.** The CLI and Panel columns below record what each surface did **at
+authoring, 2026-08-04**; work since has overtaken parts of **both** columns — row 3's Panel cell, for
+one, is the reading issue #1029 was filed to end. Where this table and a requirement block above
+disagree, the requirement block is authoritative. Only R-20 and R-21 carry delivery notes, though, so
+a row whose authoritative block is some other requirement — row 3's Required cell routes to R-1 and
+R-8 — is not disambiguated by that rule and has to be checked against the code. The rows are kept as authored
+because the requirements were derived from them; re-auditing them against current code is tracked as
+#1105.
+
 Panel column: **✗** = renders a confident value it should not, **∅** = metric absent entirely.
 Every ∅ below is now in scope to close — capacity holds via R-9, the runway via **R-17**.
 
-| # | Measurement | Precondition state | CLI today | Panel today | Required (both surfaces) |
+| # | Measurement | Precondition state | CLI at authoring | Panel at authoring | Required (both surfaces) |
 |---|---|---|---|---|---|
 | 1 | all-accounts-high | fully covered | `N episodes (Xh)` | `N episodes (Xh)` | ✅ unchanged |
 | 2 | all-accounts-high | partially covered | `N episodes (Xh, 64% covered)` | `N episodes (Xh)` — share dropped **✗** | state the share (R-2) |
@@ -609,7 +625,7 @@ Every ∅ below is now in scope to close — capacity holds via R-9, the runway 
 | 10 | fleet runway | rate exactly `0.0` | line silently omitted **✗** | **∅** | UNKNOWN, **stated** not omitted (R-3, R-17) |
 | 11 | fleet runway | quotient exceeds `i64::MAX` | **`i64::MAX` ✗** | **∅** | UNKNOWN + fault recorded (R-4, R-15, R-17) |
 
-Row 10 is the subtle one: the current guard *works* at exactly zero and the line vanishes. Silent
+Row 10 is the subtle one: the guard then *worked* at exactly zero and the line vanished. Silent
 absence is the same misinformation in a quieter register — the operator reads "no problem".
 
 ## 8. Assumption Registry
@@ -712,8 +728,8 @@ arose.
 | R-17 | Operator scope amendment 2026-08-04, from the orphaned `fleetRunwayWarnSecs` tunable (`SettingsModel.swift:48`, `ConfigWire.swift:45`) vs. `design-stats.md:115` roster-block composition | user-stated |
 | R-18 | Second operator scope amendment 2026-08-04. Mechanism: `config.rs` `DEFAULT_EXHAUSTED_POLL_SECS = 3600` vs `AggregateParams::new` (`stale_after_secs` = `poll_secs` = 300) vs `usage_stats.rs` `validity_windows()` (`hi = next.min(s.ts + stale_after)`). Precedent: `blocked_windows()` `anchored_hi = cadence_hi.max(relief_at)`, ratified by REQ-STA-B-010 | code forensics + user-stated |
 | R-19 | Necessary companion to R-18 — REQ-STA-B-010 carries the anchoring rule at requirement level for capacity holds; the symmetric census change belongs at the same level | enrichment-expanded |
-| R-20 | Operator, 2026-08-04: *"for CLI this line needs to be printed."* Verified against `stats.rs:1729` — `fleet_line` emits the runway only under `runway_secs: Some(_)` | user-stated |
-| R-21 | Operator, 2026-08-04: *"0 covered — covered WHAT?"* Verified against `stats.rs:1453` (CLI renders `, {n}% covered`) and the proposed panel copy | user-stated |
+| R-20 | Operator, 2026-08-04: *"for CLI this line needs to be printed."* Verified against `render_summary`, which then emitted the runway line only when the figure was finite (since delivered — issue #1028) | user-stated |
+| R-21 | Operator, 2026-08-04: *"0 covered — covered WHAT?"* Verified against `roster_line`, which then rendered `, {n}% covered` (since delivered — issue #1029), and the proposed panel copy | user-stated |
 | All | Live captures 2026-08-03: `all_high_covered_secs: 0`; `fleet: {runway_secs: 9223372036854775807, counted: 2, observed: 6}`; `capacity_holds: 6, capacity_hold_covered_secs: 386747` | self-verifying (A) |
 
 **Verified-not-assumed** (each checked at `cb3eaca`, not carried from memory):
