@@ -1907,23 +1907,45 @@ fn render_summary(report: &Report) -> String {
     // The two unknowns are worded as the reader-meaningful condition each represents, not as the
     // internal cause (R-21 — no implementation vocabulary on a user-facing stat string), and both
     // stay descriptive of what WAS measured, with no forecast verb (REQ-STA-B-006 / REQ-STA-SUR-001).
-    if let Some(FleetRunway {
-        state,
-        counted,
-        observed,
-    }) = fleet_runway(report)
-    {
-        lines.push(format!(
-            "  accounts last {} ({counted} of {observed} counted)",
-            fleet_runway_phrase(state)
-        ));
+    if let Some(fleet) = fleet_runway(report) {
+        lines.push(format!("  {}", fleet_runway_line(fleet)));
     }
 
     lines.join("\n")
 }
 
+/// The fleet runway's whole line for the roster band: the `accounts last:` label, the clause
+/// [`fleet_runway_phrase`] states for the runway's state, and the `n of m` cardinality.
+///
+/// The label takes a COLON (issue #1082) because the clause after it is a figure in only one of
+/// four states. Without one, `last` is a verb reaching for a duration, and the three refusing states
+/// render `accounts last unknown …` — a sentence whose object never arrives, and which parses only
+/// for a reader who already knows the figure-bearing shape it stands in for. The colon demotes the
+/// label to what the facts around it already are — `lowest utilisation: …` directly above in this
+/// band, and the roster line's `capacity holds …: …` cell, which keeps the label form in its
+/// degraded state (`capacity holds: —`) as well as in its measured one — so a stated unknown reads
+/// as the value of a named fact rather than as a truncation. The label is state-INDEPENDENT for the
+/// same reason: one line rendering as a sentence in one state and as a label in another asks the
+/// reader to decide whether the two are even the same fact.
+///
+/// Split out from the render for the reason [`fleet_runway_phrase`] was: the frame is what was
+/// mis-worded, and a frame reachable only through a whole [`Report`] cannot be checked against the
+/// state ([`FleetRunwayState::Unmeasurable`]) no WELL-FORMED report produces.
+fn fleet_runway_line(fleet: FleetRunway) -> String {
+    let FleetRunway {
+        state,
+        counted,
+        observed,
+    } = fleet;
+    format!(
+        "accounts last: {} ({counted} of {observed} counted)",
+        fleet_runway_phrase(state)
+    )
+}
+
 /// The fleet runway's clause for the roster band — the figure, or the STATED unknown that stands in
-/// for it (issue #1028). The caller wraps it with `accounts last …` and the `n of m` cardinality.
+/// for it (issue #1028). [`fleet_runway_line`] wraps it with the `accounts last:` label and the
+/// `n of m` cardinality.
 ///
 /// Split out from the render so every arm is reachable from a test. The unknown arms are otherwise
 /// gated behind constructing a whole [`Report`] whose pooled arithmetic lands in each state, and one
@@ -6568,7 +6590,7 @@ mod tests {
         // aggregate fleet line (§D-STA-5 — weekly per-account is not a per-row cell), on day scale.
         assert!(text.contains("~2h"), "session head-room cell: {text}");
         assert!(
-            text.contains("accounts last ~2 days at the current combined rate"),
+            text.contains("accounts last: ~2 days at the current combined rate"),
             "weekly head-room on the fleet line: {text}"
         );
         assert_eq!(scan_banned(&text), None, "the days render is neutral");
@@ -6795,7 +6817,7 @@ mod tests {
         // cardinality (§D-STA-5 — an aggregate line, 2-space indented, no per-account `fleet` prefix).
         let text = render_text(&report, None);
         assert!(
-            text.contains("  accounts last ~2 days at the current combined rate (2 of 3 counted)"),
+            text.contains("  accounts last: ~2 days at the current combined rate (2 of 3 counted)"),
             "fleet line: {text}"
         );
         assert_eq!(
@@ -6900,7 +6922,7 @@ mod tests {
         let flat_text = render_text(&flat, None);
         assert!(
             flat_text
-                .contains("accounts last unknown — no combined usage measured (2 of 2 counted)"),
+                .contains("accounts last: unknown — no combined usage measured (2 of 2 counted)"),
             "a flat fleet STATES its unknown rather than omitting the line: {flat_text}"
         );
         assert_eq!(
@@ -7143,6 +7165,74 @@ mod tests {
     }
 
     #[test]
+    fn the_fleet_runway_line_labels_its_value_so_a_stated_unknown_still_parses() {
+        // Issue #1082. The frame was `accounts last {phrase}` — a sentence whose verb reaches for a
+        // duration, which only ONE of the four states supplies. The other three rendered
+        // `accounts last unknown — …`: an object that never arrives, parseable only by a reader who
+        // already knows the figure-bearing shape it stands in for. Asserted on the LINE rather than
+        // the phrase, and over all four states, because the FRAME is what was mis-worded and
+        // `Unmeasurable` reaches no render through a WELL-FORMED `Report`.
+        let lines = [
+            FleetRunwayState::Known(300_000),
+            FleetRunwayState::Flat,
+            FleetRunwayState::BeyondWeeklyWindow,
+            FleetRunwayState::Unmeasurable,
+        ]
+        .map(|state| {
+            (
+                state,
+                fleet_runway_line(FleetRunway {
+                    state,
+                    counted: 2,
+                    observed: 3,
+                }),
+            )
+        });
+
+        for (state, line) in &lines {
+            // A LABEL, not a verb: what precedes the first `: ` names the fact and what follows is
+            // its value, whatever that value turns out to be. A bare-verb frame affords no such
+            // split, so this fails on the shape rather than on the copy.
+            let (label, value) = line
+                .split_once(": ")
+                .unwrap_or_else(|| panic!("{state:?} states a labelled value: {line}"));
+            assert_eq!(
+                label, "accounts last",
+                "{state:?} labels the same fact — the frame does not move with the state: {line}"
+            );
+            assert!(
+                value.starts_with(&fleet_runway_phrase(*state)),
+                "{state:?} states its own clause as that value: {line}"
+            );
+            assert!(
+                !line.contains("accounts last unknown"),
+                "{state:?} leaves the verb reaching for an object that never comes: {line}"
+            );
+            assert!(
+                line.ends_with("(2 of 3 counted)"),
+                "{state:?} keeps its cardinality (R-5): {line}"
+            );
+            assert_eq!(scan_banned(line), None, "{state:?} stays neutral: {line}");
+        }
+
+        // The distinctions the line exists to carry survive the label — a figure only where one was
+        // measured, and three unknowns still telling themselves apart from it and from each other.
+        assert!(
+            lines[0].1.contains('~') && !lines[0].1.contains("unknown"),
+            "a plausible runway still states its figure: {}",
+            lines[0].1
+        );
+        for (state, line) in &lines[1..] {
+            assert!(
+                line.starts_with("accounts last: unknown — "),
+                "{state:?} states the unknown AS the labelled value: {line}"
+            );
+        }
+        let distinct: std::collections::HashSet<_> = lines.iter().map(|(_, l)| l).collect();
+        assert_eq!(distinct.len(), 4, "each state renders its own line");
+    }
+
+    #[test]
     fn fleet_runway_figure_is_derived_from_the_state_so_the_two_cannot_disagree() {
         // `runway_secs()` is a projection, not a stored twin — the property that makes a fixture
         // pairing "a figure" with "there is no figure" unrepresentable.
@@ -7202,7 +7292,7 @@ mod tests {
         let text = render_text(&creeping, None);
         assert!(
             text.contains(
-                "accounts last unknown — more than a week at the current combined rate \
+                "accounts last: unknown — more than a week at the current combined rate \
                  (2 of 2 counted)"
             ),
             "the out-of-window unknown is stated with its cardinality: {text}"

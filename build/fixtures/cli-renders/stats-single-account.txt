@@ -13,5 +13,5 @@ session distribution — mean · p95 · peak
 alpha  ┤────────────────────────m────────────P─x├  62% · 94% · 99%
 
   lowest utilisation: alpha (session mean 62%)
-  accounts last ~1 day at the current combined rate (1 of 1 counted)
+  accounts last: ~1 day at the current combined rate (1 of 1 counted)
 roster: 4 swaps (2 session, 1 weekly, 1 manual, 0 forced, 0 emergency) · all-accounts-high (≥95%): 0 episodes (0s) · capacity holds: —
