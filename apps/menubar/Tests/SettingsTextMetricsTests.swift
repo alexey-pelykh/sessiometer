@@ -37,7 +37,12 @@
 //     (`TextMetrics`), over the same text styles the views declare — a model of the layout, not an
 //     observation of the live view tree;
 //   * that each string is rendered at the site it belongs to. A constant asserted here and then wired
-//     to the wrong control would pass. The tree walk that would catch that is issue #840;
+//     to the wrong control would pass. The tree walk that would catch that is issue #840. ONE site is
+//     now narrower than that: the `.failed` apply-status label's own modifier chain is read out of
+//     `SettingsView.swift` AS DATA (issue #844, § AC-2 cont.), the route `PanelReachabilityLintTests`
+//     established for a source file this bundle deliberately does not compile. That proves the clamp
+//     and its `.help` recovery are WRITTEN there with the shared constants as their arguments — never
+//     that SwiftUI honours them, which stays #840's;
 //   * that the copy is GOOD. It is inferred product copy on a surface with no ratified design
 //     reference (issue #763) — this gate checks it exists and is distinct, never that it is right.
 //
@@ -50,15 +55,21 @@
 //
 // THREE MEASURED FACTS THAT CONTRADICT THIS ITEM'S OWN PREMISES, recorded rather than quietly rounded:
 //
-//   1. Issue #762 AC-2 calls the `.failed` arm of `SettingsView`'s `applyStatus` (`SettingsView.swift:294`
-//      as the issue cites it) a hazard where "the inline label truncates". It does NOT truncate — there is
-//      no `.lineLimit` and no `.truncationMode` on that `Label`, so it WRAPS, in a window whose style mask
-//      carries no `.resizable`. The code comment on that arm said "truncates" too; both were wrong about
-//      the mechanism, and the mechanism is what decides whether the hover tooltip is a sufficient
-//      mitigation (for truncation it is; for unbounded wrap it is not, because the wrap consumes the form
-//      above it). Gated at the MEASURED behaviour, and the overflow itself is filed as issue #844 rather
-//      than fixed here — this umbrella's standing rule is that a measurement item reports overflows and
-//      does not fix them (the issue #781 precedent).
+//   1. Issue #762 AC-2 called the `.failed` arm of `SettingsView`'s `applyStatus` a hazard where "the
+//      inline label truncates". It did NOT truncate — there was no `.lineLimit` and no `.truncationMode`
+//      on that `Label`, so it WRAPPED, in a window whose style mask carries no `.resizable`. The code
+//      comment on that arm said "truncates" too; both were wrong about the mechanism, and the mechanism is
+//      what decides whether the hover tooltip is a sufficient mitigation (for truncation it is; for
+//      unbounded wrap it is not, because the wrap consumes the form above it). Gated at the MEASURED
+//      behaviour, and the overflow itself was filed as issue #844 rather than fixed there — this
+//      umbrella's standing rule is that a measurement item reports overflows and does not fix them (the
+//      issue #781 precedent).
+//
+//      ISSUE #844 HAS SINCE LANDED, so the mechanism is now truncation for real: the label carries
+//      `.lineLimit(SettingsFormat.applyStatusLineLimit)` + `.truncationMode(.tail)`, and this file's AC-2
+//      section switched to the truncation predicate exactly as the old assertion's own failure message
+//      instructed. The `.rejected` arm four lines above it still wraps — that is issue #944, deliberately
+//      untouched, and the chain lint below is scoped so the two cannot cover for each other.
 //
 //   2. The hazard is much larger than "can be long". The issue #628 `detail` this arm interpolates is
 //      serde's own `deny_unknown_fields` message, which names EVERY expected tunable — so the string that
@@ -83,7 +94,7 @@
 //   | 3 | The `LabeledContent` title/value column split                   | a `Form` decision with no frame     | issue #763 (no ratified reference) |
 //   | 4 | Rendered pixels of the form                                     | no design reference exists yet      | issue #763 |
 //   | 5 | Dynamic Type behaviour of the two fixed cells                   | pinned below as a defect, not fixed | issue #845 |
-//   | 6 | `ProgressView` spin, focus ring, `.help` hover tooltip          | runtime, not an attribute           | manual — `design/README.md` |
+//   | 6 | `ProgressView` spin, focus ring, `.help` HOVER rendering        | runtime, not an attribute           | manual — `design/README.md` |
 //   | 7 | ⌘S actually reaching `apply()`                                  | needs a key event into a live window| manual — `design/README.md` (issue #761 closed GO, suite unbuilt) |
 //   | 8 | `SettingsWindowController` activation-policy + single-instance   | `NSApp`/`NSWindow` global state     | manual — `design/README.md` |
 //
@@ -526,10 +537,19 @@ final class SettingsTextMetricsTests: XCTestCase {
 
     // MARK: - AC-2: the long-text hazard in `applyStatus`'s `.failed` arm, measured
 
-    // The issue calls it a truncation hazard mitigated by a hover tooltip. Measured, the mechanism is
-    // WRAP, not truncation — there is no `.lineLimit` on that `Label` — and that changes the verdict:
-    // a truncated line stays one line and the tooltip recovers the rest, whereas an unbounded wrap grows
-    // the footer inside a window that carries no `.resizable` in its style mask, pushing the form.
+    // Issue #762 called it a truncation hazard mitigated by a hover tooltip. Measured, the mechanism was
+    // WRAP, not truncation — there was no `.lineLimit` on that `Label` — and that changed the verdict: a
+    // truncated line stays one line and the tooltip recovers the rest, whereas an unbounded wrap grew the
+    // footer inside a window that carries no `.resizable` in its style mask, pushing the form. Filed as
+    // issue #844 rather than fixed here, per this umbrella's standing measure-don't-fix rule.
+    //
+    // ISSUE #844 IS NOW FIXED, so this gate has switched to the truncation predicate — the switch its own
+    // failure message instructed, because after the clamp the property worth gating is a different one.
+    // The label carries `.lineLimit(SettingsFormat.applyStatusLineLimit)` + `.truncationMode(.tail)`, so
+    // the cost is no longer height; what must hold instead is that the clamp BINDS on the reachable
+    // string (else the tooltip is decoration), that the bound it imposes is small, and that the message
+    // the tooltip recovers is still the daemon's in full — bound the geometry, never edit the message
+    // (`design/README.md` § "The Settings window (#763)").
     func testTheApplyFailureLabelIsMeasuredAndTheStaleKeyDetailOverflowsIt() {
         let budget = SettingsFormat.applyStatusBudget()
 
@@ -554,25 +574,273 @@ final class SettingsTextMetricsTests: XCTestCase {
                              + "\(String(format: "%.2f", budget)) pt — under 3× the slot it may be worth "
                              + "re-reading issue #844's severity")
 
-        // THE MECHANISM. With no `.lineLimit`, the label wraps — so the cost is HEIGHT, in a fixed window.
+        // THE MECHANISM, part 1 — THE CLAMP BINDS. Wrapped to the footer slot this string needs strictly
+        // more lines than `.lineLimit` allows, so the truncation is not hypothetical: it happens on the
+        // ordinary reachable trigger (a daemon upgraded past the app). This is the assertion the tooltip's
+        // load-bearingness rests on — if the clamp stopped binding, the recovery would be decoration.
         let wrap = TextMetrics.wrapped(long, bodyFont, budget: budget)
         XCTAssertTrue(wrap.bounded,
                       "the wrap probe clipped the string — the line count below is a floor, not a total")
-        XCTAssertGreaterThan(wrap.lines, 1,
-                             "the apply-failure label no longer wraps. If a `.lineLimit` was added, this "
-                             + "gate must switch to the truncation predicate (issue #844) — do not delete it")
+        XCTAssertGreaterThan(wrap.lines, SettingsFormat.applyStatusLineLimit,
+                             "the stale-key detail now lays out in \(wrap.lines) lines, within the "
+                             + "\(SettingsFormat.applyStatusLineLimit)-line clamp — nothing is truncated, so "
+                             + "the `.help` recovery this gate protects is no longer load-bearing. "
+                             + "Re-measure before relaxing it (issue #844)")
 
-        // How much of the fixed window that wrap eats. The footer is one line plus its padding when
-        // healthy; every extra line comes out of the form above it.
+        // FALSIFIER, same run: the predicate must also be able to say NO. The short arms are the common
+        // case and they fit inside the clamp, so "binds" above is a real discrimination rather than a
+        // predicate that fires on everything (issue #748 CONSTRAINT-A).
+        for (name, failure) in shortApplyFailureCases {
+            let short = TextMetrics.wrapped(SettingsFormat.applyFailureText(failure), bodyFont, budget: budget)
+            XCTAssertLessThanOrEqual(short.lines, SettingsFormat.applyStatusLineLimit,
+                                     "apply-status label, \(name): an ORDINARY failure sentence needs "
+                                     + "\(short.lines) lines and would itself be truncated — the clamp is "
+                                     + "biting the common case, not just the #628 hazard")
+        }
+
+        // THE MECHANISM, part 2 — WHAT THE CLAMP BUYS. Unclamped this label cost `wrap.height` in a window
+        // that cannot be resized; clamped it can cost at most this. Asserted as a real reduction so a clamp
+        // that stopped bounding anything could not pass as a fix.
         let oneLine = TextMetrics.singleLineHeight(bodyFont)
-        let overrun = wrap.height - oneLine
-        XCTAssertGreaterThan(overrun, 0,
-                             "the wrapped label costs no more height than one line — either the wrap probe "
-                             + "or `singleLineHeight` stopped measuring, and the overrun bound below is inert")
-        XCTAssertLessThan(overrun, SettingsFormat.windowMinContentHeight,
-                          "the wrapped apply-failure label alone (\(String(format: "%.2f", wrap.height)) pt "
-                          + "over \(wrap.lines) lines) exceeds the whole \(SettingsFormat.windowMinContentHeight) "
-                          + "pt minimum window height — the form would be entirely displaced")
+        let clampedHeight = oneLine * Double(SettingsFormat.applyStatusLineLimit)
+        XCTAssertGreaterThan(oneLine, 0,
+                             "`singleLineHeight` stopped measuring — the height bound below is inert")
+        XCTAssertLessThan(clampedHeight, wrap.height,
+                          "the \(SettingsFormat.applyStatusLineLimit)-line clamp "
+                          + "(\(String(format: "%.2f", clampedHeight)) pt) does not bound the unclamped wrap "
+                          + "(\(String(format: "%.2f", wrap.height)) pt over \(wrap.lines) lines) — the fix "
+                          + "buys nothing")
+        XCTAssertLessThan(clampedHeight, SettingsFormat.windowMinContentHeight / 4,
+                          "the clamped apply-failure label costs \(String(format: "%.2f", clampedHeight)) pt "
+                          + "of a \(SettingsFormat.windowMinContentHeight) pt window — a footer status line "
+                          + "taking a quarter of the shortest declared window is no longer a bound")
+
+        // THE MECHANISM, part 3 — CLAMP THE DRAWING, NEVER THE TRUTH. The recovery is only a recovery if
+        // the string handed to `.help` is the daemon's message in FULL. That is the half a future "fix"
+        // would most plausibly get wrong — shortening the message at this layer instead of bounding the
+        // drawing at the view — and it is testable here precisely because it is a format-layer property.
+        XCTAssertTrue(long.contains(staleKeyDetail),
+                      "`applyFailureText` no longer carries the daemon's `detail` verbatim — the message is "
+                      + "being edited rather than the geometry bounded, which inverts the #763 rule the "
+                      + "clamp implements")
+    }
+
+    // WHAT THE THREE ASSERTIONS ABOVE DO NOT REACH, and the one thing that can be added.
+    //
+    // They are all format-layer, and deliberately: `SettingsView` is absent from this bundle
+    // (`project.yml`), compiling it in is issue #840's call rather than this gate's, so NOTHING here
+    // observes the view APPLYING the clamp or the tooltip. That gap is stated rather than papered over.
+    //
+    // What IS reachable is the MECHANISM the recovery rests on, which was otherwise an unverified claim in
+    // a code comment. `design/README.md` § "The Settings window (#763)" names `accessibilityHelp` as the
+    // second recovery surface beside the hover tooltip — but there is no SwiftUI modifier of that name, so
+    // the rule only holds if `.help` is what sets the AppKit AX attribute, and if a CLAMPED label still
+    // publishes the whole message rather than the truncated drawing. Both are measured here through
+    // `PanelA11y` — the in-process tree walker issue #758 built and wrote surface-agnostic — instead of
+    // being believed.
+    //
+    // The subject is a STAND-IN mirroring the shipped modifier stack, not the shipped view. A stand-in
+    // that drifted from `SettingsView`'s stack would pass this and still fail the operator; catching that
+    // needs the live view in the tree, which is exactly issue #840.
+    @MainActor
+    func testAClampedLabelPublishesTheWholeMessageThroughHelpAndNotTheTruncatedDrawing() {
+        let text = SettingsFormat.applyFailureText(staleKeyApplyFailure)
+        let size = CGSize(width: SettingsFormat.applyStatusBudget(), height: 120)
+
+        let clamped = PanelA11y.tree(
+            for: Label(text, systemImage: "bolt.horizontal.circle")
+                .lineLimit(SettingsFormat.applyStatusLineLimit)
+                .truncationMode(.tail)
+                .help(text),
+            size: size)
+
+        // THE ABSENCE TRAP, as this suite's neighbour states it as a rule: a claim about a tree is
+        // evidence only if the tree is non-empty and the query actually ran. Both halves, before any
+        // verdict — an empty tree would make the canary below pass vacuously.
+        XCTAssertFalse(clamped.isEmpty,
+                       "the accessibility tree is empty — activation failed, so every verdict here is "
+                       + "vacuous (see `PanelAccessibilityTreeTests`' activation recipe)")
+        XCTAssertNotNil(clamped.firstContaining(text),
+                        "the label's own text is not in the tree at all — the walk found something else, "
+                        + "and the help assertion below would be measuring the wrong element. Tree: "
+                        + clamped.map(\.description).joined(separator: "\n"))
+
+        // THE CLAIM: the whole message, not the two lines that were drawn.
+        XCTAssertTrue(clamped.contains { $0.help == text },
+                      "no element publishes the full \(text.count)-character message as "
+                      + "`accessibilityHelp`. The #763 rule's second recovery surface does not exist, so "
+                      + "the clamp is discarding text with only a hover tooltip behind it. Tree: "
+                      + clamped.map { "\($0.description) help='\($0.help)'" }.joined(separator: "\n"))
+
+        // CANARY, through the SAME predicate: drop `.help` and the attribute must go away. Without this a
+        // tree that published the message as help for some unrelated reason would read as a passing gate,
+        // and the modifier this whole mitigation names would be untested.
+        let unhelped = PanelA11y.tree(
+            for: Label(text, systemImage: "bolt.horizontal.circle")
+                .lineLimit(SettingsFormat.applyStatusLineLimit)
+                .truncationMode(.tail),
+            size: size)
+        XCTAssertFalse(unhelped.isEmpty, "the canary tree is empty — it cannot falsify anything")
+        XCTAssertFalse(unhelped.contains { $0.help == text },
+                       "a label with NO `.help` still publishes the message as `accessibilityHelp` — the "
+                       + "assertion above passes for a reason other than the modifier it is about")
+    }
+
+    // MARK: - AC-2 (cont.): the VIEW's own chain, read as data (issue #844)
+
+    // The last gap the two sections above leave open is the one that matters most: nothing yet observes
+    // `SettingsView` APPLYING the clamp. The constants can be perfect and the mechanism proven while the
+    // view never calls either.
+    //
+    // Compiling `SettingsView` into this bundle would close it properly, and that is issue #840's call,
+    // not this gate's — the file is deliberately excluded (`project.yml`). So this uses the OTHER route
+    // this codebase already established for an excluded source file: read it as DATA and lint its text,
+    // exactly as `PanelReachabilityLintTests` reads `StatusItemController.swift`.
+    //
+    // SCOPE IS THE `.failed` LABEL'S OWN CHAIN, not the file and not the property. A file-wide
+    // `contains(".lineLimit(")` is the trap here, and a dated one: issue #944 is the same defect on the
+    // `.rejected` arm four lines up, so the moment IT lands a file-wide predicate goes green whether or
+    // not `.failed` still carries anything. The chain is therefore taken from the `Label(` whose title is
+    // `applyFailureText` and nowhere else — and the third canary below splices the clamp into the
+    // `.rejected` arm to prove the distinction is real rather than intended.
+    //
+    // THE HONEST BOUND, stated because a text predicate invites over-reading: a green here means the
+    // modifiers are WRITTEN on that chain with the constant as their argument. It cannot mean SwiftUI
+    // honours them, that the label bounds the footer on screen, or that this is the chain the operator
+    // sees. That residue needs the live view in a tree — issue #840 — and it is the same WIRED-not-
+    // DELIVERED bound `PanelReachabilityLintTests` states for its own verdict.
+
+    /// The `.failed` apply-status `Label`'s modifier chain, extracted from `SettingsView.swift`'s text.
+    ///
+    /// `chain` is the run of consecutive `.`-leading lines under the construction, comments stripped, so
+    /// a `.lineLimit` mentioned in the arm's PROSE cannot satisfy the gate that its code should.
+    private struct FailedArmChain {
+        let chain: [String]
+        var lineLimitArgument: String? { argument(of: ".lineLimit(") }
+        var truncationModeArgument: String? { argument(of: ".truncationMode(") }
+        var helpArgument: String? { argument(of: ".help(") }
+
+        private func argument(of modifier: String) -> String? {
+            guard let line = chain.first(where: { $0.hasPrefix(modifier) }) else { return nil }
+            return String(line.dropFirst(modifier.count).dropLast())   // trailing `)`
+        }
+    }
+
+    /// The one construction whose title is the apply-failure text, plus the chain hanging off it.
+    /// `nil` when the site is missing or ambiguous — never "no violation", which is the degenerate
+    /// subject this suite refuses to score as a pass.
+    private func failedArmChain(in source: String) -> FailedArmChain? {
+        let lines = source.components(separatedBy: "\n")
+        let sites = lines.indices.filter { lines[$0].contains("Label(SettingsFormat.applyFailureText(") }
+        guard sites.count == 1, let site = sites.first else { return nil }
+
+        var chain: [String] = []
+        for line in lines.dropFirst(site + 1) {
+            let code = line.components(separatedBy: "//")[0].trimmingCharacters(in: .whitespaces)
+            // A blank or comment-only line INSIDE the chain is not the chain ending — Swift permits it
+            // and annotating a modifier is exactly what a reader of this arm would do. Breaking here
+            // instead reported all three modifiers ABSENT while all three were present: fail-closed, so
+            // never a false pass, but it misdiagnoses the cause for precisely the person who caused it.
+            // Skipping is safe because the real terminator is the `}` closing the `switch`, which is
+            // neither empty nor `.`-prefixed.
+            if code.isEmpty { continue }
+            guard code.hasPrefix("."), code.hasSuffix(")") else { break }
+            chain.append(code)
+        }
+        return chain.isEmpty ? nil : FailedArmChain(chain: chain)
+    }
+
+    private var settingsViewURL: URL {
+        URL(fileURLWithPath: #filePath)      // …/apps/menubar/Tests/SettingsTextMetricsTests.swift
+            .deletingLastPathComponent()     // …/apps/menubar/Tests
+            .deletingLastPathComponent()     // …/apps/menubar
+            .appendingPathComponent("Sources")
+            .appendingPathComponent("SettingsView.swift")
+    }
+
+    private func settingsViewSource() throws -> String {
+        try XCTUnwrap(try? String(contentsOf: settingsViewURL, encoding: .utf8),
+                      "SettingsView.swift must be readable as data — this gate reads it, it does not "
+                      + "compile it (the file is excluded from this bundle by `project.yml`)")
+    }
+
+    func testTheFailedArmActuallyCarriesTheClampTheTruncationModeAndTheHelpRecovery() throws {
+        let source = try settingsViewSource()
+        // DEGENERATE SUBJECT, first: an unreadable file or a moved construction would make every verdict
+        // below vacuous, and "no chain found" must never read as "no violation".
+        XCTAssertGreaterThan(source.utf8.count, 2000,
+                             "read a real file, not a stub — SettingsView is a substantial source")
+        let arm = try XCTUnwrap(failedArmChain(in: source),
+                                "no single `Label(SettingsFormat.applyFailureText(` construction with a "
+                                + "modifier chain — the gate has no subject, so it cannot have a verdict")
+
+        // The clamp, through the CONSTANT — a bare `2` here would be the second copy the whole
+        // `SettingsFormat` seam exists to prevent, and canary 2 below proves this tells them apart.
+        XCTAssertEqual(arm.lineLimitArgument, "SettingsFormat.applyStatusLineLimit",
+                       "the `.failed` label's chain is \(arm.chain) — it must clamp through the shared "
+                       + "constant, which is the value `SettingsTextMetricsTests` measures against")
+        // Explicit, not defaulted: `.tail` IS the default truncation mode, so writing it changes no
+        // pixel — it states which end is sacrificed at the site where a future reader decides.
+        XCTAssertEqual(arm.truncationModeArgument, ".tail",
+                       "the `.failed` label must name its truncation mode; chain: \(arm.chain)")
+        // And the recovery the clamp makes load-bearing: the FULL text, never a shortened one.
+        XCTAssertEqual(arm.helpArgument, "SettingsFormat.applyFailureText(failure)",
+                       "the `.help` recovery must carry the daemon's whole message — a clamp whose "
+                       + "tooltip is itself edited loses the text outright; chain: \(arm.chain)")
+    }
+
+    // CONSTRAINT-A (issue #748): the lint is driven by MUTATION of the REAL file, through the SAME
+    // extractor the assertion above uses. Three mutations, three distinct false-pass shapes.
+    func testTheChainLintFailsOnAStrippedClampALiteralClampAndASiblingArmsClamp() throws {
+        let real = try settingsViewSource()
+
+        // 1. The regression it exists for: the clamp deleted outright.
+        let stripped = real.replacingOccurrences(
+            of: ".lineLimit(SettingsFormat.applyStatusLineLimit)\n", with: "")
+        XCTAssertNotEqual(stripped, real, "the mutation changed nothing — the canary is inert")
+        XCTAssertNil(try XCTUnwrap(failedArmChain(in: stripped)).lineLimitArgument,
+                     "a `SettingsView.swift` with no `.lineLimit` on the `.failed` chain still reports one "
+                     + "— this gate cannot fail, so its green is not evidence")
+
+        // 2. The drift it exists for: the constant replaced by the literal it happens to equal today.
+        let literal = real.replacingOccurrences(
+            of: ".lineLimit(SettingsFormat.applyStatusLineLimit)", with: ".lineLimit(2)")
+        XCTAssertEqual(try XCTUnwrap(failedArmChain(in: literal)).lineLimitArgument, "2",
+                       "the extractor cannot tell the shared constant from a hardcoded literal, so the "
+                       + "assertion above would pass over a second copy of the clamp value")
+
+        // 3. The one issue #944 will create: the clamp present in the FILE, on the sibling `.rejected`
+        //    arm, and absent from this one. A file-wide predicate goes green here; this must not.
+        let siblingOnly = stripped.replacingOccurrences(
+            of: ".help(detail ?? \"\")",
+            with: ".help(detail ?? \"\")\n                .lineLimit(SettingsFormat.applyStatusLineLimit)")
+        XCTAssertTrue(siblingOnly.contains(".lineLimit(SettingsFormat.applyStatusLineLimit)"),
+                      "the splice did not land — canary 3 is not testing what it claims")
+        XCTAssertNil(try XCTUnwrap(failedArmChain(in: siblingOnly)).lineLimitArgument,
+                     "a clamp on the `.rejected` arm satisfies the `.failed` arm's gate — the two defects "
+                     + "would cover for each other and issue #944 landing would silently green this one")
+    }
+
+    // The extractor's own robustness, driven by the SAME real-file mutation the canaries use. A gate
+    // that goes red for the wrong reason costs a reader the same round-trip a false pass does, and the
+    // reader who trips this one is the reader who just annotated the arm the gate is about.
+    func testAnAnnotatedChainIsStillReadWhole() throws {
+        let annotated = try settingsViewSource().replacingOccurrences(
+            of: "                .lineLimit(SettingsFormat.applyStatusLineLimit)",
+            with: "                // two lines, per the #763 ratified rule\n\n"
+                + "                .lineLimit(SettingsFormat.applyStatusLineLimit)")
+        XCTAssertTrue(annotated.contains("// two lines, per the #763 ratified rule"),
+                      "the annotation did not land — this test is not exercising what it claims")
+
+        let arm = try XCTUnwrap(failedArmChain(in: annotated),
+                                "a comment plus a blank line between two modifiers made the whole chain "
+                                + "unfindable — the extractor reads legal Swift as the chain ending")
+        XCTAssertEqual(arm.lineLimitArgument, "SettingsFormat.applyStatusLineLimit",
+                       "an annotated chain lost its clamp; read: \(arm.chain)")
+        XCTAssertEqual(arm.truncationModeArgument, ".tail",
+                       "an annotated chain lost its truncation mode; read: \(arm.chain)")
+        XCTAssertEqual(arm.helpArgument, "SettingsFormat.applyFailureText(failure)",
+                       "an annotated chain lost its `.help` recovery; read: \(arm.chain)")
     }
 
     // The allowances the footer budget rests on are not free-floating numbers: the Save button must
@@ -593,6 +861,17 @@ final class SettingsTextMetricsTests: XCTestCase {
         // And the derived budget is a real, positive slot at the width it claims.
         XCTAssertEqual(SettingsFormat.applyStatusBudget(), 328, accuracy: 0.001,
                        "the apply-status budget derivation changed — re-derive it, do not re-tune the tests")
+
+        // The slot's OTHER dimension, pinned to the same standard. Everything else about the clamp is
+        // gated RELATIVE to this constant — the chain lint proves the view references it, and the AC-2
+        // assertions read it — so the one thing none of them can see is the constant's own VALUE: at 3,
+        // 4, 5 or 6 the whole suite still passes while the shipped label no longer matches the reference
+        // it is documented as conforming to. This is the pin that makes that edit loud.
+        XCTAssertEqual(SettingsFormat.applyStatusLineLimit, 2,
+                       "the #763 reference ratifies TWO lines (`-webkit-line-clamp:2` on "
+                       + "`menubar-preview.html`'s `.win-status .txt`) and `design/README.md` now states "
+                       + "the shipped `.failed` arm conforms — changing this needs the reference amended "
+                       + "first, not the pin re-tuned")
         XCTAssertGreaterThan(SettingsFormat.applyStatusBudget(),
                              SettingsFormat.applyStatusBudget(contentWidth: SettingsFormat.windowMinContentWidth),
                              "the shipped 460 pt window must give the footer MORE room than the 440 pt floor")
