@@ -18,7 +18,7 @@ issue threads is consolidated here in a stable, discoverable place.
 | [0003](0003-no-torn-swap-invariant.md) | No-torn-swap invariant | Accepted |
 | [0004](0004-incidental-libc-ffi-kept-raw.md) | Incidental `libc` FFI kept raw (no wrapper crate) | Accepted |
 | [0005](0005-config-parsed-by-crate-emitted-by-hand.md) | Config parsed with the `toml` crate, emitted by hand | Accepted |
-| [0006](0006-migration-schema-evolution-policy.md) | Migration-artifact schema-evolution policy; v1 format frozen | Accepted |
+| [0006](0006-migration-schema-evolution-policy.md) | Migration-artifact schema-evolution policy; v1 format frozen | Accepted (amended 2026-08-09 by #1053 — the config-text surface the freeze did not anticipate) |
 | [0007](0007-decided-against-credential-recovery-options.md) | Decided-against credential-recovery options for dead accounts | Accepted |
 | [0008](0008-login-decouples-unquarantine-from-activation.md) | `login` decouples un-quarantine from activation | Accepted |
 | [0009](0009-rate-limit-backoff-per-account.md) | Rate-limit back-off is scoped per-account, not endpoint-global | Accepted |

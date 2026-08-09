@@ -31,6 +31,74 @@ has not shipped and **no real field artifact exists yet**. Breaking changes to v
 therefore still free at the time of this decision; freezing now pins v1 before that
 window closes.
 
+**Amended 2026-08-09 (#1053) — the freeze governs the CONTAINER; the artifact has a second
+compatibility surface this ADR did not anticipate, and it is not versioned.** The three
+evolution surfaces below are the container's own — preamble, header, payload — and every rule
+here is about them. But the `Payload` carries `config_toml` as **text**, and the importing
+binary re-parses it with *its own* `Config` parser. **Every** `Raw*` struct there carries
+`#[serde(deny_unknown_fields)]` (`src/config.rs`), so the unit of breakage is a **key at any
+nesting level**, not a top-level block: a key the importing build does not know is a **hard parse
+failure**, not an ignored one — and `format_version` reads `1` on both sides throughout. **The
+version number says compatible and the parser says otherwise**, which is exactly why the break
+went undiagnosed: no gate in this ADR fires, and nothing in the container is wrong.
+
+This is **not** an argument that § Consequences → Positive's "the `config.toml` payload is
+carried verbatim as text so the config schema evolves independently of the format" is false. It is
+true of the *format*. What it does not say, and what a reader reasonably concluded from it, is
+that the config schema therefore evolves **freely** — it does not: it evolves under a
+`deny_unknown_fields` parser on the far side, so each added key raises an import floor of its
+own, invisibly to everything this ADR gates.
+
+**The measured shape, as of 2026-08-09.** Since this freeze (`64ff6e9`) the rendered config has
+gained **one** new top-level block — `[credential]`, in `6fe3457` (2026-07-29), 26 days after —
+and **22** new value keys: 16 in `[tunables]`, 2 each in `[jitter]`, `[refresh]` and
+`[credential]`. Twenty-one of those 22 arrived *after* their block already existed, so a
+block-scoped guard could never have seen them even in principle. Every one is emitted
+unconditionally by `Config::render` (`src/config/render.rs`), so each break is universal rather
+than conditional on the operator's settings. Re-derive by diffing the `Raw*` struct fields
+between `64ff6e9` and `HEAD`; do not trust the count without doing so, since it moves with the
+next added key.
+
+**The floor therefore is NOT where the block arrived, and that mattered here.** #1053 first named
+`6fe3457` as the floor. A build pinned at exactly that commit still refuses a current artifact,
+because `expiry_cohort_window_secs` landed inside `[credential]` **14 commits later the same
+day** (`81bd4f2`, issue #879). An operator following the earlier advice would have landed on a
+build that fails *and* predates the new message — the defect in its least legible form. The floor
+is the most recent commit that added a **rendered key**, which today is `81bd4f2`.
+
+**What changes, and what deliberately does not.** No rule below is amended and
+`FORMAT_VERSION` is **not** bumped — the artifact is v1 in both directions and the container is
+not the thing that is wrong. #1053 adds (i) a documented version floor
+(`migration::CONFIG_BLOCK_VERSION_FLOOR`) that the import path names instead of surfacing a bare
+`deny_unknown_fields` line, and (ii) two hand-built historical-parser fixtures
+(`src/config/load.rs`) — a pre-`6fe3457` `RawConfig` mirror, and a `RawCredential` mirror as it
+stood *at* `6fe3457`, the pair of which falsify "the block's commit is the floor" rather than
+merely illustrating it. Note what the fixtures are: this ADR's own § Consequences → Negative /
+trade-offs already says the forward/backward asymmetry is "**not catchable by any in-repo test**
+(CI has no old binary)" — that remains true of the *binary*, so they witness the *shape*, and
+neither they nor #1053 claims to repair an already-built one.
+
+**The recurrence gate is narrower than the mechanism, deliberately and on the record.** The
+fixture arm that fires on drift covers **new top-level blocks only** — 1 of the 23 changes
+counted above. A key added inside an existing block stays **ungated**, which is precisely how the
+second break passed unremarked, and the `[credential]` fixture covers that class for that one
+block rather than generally. Closing the gap needs a gate at key granularity, whose cost is a
+deliberate acknowledgment on every config-key addition; that is a policy call this amendment does
+not take.
+
+**The floor is a BUILD floor, not a release floor** — the same "no git tags / no releases" fact
+recorded above still holds, so no *released* binary predates the floor; the affected population
+is binaries built from source before it, and every future release sits at or above it.
+
+**Left open.** Whether the artifact-config parse path becomes tolerant of unknown *keys* — so the
+next addition does not re-break older builds the same way — is design OQ-5
+(`docs/design/migration-credential-portability-solution-design.md`), and it is a product call
+that is **not settled by this amendment**. The measurement above sharpens it: the recurrence is
+not a once-in-a-freeze event but a 23-times-and-counting one, and every instance except the
+single block addition sits in the class no gate here catches. Per-account strictness
+(`RawAccount`'s own `deny_unknown_fields`, where it catches genuine typos) is not in question
+either way.
+
 ## Context
 
 The encrypted artifact wraps its body in an Argon2id + XChaCha20-Poly1305 envelope and
@@ -145,6 +213,17 @@ exact-match island then makes the older reader refuse the artifact with a typed 
 This is a **recorded "no", not a default-by-omission** — because adding *any* header
 field is a breaking change after the freeze, this was the maintainer's last free moment
 to decide it, and the council was unanimous it is unnecessary.
+
+> **The "subsume every case" premise is FALSIFIED — see § Status → Amended 2026-08-09 (#1053).**
+> *The paragraph above is left as written, per this directory's immutability convention; this note
+> records what is now known against it.* A rendered **config-key** addition matters to an older
+> reader, forces **no** `format_version` bump — the container is untouched, so BREAKING (2)/(3)
+> never fire — and the older reader refuses the artifact with a **bare `serde` parse error**, not
+> the typed one this rationale promises. That is the exact case a writer-side "an older reader
+> must refuse this rather than mis-handle it" signal addresses, so the decision's *conclusion* may
+> well still stand on the freeze-cost grounds it also cites, but this particular *argument* for it
+> no longer does. Anyone revisiting the guard-field question — or weighing design **OQ-5**, which
+> is the live form of it — should start from the amendment rather than from this sentence.
 
 ## Enforcement: the cross-version round-trip test
 
@@ -261,10 +340,15 @@ frozen v1's wire shape** — old artifacts stay readable, new ones opt in.
 ## Related
 
 - Issues: #198 (this policy), #147 (envelope — the AAD binding), #146 (format), #148 /
-  #149 / #150 (export/import wiring), #15 (redaction hygiene).
+  #149 / #150 (export/import wiring), #15 (redaction hygiene), **#1053 (the 2026-08-09
+  amendment — the config-text surface this freeze did not anticipate; part of #999)**.
 - Code: `src/migration.rs` — `Header`, `Header::associated_data` (~L555), version gate
   (~L364), encrypt/decrypt AAD (~L633, ~L683), algorithm-string dispatch (~L672, ~L711),
   cost from header (~L737), `Body` tag, the golden-fixture tests and their `#[ignore]`
   emitter; `build/fixtures/` (the frozen v1 artifacts); `build/version-compat.md`
-  (empirical ledger).
+  (empirical ledger). Amendment: `migration::CONFIG_BLOCK_VERSION_FLOOR`,
+  `Error::MigrationImportConfigRejected`, `cli::name_the_import_version_floor`, and the two
+  historical-parser fixtures in `src/config/load.rs`
+  (`a_pre_credential_block_parser_rejects_a_config_a_current_build_renders`,
+  `a_build_at_the_blocks_own_commit_still_rejects_a_current_render`).
 - ADR-0002 / ADR-0003 / ADR-0004 / ADR-0005 (house style; minimal-dependency posture).

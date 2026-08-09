@@ -540,6 +540,44 @@ pub(crate) const PLAINTEXT_WARNING: &str =
      account credentials in the clear. Anyone who can read the file can restore your \
      accounts. Store it like a password and delete it as soon as the import is done.";
 
+/// The import **version floor** (issue #1053): what an operator is told when the config
+/// an artifact carries is refused by the importing build's own parser. The wording lives
+/// here beside [`PLAINTEXT_WARNING`] so the migration layer owns it; the emitter is
+/// [`Error::MigrationImportConfigRejected`](crate::error::Error), raised at the
+/// artifact-config parse seam in [`crate::cli`].
+///
+/// **The artifact has a second compatibility surface, and it is not versioned.** The
+/// [`format_version`](Header) preamble gates the *container*, and ADR-0006 froze v1 with an
+/// exact-match island. But [`Payload::config_toml`] travels as **text** and is re-parsed by
+/// the importing build's own `Config` parser. Every `Raw*` struct there carries
+/// `#[serde(deny_unknown_fields)]` (`src/config.rs`), so the unit of breakage is a **key at any
+/// nesting level**, not a top-level block: a key the importing build does not know is a hard
+/// parse failure, not an ignored one, while `format_version` still reads `1` on both sides. The
+/// version number says compatible and the parser says otherwise; ADR-0006's freeze governs the
+/// container and never anticipated the config surface growing underneath it.
+///
+/// **So the floor moves with the most recent RENDERED KEY, not with the newest block.**
+/// `[credential]` arrived in `6fe3457` (2026-07-29) — but a build pinned at exactly that commit
+/// *still* refuses a current artifact, because `expiry_cohort_window_secs` landed inside the
+/// same block 14 commits later the same day (`81bd4f2`, issue #879). Both are emitted
+/// unconditionally by `Config::render` (`src/config/render.rs`), so the break is universal
+/// rather than conditional on the operator's settings — and naming the block's own commit as
+/// the floor would send an operator to a build that reproduces the defect in its least legible
+/// form, since their build would postdate the message below and never print it.
+///
+/// **The floor is a BUILD floor, not a release floor.** The repo carries no tags and no
+/// releases, so **no *released* binary predates it**: the affected population is binaries built
+/// from source before the floor commit, and every future release sits at or above it.
+/// Already-built binaries cannot be patched, which is why this constant makes the *next*
+/// occurrence legible rather than claiming to repair one already in the field.
+pub(crate) const CONFIG_BLOCK_VERSION_FLOOR: &str =
+    "import version floor: an artifact carries the config as TEXT, and the importing build \
+     refuses any config key it does not know, at any nesting level — so an artifact is only as \
+     portable as the OLDEST build that reads it. The floor is therefore the most recent commit \
+     that added a rendered config key, which as of 2026-08-09 is 81bd4f2 \
+     (`[credential].expiry_cohort_window_secs`); a build older than that refuses artifacts a \
+     later build mints. Import on a build at least as new as the one that wrote this artifact.";
+
 impl Header {
     /// The header, serialized, used as the AEAD **associated data** so the whole
     /// header — version, `encrypted` flag, and KDF + cipher parameters — is
@@ -1400,6 +1438,56 @@ mod tests {
         assert!(
             lower.contains("credential"),
             "warning must name credentials"
+        );
+    }
+
+    /// The version-floor wording states a floor an operator can ACT on (issue #1053), not a
+    /// vague "older versions may not work". It is the documented half of R-16, and the half
+    /// that is **not** OQ-5-gated.
+    ///
+    /// Pinned here because the string IS the deliverable: it is what
+    /// [`Error::MigrationImportConfigRejected`] appends in place of a bare
+    /// `deny_unknown_fields` line, and a reword that drops the anchor would leave the error
+    /// legible-looking and unactionable.
+    ///
+    /// **The first version of this test asserted a shape rather than a truth, and passed over
+    /// the wrong commit.** It required only "names *a* commit and *a* date", which `6fe3457`
+    /// satisfied — and `6fe3457` is where the `[credential]` **block** arrived, not where the
+    /// floor sits, because `expiry_cohort_window_secs` landed inside that block 14 commits
+    /// later (`81bd4f2`). So the assertions below name the floor commit **literally**: this
+    /// test's job is to fail when the constant drifts off the anchor, which a shape check
+    /// cannot do.
+    #[test]
+    fn the_version_floor_names_the_commit_and_date_an_operator_can_act_on() {
+        let floor = CONFIG_BLOCK_VERSION_FLOOR;
+        assert!(
+            floor.contains("81bd4f2"),
+            "the floor must name the most recent commit that added a rendered config key: {floor}"
+        );
+        assert!(
+            !floor.contains("6fe3457"),
+            "6fe3457 is where the BLOCK arrived, not the floor — a build pinned there still \
+             refuses a current artifact over `expiry_cohort_window_secs`: {floor}"
+        );
+        assert!(
+            floor.contains("2026-08-09"),
+            "the floor must date its anchor, since a commit-pinned floor is only true as of a \
+             day and this repo has no tags to name instead: {floor}"
+        );
+        assert!(
+            floor.contains("expiry_cohort_window_secs"),
+            "the floor must name the key that sets it, not just the block: {floor}"
+        );
+        // The RULE, not just today's instance — the anchor goes stale on the next rendered key,
+        // and an operator who has only the instance cannot tell that it has.
+        assert!(
+            floor.contains("any config key it does not know, at any nesting level"),
+            "the floor must state the KEY-scoped rule; block-scoped wording is what let the \
+             second break through silently: {floor}"
+        );
+        assert!(
+            floor.contains("most recent commit that added a rendered config key"),
+            "the floor must state how to re-derive itself, not only its current value: {floor}"
         );
     }
 
