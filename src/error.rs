@@ -916,6 +916,26 @@ pub(crate) enum Error {
     #[error("import requires a migration artifact path: sessiometer import <file>")]
     MigrationImportPathRequired,
 
+    /// The config an artifact carries did not PARSE under this build's config parser
+    /// (issue #1053) — the shape failure only, never a range/roster violation, which keeps
+    /// its own [`Error::ConfigInvalid`]. Wraps the parser's own message (which names the
+    /// offending key — the actionable half) and appends
+    /// [`CONFIG_BLOCK_VERSION_FLOOR`](crate::migration::CONFIG_BLOCK_VERSION_FLOOR), so the
+    /// operator gets the compatibility rule instead of a bare `deny_unknown_fields` line
+    /// that names a key and explains nothing.
+    ///
+    /// **Redaction: inherited, not widened.** This path emits the parser message TODAY as
+    /// [`Error::ConfigParse`], whose doc records why that is secret-free (a config holds only
+    /// labels, account UUIDs, stash names and integer tunables — issue #15). So this variant
+    /// exposes exactly the bytes the seam already exposed; it is the one member of the import
+    /// group whose payload is that class rather than the group comment's "a count or a static
+    /// reason", and it carries no credential, token or email either way.
+    #[error(
+        "the migration artifact's config was rejected by this build: {detail}\n  {}",
+        crate::migration::CONFIG_BLOCK_VERSION_FLOOR
+    )]
+    MigrationImportConfigRejected { detail: String },
+
     /// An imported credential failed READ-BACK verification: the stash was written but
     /// a re-read did not hash-match what was written (a locked keychain at read-back, or
     /// a store that did not persist the bytes). The account is reported `failed` and left

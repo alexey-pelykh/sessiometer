@@ -1213,6 +1213,26 @@ everywhere. It is worth knowing for artifacts exported before `target_max_sessio
 default-on `80` (issue #398): they import with the reserve **on**, where the original
 machine ran with it off.
 
+**Import version floor.** Because the config travels as text, the *importing* build re-parses it
+with its own parser — and that parser refuses any config **key** it does not know, at any nesting
+level, not merely a whole unfamiliar section. So an artifact is only as portable as the **oldest**
+build that has to read it, and the artifact's own format version does not warn you: it reads `1`
+on both sides either way.
+
+There are no releases yet, so this is a floor on **builds**, not on versions — and it moves every
+time a rendered config key is added, so it is not a fixed number to memorize. As of 2026-08-09 it
+sits at commit `81bd4f2` (`[credential].expiry_cohort_window_secs`). Do not reach for the commit
+that added a whole *section*: `[credential]` arrived 14 commits earlier in `6fe3457`, and a build
+pinned there still refuses a current artifact over the later key.
+
+**So the rule to follow is the one that cannot go stale: import on a build at least as new as the
+one that wrote the artifact.** The two ways of breaking it read differently, which is worth
+knowing before you diagnose one. A build older than the floor stops on a bare parser complaint
+naming an unexpected key, and no change to `sessiometer` can improve that message — it is the old
+build printing it, and it has already been built. A build that is merely older than *the artifact*
+stops and states this floor instead (issue #1053,
+[ADR-0006](docs/adr/0006-migration-schema-evolution-policy.md)).
+
 ## Privacy: no telemetry
 
 `sessiometer` phones home for nothing. It sends **no** analytics, usage

@@ -4702,6 +4702,30 @@ fn resolve_import_overwrite(cli_overwrite: bool, local: Option<&Config>) -> bool
         == ConflictPolicy::Overwrite
 }
 
+/// Re-badge an artifact-config SHAPE failure so it names the import version floor
+/// (issue #1053). Pure, so the mapping is unit-testable without an artifact on disk.
+///
+/// The artifact's config travels as text and is re-parsed by THIS build's parser, whose every
+/// `Raw*` struct carries `deny_unknown_fields` — so a config key this build does not know, at
+/// any nesting level, aborts the import as a bare `deny_unknown_fields` line that names a key
+/// and explains nothing, while the container's `format_version` still reads `1` on both sides.
+/// That is the same defect the rendered config has already inflicted twice on older builds
+/// (see [`CONFIG_BLOCK_VERSION_FLOOR`](crate::migration::CONFIG_BLOCK_VERSION_FLOOR) for the
+/// floor and how to re-derive it); this build cannot repair an already-built binary, but it
+/// can stop being the one that fails mutely when the artifact is the newer side.
+///
+/// **Scoped to the symptom it detects.** Only [`Error::ConfigParse`] — the *shape* failure —
+/// is re-badged. [`Error::ConfigInvalid`] (a range violation, a duplicate `account_uuid`) is
+/// a validation verdict on a config this build parsed FINE, so the floor is not its
+/// explanation and it passes through with its own precise message. Every other error class
+/// is likewise untouched.
+fn name_the_import_version_floor(err: Error) -> Error {
+    match err {
+        Error::ConfigParse(detail) => Error::MigrationImportConfigRejected { detail },
+        other => other,
+    }
+}
+
 /// Resolve WHICH roster account this machine is currently logged into, for `import`'s
 /// non-adoption report (issue #1001) — token-first, through the SAME shared resolver
 /// ([`crate::active`]) the daemon's poll loop and the `use` swap consult, so all three
@@ -4826,8 +4850,10 @@ async fn apply_import<S: AccountStash>(
     overwrite: bool,
 ) -> Result<(Config, Vec<AccountImport>)> {
     // The roster + tunables the artifact carries, held to the same invariants as any
-    // on-disk config (unique non-empty account_uuid, tunable ranges).
-    let incoming = Config::from_toml_str(payload.config_toml())?;
+    // on-disk config (unique non-empty account_uuid, tunable ranges) — with the SHAPE
+    // failure re-badged to name the import version floor (issue #1053).
+    let incoming =
+        Config::from_toml_str(payload.config_toml()).map_err(name_the_import_version_floor)?;
 
     // Base config: preserve the LOCAL config when present — its tunables / refresh / login / stats
     // / migration blocks and existing roster are authoritative (the per-account merge below only
@@ -11616,6 +11642,87 @@ spare  22222222-2222\n\
         )
         .await
         .expect("a config-only import over a valid roster succeeds")
+    }
+
+    /// **An unknown config key names the import version floor instead of a bare serde line**
+    /// (issue #1053). The artifact's config travels as TEXT and is re-parsed by THIS build's
+    /// parser, whose every `Raw*` struct carries `deny_unknown_fields` — so an artifact minted
+    /// by a NEWER build aborts the import over a key this one does not know, at any nesting
+    /// level, while the container's `format_version` reads `1` on both sides and says
+    /// compatible.
+    ///
+    /// That is the defect the rendered config has already inflicted twice, running in the
+    /// direction this tree can still act on: builds older than the floor refuse every artifact
+    /// a current build mints, and those binaries cannot be patched. Nothing here asserts what
+    /// one of them prints.
+    #[tokio::test]
+    async fn an_unknown_config_block_names_the_import_version_floor_not_a_bare_parse_error() {
+        // A block no build in this tree knows. Deliberately NOT `[credential]`: the current
+        // parser KNOWS that one, so a test built on it would be green over nothing.
+        let mut text = config_with(vec![acct("work", UUID_A)]).render();
+        text.push_str("\n[telemetry]\nenabled = true\n");
+
+        let outcome = apply_import(
+            None,
+            &Payload::new(text, Vec::new()),
+            None,
+            None,
+            &crate::stash::FakeAccountStash::empty(),
+            false,
+        )
+        .await;
+        let err = match outcome {
+            Err(err) => err,
+            Ok(_) => panic!("an unknown config block must abort the import"),
+        };
+
+        assert!(
+            matches!(err, Error::MigrationImportConfigRejected { .. }),
+            "the shape failure must be re-badged, not left as a bare ConfigParse: {err:?}"
+        );
+        let shown = err.to_string();
+        // The parser's own detail survives — it names the offending key, the actionable half
+        // a re-badge must not swallow.
+        assert!(
+            shown.contains("telemetry"),
+            "the message must still name the block that failed: {shown}"
+        );
+        // ...and the floor is stated, which is the half a bare serde line never carries.
+        assert!(
+            shown.contains(crate::migration::CONFIG_BLOCK_VERSION_FLOOR),
+            "the message must carry the version floor verbatim: {shown}"
+        );
+        assert_eq!(
+            err.exit_code(),
+            1,
+            "re-badging changes what the operator READS, not what a script branches on"
+        );
+    }
+
+    /// The re-badge is scoped to the symptom it detects (issue #1053). A config this build
+    /// parsed FINE and then refused on a range or roster invariant is not a version-floor
+    /// symptom; handing it the floor's explanation would send an operator chasing a
+    /// compatibility problem they do not have.
+    #[test]
+    fn only_the_shape_failure_is_re_badged_a_validation_verdict_keeps_its_own_message() {
+        assert!(
+            matches!(
+                name_the_import_version_floor(Error::ConfigParse("unknown field `x`".to_owned())),
+                Error::MigrationImportConfigRejected { .. }
+            ),
+            "a SHAPE failure is the version-floor symptom"
+        );
+        for untouched in [
+            Error::ConfigInvalid("poll_secs out of range".to_owned()),
+            Error::MigrationImportVerifyFailed,
+        ] {
+            let shown = untouched.to_string();
+            assert_eq!(
+                name_the_import_version_floor(untouched).to_string(),
+                shown,
+                "only ConfigParse is re-badged; every other verdict keeps its own message"
+            );
+        }
     }
 
     /// The label-INDEPENDENT core of the duplicate-label notice — what a NEGATIVE assertion
