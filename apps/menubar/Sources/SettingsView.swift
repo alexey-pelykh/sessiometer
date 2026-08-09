@@ -13,9 +13,11 @@
 // already compiles — where `SettingsTextMetricsTests` covers and measures them. Read every
 // `SettingsFormat.` reference below as a LINK, not a copy: this file deliberately holds NO
 // operator-visible literal of its own, so changing a label or a width means changing it there, which is
-// what reddens the gate. (The only string literals remaining below are the five SF Symbol NAMES, the
-// `"s"` ⌘S key equivalent, and the `?? ""` empty-tooltip fallback — none of which is text an operator
-// reads. The bare `spacing:` / `padding:` numbers that remain are cosmetic ones no budget charges.)
+// what reddens the gate. (The only string literals remaining below are the five SF Symbol NAMES and the
+// `"s"` ⌘S key equivalent — neither of which is text an operator reads. The `?? ""` empty-tooltip
+// fallback this list used to name is gone: issue #944 replaced it with `rejectionTooltip`, because an
+// empty string IS what an operator read on the four rejection reasons the daemon sends no `detail` for.
+// The bare `spacing:` / `padding:` numbers that remain are cosmetic ones no budget charges.)
 //
 // The rule to keep: a new string, or a frame constant any budget would charge, goes in `SettingsFormat`
 // FIRST and is referenced from here. Adding it as a literal is not caught by any compiler — it just
@@ -271,9 +273,41 @@ struct SettingsView: View {
             Label(SettingsFormat.invalidInputText, systemImage: "exclamationmark.triangle")
                 .foregroundStyle(.orange)
         case .rejected(let reason, let detail):
+            // BOUNDED BY GEOMETRY, NEVER EDITED (issue #944) — the same ratified rule the `.failed` arm
+            // below implements (issue #844). `design/README.md` § "The Settings window (#763)" states it
+            // for the apply-status slot as a whole, and `menubar-preview.html`'s `.win-status .txt` names
+            // `.failed` and `.rejected` together. Read off that RULE, not off a frame: NO frame renders
+            // this arm (that reference's own unauthored register R-11 → issue #946).
+            //
+            // SHARPER HERE THAN BELOW, and measured (`SettingsTextMetricsTests`): `applyFailureText` wraps
+            // the daemon's text in a fixed app sentence, but `rejectionText(.invalid, detail)` RETURNS the
+            // detail — on that path the daemon's whole message IS the label. `src/config/validate.rs`
+            // spells its cross-field remedies out, and the `target_max_session_usage = 0` rejection (the
+            // documented issue #414 operator trap: 0 is the natural wrong guess for "no restriction", its
+            // exact opposite) is 169 characters / ~1 027 pt of text in the 328 pt slot — four wrapped
+            // lines, in a window `SettingsWindowController` builds with no `.resizable`, so that height
+            // came out of the form above rather than clipping.
+            //
+            // `.help` is the recovery and carries BOTH surfaces the design rule names — the hover tooltip
+            // AND `accessibilityHelp` (there is no SwiftUI modifier of that name; the AX attribute is the
+            // one `.help` sets). It takes `rejectionTooltip`, which is the rendered label PLUS the
+            // daemon's `detail` when the label does not already carry it, replacing the `detail ?? ""`
+            // this arm used to pass.
+            //
+            // THE DETAIL IS SENT ON TWO REASONS, NOT ONE, and that is what makes the tooltip a distinct
+            // string rather than a copy of the label. `ConfigSetAck::Rejected`'s doc
+            // (`src/daemon/socket.rs`) carries the non-secret message for `invalid` AND for
+            // `config-unreadable` — the baseline TOML parse error (issue #628), which
+            // `classify_config_set_failure` (`src/daemon/classify.rs`) attaches so a malformed on-disk
+            // config is diagnosable rather than a bare envelope. `rejectionText` returns `detail` only on
+            // `.invalid`, so on `.configUnreadable` the parse error would be dropped — and nothing else
+            // in this app surfaces it. The other four reasons carry no detail at all; for them the
+            // tooltip is the arm's own sentence, which is what `detail ?? ""` failed to show.
             Label(SettingsFormat.rejectionText(reason, detail), systemImage: "xmark.octagon")
                 .foregroundStyle(.red)
-                .help(detail ?? "")
+                .lineLimit(SettingsFormat.applyStatusLineLimit)
+                .truncationMode(.tail)
+                .help(SettingsFormat.rejectionTooltip(reason, detail))
         case .failed(let failure):
             // BOUNDED BY GEOMETRY, NEVER EDITED (issue #844) — the rule `design/README.md`
             // § "The Settings window (#763)" ratifies and whose `loaded` frames render.
