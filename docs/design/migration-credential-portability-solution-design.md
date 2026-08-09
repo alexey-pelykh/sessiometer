@@ -477,6 +477,19 @@ recurring**, by making the artifact-config parse path tolerant of unknown blocks
 added does not re-break it. R-9b's narrow-parse delivers (b) for the roster-only case as a side effect;
 the full-artifact case needs the same treatment deliberately.
 
+> **This paragraph's premise is wrong on the FLOOR and on the UNIT.** *Corrected 2026-08-09
+> (#1053), against the working tree; the text above is left as written since R-16 is ratified.*
+> **(1) The floor is not `6fe3457`.** That is where the `[credential]` block arrived, but
+> `expiry_cohort_window_secs` landed inside it **14 commits later the same day** (`81bd4f2`, issue
+> #879), so a binary built at exactly `6fe3457` still rejects a current artifact. The floor is the
+> most recent commit that added a **rendered config key** — today `81bd4f2`. Reproduced in
+> `src/config/load.rs::a_build_at_the_blocks_own_commit_still_rejects_a_current_render`.
+> **(2) The unit is a key, not a block.** *Every* `Raw*` struct carries `deny_unknown_fields`, not
+> only `RawConfig`, so an unknown key at any nesting level is refused exactly as an unknown block
+> is. Since the freeze the rendered config has gained one new top-level block and 22 new value
+> keys, so "(b) tolerant of unknown **blocks**" would repair 1 case in 23 — an implementer of (b)
+> must build **key**-tolerance. See ADR-0006 § Status, and OQ-5 in § 14 Risks and Open Questions.
+
 ## 5. Building Blocks
 
 | Block | Change | Requirements |
@@ -876,6 +889,29 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
   **(b)** — (a) alone leaves the defect free to recur. *(Restated 2026-08-05: this was written as three
   options — "(a), (b) also …, or both" — but (b)'s "also" already subsumes (a), so "both" was a
   duplicate of (b). AC-16 and Cap-11.2 gate their tolerance clause on this landing at (b).)*
+  **STILL OPEN — the ungated half has SHIPPED underneath it (2026-08-09, #1053).** The version
+  floor is documented (`migration::CONFIG_BLOCK_VERSION_FLOOR`, ADR-0006 § Status, README
+  § Exporting state offline), the import path names it instead of surfacing a bare
+  `deny_unknown_fields` line (`Error::MigrationImportConfigRejected`), and the incompatibility is
+  pinned by two hand-built historical-parser fixtures (`src/config/load.rs`).
+  **The tolerance half is NOT built** — AC-16's ordering says OQ-5 closes *before* any tolerance
+  code is written, and the recorded lean above is a lean, not a closure, so #1053 shipped (a)'s
+  ungated content and left the choice to the maintainer rather than settling it by writing code.
+  What is now decided is only *what the answer costs*: (a) is already paid for, so choosing (b)
+  is an increment on a landed floor rather than a fresh build.
+  **Three facts not in evidence when this question was written, all of which push toward (b).**
+  (i) `Config::render` emits every key **unconditionally**, so a break is universal rather than
+  settings-dependent. (ii) The repo still carries **no tags and no releases**, so no *released*
+  binary predates the floor — the affected population is source-built binaries, which shrinks the
+  unfixable half to approximately nobody and leaves recurrence, which is what (b) addresses, as
+  the live half of the question rather than the historical one. (iii) **The recurrence is far
+  larger than "blocks" suggests, and this is the decisive correction.** Every `Raw*` struct
+  carries `deny_unknown_fields`, so the breaking unit is a **key at any nesting level**: since
+  the ADR-0006 freeze the rendered config has gained one new top-level block and **22** new value
+  keys (ADR-0006 § Status has the per-block breakdown and how to re-derive it). So the wording
+  throughout this question — "unknown *blocks*", "the next added *block*" — understates its own
+  scope by more than an order of magnitude, and any tolerance built to the letter of it would
+  repair 1 case in 23. **If (b) is taken, it must be key-tolerance, not block-tolerance.**
 - **OQ-7 (bounds R-9 / R-11c / AD-11)** — **what does `--settings` do on a target that already has a
   config?** The two things this document says are mutually exclusive. § 4.7 models scope as a
   **lattice meet** over `ImportScope { accounts, settings }` with both-true ≡ today's behaviour, and

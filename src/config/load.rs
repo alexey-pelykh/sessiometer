@@ -524,4 +524,148 @@ mod tests {
             Err(Error::ConfigParse(_))
         ));
     }
+
+    /// **A migration artifact has a SECOND compatibility surface, and it is not versioned**
+    /// (issue #1053). The container's `format_version` gate is exact-match and ADR-0006 froze
+    /// v1; but the config rides inside as TEXT and is re-parsed by the importing build's own
+    /// [`RawConfig`], which carries `deny_unknown_fields` — as does every other `Raw*` struct.
+    /// So a build whose parser predates any rendered **key** rejects every artifact a later
+    /// build mints, while `format_version` reads `1` on both sides and says compatible. That
+    /// disagreement is why nobody noticed.
+    ///
+    /// **The unit of breakage is a KEY, not a block — which is why the floor is not where the
+    /// block arrived.** `[credential]` was added in `6fe3457` (2026-07-29), but a build pinned
+    /// at exactly that commit *still* refuses a current artifact: `expiry_cohort_window_secs`
+    /// landed inside the same block 14 commits later the same day (`81bd4f2`, issue #879). The
+    /// two arms below witness both, which is what makes the pair falsify "the block's commit is
+    /// the floor" rather than merely illustrate it.
+    ///
+    /// **What this can and cannot witness.** The failing parser lives in an already-BUILT
+    /// binary, which no test in this tree can reach — ADR-0006 § Consequences → Negative /
+    /// trade-offs says exactly that ("not catchable by any in-repo test … CI has no old
+    /// binary"), and issue #1053 forbids trying. So each incompatibility is pinned against a
+    /// hand-built mirror of the historical raw shape. The fixtures are the witnesses; the built
+    /// binary stays out of reach, and nothing here claims to repair it.
+    #[test]
+    fn a_pre_credential_block_parser_rejects_a_config_a_current_build_renders() {
+        /// The pre-`6fe3457` `RawConfig`, field-for-field, MINUS `credential`. Written out by
+        /// hand rather than derived from the live struct — a derived mirror would track the
+        /// very drift this exists to witness. Nothing reads the fields; the parse verdict is
+        /// the whole assertion, so `dead_code` is expected here.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct PreCredentialRawConfig {
+            #[serde(default)]
+            account: Vec<RawAccount>,
+            #[serde(default)]
+            tunables: RawTunables,
+            #[serde(default)]
+            jitter: RawJitter,
+            #[serde(default)]
+            refresh: RawRefresh,
+            #[serde(default)]
+            login: RawLogin,
+            #[serde(default)]
+            stats: RawStats,
+            #[serde(default)]
+            migration: RawMigration,
+        }
+
+        // What `export` actually writes into an artifact: a current build's own render.
+        let current = Config::parse(VALID)
+            .expect("the baseline config parses")
+            .render();
+        assert!(
+            current.contains("[credential]"),
+            "render must emit [credential] or this test witnesses nothing: {current}"
+        );
+
+        // A current build reads what a current build renders — the version number is honest
+        // about THIS direction.
+        Config::parse(&current).expect("a current build must read its own render");
+
+        // A build that predates the block does not, and says so by naming the block.
+        let rejected = match toml::from_str::<PreCredentialRawConfig>(&current) {
+            Err(err) => err,
+            Ok(_) => panic!("a pre-6fe3457 parser must REJECT a [credential]-bearing config"),
+        };
+        assert!(
+            rejected.to_string().contains("credential"),
+            "the rejection must name the block responsible: {rejected}"
+        );
+
+        // `[credential]` is the only top-level BLOCK that crosses the floor: drop it and the
+        // same pre-6fe3457 parser accepts the rest of a current render. This arm is a
+        // recurrence gate, and its scope is exactly one class — a new TOP-LEVEL BLOCK. A key
+        // added inside an existing block is invisible to it, which is how the second break got
+        // through; that class is witnessed by the sibling test below, for `[credential]` only.
+        //
+        // Dropped through a `toml::Table` rather than by cutting lines, so the arm cannot be
+        // silently defeated by a renderer whose formatting stops matching the cut (a strip that
+        // over-reaches would fail below wearing the recurrence message, which is the wrong
+        // diagnosis in the loudest possible place).
+        let mut table: toml::Table = toml::from_str(&current).expect("a render is valid TOML");
+        assert!(
+            table.remove("credential").is_some(),
+            "the [credential] key must be present to remove: {current}"
+        );
+        let without = toml::to_string(&table).expect("re-serializing a parsed table cannot fail");
+        toml::from_str::<PreCredentialRawConfig>(&without).expect(
+            "a NEW top-level rendered config block crosses the import version floor (issue \
+             #1053): every build older than it will refuse every artifact this build mints, \
+             exactly as `[credential]` already does. Decide that deliberately — see ADR-0006 \
+             § Status",
+        );
+    }
+
+    /// **The floor is NOT where the block arrived** (issue #1053). A build pinned at `6fe3457`
+    /// — the commit that introduced `[credential]`, and the commit an earlier draft of this
+    /// work named as the floor — still refuses a current artifact, because
+    /// `expiry_cohort_window_secs` landed inside that same block 14 commits later on the same
+    /// day (`81bd4f2`, issue #879). `git rev-list --count 6fe3457..81bd4f2` is 14.
+    ///
+    /// This is the second breakage class and the more dangerous one: every `Raw*` struct
+    /// carries `deny_unknown_fields`, so an unknown **key inside a known block** is refused
+    /// exactly as a whole unknown block is — but nothing about it looks like a schema change,
+    /// which is how it passed unremarked. The sibling test above gates new top-level blocks and
+    /// is structurally blind to this class.
+    ///
+    /// It also pins the *actionable* half. An operator told to build from `6fe3457` lands on a
+    /// binary that still fails AND predates the version-floor message, so they get the bare
+    /// serde line — the defect in its least legible form. That is what this asserts against.
+    #[test]
+    fn a_build_at_the_blocks_own_commit_still_rejects_a_current_render() {
+        /// `RawCredential` exactly as it stood at `6fe3457`: one field, `deny_unknown_fields`.
+        /// Hand-written for the same reason as its sibling — deriving it from the live struct
+        /// would track the drift it exists to witness.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct CredentialAtBlockIntroduction {
+            #[serde(default)]
+            expiry_horizon_secs: i64,
+        }
+
+        let current = Config::parse(VALID)
+            .expect("the baseline config parses")
+            .render();
+        let mut table: toml::Table = toml::from_str(&current).expect("a render is valid TOML");
+        let credential = table
+            .remove("credential")
+            .expect("render must emit [credential] or this test witnesses nothing");
+
+        let rejected = match credential.try_into::<CredentialAtBlockIntroduction>() {
+            Err(err) => err,
+            Ok(_) => panic!(
+                "a parser at 6fe3457 must REJECT a current [credential] block — if this passes, \
+                 the floor really is the block's own commit and the wording in \
+                 `migration::CONFIG_BLOCK_VERSION_FLOOR` must move back to it"
+            ),
+        };
+        assert!(
+            rejected.to_string().contains("expiry_cohort_window_secs"),
+            "the rejection must name the key that moved the floor past the block: {rejected}"
+        );
+    }
 }
