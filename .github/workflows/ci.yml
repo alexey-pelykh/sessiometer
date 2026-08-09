@@ -202,17 +202,23 @@ jobs:
   # only when the app changes.
   #
   # HOW "non-required" is achieved, and why it is done THIS way: EVERY step carries
-  # `continue-on-error: true`, so the job's conclusion is always success and the `ci-ok` rollup can never
-  # be blocked by it. The job still appears in `ci-ok.needs` — it must, or `ci-ok-needs-complete`
-  # (issue #318) fails — but structurally cannot fail the gate.
+  # `continue-on-error: true`, so whenever this job runs its conclusion is success and the `ci-ok`
+  # rollup can never be blocked by its verdict. The job still appears in `ci-ok.needs` — it must, or
+  # `ci-ok-needs-complete` (issue #318) fails — but structurally cannot fail the gate on drift.
   #
-  # EVERY step, not just the gate step, and that distinction is the whole point. `ci-ok` fails on
-  # `contains(needs.*.result, 'failure')`, and a job's result is failure if ANY un-guarded step fails —
-  # so marking only the gate step soft would still let `brew install xcodegen` (a network operation, on
-  # every apps/menubar/** PR) or a checkout blip block a merge. That is precisely the RISK-2 failure this
-  # job's non-required landing exists to avoid, arriving through the setup steps instead of the assertion.
-  # A setup failure surfaces as a RED soft verdict below, which is the honest reading: the gate did not
-  # produce a measurement.
+  # EVERY step, not just the gate step, and that distinction is the whole point. A job's result is
+  # `failure` if ANY un-guarded step fails, and `ci-ok` admits only `success`/`skipped` — so marking
+  # only the gate step soft would still let `brew install xcodegen` (a network operation, on every
+  # apps/menubar/** PR) or a checkout blip block a merge. That is precisely the RISK-2 failure this
+  # job's non-required landing exists to avoid, arriving through the setup steps instead of the
+  # assertion. A setup failure surfaces as a RED soft verdict below, which is the honest reading: the
+  # gate did not produce a measurement.
+  #
+  # The one thing `continue-on-error` cannot soften is this job never starting at all — an `abandoned`
+  # result, which since issue #1079 fails the rollup like any other non-`success`/`skipped` value. That
+  # is intended, and it is not a hole in the soft landing: `continue-on-error` absorbs every verdict
+  # this job can PRODUCE, and `abandoned` is not one of them — it means no verdict exists. Exempting it
+  # would mean naming this job inside the rollup, reopening the escape hatch #318 closed.
   #
   # Note this is NOT done by putting `continue-on-error` on the JOB: whether a continue-on-error job
   # reports `success` or `failure` in `needs.*.result` is not something this repo's merge gate should
@@ -340,7 +346,7 @@ jobs:
   # it lands here as a step rather than as another job needing its own `ci-ok.needs` entry.
   #
   # NO PATH FILTER, deliberately, and this is the load-bearing part. `ci-ok` counts a
-  # `skipped` job as a PASS (only `failure`/`cancelled` fail its rollup), so a filtered
+  # `skipped` job as a PASS (its rollup admits `success` and `skipped`), so a filtered
   # gate that misses is indistinguishable from one that ran clean — the gate would report
   # green having evaluated nothing, which is precisely the failure the check guards against
   # inside itself by treating a zero citation count as fatal. There is no `docs` filter to
@@ -425,13 +431,25 @@ jobs:
     steps:
       # `needs.*.result` auto-covers every job in `needs:` above — and the `ci-ok-needs-complete`
       # job asserts that list names every other job, so a new job can't be added to the workflow
-      # and silently escape this rollup. A path-skipped job has result `skipped`, which is a pass;
-      # only `failure`/`cancelled` fail this gate.
-      - name: Fail if any required job did not pass
-        if: ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}
-        run: |
-          echo "::error::A required job failed or was cancelled (results: ${{ join(needs.*.result, ', ') }})"
-          exit 1
-      - name: Summary
-        run: |
-          echo "All required jobs passed or were legitimately skipped (results: ${{ join(needs.*.result, ', ') }})."
+      # and silently escape this rollup. A path-skipped job has result `skipped`, which is a pass.
+      #
+      # The verdict is an ALLOW-LIST — `success` and `skipped` pass, anything else fails — and it
+      # lives in a script rather than in a step `if:`. Both halves are issue #1079. The old
+      # expression denied `failure`/`cancelled`, written as though those plus `skipped` were the
+      # whole value space; GitHub also emits `abandoned` for a job that died in `Set up job`, which
+      # matched neither term, so the fail step was skipped and this gate went green on a run where
+      # three gates never executed. A deny-list fails OPEN on every value it does not enumerate.
+      # The step also runs UNCONDITIONALLY now: a gate whose firing is itself conditional can be
+      # silently un-fired by that condition, which is exactly how the defect stayed invisible.
+      #
+      # The checkout is what putting the classifier in a locally-runnable, falsifiable script costs
+      # (the house pattern — check-ci-ok-needs.sh, check-gate-change-ack.sh). It does add an infra
+      # failure surface to the one required check, but in the safe direction: a checkout blip turns
+      # this gate red and a re-run clears it, rather than waving through something unverified.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Assert every needed job passed or was legitimately skipped
+        env:
+          # One join, one separator. The script both classifies and prints the rollup, so there is
+          # no second `join` here to drift out of step with the one the classifier parses.
+          CI_OK_RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: ./scripts/check-ci-ok-results.sh
