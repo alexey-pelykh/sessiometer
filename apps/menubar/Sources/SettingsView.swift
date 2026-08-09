@@ -275,18 +275,27 @@ struct SettingsView: View {
                 .foregroundStyle(.red)
                 .help(detail ?? "")
         case .failed(let failure):
-            // `.help` mirrors the `rejected` path: a daemon-error `detail` (the #628 stale-key message,
-            // issue #645) can be long, so keep it fully readable on hover.
+            // BOUNDED BY GEOMETRY, NEVER EDITED (issue #844) — the rule `design/README.md`
+            // § "The Settings window (#763)" ratifies and whose `loaded` frames render.
             //
-            // MEASURED (issue #762, `SettingsTextMetricsTests`): "can be long" understates it by an order
-            // of magnitude. The #628 detail is serde's `deny_unknown_fields` error, which names EVERY
-            // expected tunable, so this reaches AT LEAST ~2 700 pt of text in the 328 pt footer slot (the
-            // gate's fixture is a deliberate lower bound). And there is NO `.lineLimit` here — so it WRAPS,
-            // to at least 10 lines / 160 pt, rather than truncating, in a window that is not resizable.
-            // The overflow is filed as issue #844 rather than fixed inline (this umbrella's standing
-            // rule); the gate pins the measured boundary so a fix is verifiable and a regression is loud.
+            // MEASURED (issue #762, `SettingsTextMetricsTests`): the #628 `detail` this interpolates is
+            // serde's `deny_unknown_fields` error, which names EVERY expected tunable, so it reaches AT
+            // LEAST ~2 700 pt of text in the 328 pt footer slot (the gate's fixture is a deliberate lower
+            // bound). Unclamped it WRAPPED rather than truncating — to at least 10 lines — and
+            // `SettingsWindowController` builds the window with `[.titled, .closable]` and no `.resizable`,
+            // so that height came out of the form above it. The clamp caps the drawing at two lines; the
+            // message handed to `.help` is never shortened.
+            //
+            // `.help` is the recovery, and it carries BOTH surfaces the design rule names: the hover
+            // tooltip AND `accessibilityHelp` — there is no SwiftUI `.accessibilityHelp` modifier, and the
+            // AX attribute of that name (the one `PanelAccessibilityTreeTests` walks) is what `.help` sets.
+            // `SettingsTextMetricsTests` gates all three parts: that the clamp BINDS on this string, that
+            // the string handed to `.help` is still the daemon's message in full, and — through a stand-in
+            // label in the AX tree — that a clamped `.help` really does publish the whole message.
             Label(SettingsFormat.applyFailureText(failure), systemImage: "bolt.horizontal.circle")
                 .foregroundStyle(.red)
+                .lineLimit(SettingsFormat.applyStatusLineLimit)
+                .truncationMode(.tail)
                 .help(SettingsFormat.applyFailureText(failure))
         }
     }
