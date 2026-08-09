@@ -354,15 +354,28 @@ final class AccountCaptureTests: XCTestCase {
         ControlCommandClient(connector: CommandFakeConnector(.succeed(connection)), timeout: .seconds(5))
     }
 
-    /// Spin the cooperative executor until `predicate` holds (bounded), so a wiring bug fails the test
-    /// instead of hanging. `@MainActor`, so it reads the model on its own actor without a hop.
+    /// Poll ON THE MAIN ACTOR, bounded by WALL CLOCK, so a wiring bug fails the test instead of hanging.
+    /// `@MainActor` because `AccountCaptureModel` is, so `phase` is read on its own actor without a hop.
+    ///
+    /// The bound is a deadline rather than a `Task.yield()` count because yielding grants no real time: the
+    /// former `0..<10_000` budget was however long 10 000 reschedules happened to take — ~10 ms on an idle
+    /// host, and SHORTER the faster the host (issue #948; ported to this copy by #1078).
+    ///
+    /// What kept that budget survivable HERE was an ordering, not its size: `AccountCaptureModel.capture`
+    /// assigns `.pending` before its first `await`, so the transition both waits in this file observe is
+    /// already queued on the main actor and a single yield would release it. Point a wait in this suite at
+    /// something that settles only AFTER a suspension and that protection is gone with no signal — which is
+    /// the case the deadline now covers.
     @MainActor
     private func waitUntil(_ predicate: () -> Bool, _ label: String) async throws {
-        for _ in 0..<10_000 {
-            if predicate() { return }
-            await Task.yield()
+        let budget: Duration = .seconds(5)
+        let deadline = ContinuousClock.now.advanced(by: budget)
+        while !predicate() {
+            guard ContinuousClock.now < deadline else {
+                return XCTFail("timed out waiting for \(label) after \(budget)")
+            }
+            try await Task.sleep(for: .milliseconds(1))
         }
-        XCTFail("timed out waiting for \(label)")
     }
 }
 
