@@ -991,17 +991,30 @@ final class StatsTests: XCTestCase {
         StatsWindow(start: 0, end: weekSecs, label: "l", period: period, since: nil)
     }
 
+    /// Poll ON THE MAIN ACTOR, bounded by WALL CLOCK. This copy already reasoned its way to the wall-clock
+    /// half; `@MainActor` is the half #1078 adds — `PanelStatsModel` is `@MainActor`, and `StatsTests` is
+    /// not, so this helper was nonisolated and read `phase` from the global cooperative executor (SE-0338).
+    ///
+    /// The deadline stays load-bearing here for a reason that does NOT hold in the capture suites: `select`
+    /// kicks off `load()` on a `Task`, and `phase` only carries a wire AFTER `await client.send(…)` returns
+    /// — strictly after a suspension. There is no already-queued transition for a yield to release, so a
+    /// `Task.yield()` budget grants the load no real time and starves under scheduler contention: measured
+    /// on this suite (issue #1078), swapping this poll for a `0..<10_000` yield budget failed 5 of 15
+    /// isolated runs under 8x CPU oversubscription, where a wall-clock-bounded poll failed 0 of 15
+    /// interleaved against it.
+    ///
+    /// Sleeping is what grants that real time, and because it SUSPENDS rather than blocks, the main actor
+    /// stays free to run the very load being awaited. The poll still returns the instant the predicate
+    /// holds, so only the failure path is time-bounded.
+    @MainActor
     private func waitUntil(_ predicate: () -> Bool, _ label: String) async throws {
-        // A WALL-CLOCK-bounded poll (≈5 s max at 1 ms/iter), NOT a fixed `Task.yield()` budget: `Task.yield()`
-        // only reschedules — it grants no real time — so under CI scheduler contention the detached stats-load
-        // task can be starved past a yield-count budget and time out, while passing locally (fast, low
-        // contention) and only intermittently on CI. `Task.sleep` gives the awaited task real time to run
-        // regardless of load; the poll still returns the instant the predicate holds, so the success path
-        // stays fast — only the failure path is now time-bounded.
-        for _ in 0..<5_000 {
-            if predicate() { return }
+        let budget: Duration = .seconds(5)
+        let deadline = ContinuousClock.now.advanced(by: budget)
+        while !predicate() {
+            guard ContinuousClock.now < deadline else {
+                return XCTFail("timed out waiting for \(label) after \(budget)")
+            }
             try await Task.sleep(for: .milliseconds(1))
         }
-        XCTFail("timed out waiting for \(label)")
     }
 }

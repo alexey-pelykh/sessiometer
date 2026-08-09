@@ -643,14 +643,28 @@ final class PanelCaptureCardTests: XCTestCase {
         return model
     }
 
-    /// Spin the cooperative executor until `predicate` holds (bounded), so a wiring bug fails the test
-    /// instead of hanging — the same helper shape `AccountCaptureTests` uses.
+    /// Poll ON THE MAIN ACTOR, bounded by WALL CLOCK, so a wiring bug fails the test instead of hanging —
+    /// the same helper shape `AccountCaptureTests` uses, awaiting the same `AccountCaptureModel` transition.
+    ///
+    /// `@MainActor` here is redundant with the class-level annotation and stated anyway, so the isolation
+    /// this helper depends on is legible at the declaration rather than at the top of the file, and stays true
+    /// if that annotation is ever narrowed.
+    ///
+    /// The bound is a deadline rather than a `Task.yield()` count because yielding grants no real time: the
+    /// former `0..<10_000` budget was however long 10 000 reschedules happened to take — ~10 ms on an idle
+    /// host, and SHORTER the faster the host (issue #948; ported to this copy by #1078). As in
+    /// `AccountCaptureTests`, what kept that survivable was `capture` assigning `.pending` before its first
+    /// `await`, not the budget's size.
+    @MainActor
     private func waitUntil(_ predicate: () -> Bool, _ label: String) async throws {
-        for _ in 0..<10_000 {
-            if predicate() { return }
-            await Task.yield()
+        let budget: Duration = .seconds(5)
+        let deadline = ContinuousClock.now.advanced(by: budget)
+        while !predicate() {
+            guard ContinuousClock.now < deadline else {
+                return XCTFail("timed out waiting for \(label) after \(budget)")
+            }
+            try await Task.sleep(for: .milliseconds(1))
         }
-        XCTFail("timed out waiting for \(label)")
     }
 }
 
