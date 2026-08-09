@@ -2184,6 +2184,16 @@ where
     ///   band's ceiling, so this state settles the question for every threshold an operator can
     ///   configure — which is what makes the LEAVE edge reachable across the whole band rather
     ///   than only its lower part.
+    /// - **The principle stops there, and `Flat` is the arm that looks like it should not.** A zero
+    ///   combined burn never exhausts, which reads as stronger evidence still — yet it re-arms
+    ///   nothing. The two states bound DIFFERENT things: `BeyondWeeklyWindow` bounds the QUOTIENT,
+    ///   head-room over burn, which is the quantity a threshold is expressed in; `Flat` bounds only
+    ///   the denominator, and `stats::fleet_runway_state` returns it BEFORE reading
+    ///   head-room at all — so a nearly-exhausted idle pool and a brim-full one produce the
+    ///   identical reading. Re-arming on it would clear a live alarm using a measurement that
+    ///   cannot see the head-room the alarm is about, and an idle stretch mid-episode is exactly
+    ///   when that reading arrives. The #650 D4 hold is therefore deliberate on its own terms, not
+    ///   an arm #1028 forgot to revisit.
     /// - **Edge-triggered.** A KNOWN runway below the line emits `fleet_runway_low` exactly ONCE
     ///   on the downward crossing (held silent while it stays below); a runway demonstrably back
     ///   at/over the line emits the [`Event::FleetRunwayRecovered`] LEAVE marker once and

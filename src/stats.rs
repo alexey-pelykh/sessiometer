@@ -1090,8 +1090,10 @@ pub(crate) enum FleetRunwayState {
     ///
     /// Inputs only. A non-finite QUOTIENT is [`Self::BeyondWeeklyWindow`], not this: it comes from
     /// a burn that was measured and merely tiny, so it still says the pool outlasts a week. The
-    /// checked conversion in [`fleet_runway_state`] also falls back here, but the gates above make
-    /// that arm unreachable — it is a fail-closed backstop, not a fifth classification.
+    /// checked conversion ([`checked_runway_secs`]) also falls back here when it refuses, but the
+    /// gates above make that arm unreachable — it is a fail-closed backstop, not a fifth
+    /// classification. The conversion is nonetheless tested, by calling it directly rather than
+    /// through [`fleet_runway_state`], which is what leaves this arm's status unchanged (#1081).
     Unmeasurable,
 }
 
@@ -1221,26 +1223,30 @@ pub(crate) const FLEET_RUNWAY_PLAUSIBLE_MAX_SECS: i64 = 7 * DAY_SECS;
 ///    the pool outlasts a week, and an infinite quotient is merely the emphatic form of it. That is
 ///    distinct from `Unmeasurable`, because it still tells a decision-maker the drain is slower than
 ///    one reset cycle.
-/// 4. **The conversion must succeed**, or there is no whole-second figure to state.
+/// 4. **The conversion must succeed** ([`checked_runway_secs`]), or there is no whole-second figure
+///    to state.
 ///
 /// Note what gate 1 does NOT do: it does not reject a merely SMALL rate. A decayed EMA of `1e-11` is
-/// finite and positive, so it passes — and yields ~787,000 days, the order of the `~648427 days`
-/// this issue reported. The prior guard was written for the flat case (`total_rate > 0.0`) and so
-/// read a vanishing burn as a real one. What refuses it is the RESULT bound at gate 3, which is the
-/// point: the bound is expressed in the unit an operator can check, not in the EMA's native
-/// fraction-per-second (where a "small" constant is unreadable and drifts if the unit ever changes —
-/// the input-side epsilon this issue explicitly rejected).
+/// finite and positive, so it passes — and at the reproduction's pooled head-room (≈0.68) yields
+/// ~787,000 days, the order of the `~648427 days` this issue reported. The head-room is named
+/// because the figure is a QUOTIENT: at another head-room the same rate yields another horizon, so
+/// a reader recomputing from the rate alone cannot land on this number. The prior guard was written
+/// for the flat case (`total_rate > 0.0`) and so read a vanishing burn as a real one. What refuses
+/// it is the RESULT bound at gate 3, which is the point: the bound is expressed in the unit an
+/// operator can check, not in the EMA's native fraction-per-second (where a "small" constant is
+/// unreadable and drifts if the unit ever changes — the input-side epsilon this issue explicitly
+/// rejected).
 ///
 /// The corollary is that `Unmeasurable` is a statement about the INPUTS only. Nothing about a
 /// well-formed pooled reading lands there, however extreme — a slower burn must never be read as
 /// carrying LESS information than a faster one.
 ///
-/// The conversion is CHECKED, never `as i64`: since Rust 1.45 a float→int `as` cast SATURATES rather
-/// than trapping, which is exactly how an overflowing quotient reached the surface as `i64::MAX`
-/// (106,751,991,167,300 days) instead of failing. Widening to `i128` first cannot launder that — a
-/// saturated `i128::MAX` is still out of `i64` range, so [`i64::try_from`] rejects it. That makes
-/// gate 4 total on its own, independent of gate 3: the semantic bound and the structural one fail
-/// closed separately, so relaxing either later cannot silently reintroduce saturation (R-4).
+/// The conversion is CHECKED, never `as i64`. That gate is [`checked_runway_secs`], extracted so it
+/// is REACHABLE on its own (issue #1081): gate 3 leaves it nothing to refuse, so its independence
+/// from gate 3 — the R-4 defence-in-depth claim — was prose no test could exercise, and measurably
+/// ungated (a mutation swapping the checked conversion for a saturating `as i64` passed the entire
+/// suite). The claim, and the reasoning behind it, now live on that function with the test that
+/// pins them.
 ///
 /// Deliberately NOT a clamp. Clamping an absurd figure to a large plausible one converts an
 /// obviously-wrong number into a CREDIBLE one, which is strictly harder to notice — refusal is the fix.
@@ -1267,11 +1273,53 @@ fn fleet_runway_state(headroom: f64, rate: f64) -> FleetRunwayState {
         return FleetRunwayState::BeyondWeeklyWindow;
     }
     // `secs` is now finite, inside the window, and non-negative (non-negative numerator, strictly
-    // positive denominator), so BOTH guards below already hold: the `Unmeasurable` arm is a
-    // fail-closed backstop that outlives any later relaxation of gate 3, not a reachable outcome.
+    // positive denominator), so gate 4 already holds for every value that can arrive here: the
+    // `Unmeasurable` arm is a fail-closed backstop that outlives any later relaxation of gate 3,
+    // not a reachable outcome. That is why gate 4 is TESTED through `checked_runway_secs` directly
+    // rather than through this function — no argument pair reaches it with a value it would refuse.
+    match checked_runway_secs(secs) {
+        Some(secs) => FleetRunwayState::Known(secs),
+        None => FleetRunwayState::Unmeasurable,
+    }
+}
+
+/// Gate 4 of [`fleet_runway_state`] as its own function: the CHECKED conversion of a rounded second
+/// count into the `i64` a [`Known`](FleetRunwayState::Known) runway carries. `None` is "no
+/// whole-second figure to state".
+///
+/// TOTAL on its own, independent of gate 3 — the R-4 claim, and the reason this is a separate
+/// function at all (issue #1081). Gate 3 has already bounded `secs` to
+/// `0..=`[`FLEET_RUNWAY_PLAUSIBLE_MAX_SECS`] before any call from `fleet_runway_state`, so no such
+/// call can make this answer `None`; reaching the gate from a test therefore requires reaching it
+/// HERE, with a value gate 3 would have refused. Doing so does not change the reachability of that
+/// function's `Unmeasurable` arm, which stays the fail-closed backstop its own doc describes — this
+/// returns `None`, and only `fleet_runway_state` turns a `None` into a classification.
+///
+/// Three ways an unchecked `secs as i64` fails open, all refused here:
+///
+/// - **Above the range.** A float→int `as` cast SATURATES rather than trapping (Rust 1.45+), which
+///   is exactly how an overflowing quotient reached the surface as `i64::MAX`
+///   (106,751,991,167,300 days) instead of failing (issue #1028). Widening to `i128` first cannot
+///   launder it — a saturated `i128::MAX` is still out of `i64` range, so [`i64::try_from`] rejects
+///   it.
+/// - **Below zero.** A negative count saturates toward `i64::MIN` rather than refusing, and a
+///   NEGATIVE runway would state a figure as confidently as a positive one.
+/// - **Not a number.** `NaN as i128` is `0`, not a saturated sentinel — the one failure mode that
+///   produces a small, entirely CREDIBLE figure. A `Known(0)` runway reads as "exhausted now" and
+///   would FIRE the daemon's warn edge, so the finite check is the fail-closed half of this gate,
+///   not a duplicate of gate 3's: gate 3 classifies a non-finite QUOTIENT as out-of-window, while
+///   this refuses to convert one at all.
+///
+/// The last is inert for every call `fleet_runway_state` can make (gate 3 rejects non-finite first)
+/// and is what makes "relaxing either gate later cannot silently reintroduce a fabricated figure"
+/// true of this function rather than merely of the pair.
+fn checked_runway_secs(secs: f64) -> Option<i64> {
+    if !secs.is_finite() {
+        return None;
+    }
     match i64::try_from(secs as i128) {
-        Ok(secs) if secs >= 0 => FleetRunwayState::Known(secs),
-        _ => FleetRunwayState::Unmeasurable,
+        Ok(secs) if secs >= 0 => Some(secs),
+        _ => None,
     }
 }
 
@@ -6985,7 +7033,8 @@ mod tests {
         assert_eq!(
             fleet_runway_state(0.5, 1e-11),
             FleetRunwayState::BeyondWeeklyWindow,
-            "1e-11 fraction/sec yielded ~787,000 days — the same order as the reported ~648427"
+            "0.5 head-room at 1e-11 fraction/sec is ~578,700 days — the same order as the reported \
+             ~648427 (whose ~787,000 came from the reproduction's larger head-room, not this rate)"
         );
         assert_eq!(
             fleet_runway_state(0.5, 1e-300),
@@ -7048,6 +7097,60 @@ mod tests {
             fleet_runway_state(0.5, 1e-5),
             FleetRunwayState::Known(50_000)
         );
+    }
+
+    #[test]
+    fn checked_runway_secs_refuses_every_figure_a_saturating_cast_would_state() {
+        // Gate 4 IN ISOLATION (issue #1081). Gate 3 bounds the quotient to one weekly window before
+        // `fleet_runway_state` can reach the conversion, so no argument pair to that function
+        // exercises this gate at all — which is why the R-4 independence claim shipped ungated:
+        // replacing the checked conversion with `secs as i64`, the plausibility bound left fully
+        // intact, passed the entire suite. Reaching the gate means calling it directly, with the
+        // values gate 3 would have refused.
+        //
+        // This does NOT make `fleet_runway_state`'s `Unmeasurable` arm reachable: the refusals here
+        // are `None`, and only that function turns a `None` into a classification.
+
+        // Out of range ABOVE. What the unchecked cast does is asserted FIRST on every input —
+        // a value refused for some unrelated reason would look like it proves the gate while
+        // discriminating nothing. `i64::MAX as f64` is the boundary: `i64::MAX` is not
+        // representable in `f64`, so it rounds to `i64::MAX + 1` — one past the range, and the
+        // exact figure the cast collapses to.
+        for secs in [1e300, f64::MAX, i64::MAX as f64, f64::INFINITY] {
+            assert_eq!(
+                secs as i64,
+                i64::MAX,
+                "{secs:e} must saturate to issue #1028's sentinel, or this case tests nothing"
+            );
+            assert_eq!(
+                checked_runway_secs(secs),
+                None,
+                "{secs:e} has no whole-second figure — refuse it, never state i64::MAX"
+            );
+        }
+
+        // Out of range BELOW: the cast states a NEGATIVE runway as confidently as a positive one.
+        assert_eq!(-1.0_f64 as i64, -1, "the cast states a negative runway");
+        assert_eq!(checked_runway_secs(-1.0), None);
+
+        // NOT A NUMBER — the only failure mode yielding a small, entirely credible figure rather
+        // than a conspicuous sentinel: `NaN as i64` is 0, so `Known(0)` would read as "exhausted
+        // now" and FIRE the daemon's warn edge rather than merely mis-state a horizon. That one is
+        // stated rather than asserted because `clippy::cast_nan_to_int` — warn-by-default, and
+        // denied by this repo's clippy gate's `-D warnings` — rejects the demonstrating cast under
+        // `cargo clippy`. `ci-ok` requires that gate, so the cast cannot land; `cargo test` alone
+        // would compile it, which is why the guarantee is the gate's and not the compiler's.
+        assert_eq!(checked_runway_secs(f64::NAN), None);
+
+        // The positive half, so the gate is a filter and not a blanket refusal: everything gate 3
+        // can actually hand it converts, endpoints included.
+        for secs in [0.0, 1.0, 50_000.0, FLEET_RUNWAY_PLAUSIBLE_MAX_SECS as f64] {
+            assert_eq!(
+                checked_runway_secs(secs),
+                Some(secs as i64),
+                "{secs} is inside the window and must convert"
+            );
+        }
     }
 
     #[test]
