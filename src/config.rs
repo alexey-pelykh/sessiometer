@@ -518,8 +518,11 @@ pub(crate) struct Tunables {
     /// burn — drops BELOW this, the daemon emits ONE edge-triggered `fleet_runway_low` event (the
     /// operator's lead-time signal BEFORE the all-exhausted terminal state, #11). **`0` disables
     /// the path (the kill-switch, and the opt-in default)**; a non-zero value is bounded
-    /// `60..=2_592_000` (1 min..30 d — a warn line above 30 days is always-on noise, not a
-    /// warning). Purely an operator-visibility signal: no swap decision reads it.
+    /// `60..=`[`crate::stats::FLEET_RUNWAY_PLAUSIBLE_MAX_SECS`] (1 min..7 d). The ceiling is that
+    /// plausibility bound itself, not a separate taste bound (issue #1076): the runway model
+    /// ignores replenishment, so it can rank no horizon past the first weekly reset — a warn line
+    /// above the bound has no reading that could ever clear it. Purely an operator-visibility
+    /// signal: no swap decision reads it.
     pub(crate) fleet_runway_warn_secs: u64,
     /// The documented operator override for a FALSE behavioral-canary drift (issue #714). The
     /// canary refuses credential writes on a positive Layer-2 DRIFT (the resolved canonical
