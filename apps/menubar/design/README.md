@@ -646,8 +646,9 @@ Issue #762 put the Settings window's copy and its two hardcoded field widths und
 (`Tests/SettingsTextMetricsTests`). Three surfaces stayed out of reach of that gate — window/activation
 lifecycle, the `⌘S` key event, and runtime affordances (spinner, focus ring, hover tooltip) — and they
 are listed here rather than left silent, since the issue's AC-4 is explicit that an untestable surface
-must be named as such. They expand to the five steps below because two of them have a stopped-daemon and
-a running-daemon half. Everything else the gate could not reach has a tracked owner instead: the
+must be named as such. They expand to the six steps below because two of them have a stopped-daemon and
+a running-daemon half, and because issue #844 added a second runtime affordance — the footer's clamped
+failure label — whose drawing no headless bundle can observe. Everything else the gate could not reach has a tracked owner instead: the
 accessibility tree is issue #840, the design reference is § The Settings window below (issue #763,
 landed), and Dynamic Type is the
 pinned defect issue #845.
@@ -671,6 +672,14 @@ Run these with the daemon RUNNING (so the form loads) unless a step says otherwi
       place a field's unit and meaning are explained, and hover is not an accessibility attribute — no
       tree walk can see it. (VoiceOver users get the same copy via `accessibilityHelp`, which the
       VoiceOver checklist above covers; this bullet is the sighted-mouse half.)
+- [ ] **The footer's clamped failure label** (issue #844). Save a tunable from an app older than the
+      daemon — or edit `SettingsFormat.applyFailureText`'s `.daemonError` arm to interpolate a few
+      hundred characters — and confirm the red footer line stops at **two** lines with a trailing
+      ellipsis, that the form above it does not move, and that hovering it shows the message in full.
+      The clamp CONSTANT, that the string overruns it, and that `.help` publishes the whole message to
+      the accessibility tree are all gated in `SettingsTextMetricsTests`; that SwiftUI actually draws
+      two lines and not ten is the half only an eye can settle, and the window is not resizable, so an
+      unbounded label eats the form rather than clipping.
 
 Not on this list on purpose: the per-field COPY, the Save enable/disable rule, and whether a value or
 label fits its field. Those are measured in `SettingsTextMetricsTests` and do not need a human.
@@ -1341,8 +1350,14 @@ the defect #573 fixed and the arrangement this reference now locks.
 from two allowances and says to treat it as approximate) and the daemon's `detail` can reach
 several thousand, so the label clamps to two lines while the full message stays reachable through the
 hover tooltip and `accessibilityHelp`. That is the same call the `255%` meter already ratified —
-clamp the drawing, never the truth. The shipped window does **not** do this yet (issue #844, and its
-sibling on the `.rejected` arm); the frames show the target, not the current build.
+clamp the drawing, never the truth. The shipped `.failed` arm now does this (issue #844 — the clamp is
+`SettingsFormat.applyStatusLineLimit`, and `.help` is what carries both recovery surfaces, since there
+is no SwiftUI `accessibilityHelp` modifier and that AX attribute is the one `.help` sets). Its sibling
+on the `.rejected` arm does **not** yet (issue #944). For that arm the target is carried by the
+ratified **rule** alone — the `-webkit-line-clamp:2` on `menubar-preview.html`'s `.win-status .txt`,
+under a comment that names `.failed` and `.rejected` together — and by **no frame**: every
+apply-status arm except `.failed` is among the surfaces these four frames deliberately do not author
+(§ above, register R-11 → issue #946). Read that arm's target off the rule, not off a frame.
 
 ## Design constraints the mock honors
 

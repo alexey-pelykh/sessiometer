@@ -765,6 +765,23 @@ enum SettingsFormat {
         contentWidth - 2 * formRowHorizontalInset
     }
 
+    /// LINKED — the footer apply-status `Label`'s `.lineLimit`. The slot's OTHER dimension: the budget
+    /// below bounds it horizontally, this bounds it vertically, and they sit together so the two halves of
+    /// one slot cannot be re-derived apart.
+    ///
+    /// The ratified rule (`design/README.md` § "The Settings window (#763)", whose `loaded` frames render
+    /// this clamp): long daemon text is bounded by GEOMETRY, never edited. The daemon's `detail` can reach
+    /// several thousand points against a 328 pt slot, so the label clamps and the full message stays
+    /// reachable through the `.help` tooltip — the same call the `255%` meter already made.
+    ///
+    /// A constant rather than a literal at the view site for the reason every other LINKED value here is
+    /// one: `SettingsView` is not in the test bundle (`project.yml`), so a literal there is unreachable
+    /// from any test, whereas this is the value `SettingsTextMetricsTests` measures the clamp against. The
+    /// ratified clamp RULE covers the `.failed` AND `.rejected` labels alike — the rule, not a frame:
+    /// no frame renders `.rejected` (`design/README.md` § "The Settings window (#763)"). Only `.failed`
+    /// reads this today (issue #844); issue #944 is the `.rejected` half, and this is what it should reuse.
+    static let applyStatusLineLimit = 2
+
     /// The width available to the footer's apply-status `Label` TITLE.
     ///
     /// Derived, never hand-tuned: the content width less both footer paddings, the two `HStack` gaps, the
