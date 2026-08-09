@@ -25,7 +25,7 @@ delta   ┤x──────────────────────�
 ガンマ  ┤───m──Px────────────────────────────────├  8% · 15% · 17%
 
   lowest utilisation: ガンマ (session mean 8%)
-  accounts last ~3 days at the current combined rate (2 of 3 counted)
+  accounts last: ~3 days at the current combined rate (2 of 3 counted)
 not in roster (1): retired
 all-accounts-high fires more readily without a roster — config.toml is not valid TOML — run `sessiometer config validate` for the detail
 roster: 4 swaps (2 session, 1 weekly, 1 manual, 0 forced, 0 emergency) · all-accounts-high (≥95%, sampled accounts): 0 episodes (0s) · capacity holds: —
