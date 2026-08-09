@@ -174,6 +174,19 @@ Before adding a dependency, weigh:
   and fails the build if any job other than `ci-ok` is missing from `ci-ok.needs`,
   so a newly added job cannot silently escape the `ci-ok` summary gate's rollup
   (issue #318).
+- [`scripts/check-ci-ok-results.sh`](scripts/check-ci-ok-results.sh)
+  — a CI guard (a step in the `ci-ok` job itself in
+  [`.github/workflows/ci.yml`](.github/workflows/ci.yml)) that is the gate's
+  verdict: it reads the rolled-up `needs.*.result` list and admits only
+  `success` and `skipped`, failing on anything else. An
+  allow-list rather than a deny-list, because the deny-list it replaced enumerated
+  `failure`/`cancelled` and so waved through `abandoned` — the result GitHub gives
+  a job that died in `Set up job` — letting `ci-ok` report green on a run where
+  three gates never executed (issue #1079). Its sibling above answers "is every
+  job in the rollup?"; this one answers "did every job in it actually pass?".
+  Falsifier peer: [`scripts/check-ci-ok-results.test.sh`](scripts/check-ci-ok-results.test.sh),
+  which proves the guard goes RED on that run's verbatim results string and on a
+  value nobody has enumerated yet.
 - [`scripts/check-formula.sh`](scripts/check-formula.sh)
   — a CI guard (the `formula` job in
   [`.github/workflows/ci.yml`](.github/workflows/ci.yml)) that runs `brew style` and

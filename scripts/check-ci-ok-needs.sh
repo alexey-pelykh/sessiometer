@@ -2,14 +2,14 @@
 # Fail the build if any CI job is missing from `ci-ok.needs`.
 #
 # `ci-ok` is the single always-running required check; it rolls up every job in
-# its `needs:` list via `needs.*.result`, failing on any `failure`/`cancelled`
-# (a path-skipped job is a pass). That `needs:` list is the manual source of
-# truth for "which jobs the gate covers". Add a job to the workflow and forget to
-# add it to `ci-ok.needs`, and that job sits OUTSIDE the rollup — its failure
-# would not fail the gate. GitHub exposes no "all jobs in this workflow" context,
-# so this guard parses the workflow and asserts the invariant that every job
-# other than `ci-ok` appears in `ci-ok.needs` (issue #318). It converts the one
-# manual rollup invariant from discipline to enforcement.
+# its `needs:` list via `needs.*.result`, admitting only `success` and `skipped`
+# (a path-skipped job is a pass — issue #1079). That `needs:` list is the manual
+# source of truth for "which jobs the gate covers". Add a job to the workflow and
+# forget to add it to `ci-ok.needs`, and that job sits OUTSIDE the rollup — its
+# failure would not fail the gate. GitHub exposes no "all jobs in this workflow"
+# context, so this guard parses the workflow and asserts the invariant that every
+# job other than `ci-ok` appears in `ci-ok.needs` (issue #318). It converts the
+# one manual rollup invariant from discipline to enforcement.
 #
 # The reverse direction — a `needs:` entry that is not a real job — is already
 # enforced by GitHub Actions itself ("depends on unknown job"), so this only
