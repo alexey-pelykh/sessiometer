@@ -15,6 +15,8 @@
 
 use super::*;
 
+use crate::stats::FLEET_RUNWAY_PLAUSIBLE_MAX_SECS;
+
 impl Config {
     /// Stage two: bounds-check every tunable and the roster, producing the typed
     /// `Config`. Each rejection names the offending field; the cross-field rule
@@ -195,13 +197,25 @@ impl Config {
         range("monitor_recovery_m", t.monitor_recovery_m, 1, 20)?;
         // The proactive fleet-runway warning threshold (issue #650). `0` disables the path (the
         // kill-switch AND the opt-in default, like `session_velocity_horizon_secs`); a non-zero
-        // value is a runway threshold in `60..=2_592_000` s (1 min..30 d — a warn line above 30
-        // days is always-on noise, not a warning; below a minute is indistinguishable from the
-        // all-exhausted signal itself). `range` cannot express the `0`-or-band shape, so spell it
-        // out, mirroring the `near_limit_poll_secs` message above.
-        if t.fleet_runway_warn_secs != 0 && !(60..=2_592_000).contains(&t.fleet_runway_warn_secs) {
+        // value is a runway threshold in `60..=FLEET_RUNWAY_PLAUSIBLE_MAX_SECS` s (1 min..7 d;
+        // below a minute is indistinguishable from the all-exhausted signal itself).
+        //
+        // The CEILING is the #1028 plausibility bound ITSELF, read from that constant rather than
+        // re-typed (issue #1076). It is not a taste bound — it is the widest line the runway model
+        // can still RANK. The model ignores replenishment, so no reading may claim a horizon past
+        // the first weekly reset; a threshold above the bound therefore has no reading that can
+        // reach it, which latched `fleet_runway_low` on permanently and made
+        // `Event::FleetRunwayRecovered` unreachable. Deriving the band from the bound makes that
+        // contradiction structurally impossible: move the bound and the band follows, so the two
+        // cannot drift apart again. `range` cannot express the `0`-or-band shape, so spell it out,
+        // mirroring the `near_limit_poll_secs` message above.
+        if t.fleet_runway_warn_secs != 0
+            && !(60..=FLEET_RUNWAY_PLAUSIBLE_MAX_SECS).contains(&t.fleet_runway_warn_secs)
+        {
             return Err(Error::ConfigInvalid(format!(
-                "fleet_runway_warn_secs must be 0 (disabled) or in 60..=2592000, got {}",
+                "fleet_runway_warn_secs must be 0 (disabled) or in \
+                 60..={FLEET_RUNWAY_PLAUSIBLE_MAX_SECS} (one weekly window; a longer warn line \
+                 could never clear), got {}",
                 t.fleet_runway_warn_secs
             )));
         }
@@ -974,13 +988,20 @@ mod tests {
     }
 
     #[test]
-    fn fleet_runway_warn_secs_accepts_zero_disabled_or_the_60_to_2592000_band() {
+    fn fleet_runway_warn_secs_accepts_zero_disabled_or_the_60_to_weekly_window_band() {
         // Issue #650: the proactive fleet-runway warn threshold is `0` (disabled — the shipped
-        // DEFAULT and the kill-switch, since the warning is opt-in) OR in the 60..=2_592_000 s
-        // band (one minute of lead time up to a 30-day cap). The `0`-OR-band shape mirrors
-        // `near_limit_poll_secs` above: a naive `(60..=2_592_000).contains()` WITHOUT the `!= 0`
-        // guard would reject the documented default/kill-switch. There is deliberately NO
-        // cross-field bound — it is a pure operator-visibility line, coupled to no decision field.
+        // DEFAULT and the kill-switch, since the warning is opt-in) OR in the
+        // 60..=FLEET_RUNWAY_PLAUSIBLE_MAX_SECS band (one minute of lead time up to one weekly
+        // window). The `0`-OR-band shape mirrors `near_limit_poll_secs` above: a naive
+        // `(60..=..).contains()` WITHOUT the `!= 0` guard would reject the documented
+        // default/kill-switch. There is deliberately NO cross-field bound — it is a pure
+        // operator-visibility line, coupled to no decision field.
+        //
+        // The ceiling was 2_592_000 (30 d) through issue #1076, which is where this band
+        // CONTRADICTED the #1028 plausibility bound: a threshold above one weekly window had no
+        // reading that could reach it, so the alarm latched on and never cleared. The rejections
+        // below pin the narrowing; the behaviour it buys is pinned in `daemon.rs` by
+        // `fleet_runway_warn_band_is_serviceable_at_every_configurable_threshold`.
 
         // Absent → the compiled-in `0` default (OFF).
         let default = Config::parse(&with_tunables("poll_secs = 300")).unwrap();
@@ -991,8 +1012,11 @@ mod tests {
             .expect("0 is the valid disabled default, not a sub-floor rejection");
         assert_eq!(disabled.tunables.fleet_runway_warn_secs, 0);
 
-        // Both band edges load and thread through verbatim.
-        for edge in [60u64, 2_592_000] {
+        // Both band edges load and thread through verbatim. The ceiling edge is spelled as the
+        // CONSTANT, not as `604800`: if the plausibility bound ever moves, this test must follow
+        // it rather than pin a stale literal the validator no longer enforces.
+        let ceiling = FLEET_RUNWAY_PLAUSIBLE_MAX_SECS as u64;
+        for edge in [60u64, ceiling] {
             let cfg = Config::parse(&with_tunables(&format!("fleet_runway_warn_secs = {edge}")))
                 .unwrap_or_else(|e| {
                     panic!("fleet_runway_warn_secs = {edge} is a valid edge: {e:?}")
@@ -1000,12 +1024,16 @@ mod tests {
             assert_eq!(cfg.tunables.fleet_runway_warn_secs, edge);
         }
 
-        // A non-zero sub-floor (1, 59) and an above-cap value (2_592_001) each trip the field
-        // range: the `!= 0` guard admits ONLY 0, never a sub-60 warn line.
-        for bad in [1u64, 59, 2_592_001] {
+        // A non-zero sub-floor (1, 59) and an above-ceiling value each trip the field range: the
+        // `!= 0` guard admits ONLY 0, never a sub-60 warn line. `2_592_000` — the OLD 30-day
+        // ceiling — is in that rejected set on purpose: it is the exact value that used to load
+        // and then latch the alarm forever (issue #1076), so its rejection is the fix, not an
+        // incidental consequence of it.
+        for bad in [1u64, 59, ceiling + 1, 1_728_000, 2_592_000] {
             match Config::parse(&with_tunables(&format!("fleet_runway_warn_secs = {bad}"))) {
                 Err(Error::ConfigInvalid(msg)) => assert!(
-                    msg.contains("fleet_runway_warn_secs") && msg.contains("60..=2592000"),
+                    msg.contains("fleet_runway_warn_secs")
+                        && msg.contains(&format!("60..={FLEET_RUNWAY_PLAUSIBLE_MAX_SECS}")),
                     "out-of-band {bad} must trip the field range, got: {msg}"
                 ),
                 other => panic!("{bad} is out of band — expected ConfigInvalid, got: {other:?}"),

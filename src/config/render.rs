@@ -18,6 +18,8 @@
 
 use super::*;
 
+use crate::stats::FLEET_RUNWAY_PLAUSIBLE_MAX_SECS;
+
 impl Config {
     /// Build the origin report from the effective config (`self`) and the raw TOML
     /// `table` (the presence source). Mirrors [`render`](Config::render)'s field walk —
@@ -498,14 +500,17 @@ impl Config {
              # the rotation (1..=20). A re-login restores it immediately.\n",
         );
         out.push_str(&format!("monitor_recovery_m = {}\n", t.monitor_recovery_m));
-        out.push_str(
+        out.push_str(&format!(
             "# Proactive fleet-runway warning (issue #650): when the roster's combined weekly\n\
              # head-room over its combined observed burn (the `stats` fleet runway) drops BELOW\n\
              # this many seconds, the daemon logs ONE edge-triggered fleet_runway_low event —\n\
              # lead time BEFORE the all-exhausted terminal state. 0 disables (the default; the\n\
-             # warning is opt-in), else 60..=2592000 (1 min..30 d). Purely a visibility signal:\n\
-             # it never triggers a swap.\n",
-        );
+             # warning is opt-in), else 60..={FLEET_RUNWAY_PLAUSIBLE_MAX_SECS} (1 min..7 d). The\n\
+             # ceiling is one weekly quota window, because the runway is measured as a drain with\n\
+             # no reset intervening: past that window there is nothing to measure, so a longer\n\
+             # warn line could be crossed but never cleared. Purely a visibility signal: it never\n\
+             # triggers a swap.\n",
+        ));
         out.push_str(&format!(
             "fleet_runway_warn_secs = {}\n",
             t.fleet_runway_warn_secs

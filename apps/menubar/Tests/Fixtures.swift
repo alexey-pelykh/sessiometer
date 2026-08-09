@@ -573,12 +573,18 @@ enum Fixtures {
     {"error":"malformed request","detail":"unknown field `session_trigger`, expected one of `poll_secs`, `exhausted_poll_secs`, `near_limit_poll_secs`, `cooldown_secs`, `target_max_session_usage`, `session_ceiling`, `weekly_ceiling`, `session_blind_swap_secs`, `session_blind_risk_band`, `session_velocity_horizon_secs`, `session_velocity_min_project_above`, `session_velocity_ema_alpha_pct`, `monitor_401_n`, `monitor_recovery_m`, `fleet_runway_warn_secs`"}
     """#
 
-    /// `config-set` rejected: `fleet_runway_warn_secs` (issues #650/#692) outside its `0 | 60..=2_592_000`
-    /// band — the daemon's `Config::validate` message (`src/config/validate.rs`) threaded verbatim into
-    /// `detail` (the same `invalid` + field-naming shape as `configSetRejectedInvalid`). AC 3: an out-of-band
-    /// value surfaces the daemon's OWN detail, never a generic `.undecodable`. `30` is in the forbidden gap
-    /// (`> 0` but `< 60`) — the value a "0 = off" affordance must NOT silently accept as disabling.
+    /// `config-set` rejected: `fleet_runway_warn_secs` (issues #650/#692) outside its
+    /// `0 | 60..=604800` band — the daemon's `Config::validate` message (`src/config/validate.rs`) threaded
+    /// verbatim into `detail` (the same `invalid` + field-naming shape as `configSetRejectedInvalid`). AC 3:
+    /// an out-of-band value surfaces the daemon's OWN detail, never a generic `.undecodable`. `30` is in the
+    /// forbidden gap (`> 0` but `< 60`) — the value a "0 = off" affordance must NOT silently accept as
+    /// disabling.
+    ///
+    /// The ceiling was `2592000` (30 d) until issue #1076 narrowed it to one weekly window — the widest
+    /// line the runway model can rank, above which the alarm could fire but never clear. This fixture is a
+    /// COPY of a Rust-side string with nothing cross-checking the two, so it is updated by hand when that
+    /// message changes; `30` keeps tripping the floor either way, so the band text is the only stale part.
     static let configSetRejectedFleetRunwayInvalid = #"""
-    {"result":"rejected","reason":"invalid","detail":"fleet_runway_warn_secs must be 0 (disabled) or in 60..=2592000, got 30"}
+    {"result":"rejected","reason":"invalid","detail":"fleet_runway_warn_secs must be 0 (disabled) or in 60..=604800 (one weekly window; a longer warn line could never clear), got 30"}
     """#
 }

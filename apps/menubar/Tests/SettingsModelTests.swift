@@ -242,7 +242,7 @@ final class SettingsModelTests: XCTestCase {
     }
 
     /// AC 3: an out-of-band `fleet_runway_warn_secs` (30 — inside the forbidden `0 < n < 60` gap) is the
-    /// DAEMON's to reject. The model surfaces the daemon's OWN field-naming `detail` (the `0 | 60..=2_592_000`
+    /// DAEMON's to reject. The model surfaces the daemon's OWN field-naming `detail` (the `0 | 60..=604800`
     /// message from `Config::validate`), NOT a generic `.undecodable` (the #645 precedent), and keeps the edit
     /// for a retry (the daemon wrote nothing, so the form stays dirty).
     func testApplyFleetRunwayOutOfBandRejectedWithDaemonDetail() async {
@@ -255,7 +255,8 @@ final class SettingsModelTests: XCTestCase {
             model.applyPhase,
             .rejected(
                 reason: .invalid,
-                detail: "fleet_runway_warn_secs must be 0 (disabled) or in 60..=2592000, got 30"))
+                detail: "fleet_runway_warn_secs must be 0 (disabled) or in 60..=604800 "
+                    + "(one weekly window; a longer warn line could never clear), got 30"))
         XCTAssertTrue(model.isDirty, "a rejected edit is NOT rebaselined — no partial write, edit kept for retry")
     }
 
