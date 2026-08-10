@@ -93,6 +93,16 @@ Light shown here:
 
 **Expected reconciliations** — the built panel intentionally differs from the mock in these spots:
 
+- **a `--render-panel` capture is NOT the live panel's layout** past the height budget (#818).
+  `ImageRenderer` cannot rasterize a `ScrollView`'s content — measured against a working control, and not
+  a clipping effect, since a viewport *taller* than its content renders just as blank — so
+  `PanelRenderHarness` renders with the scroll boundaries bypassed. Every capture therefore shows each
+  state's body at its full intrinsic height, where the live panel clamps at the budget and scrolls the
+  excess. That is honest exactly while no state reaches the budget, which holds for every fixture at the
+  default text size and is pinned per fixture by `testTheRenderBypassIsANoOpAtTheGoldenSizeClass`; the
+  platform premise itself is pinned by `testImageRendererStillCannotDrawAScrollView`, which reddens the day
+  the seam should be deleted. **A regression inside a scrolled body would not be visible to the golden
+  gate** — tracked as **#1177**, which includes "accept the gap" among its routes
 - no provider secondary line — the wire carries no `provider` field yet (#173)
 - the Stats aggregate callout has a **second, mock-unauthored form**. When the daemon had no
   configured roster the census degraded to whoever held samples, and the panel says so by narrowing
@@ -1161,6 +1171,7 @@ Named so that "not here" is not misread as "not decided anywhere".
 | **Dynamic Type** (12 classes) | a static browser frame cannot express a type-scale sweep | measured — `PanelTextMetricsTests` / `PanelCaptureCardTests` metrics lane; § Accessibility |
 | **Increase Contrast · Reduce Transparency · Reduce Motion** | not reachable from a raster; Reduce Transparency is doubly unreachable (get-only, and the renderer reports `false`) | § *Appearance variants* (#760) + its manual checklist |
 | **Settings window** | **NOT in this class — it IS authored**, as Group 8 (#763). Listed here only because it is the one people expect to be missing | § *The Settings window* |
+| **Scroll behaviour + the panel's height bound** | a static frame cannot express what happens when content outgrows the popover | measured — `PanelScrollBoundaryTests` / `PanelRosterGeometryTests`; § *The scroll boundary (#818)*. The MECHANISM is oracled there; the product decision behind it is listed as open below |
 
 ### Genuinely open — nobody has decided yet
 
@@ -1171,6 +1182,7 @@ Go and settle these; do not infer them from the mock.
 | the next-swap callout for a *degenerate* target; the reset cell past three digits of days | hq `strategy/design-menubar.md` § D-UX-PATHOLOGICAL |
 | Settings **Accounts** section row anatomy (incl. the 160 pt label cell of #846); loading placeholder; six remaining apply-status arms; launch-at-login approval sub-block; inline per-field format-error row | register R-11, hq `strategy/design-menubar.md` — routed to #946 |
 | the four **canary** fault ranks — no matching mock frames, so the harness has nothing to pair | #571 |
+| the 856 pt height bound (or a screen-adaptive rule); whether the Swap action and the daemon-fault banner are the right things to PIN; scroll vs condense for a long roster | § *The scroll boundary (#818)* — **decided in code and shipped**, from measurement, because #818 could not be fixed without an answer. Ratify or overrule it; hq `strategy/design-menubar.md` |
 
 **The rule this register enforces:** if an axis is in none of the three classes above, it is
 *unclassified* — and an unclassified silence is not authority to invent. Classify it (here, or in a
@@ -1416,6 +1428,75 @@ Four of the six *fixed* app sentences already occupy **both** clamped lines, so 
 is working inside a real budget: measured, the widest of them clears the second line by about 39
 characters. `SettingsTextMetricsTests` computes that margin and fails with the number rather than
 leaving it to be discovered by shipping.
+
+## The scroll boundary (#818) — DECIDED IN CODE, PENDING RATIFICATION
+
+> **This mock does not author any of what follows.** It authors no scroll behaviour, no panel height
+> bound, and no rule about which parts of the panel a long roster may push out of view. Issue #818 was a
+> real defect — content past the popover's height was unreachable, at the default text size on a
+> seven-account roster and at `.accessibility3` on almost every state — so it had to be answered to be
+> fixed. It was answered by the implementer, from measurement, and it is recorded here so a design owner
+> can ratify or overrule it. **Until then it is the shipped behaviour, not a ratified design.**
+
+**The bound: 856 pt.** Derived, not chosen — the smallest logical display height a Mac meeting the app's
+13.0 deployment target plausibly presents (1440 × 900), less the menu bar (24 pt) and the popover's own
+chrome (20 pt). Both allowances are deliberately *generous to the panel*, so the bound errs toward
+letting the panel be tall rather than manufacturing a scroll. It lives in
+`StatusPanelFormat.panelHeightBudget`, and `PanelRosterGeometryTests` — which derived the same number
+independently as a measuring stick before the fix existed — now reads it rather than restating it.
+
+Two properties worth stating because the alternatives are tempting:
+
+- It is **not scaled by text size**. Scaling it would hand an `.accessibility3` operator a 2014 pt budget
+  on the same 900 pt display — the defect, reintroduced for exactly the operator most exposed to it.
+- It is **fixed, not derived from `NSScreen`**. A screen-adaptive budget is the better product answer and
+  is the obvious follow-up; it is not this change, because a panel whose height depends on the machine
+  makes every committed golden machine-dependent, which is the hazard the harness's pinned `.tint`
+  already exists to avoid.
+
+**What stays pinned, and what scrolls.** The real question the issue asks. The split is by GROWTH, not by
+importance — a thing is pinned if its height is bounded by construction, and scrolled if a daemon, a
+roster or an operator can make it arbitrarily tall:
+
+| Pinned (always on screen) | Scrolled (inside the boundary) |
+|---|---|
+| `PanelHeader`, `HonestStrip`, the tab bar | the roster (live and dimmed) |
+| the daemon-fault `BannerView` | `StatsView` |
+| `SwapCalloutCard`, `SwapStatusLine` | the capture card (onboarding and add-account) |
+| `FooterView` | `DaemonLogCard`, `StartDaemonCard`, the honest-message card |
+
+The two that took argument:
+
+- **The Swap action is pinned.** It is the panel's only *destructive-adjacent* control, and the operator
+  reaches for it precisely when the roster is long. An action that a longer fleet pushes off-screen is
+  worse than one that is merely hard to find. Pinning it cannot itself starve the boundary: the pinned set
+  appears at most once per state, so its cost is one-off, and
+  `PanelScrollBoundaryTests.testTheBoundaryHoldsMoreRosterThanTheViewportCanShowAtBothSizeClasses` asserts
+  at both size classes that what is left over is a positive viewport, failing with the live figure if it
+  ever is not. No pt figure is recorded here deliberately — this split is what *defines* the pinned set, so
+  a number written down mirrors a base that moves whenever an element joins or leaves it.
+- **`BannerView` is on BOTH sides**, and that is the rule rather than an exception being tolerated. The
+  daemon-level fault banner is pinned, because a roster below it would carry it off the top. The honest
+  message card that *is* the body of `.connecting` / `.unsupported` scrolls, because there is nothing
+  below it to push it away and pinning it would clip the honest message itself.
+
+**What this cost the goldens: nothing.** Measured, all 44 committed goldens are byte-identical
+(`max drift 0.000000 over 44 cells`). At the default text size no state reaches the budget — the tallest
+is 637 pt — so the boundary is inert there and the panel draws exactly what it drew before.
+
+**One consequence a reader must know about.** `ImageRenderer` cannot rasterize a `ScrollView`'s content —
+measured, and not a clipping effect: a viewport *taller* than its content renders just as blank. So
+`PanelRenderHarness` renders the panel with its boundaries bypassed, and the design-parity capture below
+shows each state's body in full rather than as the popover bounds it. That is faithful *at the default
+text size* and only there, which is pinned per-fixture by
+`PanelScrollBoundaryTests.testTheRenderBypassIsANoOpAtTheGoldenSizeClass`. At `.accessibility3` a capture
+shows more than the popover does.
+
+**To ratify, overrule, or refine**, the questions actually open are: the 856 pt figure (or a
+screen-adaptive rule); whether the Swap action and the fault banner are the right things to pin; and
+whether a long roster should scroll at all versus condense. The design SSOT is
+`hq strategy/design-menubar.md`; the measurements behind every number above are in
+`PanelRosterGeometryTests` and `PanelScrollBoundaryTests`.
 
 ## Design constraints the mock honors
 

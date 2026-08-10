@@ -108,8 +108,11 @@ private struct StatsContent: View {
 /// Part of this text is DAEMON-AUTHORED, so the panel does not own its length. The daemon keeps it short by
 /// construction — it sends one of a small set of STATIC reasons, never the parser's own message (which
 /// re-prints the operator's config file) — and `lineLimit` below is the panel-side suspenders to that belt:
-/// the popover is fixed in WIDTH (380pt) but INTRINSIC in height, with no `ScrollView`, so an unbounded
-/// reason from a drifted daemon would not clip, it would grow the whole panel arbitrarily tall.
+/// the popover is fixed in WIDTH (380pt), so an unbounded reason from a drifted daemon would grow the
+/// panel's height rather than wrap into a fixed box. Since issue #818 that growth is caught by a scroll
+/// boundary instead of running off-screen — which does NOT retire this `lineLimit`: an unbounded caveat
+/// would still push the rest of the Stats body behind a scroll it has no reason to need, and a daemon
+/// fault that quietly costs the operator their whole tab is the same defect one indirection out.
 private struct StatsCaveat: View {
     /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
     @Environment(\.panelScale) private var scale

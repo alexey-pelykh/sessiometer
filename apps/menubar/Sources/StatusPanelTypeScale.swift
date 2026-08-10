@@ -43,7 +43,7 @@
 //      opposite — see § Rejected below, where the arithmetic is not marginal but catastrophic.
 //   2. `k(.large) == 1.0` EXACTLY, so at the default size class every product is the identity (`11 * 1.0`
 //      is `11` in IEEE-754, exactly) and the panel renders byte-for-byte what it rendered before. That is
-//      what lets the 34 committed panel goldens (issue #754) stay valid WITHOUT a re-baseline.
+//      what lets the committed panel goldens (issue #754) stay valid WITHOUT a re-baseline.
 //
 // REJECTED ALTERNATIVES, with the arithmetic that rejected them:
 //
@@ -66,11 +66,17 @@
 // modifier at the panel root and enforced again inside `factor(for:)` so the two can never disagree.
 // `.accessibility4` / `.accessibility5` therefore render at `.accessibility3` sizing rather than growing
 // further. Stated as a limit rather than left implicit: at ×2.3529 the healthy panel is already 894 pt
-// wide and the Stats tab 1322 pt tall, and the panel has NO `ScrollView` (`StatusPanelStats` records that
-// it is "fixed in WIDTH (380pt) but INTRINSIC in height"), so growing past this ceiling trades a readable
-// panel for one the screen cannot show. That popover-height ceiling is a PRE-EXISTING, orthogonal limit —
-// a long enough roster overflows today at the default text size — and is tracked separately rather than
-// absorbed here.
+// wide and the Stats tab 1300.50 pt tall, so growing past this ceiling trades a readable panel for one the
+// operator has to scroll through in its entirety. (That Stats figure read 1322 pt when this was written
+// and is re-measured here at `f66a341`; the panel's own height at the ceiling is now its 856 pt budget,
+// and 1300.50 is what the tab's CONTENT comes to inside the boundary.)
+//
+// The popover-height ceiling that used to sit alongside this one was a PRE-EXISTING, orthogonal limit — a
+// long enough roster overflowed at the default text size too — and it is now FIXED rather than merely
+// tracked: issue #818 bounds the panel at `StatusPanelFormat.panelHeightBudget` and puts each state's
+// unbounded body inside a scroll boundary. What that changes for THIS ceiling is the failure it prevents:
+// past `.accessibility3` the panel would no longer be unreadable off-screen, it would be readable only by
+// scrolling. Still worth declining, and no longer the same kind of harm.
 //
 // WHAT STILL HAS NO DRIVER, stated plainly because it bounds what a user gets today. macOS's system Text
 // Size (System Settings → Accessibility → Display → Text Size) reaches only apps that adopt Apple's
@@ -197,6 +203,46 @@ extension EnvironmentValues {
     var panelScale: Double {
         get { self[PanelScaleKey.self] }
         set { self[PanelScaleKey.self] = newValue }
+    }
+}
+
+/// Whether the panel composes its scroll boundaries (issue #818). TRUE everywhere the panel is *used*;
+/// set FALSE by `PanelRenderHarness` alone, and only because `ImageRenderer` cannot draw a `ScrollView`.
+///
+/// THE CONSTRAINT, measured rather than assumed. `ImageRenderer` rasterizes a `ScrollView`'s frame and
+/// none of its content: the same six-row body scores 0.0988 ink rendered plainly and **0.0** inside a
+/// `ScrollView` — with a definite 200×120 frame, with a definite 200×300 frame (taller than the content,
+/// so nothing is even scrolled out), and under `fixedSize`. All four. It is the container, not the bound.
+/// `PanelScrollBoundaryTests.testImageRendererStillCannotDrawAScrollView` is that measurement, kept
+/// running: the day the platform starts drawing them, it goes RED and this whole seam should be deleted.
+///
+/// WHY A SEAM AND NOT A WORKAROUND. Left unhandled, every committed golden would rasterize its header and
+/// tab bar over an empty body — 44 blank-bodied PNGs that still diff clean against each other, which is
+/// the worst possible failure: the panel's whole visual gate would keep reporting green while seeing
+/// nothing. That is not a hypothetical; it is what the first cut of #818 did, and `stats` was caught by
+/// `testEveryFixtureRendersNonBlank` at 0.0198 ink against its 0.02 floor.
+///
+/// WHY IT IS HONEST. The bypass is not "render something other than what ships" — at the size class the
+/// goldens capture, the two trees are *observably the same panel*. A `ScrollView` whose content fits its
+/// viewport scrolls nothing and draws nothing extra, and at `.large` no fixture reaches the height budget
+/// (the tallest is 637 pt against 856). `testTheRenderBypassIsANoOpAtTheGoldenSizeClass` pins exactly
+/// that, per fixture, by measuring both trees and requiring equal heights under the budget — so the
+/// fidelity claim is a MEASUREMENT that reddens the day a fixture grows past the bound, not a comment
+/// asking to be trusted. What the goldens then stop covering is the boundary itself; that is covered
+/// where it can be, in `PanelScrollBoundaryTests` (geometry) and the `AXScrollArea` role-histogram pin in
+/// `PanelAccessibilityTreeTests` (structure).
+private struct PanelScrollBoundaryEnabledKey: EnvironmentKey {
+    /// `true` — composing the boundary is the panel's real behaviour, so every consumer that does not
+    /// deliberately opt out (the app, the previews, every test but the render harness) gets it.
+    static let defaultValue = true
+}
+
+extension EnvironmentValues {
+    /// Whether `StatusPanelView` wraps its unbounded bodies in a scroll boundary. See above — the only
+    /// writer is `PanelRenderHarness`, and only to work around `ImageRenderer`.
+    var panelScrollBoundaryEnabled: Bool {
+        get { self[PanelScrollBoundaryEnabledKey.self] }
+        set { self[PanelScrollBoundaryEnabledKey.self] = newValue }
     }
 }
 
