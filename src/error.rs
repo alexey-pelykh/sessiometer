@@ -34,6 +34,31 @@ pub(crate) enum Error {
     /// passphrase — the passphrase is read off-argv, cf. #39). Maps to the generic
     /// exit `1`, matching [`Error::UnknownCommand`] — both are "you asked for
     /// something that isn't a thing", distinct from a runtime failure.
+    ///
+    /// **FRAMING firewall: the AUTHORED half is IN SCOPE; interpolated argv is OUT** (issue
+    /// #1123). This variant is the one operator-facing surface whose rendered text is not wholly
+    /// ours, so the verdict splits along that seam rather than covering or skipping the variant
+    /// whole:
+    ///
+    /// - **In scope** — everything this crate wrote: each `message` TEMPLATE, every `usage_hint`,
+    ///   and the `run … for usage` wrapper below. `src/cli.rs`'s
+    ///   `the_usage_prose_carries_no_banned_framing_but_the_guard_bites_on_injection` drives every
+    ///   construction site through the real parser with NEUTRAL argv and scans the rendered
+    ///   `Display` against `crate::framing_vocabulary::scan_usage_banned`. The exemption it
+    ///   allows is `USAGE_EXEMPT_TOKENS` — `disable` / `enable` / `remove`, earned solely because
+    ///   a hint whose job is to name the command to run must spell that command.
+    /// - **Out of scope** — the operator's own argv, echoed back through the flag or action name.
+    ///   `sessiometer status --should` renders "unknown flag `--should`", and that `should` is
+    ///   the operator quoting themselves, not this tool editorialising: the issue #160 firewall
+    ///   governs what the tool ASSERTS, and the assertion here is "I do not recognise this",
+    ///   which is neutral whatever the flag was called. Eliding or sanitising the echoed token
+    ///   would corrupt the one diagnostic the message exists to deliver, so the guard is pointed
+    ///   at the template rather than at live output.
+    ///   `src/cli.rs`'s `the_argv_echo_is_the_operators_words_not_this_tools_framing` pins that
+    ///   boundary, so it is a recorded decision rather than a gap someone later "fixes".
+    ///
+    /// The `From<lexopt::Error>` path is third-party prose rather than ours, and is scanned
+    /// anyway — we ship it, so we own how it reads even though we did not write it.
     #[error("{message}\n  run `{usage_hint}` for usage")]
     CliUsage {
         message: String,
