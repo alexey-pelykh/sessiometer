@@ -5597,6 +5597,9 @@ mod tests {
     use crate::daemon::{
         AccountStatusLine, BlindActive, BlindPreemptSwap, LandingOvershoot, NextSwap, NoTargetCause,
     };
+    // The shared framing vocabulary (issue #918) — the same list `stats.rs` scans against, minus
+    // the mechanical-operation verbs help legitimately spends.
+    use crate::framing_vocabulary::{help_banned_tokens, scan_help_banned};
     use std::path::PathBuf;
 
     fn acct(label: &str, uuid: &str) -> Account {
@@ -12102,14 +12105,20 @@ spare  22222222-2222\n\
     /// acquisitive CALL the issue enumerates, plus the recommendation and alarmist-projection
     /// framing that turns a stated deadline into a call to action.
     ///
-    /// Deliberately NARROWER than `stats.rs`'s central `BANNED_TOKENS`, and the difference is the
-    /// point: that list bans `remove` / `disable` / `enable`, which are this CLI's own COMMAND
-    /// NAMES and appear in `ROOT_USAGE` as such, and `add`, which `STATUS_USAGE` — a surface
-    /// scanned right here — spends on its own `-v` line ("add each account's access-token
-    /// expiry"). A scan of help text against the central list would fail on `main` today — which
-    /// is also why no such scan exists (the central scanner is private to `stats.rs`'s test module
-    /// and covers only stats renders and `--json` keys). This guard covers the surface issue #885
-    /// owns; widening it repo-wide is issue #918.
+    /// Deliberately NARROWER than the central `BANNED_TOKENS`, and the difference is the point:
+    /// that list bans `remove` / `disable` / `enable`, which are this CLI's own COMMAND NAMES and
+    /// appear in `ROOT_USAGE` as such, and `add`, which `STATUS_USAGE` — a surface scanned right
+    /// here — spends on its own `-v` line ("add each account's access-token expiry").
+    ///
+    /// Issue #918 settled that repo-wide: the vocabulary moved to `crate::framing_vocabulary`,
+    /// `--help` is now scanned in FULL by
+    /// `every_help_surface_carries_no_banned_framing_but_the_guard_bites_on_injection`, and those
+    /// four mechanical verbs are the measured exemption set. This narrower guard is KEPT rather
+    /// than folded in, because it is not redundant: it uniquely contributes `beat`, a token the
+    /// central list does not carry. That relationship is asserted, not asserted-in-prose, by
+    /// `the_repo_wide_help_guard_subsumes_the_expiry_guard_bar_its_own_extras` below — so if the
+    /// central list ever grows `beat`, this guard becomes genuinely redundant and that test says
+    /// so.
     const EXPIRY_HELP_BANNED_TOKENS: &[&str] = &[
         // The acquisitive call (issue #885's enumerated list).
         "buy",
@@ -12261,6 +12270,295 @@ spare  22222222-2222\n\
                 "expiry 6d21h; lapsed once past; recovered by `sessiometer login`; nothing bypasses it"
             ),
             None
+        );
+    }
+
+    // --- the framing guard, across the WHOLE `--help` surface (issue #918) -----------
+
+    /// Every [`HelpTopic`] there is. The framing guard below scans the help of ALL of them, so
+    /// coverage is the surface rather than a hand-picked sample of it — issue #918 exists because
+    /// a claim of help coverage outran the coverage itself, and a guard that skips a verb would
+    /// recreate that one subcommand at a time.
+    ///
+    /// Two tripwires keep the list complete:
+    /// 1. Adding a `HelpTopic` variant makes `topic_const_name`'s match non-exhaustive, so the
+    ///    build fails until the new topic is named.
+    /// 2. `every_help_constant_is_scanned` reads this file's own source and asserts every
+    ///    `const *_USAGE: &str` it declares is reached from here — so writing the match arm but
+    ///    forgetting this table reddens too, which the compiler alone would not catch.
+    const ALL_HELP_TOPICS: &[HelpTopic] = &[
+        HelpTopic::Root,
+        HelpTopic::Capture,
+        HelpTopic::Login,
+        HelpTopic::Run,
+        HelpTopic::Service,
+        HelpTopic::Daemon,
+        HelpTopic::Config,
+        HelpTopic::Status,
+        HelpTopic::List,
+        HelpTopic::Use,
+        HelpTopic::Disable,
+        HelpTopic::Enable,
+        HelpTopic::Remove,
+        HelpTopic::Poke,
+        HelpTopic::Stats,
+        HelpTopic::Reliability,
+        HelpTopic::Log,
+        HelpTopic::Export,
+        HelpTopic::Import,
+    ];
+
+    /// The name of the constant a topic's help text lives in — used to name the offender in an
+    /// assertion message, and, being an exhaustive match, to make a new subcommand a BUILD error
+    /// here rather than a silently unscanned surface.
+    fn topic_const_name(topic: HelpTopic) -> &'static str {
+        match topic {
+            HelpTopic::Root => "ROOT_USAGE",
+            HelpTopic::Capture => "CAPTURE_USAGE",
+            HelpTopic::Login => "LOGIN_USAGE",
+            HelpTopic::Run => "RUN_USAGE",
+            HelpTopic::Service => "SERVICE_USAGE",
+            HelpTopic::Daemon => "DAEMON_USAGE",
+            HelpTopic::Config => "CONFIG_USAGE",
+            HelpTopic::Status => "STATUS_USAGE",
+            HelpTopic::List => "LIST_USAGE",
+            HelpTopic::Use => "USE_USAGE",
+            HelpTopic::Disable => "DISABLE_USAGE",
+            HelpTopic::Enable => "ENABLE_USAGE",
+            HelpTopic::Remove => "REMOVE_USAGE",
+            HelpTopic::Poke => "POKE_USAGE",
+            HelpTopic::Stats => "STATS_USAGE",
+            HelpTopic::Reliability => "RELIABILITY_USAGE",
+            HelpTopic::Log => "LOG_USAGE",
+            HelpTopic::Export => "EXPORT_USAGE",
+            HelpTopic::Import => "IMPORT_USAGE",
+        }
+    }
+
+    /// The whole scanned surface: every topic's constant name paired with the text it prints.
+    fn help_surfaces() -> Vec<(&'static str, &'static str)> {
+        ALL_HELP_TOPICS
+            .iter()
+            .map(|topic| (topic_const_name(*topic), topic.help()))
+            .collect()
+    }
+
+    /// The name of the help constant a top-level declaration on `line` introduces, or `None` when
+    /// the line declares no such thing.
+    ///
+    /// This is a TEXTUAL parser over source, which makes it the soft spot of the completeness
+    /// tripwire that calls it: a declaration spelling it fails to recognise is a help surface the
+    /// gate cannot see — the very defect of issue #918, reproduced one level down inside its own
+    /// fix. It therefore strips visibility STRUCTURALLY (`pub`, `pub(crate)`, `pub(super)`,
+    /// `pub(in …)`) rather than matching a fixed list of prefixes, so the accepted set is CLOSED
+    /// over Rust's visibility grammar instead of being three spellings someone happened to think
+    /// of. `the_declaration_parser_recognises_every_visibility_spelling` pins each accepted form,
+    /// because an untested parser inside a completeness guard is that same defect again.
+    ///
+    /// Column-0 only: the help constants are top-level, and this deliberately ignores any indented
+    /// `const … : &str` a test module declares for its own fixtures. Whitespace normalisation is
+    /// not a variable here — `cargo fmt --all --check` is a gate, so the source this reads is
+    /// always rustfmt-shaped.
+    fn declared_help_constant(line: &str) -> Option<&str> {
+        let after_visibility = match line.strip_prefix("pub") {
+            // `pub(crate)` / `pub(super)` / `pub(in crate::…)` — step over the scope.
+            Some(rest) => match rest.strip_prefix('(') {
+                Some(scoped) => scoped.split_once(')')?.1,
+                None => rest,
+            },
+            None => line,
+        };
+        let declaration = after_visibility
+            .strip_prefix("const ")
+            .or_else(|| after_visibility.strip_prefix(" const "))?;
+        let (name, _) = declaration.split_once(": &str")?;
+        name.ends_with("_USAGE").then_some(name)
+    }
+
+    /// [`declared_help_constant`] is the one textual link in the completeness chain, so it is
+    /// tested directly rather than only through its caller. Every visibility spelling Rust would
+    /// accept on a help constant must be recognised; a spelling that slips through is an
+    /// operator-facing `--help` surface that ships entirely unscanned while every gate stays
+    /// green. That is not hypothetical — before this test existed, the parser matched only a bare
+    /// `const `, so a `pub(crate) const PURGE_USAGE` carrying banned framing was invisible to it.
+    #[test]
+    fn the_declaration_parser_recognises_every_visibility_spelling() {
+        for spelling in [
+            "const DECOY_USAGE: &str = \"x\";",
+            "pub const DECOY_USAGE: &str = \"x\";",
+            "pub(crate) const DECOY_USAGE: &str = \"x\";",
+            "pub(super) const DECOY_USAGE: &str = \"x\";",
+            "pub(in crate::cli) const DECOY_USAGE: &str = \"x\";",
+        ] {
+            assert_eq!(
+                declared_help_constant(spelling),
+                Some("DECOY_USAGE"),
+                "the declaration parser must recognise {spelling:?} — a spelling it misses is a \
+                 help surface the completeness gate cannot see"
+            );
+        }
+
+        // …and it stays NARROW, or the gate would demand topic entries for things that are not
+        // help surfaces at all: a non-help `&str` const, an indented fixture belonging to some
+        // test module, a commented-out line, and a non-const declaration.
+        for ignored in [
+            "const DEGRADED_CUE: &str = \"x\";",
+            "    const INDENTED_USAGE: &str = \"x\";",
+            "// const COMMENTED_USAGE: &str = \"x\";",
+            "pub fn not_a_const_USAGE() {}",
+        ] {
+            assert_eq!(
+                declared_help_constant(ignored),
+                None,
+                "the declaration parser must ignore {ignored:?}"
+            );
+        }
+    }
+
+    /// The completeness tripwire the compiler cannot provide: every `const *_USAGE: &str`
+    /// DECLARED in this file — under any visibility — must be reachable from
+    /// [`ALL_HELP_TOPICS`]. Reads this file's own source, so a help constant added without being
+    /// wired into the topic table is caught by the gate instead of quietly sitting outside it.
+    ///
+    /// The source is embedded with `include_str!` rather than read at run time, so the check
+    /// cannot be skipped by a working directory it did not expect — the same
+    /// compile-time-input discipline `crate::render_golden` applies to the committed goldens.
+    #[test]
+    fn every_help_constant_is_scanned() {
+        let mut declared: Vec<&str> = include_str!("cli.rs")
+            .lines()
+            .filter_map(declared_help_constant)
+            .collect();
+        declared.sort_unstable();
+        let mut scanned: Vec<&str> = help_surfaces().iter().map(|(name, _)| *name).collect();
+        scanned.sort_unstable();
+        assert_eq!(
+            scanned, declared,
+            "every `const *_USAGE` in src/cli.rs must be reached from ALL_HELP_TOPICS — an \
+             unscanned help surface is exactly what issue #918 was opened about"
+        );
+        // Cardinality, stated because a gate over an empty or halved subject passes identically:
+        // both sides above could agree at zero if the source scan silently matched nothing.
+        assert_eq!(
+            declared.len(),
+            19,
+            "expected 19 help constants; the count moved — wire the new verb in, then update this"
+        );
+    }
+
+    /// Issue #918 AC2: the WHOLE `--help` surface is scanned against the central framing
+    /// vocabulary, minus the mechanical-operation verbs a CLI must use to name its own commands
+    /// (`crate::framing_vocabulary::HELP_EXEMPT_TOKENS`, which records why each is excused).
+    ///
+    /// The bite half is not decoration. Issue #918 exists because issue #885's AC4 asserted help
+    /// coverage that did not exist, and the reason that survived review is that a "current help
+    /// is clean" loop passes IDENTICALLY over a guard which inspects nothing. So each editorial
+    /// group is injected into a real surface and asserted caught.
+    #[test]
+    fn every_help_surface_carries_no_banned_framing_but_the_guard_bites_on_injection() {
+        let surfaces = help_surfaces();
+        assert_eq!(surfaces.len(), 19, "the scan must cover every help topic");
+
+        // PASSES on the real, shipped help — all of it, not a sample.
+        for (name, help) in &surfaces {
+            assert_eq!(
+                scan_help_banned(help),
+                None,
+                "{name} must carry no banned framing:\n{help}"
+            );
+        }
+
+        // BITES: each editorial group injected into a REAL surface is caught. A scanner matching
+        // nothing would pass the loop above word for word.
+        for (injected, caught) in [
+            ("You should re-login.", "should"),
+            ("Upgrade your plan.", "upgrade"),
+            ("Your usage is critical.", "critical"),
+            ("Exhaustion is imminent.", "imminent"),
+            ("Running out — top up first.", "top up"),
+            ("Running low — need more seats.", "need"),
+        ] {
+            assert_eq!(
+                scan_help_banned(&format!("{ROOT_USAGE}\n{injected}")),
+                Some(caught),
+                "injecting {injected:?} into ROOT_USAGE must be caught"
+            );
+        }
+
+        // The exemption is a carve-out, not a hole. The verb table passes…
+        assert_eq!(
+            scan_help_banned("disable <account>    Park an account: take it out of the rotation"),
+            None
+        );
+        // …while a recommendation built AROUND an excused verb is still caught, on a group the
+        // exemption never touched. This is why excusing `disable`/`remove` does not hand help a
+        // licence to editorialise.
+        assert_eq!(
+            scan_help_banned("you should disable <account>"),
+            Some("should")
+        );
+        assert_eq!(
+            scan_help_banned("consider whether to disable that account"),
+            Some("consider")
+        );
+    }
+
+    /// Every exemption is LOAD-BEARING: each token excused from the help scan is one the shipped
+    /// help measurably spends. Issue #918 rejected a hand-picked "command name" exemption set on
+    /// exactly this evidence — `add` is not a command in this CLI, and `remove` in
+    /// `SERVICE_USAGE` is not used as one — so the set must keep being measured rather than
+    /// inherited.
+    ///
+    /// Reddening here means a help edit dropped the last use of an excused token: the fix is to
+    /// TIGHTEN the exemption set, not to widen this test.
+    #[test]
+    fn every_help_exemption_is_still_earned_by_the_shipped_help() {
+        let surfaces = help_surfaces();
+        for exempt in crate::framing_vocabulary::HELP_EXEMPT_TOKENS {
+            let earned = surfaces.iter().any(|(_, help)| {
+                help.split(|c: char| !c.is_ascii_alphanumeric())
+                    .any(|word| word.eq_ignore_ascii_case(exempt))
+            });
+            assert!(
+                earned,
+                "{exempt:?} is exempt from the help scan but no help surface uses it any more — \
+                 tighten HELP_EXEMPT_TOKENS rather than carry a dead carve-out"
+            );
+        }
+    }
+
+    /// The two help guards' relationship, ASSERTED rather than described: the repo-wide scan
+    /// covers everything issue #885's narrower expiry guard covers, bar two extras that keep the
+    /// older guard worth its lines.
+    #[test]
+    fn the_repo_wide_help_guard_subsumes_the_expiry_guard_bar_its_own_extras() {
+        let repo_wide = help_banned_tokens();
+        let mut extra: Vec<&str> = EXPIRY_HELP_BANNED_TOKENS
+            .iter()
+            .copied()
+            .filter(|token| !repo_wide.contains(token))
+            .collect();
+        extra.sort_unstable();
+        assert_eq!(
+            extra,
+            ["beat"],
+            "the expiry guard's only unique TOKEN should be `beat`; if this set changed, the two \
+             guards' division of labour changed with it"
+        );
+
+        // Its phrase list carries one extra too — `need more` — but the repo-wide scan already
+        // catches that sentence on the single token `need`, so the phrase is not a coverage gap.
+        let mut extra_phrases: Vec<&str> = EXPIRY_HELP_BANNED_PHRASES
+            .iter()
+            .copied()
+            .filter(|phrase| !crate::framing_vocabulary::BANNED_PHRASES.contains(phrase))
+            .collect();
+        extra_phrases.sort_unstable();
+        assert_eq!(extra_phrases, ["need more"]);
+        assert_eq!(
+            scan_help_banned("running out — need more seats"),
+            Some("need"),
+            "`need more` is covered repo-wide by the single token `need`"
         );
     }
 

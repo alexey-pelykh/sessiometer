@@ -20,7 +20,7 @@ banned. Prerequisite for the **issue #541** runway surfaces (issues #543 / #544)
 
 The `stats` verb foots its human views with a neutral summary band (issue #160) and
 carries a CI **framing guard** — a central banned vocabulary (`BANNED_TOKENS`) plus a
-scanner (`scan_banned`) in `src/stats.rs`, asserted by the
+scanner (`scan_banned`) in `src/framing_vocabulary.rs`, asserted by the
 `summary_render_carries_no_banned_token_but_the_guard_bites_on_injection` test — that keeps
 every rendered surface descriptive: no value judgement, no imperative, no recommendation,
 no projection framing. The guard exists to stop `stats` drifting into an **acquisitive /
@@ -45,7 +45,7 @@ The guard bans the **framing**, not the **fact**. The permit/ban boundary is:
   projection *words* (`forecast` / `imminent` / `soon`). The intent-leak concern is a
   purchase prompt, never a head-room number.
 
-Two mechanical facts carry this in `src/stats.rs`:
+Two mechanical facts carry this in `src/framing_vocabulary.rs`:
 
 1. The token list is unchanged on the permit side — analysis confirmed no neutral
    runway/velocity word (`runway`, `velocity`, `rate`, `%/min`, `to trigger`, `at current
@@ -96,7 +96,14 @@ an observation but fails the instant a purchase call is appended.
 
 ## Related
 
-- Code: `src/stats.rs` — `BANNED_TOKENS`, `BANNED_PHRASES`, `scan_banned`, and the
-  `framing_guard_permits_neutral_runway_but_bans_the_acquisitive_call` test.
+- Code: `src/framing_vocabulary.rs` — `BANNED_TOKENS`, `BANNED_PHRASES`, `scan_banned`.
+  The vocabulary and scanner lived in `src/stats.rs` when this ADR was accepted; issue #918
+  hoisted them so `src/cli.rs` could scan `--help` against the same list. Nothing about the
+  permit/ban boundary this ADR settles changed in the move — the lists kept their content and
+  ordering, and `--help` scans a subset derived from them rather than a second copy.
+- Code: `src/stats.rs` — the assertions stayed put:
+  `framing_guard_permits_neutral_runway_but_bans_the_acquisitive_call` and
+  `summary_render_carries_no_banned_token_but_the_guard_bites_on_injection`.
 - Issues: #542 (this amendment) · #541 (runway umbrella) · #160 (the framing guard) ·
-  #543 / #544 (the runway surfaces) · #158 / #159 (`--json` / charts).
+  #918 (the vocabulary's relocation) · #543 / #544 (the runway surfaces) ·
+  #158 / #159 (`--json` / charts).
