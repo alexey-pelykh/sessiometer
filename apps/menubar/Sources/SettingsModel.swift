@@ -648,6 +648,28 @@ enum SettingsFormat {
         }
     }
 
+    /// The `.rejected` tooltip: the rendered label, plus the daemon's `detail` when the label does not
+    /// already carry it.
+    ///
+    /// WHY THIS IS NOT JUST `rejectionText`. The daemon sends a `detail` on TWO reasons, not one —
+    /// `ConfigSetAck::Rejected`'s own doc (`src/daemon/socket.rs`) says it carries the non-secret message
+    /// "for the `invalid` reason … and for `config-unreadable` (the baseline TOML parse error, issue
+    /// #628)", and `classify_config_set_failure` (`src/daemon/classify.rs`) maps `Error::ConfigParse` to
+    /// `(ConfigUnreadable, Some(err.to_string()))` precisely "so a stale / version-skewed on-disk config
+    /// is diagnosable, not a bare envelope". `rejectionText` returns `detail` only on `.invalid`; on
+    /// `.configUnreadable` it returns a fixed sentence and the parse error is discarded.
+    ///
+    /// Nothing else in this app surfaces it — the apply-path log prints the reason alone, and the LOAD
+    /// path's `loadFailureDetail(.daemonError(.unreadable))` is likewise a fixed sentence — so this
+    /// tooltip is the only place an operator can read WHERE their hand-edited `config.toml` is broken.
+    /// Appending rather than replacing keeps the ratified rule intact in both directions: the label's
+    /// bounded drawing is unchanged, and the message is carried in full rather than edited away.
+    static func rejectionTooltip(_ reason: ConfigSetRejection, _ detail: String?) -> String {
+        let label = rejectionText(reason, detail)
+        guard let detail, !detail.isEmpty, label != detail else { return label }
+        return "\(label)\n\(detail)"
+    }
+
     /// A transport / decode failure on the APPLY path, rendered.
     ///
     /// UNBOUNDED BY CONSTRUCTION on the `.daemonError` arm: the string it interpolates is the daemon's
@@ -778,8 +800,10 @@ enum SettingsFormat {
     /// one: `SettingsView` is not in the test bundle (`project.yml`), so a literal there is unreachable
     /// from any test, whereas this is the value `SettingsTextMetricsTests` measures the clamp against. The
     /// ratified clamp RULE covers the `.failed` AND `.rejected` labels alike — the rule, not a frame:
-    /// no frame renders `.rejected` (`design/README.md` § "The Settings window (#763)"). Only `.failed`
-    /// reads this today (issue #844); issue #944 is the `.rejected` half, and this is what it should reuse.
+    /// no frame renders `.rejected` (`design/README.md` § "The Settings window (#763)"). BOTH arms read
+    /// this — `.failed` since issue #844, `.rejected` since issue #944 — which is why the chain lint in
+    /// `SettingsTextMetricsTests` is scoped per ARM in both directions rather than to the file: one
+    /// constant shared by two chains means a file-wide `contains` would go green on either one alone.
     static let applyStatusLineLimit = 2
 
     /// The width available to the footer's apply-status `Label` TITLE.
