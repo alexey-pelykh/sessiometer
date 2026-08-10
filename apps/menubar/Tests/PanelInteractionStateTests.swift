@@ -310,8 +310,8 @@ final class PanelInteractionStateTests: XCTestCase {
     /// silently, since a copy that quietly relaxes its bound still passes. Read it there;
     /// `PanelGoldenParityTests.testSettledLoopsUntilTwoConsecutiveRastersAgree` and
     /// `PanelGoldenParityTests.testSettledThrowsAndNamesItsCallerRatherThanReturningAnUnsettledRaster` prove
-    /// the shared loop genuinely iterates and genuinely throws. `PanelRenderHarness`'s
-    /// `warmUpIfNeeded()` deliberately keeps its own: it ships in the app target, where `PanelRaster` does
+    /// the shared loop genuinely iterates and genuinely throws. `PanelRenderHarness`'s own settle
+    /// deliberately keeps its own copy: it ships in the app target, where `PanelRaster` does
     /// not exist. What stays here is the SUBJECT label a failure names; `file`/`line` default at the caller,
     /// so a red points at the test that drifted rather than at this wrapper.
     private func stableRender(_ view: some View,

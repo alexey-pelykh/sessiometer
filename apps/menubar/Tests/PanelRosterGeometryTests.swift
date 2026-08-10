@@ -22,18 +22,18 @@
 // define. These are measurement probes, so they go through the harness's RENDER — the shared wiring, so the
 // panel is assembled exactly as the app assembles it — without joining its catalog.
 //
-// ISSUE #824 DOES NOT REACH THIS SUITE, and that is asserted rather than assumed. The harness warm-up
-// warms `healthy`/light/`.large` only, so an un-warmed fixture's first raster can differ from its steady
-// state by ±1/255 on a few hundred bytes — the open artifact #824 tracks, and the reason
+// ISSUE #824 DID NOT REACH THIS SUITE, and that was asserted rather than assumed. Before #824 the harness
+// warmed `healthy`/light/`.large` only, so an un-warmed fixture's first raster could differ from its steady
+// state by ±1/255 on a few hundred bytes — the artifact #824 tracked, and the reason
 // `PanelAppearanceVariantTests` (#760) needs a `stableRender` before any byte-granular comparison. Every
 // predicate HERE reads a DIMENSION, which a colour drift cannot move: a raster's width and height come
-// from the layout pass, not from the pixel values the warm-up settles.
+// from the layout pass, not from the pixel values a settle converges.
 //
 // That argument is a-priori and `testTheMeasuredHeightIsStableAcrossRepeatedRenders` CORROBORATES rather
-// than proves it: `warmUpIfNeeded` fires on the first `render` in the process, so its six agreeing renders
-// are all post-warm-up, and what they demonstrate is REPEATABILITY. Stated precisely because the looser
-// phrasing was worth correcting. Do not "fix" a future flake here by loosening a height comparison — a
-// height that moves between renders is a bigger finding than #824 and belongs there.
+// than proves it: the harness settles every render it serves, so its six agreeing renders are all steady
+// ones, and what they demonstrate is REPEATABILITY. Stated precisely because the looser phrasing was worth
+// correcting. Do not "fix" a future flake here by loosening a height comparison — a height that moves
+// between renders is a bigger finding than a cold raster ever was, and belongs in its own issue.
 //
 // ── THE DERIVED CEILING IS AN ASSUMPTION, NOT A RATIFIED TARGET ────────────────────────────────────────
 //
@@ -387,9 +387,9 @@ final class PanelRosterGeometryTests: XCTestCase {
     /// Six renders of an UN-WARMED fixture must report the same height to the pixel.
     ///
     /// WHY THIS COMES FIRST. It is what turns the file header's a-priori argument — a DIMENSION cannot
-    /// carry the ±1/255 cold-raster artifact issue #824 tracks, because width and height come from the
-    /// layout pass rather than from the pixel values the warm-up settles — into a measurement (observed:
-    /// 1546 px, six times out of six, on a fixture the harness warm-up never touches).
+    /// carry the ±1/255 cold-raster artifact issue #824 tracked, because width and height come from the
+    /// layout pass rather than from the pixel values a settle converges — into a measurement (observed:
+    /// 1546 px, six times out of six, on a fixture outside the harness's catalog).
     ///
     /// It doubles as the degenerate-subject guard for everything below: a rasterizer returning nil, or a
     /// zero-height image, would make every height comparison in this file a comparison of nothing.

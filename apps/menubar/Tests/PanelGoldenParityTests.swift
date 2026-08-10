@@ -92,17 +92,21 @@
 // Every 0.000000 above is also 0 at the BYTE level, which is a stronger claim than the metric can make and
 // is asserted separately (the metric ignores channel deltas under 64/255, so it would report 0.000000 for a
 // raster off by ±1 everywhere). That byte-exactness is not free: the first renders in a process disagree
-// with the steady state by ±1/255 on ~0.03 % of bytes — a rasterization warm-up artifact, measured by
+// with the steady state by ±1/255 on ~0.03 % of bytes — a rasterization start-up transient, measured by
 // rendering one fixture six times (renders 0–1 agree, renders 2–5 agree, the groups differ) and ruled
-// clock-independent by the seed-lag rows above. `PanelRenderHarness` discards renders until two consecutive
-// ones agree, so both the app tool and this gate rasterize from the steady state; the byte assertions here
-// are what keep that honest. HONEST LIMIT, measured for issue #821: that warm-up renders the `healthy`
-// fixture only, and its "two consecutive agree" rule cannot detect a cold group that agrees with ITSELF —
-// rendering `blind-cornered/dark` ten times as a process's first renders gives frames 0–1 identical and
-// frames 2+ differing from them by 1/255 on 728 bytes, at an IDENTICAL seed. So the steady state is reached
-// in practice by the volume of renders this suite does, not guaranteed by the warm-up, and a byte assertion
-// can still redden on a run that rasterizes a cell for the first time. Tracked as issue #824; do NOT
-// absorb it into a tolerance.
+// clock-independent by the seed-lag rows above. `PanelRenderHarness.render` settles EVERY render against a
+// transient depth it measures on this machine (issue #824), so both the app tool and this gate rasterize
+// from the steady state whatever order the suite runs in; the byte assertions here are what keep that
+// honest.
+//
+// Through issue #821 this paragraph carried an HONEST LIMIT that no longer applies, recorded because the
+// numbers stay useful: the pre-#824 warm-up rendered the `healthy` fixture only, and its "two consecutive
+// agree" rule could not detect a cold group that agreed with ITSELF — rendering `blind-cornered/dark` ten
+// times as a process's first renders gave frames 0–1 identical and frames 2+ differing from them by 1/255
+// on 728 bytes, at an IDENTICAL seed. The steady state was therefore reached in practice by the volume of
+// renders this suite does rather than guaranteed by the warm-up, and a byte assertion could redden on a run
+// that rasterized a cell for the first time. Issue #824 removed the cause. It did NOT license a tolerance,
+// and neither does anything else: absorbing a ±1 into the byte assertions would put the exposure back.
 //
 // The median is quoted only to be dismissed: of the 62 same-size pairs, 42 are cross-theme (light vs dark,
 // ~0.97), which is what drags the median up to the figure in the table and so says nothing whatever about
@@ -398,22 +402,29 @@ final class PanelGoldenParityTests: XCTestCase {
     // is the strong form of the claim above (identical strings rasterize to identical bytes). An earlier
     // revision of this comment asserted the opposite — that this was "the one place in this suite where it
     // is NOT zero", ±1/255 tracking the seed→raster latency — while the assertion below demanded exactly 0.
-    // That prose was stale (issue #821): it predated `PanelRenderHarness.warmUpIfNeeded()`, whose own doc
+    // That prose was stale (issue #821): it predated the harness's process-level warm-up, whose own doc
     // records the measurement that refutes it — "renders seeded seconds apart are byte-identical, which
     // rules the clock out directly". Re-measured for #821: 11 consecutive runs (5 of this class alone, 6 of
     // the whole suite under 14-core saturation, load average to 38) reported `worst delta 0 over up to 0
     // bytes` every time. The assertion was right and the comment was wrong; do NOT re-loosen it to a
     // tolerance on the strength of the deleted prose.
     //
-    // WHAT DOES move bytes by ±1 is a COLD raster, not the clock — the header's HONEST LIMIT carries that
-    // measurement, and this test is where it surfaces, because `atSeed` lands in the cold group while the
-    // lagged renders land outside it. Worth knowing it is NOT a flake when it does: running this test ALONE
-    // (`-only-testing:…/testRendersSurviveTheClockDriftWindow`) is red 6 times out of 6, at exactly 882
-    // bytes and worst delta 1, on this commit and on the one before it alike — the observed #756 signature
-    // exactly, and a warm-up signature rather than a clock one. In the FULL suite the earlier tests have
-    // already rasterized the catalog, so the rasterizer is warm by the time this runs and the measurement is
-    // 0 — which is why the required job is green, and why a lone re-run is not a diagnosis. Closing the
-    // exposure is a change to the harness's warm-up, tracked as issue #824.
+    // WHAT DOES move bytes by ±1 is a COLD raster, not the clock, and this test is where that used to
+    // surface: `atSeed` landed inside the rasterizer's start-up transient while the lagged renders landed
+    // outside it. Run ALONE (`-only-testing:…/testRendersSurviveTheClockDriftWindow`) it was red 6 times out
+    // of 6 at exactly 882 bytes and worst delta 1 — the observed #756 signature, a warm-up signature rather
+    // than a clock one — while the full suite stayed green because the earlier tests had already rasterized
+    // the catalog. That is luck, not a gate, which is why issue #824 replaced the warm-up: every render is
+    // now settled against a measured transient depth, so `atSeed` cannot land in a transient. Re-measured
+    // across 40 lone invocations on the #824 commit: 38 report `worst delta 0 over up to 0 bytes`, against
+    // 15 out of 15 reproducing the 882-byte red on the parent commit.
+    //
+    // The other 2 of those 40 are NOT this: they report a worst delta in the 200s over ~450 bytes, which is
+    // a TEXT change and therefore the second arm of the message below — the 29 s lag against a 30 s
+    // `boundaryGuardSecs` leaves about one second of margin, so the sub-second seed truncation plus render
+    // latency can cross a `humanizeUntil` boundary. That is a margin defect in this test rather than a
+    // fixture-offset defect, it is pre-existing, and settling every render makes a render slower and so
+    // widens it. Tracked as issue #1128; do not absorb it into a tolerance here either.
     //
     // `atSeed` is rendered UNCACHED below for the same reason `testAnIdenticalRerenderScoresExactlyZero`
     // renders both of its sides uncached: the lagged renders already bypass the cache, so caching only this
@@ -449,8 +460,9 @@ final class PanelGoldenParityTests: XCTestCase {
                        + "being byte-reproducible, so a re-bless churns files that did not change and the "
                        + "`Panel-Goldens-Rebaselined:` audit trail stops being readable. "
                        + "DIAGNOSE, do not re-run (issue #821): a worst delta of exactly 1 over a few "
-                       + "hundred bytes is the COLD-RASTER signature, not a clock failure — the warm-up "
-                       + "covers the `healthy` fixture only (issue #824). A worst delta above 1, or a byte "
+                       + "hundred bytes is the COLD-RASTER signature, not a clock failure — it means a "
+                       + "raster reached this comparison un-settled, so look at `PanelRenderHarness`'s "
+                       + "steady state (issue #824) before the clock. A worst delta above 1, or a byte "
                        + "count in the thousands, is the real subject of this test: a clock-relative string "
                        + "crossed a `humanizeUntil` boundary inside the "
                        + "\(PanelRenderHarness.boundaryGuardSecs)s guard window — move the offending "
@@ -1384,19 +1396,25 @@ struct PanelRaster {
     /// 849 bytes), and a flaky catch is not a gate — which is why those two canaries drive the loop directly
     /// instead.
     ///
-    /// The THIRD copy, `PanelRenderHarness.warmUpIfNeeded()`, deliberately stays its own: the `Menubar` app
-    /// target takes `sources: - Sources` (the whole directory), so `Sources/PanelRenderHarness.swift`
-    /// compiles into the SHIPPING APP as well as into this bundle, while `PanelRaster` is declared in this
-    /// test-only file. The harness must therefore compile in a target where this type does not exist, and so
-    /// cannot reference it. Its own `rawBytes` says the same thing from the other side.
+    /// The THIRD copy, `PanelRenderHarness.settled(pastTransientRun:budget:_:)`, deliberately stays its own:
+    /// the `Menubar` app target takes `sources: - Sources` (the whole directory), so
+    /// `Sources/PanelRenderHarness.swift` compiles into the SHIPPING APP as well as into this bundle, while
+    /// `PanelRaster` is declared in this test-only file. The harness must therefore compile in a target where
+    /// this type does not exist, and so cannot reference it. Its own `rawBytes` says the same thing from the
+    /// other side. (That copy is no longer near-verbatim: since issue #824 it settles against a transient
+    /// depth it MEASURES rather than against a fixed "two consecutive agree", because it is the one loop that
+    /// has to survive being the first thing to render in a process. This one runs on renders the harness has
+    /// already settled, so the simpler rule is sufficient here.)
     ///
-    /// WHY THIS IS NEEDED, and why it is not a loosened tolerance. `PanelRenderHarness`'s process-level
-    /// warm-up discards renders until two consecutive agree, but it warms the `healthy` fixture in the
-    /// LIGHT scheme only — so the first renders of any other cell still carry cold pixels, differing from
-    /// the steady state by ±1/255 on a few hundred bytes. That is issue #824, an open and separately
-    /// tracked rasterizer artifact, and it is exactly what this suite tripped over first: `healthy/dark`
-    /// reported 849 differing bytes at worst channel 1 between the plain and high-contrast appearances,
-    /// which reads as "the appearance reached the render" and is nothing of the sort.
+    /// WHY THIS IS NEEDED, and why it is not a loosened tolerance. It predates issue #824: the harness's
+    /// warm-up used to discard renders until two consecutive agreed, warming the `healthy` fixture in the
+    /// LIGHT scheme only — so the first renders of any other cell still carried cold pixels, differing from
+    /// the steady state by ±1/255 on a few hundred bytes, and that is exactly what this suite tripped over
+    /// first: `healthy/dark` reported 849 differing bytes at worst channel 1 between the plain and
+    /// high-contrast appearances, which reads as "the appearance reached the render" and is nothing of the
+    /// sort. #824 removed that cause at the harness. This wrapper is kept regardless: it settles renders
+    /// this suite takes through paths of its own (an `NSAppearance` override, an interaction seam), and a
+    /// suite that pins bytes should not have to assume its inputs were settled somewhere else.
     ///
     /// The fix is to remove the confound, not to widen the comparison. Absorbing it into a tolerance —
     /// switching the pin to `diffFraction`'s 64/255 threshold, or allowing "worst channel ≤ 1" — would also
