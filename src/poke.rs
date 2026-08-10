@@ -1432,6 +1432,207 @@ mod tests {
         assert!(engine.refreshed().is_empty());
     }
 
+    // --- issue #1087: a duplicated label refuses, and the refusal is not a report line ------
+    //
+    // `poke` shares `use_account::resolve_target` with the five other label-resolving sites, so
+    // it refuses a duplicated label rather than taking the earliest bearer (#17, OQ-1). The half
+    // that had no test is what happens to that `Err` afterwards: `poke` is the one CLI site that
+    // COMPOSES per-account report lines, and its all-accounts sweep deliberately turns a
+    // per-account `Err` into an outcome string (`format!("error ({err})")`, `poke_all`) and keeps
+    // going — a completed, exit-0 report. A named refusal routed into that composition would be
+    // indistinguishable to a script and nearly so to a reader: the same words, on the wrong
+    // stream, under a success exit.
+    //
+    // Two tests, because the claim has two halves that fail independently. The first pins the
+    // CONTRACT (which error, which exit code, and that the engine never ran); the second pins the
+    // OBSERVABLE — the two byte streams an operator actually gets — which no in-process assertion
+    // can see, since a swallow that printed a report line and returned `Ok(())` satisfies "the
+    // engine never ran" perfectly.
+
+    #[tokio::test]
+    async fn named_refuses_a_duplicated_label_and_the_uuid_is_the_way_out() {
+        let roster = vec![acct("dup", "u-A"), acct("dup", "u-B"), acct("solo", "u-C")];
+        let engine = FakePokeEngine::new();
+        let err = run_poke(
+            &roster,
+            Some("dup"),
+            None,
+            0,
+            &engine,
+            None,
+            &FakeRestoreNotifier::new(),
+        )
+        .await
+        .expect_err("a duplicated label must refuse, not report a per-account outcome");
+        assert!(
+            matches!(err, Error::UseTargetAmbiguous { count: 2, ref query } if query == "dup"),
+            "got {err:?}",
+        );
+        // The literal code, not merely "some error": exit 6 is the operator-visible contract a
+        // script keys on, and a report line would have exited 0.
+        assert_eq!(err.exit_code(), 6, "an ambiguous target exits 6");
+        assert!(
+            engine.refreshed().is_empty(),
+            "an ambiguous target refreshes nothing",
+        );
+
+        // The refusal is actionable rather than a dead end: there is no `--account-uuid`
+        // disambiguator flag, so the account-uuid the message points at IS the remedy, and it has
+        // to work through `poke` itself — the sibling of `cli`'s
+        // `the_label_resolving_verbs_accept_an_account_uuid_so_a_refusal_is_actionable`.
+        run_poke(
+            &roster,
+            Some("u-B"),
+            None,
+            0,
+            &engine,
+            None,
+            &FakeRestoreNotifier::new(),
+        )
+        .await
+        .expect("the account-uuid disambiguates a duplicated label");
+        assert_eq!(
+            engine.refreshed(),
+            vec!["u-B"],
+            "and it pokes the bearer the operator named, only",
+        );
+    }
+
+    /// Environment variable set on the re-exec'd child. Read by BOTH sides: the parent asserts it
+    /// is unset (a parent running inside its own child would re-exec forever), the payload asserts
+    /// it is set (so an accidental direct `--ignored` run is a loud failure, not a process exit
+    /// under someone else's suite).
+    const AMBIGUITY_CHILD_VAR: &str = "SESSIOMETER_POKE_AMBIGUITY_CHILD";
+
+    /// The `#[ignore]`d child payload's function name, used to build the `--exact` filter. A drift
+    /// between this and the payload's real name selects NOTHING, and libtest exits 0 on an empty
+    /// selection — which is why the parent asserts [`AMBIGUITY_CHILD_RAN`] rather than the child's
+    /// status alone.
+    const AMBIGUITY_CHILD_FN: &str = "poke_ambiguity_child_payload";
+
+    /// Written to fd 2 by the payload before it exits, proving to the parent that the payload
+    /// really ran.
+    const AMBIGUITY_CHILD_RAN: &str = "poke-ambiguity-child-ran";
+
+    /// The exact sentence `main` prints for this refusal, pinned as a literal rather than
+    /// re-derived from `Error::UseTargetAmbiguous` — re-deriving it would make the assertion agree
+    /// with whatever the template says, including a rewording that stopped naming the remedy.
+    const AMBIGUITY_REFUSAL: &str =
+        "`dup` is ambiguous: 2 accounts match — disambiguate with the account-uuid";
+
+    #[test]
+    fn a_duplicated_label_refusal_reaches_the_operator_on_stderr_not_as_a_report_line() {
+        // AC-1's own words are that the refusal is visible in `poke`'s OUTPUT, so this asserts on
+        // the output: both of the child's streams, and its exit status.
+        //
+        // It needs a child process to do it. `println!` and `eprintln!` route through the
+        // thread-local capture libtest installs, so in-process both streams arrive empty — the
+        // re-exec with `--nocapture` (the pattern `crate::paths`'s launchd cases use) is what
+        // makes the streams observable at all.
+        //
+        // Which assertions that endangers is worth being exact about, because the imprecise
+        // version of this sentence ("every assertion would pass over nothing") invites deleting
+        // the CHILD_RAN sentinel as belt-and-braces. The POSITIVE assertions — stderr carries the
+        // refusal, the status is 6 — fail loudly against empty streams and need no help. It is the
+        // two NEGATIVE ones, requiring that stdout carries neither a `dup:` report line nor the
+        // refusal's words, that an empty capture satisfies perfectly. The sentinel is what
+        // separates "the child ran and printed nothing there" from "the child never ran": a
+        // drifted filter selects zero tests and libtest exits 0, which without it reads as a pass.
+        assert!(
+            std::env::var_os(AMBIGUITY_CHILD_VAR).is_none(),
+            "{AMBIGUITY_CHILD_VAR} is set — this parent is running inside its own child",
+        );
+        let module = module_path!();
+        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("the test binary must know its own path"),
+        )
+        .arg(format!("{module}::{AMBIGUITY_CHILD_FN}"))
+        .arg("--exact")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .arg("--test-threads=1")
+        .env(AMBIGUITY_CHILD_VAR, "1")
+        .output()
+        .expect("the child test binary must run");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+        assert!(
+            stderr.contains(AMBIGUITY_CHILD_RAN),
+            "the payload did not run — a drifted name selects nothing and libtest exits 0 on an \
+             empty selection.\nstdout: {stdout}\nstderr: {stderr}",
+        );
+        // 1. The refusal reached the operator, on the ERROR stream, in `main`'s words.
+        assert!(
+            stderr.contains(&format!("sessiometer: {AMBIGUITY_REFUSAL}")),
+            "the refusal must be visible on stderr.\nstdout: {stdout}\nstderr: {stderr}",
+        );
+        // 2. …carrying exit 6. A per-account report is an exit-0 event, so this alone separates
+        //    the two channels for every caller that only reads a status.
+        assert_eq!(
+            output.status.code(),
+            Some(6),
+            "the refusal must exit 6.\nstdout: {stdout}\nstderr: {stderr}",
+        );
+        // 3. …and NOTHING of it reached the report stream. Both shapes a swallow can take are
+        //    excluded: a `poke_line` for the query (`<label>: <outcome>`, the form `poke_all`
+        //    composes for a per-account error) and the refusal's own words anywhere on fd 1.
+        assert!(
+            !stdout.lines().any(|line| line.starts_with("dup:")),
+            "the refusal must not be reported as a per-account line.\nstdout: {stdout}",
+        );
+        assert!(
+            !stdout.contains(AMBIGUITY_REFUSAL),
+            "the refusal must not reach stdout at all.\nstdout: {stdout}",
+        );
+    }
+
+    /// The child payload of
+    /// [`a_duplicated_label_refusal_reaches_the_operator_on_stderr_not_as_a_report_line`]: run
+    /// `poke dup` on a duplicate-label roster over in-memory fakes, then reproduce `main`'s tail
+    /// verbatim — the refusal on fd 2, the typed exit code — so the parent observes exactly the two
+    /// streams an operator does, and nothing is asserted here that the parent could not see.
+    ///
+    /// `#[ignore]`d because it is not a test in its own right: it asserts nothing about `poke` and
+    /// it EXITS the process, so it must never join an ordinary run. The parent selects it by exact
+    /// name with `--ignored`.
+    #[tokio::test]
+    #[ignore = "child payload; re-exec'd by its parent, never run directly"]
+    async fn poke_ambiguity_child_payload() {
+        use std::io::Write as _;
+
+        assert!(
+            std::env::var_os(AMBIGUITY_CHILD_VAR).is_some(),
+            "{AMBIGUITY_CHILD_VAR} is unset — this payload exits the process and is only \
+             meaningful under its parent",
+        );
+        let roster = vec![acct("dup", "u-A"), acct("dup", "u-B"), acct("solo", "u-C")];
+        let engine = FakePokeEngine::new();
+        let result = run_poke(
+            &roster,
+            Some("dup"),
+            None,
+            0,
+            &engine,
+            None,
+            &FakeRestoreNotifier::new(),
+        )
+        .await;
+        // Straight to the stderr HANDLE, and BEFORE the exit below: this is the parent's proof that
+        // the payload ran at all.
+        let _ = writeln!(std::io::stderr(), "{AMBIGUITY_CHILD_RAN}");
+        // `main`'s tail, verbatim. An `Ok` exits 0 having said whatever it already printed on
+        // fd 1 — which is precisely what a swallowed refusal looks like from outside.
+        match result {
+            Ok(()) => std::process::exit(0),
+            Err(err) => {
+                eprintln!("sessiometer: {err}");
+                std::process::exit(i32::from(err.exit_code()));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn named_propagates_a_hard_refresh_error() {
         let roster = vec![acct("work", "u-A"), acct("spare", "u-B")];
