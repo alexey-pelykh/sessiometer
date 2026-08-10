@@ -3747,9 +3747,10 @@ mod tests {
     /// A snapshot frame carrying the REFRESH-token expiry modifier (issues #878/#882) in **all
     /// four** of its states, plus the fleet-level `expiry_cohort` condition (issue #879).
     ///
-    /// The other four goldens carry `expiry: None` on every account and no cohort, so BOTH objects
-    /// are omitted from all of them (`skip_serializing_if`) and neither the [`AccountExpiry`]
-    /// encoder nor the [`ExpiryCohort`] one has any byte-drift coverage. This freezes both.
+    /// Every other committed status/watch golden carries `expiry: None` on every account and no
+    /// cohort, so BOTH objects are omitted from all of them (`skip_serializing_if`) and neither
+    /// the [`AccountExpiry`] encoder nor the [`ExpiryCohort`] one has any byte-drift coverage.
+    /// This freezes both.
     ///
     /// The fourth account is the load-bearing one and the reason issue #886 exists: it was POLLED
     /// and its credential carried NO `refreshTokenExpiresAt`, so it encodes
@@ -4057,16 +4058,17 @@ mod tests {
     #[test]
     fn snapshot_frame_encodes_recent_blind_preempt_swap_only_when_present() {
         // Issue #479 (surface 2): the ADDITIVE `recent_blind_preempt_swap` wire field (schema 1.7).
-        // The 4 committed goldens all carry it as `None` (it is
-        // `#[serde(default, skip_serializing_if = "Option::is_none")]`), so THEY prove the omit-when-
-        // absent half — an older client and every unaffected frame stay byte-identical — but NONE of
-        // them exercise the POPULATED shape. This locks the wire bytes the field emits when a recent
-        // preemptive swap IS present, so a later `#[serde(rename)]` / reorder / retype of
-        // `BlindPreemptSwap`'s fields (which the CLI render test would NOT catch — it constructs the
-        // struct in Rust, never round-trips the JSON keys) drifts this test. The menubar mirror is out
-        // of scope for #479 (#169/#485 own it), so this stays a Rust-side byte-lock rather than a fifth
-        // cross-language golden; the Swift decoder's forward-compatible tolerance of the new unknown
-        // top-level key is already covered by the `future_top` fixture (apps/menubar Fixtures.swift).
+        // Every committed status/watch golden either carries it as `None` or has no snapshot body
+        // at all (it is `#[serde(default, skip_serializing_if = "Option::is_none")]`), so THEY
+        // prove the omit-when-absent half — an older client and every unaffected frame stay
+        // byte-identical — but NONE of them exercise the POPULATED shape. This locks the wire bytes
+        // the field emits when a recent preemptive swap IS present, so a later `#[serde(rename)]` /
+        // reorder / retype of `BlindPreemptSwap`'s fields (which the CLI render test would NOT
+        // catch — it constructs the struct in Rust, never round-trips the JSON keys) drifts this
+        // test. The menubar mirror is out of scope for #479 (#169/#485 own it), so this stays a
+        // Rust-side byte-lock rather than another cross-language golden; the Swift decoder's
+        // forward-compatible tolerance of the new unknown top-level key is already covered by the
+        // `future_top` fixture (apps/menubar Fixtures.swift).
         let mut snapshot = watch_snapshot("work", 42, 0.60);
         snapshot.recent_blind_preempt_swap = Some(BlindPreemptSwap {
             from_label: "work".to_owned(),
@@ -4093,16 +4095,18 @@ mod tests {
     #[test]
     fn account_line_encodes_the_expiry_modifier_only_once_the_account_has_been_polled() {
         // Issue #882: the ADDITIVE per-account `expiry` wire field (schema 1.12), the ADR-0017
-        // `blind_active` modifier posture applied to the #878 refresh-token foresight axis. The 4
-        // committed goldens all build their reading with `..Default::default()`, so `expiry` is
-        // `None` there and THEY prove the omit-when-absent half — every unpolled row stays
-        // byte-identical, which is why the regenerated goldens differ from their predecessors in
-        // `schema_version` and nothing else. None of them exercise the POPULATED shape, so this
-        // locks the bytes the field emits when a reading IS present: a later `#[serde(rename)]`,
-        // reorder, or retype of `AccountExpiry` / `ExpiryHorizon` drifts this test. The menubar
-        // mirror is out of scope here (issue #884 owns the panel, #883 the CLI cell), so this stays
-        // a Rust-side byte-lock rather than a fifth cross-language golden — exactly the posture
-        // issue #479 took for `recent_blind_preempt_swap` above; the Swift decoder's forward-
+        // `blind_active` modifier posture applied to the #878 refresh-token foresight axis. The
+        // goldens that build their reading with `..Default::default()` carry `expiry` as `None`,
+        // and THEY prove the omit-when-absent half — every unpolled row stays byte-identical, which
+        // is why the regenerated goldens differ from their predecessors in `schema_version` and
+        // nothing else. No golden exercised the POPULATED shape when this landed, so this locks the
+        // bytes the field emits when a reading IS present: a later `#[serde(rename)]`, reorder, or
+        // retype of `AccountExpiry` / `ExpiryHorizon` drifts this test. `wire-snapshot-expiry.json`
+        // (issue #886) covered that shape as a golden later the same day; this remains the lock
+        // that holds in isolation. The menubar mirror is out of scope here (issue #884 owns the
+        // panel, #883 the CLI cell), so this stays a Rust-side byte-lock rather than another
+        // cross-language golden — exactly the posture issue #479 took for
+        // `recent_blind_preempt_swap` above; the Swift decoder's forward-
         // compatible tolerance of a new unknown PER-ACCOUNT key is already covered by the
         // `future_field` fixture (apps/menubar Fixtures.swift).
         let mut snapshot = watch_snapshot("work", 42, 0.60);

@@ -10134,7 +10134,7 @@ mod tests {
         // tripping the reactive threshold — closing the observed reactive overshoot (#363).
         // Warmed on a frozen clock (u-A at 86 %, schedule A, B, A, C): the helper asserts warmed-up,
         // u-A active, and — since no interval elapsed — an unseeded (`None`) EMA. Same fixture the
-        // five direct-call velocity_swap tests route through.
+        // warmed direct-call velocity_swap tests route through.
         let mut daemon = warmed_velocity_daemon(0.86).await;
         // Arm the projective gate at 150 s — the TOP of the #538-validated safe band (H ≤ 150 s).
         daemon.session_velocity_horizon_secs = 150;
