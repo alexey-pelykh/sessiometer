@@ -2529,9 +2529,12 @@ struct AccountWire {
 struct VelocityWire {
     /// Smoothed session-usage rate in percent-per-minute (#539's EMA, replayed stats-side over
     /// the stored series). Always a real number — the object is present only when it is known.
+    /// `0.0` here is a MEASURED FLAT account and nothing else: [`round_pct_per_min`] re-quantizes a
+    /// rate too small for its three decimals rather than collapsing it onto this reading (#1146).
     session_pct_per_min: f64,
     /// Smoothed weekly-usage rate in percent-per-minute, or `null` when the weekly dimension has
-    /// no measurable rate (flat / reset / fewer than two sample intervals).
+    /// no measurable rate (flat / reset / fewer than two sample intervals). `0.0` carries the same
+    /// measured-flat meaning it does on the session field, on the same quantizer.
     weekly_pct_per_min: Option<f64>,
     /// Approximate whole seconds until the session reading reaches `session_ceiling`, or `null`
     /// when the rate is `0` or the reading is already at/over the ceiling (no positive head-room),
@@ -2802,8 +2805,9 @@ fn account_wire(a: &AccountStats, velocity: Option<&AccountVelocity>) -> Account
 /// The wire form of an [`AccountVelocity`] — `Some` only when the SESSION velocity is known (the
 /// discriminator between "figures present" and "object absent"); the session rate is then a real
 /// number and the weekly rate / both runways are explicit `null` when individually unknown. Rates
-/// are rounded to `%/min` (3 decimals) so the wire is stable — no float-tail noise — while keeping
-/// the weekly dimension's small figures; runways stay whole seconds.
+/// are quantized to `%/min` by [`round_pct_per_min`] so the wire is stable — no float-tail noise —
+/// while keeping the weekly dimension's small figures and never quantizing a burn onto the
+/// measured-flat `0.0` (issue #1146); runways stay whole seconds.
 fn velocity_wire(v: &AccountVelocity) -> Option<VelocityWire> {
     let session = v.session_rate?; // absent field when the session velocity is unknown
     Some(VelocityWire {
@@ -2827,10 +2831,68 @@ fn fleet_wire(f: FleetRunway) -> FleetWire {
     }
 }
 
-/// A usage rate (fraction/second) as percent-per-minute, rounded to 3 decimals so the `--json`
-/// wire is stable across runs yet keeps the weekly dimension's small values.
+/// A usage rate (fraction/second) as percent-per-minute, QUANTIZED so the `--json` wire is stable
+/// across runs — and never quantized ACROSS the zero boundary (issue #1146).
+///
+/// Three decimals is the primary form: it holds the wire diffable while keeping the weekly
+/// dimension's small values, and every rate it can carry reaches the wire unchanged by the arm
+/// below.
+///
+/// That arm exists because `0.0` is TAKEN on this wire. [`VelocityWire`] spends a three-way
+/// vocabulary deliberately — `0.0` is a MEASURED FLAT reading, `null` is UNKNOWN, a positive number
+/// is a measured rate — so a burn quantized down to `0.0` does not merely lose precision, it changes
+/// CATEGORY, asserting a reading the aggregator never made. Three decimals of `%/min` collapse every
+/// rate under `8.333e-8` frac/s, and the worst case still inside that band drains ~0.15% of a
+/// session quota per 5 h window. `1e-9` frac/s sat there too — the rate the human cell has stated as
+/// [`SUB_THRESHOLD_PCT_PER_MIN`] since issue #1136 — so the two surfaces disagreed about whether the
+/// account was measured burning at all.
+///
+/// The collapse is detected by comparing against the primary form's OWN output rather than a
+/// hand-written epsilon, exactly as [`fmt_pct_per_min`] does: whatever three decimals round to zero
+/// IS the band, by construction, so the two cannot drift. The guard is `> 0.0` and not `!= 0.0`
+/// because the bound asserts a BURN, which a negative rate is not — the same reason
+/// [`fmt_pct_per_min`] gives. A measured flat rate reaches `0.0` under either spelling (`0.0 != 0.0`
+/// is false); the spelling bites only on a NEGATIVE sub-threshold rate, which `replay_velocity_ema`
+/// cannot produce — non-negative by construction, since a drop resets. And no non-finite rate
+/// satisfies BOTH conditions: `NaN` and `-inf` fail `> 0.0`, while `+inf` passes that and fails
+/// `rounded == 0.0`. All of them take the primary path exactly as before, so [`render_json`]'s
+/// serialize refusal is unaffected.
+///
+/// The fallback re-quantizes to three SIGNIFICANT figures — the same quantity of information, placed
+/// where the value actually is. Being a quantizer, it keeps the stability the rounding exists for:
+/// every one of 2000 adjacent `f64`s around `1e-9` frac/s serialises the identical `6e-6`, where the
+/// unrounded rate gives over a thousand distinct strings
+/// (`sub_threshold_wire_values_are_stable_across_runs`). It goes through the shortest decimal
+/// round-trip rather than `powi` scaling, which loses its own last digits at extreme exponents —
+/// `1.335e-304 %/min` re-quantizes to `1.339999999999999e-304` that way, reintroducing the very tail
+/// this avoids.
+///
+/// Two shapes issue #1146 offered and this rejects:
+///
+/// - **Floor a positive rate to the smallest representable non-zero** (`0.001`). It repairs the
+///   category by breaking the magnitude: the issue's own `1e-9` row is a true `6e-6 %/min`, which
+///   the floor overstates 167-fold, unboundedly so further down the band. That trades a false `0.0`
+///   for a false `0.001` — moving the lie rather than removing it — and a machine reader cannot
+///   eyeball the discrepancy the way an operator can, which is the one respect in which this wire is
+///   harder to fix than the cell.
+/// - **Carry the unrounded value on this field alone.** Honest and unstable: it puts float-tail
+///   noise back on a wire that gets diffed across runs, which is the defect the rounding exists to
+///   prevent, and splits this field's contract from its sibling's for no reason a reader could infer.
+///
+/// `JSON_SCHEMA_VERSION` does not move. Type, presence and JSON value-kind are all unchanged and
+/// only the value differs — the same value-side reasoning issue #1075 recorded one field down on
+/// `session_runway_secs`. What changes is that the wire now MEANS what it already documented.
 fn round_pct_per_min(rate_frac_per_sec: f64) -> f64 {
-    (pct_per_min(rate_frac_per_sec) * 1000.0).round() / 1000.0
+    let per_min = pct_per_min(rate_frac_per_sec);
+    let rounded = (per_min * 1000.0).round() / 1000.0;
+    if per_min > 0.0 && rounded == 0.0 {
+        // `{:.2e}` IS three significant figures. Parsing it back is total for the finite, strictly
+        // positive `per_min` the guard admits; the `unwrap_or` is unreachable rather than load-
+        // bearing, and falls back to the true rate so the strictly-positive invariant holds either
+        // way.
+        return format!("{per_min:.2e}").parse().unwrap_or(per_min);
+    }
+    rounded
 }
 
 fn dim_wire(d: &crate::usage_stats::DimStats) -> DimWire {
@@ -7428,6 +7490,190 @@ mod tests {
         // The new string is a neutral observation, not advice — it must clear the #542 guard the
         // same way every other cell on this surface does.
         assert_eq!(scan_banned(&text), None, "the bound render is neutral");
+    }
+
+    // --- AC (issue #1146): `0.0` on the WIRE means a measured zero, and nothing else ----
+
+    #[test]
+    fn round_pct_per_min_never_wires_a_burn_as_the_measured_flat_reading() {
+        // The boundary re-derived by bit-exact binary search on the `f64` ladder, straddled. These
+        // two rates are ADJACENT `f64`s — there is nothing between them — and they sat either side
+        // of the three-decimal cliff, so before this fix the first wired the same `0.0` a measured
+        // flat account carries while the second wired `0.001`.
+        assert!(round_pct_per_min(8.333_333_333_333_331e-8) > 0.0);
+        assert_eq!(round_pct_per_min(8.333_333_333_333_333e-8), 0.001);
+
+        // The issue's measured rows, worst-case first. `8e-8` frac/s drains ~0.144% of a session
+        // quota per 5 h window and used to wire as idle; `1e-9` is the rate #1136 cites as its
+        // motivating case. Bounding BOTH sides is what makes this a distinction rather than a
+        // blanket rescale: the value must be strictly positive AND still under the smallest figure
+        // three decimals can carry, which is what a floor-to-`0.001` shape would fail.
+        for rate in [1e-9f64, 8.0e-8, 8.333_333_333_333_331e-8] {
+            let wired = round_pct_per_min(rate);
+            assert!(
+                wired > 0.0,
+                "{rate:e} frac/s is a measured BURN, not a measured flat: wired {wired:?}"
+            );
+            assert!(
+                wired < 0.001,
+                "{rate:e} frac/s must keep its magnitude, not be floored to the smallest \
+                 three-decimal value: wired {wired:?}"
+            );
+            // And the magnitude is the rate's OWN, not a synthetic constant — within the three
+            // significant figures the fallback quantizes to.
+            let truth = pct_per_min(rate);
+            assert!(
+                (wired - truth).abs() <= truth * 1e-2,
+                "{rate:e} frac/s: wired {wired:?} is not the measured {truth:e}"
+            );
+        }
+
+        // Every rate the primary form can already carry is untouched — this arm adds a case, it does
+        // not rescale the field.
+        assert_eq!(round_pct_per_min(5e-6), 0.03);
+        assert_eq!(round_pct_per_min(1e-2), 60.0);
+
+        // The half that makes it a distinction: a genuinely flat account still wires the measured
+        // zero, and is now the ONLY thing that does. Without this line a quantizer that lifted
+        // everything off zero would pass every row above.
+        assert_eq!(round_pct_per_min(0.0), 0.0);
+    }
+
+    #[test]
+    fn sub_threshold_wire_values_are_stable_across_runs() {
+        // The constraint the rounding exists for, and the one the "carry the unrounded value"
+        // shape would have broken: a `--json` wire that gets diffed across runs must not churn
+        // when the EMA lands a few bits apart on two runs of the same data. Walked over 2000
+        // ADJACENT `f64`s — the finest perturbation that exists — on both sides of the cliff.
+        //
+        // Deliberately INERT against the pre-#1146 body, which was stable too (`0.0` never churns).
+        // This guards the OTHER direction — a future edit that reaches for raw precision in the
+        // sub-threshold band — so it is a constraint on the fix, not a regression test for it.
+        for base in [1e-9f64, 8.0e-8, 1.234_567_89e-2] {
+            let mut seen = BTreeSet::new();
+            let mut rate = base;
+            for _ in 0..2000 {
+                rate = f64::from_bits(rate.to_bits() + 1);
+                seen.insert(format!("{:?}", round_pct_per_min(rate)));
+            }
+            assert_eq!(
+                seen.len(),
+                1,
+                "{base:e} frac/s must quantize to ONE wire value, got {seen:?}"
+            );
+        }
+
+        // The control that keeps the assertion above from being vacuous: the same walk on the
+        // UNROUNDED rate churns, so the stability measured there is the quantizer's doing and not a
+        // property of `f64`s that close together.
+        let mut raw = BTreeSet::new();
+        let mut rate = 1e-9f64;
+        for _ in 0..2000 {
+            rate = f64::from_bits(rate.to_bits() + 1);
+            raw.insert(format!("{:?}", pct_per_min(rate)));
+        }
+        assert!(
+            raw.len() > 1000,
+            "the unrounded rate should churn across adjacent f64s, got {} distinct",
+            raw.len()
+        );
+    }
+
+    #[test]
+    fn the_wire_and_the_cell_agree_that_a_sub_threshold_rate_is_a_burn() {
+        // The issue's stated acceptance signal. Since #1136 the human cell states `1e-9` frac/s as a
+        // BOUND — an explicit "measured, strictly positive" — while the wire still called the same
+        // reading flat. The two surfaces scale the identical EMA through the identical
+        // `pct_per_min`, so a reader consulting both got contradictory answers about whether the
+        // account was burning at all. Asserted as the AGREEMENT it is, on both surfaces at once.
+        for rate in [1e-9f64, 8.0e-8, 5e-6] {
+            assert_eq!(fmt_pct_per_min(rate), SUB_THRESHOLD_PCT_PER_MIN);
+            assert!(
+                round_pct_per_min(rate) > 0.0,
+                "{rate:e} frac/s: the cell says measured-burning, the wire must not say flat"
+            );
+        }
+        // And they agree about flatness too. This pins the agreement, NOT the guard's spelling —
+        // a flat rate reaches `0.0` under `!= 0.0` as well, since `0.0 != 0.0` is false. The
+        // spelling only separates them on a negative rate, which `replay_velocity_ema` cannot
+        // produce.
+        assert_eq!(fmt_pct_per_min(0.0), ZERO_PCT_PER_MIN);
+        assert_eq!(round_pct_per_min(0.0), 0.0);
+    }
+
+    #[test]
+    fn a_sub_threshold_burn_reaches_the_json_wire_as_a_burn_on_both_rate_fields() {
+        // Driven through `render_json`, not the quantizer — the values have to reach a machine
+        // reader distinguishable, which is a fact about the serialized document and not about
+        // `round_pct_per_min` in isolation.
+        //
+        // `creep` climbs +6e-6 session per 300 s → 2e-8 frac/s → 1.2e-4 %/min, and +3e-6 weekly →
+        //   1e-8 frac/s → 6e-5 %/min. Both are inside the band three decimals collapse.
+        // `flat` never moves → a measured 0.0 on BOTH rates. A flat weekly is a KNOWN zero here,
+        //   not an unknown one — `replay_velocity_ema` only withholds a rate on a reset or too few
+        //   intervals, which is why the third account is needed to reach `null` at all.
+        // `reset` climbs its session but DROPS its weekly on the last interval → the EMA resets, so
+        //   its weekly rate is genuinely unmeasurable → the explicit `null`.
+        let now = epoch("2026-07-01T12:00:00Z");
+        let report = velocity_report(
+            vec![
+                sample(now - 900, "creep", 0.600_000, 0.300_000),
+                sample(now - 600, "creep", 0.600_006, 0.300_003),
+                sample(now - 300, "creep", 0.600_012, 0.300_006),
+                sample(now - 900, "flat", 0.600_000, 0.300_000),
+                sample(now - 600, "flat", 0.600_000, 0.300_000),
+                sample(now - 300, "flat", 0.600_000, 0.300_000),
+                sample(now - 900, "reset", 0.500_000, 0.300_000),
+                sample(now - 600, "reset", 0.530_000, 0.310_000),
+                sample(now - 300, "reset", 0.560_000, 0.290_000),
+            ],
+            now,
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&render_json(&report, None).unwrap()).unwrap();
+        let vel = |handle: &str| v["summary"]["accounts"][handle]["velocity"].clone();
+
+        // The three-way vocabulary, all three states present in ONE document so the assertions are
+        // about the distinction rather than about any single value.
+        let creep = vel("creep");
+        for field in ["session_pct_per_min", "weekly_pct_per_min"] {
+            let wired = creep[field]
+                .as_f64()
+                .unwrap_or_else(|| panic!("{field} is a real number: {creep}"));
+            assert!(
+                wired > 0.0,
+                "a measured burn must not wire the measured-flat 0.0 on {field}: {creep}"
+            );
+            assert!(
+                wired < 0.001,
+                "and must keep its own magnitude rather than be floored on {field}: {creep}"
+            );
+        }
+
+        // MEASURED FLAT — the reading the `0.0` this issue reclaimed actually belongs to. Both
+        // rates, because the fix touches both fields through the one quantizer.
+        let flat = vel("flat");
+        for field in ["session_pct_per_min", "weekly_pct_per_min"] {
+            assert_eq!(
+                flat[field].as_f64().unwrap(),
+                0.0,
+                "a measured flat account still wires 0.0 on {field}: {flat}"
+            );
+        }
+
+        // UNKNOWN — still the explicit `null`, never a sentinel, which is the state the rescued
+        // burns must not be pushed into either.
+        let reset = vel("reset");
+        assert!(
+            reset["weekly_pct_per_min"].is_null(),
+            "an unmeasurable weekly rate is an explicit null, never a number: {reset}"
+        );
+
+        // All three states in one document, mutually distinct — a wire that collapsed any pair
+        // would satisfy the individual assertions above but not this.
+        assert_ne!(creep["session_pct_per_min"], flat["session_pct_per_min"]);
+        assert_ne!(creep["weekly_pct_per_min"], flat["weekly_pct_per_min"]);
+        assert_ne!(flat["weekly_pct_per_min"], reset["weekly_pct_per_min"]);
     }
 
     // --- AC (issue #544): fleet/roster runway aggregate ("accounts last ~X days") ------
