@@ -24,7 +24,9 @@
 // boundary: the sub-second gap between building a fixture and rasterizing it can shift the rendered
 // delta by a second or two, and a boundary-adjacent offset would flip "2h14m" → "2h13m" and redden the
 // gate at random. `boundaryGuardSecs` below is that margin, and `PanelGoldenParityTests` asserts the
-// stability empirically (two renders taken seconds apart must score exactly 0).
+// stability empirically (two renders taken seconds apart must score exactly 0). The rasterizer's own
+// start-up transient is the OTHER half of determinism and is handled separately: `render` returns a raster
+// it has CONFIRMED reproducible rather than the first one it obtains (issue #824, § Steady state below).
 //
 // SCALE. Both consumers render at `scale` = 2, matching the committed `panel-healthy-*.png` oracle and
 // the Retina surface the panel actually ships on.
@@ -587,50 +589,241 @@ enum PanelRenderHarness {
     /// gate is the intended consumer of it.
     static func render(_ fixture: PanelRenderFixture, scheme: ColorScheme,
                        dynamicTypeSize: DynamicTypeSize = .large) -> CGImage? {
-        warmUpIfNeeded()
-        return rasterize(fixture, scheme: scheme, dynamicTypeSize: dynamicTypeSize)
+        calibrateIfNeeded()
+        let outcome = settled(pastTransientRun: longestTransientRun) { () -> (raster: CGImage, bytes: [UInt8])? in
+            guard let cg = rasterize(fixture, scheme: scheme, dynamicTypeSize: dynamicTypeSize),
+                  let bytes = rawBytes(cg) else { return nil }
+            return (raster: cg, bytes: bytes)
+        }
+        if !outcome.didSettle { unsettledRenders += 1 }
+        return outcome.raster
     }
 
-    /// Discard-renders until the rasterizer reaches its steady state, once per process.
+    // MARK: - Steady state (issue #824)
+
+    // WHAT THE RASTERIZER DOES, measured. The first renders in a process do not match the ones that follow:
+    // rendering `healthy/light` six times in a row yields renders 0–1 identical to each other, renders 2–5
+    // identical to each other, and the two groups differing by ±1/255 on 905 of 2 729 920 bytes — text
+    // rasterization caches populating, not a clock or fixture effect. Renders seeded seconds apart are
+    // byte-identical, which rules the clock out directly.
+    //
+    // Re-measured for issue #824, first renders in a fresh process, one fixture at a time: `blind-cornered/
+    // dark` agreed with itself for two renders and then moved 1075 bytes; `stats/dark`, rendered next,
+    // agreed with itself for two renders and then moved 10; `stale/dark` after those did not move at all.
+    // So it looks at first like a start-up effect that decays — and it is NOT only that. Surveyed by running
+    // every render of the whole `MenubarTests` suite in measurement mode, the plateaus land at rasterizer
+    // passes #48, #648, #656 and #1872 — the last one on `healthy/dark`, a cell rendered many times earlier
+    // in the same process. So a transient can appear at ANY point in a long run, on content already
+    // rendered, which is what rules out warming once at start-up however thoroughly it is done. Only
+    // settling the render being asked for, every time, covers pass #1872.
+    //
+    // Left unhandled it is quietly corrosive rather than dramatic: whichever cells happen to be rasterized
+    // first carry cold pixels, so a re-bless rewrites files that did not change, and the churn buries a
+    // real change in the `git diff` that `Panel-Goldens-Rebaselined:` exists to make readable. The gate
+    // metric's 64/255 threshold hides ±1 either way, so nothing here is load-bearing for a verdict — it is
+    // load-bearing for the AUDIT TRAIL.
+    //
+    // WHY THE OLD WARM-UP DID NOT CLOSE IT (the defect issue #824 names). It discard-rendered `healthy` at
+    // `.light` until two consecutive rasters agreed — but the transient's own rasters agree WITH EACH OTHER,
+    // so that rule returned on the cold pair, and it warmed one fixture while claiming a process-wide
+    // steady state. Two renders is also indistinguishable from a settled two renders, so no rule reading
+    // only the requested content's own sequence can tell the two apart. The requirement has to come from
+    // somewhere else — which is what `longestTransientRun` is.
+
+    /// The longest raster plateau this process has watched END — the yardstick the stopping rule measures
+    /// against, and the reason it is a measurement rather than a tuned pass count.
     ///
-    /// MEASURED, and the reason committed goldens are byte-reproducible at all. The first renders in a
-    /// process do not match the ones that follow: rendering `healthy/light` six times in a row yields
-    /// renders 0–1 identical to each other, renders 2–5 identical to each other, and the two groups
-    /// differing by ±1/255 on 905 of 2 729 920 bytes — a warm-up artifact (text rasterization caches
-    /// populating), not a clock or fixture effect. Renders seeded seconds apart are byte-identical, which
-    /// rules the clock out directly.
+    /// `calibrateIfNeeded` is the ONLY path that can raise it, and it runs once. A `render`'s own settle
+    /// cannot: it returns as soon as a run exceeds the yardstick, so the deepest plateau it can ever watch
+    /// END is the yardstick itself, and folding that back would be `max(y, ≤y)`. Only measurement mode
+    /// (`pastTransientRun: .max`, where the stopping rule is unreachable) can observe a plateau deeper than
+    /// the yardstick at all. `testASettleCanNeverWatchAPlateauDeeperThanItsOwnYardstick` pins that.
     ///
-    /// Left unhandled it is quietly corrosive rather than dramatic: whichever cells happen to be rasterized
-    /// first carry cold pixels, so a re-bless rewrites files that did not change, and the churn buries a
-    /// real change in the `git diff` that `Panel-Goldens-Rebaselined:` exists to make readable. The gate
-    /// metric's 64/255 threshold hides ±1 either way, so nothing here is load-bearing for a verdict — it is
-    /// load-bearing for the AUDIT TRAIL.
+    /// DO NOT ADD A PER-RENDER FOLD to "fix" that asymmetry. Making it reachable would let a plateau that
+    /// is not a rasterizer transient at all inflate the yardstick — a clock-relative string crossing a
+    /// `humanizeUntil` boundary mid-settle breaks the run, and a long enough pass can record a deep plateau
+    /// from that alone. Once the yardstick reached `settleBudget` no run could ever exceed it, so EVERY
+    /// later render would exhaust the budget and come back unsettled, permanently and for the whole
+    /// process. The absence of that fold is load-bearing.
     ///
-    /// Self-calibrating rather than a tuned constant: renders a throwaway fixture until two consecutive
-    /// rasters agree byte-for-byte, so a machine that warms up in a different number of passes is handled
-    /// without a magic number. Bounded, and never fatal — if it cannot stabilize it returns anyway, and
-    /// `PanelGoldenParityTests.testAnIdenticalRerenderScoresExactlyZero` is the assertion that turns that
-    /// into a loud failure instead of a silent one.
-    private static var isWarm = false
-    private static func warmUpIfNeeded() {
-        guard !isWarm else { return }
-        isWarm = true
+    /// SO WHAT THIS DOES NOT COVER, stated plainly: a transient plateau deeper than the yardstick is
+    /// returned COLD, with `didSettle == true`, because the run that satisfied the rule was still inside
+    /// it. The floor below is what keeps that from being the ordinary case rather than the rare one.
+    ///
+    /// THE STARTING VALUE IS A FLOOR ON THE ESTIMATE, NOT THE STOPPING RULE, and 2 rather than 1 for a
+    /// measured reason. Every transient plateau observed for this issue was exactly 2 rasters deep — three
+    /// at process start (`healthy/light` in the original warm-up measurement, `blind-cornered/dark`,
+    /// `stats/dark`) and four in the full-suite survey above. But a calibration that lands on a
+    /// PARTIALLY-warm process measures less: in a whole-suite run, where other suites rasterize before this
+    /// one is first asked for a panel, the calibration reports 1 — and a yardstick of 1 IS the pre-#824
+    /// rule, which the survey's pass-#1872 plateau would then walk straight through. So the floor says
+    /// "never estimate the transient shallower than one has ever been measured", and it is the floor —
+    /// not the calibration — that carries the guarantee in exactly that partially-warm case, because the
+    /// calibration measured BELOW it and the fold cannot lower it. The RULE above still has to observe a
+    /// longer run than whichever of the two wins. Lowering this to 1 re-opens the issue.
+    ///
+    /// A machine whose transient is genuinely deeper is covered only if the CALIBRATION sees it — one
+    /// measurement, taken as early as this harness can take one. That is the honest reach of the fix.
+    ///
+    /// Read-only outside the harness so a test can report what this machine measured. The FLOOR is
+    /// assertable (`testTheYardstickIsFlooredAtTheDeepestTransientEverMeasured`); the measured value on top
+    /// of it is not, so no test may pin it to a particular number.
+    private(set) static var longestTransientRun = 2
+
+    /// `ImageRenderer` passes this process has run.
+    ///
+    /// The harness never reads it. It exists because "does `render` settle, or does it rasterize once and
+    /// trust the result?" is a claim no comparison of returned rasters can make once the process is warm —
+    /// past the transient every raster is steady under the settled implementation and the un-settled one
+    /// alike, so only the pass COUNT still separates them. `PanelRenderHarnessSteadyStateTests` is the
+    /// consumer.
+    private(set) static var rasterPasses = 0
+
+    /// Renders that came back through the BUDGET VALVE rather than the stopping rule — i.e. rasters returned
+    /// without ever being confirmed reproducible.
+    ///
+    /// Expected to stay 0, and it is not decoration: `render` is the shared engine for two consumers with
+    /// very different failure modes. The in-bundle gate would eventually notice an unconfirmed raster,
+    /// because its own byte assertions compare against a committed golden. `--render-panel` asserts nothing
+    /// at all — it would write cold pixels to disk in silence, and those files are what a human then reads
+    /// as the design oracle. This counter is the only thing that makes the condition visible on that path.
+    /// `RenderPanelTool` reports it; `PanelRenderHarnessSteadyStateTests` asserts it.
+    private(set) static var unsettledRenders = 0
+
+    /// What one settle pass observed.
+    struct SettleOutcome<Raster> {
+        /// The confirmed-steady raster — or the last one pulled, if `budget` ran out or `produce` failed
+        /// part-way. `nil` only when `produce` failed on its very first call.
+        let raster: Raster?
+        /// The longest plateau that ENDED during this pass (0 if none did). The caller folds it into
+        /// `longestTransientRun`; the final, un-ended plateau is deliberately NOT reported, because that is
+        /// the steady one and counting it would ratchet the requirement up forever.
+        let longestEndedRun: Int
+        /// How many rasters were pulled.
+        let passes: Int
+        /// Whether the STOPPING RULE returned this raster. `false` means the budget valve did, and the
+        /// raster is the last one pulled rather than a confirmed-steady one.
+        let didSettle: Bool
+    }
+
+    /// Pull rasters from `produce` until one is CONFIRMED steady, and report what the pass saw.
+    ///
+    /// THE STOPPING RULE: return the current raster once the run of consecutive byte-identical rasters is
+    /// strictly LONGER than `pastTransientRun` — the longest plateau this process has already watched end.
+    /// A transient that agrees with itself for `n` rasters therefore cannot satisfy it, because `n` is the
+    /// very number the requirement was set from. Self-calibrating in the sense the issue asks for: nothing
+    /// here encodes how many passes a machine needs — the number of passes is whatever observing the run
+    /// takes, against a yardstick `calibrate` measured on the running machine.
+    ///
+    /// Note what this loop CANNOT do, because a caller reasoning about the yardstick will want it: since it
+    /// returns the moment a run exceeds `pastTransientRun`, the deepest plateau it can watch END is
+    /// `pastTransientRun` itself. It can never discover that the yardstick is too low. Only measurement
+    /// mode can — see `calibrate`, and the "DO NOT ADD A PER-RENDER FOLD" note on `longestTransientRun`.
+    ///
+    /// Pass `pastTransientRun: .max` to make the rule unreachable and spend `budget` in full — that is
+    /// MEASUREMENT mode, which is how `calibrate` derives the yardstick in the first place.
+    ///
+    /// `budget` is a non-termination valve, NOT the stopping rule: exhausting it returns the last raster
+    /// pulled with `didSettle == false` rather than trapping, exactly as the old warm-up returned anyway.
+    /// `render` counts those into `unsettledRenders` so the condition is observable on BOTH consumers —
+    /// the in-bundle gate's byte assertions would eventually catch an unsettled raster, but `--render-panel`
+    /// asserts nothing and would otherwise write cold pixels in silence.
+    ///
+    /// Internal rather than private, and generic over the raster type, so the canaries can drive it with a
+    /// scripted sequence — including the measured cold sequence this issue is about — without rendering.
+    static func settled<Raster>(pastTransientRun: Int,
+                                budget: Int = settleBudget,
+                                _ produce: () -> (raster: Raster, bytes: [UInt8])?)
+        -> SettleOutcome<Raster> {
+        var previousBytes: [UInt8]?
+        var latest: Raster?
+        var run = 0
+        var longestEndedRun = 0
+        var passes = 0
+        while passes < budget {
+            guard let pulled = produce() else { break }
+            passes += 1
+            if let previousBytes, previousBytes == pulled.bytes {
+                run += 1
+            } else {
+                // The plateau that was running has just ended, so it was a transient one.
+                longestEndedRun = max(longestEndedRun, run)
+                run = 1
+            }
+            latest = pulled.raster
+            previousBytes = pulled.bytes
+            if run > pastTransientRun {
+                return SettleOutcome(raster: latest, longestEndedRun: longestEndedRun,
+                                     passes: passes, didSettle: true)
+            }
+        }
+        return SettleOutcome(raster: latest, longestEndedRun: longestEndedRun,
+                             passes: passes, didSettle: false)
+    }
+
+    /// Passes the once-per-process calibration spends, and a ceiling on its cost (a raster is ~10 ms here,
+    /// so ~0.25 s once per process). Spent IN FULL, deliberately: the calibration is a measurement, and an
+    /// early exit would be a second stopping rule to get wrong — the very thing that went wrong the first
+    /// time. Generous rather than tight — 24 against a measured 2 — because this measurement is taken ONCE
+    /// and never revised: a transient deeper than this budget would be measured short and nothing later
+    /// corrects it (see `longestTransientRun`, which explains why nothing may).
+    nonisolated static let calibrationPasses = 24
+
+    /// The non-termination valve on a settle — NOT the stopping rule. Comfortably above any plateau this
+    /// machine exhibits (measured: 2), with room for the requirement to be raised mid-run.
+    nonisolated static let settleBudget = 16
+
+    private static var isCalibrated = false
+
+    /// Run one MEASUREMENT pass and RAISE `yardstick` to the deepest plateau it watched end.
+    ///
+    /// The whole of the calibration's arithmetic, extracted so it can be gated. `max`, never assignment: a
+    /// measurement that lands on a partially-warm process reports SHALLOWER than the floor (measured: 1 in a
+    /// whole-suite run, 2 on a cold one), and lowering the yardstick to that would restore the pre-#824 rule.
+    ///
+    /// Generic over the raster type and taking `yardstick` by reference for the same reason `settled` is
+    /// generic: a canary can then drive this exact wiring with a scripted sequence, against its OWN storage,
+    /// and assert the yardstick ROSE — without rendering, without perturbing the process-wide yardstick, and
+    /// without pinning a number that belongs to the machine. `testTheCalibrationRaisesTheYardstickItIsGiven`
+    /// is that canary; deleting the `max` line below reddens it.
+    @discardableResult
+    static func calibrate<Raster>(into yardstick: inout Int,
+                                  budget: Int = calibrationPasses,
+                                  _ produce: () -> (raster: Raster, bytes: [UInt8])?)
+        -> SettleOutcome<Raster> {
+        let outcome = settled(pastTransientRun: .max, budget: budget, produce)
+        yardstick = max(yardstick, outcome.longestEndedRun)
+        return outcome
+    }
+
+    /// Measure this machine's transient before the first render, so the yardstick can rise above the floor
+    /// on a machine that needs it to.
+    ///
+    /// The first render THIS harness is asked for is the earliest moment it can measure anything, and early
+    /// is where a transient is most likely to be observable end-to-end — a settle on already-warm content
+    /// cannot see one at all. What it is NOT is a guarantee: measured, in a whole-suite run other suites
+    /// rasterize SwiftUI before this harness is first asked for a panel, and this probe then reports 1 where
+    /// the same probe on a cold process reports 2. In THAT case the floor on `longestTransientRun` is what
+    /// carries the guarantee, since `calibrate` can only raise the yardstick and this measurement came in
+    /// below it. Nothing revises the estimate afterwards, and `longestTransientRun` explains why nothing may.
+    /// Warming the probe is a side effect, not the point.
+    private static func calibrateIfNeeded() {
+        guard !isCalibrated else { return }
+        isCalibrated = true
         // Seeded from the real clock, NOT from 0: at epoch 0 every countdown in the fixture is ~56 years in
-        // the past, which is not a state the panel is ever asked to format and not what we want to warm.
+        // the past, which is not a state the panel is ever asked to format and not what we want to measure.
         let probe = fixtures(now: Int64(Date().timeIntervalSince1970)).first { $0.name == "healthy" }
         guard let probe else { return }
-        var previous: [UInt8]?
-        for _ in 0..<8 {
+        calibrate(into: &longestTransientRun) { () -> (raster: CGImage, bytes: [UInt8])? in
             guard let cg = rasterize(probe, scheme: .light, dynamicTypeSize: .large),
-                  let bytes = rawBytes(cg) else { return }
-            if let previous, previous == bytes { return }
-            previous = bytes
+                  let bytes = rawBytes(cg) else { return nil }
+            return (raster: cg, bytes: bytes)
         }
     }
 
-    /// Tightly-packed RGBA8 bytes for the warm-up comparison. Deliberately its own small routine rather than
+    /// Tightly-packed RGBA8 bytes for the settle comparison. Deliberately its own small routine rather than
     /// a dependency on the test target's `PanelRaster` — the harness ships in the APP too, and the app tool
-    /// needs the same warm-up so its renders and the in-bundle goldens agree byte-for-byte.
+    /// needs the same steady-state guarantee so its renders and the in-bundle goldens agree byte-for-byte.
     private static func rawBytes(_ image: CGImage) -> [UInt8]? {
         let width = image.width, height = image.height
         guard width > 0, height > 0, let space = CGColorSpace(name: CGColorSpace.sRGB) else { return nil }
@@ -649,6 +842,7 @@ enum PanelRenderHarness {
 
     private static func rasterize(_ fixture: PanelRenderFixture, scheme: ColorScheme,
                                   dynamicTypeSize: DynamicTypeSize) -> CGImage? {
+        rasterPasses += 1
         let store = WatchStatusStore.preview(state: fixture.state, rows: fixture.rows,
                                              nextSwap: fixture.nextSwap, generatedAt: fixture.generatedAt,
                                              canonicalScrub: fixture.canonicalScrub,
