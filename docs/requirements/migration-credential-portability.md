@@ -1120,13 +1120,19 @@ unreachable in it.
 > `apply_import_warns_when_it_deepens_a_duplicate_the_target_already_had`,
 > `apply_enabled_refuses_a_duplicate_label_without_touching_the_roster`,
 > `apply_remove_refuses_a_duplicate_label_without_touching_the_roster`,
-> `every_label_resolving_site_shares_one_resolver`,
+> `the_two_verbs_routed_to_the_shared_resolver_return_its_own_error`,
 > `the_label_resolving_verbs_accept_an_account_uuid_so_a_refusal_is_actionable`.
 >
-> The last two are not decoration. `every_label_resolving_site_shares_one_resolver` asserts the
-> *property* that makes six sites agree — that they reach one resolver — rather than sampling six
-> behaviours that happen to match today; sampling a finite set one member at a time is what produced
-> three successive corrections to this AC's own command list. And
+> The last two are not decoration.
+> `the_two_verbs_routed_to_the_shared_resolver_return_its_own_error` asserts that the two verbs
+> #1005 routed return the resolver's OWN error rather than a restatement of it, so the two cannot
+> drift apart. It was called `every_label_resolving_site_shares_one_resolver` until issue #1186 and
+> was read here as covering all six sites; it never did, and the correction matters because
+> sampling a finite set one member at a time is what produced three successive corrections to this
+> AC's own command list. The set-level property — that no SEVENTH site grows its own resolver — is
+> carried by `every_handle_read_is_dispositioned` and
+> `resolve_target_has_exactly_the_five_known_call_sites` (`src/use_account.rs`, issue #1186), which
+> is the only shape that can cover a site that does not exist yet. And
 > `the_label_resolving_verbs_accept_an_account_uuid_so_a_refusal_is_actionable` pins the remedy: a
 > refusal with no way to act on it would be a worse defect than the first-match-wins it replaced.
 
@@ -1334,7 +1340,7 @@ by symbol against `HEAD` on 2026-08-04 before this document was committed.
 | Conflict match is uuid-only | `apply_import`'s `existing` binding (`src/cli.rs`) — `.position(\|account\| account.account_uuid == incoming_account.account_uuid)` |
 | Whole-config merge is acknowledged future work | `apply_import`'s "Base config" comment (`src/cli.rs`) — verbatim in-code |
 | Labels are non-unique by design | `Config::validate` (`src/config/validate.rs`) checks empty uuid, empty label and duplicate uuid — and has no duplicate-label arm |
-| ~~`use` refuses on ambiguity; `enable`/`disable` take first~~ — **no longer true; superseded by #1005.** All six sites now share `use_account::resolve_target` and refuse | `resolve_target` (`src/use_account.rs`); `apply_enabled` / `apply_remove` (`src/cli.rs`); `Error::exit_code` (`src/error.rs`) — pinned by `every_label_resolving_site_shares_one_resolver` |
+| ~~`use` refuses on ambiguity; `enable`/`disable` take first~~ — **no longer true; superseded by #1005.** All six sites now share `use_account::resolve_target` and refuse | `resolve_target` (`src/use_account.rs`); `apply_enabled` / `apply_remove` (`src/cli.rs`); `Error::exit_code` (`src/error.rs`) — pinned by `the_two_verbs_routed_to_the_shared_resolver_return_its_own_error`, and the no-seventh-site half by `every_handle_read_is_dispositioned` (`src/use_account.rs`, #1186) |
 | `Payload` has no timestamp; `FORMAT_VERSION = 1` | `src/migration.rs:199-210`; `src/migration.rs:97` |
 | Existing migration test coverage — the **7 this scope reasons about**, of **45** total (16 in `src/cli.rs`'s #148/#149/#150 sections, 29 in `src/migration.rs` incl. the frozen-fixture gates C-1 depends on, `src/migration.rs:1730`, `:1767`) | `export_encrypted_round_trips_gathered_state_and_hides_it`, `export_no_secrets_omits_every_credential_blob`, `export_plaintext_round_trips_and_carries_secrets_in_the_clear`, `import_round_trips_an_encrypted_export_and_restores_every_account_byte_faithfully`, `a_config_only_artifact_imports_accounts_as_roster_entries_without_a_stash`, `the_import_report_names_labels_only_never_a_token_or_email`, `the_migration_conflict_policy_default_drives_import_behaviour` |
 | Conflict test's target is a clone of the source | `the_migration_conflict_policy_default_drives_import_behaviour` (`src/cli.rs`) — still a clone, deliberately: it tests the conflict policy. The duplicate-label branch it cannot reach is covered by the `apply_import_warns_*` tests #1005 added, each building its target explicitly |

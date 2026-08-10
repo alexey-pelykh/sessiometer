@@ -8113,15 +8113,21 @@ spare  22222222-2222\n\
     }
 
     #[test]
-    fn every_label_resolving_site_shares_one_resolver() {
-        // R-6a spans two mechanisms over six call sites, and the property that makes them
-        // agree is that all six reach `resolve_target` — not that six sampled behaviours
-        // happen to match today. `use` (src/use_account.rs), `poke` (src/poke.rs) and the
-        // daemon's control-socket swap (src/daemon/commands.rs) call it directly and always
-        // did; `apply_enabled` and `apply_remove` are the two that were routed to it here.
-        // Assert the shared resolver's verdict IS what these two return, on the same roster,
-        // rather than restating its behaviour independently — an independent restatement
-        // would drift the moment the resolver's policy changed.
+    fn the_two_verbs_routed_to_the_shared_resolver_return_its_own_error() {
+        // The two verbs #1005 newly routed — `apply_enabled` (`enable` / `disable`) and
+        // `apply_remove` — and ONLY those two. Assert the shared resolver's verdict IS what they
+        // return, on the same roster, rather than restating its behaviour independently: an
+        // independent restatement would drift the moment the resolver's policy changed.
+        //
+        // This test was called `every_label_resolving_site_shares_one_resolver` until issue
+        // #1186, and the name outran the body by four sites. `use`, `poke` and the daemon's
+        // control-socket swap appeared only in a comment here, so a reader who trusted the name
+        // credited them with cover they did not have — issue #1087 was filed on exactly that
+        // belief. Those three now assert their own refusals where they live (#1087, PR #1184),
+        // and the SET-level property the old name claimed — that no SEVENTH site grows its own
+        // resolver — is owned by `use_account`'s `every_handle_read_is_dispositioned` and
+        // `resolve_target_has_exactly_the_five_known_call_sites`, which are the only shape that
+        // can cover a site that does not exist yet.
         let roster = vec![acct("dup", "u1"), acct("dup", "u2")];
         let shared = crate::use_account::resolve_target(&roster, "dup")
             .expect_err("the shared resolver refuses a duplicate");
