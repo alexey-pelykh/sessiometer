@@ -109,6 +109,27 @@ enum PanelRenderHarness {
     /// sub-second delay between seeding a fixture and rasterizing it cannot change the rendered text.
     /// 30 s is half a minute — the finest unit `humanizeUntil` prints — so a render that lands anywhere in
     /// a ±30 s window around the seed instant formats to the same string.
+    ///
+    /// 30 IS THE MAXIMUM, not a starting point — raising it NARROWS the window it exists to widen, and the
+    /// arithmetic is worth having in front of you before you try (issue #1128). Renders always land AFTER
+    /// their seed, so only the post-seed direction is ever exercised, and this constant is spent in BOTH
+    /// directions on the SAME 60 s `humanizeUntil` plateau:
+    ///
+    ///   • a FUTURE instant (`now + X + G`, every reset / expiry / next-swap offset below) prints the same
+    ///     string while the render lands within `G` seconds of the seed — margin `G`, first crossing at
+    ///     `G + 1`;
+    ///   • a PAST instant (`now - (X + G)`, the `generatedAt` ages below, read through `snapshotAgeText`)
+    ///     has `G` seconds of the plateau ALREADY SPENT before the render adds any — first crossing at
+    ///     `60 - G`, so margin `59 - G`.
+    ///
+    /// So the first crossing is `min(G + 1, 60 - G)` and the window every fixture survives is
+    /// `min(G, 59 - G)`. That window is maximised at `G = 29` and `G = 30` ALIKE — a tie, both worth 29 s
+    /// — and 30 is the one in use. `G = 45` would buy the countdowns 45 s and cut the ages to 14 — a NET
+    /// LOSS of more than half the margin, on the very `stale` / `disconnected` fixtures whose ages are the
+    /// observed failure. Nothing here rounds:
+    /// `PanelGoldenParityTests.testEveryClockRelativeFixtureInstantKeepsTheFullGuard` walks the whole
+    /// catalog and asserts the measured FIRST CROSSING is at least `G`, so a change to this constant is
+    /// answered with the number rather than with a flake.
     nonisolated static let boundaryGuardSecs: Int64 = 30
 
     /// The `View log` fixture's stand-in log path (#776) — a FIXED literal, never a resolved one.
