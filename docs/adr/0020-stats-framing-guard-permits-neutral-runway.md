@@ -142,7 +142,8 @@ an observation but fails the instant a purchase call is appended.
   them rather than a second copy. The boundary itself was later amended: issue #1123 settled the
   non-acquisitive remedy directive as permitted on operator advisories (§ Status → Amended
   2026-08-10), which is a change to what this ADR settles rather than to where the code lives.
-  The central lists remain untouched by it.
+  The central lists remain untouched by it — and by issue #1139, which added a fifth audience
+  (see below) without amending this ADR.
 - Code: `src/stats.rs` — the assertions stayed put:
   `framing_guard_permits_neutral_runway_but_bans_the_acquisitive_call` and
   `summary_render_carries_no_banned_token_but_the_guard_bites_on_injection`.
@@ -150,4 +151,36 @@ an observation but fails the instant a purchase call is appended.
   #918 (the vocabulary's relocation) · **#1123 (the 2026-08-10 amendment — the non-acquisitive
   remedy directive, permitted on operator advisories)** · #376 / #397 (the clear-and-FOLLOWABLE
   operator-guidance requirement that amendment rests on) · #543 / #544 (the runway surfaces) ·
-  #158 / #159 (`--json` / charts).
+  #158 / #159 (`--json` / charts) · #1139 (see below) · #1151 (the one violation it found).
+
+### Issue #1139 applied this ADR without amending it — deliberately
+
+Issue #1139 took `Error`'s authored `#[error(...)]` templates inside the firewall as a fifth
+audience, and had to judge three tokens the shipped messages already spend. It recorded the
+verdicts in `src/error.rs`'s `ERROR_PROSE_LEDGER` and changed **no boundary here**, so this ADR's
+status cell in `README.md` is unchanged. That is a decision worth being explicit about, because
+#1123 set the opposite precedent and a reader may reasonably expect a second amendment:
+
+- **`add`**, in `ActiveAccountUnresolved`'s "add it to the rotation", is permitted by the 2026-08-10
+  amendment **as written**, not by an extension of it. That amendment's discriminator is stated
+  generally — the OBJECT of the imperative, a free, local, mechanical operation on the tool's own
+  state versus an acquisition — and its own § Status bounds it against `stats`' bands for the
+  reason that "a band has no remedy to direct". An error message diagnosing a repairable state is
+  the opposite case, and it is the surface the amendment already cites for its authority: the
+  clear-and-FOLLOWABLE requirement of #376 / #397, whose named examples are `src/error.rs`'s
+  `NoManagedService` and `UnmanagedDaemonNoRestart`. Applying the rule to the surface its authority
+  came from does not move it.
+- **`must`**, in `ConfigTargetMaxSessionAboveTrigger` and `SharedCredentialMutated`, is a CONSTRAINT
+  STATEMENT rather than the recommendation framing the group bans: the modal's subject is a config
+  value or this tool's own invariant, never the operator. That is a reading of the existing group,
+  not a new permit — nothing about the acquisitive call, the value judgements or the projection
+  words changed.
+- **`healthy`**, in `ActiveAccountUnresolved`, did **not** survive. It is a value judgement, the
+  group this firewall exists for, and the defence that it names the machine-checkable
+  `CredentialHealth::Healthy` is false on that code path. It is recorded as a violation under
+  issue #1151 rather than excused — so the boundary held here rather than moving.
+
+The one thing #1139 did add is a mechanism, not a boundary: this audience gets **no exemption set**
+and scans the central lists whole, because `Error` is dozens of independent messages rather than one
+surface, so its carve-outs are per-(variant, token). See `src/framing_vocabulary.rs`'s module doc
+§ "The fifth audience has no exemption set".
