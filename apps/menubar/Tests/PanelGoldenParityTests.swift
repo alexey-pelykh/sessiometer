@@ -719,7 +719,8 @@ final class PanelGoldenParityTests: XCTestCase {
     // must throw rather than hand back its last cold attempt, and the thrown message must still name WHICH
     // caller drifted (one helper now serves several suites) and still carry the #824 reasoning for not
     // absorbing the drift into a looser threshold. Asserting on that message is what makes a quiet softening
-    // of it a RED test instead of an unreviewed comment edit.
+    // of it a RED test instead of an unreviewed comment edit — and asserting on its DIRECTION rather than
+    // only its tokens (issue #1127) is what makes an INVERTED one red as well.
     func testSettledThrowsAndNamesItsCallerRatherThanReturningAnUnsettledRaster() throws {
         var calls = 0
         var thrown: Error?
@@ -747,6 +748,67 @@ final class PanelGoldenParityTests: XCTestCase {
                           + "whole reason #911 consolidated these copies — losing it from the one remaining "
                           + "home is the silent drift the consolidation was meant to make impossible")
         }
+
+        // DECISION (issue #1127) — STRENGTHEN, rather than accept the substring anchor as sufficient.
+        //
+        // The loop above pins the reasoning's TOKENS, not its DIRECTION. A message carrying `#824` and
+        // `NOT absorbed by relaxing` verbatim while telling the reader to WIDEN the tolerance passes it,
+        // demonstrated by mutation in the independent merge gate for #911 / PR #1124 (finding R-3). That
+        // takes an actively adversarial edit rather than ordinary drift, so it is not urgent, and #911's
+        // one guarded copy is already far stronger than the three unguarded ones it replaced. Closed
+        // anyway: #911's whole premise is that this reasoning cannot drift silently, and a substring
+        // anchor is the weakest form of that guarantee — the "looks checked but isn't" shape issue #918
+        // was opened about, one level down.
+        //
+        // Asserted RELATIONALLY, because a third literal would carry the very property being fixed: an
+        // adversarial edit satisfies a longer anchor by quoting it and then contradicting it. What carries
+        // the instruction is a NEGATION bound to a relaxation verb, so the invariant is structural — every
+        // clause reaching for a relaxation verb must also carry a negation. Inverting the instruction means
+        // writing an un-negated one.
+        //
+        // Deliberately NOT the `#filePath` source-text lint issue #1127 cites as available. This test
+        // already holds the RUNTIME message, which is strictly better evidence than the source literal — it
+        // sees the interpolated subject and call site a source scan cannot — and `NeverSettled` is declared
+        // in THIS file, so a lint reading `#filePath` would be scanning its own vocabulary alongside the
+        // message's, and would have to re-find the declaration by shape to avoid matching itself.
+        //
+        // WHAT THIS DOES NOT CATCH, stated rather than implied. It is vocabulary-bounded in BOTH lists, and
+        // both are CLOSED. It therefore fails in both directions. False green: an inversion written entirely
+        // outside `relaxationVerbs` ("bump the ceiling to 2", "let this one through") passes. False red: a
+        // semantic negation outside `negations` reds although it negates perfectly well — "Resist the urge to
+        // relax the predicate", "absorbing it into a looser predicate is forbidden", a sentence opening
+        // "Relaxing this suite's predicate would swallow…", a clause-final "Never". That false red is the
+        // deliberate half, and it is cheap: it surfaces the moment you run the suite, and the fix is to
+        // reword into the list. Widening `negations` is the move to resist — it makes this check strictly
+        // EASIER to satisfy, spending the very RED issue #1127 bought to buy back a phrasing convenience.
+        //
+        // It checks co-presence within a clause, not grammatical binding, so a negation attached to something
+        // else in the same clause licenses the verb. ORDER IS IRRELEVANT — `contains` is position-independent,
+        // so a negation trailing its verb ("absorbed by relaxing the predicate is not the fix") passes just as
+        // a leading one does. What it cannot see is a negation in a DIFFERENT clause: the split above breaks
+        // on punctuation, so "do not do this. Relax the predicate" reds on the second clause.
+        let relaxationVerbs = ["relax", "widen", "loosen", "soften", "absorb"]
+        let negations = ["not ", "never ", "rather than ", "instead of ", "without "]
+        var verbsGuarded = 0
+        for clause in message.lowercased().split(whereSeparator: { ".,;:!?()—–\n".contains($0) }) {
+            let text = String(clause)
+            let reached = relaxationVerbs.filter { text.contains($0) }
+            guard !reached.isEmpty else { continue }
+            verbsGuarded += reached.count
+            XCTAssertTrue(negations.contains { text.contains($0) },
+                          "the failure reaches for \(reached) with no negation in the same clause: "
+                          + "'\(text.trimmingCharacters(in: .whitespaces))' — in full: \(message). The "
+                          + "reasoning has been INVERTED: it now reads as an instruction to absorb the "
+                          + "drift into a looser predicate, which is the one thing issue #824 asks callers "
+                          + "not to do. The fragment loop above still passes, which is why this exists")
+        }
+        // Cardinality floor. The loop above is universally quantified, so a message naming no relaxation
+        // verb at all satisfies it while evaluating NOTHING. It must not lean on the fragment pin above for
+        // its non-vacuity either — that list is editable independently of this check.
+        XCTAssertGreaterThan(verbsGuarded, 0,
+                             "the failure names no relaxation verb at all, so the direction check above "
+                             + "evaluated nothing: \(message). What has to survive here is the REASONING "
+                             + "itself, not merely the absence of a wrong instruction")
 
         // The bound is a parameter, not a constant baked into the loop.
         var boundedCalls = 0
@@ -1362,6 +1424,15 @@ struct PanelRaster {
     /// names the CALLER, because one helper serving several suites must still say which surface drifted.
     /// `testSettledThrowsAndNamesItsCallerRatherThanReturningAnUnsettledRaster` asserts both halves, so
     /// neither can be dropped silently.
+    ///
+    /// It also asserts the message's DIRECTION, not only its tokens (issue #1127) — as a VOCABULARY check,
+    /// never a semantic one: every clause below that reaches for a verb on a fixed relaxation list must also
+    /// carry a token from a fixed negation list. So an edit that keeps the anchors while telling the reader
+    /// to widen the tolerance reds only when it says so in those words; phrased outside either list it
+    /// passes, and an honest reword that negates outside the negation list reds. Reword this freely, but
+    /// keep each negation in the SAME CLAUSE as the verb it governs — the check splits on punctuation and
+    /// reads co-presence within a clause, in either order. Both lists, and the full limits, are in
+    /// `testSettledThrowsAndNamesItsCallerRatherThanReturningAnUnsettledRaster`.
     struct NeverSettled: Error, CustomStringConvertible, LocalizedError {
         let subject: String
         let attempts: Int
