@@ -124,7 +124,8 @@ final class StatsTests: XCTestCase {
         // The daemon never derives this string from the config (the parser's own message re-prints
         // the operator's file, where e-mail labels live), so it is one of a small set of STATIC
         // reasons. Assert that contract at the point of consumption too — the panel renders it
-        // verbatim into a fixed-width popover with no scroll view.
+        // verbatim into a fixed-width popover, where an over-long reason costs vertical room the rest
+        // of the tab needs (issue #818 bounds the panel, so the cost is a scroll rather than a clip).
         XCTAssertFalse(detail.contains("\n"), "one line — no caret art in a fixed-size popover")
         XCTAssertFalse(detail.contains("|"), "no span-echo gutter of the operator's own config")
         XCTAssertFalse(detail.contains("@"), "no address-shaped token from an echoed config line")

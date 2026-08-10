@@ -33,7 +33,7 @@
 //      so it is where a scale-up overflow would land first.
 //
 // The card is driven DIRECTLY here rather than through a new `PanelRenderHarness` fixture. That is
-// deliberate: adding capture-phase fixtures would re-baseline 34 committed goldens and bump #758's
+// deliberate: adding capture-phase fixtures would re-baseline every committed golden and bump #758's
 // shape-pin cardinality guard, for phases whose whole point is that the golden lane cannot see them.
 //
 // WHAT THIS DOES NOT CLAIM. Not that the card LOOKS right — the goldens own drift and the mock
