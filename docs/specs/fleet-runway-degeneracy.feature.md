@@ -1,6 +1,6 @@
 # Feature: the fleet runway refuses rather than states an impossible duration
 
-Issue #1028 · PRD R-3 / R-4 / R-7 / R-20 · design D-A / D-B
+Issue #1028 · PRD R-3 / R-4 / R-7 / R-20 · design D-A / D-C
 
 Example Mapping: 🟦 4 rules · 🟩 11 examples · 🟥 0 open
 
