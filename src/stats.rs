@@ -2157,11 +2157,67 @@ fn pct_per_min(rate_frac_per_sec: f64) -> f64 {
     rate_frac_per_sec * 60.0 * 100.0
 }
 
-/// A smoothed usage rate (usage-fraction per SECOND — the EMA's native unit) as a neutral
-/// `%/min` string, to one decimal. `0.0%/min` for an idle (flat) account is an honest
-/// reading, not a gap.
+/// The `%/min` cell's MEASURED-ZERO form and — since issue #1136 — nothing else. Also the probe
+/// [`fmt_pct_per_min`] compares its OWN output against, so the sub-threshold band is defined by the
+/// precision actually displayed rather than by a second, drifting copy of it.
+const ZERO_PCT_PER_MIN: &str = "0.0%/min";
+
+/// The `%/min` cell's SUB-THRESHOLD form: a measured, strictly positive rate too small to state at
+/// [`fmt_pct_per_min`]'s one decimal. The `0.1` here must be the SMALLEST figure that precision can
+/// carry, so that the bound is exactly the figure form's floor — a bound naming a value the figure
+/// form could itself have stated would exclude readings that are not in the band at all. Nothing in
+/// the type system ties the two; `sub_threshold_bound_is_the_figure_forms_floor` does, by asserting
+/// the figure just above the cliff. Change the precision without changing this string and that test
+/// fails, rather than a lying bound shipping.
+const SUB_THRESHOLD_PCT_PER_MIN: &str = "<0.1%/min";
+
+/// A smoothed usage rate (usage-fraction per SECOND — the EMA's native unit) as a neutral `%/min`
+/// string. THREE forms, and the distinction between the first two is the whole point (issue #1136):
+///
+/// - [`ZERO_PCT_PER_MIN`] (`0.0%/min`) — a MEASURED ZERO, and nothing else. An idle-but-known
+///   account is a reading; `—` is the gap ([`velocity_cell`]).
+/// - [`SUB_THRESHOLD_PCT_PER_MIN`] (`<0.1%/min`) — a BOUND: measured, strictly positive, and below
+///   what one decimal can state.
+/// - `X.Y%/min` — the figure, to one decimal.
+///
+/// Before #1136 the first two shared one string. `{:.1}` alone renders every rate under `8.33e-6`
+/// frac/s as `0.0%/min`, and that band reaches ~15% of a session quota per 5 h window — so an
+/// account draining that much of its quota read exactly like an idle one. Issue #1075 made the
+/// pairing worse rather than better: such an account's runway is now refused as implausible, so
+/// *measured flat, no drain to divide by* and *measured burning, quotient unreachable before the
+/// reset* rendered identical bytes on BOTH cells, leaving nothing on the human surface to
+/// separate them.
+///
+/// The band is read back from THIS call's own output rather than compared against a hand-written
+/// epsilon: whatever `{:.1}` rounds to zero IS the band, by construction, so the two cannot drift —
+/// including at the half-way case, which follows the binary representation rather than a decimal
+/// rule. The guard is `> 0.0` and not `!= 0.0` because the bound asserts a BURN, which a negative
+/// rate is not; [`replay_velocity_ema`] resets on a drop and divides by a positive elapsed, so
+/// every rate reaching here is non-negative anyway.
+///
+/// Two shapes the issue offered and this rejects:
+///
+/// - **More decimals for small magnitudes** (`0.03%/min`). It keeps one string per fact, but it
+///   does not remove the cliff — it moves it: a fixed-width cell cannot carry unbounded precision,
+///   and below wherever the digits stop, a real burn renders `0.000…%/min`, the same defect three
+///   decades down. It also states precision the EMA does not have, and the issue's own `1e-9` row
+///   needs `0.000006%/min` — 13 columns against this column's 8.
+/// - **The bound for the whole band, exact zero included.** It satisfies "`0.0%/min` means a
+///   measured zero" vacuously, by deleting `0.0%/min` from the vocabulary — and with it the
+///   flat-versus-gap distinction the cell turns on. A flat account would read `<0.1%/min`: true,
+///   but weaker than the reading the aggregator actually made.
+///
+/// A BOUND is this surface's established form for "a figure here would be false precision" —
+/// [`fleet_runway_phrase`] states *more than a week* rather than a number for the same reason, at
+/// the other end of the same scale. It is not a third ambiguous state: `—` still means no
+/// measurement was made, and `<0.1%/min` is emphatically one that was.
 fn fmt_pct_per_min(rate_frac_per_sec: f64) -> String {
-    format!("{:.1}%/min", pct_per_min(rate_frac_per_sec))
+    let per_min = pct_per_min(rate_frac_per_sec);
+    let figure = format!("{per_min:.1}%/min");
+    if per_min > 0.0 && figure == ZERO_PCT_PER_MIN {
+        return SUB_THRESHOLD_PCT_PER_MIN.to_owned();
+    }
+    figure
 }
 
 /// An APPROXIMATE hours-scale runway, e.g. `~4h`, `~45m`, `~30s` — rounded to the coarsest
@@ -2239,7 +2295,10 @@ fn session_cell(a: &AccountStats) -> String {
 
 /// This account's compact VELOCITY cell — the neutral session `%/min` rate, or `—` when the rate
 /// is unknown (too few samples, stale, or no velocity overlay on the report). The COLUMN form of
-/// the retired band's velocity list; `0.0%/min` for an idle-but-known account is a reading, `—` a gap.
+/// the retired band's velocity list; `0.0%/min` for an idle-but-known account is a reading,
+/// [`SUB_THRESHOLD_PCT_PER_MIN`] a measured burn below the displayed precision (issue #1136), `—` a
+/// gap. The bound is a reading too, so a column holding one does not elide — the empty-column
+/// pre-pass keys on [`EXPIRY_GAP`], which only the gap spells.
 fn velocity_cell(v: Option<&AccountVelocity>) -> String {
     match v.and_then(|v| v.session_rate) {
         Some(rate) => fmt_pct_per_min(rate),
@@ -7089,8 +7148,12 @@ mod tests {
             !text.contains("runway"),
             "the uniformly-refused column elides, as the uniformly-flat one does: {text}"
         );
+        // The rate is still stated beside it — and since issue #1136 it is stated as the BOUND,
+        // not as `0.0%/min`. Until then this assertion pinned the very string the sentence above
+        // denies: `1e-9` frac/s rendered byte-identical to a flat account, so "keeps stating its
+        // measured velocity" was satisfied by a cell claiming there was nothing to measure.
         assert!(
-            text.contains("velocity") && text.contains("0.0%/min"),
+            text.contains("velocity") && text.contains(SUB_THRESHOLD_PCT_PER_MIN),
             "the measured rate is still stated beside it: {text}"
         );
         assert!(
@@ -7098,6 +7161,127 @@ mod tests {
             "and the fleet line — the surface R-3 / R-20 govern — states its unknown rather than \
              vanishing: {text}"
         );
+    }
+
+    // --- AC (issue #1136): `0.0%/min` means a measured zero, and nothing else ----------
+
+    #[test]
+    fn fmt_pct_per_min_bounds_the_sub_threshold_band_instead_of_claiming_zero() {
+        // The BOUNDARY the issue measured, straddled. These two rates differ by 1e-7 frac/s and
+        // sit either side of the one-decimal cliff at 8.33e-6; they must differ in KIND, because
+        // one is inside the band the figure form cannot state and the other is the smallest figure
+        // it can. Before this fix the first rendered `0.0%/min`.
+        assert_eq!(fmt_pct_per_min(8.3e-6), "<0.1%/min"); // 0.0498 %/min — under the cliff
+        assert_eq!(fmt_pct_per_min(8.4e-6), "0.1%/min"); // 0.0504 %/min — over it
+
+        // The issue's other measured rows. `5e-6` is a REAL burn moving ~9% of the session quota
+        // per 5 h window — it is also #1075's own `~11h` review case — and `1e-9` is the vanishing
+        // rate #1132's merge judge flagged. Both used to read as idle.
+        assert_eq!(fmt_pct_per_min(5e-6), "<0.1%/min");
+        assert_eq!(fmt_pct_per_min(1e-9), "<0.1%/min");
+
+        // The half that makes the change a distinction rather than a blanket reformat: a genuinely
+        // flat account still renders the measured-zero string, and is now the ONLY thing that does.
+        // Without this line a formatter that bounded everything below 0.1 would pass the rows above.
+        assert_eq!(fmt_pct_per_min(0.0), ZERO_PCT_PER_MIN);
+    }
+
+    #[test]
+    fn sub_threshold_bound_is_the_figure_forms_floor() {
+        // The coupling nothing in the type system holds: `<0.1%/min` is honest only while `0.1` is
+        // the SMALLEST figure the cell's precision can carry. Re-derived from the formatter itself
+        // rather than restated — the rate just over the cliff must render exactly the value the
+        // bound names. Widen the precision to `{:.2}` and this fails (`0.05%/min`), instead of a
+        // bound shipping that excludes readings the figure form could have stated outright.
+        assert_eq!(SUB_THRESHOLD_PCT_PER_MIN, "<0.1%/min");
+        assert_eq!(fmt_pct_per_min(8.4e-6), "0.1%/min");
+    }
+
+    #[test]
+    fn velocity_cell_separates_a_refused_runway_from_a_flat_one() {
+        // The concrete harm: since #1075 a sub-threshold BURN and a flat account rendered the same
+        // bytes on BOTH cells. Driven through the render, not the formatter — the cells have to
+        // reach the operator's table distinguishable, which is a fact about the row and not about
+        // `fmt_pct_per_min` in isolation.
+        //
+        // `burn` climbs +0.03 per 300 s → 1e-4 frac/s → 0.6 %/min, head-room 0.24 to the 0.80
+        //   trigger → 2400 s, inside the one-window bound, so its runway is a figure and the
+        //   droppable runway column survives the elision pre-pass.
+        // `creep` climbs +0.0015 per 300 s → 5e-6 frac/s → 0.03 %/min, head-room 0.297 → 59 400 s,
+        //   past the 18 000 s bound, so #1075 refuses the quotient.
+        // `flat` never moves → a known 0.0 rate, and gate 1 has no drain to divide by.
+        let now = epoch("2026-07-01T12:00:00Z");
+        let report = velocity_report(
+            vec![
+                sample(now - 900, "burn", 0.5000, 0.30),
+                sample(now - 600, "burn", 0.5300, 0.30),
+                sample(now - 300, "burn", 0.5600, 0.30),
+                sample(now - 900, "creep", 0.5000, 0.30),
+                sample(now - 600, "creep", 0.5015, 0.30),
+                sample(now - 300, "creep", 0.5030, 0.30),
+                sample(now - 900, "flat", 0.6000, 0.30),
+                sample(now - 600, "flat", 0.6000, 0.30),
+                sample(now - 300, "flat", 0.6000, 0.30),
+            ],
+            now,
+        );
+        for (handle, refused) in [("burn", false), ("creep", true), ("flat", true)] {
+            let v = report.velocity.get(handle).expect("a readout");
+            assert_eq!(
+                v.session_runway_secs.is_none(),
+                refused,
+                "{handle}'s runway: {v:?}"
+            );
+        }
+
+        let text = render_text(&report, None);
+        let row = |handle: &str| {
+            text.lines()
+                .find(|l| l.starts_with(handle))
+                .unwrap_or_else(|| panic!("no `{handle}` row in: {text}"))
+                .to_owned()
+        };
+
+        // The RUNWAY cell cannot tell `creep` from `flat` — refused and absent are one gap, by
+        // #1075's design ("`None` — NEVER a sentinel — for every refusal alike"). Only `burn`,
+        // whose quotient was admitted, carries an approximate figure. Asserted against a LIVE
+        // column: `burn` keeps it off the elision pre-pass, so "no figure on the other two" is a
+        // measured absence rather than the vacuous truth an elided column would also satisfy.
+        assert!(text.contains("runway"), "the runway column is live: {text}");
+        assert!(row("burn").contains("~40m"), "admitted runway: {text}");
+        for handle in ["creep", "flat"] {
+            assert!(
+                !row(handle).contains('~'),
+                "{handle}'s runway states no figure: {text}"
+            );
+        }
+
+        // So the VELOCITY cell is the whole discriminator, and it now discriminates.
+        assert!(row("burn").contains("0.6%/min"), "the figure: {text}");
+        assert!(
+            row("creep").contains(SUB_THRESHOLD_PCT_PER_MIN),
+            "a measured burn under the precision reads as a bound: {text}"
+        );
+        assert!(
+            row("flat").contains(ZERO_PCT_PER_MIN),
+            "a measured zero keeps the zero string: {text}"
+        );
+        assert!(
+            !row("flat").contains(SUB_THRESHOLD_PCT_PER_MIN),
+            "and does NOT read as a burn: {text}"
+        );
+        // Stated once more on the CELLS themselves rather than on the rows around them: two rows
+        // differ in their session column whatever the velocity cell does, so a row-level inequality
+        // would go green without touching the thing this issue is about.
+        assert_ne!(
+            velocity_cell(report.velocity.get("creep")),
+            velocity_cell(report.velocity.get("flat")),
+            "the two cells that #1136 found byte-identical"
+        );
+
+        // The new string is a neutral observation, not advice — it must clear the #542 guard the
+        // same way every other cell on this surface does.
+        assert_eq!(scan_banned(&text), None, "the bound render is neutral");
     }
 
     // --- AC (issue #544): fleet/roster runway aggregate ("accounts last ~X days") ------
