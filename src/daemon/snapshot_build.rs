@@ -11,6 +11,29 @@
 
 use super::*;
 
+/// How ONE deadline observation is ATTRIBUTED (issues #880, #907) — everything
+/// [`Daemon::fold_expiry_observation`] needs to know ABOUT a reading, as distinct from the reading
+/// itself. Built by each of the fold's two callers from the evidence only that caller has.
+///
+/// Bundled into one struct so the fold stays within the repo's 7-argument clippy bound (this repo
+/// never `#[allow]`s `too_many_arguments`) once #907 adds the read source beside the provenance —
+/// the same argument-bundle shape as [`AnchorArmInputs`]. The DEADLINE deliberately stays a
+/// separate `Option<i64>` argument rather than joining it: the `None` early-return is the whole
+/// reason the fold is shared, and folding the deadline in here would push that guard back out to
+/// both callers, which is exactly the drift the shared core exists to prevent.
+#[derive(Clone, Copy)]
+struct ExpiryAttribution {
+    /// WHICH credential item this deadline was read out of (issue #907) — the
+    /// [`ExpiryProvenance::ReadSourceSwitched`] discriminator, recorded onto the baseline so the
+    /// NEXT comparison knows whether it spans two items.
+    source: CredentialReadSource,
+    /// WHO the record says moved the deadline, derived by the caller from the evidence it holds.
+    provenance: ExpiryProvenance,
+    /// Whether a NEW OAuth grant was minted, where the caller can tell — `None` on every poll path,
+    /// which never holds two credential blobs to compare.
+    grant_replaced: Option<bool>,
+}
+
 impl<P, C, S, K> super::Daemon<P, C, S, K>
 where
     P: RosterPoller,
@@ -37,24 +60,38 @@ where
     /// stash) yields all-`None`, leaving the fields null this cycle. The refresh-token deadline is
     /// independently optional even on a READABLE credential — an older Claude Code omits it —
     /// which [`account_expiry`] classifies [`ExpiryHorizon::Unknown`] (issue #137).
+    ///
+    /// Returns WHICH item it read alongside the clocks (issue #907). That fact is not decorative:
+    /// the two items can transiently disagree, so a deadline compared against a baseline read from
+    /// the OTHER one measures the gap between them rather than a write, and
+    /// [`note_polled_expiry`](Self::note_polled_expiry) needs the source to tell those apart. It is
+    /// returned rather than re-derived at the caller so the reported source and the item actually
+    /// read are one fact — the branch below is taken ON it (see
+    /// [`CredentialReadSource::for_poll`]).
     pub(super) async fn read_poll_clocks(
         &self,
         account: &Account,
         active: bool,
-    ) -> CredentialClocks {
-        let ms = if active {
-            self.store
+    ) -> (CredentialClocks, CredentialReadSource) {
+        let source = CredentialReadSource::for_poll(active);
+        let ms = match source {
+            CredentialReadSource::Canonical => self
+                .store
                 .read()
                 .await
                 .map(|credential| crate::refresh::credential_clocks(credential.expose()))
-                .unwrap_or_default()
-        } else {
-            crate::refresh::stored_credential_clocks(&self.stash, &account.stash()).await
+                .unwrap_or_default(),
+            CredentialReadSource::Stash => {
+                crate::refresh::stored_credential_clocks(&self.stash, &account.stash()).await
+            }
         };
-        CredentialClocks {
-            access_expires_at: ms.access_expires_at.map(millis_to_secs),
-            refresh_token_expires_at: ms.refresh_token_expires_at.map(millis_to_secs),
-        }
+        (
+            CredentialClocks {
+                access_expires_at: ms.access_expires_at.map(millis_to_secs),
+                refresh_token_expires_at: ms.refresh_token_expires_at.map(millis_to_secs),
+            },
+            source,
+        )
     }
 
     /// Record that the daemon's OWN refresh wrote account `idx`'s credential (issue #880) — the
@@ -80,13 +117,25 @@ where
     ///
     /// `observed` is the deadline in epoch SECONDS as
     /// [`read_poll_clocks`](Self::read_poll_clocks) just read it, or `None` when this poll could not
-    /// observe one (an unreadable credential, or a Claude Code that omits the field).
+    /// observe one (an unreadable credential, or a Claude Code that omits the field). `source` is
+    /// WHICH item that same call read it out of (issue #907).
     ///
     /// Provenance, in order: the first observation this run is
     /// [`ExpiryProvenance::FirstObservation`]; a change with the own-refresh latch set is
-    /// [`ExpiryProvenance::MyRefresh`]; a change with the latch clear is
-    /// [`ExpiryProvenance::ExternalChange`] — *a delta observed on a poll with no intervening daemon
-    /// refresh for that account*.
+    /// [`ExpiryProvenance::MyRefresh`]; a change measured against a baseline read from the OTHER
+    /// credential item is [`ExpiryProvenance::ReadSourceSwitched`]; a change with the latch clear
+    /// and the source held is [`ExpiryProvenance::ExternalChange`] — *a delta observed on a poll
+    /// with no intervening daemon refresh for that account*.
+    ///
+    /// The source check sits BELOW `my_refresh` and ABOVE `external_change`, and that position is
+    /// the decision, not an ordering detail. `my_refresh` is HARD evidence — the daemon drove a
+    /// CAS-protected write and KNOWS it caused one — so a swap in the same interval must not
+    /// demote it to a tag that says *we cannot attribute this*; issue #877 weighs that population
+    /// precisely because it is not inferred. `external_change` is the residual INFERENCE, and the
+    /// cross-source case is the subset of that residual the daemon can now positively identify, so
+    /// it is exactly what the new tag takes over. Nothing is suppressed: the delta, both deadlines
+    /// and the account still reach the log — see [`ExpiryProvenance::ReadSourceSwitched`] for why
+    /// marking beats dropping the line.
     ///
     /// The emitted record's `grant_replaced` is always `None` here: this path reads the deadline out of
     /// the account's poll clocks and never holds two credential blobs to compare, so it cannot speak
@@ -96,6 +145,7 @@ where
         &mut self,
         idx: usize,
         observed: Option<i64>,
+        source: CredentialReadSource,
         now_secs: i64,
         events: &mut Vec<Event>,
     ) {
@@ -104,10 +154,26 @@ where
             ExpiryProvenance::FirstObservation
         } else if health.own_refresh_since_expiry_observation {
             ExpiryProvenance::MyRefresh
+        // `!=` rather than a match on two `Some`s: an absent recorded source is unreachable while
+        // the baseline is `Some` (both are written together by the one fold below), and if that
+        // pairing were ever broken the honest reading is *we cannot say both came from the same
+        // item* — which is this tag, not the `external_change` inference.
+        } else if health.refresh_token_expires_at_baseline_source != Some(source) {
+            ExpiryProvenance::ReadSourceSwitched
         } else {
             ExpiryProvenance::ExternalChange
         };
-        self.fold_expiry_observation(idx, observed, provenance, None, now_secs, events);
+        self.fold_expiry_observation(
+            idx,
+            observed,
+            ExpiryAttribution {
+                source,
+                provenance,
+                grant_replaced: None,
+            },
+            now_secs,
+            events,
+        );
     }
 
     /// Fold the observation the #13 re-auth re-stash just made (issue #880): the daemon HEALED an
@@ -150,8 +216,17 @@ where
         self.fold_expiry_observation(
             idx,
             observed,
-            ExpiryProvenance::CanonicalRestash,
-            grant_replaced,
+            ExpiryAttribution {
+                // This edge reads the CANONICAL blob it just re-stashed — the caller passes the
+                // very credential `Daemon::reconcile_canonical_change` read off the canonical item
+                // — so the baseline it leaves behind is canonical-sourced (issue #907). Recording
+                // that is what keeps the NEXT poll's comparison honest in both directions: the
+                // account is now the active one, so its poll reads the canonical too and correctly
+                // reports no switch, while a poll that finds it parked correctly reports one.
+                source: CredentialReadSource::Canonical,
+                provenance: ExpiryProvenance::CanonicalRestash,
+                grant_replaced,
+            },
             now_secs,
             events,
         );
@@ -168,17 +243,24 @@ where
     /// stay silent). The two were separate parameters and were necessarily set in lockstep by the two
     /// callers — one fact, derived once here, so they cannot drift apart.
     ///
-    /// A `None` `observed` returns immediately, touching NOTHING — not the baseline, not the latches,
-    /// not the horizon. A poll that could not look is a NON-observation, not an observation of
-    /// absence: see [`AccountHealth::refresh_token_expires_at_baseline`] for why clearing the baseline there would
-    /// let a flaky read fabricate a change, and [`Event::CredentialExpiryObserved`] for why it must
-    /// not be reported as a `Some -> None` transition.
+    /// A `None` `observed` returns immediately, touching NOTHING — not the baseline, not its
+    /// `source`, not the latches, not the horizon. A poll that could not look is a NON-observation,
+    /// not an observation of absence: see [`AccountHealth::refresh_token_expires_at_baseline`] for
+    /// why clearing the baseline there would let a flaky read fabricate a change, and
+    /// [`Event::CredentialExpiryObserved`] for why it must not be reported as a `Some -> None`
+    /// transition. The source is carried under that same guard for the same reason — a read that
+    /// produced no deadline is not evidence about WHERE the standing baseline came from, and
+    /// advancing the source alone would silently convert the next genuine cross-item comparison
+    /// into an `external_change`.
+    ///
+    /// [`ExpiryAttribution::source`] is the ONE new input (issue #907) rather than something derived
+    /// here: this is the sole writer of the baseline, so writing the two in LOCKSTEP is what lets
+    /// every reader assume a `Some` baseline carries a `Some` source.
     fn fold_expiry_observation(
         &mut self,
         idx: usize,
         observed: Option<i64>,
-        provenance: ExpiryProvenance,
-        grant_replaced: Option<bool>,
+        attribution: ExpiryAttribution,
         now_secs: i64,
         events: &mut Vec<Event>,
     ) {
@@ -189,10 +271,18 @@ where
         let Some(deadline) = observed else {
             return;
         };
+        let ExpiryAttribution {
+            source,
+            provenance,
+            grant_replaced,
+        } = attribution;
         let record_unchanged = provenance == ExpiryProvenance::CanonicalRestash;
         let health = &mut self.state.accounts[idx].health;
         let before = health.refresh_token_expires_at_baseline;
         health.refresh_token_expires_at_baseline = Some(deadline);
+        // Issue #907: the deadline and the item it came out of advance TOGETHER, so the next
+        // comparison knows which item its baseline belongs to.
+        health.refresh_token_expires_at_baseline_source = Some(source);
         health.own_refresh_since_expiry_observation = false;
         // Emit on a CHANGE, or — for the re-stash edge only — on an explicit no-change. A FIRST
         // observation needs no separate arm: it has no baseline, so `before` is `None`, which never
@@ -1795,6 +1885,15 @@ mod tests {
     const WITHIN: i64 = EXPIRY_NOW + 86_400;
     /// A deadline already PAST.
     const LAPSED: i64 = EXPIRY_NOW - 1;
+    /// The read source the direct-drive folds below hold CONSTANT (issue #907).
+    ///
+    /// Those tests pin the fold's OWN logic, not `read_poll_clocks`' branch, so every call within a
+    /// given test passes the same item and the provenance each asserts is therefore the
+    /// source-held-constant one. Named for that property rather than for the item, because holding
+    /// it fixed is what the tests depend on; the cross-source case has its own tests below, driven
+    /// through a real swap boundary. `Canonical` also happens to be faithful for index 0, the
+    /// fixture's active account.
+    const SAME_ITEM: CredentialReadSource = CredentialReadSource::Canonical;
 
     /// Issue #880: the FIRST deadline seen for an account anchors the log — it is an observation, not
     /// a change — and a later poll reading the SAME deadline stays silent.
@@ -1807,7 +1906,7 @@ mod tests {
         let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
         let mut events = Vec::new();
 
-        daemon.note_polled_expiry(0, Some(BEYOND), EXPIRY_NOW, &mut events);
+        daemon.note_polled_expiry(0, Some(BEYOND), SAME_ITEM, EXPIRY_NOW, &mut events);
         assert_eq!(
             events,
             vec![Event::CredentialExpiryObserved {
@@ -1823,7 +1922,7 @@ mod tests {
         );
 
         events.clear();
-        daemon.note_polled_expiry(0, Some(BEYOND), EXPIRY_NOW, &mut events);
+        daemon.note_polled_expiry(0, Some(BEYOND), SAME_ITEM, EXPIRY_NOW, &mut events);
         assert!(
             events.is_empty(),
             "an unchanged deadline is not an event: {events:?}"
@@ -1841,12 +1940,12 @@ mod tests {
     ) {
         let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
         let mut events = Vec::new();
-        daemon.note_polled_expiry(0, Some(BEYOND), EXPIRY_NOW, &mut events);
+        daemon.note_polled_expiry(0, Some(BEYOND), SAME_ITEM, EXPIRY_NOW, &mut events);
         events.clear();
 
         // The daemon refreshed this account, THEN the deadline moved → the server extended it.
         daemon.note_own_credential_refresh(0);
-        daemon.note_polled_expiry(0, Some(BEYOND + 86_400), EXPIRY_NOW, &mut events);
+        daemon.note_polled_expiry(0, Some(BEYOND + 86_400), SAME_ITEM, EXPIRY_NOW, &mut events);
         assert_eq!(
             events,
             vec![Event::CredentialExpiryObserved {
@@ -1860,7 +1959,13 @@ mod tests {
 
         // No refresh since → the next change was written by something ELSE.
         events.clear();
-        daemon.note_polled_expiry(0, Some(BEYOND + 172_800), EXPIRY_NOW, &mut events);
+        daemon.note_polled_expiry(
+            0,
+            Some(BEYOND + 172_800),
+            SAME_ITEM,
+            EXPIRY_NOW,
+            &mut events,
+        );
         assert_eq!(
             events,
             vec![Event::CredentialExpiryObserved {
@@ -1892,12 +1997,12 @@ mod tests {
     async fn an_unobservable_credential_neither_reports_a_change_nor_disturbs_the_baseline() {
         let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
         let mut events = Vec::new();
-        daemon.note_polled_expiry(0, Some(BEYOND), EXPIRY_NOW, &mut events);
+        daemon.note_polled_expiry(0, Some(BEYOND), SAME_ITEM, EXPIRY_NOW, &mut events);
         events.clear();
         daemon.note_own_credential_refresh(0);
 
         // The unreadable poll.
-        daemon.note_polled_expiry(0, None, EXPIRY_NOW, &mut events);
+        daemon.note_polled_expiry(0, None, SAME_ITEM, EXPIRY_NOW, &mut events);
         assert!(events.is_empty(), "a non-observation is not an event");
         assert_eq!(
             daemon.state.accounts[0]
@@ -1915,7 +2020,7 @@ mod tests {
 
         // The next successful poll reads the SAME deadline: still silent. A cleared baseline would
         // have made this a fabricated change here.
-        daemon.note_polled_expiry(0, Some(BEYOND), EXPIRY_NOW, &mut events);
+        daemon.note_polled_expiry(0, Some(BEYOND), SAME_ITEM, EXPIRY_NOW, &mut events);
         assert!(
             events.is_empty(),
             "a flaky read must not manufacture a change: {events:?}"
@@ -1930,7 +2035,7 @@ mod tests {
     async fn the_horizon_entry_edge_fires_once_per_band_and_escalates_to_lapsed() {
         let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
         let mut events = Vec::new();
-        daemon.note_polled_expiry(0, Some(BEYOND), EXPIRY_NOW, &mut events);
+        daemon.note_polled_expiry(0, Some(BEYOND), SAME_ITEM, EXPIRY_NOW, &mut events);
         assert!(
             !events
                 .iter()
@@ -1940,7 +2045,7 @@ mod tests {
 
         // ENTRY.
         events.clear();
-        daemon.note_polled_expiry(0, Some(WITHIN), EXPIRY_NOW, &mut events);
+        daemon.note_polled_expiry(0, Some(WITHIN), SAME_ITEM, EXPIRY_NOW, &mut events);
         assert!(events.contains(&Event::CredentialExpiryHorizon {
             account: "u-A".to_owned(),
             state: ExpiryHorizon::Within,
@@ -1951,7 +2056,7 @@ mod tests {
         // HELD: the same band re-polls silently, even though the deadline itself moved (so the
         // observation record still fires — this pins that the two edges are independent).
         events.clear();
-        daemon.note_polled_expiry(0, Some(WITHIN + 60), EXPIRY_NOW, &mut events);
+        daemon.note_polled_expiry(0, Some(WITHIN + 60), SAME_ITEM, EXPIRY_NOW, &mut events);
         assert!(
             !events
                 .iter()
@@ -1962,7 +2067,7 @@ mod tests {
 
         // ESCALATION.
         events.clear();
-        daemon.note_polled_expiry(0, Some(LAPSED), EXPIRY_NOW, &mut events);
+        daemon.note_polled_expiry(0, Some(LAPSED), SAME_ITEM, EXPIRY_NOW, &mut events);
         assert!(events.contains(&Event::CredentialExpiryHorizon {
             account: "u-A".to_owned(),
             state: ExpiryHorizon::Lapsed,
@@ -1978,7 +2083,7 @@ mod tests {
     async fn an_already_lapsed_first_observation_emits_the_lapsed_band_without_a_within_edge() {
         let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
         let mut events = Vec::new();
-        daemon.note_polled_expiry(0, Some(LAPSED), EXPIRY_NOW, &mut events);
+        daemon.note_polled_expiry(0, Some(LAPSED), SAME_ITEM, EXPIRY_NOW, &mut events);
         assert_eq!(
             events,
             vec![
@@ -2022,7 +2127,7 @@ mod tests {
 
         // One hour BEFORE the deadline enters the seven-day window.
         let deadline = EXPIRY_NOW + 604_800 + 3_600;
-        daemon.note_polled_expiry(0, Some(deadline), EXPIRY_NOW, &mut events);
+        daemon.note_polled_expiry(0, Some(deadline), SAME_ITEM, EXPIRY_NOW, &mut events);
         assert_eq!(
             events,
             vec![Event::CredentialExpiryObserved {
@@ -2037,7 +2142,13 @@ mod tests {
 
         // Two hours later. The SAME deadline is now inside the window.
         events.clear();
-        daemon.note_polled_expiry(0, Some(deadline), EXPIRY_NOW + 7_200, &mut events);
+        daemon.note_polled_expiry(
+            0,
+            Some(deadline),
+            SAME_ITEM,
+            EXPIRY_NOW + 7_200,
+            &mut events,
+        );
         assert_eq!(
             events,
             vec![Event::CredentialExpiryHorizon {
@@ -2051,7 +2162,13 @@ mod tests {
 
         // Still inside, still stationary — the latch holds, exactly as for a moving deadline.
         events.clear();
-        daemon.note_polled_expiry(0, Some(deadline), EXPIRY_NOW + 10_800, &mut events);
+        daemon.note_polled_expiry(
+            0,
+            Some(deadline),
+            SAME_ITEM,
+            EXPIRY_NOW + 10_800,
+            &mut events,
+        );
         assert!(
             events.is_empty(),
             "the entry edge fires once, not once per poll: {events:?}"
@@ -2059,7 +2176,7 @@ mod tests {
 
         // The clock walks past the deadline itself: `lapsed` is a distinct band, so it re-signals.
         events.clear();
-        daemon.note_polled_expiry(0, Some(deadline), deadline + 1, &mut events);
+        daemon.note_polled_expiry(0, Some(deadline), SAME_ITEM, deadline + 1, &mut events);
         assert_eq!(
             events,
             vec![Event::CredentialExpiryHorizon {
@@ -2083,11 +2200,11 @@ mod tests {
     async fn a_deadline_that_moves_back_out_of_the_horizon_re_arms_the_entry_edge() {
         let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
         let mut events = Vec::new();
-        daemon.note_polled_expiry(0, Some(WITHIN), EXPIRY_NOW, &mut events);
+        daemon.note_polled_expiry(0, Some(WITHIN), SAME_ITEM, EXPIRY_NOW, &mut events);
 
         // Out of the band — the exit is carried by the observation record, not a marker.
         events.clear();
-        daemon.note_polled_expiry(0, Some(BEYOND), EXPIRY_NOW, &mut events);
+        daemon.note_polled_expiry(0, Some(BEYOND), SAME_ITEM, EXPIRY_NOW, &mut events);
         assert_eq!(
             events,
             vec![Event::CredentialExpiryObserved {
@@ -2106,7 +2223,7 @@ mod tests {
 
         // Back in — signals again.
         events.clear();
-        daemon.note_polled_expiry(0, Some(WITHIN), EXPIRY_NOW, &mut events);
+        daemon.note_polled_expiry(0, Some(WITHIN), SAME_ITEM, EXPIRY_NOW, &mut events);
         assert!(events.contains(&Event::CredentialExpiryHorizon {
             account: "u-A".to_owned(),
             state: ExpiryHorizon::Within,
@@ -2127,7 +2244,7 @@ mod tests {
     async fn an_external_write_that_leaves_the_deadline_alone_is_still_recorded_exactly_once() {
         let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
         let mut events = Vec::new();
-        daemon.note_polled_expiry(0, Some(WITHIN), EXPIRY_NOW, &mut events);
+        daemon.note_polled_expiry(0, Some(WITHIN), SAME_ITEM, EXPIRY_NOW, &mut events);
         events.clear();
 
         // The #13 re-stash edge: the canonical was rewritten underneath the daemon, a NEW grant was
@@ -2156,7 +2273,7 @@ mod tests {
 
         // The later poll of the same account is silent — the baseline was reconciled at the edge.
         events.clear();
-        daemon.note_polled_expiry(0, Some(WITHIN), EXPIRY_NOW, &mut events);
+        daemon.note_polled_expiry(0, Some(WITHIN), SAME_ITEM, EXPIRY_NOW, &mut events);
         assert!(
             events.is_empty(),
             "one write must not be recorded twice: {events:?}"
@@ -2176,15 +2293,15 @@ mod tests {
         let mut events = Vec::new();
         // Anchor all three, then discard the anchors: the rows under test are what follows.
         for i in 0..3 {
-            daemon.note_polled_expiry(i, Some(WITHIN), EXPIRY_NOW, &mut events);
+            daemon.note_polled_expiry(i, Some(WITHIN), SAME_ITEM, EXPIRY_NOW, &mut events);
         }
         events.clear();
 
         // Row 1: changed DURING the daemon's own refresh cycle.
         daemon.note_own_credential_refresh(0);
-        daemon.note_polled_expiry(0, Some(WITHIN + 3600), EXPIRY_NOW, &mut events);
+        daemon.note_polled_expiry(0, Some(WITHIN + 3600), SAME_ITEM, EXPIRY_NOW, &mut events);
         // Row 2: changed between polls with NO daemon refresh.
-        daemon.note_polled_expiry(1, Some(WITHIN + 3600), EXPIRY_NOW, &mut events);
+        daemon.note_polled_expiry(1, Some(WITHIN + 3600), SAME_ITEM, EXPIRY_NOW, &mut events);
         // Row 3: UNCHANGED across an external credential write that DID mint a new grant.
         daemon.note_restash_expiry(2, Some(WITHIN), Some(true), EXPIRY_NOW, &mut events);
 
@@ -2306,6 +2423,601 @@ mod tests {
                 Event::CredentialExpiryObserved { account, .. } if account == "u-A"
             )),
             "an account whose credential omits the field emits nothing: {events:?}"
+        );
+    }
+
+    // --- issue #907: the baseline carries the item it was read from ----------
+
+    /// A well-formed Claude Code credential blob carrying `deadline_secs` as BOTH clocks, in the
+    /// epoch MILLISECONDS Claude Code stores (the read boundary folds MS→s). `tag` names the
+    /// ACCOUNT, so two copies of one account's credential differ only in the deadline — which is
+    /// exactly the canonical-vs-stash divergence these tests construct, and it keeps the two byte-
+    /// DISTINCT for the token-first active resolver.
+    fn expiry_blob(tag: &str, deadline_secs: i64) -> Vec<u8> {
+        let ms = deadline_secs * 1_000;
+        format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"{tag}-access","refreshToken":"{tag}-rt","expiresAt":{ms},"refreshTokenExpiresAt":{ms}}}}}"#
+        )
+        .into_bytes()
+    }
+
+    /// The [`Event::CredentialExpiryObserved`] records for ONE account, in order. The #907 tests
+    /// read a real tick's whole event stream, which also carries health transitions, the re-stash
+    /// edge and the swapped-onto account's own lines.
+    fn observations_for<'a>(events: &'a [Event], account: &str) -> Vec<&'a Event> {
+        events
+            .iter()
+            .filter(
+                |e| matches!(e, Event::CredentialExpiryObserved { account: a, .. } if a == account),
+            )
+            .collect()
+    }
+
+    /// Issue #907 (AC-1 + AC-3): a deadline delta observed ACROSS a change of READ SOURCE is
+    /// DISTINGUISHABLE from one observed with the source held constant — the first is marked
+    /// `read_source_switched`, the second is still the inferred `external_change`.
+    ///
+    /// Both halves run on ONE account through ONE real daemon, with the SAME size of delta, because
+    /// AC-1 asks for a distinction and a distinction needs both sides. A blanket re-label of every
+    /// post-swap delta would pass a one-sided test and destroy the population issue #877 rests on.
+    ///
+    /// **This drives a real swap boundary, not a substitute.** The active account changes because
+    /// the shared canonical item is rerouted underneath the daemon — a concurrent `sessiometer use`
+    /// or an operator's `claude /login` onto the other account — which `Daemon::tick` adopts
+    /// through the production `reconcile_canonical_change` path (re-stash the account the canonical
+    /// now belongs to, drop the cached active, re-resolve). `work` is polled through the real
+    /// `read_poll_clocks` on both sides: from the canonical while it is active, from its own stash
+    /// once it is parked, with genuine JSON blobs parsed by the production extractor.
+    ///
+    /// **The choice of THIS boundary is about cost, not about the others being exempt**, and that
+    /// distinction is worth stating because the mechanism is class-INDEPENDENT. The read source is
+    /// derived at exactly one site (`CredentialReadSource::for_poll`, whose sole caller is
+    /// `read_poll_clocks`) and consumed at exactly one site (the comparison in
+    /// `note_polled_expiry`); neither reads the swap CLASS, and nothing between them distinguishes
+    /// an out-of-band adoption from the daemon's own reactive swap or a `swap::adopt_target`
+    /// recovery. So a fixture per boundary class would add FIXTURE coverage, not BEHAVIOURAL
+    /// coverage. This one is here because rerouting the shared canonical is the cheapest boundary
+    /// to construct in-process. The two sibling tests below drive the daemon's OWN swap engine
+    /// through both of its outcomes — the divergence it discards, and the one it creates.
+    ///
+    /// The divergence itself is deliberate, per AC-3: `work`'s stash copy carries a deadline one day
+    /// further out than the canonical item it is currently served from. That is the window the issue
+    /// names — a re-stash that failed on a locked keychain, a canonical write not yet reconciled —
+    /// and NOTHING here reconciles them, which is the point: the fix does not require it.
+    #[tokio::test]
+    async fn a_deadline_delta_across_a_swap_boundary_is_marked_while_a_same_source_delta_is_not() {
+        // Every deadline sits a month out — beyond the shipped seven-day horizon against the WALL
+        // clock this path reads — so no band edge joins the stream whenever the test happens to run.
+        let now = crate::daemon::wall_clock_now_secs();
+        let canonical_deadline = now + 30 * DAY_SECS;
+        let stash_deadline = canonical_deadline + DAY_SECS;
+        // The same +1d delta again, later, with the source held constant — so the two halves differ
+        // in the SOURCE and in nothing else.
+        let later_stash_deadline = stash_deadline + DAY_SECS;
+
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        // THE DELIBERATE DIVERGENCE: the canonical item `work` is currently served from and
+        // `work`'s own stash copy carry different deadlines for the same grant.
+        let store = store_holding(&expiry_blob("A", canonical_deadline)).await;
+        let work_stashed = expiry_blob("A", stash_deadline);
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", work_stashed.as_slice(), "u-A"),
+            // `spare`'s stash is an opaque token: it parses as no credential, so it observes no
+            // deadline and contributes no line — keeping every record below `work`'s.
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (dir, json) = claude_json("u-A");
+        std::mem::forget(dir);
+        let tun = tunables(95, 80, 0);
+        let mut daemon = Daemon::new(
+            roster,
+            // Both accounts idle, so the daemon never swaps on its own — the ONLY change of active
+            // account in this test is the out-of-band one below.
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .ok("u-B", 0.10, 0.10),
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+
+        // --- 1. `work` ACTIVE: its poll reads the CANONICAL, and anchors there.
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            events.extend(daemon.tick().await.events);
+        }
+        assert_eq!(daemon.state.active, Some(0), "`work` starts active");
+        assert_eq!(
+            observations_for(&events, "u-A"),
+            vec![&Event::CredentialExpiryObserved {
+                account: "u-A".to_owned(),
+                provenance: ExpiryProvenance::FirstObservation,
+                before: None,
+                after: canonical_deadline,
+                grant_replaced: None,
+            }],
+            "the anchor is the CANONICAL deadline — the item an ACTIVE account's poll reads: \
+             {events:?}"
+        );
+
+        // --- 2. THE SWAP BOUNDARY: something out-of-band reroutes the shared canonical item to
+        // `spare`. Written as `spare`'s own stashed bytes, so the daemon's token-first resolver
+        // identifies the new active from the credential rather than the display file (which still
+        // names `work`). `work`'s stash is not touched by anything here.
+        daemon.store.write(&cred(b"B-token")).await.unwrap();
+
+        events.clear();
+        for _ in 0..4 {
+            events.extend(daemon.tick().await.events);
+        }
+        assert_eq!(
+            daemon.state.active,
+            Some(1),
+            "the out-of-band write moved the active account onto `spare`: {events:?}"
+        );
+        // `work` is now parked, so this poll read its STASH — a different item from the anchor's.
+        // NOTHING was written to `work`'s credential; only the place we looked changed.
+        assert_eq!(
+            observations_for(&events, "u-A"),
+            vec![&Event::CredentialExpiryObserved {
+                account: "u-A".to_owned(),
+                provenance: ExpiryProvenance::ReadSourceSwitched,
+                before: Some(canonical_deadline),
+                after: stash_deadline,
+                grant_replaced: None,
+            }],
+            "a delta spanning two ITEMS is marked, not inferred to be an external write: {events:?}"
+        );
+        // …and it says so on the durable line, which is where issue #877 reads it from. The
+        // absence assertion is the load-bearing one: the confound must be OUT of the population
+        // that conclusion counts, not merely annotated somewhere inside it.
+        let line = observations_for(&events, "u-A")[0].to_log_line(std::time::UNIX_EPOCH);
+        assert!(line.contains(" provenance=read_source_switched "), "{line}");
+        assert!(line.ends_with(" delta_secs=86400"), "{line}");
+        assert!(
+            !line.contains("external_change"),
+            "the `external_change` population must not absorb this: {line}"
+        );
+
+        // --- 3. THE CONTRAST: the same account, the same +1d delta, the source HELD. `work` stays
+        // parked, so both this observation and the baseline it differences against come out of its
+        // stash — and an external writer really did move that item.
+        daemon
+            .stash
+            .write(
+                "Sessiometer/u-A",
+                &stashed(&expiry_blob("A", later_stash_deadline), "u-A"),
+            )
+            .await
+            .unwrap();
+
+        events.clear();
+        for _ in 0..4 {
+            events.extend(daemon.tick().await.events);
+        }
+        assert_eq!(
+            daemon.state.active,
+            Some(1),
+            "no second swap: `work` is parked throughout this half"
+        );
+        assert_eq!(
+            observations_for(&events, "u-A"),
+            vec![&Event::CredentialExpiryObserved {
+                account: "u-A".to_owned(),
+                provenance: ExpiryProvenance::ExternalChange,
+                before: Some(stash_deadline),
+                after: later_stash_deadline,
+                grant_replaced: None,
+            }],
+            "an identical delta with the read source HELD is still the external-write inference — \
+             the tag is about the SOURCE, not about having swapped recently: {events:?}"
+        );
+    }
+
+    /// Issue #907: the daemon's OWN reactive swap parks the outgoing account's canonical as it
+    /// stands at SWAP time, so a stale divergence already sitting in that account's stash is
+    /// DISCARDED rather than reported — a deliberately-divergent pair produces no deadline record
+    /// at all across that boundary.
+    ///
+    /// This is the ZERO case of a sharp identity, and pinning it is what rules out a plausible
+    /// wrong reading of the fix. `swap::swap` step 2 re-stashes the outgoing account from the LIVE
+    /// canonical before it overwrites it — the token-refresh-rotation drift guard, which exists
+    /// precisely because that canonical may have MOVED. So the stash the account is parked with is
+    /// the canonical as of swap time, and the delta its next parked poll can see is exactly the
+    /// CANONICAL's own movement between that account's last active poll and the swap. Whatever the
+    /// stash held before is irrelevant — here it held a deadline a day further out, and the swap
+    /// simply overwrote it. The canonical did not move, so the two readings agree and nothing is
+    /// emitted.
+    ///
+    /// The NON-zero case is the sibling directly below: rotate the canonical inside that window and
+    /// the same engine parks a CHANGED deadline, which is reported. Read the two together — *a swap
+    /// reconciles the two items* is the wrong model, and this pair is what rules it out.
+    ///
+    /// It is also a real regression guard in the other direction: if a future change dropped that
+    /// re-stash, this test fails, and the failure names the reason the `read_source_switched`
+    /// population would otherwise have started growing for no operator-visible cause.
+    #[tokio::test]
+    async fn an_autonomous_swap_parks_the_canonical_so_a_stale_stash_divergence_is_discarded() {
+        let now = crate::daemon::wall_clock_now_secs();
+        let canonical_deadline = now + 30 * DAY_SECS;
+        let stash_deadline = canonical_deadline + DAY_SECS;
+
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        // The SAME deliberate divergence as the test above.
+        let store = store_holding(&expiry_blob("A", canonical_deadline)).await;
+        let work_stashed = expiry_blob("A", stash_deadline);
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", work_stashed.as_slice(), "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (dir, json) = claude_json("u-A");
+        std::mem::forget(dir);
+        let tun = tunables(95, 80, 0);
+        let mut daemon = Daemon::new(
+            roster,
+            FakeRosterPoller::new()
+                .ok("u-A", 0.97, 0.40) // active, over the session trigger
+                .ok("u-B", 0.05, 0.05), // the only viable target
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+
+        // A REAL reactive swap off `work` onto `spare`. Driven as its own loop rather than through
+        // `warmed_tick`, which returns only the LAST tick's outcome: the anchoring poll of `work`
+        // happens during warm-up, several ticks before the swap decides, so the records under test
+        // have to be accumulated across the whole run.
+        let mut events = Vec::new();
+        let mut action = None;
+        for _ in 0..(2 * daemon.roster.len() + 1) {
+            let outcome = daemon.tick().await;
+            events.extend(outcome.events);
+            if matches!(outcome.action, TickAction::Swapped { .. }) {
+                action = Some(outcome.action);
+                break;
+            }
+        }
+        assert_eq!(action, Some(TickAction::Swapped { from: 0, to: 1 }));
+        assert_eq!(daemon.state.active, Some(1));
+
+        // The anchor was read from the canonical while `work` was active…
+        assert_eq!(
+            observations_for(&events, "u-A"),
+            vec![&Event::CredentialExpiryObserved {
+                account: "u-A".to_owned(),
+                provenance: ExpiryProvenance::FirstObservation,
+                before: None,
+                after: canonical_deadline,
+                grant_replaced: None,
+            }],
+            "the pre-swap poll anchored on the canonical: {events:?}"
+        );
+        // …and the swap OVERWROTE `work`'s stash with that same credential. The day-further-out
+        // deadline that stash held is simply gone — discarded, never compared against anything.
+        assert_eq!(
+            crate::refresh::stored_credential_clocks(&daemon.stash, "Sessiometer/u-A")
+                .await
+                .refresh_token_expires_at
+                .map(millis_to_secs),
+            Some(canonical_deadline),
+            "the swap engine parked the canonical as of swap time, not the stash's prior contents"
+        );
+
+        // Subsequent parked polls read that overwritten stash: same deadline as the anchor, so NO
+        // record — neither the marked one nor an inferred external write.
+        events.clear();
+        for _ in 0..4 {
+            events.extend(daemon.tick().await.events);
+        }
+        assert!(
+            observations_for(&events, "u-A").is_empty(),
+            "the canonical did not move between the anchoring poll and the swap, so the parked \
+             stash agrees with the anchor and there is nothing to report: {events:?}"
+        );
+    }
+
+    /// Issue #907, the NON-zero case of the identity above: the daemon's OWN reactive swap CAN
+    /// produce this delta, because step 2 parks the canonical as of SWAP time — not as of the
+    /// outgoing account's last poll.
+    ///
+    /// A token that refreshes IN PLACE between that poll and the swap is what opens the window:
+    /// the canonical moves, `swap::swap` step 1 reads the MOVED blob, step 2 parks it, and the
+    /// account's next parked poll differences a stash reading against a canonical baseline that
+    /// predates the rotation. Step 2's own drift-guard comment names this exact case — a canonical
+    /// matching NEITHER stash is "the legitimate in-place token-refresh DRIFT the re-stash exists
+    /// to capture" — so the re-stash is not a reconciliation of the two items and was never meant
+    /// to be one. It preserves a fresh token; it does not make two readings agree.
+    ///
+    /// What DOES keep this line rare is a different mechanism: the top-of-tick
+    /// [`Daemon::reconcile_canonical_change`] normally catches an out-of-band canonical write on the
+    /// following tick, re-stashes it, and folds the baseline forward before this account is polled
+    /// again. That is why the rotation below is written between the anchoring tick and the swap
+    /// with NO tick in between — the position a refresh has to land in for that reconciliation to
+    /// miss it. It stays missed afterwards too, which is the half worth pinning: `record_swap`
+    /// commits the canonical watch to the INCOMING credential, so no later tick ever classifies the
+    /// rotated blob `Changed` for the outgoing account. The single-record assertion at the end is
+    /// what proves that — a recovering reconciliation would show up as a `canonical_restash` line.
+    ///
+    /// Driven through `locked_swap` + `record_swap`, the pair [`Daemon::decide_action`] runs back
+    /// to back on the reactive path, rather than through [`Daemon::tick`] — a tick would interpose
+    /// exactly the reconciliation this window is defined by being narrower than.
+    #[tokio::test]
+    async fn a_rotation_between_the_poll_and_the_swap_is_parked_by_the_swap_and_then_marked() {
+        let now = crate::daemon::wall_clock_now_secs();
+        let anchored_deadline = now + 30 * DAY_SECS;
+        // Where the in-place refresh moves it, mid-window.
+        let rotated_deadline = anchored_deadline + DAY_SECS;
+
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        // NO pre-existing divergence this time: the canonical and `work`'s stash carry the same
+        // credential, so every delta below is manufactured by the window itself rather than
+        // inherited from a fixture that started out inconsistent.
+        let store = store_holding(&expiry_blob("A", anchored_deadline)).await;
+        let work_stashed = expiry_blob("A", anchored_deadline);
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", work_stashed.as_slice(), "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (dir, json) = claude_json("u-A");
+        std::mem::forget(dir);
+        let tun = tunables(95, 80, 0);
+        let mut daemon = Daemon::new(
+            roster,
+            // Both idle: the swap below is driven by hand, so nothing the daemon decides on its
+            // own can move the active account and confuse which boundary produced the record.
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .ok("u-B", 0.10, 0.10),
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+
+        // --- 1. `work` ACTIVE: its poll anchors on the canonical, through `read_poll_clocks`.
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            events.extend(daemon.tick().await.events);
+        }
+        assert_eq!(daemon.state.active, Some(0), "`work` starts active");
+        assert_eq!(
+            observations_for(&events, "u-A"),
+            vec![&Event::CredentialExpiryObserved {
+                account: "u-A".to_owned(),
+                provenance: ExpiryProvenance::FirstObservation,
+                before: None,
+                after: anchored_deadline,
+                grant_replaced: None,
+            }],
+            "the anchor is the canonical deadline, read while `work` was active: {events:?}"
+        );
+
+        // --- 2. THE WINDOW: another Claude Code refreshes `work`'s token IN PLACE. Same account,
+        // same grant shape, new deadline — and no tick observes it before the swap does.
+        daemon
+            .store
+            .write(&cred(&expiry_blob("A", rotated_deadline)))
+            .await
+            .unwrap();
+
+        // --- 3. THE REAL SWAP ENGINE. Step 1 reads that rotated canonical, step 2 parks it in
+        // `work`'s stash (its drift guard deliberately ALLOWS a canonical matching neither stash),
+        // step 3 writes `spare`'s token to the canonical.
+        events.clear();
+        daemon
+            .locked_swap("Sessiometer/u-A", "Sessiometer/u-B", false, &mut events)
+            .await
+            .expect(
+                "an in-place refresh must not block the swap — it is the case step 2 exists for",
+            );
+        let at = daemon.clock.now();
+        daemon.record_swap(1, "Sessiometer/u-B", at).await;
+        assert_eq!(daemon.state.active, Some(1));
+
+        // The divergence the next poll will see was CREATED by the swap: `work`'s stash now holds a
+        // deadline its own baseline has never seen.
+        assert_eq!(
+            crate::refresh::stored_credential_clocks(&daemon.stash, "Sessiometer/u-A")
+                .await
+                .refresh_token_expires_at
+                .map(millis_to_secs),
+            Some(rotated_deadline),
+            "step 2 parked the canonical as of SWAP time, rotation included"
+        );
+
+        // --- 4. `work` is parked, so its next poll reads that stash while the baseline beside it is
+        // canonical-sourced. Marked, not inferred to be an external write.
+        events.clear();
+        for _ in 0..4 {
+            events.extend(daemon.tick().await.events);
+        }
+        assert_eq!(
+            observations_for(&events, "u-A"),
+            vec![&Event::CredentialExpiryObserved {
+                account: "u-A".to_owned(),
+                provenance: ExpiryProvenance::ReadSourceSwitched,
+                before: Some(anchored_deadline),
+                after: rotated_deadline,
+                grant_replaced: None,
+            }],
+            "the daemon's own swap boundary produced this delta, and it is marked as spanning two \
+             items — and it is the ONLY record for the account, so no later tick reconciled the \
+             rotation away: {events:?}"
+        );
+    }
+
+    /// Issue #907, the fold's own ordering and its silence — the two ways a source-aware baseline
+    /// could go wrong that no swap-boundary fixture exercises.
+    ///
+    /// Direct-drive on purpose, and the scope is honest about it: these pin the CLASSIFIER's
+    /// precedence, which is a property of `note_polled_expiry` alone. The end-to-end behaviour AC-3
+    /// asks for is pinned by the swap-boundary tests above.
+    ///
+    /// - A source switch must NOT outrank `my_refresh`. That attribution is hard evidence — the
+    ///   daemon drove the write and knows it — so demoting it to *we cannot attribute this* because
+    ///   a swap happened in the same interval would shrink exactly the population issue #877 weighs
+    ///   most heavily. The check sits below the latch for this reason, and swapping the two arms is
+    ///   otherwise invisible to the suite.
+    /// - A source switch over an AGREEING pair emits nothing. The two items match on almost every
+    ///   real swap, so a tag that fired on the SWITCH rather than on a resulting DELTA would put a
+    ///   line on the log for every rotation and drown the class it exists to make visible.
+    #[tokio::test]
+    async fn a_daemon_refresh_outranks_a_source_switch_and_an_agreeing_pair_stays_silent() {
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        let mut events = Vec::new();
+
+        // Anchor account 0 on the canonical, then swap the read source AND move the deadline —
+        // with the daemon's own refresh latched in that interval.
+        daemon.note_polled_expiry(
+            0,
+            Some(BEYOND),
+            CredentialReadSource::Canonical,
+            EXPIRY_NOW,
+            &mut events,
+        );
+        events.clear();
+        daemon.note_own_credential_refresh(0);
+        daemon.note_polled_expiry(
+            0,
+            Some(BEYOND + 86_400),
+            CredentialReadSource::Stash,
+            EXPIRY_NOW,
+            &mut events,
+        );
+        assert_eq!(
+            observations_for(&events, "u-A"),
+            vec![&Event::CredentialExpiryObserved {
+                account: "u-A".to_owned(),
+                provenance: ExpiryProvenance::MyRefresh,
+                before: Some(BEYOND),
+                after: BEYOND + 86_400,
+                grant_replaced: None,
+            }],
+            "a swap in the interval must not demote the daemon's own hard attribution: {events:?}"
+        );
+
+        // A second account, whose two items AGREE across the switch: the deadline is unchanged, so
+        // there is nothing to report and the switch alone reports nothing.
+        events.clear();
+        daemon.note_polled_expiry(
+            1,
+            Some(WITHIN),
+            CredentialReadSource::Stash,
+            EXPIRY_NOW,
+            &mut events,
+        );
+        events.clear();
+        daemon.note_polled_expiry(
+            1,
+            Some(WITHIN),
+            CredentialReadSource::Canonical,
+            EXPIRY_NOW,
+            &mut events,
+        );
+        assert!(
+            events.is_empty(),
+            "the SWITCH is not the event — a delta across one is: {events:?}"
+        );
+        // The switch was still absorbed into the baseline, so a later same-source delta is not
+        // retroactively reported as a cross-source one.
+        events.clear();
+        daemon.note_polled_expiry(
+            1,
+            Some(WITHIN + 60),
+            CredentialReadSource::Canonical,
+            EXPIRY_NOW,
+            &mut events,
+        );
+        assert_eq!(
+            observations_for(&events, "u-B"),
+            vec![&Event::CredentialExpiryObserved {
+                account: "u-B".to_owned(),
+                provenance: ExpiryProvenance::ExternalChange,
+                before: Some(WITHIN),
+                after: WITHIN + 60,
+                grant_replaced: None,
+            }],
+            "a silent switch still advances the recorded source: {events:?}"
+        );
+    }
+
+    /// Issue #907: the OTHER writer of the baseline source — the #13 re-auth re-stash — leaves a
+    /// CANONICAL-sourced baseline, and both verdicts that depend on it.
+    ///
+    /// [`Daemon::note_restash_expiry`] hardcodes its source, because it always reads the blob
+    /// `Daemon::reconcile_canonical_change` just took off the canonical item; there is no `active`
+    /// flag to derive it from. A hardcoded value is exactly the kind nothing tests by accident —
+    /// every swap-boundary fixture above anchors through the POLL path instead, so flipping this
+    /// constant to `Stash` leaves the rest of the suite green while quietly inverting both verdicts
+    /// below. Both are asserted rather than just one: the constant is only pinned by a pair, since
+    /// a wrong value swaps the two answers rather than breaking either in isolation.
+    ///
+    /// Direct-drive on purpose, and the scope is honest about it — this pins which SOURCE the
+    /// re-stash fold records, which is a property of that one call. Its end-to-end context (the
+    /// re-stash runs at the TOP of the tick, so the same account's later poll finds the baseline
+    /// already reconciled) is pinned by the #880 canonical-reconciliation tests.
+    #[tokio::test]
+    async fn a_re_stash_leaves_a_canonical_sourced_baseline_in_both_directions() {
+        let mut daemon = three_account_daemon(FakeRosterPoller::new()).await;
+        let mut events = Vec::new();
+
+        // The re-stash fold anchors account 0 on the blob it healed the canonical with…
+        daemon.note_restash_expiry(0, Some(BEYOND), None, EXPIRY_NOW, &mut events);
+        events.clear();
+        // …and a re-auth leaves that account ACTIVE, so its next poll reads the SAME item. A
+        // deadline that moved since is then a genuine external write, and must still be reported as
+        // one — a source-switch tag here would take a real observation out of the population issue
+        // #877 counts.
+        daemon.note_polled_expiry(
+            0,
+            Some(BEYOND + 86_400),
+            CredentialReadSource::Canonical,
+            EXPIRY_NOW,
+            &mut events,
+        );
+        assert_eq!(
+            observations_for(&events, "u-A"),
+            vec![&Event::CredentialExpiryObserved {
+                account: "u-A".to_owned(),
+                provenance: ExpiryProvenance::ExternalChange,
+                before: Some(BEYOND),
+                after: BEYOND + 86_400,
+                grant_replaced: None,
+            }],
+            "a re-stash baseline vs a canonical poll is one item, not two: {events:?}"
+        );
+
+        // The mirror, on a second account: the same re-stash anchor, but a swap parks the account
+        // before its next poll, so that poll reads its stash. Same fold, same constant, opposite
+        // verdict — which is what makes the constant observable at all.
+        events.clear();
+        daemon.note_restash_expiry(1, Some(BEYOND), None, EXPIRY_NOW, &mut events);
+        events.clear();
+        daemon.note_polled_expiry(
+            1,
+            Some(BEYOND + 86_400),
+            CredentialReadSource::Stash,
+            EXPIRY_NOW,
+            &mut events,
+        );
+        assert_eq!(
+            observations_for(&events, "u-B"),
+            vec![&Event::CredentialExpiryObserved {
+                account: "u-B".to_owned(),
+                provenance: ExpiryProvenance::ReadSourceSwitched,
+                before: Some(BEYOND),
+                after: BEYOND + 86_400,
+                grant_replaced: None,
+            }],
+            "a re-stash baseline vs a stash poll spans two items: {events:?}"
         );
     }
 

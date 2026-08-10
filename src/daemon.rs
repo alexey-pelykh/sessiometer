@@ -258,8 +258,8 @@ pub(crate) use records::{TickAction, TickOutcome};
 // takes the daemon-private `AnchorArmInputs`, which would be a more-private type in a public
 // interface.
 use records::{
-    blind_active_view, BlindAnchor, BlindPreemptSwapRecord, LastGood, LastSwap, ParkedLanding,
-    SwapVerdict, TickBackoff, VelocityEma,
+    blind_active_view, BlindAnchor, BlindPreemptSwapRecord, CredentialReadSource, LastGood,
+    LastSwap, ParkedLanding, SwapVerdict, TickBackoff, VelocityEma,
 };
 
 // The five responsibility clusters carved out of the single `impl Daemon<P, C, S, K>` block by the
@@ -1110,6 +1110,23 @@ pub(crate) struct AccountHealth {
     /// `AccountRuntime::polled_once`, which tracks the POLL and is set even by a poll that read no
     /// credential.
     refresh_token_expires_at_baseline: Option<i64>,
+    /// WHICH credential item the baseline above was read out of (issue #907) — the
+    /// [`ExpiryProvenance::ReadSourceSwitched`] discriminator.
+    ///
+    /// The daemon reads an account's deadline from the CANONICAL item while it is active and from
+    /// that account's own STASH while it is parked ([`Daemon::read_poll_clocks`]). Those two
+    /// normally agree, so most swaps produce no delta at all — but while they transiently disagree,
+    /// comparing an observation from one against a baseline from the other measures the gap between
+    /// two ITEMS, not a write. Carrying the source beside the deadline is what lets
+    /// `note_polled_expiry` say so on the record instead of inferring an external write that never
+    /// happened.
+    ///
+    /// Written in LOCKSTEP with the baseline — `fold_expiry_observation` is the only writer of
+    /// either, and it sets both on every observation it folds — so `Some(baseline)` always implies
+    /// `Some(source)`. The comparison is nonetheless written to treat an ABSENT source as a switch
+    /// rather than a match: if the pairing were ever broken, the honest answer is *we cannot say
+    /// both readings came from the same item*, and that is the tag that says so.
+    refresh_token_expires_at_baseline_source: Option<CredentialReadSource>,
     /// Whether the daemon's OWN refresh wrote this account's credential since the last deadline
     /// observation (issue #880) — the `my_refresh`-vs-`external_change` provenance latch.
     ///
@@ -1120,9 +1137,12 @@ pub(crate) struct AccountHealth {
     ///
     /// The latch covers the daemon's own IN-PROCESS refresh paths, which is narrower than "every
     /// first-party refresh" — an out-of-process `sessiometer poke` arms nothing here. So a clear latch
-    /// means only *this process did not refresh*, and the change it fails to explain is attributed
-    /// `external_change`, which is a residual category rather than a positive finding. The set of
-    /// writes that land there wrongly is enumerated once, on
+    /// means only *this process did not refresh*. A change it fails to explain is attributed
+    /// `external_change` only once [`Daemon::note_polled_expiry`]'s source check below it has ruled
+    /// out a read-source switch (issue #907): a delta measured across the canonical/stash boundary is
+    /// [`ExpiryProvenance::ReadSourceSwitched`] and never reaches the residual category. What does
+    /// reach it is a residual category rather than a positive finding — the set of writes that land
+    /// there wrongly is enumerated once, on
     /// [`ExpiryProvenance::ExternalChange`] — read it before drawing a conclusion from that tag.
     own_refresh_since_expiry_observation: bool,
     /// The horizon band this account was last SIGNALED at (issue #880) — the edge-trigger latch
@@ -2741,7 +2761,11 @@ where
             // Issue #878: the SAME read also yields the REFRESH token's own fixed deadline, which
             // feeds the orthogonal expiry modifier (never `credential_health`) — one credential
             // read, two clocks, no extra `security` subprocess per cycle.
-            let clocks = self
+            // Issue #907: that read also reports WHICH credential item it came out of — the
+            // canonical for the active account, this account's own stash otherwise. Carried into
+            // the fold below so a delta measured across a switch between the two is marked as
+            // such rather than inferred to be an external write.
+            let (clocks, clocks_source) = self
                 .read_poll_clocks(&self.roster[i], active == Some(i))
                 .await;
             self.state.accounts[i].health.poll_expires_at = clocks.access_expires_at;
@@ -2756,6 +2780,7 @@ where
             self.note_polled_expiry(
                 i,
                 clocks.refresh_token_expires_at,
+                clocks_source,
                 wall_clock_now_secs(),
                 &mut events,
             );

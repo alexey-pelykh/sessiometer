@@ -588,15 +588,13 @@ pub(crate) enum ExpiryProvenance {
     ///   durable event of its own either, so there is nothing to correlate against — tracked as
     ///   issue #906;
     /// - a swap-lock-serialized write by any other CLI verb on the same stash;
-    /// - **a change of READ SOURCE, with nothing written at all.**
-    ///   [`crate::daemon::Daemon::read_poll_clocks`] reads the ACTIVE account's deadline from the
-    ///   canonical keychain item and a PARKED account's from its stash copy, so an account that
-    ///   swapped in or out between two polls has its deadline read from a DIFFERENT item on either
-    ///   side of the comparison. Those two normally agree — the daemon re-stashes on every write it
-    ///   makes — but while they transiently disagree the delta is an artifact of where we looked, not
-    ///   of anything that happened. Correlate against `event=swap` / `event=restash` for the same
-    ///   `acct=` when a change lands on a swap boundary; closing it needs a baseline that carries the
-    ///   read source, tracked as issue #907.
+    /// - a change of READ SOURCE — **no longer this variant, since issue #907.** The baseline now
+    ///   carries the item it was read out of, so a delta measured across a switch between the
+    ///   canonical and a stash is classified [`Self::ReadSourceSwitched`] and never reaches here.
+    ///   Nothing about the underlying two-item design changed and no reconciliation was added: what
+    ///   changed is that the daemon now KNOWS the comparison spanned two items and says so. Reaching
+    ///   this variant is therefore a positive statement that both readings came out of the SAME item
+    ///   — which is what makes the population below countable.
     ///
     /// The inference is one-directional in the OTHER direction from what a reader might hope: an
     /// external write that RACES the daemon's own refresh inside one poll interval is attributed
@@ -608,6 +606,53 @@ pub(crate) enum ExpiryProvenance {
     /// spike is read, and cross-check a surprising cluster against `event=refresh` for the same
     /// `acct=` before concluding anything about re-login behaviour.
     ExternalChange,
+    /// The two compared observations were read out of DIFFERENT credential items (issue #907): the
+    /// deadline moved across a change of READ SOURCE, so the delta may be an artifact of where we
+    /// looked rather than evidence that anything was written.
+    ///
+    /// [`crate::daemon::Daemon::read_poll_clocks`] reads the ACTIVE account's deadline from the
+    /// shared canonical keychain item and a PARKED account's from its own stash copy, so an account
+    /// that swapped in or out between two polls has its deadline read from a different item on
+    /// either side of the comparison. Most swap boundaries still produce no delta and therefore no
+    /// line at all — but NOT because the swap engine reconciles the two items. `swap::swap` step 2
+    /// re-stashes the outgoing account from the canonical as it stands at SWAP time, so the item it
+    /// parks carries that canonical's CURRENT deadline: the delta a later parked poll can see is
+    /// exactly the canonical's own movement between that account's last active poll and the swap.
+    /// Usually zero, and then there is no line; a token that rotated IN PLACE inside that window is
+    /// parked with a changed deadline, and the daemon's own swap does produce this variant.
+    ///
+    /// What actually keeps the line rare is a different mechanism: the top-of-tick
+    /// [`crate::daemon::Daemon::reconcile_canonical_change`] normally catches an out-of-band
+    /// canonical write on the next tick, re-stashes it, and folds the baseline forward as
+    /// [`Self::CanonicalRestash`] before that account is polled again. So this variant appears
+    /// where that reconciliation did not get there first, which makes it a positive signal in its
+    /// own right: the re-stash discipline has a gap for that account right now (a re-stash that
+    /// failed on a locked keychain, a canonical write not yet reconciled, a rotation landing
+    /// between the poll's own canonical read and the swap's — which the NEXT tick cannot recover
+    /// either, because `record_swap` has by then committed the canonical watch to the INCOMING
+    /// credential — or a swap path that re-stashes nothing for the departing account: an
+    /// out-of-band `claude /login` / `use` adoption, or the #467 scrub adopt).
+    ///
+    /// **Marked, not suppressed, and the choice is about the reader.** Dropping the line would
+    /// assert *this was not a real change* — a claim the daemon cannot support, since a genuine
+    /// external write may ALSO have landed in that interval; the daemon knows only that the
+    /// comparison spanned two items. Worse, it would be silent exactly where it hurts: swap
+    /// boundaries are frequent and correlate with the periods an operator is most likely to have
+    /// re-logged in, so suppression would blind the record over the very population issue #877 is
+    /// asking about. Keeping the line preserves the delta and both deadlines for an operator, and
+    /// gives an offline reader a one-token filter — the same partition-by-`provenance=` the other
+    /// rows already support — instead of an absence to reason about. Naming it also keeps the
+    /// residual [`Self::ExternalChange`] population countable BY DEFAULT: a reader who knows
+    /// nothing of this variant now counts a cleaner set, and one who wants the union adds it back
+    /// deliberately.
+    ///
+    /// Observational, like every variant here: it names what was true of the COMPARISON, never what
+    /// the delta means. It does NOT claim the deadline is unchanged, and it does not rule an
+    /// external write out — it says the evidence cannot separate the two. It is also strictly a
+    /// subset of what [`Self::ExternalChange`] used to absorb; a change the daemon's own refresh
+    /// caused still reports [`Self::MyRefresh`], because that attribution is hard evidence and a
+    /// concurrent swap does not weaken it (see `Daemon::note_polled_expiry` for the ordering).
+    ReadSourceSwitched,
     /// The daemon HEALED an out-of-band canonical write (the issue #13 re-auth re-stash) — the same
     /// external class as [`Self::ExternalChange`], but caught AT the write edge rather than inferred
     /// from a later poll delta.
@@ -631,6 +676,7 @@ impl ExpiryProvenance {
             ExpiryProvenance::FirstObservation => "first_observation",
             ExpiryProvenance::MyRefresh => "my_refresh",
             ExpiryProvenance::ExternalChange => "external_change",
+            ExpiryProvenance::ReadSourceSwitched => "read_source_switched",
             ExpiryProvenance::CanonicalRestash => "canonical_restash",
         }
     }
@@ -1854,7 +1900,7 @@ pub(crate) enum Event {
     /// - the FIRST deadline observed for the account this run ([`ExpiryProvenance::FirstObservation`]
     ///   — an absolute anchor, see that variant for the restart gap it closes),
     /// - a CHANGE against the last observed deadline ([`ExpiryProvenance::MyRefresh`] /
-    ///   [`ExpiryProvenance::ExternalChange`]),
+    ///   [`ExpiryProvenance::ReadSourceSwitched`] / [`ExpiryProvenance::ExternalChange`]),
     /// - the daemon healing an out-of-band canonical write ([`ExpiryProvenance::CanonicalRestash`]),
     ///   change or no change.
     ///
@@ -6229,6 +6275,77 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
         assert!(
             line.ends_with(" delta_secs=-86400"),
             "a shrinking deadline keeps its sign: {line}"
+        );
+    }
+
+    /// Issue #907: the cross-source observation renders its OWN token, and the provenance set stays
+    /// a closed list of distinct, fixed `snake_case` literals.
+    ///
+    /// The token is the analysis interface — issue #877's population is partitioned by
+    /// `provenance=`, exactly as `the_three_provenance_rows_are_distinguishable_from_the_rendered_
+    /// log_alone` reads it — so a delta that spanned two credential items has to be filterable off
+    /// the rendered line, not merely distinguishable in memory.
+    ///
+    /// The EXHAUSTIVE match below is the mechanical half, the same idiom as the `CredentialHealth`
+    /// ramp guard in [`crate::daemon`]: a fifth variant fails to COMPILE here, so no provenance can
+    /// reach the log without someone stating its token (and extending the list beside it). The
+    /// literals are spelled out again rather than routed through `as_str`, which would be a
+    /// tautology — this is the second, independent statement of the mapping. That each arm is a
+    /// LITERAL is itself the issue #15 guarantee: the `provenance=` value is never dynamic text, so
+    /// the line cannot carry a secret by construction rather than by review.
+    #[test]
+    fn the_expiry_provenance_tokens_are_a_closed_set_of_fixed_snake_case_literals() {
+        let line = Event::CredentialExpiryObserved {
+            account: "u-A".to_owned(),
+            provenance: ExpiryProvenance::ReadSourceSwitched,
+            before: Some(1_785_499_802),
+            after: 1_785_586_202,
+            grant_replaced: None,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!(
+                "{TS0} event=credential_expiry_observed acct=u-A provenance=read_source_switched before=2026-07-31T12:10:02Z after=2026-08-01T12:10:02Z delta_secs=86400"
+            )
+        );
+
+        let mut tokens = Vec::new();
+        for provenance in [
+            ExpiryProvenance::FirstObservation,
+            ExpiryProvenance::MyRefresh,
+            ExpiryProvenance::ExternalChange,
+            ExpiryProvenance::ReadSourceSwitched,
+            ExpiryProvenance::CanonicalRestash,
+        ] {
+            let expected = match provenance {
+                ExpiryProvenance::FirstObservation => "first_observation",
+                ExpiryProvenance::MyRefresh => "my_refresh",
+                ExpiryProvenance::ExternalChange => "external_change",
+                ExpiryProvenance::ReadSourceSwitched => "read_source_switched",
+                ExpiryProvenance::CanonicalRestash => "canonical_restash",
+            };
+            assert_eq!(provenance.as_str(), expected, "{provenance:?}");
+            assert!(
+                expected
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b == b'_'),
+                "a provenance token is bare `snake_case`: {expected}"
+            );
+            // The same blunt rule `no_event_line_carries_an_email_or_token_sigil` applies to every
+            // line, restated on the token itself so a respelling is rejected where it is CHOSEN
+            // rather than three tests away — see `grant_replaced`'s doc for why that check earns
+            // its bluntness and must not be relaxed to accommodate a name.
+            assert!(!expected.contains("token"), "{expected}");
+            tokens.push(expected);
+        }
+        let mut distinct = tokens.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            tokens.len(),
+            "two provenances sharing a token would silently merge two populations: {tokens:?}"
         );
     }
 
