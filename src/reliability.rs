@@ -1427,8 +1427,14 @@ impl Landing {
 ///
 /// Percentiles are `None` when no positive velocity sample was observed — cardinality-zero is not a
 /// passing distribution (the [`SwapOvershoot`] discipline), so the readout never asserts the constant
-/// is honest on an empty subject. Rates are `f64` %/min (rounded for display only), not the `u8`
-/// percents the swap-out SLIs carry.
+/// is honest on an empty subject. Rates are `f64` %/min, not the `u8` percents the swap-out SLIs
+/// carry.
+///
+/// **The stored rates are never rounded** (issue #1172). Each surface renders them at its own width
+/// — the wire at full `f64` precision, the human render at 4 dp — but the value these fields hold is
+/// the recomputed rate as measured, because [`Self::v_peak_honest`] compares `p100` against a 2-dp
+/// constant and rounding first would let a real peak that exceeds it read as honest. Why that is a
+/// reachable false negative and not a rounding nicety: [`round_pp`] § "Where this is the wrong tool".
 #[derive(Debug, PartialEq)]
 struct ObservedPeak {
     /// Count of positive session-velocity samples in view.
@@ -1656,6 +1662,28 @@ struct BlindProjectionError {
 /// report different numbers for the same episode. The trailing `+ 0.0` normalizes IEEE `-0.0` (an
 /// error that rounds to zero from below) to `0.0`, so a spot-on projection renders `+0.00` rather
 /// than the confusing `-0.00`.
+///
+/// # Where this is the wrong tool, and why that is not an inconsistency (issue #1172)
+///
+/// The invariant above is about a single stored value feeding both renderers — it is NOT a licence
+/// to quantize any figure at aggregation. It is safe HERE because the blind-arm projection error is
+/// only ever reported: nothing downstream compares it against a threshold, so rounding it changes
+/// how it reads and nothing else.
+///
+/// [`ObservedPeak`] deliberately does NOT use this, and the reason is a correctness one rather than
+/// a taste one. Its `p100` is not merely reported — [`ObservedPeak::v_peak_honest`] compares it
+/// against [`crate::swap::V_PEAK_SESSION_PCT_PER_MIN`], a 2-dp constant (`6.95`). Rounding it here
+/// would quantize the compared value onto the constant's own grid, so any real peak exceeding the
+/// constant by less than half a quantum would land exactly ON it and read as honest. That is
+/// reachable from an ordinary emittable line, not a contrived one: `session_delta_pct=19` (an `i16`)
+/// over `elapsed_secs=164` is `6.9512…` %/min, which `round_pp` sends to exactly `6.95`, flipping
+/// the verdict from "re-calibrate" to "ok" — a silent false negative on the one question that SLI
+/// exists to answer, at precisely the boundary where it matters. Pinned by the test
+/// `v_peak_honest_compares_the_unrounded_peak`, which also asserts the counterfactual so the trap
+/// stays visible rather than merely avoided.
+///
+/// The divergence that made this question worth asking is settled on the DISPLAY side instead: see
+/// the § "WHY 4 dp AND NOT 2" note in [`render_human`]'s SLI 1d arm.
 fn round_pp(v: f64) -> f64 {
     (v * 100.0).round() / 100.0 + 0.0
 }
@@ -2068,6 +2096,30 @@ fn render_human(r: &Report) -> String {
     // SLI 1d — OBSERVED session velocity (issue #608): the live session_pct_per_min distribution vs
     // the assumed v_peak the swap-target reserve coupling bound is calibrated on. Keeps that constant
     // honest — if the real peak outruns v_peak, the config-load bound is silently too loose.
+    //
+    // WHY 4 dp AND NOT 2 (issue #1172). Both figures on the P100 line are widened together, because
+    // the line is a COMPARISON and comparing two numbers printed at different widths is the confusion
+    // being fixed. Two dp was too coarse on both of this SLI's jobs:
+    //   - Reading a rate at all. A climb under 0.005 %/min printed `0.00` — the same floor that hid
+    //     the sample from the SLI entirely until issue #1158 read the ingredients instead of the
+    //     rendered field. Fixing the input while the readout still printed `0.00` left the fix
+    //     invisible on the surface an operator actually reads.
+    //   - Reading the verdict. `v_peak_honest` compares the UNROUNDED p100 against a 2-dp constant,
+    //     so a peak exceeding it by less than half of the 2-dp quantum rendered as
+    //     `6.95 … vs assumed v_peak 6.95 … [RECALIBRATE]` — the flag correct, the numbers beside it
+    //     apparently contradicting it, and nothing to tell the reader which to believe.
+    // 4 dp CLOSES that second band for every line this emitter can produce, which is the reason it
+    // is 4 and not 3. As a format it does not: an excess below 0.00005 still prints as a tie. But
+    // `session_delta_pct` is a difference of two `to_pct` values (`src/daemon/snapshot.rs:1072`
+    // clamps each to 0..=100), so the numerator is an integer in -100..=100, and a tie additionally
+    // needs the rate to sit above 6.95, which bounds `elapsed_secs`. Sweeping every integer
+    // `(delta in 1..=100, elapsed in 1..=1_000_000)` pair that carries a real excess yet renders
+    // peak and constant alike: 30 such pairs at 2 dp (the first is `(19, 164)`, which
+    // `NEAR_BOUNDARY_LOG` is), 3 at 3 dp, and ZERO at 4. The first pair reaching the 4-dp band at
+    // all needs `session_delta_pct = 248` — two and a half times what the emitter can produce.
+    // So two equal-looking figures under `[RECALIBRATE]` are never a rendering artifact here, and
+    // must not be discounted as one. The FLAG stays authoritative regardless — it is computed from
+    // the stored value, never from these digits.
     match (
         r.observed_peak.p50,
         r.observed_peak.p90,
@@ -2081,10 +2133,10 @@ fn render_human(r: &Report) -> String {
                 "  measured n={} usage_velocity samples\n",
                 r.observed_peak.n
             ));
-            out.push_str(&format!("  P50  = {p50:.2} %/min\n"));
-            out.push_str(&format!("  P90  = {p90:.2} %/min\n"));
+            out.push_str(&format!("  P50  = {p50:.4} %/min\n"));
+            out.push_str(&format!("  P90  = {p90:.4} %/min\n"));
             out.push_str(&format!(
-                "  P100 = {p100:.2} %/min  vs assumed v_peak {:.2} %/min  {}\n",
+                "  P100 = {p100:.4} %/min  vs assumed v_peak {:.4} %/min  {}\n",
                 crate::swap::V_PEAK_SESSION_PCT_PER_MIN,
                 // Distinct label from the swap-out SLIs' [ok]/[OVER]: this is not an SLO breach but
                 // a calibration signal — the constant is too loose, not the daemon too slow.
@@ -2439,9 +2491,15 @@ struct LandingClassesWire {
 /// are now recomputed from `session_delta_pct` + `elapsed_secs`, so a rate like `0.004975…`
 /// reaches the wire as written. Deliberately NOT re-rounded here: re-quantizing the calibration
 /// readout would undo, at the surface a human reads to re-calibrate the constant, exactly the
-/// precision loss #1158 removed. The human render is unaffected — it has always formatted these with
-/// `{:.2}` at the point of display — so the two surfaces can now show different precision for the
-/// same sample; whether to reconcile them, and at which layer, is tracked as issue #1172.
+/// precision loss #1158 removed.
+///
+/// The precision the human render shows beside it was reconciled by issue #1172, and the layer it
+/// was reconciled AT is the point: the human render widened to 4 dp, while the aggregation — and
+/// therefore this wire — kept the value unrounded. Both surfaces now render one shared value at
+/// their own width rather than reporting two different ones, which is what the divergence was.
+/// Rounding at aggregation instead would have quantized the value `v_peak_honest` compares
+/// ([`round_pp`] § "Where this is the wrong tool"), and rounding in both renderers would have
+/// re-quantized exactly the machine-readable figure a calibration script consumes.
 #[derive(serde::Serialize)]
 struct ObservedPeakWire {
     n: usize,
@@ -3308,6 +3366,156 @@ ts=2026-07-11T00:02:00Z event=usage_velocity acct=u-A session_pct_per_min=-0.15 
         );
     }
 
+    // --- issue #1172: which layer may quantize this SLI's rates -----------------
+
+    /// An ordinary emittable line whose rate exceeds `V_PEAK_SESSION_PCT_PER_MIN` by less than half
+    /// of the 2-dp quantum: `session_delta_pct=19` over `elapsed_secs=164` is `6.9512…` %/min.
+    ///
+    /// Both ingredients are shapes the emitter really produces — `session_delta_pct` is an `i16` and
+    /// `elapsed_secs` a whole-second interval — so this is not a synthetic float chosen to sit in the
+    /// gap. It was found by scanning integer `(delta, elapsed)` pairs for a rate inside
+    /// `(6.95, 6.955)`; the first is `(19, 164)`, and a 19-point climb over 2 min 44 s is exactly the
+    /// heavy-usage burst this SLI is watching for.
+    const NEAR_BOUNDARY_LOG: &str = "ts=2026-07-11T00:00:00Z event=usage_velocity acct=u-A session_pct_per_min=6.95 weekly_pct_per_min=0.01 elapsed_secs=164 session_delta_pct=19 weekly_delta_pct=0\n";
+
+    /// [`ObservedPeak::v_peak_honest`] must compare the rate AS MEASURED, never a display-rounded
+    /// one — the constraint that decides which layer may quantize this SLI (issue #1172), and the
+    /// reason [`round_pp`] is not reached for from [`aggregate`]'s `velocity_pct`.
+    ///
+    /// The second half asserts the COUNTERFACTUAL rather than merely avoiding it: rounding at
+    /// aggregation flips this exact sample from "re-calibrate" to "ok". Without it the first
+    /// assertion looks like an arbitrary precision preference, and the next reader re-derives the
+    /// trap from scratch — or does not.
+    #[test]
+    fn v_peak_honest_compares_the_unrounded_peak() {
+        let r = aggregate(&parse_events(NEAR_BOUNDARY_LOG, None), &[], None);
+        let p100 = r.observed_peak.p100.expect("one positive sample");
+        assert!(
+            p100 > crate::swap::V_PEAK_SESSION_PCT_PER_MIN,
+            "fixture must sit ABOVE the assumed peak or this test asserts nothing: {p100}"
+        );
+        assert_eq!(
+            r.observed_peak.v_peak_honest(),
+            Some(false),
+            "a real peak above the constant must flag it too loose, however small the excess"
+        );
+
+        // The rejected repair, made executable. `round_pp` lands this sample exactly ON the
+        // constant, and `<=` then reads it as bounded — the SLI reporting the constant honest at the
+        // one moment it is not.
+        assert_eq!(
+            round_pp(p100),
+            crate::swap::V_PEAK_SESSION_PCT_PER_MIN,
+            "the trap's premise: 2-dp rounding puts this peak exactly on the constant"
+        );
+        let as_if_rounded = ObservedPeak {
+            p100: Some(round_pp(p100)),
+            ..r.observed_peak
+        };
+        assert_eq!(
+            as_if_rounded.v_peak_honest(),
+            Some(true),
+            "rounding at aggregation would invert the verdict — why this SLI must not use round_pp"
+        );
+    }
+
+    /// The issue #1172 divergence itself: one `Report`, two renderers, and they must not report
+    /// different NUMBERS for the same sample.
+    ///
+    /// The fixture is the issue #1158 climb that `{:.2}` floored to `0.00` — `session_delta_pct=1`
+    /// over 12 060 s. Reading the ingredients kept the sample; this asserts the readout an operator
+    /// looks at finally shows it, while the wire keeps the value at full precision for a calibration
+    /// script. Both surfaces render ONE stored value; neither re-quantizes what is stored.
+    #[test]
+    fn both_surfaces_report_the_same_sub_two_dp_climb() {
+        let log = "ts=2026-07-11T00:00:00Z event=usage_velocity acct=u-A session_pct_per_min=0.00 weekly_pct_per_min=0.00 elapsed_secs=12060 session_delta_pct=1 weekly_delta_pct=0\n";
+        let r = aggregate(&parse_events(log, None), &[], None);
+
+        let human = render_human(&r);
+        assert!(
+            human.contains("  P100 = 0.0050 %/min"),
+            "the human readout must show a sub-0.01 climb as a rate, not as 0.00: {human}"
+        );
+        assert!(
+            !human.contains("= 0.00 %/min"),
+            "no percentile may still render as a flat zero: {human}"
+        );
+
+        let json = render_json(&r).expect("serializes");
+        assert!(
+            json.contains("\"p100\": 0.004975124378109453"),
+            "the wire must keep the rate unrounded for a calibration consumer: {json}"
+        );
+    }
+
+    /// A `[RECALIBRATE]` verdict must be legible in the numbers printed beside it.
+    ///
+    /// At 2 dp this line read `P100 = 6.95 %/min  vs assumed v_peak 6.95 %/min  [RECALIBRATE]` —
+    /// two identical figures and a flag apparently contradicting them. Both are widened together,
+    /// because the line is a comparison. This does not hold for an excess below `0.00005`, where the
+    /// two again print alike; the flag, computed from the stored value, stays authoritative.
+    #[test]
+    fn human_render_shows_the_excess_behind_a_recalibrate_flag() {
+        let r = aggregate(&parse_events(NEAR_BOUNDARY_LOG, None), &[], None);
+        let human = render_human(&r);
+        assert!(
+            human.contains(
+                "  P100 = 6.9512 %/min  vs assumed v_peak 6.9500 %/min  [RECALIBRATE]\n"
+            ),
+            "the printed peak must visibly exceed the printed constant when the flag says so: {human}"
+        );
+    }
+
+    /// 4 dp is the narrowest width that leaves NO emittable line printing a real excess as a tie —
+    /// the measurement behind [`render_human`]'s "why 4 dp and not 3", and the reason an operator
+    /// must never discount two equal-looking figures under `[RECALIBRATE]` as a rounding artifact.
+    ///
+    /// The claim is bounded, not universal: as a FORMAT `{:.4}` still ties on an excess below
+    /// `0.00005`. What closes it is the emitter. `session_delta_pct` is a difference of two
+    /// [`crate::daemon::snapshot::to_pct`] values, each clamped to `0..=100`, so the numerator is
+    /// an integer in `-100..=100`; requiring a real excess then bounds `elapsed_secs`, because the
+    /// rate falls monotonically as it grows. That makes the search finite and this sweep
+    /// exhaustive over it rather than a sample of it.
+    #[test]
+    fn four_dp_leaves_no_emittable_near_boundary_tie() {
+        let v_peak = crate::swap::V_PEAK_SESSION_PCT_PER_MIN;
+        // Every integer (delta, elapsed) carrying a REAL excess that still renders alike at `width`.
+        let ties = |width: usize| -> Vec<(i32, i32)> {
+            let mut out = Vec::new();
+            for delta in 1..=100 {
+                for elapsed in 1..1_000_000 {
+                    let rate = f64::from(delta) * 60.0 / f64::from(elapsed);
+                    if rate <= v_peak {
+                        break; // monotonically decreasing in `elapsed` — nothing further can exceed
+                    }
+                    if format!("{rate:.*}", width) == format!("{v_peak:.*}", width) {
+                        out.push((delta, elapsed));
+                    }
+                }
+            }
+            out
+        };
+
+        // Canaried against a width whose answer is already known and pinned elsewhere: 2 dp is the
+        // regime this change replaces, and NEAR_BOUNDARY_LOG's own pair must be the first hit. A
+        // sweep that cannot reproduce a known-positive is not evidence about the negative.
+        let two = ties(2);
+        assert_eq!(
+            two.first(),
+            Some(&(19, 164)),
+            "the 2-dp sweep must rediscover NEAR_BOUNDARY_LOG's own pair, or it is not measuring \
+             what this test claims"
+        );
+        assert_eq!(two.len(), 30, "2 dp: {two:?}");
+        assert_eq!(ties(3).len(), 3, "3 dp still leaves emittable ties");
+        assert_eq!(
+            ties(4),
+            Vec::new(),
+            "4 dp must leave NONE — if this reds, render_human's stated bound is false and the \
+             comment must be narrowed to what the sweep actually shows"
+        );
+    }
+
     #[test]
     fn observed_peak_is_bounded_by_the_active_window() {
         // The #494 `--since` window bounds this SLI like every other: a cutoff after the early
@@ -3627,9 +3835,9 @@ ts=2026-07-11T00:04:00Z event=swap from=c to=d reason=session session_pct=100
                 "\n",
                 "observed session velocity (session_pct_per_min, positive climbs only; the v_peak reserve-coupling calibration input)\n",
                 "  measured n=1 usage_velocity samples\n",
-                "  P50  = 0.20 %/min\n",
-                "  P90  = 0.20 %/min\n",
-                "  P100 = 0.20 %/min  vs assumed v_peak 6.95 %/min  [ok]\n",
+                "  P50  = 0.2000 %/min\n",
+                "  P90  = 0.2000 %/min\n",
+                "  P100 = 0.2000 %/min  vs assumed v_peak 6.9500 %/min  [ok]\n",
                 "\n",
                 "time blind & near-limit: 900s (sum of blind_window duration_secs where near_limit=true)\n",
                 // The issue #591 uncensored census, rendered BESIDE the censored 900s figure — never
