@@ -225,9 +225,25 @@ EXPIRY AUTH` column parity (R-2 of the CLI/panel parity contract).
 
 **AC-2 (R-2, R-2a)** — *Given* the emitted `AppIcon.appiconset` at any size, *When* the opaque-content
 bounding box is measured as a fraction of canvas, *Then* it matches the Apple-published grid within
-tolerance. **BUT NOT** with the value sourced only from peer-app measurement; **BUT NOT** by retaining the
-baked 22.4 % corner radius on top of the system's own mask; **BUT NOT** at only some sizes — all of
-16→1024 conform or the change is incomplete.
+tolerance. **BUT NOT** with the value sourced only from peer-app measurement;
+~~**BUT NOT** by retaining the baked 22.4 % corner radius on top of the system's own mask~~ →
+**BUT NOT** by *dropping* that baked radius, which this AC's own bounding-box measurement cannot see
+(the note below); **BUT NOT** at only some sizes — all of 16→1024 conform or the change is incomplete.
+
+> **AMENDED 2026-08-10 (#1141) — the struck clause is wrong; the live clause inverts it.** There is no
+> "system's own mask": macOS is not iOS and applies none, so the rounding lives in the artwork — every
+> peer app measured reads **alpha 0** at its own body-box corners. Dropping `icon.svg`'s `rx="229"`
+> therefore ships a hard-cornered **square** whose bounding box is *identical* to the shipped tile's —
+> so this AC, which measures a bounding box, is structurally blind to the defect its old wording asked
+> for, and the clause is inverted rather than dropped. The shipped gate closes that blindness with
+> a second probe (`AppIconGrid.cornerAlphas` / `squareFillThreshold`, issue #991). The radius was never
+> the defect — it rides `APPICON_SCALE` from 229 down to **184.3** on an 824 body, 0.6 % under the
+> template's 185.4; the icon read over-rounded because it was over-**sized**
+> (`brand/README.md` § "The baked `rx` stays — macOS is not iOS"). **R-2 is unchanged and is satisfied as
+> shipped**: its *"rather than emitting a full-bleed canvas with a baked corner radius"* names the
+> pre-#952 artifact, which was full-bleed **and** baked-radius together — it rejects the full-bleed
+> canvas, not the radius. Struck rather than deleted, because it was a recorded position that #952
+> deliberately did not follow.
 
 **AC-3 (R-3a, R-3b)** — *Given* the swap chip in its resting state, *When* its as-shipped contrast against
 the composited row background is measured, *Then* a recorded number exists and either clears 3.0:1 or is
@@ -284,7 +300,7 @@ PAST:    100.0% at every size (full-bleed); peers measure 81.2 / 82.8 / 82.8
 | Feature | Verdict | Gap |
 |---|---|---|
 | Expiry column placement (R-1, R-10) | ✅ **DELIVERED** 2026-07-30 | ~~Target placement undecided~~ — decided and shipped as issue #951, commit `c5f851d`. |
-| App-icon grid (R-2, R-2a) | ✅ **DELIVERED** 2026-07-30 | ~~Inset value ungrounded (R-2a)~~ — grounded and shipped as issue #952, commit `12ee1c4`. **Still open**: the grid has no *gate* (issue #991), and whether an Icon Composer `.icon` asset ships alongside (D5). |
+| App-icon grid (R-2, R-2a) | ✅ **DELIVERED** 2026-07-30 | ~~Inset value ungrounded (R-2a)~~ — grounded and shipped as issue #952, commit `12ee1c4`. ~~**Still open**: the grid has no *gate* (issue #991)~~ — gated 2026-08-10 by `AppIconGridTests`, commit `2388c26` (PR #1142). **Still open**: whether an Icon Composer `.icon` asset ships alongside (D5). |
 | Resting chip contrast (R-3a, R-3b) | ✅ **DELIVERED** 2026-07-30 | ~~As-shipped value unmeasured~~ — issue #949 measured it on a built panel (1.91:1 light / 2.70:1 dark, 0 of 243 / 433 chip pixels clearing 3:1); issue #956 then shipped a four-variant `SwapChipResting` colour set at **3.34:1 both appearances**, commit `0ab82fc`. The product decision resolved to design § 4.4 option (d). |
 | Row affordance coverage (R-4, R-11) | **NEAR-COMPLETE** ⟵ *amended* | **Was INCOMPLETE on a false premise** — see § 13.2. The mock **does** author the active row (28 `.acct active`) and the blocked copy **verbatim** ×4; the auth-glyph omission is a deliberate 42-vs-0 `title=` pattern, not silence. Remaining gap is **one** state (blocked) and a *treatment* for the health glyph. |
 | Tooltip scope (R-5) | **COMPLETE** | Reference is present and unambiguous (`menubar-preview.html:742`). Conform, subject to R-11. |

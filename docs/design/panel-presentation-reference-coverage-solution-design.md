@@ -91,9 +91,22 @@ one of which wants the inset:
 Option (a) — the obvious single-source edit — would have silently degraded the website's touch icon and
 all four derived status variants. **Mechanism for (b) needs no new tooling**: `generate.sh` already
 transforms SVG textually via `derive()` (`sed`), so the padding stage emits a wrapper SVG embedding the
-mark at the grid fraction and rasterises that. The baked `rx="229"` radius must also be dropped from the
-app-icon path — the system applies its own mask, and stacking the two is what produces the over-rounded
-"circular" read.
+mark at the grid fraction and rasterises that. ~~The baked `rx="229"` radius must also be dropped from
+the app-icon path — the system applies its own mask, and stacking the two is what produces the
+over-rounded "circular" read.~~
+
+> **AMENDED 2026-08-10 (#1141) — the struck sentence is wrong on both halves, and #952 shipped the
+> opposite.** macOS is not iOS and applies **no mask of its own**: every peer app measured reads
+> **alpha 0** at its own body-box corners, so if the system masked, a peer could ship square artwork —
+> and none does. The rounding lives in the artwork, which makes dropping `rx="229"` a hard-cornered
+> **square**, not an unmasked rounded tile. That square has the *same* bounding box as the shipped one,
+> so Cap-4.1's grid measurement is structurally blind to it — the reason the shipped gate carries a
+> second, corner-reading probe. The radius was never the defect: it rides `APPICON_SCALE` from 229 down
+> to **184.3** on an 824 body, 0.6 % under the template's 185.4; the icon read over-rounded because it
+> was over-**sized**. The correction is recorded at `brand/README.md` § "The baked `rx` stays — macOS is
+> not iOS" (with the peer measurement), in `brand/generate.sh` at `APPICON_INSET`, and executably in
+> `AppIconGrid` (`cornerRadiusRatio`, `cornerAlphas`, `squareFillThreshold`). Struck rather than deleted,
+> recorded because it was a real position and the wrong premise would otherwise be re-derived.
 
 ### 4.3 Axis-disposition mechanism — ~~a trailer gate in `gate-change-ack`~~ → **a scope-time DoR question**
 
@@ -192,7 +205,7 @@ ADR-STUB-1), Context + Options recorded, Decision left OPEN.
 |---|---|---|
 | `StatusPanelRoster.ExpiryLine` | Merged 101 pt right-aligned value cell | UX/IA + UI |
 | `StatusPanelFormat` | A merged-tail cell-width constant, derived from the existing 40/9/52 constants rather than a fourth magic number | UI |
-| `brand/generate.sh` | App-icon-only padding stage + radius drop | Technical Arch |
+| `brand/generate.sh` | App-icon-only padding stage ~~+ radius drop~~ — the baked `rx` **stays**, see § 4.2 | Technical Arch |
 | `StatusPanelRoster.authView` | Hover treatment + `.help()` (shape gated on 4.4 and R-6) | UX/IA |
 | `StatusPanelRoster` row branches | Chip-scoped tooltip + a row-level fallback (R-11) | UX/IA |
 | `design/menubar-preview.html` | New frames: expiry line, auth-glyph affordance, active-row hover | Build reference |
@@ -401,7 +414,7 @@ hatch, which is why it must not be dropped from the option set.
 | Merged 101 pt value cell | Screen element | R-1, R-10 | traced |
 | Fact-tier / value-gutter IA rule | IA rule | R-1 | traced |
 | App-icon padding stage (`generate.sh`) | Pipeline element | R-2 | traced |
-| Radius drop on the app-icon path | Pipeline element | R-2 | traced |
+| ~~Radius drop on the app-icon path~~ | ~~Pipeline element~~ | ~~R-2~~ | **CUT — never an element; see § 4.2.** Never shipped, and the trace was spurious: R-2 rejects the full-bleed *canvas*, not the radius |
 | Chip token option set (a/b/c) | Option set — not yet committed | R-3b | traced, **decision open** |
 | Non-colour affordance channel | Option (4.4b) | R-3b | traced as an option, not an element |
 | Auth-glyph hover + `.help()` | Screen element | R-4 | traced |
