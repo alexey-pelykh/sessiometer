@@ -1409,6 +1409,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn perform_socket_swap_refuses_a_duplicated_label_and_serialises_it_onto_the_wire() {
+        // Issue #1087 AC-2. The daemon shares `use_account::resolve_target` with the five other
+        // label-resolving sites, so it REFUSES a duplicated label rather than taking the earliest
+        // bearer (#17, OQ-1). What no test looked at until now is the half after that: this site
+        // does not exit a process, it SERIALISES its refusal onto a socket, and a refusal that is
+        // correct in-process can still be mis-mapped, malformed or dropped on the way out — a
+        // silent failure whose whole surface is the wire.
+        //
+        // So the assertions come in two halves. First the in-process verdict — the resolver's
+        // `UseTargetAmbiguous` becomes `SwapRejection::AmbiguousTarget` and NOT the neighbouring
+        // `UnknownTarget` (`perform_socket_swap`'s catch-all arm, immediately below the arm under
+        // test, which a swallow of the ambiguous arm would fall through to), with ZERO writes.
+        // Then the wire itself: the exact bytes a client reads, and that they decode back.
+        //
+        // WHICH wire, because this repo has four schema-versioned ones and being on the control
+        // socket implies NONE of them: `STATUS_SCHEMA_VERSION` governs the `status` reply and both
+        // `watch` frames (src/daemon/snapshot.rs), and `log` / `stats` / `reliability` each carry
+        // their own `JSON_SCHEMA_VERSION` in their own module. `SwapAck` is the un-versioned
+        // `swap`-command reply: it carries a `result` tag and a kebab-case `reason` and nothing
+        // else — no `schema` object — so the literal below is not a versioned fixture and pinning
+        // it moves no version.
+        let roster = vec![
+            account("u-A", "work"),
+            account("u-B", "dup"),
+            account("u-C", "dup"),
+        ];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+            ("Sessiometer/u-C", b"C-token", "u-C"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10)
+            .ok("u-C", 0.10, 0.10);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        );
+        warmed_tick(&mut daemon).await;
+
+        // `force: true` deliberately: resolution is not a POLICY gate, so `force` cannot buy past
+        // it — the same reason the unknown-target sibling above forces too. Both bearers are
+        // otherwise perfectly viable (0.10 weekly, unquarantined, cooldown 0), so the ONLY thing
+        // that can refuse this request is the duplicated label.
+        let (ack, events) = daemon
+            .perform_socket_swap(&SwapCommand {
+                target: "dup".to_owned(),
+                force: true,
+            })
+            .await;
+
+        assert_eq!(
+            ack,
+            SwapAck::Rejected {
+                reason: SwapRejection::AmbiguousTarget,
+            },
+            "a duplicated label is AMBIGUOUS, not unknown and not a swap",
+        );
+        assert!(events.is_empty(), "a refused swap logs nothing: {events:?}");
+        assert!(
+            daemon
+                .store
+                .read()
+                .await
+                .unwrap()
+                .matches(&cred(b"A-token")),
+            "an ambiguous target wrote nothing",
+        );
+        assert_eq!(daemon.state.active, Some(0), "…and moved nothing");
+
+        // The wire half. `write_swap_ack` is what the run loop hands the client, so serialise
+        // through IT rather than calling `serde_json` here — the frame's newline, its compact
+        // form and its field names are all properties of that function, and a test that
+        // re-encoded the ack itself would assert none of them.
+        let mut wire = Vec::new();
+        write_swap_ack(&mut wire, &ack)
+            .await
+            .expect("a swap ack must serialise");
+        let wire = String::from_utf8(wire).expect("the ack frame is UTF-8");
+        assert_eq!(
+            wire, "{\"result\":\"rejected\",\"reason\":\"ambiguous-target\"}\n",
+            "the ambiguity refusal's frame, byte for byte",
+        );
+
+        // …and it is a shape a client can ACT on, not merely one it can read: the frame decodes
+        // back to the same closed enum, which is what lets `use`'s daemon-routed path map it to
+        // `Error::UseTargetAmbiguous` and exit 6 (pinned there by
+        // `swap_rejection_error_maps_each_reason_to_the_standalone_exit_taxonomy`).
+        let decoded: SwapAck =
+            serde_json::from_str(wire.trim_end()).expect("a client must be able to decode it");
+        assert_eq!(decoded, ack, "the frame round-trips");
+    }
+
+    #[tokio::test]
     async fn perform_socket_swap_reports_an_already_active_target_as_a_noop() {
         // Non-force swap onto the ALREADY-active account: a no-op SUCCESS (nothing written), the
         // `AlreadyActive` ack — the daemon-routed mirror of the standalone `use` no-op.
