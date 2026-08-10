@@ -2147,7 +2147,7 @@ mod tests {
         ("cached_viability_for", NotHandleResolution, "`AccountStatusLine.label` — a daemon WIRE line, and a duplicated handle there returns None rather than guessing"),
         ("capture", NotHandleResolution, "`CaptureReport.label`"),
         ("capture_failure", NotHandleResolution, "`CaptureCommand.label` — the name being ASSIGNED to a new account"),
-        ("daemon_marks_quarantined", NotHandleResolution, "`AccountStatusLine.label` — matches the daemon's wire line, not the roster"),
+        ("daemon_marks_quarantined", NotHandleResolution, "matches BOTH the daemon's wire line (`AccountStatusLine.label`) and the roster (`Account.label`) since issue #1086 — but it COUNTS bearers on each side and refuses on either being non-unique, exactly as the registered `label_bearers` does. Counting is not resolving"),
         ("import_report", NotHandleResolution, "`AccountImport.label` — per-entry import outcomes"),
         ("new", NotHandleResolution, "`AccountStatusLine.label` — `StatusRow`'s rendered account cell"),
         ("perform_socket_capture", NotHandleResolution, "`CaptureCommand.label` — the name being ASSIGNED to a new account"),
