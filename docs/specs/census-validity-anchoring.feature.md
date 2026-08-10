@@ -1,6 +1,6 @@
 # Feature: a reading stays valid as long as it carries a guarantee
 
-Issue #1030 · PRD R-18 / R-19 · design D-D
+Issue #1030 · PRD R-18 / R-19 · design D-I
 
 Example Mapping: 🟦 5 rules · 🟩 11 examples · 🟥 0 open
 

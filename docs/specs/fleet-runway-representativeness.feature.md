@@ -1,6 +1,6 @@
 # Feature: the runway names who it counted, and refuses when they are the wrong accounts
 
-Issue #1034 · PRD R-5 / R-6 · design D-F · gated by SPIKE #1033
+Issue #1034 · PRD R-5 / R-6 · design D-B · gated by SPIKE #1033
 
 Example Mapping: 🟦 3 rules · 🟩 8 examples · 🟥 0 open
 
