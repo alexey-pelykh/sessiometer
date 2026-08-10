@@ -374,11 +374,14 @@ struct AccountVelocity {
     weekly_rate: Option<f64>,
     /// Approximate whole seconds until the session reading reaches `session_ceiling` at the
     /// smoothed rate: `(ceiling − current) / rate`. `None` when the rate is unknown or `0`, or
-    /// the reading is already at/over the ceiling (no positive head-room to state as a fact).
+    /// the reading is already at/over the ceiling (no positive head-room to state as a fact), or
+    /// the quotient is not PLAUSIBLE — past one rolling session window
+    /// ([`SESSION_RUNWAY_PLAUSIBLE_MAX_SECS`], issue #1075).
     session_runway_secs: Option<i64>,
     /// Approximate whole seconds until the weekly reading reaches `weekly_ceiling`. `None` on
     /// the same cases (commonly `None` — the weekly window moves slowly, so a flat weekly
-    /// dimension has no measurable rate).
+    /// dimension has no measurable rate), bounded at one weekly window
+    /// ([`WEEKLY_RUNWAY_PLAUSIBLE_MAX_SECS`]) rather than the session one.
     weekly_runway_secs: Option<i64>,
     /// The account's remaining WEEKLY head-room as a usage fraction — `max(0, weekly_ceiling −
     /// latest weekly reading)` — the pool contribution the fleet aggregate (issue #544) sums. `Some`
@@ -935,22 +938,120 @@ fn replay_velocity_ema(series: &[(i64, f64)], alpha: f64) -> Option<f64> {
     }
 }
 
-/// Approximate whole seconds until `current` reaches `trigger` at `rate` (fraction/second):
-/// `(trigger − current) / rate`. `None` — NEVER a sentinel — when the rate is unknown or
-/// non-positive (an idle / flat dimension has no finite runway) or the reading is already at/over
-/// the trigger (no positive head-room left to state as a neutral fact).
+/// The plausibility bound on a per-account SESSION runway: ONE rolling session window.
 ///
-/// KNOWN DEFECT, tracked as issue #1075: this is the PER-ACCOUNT sibling of the fleet quotient and
-/// still carries BOTH faults issue #1028 removed from [`fleet_runway_state`] — `rate <= 0.0` admits
-/// a decayed EMA (measured: `1e-11` → 925,925 days), and `as i64` SATURATES rather than failing
-/// (measured: `1e-300` → `i64::MAX`). #1028 scoped itself to the fleet site on purpose; do not read
-/// the bounded sibling as evidence that this expression is bounded too.
-fn runway_secs(rate: Option<f64>, current: f64, trigger: f64) -> Option<i64> {
+/// The DERIVATION, not the number, is what carries over from [`FLEET_RUNWAY_PLAUSIBLE_MAX_SECS`].
+/// `(trigger − current) / rate` computes a drain time that ignores replenishment entirely — it asks
+/// "how long to reach the trigger at this burn" as if the window never reset. What bounds that
+/// question is **the dimension's OWN reset cadence**, and seven days is merely what that cadence
+/// happens to be for the weekly dimension. The session quota rides the rolling 5-hour session
+/// window ([`crate::usage::Usage::session`], [`crate::usage_store::Sample::session`]), so **any
+/// session runway exceeding one session window asserts the account drains with no session reset
+/// intervening, which cannot happen.**
+///
+/// Sharing the weekly bound here would wave absurd session figures straight through: 7 days is
+/// 33.6 session windows, so a 3-day "session runway" — asserting ~14 intervening resets — would
+/// pass it. The converse fails just as badly: bounding the weekly arm at 5 hours would refuse
+/// nearly every legitimate weekly runway. One bound for both dimensions is a wrong answer even
+/// where the arithmetic is right.
+///
+/// The window ROLLS; usage does not drain continuously inside it. Those are separate claims, and
+/// only the first is the crate's. [`crate::swap::SessionHighWater`] (issue #614, calibrated over
+/// 24,244 measured samples) holds the model this bound rests on: session usage is *"MONOTONIC
+/// within a window"* — *"the 5 h window only accumulates"* — so *"a DROP inside one window is
+/// implausible"*, and the only legitimate fall is the discrete roll, observed there as a cluster at
+/// 17999–18001 s. Accumulate, then reset; never a continuous ageing-out that returns each consumed
+/// unit one window later.
+///
+/// Under that model the bound is an IDENTITY, not an approximation — which is the strongest form
+/// the claim takes. For a finite, strictly positive rate:
+///
+/// ```text
+/// runway > W   ⟺   (ceiling − current) / rate > W   ⟺   current + rate·W < ceiling
+/// ```
+///
+/// and the right-hand side says exactly *the ceiling is unreachable before this window resets*.
+/// Accumulation is all that happens until the reset, so a runway past one window does not describe
+/// a distant crossing — it describes a crossing this window cannot contain **at all**. Refusing it
+/// is not caution about a large number; it is declining to state an event that does not occur.
+/// Concretely, at `current = 0.10` and `rate = 1e-5` frac/s the reading tops out at
+/// `0.10 + 1e-5 × 18000 = 0.28`: the quotient's confident `~19h` to a `0.80` ceiling is a crossing
+/// that never happens, in this window or any later one.
+///
+/// One WINDOW, deliberately, rather than the time to this account's next reset.
+/// [`crate::usage_store::Sample::session_resets_at`] does carry that stamp, but it is `Option` —
+/// absent whenever the poll did not know it — and it moves with the window's phase. With `τ ≤ W`
+/// left before the reset the phase-EXACT bound would be `τ`, so using `W` is the conservative
+/// choice in the one direction that matters: it can only admit figures a phase-aware rule would
+/// refuse, never refuse one that rule would admit. Refusal stays sound at every phase, since
+/// `current + rate·τ ≤ current + rate·W < ceiling`.
+const SESSION_RUNWAY_PLAUSIBLE_MAX_SECS: i64 = 5 * HOUR_SECS;
+
+/// The plausibility bound on a per-account WEEKLY runway: ONE weekly window.
+///
+/// This arm SHARES [`FLEET_RUNWAY_PLAUSIBLE_MAX_SECS`]'s derivation — the weekly quota resets on
+/// its own ~7-day cycle, so a runway past one weekly window asserts a drain with no reset
+/// intervening — and equals it by construction. Kept a separate name because the SUBJECT differs:
+/// that constant bounds the pooled roster and argues its independence from roster size, while this
+/// bounds ONE account, the primitive that argument generalises. Reading either as the other's alias
+/// would make a fleet-scoped rationale look like authority over a per-account figure.
+const WEEKLY_RUNWAY_PLAUSIBLE_MAX_SECS: i64 = 7 * DAY_SECS;
+
+/// Approximate whole seconds until `current` reaches `trigger` at `rate` (fraction/second):
+/// `(trigger − current) / rate`, refused unless the result is PLAUSIBLE. `None` — NEVER a sentinel
+/// — for every refusal alike, which is all the two consumers need: the `runway` cell renders the
+/// gap sentinel `—` and the wire emits explicit `null`, neither of which distinguishes *why*.
+///
+/// `max_plausible_secs` is the caller's DIMENSION-SPECIFIC bound
+/// ([`SESSION_RUNWAY_PLAUSIBLE_MAX_SECS`] / [`WEEKLY_RUNWAY_PLAUSIBLE_MAX_SECS`]) — a parameter
+/// rather than one shared constant precisely because the two dimensions reset on different
+/// cadences; each constant's doc derives its own.
+///
+/// Four gates, mirroring [`fleet_runway_state`]'s order (issue #1075 — this is the PER-ACCOUNT
+/// sibling, and it carried both faults #1028 removed from that one until now):
+///
+/// 1. **The rate must be known**, and otherwise finite and strictly positive. A flat or idle
+///    dimension has no drain to divide by, and a non-finite one was never a measurement.
+/// 2. **The head-room must be finite and strictly positive.** At or over the trigger there is no
+///    positive head-room left to state as a neutral fact.
+/// 3. **The quotient must fall within `max_plausible_secs`**, compared in `f64` BEFORE converting —
+///    an `as i64` cast would saturate the very overflow being rejected. This is the gate that
+///    refuses a vanishing decayed EMA: gate 1 cannot, because `1e-11` is finite and positive and
+///    so a perfectly well-formed rate. Expressing the bound on the RESULT, in seconds, is also
+///    what keeps it readable — an input-side epsilon on the rate would be arbitrary, unit-coupled
+///    to the EMA's native fraction-per-second, and would drift silently if that unit ever changed.
+/// 4. **The conversion must succeed** ([`checked_runway_secs`]), or there is no whole-second figure
+///    to state.
+///
+/// Deliberately NOT a clamp. Clamping an absurd figure to a large plausible one converts an
+/// obviously-wrong number into a CREDIBLE one, which is strictly harder to notice — refusal is the
+/// fix. That is also why gate 1 refuses a NON-FINITE rate rather than letting it divide: a `NaN`
+/// rate slipped past the old `rate <= 0.0` guard (every `NaN` comparison is false) and
+/// `NaN.round() as i64` is `0`, so it surfaced as `~0s` — "exhausted right now" — the one failure
+/// mode of the three that produces a small, entirely credible figure.
+fn runway_secs(
+    rate: Option<f64>,
+    current: f64,
+    trigger: f64,
+    max_plausible_secs: i64,
+) -> Option<i64> {
     let rate = rate?;
-    if rate <= 0.0 || current >= trigger {
+    if !rate.is_finite() || rate <= 0.0 {
         return None;
     }
-    Some(((trigger - current) / rate).round() as i64)
+    if !current.is_finite() || !trigger.is_finite() || current >= trigger {
+        return None;
+    }
+    let secs = ((trigger - current) / rate).round();
+    // A non-finite quotient here can ONLY be `+inf`, and only from overflow: the gates above leave
+    // the numerator finite and strictly positive and the denominator finite and strictly positive,
+    // so `0/0` and `inf/inf` — the only routes to `NaN` — are both unreachable. Overflow happens
+    // for a real, MEASURED burn once the EMA decays subnormal, and it is refused for the same
+    // reason a merely enormous quotient is: neither is a runway an operator can read.
+    if !secs.is_finite() || secs > max_plausible_secs as f64 {
+        return None;
+    }
+    checked_runway_secs(secs)
 }
 
 /// The per-account velocity + runway readout (issue #543) for `handle`, computed over its
@@ -997,8 +1098,21 @@ fn account_velocity(
     AccountVelocity {
         session_rate,
         weekly_rate,
-        session_runway_secs: runway_secs(session_rate, last.session, vparams.session_ceiling),
-        weekly_runway_secs: runway_secs(weekly_rate, last.weekly, vparams.weekly_ceiling),
+        // Each arm carries its OWN dimension's plausibility bound (issue #1075) — the session
+        // quota resets every rolling 5 h and the weekly one every ~7 days, so one shared bound
+        // would either wave through absurd session figures or refuse legitimate weekly ones.
+        session_runway_secs: runway_secs(
+            session_rate,
+            last.session,
+            vparams.session_ceiling,
+            SESSION_RUNWAY_PLAUSIBLE_MAX_SECS,
+        ),
+        weekly_runway_secs: runway_secs(
+            weekly_rate,
+            last.weekly,
+            vparams.weekly_ceiling,
+            WEEKLY_RUNWAY_PLAUSIBLE_MAX_SECS,
+        ),
         // The pool contribution for the fleet aggregate (issue #544): raw weekly head-room from the
         // SAME latest reading and trigger the weekly runway uses, recorded ONLY when the weekly
         // velocity is known (so an unknown / stale account contributes neither head-room nor burn).
@@ -1286,6 +1400,17 @@ fn fleet_runway_state(headroom: f64, rate: f64) -> FleetRunwayState {
 /// Gate 4 of [`fleet_runway_state`] as its own function: the CHECKED conversion of a rounded second
 /// count into the `i64` a [`Known`](FleetRunwayState::Known) runway carries. `None` is "no
 /// whole-second figure to state".
+///
+/// SHARED with the per-account [`runway_secs`], which is gate-for-gate the same decision one
+/// account down (issue #1075) and reaches this as its own gate 4. One implementation rather than
+/// two, because a second copy of a conversion whose whole purpose is to fail closed is a second
+/// place for it to fail open — and the reasoning below then has to hold in only one place. Every
+/// claim here is about THIS function's arguments, so it reads identically for both callers.
+///
+/// That second caller does NOT make the gate reachable through a caller: its own gate 3 bounds
+/// `secs` to `0..=max_plausible_secs` first, exactly as the fleet's does, so the independence
+/// argument below — and the direct test that carries it — still speaks for both. Neither caller's
+/// bound is this function's business; it refuses the same three shapes whoever asks.
 ///
 /// TOTAL on its own, independent of gate 3 — the R-4 claim, and the reason this is a separate
 /// function at all (issue #1081). Gate 3 has already bounded `secs` to
@@ -2350,9 +2475,14 @@ struct VelocityWire {
     /// no measurable rate (flat / reset / fewer than two sample intervals).
     weekly_pct_per_min: Option<f64>,
     /// Approximate whole seconds until the session reading reaches `session_ceiling`, or `null`
-    /// when the rate is `0` or the reading is already at/over the ceiling (no positive head-room).
+    /// when the rate is `0` or the reading is already at/over the ceiling (no positive head-room),
+    /// or the figure would be IMPLAUSIBLE — past one rolling session window (issue #1075). The
+    /// last is a value-side refusal only: this field's type, presence and JSON value-kinds are
+    /// unchanged, so `JSON_SCHEMA_VERSION` does not move and a reader that already handled the
+    /// `null` this field has always been able to carry decodes exactly as before.
     session_runway_secs: Option<i64>,
-    /// Approximate whole seconds until the weekly reading reaches `weekly_ceiling`, or `null`.
+    /// Approximate whole seconds until the weekly reading reaches `weekly_ceiling`, or `null` —
+    /// on the same cases, bounded at one WEEKLY window rather than the session one.
     weekly_runway_secs: Option<i64>,
 }
 
@@ -6699,6 +6829,275 @@ mod tests {
         assert_eq!(fmt_runway_days(432_000), "~5 days");
         assert_eq!(fmt_runway_days(86_400), "~1 day");
         assert_eq!(fmt_runway_days(18_000), "~5h"); // under a day falls back to hours
+    }
+
+    // --- AC (issue #1075): the PER-ACCOUNT runway refuses an implausible figure ---------
+
+    #[test]
+    fn runway_secs_refuses_the_quotient_of_a_vanishing_rate() {
+        // DEFECT 1 of the two. `1e-11` is finite and strictly positive — a perfectly well-formed
+        // rate — so no guard on the RATE can refuse it, and the old `rate <= 0.0` duly waved it
+        // through. Re-derived against the pre-fix expression, the issue's own session reproduction:
+        //   (0.80 − 0.0) / 1e-11 = 80_000_000_000 s = 925,925 days.
+        // What refuses it is the RESULT bound, which is the point — the bound is expressed in the
+        // unit an operator can check, not in the EMA's native fraction-per-second (the input-side
+        // epsilon the issue explicitly rejected).
+        assert_eq!(
+            runway_secs(Some(1e-11), 0.0, 0.80, SESSION_RUNWAY_PLAUSIBLE_MAX_SECS),
+            None,
+            "925,925 days is not a session runway"
+        );
+        // NOT a clamp: refusal, never a large plausible-looking stand-in at the boundary — that
+        // would convert an obviously-wrong number into a credible one.
+        assert_ne!(
+            runway_secs(Some(1e-11), 0.0, 0.80, SESSION_RUNWAY_PLAUSIBLE_MAX_SECS),
+            Some(SESSION_RUNWAY_PLAUSIBLE_MAX_SECS),
+            "refused, never clamped back to the bound"
+        );
+        // The weekly arm carries the same fault and the same fix, at its own bound.
+        assert_eq!(
+            runway_secs(Some(1e-11), 0.0, 0.95, WEEKLY_RUNWAY_PLAUSIBLE_MAX_SECS),
+            None
+        );
+
+        // The gate does NOT over-refuse: an ordinary drain still states its figure. 0.20 head-room
+        // at 1e-4 frac/s is 2,000 s (~33 m), well inside one session window.
+        assert_eq!(
+            runway_secs(Some(1e-4), 0.60, 0.80, SESSION_RUNWAY_PLAUSIBLE_MAX_SECS),
+            Some(2_000)
+        );
+    }
+
+    #[test]
+    fn runway_secs_refuses_a_figure_a_saturating_cast_would_state() {
+        // DEFECT 2 of the two, and the arm that survives when only the bound is removed: a float→int
+        // `as` cast SATURATES rather than trapping (Rust 1.45+). Re-derived against the pre-fix
+        // expression, the issue's own weekly reproduction:
+        //   (0.95 − 0.0) / 1e-300 = 9.5e299 → `as i64` → 9223372036854775807, EXACTLY `i64::MAX`
+        //   (106,751,991,167,300 days).
+        assert_eq!(
+            runway_secs(Some(1e-300), 0.0, 0.95, WEEKLY_RUNWAY_PLAUSIBLE_MAX_SECS),
+            None
+        );
+        // Naming the saturated sentinel explicitly is what makes this test the one that detects a
+        // restored bare cast — an `is_none` assertion alone cannot tell the two defects apart.
+        assert_ne!(
+            runway_secs(Some(1e-300), 0.0, 0.95, WEEKLY_RUNWAY_PLAUSIBLE_MAX_SECS),
+            Some(i64::MAX),
+            "a saturating conversion must be unreachable"
+        );
+        for rate in [1e-300, f64::MIN_POSITIVE, 5e-324] {
+            for (trigger, bound) in [
+                (0.80, SESSION_RUNWAY_PLAUSIBLE_MAX_SECS),
+                (0.95, WEEKLY_RUNWAY_PLAUSIBLE_MAX_SECS),
+            ] {
+                assert_eq!(
+                    runway_secs(Some(rate), 0.0, trigger, bound),
+                    None,
+                    "rate {rate:e} against trigger {trigger} states no figure"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn runway_secs_refuses_a_non_finite_rate_rather_than_stating_exhausted_now() {
+        // A THIRD arm, found while re-deriving the two the issue reports and fixed by the same
+        // gate. Every `NaN` comparison is false, so `NaN <= 0.0` did not refuse it; `NaN.round() as
+        // i64` is `0`, not a saturated sentinel — so a `NaN` rate surfaced as `~0s`, "exhausted
+        // right now". That is the one failure mode of the three producing a small, entirely
+        // CREDIBLE figure, and on the session dimension it reads as an account about to be swapped
+        // off. An infinite rate lands on the same `Some(0)` by a different route.
+        for rate in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let got = runway_secs(Some(rate), 0.0, 0.80, SESSION_RUNWAY_PLAUSIBLE_MAX_SECS);
+            assert_eq!(got, None, "rate {rate} is not a measurement");
+            assert_ne!(got, Some(0), "and must never read as exhausted-now");
+        }
+        // The same for a non-finite READING or trigger, which reach the quotient the same way.
+        assert_eq!(
+            runway_secs(
+                Some(1e-4),
+                f64::NAN,
+                0.80,
+                SESSION_RUNWAY_PLAUSIBLE_MAX_SECS
+            ),
+            None
+        );
+        assert_eq!(
+            runway_secs(
+                Some(1e-4),
+                0.60,
+                f64::NAN,
+                SESSION_RUNWAY_PLAUSIBLE_MAX_SECS
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_runway_bound_is_each_dimension_s_own_reset_cadence_not_one_shared_number() {
+        // The design claim the issue makes load-bearing: the bound is DERIVED per dimension, not
+        // copied. Both constants are one of their own dimension's reset windows.
+        assert_eq!(
+            SESSION_RUNWAY_PLAUSIBLE_MAX_SECS, 18_000,
+            "one rolling 5-hour session window in seconds"
+        );
+        assert_eq!(
+            WEEKLY_RUNWAY_PLAUSIBLE_MAX_SECS, 604_800,
+            "one weekly window in seconds"
+        );
+
+        // THE test that goes red if the two are ever collapsed into one number. A three-day
+        // quotient is an ordinary weekly runway and an absurd session one — it asserts the account
+        // drains across ~14 intervening session resets. One shared bound cannot hold both readings.
+        let headroom = 0.5;
+        let three_days = 3 * DAY_SECS;
+        let rate = headroom / three_days as f64;
+        assert_eq!(
+            runway_secs(Some(rate), 0.0, headroom, WEEKLY_RUNWAY_PLAUSIBLE_MAX_SECS),
+            Some(three_days),
+            "three days is inside one weekly window — a legitimate weekly runway"
+        );
+        assert_eq!(
+            runway_secs(Some(rate), 0.0, headroom, SESSION_RUNWAY_PLAUSIBLE_MAX_SECS),
+            None,
+            "the SAME quotient is refused on the session dimension, whose window is 5 h"
+        );
+
+        // Each bound is inclusive at its own edge and refuses — never clamps — one second past it.
+        for bound in [
+            SESSION_RUNWAY_PLAUSIBLE_MAX_SECS,
+            WEEKLY_RUNWAY_PLAUSIBLE_MAX_SECS,
+        ] {
+            assert_eq!(
+                runway_secs(Some(headroom / bound as f64), 0.0, headroom, bound),
+                Some(bound),
+                "exactly one window is still plausible — the bound is inclusive"
+            );
+            assert_eq!(
+                runway_secs(Some(headroom / (bound + 1) as f64), 0.0, headroom, bound),
+                None,
+                "one second past the window is refused, not clamped back to the bound"
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_runway_is_stated_as_a_gap_beside_a_real_one() {
+        // R-3 / R-20 for the NEWLY-refused values (the issue's "also worth deciding"): a refusal
+        // must be STATED, never hidden. Two accounts through the real `build_report` →
+        // `with_velocity` pipeline — `alpha` drains at an ordinary rate, `beta` at a vanishing
+        // 1e-9 frac/s (0.0000003 per 300 s) whose quotient, ~2,314 days, this issue now refuses.
+        let now = epoch("2026-07-01T12:00:00Z");
+        let report = velocity_report(
+            vec![
+                sample(now - 900, "alpha", 0.60, 0.30),
+                sample(now - 600, "alpha", 0.65, 0.30),
+                sample(now - 300, "alpha", 0.70, 0.30),
+                sample(now - 900, "beta", 0.6000000, 0.30),
+                sample(now - 600, "beta", 0.6000003, 0.30),
+                sample(now - 300, "beta", 0.6000006, 0.30),
+            ],
+            now,
+        );
+
+        // `beta`'s runway is refused while its VELOCITY is still known — the refusal is scoped to
+        // the implausible quotient and takes no measured fact down with it.
+        let beta = report.velocity.get("beta").expect("beta has a readout");
+        assert_eq!(beta.session_runway_secs, None, "the quotient is refused");
+        assert!(beta.session_rate.is_some(), "the measured rate survives it");
+
+        let text = render_text(&report, None);
+        // The column is STATED, not dropped: `alpha` holds the datum, so §D-STA-5's empty-column
+        // elision cannot fire, and `beta`'s refusal appears as the gap sentinel on its own row.
+        assert!(
+            text.contains("runway"),
+            "the runway column is stated: {text}"
+        );
+        assert!(
+            text.contains("~10m"),
+            "alpha's real runway — 0.10 head-room at 1.667e-4 frac/s is 600 s: {text}"
+        );
+        let beta_row = text
+            .lines()
+            .find(|l| l.contains("beta"))
+            .expect("a beta row");
+        assert!(
+            beta_row.contains('—'),
+            "beta's refused runway is an explicit gap, never a fabricated figure: {beta_row}"
+        );
+        assert!(
+            !beta_row.contains("day"),
+            "and specifically not the ~2,314 days the pre-fix quotient stated: {beta_row}"
+        );
+
+        // The wire says the same thing in its own vocabulary: explicit `null`, never a sentinel.
+        let v: serde_json::Value =
+            serde_json::from_str(&render_json(&report, None).unwrap()).unwrap();
+        let vel = &v["summary"]["accounts"]["beta"]["velocity"];
+        assert!(
+            vel["session_runway_secs"].is_null(),
+            "refused → null, not `0` and not a saturated integer: {vel}"
+        );
+        assert!(
+            vel["session_pct_per_min"].is_number(),
+            "beside the rate, which is still a measured fact: {vel}"
+        );
+    }
+
+    #[test]
+    fn a_wholly_refused_runway_column_elides_exactly_as_a_wholly_flat_one_already_does() {
+        // The interaction the issue asks to CONFIRM rather than assume: §D-STA-5 drops a droppable
+        // column that is uniformly the gap sentinel, so refusing enough values could in principle
+        // stop the runway being stated at all. Measured here with EVERY account vanishing-rated.
+        //
+        // The verdict is that this issue adds no new omission mode. The elision is reached today,
+        // before any of this, by a wholly FLAT fleet — `zero_velocity_reports_a_known_rate_but_an_
+        // unknown_runway` pins exactly this output for `rate == 0` — and a refusal is the same
+        // fact-shaped gap as that one: no runway to state. What changes is only WHICH inputs land
+        // there, and every one of them previously stated a figure that was FALSE — not merely
+        // large. Most were not even conspicuous: at `current = 0.6` and `rate = 5e-6` frac/s the
+        // pre-fix code rendered `~11h`, which an operator would act on without hesitation, while
+        // the reading tops out at 0.69 against a 0.80 ceiling and never crosses it. A credible
+        // wrong figure is worse than an absurd one, for the reason the non-finite arm gives: an
+        // absurd number invites the suspicion that saves the reader, and a plausible one does not.
+        //
+        // R-3 / R-20 are satisfied where they are actually addressed: the account keeps stating its
+        // measured VELOCITY, and the fleet line below states its own unknown in words rather than
+        // disappearing. Nothing here silently drops a fact that has a value.
+        let now = epoch("2026-07-01T12:00:00Z");
+        let report = velocity_report(
+            vec![
+                sample(now - 900, "alpha", 0.6000000, 0.30),
+                sample(now - 600, "alpha", 0.6000003, 0.30),
+                sample(now - 300, "alpha", 0.6000006, 0.30),
+                sample(now - 900, "beta", 0.5000000, 0.30),
+                sample(now - 600, "beta", 0.5000003, 0.30),
+                sample(now - 300, "beta", 0.5000006, 0.30),
+            ],
+            now,
+        );
+        for handle in ["alpha", "beta"] {
+            let v = report.velocity.get(handle).expect("a readout");
+            assert_eq!(
+                v.session_runway_secs, None,
+                "{handle}'s quotient is refused"
+            );
+        }
+        let text = render_text(&report, None);
+        assert!(
+            !text.contains("runway"),
+            "the uniformly-refused column elides, as the uniformly-flat one does: {text}"
+        );
+        assert!(
+            text.contains("velocity") && text.contains("0.0%/min"),
+            "the measured rate is still stated beside it: {text}"
+        );
+        assert!(
+            text.contains("accounts last: unknown"),
+            "and the fleet line — the surface R-3 / R-20 govern — states its unknown rather than \
+             vanishing: {text}"
+        );
     }
 
     // --- AC (issue #544): fleet/roster runway aggregate ("accounts last ~X days") ------
