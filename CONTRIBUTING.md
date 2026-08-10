@@ -16,8 +16,8 @@ omission is intentional, not an oversight.
 **`sessiometer` builds and runs on macOS only.** The crate does not compile for a Linux
 or Windows target today, and **no CI job attempts it** — every job that runs `cargo
 build` / `test` / `clippy` / `doc` uses a `macos-latest` runner. The `ubuntu-latest` jobs
-(`changes`, `deny`, `ci-ok-needs-complete`, `gate-change-ack`, `ci-ok`) are gates and
-routers; none of them compiles the crate.
+(`changes`, `deny`, `ci-ok-needs-complete`, `doc-gates`, `gate-change-ack`, `ci-ok`) are
+gates and routers; none of them compiles the crate.
 
 Two things follow, and both matter when you write or review a change:
 
