@@ -15,6 +15,32 @@ use std::time::Duration;
 pub(crate) type Result<T> = std::result::Result<T, Error>;
 
 /// Every fallible operation in the crate surfaces one of these.
+///
+/// # Adding a variant: its message is inside the FRAMING firewall (issue #1139)
+///
+/// `src/main.rs` prints whatever reaches it as `sessiometer: {err}`, so a variant's `#[error(...)]`
+/// message is operator-facing prose of the same register as `--help` (issue #918) and the `status`
+/// advisories (issue #1123) — and it is scanned as such. The SUBJECT is the `#[error(...)]`
+/// ATTRIBUTE, which is narrower than "what this crate wrote": a template holds `{query}`, never the
+/// operator's query, and `{0}`, never the TOML parser's sentence — but a crate-authored string built
+/// at a CONSTRUCTION site and handed in as a payload (`Error::ConfigInvalid(format!(…))`) is equally
+/// outside it, though this crate wrote that too. [`Error::CliUsage`] below draws a WIDER seam: it
+/// renders through the real parser with neutral argv, so its construction-site prose IS scanned and
+/// only the operator's echoed argv is out. Issue #1152 tracks this residual.
+///
+/// Adding a variant opts its TEMPLATE in with nothing further needed: `thiserror` will not compile
+/// one without an `#[error(...)]`, so the guard's walk over the attributes is a walk over the
+/// variants. Prose you build at the call site and pass in as a payload is NOT covered. What that
+/// means in practice is that a message spending the editorialising vocabulary of issue #160 — a
+/// value judgement, an acquisitive imperative, a recommendation, an alarmist projection — reddens
+/// `every_error_template_carries_no_banned_framing_beyond_the_pinned_ledger` on first run.
+///
+/// That is a DECISION to make, not a lint to silence. There is deliberately no
+/// `ERROR_EXEMPT_TOKENS` set to add to: one would excuse the token across every message here, so
+/// carve-outs are per-(variant, token) in `ERROR_PROSE_LEDGER`, each with its reasoning. Judge the
+/// token the way those entries do, then either reword the message or add an entry. See
+/// `crate::framing_vocabulary`'s module doc for the boundary itself (test-only, so rustdoc does
+/// not build it — read the source).
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum Error {
     /// A subsystem exists as a seam but its behavior lands in a later work
@@ -273,6 +299,11 @@ pub(crate) enum Error {
     /// must sit below is itself above the trigger). A distinct variant from
     /// [`Error::ConfigInvalid`] so this case can be matched specifically
     /// (issue #3).
+    ///
+    /// FRAMING (issue #1139): the `must` here is a CONSTRAINT STATEMENT — the modal's subject is a
+    /// config VALUE, so it cites the schema rule the value broke rather than advising the operator
+    /// — and is carved out for this variant alone in `ERROR_PROSE_LEDGER`. Editing this message
+    /// away from that reading, or dropping the word, means updating that entry.
     #[error("invalid config: target_max_session_usage ({target_max_session_usage}) must not exceed session_ceiling ({trigger})")]
     ConfigTargetMaxSessionAboveTrigger {
         target_max_session_usage: i64,
@@ -624,6 +655,17 @@ pub(crate) enum Error {
     /// this instead becomes the adopt-target RECOVERY (issue #212) — the target is
     /// installed directly, no outgoing re-stash — so this error is the non-forced path
     /// only. ZERO writes. Secret-free.
+    ///
+    /// FRAMING (issue #1139): this message carries the only VIOLATION the firewall's ledger
+    /// records. `add it to the rotation` is the permitted non-acquisitive remedy directive
+    /// (ADR-0020 § Status → Amended 2026-08-10), but **`healthy` is a value judgement**: the path
+    /// it points at, `use --force`, computes no health at all — `crate::use_account` never imports
+    /// `CredentialHealth`, and `warn_if_forcing_onto_non_viable` warns and PROCEEDS on weekly
+    /// viability — so the word decides nothing and cannot be read as naming
+    /// [`CredentialHealth::Healthy`](crate::observability::CredentialHealth). Rewording it is
+    /// issue #1151, deliberately NOT issue #1139: changing a shipped message to make a new guard
+    /// pass is how a guard comes to certify the prose it was pointed at. Both tokens are carved
+    /// out for this variant alone in `ERROR_PROSE_LEDGER`, with the reasoning.
     #[error(
         "cannot determine the active account to swap away from \
          (no logged-in account matches the roster — run `sessiometer login` to \
@@ -862,6 +904,10 @@ pub(crate) enum Error {
     /// isolated item — `build/version-compat.md` #130) was violated, so the engine
     /// refuses to harvest and surfaces the breach loudly. Secret-free — the mutation
     /// is detected via non-secret sha256 hashes, never by exposing either blob.
+    ///
+    /// FRAMING (issue #1139): the `must` here is a CONSTRAINT STATEMENT — it states the isolation
+    /// INVARIANT this engine enforces and is reporting a breach of, so the modal governs the tool
+    /// rather than the operator — and is carved out for this variant alone in `ERROR_PROSE_LEDGER`.
     #[error(
         "aborting login capture: the shared `Claude Code-credentials` item changed during the \
          isolated login — refusing to proceed (the live session's credential must stay untouched)"
@@ -1057,6 +1103,12 @@ impl Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The FRAMING firewall over this file's authored prose (issue #1139) — see the
+    // `--- the FRAMING firewall ---` section at the foot of this module.
+    use crate::framing_vocabulary::{
+        scan_all_banned, scan_banned, ADVISORY_EXEMPT_TOKENS, BANNED_PHRASES, BANNED_TOKENS,
+        HELP_EXEMPT_TOKENS, USAGE_EXEMPT_TOKENS,
+    };
 
     #[test]
     fn already_running_exits_three_so_a_supervisor_can_tell_it_apart() {
@@ -1380,5 +1432,630 @@ mod tests {
             !message.to_lowercase().contains("token"),
             "no token: {message}"
         );
+    }
+
+    // --- the FRAMING firewall over this file's authored prose (issue #1139) --------------
+    //
+    // Issue #1123 took `Error::CliUsage` inside the #160 firewall and scoped itself to that ONE
+    // variant. Issue #1139 carries the rest, and its first acceptance criterion is a SCOPING
+    // DECISION rather than a patch. Both halves are recorded in
+    // `crate::framing_vocabulary`'s module doc (§ "The fifth audience has no exemption set");
+    // what follows is the mechanism, and `ERROR_PROSE_LEDGER` is the per-token reasoning.
+
+    /// What issue #1139 decided about ONE banned token in ONE variant's message.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Verdict {
+        /// Measured, judged against the four editorial groups, and found OUTSIDE them. The
+        /// message stands as shipped.
+        Permitted,
+        /// A real breach of the #160 firewall, tracked at the named issue and deliberately NOT
+        /// reworded here: issue #1139 scoped a GUARD, and editing a shipped message to make a
+        /// new guard pass is how a guard comes to certify the prose it was pointed at.
+        Violation(&'static str),
+    }
+
+    struct LedgerEntry {
+        variant: &'static str,
+        token: &'static str,
+        verdict: Verdict,
+        why: &'static str,
+    }
+
+    /// The per-(variant, token) carve-out ledger — deliberately NOT an `ERROR_EXEMPT_TOKENS`
+    /// set, which is the move issue #1139 was opened to refuse.
+    ///
+    /// The three exemption sets in `crate::framing_vocabulary` are earned by whole SURFACES
+    /// whose every member spends the token: a `usage_hint`'s job is to name a command, so all of
+    /// them may spell `disable`. `Error` is not a surface — it is dozens of independent messages
+    /// that share a type. A set carrying `{add, healthy, must}` would excuse those tokens in EVERY
+    /// one of them,
+    /// so the day a new variant read "you must add an account" the guard would wave it through,
+    /// having been widened by three earlier messages that had nothing to do with it. Scoping
+    /// each carve-out to the ONE variant that earned it keeps that from being possible, and it
+    /// is why the guard scans all hits rather than the first: a second banned token in an
+    /// already-ledgered message still bites.
+    ///
+    /// Reddening means either a message changed or a new one spends central vocabulary. Both are
+    /// decisions — judge the token against the four groups the way the entries below do, then
+    /// reword the message or add an entry with its reasoning. Never widen this into a set.
+    ///
+    /// # Why the bar here is a judgement, where `NOT_OPERATOR_PROSE`'s is not
+    ///
+    /// `src/cli.rs`'s `NOT_OPERATOR_PROSE` admits only a mechanically vacuous reason — the excused
+    /// constant carries no WORDS — and says outright that "this one reads fine to me" is the
+    /// judgement the guard exists to replace. That bar is right THERE and would be wrong here,
+    /// because the two carve-outs remove different things. An excusal there takes a string out of
+    /// the SUBJECT: it is never scanned, so nothing would ever catch it drifting, and only a
+    /// property that makes scanning pointless can justify that. This ledger removes nothing from
+    /// the subject. Every template is scanned, every hit is found, and an entry only records what
+    /// was decided about a hit the guard already made. That is the same class of carve-out as
+    /// `HELP_EXEMPT_TOKENS` and `USAGE_EXEMPT_TOKENS`, which are judgements too (the mechanical
+    /// verb / editorial framing line issue #918 settled on the evidence), held honest the same way:
+    /// pinned, and asserted to still be earned by the prose they excuse.
+    ///
+    /// What DOES transfer is that precedent's actual lesson — it was written because a doc
+    /// requiring a reason while nothing tested for one let issue #1123's merge review excuse an
+    /// editorialising string in three edits and a green run. So the reasoning below is enforced
+    /// mechanically, not trusted: see `every_ledger_entry_is_earned_reasoned_and_pinned`.
+    const ERROR_PROSE_LEDGER: &[LedgerEntry] = &[
+        LedgerEntry {
+            variant: "ConfigTargetMaxSessionAboveTrigger",
+            token: "must",
+            verdict: Verdict::Permitted,
+            why: "CONSTRAINT STATEMENT, not recommendation framing. The group bans the \
+                  operator-directed modal the issue #160 caller quoted (`you should`); here the \
+                  modal's subject is a CONFIG VALUE — `target_max_session_usage must not exceed \
+                  session_ceiling` cites the schema rule the value broke, in the third person, \
+                  and directs nobody. The discriminator a future author should apply is whose \
+                  behaviour the modal governs: the operator (recommendation, banned) or a value \
+                  / this tool's own invariant (constraint, permitted).",
+        },
+        LedgerEntry {
+            variant: "SharedCredentialMutated",
+            token: "must",
+            verdict: Verdict::Permitted,
+            why: "CONSTRAINT STATEMENT, same test as the entry above: `the live session's \
+                  credential must stay untouched` states the ISOLATION PREMISE this engine \
+                  enforces — and is reporting a breach of — so the modal governs the tool's own \
+                  invariant rather than the operator.",
+        },
+        LedgerEntry {
+            variant: "ActiveAccountUnresolved",
+            token: "add",
+            verdict: Verdict::Permitted,
+            why: "The non-acquisitive REMEDY DIRECTIVE that ADR-0020 § Status → Amended \
+                  2026-08-10 (issue #1123) settled. The discriminator is the OBJECT of the \
+                  imperative, not its mood: `add it to the rotation` adds THIS account to this \
+                  tool's own roster — a free, local, mechanical operation on its own state — \
+                  whereas the banned sense is acquisition, `add an account` in the sense of \
+                  obtaining more capacity, which is the reading `BANNED_TOKENS`' own issue #160 \
+                  note quotes (`add / buy / upgrade / cancel / bypass / need more`).",
+        },
+        LedgerEntry {
+            variant: "ActiveAccountUnresolved",
+            token: "healthy",
+            verdict: Verdict::Violation("#1151"),
+            why: "VALUE JUDGEMENT — the group the #160 firewall exists for, and the one entry \
+                  here that did not survive its own defence. Issue #1139 asked whether `adopt a \
+                  healthy account` NAMES the machine-checkable `CredentialHealth::Healthy` \
+                  rather than editorialising. It does not, and the code decides it: this message \
+                  routes the operator to `use --force`, and `crate::use_account` never imports \
+                  `CredentialHealth` at all — the only check `--force` runs is \
+                  `warn_if_forcing_onto_non_viable`, which warns and PROCEEDS, and whose subject \
+                  is weekly `Viability`, not health. `use --force <account>` adopts a target in \
+                  ANY health state, `Dead` included, so the word decides nothing and is the \
+                  author's characterisation. It is worse than inert for the operator: this error \
+                  fires when the canonical credential was scrubbed, which is also when no daemon \
+                  may be running — and `CredentialHealth` is daemon-computed, so the `status` \
+                  screen that would name it answers `daemon not running`. A reader who has never \
+                  seen the enum reads `a good one`, with no way to tell which. NOT reworded here \
+                  — that is issue #1151.",
+        },
+    ];
+
+    /// One variant's authored `#[error(...)]` attribute, parsed out of this file's own source.
+    struct ErrorProse {
+        variant: String,
+        /// Every string literal in the attribute, concatenated with Rust's line-continuation
+        /// semantics resolved. EMPTY for `#[error(transparent)]`, whose `Display` is a foreign
+        /// type's.
+        template: String,
+        /// The attribute's NON-literal arguments, verbatim (`transparent`, or the path of an
+        /// interpolated constant).
+        args: Vec<String>,
+    }
+
+    /// Every `#[error(...)]` attribute in this file's NON-test half, paired with the variant it
+    /// decorates.
+    ///
+    /// The SUBJECT is each template, and that is the authored/interpolated seam
+    /// [`Error::CliUsage`]'s own doc comment already draws rather than a new one: a template
+    /// holds `{query}`, never the operator's query; `{0}`, never the TOML parser's sentence. It
+    /// also buys the completeness argument — `thiserror` refuses to compile a variant carrying
+    /// no `#[error(...)]`, so walking the attributes IS walking the variants, enforced by the
+    /// compiler rather than by this walk being careful.
+    ///
+    /// Comment lines are dropped BEFORE anything is matched, and that cut is load-bearing twice
+    /// over. This file's doc comments are dense with the very words the guard bans (`SAFETY
+    /// ALARM` and `healthy` both occur here in prose) — they are DEVELOPER prose, never printed to
+    /// an operator, so scanning them would report a firewall breach every other paragraph while
+    /// telling an operator nothing. And dropping them first means the variant identifier is
+    /// simply the next word after the attribute, with no doc block to walk over.
+    fn error_prose() -> Vec<ErrorProse> {
+        let source: Vec<char> = include_str!("error.rs")
+            .lines()
+            .take_while(|line| !line.starts_with("#[cfg(test)]"))
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .chars()
+            .collect();
+        let needle: Vec<char> = "#[error(".chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + needle.len() <= source.len() {
+            if source[i..i + needle.len()] != needle[..] {
+                i += 1;
+                continue;
+            }
+            // Balanced-paren walk, ignoring parens INSIDE a string literal — several messages
+            // carry a parenthetical, and a naive walk would end the attribute on the first one.
+            let body_start = i + needle.len();
+            let mut j = body_start;
+            let mut depth = 1_usize;
+            let mut in_string = false;
+            while j < source.len() && depth > 0 {
+                match source[j] {
+                    '\\' if in_string => j += 1,
+                    '"' => in_string = !in_string,
+                    '(' if !in_string => depth += 1,
+                    ')' if !in_string => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            let body: String = source[body_start..j - 1].iter().collect();
+            // Past the attribute's `]`, any further attributes, and the whitespace between, to
+            // the variant identifier itself.
+            let mut k = j;
+            while k < source.len() {
+                match source[k] {
+                    c if c.is_whitespace() || c == ']' => k += 1,
+                    '#' => {
+                        while k < source.len() && source[k] != ']' {
+                            k += 1;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            let variant: String = source[k..]
+                .iter()
+                .take_while(|c| c.is_alphanumeric() || **c == '_')
+                .collect();
+            let (template, args) = split_attr(&body);
+            out.push(ErrorProse {
+                variant,
+                template,
+                args,
+            });
+            i = j;
+        }
+        out
+    }
+
+    /// Split an `#[error(...)]` body into its concatenated string literals and its non-literal
+    /// arguments.
+    ///
+    /// Rust's line continuation — a `\` at end of line, which eats the newline AND the next
+    /// line's indentation — resolves to a single space. The scanner tokenises on non-alphanumeric
+    /// boundaries so whitespace shape is irrelevant, but SWALLOWING the continuation would
+    /// silently truncate the message: two of the three templates issue #1139 is about keep their
+    /// banned token on the far side of one, which is what the canary in
+    /// `every_error_template_is_scanned_and_the_parse_cannot_be_evaded` pins.
+    fn split_attr(body: &str) -> (String, Vec<String>) {
+        let mut literal = String::new();
+        let mut rest = String::new();
+        let mut chars = body.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '"' {
+                rest.push(c);
+                continue;
+            }
+            while let Some(c2) = chars.next() {
+                match c2 {
+                    '"' => break,
+                    '\\' => match chars.next() {
+                        Some('\n') => {
+                            while chars
+                                .peek()
+                                .is_some_and(|c| *c != '\n' && c.is_whitespace())
+                            {
+                                chars.next();
+                            }
+                            literal.push(' ');
+                        }
+                        Some('n') => literal.push('\n'),
+                        Some('t') => literal.push('\t'),
+                        Some('r') => literal.push('\r'),
+                        Some(other) => literal.push(other),
+                        None => break,
+                    },
+                    _ => literal.push(c2),
+                }
+            }
+        }
+        let args = rest
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+        (literal, args)
+    }
+
+    /// Every banned token in an authored error template that [`ERROR_PROSE_LEDGER`] does not
+    /// account for — the audit itself, factored out of the assertion so the BITE proof can drive
+    /// the identical code path over a deliberately poisoned copy of the REAL shipped prose.
+    fn unaccounted_framing(prose: &[ErrorProse]) -> Vec<String> {
+        let mut findings = Vec::new();
+        for item in prose {
+            for hit in scan_all_banned(&item.template) {
+                if !ERROR_PROSE_LEDGER
+                    .iter()
+                    .any(|entry| entry.variant == item.variant && entry.token == hit)
+                {
+                    findings.push(format!("{}: {hit:?}", item.variant));
+                }
+            }
+        }
+        findings
+    }
+
+    /// Issue #1139's completeness tripwire: a NEW variant cannot ship unscanned, and the parse
+    /// that guarantees it cannot be defeated by spelling something differently.
+    ///
+    /// The nearest precedent is `src/cli.rs`'s `every_cli_usage_construction_site_is_scanned`,
+    /// which pins a construction-site COUNT and needs a hand-written argv case per site. This
+    /// one is structurally stronger and needs neither: `thiserror` will not compile a variant
+    /// carrying no `#[error(...)]`, so a new variant is scanned the moment it exists. What is
+    /// left to guard is the PARSE — and a parse that silently matched fewer attributes, or
+    /// returned empty templates, would satisfy every assertion in the guard below over nothing.
+    #[test]
+    fn every_error_template_is_scanned_and_the_parse_cannot_be_evaded() {
+        let prose = error_prose();
+
+        // CARDINALITY, pinned rather than compared — the degenerate-subject guard. Growing the
+        // enum is expected and cheap: add the variant, bump this in the same commit.
+        assert_eq!(
+            prose.len(),
+            87,
+            "the `#[error(...)]` count moved. A new variant is scanned automatically (that is \
+             the point), but the subject's SIZE is pinned so a parse that matched fewer cannot \
+             pass silently — which is issue #918's failure, one variant down instead of one \
+             surface down"
+        );
+
+        // The names are real, distinct variant identifiers — not `]`, whitespace, or a repeat
+        // that a mis-stepped walk to the identifier would collect.
+        for item in &prose {
+            assert!(
+                item.variant.chars().next().is_some_and(char::is_uppercase),
+                "parsed {:?} as a variant name — the walk past the attribute is wrong",
+                item.variant
+            );
+        }
+        let mut names: Vec<&str> = prose.iter().map(|p| p.variant.as_str()).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(before, names.len(), "a variant name was parsed twice");
+
+        let by_name = |name: &str| -> String {
+            prose
+                .iter()
+                .find(|p| p.variant == name)
+                .unwrap_or_else(|| panic!("{name} is missing from the parse"))
+                .template
+                .clone()
+        };
+
+        // CANARY the extraction. A parser returning empty strings carries no banned framing
+        // perfectly, so the three templates issue #1139 was filed about are asserted to hold
+        // real, distinctive text — and specifically text on the FAR side of a `\` line
+        // continuation, which is exactly where a walk that stopped at the first backslash would
+        // truncate while still looking like it worked.
+        for (variant, fragment) in [
+            (
+                "ConfigTargetMaxSessionAboveTrigger",
+                "must not exceed session_ceiling",
+            ),
+            ("SharedCredentialMutated", "credential must stay untouched"),
+            (
+                "ActiveAccountUnresolved",
+                "adopt a healthy account directly",
+            ),
+        ] {
+            let template = by_name(variant);
+            assert!(
+                template.contains(fragment),
+                "{variant}'s template lost {fragment:?} — the literal walk truncated it: \
+                 {template:?}"
+            );
+        }
+
+        // Every template is non-empty EXCEPT the one `#[error(transparent)]`, whose `Display` is
+        // a foreign type's and cannot be scanned here. Pinned BY NAME: a second transparent
+        // variant is a new hole in the subject and should be a deliberate edit that reddens.
+        let foreign: Vec<&str> = prose
+            .iter()
+            .filter(|p| p.template.is_empty())
+            .map(|p| p.variant.as_str())
+            .collect();
+        assert_eq!(
+            foreign,
+            ["Io"],
+            "the set of variants with no authored template moved — `#[error(transparent)]` \
+             delegates `Display` to another type, so its prose is outside this guard's reach"
+        );
+
+        // The ONE non-literal argument any attribute passes, besides `transparent`, is an
+        // interpolated constant — and it is OURS, so it is scanned here rather than waved
+        // through as "not a literal". Without this, `#[error("{}", SOME_EDITORIAL_CONST)]` would
+        // carry banned prose into an operator's terminal straight past a literal-only walk.
+        let mut args: Vec<&str> = prose
+            .iter()
+            .flat_map(|p| p.args.iter().map(String::as_str))
+            .collect();
+        args.sort_unstable();
+        assert_eq!(
+            args,
+            [
+                "crate::migration::CONFIG_BLOCK_VERSION_FLOOR",
+                "transparent"
+            ],
+            "an `#[error(...)]` grew a non-literal argument. Its VALUE is operator-facing prose \
+             this walk cannot see, so scan it explicitly beside the import floor below"
+        );
+        assert_eq!(
+            scan_all_banned(crate::migration::CONFIG_BLOCK_VERSION_FLOOR),
+            Vec::<&str>::new(),
+            "the interpolated import-floor constant carries banned framing"
+        );
+    }
+
+    /// Issue #1139's guard: no authored error template spends central FRAMING vocabulary that
+    /// [`ERROR_PROSE_LEDGER`] does not account for.
+    #[test]
+    fn every_error_template_carries_no_banned_framing_beyond_the_pinned_ledger() {
+        assert_eq!(
+            unaccounted_framing(&error_prose()),
+            Vec::<String>::new(),
+            "an authored error template spends central FRAMING vocabulary (issue #160) that no \
+             `ERROR_PROSE_LEDGER` entry accounts for. This is a DECISION, not a lint to silence: \
+             judge the token against the four editorial groups the way the ledger's own entries \
+             do, then either reword the message or add an entry carrying that reasoning. Do NOT \
+             reach for an `ERROR_EXEMPT_TOKENS` set — issue #1139 settled that this audience has \
+             none, because one set would excuse the token across every message in this file"
+        );
+    }
+
+    /// Issue #1139 AC-2, to the standard issue #918 established: the guard BITES, demonstrated
+    /// on the REAL shipped prose rather than on a string this test wrote for itself.
+    ///
+    /// That distinction is the whole of the standard. Issue #885 asserted coverage that did not
+    /// exist and nothing caught it, because a scan over prose that is already clean passes
+    /// identically over a scanner that inspects nothing. Here the subject is
+    /// [`error_prose`]'s real output, poisoned one token at a time and reverted between, driven
+    /// through the same [`unaccounted_framing`] the assertion above uses.
+    #[test]
+    fn the_error_guard_bites_on_every_editorial_group_injected_into_real_shipped_prose() {
+        // GREEN before: the unpoisoned shipped subject is clean.
+        assert_eq!(unaccounted_framing(&error_prose()), Vec::<String>::new());
+
+        // RED on each editorial group, injected into a real shipped message.
+        for (group, injection, caught) in [
+            ("acquisitive imperative", "Upgrade your plan.", "upgrade"),
+            ("value judgement", "Your usage is critical.", "critical"),
+            ("recommendation framing", "You should re-login.", "should"),
+            ("alarmist projection", "Exhaustion is imminent.", "imminent"),
+            (
+                "acquisitive phrase",
+                "Running out — top up first.",
+                "top up",
+            ),
+            (
+                "acquisitive phrase",
+                "Running low — get more seats.",
+                "get more",
+            ),
+        ] {
+            let mut poisoned = error_prose();
+            poisoned
+                .iter_mut()
+                .find(|p| p.variant == "DaemonNotRunning")
+                .expect("DaemonNotRunning is a real shipped variant")
+                .template
+                .push_str(injection);
+            assert_eq!(
+                unaccounted_framing(&poisoned),
+                vec![format!("DaemonNotRunning: {caught:?}")],
+                "the {group} group must bite when injected into a real shipped error template"
+            );
+        }
+
+        // A LEDGERED variant is not a blanket pass. The ledger excuses a TOKEN on a VARIANT, so
+        // a SECOND banned token in the same message still bites — the property an
+        // `ERROR_EXEMPT_TOKENS` set could not have given, and the reason the scan is all-hits
+        // rather than first-hit.
+        let mut poisoned = error_prose();
+        poisoned
+            .iter_mut()
+            .find(|p| p.variant == "ActiveAccountUnresolved")
+            .expect("ActiveAccountUnresolved is a real shipped variant")
+            .template
+            .push_str("Upgrade your plan.");
+        assert_eq!(
+            unaccounted_framing(&poisoned),
+            vec!["ActiveAccountUnresolved: \"upgrade\"".to_owned()],
+            "a ledgered variant must still bite on a token its entry does not name — and its \
+             ledgered `add` / `healthy` must stay accounted for while it does"
+        );
+
+        // GREEN after: reverted, the shipped subject is clean again.
+        assert_eq!(unaccounted_framing(&error_prose()), Vec::<String>::new());
+    }
+
+    /// Issue #1139 AC-3, the does-the-carve-out-swallow-the-guard proof, from both ends: every
+    /// ledger entry is EARNED by the variant it names, and the ledger as a whole is PINNED.
+    ///
+    /// Reddening on the earned half means a message edit dropped the last use of a carve-out:
+    /// DELETE the entry, never widen this test. That is also the completion signal for the
+    /// violation entry — issue #1151 is done exactly when its token stops being spent.
+    #[test]
+    fn every_ledger_entry_is_earned_reasoned_and_pinned() {
+        let prose = error_prose();
+
+        // PINNED to exactly the four measured entries, for the reason issue #918 pinned the help
+        // exemption set: growing this is a design decision that must redden a test, never
+        // something that accretes an entry at a time to silence an inconvenient message.
+        let pairs: Vec<(&str, &str)> = ERROR_PROSE_LEDGER
+            .iter()
+            .map(|entry| (entry.variant, entry.token))
+            .collect();
+        assert_eq!(
+            pairs,
+            [
+                ("ConfigTargetMaxSessionAboveTrigger", "must"),
+                ("SharedCredentialMutated", "must"),
+                ("ActiveAccountUnresolved", "add"),
+                ("ActiveAccountUnresolved", "healthy"),
+            ],
+            "the ledger moved — see issue #1139: these are the (variant, token) pairs the \
+             shipped error prose measurably spends, and each was judged one at a time"
+        );
+
+        for entry in ERROR_PROSE_LEDGER {
+            // No carve-out for a token nobody bans: it would read as a real one while carving
+            // out nothing — the same discipline as `every_derived_exemption_names_a_real_central_token`.
+            assert!(
+                BANNED_TOKENS.contains(&entry.token),
+                "{}: {:?} is carved out but is not in BANNED_TOKENS",
+                entry.variant,
+                entry.token
+            );
+            // …and it is STILL SPENT by the variant it names.
+            let template = prose
+                .iter()
+                .find(|p| p.variant == entry.variant)
+                .unwrap_or_else(|| panic!("{} names no variant", entry.variant));
+            assert!(
+                scan_all_banned(&template.template).contains(&entry.token),
+                "{}: {:?} is carved out but that message no longer spends it — DELETE the \
+                 entry rather than carry a dead carve-out",
+                entry.variant,
+                entry.token
+            );
+            // EVERY entry records why, violation or not — the lesson `src/cli.rs`'s
+            // `every_excusal_is_reasoned` was written to teach: a doc that REQUIRES a reason while
+            // nothing TESTS for one let issue #1123's merge review excuse an editorialising string
+            // in three mechanical edits and a fully green run. Asserted for the `Permitted` entries
+            // especially, since those are the ones whose only defence IS their reasoning.
+            assert!(
+                !entry.why.trim().is_empty(),
+                "{}: {:?} is carved out with no reasoning recorded — an unreasoned carve-out is \
+                 indistinguishable from an oversight",
+                entry.variant,
+                entry.token
+            );
+            // Every VIOLATION names its tracking issue, and its reasoning cites the same one. An
+            // untracked violation is an exemption with a disapproving tone.
+            if let Verdict::Violation(issue) = entry.verdict {
+                assert!(
+                    issue.starts_with('#') && issue[1..].chars().all(|c| c.is_ascii_digit()),
+                    "{}: {issue:?} is not an issue reference",
+                    entry.variant
+                );
+                assert!(
+                    entry.why.contains(issue),
+                    "{}: the reasoning does not cite the issue tracking it",
+                    entry.variant
+                );
+            }
+        }
+
+        // The violation set is pinned too: it is what tells a reader which entries are DECISIONS
+        // and which are debts, and a Permitted entry quietly re-labelled would erase that.
+        let violations: Vec<&str> = ERROR_PROSE_LEDGER
+            .iter()
+            .filter_map(|entry| match entry.verdict {
+                Verdict::Violation(issue) => Some(issue),
+                Verdict::Permitted => None,
+            })
+            .collect();
+        assert_eq!(
+            violations,
+            ["#1151"],
+            "the ledger's violation set moved — a new one needs its own issue, and a resolved \
+             one needs its entry deleted rather than flipped to Permitted"
+        );
+    }
+
+    /// Issue #1139 AC-5: `Error::CliUsage`'s existing coverage, and the stats-side and help-side
+    /// coverage, are UNCHANGED — asserted here rather than assumed, from the side issue #1139
+    /// could have broken them.
+    ///
+    /// It could have broken them two ways, and both are checked. The fifth audience was added
+    /// BESIDE the existing four rather than by widening one, so the central lists and all three
+    /// exemption sets must be exactly what they were (this deliberately duplicates the pins in
+    /// `crate::framing_vocabulary`, as a regression check on THIS change rather than a
+    /// restatement of theirs). And `scan_with` was re-expressed as the first element of the new
+    /// `scan_all_with` rather than left as a second walk, so first-hit and all-hits are asserted
+    /// to agree — a fork there would have changed what every other audience sees.
+    #[test]
+    fn the_error_audience_neither_widened_nor_narrowed_the_other_four() {
+        assert_eq!(BANNED_TOKENS.len(), 51);
+        assert_eq!(BANNED_PHRASES, &["top up", "get more"]);
+        assert_eq!(HELP_EXEMPT_TOKENS, &["add", "disable", "enable", "remove"]);
+        assert_eq!(ADVISORY_EXEMPT_TOKENS, &["enable"]);
+        assert_eq!(USAGE_EXEMPT_TOKENS, &["disable", "enable", "remove"]);
+
+        // This audience really does scan the WHOLE list. With no exemption set, every editorial
+        // group is armed on every variant BY CONSTRUCTION — there is no subset that could have
+        // dropped one — so the proof is that each central token and phrase still bites in
+        // error-shaped prose.
+        for token in BANNED_TOKENS {
+            assert_eq!(
+                scan_all_banned(&format!("refusing to swap: {token} something")),
+                vec![*token],
+                "the Error audience must see every central token — it has no exemption set"
+            );
+        }
+        for phrase in BANNED_PHRASES {
+            assert_eq!(
+                scan_all_banned(&format!("running out — {phrase} first")),
+                vec![*phrase],
+                "the Error audience must see every central phrase"
+            );
+        }
+
+        // First-hit IS the first element of all-hits, over prose that exercises the tokenizer's
+        // documented behaviours: clean, single token, multiple tokens, a phrase, ANSI, and case
+        // plus punctuation.
+        for text in [
+            "daemon not running — start it with `sessiometer run`",
+            "refusing to swap: a swap cooldown is active",
+            "you should upgrade and add another",
+            "runs out in ~4h — top up before then",
+            "\x1b[31mcritical\x1b[0m",
+            "period — you SHOULD.",
+            "nothing bypasses it",
+        ] {
+            assert_eq!(
+                scan_banned(text),
+                scan_all_banned(text).into_iter().next(),
+                "first-hit and all-hits disagreed on {text:?} — the shared tokenizer forked"
+            );
+        }
     }
 }
