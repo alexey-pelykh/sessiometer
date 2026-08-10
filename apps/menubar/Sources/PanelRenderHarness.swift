@@ -33,12 +33,31 @@
 //
 // HOST-EQUIVALENCE, measured. Because both consumers route through this one `render`, the app tool and the
 // in-bundle gate produce PIXEL-IDENTICAL output — verified by rendering all 44 cells through
-// `--render-panel` and diffing them against the in-bundle goldens (max drift 0.000000 over 44 cells). The
-// PNG *files* still differ byte-wise, because the app tool encodes the renderer's `CGImage` directly while
-// the gate encodes from its normalized comparison buffer; only the pixels are the claim. That equivalence
-// is not free — it is what `Color.panelAssets` (asset lookup follows the compiled-into bundle, not
-// `.main`) and the explicit `.tint` below buy. Do NOT re-bless the goldens from the app tool anyway: the
-// gate owns its own regeneration path so the committed bytes are exactly what it reads back.
+// `--render-panel` and diffing them against the in-bundle goldens (max drift 0.000000 over 44 cells). On a
+// GIVEN TOOLCHAIN the PNG *files* match too, byte for byte, and the encoder difference one might expect
+// contributes nothing: the app tool encodes the renderer's `CGImage` directly while the gate encodes from
+// its normalized comparison buffer, but `ImageRenderer` hands back sRGB / RGBA8 / premultipliedLast,
+// tightly packed, in default byte order — exactly the `CGContext` the gate's `PanelRaster.normalize`
+// redraws into — so that redraw is an identity and both paths hand `NSBitmapImageRep` the same samples.
+//
+// The PIXEL half is still the PORTABLE one, and that is the distinction worth keeping: `NSBitmapImageRep`'s
+// PNG encoder is byte-stable for one OS + Xcode but not across versions (design/README.md § Panel golden
+// drift gate), and `ImageRenderer`'s pixel format is no more contractual than that. So the byte half is a
+// statement about THIS machine, while the pixel half travels.
+//
+// NOTHING GATES THE BYTE HALF, so re-measure it rather than trust it: it is an out-of-band `diff -rq` of a
+// `--render-panel` scratch directory against `renders/panel-goldens/` (recipe in design/README.md).
+// `testAGoldenRoundTripsToTheSameBytes` asserts the gate's OWN buffer round-trip and never exercises the
+// app tool's encode path, and the `panel-goldens` job is soft and compares pixels. It has already rotted
+// unnoticed once: six goldens blessed from cold rasters stopped matching when #824 landed and matched
+// again only once #1129 re-blessed them, with nothing red either way. Until issue #1144 this header
+// asserted the reverse outright ("the PNG *files* still differ byte-wise"), contradicting both the
+// measurement table in `PanelGoldenParityTests` and the `diff -rq` recipe in design/README.md — the two
+// surfaces that had it right.
+//
+// That equivalence is not free — it is what `Color.panelAssets` (asset lookup follows the compiled-into
+// bundle, not `.main`) and the explicit `.tint` below buy. Do NOT re-bless the goldens from the app tool
+// anyway: the gate owns its own regeneration path so the committed bytes are exactly what it reads back.
 
 #if DEBUG
 import AppKit
