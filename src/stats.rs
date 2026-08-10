@@ -4488,12 +4488,30 @@ mod tests {
         // counting was the reported defect. One populated bucket makes the premise true.
         let aa = stat(3, ds(0.30, 0.90, 0.85), 0.40, 0.60);
         let bb = stat(3, ds(0.10, 0.15, 0.12), 0.20, 0.40);
-        let mut r = charts_report(&[("aa", aa), ("bb", bb)], &[&[("aa", aa), ("bb", bb)]]);
+        let cc = stat(3, ds(0.20, 0.40, 0.35), 0.30, 0.50);
+        let mut r = charts_report(
+            &[("aa", aa), ("bb", bb), ("cc", cc)],
+            &[&[("aa", aa), ("bb", bb), ("cc", cc)]],
+        );
         r.velocity.insert(
             "aa".to_string(),
             AccountVelocity {
                 session_rate: Some(0.00015),
                 session_runway_secs: Some(7200),
+                ..Default::default()
+            },
+        );
+        // `cc` carries the SUB-THRESHOLD burn (issue #1147). The shared-cell check below is the
+        // anti-drift guarantee for `col_velocity`, and until now it exercised only the eight-column
+        // figure — the one width at which the cell is exactly as wide as its own header, so both
+        // surfaces size the column identically whatever they do with the cells. `<0.1%/min` is nine
+        // columns and forces each renderer to size the column from the CELL, which is where they
+        // could disagree. Its runway is refused (#1075), so the cell also crosses both surfaces as
+        // a gap while `aa`'s stays a figure.
+        r.velocity.insert(
+            "cc".to_string(),
+            AccountVelocity {
+                session_rate: Some(5e-6),
                 ..Default::default()
             },
         );
@@ -4567,6 +4585,11 @@ mod tests {
                 "aa's shared `{cell}` renders identically on both surfaces"
             );
         }
+        assert!(
+            piped.contains(SUB_THRESHOLD_PCT_PER_MIN) && tty.contains(SUB_THRESHOLD_PCT_PER_MIN),
+            "cc's shared `{SUB_THRESHOLD_PCT_PER_MIN}` — the one cell WIDER than its own column \
+             header — renders identically on both surfaces"
+        );
 
         // Neither surface leaks the OTHER's exclusive columns.
         assert!(
@@ -9553,11 +9576,12 @@ mod tests {
                 ]
                 .into_iter()
                 .collect(),
-                // No expiry overlay (issue #883): the `expiry` column elides, so the twelve
-                // goldens derived from this fixture stay byte-identical to their pre-#883 selves,
-                // and are the only proof that elision holds. The one derived golden that DOES grow
-                // the column is `stats-expiry-wide`, via [`report_with_expiry`] — a separate
-                // fixture precisely so both directions are pinned (issue #886).
+                // No expiry overlay (issue #883): the `expiry` column elides, so no golden
+                // derived from this fixture renders it — the ones that predate #883 stayed
+                // byte-identical straight through it, and collectively they are the only proof
+                // that elision holds. The one derived golden that DOES grow the column is
+                // `stats-expiry-wide`, via [`report_with_expiry`] — a separate fixture precisely
+                // so both directions are pinned (issue #886).
                 expiry: BTreeMap::new(),
                 // The CONFIGURED regime — every golden derived from this fixture pins the
                 // un-annotated render, so the degraded one gets its own case (issue #836).
@@ -9639,13 +9663,59 @@ mod tests {
             }
         }
 
+        /// The same roster whose `velocity` column carries EVERY form the cell can take — and so
+        /// the only fixture in which that column is MIXED-WIDTH (issue #1147).
+        ///
+        /// Issue #1136 added [`SUB_THRESHOLD_PCT_PER_MIN`] as a third string class and no golden
+        /// carried it. The gap was not cosmetic. `<0.1%/min` is NINE display columns where no cell
+        /// the corpus pinned reached past eight, and [`ChartCol::width`] takes the widest of a
+        /// column's header AND its cells — so while nothing under it passed eight that maximum was
+        /// the eight-wide header itself, and the whole pre-#1147 corpus reads identically whether
+        /// the width came from the cells or from the header alone. [`col_velocity`] is
+        /// `Align::Right`, so the extra column also has to land as leading pad on the shorter cells
+        /// beside it, and it is `priority: Some(3)`, so it enters the fit decision that sheds the
+        /// column.
+        ///
+        /// Only the SESSION dimension of the overlay moves — the weekly rates, weekly runways and
+        /// head-rooms are untouched — so the fleet line is unchanged and the diff against
+        /// `stats-piped` / `stats-wide-unicode-plain` is `beta`'s two overlay cells, `ガンマ`'s
+        /// velocity cell, and the column of pad the widened `velocity` column adds to every row —
+        /// that last one being the whole reason this fixture exists:
+        ///
+        /// - `alpha` keeps the climbing FIGURE (`0.9%/min`, eight columns) and its admitted runway;
+        /// - `beta` becomes MEASURED-FLAT: `0.0` is a reading, and gate 1 then has no drain to
+        ///   divide by, so no session runway comes with it;
+        /// - `ガンマ` takes the SUB-THRESHOLD burn. `5e-6` frac/s is the rate
+        ///   `fmt_pct_per_min_bounds_the_sub_threshold_band_instead_of_claiming_zero` records as a
+        ///   REAL burn moving ~9% of the session quota per 5 h window, and it is #1075's own review
+        ///   case — measured, strictly positive, and past that issue's plausibility bound, so the
+        ///   quotient is refused and the runway cell is a gap;
+        /// - `delta` has no overlay entry at all, so both its cells are the gap sentinel.
+        ///
+        /// That is the render-level form of the discrimination
+        /// [`velocity_cell_separates_a_refused_runway_from_a_flat_one`] proves in memory: the two
+        /// readings #1136 found byte-identical now sit one row apart in ONE right-aligned column,
+        /// where a whole-output comparison can see them and a substring check still cannot.
+        fn report_with_sub_threshold_velocity() -> Report {
+            let base = golden_report();
+            let mut velocity = base.velocity.clone();
+            let beta = velocity.get_mut("beta").expect("`beta` is in the roster");
+            beta.session_rate = Some(0.0);
+            beta.session_runway_secs = None;
+            let gamma = velocity
+                .get_mut("ガンマ")
+                .expect("`ガンマ` is in the roster");
+            gamma.session_rate = Some(5e-6);
+            Report { velocity, ..base }
+        }
+
         /// The same roster WITH the REFRESH-token expiry overlay populated (issue #886) — the
         /// `expiry` column's other direction.
         ///
         /// [`golden_report`] leaves `Report::expiry` empty, which is the shape every PRODUCTION
         /// path still produces (`stats` reads a persisted series and never talks to the daemon, so
         /// the overlay has no producer until issue #917 folds the durable expiry events into it).
-        /// That empty map is why the twelve cases above pin the column's ELISION. This one pins
+        /// That empty map is why every other case pins the column's ELISION. This one pins
         /// the POPULATED render, so the column that ships is goldened rather than only unit-tested
         /// — the layout facts a whole-output comparison sees (its RIGHT alignment among left-aligned
         /// text cells, its position in the row, the widths around it) are exactly the ones a
@@ -9948,6 +10018,26 @@ mod tests {
                     "stats-expiry-wide",
                     render_human(&report_with_expiry(), WIDE_UNICODE_PLAIN, None),
                 ),
+                // The velocity cell's NINE-column form (issue #1147) — the one string class no
+                // golden carried, beside eight-column ones in the same right-aligned column.
+                //
+                // Goldened on BOTH surfaces because they are two renderers over one
+                // [`col_velocity`]: the piped numeric table and the TTY chart table size the
+                // shared cell independently and against different neighbours, so pinning one
+                // width leaves the other free to regress. Every existing assertion on the bound
+                // reaches it through `render_text`, which is the piped half only.
+                Case::new(
+                    "stats-sub-threshold-velocity-piped",
+                    render_human(&report_with_sub_threshold_velocity(), PIPED, None),
+                ),
+                Case::new(
+                    "stats-sub-threshold-velocity-wide",
+                    render_human(
+                        &report_with_sub_threshold_velocity(),
+                        WIDE_UNICODE_PLAIN,
+                        None,
+                    ),
+                ),
             ]
         }
 
@@ -9970,6 +10060,8 @@ mod tests {
             "stats-fallback-census-piped",
             "stats-fallback-census-wide",
             "stats-expiry-wide",
+            "stats-sub-threshold-velocity-piped",
+            "stats-sub-threshold-velocity-wide",
         ];
 
         /// One-time emitter for the committed `stats` render goldens (issue #767).
@@ -10017,13 +10109,13 @@ mod tests {
         }
 
         /// The expiry case must actually EXERCISE the column it was added for (issue #886) — and
-        /// the twelve cases beside it must go on eliding it.
+        /// every case beside it must go on eliding it.
         ///
         /// Both halves matter and neither is visible to [`assert_matches_goldens`]. If
         /// `report_with_expiry` silently lost its overlay, `stats-expiry-wide` would re-emit as a
         /// copy of `stats-wide-unicode-plain`, match its own golden forever, and assert nothing
-        /// about the column. If the elision rule broke the other way, twelve goldens would grow a
-        /// wall of `—`. Stated as properties of the render, so both survive a re-baseline.
+        /// about the column. If the elision rule broke the other way, every other golden would grow
+        /// a wall of `—`. Stated as properties of the render, so both survive a re-baseline.
         #[test]
         fn the_expiry_case_renders_the_column_and_the_others_still_elide_it() {
             let with = render_human(&report_with_expiry(), WIDE_UNICODE_PLAIN, None);
@@ -10078,6 +10170,129 @@ mod tests {
             assert!(
                 !with.contains('\u{1b}'),
                 "the plain stats render carries no escape sequences:\n{with}"
+            );
+        }
+
+        /// The sub-threshold pair must actually carry the NINE-column form beside eight-column
+        /// ones, and the column must still RIGHT-align across that mixed width (issue #1147).
+        ///
+        /// Neither half is visible to [`assert_matches_goldens`]. If the fixture silently lost its
+        /// sub-threshold rate, both cases would re-emit as copies of `stats-piped` /
+        /// `stats-wide-unicode-plain` with `beta` flat, match their own goldens forever, and assert
+        /// nothing about the width they exist for — the failure mode
+        /// `the_expiry_case_renders_the_column_and_the_others_still_elide_it` guards for its own
+        /// column. Stated as properties of the render, so both survive a re-baseline.
+        #[test]
+        fn the_sub_threshold_cases_pin_a_mixed_width_right_aligned_velocity_column() {
+            // The premise the whole case rests on, asserted rather than assumed: the bound is ONE
+            // column wider than the figure form. Shorten it and this stops being a mixed-width
+            // case, which would otherwise degrade silently into a second copy of the twin.
+            let width = crate::cli::display_width;
+            assert_eq!(
+                width(SUB_THRESHOLD_PCT_PER_MIN),
+                width(ZERO_PCT_PER_MIN) + 1,
+                "`{SUB_THRESHOLD_PCT_PER_MIN}` is no longer wider than `{ZERO_PCT_PER_MIN}`, so \
+                 these cases pin no width the rest of the corpus was missing"
+            );
+
+            let all = cases();
+            for name in [
+                "stats-sub-threshold-velocity-piped",
+                "stats-sub-threshold-velocity-wide",
+            ] {
+                let out = render_golden::rendered(&all, name);
+
+                // All three MEASURED forms in one column — the bound, the measured zero, and the
+                // figure. The gap is `delta`'s, and it is the one cell that is not a reading.
+                for (handle, cell) in [
+                    ("ガンマ", SUB_THRESHOLD_PCT_PER_MIN),
+                    ("beta", ZERO_PCT_PER_MIN),
+                    ("alpha", "0.9%/min"),
+                ] {
+                    assert!(
+                        out.contains(cell),
+                        "`{name}` does not render `{handle}`'s `{cell}` — the case no longer \
+                         carries the form it is named for:\n{out}"
+                    );
+                }
+
+                // RIGHT-aligned across the mixed width: the nine-column cell and the eight-column
+                // ones land their right edges in ONE terminal cell, so the `%/min` suffixes read
+                // down the column. Flip `col_velocity` to `Align::Left` and the two eight-column
+                // rows come up one column short of `ガンマ`'s.
+                let edge = cell_right_edge(out, "ガンマ", SUB_THRESHOLD_PCT_PER_MIN);
+                for (handle, cell) in [("alpha", "0.9%/min"), ("beta", ZERO_PCT_PER_MIN)] {
+                    assert_eq!(
+                        cell_right_edge(out, handle, cell),
+                        edge,
+                        "in `{name}`, `{handle}`'s eight-column `{cell}` does not right-align \
+                         with `ガンマ`'s nine-column bound:\n{out}"
+                    );
+                }
+            }
+        }
+
+        /// The nine-column cell is COUNTED in the column-fit decision, not merely rendered wider
+        /// (issue #1147).
+        ///
+        /// [`table_width`] sums each column's lead gap and [`ChartCol::width`], the widest of that
+        /// column's header AND its cells, and the loop in [`render_account_table`] sheds the lowest
+        /// present priority until that sum fits. While no `velocity` cell passes eight the maximum
+        /// is the eight-wide header itself, so a width taken from the header alone fits every other
+        /// golden byte for byte — the corpus cannot tell the two apart. One nine-column cell can.
+        ///
+        /// The boundary is DERIVED by sweeping the twin fixture rather than hard-coded, so this
+        /// keeps testing the same relationship when an unrelated column changes width — a
+        /// hand-picked number would quietly stop being the boundary and assert nothing.
+        #[test]
+        fn the_nine_column_velocity_cell_reaches_the_column_fit_decision() {
+            let twin = golden_report();
+            let sub = report_with_sub_threshold_velocity();
+            let header = |r: &Report, w: usize| {
+                render_chart_table(r, &keys(r), w, false, false)
+                    .lines()
+                    .next()
+                    .expect("the chart table has a header row")
+                    .to_owned()
+            };
+            let keeps_velocity = |r: &Report, w: usize| header(r, w).contains("velocity");
+
+            // The narrowest width at which the all-eight-column table still keeps `velocity`, and
+            // the bound form's render one column wider — the width everything below is about.
+            let boundary = (1..=200)
+                .find(|&w| keeps_velocity(&twin, w))
+                .expect("`velocity` survives somewhere at or under 200 columns");
+            let shed = render_chart_table(&sub, &keys(&sub), boundary + 1, false, false);
+
+            // The two fixtures differ in exactly ONE display column — `beta`'s runway cell narrows
+            // from `~9h` to the sentinel, which its six-wide header already dominates — so the
+            // bound form needs precisely one more, and both directions have to hold. Without the
+            // second assertion a `velocity` column lost for any OTHER reason would satisfy this.
+            assert!(
+                !keeps_velocity(&sub, boundary),
+                "at w={boundary} the nine-column cell still fit, so its extra column is not \
+                 reaching the fit decision:\n{}",
+                render_chart_table(&sub, &keys(&sub), boundary, false, false)
+            );
+            assert!(
+                keeps_velocity(&sub, boundary + 1),
+                "…and one more column is all it needs, so the shed above is the WIDTH and not a \
+                 column lost for some other reason:\n{shed}"
+            );
+
+            // That surviving render is a genuinely SHED layout — a lower-priority column has
+            // already gone — which no wide golden renders. The cell still right-aligns in it, so
+            // the post-drop alignment slice stays index-aligned with the widths beside it.
+            let count = |line: &str| line.split_whitespace().count();
+            assert!(
+                count(&header(&sub, boundary + 1)) < count(&header(&sub, 200)),
+                "nothing had shed at w={}, so this is just the wide layout again:\n{shed}",
+                boundary + 1
+            );
+            assert_eq!(
+                cell_right_edge(&shed, "alpha", "0.9%/min"),
+                cell_right_edge(&shed, "ガンマ", SUB_THRESHOLD_PCT_PER_MIN),
+                "the mixed-width column stops right-aligning once a column sheds:\n{shed}"
             );
         }
 
