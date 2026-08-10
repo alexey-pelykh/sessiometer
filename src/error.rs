@@ -1647,12 +1647,65 @@ mod tests {
     /// Split an `#[error(...)]` body into its concatenated string literals and its non-literal
     /// arguments.
     ///
-    /// Rust's line continuation — a `\` at end of line, which eats the newline AND the next
-    /// line's indentation — resolves to a single space. The scanner tokenises on non-alphanumeric
-    /// boundaries so whitespace shape is irrelevant, but SWALLOWING the continuation would
-    /// silently truncate the message: two of the three templates issue #1139 is about keep their
-    /// banned token on the far side of one, which is what the canary in
-    /// `every_error_template_is_scanned_and_the_parse_cannot_be_evaded` pins.
+    /// This models `rustc`'s string-literal escapes, and issue #1161 is what a divergence between
+    /// the model and the language costs: the operator reads what `rustc` rendered, the guard
+    /// scans what this function returned, so a banned token can be present in the first and
+    /// absent from the second with every test green. Both halves below were demonstrated that
+    /// way — by checking what the message RENDERS to, not by reading this function.
+    ///
+    /// Rust's line continuation — a `\` at end of line — eats the newline AND the run of ASCII
+    /// whitespace after it, and resolves to NOTHING. It is emphatically not a space: a space is
+    /// what this function used to push, which is why `"up\<newline>grade your plan"` reached an
+    /// operator as `upgrade your plan` while the guard scanned `up grade your plan` and found
+    /// nothing to report.
+    ///
+    /// State the skipped run precisely, because BOTH of its bounds are places to be wrong and an
+    /// earlier revision of this fix was wrong at both. It is **ASCII** whitespace, so a NBSP
+    /// (`U+00A0`) after the `\` is KEPT — `rustc` warns about it and moves on — whereas
+    /// `char::is_whitespace`, the Unicode predicate, would eat it; and since a NBSP renders as a
+    /// space, eating it is how `top\<newline><NBSP>up` reaches an operator as `top up` while the
+    /// guard scans `topup`. And the run does not stop at the next newline: `rustc` skips a blank
+    /// line after the `\` (warning "multiple lines skipped by escaped newline"), so a model that
+    /// halted at `\n` would leave the far side unattached. `char::is_ascii_whitespace` is
+    /// exactly the predicate `rustc`'s own unescaper uses, which is why this arm spells it that
+    /// way rather than enumerating characters.
+    ///
+    /// Resolving the continuation to nothing does not SWALLOW the remainder — the far side
+    /// is still appended, which is what the canary in
+    /// `every_error_template_is_scanned_and_the_parse_cannot_be_evaded` pins, on the two of its
+    /// three templates that carry their banned token past a continuation.
+    ///
+    /// # Why the escape set is CLOSED, and why anything outside it panics
+    ///
+    /// The other half of issue #1161 was `\u{75}` and `\x75`, which fell through to a
+    /// push-it-verbatim arm: `u` followed by a literal `{75}`, so the banned word was never
+    /// reassembled and never scanned. The fix could have RESOLVED them. It refuses instead, on
+    /// the evidence of this file's own templates — measured when issue #1161 was decided, over
+    /// the 87 then present: the only escapes any of them spend are the line continuation (43
+    /// sites across 19 templates) and `\n` (2). No `\u{…}`, no `\x..`, while the 34 templates
+    /// that need a non-ASCII character write it directly, `—` and all. The construct a resolver
+    /// would model is one the house style does not reach for even where it is the obvious tool.
+    ///
+    /// Those counts are a snapshot and will drift; the claim resting on them does not, because
+    /// the refusal below enforces it. The day a template does spend a `\u{…}`, this stops being
+    /// a matter of anyone's recollection and becomes a failing test.
+    ///
+    /// Against that, a resolver is a strictly larger model and so a strictly larger drift
+    /// surface, in the very way that produced this defect. `\u{75}`, `\u{7_5}` (underscores are
+    /// legal between the hex digits), `\u{000075}` and `\x75` all render `upgrade`; surrogates
+    /// and anything past `10FFFF` are compile errors rather than characters. Every one of those
+    /// is a place a hand-rolled decoder can be subtly wrong, and wrong SILENTLY — which is the
+    /// property being fixed, not a property worth re-buying.
+    ///
+    /// So the set below is closed and everything else panics naming the template. The cost is
+    /// real and is accepted: a legitimate future `\u{…}` reddens this guard until someone teaches
+    /// this arm and gives it a canary. That is the correct direction for the asymmetry — a false
+    /// RED costs one edit, is paid at authoring time by the author who caused it, and says which
+    /// template; a false GREEN is a firewall breach nobody learns about.
+    ///
+    /// `\\`, `\"` and `\'` are modeled rather than refused because this function already handled
+    /// them correctly, by accident, in the arm that mangled `\u{…}`. Refusing them would narrow
+    /// behaviour that was never wrong.
     fn split_attr(body: &str) -> (String, Vec<String>) {
         let mut literal = String::new();
         let mut rest = String::new();
@@ -1666,19 +1719,33 @@ mod tests {
                 match c2 {
                     '"' => break,
                     '\\' => match chars.next() {
+                        // Resolves to NOTHING — see this function's doc comment. Pushing a space
+                        // here is what let `up\<newline>grade` past the guard as `up grade`.
                         Some('\n') => {
-                            while chars
-                                .peek()
-                                .is_some_and(|c| *c != '\n' && c.is_whitespace())
-                            {
+                            // ASCII whitespace, and newlines INCLUDED — both halves matter, and
+                            // an earlier revision of this fix had each of them backwards. See the
+                            // doc comment: `char::is_whitespace` is the Unicode predicate and
+                            // would eat a NBSP `rustc` keeps, while stopping at `\n` would leave
+                            // a blank line after the `\` that `rustc` skips.
+                            while chars.peek().is_some_and(char::is_ascii_whitespace) {
                                 chars.next();
                             }
-                            literal.push(' ');
                         }
                         Some('n') => literal.push('\n'),
                         Some('t') => literal.push('\t'),
                         Some('r') => literal.push('\r'),
-                        Some(other) => literal.push(other),
+                        Some(verbatim @ ('\\' | '"' | '\'')) => literal.push(verbatim),
+                        Some(other) => panic!(
+                            "`\\{other}` is an escape this extractor does not model, in the \
+                             template {body:?}. It models `rustc` over a CLOSED set — `\\n`, \
+                             `\\t`, `\\r`, `\\\\`, `\\\"`, `\\'`, and a line continuation — and \
+                             REFUSES the rest rather than guess, because guessing is the issue \
+                             #1161 defect: `\\u{{75}}pgrade your plan` reached an operator's \
+                             terminal as `upgrade your plan` while this function returned \
+                             `u{{75}}pgrade your plan` and the guard passed it. Write the \
+                             character directly, as every non-ASCII template here already does, \
+                             or teach this arm and give it a canary that reddens without it"
+                        ),
                         None => break,
                     },
                     _ => literal.push(c2),
@@ -1692,6 +1759,182 @@ mod tests {
             .map(str::to_owned)
             .collect();
         (literal, args)
+    }
+
+    /// Issue #1161's fidelity canary: what [`split_attr`] returns for a template is what `rustc`
+    /// renders from the same source, across every escape the model claims to handle.
+    ///
+    /// The construction is the point, and it is why this cannot rot into the defect it fixes.
+    /// Each case is the SAME source text twice — on the left as the characters [`error_prose`]
+    /// reads out of this file (a raw string, where `\` is just a backslash), on the right as a
+    /// real Rust literal, so the COMPILER supplies the expected value. One side of every pair IS
+    /// the language being modeled, so no hand-typed expectation sits between the two and there is
+    /// nothing to keep in sync: teaching the model a new escape means adding a pair, and a pair
+    /// that disagrees with `rustc` cannot be written down.
+    #[test]
+    fn split_attr_resolves_every_modeled_escape_exactly_as_rustc_does() {
+        // (the source text, what `rustc` makes of it)
+        let cases: &[(&str, &str)] = &[
+            // Issue #1161's own fixture — a continuation SPLITTING a word. RED before the fix:
+            // the arm pushed a space, so this read `up grade your plan`.
+            (
+                r#""up\
+                 grade your plan""#,
+                "up\
+                 grade your plan",
+            ),
+            // The idiom this file actually writes, at most of its continuation sites: an
+            // explicit space BEFORE the `\`. Also RED before the fix, which produced a DOUBLE
+            // space — the same divergence as the case above, harmless to the tokenizer and
+            // therefore never noticed.
+            (
+                r#""refusing to swap: \
+                 name a target""#,
+                "refusing to swap: \
+                 name a target",
+            ),
+            // (the continuation's skipped run has two BOUNDS, and an earlier revision of this fix
+            // had each of them backwards; both are pinned below rather than here, because
+            // neither case can be written as a compiling pair — see the comment there)
+            //
+            // The rest are GREEN before and after: regression pins on the arms that were already
+            // faithful, so a later edit cannot quietly trade one divergence for another.
+            (r#""line\nbreak""#, "line\nbreak"),
+            (r#""col\tumn""#, "col\tumn"),
+            (r#""ret\rurn""#, "ret\rurn"),
+            (r#""back\\slash""#, "back\\slash"),
+            (r##""he said \"no\"""##, "he said \"no\""),
+            (r#""it\'s""#, "it\'s"),
+            (r#""no escapes at all""#, "no escapes at all"),
+        ];
+        for (source, rendered) in cases {
+            let (extracted, _) = split_attr(source);
+            assert_eq!(
+                &extracted, rendered,
+                "the extractor and `rustc` disagree about {source:?} — the operator reads \
+                 `rustc`'s answer and the guard scans this one, so any gap here is a message \
+                 that can carry banned framing past a green run (issue #1161)"
+            );
+        }
+
+        // The continuation's two BOUNDS. Both were RED at an earlier revision of this fix, both
+        // are word-SPLITTING — so each is a live evasion, not a cosmetic difference — and neither
+        // can join the compiling pairs above:
+        //
+        //   * the UPPER bound needs a real literal whose `\` is followed by a BLANK LINE, and
+        //     `rustc` warns "multiple lines skipped by escaped newline" on exactly that. The
+        //     warning is a lexer warning rather than a lint, so `-D warnings` does not escalate
+        //     it — but it also cannot be silenced, and a permanent warning in every build is a
+        //     worse thing to ship than a hand-written expectation with its provenance stated.
+        //   * the LOWER bound needs a literal NBSP in this file, which would be invisible to
+        //     every reader and easy to "tidy away".
+        //
+        // So both build the LEFT side — the characters `error_prose` would read out of a file —
+        // and state the right side, which was established by running `rustc` over each source as
+        // a real literal and printing the result. What that probe showed, verbatim:
+        //
+        //     H1 rustc renders: "upgrade your plan"
+        //     H2 rustc renders: "running low — top\u{a0}\u{a0}\u{a0}up first"
+        //
+        // Upper bound: the skipped run does NOT stop at the next newline, so a model halting at
+        // `\n` leaves the far side unattached and the split word never reassembles.
+        let blank_line_source = "\"up\\\n\n             grade your plan\"";
+        let (blank_line_extracted, _) = split_attr(blank_line_source);
+        assert_eq!(
+            blank_line_extracted, "upgrade your plan",
+            "`rustc` skips a BLANK LINE after a continuation — it warns and skips it anyway — so \
+             stopping the skipped run at `\\n` leaves the operator reading `upgrade` while the \
+             guard scans two harmless halves (issue #1161)"
+        );
+        assert_eq!(
+            scan_all_banned(&blank_line_extracted),
+            vec!["upgrade"],
+            "the guard's verdict, not merely the extracted string, is what a divergence here costs"
+        );
+
+        // Lower bound: the run is ASCII whitespace, so the NBSP is KEPT. The Unicode predicate
+        // would eat it — and because a NBSP RENDERS as a space, eating it is how an operator
+        // reads `top up` while the guard scans `topup`.
+        let nbsp = '\u{a0}';
+        let nbsp_source = format!("\"running low — top\\\n{nbsp}{nbsp}{nbsp}up first\"");
+        let (nbsp_extracted, _) = split_attr(&nbsp_source);
+        assert_eq!(
+            nbsp_extracted,
+            format!("running low — top{nbsp}{nbsp}{nbsp}up first"),
+            "a NBSP after a line continuation is KEPT by `rustc`, so eating it here would let \
+             `top<NBSP>up` — which an operator READS as `top up` — reach the scan as `topup` \
+             (issue #1161)"
+        );
+        assert_eq!(
+            scan_all_banned(&nbsp_extracted),
+            scan_all_banned("running low — top up first"),
+            "the guard's verdict must not depend on WHICH space character separates two words, \
+             since the operator cannot tell them apart on a terminal"
+        );
+
+        // END TO END, which is how issue #1161 was demonstrated in the first place: not that the
+        // extracted string changed, but that the GUARD'S VERDICT on it did. Before the fix this
+        // scan came back empty over a message that renders `upgrade your plan`.
+        let (template, _) = split_attr(
+            r#""up\
+             grade your plan""#,
+        );
+        assert_eq!(
+            scan_all_banned(&template),
+            vec!["upgrade"],
+            "a banned token split across a line continuation must be scanned as the operator \
+             reads it — reassembled, not left as two harmless-looking halves"
+        );
+    }
+
+    /// Issue #1161's refusal canary: an escape outside the modeled set stops the guard LOUDLY and
+    /// says which template did it, instead of being guessed at and scanned as a string the
+    /// operator will never see.
+    ///
+    /// Both halves are asserted, because loud and legible are different properties and only the
+    /// second one is actionable. A panic that said merely "unsupported escape" would pass a
+    /// did-it-refuse test while leaving the next author to bisect 87 templates by hand.
+    #[test]
+    fn split_attr_refuses_an_unmodeled_escape_and_names_the_offending_template() {
+        for (source, escape) in [
+            // The issue's fixture. Before the fix this returned `u{75}pgrade your plan`, which
+            // tokenises to `u` / `75` / `pgrade` and reports clean.
+            (r#""\u{75}pgrade your plan""#, r"\u"),
+            // `\x..` is the same hole differently spelled — and so are `\u{7_5}` (underscores
+            // are legal between the hex digits) and `\u{000075}`. All four render `upgrade`,
+            // which is the case for refusing the CLASS rather than racing its spellings.
+            (r#""\x75pgrade your plan""#, r"\x"),
+            (r#""\u{7_5}pgrade your plan""#, r"\u"),
+            // `\0` is NUL to `rustc` and was the digit `0` here. Nothing to do with the guard's
+            // vocabulary, caught anyway by closing the set rather than patching known holes.
+            (r#""\0""#, r"\0"),
+        ] {
+            let payload = match std::panic::catch_unwind(|| split_attr(source)) {
+                Ok((extracted, _)) => panic!(
+                    "`split_attr` did not refuse {source:?} — it silently returned \
+                     {extracted:?}, which is not what `rustc` renders. That gap IS issue #1161"
+                ),
+                Err(payload) => payload,
+            };
+            let message = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .unwrap_or_else(|| "<the panic payload was not a String>".to_owned());
+            // Split on the template echo FIRST and assert the escape is named in what precedes
+            // it. Asserting `message.contains(escape)` over the whole message cannot fail: the
+            // Debug echo of the template already spells the escape, so the check below would
+            // subsume it and the escape half would be pure ceremony.
+            let echo = format!("{source:?}");
+            let (before_echo, _) = message.split_once(&echo).unwrap_or_else(|| {
+                panic!("the refusal does not name the offending template {source:?}: {message}")
+            });
+            assert!(
+                before_echo.contains(escape),
+                "the refusal echoes the template but never names the offending escape \
+                 {escape:?} in its own right, so a reader has to spot it inside the quoted \
+                 template: {message}"
+            );
+        }
     }
 
     /// Every banned token in an authored error template that [`ERROR_PROSE_LEDGER`] does not
