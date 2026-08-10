@@ -177,8 +177,12 @@ status cell in `README.md` is unchanged. That is a decision worth being explicit
   words changed.
 - **`healthy`**, in `ActiveAccountUnresolved`, did **not** survive. It is a value judgement, the
   group this firewall exists for, and the defence that it names the machine-checkable
-  `CredentialHealth::Healthy` is false on that code path. It is recorded as a violation under
-  issue #1151 rather than excused — so the boundary held here rather than moving.
+  `CredentialHealth::Healthy` is false on that code path. It was recorded as a violation under
+  issue #1151 rather than excused — so the boundary held here rather than moving. **Issue #1151
+  then spent that debt**: the message no longer says `healthy`, the ledger entry is gone, and
+  `ERROR_PROSE_LEDGER`'s violation set is now asserted EMPTY. This bullet is kept in the past
+  tense rather than deleted, because what it records is how the boundary behaved when it was
+  tested — not a debt a reader should expect to still find in the code.
 
 The one thing #1139 did add is a mechanism, not a boundary: this audience gets **no exemption set**
 and scans the central lists whole, because `Error` is dozens of independent messages rather than one
