@@ -646,9 +646,10 @@ Issue #762 put the Settings window's copy and its two hardcoded field widths und
 (`Tests/SettingsTextMetricsTests`). Three surfaces stayed out of reach of that gate — window/activation
 lifecycle, the `⌘S` key event, and runtime affordances (spinner, focus ring, hover tooltip) — and they
 are listed here rather than left silent, since the issue's AC-4 is explicit that an untestable surface
-must be named as such. They expand to the six steps below because two of them have a stopped-daemon and
-a running-daemon half, and because issue #844 added a second runtime affordance — the footer's clamped
-failure label — whose drawing no headless bundle can observe. Everything else the gate could not reach has a tracked owner instead: the
+must be named as such. They expand to the seven steps below because two of them have a stopped-daemon and
+a running-daemon half, and because issues #844 and #944 added a second runtime affordance — the footer's
+clamped apply-status label, one step per arm since the two have different triggers — whose drawing no
+headless bundle can observe. Everything else the gate could not reach has a tracked owner instead: the
 accessibility tree is issue #840, the design reference is § The Settings window below (issue #763,
 landed), and Dynamic Type is the
 pinned defect issue #845.
@@ -680,6 +681,18 @@ Run these with the daemon RUNNING (so the form loads) unless a step says otherwi
       the accessibility tree are all gated in `SettingsTextMetricsTests`; that SwiftUI actually draws
       two lines and not ten is the half only an eye can settle, and the window is not resizable, so an
       unbounded label eats the form rather than clipping.
+- [ ] **The footer's clamped rejection label** (issue #944). Its own step rather than a note on the one
+      above, because the trigger is different and far cheaper: set `target_max_session_usage` to **0**
+      and save. No version skew, no source edit — the daemon rejects it with a 169-character
+      cross-field remedy (`src/config/validate.rs`, the issue #414 trap), and on the `invalid` path
+      that message *is* the label rather than a detail appended to an app sentence. Confirm the red
+      footer line stops at **two** lines, that the form above it does not move, and that hovering shows
+      the remedy in full — the tooltip is the only place the operator can read the fix. Then check a
+      reason that carries no detail (edit a label for a removed account): the tooltip must still show
+      that arm's sentence rather than nothing, which is what `.help(detail ?? "")` used to do. Finally
+      malform `config.toml` by hand and save: the label says only that the file couldn't be read, and
+      the tooltip must add the daemon's parse error under it — that error names the line and column,
+      and this tooltip is the only surface carrying it.
 
 Not on this list on purpose: the per-field COPY, the Save enable/disable rule, and whether a value or
 label fits its field. Those are measured in `SettingsTextMetricsTests` and do not need a human.
@@ -1350,14 +1363,23 @@ the defect #573 fixed and the arrangement this reference now locks.
 from two allowances and says to treat it as approximate) and the daemon's `detail` can reach
 several thousand, so the label clamps to two lines while the full message stays reachable through the
 hover tooltip and `accessibilityHelp`. That is the same call the `255%` meter already ratified —
-clamp the drawing, never the truth. The shipped `.failed` arm now does this (issue #844 — the clamp is
-`SettingsFormat.applyStatusLineLimit`, and `.help` is what carries both recovery surfaces, since there
-is no SwiftUI `accessibilityHelp` modifier and that AX attribute is the one `.help` sets). Its sibling
-on the `.rejected` arm does **not** yet (issue #944). For that arm the target is carried by the
-ratified **rule** alone — the `-webkit-line-clamp:2` on `menubar-preview.html`'s `.win-status .txt`,
-under a comment that names `.failed` and `.rejected` together — and by **no frame**: every
-apply-status arm except `.failed` is among the surfaces these four frames deliberately do not author
-(§ above, register R-11 → issue #946). Read that arm's target off the rule, not off a frame.
+clamp the drawing, never the truth. **Both** shipped arms now do this — `.failed` (issue #844) and its
+sibling `.rejected` (issue #944) — through one shared `SettingsFormat.applyStatusLineLimit`, with
+`.help` carrying both recovery surfaces, since there is no SwiftUI `accessibilityHelp` modifier and
+that AX attribute is the one `.help` sets.
+
+The `.rejected` arm is the one to read carefully if you touch this slot, for two reasons. Its target
+was taken from the ratified **rule** alone — the `-webkit-line-clamp:2` on `menubar-preview.html`'s
+`.win-status .txt`, under a comment that names `.failed` and `.rejected` together — and from **no
+frame**: every apply-status arm except `.failed` is among the surfaces these four frames deliberately
+do not author (§ above, register R-11 → issue #946), so silence there is still not authority. And it
+is the arm where the rule bites hardest: `rejectionText(.invalid, detail)` *returns* the daemon's
+`detail`, so the whole label is the daemon's message with no app sentence around it — measured, the
+`target_max_session_usage = 0` remedy is 169 characters and ~1 027 pt of text in that 328 pt slot.
+Four of the six *fixed* app sentences already occupy **both** clamped lines, so a rewrite of that copy
+is working inside a real budget: measured, the widest of them clears the second line by about 39
+characters. `SettingsTextMetricsTests` computes that margin and fails with the number rather than
+leaving it to be discovered by shipping.
 
 ## Design constraints the mock honors
 
