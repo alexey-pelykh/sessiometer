@@ -1,8 +1,8 @@
 // Copyright (c) 2026 Oleksii PELYKH
 // SPDX-License-Identifier: MIT
 
-//! The FRAMING guard's shared vocabulary (issues #160, #542, #918, #1123) — one banned list, one
-//! scanner, reachable from every operator-facing surface's tests.
+//! The FRAMING guard's shared vocabulary (issues #160, #542, #918, #1123, #1139) — one banned
+//! list, one scanner, reachable from every operator-facing surface's tests.
 //!
 //! # Why this module exists at all
 //!
@@ -16,10 +16,10 @@
 //! Hoisting the list here is the split issue #918 records: the vocabulary is not a stats
 //! implementation detail, it is the FRAMING contract every operator-facing prose surface owes.
 //!
-//! # One list, four audiences
+//! # One list, five audiences
 //!
 //! [`BANNED_TOKENS`] stays whole and stats keeps scanning against all of it — nothing was
-//! subtracted from what `stats.rs` saw before. Every other audience scans a DERIVED subset:
+//! subtracted from what `stats.rs` saw before. Three audiences scan a DERIVED subset:
 //! [`BANNED_TOKENS`] minus that audience's own exemption set, computed by
 //! [`banned_tokens_except`]. Deriving the subsets rather than hand-copying them is the point: a
 //! second hand-maintained list would drift from the first, which is the failure mode this module
@@ -32,18 +32,65 @@
 //! | `--help` (#918) | [`help_banned_tokens`] | [`HELP_EXEMPT_TOKENS`] | the shipped help |
 //! | operator advisories (#1123) | [`advisory_banned_tokens`] | [`ADVISORY_EXEMPT_TOKENS`] | the shipped advisories |
 //! | `Error::CliUsage` prose (#1123) | [`usage_banned_tokens`] | [`USAGE_EXEMPT_TOKENS`] | the shipped usage hints |
+//! | `Error` templates (#1139) | [`BANNED_TOKENS`] whole | **none** — a per-variant ledger instead | — |
 //!
-//! That fourth row names ONE variant, and the narrowness is deliberate rather than shorthand.
-//! `Error` has many other operator-facing variants and several carry central vocabulary today —
+//! The fourth row names ONE variant, and the narrowness is deliberate rather than shorthand:
+//! issue #1123 scoped `Error::CliUsage`, whose prose is a usage HINT of the same register as the
+//! help text issue #918 scanned. Calling that row "error prose" would advertise a reach it does
+//! not have, which is the exact defect issue #918 was opened about.
+//!
+//! All five share ONE tokenizer ([`words_of`], reached through [`scan_with`] /
+//! [`scan_all_with`]), so no guard can silently disagree with another about what counts as a
+//! word.
+//!
+//! # The fifth audience has no exemption set, and that is the answer to a scoping question
+//!
+//! Issue #1139 asked whether `Error`'s other variants — three of which spend central vocabulary:
 //! `ConfigTargetMaxSessionAboveTrigger` and `SharedCredentialMutated` spend `must`,
-//! `ActiveAccountUnresolved` spends `add` and the value judgement `healthy`. None is in scope
-//! here: issue #1123 scoped `Error::CliUsage`, whose prose is a usage HINT of the same register
-//! as the help text issue #918 scanned. Issue #1139 carries the rest. Calling this row "error
-//! prose" would advertise a reach it does not have, which is the exact defect issue #918 was
-//! opened about.
+//! `ActiveAccountUnresolved` spends `add` and `healthy` — belong inside this firewall, and if so
+//! under which vocabulary. Both halves are settled, and the second half is the interesting one.
 //!
-//! All four share ONE tokenizer ([`scan_with`]), so no guard can silently disagree with another
-//! about what counts as a word.
+//! **In scope, and the subject is the attribute.** `src/main.rs` prints every
+//! error that reaches it as `sessiometer: {err}`, so an `Error`'s `Display` is an operator-facing
+//! prose surface of the same register as `--help` and the advisories. The SUBJECT is each
+//! variant's authored `#[error(...)]` TEMPLATE — the ATTRIBUTE, which is NARROWER than "what this
+//! crate wrote": a crate-authored string built at a CONSTRUCTION site and handed in as a payload
+//! (`Error::ConfigInvalid(format!(…))`) sits outside this subject even though this crate wrote it.
+//! `Error::CliUsage`'s own doc comment draws a DIFFERENT and WIDER seam — it drives each message
+//! through the real parser with neutral argv and scans what RENDERS, so its construction-site prose
+//! is covered and only the operator's echoed argv is out. A template holds `{query}`, never the
+//! operator's query; `{0}`, never the TOML parser's sentence; and `Io` is `#[error(transparent)]`,
+//! whose `Display` is the OS's. Scoping to templates therefore keeps the guard pointed at this
+//! crate's own assertions, and gets a completeness argument for free: `thiserror` will not compile a
+//! variant that carries no `#[error(...)]`, so walking the attributes IS walking the variants —
+//! which is not the same as walking every string a variant can carry. Issue #1152 tracks that
+//! residual, including the `ConfigInvalid` / `MigrationInvalid` construction sites.
+//!
+//! **Under no exemption set at all.** This audience scans [`BANNED_TOKENS`] whole, like stats —
+//! the strictest of the five. That is not an oversight; a per-surface exemption set is the wrong
+//! SHAPE of carve-out here, and reaching for one is the move issue #1139 was opened to refuse.
+//! The three sets above are earned by whole surfaces whose every member spends the token (a
+//! `usage_hint`'s job is to name a command, so ALL of them may spell `disable`). `Error` is not
+//! one surface — it is dozens of independent messages that share a type. An `ERROR_EXEMPT_TOKENS`
+//! carrying `{add, healthy, must}` would excuse those tokens in EVERY one of them, so the day a
+//! new variant read "you must add an account" the guard would pass it, having been widened by
+//! three earlier messages that had nothing to do with it. The carve-out is therefore
+//! per-(variant, token):
+//! `src/error.rs`'s `ERROR_PROSE_LEDGER`, four entries, each naming the ONE variant it excuses,
+//! carrying a written verdict, and asserted to still be spent by that variant. Anything not in
+//! the ledger reddens — including a second banned token in an already-ledgered message, which is
+//! why that guard scans with [`scan_all_banned`] rather than first-hit.
+//!
+//! **No boundary moved, so ADR-0020 needs no amendment.** The three tokens were judged against
+//! the boundary as it already stands: `add` in "add it to the rotation" is the non-acquisitive
+//! REMEDY DIRECTIVE the #1123 amendment settled (its object is a mechanical operation on this
+//! tool's own roster, not an acquisition); `must` in both its uses is a CONSTRAINT STATEMENT
+//! whose modal governs a config value or this tool's own invariant rather than the operator, so
+//! it is not the "you should" recommendation framing the group bans. `healthy` is the one that
+//! did NOT survive: it is a value judgement, the group the #160 firewall exists for, and it is
+//! recorded in the ledger as a VIOLATION under its own issue rather than excused or reworded.
+//! See `src/error.rs`'s `ERROR_PROSE_LEDGER` for the per-entry reasoning, including why the
+//! defence that `healthy` names `CredentialHealth::Healthy` is false on that code path.
 //!
 //! # Why each audience gets its OWN exemption set, and not the widest one
 //!
@@ -288,20 +335,62 @@ pub fn usage_banned_tokens() -> Vec<&'static str> {
 }
 
 /// The first banned token OR acquisitive phrase from the given lists appearing in `text`, or
-/// `None` when it is clean. Strips ANSI SGR runs first (so a colour-wrapped word tokenises
-/// intact), then matches whole lowercase WORDS on non-alphanumeric boundaries — so `at-risk`,
-/// `At Risk`, and `risk!` all trip `risk`, while `saturated` or an account handle never
-/// false-trips — and finally adjacent-word purchase-calls (`top up`), so a neutral head-room fact
-/// passes while an acquisitive call does not (issue #542).
+/// `None` when it is clean. Tokenises via [`words_of`] — ANSI-stripped, whole lowercase words on
+/// non-alphanumeric boundaries — then matches single editorialising words before adjacent-word
+/// purchase-calls (`top up`), so a neutral head-room fact passes while an acquisitive call does
+/// not (issue #542).
 ///
-/// The single tokenizer both audiences share: [`scan_banned`] passes the whole list,
+/// The entry point every audience shares: [`scan_banned`] passes the whole list,
 /// [`scan_help_banned`] passes the derived subset, and neither can drift from the other on what
-/// counts as a word.
+/// counts as a word. Since issue #1139 this is the first element of [`scan_all_with`] rather
+/// than a second implementation of the same walk, so "the first hit" and "every hit" cannot
+/// disagree either.
 pub fn scan_with(
     text: &str,
     tokens: &[&'static str],
     phrases: &[&'static str],
 ) -> Option<&'static str> {
+    scan_all_with(text, tokens, phrases).into_iter().next()
+}
+
+/// EVERY banned token and acquisitive phrase from the given lists appearing in `text`, tokens
+/// first (in list order), then phrases — so [`scan_with`] above is literally this function's
+/// first element and the two CANNOT disagree about what a word is or which hit comes first.
+///
+/// Issue #1139 needs all of them rather than the first: its subject is
+/// [`Error`](crate::error::Error)'s authored `#[error(...)]` templates, carved out per
+/// (variant, token) rather than per surface, and a first-hit scan would let a SECOND banned
+/// token hide behind a pinned first one — a message spending both `must` and `upgrade` would
+/// report only `must` and pass once `must` was accounted for.
+pub fn scan_all_with(
+    text: &str,
+    tokens: &[&'static str],
+    phrases: &[&'static str],
+) -> Vec<&'static str> {
+    let words = words_of(text);
+    tokens
+        .iter()
+        .copied()
+        // A single editorialising / acquisitive WORD (issue #160).
+        .filter(|b| words.iter().any(|w| w == b))
+        // A purchase-CALL spanning adjacent words (issue #542): `top up` / `get more`.
+        .chain(
+            phrases
+                .iter()
+                .copied()
+                .filter(|phrase| phrase_present(&words, phrase)),
+        )
+        .collect()
+}
+
+/// The ONE tokenizer every audience shares. Strips ANSI SGR runs first (so a colour-wrapped word
+/// tokenises intact), then splits into whole lowercase WORDS on non-alphanumeric boundaries — so
+/// `at-risk`, `At Risk`, and `risk!` all yield `risk`, while `saturated` or an account handle
+/// never false-trips.
+///
+/// Words come back in READING ORDER (a Vec, not a set) — the order is what lets
+/// [`phrase_present`] match an adjacent-word purchase-call without a fragile substring test.
+fn words_of(text: &str) -> Vec<String> {
     let mut plain = String::with_capacity(text.len());
     let mut chars = text.chars();
     while let Some(c) = chars.next() {
@@ -316,34 +405,35 @@ pub fn scan_with(
             plain.push(c);
         }
     }
-    // Lowercase words in READING ORDER (a Vec, not a set) — the order lets the phrase scan
-    // below match an adjacent-word purchase-call without a fragile substring test.
-    let words: Vec<String> = plain
+    plain
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|w| !w.is_empty())
         .map(str::to_ascii_lowercase)
-        .collect();
-    // A single editorialising / acquisitive WORD (issue #160).
-    if let Some(hit) = tokens
-        .iter()
-        .copied()
-        .find(|b| words.iter().any(|w| w == b))
-    {
-        return Some(hit);
-    }
-    // A purchase-CALL spanning adjacent words (issue #542): `top up` / `get more`.
-    phrases.iter().copied().find(|phrase| {
-        let parts: Vec<&str> = phrase.split(' ').collect();
-        words
-            .windows(parts.len())
-            .any(|win| win.iter().zip(&parts).all(|(w, p)| w.as_str() == *p))
-    })
+        .collect()
+}
+
+/// Whether `phrase`'s space-separated parts appear as ADJACENT words in `words` — the
+/// word-boundary-safe form of the acquisitive purchase-call test (issue #542), so a neutral
+/// render never false-trips (`laptop update` is not `top up`).
+fn phrase_present(words: &[String], phrase: &str) -> bool {
+    let parts: Vec<&str> = phrase.split(' ').collect();
+    words
+        .windows(parts.len())
+        .any(|win| win.iter().zip(&parts).all(|(w, p)| w.as_str() == *p))
 }
 
 /// Scan `text` against the WHOLE central vocabulary — the stats-side guard (issues #160, #542),
 /// unchanged in reach by issue #918's split.
 pub fn scan_banned(text: &str) -> Option<&'static str> {
     scan_with(text, BANNED_TOKENS, BANNED_PHRASES)
+}
+
+/// EVERY hit in `text` against the WHOLE central vocabulary — no exemption set, because the
+/// audience that needs this one has none (issue #1139:
+/// [`Error`](crate::error::Error)'s authored `#[error(...)]` templates). `src/error.rs`'s
+/// `every_error_template_carries_no_banned_framing_beyond_the_pinned_ledger` is its only caller.
+pub fn scan_all_banned(text: &str) -> Vec<&'static str> {
+    scan_all_with(text, BANNED_TOKENS, BANNED_PHRASES)
 }
 
 /// Scan `text` against the help-side subset — every banned phrase, and every banned token except
