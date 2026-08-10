@@ -147,35 +147,26 @@ final class PanelAppearanceVariantTests: XCTestCase {
 
     /// A render proven REPRODUCIBLE in this process before it is compared at byte granularity.
     ///
-    /// WHY THIS IS NEEDED, and why it is not a loosened tolerance. `PanelRenderHarness`'s process-level
-    /// warm-up discards renders until two consecutive agree, but it warms the `healthy` fixture in the
-    /// LIGHT scheme only — so the first renders of any other cell still carry cold pixels, differing from
-    /// the steady state by ±1/255 on a few hundred bytes. That is issue #824, an open and separately
-    /// tracked rasterizer artifact, and it is exactly what this suite tripped over first: `healthy/dark`
-    /// reported 849 differing bytes at worst channel 1 between the plain and high-contrast appearances,
-    /// which reads as "the appearance reached the render" and is nothing of the sort.
+    /// The loop, its `0..<8` bound, its `byteDelta(...).differing == 0` predicate and — above all — the whole
+    /// reasoning for NOT absorbing issue #824's ±1/255 cold-raster drift into a looser threshold moved onto
+    /// `PanelRaster.settled` at issue #911. This was one of three near-verbatim copies of that reasoning, and
+    /// three copies is three places for it to drift silently, since a copy that quietly relaxes its bound
+    /// still passes. Read `PanelRaster.settled`'s doc comment for it;
+    /// `PanelGoldenParityTests.testSettledLoopsUntilTwoConsecutiveRastersAgree` and
+    /// `PanelGoldenParityTests.testSettledThrowsAndNamesItsCallerRatherThanReturningAnUnsettledRaster` prove
+    /// the shared loop genuinely iterates and genuinely throws.
     ///
-    /// The fix is to remove the confound, not to widen the comparison. Absorbing it into a tolerance —
-    /// switching the pin to `diffFraction`'s 64/255 threshold, or allowing "worst channel ≤ 1" — would also
-    /// swallow a real but faint high-contrast effect, which is precisely the signal the pin exists to
-    /// detect. So each cell is rendered until two consecutive rasters are byte-identical and the STEADY
-    /// one is what gets compared; the strict predicate survives intact. Same self-calibrating shape as the
-    /// harness's own warm-up (no tuned iteration count), and it fails loudly rather than silently
-    /// returning a cold raster.
+    /// What stays here is the only part that was ever local: WHICH render is being settled, and the SUBJECT
+    /// label a failure names. `file`/`line` default at the caller, so a red points at the test that drifted
+    /// rather than at this wrapper.
     private func stableRender(_ fixture: PanelRenderFixture, scheme: ColorScheme,
-                              appearance: NSAppearance.Name) throws -> PanelRaster {
-        var previous: PanelRaster?
-        for _ in 0..<8 {
-            let current = try render(fixture, scheme: scheme, appearance: appearance)
-            if let previous, PanelRaster.byteDelta(previous, current).differing == 0 { return current }
-            previous = current
+                              appearance: NSAppearance.Name,
+                              file: StaticString = #filePath, line: UInt = #line) throws -> PanelRaster {
+        let subject = "\(fixture.name)/\(PanelRenderHarness.themeToken(scheme)) "
+            + "under .\(appearance.rawValue)"
+        return try PanelRaster.settled(subject, file: file, line: line) {
+            try render(fixture, scheme: scheme, appearance: appearance)
         }
-        XCTFail("healthy/\(PanelRenderHarness.themeToken(scheme)) never rasterized the same way twice in 8 "
-                + "attempts under .\(appearance.rawValue), so no byte-granular comparison of it can mean "
-                + "anything. Expected the ±1/255 cold-raster settle issue #824 describes; a cell that never "
-                + "settles is a bigger finding than #824 and should be diagnosed there, NOT absorbed by "
-                + "relaxing this suite's predicate")
-        return try XCTUnwrap(previous, "no raster at all")
     }
 
     // MARK: - AXIS 1 (increased contrast) — PIN: `NSAppearance` does not reach an `ImageRenderer` render
