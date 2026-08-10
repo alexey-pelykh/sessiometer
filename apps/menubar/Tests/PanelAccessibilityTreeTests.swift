@@ -507,26 +507,34 @@ final class PanelAccessibilityTreeTests: XCTestCase {
     /// the structure without the prose.
     ///
     /// Note `stats` legitimately carries `AXImage:1` — that is the issue #838 leak, pinned here too.
+    ///
+    /// Every entry carries `AXScrollArea:1` since #818, and the uniformity is the point rather than an
+    /// accident of transcription: the panel composes **one** scroll boundary per state, around whichever
+    /// body is unbounded, and every state has exactly one such body. So the table below is where that
+    /// invariant is observable — a second boundary appearing in any state (nesting one inside another, or
+    /// wrapping a body that is already pinned) reddens this pin, and a state losing its boundary reddens
+    /// it too. The height gate in `PanelScrollBoundaryTests` cannot see either: two nested boundaries
+    /// still fit the budget.
     func testTheAccessibilityShapeOfEveryFixtureIsUnchanged() {
         let pinned: [String: String] = [
-            "healthy": "AXButton:5 AXStaticText:3 AXUnknown:1",
-            "stats": "AXButton:2 AXImage:1 AXStaticText:2 AXUnknown:3",
-            "stale": "AXButton:5 AXStaticText:3 AXUnknown:1",
-            "disconnected": "AXStaticText:3 AXUnknown:3",
-            "connecting": "AXStaticText:2",
+            "healthy": "AXButton:5 AXScrollArea:1 AXStaticText:3 AXUnknown:1",
+            "stats": "AXButton:2 AXImage:1 AXScrollArea:1 AXStaticText:2 AXUnknown:3",
+            "stale": "AXButton:5 AXScrollArea:1 AXStaticText:3 AXUnknown:1",
+            "disconnected": "AXScrollArea:1 AXStaticText:3 AXUnknown:3",
+            "connecting": "AXScrollArea:1 AXStaticText:2",
             // `starting` / `crash-looping` carry `AXButton:1` since issue #776: the mock specifies a
             // `View log` action in exactly these two cold states, and their fixtures seed a `daemonLogPath`
             // so it renders. Their `.connecting` / `.unsupported` siblings below stay button-free — the mock
             // gives them no action — which is what keeps this pin a statement about the reference rather
             // than about "cold states have a button".
-            "starting": "AXButton:1 AXStaticText:2",
-            "not-running": "AXButton:1 AXStaticText:3",
-            "crash-looping": "AXButton:1 AXStaticText:2",
-            "unsupported": "AXStaticText:2",
-            "empty-roster": "AXButton:1 AXStaticText:4 AXTextField:1",
-            "blind-ok": "AXButton:5 AXStaticText:3 AXUnknown:1",
-            "blind-degraded": "AXButton:5 AXStaticText:3 AXUnknown:1",
-            "blind-cornered": "AXButton:4 AXStaticText:2 AXUnknown:1",
+            "starting": "AXButton:1 AXScrollArea:1 AXStaticText:2",
+            "not-running": "AXButton:1 AXScrollArea:1 AXStaticText:3",
+            "crash-looping": "AXButton:1 AXScrollArea:1 AXStaticText:2",
+            "unsupported": "AXScrollArea:1 AXStaticText:2",
+            "empty-roster": "AXButton:1 AXScrollArea:1 AXStaticText:4 AXTextField:1",
+            "blind-ok": "AXButton:5 AXScrollArea:1 AXStaticText:3 AXUnknown:1",
+            "blind-degraded": "AXButton:5 AXScrollArea:1 AXStaticText:3 AXUnknown:1",
+            "blind-cornered": "AXButton:4 AXScrollArea:1 AXStaticText:2 AXUnknown:1",
             // `expiry` (#886) carries `AXButton:6` — one more than `healthy` above — purely because its
             // roster has FOUR rows rather than three; each account row is one focusable element. The
             // expiry LINE itself adds NOTHING to this histogram, and that is the assertion worth having:
@@ -535,26 +543,26 @@ final class PanelAccessibilityTreeTests: XCTestCase {
             // than making an operator arrow through a second stop per row. A future change that
             // accidentally exposed the line as its own element would show up here as `AXStaticText:4` on
             // this fixture alone.
-            "expiry": "AXButton:6 AXStaticText:3 AXUnknown:1",
-            "fault-keychain-locked": "AXButton:5 AXStaticText:4 AXUnknown:1",
-            "fault-scrub-exhausted": "AXButton:5 AXStaticText:4 AXUnknown:1",
-            "fault-systemic-refresh": "AXButton:5 AXStaticText:4 AXUnknown:1",
-            "fault-scrub-recovering": "AXButton:5 AXStaticText:4 AXUnknown:1",
+            "expiry": "AXButton:6 AXScrollArea:1 AXStaticText:3 AXUnknown:1",
+            "fault-keychain-locked": "AXButton:5 AXScrollArea:1 AXStaticText:4 AXUnknown:1",
+            "fault-scrub-exhausted": "AXButton:5 AXScrollArea:1 AXStaticText:4 AXUnknown:1",
+            "fault-systemic-refresh": "AXButton:5 AXScrollArea:1 AXStaticText:4 AXUnknown:1",
+            "fault-scrub-recovering": "AXButton:5 AXScrollArea:1 AXStaticText:4 AXUnknown:1",
             // The four pathological-content rosters (#753). Their shapes are the ORDINARY ones for their
             // row counts — the three 4-row rosters match `expiry` and the 3-row `wire-hostile-numerics`
             // matches `healthy` — and that is the claim worth pinning: hostile CONTENT must not change the
             // panel's accessibility STRUCTURE. A 40-char label, a bidi text run, an empty label and a 255 %
             // reading each stay exactly one focusable row, gaining no element and losing none.
-            "pathological-label": "AXButton:6 AXStaticText:3 AXUnknown:1",
-            "same-local-part": "AXButton:6 AXStaticText:3 AXUnknown:1",
+            "pathological-label": "AXButton:6 AXScrollArea:1 AXStaticText:3 AXUnknown:1",
+            "same-local-part": "AXButton:6 AXScrollArea:1 AXStaticText:3 AXUnknown:1",
             // `degenerate-label` matching its siblings is a NARROW claim, and issue #939 is the reason to
             // say so here: the two blank-label rows are focusable and structurally identical to any other
             // row, but their spoken LABEL carries no identity — `rowAccessibilityLabel` filters the empty
             // string out entirely, so the `?` / `?2` monogram the badge shows has no spoken counterpart. A
             // role histogram cannot see that; it is a text-level defect on a structurally-correct tree.
             // Do not read this green pin as "the degenerate rows are accessible".
-            "degenerate-label": "AXButton:6 AXStaticText:3 AXUnknown:1",
-            "wire-hostile-numerics": "AXButton:5 AXStaticText:3 AXUnknown:1",
+            "degenerate-label": "AXButton:6 AXScrollArea:1 AXStaticText:3 AXUnknown:1",
+            "wire-hostile-numerics": "AXButton:5 AXScrollArea:1 AXStaticText:3 AXUnknown:1",
         ]
 
         let fixtures = PanelA11y.allFixtures
@@ -615,6 +623,14 @@ final class PanelAccessibilityTreeTests: XCTestCase {
     /// Focus order is the sequence `accessibilityChildrenInNavigationOrder()` publishes — the order a
     /// VoiceOver user traverses. Asserted as a SHAPE (header → tabs → roster → footer) rather than exact
     /// prose, so a wording change in `StatusPanelFormat` cannot redden it while a genuine re-ordering does.
+    ///
+    /// Since #818 the roster is one level down, inside the scroll boundary, so the top-level sequence
+    /// reaches it through `AXScrollArea` and this test carries a second claim it did not carry before:
+    /// CONTAINMENT. A boundary in the right position proves nothing on its own — if the `ScrollView` had
+    /// swallowed the rows instead of hosting them, the top-level sequence would read *identically*, and
+    /// the flat `depth == 1` filter this test used before could not tell the two apart. That the rows are
+    /// still in the tree, one level down and fully spoken, is the whole reachability claim #818 turns on:
+    /// a sighted user scrolls to them, a VoiceOver user enters the region and finds them.
     func testNavigationOrderRunsHeaderThenTabsThenRosterThenFooter() throws {
         let fixture = try XCTUnwrap(PanelA11y.allFixtures.first { $0.name == "healthy" })
         let nodes = PanelA11y.panelTree(fixture: fixture)
@@ -629,14 +645,36 @@ final class PanelAccessibilityTreeTests: XCTestCase {
         let header = try index("Sessiometer.")
         let statusTab = try index("Status")
         let statsTab = try index("Stats")
-        let firstRow = try index("Work,")
+        let roster = try index(StatusPanelFormat.scrollRegionAccountsLabel)
         let footer = try index("updated")
 
         XCTAssertEqual(header, 0, "the header is not the first element a VoiceOver user reaches")
         XCTAssertLessThan(statusTab, statsTab, "the Status tab must precede Stats")
-        XCTAssertLessThan(statsTab, firstRow, "the tab bar must precede the roster")
-        XCTAssertLessThan(firstRow, footer, "the roster must precede the footer")
+        XCTAssertLessThan(statsTab, roster, "the tab bar must precede the roster")
+        XCTAssertLessThan(roster, footer, "the roster must precede the footer")
         XCTAssertEqual(footer, top.count - 1, "the footer is not the last element")
+        XCTAssertEqual(top[roster].role, "AXScrollArea", """
+            the element between the tab bar and the footer is a \(top[roster].role), not the scroll \
+            boundary — the roster is reachable by scrolling only if a scroll region is what hosts it
+            """)
+
+        // Containment. `nodes` is a pre-order walk, so a node's subtree is the run that follows it while
+        // the depth stays greater than its own.
+        let at = try XCTUnwrap(nodes.firstIndex { $0.depth == 1 && $0.role == "AXScrollArea" },
+                               "no scroll boundary at top level: \(nodes)")
+        let inside = Array(nodes[(at + 1)...].prefix { $0.depth > nodes[at].depth })
+        for account in ["Work,", "Personal,", "Temp,"] {
+            XCTAssertTrue(inside.contains { $0.text.contains(account) }, """
+                the '\(account)' roster row is not inside the scroll boundary — a VoiceOver user who \
+                enters the region would not find it. Boundary subtree: \(inside)
+                """)
+        }
+        XCTAssertEqual(inside.count, 3, """
+            the boundary hosts \(inside.count) elements, not the fixture's three roster rows — either a \
+            row was dropped or something that should have stayed pinned moved inside: \(inside)
+            """)
+        XCTAssertFalse(top.contains { $0.text.contains("Work,") },
+                       "a roster row is published at BOTH depths — VoiceOver would announce it twice")
     }
 
     /// Every element a VoiceOver user can focus must SAY something. An element in the tree with no label

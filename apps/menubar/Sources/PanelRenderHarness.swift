@@ -608,11 +608,22 @@ enum PanelRenderHarness {
     /// byte-for-byte what it rendered before issue #756. It is a parameter at all because AC-3 asks what the
     /// panel looks like "given each Dynamic Type size class", and that question needs a seam; issue #757's
     /// gate is the intended consumer of it.
+    ///
+    /// `composingScrollBoundaries` defaults to FALSE — the panel is rasterized WITHOUT the scroll
+    /// boundaries #818 added, because `ImageRenderer` draws a `ScrollView`'s frame and none of its content.
+    /// Every consumer that wants PIXELS wants this default; the argument for why the result is still the
+    /// shipped panel, and the canary that keeps that argument honest, are on `\.panelScrollBoundaryEnabled`.
+    /// Pass TRUE to measure the panel as it actually composes — `PanelScrollBoundaryTests` does, because
+    /// the geometry it asserts is the boundary's, and a bypassed panel would show it the very
+    /// crops-instead-of-scrolls layout it exists to reject. Such a render carries a blank body by
+    /// construction, so what a TRUE render can be asked is heights and the pinned chrome, never content.
     static func render(_ fixture: PanelRenderFixture, scheme: ColorScheme,
-                       dynamicTypeSize: DynamicTypeSize = .large) -> CGImage? {
+                       dynamicTypeSize: DynamicTypeSize = .large,
+                       composingScrollBoundaries: Bool = false) -> CGImage? {
         calibrateIfNeeded()
         let outcome = settled(pastTransientRun: longestTransientRun) { () -> (raster: CGImage, bytes: [UInt8])? in
-            guard let cg = rasterize(fixture, scheme: scheme, dynamicTypeSize: dynamicTypeSize),
+            guard let cg = rasterize(fixture, scheme: scheme, dynamicTypeSize: dynamicTypeSize,
+                                     composingScrollBoundaries: composingScrollBoundaries),
                   let bytes = rawBytes(cg) else { return nil }
             return (raster: cg, bytes: bytes)
         }
@@ -836,7 +847,10 @@ enum PanelRenderHarness {
         let probe = fixtures(now: Int64(Date().timeIntervalSince1970)).first { $0.name == "healthy" }
         guard let probe else { return }
         calibrate(into: &longestTransientRun) { () -> (raster: CGImage, bytes: [UInt8])? in
-            guard let cg = rasterize(probe, scheme: .light, dynamicTypeSize: .large),
+            // Bypassed, like the consumers this calibration serves: the yardstick measures the rasterizer's
+            // text-caching transient, so it must be taken on a render that HAS text in it.
+            guard let cg = rasterize(probe, scheme: .light, dynamicTypeSize: .large,
+                                     composingScrollBoundaries: false),
                   let bytes = rawBytes(cg) else { return nil }
             return (raster: cg, bytes: bytes)
         }
@@ -862,7 +876,8 @@ enum PanelRenderHarness {
     }
 
     private static func rasterize(_ fixture: PanelRenderFixture, scheme: ColorScheme,
-                                  dynamicTypeSize: DynamicTypeSize) -> CGImage? {
+                                  dynamicTypeSize: DynamicTypeSize,
+                                  composingScrollBoundaries: Bool) -> CGImage? {
         rasterPasses += 1
         let store = WatchStatusStore.preview(state: fixture.state, rows: fixture.rows,
                                              nextSwap: fixture.nextSwap, generatedAt: fixture.generatedAt,
@@ -892,6 +907,13 @@ enum PanelRenderHarness {
             // The Dynamic Type size class (issue #756). `StatusPanelView` clamps it to
             // `PanelTypeScale.ceiling` and derives the panel's uniform scale factor from it.
             .dynamicTypeSize(dynamicTypeSize)
+            // DROP the scroll boundaries (#818), because `ImageRenderer` draws a `ScrollView`'s frame and
+            // none of its content. Rendered WITH them, every panel here rasterizes its header and tab bar
+            // over an empty body — and blank bodies still diff clean against each other, so the golden gate
+            // would go on reporting green while seeing nothing. `\.panelScrollBoundaryEnabled` carries the
+            // measurement, the in-repo canary that keeps it honest, and the argument for why what this
+            // renders is still the shipped panel at the size class the goldens capture.
+            .environment(\.panelScrollBoundaryEnabled, composingScrollBoundaries)
         let renderer = ImageRenderer(content: view)
         renderer.scale = scale
         return renderer.cgImage

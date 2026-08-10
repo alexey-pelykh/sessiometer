@@ -367,6 +367,98 @@ enum StatusPanelFormat {
     /// The width available to one roster row on the shipped fixed-width panel.
     static var defaultRowWidth: Double { panelContentWidth - 2 * rosterHorizontalInset }
 
+    // MARK: - The panel's height budget (issue #818 — the scroll boundary's bound)
+
+    // WHY A BOUND EXISTS AT ALL. The panel is fixed in WIDTH and was INTRINSIC in height, and the
+    // borderless `NSPanel` that hosts it (`StatusItemController.FloatingPanel`) sizes itself to that
+    // intrinsic height — so a roster or a Stats tab taller than the space under the
+    // menu bar put its overflow off-screen with nothing to scroll. Measured at `f66a341`: 16 of the 22
+    // rendered fixtures exceeded the budget below at `.accessibility3`, and roster growth is LINEAR and
+    // never plateaus (`PanelRosterGeometryTests`), so the overflow is unbounded rather than merely large.
+    //
+    // WHERE THE NUMBER COMES FROM, and what it is NOT. The three inputs below are assumptions about the
+    // OPERATOR'S HARDWARE, not a ratified product decision: `design/menubar-preview.html` authors no scroll
+    // behaviour and no maximum, and the design SSOT carries nothing on panel height. The decision to bound
+    // here — and what stays pinned outside the boundary — is recorded in `design/README.md`
+    // § The scroll boundary (#818) as PENDING DESIGN-OWNER RATIFICATION.
+    //
+    // Every input errs toward the panel, deliberately — but BOTH directions carry a correctness cost, and
+    // saying otherwise would be worse than the error itself. Too tight scrolls content that fits: an
+    // annoyance, and recoverable, since the content is still reachable inside the boundary. Too generous is
+    // the sharper one: the panel then exceeds the screen's `visibleFrame`, and `StatusItemChrome.panelFrame`
+    // clamps Y from the BOTTOM only, so the excess leaves at the TOP — carrying the header, the honest-state
+    // line and the Status|Stats switcher out of view. Those are PINNED, i.e. outside the boundary, so
+    // scrolling cannot bring them back. That is reachable in a default configuration: see
+    // `popoverChromeAllowance` below, where the measured chrome is 120 pt against the 44 pt allowed here.
+    // Deriving the budget from the live screen instead of this fixed figure is issue #1176; it is not done
+    // here because a screen-derived budget makes every committed golden machine-dependent.
+    // This is the SAME arithmetic `PanelRosterGeometryTests` derived its measuring stick
+    // from before a bound existed; that suite now reads these constants rather than keeping a second copy
+    // (the issue #750 discipline — one value, never a second copy that can drift).
+
+    /// The smallest logical display height a Mac meeting this app's deployment target (macOS 13.0, see
+    /// `apps/menubar/project.yml`) plausibly presents: the 13-inch Retina MacBook Air / Pro default scaled
+    /// mode is 1440 × 900 points. Logical points, not pixels — the panel is laid out in points.
+    static let smallestPlausibleDisplayHeight: Double = 900
+
+    /// The macOS menu bar the panel hangs below. `NSStatusBar.system.thickness` measures 22.0; 24 is used
+    /// instead because the budget should err toward being GENEROUS to the panel.
+    static let menuBarHeight: Double = 24
+
+    /// The window chrome around the hosted view, plus the margin macOS keeps from the screen edge. The NAME
+    /// is historical: this app dropped `NSPopover` for a borderless `NSPanel` (`StatusItemController`), so
+    /// there is no arrow to charge for — the allowance is the gap below the status item and the screen-edge
+    /// margin. Deliberately excludes the Dock, which on a default configuration takes considerably more
+    /// (measured: a 1080 pt display reports a 960 pt `visibleFrame`, i.e. **120 pt** of chrome against the
+    /// 44 pt allowed here). That is the direction the paragraph above calls the sharper one, and issue
+    /// #1176 tracks deriving this from the live screen instead.
+    static let popoverChromeAllowance: Double = 20
+
+    // MARK: The boundary's spoken names (issue #818)
+
+    // A scroll region publishes an `AXScrollArea` of its own, and a container in the tree with neither a
+    // label nor a value is one VoiceOver lands on and says NOTHING about — the exact condition
+    // `PanelAccessibilityTreeTests.testNoFocusableElementIsSilent` refuses, and it caught these four the
+    // moment the boundary landed. So each region says what it holds.
+    //
+    // They are NOT invented product vocabulary: each echoes a term the panel already speaks — the roster's
+    // own noun from the header sub-line, the Stats tab's own words, and the two card families by what the
+    // daemon or the operator is doing there. Short on purpose: this is the word spoken BEFORE the contents,
+    // on the way in, so a sentence here is a toll every VoiceOver traversal pays.
+
+    /// The roster region — the panel's unbounded axis, and the one an operator scrolls most.
+    static let scrollRegionAccountsLabel = "Accounts"
+
+    /// The Stats tab's body. Echoes `statsDefaultHeaderSubtitle`'s own noun rather than the tab's terse
+    /// "Stats", which out of the tab bar's context reads as a control rather than a region.
+    static let scrollRegionStatsLabel = "Usage stats"
+
+    /// The capture surface — the add-account card and its first-run onboarding twin.
+    static let scrollRegionCaptureLabel = "Account capture"
+
+    /// The honest message-card states: connecting, unsupported, starting, crash-looping, not-running. What
+    /// they have in common is that the card IS the panel's answer about the daemon.
+    static let scrollRegionMessageLabel = "Daemon status"
+
+    /// The panel's maximum height in points — **856 pt**. Past this the popover's own content would be
+    /// off-screen, so this is where the scroll boundary takes over from intrinsic growth.
+    ///
+    /// NOT SCALED BY THE TYPE SIZE, and that is the design rather than an omission. Every other panel
+    /// constant is multiplied by `PanelTypeScale.factor` because the panel's own drawing grows with the text
+    /// size; this one measures the SCREEN, which does not. Scaling it would hand an `.accessibility3`
+    /// operator a 2014 pt budget on the same 900 pt display — restoring the defect at the exact size class
+    /// that forces it. `PanelMetrics` states the same rule at the call site.
+    ///
+    /// A FIXED value rather than the running machine's real `visibleFrame`, deliberately. Reading `NSScreen`
+    /// would fit each display exactly, but it would also make the panel's layout — and therefore the
+    /// committed goldens and every render the design-parity tool writes — a function of which machine
+    /// rendered them, which is the machine-dependence `PanelRenderHarness` pins the accent to avoid. Making
+    /// the budget screen-aware is a real improvement and a separate decision; it is tracked rather than
+    /// smuggled in here.
+    static var panelHeightBudget: Double {
+        smallestPlausibleDisplayHeight - menuBarHeight - popoverChromeAllowance
+    }
+
     // MARK: - Stats card geometry (issue #700 — the panel↔mock pin for the full-width chart row)
 
     /// The Stats row card's own horizontal padding (mock `.stat { padding:10px 8px }`). Held here rather

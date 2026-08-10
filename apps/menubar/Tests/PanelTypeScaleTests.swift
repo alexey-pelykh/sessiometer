@@ -72,7 +72,7 @@ final class PanelTypeScaleTests: XCTestCase {
 
     /// The property the whole change rests on: at the DEFAULT size class the factor is EXACTLY 1.0, so
     /// every `points * scale` is the identity in IEEE-754 and the panel renders byte-for-byte what it did
-    /// before issue #756. This is what let the 34 committed goldens (issue #754) stay valid without a
+    /// before issue #756. This is what let the committed goldens (issue #754) stay valid without a
     /// re-baseline — `testTheDefaultSizeClassRendersTheUnscaledPanel` is the end-to-end half of it.
     ///
     /// `XCTAssertEqual` without an accuracy, deliberately: "close to 1.0" is not the claim. A factor of
@@ -101,8 +101,9 @@ final class PanelTypeScaleTests: XCTestCase {
 
     /// Sizes above the ceiling clamp to it rather than growing further. The ceiling is AC-3's own — the
     /// panel is required to render correctly *to* `.accessibility3` — and `StatusPanelTypeScale`'s header
-    /// records why the panel declares a limit instead of scaling without bound (at ×2.3529 the Stats tab
-    /// is already 1322 pt tall, and the panel has no `ScrollView`).
+    /// records why the panel declares a limit instead of scaling without bound (at ×2.3529 the Stats
+    /// tab's content is already 1300.50 pt against the panel's 856 pt budget, so every screenful past the
+    /// first is reached by scrolling).
     func testSizesAboveTheCeilingClampToIt() {
         let ceiling = PanelTypeScale.factor(for: PanelTypeScale.ceiling)
         for over in [DynamicTypeSize.accessibility4, .accessibility5] {
@@ -159,7 +160,7 @@ final class PanelTypeScaleTests: XCTestCase {
     /// A regression guard on the DEFAULT ARGUMENT, and deliberately no more than that: rendering at an
     /// explicit `.large` must agree to the byte with the default-argument path that `--render-panel` and
     /// the golden gate call. It would still pass if `factor(for: .large)` were 1.5 — because both paths
-    /// route through the same size class — so it is NOT what protects the 34 committed goldens. That load
+    /// route through the same size class — so it is NOT what protects the committed goldens. That load
     /// is carried by `testTheDefaultSizeClassFactorIsExactlyOne` (the arithmetic) and the goldens
     /// themselves (the bytes). What this catches is the default drifting off `.large` later.
     func testTheDefaultSizeClassRendersTheUnscaledPanel() throws {
