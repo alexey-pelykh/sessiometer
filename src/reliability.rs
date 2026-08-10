@@ -464,12 +464,15 @@ struct Inputs {
     /// (`active_at != acct`). All four revival paths count — re-activation is not swap-reason- or
     /// swap-kind-specific.
     reactivations: Vec<Reactivation>,
-    /// Every observed POSITIVE `session_pct_per_min` from an `event=usage_velocity` line (issue
-    /// #608) — the live session-climb distribution the assumed peak constant
-    /// (`swap::V_PEAK_SESSION_PCT_PER_MIN`) is measured against. Roster-wide (no per-account split,
-    /// like every other SLI here); negatives (window resets) and malformed values are dropped at
-    /// parse. Keeps the constant honest: when the real peak outruns it, the `v_peak` coupling bound
-    /// is silently too loose, exactly as `TAIL_MARGIN` is kept honest by the #595 landing SLI.
+    /// Every observed POSITIVE session climb rate in %/min from an `event=usage_velocity` line
+    /// (issue #608) — the live session-climb distribution the assumed peak constant
+    /// (`swap::V_PEAK_SESSION_PCT_PER_MIN`) is measured against. RECOMPUTED from the line's
+    /// `session_delta_pct` + `elapsed_secs`, not read from its rendered `session_pct_per_min`, whose
+    /// `{:.2}` floors a slow climb to `0.00` (issue #1158). Roster-wide (no per-account split, like
+    /// every other SLI here); negatives (window resets) and malformed or absent ingredients are
+    /// dropped at parse. Keeps the constant honest: when the real peak outruns it, the `v_peak`
+    /// coupling bound is silently too loose, exactly as `TAIL_MARGIN` is kept honest by the #595
+    /// landing SLI.
     session_velocities: Vec<f64>,
     /// Every `blind_window` that carried #634's velocity ingredients, recomputed into a
     /// (projection, actual) pair — the blind-arm projection-error input (issue #636).
@@ -1198,17 +1201,42 @@ fn parse_events(text: &str, cutoff: Option<i64>) -> Inputs {
                 record_reactivation_edge(&mut inputs, &fields, "account")
             }
             // The observed session-velocity distribution (issue #608): every `usage_velocity` line
-            // carries the account's climb rate between its last two readings, already normalized to
-            // %/min by the emitter (issue #449). NEGATIVE rates are dropped: a negative delta is a
-            // session-window RESET (usage fell because the 5 h window rolled), not a climb — folding
-            // it in would drag the distribution down and understate the peak this SLI exists to
-            // catch. Zero is likewise not a climb, and the emitter is already silent on a flat
-            // account, so the filter is `> 0`. A malformed value is dropped (the tolerant-drop
-            // precedent the sibling arms use), never defaulted to 0.
+            // carries the account's climb rate between its last two readings, normalized to %/min
+            // (issue #449). The rate is RECOMPUTED here from the raw ingredients the line also
+            // carries — `session_delta_pct` and `elapsed_secs` — never parsed back out of the
+            // rendered `session_pct_per_min` field (issue #1158).
+            //
+            // THE DISTINCTION THAT MATTERS, because getting it wrong is what hid a real drop: a
+            // `0.00` in the rendered field is TWO different facts wearing one spelling.
+            //   - The EMITTER's zero — the session dimension genuinely did not move
+            //     (`session_delta_pct=0`). The emitter is not silent on it, because its gate is
+            //     `(session_delta_pct != 0 || weekly_delta_pct != 0)`: a flat session alongside a
+            //     moving WEEKLY dimension still emits. Correctly not a climb.
+            //   - The RENDERER's zero — a measured climb that `{:.2}` floored, which happens
+            //     whenever `session_delta_pct / minutes < 0.005` (for the smallest non-zero delta,
+            //     any interval past 12 000 s). The climb is right there on the same line.
+            // Reading the rendered field cannot tell these apart; reading the ingredients does not
+            // have to. `elapsed_secs` is `saturating_duration_since` with only a `> 0` guard at the
+            // call site, so nothing bounds the interval from above.
+            //
+            // The `> 0` filter itself is unchanged and still load-bearing: NEGATIVE rates are
+            // dropped because a negative delta is a session-window RESET (usage fell because the
+            // 5 h window rolled), not a climb — folding it in would drag the distribution down and
+            // understate the peak this SLI exists to catch. A malformed or absent value is dropped
+            // (the tolerant-drop precedent the sibling arms use), never defaulted to 0 — which also
+            // keeps the pre-#449 lines that predate `elapsed_secs` out, exactly as before: they
+            // carry no interval, so they have no rate to contribute.
             Some("usage_velocity") => {
                 if let Some(rate) = fields
-                    .get("session_pct_per_min")
+                    .get("session_delta_pct")
                     .and_then(|v| v.parse::<f64>().ok())
+                    .zip(
+                        fields
+                            .get("elapsed_secs")
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .filter(|secs| *secs > 0.0),
+                    )
+                    .map(|(delta_pct, elapsed_secs)| delta_pct / (elapsed_secs / 60.0))
                     .filter(|v| v.is_finite() && *v > 0.0)
                 {
                     inputs.session_velocities.push(rate);
@@ -1386,8 +1414,11 @@ impl Landing {
     }
 }
 
-/// The observed session-velocity distribution SLI (issue #608): the live `session_pct_per_min`
-/// percentiles, measured against the assumed peak constant [`crate::swap::V_PEAK_SESSION_PCT_PER_MIN`]
+/// The observed session-velocity distribution SLI (issue #608): percentiles of the session climb
+/// rate RECOMPUTED from each `usage_velocity` line's own ingredients — `session_delta_pct` over
+/// `elapsed_secs` — rather than parsed back out of the line's `{:.2}`-rendered
+/// `session_pct_per_min` field, which floored a real climb to `0.00` and dropped it (issue #1158).
+/// Measured against the assumed peak constant [`crate::swap::V_PEAK_SESSION_PCT_PER_MIN`]
 /// that the `v_peak` coupling bound ([`crate::swap::peak_runway_reserve_bound`]) is calibrated on.
 /// Its job is to keep that constant HONEST: the bound assumes no account climbs faster than `v_peak`,
 /// so if the real peak (`p100`) outruns it, the config-load coupling is silently too loose and the
@@ -1400,7 +1431,7 @@ impl Landing {
 /// percents the swap-out SLIs carry.
 #[derive(Debug, PartialEq)]
 struct ObservedPeak {
-    /// Count of positive `session_pct_per_min` samples in view.
+    /// Count of positive session-velocity samples in view.
     n: usize,
     p50: Option<f64>,
     p90: Option<f64>,
@@ -2398,10 +2429,19 @@ struct LandingClassesWire {
     gap_crossing: usize,
 }
 
-/// Observed session-velocity block (issue #608): the live `session_pct_per_min` percentiles vs the
+/// Observed session-velocity block (issue #608): the live session-velocity percentiles vs the
 /// assumed peak constant the `v_peak` coupling bound is calibrated on. `p50`/`p90`/`p100`/`met.*` are
-/// `null` with no positive velocity sample (an empty subject is not a passing distribution). Rates
-/// are rounded to two decimals for the wire, matching the `usage_velocity` log line's own precision.
+/// `null` with no positive velocity sample (an empty subject is not a passing distribution).
+///
+/// Rates are FULL-PRECISION %/min. Until issue #1158 they were 2 dp — not because anything rounded
+/// them, but because the samples were parsed out of the log's `{:.2}`-rendered field and a
+/// percentile SELECTS a sample rather than interpolating one, so 2-dp in meant 2-dp out. The samples
+/// are now recomputed from `session_delta_pct` + `elapsed_secs`, so a rate like `0.004975…`
+/// reaches the wire as written. Deliberately NOT re-rounded here: re-quantizing the calibration
+/// readout would undo, at the surface a human reads to re-calibrate the constant, exactly the
+/// precision loss #1158 removed. The human render is unaffected — it has always formatted these with
+/// `{:.2}` at the point of display — so the two surfaces can now show different precision for the
+/// same sample; whether to reconcile them, and at which layer, is tracked as issue #1172.
 #[derive(serde::Serialize)]
 struct ObservedPeakWire {
     n: usize,
@@ -2727,7 +2767,7 @@ ts=2026-07-11T00:40:00Z event=usage_backoff acct=u-A class=rate_limited consecut
 ts=2026-07-11T00:41:00Z event=usage_backoff acct=u-A class=rate_limited consecutive=2 backoff_secs=120 retry_after_secs=120
 ts=2026-07-11T00:42:00Z event=usage_backoff acct=u-B class=transient consecutive=1 backoff_secs=30
 ts=2026-07-11T00:45:00Z event=usage_backoff_cleared acct=u-A
-ts=2026-07-11T00:50:00Z event=usage_velocity acct=u-A session_pct_per_min=0.20 weekly_pct_per_min=0.01 elapsed_secs=120 session_delta_pct=1 weekly_delta_pct=0
+ts=2026-07-11T00:50:00Z event=usage_velocity acct=u-A session_pct_per_min=0.20 weekly_pct_per_min=0.01 elapsed_secs=300 session_delta_pct=1 weekly_delta_pct=0
 ";
 
     fn fixture_report() -> Report {
@@ -3130,12 +3170,26 @@ ts=2026-07-11T00:14:00Z event=refresh account=spare outcome=dead rotated=false
 
     /// A usage_velocity fixture spanning the p50/p90/max shape of the real distribution PLUS the
     /// two lines that must be DROPPED: a window-reset NEGATIVE rate, and a flat 0.00 climb. The
-    /// positive samples are 0.63 / 1.86 / 6.95 (the ADR's p50/p90/max) so the percentiles land on
-    /// recognizable values.
+    /// positive samples are 0.63 / 1.86 / 6.90 so the percentiles land on recognizable values.
+    ///
+    /// Every line is INTERNALLY CONSISTENT: `session_delta_pct / (elapsed_secs / 60)` reproduces the
+    /// rendered `session_pct_per_min` exactly, which is what
+    /// [`crate::observability::Event::to_log_line`] would actually emit. Before issue #1158 only the rendered half was read, so the two halves were free to
+    /// disagree and did — `0.63` sat on ingredients meaning 1.00. Now the ingredients ARE the input,
+    /// so a fixture that could never be emitted would be testing nothing. `elapsed_secs` is kept a
+    /// multiple of 60 so `elapsed_secs / 60.0` is exact and the quotient matches the 2-dp literal
+    /// bit-for-bit.
+    ///
+    /// The max is 6.90 rather than the `V_PEAK_SESSION_PCT_PER_MIN` 6.95 for an arithmetic reason
+    /// worth recording: 6.95 is 139/20 and 139 is prime, so `60·delta/elapsed_secs = 6.95` forces
+    /// `delta` to be a multiple of 139 — impossible for a session-percent delta bounded by 100. No
+    /// emittable line can carry exactly 6.95, so the `p100 == v_peak` equality boundary is pinned
+    /// directly on the predicate instead, by
+    /// [`v_peak_honest_admits_a_sample_exactly_at_the_assumed_peak`].
     const VELOCITY_LOG: &str = "\
-ts=2026-07-11T00:00:00Z event=usage_velocity acct=u-A session_pct_per_min=0.63 weekly_pct_per_min=0.01 elapsed_secs=60 session_delta_pct=1 weekly_delta_pct=0
-ts=2026-07-11T00:01:00Z event=usage_velocity acct=u-A session_pct_per_min=1.86 weekly_pct_per_min=0.02 elapsed_secs=60 session_delta_pct=2 weekly_delta_pct=0
-ts=2026-07-11T00:02:00Z event=usage_velocity acct=u-A session_pct_per_min=6.95 weekly_pct_per_min=0.03 elapsed_secs=60 session_delta_pct=7 weekly_delta_pct=0
+ts=2026-07-11T00:00:00Z event=usage_velocity acct=u-A session_pct_per_min=0.63 weekly_pct_per_min=0.01 elapsed_secs=6000 session_delta_pct=63 weekly_delta_pct=0
+ts=2026-07-11T00:01:00Z event=usage_velocity acct=u-A session_pct_per_min=1.86 weekly_pct_per_min=0.02 elapsed_secs=3000 session_delta_pct=93 weekly_delta_pct=0
+ts=2026-07-11T00:02:00Z event=usage_velocity acct=u-A session_pct_per_min=6.90 weekly_pct_per_min=0.03 elapsed_secs=600 session_delta_pct=69 weekly_delta_pct=0
 ts=2026-07-11T00:03:00Z event=usage_velocity acct=u-A session_pct_per_min=-92.00 weekly_pct_per_min=0.00 elapsed_secs=60 session_delta_pct=-92 weekly_delta_pct=0
 ts=2026-07-11T00:04:00Z event=usage_velocity acct=u-A session_pct_per_min=0.00 weekly_pct_per_min=0.00 elapsed_secs=60 session_delta_pct=0 weekly_delta_pct=0
 ";
@@ -3145,16 +3199,48 @@ ts=2026-07-11T00:04:00Z event=usage_velocity acct=u-A session_pct_per_min=0.00 w
         let inputs = parse_events(VELOCITY_LOG, None);
         // Only the three POSITIVE climbs — the −92 window-reset and the 0.00 flat are dropped so
         // they cannot drag the distribution down and hide a real peak.
-        assert_eq!(inputs.session_velocities, vec![0.63, 1.86, 6.95]);
+        assert_eq!(inputs.session_velocities, vec![0.63, 1.86, 6.90]);
         let r = aggregate(&inputs, &[], None);
         assert_eq!(r.observed_peak.n, 3);
-        // n=3 sorted [0.63,1.86,6.95]: P50=ceil(.5·3)=2→1.86, P90=ceil(.9·3)=3→6.95, P100→6.95.
+        // n=3 sorted [0.63,1.86,6.90]: P50=ceil(.5·3)=2→1.86, P90=ceil(.9·3)=3→6.90, P100→6.90.
         assert_eq!(r.observed_peak.p50, Some(1.86));
-        assert_eq!(r.observed_peak.p90, Some(6.95));
-        assert_eq!(r.observed_peak.p100, Some(6.95));
-        // The observed max EQUALS the assumed v_peak (6.95), so the constant is still honest — the
-        // epsilon absorbs the display-rounding round trip so equality is not flagged by float dust.
+        assert_eq!(r.observed_peak.p90, Some(6.90));
+        assert_eq!(r.observed_peak.p100, Some(6.90));
+        // The observed max sits just under the assumed v_peak (6.95), so the constant is still
+        // honest. The `==` boundary itself is pinned by the sibling test below.
         assert_eq!(r.observed_peak.v_peak_honest(), Some(true));
+    }
+
+    /// Issue #1158: a MEASURED climb whose rendered rate the emitter's `{:.2}` floored to `0.00`.
+    /// `session_delta_pct=1` over 12 060 s is 0.004975 %/min — under the 0.005 the second decimal
+    /// can hold — so the rendered field reads `0.00` while the raw ingredients on the SAME line
+    /// record a real 1 % climb. Reading the ingredients keeps the sample; reading the rendered
+    /// field dropped it as "not a climb".
+    ///
+    /// The fixture is SYNTHETIC and deliberately so: a replay of the live event log
+    /// (~/Library/Logs/sessiometer/sessiometer.log, 8 527 `usage_velocity` lines carrying an
+    /// interval, 2026-07-13 → 2026-08-10) found ZERO lines matching this shape — the longest
+    /// interval over a positive delta was 4 108 s, and the slowest positive climb was
+    /// 0.0147 %/min, ~2.95x the 0.005 rounding floor. So this test pins the filter's LOGIC, and
+    /// must not be read as evidence the shape occurs in production. `elapsed_secs` is
+    /// `saturating_duration_since` with only a `> 0` guard at the call site, so the observed
+    /// ceiling is a property of this host's poll cadence, not of the code.
+    #[test]
+    fn observed_peak_folds_a_slow_climb_whose_rendered_rate_floored_to_zero() {
+        let log = "\
+ts=2026-07-11T00:00:00Z event=usage_velocity acct=u-A session_pct_per_min=0.00 weekly_pct_per_min=0.00 elapsed_secs=12060 session_delta_pct=1 weekly_delta_pct=0
+ts=2026-07-11T00:01:00Z event=usage_velocity acct=u-A session_pct_per_min=0.00 weekly_pct_per_min=0.00 elapsed_secs=12060 session_delta_pct=0 weekly_delta_pct=3
+ts=2026-07-11T00:02:00Z event=usage_velocity acct=u-A session_pct_per_min=-0.15 weekly_pct_per_min=0.00 elapsed_secs=12060 session_delta_pct=-30 weekly_delta_pct=0
+";
+        let inputs = parse_events(log, None);
+        // EXACTLY ONE sample: the 1 %-over-12060 s climb. The flat session dimension (whose
+        // non-zero WEEKLY delta is what got the line emitted at all) and the window reset are
+        // both still excluded — the drop this fixes must not be traded for a new one.
+        assert_eq!(
+            inputs.session_velocities,
+            vec![1.0 / (12060.0 / 60.0)],
+            "a measured climb must survive its own rendered 0.00, while the flat and the reset stay dropped"
+        );
     }
 
     #[test]
@@ -3163,7 +3249,7 @@ ts=2026-07-11T00:04:00Z event=usage_velocity acct=u-A session_pct_per_min=0.00 w
         // purpose: when the live peak outruns the constant, the config-load coupling bound is
         // silently too loose and the constant needs re-calibrating (the "measure, don't trust the
         // constant" discipline TAIL_MARGIN has via the #595 landing SLI).
-        let log = "ts=2026-07-11T00:00:00Z event=usage_velocity acct=u-A session_pct_per_min=8.40 weekly_pct_per_min=0.01 elapsed_secs=60 session_delta_pct=8 weekly_delta_pct=0\n";
+        let log = "ts=2026-07-11T00:00:00Z event=usage_velocity acct=u-A session_pct_per_min=8.40 weekly_pct_per_min=0.01 elapsed_secs=300 session_delta_pct=42 weekly_delta_pct=0\n";
         let r = aggregate(&parse_events(log, None), &[], None);
         assert_eq!(r.observed_peak.p100, Some(8.40));
         assert_eq!(
@@ -3182,6 +3268,43 @@ ts=2026-07-11T00:04:00Z event=usage_velocity acct=u-A session_pct_per_min=0.00 w
         assert!(
             json.contains("\"v_peak_honest\": false"),
             "json must carry the recalibrate flag: {json}"
+        );
+    }
+
+    /// The `<=` boundary of [`ObservedPeak::v_peak_honest`]: a max recorded at EXACTLY the assumed
+    /// peak is still honest — the constant bounds the observation, so nothing needs re-calibrating.
+    ///
+    /// Pinned directly on the predicate rather than through a log fixture because no emittable line
+    /// can carry exactly 6.95 (see [`VELOCITY_LOG`] — it would need a `session_delta_pct` of at
+    /// least 139). Asserting it here also makes the boundary independent of the parse path, so a
+    /// future change to how the rate is derived cannot quietly retire this case.
+    #[test]
+    fn v_peak_honest_admits_a_sample_exactly_at_the_assumed_peak() {
+        let at_peak = ObservedPeak {
+            n: 1,
+            p50: Some(crate::swap::V_PEAK_SESSION_PCT_PER_MIN),
+            p90: Some(crate::swap::V_PEAK_SESSION_PCT_PER_MIN),
+            p100: Some(crate::swap::V_PEAK_SESSION_PCT_PER_MIN),
+        };
+        assert_eq!(
+            at_peak.v_peak_honest(),
+            Some(true),
+            "a max exactly AT the assumed peak is bounded by it — `<=`, not `<`"
+        );
+        // And a sample above it is not, so the assertion above is not vacuously true for every
+        // input. `1e-6` is chosen to clear `v_peak_honest`'s ABSOLUTE `1e-9` tolerance, not because
+        // it is the smallest representable step: one ulp at 6.95 is ~8.88e-16, which sits INSIDE
+        // that tolerance, so substituting a true ulp here makes this assertion fail. Measured, not
+        // argued — `f64::from_bits(V_PEAK_SESSION_PCT_PER_MIN.to_bits() + 1)` in this slot REDs
+        // `v_peak_honest_admits_a_sample_exactly_at_the_assumed_peak`.
+        let over = ObservedPeak {
+            p100: Some(crate::swap::V_PEAK_SESSION_PCT_PER_MIN + 1e-6),
+            ..at_peak
+        };
+        assert_eq!(
+            over.v_peak_honest(),
+            Some(false),
+            "a max above the assumed peak must flag the constant as too loose"
         );
     }
 
@@ -5232,7 +5355,7 @@ ts=2026-07-11T00:46:00Z event=poll_refresh account=spare trigger=poll_401 outcom
 ts=2026-07-11T00:47:00Z event=refresh account=spare outcome=dead expires_before=1970-01-01T00:00:00Z expires_after=1970-01-01T00:00:00Z rotated=false window_secs=0
 ts=2026-07-11T00:48:00Z event=refresh account=third outcome=refreshed expires_before=2026-07-11T00:00:00Z expires_after=2026-07-11T08:00:00Z rotated=false window_secs=28800
 ts=2026-07-11T00:49:00Z event=credential_unrecoverable account=spare
-ts=2026-07-11T00:50:00Z event=usage_velocity acct=u-A session_pct_per_min=0.20 weekly_pct_per_min=0.01 elapsed_secs=120 session_delta_pct=1 weekly_delta_pct=0
+ts=2026-07-11T00:50:00Z event=usage_velocity acct=u-A session_pct_per_min=0.20 weekly_pct_per_min=0.01 elapsed_secs=300 session_delta_pct=1 weekly_delta_pct=0
 ";
 
         /// The usage samples the #595 landing SLI joins against the swap anchors above: for
