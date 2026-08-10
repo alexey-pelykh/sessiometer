@@ -472,9 +472,11 @@ pub(crate) fn parse_swap_events(text: &str) -> Vec<SwapEvent> {
 /// for the active-account timeline). Output is deterministic: per-account results are a
 /// [`BTreeMap`] keyed by handle, and every metric is a pure function of the inputs.
 ///
-/// The all-accounts-high census is taken over the accounts that HOLD SAMPLES in the period,
-/// which fires more readily than over a known roster (an unsampled account cannot withhold
-/// it). A caller that knows the configured roster should pass it to
+/// The all-accounts-high census is taken over the accounts that HOLD SAMPLES in the period.
+/// That set differs from a known roster in BOTH directions, so neither regime is the more
+/// readily-firing one in general (issue #864): an unsampled rostered account cannot withhold
+/// the metric here, while an orphan handle the roster excludes IS admitted here and can end a
+/// joint hold. A caller that knows the configured roster should pass it to
 /// [`aggregate_with_roster`] instead — this is exactly that call with `None` (issue #804).
 pub(crate) fn aggregate(
     samples: &[Sample],
@@ -2710,6 +2712,123 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
             Some(&roster(&["a", "absent"])),
         );
         assert_eq!(report.roster.capacity_hold_covered_secs, 0, "UNKNOWN");
+    }
+
+    // --- issue #864: WHICH WAY the holds census degrades when no roster is known ---------
+    //
+    // The three tests below are the measurement behind the render's wording: they are why the
+    // human caveat states the SET the reading was taken over rather than a direction. Each
+    // contrasts the two regimes over ONE sample set, so the regime is the only variable.
+
+    #[test]
+    fn the_fallback_regime_fires_a_hold_the_configured_roster_reports_as_unknown() {
+        // Direction ONE, and the one issue #836 named for the census: a ROSTERED account with no
+        // samples cannot withhold the metric once the roster is unknown, because the fallback
+        // censuses whoever holds samples and that account is simply not among them. `a` is
+        // blocked across the window and `gone` was never sampled.
+        let period = Period::new(0, 10_000);
+        let samples = vec![dated(0, "a", 0.99, 0.99, 8_000, 8_000)];
+
+        let configured = aggregate_with_roster(
+            &samples,
+            &[],
+            period,
+            &hold_params(),
+            Some(&roster(&["a", "gone"])),
+        );
+        assert_eq!(
+            configured.roster.capacity_hold_covered_secs, 0,
+            "`gone` covered nothing and stayed in the intersection — UNKNOWN, which renders `—`"
+        );
+        assert_eq!(configured.roster.capacity_holds, 0);
+
+        let fallback = aggregate(&samples, &[], period, &hold_params());
+        assert_eq!(
+            fallback.roster.capacity_holds, 1,
+            "the fallback never had `gone` to withhold the reading, so the hold is reported"
+        );
+        assert_eq!(
+            fallback.roster.capacity_hold_covered_secs, 8_000,
+            "and it is a MEASURED reading, not the unmeasurable one the roster produced"
+        );
+    }
+
+    #[test]
+    fn the_fallback_admits_an_orphan_handle_that_can_end_a_real_hold() {
+        // Direction TWO, the opposite one, and why `fires more readily` is not a property of this
+        // regime. An ORPHAN handle (issue #314 — samples from a removed/renamed account) is
+        // EXCLUDED by the configured census and ADMITTED by the fallback, so it joins the
+        // intersection. `retired` is viable throughout, which is exactly what ends a joint hold:
+        // the fallback reports the daemon had somewhere to land when the real roster did not.
+        let period = Period::new(0, 10_000);
+        let samples = vec![
+            dated(0, "a", 0.99, 0.99, 8_000, 8_000),
+            dated(0, "retired", 0.05, 0.05, 999_999, 999_999),
+        ];
+
+        let configured =
+            aggregate_with_roster(&samples, &[], period, &hold_params(), Some(&roster(&["a"])));
+        assert_eq!(
+            configured.roster.capacity_holds, 1,
+            "the orphan is not in the roster, so it is not part of the census"
+        );
+        assert_eq!(configured.roster.capacity_hold_secs_lower_bound, 8_000);
+
+        let fallback = aggregate(&samples, &[], period, &hold_params());
+        assert_eq!(
+            fallback.roster.capacity_holds, 0,
+            "the orphan's viable readings suppress a hold the configured roster really was in"
+        );
+        assert!(
+            fallback.roster.capacity_hold_covered_secs > 0,
+            "and it is a MEASURED zero, so no surface degrades to `—` and warns the reader — \
+             the suppression is silent, which is what makes this direction worth stating"
+        );
+    }
+
+    #[test]
+    fn the_regime_can_re_attribute_a_holds_cause_without_changing_the_count() {
+        // Direction THREE, which the utilisation census cannot have because it has no cause
+        // split — so this one is holds-only and no analogy to issue #836 could have found it.
+        // `intersect_tagged` keeps the cause of whichever account's block ends FIRST, and the
+        // regime decides which accounts are in that intersection. `a` is weekly-blocked and long,
+        // the orphan `b` is session-blocked and short; the COUNT is 1 either way and the split
+        // moves wholesale between the two dimensions.
+        let period = Period::new(0, 10_000);
+        let samples = vec![
+            dated(0, "a", 0.10, 0.99, 999_999, 8_000),
+            dated(0, "b", 0.85, 0.10, 3_000, 999_999),
+        ];
+
+        let configured =
+            aggregate_with_roster(&samples, &[], period, &hold_params(), Some(&roster(&["a"])));
+        let fallback = aggregate(&samples, &[], period, &hold_params());
+
+        assert_eq!(
+            (
+                configured.roster.capacity_holds,
+                fallback.roster.capacity_holds
+            ),
+            (1, 1),
+            "one hold under both regimes — the count is NOT what moved"
+        );
+        assert_eq!(
+            (
+                configured.roster.capacity_holds_session,
+                configured.roster.capacity_holds_weekly
+            ),
+            (0, 1),
+            "over the roster, `a`'s weekly block is the only one in the census and gates relief"
+        );
+        assert_eq!(
+            (
+                fallback.roster.capacity_holds_session,
+                fallback.roster.capacity_holds_weekly
+            ),
+            (1, 0),
+            "the fallback admits `b`, whose SESSION block ends first and so names the joint hold \
+             — the same episode attributed to the other dimension"
+        );
     }
 
     #[test]

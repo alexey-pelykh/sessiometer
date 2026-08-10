@@ -329,9 +329,11 @@ struct Report {
     /// degraded to whoever held samples in the period.
     ///
     /// Issue #804 introduced the two regimes and they are NOT interchangeable — under the
-    /// fallback an unsampled account silently leaves the intersection, so the metric fires on
-    /// strictly less evidence than the configured form, which is the one direction
-    /// REQ-STA-B-005's amendment forbids. Without this the human render states the census's
+    /// fallback an unsampled account silently leaves the intersection, which is the one
+    /// direction REQ-STA-B-005's amendment forbids. That amendment is narrow, and the flag is
+    /// NOT a direction: the fallback also ADMITS an orphan handle the configured regime excludes
+    /// (issue #864), so it can fire less readily too, and for holds it can re-attribute a cause
+    /// without moving the count. Without this the human render states the census's
     /// water but not its set, so the two regimes print the same bytes and a reader cannot tell
     /// which number they hold.
     ///
@@ -1750,7 +1752,8 @@ fn render_text(report: &Report, config_unreadable: Option<&str>) -> String {
 /// It also states its SET, for exactly the reason it states its water (issue #836).
 /// `census_over_roster` is [`Report::census_over_roster`] — `false` means no roster was known
 /// and the census degraded to the sampled accounts, where an unsampled account cannot withhold
-/// the metric and it therefore fires more readily. The qualifier rides the census label's own
+/// the metric (and where an orphan handle the roster excludes is admitted instead, so the set
+/// differs in both directions rather than one — issue #864). The qualifier rides the census label's own
 /// parenthetical, beside the water, because both are parameters of the same reading; a reader
 /// who greps out this line cannot separate the number from the set that produced it.
 ///
@@ -1769,10 +1772,10 @@ fn render_text(report: &Report, config_unreadable: Option<&str>) -> String {
 /// distinction carries no operator consequence — both readings are `—` — which is why it is
 /// accepted here rather than closed.
 ///
-/// The capacity-holds cell beside this one degrades over the SAME `roster` and is deliberately
-/// NOT annotated by this change (issue #836 is scoped to the census); that asymmetry is tracked
-/// as issue #864. Until it lands, a reader who notices one cell carrying a regime qualifier may
-/// infer the neighbour is regime-independent — it is not.
+/// The capacity-holds cell beside this one degrades over the SAME `roster` and carries the SAME
+/// qualifier from the SAME flag (issue #864) — see [`capacity_holds_cell`]. The two cells are
+/// annotated together on purpose: one qualified cell beside an unqualified one reads as though the
+/// unqualified metric were regime-independent, which is how this line misled between #836 and #864.
 fn roster_line(report: &UsageReport, census_over_roster: bool) -> String {
     let r = &report.roster;
     let period_secs = report.period.duration();
@@ -1844,16 +1847,56 @@ fn roster_line(report: &UsageReport, census_over_roster: bool) -> String {
         pct(r.high_threshold),
         set,
         census,
-        capacity_holds_cell(r),
+        capacity_holds_cell(r, census_over_roster),
     )
 }
 
 /// The config-provenance caveat the human render places directly ABOVE the roster line when
 /// `config.toml` exists but could not be read (issue #836), e.g.
-/// `all-accounts-high fires more readily without a roster — config.toml is not valid TOML —
-/// run `sessiometer config validate` for the detail`. `None` — nothing rendered — for a
+/// `all-accounts-high and capacity holds are measured over the sampled accounts, not the
+/// configured roster — config.toml is not valid TOML — run `sessiometer config validate` for the
+/// detail`. `None` — nothing rendered — for a
 /// readable config AND for an ABSENT one, which is the normal pre-`capture` state issue #627
 /// deliberately keeps silent (its regime is already stated by [`roster_line`]'s own qualifier).
+///
+/// # Why it names BOTH metrics, and why it no longer names a direction
+///
+/// It names both because both degrade: [`capacity_holds_cell`]'s aggregate selects its census from
+/// the same `roster` by the same `match` the utilisation census uses (issue #864). Naming one of
+/// two affected metrics is the same defect at one line's remove — the reader concludes the
+/// unnamed one is unaffected.
+///
+/// It no longer says `fires more readily` because that is not true of either metric once measured.
+/// The phrasing came from ONE of the two ways the sampled set differs from the roster, and the
+/// module's own tests already pin both:
+///
+/// - a ROSTERED account with no samples cannot withhold the metric under the fallback, so the
+///   fallback fires where the configured regime reports UNKNOWN — the direction #836 named
+///   (`a_rostered_account_with_no_samples_stays_in_the_census_instead_of_vanishing` and its holds
+///   sibling `the_fallback_regime_fires_a_hold_the_configured_roster_reports_as_unknown`);
+/// - an ORPHAN handle — samples from a removed/renamed account, issue #314 — is admitted by the
+///   fallback and EXCLUDED by the configured regime, so it joins the intersection and can end a
+///   joint hold the roster really was in. There the fallback fires LESS readily
+///   (`the_census_excludes_an_orphan_handle_that_is_not_in_the_configured_roster` and its holds
+///   sibling).
+///
+/// Holds carry a third, which the census cannot have because it has no cause split: the regime can
+/// re-attribute a hold's SESSION/WEEKLY cause without moving the count at all, because
+/// `intersect_tagged` keeps the cause of whichever account's block ends FIRST and the regime
+/// decides which accounts are in that intersection. So no single direction survives, and the
+/// honest operator-actionable fact is the SET — which is also what the two cells' own qualifiers
+/// say, in the same words, so the caveat and the line beneath it agree.
+///
+/// # Why `fall back to` and not `are measured over`
+///
+/// The verb has to be DISPOSITIONAL, not stative, because this line is not gated on either metric
+/// having fired (below) while both cells go quiet when theirs did not: the census suppresses its
+/// qualifier, and [`capacity_holds_cell`] returns `capacity holds: —` before composing one at all.
+/// `are measured over` asserts the reading — so it claimed one directly above two cells that
+/// refuse to, and both `stats-fallback-census-*` goldens render exactly that pair. `fall back to`
+/// is a property of the regime, true whether or not the window yielded a reading, which is the
+/// same grammatical class the removed `fires more readily` had and the reason that phrasing was
+/// safe to sit here even though it was wrong about direction.
 ///
 /// `reason` is the SAME static string [`wire_config_reason`] puts on the wire for issue #642,
 /// so the human surface and `--json` cannot describe one config failure two ways. That type is
@@ -1861,19 +1904,23 @@ fn roster_line(report: &UsageReport, census_over_roster: bool) -> String {
 /// `config.toml`, which is the whole reason #642 chose it for the wider surfaces — and stdout,
 /// piped into a file or a screenshot, is one of them.
 ///
-/// This is a SEPARATE annotation from the roster line's set qualifier, on a separate key,
-/// because the two answer different questions: the qualifier says WHICH SET the census used
+/// This is a SEPARATE annotation from the roster line's set qualifiers, on a separate key,
+/// because the two answer different questions: a qualifier says WHICH SET its cell used
 /// (true under an absent config too), while this says WHY there was no roster to use. It is
-/// NOT gated on the census having fired — "fires more readily" is a property of the metric
-/// under this regime, not a claim that it fired — so a broken config is stated whether or not
-/// the window happened to yield a reading.
+/// NOT gated on either metric having fired — the SET is a property of the reading's regime, not
+/// a claim that a reading was taken — so a broken config is stated whether or not the window
+/// happened to yield one.
 ///
 /// The stderr warning [`run_output`] already emits is not a substitute: it carries the FULL
 /// operator-scoped parser detail to a stream that a `stats > file`, a dashboard, or a
-/// screenshot does not capture, and it says nothing about the census's regime.
+/// screenshot does not capture, and it says nothing about either metric's regime.
 fn config_regime_line(reason: Option<&str>) -> Option<String> {
-    reason
-        .map(|reason| format!("all-accounts-high fires more readily without a roster — {reason}\n"))
+    reason.map(|reason| {
+        format!(
+            "all-accounts-high and capacity holds fall back to the sampled accounts, \
+             not the configured roster — {reason}\n"
+        )
+    })
 }
 
 /// The capacity-holds cell of the roster line (§D-STA-5, issue #803): `capacity holds (session
@@ -1899,20 +1946,37 @@ fn config_regime_line(reason: Option<&str>) -> Option<String> {
 /// with the census untaken the carried lines are `0.0`, and printing `≥0%` would state a line no
 /// reading was ever measured against.
 ///
-/// It does NOT yet state its SET, and the omission is a gap rather than a decision. The
-/// `capacity_holds` aggregate (`src/usage_stats.rs`) intersects over the same `roster` the census
-/// does and degrades the same way when none is known, so this cell has the two regimes issue #836
-/// made the census beside it declare — it is simply out of that issue's scope, and is tracked as
-/// issue #864. Until then the parenthetical asymmetry on the rendered line (a qualified census
-/// beside an unqualified holds cell) reads as though holds were regime-independent. It is not.
-fn capacity_holds_cell(r: &crate::usage_stats::RosterStats) -> String {
+/// It STATES ITS SET too, beside its boundary and for the same reason the census beside it states
+/// its own (issue #864). The `capacity_holds` aggregate (`src/usage_stats.rs`) selects its census
+/// from the very same `roster` argument by the very same `match` the utilisation census uses, so
+/// the two cells have always had ONE shared regime — and until this landed, only one of them said
+/// so. The asymmetry was the defect: a reader who saw a qualifier on the census and none here could
+/// only conclude that holds were regime-independent, which is the opposite of true.
+///
+/// `census_over_roster` is [`Report::census_over_roster`] — the same flag [`roster_line`] passes to
+/// the census, because it is read off `roster.is_some()` and therefore already describes BOTH
+/// aggregates rather than only the one it was named for.
+///
+/// STATED ONLY WHEN THE CENSUS WAS TAKEN, which here needs no branch of its own: the `—` arm above
+/// returns first, so an unmeasurable cell cannot carry a set. That is the same rule the census
+/// follows and it holds for the same reason — naming a set on a non-reading would describe a
+/// measurement that never happened.
+fn capacity_holds_cell(r: &crate::usage_stats::RosterStats, census_over_roster: bool) -> String {
     if r.capacity_hold_covered_secs == 0 {
         return "capacity holds: —".to_owned();
     }
+    // The SET, in the same words and the same parenthetical position the census uses — one
+    // vocabulary across the line, so a reader learns the qualifier once and reads both cells.
+    let set = if census_over_roster {
+        ""
+    } else {
+        ", sampled accounts"
+    };
     format!(
-        "capacity holds (session ≥{}%, weekly ≥{}%): {} ({} session / {} weekly) · ≥{}",
+        "capacity holds (session ≥{}%, weekly ≥{}%{}): {} ({} session / {} weekly) · ≥{}",
         pct(r.capacity_session_line),
         pct(r.capacity_weekly_line),
+        set,
         r.capacity_holds,
         r.capacity_holds_session,
         r.capacity_holds_weekly,
@@ -2585,8 +2649,10 @@ struct RosterWire {
     all_high_covered_secs: i64,
     /// The census's SET, beside its water and its denominator (issue #866): `true` when the census
     /// intersected the CONFIGURED roster, `false` when no roster was known and it degraded to
-    /// whoever held samples — where an unsampled account cannot withhold the metric, so it fires on
-    /// strictly less evidence. Carried for the same reason `all_high_threshold` is — issue #804
+    /// whoever held samples — where an unsampled account cannot withhold the metric, and where an
+    /// orphan handle the roster excludes is admitted instead, so the two sets differ in BOTH
+    /// directions and neither fires more readily in general (issue #864). Carried for the same
+    /// reason `all_high_threshold` is — issue #804
     /// put the water on the wire because three surfaces were each giving a different answer for
     /// it, and a surface that has to re-derive a census parameter answers from a second source
     /// that can drift. The set is the same shape of fact: the panel's aggregate callout
@@ -2602,9 +2668,17 @@ struct RosterWire {
     /// "not measurable" / "field not sent" collapse the block rule forbids, on the one field where
     /// the elided value is the informative one.
     ///
-    /// This is the census's set ONLY. The capacity-holds figures below degrade over the SAME
-    /// `roster` and carry no equivalent flag — issue #864 tracks that asymmetry CLI-side; a
-    /// consumer must not read this field as annotating them.
+    /// It annotates the capacity-holds figures below TOO, and always did: this is
+    /// [`Report::census_over_roster`], which is `roster.is_some()` — the state of the very
+    /// argument BOTH aggregates select their census from, not a census-specific derivation. The
+    /// name is the census's because issue #866 put it on the wire for the census; issue #864
+    /// established that the fact is shared and annotated both CLI-side. A consumer may read it
+    /// as qualifying every figure in this block that names a set.
+    ///
+    /// It stays named as it is rather than being renamed to something set-neutral: the rename
+    /// would be a BREAKING wire change for a field whose value is already correct, costing a
+    /// `JSON_SCHEMA_VERSION` major and an edit to the hand-maintained Swift `StatsRoster` mirror
+    /// to buy nothing a doc comment cannot say.
     census_over_roster: bool,
     /// Maximal intervals in which EVERY rostered account was simultaneously non-viable at the
     /// daemon's own boundary, so swapping could not have restored capacity (issue #803).
@@ -6122,9 +6196,10 @@ mod tests {
     #[test]
     fn a_fired_census_names_its_set_only_when_the_roster_was_unknown() {
         // THE reported defect: issue #804 gave the census two regimes that print the same
-        // bytes. The degraded one drops an unsampled account from the intersection, so it fires
-        // on strictly less evidence — the direction REQ-STA-B-005's amendment forbids — and a
-        // reader holding the number could not tell which one produced it.
+        // bytes. The degraded one drops an unsampled account from the intersection — the one
+        // direction REQ-STA-B-005's amendment forbids, and only one of the two ways the sets
+        // differ (issue #864) — and a reader holding the number could not tell which one
+        // produced it.
         let configured = fired_census_line(true);
         assert!(
             configured.contains("all-accounts-high (≥95%): 3 episodes (1h40m)"),
@@ -6152,6 +6227,129 @@ mod tests {
             scan_banned(&degraded),
             None,
             "the set qualifier must not editorialise: {degraded}"
+        );
+    }
+
+    // --- issue #864: the holds cell states its set too -----------------------------------
+
+    /// A holds cell that was MEASURED — the branch whose numbers can be misread, and the one no
+    /// committed golden exercises (every `stats-*` fixture's holds cell is the `—` arm, so the
+    /// golden suite cannot witness anything asserted below).
+    fn fired_holds_cell(census_over_roster: bool) -> String {
+        capacity_holds_cell(
+            &RosterStats {
+                capacity_holds: 7,
+                capacity_holds_session: 2,
+                capacity_holds_weekly: 5,
+                capacity_hold_secs_lower_bound: 106_080,
+                capacity_hold_covered_secs: CENSUS_WINDOW,
+                capacity_session_line: 0.80,
+                capacity_weekly_line: 0.97,
+                ..Default::default()
+            },
+            census_over_roster,
+        )
+    }
+
+    #[test]
+    fn a_measured_holds_cell_names_its_set_only_when_the_roster_was_unknown() {
+        // THE reported defect (issue #864): `capacity_holds` intersects over the same `roster`
+        // the census does, by the same `match`, so it has always had the two regimes — and until
+        // this landed only the census beside it said so. One qualified cell beside an unqualified
+        // one reads as though the unqualified metric were regime-independent.
+        let configured = fired_holds_cell(true);
+        assert!(
+            configured
+                .contains("capacity holds (session ≥80%, weekly ≥97%): 7 (2 session / 5 weekly)"),
+            "the configured regime is the norm and stays unqualified: {configured}"
+        );
+        assert!(
+            !configured.contains("sampled accounts"),
+            "no qualifier when the holds census DID intersect the configured roster: {configured}"
+        );
+
+        // ONE contiguous string, which pins PLACEMENT as well as presence — and pins it INSIDE
+        // the boundary parenthetical, beside the two lines it qualifies, exactly where the census
+        // puts its own. A qualifier rendered in the neighbouring `·` cell or on its own line is
+        // separable from the number by the grep an operator actually runs.
+        let degraded = fired_holds_cell(false);
+        assert!(
+            degraded.contains(
+                "capacity holds (session ≥80%, weekly ≥97%, sampled accounts): 7 (2 session / 5 weekly)"
+            ),
+            "the degraded regime names its set beside its boundary: {degraded}"
+        );
+        // Same words as the census's qualifier, deliberately: one vocabulary across the line.
+        assert_eq!(
+            degraded.matches("sampled accounts").count(),
+            1,
+            "named once, not doubled: {degraded}"
+        );
+        assert_eq!(
+            scan_banned(&degraded),
+            None,
+            "the set qualifier must not editorialise: {degraded}"
+        );
+    }
+
+    #[test]
+    fn an_unmeasurable_holds_cell_states_no_set_under_either_regime() {
+        // The `—` arm returns before the qualifier is composed, so this needs no branch of its
+        // own — but it is asserted because the rule is load-bearing and shared with the census:
+        // naming a set on a non-reading describes a measurement that never happened. It is also
+        // the arm EVERY committed `stats-*` golden renders, so without this the regime code is
+        // pinned only on a branch no fixture reaches.
+        for regime in [true, false] {
+            let cell = capacity_holds_cell(
+                &RosterStats {
+                    capacity_hold_covered_secs: 0,
+                    capacity_session_line: 0.80,
+                    capacity_weekly_line: 0.97,
+                    ..Default::default()
+                },
+                regime,
+            );
+            assert_eq!(
+                cell, "capacity holds: —",
+                "an untaken holds census renders `—` with no set and no boundary, regime={regime}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_cells_of_the_roster_line_carry_the_same_regime() {
+        // The asymmetry issue #864 reports is a property of the LINE, not of either cell, so it
+        // is asserted on the composed line: the two cells are driven by one flag and must never
+        // disagree about which set produced the numbers a reader sees side by side.
+        let report = UsageReport {
+            period: Period::new(0, CENSUS_WINDOW),
+            per_account: BTreeMap::new(),
+            roster: RosterStats {
+                all_high_episodes: 3,
+                all_high_secs: 6_000,
+                all_high_covered_secs: CENSUS_WINDOW,
+                high_threshold: 0.95,
+                capacity_holds: 7,
+                capacity_holds_session: 2,
+                capacity_holds_weekly: 5,
+                capacity_hold_secs_lower_bound: 106_080,
+                capacity_hold_covered_secs: CENSUS_WINDOW,
+                capacity_session_line: 0.80,
+                capacity_weekly_line: 0.97,
+                ..Default::default()
+            },
+        };
+        let degraded = roster_line(&report, false);
+        assert_eq!(
+            degraded.matches("sampled accounts").count(),
+            2,
+            "BOTH cells name the set — one qualified beside one unqualified is the defect: \
+             {degraded}"
+        );
+        let configured = roster_line(&report, true);
+        assert!(
+            !configured.contains("sampled accounts"),
+            "and neither does under the configured roster: {configured}"
         );
     }
 
@@ -6197,9 +6395,45 @@ mod tests {
             "leads with the metric it qualifies, so one grep catches the caveat AND the \
              number: {line}"
         );
+        // NAMES BOTH degraded metrics (issue #864). Both aggregates select their census from the
+        // same `roster` by the same `match`, so a caveat naming one of them tells a reader the
+        // other is unaffected — the very inference the unqualified holds cell already invited.
         assert!(
-            line.contains("fires more readily"),
-            "states the DIRECTION of the bias, which is the operator-actionable half: {line}"
+            line.contains("capacity holds"),
+            "names the holds metric too, not only the census: {line}"
+        );
+        // States the SET rather than a DIRECTION. `fires more readily` was true of only one of
+        // the two ways the sampled set differs from the roster: an orphan handle (issue #314) is
+        // admitted by the fallback and excluded by the configured regime, so it JOINS the
+        // intersection and the fallback fires LESS readily — pinned for both metrics by
+        // `the_census_excludes_an_orphan_handle_that_is_not_in_the_configured_roster` and
+        // `the_fallback_admits_an_orphan_handle_that_can_end_a_real_hold`. Holds add a third case
+        // the census cannot have: the regime re-attributes a hold's cause without moving the
+        // count (`the_regime_can_re_attribute_a_holds_cause_without_changing_the_count`). No one
+        // direction is true, so the caveat states what IS — the set the reading was taken over.
+        assert!(
+            line.contains("sampled accounts") && line.contains("not the configured roster"),
+            "states the SET it degraded to, and the set it is NOT: {line}"
+        );
+        assert!(
+            !line.contains("fires more readily"),
+            "no directional claim — measured false in both of the cases cited above: {line}"
+        );
+        // DISPOSITIONAL, not stative — the class the caveat's verb must stay in. This line is not
+        // gated on either metric having fired, while both cells go quiet when theirs did not:
+        // `capacity_holds_cell` returns `capacity holds: —` before composing a qualifier at all
+        // (`an_unmeasurable_holds_cell_states_no_set_under_either_regime`). `are measured over`
+        // asserts a reading, so it claimed one directly above a cell refusing to claim it — and
+        // both `stats-fallback-census-*` goldens render that exact pair, which is what made the
+        // first attempt at this line wrong in a way no per-cell test could see. `fall back to`
+        // states what the metrics DO under the regime and survives the `—` arm.
+        assert!(
+            line.contains("fall back to"),
+            "names what the metrics do under the regime, not a reading that may not exist: {line}"
+        );
+        assert!(
+            !line.contains("are measured over") && !line.contains("were measured over"),
+            "no stative claim — the caveat fires whether or not either metric was measured: {line}"
         );
         assert!(
             line.ends_with('\n'),
@@ -6276,7 +6510,7 @@ mod tests {
             // Directly ABOVE the line it qualifies, so it is read BEFORE the number rather
             // than as a footnote correcting a reading already taken.
             let caveat = out
-                .find("all-accounts-high fires more readily")
+                .find("all-accounts-high and capacity holds fall back to the sampled accounts")
                 .expect("the caveat is present");
             let roster = out.find("\nroster: ").expect("the roster line is present");
             assert!(
@@ -6289,15 +6523,19 @@ mod tests {
                  line, between the caveat and what it qualifies: {out}"
             );
         }
-        // And the CONFIGURED regime with a readable config renders exactly as it always did:
-        // the annotation is purely additive, which is why no committed golden moved.
+        // And the CONFIGURED regime with a readable config renders exactly as it always did: the
+        // annotation is reachable ONLY from the degraded regime, which is why the only committed
+        // goldens issue #864 moved are the two that already pinned the fallback.
         let normal = fired_report(true);
         for out in [
             render_text(&normal, None),
             render_charts(&normal, 100, false, false, None),
         ] {
             assert!(!out.contains("sampled accounts"), "unqualified: {out}");
-            assert!(!out.contains("fires more readily"), "no caveat: {out}");
+            assert!(
+                !out.contains("are measured over the sampled accounts"),
+                "no caveat: {out}"
+            );
         }
     }
 
@@ -9590,7 +9828,7 @@ mod tests {
         }
 
         /// The same roster under the DEGRADED census regime (issue #836): no configured roster
-        /// was known, so the census intersected whoever held samples and fires more readily.
+        /// was known, so the census intersected whoever held samples instead.
         ///
         /// Goldened because the whole point of issue #836 is that the two regimes used to print
         /// IDENTICAL bytes over identical data — which is exactly the corruption a substring
