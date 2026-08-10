@@ -3390,6 +3390,16 @@ fn has_stale_nonactive(response: &StatusResponse) -> bool {
 /// `[refresh]`. Lowercase and terse, matching the `next swap:` footer register; carries no
 /// account labels (AC-4, no PII). Leading blank line separates it from the footer (mirroring the
 /// verbose block's leading `\n`); trailing newline closes it.
+///
+/// **FRAMING firewall: IN SCOPE** (issue #1123). Scanned by
+/// `the_operator_advisories_carry_no_banned_framing_but_the_guard_bites_on_injection` against
+/// `crate::framing_vocabulary::scan_advisory_banned` — the central #160 vocabulary minus
+/// `ADVISORY_EXEMPT_TOKENS`, which is `enable` and nothing else. This line is the sole earner of
+/// that exemption: "or enable [refresh]" names a config operation the operator performs on the
+/// tool's own state, the mechanical class issue #918 measured on `--help`. What stays armed is
+/// everything the advisory has no business saying — it may state that credentials are going
+/// unmaintained and name the two remedies, and it may not call that state `critical`, call the
+/// lapse `imminent`, or tell the operator what they `should` do about it.
 const REFRESH_DISABLED_ADVISORY: &str = "\nadvisory: [refresh] is off and non-active accounts \
     are going stale — run 'sessiometer poke' or enable [refresh] to maintain them\n";
 
@@ -3498,6 +3508,29 @@ impl StatusRow {
 /// `[refresh]` — the durable fix — is carried holistically by [`REFRESH_DISABLED_ADVISORY`], and
 /// a genuine refresh-token death still escalates to 🔴 `claude /login`. Deliberately NOT
 /// "re-login" — that is precisely the over-reaction the honest verdict prevents.
+///
+/// **FRAMING firewall: IN SCOPE, at full strictness** (issue #1123). This is the surface that
+/// posed the issue's imperative question — `run 'sessiometer poke'` is a directive, and `--help`
+/// was only ever scoped against prose that NAMES operations rather than ordering them. Measured,
+/// the imperative costs nothing: the cue is clean against the WHOLE central vocabulary, so it is
+/// scanned by `scan_banned` and not by the advisory subset, and needs no exemption at all.
+///
+/// That is not an accident of wording — it is what the #160 vocabulary actually bans. The list
+/// never proscribed the imperative MOOD; it proscribes acquisition, value judgement,
+/// recommendation and alarm. An imperative pointing at a free, local, mechanical remedy is a FACT
+/// about what fixes the state. `degraded — buy more capacity` would trip; `degraded — run
+/// 'sessiometer poke'` does not.
+///
+/// And *should* not, which is a separate claim needing a separate reason — the head-room permit
+/// ADR-0020 records cannot supply it, since that permit is for a fact stated "as an observation,
+/// not advice" and this cue is advice. The reason is that this tool is REQUIRED elsewhere to make
+/// its operator guidance clear and FOLLOWABLE (issues #376 / #397 — `crate::error`'s
+/// `NoManagedService` and `UnmanagedDaemonNoRestart`, the
+/// `unmanaged_daemon_no_restart_guides_the_operator_with_a_followable_action` test, and the
+/// "name the followable stop first" rule this file already follows). Reading the #160 firewall as
+/// a ban on directives would set those two requirements against each other: the AUTH cell would
+/// have to report a repairable account while withholding the one command that repairs it.
+/// ADR-0020 § Status → Amended 2026-08-10 (#1123) records the boundary this extends.
 const DEGRADED_CUE: &str = "degraded — run 'sessiometer poke'";
 
 /// The `status` AUTH cell for one account (issue #119, extended by #427): the daemon's credential
@@ -5597,9 +5630,13 @@ mod tests {
     use crate::daemon::{
         AccountStatusLine, BlindActive, BlindPreemptSwap, LandingOvershoot, NextSwap, NoTargetCause,
     };
-    // The shared framing vocabulary (issue #918) — the same list `stats.rs` scans against, minus
-    // the mechanical-operation verbs help legitimately spends.
-    use crate::framing_vocabulary::{help_banned_tokens, scan_help_banned};
+    // The shared framing vocabulary (issues #918, #1123) — the same list `stats.rs` scans
+    // against, minus the mechanical-operation verbs each operator-facing surface legitimately
+    // spends. One scanner per audience; the exemption sets are measured, not inherited.
+    use crate::framing_vocabulary::{
+        help_banned_tokens, scan_advisory_banned, scan_banned, scan_help_banned, scan_usage_banned,
+        ADVISORY_EXEMPT_TOKENS, USAGE_EXEMPT_TOKENS,
+    };
     use std::path::PathBuf;
 
     fn acct(label: &str, uuid: &str) -> Account {
@@ -12360,57 +12397,182 @@ spare  22222222-2222\n\
     /// not a variable here — `cargo fmt --all --check` is a gate, so the source this reads is
     /// always rustfmt-shaped.
     fn declared_help_constant(line: &str) -> Option<&str> {
-        let after_visibility = match line.strip_prefix("pub") {
-            // `pub(crate)` / `pub(super)` / `pub(in crate::…)` — step over the scope.
-            Some(rest) => match rest.strip_prefix('(') {
-                Some(scoped) => scoped.split_once(')')?.1,
-                None => rest,
-            },
-            None => line,
-        };
-        let declaration = after_visibility
-            .strip_prefix("const ")
-            .or_else(|| after_visibility.strip_prefix(" const "))?;
-        let (name, _) = declaration.split_once(": &str")?;
-        name.ends_with("_USAGE").then_some(name)
+        declared_str_constant(line).filter(|name| name.ends_with("_USAGE"))
     }
 
-    /// [`declared_help_constant`] is the one textual link in the completeness chain, so it is
-    /// tested directly rather than only through its caller. Every visibility spelling Rust would
-    /// accept on a help constant must be recognised; a spelling that slips through is an
-    /// operator-facing `--help` surface that ships entirely unscanned while every gate stays
-    /// green. That is not hypothetical — before this test existed, the parser matched only a bare
-    /// `const `, so a `pub(crate) const PURGE_USAGE` carrying banned framing was invisible to it.
-    #[test]
-    fn the_declaration_parser_recognises_every_visibility_spelling() {
-        for spelling in [
-            "const DECOY_USAGE: &str = \"x\";",
-            "pub const DECOY_USAGE: &str = \"x\";",
-            "pub(crate) const DECOY_USAGE: &str = \"x\";",
-            "pub(super) const DECOY_USAGE: &str = \"x\";",
-            "pub(in crate::cli) const DECOY_USAGE: &str = \"x\";",
+    /// The name of ANY top-level string-valued item a declaration on `line` introduces — the
+    /// shared grammar [`declared_help_constant`] and [`declared_prose_constant`] both filter.
+    ///
+    /// Factored out rather than copied because the doc above names this parser as the soft spot
+    /// of the tripwires that call it: two hand-maintained copies of Rust's declaration grammar
+    /// would be two chances to miss a spelling, and only one of them would be under test.
+    ///
+    /// Three axes vary independently and all three are handled STRUCTURALLY, so the accepted set
+    /// is closed over each rather than being the spellings someone thought of:
+    ///
+    /// - **Visibility** — `pub`, `pub(crate)`, `pub(super)`, `pub(in …)`, stepped over by parsing
+    ///   the scope rather than by matching a fixed list of prefixes.
+    /// - **Item kind** — `const` AND `static`. Both declare a top-level value that ships, and
+    ///   nothing about a framing guard cares which keyword introduced the prose.
+    /// - **Type** — delegated to [`is_str_shaped`], which accepts every string spelling rather
+    ///   than the literal `&str` this parser originally matched.
+    ///
+    /// The item-kind and type axes were added by issue #1123's merge review, which defeated the
+    /// `const`-plus-`&str`-only grammar five ways — `static X: &str`, `const X: &'static str`,
+    /// `&[&str]`, `[&str; N]` — every one rustfmt-stable and invisible to the disposition gate. A
+    /// gate you evade by DECLARING a constant differently is no more a gate than one you evade by
+    /// NAMING it differently, which is the lexical guess issue #918 already rejected.
+    ///
+    /// Column-0 only, which is why this never reaches for `trim_start`: the sole leading space it
+    /// tolerates is the one `pub` leaves behind. An indented `const` belongs to a test module's
+    /// own fixtures and is deliberately none of this gate's business.
+    fn declared_str_constant(line: &str) -> Option<&str> {
+        let (after_visibility, had_visibility) = match line.strip_prefix("pub") {
+            // `pub(crate)` / `pub(super)` / `pub(in crate::…)` — step over the scope.
+            Some(rest) => match rest.strip_prefix('(') {
+                Some(scoped) => (scoped.split_once(')')?.1, true),
+                None => (rest, true),
+            },
+            None => (line, false),
+        };
+        let body = if had_visibility {
+            after_visibility.strip_prefix(' ')?
+        } else {
+            after_visibility
+        };
+        let declaration = body
+            .strip_prefix("const ")
+            .or_else(|| body.strip_prefix("static "))?;
+        let (name, rest) = declaration.split_once(": ")?;
+        // The type is everything up to the initialiser. A multi-line declaration breaks after the
+        // `=`, so an absent ` = ` leaves the remainder as-is rather than rejecting the line.
+        let ty = rest.split_once(" = ").map_or(rest, |(ty, _)| ty);
+        is_str_shaped(ty).then_some(name)
+    }
+
+    /// Whether `ty` is STRING-shaped — the property that makes a declaration shipped prose rather
+    /// than a number, a duration or a byte string. Decided by looking for the whole WORD `str`,
+    /// so it covers `&str`, `&'static str`, `&[&str]` and `[&str; N]` without enumerating them,
+    /// while `usize`, `Duration`, `&[u8]` and `&OsStr` all fail it.
+    ///
+    /// Deliberately errs toward ACCEPTING. A type it wrongly accepts costs one disposition entry
+    /// and a moment's annoyance; a type it wrongly rejects is a shipped string no framing guard
+    /// reaches, which is the whole failure class this tripwire exists to end.
+    fn is_str_shaped(ty: &str) -> bool {
+        ty.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .any(|word| word == "str")
+    }
+
+    /// The name of a top-level `&str` constant that is NOT a help surface — the candidate
+    /// operator-prose constants issue #1123's disposition tripwire enumerates. The complement of
+    /// [`declared_help_constant`] over the same closed visibility grammar, so the two together
+    /// account for every `const … : &str` this file declares and neither can be evaded by a
+    /// spelling the other would have caught.
+    fn declared_prose_constant(line: &str) -> Option<&str> {
+        declared_str_constant(line).filter(|name| !name.ends_with("_USAGE"))
+    }
+
+    /// Every spelling that declares a shipped string at column 0, as the PRODUCT of the three
+    /// axes Rust varies independently — visibility, item kind, and type. Enumerated as a product
+    /// rather than as the handful anyone happened to think of, because each axis was added to
+    /// this parser only after a review found the cell it was missing.
+    fn declaration_spellings(name: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for visibility in [
+            "",
+            "pub ",
+            "pub(crate) ",
+            "pub(super) ",
+            "pub(in crate::cli) ",
         ] {
+            for kind in ["const", "static"] {
+                for (ty, value) in [
+                    ("&str", "\"x\""),
+                    ("&'static str", "\"x\""),
+                    ("&[&str]", "&[\"x\"]"),
+                    ("[&str; 1]", "[\"x\"]"),
+                ] {
+                    out.push(format!("{visibility}{kind} {name}: {ty} = {value};"));
+                }
+            }
+        }
+        out
+    }
+
+    /// [`declared_str_constant`] is the one textual link in the completeness chain, so it is
+    /// tested directly rather than only through its callers. Every declaration spelling Rust
+    /// would accept on a shipped string must be recognised; one that slips through is an
+    /// operator-facing surface that ships entirely unscanned while every gate stays green.
+    ///
+    /// That is not hypothetical, and it has now happened twice on two different axes. Before this
+    /// test existed the parser matched only a bare `const `, so a `pub(crate) const PURGE_USAGE`
+    /// carrying banned framing was invisible to it. Before issue #1123's merge review it matched
+    /// only the item kind `const` and the type `&str`, so `static DEGRADED_CUE: &str`, or a
+    /// `&[&str]` list of advisories, was invisible in exactly the same way — a gate you evade by
+    /// DECLARING a constant differently is no more a gate than one you evade by NAMING it
+    /// differently. Hence the product above rather than a list.
+    #[test]
+    fn the_declaration_parser_recognises_every_declaration_spelling() {
+        // Collected rather than asserted one at a time, deliberately: the subject is PRODUCT
+        // coverage, so a run must name every cell the grammar misses rather than stopping at the
+        // first — fixing one axis and rediscovering the next on the following run is how a
+        // partial grammar gets mistaken for a complete one.
+        let missed: Vec<String> = declaration_spellings("DECOY_USAGE")
+            .into_iter()
+            .filter(|spelling| declared_help_constant(spelling) != Some("DECOY_USAGE"))
+            .chain(
+                declaration_spellings("DEGRADED_CUE")
+                    .into_iter()
+                    .filter(|spelling| declared_prose_constant(spelling) != Some("DEGRADED_CUE")),
+            )
+            .collect();
+        assert!(
+            missed.is_empty(),
+            "the declaration parser misses {} spelling(s) — each one is an operator-facing \
+             surface the completeness gate cannot see:\n{}",
+            missed.len(),
+            missed.join("\n")
+        );
+
+        // The two filters PARTITION that grammar (issue #1123): every spelling above lands on
+        // exactly one side. A constant falling through BOTH would be a shipped string no tripwire
+        // owns — the shape of the defect issue #918 was opened about, one filter down.
+        for spelling in declaration_spellings("DECOY_USAGE") {
             assert_eq!(
-                declared_help_constant(spelling),
-                Some("DECOY_USAGE"),
-                "the declaration parser must recognise {spelling:?} — a spelling it misses is a \
-                 help surface the completeness gate cannot see"
+                declared_prose_constant(&spelling),
+                None,
+                "{spelling:?} must not also count as operator prose"
+            );
+        }
+        for spelling in declaration_spellings("DEGRADED_CUE") {
+            assert_eq!(
+                declared_help_constant(&spelling),
+                None,
+                "{spelling:?} must not also count as a help surface"
             );
         }
 
-        // …and it stays NARROW, or the gate would demand topic entries for things that are not
-        // help surfaces at all: a non-help `&str` const, an indented fixture belonging to some
-        // test module, a commented-out line, and a non-const declaration.
+        // …and it stays NARROW, or the gate would demand entries for things that are not shipped
+        // prose at all: an indented fixture belonging to some test module, a commented-out line,
+        // a non-const declaration, and a constant whose type is not string-shaped.
         for ignored in [
-            "const DEGRADED_CUE: &str = \"x\";",
             "    const INDENTED_USAGE: &str = \"x\";",
+            "    static INDENTED_CUE: &str = \"x\";",
             "// const COMMENTED_USAGE: &str = \"x\";",
             "pub fn not_a_const_USAGE() {}",
+            "const NOT_A_STRING: usize = 3;",
+            "const NOT_A_STRING_EITHER: &[u8] = b\"x\";",
+            "const STILL_NOT_A_STRING: Duration = Duration::from_secs(2);",
         ] {
             assert_eq!(
                 declared_help_constant(ignored),
                 None,
                 "the declaration parser must ignore {ignored:?}"
+            );
+            assert_eq!(
+                declared_prose_constant(ignored),
+                None,
+                "the prose parser must ignore {ignored:?}"
             );
         }
     }
@@ -12559,6 +12721,508 @@ spare  22222222-2222\n\
             scan_help_banned("running out — need more seats"),
             Some("need"),
             "`need more` is covered repo-wide by the single token `need`"
+        );
+    }
+
+    // --- the framing guard, over operator advisories and usage prose (issue #1123) ----
+
+    /// The static operator-prose this file renders into `status` — the surfaces issue #1123
+    /// brings inside the firewall. Both are authored English an operator reads on the same
+    /// subject and in the same voice as the help text issue #918 scanned; the firewall's rationale
+    /// never distinguished them, only the guard's scope did.
+    const ADVISORY_SURFACES: &[(&str, &str)] = &[
+        ("REFRESH_DISABLED_ADVISORY", REFRESH_DISABLED_ADVISORY),
+        ("DEGRADED_CUE", DEGRADED_CUE),
+    ];
+
+    /// Top-level string constants that are deliberately NOT operator prose, and so are outside
+    /// [`ADVISORY_SURFACES`] rather than missing from it. The disposition tripwire below requires
+    /// every declared string to appear in one list or the other, so this is the place a non-prose
+    /// constant is EXCUSED on the record instead of by omission.
+    ///
+    /// Each entry is paired with the REASON it is not prose, because an excuse without one is
+    /// indistinguishable from an oversight — and [`every_excusal_is_reasoned`] enforces the
+    /// pairing mechanically rather than trusting this doc to be kept honest. Issue #1123's merge
+    /// review excused a genuinely editorialising string here in three mechanical edits and a
+    /// fully green run: the doc REQUIRED a reason, nothing TESTED for one.
+    ///
+    /// The bar a reason must clear is deliberately narrow, and `EXPIRY_GAP` is the shape of it:
+    /// the constant carries no WORDS, so scanning it is not a weaker check but a vacuous one.
+    /// "This one reads fine to me" is not that; it is the judgement the guard exists to replace.
+    const NOT_OPERATOR_PROSE: &[(&str, &str)] = &[(
+        "EXPIRY_GAP",
+        "a single em dash — the NOT-OBSERVED sentinel for the `EXPIRY` cell, carrying no words",
+    )];
+
+    /// Every excusal names a constant that is WORD-FREE, which is the only reason
+    /// [`NOT_OPERATOR_PROSE`] admits: a string with no words cannot editorialise, so scanning it
+    /// would be vacuous rather than weaker. A string WITH words that someone excused anyway is a
+    /// hole in the guard wearing a rationale, and the rationale is exactly what makes it survive
+    /// review — so the property is asserted against the constant's own VALUE rather than argued
+    /// in prose beside it.
+    ///
+    /// This is the discipline every exemption SET already carries (`…_is_still_earned_by_…`),
+    /// applied to the one carve-out that had a documented requirement and no test.
+    #[test]
+    fn every_excusal_is_reasoned() {
+        // Resolve each excused NAME to the value it stands for. An excusal naming a constant this
+        // list cannot resolve is itself a defect — the disposition gate would still balance while
+        // nothing checked what was excused.
+        let resolved: &[(&str, &str)] = &[("EXPIRY_GAP", EXPIRY_GAP)];
+        for (name, reason) in NOT_OPERATOR_PROSE {
+            assert!(
+                !reason.trim().is_empty(),
+                "{name:?} is excused from the prose scan with no reason recorded"
+            );
+            let (_, value) = resolved
+                .iter()
+                .find(|(candidate, _)| candidate == name)
+                .unwrap_or_else(|| {
+                    panic!("{name:?} is excused but this test cannot resolve its value")
+                });
+            assert!(
+                value
+                    .split(|c: char| !c.is_ascii_alphanumeric())
+                    .all(str::is_empty),
+                "{name:?} is excused from the prose scan but carries WORDS ({value:?}) — a \
+                 word-bearing string is operator prose and belongs in ADVISORY_SURFACES, whatever \
+                 the recorded reason says"
+            );
+        }
+    }
+
+    /// The rendered `status` AUTH cell, over every shape [`health_cell`] can produce — the
+    /// operator prose this file builds from INLINE literals rather than from a named constant.
+    ///
+    /// [`every_prose_constant_is_dispositioned`] reads DECLARATIONS, so it is structurally blind
+    /// to `cell.push_str("claude /login")` — which sits three lines from [`DEGRADED_CUE`]'s own
+    /// use and is every bit as much authored English an operator reads. Issue #1123's merge
+    /// review shipped exactly that payload as an inline literal past a fully green run. Scanning
+    /// the RENDERED cell closes it the way [`usage_error_surfaces`] closes the same seam for
+    /// `Error::CliUsage`: drive the real function over its whole input space and scan what an
+    /// operator would actually see, rather than trying to parse string literals out of a function
+    /// body.
+    ///
+    /// The residual limit, stated rather than left as an unexplained gap: this covers the inline
+    /// prose of `health_cell` and `legacy_health_tags`, not every inline literal in the file. No
+    /// declaration-reading tripwire can enumerate those, so a NEW function that renders operator
+    /// prose from inline literals needs a line here — the same obligation `ADVISORY_SURFACES`
+    /// carries for a new constant, minus the tripwire that enforces it. Issue #1138 tracks
+    /// closing that asymmetry.
+    fn rendered_advisory_surfaces() -> Vec<(String, String)> {
+        use CredentialHealth::{AtRisk, Dead, Degraded, Healthy, Stale, Unknown};
+        let mut out = Vec::new();
+        // The full product: every rollup verdict × healing × parked, plus the `health: None`
+        // legacy fallback. Exhaustive rather than sampled — a cue reachable only in one corner of
+        // that space is still a cue an operator reads.
+        for health in [
+            Some(Healthy),
+            Some(Unknown),
+            Some(Stale),
+            Some(AtRisk),
+            Some(Degraded),
+            Some(Dead),
+            None,
+        ] {
+            for recovering in [false, true] {
+                for enabled in [false, true] {
+                    let cell = health_cell(&AccountStatusLine {
+                        health,
+                        quarantined: true,
+                        recovering,
+                        enabled,
+                        ..status_line("work", false, Some(10), Some(20))
+                    });
+                    out.push((
+                        format!(
+                            "health_cell({health:?}, recovering={recovering}, enabled={enabled})"
+                        ),
+                        cell,
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    /// The completeness tripwire for the advisory guard — the counterpart to
+    /// [`every_help_constant_is_scanned`], and the reason a new advisory cannot ship unscanned.
+    ///
+    /// Issue #918's lesson was that a guard nobody can extend by accident is a guard that silently
+    /// stops covering the surface. Help got that tripwire; the advisories had none, so a second
+    /// `const SOMETHING_ADVISORY` added next year would sit outside every scan while `cargo test`
+    /// stayed green. This closes that by DISPOSITION rather than by naming convention: every
+    /// top-level string this file DECLARES must be either scanned as prose or listed as
+    /// [`NOT_OPERATOR_PROSE`]. Matching on a name suffix (`*_ADVISORY`, `*_CUE`) would have been
+    /// the lexical guess issue #918 explicitly rejected — the next advisory may be called
+    /// anything, and a gate you can evade by naming a constant differently is not a gate.
+    ///
+    /// Its reach is DECLARATIONS, and the boundary is worth stating because it was mistaken once:
+    /// prose built from INLINE literals inside a function body has no declaration to key off and
+    /// is invisible here, whatever the grammar in [`declared_str_constant`] accepts.
+    /// [`rendered_advisory_surfaces`] covers the known instance of that by scanning rendered
+    /// output instead, and records what remains uncovered.
+    ///
+    /// Reads this file's own source via `include_str!`, so the check cannot be skipped by an
+    /// unexpected working directory — the same compile-time-input discipline the help tripwire and
+    /// `crate::render_golden` use.
+    #[test]
+    fn every_prose_constant_is_dispositioned() {
+        let mut declared: Vec<&str> = include_str!("cli.rs")
+            .lines()
+            .filter_map(declared_prose_constant)
+            .collect();
+        declared.sort_unstable();
+
+        let mut dispositioned: Vec<&str> = ADVISORY_SURFACES
+            .iter()
+            .map(|(name, _)| *name)
+            .chain(NOT_OPERATOR_PROSE.iter().map(|(name, _)| *name))
+            .collect();
+        dispositioned.sort_unstable();
+
+        assert_eq!(
+            declared, dispositioned,
+            "every top-level string constant in src/cli.rs must be either scanned as operator \
+             prose (ADVISORY_SURFACES) or excused on the record (NOT_OPERATOR_PROSE) — an \
+             undispositioned one is an operator-facing string no framing guard reaches"
+        );
+        // Cardinality, stated because a gate over an empty subject passes identically: both sides
+        // above would agree at zero if the source scan silently matched nothing.
+        assert_eq!(
+            declared.len(),
+            3,
+            "expected 3 top-level `&str` constants; the count moved — disposition the new one, \
+             then update this"
+        );
+    }
+
+    /// Issue #1123 AC-2 for the advisory surface: the shipped operator advisories carry no banned
+    /// framing, and the guard that says so can fail.
+    ///
+    /// The bite half is the whole point, for the reason issue #918 recorded: a "current prose is
+    /// clean" loop passes IDENTICALLY over a scanner that inspects nothing, and that is precisely
+    /// how issue #885's claimed help coverage survived review. So each editorial group is injected
+    /// into a REAL advisory and asserted caught.
+    #[test]
+    fn the_operator_advisories_carry_no_banned_framing_but_the_guard_bites_on_injection() {
+        // PASSES on the real, shipped advisories.
+        for (name, prose) in ADVISORY_SURFACES {
+            assert_eq!(
+                scan_advisory_banned(prose),
+                None,
+                "{name} must carry no banned framing:\n{prose}"
+            );
+        }
+        // …and on the AUTH cell's inline prose, which no declaration-reading tripwire can see.
+        let rendered = rendered_advisory_surfaces();
+        assert_eq!(
+            rendered.len(),
+            28,
+            "the rendered AUTH-cell product changed size — a scan over a shrunken subject passes \
+             identically, so this is pinned rather than trusted"
+        );
+        for (label, cell) in &rendered {
+            assert_eq!(
+                scan_advisory_banned(cell),
+                None,
+                "{label} must render no banned framing:\n{cell}"
+            );
+        }
+        // The cue an operator acts on is genuinely IN that subject — a product of empty cells
+        // would satisfy the loop above while scanning nothing that matters.
+        assert!(
+            rendered
+                .iter()
+                .any(|(_, cell)| cell.contains("claude /login")),
+            "the rendered AUTH-cell scan must actually reach the inline `claude /login` cue"
+        );
+
+        // BITES: each editorial group injected into a REAL advisory is caught.
+        for (injected, caught) in [
+            ("You should re-login.", "should"),
+            ("Upgrade your plan.", "upgrade"),
+            ("Your credentials are critical.", "critical"),
+            ("Death is imminent.", "imminent"),
+            ("Running out — top up first.", "top up"),
+            ("Running low — need more seats.", "need"),
+        ] {
+            assert_eq!(
+                scan_advisory_banned(&format!("{REFRESH_DISABLED_ADVISORY}\n{injected}")),
+                Some(caught),
+                "injecting {injected:?} into the refresh advisory must be caught"
+            );
+        }
+
+        // The exemption is a carve-out, not a hole: naming the config section passes, while a
+        // recommendation built AROUND that same verb is still caught on a group the exemption
+        // never touched.
+        assert_eq!(
+            scan_advisory_banned("enable [refresh] to maintain them"),
+            None
+        );
+        assert_eq!(
+            scan_advisory_banned("you should enable [refresh]"),
+            Some("should")
+        );
+    }
+
+    /// Issue #1123 AC-1, asserted where the imperative actually lives: the advisory exemption is
+    /// earned by `REFRESH_DISABLED_ADVISORY` ALONE, and `DEGRADED_CUE` — the imperative the issue
+    /// was opened about — needs no exemption whatsoever.
+    ///
+    /// This is the measurement the decision rests on rather than a restatement of it. The cue
+    /// orders an operation (`run 'sessiometer poke'`) and is nonetheless clean against the WHOLE
+    /// central vocabulary, which is why issue #1123 concluded that the imperative MOOD is not what
+    /// the #160 firewall polices and that no new vocabulary was needed to take these surfaces in.
+    /// If a future edit makes the cue editorialise, the strict half here reddens even though the
+    /// advisory-subset scan above would still pass it.
+    ///
+    /// Reddening on the earned half means an advisory edit dropped the last use of `enable`: the
+    /// fix is to TIGHTEN `ADVISORY_EXEMPT_TOKENS`, not to widen this test.
+    #[test]
+    fn the_advisory_exemption_is_earned_by_the_advisory_alone_not_by_the_cue() {
+        assert_eq!(
+            scan_banned(DEGRADED_CUE),
+            None,
+            "the degraded cue must stay clean against the FULL central vocabulary — its \
+             imperative is a remedy, not framing:\n{DEGRADED_CUE}"
+        );
+        for exempt in ADVISORY_EXEMPT_TOKENS {
+            assert!(
+                REFRESH_DISABLED_ADVISORY
+                    .split(|c: char| !c.is_ascii_alphanumeric())
+                    .any(|word| word.eq_ignore_ascii_case(exempt)),
+                "{exempt:?} is exempt for the advisories but the refresh advisory no longer \
+                 spends it — tighten ADVISORY_EXEMPT_TOKENS rather than carry a dead carve-out"
+            );
+        }
+    }
+
+    /// Every `Error::CliUsage` this parser can produce, rendered through its real `Display` and
+    /// labelled by the argv that reaches it. Driven through [`parse_argv`] rather than hand-built,
+    /// so the scan sees the shipped template, the real `usage_hint` and the `run … for usage`
+    /// wrapper exactly as an operator would.
+    ///
+    /// The argv is deliberately NEUTRAL (`--zzz`, `zzz`). That is not the guard looking away: the
+    /// interpolated half is the operator's own words, and pointing the scan at live output would
+    /// make it report the operator's typo as our framing. `Error::CliUsage`'s doc comment records
+    /// that split, and `the_argv_echo_is_the_operators_words_not_this_tools_framing` pins it.
+    fn usage_error_surfaces() -> Vec<(&'static str, String)> {
+        [
+            // The three shapes `unexpected` renders — long flag, short flag, stray value — plus
+            // the three verbs whose hints are what EARN the usage exemptions.
+            ("status --zzz", vec!["status", "--zzz"]),
+            ("status -z", vec!["status", "-z"]),
+            ("log zzz", vec!["log", "zzz"]),
+            ("disable --zzz", vec!["disable", "--zzz"]),
+            ("enable --zzz", vec!["enable", "--zzz"]),
+            ("remove --zzz", vec!["remove", "--zzz"]),
+            // A value-bearing flag left dangling (`required_value`).
+            ("stats --period", vec!["stats", "--period"]),
+            // The three unknown-sub-action arms.
+            ("service zzz", vec!["service", "zzz"]),
+            ("daemon zzz", vec!["daemon", "zzz"]),
+            ("config zzz", vec!["config", "zzz"]),
+            // The two fully-static messages.
+            ("config path --origin", vec!["config", "path", "--origin"]),
+            ("use zzz --next", vec!["use", "zzz", "--next"]),
+            // lexopt's own message, folded in by `From<lexopt::Error>` — third-party prose we
+            // nonetheless ship, so it is scanned like the rest.
+            ("status --json=1", vec!["status", "--json=1"]),
+        ]
+        .into_iter()
+        .map(|(label, argv)| match parse_argv(&argv) {
+            Err(err @ Error::CliUsage { .. }) => (label, err.to_string()),
+            other => panic!("`{label}` must produce a CliUsage error, got {other:?}"),
+        })
+        .collect()
+    }
+
+    /// The completeness tripwire for the usage guard: every `Error::CliUsage` CONSTRUCTION SITE in
+    /// this file's non-test code must be covered by [`usage_error_surfaces`].
+    ///
+    /// The same question issue #918's [`every_help_constant_is_scanned`] answers, asked of the
+    /// other surface: without it, a new rejection path carrying "you should upgrade your plan"
+    /// would ship entirely unscanned while every gate stayed green. A count rather than a
+    /// name-match, because these are expressions inside function bodies with no declaration to
+    /// key off.
+    ///
+    /// Keyed on the bare VARIANT name, not on `Error::CliUsage`: importing the variant and
+    /// writing `CliUsage { … }` is ordinary Rust that the qualified spelling would have missed
+    /// entirely — issue #1123's merge review found it. What the count still cannot see is a
+    /// RENAMING import (`use …::CliUsage as Rejected`), so rather than leave that as an
+    /// unexplained hole the test forbids one outright: this file has no reason to alias the
+    /// variant, and an alias would silently empty the count below.
+    ///
+    /// Non-test code only — the test module constructs the variant freely in its own assertions,
+    /// and those are not shipped prose. The boundary is this file's column-0 `#[cfg(test)]`, the
+    /// same structural marker the module itself uses.
+    #[test]
+    fn every_cli_usage_construction_site_is_scanned() {
+        let non_test = || {
+            include_str!("cli.rs")
+                .lines()
+                .take_while(|line| !line.starts_with("#[cfg(test)]"))
+        };
+        assert!(
+            !non_test().any(|line| line.contains("CliUsage as ")),
+            "src/cli.rs aliases `CliUsage` under another name — the construction-site count below \
+             keys on the variant name and would silently miss every site built through the alias"
+        );
+        let sites = non_test()
+            .filter(|line| line.contains("CliUsage {"))
+            .count();
+        assert_eq!(
+            sites, 8,
+            "expected 8 `CliUsage` construction sites in src/cli.rs's non-test code; the count \
+             moved — add an argv case to `usage_error_surfaces` covering the new site, then \
+             update this"
+        );
+        // Cardinality on the other side too, pinned rather than compared: the argv cases and the
+        // construction sites are DIFFERENT populations (several sites are reached by more than
+        // one argv, and `status --json=1` reaches lexopt rather than a site here), so no
+        // inequality between the two counts would evidence that any particular site is exercised.
+        // What this pins is that the scanned subject has not silently shrunk.
+        assert_eq!(
+            usage_error_surfaces().len(),
+            13,
+            "the scanned argv cases changed count — a scan over a shrunken subject passes \
+             identically, so this is pinned rather than trusted"
+        );
+    }
+
+    /// Issue #1123 AC-2 for the usage surface: every authored usage hint and every rendered
+    /// `Error::CliUsage` carries no banned framing, and the guard bites.
+    #[test]
+    fn the_usage_prose_carries_no_banned_framing_but_the_guard_bites_on_injection() {
+        // Every `usage_hint` there is. Reached through [`ALL_HELP_TOPICS`], so this inherits the
+        // completeness [`every_help_constant_is_scanned`] already enforces on that table rather
+        // than hand-listing nineteen strings that could drift from it.
+        for topic in ALL_HELP_TOPICS {
+            let hint = topic.hint();
+            assert_eq!(
+                scan_usage_banned(hint),
+                None,
+                "the {} usage hint must carry no banned framing: {hint}",
+                topic_const_name(*topic)
+            );
+        }
+
+        // PASSES on every rendered rejection the parser can produce.
+        for (label, rendered) in usage_error_surfaces() {
+            assert_eq!(
+                scan_usage_banned(&rendered),
+                None,
+                "`{label}` must render no banned framing:\n{rendered}"
+            );
+        }
+
+        // BITES: each editorial group injected into a REAL rendered error is caught.
+        let real = Error::CliUsage {
+            message: "unknown flag `--zzz`".to_owned(),
+            usage_hint: HelpTopic::Status.hint(),
+        }
+        .to_string();
+        for (injected, caught) in [
+            ("You should re-login.", "should"),
+            ("Upgrade your plan.", "upgrade"),
+            ("Your usage is critical.", "critical"),
+            ("Exhaustion is imminent.", "imminent"),
+            ("Running out — top up first.", "top up"),
+            ("Running low — need more seats.", "need"),
+        ] {
+            assert_eq!(
+                scan_usage_banned(&format!("{real}\n{injected}")),
+                Some(caught),
+                "injecting {injected:?} into a rendered usage error must be caught"
+            );
+        }
+
+        // The exemption is a carve-out, not a hole: the hint may name the command, while a
+        // recommendation built around that same verb is still caught.
+        assert_eq!(
+            scan_usage_banned("run `sessiometer remove --help` for usage"),
+            None
+        );
+        assert_eq!(
+            scan_usage_banned("you should remove that account"),
+            Some("should")
+        );
+    }
+
+    /// Every usage exemption is LOAD-BEARING: each token excused from the usage scan is one the
+    /// shipped usage prose measurably spends, and the earner is identified rather than assumed.
+    /// Issue #918 rejected a hand-picked "command name" exemption set on exactly this kind of
+    /// evidence, and issue #1123 keeps the discipline by measuring a SEPARATE, tighter set here
+    /// rather than reusing help's.
+    ///
+    /// Reddening means a hint edit dropped the last use of an excused token: TIGHTEN
+    /// `USAGE_EXEMPT_TOKENS`, do not widen this test.
+    #[test]
+    fn every_usage_exemption_is_still_earned_by_the_shipped_usage_prose() {
+        let surfaces: Vec<String> = ALL_HELP_TOPICS
+            .iter()
+            .map(|topic| topic.hint().to_owned())
+            .chain(usage_error_surfaces().into_iter().map(|(_, text)| text))
+            .collect();
+        for exempt in USAGE_EXEMPT_TOKENS {
+            let earned = surfaces.iter().any(|text| {
+                text.split(|c: char| !c.is_ascii_alphanumeric())
+                    .any(|word| word.eq_ignore_ascii_case(exempt))
+            });
+            assert!(
+                earned,
+                "{exempt:?} is exempt from the usage scan but no usage hint or rendered error \
+                 uses it any more — tighten USAGE_EXEMPT_TOKENS rather than carry a dead carve-out"
+            );
+        }
+        // …and the set stays TIGHTER than help's, which is why it is its own constant: `add` is
+        // help-only vocabulary and no usage hint can earn it.
+        assert!(
+            !USAGE_EXEMPT_TOKENS.contains(&"add"),
+            "`add` is not a verb in this CLI, so no usage hint can earn it"
+        );
+    }
+
+    /// Issue #1123's other half of the `Error::CliUsage` verdict, PINNED rather than left
+    /// implicit: a banned token arriving through argv reaches the rendered message, and that is
+    /// correct.
+    ///
+    /// The #160 firewall governs what this tool ASSERTS. "unknown flag `--should`" asserts only
+    /// that the flag was not recognised — neutral whatever the operator called it — so the
+    /// `should` in it is the operator quoting themselves. Two things follow, and both are the
+    /// reason this test exists rather than a comment saying so:
+    ///
+    /// 1. The echo must SURVIVE. Sanitising it would destroy the single diagnostic the message
+    ///    exists to carry, so anyone who later "fixes" this by filtering argv reddens here and
+    ///    reads the reasoning.
+    /// 2. The guard's subject is therefore the TEMPLATE, driven with neutral argv, not live
+    ///    output — a limitation of this surface worth stating outright, since a scan pointed at
+    ///    production output would report the operator's typo as our framing.
+    #[test]
+    fn the_argv_echo_is_the_operators_words_not_this_tools_framing() {
+        let rendered = match parse_argv(&["status", "--should"]) {
+            Err(err @ Error::CliUsage { .. }) => err.to_string(),
+            other => panic!("expected a CliUsage error, got {other:?}"),
+        };
+        assert!(
+            rendered.contains("--should"),
+            "the operator's own flag must survive into the diagnostic verbatim:\n{rendered}"
+        );
+        // Scanned as if it were our prose it WOULD trip — which is exactly why the guard above is
+        // pointed at the template with neutral argv instead of at live output.
+        assert_eq!(
+            scan_usage_banned(&rendered),
+            Some("should"),
+            "the echoed token is visible to the scanner; the decision is that it is not ours"
+        );
+        // The authored half of that very same message is clean — the token came in through argv
+        // and nowhere else.
+        assert_eq!(
+            scan_usage_banned(&rendered.replace("--should", "--zzz")),
+            None,
+            "with the operator's word removed, nothing this crate wrote trips the guard"
         );
     }
 
