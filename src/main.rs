@@ -26,6 +26,12 @@ mod cross_surface;
 mod daemon;
 mod duration;
 mod error;
+/// The FRAMING guard's shared vocabulary (issues #160, #542, #918) — the central banned-token
+/// and banned-phrase lists, the single scanner both audiences share, and the help-side exemption
+/// set that lets `--help` name this CLI's own verbs. Test-only: nothing in the shipping binary
+/// reads the vocabulary.
+#[cfg(test)]
+mod framing_vocabulary;
 mod hex;
 mod isolated_spawn;
 mod keychain;

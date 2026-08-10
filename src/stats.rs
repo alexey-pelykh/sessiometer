@@ -6241,133 +6241,14 @@ mod tests {
 
     // --- the framing guard: a CENTRAL banned vocabulary + its scanner ----------------
 
-    /// The editorialising vocabulary the neutral summary band (issue #160) — and every
-    /// surface this guard scans — must NEVER contain: a value judgement (`healthy`, `danger`),
-    /// an acquisitive imperative (`add`, `upgrade`, `buy`), a recommendation (`should`,
-    /// `recommend`), or ALARMIST projection FRAMING (`forecast`, `imminent`, `soon`). CENTRAL +
-    /// explicit so the guard stays maintainable: one list, one scanner, extended in a single
-    /// place.
-    ///
-    /// Boundary (issue #542, ADR-0020) — these ban the FRAMING, not the FACT. A neutrally
-    /// framed velocity + runway readout — a `%/min` rate, an approximate time-to-trigger or
-    /// days-of-runway phrased as an observation (`~4h to trigger`, `~3 days at current rate`) —
-    /// is PERMITTED: it uses none of this vocabulary. What stays banned is the acquisitive CALL
-    /// (a purchase prompt) and the alarmist projection words, never a head-room number. Neutral
-    /// MAGNITUDE words the wire legitimately uses (`idle`/`low`/`moderate`/`high`/`at_cap`) are
-    /// likewise absent — they describe, they do not editorialise.
-    const BANNED_TOKENS: &[&str] = &[
-        // Imperatives / recommended actions (issue #160: "add / buy / upgrade / cancel /
-        // bypass / need more").
-        "add",
-        "buy",
-        "upgrade",
-        "cancel",
-        "bypass",
-        "need",
-        "purchase",
-        "remove",
-        "disable",
-        "enable",
-        "fix",
-        "avoid",
-        "reduce",
-        "increase",
-        "throttle",
-        "rotate",
-        // Value judgements (caller: "healthy / at risk / warning / danger / good / bad").
-        "healthy",
-        "unhealthy",
-        "risk",
-        "risky",
-        "warning",
-        "warn",
-        "danger",
-        "dangerous",
-        "good",
-        "bad",
-        "critical",
-        "severe",
-        "poor",
-        "safe",
-        "unsafe",
-        "optimal",
-        // Recommendation framing (caller: "you should").
-        "should",
-        "must",
-        "ought",
-        "recommend",
-        "recommended",
-        "recommendation",
-        "suggest",
-        "suggestion",
-        "consider",
-        "advise",
-        "advice",
-        // Alarmist / editorialising projection FRAMING. A neutral numeric runway is a
-        // permitted FACT (issue #542, ADR-0020); these ban the ALARM ("forecast", "imminent",
-        // "soon"), not the head-room number ("~4h to trigger").
-        "forecast",
-        "predict",
-        "prediction",
-        "projected",
-        "projection",
-        "anticipate",
-        "imminent",
-        "soon",
-    ];
-
-    /// Acquisitive purchase-CALLS that span two adjacent words, so the single-token scan above
-    /// misses them (issue #542): the imperative-free `top up` / `get more` a purchase prompt
-    /// reaches for once `buy`/`add`/`upgrade` are gone. The discriminator the guard draws is the
-    /// CALL to acquire, never the head-room fact — `runs out in ~4h` is permitted, `runs out —
-    /// top up` is not. Kept SHORT and matched on WORD boundaries (adjacent tokens, not a raw
-    /// substring) so a neutral render never false-trips (`laptop update` is not `top up`).
-    const BANNED_PHRASES: &[&str] = &["top up", "get more"];
-
-    /// The first banned token OR acquisitive phrase appearing in `text`, or `None` when it is
-    /// clean. Strips ANSI SGR runs first (so a colour-wrapped word tokenises intact), then
-    /// matches whole lowercase WORDS on non-alphanumeric boundaries — so `at-risk`, `At Risk`,
-    /// and `risk!` all trip `risk`, while `saturated` or an account handle never false-trips —
-    /// and finally adjacent-word purchase-calls (`top up`), so a neutral head-room fact passes
-    /// while an acquisitive call does not (issue #542).
-    fn scan_banned(text: &str) -> Option<&'static str> {
-        let mut plain = String::with_capacity(text.len());
-        let mut chars = text.chars();
-        while let Some(c) = chars.next() {
-            if c == '\x1b' {
-                // Drop the SGR sequence up to and including its `m` terminator.
-                for c2 in chars.by_ref() {
-                    if c2 == 'm' {
-                        break;
-                    }
-                }
-            } else {
-                plain.push(c);
-            }
-        }
-        // Lowercase words in READING ORDER (a Vec, not a set) — the order lets the phrase scan
-        // below match an adjacent-word purchase-call without a fragile substring test.
-        let words: Vec<String> = plain
-            .split(|c: char| !c.is_ascii_alphanumeric())
-            .filter(|w| !w.is_empty())
-            .map(str::to_ascii_lowercase)
-            .collect();
-        // A single editorialising / acquisitive WORD (issue #160).
-        if let Some(hit) = BANNED_TOKENS
-            .iter()
-            .copied()
-            .find(|b| words.iter().any(|w| w == b))
-        {
-            return Some(hit);
-        }
-        // A purchase-CALL spanning adjacent words (issue #542): `top up` / `get more`.
-        BANNED_PHRASES.iter().copied().find(|phrase| {
-            let parts: Vec<&str> = phrase.split(' ').collect();
-            words
-                .windows(parts.len())
-                .any(|win| win.iter().zip(&parts).all(|(w, p)| w.as_str() == *p))
-        })
-    }
+    // The vocabulary and the scanner now live in `crate::framing_vocabulary`, hoisted there by
+    // issue #918 so `src/cli.rs` can guard `--help` against the same list instead of the
+    // coverage that issue #885's AC4 assumed and nobody had written. Nothing was subtracted on
+    // the way out: `scan_banned` below is the identical scan over the identical `BANNED_TOKENS`
+    // and `BANNED_PHRASES`, and `every_central_token_and_phrase_bites` asserts token by token
+    // that this side still sees all of it. What `--help` gets is a DERIVED subset, never a
+    // second copy of the list.
+    use crate::framing_vocabulary::scan_banned;
 
     /// Every object key in `v`, recursively — the surface the `--json` banned-token scan
     /// covers (the wire's VALUES are numbers and neutral descriptor enums; the KEYS are the
