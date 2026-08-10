@@ -334,6 +334,51 @@ pub(super) enum SwapVerdict {
     Reject(SwapRejection),
 }
 
+/// WHICH credential item a poll read an account's clocks OUT OF (issue #907).
+///
+/// The daemon stores each account's credential in TWO places and reads whichever one the account's
+/// rotation state makes authoritative — see [`Daemon::read_poll_clocks`], which is the sole
+/// producer. Carried on [`AccountHealth::refresh_token_expires_at_baseline_source`] beside the
+/// deadline baseline itself, so a later comparison KNOWS whether both observations came out of the
+/// same item.
+///
+/// Exists because the two items can transiently disagree. The daemon re-stashes on every write it
+/// makes, but that discipline is about WRITES landing somewhere, not about the two READINGS
+/// agreeing: `swap::swap` step 2 parks the outgoing account's canonical as of SWAP time, so a token
+/// that rotated in place since that account's last active poll is parked with a CHANGED deadline —
+/// the daemon's own swap can open this window, not only the paths that re-stash nothing. A failed
+/// re-stash, a canonical write not yet reconciled, and a swap path that re-stashes nothing for the
+/// departing account (an out-of-band `claude /login` / `use` adoption, or the #467 scrub adopt)
+/// leave the same kind of window. A delta measured ACROSS a switch between them is then an artifact
+/// of where we looked rather than evidence of a write, and without this the residual
+/// [`ExpiryProvenance::ExternalChange`] absorbed it silently. Process-local: never serialized, and
+/// never rendered — the classification it feeds is what reaches a line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CredentialReadSource {
+    /// The shared canonical `Claude Code-credentials` keychain item — the ACTIVE account's, whose
+    /// token refreshes in place there and is therefore the freshest reading available for it.
+    Canonical,
+    /// The account's OWN per-account stash item — every non-active account's, and the only place a
+    /// parked account's credential lives.
+    Stash,
+}
+
+impl CredentialReadSource {
+    /// Which item a poll of an account in this rotation state reads — the ONE place `active` is
+    /// turned into a read source.
+    ///
+    /// Single-homed deliberately: [`Daemon::read_poll_clocks`] branches on the returned value
+    /// rather than re-testing `active`, so the source it REPORTS and the item it actually read
+    /// cannot drift apart. A second `if active` at either site would be two copies of one fact.
+    pub(super) fn for_poll(active: bool) -> Self {
+        if active {
+            Self::Canonical
+        } else {
+            Self::Stash
+        }
+    }
+}
+
 /// Project the active account's BOUNDED-BLINDNESS state (issue #479, umbrella #363 Path B) for the
 /// `status` wire, or `None` when the account is not in bounded blindness. PURE — a function of the
 /// retained pre-blind anchor (`last_good`, #450), the blind predicate, the quarantine flag, and the

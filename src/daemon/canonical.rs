@@ -2658,7 +2658,17 @@ mod tests {
         // deadline), so priming the watch above did NOT establish one, and without this step the next
         // line would honestly carry `before: None` and derive no delta.
         events.clear();
-        daemon.note_polled_expiry(0, Some(1_785_499_802), 1_782_777_600, &mut events);
+        daemon.note_polled_expiry(
+            0,
+            Some(1_785_499_802),
+            // Issue #907: `u-A` is this fixture's ACTIVE account, so the poll loop would read its
+            // deadline from the canonical — the same item the re-stash edge below reads. Seeding
+            // with the production source keeps the next line's provenance about the re-stash
+            // rather than a spurious read-source switch.
+            CredentialReadSource::Canonical,
+            1_782_777_600,
+            &mut events,
+        );
         events.clear();
 
         // A DIFFERENT refresh token under the same deadline: a new grant that did NOT move the
@@ -2754,7 +2764,17 @@ mod tests {
             .reconcile_canonical_change(&rt_blob("rt-1", deadline_ms), &mut events)
             .await;
         events.clear();
-        daemon.note_polled_expiry(0, Some(1_785_499_802), 1_782_777_600, &mut events);
+        daemon.note_polled_expiry(
+            0,
+            Some(1_785_499_802),
+            // Issue #907: `u-A` is this fixture's ACTIVE account, so the poll loop would read its
+            // deadline from the canonical — the same item the re-stash edge below reads. Seeding
+            // with the production source keeps the next line's provenance about the re-stash
+            // rather than a spurious read-source switch.
+            CredentialReadSource::Canonical,
+            1_782_777_600,
+            &mut events,
+        );
         events.clear();
 
         // CC clears the refresh token in place, leaving the deadline behind. The blob changed, so the
