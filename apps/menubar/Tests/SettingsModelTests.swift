@@ -364,7 +364,7 @@ final class SettingsModelTests: XCTestCase {
     /// `GatedApplyConnector` PINS the first apply in that in-flight window (its `send` blocks until released),
     /// making the overlap deterministic rather than a race against the synchronous fake. Guards a rapid double
     /// Cmd-S from spawning two writes before the view's `saveEnabled` disable (an async re-render) lands.
-    func testOverlappingApplyCollapsesToASingleConfigSet() async {
+    func testOverlappingApplyCollapsesToASingleConfigSet() async throws {
         let connector = GatedApplyConnector(loadReply: Fixtures.configViewBasic,
                                             applyReply: Fixtures.configSetAppliedLive)
         let model = SettingsModel(
@@ -373,10 +373,13 @@ final class SettingsModelTests: XCTestCase {
         await model.load()
         model.setDraft("120", for: .pollSecs)
 
-        // The gated `send` holds the first apply in `.applying` and will NOT advance until released, so
-        // yielding until we observe `.applying` converges (no transient-state miss on the serial actor).
+        // The gated `send` holds the first apply in `.applying` and will NOT advance until released, so the
+        // wait converges as soon as that latch lands — one sleep in, since the `async let` child cannot run
+        // until this task suspends — and never approaches its deadline. It is bounded anyway: convergence
+        // is a property of THIS fake and THIS call ordering, not of the wait (issue #1114).
         async let firstApply: Void = model.apply()
-        while model.applyPhase != .applying { await Task.yield() }
+        try await waitUntil({ model.applyPhase == .applying },
+                            "the first apply to latch .applying (observed \(model.applyPhase))")
 
         await model.apply()  // the overlapping submit — observes `.applying`, returns immediately (the guard)
         XCTAssertEqual(model.applyPhase, .applying, "the second apply neither superseded nor cleared the first")
@@ -473,6 +476,34 @@ final class SettingsModelTests: XCTestCase {
         let defaults = UserDefaults(suiteName: suite)!
         defaults.removePersistentDomain(forName: suite)
         return NotificationPreferences(defaults: defaults)
+    }
+
+    /// Poll ON THE MAIN ACTOR, bounded by WALL CLOCK — the body the suite's four other `waitUntil` copies
+    /// share after #1078, ported here rather than left as an unbounded `Task.yield()` spin (issue #1114).
+    /// `@MainActor` is already satisfied by the class annotation and restated so the isolation this poll
+    /// depends on is legible at the declaration, and stays true if that annotation is ever narrowed.
+    ///
+    /// The bound is a deadline rather than a `Task.yield()` count because a yield budget is denominated in
+    /// RESCHEDULES, not time: it is SHORTER on a faster host, so it shrinks exactly where a loaded CI host
+    /// needs it to grow (issue #948). Five seconds matches the four sibling copies and this suite's own
+    /// `ControlCommandClient` timeout, so it is the suite's existing convention rather than a fresh number.
+    /// Only the FAILURE path is time-bounded — the poll still returns the instant the predicate holds.
+    ///
+    /// One divergence from those four copies: `label` is an `@autoclosure`, so it is evaluated at the
+    /// DEADLINE rather than at the call, letting the message report the state actually observed instead of
+    /// only the one awaited. A plain string literal still satisfies it, so all four existing call sites
+    /// would compile against this signature unchanged — it does not obstruct the de-duplication #1114
+    /// explicitly defers.
+    @MainActor
+    private func waitUntil(_ predicate: () -> Bool, _ label: @autoclosure () -> String) async throws {
+        let budget: Duration = .seconds(5)
+        let deadline = ContinuousClock.now.advanced(by: budget)
+        while !predicate() {
+            guard ContinuousClock.now < deadline else {
+                return XCTFail("timed out waiting for \(label()) after \(budget)")
+            }
+            try await Task.sleep(for: .milliseconds(1))
+        }
     }
 }
 
