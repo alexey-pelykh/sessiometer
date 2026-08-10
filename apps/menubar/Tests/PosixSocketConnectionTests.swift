@@ -179,9 +179,114 @@ final class PosixSocketConnectionTests: XCTestCase {
         }
     }
 
+    // MARK: - Descriptor retirement (issue #899)
+
+    // The reader RELEASES the descriptor number once its loop has ended. Issue #859 moved release off
+    // `close()` and onto the reader thread, which bought the guarantee the test above rests on — and
+    // created a failure mode the synchronous design could not have: never releasing at all. That went
+    // ungated. Deleting `descriptor.retire()` from `startReader()` passed the whole suite, and
+    // `testTeardownDoesNotStrandAReaderOnAReusedDescriptor` cannot see it BY CONSTRUCTION — it asserts
+    // a fresh connection receives its own bytes, and a number that is never released can never be
+    // reused, so leaking makes byte-stealing LESS likely. The two are complements: that one gates
+    // release-too-EARLY, this one gates release-NEVER.
+    //
+    // Asking "is this number still a valid descriptor?" is only sound if the number cannot have been
+    // REISSUED in between — this bundle runs amid Foundation/XPC activity that opens descriptors of its
+    // own, and a reissued number reports "still open", failing a reader that retired correctly. So the
+    // descriptor is FENCED first: `F_DUPFD` moves it to the lowest free number at or above a high
+    // floor. That converts reuse from unlikely-by-timing into forbidden-by-contract, because POSIX
+    // specifies allocation returns "the lowest numbered descriptor not currently open" — so this number
+    // can only be handed out once EVERY number below it is open simultaneously. `headroom` measures how
+    // many concurrent descriptors that would take, and is asserted rather than assumed — measured here
+    // at 505 under the full suite and 506 for this class alone, against a floor of 64.
+    //
+    // What this gate does NOT assert is the other direction — that release is not too early. There is
+    // no non-racy way to observe "still open" at an instant (the reader may legitimately finish first),
+    // and that direction already has a behavioural gate in the test above.
+    func testTheReaderRetiresTheDescriptorOnceItsLoopHasEnded() async throws {
+        let pair = try makeSocketPair()
+        defer { Darwin.close(pair.peer) }
+        let fenced = try fence(pair.conn)
+
+        let connection = PosixSocketConnection(fd: fenced)
+        let collector = LineCollector(); collector.consume(connection.lines)
+
+        // Proves the reader is really reading the FENCED descriptor — otherwise a released-looking
+        // number could just be one the connection never used.
+        writeBytes(pair.peer, "live\n")
+        try await XCTAssertNextLine(collector, "live", "the connection is not reading fd \(fenced)")
+
+        connection.close()
+        let end = try await nextLine(collector)
+        XCTAssertNil(end, "close() finishes the stream — the reader's loop has ended")
+
+        let released = await awaitDescriptorRelease(fenced)
+        // Measured AFTER the probe, so it describes the conditions the probe actually ran under; an
+        // unmeasurable margin counts as fully collapsed, since being unable to open a socket at all is
+        // exactly the descriptor pressure that would break the fence.
+        let headroom = lowestFreeDescriptor().map { fenced - $0 } ?? 0
+        // A collapsed margin makes the verdict below untrustworthy in EITHER direction, so it is checked
+        // rather than assumed.
+        XCTAssertGreaterThanOrEqual(
+            headroom, 64,
+            "fence margin collapsed to \(headroom) numbers below fd \(fenced) — reuse is no longer "
+                + "excluded, so the retirement verdict is inconclusive rather than wrong")
+        XCTAssertTrue(
+            released,
+            "fd \(fenced) is still open after the stream finished: the reader never retired it. The "
+                + "lowest free number is \(fenced - headroom), so the fence held and this is a leak "
+                + "rather than a number reissued to unrelated activity")
+        // A leaked descriptor would otherwise accumulate across the rest of the run. Sound to reclaim
+        // for the same reason the verdict is sound: with that much headroom the number is still ours.
+        if !released { Darwin.close(fenced) }
+    }
+
     // MARK: - Fixtures
 
     private struct SocketPairError: Error { let errnoValue: Int32 }
+
+    private struct FenceError: Error { let floors: [Int32]; let errnoValue: Int32 }
+
+    /// Move `fd` to the lowest free descriptor at or above a high floor, so that the number cannot be
+    /// reissued under the test without the process first opening every descriptor beneath it. TAKES
+    /// OWNERSHIP of `fd`: it is closed on both paths, so a caller only ever handles the returned number.
+    /// The ladder descends because the floor must fall under `RLIMIT_NOFILE` (`F_DUPFD` reports `EINVAL`
+    /// otherwise), which is not fixed across machines or CI images.
+    private func fence(_ fd: Int32) throws -> Int32 {
+        let floors: [Int32] = [512, 256, 128]
+        for floor in floors {
+            let moved = fcntl(fd, F_DUPFD, floor)
+            if moved >= 0 {
+                Darwin.close(fd)
+                return moved
+            }
+        }
+        let failure = FenceError(floors: floors, errnoValue: errno)
+        Darwin.close(fd)
+        throw failure
+    }
+
+    /// The number a fresh allocation would receive right now — the process's lowest free descriptor,
+    /// which is what the fence's margin is measured against. `nil` when the process cannot spare one.
+    private func lowestFreeDescriptor() -> Int32? {
+        let probe = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard probe >= 0 else { return nil }
+        Darwin.close(probe)
+        return probe
+    }
+
+    /// Poll until `fd` is no longer a valid descriptor. Retirement happens on the reader thread AFTER
+    /// `continuation.finish()`, so there is no completion to await (issue #859) — but the condition is
+    /// a one-way step, so a slow machine only makes this slower, never flakier.
+    private func awaitDescriptorRelease(_ fd: Int32, timeout: Duration = .seconds(10)) async -> Bool {
+        func isReleased() -> Bool { fcntl(fd, F_GETFD) < 0 && errno == EBADF }
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while ContinuousClock.now < deadline {
+            if isReleased() { return true }
+            try? await Task.sleep(for: .milliseconds(1))
+        }
+        return isReleased()
+    }
 
     /// A connected AF_UNIX stream fd pair (no filesystem socket, no daemon). `conn` is wrapped by the
     /// production `PosixSocketConnection`; `peer` is the test's end to write / close directly.
