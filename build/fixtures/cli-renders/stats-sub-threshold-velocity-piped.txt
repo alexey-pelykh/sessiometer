@@ -1,0 +1,15 @@
+usage — last 24h (Jun 30–Jul 1)
+
+account  signal      cov  session m/p/p95  weekly m/p/p95  caps  t@cap  share   velocity  runway
+alpha    saturated  100%         62/99/94        40/48/46     3    15m    55%   0.9%/min     ~2h
+beta     balanced    58%         44/66/61        20/24/23     0     0s    30%   0.0%/min       —
+delta    —            0%            0/0/0           0/0/0     0     0s     0%          —       —
+ガンマ   underused   75%          8/17/15           3/5/4     0     0s    15%  <0.1%/min       —
+
+not in roster (1):
+account  signal      cov  session m/p/p95  weekly m/p/p95  caps  t@cap  share   velocity  runway
+retired  underused   33%         11/19/18           2/3/3     0     0s     0%          —       —
+
+  lowest utilisation: ガンマ (session mean 8%)
+  accounts last: ~3 days at the current combined rate (2 of 3 counted)
+roster: 4 swaps (2 session, 1 weekly, 1 manual, 0 forced, 0 emergency) · all-accounts-high (≥95%): 0 episodes (0s) · capacity holds: —
