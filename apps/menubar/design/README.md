@@ -357,17 +357,29 @@ aqua-vs-darkAqua row, and the app-tool-vs-goldens row measured out of band by ru
 into a scratch directory and `diff -rq`-ing it against `renders/panel-goldens/`), so re-deriving the
 whole table means running the default suite too.
 
-> **Keep `-only-testing:` on that command — the `#824` cold-raster edge is now reachable without it.**
-> `SESSIOMETER_PANEL_MEASURE=1` with the WHOLE `PanelGoldenParityTests` class (no `-only-testing:`)
-> reddens `testRendersSurviveTheClockDriftWindow` with `worst delta 1 over up to 19 bytes`. It is
-> deterministic, not flaky, and it is **not** a panel regression: `testMeasureSeparations` adds a second
-> full-catalog render pass, and at 44 cells (was 36) that tips the rasterizer past the cold-raster
-> threshold issue #824 tracks — `PanelRenderHarness.warmUpIfNeeded()` warms only the `healthy` fixture, so
-> a first-render cell can still carry ±1/255. Issue #753 grew the catalog and so turned a latent exposure
-> into a certain one in that one configuration. Nothing else reaches it: the required `swift` job sets no
-> `TEST_RUNNER_*`, the soft `panel-goldens` job runs two named tests, and the recipe above is
-> `-only-testing:`-scoped — the full documented suite is `796 tests, 0 failures`. Fixing it belongs to
-> #824 (warm every fixture, or warm to a fixed point per cell), not to a tolerance here.
+> **The `#824` cold-raster edge this recipe used to warn about is closed — the cause, not the symptom.**
+> This block used to say: keep `-only-testing:` on that command, because `SESSIOMETER_PANEL_MEASURE=1`
+> with the WHOLE `PanelGoldenParityTests` class reddens `testRendersSurviveTheClockDriftWindow` with
+> `worst delta 1 over up to 19 bytes` — not a panel regression but the cold-raster exposure, since
+> `testMeasureSeparations` adds a second full-catalog render pass and the warm-up covered only the
+> `healthy` fixture, so a first-render cell could still carry ±1/255. Issue #824 removed that: every
+> render is now settled against a transient depth the harness measures on the running machine, so a
+> raster cannot reach a byte assertion un-settled.
+>
+> Two things are worth stating exactly, because they are different claims. The configuration above now
+> passes (`17 tests, 3 skipped, 0 failures`, `worst delta 0 over up to 0 bytes`). But the `19 bytes` red
+> did **not** reproduce on the parent commit when it was re-run to check — that same commit reports
+> `worst delta 0` in this configuration today, so it is *not* the before/after evidence for #824. What was
+> re-measured on the parent commit is the isolated invocation
+> (`-only-testing:…/testRendersSurviveTheClockDriftWindow`): red at `882 bytes, worst delta 1` on 15 runs
+> out of 15, against 38 of 40 green at `0 bytes` on the #824 commit. Which cells land inside the transient
+> depends on how many renders precede them, so a whole-class figure is order-sensitive in a way the
+> isolated one is not. Either way the answer was never a tolerance here.
+>
+> The 2 of those 40 that were not green failed for an unrelated, pre-existing reason with a distinguishable
+> signature — a worst delta in the *hundreds* over ~450 bytes, a text change rather than the ±1/255 raster
+> one. The 29 s lag in that test sits against a 30 s `boundaryGuardSecs`, leaving about a second of margin
+> for the sub-second seed truncation plus render latency. Tracked as issue #1128.
 
 **What the relative gate does and does not cover.** The primary check —
 `testEachFreshRenderIsNearestToItsOwnGolden` — asks that a fresh render's closest same-size golden be
@@ -413,12 +425,19 @@ drift. Do not read "the PNG changed" as "the panel changed"; the gate's own verd
 
 **On THIS toolchain the goldens are byte-reproducible, and that is deliberate.** Two independent
 `SESSIOMETER_PANEL_GOLDENS=update` runs produce byte-identical files, and the app's own `--render-panel`
-output is byte-identical to all 44 goldens. It did not start out that way: the first renders in a process
-disagree with the steady state by ±1/255 on ~0.03 % of bytes — a rasterization warm-up artifact, found by
-rendering one fixture six times (renders 0–1 agree with each other, renders 2–5 agree with each other,
+output was byte-identical to all 44 goldens when that was measured. Six of the 44 no longer match it,
+by at most 1/255 — those six were blessed from cold rasters before #824 and the fresh renders are now
+settled, so the *goldens* are the stale side. Nothing fails (the drift metric is blind to ±1) and they
+are deliberately not re-blessed here; issue #1129 carries that as its own decision. It did not start out
+that way: the first renders in a process
+disagree with the steady state by ±1/255 on ~0.03 % of bytes — the rasterizer's start-up transient, found
+by rendering one fixture six times (renders 0–1 agree with each other, renders 2–5 agree with each other,
 the two groups differ) and ruled out as a clock effect because renders seeded seconds apart are
-byte-identical. `PanelRenderHarness` now discards renders until two consecutive ones agree, so both the
-app tool and the in-bundle gate rasterize from the steady state. None of this changes a VERDICT — the
+byte-identical. `PanelRenderHarness.render` now settles EVERY render it serves: it measures how long this
+machine's transient plateau runs, then hands back only a raster whose agreeing run is longer than that
+(issue #824 — the earlier "discard until two consecutive agree" rule could not see past a transient whose
+own rasters agree with each other, and warmed one fixture besides). So both the app tool and the in-bundle
+gate rasterize from the steady state whatever order they render in. None of this changes a VERDICT — the
 gate metric ignores channel deltas under 64/255 either way — it protects the AUDIT TRAIL: without it a
 re-bless rewrites files that did not change, and the real change hides among the churn in exactly the
 diff `Panel-Goldens-Rebaselined:` exists to make readable. `PanelGoldenParityTests` asserts the

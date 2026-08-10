@@ -44,6 +44,19 @@ enum RenderPanelTool {
                 write(cg, to: outputDir + "/" + name)
             }
         }
+        // The steady-state guarantee, reported rather than assumed (issue #824). `PanelRenderHarness.render`
+        // returns a raster it has CONFIRMED reproducible — unless its budget valve fires first, in which case
+        // it hands back an unconfirmed one instead of trapping, because this harness also compiles into the
+        // shipping app. The in-bundle gate would catch that eventually through its own byte assertions;
+        // NOTHING here would. These PNGs are read by a human as the design oracle, so an unconfirmed raster
+        // has to announce itself or it is invisible.
+        let unsettled = PanelRenderHarness.unsettledRenders
+        if unsettled > 0 {
+            let warning = "WARNING: \(unsettled) render(s) exhausted the settle budget, so the matching "
+                + "PNG(s) may hold cold, non-reproducible pixels. Re-run and compare before treating this "
+                + "output as a design oracle or blessing anything from it.\n"
+            FileHandle.standardError.write(Data(warning.utf8))
+        }
     }
 
     private static func write(_ cg: CGImage, to path: String) {

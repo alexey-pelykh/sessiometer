@@ -490,8 +490,9 @@ final class PanelAppearanceVariantTests: XCTestCase {
     /// the path both committed-golden consumers run through.
     ///
     /// Warms the rasterizer through the shared harness first: the first renders in a process disagree with
-    /// the steady state by ±1/255 (`PanelRenderHarness.warmUpIfNeeded`, and the honest limit issue #824
-    /// records about it). Nothing here asserts at byte granularity, so that drift cannot change a verdict —
+    /// the steady state by ±1/255 (the rasterizer's start-up transient, which `PanelRenderHarness.render`
+    /// settles per render since issue #824 — but only for renders that go THROUGH it, and the composite
+    /// below does not). Nothing here asserts at byte granularity, so that drift cannot change a verdict —
     /// but a cold first render would still make the two composited rasters incomparable for no reason.
     private func compositedRender(_ fixture: PanelRenderFixture, backdrop: Color,
                                   scheme: ColorScheme = .light) throws -> PanelRaster {
