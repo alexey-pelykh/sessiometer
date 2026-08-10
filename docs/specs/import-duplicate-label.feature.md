@@ -175,9 +175,17 @@ the pre-existing `resolve_target_reports_ambiguous_for_a_duplicated_label_and_ne
     But not by asserting only the four commands R-6a used to name
     But not by treating this as one policy over one resolver — there were two mechanisms
 
-*Binds*: `every_label_resolving_site_shares_one_resolver` (`src/cli.rs`), which asserts the property
-that makes the six agree — that `enable`/`disable`/`remove` reach `resolve_target` — rather than
-sampling call sites one at a time.
+*Binds*: three per-site refusals — `apply_enabled_refuses_a_duplicate_label_without_touching_the_roster`
+and `apply_remove_refuses_a_duplicate_label_without_touching_the_roster` (`src/cli.rs`), plus the
+`use` / `poke` / daemon-socket trio added under #1087 (`src/use_account.rs`, `src/poke.rs`,
+`src/daemon/commands.rs`) — with
+`the_two_verbs_routed_to_the_shared_resolver_return_its_own_error` (`src/cli.rs`) pinning that the
+two newly-routed verbs return the resolver's OWN error rather than a restatement of it.
+
+The set-level half — that no SEVENTH site grows its own resolver — is bound separately, by
+`every_handle_read_is_dispositioned` and `resolve_target_has_exactly_the_five_known_call_sites`
+(`src/use_account.rs`, issue #1186). Per-site tests cannot carry it: each proves that THAT site
+refuses, and a site that does not exist yet has no test to fail.
 
 > **Two mechanisms, six call sites — and `remove` was the one that did damage.** Before this change:
 >
@@ -216,8 +224,8 @@ sampling call sites one at a time.
 
 *Binds*: `apply_enabled_rejects_an_unknown_label_without_touching_the_roster` and
 `apply_remove_rejects_an_unknown_label_without_touching_the_roster` for exit 5, and
-`every_label_resolving_site_shares_one_resolver` for exit 6 — all in `src/cli.rs`, each asserting the
-literal code off a real verb path.
+`the_two_verbs_routed_to_the_shared_resolver_return_its_own_error` for exit 6 — all in
+`src/cli.rs`, each asserting the literal code off a real verb path.
 
 > **Deliberately NOT bound in `src/error.rs`.** A test there restating `UseTargetNotFound => 5` and
 > `UseTargetAmbiguous => 6` would pass unchanged against the pre-fix tree: this change did not touch

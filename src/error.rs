@@ -1254,8 +1254,8 @@ mod tests {
     // The observable move (1 → 5, and 6 becoming reachable at all) is gated where the verbs
     // actually produce the errors: `apply_enabled_rejects_an_unknown_label_without_touching_the_roster`,
     // `apply_remove_rejects_an_unknown_label_without_touching_the_roster` and
-    // `every_label_resolving_site_shares_one_resolver` in `crate::cli`, each asserting the
-    // literal code off a real verb path.
+    // `the_two_verbs_routed_to_the_shared_resolver_return_its_own_error` in `crate::cli`, each
+    // asserting the literal code off a real verb path.
 
     #[test]
     fn use_verb_extends_the_exit_code_taxonomy_with_distinct_codes() {
