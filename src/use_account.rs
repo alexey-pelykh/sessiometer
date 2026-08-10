@@ -1615,6 +1615,791 @@ mod tests {
         assert_eq!(resolve_target(&roster, "dup").unwrap(), 0);
     }
 
+    // --- the label-resolution completeness tripwire (issue #1186) ------------
+
+    /// Every `.rs` file under `src/`, read from disk at test time rather than embedded with
+    /// `include_str!`.
+    ///
+    /// `include_str!` is what [`crate::cli`]'s `INLINE_PROSE_REGISTER` uses, and it is the wrong
+    /// tool one scope up: that gate scans ONE file it can name, while this one's whole claim is
+    /// that it scanned every file there IS. A literal path list is a list that drifts — a new
+    /// module would simply not be scanned, and the gate would stay green while its subject grew.
+    /// Reading the tree closes that by construction. It also keeps ~6.5 MB of source out of the
+    /// test binary.
+    ///
+    /// The cost is a dependency on the working directory, which `cargo test` sets to the crate
+    /// root. That is not assumed — [`every_handle_read_is_dispositioned`] pins the file count and
+    /// the read total, so a walk that finds nothing (or half a tree) FAILS rather than reporting
+    /// an empty population as a clean run.
+    fn crate_sources() -> Vec<(String, String)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            let mut entries: Vec<_> = std::fs::read_dir(dir)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()))
+                .map(|e| e.expect("a readable dir entry").path())
+                .collect();
+            entries.sort();
+            for path in entries {
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let text = std::fs::read_to_string(&path)
+                        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+                    out.push((path.display().to_string(), text));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(std::path::Path::new("src"), &mut out);
+        out
+    }
+
+    /// The non-test region of `source` — everything above the file's `#[cfg(test)] mod …` line.
+    ///
+    /// The boundary is `#[cfg(test)]` IMMEDIATELY followed by a column-0 `mod`, and the second
+    /// half is load-bearing rather than defensive. `INLINE_PROSE_REGISTER`'s lexer cuts at the
+    /// first line *starting with* `#[cfg(test)]`, which is correct for `src/cli.rs` and wrong
+    /// here: this very file carries a column-0 `#[cfg(test)]` on a test-only `use` up in its
+    /// import block, far above [`resolve_target`]. Under that rule this gate would stop at that
+    /// import, never reach the resolver it exists to protect, and report green forever.
+    /// [`the_non_test_boundary_survives_a_cfg_test_import`] pins it against exactly that.
+    ///
+    /// The `mod` half must sit at column 0, which is a deliberate BIAS rather than an oversight.
+    /// Two files carry no boundary of that shape and are therefore scanned whole:
+    /// `src/daemon/socket.rs`, which has no test module at all (three `#[cfg(test)]` helpers, and
+    /// its suite lives in `src/daemon.rs`), and `src/redaction.rs`, whose `mod tests` is nested
+    /// and indented inside `mod meter`. Accepting an indented `mod` would exclude redaction's
+    /// test block — and would also cut at the FIRST such block in any future file, discarding the
+    /// production code below it. Between over-scanning and under-scanning, this gate takes
+    /// over-scanning every time: a stray test helper costs ONE register line and says so loudly,
+    /// while a truncated scan is a green run over a subject that was never read. Neither file
+    /// contributes a read today.
+    fn non_test_region(source: &str) -> String {
+        let lines: Vec<&str> = source.lines().collect();
+        let end = (0..lines.len())
+            .find(|&i| {
+                lines[i].starts_with("#[cfg(test)]")
+                    && lines.get(i + 1).is_some_and(|n| n.starts_with("mod "))
+            })
+            .unwrap_or(lines.len());
+        lines[..end].join("\n")
+    }
+
+    /// Every read of an [`Account`] identity field in `source`'s non-test code, as
+    /// `(enclosing function, field)`.
+    ///
+    /// The subject is the field read, and it is the irreducible one: `label` and `account_uuid`
+    /// are plain `pub(crate)` fields with no accessors, so code that resolves an operator's handle
+    /// MUST read one. Two narrower subjects were measured against the tree and both are refuted:
+    ///
+    /// - **Only reads next to a comparison** (`==`, `.eq`) misses a `let` hoist, and such hoists
+    ///   already ship — including inside `cli::apply_enabled` (`let label = account.label.clone()`),
+    ///   which is one of the six sites.
+    ///   This is the same refutation `INLINE_PROSE_REGISTER` records for narrowing by emitting
+    ///   position, and it fails here for the same reason: a one-line hoist defeats it anywhere.
+    /// - **Only functions naming the roster** (`Account` in the signature, or `roster` in the
+    ///   body) drops a resolver that reaches its accounts through a differently-named field.
+    ///
+    /// A read reached through a METHOD (`.account_uuid()`) is deliberately NOT a match: that
+    /// spelling belongs to the OAuth capture types, not to a roster account, and admitting it
+    /// would fill the register with entries no reader can act on. `Account` grows an accessor
+    /// only by someone editing `src/config.rs`, where
+    /// [`the_identity_fields_stay_plain_fields`] is waiting.
+    /// One pass's findings. Both populations come out of ONE lexer deliberately: they are
+    /// compared against each other (a `ViaSharedResolver` entry must appear in
+    /// [`Scan::resolver_callers`]), and two lexers that could disagree about where a function
+    /// body starts would let that comparison pass for the wrong reason.
+    struct Scan {
+        /// `(enclosing function, field)` per identity-field read.
+        reads: Vec<(String, String)>,
+        /// Every function whose body calls [`resolve_target`].
+        resolver_callers: Vec<String>,
+    }
+
+    fn handle_reads(source: &str) -> Scan {
+        let src: Vec<char> = source.chars().collect();
+        let mut out = Vec::new();
+        let mut callers: Vec<String> = Vec::new();
+        // Each open function body, with the brace depth it opened at.
+        let mut scopes: Vec<(String, usize)> = Vec::new();
+        let mut pending: Option<String> = None;
+        let mut depth = 0usize;
+        let mut i = 0usize;
+
+        while i < src.len() {
+            // Comments FIRST — this file's doc comments discuss `account.label` in prose, and
+            // lexing one as code is the likeliest way to lose the place.
+            if src[i] == '/' && src.get(i + 1) == Some(&'/') {
+                while i < src.len() && src[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if src[i] == '/' && src.get(i + 1) == Some(&'*') {
+                let mut nesting = 1usize;
+                i += 2;
+                while i < src.len() && nesting > 0 {
+                    if src[i] == '/' && src.get(i + 1) == Some(&'*') {
+                        nesting += 1;
+                        i += 2;
+                    } else if src[i] == '*' && src.get(i + 1) == Some(&'/') {
+                        nesting -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            if let Some(next) = raw_string_end(&src, i) {
+                i = next;
+                continue;
+            }
+            if let Some(next) = quoted_string_end(&src, i) {
+                i = next;
+                continue;
+            }
+            if src[i] == '\'' {
+                i += char_literal_len(&src, i).unwrap_or(1);
+                continue;
+            }
+            // `fn NAME`, remembered until its opening brace — so a signature broken across lines,
+            // or carrying a `where` clause, still binds the body that follows it.
+            if src[i] == 'f'
+                && src.get(i + 1) == Some(&'n')
+                && (i == 0 || !(src[i - 1].is_ascii_alphanumeric() || src[i - 1] == '_'))
+                && src.get(i + 2).is_some_and(|c| c.is_whitespace())
+            {
+                let mut j = i + 2;
+                while src.get(j).is_some_and(|c| c.is_whitespace()) {
+                    j += 1;
+                }
+                let start = j;
+                while src
+                    .get(j)
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
+                {
+                    j += 1;
+                }
+                if j > start {
+                    pending = Some(src[start..j].iter().collect());
+                    i = j;
+                    continue;
+                }
+            }
+            // A bodiless signature (`fn probe(&self);` in a trait) must not capture the next
+            // unrelated block.
+            if src[i] == ';' {
+                pending = None;
+                i += 1;
+                continue;
+            }
+            if src[i] == '{' {
+                depth += 1;
+                if let Some(name) = pending.take() {
+                    scopes.push((name, depth));
+                }
+                i += 1;
+                continue;
+            }
+            if src[i] == '}' {
+                if scopes.last().is_some_and(|(_, at)| *at == depth) {
+                    scopes.pop();
+                }
+                depth = depth.saturating_sub(1);
+                i += 1;
+                continue;
+            }
+            if let Some(next) = resolver_call_at(&src, i) {
+                if let Some((name, _)) = scopes.last() {
+                    callers.push(name.clone());
+                }
+                i = next;
+                continue;
+            }
+            if let Some((field, next)) = identity_field_at(&src, i) {
+                if let Some((name, _)) = scopes.last() {
+                    out.push((name.clone(), field));
+                }
+                i = next;
+                continue;
+            }
+            i += 1;
+        }
+        callers.sort_unstable();
+        callers.dedup();
+        Scan {
+            reads: out,
+            resolver_callers: callers,
+        }
+    }
+
+    /// A CALL to [`resolve_target`] at `at`, and the index just past its name. The `fn` arm above
+    /// consumes the declaration's own name before this runs, so the definition never counts as a
+    /// call to itself.
+    fn resolver_call_at(src: &[char], at: usize) -> Option<usize> {
+        const NAME: &str = "resolve_target";
+        if at > 0 && (src[at - 1].is_ascii_alphanumeric() || src[at - 1] == '_') {
+            return None;
+        }
+        let end = at + NAME.chars().count();
+        if src.get(at..end)?.iter().collect::<String>() != NAME {
+            return None;
+        }
+        let mut k = end;
+        while src.get(k).is_some_and(|c| c.is_whitespace()) {
+            k += 1;
+        }
+        (src.get(k) == Some(&'(')).then_some(end)
+    }
+
+    /// `.label` / `.account_uuid` read as a FIELD at `at`, and the index just past it. `None`
+    /// when `at` does not begin one, or when the name is followed by `(` — a method call on one
+    /// of the OAuth capture types rather than a roster account's field.
+    fn identity_field_at(src: &[char], at: usize) -> Option<(String, usize)> {
+        if src.get(at) != Some(&'.') {
+            return None;
+        }
+        let mut j = at + 1;
+        let start = j;
+        while src
+            .get(j)
+            .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
+        {
+            j += 1;
+        }
+        let name: String = src[start..j].iter().collect();
+        if name != "label" && name != "account_uuid" {
+            return None;
+        }
+        let mut k = j;
+        while src.get(k).is_some_and(|c| c.is_whitespace()) {
+            k += 1;
+        }
+        if src.get(k) == Some(&'(') {
+            return None;
+        }
+        Some((name, j))
+    }
+
+    /// The index just past a raw string literal beginning at `at` — every spelling Rust accepts
+    /// (the optional `b` / `c` prefix, any hash count).
+    fn raw_string_end(src: &[char], at: usize) -> Option<usize> {
+        let mut i = at;
+        if matches!(src.get(i), Some('b' | 'c')) {
+            i += 1;
+        }
+        if src.get(i) != Some(&'r') {
+            return None;
+        }
+        i += 1;
+        let hashes = {
+            let start = i;
+            while src.get(i) == Some(&'#') {
+                i += 1;
+            }
+            i - start
+        };
+        if src.get(i) != Some(&'"') {
+            return None;
+        }
+        i += 1;
+        while i < src.len() {
+            if src[i] == '"' && (1..=hashes).all(|h| src.get(i + h) == Some(&'#')) {
+                return Some(i + 1 + hashes);
+            }
+            i += 1;
+        }
+        Some(src.len())
+    }
+
+    /// The index just past an ordinary quoted string beginning at `at` (the optional `b` / `c`
+    /// prefix included), honouring backslash escapes.
+    fn quoted_string_end(src: &[char], at: usize) -> Option<usize> {
+        let mut i = at;
+        if matches!(src.get(i), Some('b' | 'c')) {
+            i += 1;
+        }
+        if src.get(i) != Some(&'"') {
+            return None;
+        }
+        i += 1;
+        while i < src.len() {
+            match src[i] {
+                '\\' => i += 2,
+                '"' => return Some(i + 1),
+                _ => i += 1,
+            }
+        }
+        Some(src.len())
+    }
+
+    /// The length of a char literal at `at`, or `None` when the quote opens a lifetime
+    /// (`'a`) instead.
+    fn char_literal_len(src: &[char], at: usize) -> Option<usize> {
+        if src.get(at) != Some(&'\'') {
+            return None;
+        }
+        if src.get(at + 1) == Some(&'\\') {
+            let mut i = at + 2;
+            while i < src.len() && src[i] != '\'' {
+                i += 1;
+            }
+            return Some(i + 1 - at);
+        }
+        if src.get(at + 2) == Some(&'\'') {
+            return Some(3);
+        }
+        None
+    }
+
+    /// What a function's reads of an [`Account`] identity field ARE.
+    ///
+    /// Every arm is a statement about WHERE THE MATCHED STRING CAME FROM, never about editorial
+    /// quality — deliberately, and for the reason [`crate::cli`]'s `INLINE_PROSE_REGISTER` gives
+    /// for the same choice one scope over. "Is this resolution?" invites an opinion; "did an
+    /// OPERATOR supply this string?" is a question about the code, and it is the only question
+    /// R-6a actually asks. The daemon matching a poll observation's own account-uuid back to a
+    /// roster index is not a weaker form of `use <label>`; it is a different act, and refusing on
+    /// ambiguity there would be a bug.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum HandleRead {
+        /// It IS the shared resolver.
+        SharedResolver,
+        /// It resolves an operator-supplied handle, and does so BY CALLING [`resolve_target`].
+        /// Mechanically verified — [`every_handle_read_is_dispositioned`] rejects this arm for a
+        /// function whose body holds no `resolve_target` call, so the claim cannot be merely
+        /// asserted.
+        ViaSharedResolver,
+        /// It reads an identity field for something that is not operator-handle resolution:
+        /// matching an identifier the SYSTEM supplied, capturing a handle off an
+        /// already-resolved index for an event or a snapshot, rendering, or a field of a
+        /// different type that happens to share the name.
+        NotHandleResolution,
+    }
+
+    use HandleRead::{NotHandleResolution, SharedResolver, ViaSharedResolver};
+
+    /// Every function in the crate's non-test code that reads an [`Account`] identity field, with
+    /// what that read IS and why.
+    ///
+    /// This is the set-level counterpart to the six per-site refusal tests (issues #1005, #1087),
+    /// and it exists because those six cannot cover the property their names imply. A per-site
+    /// test proves that THAT site refuses; no number of them can detect a SEVENTH site that grows
+    /// its own resolver, because the seventh site does not exist yet to have a test written about
+    /// it. That gap is what issue #1186 is about, and it is the whole of what this register
+    /// closes.
+    ///
+    /// **What this gate does NOT do.** It does not prove a `NotHandleResolution` entry is
+    /// correctly classified — that is a human reading, recorded with its reason so the next
+    /// reader can check it rather than re-derive it. What it mechanically guarantees is narrower
+    /// and is the part that matters: a function that reads an identity field and is NOT in this
+    /// list reddens the run. A seventh site therefore cannot land silently; its author must
+    /// either route it through [`resolve_target`] or write down, here, why the string it matches
+    /// is not an operator handle.
+    ///
+    /// Keyed on the function NAME, so two same-named functions in different modules share one
+    /// entry (`account_uuid` and `refresh` each do). The read-total pin in
+    /// [`every_handle_read_is_dispositioned`] is what closes that: a second same-named function
+    /// gaining a read moves the count even though it moves no name.
+    const HANDLE_READ_REGISTER: &[(&str, HandleRead, &str)] = &[
+        // --- the shared resolver, and the sites that read a handle after routing through it ----
+        ("resolve_target", SharedResolver, "the one resolver: label OR account-uuid, refusing on zero and on many (#17, OQ-1)"),
+        ("apply_enabled", ViaSharedResolver, "`enable` / `disable` — reads the resolved account's label for the confirmation"),
+        // `cli::apply_remove` is the sixth site and is deliberately ABSENT: it resolves and then
+        // removes, never reading an identity field, so the field scan cannot see it. That is not
+        // a hole — it is why this register alone is not the whole gate, and why
+        // [`resolve_target_has_exactly_the_five_known_call_sites`] pins the compliant set from
+        // the other side.
+        ("perform_socket_swap", ViaSharedResolver, "the daemon's control-socket swap — reads the resolved from/to labels for the event"),
+        ("poke_named", ViaSharedResolver, "`poke <label>` — reads the resolved account's label for its report line"),
+        ("run_use", ViaSharedResolver, "`use <label>` — reads the resolved target's label for the swap confirmation"),
+        // --- matched by an identifier the SYSTEM supplied, never an operator handle -------------
+        //
+        // These DO compare an identity field against something, and every one of them is correct
+        // to take the first match: the string is an account-uuid the daemon, the OAuth capture or
+        // the config itself produced, and it is unique by construction (`config::validate`
+        // rejects a duplicated uuid — only LABELS are un-unique, which is why R-6a is about
+        // labels). Refusing on ambiguity here would refuse on an impossible condition.
+        ("account_listed_in", NotHandleResolution, "the `[refresh].accounts` allowlist membership rule — a config-supplied set, and a duplicated label there legitimately admits BOTH bearers"),
+        ("apply_refresh_observation", NotHandleResolution, "matches a poll observation's own account-uuid back to its roster index"),
+        ("apply_refresh_restore", NotHandleResolution, "matches a restore outcome's account-uuid back to its roster index"),
+        ("is_active", NotHandleResolution, "compares an account's uuid to the ACTIVE uuid `active.rs` read from the credential"),
+        ("overlay_labels", NotHandleResolution, "applies the settings overlay to the account bearing that uuid, and ASSIGNS a label rather than matching one"),
+        ("plan_capture", NotHandleResolution, "matches the freshly captured OAuth account's uuid; the label is the name being ASSIGNED to it"),
+        ("reconcile_restored", NotHandleResolution, "matches a restored credential's uuid back to its roster index"),
+        ("reconcile_roster", NotHandleResolution, "re-indexes the roster across a config reload, by uuid"),
+        ("recovery_pending", NotHandleResolution, "membership of an account's uuid in the quarantined / excluded uuid sets"),
+        ("resolve_via_display", NotHandleResolution, "matches the DISPLAYED credential's uuid to a roster index — the credential is the input, not the operator"),
+        ("restash_account", NotHandleResolution, "compares a roster account's uuid to the displayed credential's before restashing"),
+        ("run_sweep", NotHandleResolution, "the refresh sweep's per-account uuid membership checks, plus the handles its events carry"),
+        // --- a handle read off an ALREADY-RESOLVED account or index ----------------------------
+        //
+        // The index came from the daemon's own scheduler, from an enumeration of the whole
+        // roster, or from a resolver call that already happened. Nothing here matches an operator
+        // string against anything; the read turns a chosen account into a handle for an event, a
+        // snapshot field, or a rendered cell.
+        ("active_blind_projection", NotHandleResolution, "keys the blind-projection map by label for `status`"),
+        ("apply_import", NotHandleResolution, "the import merge — matches an INCOMING artifact account's uuid, and reports per-entry labels"),
+        ("blind_swap", NotHandleResolution, "the blind-swap episode events' account / from / to handles"),
+        ("cached_viability", NotHandleResolution, "passes an already-chosen account's label to the wire lookup below"),
+        ("canary_status_of", NotHandleResolution, "the canary status' displayed / matched handles"),
+        ("decide_action", NotHandleResolution, "the swap-decision events' hold / from / to handles"),
+        ("emergency_swap", NotHandleResolution, "the emergency-swap events' hold / from / to handles"),
+        ("fold_expiry_observation", NotHandleResolution, "the expiry observation event's account uuid"),
+        ("fold_recovery_outcome", NotHandleResolution, "the recovery outcome's account uuid"),
+        ("gate_viability", NotHandleResolution, "names the already-chosen target in the viability error"),
+        ("gather_auth_subset", NotHandleResolution, "keys the per-account refresh-outcome map by label while rendering `status -v`"),
+        ("gather_payload", NotHandleResolution, "collects roster uuids into the export payload"),
+        ("keep_active_warm", NotHandleResolution, "seeds the keep-warm stagger from the active account's uuid"),
+        ("keep_warm", NotHandleResolution, "passes an already-chosen account's uuid to the keep-warm seam"),
+        ("keep_warm_and_promote", NotHandleResolution, "the promotion event's account handle"),
+        ("label_at", NotHandleResolution, "renders the handle at a given roster index, or `?`"),
+        ("label_bearers", NotHandleResolution, "counts bearers PER label for the import's duplicate notice — the count is the point"),
+        ("locked_swap", NotHandleResolution, "the locked-keychain event's displayed / matched handles"),
+        ("maintain_stats_store", NotHandleResolution, "keys the per-account stats store by label"),
+        ("next_swap", NotHandleResolution, "the next-swap projection's target handle"),
+        ("note_account_backoff", NotHandleResolution, "the backoff event's account uuid"),
+        ("note_blind_episode", NotHandleResolution, "the blind-episode events' account uuid"),
+        ("note_blind_gate_eligibility", NotHandleResolution, "the blind-gate eligibility event's account uuid"),
+        ("note_canonical_liveness", NotHandleResolution, "the canonical-liveness event's active handle"),
+        ("note_exhausted_poll", NotHandleResolution, "the exhausted-poll event's account uuid"),
+        ("note_expiry_horizon_edge", NotHandleResolution, "the expiry-horizon event's account uuid"),
+        ("note_health_transitions", NotHandleResolution, "the health-transition events' account handles"),
+        ("note_landing_overshoot", NotHandleResolution, "the landing-overshoot event's from handle"),
+        ("note_poll_outcome", NotHandleResolution, "the four poll-outcome events' account handles"),
+        ("note_refresh_outcome", NotHandleResolution, "the refresh-outcome event's account handle"),
+        ("poke_all", NotHandleResolution, "`poke` with no target — sweeps the WHOLE roster, so it resolves nothing"),
+        ("reconcile_canonical_change", NotHandleResolution, "the canonical-change events' account handles"),
+        ("recover_scrubbed_canonical", NotHandleResolution, "the scrubbed-canonical recovery events' account handles"),
+        ("refresh", NotHandleResolution, "passes an already-chosen account's uuid to the refresher (`poke` and the tick each have one)"),
+        ("refresh_exclusions", NotHandleResolution, "collects the excluded accounts' uuids"),
+        ("refresh_quarantined", NotHandleResolution, "collects the quarantined accounts' uuids"),
+        ("refresh_retry", NotHandleResolution, "the refresh-retry event's account handle"),
+        ("remove_account", NotHandleResolution, "prints the REMOVED account's label; `apply_remove` did the resolving"),
+        ("render", NotHandleResolution, "emits `account_uuid` / `label` back into `config.toml`"),
+        ("render_access_token_expiry", NotHandleResolution, "widths and cells for the `-v` access-token table"),
+        ("render_roster", NotHandleResolution, "`list`'s label column widths, cells and uuid column"),
+        ("reprobe_dead_parked_credential", NotHandleResolution, "the dead-parked reprobe event's account handle"),
+        ("resolve_active_uuid", NotHandleResolution, "reads the uuid at the ACTIVE index — the index is the input"),
+        ("resolve_active_uuid_for_import", NotHandleResolution, "reads the uuid at the ACTIVE index for the import's adoption check"),
+        ("resolve_restore", NotHandleResolution, "hands an already-chosen account's uuid to the restore notifier"),
+        ("roster_handles", NotHandleResolution, "collects every label for `stats`"),
+        ("run", NotHandleResolution, "collects roster uuids for the migration pre-flight"),
+        ("run_capture", NotHandleResolution, "reads the just-captured account's label for its report; found by STASH name"),
+        ("run_login", NotHandleResolution, "reads the just-logged-in account's label for its report; found by STASH name"),
+        ("snapshot", NotHandleResolution, "the wire snapshot's per-account `label` field and its active handle"),
+        ("status_response", NotHandleResolution, "the `status` reply's per-account `label` field"),
+        ("tick", NotHandleResolution, "the tick's own events' account handles"),
+        ("validate", NotHandleResolution, "config validation — enforces uuid uniqueness and label non-emptiness, and is where a duplicated LABEL is warned about (R-6) rather than resolved"),
+        ("velocity_swap", NotHandleResolution, "the velocity-swap event's from / to handles"),
+        ("view", NotHandleResolution, "projects an account into the settings `AccountView`"),
+        ("warn_if_forcing_onto_non_viable", NotHandleResolution, "names the already-chosen target in the `--force` warning"),
+        // --- a `label` / `account_uuid` field on a DIFFERENT type ------------------------------
+        //
+        // The lexer is textual and cannot resolve types, so these ride along. They are cheap to
+        // carry and the alternative — teaching the scanner about types — is what would make it
+        // evadable.
+        ("account_uuid", NotHandleResolution, "`&self.account_uuid` on the OAuth state record and on the migration artifact, not on a roster account"),
+        ("cached_viability_for", NotHandleResolution, "`AccountStatusLine.label` — a daemon WIRE line, and a duplicated handle there returns None rather than guessing"),
+        ("capture", NotHandleResolution, "`CaptureReport.label`"),
+        ("capture_failure", NotHandleResolution, "`CaptureCommand.label` — the name being ASSIGNED to a new account"),
+        ("daemon_marks_quarantined", NotHandleResolution, "`AccountStatusLine.label` — matches the daemon's wire line, not the roster"),
+        ("import_report", NotHandleResolution, "`AccountImport.label` — per-entry import outcomes"),
+        ("new", NotHandleResolution, "`AccountStatusLine.label` — `StatusRow`'s rendered account cell"),
+        ("perform_socket_capture", NotHandleResolution, "`CaptureCommand.label` — the name being ASSIGNED to a new account"),
+        ("reconcile_login", NotHandleResolution, "`CaptureReport.label`"),
+        ("serve_control", NotHandleResolution, "the control request's own `label` field, forwarded into a `CaptureCommand`"),
+    ];
+
+    /// The names [`every_handle_read_is_dispositioned`] compares against the register, extracted
+    /// so the canaries can drive the IDENTICAL predicate over a deliberately broken subject
+    /// rather than over a paraphrase of it (ADR-0031 § 4 CONSTRAINT-A).
+    fn functions_reading_a_handle(source: &str) -> Vec<String> {
+        let mut names: Vec<String> = handle_reads(&non_test_region(source))
+            .reads
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    /// The completeness tripwire for label resolution (issue #1186).
+    ///
+    /// `every_label_resolving_site_shares_one_resolver` (`src/cli.rs`) was named for a property
+    /// over every label-resolving site and drove two of them, and the name is what a later reader
+    /// trusts: issue #1087 was filed believing it gave `poke` and the daemon transitive cover. It
+    /// did not. That test now says what it does; this one owns the set-level claim its old name
+    /// made.
+    #[test]
+    fn every_handle_read_is_dispositioned() {
+        let sources = crate_sources();
+        let mut reads = 0usize;
+        let mut spelled: Vec<String> = Vec::new();
+        let mut callers: Vec<String> = Vec::new();
+        for (_, text) in &sources {
+            let scan = handle_reads(&non_test_region(text));
+            reads += scan.reads.len();
+            spelled.extend(scan.reads.into_iter().map(|(name, _)| name));
+            callers.extend(scan.resolver_callers);
+        }
+        spelled.sort_unstable();
+        spelled.dedup();
+        let mut registered: Vec<String> = HANDLE_READ_REGISTER
+            .iter()
+            .map(|(name, _, _)| (*name).to_owned())
+            .collect();
+        registered.sort_unstable();
+
+        assert_eq!(
+            spelled, registered,
+            "every function in the crate's non-test code that reads an Account identity field \
+             must be dispositioned in HANDLE_READ_REGISTER — an undispositioned one may be a \
+             SEVENTH label-resolving site that grew its own resolver, which is the gap issue \
+             #1186 was opened about"
+        );
+
+        // Cardinality on all three populations, because none implies the others. The names would
+        // agree at zero if the walk found no files or the lexer matched nothing — a degenerate
+        // subject reporting as a clean run, which is the failure mode a source lint dies of. The
+        // read total is additionally what catches a SECOND same-named function, since the
+        // register keys on the name alone.
+        assert_eq!(
+            sources.len(),
+            59,
+            "expected 59 `.rs` files under src/; the count moved — if a module was added, it is \
+             now scanned, so check its dispositions and update this"
+        );
+        assert_eq!(
+            spelled.len(),
+            83,
+            "expected 83 functions reading an Account identity field; the count moved — \
+             disposition the new one, then update this"
+        );
+        assert_eq!(
+            reads, 156,
+            "expected 156 identity-field reads; the count moved — check whether the function that \
+             gained one is still dispositioned correctly, then update this"
+        );
+
+        for (arm, expected) in [
+            (SharedResolver, 1),
+            (ViaSharedResolver, 4),
+            (NotHandleResolution, 78),
+        ] {
+            let actual = HANDLE_READ_REGISTER
+                .iter()
+                .filter(|(_, disposition, _)| *disposition == arm)
+                .count();
+            assert_eq!(
+                actual, expected,
+                "expected {expected} {arm:?} entries in HANDLE_READ_REGISTER, found {actual}"
+            );
+        }
+
+        // `ViaSharedResolver` is the one arm that is a CLAIM about behaviour rather than a
+        // reading, so it is the one arm that is checked rather than believed: the function must
+        // actually contain a `resolve_target` call. Without this the arm would be a comment.
+        callers.sort_unstable();
+        callers.dedup();
+        for (name, disposition, _) in HANDLE_READ_REGISTER {
+            if *disposition == ViaSharedResolver {
+                assert!(
+                    callers.iter().any(|c| c == name),
+                    "{name:?} is dispositioned ViaSharedResolver but its body holds no \
+                     `resolve_target` call — it either resolves some other way, or the \
+                     disposition is stale"
+                );
+            }
+        }
+
+        // An entry without a reason is indistinguishable from an oversight, and the reason is
+        // what the next reader copies the shape of.
+        for (name, disposition, reason) in HANDLE_READ_REGISTER {
+            assert!(
+                !reason.trim().is_empty(),
+                "{name:?} is dispositioned {disposition:?} with no reason recorded"
+            );
+        }
+    }
+
+    /// The compliant set, pinned from the other side (issue #1186).
+    ///
+    /// [`every_handle_read_is_dispositioned`] catches a site that grows its OWN resolver. It
+    /// cannot catch the inverse — a site quietly dropping [`resolve_target`] — because
+    /// `cli::apply_remove` proves the two populations differ: it resolves and removes without
+    /// ever reading an identity field, so no field scan can see it. Six operator-facing verbs
+    /// (`use`, `poke`, the daemon's control-socket swap, `enable`, `disable`, `remove`) reach the
+    /// resolver through FIVE call sites, because `enable` and `disable` share `apply_enabled`.
+    #[test]
+    fn resolve_target_has_exactly_the_five_known_call_sites() {
+        let mut callers: Vec<String> = crate_sources()
+            .iter()
+            .flat_map(|(_, text)| handle_reads(&non_test_region(text)).resolver_callers)
+            .collect();
+        callers.sort_unstable();
+        callers.dedup();
+        assert_eq!(
+            callers,
+            [
+                "apply_enabled",
+                "apply_remove",
+                "perform_socket_swap",
+                "poke_named",
+                "run_use",
+            ],
+            "the five label-resolving call sites; a new one is a new verb that must also be \
+             dispositioned in HANDLE_READ_REGISTER, and a MISSING one is a site that stopped \
+             sharing the resolver"
+        );
+    }
+
+    /// CONSTRAINT-A for the tripwire above (ADR-0031 § 4): the gate is observed to REDDEN on a
+    /// subject carrying the defect, not merely read and believed. Both cases are driven through
+    /// [`functions_reading_a_handle`], the predicate the real assertion compares with.
+    ///
+    /// The payload is the defect issue #1186 describes — a seventh verb that grows its own
+    /// first-match-wins lookup instead of calling [`resolve_target`].
+    ///
+    /// The second case is the one that settles the SUBJECT rather than the gate. Hoisting the
+    /// field through a `let` before comparing it is an ordinary refactor, and it is what a
+    /// scanner keyed on the COMPARISON would lose — which is not hypothetical: such hoists
+    /// already ship, including inside `cli::apply_enabled`, a site this property is about. Both
+    /// shapes must land, or the tripwire is one `let` away from blind.
+    #[test]
+    fn the_handle_read_tripwire_bites_on_a_seventh_site() {
+        for (shape, body) in [
+            (
+                "compared in place",
+                "    let idx = roster.iter().position(|a| a.label == query)?;",
+            ),
+            (
+                "hoisted through a `let`",
+                "    let handle = &roster[0].label;\n    let idx = (handle == query).then_some(0)?;",
+            ),
+        ] {
+            let injected = format!(
+                "fn apply_park(roster: &mut Vec<Account>, query: &str) -> Option<usize> {{\n\
+                 {body}\n\
+                 }}\n\
+                 #[cfg(test)]\n\
+                 mod tests {{\n\
+                 fn a_test_helper(a: &Account) -> String {{ a.label.clone() }}\n\
+                 }}\n"
+            );
+            let spelled = functions_reading_a_handle(&injected);
+            assert_eq!(
+                spelled,
+                ["apply_park"],
+                "the scan must see a seventh site's handle read {shape}, and must see ONLY that: \
+                 the test module's own reads are not production resolution"
+            );
+            // …and that IS a red run, because the register cannot hold a name it has never seen.
+            // Stated as the real comparison rather than left as an inference about it.
+            assert!(
+                !HANDLE_READ_REGISTER
+                    .iter()
+                    .any(|(name, _, _)| *name == "apply_park"),
+                "the canary's function must be absent from the register, or it proves nothing"
+            );
+        }
+    }
+
+    /// The boundary rule, pinned against the shape that would silently blind this whole gate.
+    ///
+    /// `INLINE_PROSE_REGISTER`'s lexer cuts at the first line STARTING with `#[cfg(test)]`. That
+    /// is correct for `src/cli.rs` and wrong for this file, which carries one in its import block
+    /// on a test-only `use`, far above [`resolve_target`]. Under that rule the gate would stop at
+    /// that import and never see the resolver it protects — a green run over a truncated subject.
+    /// Both halves are asserted: the import must NOT cut, and the real test module MUST.
+    #[test]
+    fn the_non_test_boundary_survives_a_cfg_test_import() {
+        let source = "use crate::a;\n\
+                      #[cfg(test)]\n\
+                      use crate::b;\n\
+                      fn production(a: &Account) -> String { a.label.clone() }\n\
+                      #[cfg(test)]\n\
+                      mod tests {\n\
+                      fn helper(a: &Account) -> String { a.account_uuid.clone() }\n\
+                      }\n";
+        assert_eq!(
+            functions_reading_a_handle(source),
+            ["production"],
+            "a `#[cfg(test)]` on an IMPORT must not truncate the scan, and the test module must"
+        );
+
+        // The other half of the bias, pinned so it is a decision rather than an accident: an
+        // INDENTED `mod` does not cut. `src/redaction.rs` nests its `mod tests` inside
+        // `mod meter`, and honouring that spelling would mean cutting at the first nested test
+        // block in ANY file — discarding whatever production code sits below it.
+        // Built by joining lines rather than with `\`-continuations: that escape eats the
+        // following line's leading whitespace, which would silently flatten this fixture back
+        // into the column-0 case it exists to be different from.
+        let nested = [
+            "fn production(a: &Account) -> String { a.label.clone() }",
+            "mod meter {",
+            "    #[cfg(test)]",
+            "    mod tests {}",
+            "}",
+            "fn below(a: &Account) -> String { a.account_uuid.clone() }",
+        ]
+        .join("\n");
+        assert_eq!(
+            functions_reading_a_handle(&nested),
+            ["below", "production"],
+            "an indented test module must NOT cut the scan — the code below it is production"
+        );
+
+        // …and the same rule, over the real file this trap lives in.
+        let this_file = std::fs::read_to_string("src/use_account.rs").expect("readable");
+        assert!(
+            non_test_region(&this_file).contains("pub(crate) fn resolve_target"),
+            "the non-test region of src/use_account.rs must still contain the resolver — if it \
+             does not, every assertion above is running on a truncated subject"
+        );
+    }
+
+    /// The lexer is the one textual link in this completeness chain, so its skip-classes are
+    /// tested directly rather than only through their caller. A scanner that reads an identity
+    /// field out of a doc comment or a string literal does not merely over-report: it makes the
+    /// register's counts unmaintainable, and an unmaintainable gate gets bumped past.
+    #[test]
+    fn the_lexer_reads_code_and_not_prose() {
+        let source = "/// Doc prose about account.label and account.account_uuid.\n\
+                      // A line comment mentioning a.label too.\n\
+                      fn render() -> String {\n\
+                      let _ = \"a string holding .label\";\n\
+                      let _ = r#\"a raw string holding .account_uuid\"#;\n\
+                      let _ = '\\'';\n\
+                      account.label.clone()\n\
+                      }\n";
+        let scan = handle_reads(&non_test_region(source));
+        assert_eq!(
+            scan.reads,
+            [("render".to_owned(), "label".to_owned())],
+            "only the CODE read counts — comments, strings and raw strings are prose about it"
+        );
+    }
+
+    /// The method-call exclusion in [`identity_field_at`] is safe only while [`Account`]'s
+    /// identity fields stay plain fields. `.account_uuid()` is deliberately not a match because
+    /// that spelling belongs to the OAuth capture types — but if `Account` ever grew an accessor,
+    /// a resolver could read the handle through it and pass this gate untouched.
+    #[test]
+    fn the_identity_fields_stay_plain_fields() {
+        let config = std::fs::read_to_string("src/config.rs").expect("readable");
+        let production = non_test_region(&config);
+        for accessor in ["fn label(", "fn account_uuid("] {
+            assert!(
+                !production.contains(accessor),
+                "`Account` grew a {accessor}…) accessor. The handle-read scan matches FIELDS and \
+                 skips method calls, so a resolver could now read a handle invisibly — widen \
+                 `identity_field_at` before adding one"
+            );
+        }
+    }
+
     // --- cooldown_active (pure) ---------------------------------------------
 
     #[test]
