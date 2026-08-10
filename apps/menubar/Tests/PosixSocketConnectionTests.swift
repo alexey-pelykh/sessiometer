@@ -241,6 +241,110 @@ final class PosixSocketConnectionTests: XCTestCase {
         if !released { Darwin.close(fenced) }
     }
 
+    // MARK: - Descriptor retirement without an explicit close (issue #1166)
+
+    // The OTHER teardown path, and the more fragile one. `PosixSocketConnection` releases its
+    // descriptor from exactly one place — the reader thread, after its loop ends — and for a
+    // connection nobody ever closed, the only thing that ends that loop is `deinit { close() }`.
+    // Delete that single line and everything above stays green — the #899 gate and the #859 soak
+    // included — while every abandoned connection leaks a descriptor AND strands its reader blocked in
+    // `read()` forever. Measured on `fc1bad4`, that mutant reported 924 tests, 4 skipped, 0 failures:
+    // the same verdict, test for test, as the unmutated tree. This is the production ERROR route: a
+    // subscribe-write failure discards the connection before anything attaches to it
+    // (`WatchTransport`), which also makes it the path least likely to be walked by hand.
+    //
+    // Four things could end that reader's loop, and this test is only about `deinit` because the other
+    // three are excluded by construction:
+    //   * `close()` is never called — being dropped without one is the whole subject.
+    //   * `continuation.onTermination` captures `self` WEAKLY (`WatchConnection.swift`), so when the
+    //     drop releases `lines`, the callback's `self?.close()` finds a nil `self` and does nothing.
+    //   * `FileDescriptorOwner.retire()` has exactly one caller in the app — the reader itself, after
+    //     its loop — so it cannot be the thing that ENDS that loop.
+    //   * EOF is kept off the table by holding the peer OPEN across the verdict: the `defer` below runs
+    //     after it. Closing the peer early would end the reader's loop with no help from `deinit`, and
+    //     this test would then pass just as happily on a tree with no backstop at all.
+    // Each of those is an inspection, and inspection is not evidence (ADR-0031 § 4). The evidence is
+    // the mutation, run in both directions on `fc1bad4`: with the backstop shipped, 925 tests, 4
+    // skipped, 0 failures, this one passing in 0.003 s; with `deinit { close() }` deleted, 925 tests,
+    // 4 skipped, and exactly ONE failure — this test. Every other test in the bundle returned the same
+    // verdict on both sides, which is what rules out another release path quietly carrying this.
+    //
+    // Poll deadline: `awaitDescriptorRelease`'s 10 s default, shared with the #899 gate. The whole
+    // probe — socket pair, fence, identity round-trip, drop and poll — runs in 0.002–0.003 s typical
+    // and 0.016 s at the slowest of 1,104 measured iterations, so even that outlier sits ~600× inside
+    // the deadline. The failure mode is a returned `false`, not a hang: the mutant above failed this
+    // assertion at 10.007 s rather than wedging the suite.
+    //
+    // Soak: ONE iteration in the committed test, against the 20 of
+    // `testTeardownDoesNotStrandAReaderOnAReusedDescriptor`. That test loops because it gates a RACE,
+    // whose per-iteration failure rate leaves a single pass meaning little. This is not a race: with
+    // the backstop deleted the descriptor is never released AT ALL, so the mutant fails
+    // deterministically, and a loop would buy 20× the deadline on failure and no signal on success.
+    // Non-flakiness was measured instead of looped — 1,104 executions, 0 failures: 1000 consecutive
+    // iterations in ONE long-lived process (`-test-repetition-relaunch-enabled NO` — the harshest
+    // setting for the fence's margin, since descriptor pressure accumulates rather than resetting),
+    // 100 more with relaunch enabled so each is a fresh process, and four full-suite runs where it
+    // shares a process with 924 other tests.
+    //
+    // The stranded reader THREAD is covered transitively, not separately: `descriptor.retire()` is the
+    // reader's last statement after its loop ends, so observing the release IS observing that the
+    // reader is no longer blocked. What that leaves uncovered is a backstop that released the number
+    // WITHOUT waking the reader — a bare `Darwin.close(raw)` in `deinit`.
+    //
+    // NOTHING GATES THAT, and an earlier revision of this comment wrongly said
+    // `testTeardownDoesNotStrandAReaderOnAReusedDescriptor` did. It does not: that test calls
+    // `close()` EXPLICITLY on the abandoned connection, so `shutdown()` wakes the reader before
+    // `deinit` is ever reached, and it never drives the deinit-only path this one exists for. Measured
+    // rather than argued — with `deinit { Darwin.close(descriptor.raw) }` substituted, the full bundle
+    // passes, that test included. It is the same mistake this file's own #899 reasoning warns about
+    // one paragraph up: a gate that drives the explicit path cannot see the implicit one. Tracked as
+    // issue #1187; asserting on the thread directly would need thread enumeration this bundle has no
+    // mechanism for, which is why it is filed rather than attempted here.
+    func testDroppingAConnectionWithoutClosingItRetiresTheDescriptor() async throws {
+        let pair = try makeSocketPair()
+        // Deliberately AFTER the verdict below — see the EOF bullet above.
+        defer { Darwin.close(pair.peer) }
+        let fenced = try fence(pair.conn)
+
+        do {
+            let abandonedConnection = PosixSocketConnection(fd: fenced)
+            // Proves the connection really adopted fd `fenced`, WITHOUT consuming `lines`: a
+            // released-looking number proves nothing if the connection never used that number, and
+            // attaching a consumer would introduce a stream lifetime this test is not measuring.
+            // `send()` writes to the connection's own descriptor and `pair.peer` is the only thing on
+            // the far end of it, so the round-trip pins the identity.
+            try abandonedConnection.send(Array("subscribe\n".utf8))
+            XCTAssertEqual(
+                readAvailable(pair.peer), "subscribe\n",
+                "the connection is not writing to fd \(fenced) — the verdict below would be vacuous")
+        }
+        // The last reference is gone here: no `close()`, no `lines` consumer, no stored copy, and the
+        // reader thread holds the descriptor and the continuation directly rather than through `self`.
+
+        let released = await awaitDescriptorRelease(fenced)
+        // Measured after the probe, for the reason the #899 gate measures it there: it describes the
+        // conditions the probe actually ran under.
+        let headroom = lowestFreeDescriptor().map { fenced - $0 } ?? 0
+        XCTAssertGreaterThanOrEqual(
+            headroom, 64,
+            "fence margin collapsed to \(headroom) numbers below fd \(fenced) — a number reissued to "
+                + "unrelated activity would read as 'still open', so the verdict below is inconclusive "
+                + "rather than wrong")
+        XCTAssertTrue(
+            released,
+            "fd \(fenced) is still open after the connection was dropped: the deinit backstop never "
+                + "disconnected the socket, so the reader is still blocked in read() and never retired "
+                + "the descriptor. The lowest free number is \(fenced - headroom), so the fence held "
+                + "and this is a leak rather than a number reissued to unrelated activity")
+        // No reclaiming `fenced` here, deliberately — the opposite of the #899 gate, and for the reason
+        // that gate's reclaim is sound: there the reader has already finished, so a leaked number has
+        // no owner left. Here a failure means the reader is STILL RUNNING and still owns the number, so
+        // closing it from the test would hand a live reader a number the process can immediately
+        // reissue — the exact #859 hazard this class exists to gate. The `defer` above is the reclaim:
+        // closing the peer delivers the EOF that ends the reader's loop, and the reader retires its own
+        // descriptor.
+    }
+
     // MARK: - Fixtures
 
     private struct SocketPairError: Error { let errnoValue: Int32 }
