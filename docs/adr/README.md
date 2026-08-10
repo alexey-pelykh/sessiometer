@@ -45,6 +45,7 @@ issue threads is consolidated here in a stable, discoverable place.
 | [0030](0030-one-resolution-policy-cli-included.md) | One `claude`-resolution policy for every caller — `poke` / `login` resolve via the login-shell `PATH` too | Accepted |
 | [0031](0031-ui-verification-tiers-bounded-by-structural-blindness.md) | UI verification is a tier stack bounded by structural blindness; no gate ships without a proven falsifier | Accepted |
 | [0032](0032-login-is-daemon-routable-tty-gate-is-ours.md) | `login` is daemon-routable; the TTY gate is sessiometer's own conservatism, not a Claude Code requirement | Accepted |
+| [0033](0033-weekly-saturated-session-low-stays-unknown.md) | The weekly-saturated / session-low peer stays UNKNOWN; rotation state is not carried into the census | Accepted |
 
 ## Conventions
 
