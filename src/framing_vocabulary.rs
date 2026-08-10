@@ -45,10 +45,14 @@
 //!
 //! # The fifth audience has no exemption set, and that is the answer to a scoping question
 //!
-//! Issue #1139 asked whether `Error`'s other variants — three of which spend central vocabulary:
-//! `ConfigTargetMaxSessionAboveTrigger` and `SharedCredentialMutated` spend `must`,
-//! `ActiveAccountUnresolved` spends `add` and `healthy` — belong inside this firewall, and if so
-//! under which vocabulary. Both halves are settled, and the second half is the interesting one.
+//! Issue #1139 asked whether `Error`'s other variants — three of which spent central vocabulary
+//! when it looked: `ConfigTargetMaxSessionAboveTrigger` and `SharedCredentialMutated` spend
+//! `must`, and `ActiveAccountUnresolved` spends `add` and SPENT `healthy` — belong inside this
+//! firewall, and if so under which vocabulary. Both halves are settled, and the second half is the
+//! interesting one. (Only `healthy` is past tense: issue #1151 removed it, which is what the §
+//! below predicted the answer would cost. `add` is still spent — it is the live carve-out #1151
+//! was required to leave alone, and `every_ledger_entry_is_earned_reasoned_and_pinned` asserts so
+//! on every run.)
 //!
 //! **In scope, and the subject is the attribute.** `src/main.rs` prints every
 //! error that reaches it as `sessiometer: {err}`, so an `Error`'s `Display` is an operator-facing
@@ -72,11 +76,10 @@
 //! The three sets above are earned by whole surfaces whose every member spends the token (a
 //! `usage_hint`'s job is to name a command, so ALL of them may spell `disable`). `Error` is not
 //! one surface — it is dozens of independent messages that share a type. An `ERROR_EXEMPT_TOKENS`
-//! carrying `{add, healthy, must}` would excuse those tokens in EVERY one of them, so the day a
-//! new variant read "you must add an account" the guard would pass it, having been widened by
-//! three earlier messages that had nothing to do with it. The carve-out is therefore
-//! per-(variant, token):
-//! `src/error.rs`'s `ERROR_PROSE_LEDGER`, four entries, each naming the ONE variant it excuses,
+//! carrying `{add, must}` would excuse those tokens in EVERY one of them, so the day a new
+//! variant read "you must add an account" the guard would pass it, having been widened by earlier
+//! messages that had nothing to do with it. The carve-out is therefore per-(variant, token):
+//! `src/error.rs`'s `ERROR_PROSE_LEDGER`, each entry naming the ONE variant it excuses,
 //! carrying a written verdict, and asserted to still be spent by that variant. Anything not in
 //! the ledger reddens — including a second banned token in an already-ledgered message, which is
 //! why that guard scans with [`scan_all_banned`] rather than first-hit.
@@ -87,10 +90,15 @@
 //! tool's own roster, not an acquisition); `must` in both its uses is a CONSTRAINT STATEMENT
 //! whose modal governs a config value or this tool's own invariant rather than the operator, so
 //! it is not the "you should" recommendation framing the group bans. `healthy` is the one that
-//! did NOT survive: it is a value judgement, the group the #160 firewall exists for, and it is
-//! recorded in the ledger as a VIOLATION under its own issue rather than excused or reworded.
-//! See `src/error.rs`'s `ERROR_PROSE_LEDGER` for the per-entry reasoning, including why the
-//! defence that `healthy` names `CredentialHealth::Healthy` is false on that code path.
+//! did NOT survive: it is a value judgement, the group the #160 firewall exists for, and the
+//! defence that it names the machine-checkable `CredentialHealth::Healthy` was false on that code
+//! path. Issue #1139 ledgered it as a VIOLATION under its own issue rather than excusing it —
+//! and rather than rewording it, since editing a shipped message to make a NEW guard pass is how
+//! a guard comes to certify the prose it was pointed at. Issue #1151 then spent that debt: the
+//! adjective is gone from the message, so the entry is gone from the ledger, which is the shape a
+//! violation is supposed to resolve in. `Error::ActiveAccountUnresolved`'s own doc comment keeps
+//! the reasoning, including why the repair was to DROP the word rather than substitute a better
+//! one — no property discriminating between roster accounts is computable on that path.
 //!
 //! # Why each audience gets its OWN exemption set, and not the widest one
 //!

@@ -656,21 +656,39 @@ pub(crate) enum Error {
     /// installed directly, no outgoing re-stash — so this error is the non-forced path
     /// only. ZERO writes. Secret-free.
     ///
-    /// FRAMING (issue #1139): this message carries the only VIOLATION the firewall's ledger
-    /// records. `add it to the rotation` is the permitted non-acquisitive remedy directive
-    /// (ADR-0020 § Status → Amended 2026-08-10), but **`healthy` is a value judgement**: the path
-    /// it points at, `use --force`, computes no health at all — `crate::use_account` never imports
-    /// `CredentialHealth`, and `warn_if_forcing_onto_non_viable` warns and PROCEEDS on weekly
-    /// viability — so the word decides nothing and cannot be read as naming
-    /// [`CredentialHealth::Healthy`](crate::observability::CredentialHealth). Rewording it is
-    /// issue #1151, deliberately NOT issue #1139: changing a shipped message to make a new guard
-    /// pass is how a guard comes to certify the prose it was pointed at. Both tokens are carved
-    /// out for this variant alone in `ERROR_PROSE_LEDGER`, with the reasoning.
+    /// FRAMING (issues #1139 / #1151): `add it to the rotation` is the permitted non-acquisitive
+    /// remedy directive (ADR-0020 § Status → Amended 2026-08-10), carved out for this variant
+    /// alone in `ERROR_PROSE_LEDGER`. This message also read `adopt a **healthy** account`, which
+    /// issue #1139 graded a VALUE JUDGEMENT and ledgered as the firewall's one violation: the path
+    /// it points at computes no health at all — `crate::use_account` never imports
+    /// [`CredentialHealth`](crate::observability::CredentialHealth), and the only check `--force`
+    /// runs is `warn_if_forcing_onto_non_viable`, which warns and PROCEEDS on weekly `Viability`
+    /// — so the word gated nothing and could not be read as naming the enum.
+    ///
+    /// Issue #1151 DROPPED the adjective rather than replacing it, and that is worth stating
+    /// because the obvious repair is to substitute a better word. A selection adjective here has
+    /// to name a property that DISCRIMINATES between roster accounts, and none is available.
+    /// Health is daemon-computed, and this error fires when the canonical credential was scrubbed
+    /// — which is also when no daemon may be running, so the `status` screen that would name it
+    /// answers `daemon not running` and the operator cannot look the word up. Weekly `Viability`
+    /// is no better: it is warn-only on this path, so `viable` would be false in exactly the way
+    /// `healthy` was. The reason is structural rather than incidental — NOT discriminating is
+    /// what `--force` IS: it adopts whatever is named, in ANY state, `Dead` included. So any word
+    /// telling the operator how to CHOOSE necessarily asserts something this path does not
+    /// compute, and the honest message names the command and stops.
+    ///
+    /// What `--force` really requires of the target is two things, both daemon-independent and
+    /// both enforced: it resolves in the LOCAL roster (`resolve_target`, else
+    /// [`UseTargetNotFound`](Self::UseTargetNotFound) or
+    /// [`UseTargetAmbiguous`](Self::UseTargetAmbiguous)), and its stash is readable
+    /// (`crate::swap::adopt_target` reads it first, aborting with ZERO writes). Neither narrows
+    /// the operator's choice — every account they would consider has both — so neither earns a
+    /// word here either.
     #[error(
         "cannot determine the active account to swap away from \
          (no logged-in account matches the roster — run `sessiometer login` to \
          re-authenticate and add it to the rotation, or `sessiometer use <account> \
-         --force` to adopt a healthy account directly)"
+         --force` to adopt that account directly)"
     )]
     ActiveAccountUnresolved,
 
@@ -1467,10 +1485,9 @@ mod tests {
     /// The three exemption sets in `crate::framing_vocabulary` are earned by whole SURFACES
     /// whose every member spends the token: a `usage_hint`'s job is to name a command, so all of
     /// them may spell `disable`. `Error` is not a surface — it is dozens of independent messages
-    /// that share a type. A set carrying `{add, healthy, must}` would excuse those tokens in EVERY
-    /// one of them,
-    /// so the day a new variant read "you must add an account" the guard would wave it through,
-    /// having been widened by three earlier messages that had nothing to do with it. Scoping
+    /// that share a type. A set carrying `{add, must}` would excuse those tokens in EVERY one of
+    /// them, so the day a new variant read "you must add an account" the guard would wave it
+    /// through, having been widened by earlier messages that had nothing to do with it. Scoping
     /// each carve-out to the ONE variant that earned it keeps that from being possible, and it
     /// is why the guard scans all hits rather than the first: a second banned token in an
     /// already-ledgered message still bites.
@@ -1530,26 +1547,6 @@ mod tests {
                   whereas the banned sense is acquisition, `add an account` in the sense of \
                   obtaining more capacity, which is the reading `BANNED_TOKENS`' own issue #160 \
                   note quotes (`add / buy / upgrade / cancel / bypass / need more`).",
-        },
-        LedgerEntry {
-            variant: "ActiveAccountUnresolved",
-            token: "healthy",
-            verdict: Verdict::Violation("#1151"),
-            why: "VALUE JUDGEMENT — the group the #160 firewall exists for, and the one entry \
-                  here that did not survive its own defence. Issue #1139 asked whether `adopt a \
-                  healthy account` NAMES the machine-checkable `CredentialHealth::Healthy` \
-                  rather than editorialising. It does not, and the code decides it: this message \
-                  routes the operator to `use --force`, and `crate::use_account` never imports \
-                  `CredentialHealth` at all — the only check `--force` runs is \
-                  `warn_if_forcing_onto_non_viable`, which warns and PROCEEDS, and whose subject \
-                  is weekly `Viability`, not health. `use --force <account>` adopts a target in \
-                  ANY health state, `Dead` included, so the word decides nothing and is the \
-                  author's characterisation. It is worse than inert for the operator: this error \
-                  fires when the canonical credential was scrubbed, which is also when no daemon \
-                  may be running — and `CredentialHealth` is daemon-computed, so the `status` \
-                  screen that would name it answers `daemon not running`. A reader who has never \
-                  seen the enum reads `a good one`, with no way to tell which. NOT reworded here \
-                  — that is issue #1151.",
         },
     ];
 
@@ -1937,6 +1934,35 @@ mod tests {
         }
     }
 
+    /// What is wrong with one entry's VIOLATION bookkeeping — a violation must name its tracking
+    /// issue, and its reasoning must cite the same one — or empty when the entry is sound. Every
+    /// `Permitted` entry is sound here by construction: these two rules are scoped to debts.
+    ///
+    /// Factored out of the audit for the reason [`unaccounted_framing`] is, and issue #1151 is
+    /// what made it necessary. It spent the ledger's only debt, and the shipped subject these
+    /// rules run over is now EMPTY — over zero violations they pass identically whether they check
+    /// anything or nothing. So the audit calls this, and so does a bite proof that can supply the
+    /// entries the ledger no longer has.
+    fn violation_defects(entry: &LedgerEntry) -> Vec<String> {
+        let Verdict::Violation(issue) = entry.verdict else {
+            return Vec::new();
+        };
+        let mut defects = Vec::new();
+        if !(issue.starts_with('#') && issue[1..].chars().all(|c| c.is_ascii_digit())) {
+            defects.push(format!(
+                "{}: {issue:?} is not an issue reference",
+                entry.variant
+            ));
+        }
+        if !entry.why.contains(issue) {
+            defects.push(format!(
+                "{}: the reasoning does not cite the issue tracking it",
+                entry.variant
+            ));
+        }
+        defects
+    }
+
     /// Every banned token in an authored error template that [`ERROR_PROSE_LEDGER`] does not
     /// account for — the audit itself, factored out of the assertion so the BITE proof can drive
     /// the identical code path over a deliberately poisoned copy of the REAL shipped prose.
@@ -2014,10 +2040,7 @@ mod tests {
                 "must not exceed session_ceiling",
             ),
             ("SharedCredentialMutated", "credential must stay untouched"),
-            (
-                "ActiveAccountUnresolved",
-                "adopt a healthy account directly",
-            ),
+            ("ActiveAccountUnresolved", "adopt that account directly"),
         ] {
             let template = by_name(variant);
             assert!(
@@ -2142,7 +2165,7 @@ mod tests {
             unaccounted_framing(&poisoned),
             vec!["ActiveAccountUnresolved: \"upgrade\"".to_owned()],
             "a ledgered variant must still bite on a token its entry does not name — and its \
-             ledgered `add` / `healthy` must stay accounted for while it does"
+             ledgered `add` must stay accounted for while it does"
         );
 
         // GREEN after: reverted, the shipped subject is clean again.
@@ -2159,7 +2182,7 @@ mod tests {
     fn every_ledger_entry_is_earned_reasoned_and_pinned() {
         let prose = error_prose();
 
-        // PINNED to exactly the four measured entries, for the reason issue #918 pinned the help
+        // PINNED to exactly the three measured entries, for the reason issue #918 pinned the help
         // exemption set: growing this is a design decision that must redden a test, never
         // something that accretes an entry at a time to silence an inconvenient message.
         let pairs: Vec<(&str, &str)> = ERROR_PROSE_LEDGER
@@ -2172,7 +2195,6 @@ mod tests {
                 ("ConfigTargetMaxSessionAboveTrigger", "must"),
                 ("SharedCredentialMutated", "must"),
                 ("ActiveAccountUnresolved", "add"),
-                ("ActiveAccountUnresolved", "healthy"),
             ],
             "the ledger moved — see issue #1139: these are the (variant, token) pairs the \
              shipped error prose measurably spends, and each was judged one at a time"
@@ -2212,23 +2234,28 @@ mod tests {
                 entry.token
             );
             // Every VIOLATION names its tracking issue, and its reasoning cites the same one. An
-            // untracked violation is an exemption with a disapproving tone.
-            if let Verdict::Violation(issue) = entry.verdict {
-                assert!(
-                    issue.starts_with('#') && issue[1..].chars().all(|c| c.is_ascii_digit()),
-                    "{}: {issue:?} is not an issue reference",
-                    entry.variant
-                );
-                assert!(
-                    entry.why.contains(issue),
-                    "{}: the reasoning does not cite the issue tracking it",
-                    entry.variant
-                );
-            }
+            // untracked violation is an exemption with a disapproving tone. Vacuous today by
+            // design — the ledger carries no debt since issue #1151 — so the rules themselves are
+            // proved to still bite in
+            // `the_violation_bookkeeping_bites_over_a_ledger_that_carries_no_violation`, which
+            // covers each of the three sub-predicates with a case that reddens when only that one
+            // is dropped. The digit run needed its own (`"#abc"`): the `"1151"` case short-
+            // circuits on the missing `#` and never reaches it, so for one revision that conjunct
+            // was carried by this comment rather than by a test.
+            assert_eq!(
+                violation_defects(entry),
+                Vec::<String>::new(),
+                "{}: a violation entry's bookkeeping is unsound",
+                entry.variant
+            );
         }
 
         // The violation set is pinned too: it is what tells a reader which entries are DECISIONS
-        // and which are debts, and a Permitted entry quietly re-labelled would erase that.
+        // and which are debts, and a Permitted entry quietly re-labelled would erase that. It is
+        // EMPTY since issue #1151 spent the one debt this ledger ever carried — asserted rather
+        // than deleted along with it, because "no outstanding violations" is itself a claim worth
+        // holding honest, and an empty pin is what makes the next one arrive as a deliberate edit
+        // carrying its own issue rather than as an accretion nobody had to defend.
         let violations: Vec<&str> = ERROR_PROSE_LEDGER
             .iter()
             .filter_map(|entry| match entry.verdict {
@@ -2238,9 +2265,105 @@ mod tests {
             .collect();
         assert_eq!(
             violations,
-            ["#1151"],
+            Vec::<&str>::new(),
             "the ledger's violation set moved — a new one needs its own issue, and a resolved \
              one needs its entry deleted rather than flipped to Permitted"
+        );
+    }
+
+    /// The VIOLATION bookkeeping still BITES, over a ledger that no longer carries a violation.
+    ///
+    /// Issue #1151 spent the ledger's only debt, and in doing so emptied the subject of the two
+    /// rules `every_ledger_entry_is_earned_reasoned_and_pinned` applies to a debt: over zero
+    /// violation entries they pass identically whether they check anything or nothing. That is the
+    /// degenerate subject this file refuses everywhere else — the standard
+    /// `the_error_guard_bites_on_every_editorial_group_injected_into_real_shipped_prose` states,
+    /// and the failure issue #918 measured. So the rules are driven here over entries built for
+    /// the purpose, through the same [`violation_defects`] the audit calls.
+    ///
+    /// Hand-built entries are weaker evidence than the real shipped prose, and are used here for
+    /// the one reason that makes them the ONLY evidence available: the ledger's violation set is
+    /// asserted EMPTY, so there is no real entry to poison. They stop being the only evidence the
+    /// day a violation is recorded again, at which point the audit's own call carries it.
+    #[test]
+    fn the_violation_bookkeeping_bites_over_a_ledger_that_carries_no_violation() {
+        // The premise: this test exists BECAUSE the shipped subject is empty. Should a real
+        // violation return, this is the line that says so and the synthetic cases become a
+        // supplement rather than the whole proof.
+        assert!(
+            !ERROR_PROSE_LEDGER
+                .iter()
+                .any(|entry| matches!(entry.verdict, Verdict::Violation(_))),
+            "a real violation is back in the ledger — the audit now exercises these rules over \
+             live prose, so re-read whether this synthetic proof is still the right shape"
+        );
+
+        // A sound debt: tracked at an issue reference, and its reasoning cites the same one.
+        let sound = LedgerEntry {
+            variant: "Synthetic",
+            token: "healthy",
+            verdict: Verdict::Violation("#1151"),
+            why: "the value judgement issue #1151 removed from ActiveAccountUnresolved",
+        };
+        assert_eq!(
+            violation_defects(&sound),
+            Vec::<String>::new(),
+            "a violation naming its issue and citing it in the reasoning is sound"
+        );
+
+        // …and a `Permitted` entry is out of scope for both rules, whatever it carries — the
+        // assertion that these are debt rules rather than entry rules.
+        assert_eq!(
+            violation_defects(&LedgerEntry {
+                verdict: Verdict::Permitted,
+                why: "cites no issue at all, and owes none",
+                ..sound
+            }),
+            Vec::<String>::new(),
+            "the violation rules must not fire on a Permitted entry"
+        );
+
+        // RED: a violation whose tracking reference is not an issue number. `1151` is the shape
+        // an author reaches for when the `#` is forgotten, and it would read as tracked.
+        assert_eq!(
+            violation_defects(&LedgerEntry {
+                verdict: Verdict::Violation("1151"),
+                ..sound
+            }),
+            vec!["Synthetic: \"1151\" is not an issue reference".to_owned()],
+            "an untracked violation is an exemption with a disapproving tone"
+        );
+
+        // RED, and it is the case that proves the SECOND conjunct rather than the first. `1151`
+        // above fails on `starts_with('#')` and short-circuits, so with only that case the digit
+        // run is never evaluated: replacing `c.is_ascii_digit()` with `true` leaves the whole
+        // suite green. Measured on an independent review of this branch, which is how the hole
+        // was found. This case has the `#` and reaches the digit run, so it is the one that
+        // reddens when that half is dropped.
+        //
+        // `why` is overridden rather than inherited from `sound`, and that is what isolates the
+        // rule: the reasoning must CITE the reference, so a `why` that does not mention `#abc`
+        // fires the second rule too and the expectation would no longer distinguish which one
+        // caught it. `1151` gets away with inheriting because `#1151` contains it as a substring.
+        assert_eq!(
+            violation_defects(&LedgerEntry {
+                verdict: Verdict::Violation("#abc"),
+                why: "tracked at #abc, which is not an issue number at all",
+                ..sound
+            }),
+            vec!["Synthetic: \"#abc\" is not an issue reference".to_owned()],
+            "the reference's tail must be digits — a `#` alone does not make it an issue number"
+        );
+
+        // RED: tracked at a real issue, but the reasoning cites a DIFFERENT one — the drift a
+        // reader cannot see, since both halves look filled in.
+        assert_eq!(
+            violation_defects(&LedgerEntry {
+                verdict: Verdict::Violation("#1139"),
+                ..sound
+            }),
+            vec!["Synthetic: the reasoning does not cite the issue tracking it".to_owned()],
+            "the reasoning must cite the issue the entry is tracked at, not merely some issue"
         );
     }
 
