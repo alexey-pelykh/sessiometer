@@ -25,15 +25,34 @@
 //!
 //! Note for #15: a handle is an operator-chosen label; config validation forbids
 //! an *empty* label but not whitespace, so a label containing a space or `=` would
-//! split the `key=val` grammar. Enforcing the handle charset is the meter's job
-//! (#15); this module localizes the surface but does not police it.
+//! split the `key=val` grammar into extra FIELDS. Enforcing the handle charset that
+//! far is the meter's job (#15); this module localizes the surface but does not
+//! police it — with the one exception the next section states.
 //!
 //! The one FREE-FORM value on this channel is the resolved `claude` path
 //! ([`Event::RefreshBinaryResolved`], issue #786) — a filesystem location, still
 //! never a token or an email. Because a path can legally contain a space, it is the
-//! one value this module DOES police: it renders percent-encoded ([`path_value`]),
-//! so the whitespace-free grammar every parser assumes holds by construction rather
-//! than by the operator's good luck in naming their directories.
+//! one value this module DOES police at FIELD level: it renders percent-encoded
+//! ([`path_value`]), so the whitespace-free grammar every parser assumes holds by
+//! construction rather than by the operator's good luck in naming their directories.
+//!
+//! ## Record integrity (issue #1092)
+//!
+//! Splitting a line into extra FIELDS is a nuisance; splitting it into extra
+//! RECORDS is a different class of harm, and it is the one thing this module
+//! guarantees for every value regardless of provenance. A handle is not always
+//! charset-constrained by the time it reaches a line: a roster `account_uuid` is
+//! (`[A-Za-z0-9_-]{1,128}`, issue #1052), but a `label` is deliberately free-form,
+//! and the login-FAILURE path logs an `account_uuid` harvested straight from
+//! `~/.claude.json` — checked for non-emptiness only — *before* the roster gate that
+//! would have rejected it. A newline in any of those would end one record and open
+//! another that a line-oriented reader cannot tell from a real one.
+//!
+//! So both renderers on this module's two channels percent-encode every CONTROL
+//! character on their way out ([`single_line`]), at the single exit each already
+//! has. Deliberately control characters ALONE: a value with none renders
+//! byte-for-byte as before, which is what keeps the frozen grammar
+//! ([`crate::log`]) frozen and every already-written record readable unchanged.
 //!
 //! ## The diagnostic channel (issue #77)
 //!
@@ -1989,9 +2008,16 @@ impl Event {
     /// (#15) is exactly this method. The timestamp is a parameter (not read here)
     /// so the formatting is deterministically unit-testable; [`EventLog::emit`]
     /// supplies `SystemTime::now()` at write time.
+    ///
+    /// The per-variant arms below format freely; the record-integrity guarantee
+    /// (issue #1092) is applied ONCE, here, to whatever they produce. That is the
+    /// point of the shape: the arms are a match EXPRESSION with a single exit, so a
+    /// variant added later cannot render a line that skips [`single_line`] — the
+    /// guarantee holds by construction rather than by every future author
+    /// remembering a per-field helper.
     pub(crate) fn to_log_line(&self, ts: SystemTime) -> String {
         let ts = rfc3339(ts);
-        match self {
+        let line = match self {
             Event::Swap {
                 from,
                 to,
@@ -2671,7 +2697,8 @@ impl Event {
                     "ts={ts} event=credential_expiry_observed acct={account} provenance={provenance}{before_field}{after_field}{delta}{rt_field}"
                 )
             }
-        }
+        };
+        single_line(line)
     }
 }
 
@@ -2701,12 +2728,26 @@ impl Event {
 /// yields one, and the extra machinery would buy fidelity for a value that cannot occur. The
 /// grammar holds either way: U+FFFD is not whitespace.
 fn path_value(path: &Path) -> String {
+    percent_encode(&path.display().to_string(), |ch| {
+        ch == '%' || ch.is_whitespace()
+    })
+}
+
+/// Percent-encode exactly the characters of `raw` that `needs_encoding` selects.
+///
+/// The shared body of this channel's two encoders — [`path_value`] (issue #786, one FIELD) and
+/// [`single_line`] (issue #1092, a whole LINE) — which differ only in which characters they may
+/// not let through, never in how one is spelled. Factored so a future third caller inherits the
+/// same encoding rather than growing a fourth hex loop that drifts from these two.
+///
+/// Encoding is defined on BYTES, so a selected multi-byte character renders one `%XX` triple per
+/// UTF-8 byte (U+00A0 → `%C2%A0`). Uppercase hex, the percent-encoding convention.
+fn percent_encode(raw: &str, needs_encoding: impl Fn(char) -> bool) -> String {
     /// Uppercase hex digits, the percent-encoding convention.
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let raw = path.display().to_string();
     let mut out = String::with_capacity(raw.len());
     for ch in raw.chars() {
-        if ch != '%' && !ch.is_whitespace() {
+        if !needs_encoding(ch) {
             out.push(ch);
             continue;
         }
@@ -2718,6 +2759,60 @@ fn path_value(path: &Path) -> String {
         }
     }
     out
+}
+
+/// Force a rendered log line to BE one line: percent-encode every control character in it
+/// (issue #1092).
+///
+/// Applied at the single exit of [`Event::to_log_line`] and its diagnostic sibling
+/// [`Diagnostic::to_log_line`], which is the whole design. A per-field helper would have to be
+/// remembered at ~40 interpolation sites and at every one a future field adds; one call on the
+/// finished line cannot be forgotten, and it costs nothing to be total, since every key, enum
+/// token, number and timestamp on these channels is control-free by construction — only a
+/// free-form value can ever be changed by this.
+///
+/// # What it is for
+///
+/// A record separator is the one piece of grammar a reader cannot recover from. Not every value
+/// that reaches a line is charset-constrained by then — a roster `account_uuid` is (issue #1052),
+/// but `label` is deliberately free-form, and the login-failure path logs an `account_uuid`
+/// harvested from `~/.claude.json` *before* the roster gate applies. A newline in one of those
+/// ends the record early and opens a second that can be spelled to look exactly like a real
+/// event, which is worse than a mangled line: a mangled line announces itself.
+///
+/// # Why CONTROL characters only, and not `%` with them
+///
+/// `path_value` encodes `%` so ITS mapping stays reversible. This one deliberately does not, and
+/// the two are not in tension — they are answering different questions:
+///
+/// - Encoding `%` here would double-encode [`path_value`]'s own output (`%20` → `%2520`) on the
+///   one line that carries it, since this runs after the arms.
+/// - It would also REFORMAT well-formed lines. The event log's grammar is frozen
+///   ([`crate::log`]) and its records are durable, so the bar is that a value which cannot split
+///   a record renders byte-for-byte as it always has. Touching `%` — or whitespace, which is a
+///   field-splitting concern and not a record-splitting one — would break that for values that
+///   were never a problem.
+///
+/// The cost is a residual ambiguity, stated rather than hidden: a label containing the literal
+/// text `%0A` renders identically to one containing a newline. Both come from the same operator,
+/// and neither can split the record, so the ambiguity is cosmetic where the split was not.
+///
+/// # Bound
+///
+/// `char::is_control` is Unicode category Cc — `\n`, `\r`, `\t`, `\0`, ESC, DEL and the C1 block
+/// (which includes U+0085 NEL, a line separator for some readers). It does NOT cover U+2028 /
+/// U+2029, which are not control characters and are not record separators for any reader of this
+/// log: [`crate::log`], [`crate::reliability`] and [`crate::usage_stats`] all split on `\n` via
+/// `str::lines`. This is the record-integrity boundary, not a terminal-safety one.
+fn single_line(line: String) -> String {
+    // The overwhelmingly common case is a line with no control character at all: return the
+    // string that was already built rather than a re-encoded copy of it, so the ordinary path
+    // allocates nothing extra and is byte-identical by inspection, not merely by argument.
+    if line.contains(char::is_control) {
+        percent_encode(&line, char::is_control)
+    } else {
+        line
+    }
 }
 
 /// Render the ` rotated=<bool>` field for a refresh-family line, or the empty string where
@@ -3118,9 +3213,16 @@ impl Diagnostic {
     /// [`Event::to_log_line`] — the redaction surface is this method alone. `ts` is a
     /// parameter (not read here) so the formatting is deterministically unit-testable;
     /// [`DiagnosticLog::emit`] supplies `SystemTime::now()` at write time.
+    ///
+    /// Same single-exit [`single_line`] guarantee as the event renderer (issue #1092), and for
+    /// the same reason rather than for symmetry's sake: this channel's `account=` is the same
+    /// free-form operator label, and `sessiometer log --channel diag` reads the file it lands in.
+    /// That channel is the UNGOVERNED one — it also carries panic payloads, and the reader says
+    /// so — but "ungoverned" is about what may APPEAR on a line, not about a value being allowed
+    /// to forge a second one.
     pub(crate) fn to_log_line(&self, ts: SystemTime) -> String {
         let ts = rfc3339(ts);
-        match self {
+        let line = match self {
             Diagnostic::Start {
                 accounts,
                 poll_secs,
@@ -3202,7 +3304,8 @@ impl Diagnostic {
                     "ts={ts} diag=canonical state={state}{fingerprint}{account}{expires_at}{rotated}"
                 )
             }
-        }
+        };
+        single_line(line)
     }
 }
 
@@ -4323,6 +4426,341 @@ mod tests {
         // An `=` needs no encoding: the value is a single token, and `split_once('=')` splits at
         // the FIRST `=`, so the key stays `path` and the rest is the value verbatim.
         assert_eq!(path_value(Path::new("/a=b/claude")), "/a=b/claude");
+    }
+
+    // --- Record integrity (issue #1092) -------------------------------------
+
+    /// A control-bearing handle carrying every class of control character that could end a
+    /// record: `\n` (the actual separator), `\r`, `\t`, NUL, ESC, DEL, and NEL — the one C1
+    /// character some readers also treat as a line break, and the one that proves the encoding is
+    /// defined on BYTES rather than chars.
+    ///
+    /// Deliberately SPACE-FREE, so the round-trip assertions below can be exact. A space in a
+    /// handle splits the line into extra FIELDS — a real, pre-existing, and deliberately
+    /// out-of-scope concern (issue #1092 explicitly declines to constrain `label`, and the module
+    /// docs record that field-splitting stays the #15 meter's business). `FORGED_RECORD` below
+    /// carries spaces and is asserted on the property that IS in scope: the record count.
+    const HOSTILE_HANDLE: &str = "a\n\r\t\0\u{1b}\u{7f}\u{85}b";
+
+    /// The issue's own failure scenario: a handle whose newline is followed by text spelled to
+    /// look exactly like a well-formed event, so the injected line would be indistinguishable
+    /// from a real one to any line-oriented reader.
+    const FORGED_RECORD: &str = "u-1\nts=1970-01-01T00:00:00Z event=login outcome=onboarded";
+
+    /// Decode `%XX` triples back to bytes — the inverse of [`single_line`] over a value known to
+    /// contain no literal `%` of its own.
+    ///
+    /// Deliberately a test-local re-implementation rather than a shipped decoder: the log has no
+    /// decoding consumer (readers are byte-faithful), so a production one would be dead code, and
+    /// asserting a value *round-trips* is stronger than asserting it merely "looks escaped" — an
+    /// assertion that a rejected-upstream value would also satisfy.
+    fn percent_decode(value: &str) -> String {
+        let raw = value.as_bytes();
+        let mut out: Vec<u8> = Vec::with_capacity(raw.len());
+        let mut i = 0;
+        while i < raw.len() {
+            if raw[i] == b'%' && i + 2 < raw.len() {
+                let hex = std::str::from_utf8(&raw[i + 1..i + 3]).expect("ASCII hex");
+                out.push(u8::from_str_radix(hex, 16).expect("a `%XX` triple"));
+                i += 3;
+            } else {
+                out.push(raw[i]);
+                i += 1;
+            }
+        }
+        String::from_utf8(out).expect("decoding a per-UTF-8-byte encoding yields UTF-8")
+    }
+
+    /// The value of `key` on a rendered line, tokenized exactly as the shipped readers do
+    /// (`crate::log`'s `field`, `crate::reliability`'s fold): split on whitespace, then at the
+    /// token's FIRST `=`.
+    fn field_of<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+        line.split_whitespace()
+            .filter_map(|token| token.split_once('='))
+            .find(|(k, _)| *k == key)
+            .map(|(_, value)| value)
+    }
+
+    #[test]
+    fn a_rendered_line_encodes_control_characters_and_nothing_else() {
+        // Issue #1092, both halves. The first is the guarantee; the second is its canary — an
+        // over-broad scrub would satisfy "no control character survives" while REFORMATTING every
+        // durable record ever written, which the frozen grammar (`crate::log`) forbids.
+        assert_eq!(single_line("a\nb".to_owned()), "a%0Ab");
+        assert_eq!(single_line("a\rb".to_owned()), "a%0Db");
+        assert_eq!(single_line("a\tb".to_owned()), "a%09b");
+        assert_eq!(single_line("a\0b".to_owned()), "a%00b");
+        assert_eq!(single_line("a\u{1b}[31mb".to_owned()), "a%1B[31mb");
+        assert_eq!(single_line("a\u{7f}b".to_owned()), "a%7Fb");
+        // NEL (U+0085) is two UTF-8 bytes, and encoding is defined on bytes.
+        assert_eq!(single_line("a\u{85}b".to_owned()), "a%C2%85b");
+
+        // Untouched, deliberately — each of these appears on real lines today and must render
+        // byte-for-byte as it always has: `%` (which `path_value` already emits), a space and an
+        // `=` (field-splitting, not record-splitting), and a non-control non-ASCII label.
+        for unchanged in [
+            "ts=1970-01-01T00:00:00Z event=refresh_binary_resolved path=/a%20b/claude",
+            "ts=1970-01-01T00:00:00Z event=swap from=my work to=spare reason=session",
+            "ts=1970-01-01T00:00:00Z event=restash account=r\u{e9}sum\u{e9}",
+        ] {
+            assert_eq!(single_line(unchanged.to_owned()), unchanged);
+        }
+    }
+
+    #[test]
+    fn no_free_form_field_can_split_an_event_into_a_second_record() {
+        // Issue #1092 AC: a control byte in ANY value that reaches a line — a harvested
+        // `account_uuid` or a free-form operator `label` — must not end the record early.
+        //
+        // Every distinct free-form field POSITION the `Event` grammar has, one entry each. It is
+        // a list rather than a sweep over `every_event_variant` because that corpus is clean by
+        // design (it is the #15 redaction sweep's subject), which is exactly why its own
+        // `lines().count() == 1` assertion passes vacuously and this one does not.
+        //
+        // Totality here does not rest on the list being complete: `to_log_line`'s arms are a
+        // match EXPRESSION with a single exit, so every variant — including ones added after
+        // this test — leaves through the same `single_line`. The list pins that the wiring is
+        // real and that each field's value stays RECOVERABLE, not merely mangled.
+        let h = || HOSTILE_HANDLE.to_owned();
+        let cases: Vec<(&str, Event, &[&str])> = vec![
+            (
+                "swap.from/to (operator labels)",
+                Event::Swap {
+                    from: h(),
+                    to: h(),
+                    reason: SwapReason::Session,
+                    session_pct: 97,
+                    projection: None,
+                },
+                &["from", "to"],
+            ),
+            (
+                "emergency_swap.from/to",
+                Event::EmergencySwap { from: h(), to: h() },
+                &["from", "to"],
+            ),
+            (
+                "restash.account",
+                Event::ReStash { account: h() },
+                &["account"],
+            ),
+            (
+                "all_exhausted.hold",
+                Event::AllExhausted {
+                    hold: h(),
+                    cause: SwapReason::Weekly,
+                    resets_at: Some(1_782_777_600),
+                },
+                &["hold"],
+            ),
+            (
+                "active_dead_no_target.hold",
+                Event::ActiveDeadNoTarget {
+                    hold: h(),
+                    cause: SwapReason::Weekly,
+                    resets_at: None,
+                },
+                &["hold"],
+            ),
+            (
+                "canary_drift.displayed/matched",
+                Event::CanaryDrift {
+                    displayed: h(),
+                    matched: h(),
+                    overridden: false,
+                },
+                &["displayed", "matched"],
+            ),
+            (
+                "canonical_scrubbed.account (optional)",
+                Event::CanonicalScrubbed { account: Some(h()) },
+                &["account"],
+            ),
+            (
+                "credential_health.account",
+                Event::CredentialHealth {
+                    account: h(),
+                    state: CredentialHealth::Dead,
+                },
+                &["account"],
+            ),
+            (
+                "refresh.account",
+                Event::Refresh {
+                    account: h(),
+                    outcome: RefreshEventOutcome::Dead,
+                    expires_before: None,
+                    expires_after: None,
+                    reason: None,
+                    backoff_secs: None,
+                },
+                &["account"],
+            ),
+            // The issue's named path: `login` reports the uuid harvested from `~/.claude.json`
+            // when the reconcile FAILS — including when it failed *because* the roster's
+            // `[A-Za-z0-9_-]{1,128}` gate (issue #1052) rejected that very uuid.
+            (
+                "login.account (the harvested uuid, failure path)",
+                Event::Login {
+                    account: Some(h()),
+                    outcome: LoginEventOutcome::Failed,
+                },
+                &["account"],
+            ),
+            (
+                "capture.account",
+                Event::Capture {
+                    account: Some(h()),
+                    outcome: CaptureEventOutcome::Failed,
+                },
+                &["account"],
+            ),
+            (
+                "uncaptured_login.acct (optional uuid)",
+                Event::UncapturedLogin {
+                    account_uuid: Some(h()),
+                },
+                &["acct"],
+            ),
+            (
+                "usage_gap.acct",
+                Event::UsageGap {
+                    account: h(),
+                    since: 1_782_777_600,
+                },
+                &["acct"],
+            ),
+            (
+                "usage_backoff.acct",
+                Event::UsageBackoff {
+                    account: h(),
+                    class: BackoffClass::RateLimited,
+                    consecutive: 2,
+                    retry_after_secs: Some(60),
+                    backoff_secs: 120,
+                },
+                &["acct"],
+            ),
+            (
+                "credential_expiry_observed.acct",
+                Event::CredentialExpiryObserved {
+                    account: h(),
+                    provenance: ExpiryProvenance::MyRefresh,
+                    before: Some(1_782_777_000),
+                    after: 1_782_777_600,
+                    grant_replaced: Some(true),
+                },
+                &["acct"],
+            ),
+            // The one value already encoded at FIELD level (issue #786). It must stay single-line
+            // WITHOUT being encoded twice — `path_value` turns the newline into `%0A` first, and
+            // `single_line` must then find nothing left to do.
+            (
+                "refresh_binary_resolved.path (pre-encoded)",
+                Event::RefreshBinaryResolved {
+                    path: PathBuf::from("/a\nb/claude"),
+                },
+                &["path"],
+            ),
+        ];
+
+        for (name, event, keys) in &cases {
+            let line = event.to_log_line(at_epoch(0));
+            assert_eq!(
+                line.lines().count(),
+                1,
+                "{name}: a control byte must not open a second record: {line:?}"
+            );
+            assert!(
+                !line.contains(char::is_control),
+                "{name}: no control character survives: {line:?}"
+            );
+            for key in *keys {
+                let value = field_of(&line, key)
+                    .unwrap_or_else(|| panic!("{name}: the line carries `{key}=`: {line:?}"));
+                let expected = if *key == "path" {
+                    // `path_value` also encodes `%` and whitespace, so this value decodes to the
+                    // raw path — the assertion that matters is that it was encoded ONCE.
+                    "/a\nb/claude".to_owned()
+                } else {
+                    HOSTILE_HANDLE.to_owned()
+                };
+                assert_eq!(
+                    percent_decode(value),
+                    expected,
+                    "{name}: `{key}=` must stay recoverable, not merely escaped: {line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_login_failure_planting_a_forged_record_appends_exactly_one_line() {
+        // Issue #1092's acceptance criterion, driven through the REAL sink to a real file rather
+        // than asserted on a formatted string: the login-failure path is the one that logs an
+        // `account_uuid` harvested from `~/.claude.json` — checked for non-emptiness only — and it
+        // is reached *by* the roster gate rejecting that uuid, so this value is not hypothetical.
+        //
+        // The assertion is the AC's own: the log gains EXACTLY ONE record. Asserting the output
+        // "looks escaped" would also pass if the value never reached the line at all — the
+        // round-trip below is what rules that out.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessiometer.log");
+        let mut log = EventLog::at(&path).unwrap();
+
+        log.emit(&Event::Login {
+            account: Some(FORGED_RECORD.to_owned()),
+            outcome: LoginEventOutcome::Failed,
+        })
+        .unwrap();
+
+        let logged = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            logged.lines().count(),
+            1,
+            "the log gains exactly one record: {logged:?}"
+        );
+        // Not merely one line: exactly one line NAMES an event, so nothing that reads the file
+        // by kind can see a second, forged `event=login`.
+        assert_eq!(
+            logged.lines().filter(|l| l.contains(" event=")).count(),
+            1,
+            "exactly one line names an event: {logged:?}"
+        );
+        let line = logged.lines().next().unwrap();
+        assert!(
+            line.ends_with(" outcome=failed"),
+            "the real outcome: {line}"
+        );
+        // The forged text is still THERE — it was neutralized, not dropped — and `account=`
+        // recovers it up to the first SPACE, since a space is what ends a token in this grammar
+        // and this fix deliberately leaves spaces alone (see `HOSTILE_HANDLE`). The newline that
+        // used to end the RECORD now sits inside the value, recoverable.
+        let account = field_of(line, "account").expect("an account= field");
+        assert_eq!(percent_decode(account), "u-1\nts=1970-01-01T00:00:00Z");
+        assert!(
+            logged.contains("outcome=onboarded"),
+            "the planted text is preserved verbatim-modulo-encoding, not silently discarded: \
+             {logged:?}"
+        );
+    }
+
+    #[test]
+    fn a_hostile_diagnostic_handle_cannot_open_a_second_record() {
+        // The sibling surface (issue #1092): `diag=` lines carry the same free-form operator
+        // label and land in the file `sessiometer log --channel diag` reads. That channel is the
+        // ungoverned one, but "ungoverned" bounds what may APPEAR on a line, not whether a value
+        // may forge a second one.
+        let line = Diagnostic::Poll {
+            account: HOSTILE_HANDLE.to_owned(),
+            outcome: PollClass::Live,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(line.lines().count(), 1, "single record: {line:?}");
+        assert_eq!(
+            percent_decode(field_of(&line, "account").expect("an account= field")),
+            HOSTILE_HANDLE
+        );
     }
 
     #[test]

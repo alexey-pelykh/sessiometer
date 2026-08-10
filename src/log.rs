@@ -1479,6 +1479,53 @@ ts=2026-07-11T03:00:00Z event=swap from=spare to=oleksii@pelykh.com reason=sessi
     }
 
     #[test]
+    fn a_mixed_vintage_log_reads_old_split_records_exactly_as_it_always_did() {
+        // Issue #1092 hardened the WRITER (`observability::single_line`), and the log is durable
+        // and append-only — so a real file outlives the change and holds both vintages. The
+        // reader is not versioned and must not become so; this pins what each vintage does.
+        //
+        // Line 2 is an OLD record whose `account=` carried a raw newline: on disk it IS two
+        // physical lines, and no writer change can retroactively rejoin them. Line 4 is the same
+        // hostile value written AFTER the fix.
+        const MIXED: &str = "\
+ts=2026-07-11T00:00:00Z event=restash account=u-A
+ts=2026-07-11T01:00:00Z event=login account=u-B
+ts=2026-07-11T01:00:00Z event=login outcome=onboarded
+ts=2026-07-11T02:00:00Z event=login account=u-C%0Ats=2026-07-11T02:00:00Z outcome=failed
+";
+
+        let view = select(Some(MIXED), None, None, Channel::Event);
+        // Four physical lines in, four out: the old vintage's spurious second record is still a
+        // record — it always was, and pretending otherwise would be the reader rewriting history.
+        assert_eq!(view.n_scanned, 4);
+        assert_eq!(view.matched.len(), 4);
+        assert_eq!(
+            render_text(&view).out,
+            MIXED,
+            "byte-faithful, both vintages"
+        );
+
+        // The old vintage's injected line is still indistinguishable from a real one — that is
+        // the damage this fix stops ACCRUING, not damage it can undo. `--event login` counts it.
+        let old = select(Some(MIXED), None, Some("login"), Channel::Event);
+        assert_eq!(old.matched.len(), 3);
+
+        // The NEW vintage is one record, and the `%0A` inside it is inert to the reader's
+        // tokenizer: it neither ends the record nor forges an `event=` of its own.
+        let new_line = MIXED.lines().nth(3).unwrap();
+        assert_eq!(field(new_line, "event"), Some("login"));
+        assert_eq!(
+            field(new_line, "account"),
+            Some("u-C%0Ats=2026-07-11T02:00:00Z")
+        );
+        // The one that matters: the encoded `ts=` inside the VALUE does not become the line's
+        // timestamp. `field` takes the LAST occurrence of a repeated key, so a value that could
+        // smuggle a bare `ts=` token would move the record in time — it cannot, because the
+        // whole value is one token and its `ts=` is not at the token's first `=`.
+        assert_eq!(field(new_line, "ts"), Some("2026-07-11T02:00:00Z"));
+    }
+
+    #[test]
     fn no_flags_emits_every_line_in_file_order_byte_identical() {
         let view = select(Some(FIXTURE_LOG), None, None, Channel::Event);
         assert_eq!(view.n_scanned, 4);
