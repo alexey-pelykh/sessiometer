@@ -819,9 +819,17 @@ type Windows = Vec<(i64, i64)>;
 /// `on_the_replay_corpus_the_utilisation_census_is_unknown_because_the_drain_was_weekly`, which
 /// pins that as a SEPARATE fact from this one. The alternative is not better coverage, it is
 /// fabricated calm over unobserved time, so coverage is restored where the guarantee reaches and
-/// nowhere else. Whether that class can carry a session guarantee at all is issue #1097, which also
-/// carries the correction that the ratified rationale for this asymmetry — "a low peer is the one
-/// in rotation" — is not true of it.
+/// nowhere else.
+///
+/// That the asymmetry is stated in the direction ABOVE, rather than as "a low peer is the one in
+/// rotation and was never blind", is issue #1097's correction: the ratified rationale claimed the
+/// latter, and it is false of this very class. Whether the class can carry a session guarantee of
+/// its own is DECIDED — `docs/adr/0033-weekly-saturated-session-low-stays-unknown.md`: it stays
+/// UNKNOWN. The candidate ("an account out of rotation on its weekly dimension is not being spent
+/// against, so its session cannot climb") is falsified on this corpus, and rotation state was never
+/// the blocker — `note_exhausted_poll` computes the verdict at poll time, and [`active_at`] already
+/// rebuilds an active-account timeline in this very module. Read the ADR before re-deriving any of
+/// it.
 ///
 /// # Why the WEEKLY reset is deliberately NOT consulted
 ///
@@ -3239,6 +3247,14 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
         // low-and-out-of-rotation peer is therefore a SEPARATE fact from #1030, not a shortfall
         // of it.
         //
+        // Issue #1097 asked whether THAT class could be rescued narrowly — an account out of
+        // rotation because its WEEKLY window is exhausted is not being spent against, the argument
+        // ran, so its session cannot climb and a low reading would be safe to extend for it alone.
+        // ADR-0033 decides against, and this test is where the decision is anchored rather than
+        // merely cited: the third assertion below drives that argument against the frozen corpus
+        // and finds it false. This test is the standing record the issue's acceptance names, so it
+        // must FAIL if someone implements the rescue — a paragraph would not.
+        //
         // So the assertion below is pinned to its real cause, and the movement that #1030 DID
         // produce on this same real corpus is pinned beside it — otherwise this file would carry
         // no evidence at all that the anchoring reaches live data, only synthetic proof.
@@ -3280,6 +3296,113 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
             "the set of accounts that never reach the census water changed — the corpus is frozen \
              INPUT, so this can only move if the fixture itself was edited, and if it did move the \
              UNKNOWN above is no longer explained by a weekly-only drain"
+        );
+
+        // #1097's candidate rescue, DRIVEN rather than argued — the assertion ADR-0033 rests on.
+        //
+        // The argument was: an account held out of rotation by its WEEKLY dimension is not being
+        // spent against, so its SESSION utilisation cannot climb, so a low session reading would
+        // be safe to extend for that class alone. It is an empirical claim, and this corpus is
+        // real data, so it is testable here instead of being weighed as an opinion.
+        //
+        // A pair qualifies when both readings sit at/above the daemon's own weekly ROTATION line
+        // (derived from the two real sources, never a literal, so it tracks a config change) AND
+        // both carry the SAME session_resets_at — which proves no reset intervened, so a rise is a
+        // rise WITHIN one session window rather than the start of a fresh one. A single such climb
+        // refutes "cannot climb"; magnitude is colour, so nothing here pins one.
+        let tunables = crate::config::Tunables::default();
+        let rotation_line =
+            crate::swap::weekly_effective_ceiling(f64::from(tunables.weekly_ceiling) / 100.0);
+        let widened = tunables.exhausted_poll_secs as i64;
+        let mut pinned_pairs = 0_u32;
+        // The same count restricted to the never-high population — the class the refutation is
+        // ABOUT, as opposed to any account that happens to be weekly-pinned.
+        let mut class_pairs = 0_u32;
+        let mut climbs: Vec<(&str, i64, i64, f64, f64)> = Vec::new();
+        for handle in REPLAY_ROSTER {
+            let group: Vec<&Sample> = samples.iter().filter(|s| s.acct == handle).collect();
+            for pair in group.windows(2) {
+                let (a, b) = (pair[0], pair[1]);
+                if a.weekly < rotation_line || b.weekly < rotation_line {
+                    continue;
+                }
+                if a.session_resets_at.is_none() || a.session_resets_at != b.session_resets_at {
+                    continue;
+                }
+                pinned_pairs += 1;
+                class_pairs += u32::from(never_high.contains(handle));
+                if b.session > a.session {
+                    climbs.push((
+                        handle,
+                        a.ts - CORPUS_START,
+                        b.ts - a.ts,
+                        a.session,
+                        b.session,
+                    ));
+                }
+            }
+        }
+        // Degenerate-subject guard: zero qualifying pairs would satisfy every claim below
+        // vacuously, and a mis-parsed reset column is exactly how that happens quietly.
+        assert!(
+            pinned_pairs > 0,
+            "no weekly-saturated reading pair shares a session window on this corpus, so the two \
+             assertions below would pass without witnessing anything. The corpus is frozen INPUT — \
+             suspect the session_resets_at column or the rotation line ({rotation_line})"
+        );
+        assert!(
+            !climbs.is_empty(),
+            "no weekly-saturated peer's session utilisation climbs within one session window on \
+             this corpus ({pinned_pairs} qualifying pairs examined). That would make #1097's \
+             candidate guarantee — an out-of-rotation peer is not spent against, so its session \
+             cannot climb — consistent with real data for the first time, and ADR-0033 rejected it \
+             precisely because it was not. Re-open ADR-0033 rather than deleting this assertion"
+        );
+        // The sharp case: the same climb on a peer PROVABLY on the widened cadence, which is the
+        // #1097 population exactly — low session, saturated weekly, hourly-polled. This is what
+        // makes the refutation about the class in question rather than about a busy account that
+        // happens to be weekly-pinned.
+        assert!(
+            climbs
+                .iter()
+                .any(|&(handle, _, gap, ..)| gap >= widened && never_high.contains(handle)),
+            "the weekly-saturated session climbs on this corpus are all on densely-polled accounts \
+             — none is on a peer that never reaches the water AND was polled at least \
+             {widened} s apart. The #1097 class would then be un-refuted by this fixture even \
+             though the general claim still fails. Climbs seen (acct, ts_off, gap_s, from, to): \
+             {climbs:?}"
+        );
+
+        // The two cardinals the written record quotes, PINNED rather than merely derived. Existence
+        // is what refutes the guarantee, so the assertions above are the load-bearing ones; these
+        // exist because ADR-0033, the spec's Rule 3 and the design's § D-I all quote these counts in
+        // prose, and prose cannot notice when the thing it describes moves. Both are functions of a
+        // frozen fixture and a config default, so neither can drift on its own — and if one does,
+        // reddening here is the intended outcome: it means the RECORD is now wrong and must be
+        // re-derived, not that the census regressed. The file already pins frozen-corpus figures
+        // this way (see the 74_961 / 75_213 hold-time gate above), so this is the house treatment
+        // rather than a new coupling.
+        let class_climbs = climbs
+            .iter()
+            .filter(|&&(handle, ..)| never_high.contains(handle))
+            .count();
+        assert_eq!(
+            (
+                pinned_pairs as usize,
+                climbs.len(),
+                class_pairs as usize,
+                class_climbs
+            ),
+            (274, 17, 28, 3),
+            "the weekly-pinned same-session-window census over the frozen corpus moved. Order is \
+             (roster-wide pairs, roster-wide climbs, class-only pairs, class-only climbs), where \
+             `class` is the never-high population this refutation is ABOUT. These four numbers are \
+             quoted verbatim in docs/adr/0033-weekly-saturated-session-low-stays-unknown.md, \
+             docs/specs/census-validity-anchoring.feature.md Rule 3 and the design doc's § D-I. \
+             The corpus is frozen INPUT and the rotation line ({rotation_line}) comes from \
+             config::Tunables::default(), so only a fixture edit or a weekly_ceiling change can \
+             move them — update those three documents to whatever this now reports, and check that \
+             the refutation still holds at all before doing so"
         );
 
         // #1030's real-data witness. The anchoring cannot rescue the 6-fold intersection here, but
