@@ -3240,6 +3240,12 @@ fn col_runway() -> Column {
 }
 /// `trend` — the per-bucket session-peak sparkline (the TTY surface); sheds second under a narrow
 /// terminal (a populated rate out-informs the sparkline).
+///
+/// The one droppable column whose gap is BLANK rather than the `—` every other producer spells:
+/// one break (a space, [`spark_glyph`]) per all-gap bucket, or the empty string when there are no
+/// buckets. [`render_account_table`]'s elision pre-pass reads a blank cell as a gap for exactly
+/// that reason (issue #815) — keep this cell blank; do NOT teach it the sentinel, which would
+/// restate a gap the sparkline already spells and would do so per ROW.
 fn col_trend() -> Column {
     Column {
         header: "trend",
@@ -3421,7 +3427,31 @@ fn render_account_table(
     // (issue #934) cannot break that: the gap is never bracketed. `signal` / `velocity` / `runway`
     // still spell the sentinel inline; `the_gap_sentinel_is_one_string_across_every_producer` pins
     // all of them equal, so this retain speaks for every droppable column, not just `expiry`.
-    cols.retain(|c| c.priority.is_none() || c.cells.iter().any(|s| s != EXPIRY_GAP));
+    //
+    // A cell carrying NO VISIBLE MARK is a gap too (issue #815). The sentinel is the EXPLICIT
+    // spelling of "nothing measured here"; a blank cell says the same thing, and used to survive
+    // this retain — `render_line` trims the trailing pad, so the reader got a bare header with
+    // nothing under it at any row and reasonably inferred the data exists. [`col_trend`] is the
+    // reachable producer and it spells the blank TWO ways: the EMPTY string when the report has no
+    // series buckets at all, and one break per bucket — a SPACE, see `spark_glyph` — when every
+    // bucket is a gap. Only the second is reachable from `build_report`, whose `bucket_bounds`
+    // yields no buckets only for an empty window; the first is what the `stats-all-na` fixture
+    // holds. Trimming catches both, so the contract stays ONE rule rather than a list of spellings
+    // the next droppable column would have to be added to.
+    //
+    // Rejected: emitting the sentinel from [`col_trend`] when its series is empty, so this
+    // predicate could fire unchanged. It repairs the PRODUCER, not the CONTRACT — every other
+    // droppable column keeps the asymmetry — and it is the LARGER semantic claim, not the smaller
+    // one: a break IS this column's honest rendering of a gap (issue #159), so `—` would restate
+    // "unmeasured" in a vocabulary that already has a word for it, and would do so per ROW,
+    // rewriting the cell of a single all-gap account inside an otherwise populated fleet. That row
+    // is not this defect: its column has marks in it and must stay.
+    cols.retain(|c| {
+        c.priority.is_none()
+            || c.cells
+                .iter()
+                .any(|s| !s.trim().is_empty() && s != EXPIRY_GAP)
+    });
     while table_width(&cols) > w {
         match cols.iter().filter_map(|c| c.priority).min() {
             Some(p) => cols.retain(|c| c.priority != Some(p)),
@@ -4389,13 +4419,14 @@ mod tests {
         // the two former hand-built layouts — is caught. `aa` carries a velocity overlay AND an
         // expiry one (issue #883) so nothing elides and the full declared subsets render; the TTY
         // renders wide so nothing drops.
-        let mut r = charts_report(
-            &[
-                ("aa", stat(3, ds(0.30, 0.90, 0.85), 0.40, 0.60)),
-                ("bb", stat(3, ds(0.10, 0.15, 0.12), 0.20, 0.40)),
-            ],
-            &[],
-        );
+        //
+        // The SERIES bucket is load-bearing for that "nothing elides" premise (issue #815). This
+        // fixture used to pass `&[]`, so `trend` reached the header row with no cell under it at
+        // any row — the assertion below read as "the full subset renders" while the column it was
+        // counting was the reported defect. One populated bucket makes the premise true.
+        let aa = stat(3, ds(0.30, 0.90, 0.85), 0.40, 0.60);
+        let bb = stat(3, ds(0.10, 0.15, 0.12), 0.20, 0.40);
+        let mut r = charts_report(&[("aa", aa), ("bb", bb)], &[&[("aa", aa), ("bb", bb)]]);
         r.velocity.insert(
             "aa".to_string(),
             AccountVelocity {
@@ -4661,6 +4692,111 @@ mod tests {
         assert!(
             text.contains('—'),
             "beta's missing datum is an explicit gap, not a fabricated 0: {text}"
+        );
+    }
+
+    // --- AC (issue #815): a BLANK cell is a gap for elision, in BOTH its spellings -----
+
+    /// The chart table's header words at a width nothing sheds at, so a missing column is the
+    /// EMPTY-COLUMN ELISION and never the priority drop. Read off the rendered header line —
+    /// the layout the reader actually gets — rather than a hand-built column list, so the
+    /// assertion exercises the real pre-pass in [`render_account_table`].
+    fn elided_wide_header(r: &Report) -> Vec<String> {
+        render_chart_table(r, &keys(r), 200, false, false)
+            .lines()
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The `stats-all-na` shape — every account present but never observed (`seen == 0`) — over
+    /// `buckets` series buckets. It is the shape that spells an all-blank `trend`, and the bucket
+    /// count picks WHICH spelling: `0` renders the EMPTY string (no bucket to draw), any other
+    /// count renders that many BREAKS, one space each ([`spark_glyph`]), because an unobserved
+    /// account is a gap in every bucket. Both render identically — `render_line` trims the pad —
+    /// and before issue #815 both kept the column. The bucket-bearing shape is the reachable one:
+    /// [`bucket_bounds`] yields no buckets only for an empty window.
+    fn all_unobserved_charts(buckets: usize) -> Report {
+        let unseen = stat(0, ds(0.0, 0.0, 0.0), 0.0, 0.0);
+        let bucket: &[(&str, AccountStats)] = &[("alpha", unseen), ("beta", unseen)];
+        charts_report(bucket, &vec![bucket; buckets])
+    }
+
+    #[test]
+    fn an_all_blank_optional_column_elides_in_both_spellings_of_blank() {
+        for buckets in [0usize, 1, 4] {
+            let r = all_unobserved_charts(buckets);
+            let header = elided_wide_header(&r);
+            assert!(
+                !header.contains(&"trend".to_string()),
+                "at {buckets} bucket(s) the all-blank `trend` column elides rather than heading \
+                 an empty space: {header:?}"
+            );
+            // The header row is the whole claim: before #815 `trend` sat here with no cell under
+            // it at ANY row, so the render asserted trend data the report does not hold.
+            let out = render_chart_table(&r, &keys(&r), 200, false, false);
+            assert!(
+                !out.contains("trend"),
+                "and it is gone from the render, not merely from the split: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn elision_keeps_a_column_with_any_mark_and_never_touches_the_floor() {
+        // The negative half. Without it a blanket `retain(|_| false)` would pass the test above.
+        let r = all_unobserved_charts(2);
+        let header = elided_wide_header(&r);
+        // FLOOR (`priority: None`): kept even though every `signal` cell is the gap sentinel and
+        // every `session` / `weekly` cell a zero. An unmeasured roster is unmeasured, not absent.
+        assert_eq!(
+            signal_cell(&stat(0, ds(0.0, 0.0, 0.0), 0.0, 0.0)),
+            EXPIRY_GAP,
+            "the premise: this fixture's `signal` column IS uniformly the sentinel"
+        );
+        assert_eq!(
+            header,
+            ["account", "signal", "session", "weekly"],
+            "the `account · signal · session` floor survives an all-gap roster, and `weekly` \
+             (droppable, `Some(5)`) survives on its own `0%` marks — only the blank and the \
+             all-sentinel droppables go"
+        );
+
+        // A single mark anywhere in the column keeps it — `beta` stays blank in every bucket, and
+        // that per-ROW blank is NOT this defect. This is `stats-sparse-fleet`'s `delta` shape.
+        let alpha = stat(4, ds(0.50, 0.99, 0.80), 0.40, 0.75);
+        let unseen = stat(0, ds(0.0, 0.0, 0.0), 0.0, 0.0);
+        let mixed = charts_report(
+            &[("alpha", alpha), ("beta", unseen)],
+            &[&[("alpha", alpha), ("beta", unseen)]],
+        );
+        assert!(
+            elided_wide_header(&mixed).contains(&"trend".to_string()),
+            "one populated sparkline keeps the column for the whole cohort"
+        );
+        let rows = render_chart_table(&mixed, &keys(&mixed), 200, false, false);
+        assert!(
+            rows.lines()
+                .any(|l| l.starts_with("beta") && !l.contains('█')),
+            "and `beta`'s own cell stays blank — no sentinel is invented for it: {rows}"
+        );
+    }
+
+    #[test]
+    fn a_uniformly_sentinel_column_still_elides() {
+        // The pre-existing contract issue #815 must not regress: `velocity` / `runway` spell the
+        // gap `—`, not blank, and an all-`—` droppable column elides on that string alone.
+        let sparse = two_account_charts(); // populated sparklines, no velocity overlay
+        let header = elided_wide_header(&sparse);
+        assert!(
+            header.contains(&"trend".to_string()),
+            "the fixture's premise: `trend` is populated here, so only the sentinel is on trial"
+        );
+        assert!(
+            !header.contains(&"velocity".to_string()) && !header.contains(&"runway".to_string()),
+            "an all-sentinel droppable column elides exactly as before: {header:?}"
         );
     }
 
@@ -5029,7 +5165,17 @@ mod tests {
         let out = render_charts(&all_gap, 80, false, false, None);
         assert!(
             out.contains("ghost"),
-            "an all-gap account still lists, its trend all breaks"
+            "an all-gap account still lists — its own row survives even though every column that \
+             could have charted it has nothing to say"
+        );
+        // Its trend is all breaks, and it is the ONLY account, so the whole column is blank and
+        // elides (issue #815) rather than heading an empty space. Pinned here because this is the
+        // one PRE-EXISTING fixture in the file whose blank `trend` is spelled in BREAKS rather
+        // than the empty string — the reachable spelling. The helper `all_unobserved_charts` this
+        // change adds spells it that way too, at 1 and 4 buckets.
+        assert!(
+            !out.contains("trend"),
+            "the all-break `trend` column elides on a one-account all-gap fleet: {out}"
         );
         // A pathological width of 0 must not panic either.
         let _ = render_charts(&two_account_charts(), 0, true, true, None);
@@ -9381,6 +9527,12 @@ mod tests {
         /// `signal` stays and renders a full column of the gap sentinel `—`. A keep-column is
         /// never elided even when every one of its cells is a gap — the roster is unmeasured,
         /// not absent, and the render must say so rather than quietly narrowing to look tidy.
+        ///
+        /// `trend` vanishes with them since issue #815. It is the golden that REPORTED that
+        /// defect: `series` is empty here, so every trend cell is the empty string, and the
+        /// pre-pass used to keep the column on the technicality that empty is not the sentinel —
+        /// leaving a `trend` header with no cell under it at any row. The predicate now reads any
+        /// cell with no visible mark as a gap, so this fixture pins the header WITHOUT it.
         ///
         /// The footer says so too: with no account observed, no instant had the whole roster
         /// covered, so the all-accounts-high census renders `—` rather than a fabricated `0
