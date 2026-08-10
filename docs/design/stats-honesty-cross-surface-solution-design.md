@@ -193,19 +193,26 @@ D-C and D-D. Rebaselines panel goldens → `Panel-Goldens-Rebaselined:` trailer.
 **Decision**: mirror `blocked_windows()`'s anchoring in the census path — extend a reading's validity
 to its **own carried expiry** where it carries one, exactly as REQ-STA-B-010 ratified for holds.
 
-**Asymmetry is intended**: a saturated peer carries `session_resets_at` (the blind case); a low peer
-carries no equivalent guarantee but is in rotation and polled every `poll_secs`, so it was never blind.
-Coverage extends exactly where it was lost.
+**Asymmetry is intended**, and it runs in the direction the guarantee does: session utilisation only
+climbs within a window, so a saturated peer's `session_resets_at` makes its reading true until that
+instant, while a low reading can cross the water at any moment and carries no equivalent. Coverage
+extends exactly as far as a reading's own statement reaches, and no further.
 
-> ⚠ **The second clause of that rationale is contradicted by the frozen replay corpus — see #1097.**
-> A peer can be session-low *and* polled on the widened exhausted cadence simultaneously, held out
-> of rotation by its **weekly** dimension: `a4`/`a5`/`a6` in `build/fixtures/capacity-replay-corpus.tsv`
-> carry 44 / 44 / 43 readings across 172 800 s at session peaks 0.03 / 0.15 / 0.00 — low **and**
-> ~7.6 % covered. The decision stands on the physics recorded in `high_windows`'s own doc (only a
-> high reading carries a guarantee that survives to its reset); the "never blind" justification for
-> it does not. Whether that class can carry a session guarantee is #1097, and it is the spec
-> author's call. Marked in-band so this section is not read as ratifying the premise, and mirrored
-> at `docs/specs/census-validity-anchoring.feature.md` Rule 3 and
+> **Rationale corrected by #1097 (2026-08-10); the decision is unchanged.** This section previously
+> justified the asymmetry with a second clause — *a low peer "is in rotation and polled every
+> `poll_secs`, so it was never blind"* — that the frozen replay corpus contradicts. A peer can be
+> session-low *and* polled on the widened exhausted cadence simultaneously, held out of rotation by
+> its **weekly** dimension: `a4`/`a5`/`a6` in `build/fixtures/capacity-replay-corpus.tsv` carry
+> 44 / 44 / 43 readings across 172 800 s at session peaks 0.03 / 0.15 / 0.00 — low **and** ~7.6 %
+> covered. Whether that class can carry a session guarantee of its own is **decided** by
+> **ADR-0033**: it stays UNKNOWN, because the candidate guarantee is falsified on the same corpus
+> — 17 of 274 weekly-pinned same-session-window pairs show session climbing across the whole roster,
+> and, restricted to this class alone, **3 of 28** on `a4`/`a5`/`a6`, every one of them across a
+> widened-cadence gap: `a5` climbs 0.05 → 0.15 over 4109 s at weekly 0.99 → 1.00. The roster-wide
+> figure is the wider population, so read the class-restricted one as the refutation — and because
+> anchoring low readings buys a measured 1.61 % of joint coverage for an assertion of
+> known-and-not-high over ~55 pp of unobserved window per starved peer. Mirrored at
+> `docs/specs/census-validity-anchoring.feature.md` Rule 3 and
 > `docs/requirements/stats-honesty-cross-surface.md` § R-18.
 
 **Invariants that must survive**: UNKNOWN is refined, never repealed — a genuinely dead daemon still

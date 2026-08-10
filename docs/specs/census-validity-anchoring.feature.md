@@ -2,7 +2,7 @@
 
 Issue #1030 · PRD R-18 / R-19 · design D-D
 
-Example Mapping: 🟦 5 rules · 🟩 10 examples · 🟥 0 open
+Example Mapping: 🟦 5 rules · 🟩 11 examples · 🟥 0 open
 
 > This is the item that re-sized the appetite, because it is the one that is *algorithmic* rather
 > than a render fix. #1029 stops the panel fabricating a zero — necessary, and the honest render.
@@ -92,29 +92,45 @@ Scenario: the extension is bounded by the reporting period
 
 ## Rule 3 — the asymmetry is intended, and is stated
 
-> ⚠ **The rationale below is contradicted on this repo's own corpus — see #1097.** The rule stands;
-> its *reason* does not. "The low peer is the one IN rotation, polled at the normal cadence" is not
-> true of half the roster in `build/fixtures/capacity-replay-corpus.tsv`: `a4`/`a5`/`a6` are
-> session-**low** and polled on the **widened** exhausted cadence at the same time, held out of
-> rotation by their weekly dimension — 44 / 44 / 43 readings across 172 800 s at session peaks of
-> 0.03 / 0.15 / 0.00, about 7.6 % coverage each. So a low peer can be exactly as sparsely polled as
-> a saturated one, and that population is what pins that corpus's census at UNKNOWN.
+> **Rationale corrected by #1097; the rule is unchanged.** This rule previously justified the
+> asymmetry with *"the low peer is the one IN rotation, polled at the normal cadence — its coverage
+> was never the problem."* That is false for half the roster in
+> `build/fixtures/capacity-replay-corpus.tsv`: `a4`/`a5`/`a6` are session-**low** and polled on the
+> **widened** exhausted cadence at the same time, held out of rotation by their weekly dimension —
+> 44 / 44 / 43 readings across 172 800 s at session peaks of 0.03 / 0.15 / 0.00, about 7.6 %
+> coverage each. A low peer can be exactly as sparsely polled as a saturated one, and that
+> population is what pins that corpus's census at UNKNOWN. The asymmetry's real justification is the
+> DIRECTION the guarantee runs in, which is what the scenarios below now state.
 >
-> The asymmetry is still right on the physics stated in the code — session utilisation only climbs
-> within a window, so only a high reading carries a guarantee that survives to its reset. Whether
-> the low-and-out-of-rotation class can carry a session guarantee at all is #1097's question, and
-> it is the spec author's call, not the implementer's. Marked here rather than only in #1097 so a
-> reader of this file alone does not take the premise as ratified.
+> Whether that class can carry a session guarantee of its own is **settled, not open**:
+> **ADR-0033** decides it stays UNKNOWN. The candidate — an account out of rotation on its weekly
+> dimension is not being spent against, so its session cannot climb — is contradicted by the same
+> corpus, and carriability was never the blocker. Do not reopen it here.
 
 ```gherkin
 Scenario: only readings that carry a guarantee are extended
-  Given a low-utilisation account in rotation, polled every poll_secs
+  Given a low-utilisation account, whatever cadence it is polled on
    When its validity window is computed
    Then it receives no extension
-    # A saturated peer carries session_resets_at; a low peer carries no equivalent. But the low peer
-    # is the one IN rotation, polled at the normal cadence — its coverage was never the problem.
-    # R-18 extends coverage exactly where coverage is lost, and nowhere else. The asymmetry is not
-    # an oversight to be tidied up later.
+    # A saturated peer carries session_resets_at; a low peer carries no equivalent. The asymmetry
+    # runs in the direction the guarantee does: session utilisation only climbs within a window, so
+    # a reading at/above the water stays true until its reset, while a low one can cross the water
+    # at any instant. Extending it would assert known-and-not-high over time nobody observed. The
+    # asymmetry is not an oversight to be tidied up later, and it is NOT a claim about rotation.
+
+Scenario: a low peer on the widened cadence is left UNKNOWN rather than interpolated
+  Given an account held out of rotation by its WEEKLY dimension
+    And it is polled on the widened exhausted cadence
+    And its session reading is below the water and carries a session_resets_at
+   When the census computes that reading's validity window
+   Then it receives no extension, and the time beyond the cadence horizon stays UNKNOWN
+    # The class #1097 raised, decided by ADR-0033. This is where the census genuinely loses coverage
+    # — it is the whole reason the replay corpus reports UNKNOWN — so the refusal is a cost being
+    # paid, not a case nobody thought about. The tempting narrow fix is to carry rotation state and
+    # extend on the argument that an out-of-rotation peer is not being spent against. Measured, that
+    # argument is false: 17 of 274 weekly-pinned consecutive pairs sharing one session window show
+    # session CLIMBING, `a5` by 0.05 -> 0.15 across a single 4109 s widened-cadence gap. Asserted by
+    # on_the_replay_corpus_the_utilisation_census_is_unknown_because_the_drain_was_weekly.
 ```
 
 ## Rule 4 — the existing invariant survives, extended rather than replaced
