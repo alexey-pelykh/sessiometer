@@ -1475,7 +1475,26 @@ mod tests {
         u32,
         String,
     ) {
-        let config = config_ab();
+        run_on(config_ab(), cache, query, force, in_cooldown, probe).await
+    }
+
+    /// [`run_with`] over a caller-supplied `config` rather than the shared [`config_ab`]
+    /// fixture — for the one case whose subject IS the roster's shape (a duplicated label,
+    /// issue #1087), which the fixture cannot express.
+    async fn run_on(
+        config: Config,
+        cache: &FakeCache,
+        query: &str,
+        force: bool,
+        in_cooldown: bool,
+        probe: Probe,
+    ) -> (
+        Result<()>,
+        FakeCredentialStore,
+        FakeAccountStash,
+        u32,
+        String,
+    ) {
         let (store, stash) = seeded_store_and_stash().await;
         let (_json_dir, json) = claude_json_for("u-A");
         let log_dir = tempfile::tempdir().unwrap();
@@ -2481,6 +2500,41 @@ mod tests {
             calls, 0,
             "an unresolvable target is rejected before any poll"
         );
+        assert!(!log.contains("event=swap"), "log: {log}");
+    }
+
+    #[tokio::test]
+    async fn ambiguous_target_aborts_with_zero_writes() {
+        // The `ambiguous` half this section's heading has always named and never had (issue
+        // #1087). Its sibling above covers not-found; nothing covered a DUPLICATED label through
+        // `run_use`, and the two are not the same claim — `UseTargetNotFound` resolves to nothing
+        // so there is nothing a swallow could pick, whereas an ambiguous query has two perfectly
+        // usable bearers sitting right there. A `resolve_target(…).unwrap_or(0)` here would swap
+        // the operator onto the earliest bearer of a label they did not disambiguate, which is
+        // exactly the first-match-wins harm OQ-1 removed from `enable`/`disable`/`remove`, and
+        // `resolve_target`'s own test cannot see it: the resolver would still be refusing.
+        let mut config = config_ab();
+        config.roster.push(acct("spare", "u-C"));
+        let (result, store, _stash, calls, log) = run_on(
+            config,
+            &FakeCache::miss(),
+            "spare",
+            false,
+            false,
+            Probe::Live { weekly: 0.10 },
+        )
+        .await;
+        assert!(
+            matches!(result, Err(Error::UseTargetAmbiguous { count: 2, ref query }) if query == "spare"),
+            "a duplicated label must refuse, not resolve to one of its bearers: got {result:?}"
+        );
+        assert_eq!(
+            result.unwrap_err().exit_code(),
+            6,
+            "an ambiguous target exits 6, where not-found exits 5"
+        );
+        assert_eq!(canonical(&store).await, b"A-token", "ZERO writes");
+        assert_eq!(calls, 0, "an ambiguous target is rejected before any poll");
         assert!(!log.contains("event=swap"), "log: {log}");
     }
 
