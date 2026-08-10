@@ -420,15 +420,17 @@ default and run only in the **non-required** `panel-goldens` CI job:
 bytes — which is why the suite normalizes both sides into one sRGB/RGBA8 buffer. `NSBitmapImageRep`'s PNG
 encoder is byte-stable for a given OS + Xcode but not across versions, so re-blessing on a newer machine
 can produce a diff with no visible change. Measured instance: the committed `renders/panel-healthy-*.png`
-oracle (rendered on an older toolchain) has different bytes from a fresh render and **0.000000** pixel
-drift. Do not read "the PNG changed" as "the panel changed"; the gate's own verdict is the answer.
+oracle, back when it had been rendered on an older toolchain, differed in bytes from a fresh render at
+**0.000000** pixel drift. Do not read "the PNG changed" as "the panel changed"; the gate's own verdict is
+the answer.
 
 **On THIS toolchain the goldens are byte-reproducible, and that is deliberate.** Two independent
 `SESSIOMETER_PANEL_GOLDENS=update` runs produce byte-identical files, and the app's own `--render-panel`
-output was byte-identical to all 44 goldens when that was measured. Six of the 44 no longer match it,
-by at most 1/255 — those six were blessed from cold rasters before #824 and the fresh renders are now
-settled, so the *goldens* are the stale side. Nothing fails (the drift metric is blind to ±1) and they
-are deliberately not re-blessed here; issue #1129 carries that as its own decision. It did not start out
+output is byte-identical to all 44 goldens. Six of them stopped matching when #824 landed: blessed from
+cold rasters, they held pixels a settled render no longer produces, so the *goldens* were the stale side.
+Nothing failed (the drift metric is blind to ±1), so issue #1129 re-blessed those six on a commit of
+their own rather than let the next real design change carry them — they moved by at most 1/255, on
+antialiased edges only, with alpha, dimensions and every panel state unchanged. It did not start out
 that way: the first renders in a process
 disagree with the steady state by ±1/255 on ~0.03 % of bytes — the rasterizer's start-up transient, found
 by rendering one fixture six times (renders 0–1 agree with each other, renders 2–5 agree with each other,
