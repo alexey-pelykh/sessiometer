@@ -301,25 +301,22 @@ final class PanelInteractionStateTests: XCTestCase {
         return try XCTUnwrap(PanelRaster.normalize(cg), "raster did not normalize")
     }
 
-    /// Render until two consecutive rasters agree to the BYTE — the #760 control for the ±1/255 cold-raster
-    /// settle issue #824 describes. Loosening a threshold to absorb that drift instead is exactly what
-    /// issue #824 asks callers not to do, so this settles the input rather than blunting the predicate.
+    /// A row render settled to the BYTE before it is compared — the #760 control for the ±1/255 cold-raster
+    /// drift issue #824 describes.
     ///
-    /// This is the third copy of the loop (`PanelAppearanceVariantTests` and `PanelRenderHarness`'s
-    /// `warmUpIfNeeded()` hold the others). Consolidating onto `PanelRaster` is issue #911 — it would mean
-    /// editing two files outside this item, so it is tracked rather than done here.
-    private func stableRender(_ view: some View) throws -> PanelRaster {
-        var previous: PanelRaster?
-        for _ in 0..<8 {
-            let current = try render(view)
-            if let previous, PanelRaster.byteDelta(previous, current).differing == 0 { return current }
-            previous = current
-        }
-        XCTFail("a row never rasterized the same way twice in 8 attempts, so no comparison of it can mean "
-                + "anything. Expected the ±1/255 cold-raster settle issue #824 describes; a cell that never "
-                + "settles is a bigger finding than #824 and belongs there, NOT absorbed by relaxing this "
-                + "suite's predicate")
-        return try XCTUnwrap(previous, "no raster at all")
+    /// The loop, its bound, its predicate and the reasoning for NOT absorbing that drift into a looser
+    /// threshold moved onto `PanelRaster.settled` at issue #911, taking this file's copy of that prose with
+    /// them: it was one of three near-verbatim copies, and three homes is three places for it to drift
+    /// silently, since a copy that quietly relaxes its bound still passes. Read it there;
+    /// `PanelGoldenParityTests.testSettledLoopsUntilTwoConsecutiveRastersAgree` and
+    /// `PanelGoldenParityTests.testSettledThrowsAndNamesItsCallerRatherThanReturningAnUnsettledRaster` prove
+    /// the shared loop genuinely iterates and genuinely throws. `PanelRenderHarness`'s
+    /// `warmUpIfNeeded()` deliberately keeps its own: it ships in the app target, where `PanelRaster` does
+    /// not exist. What stays here is the SUBJECT label a failure names; `file`/`line` default at the caller,
+    /// so a red points at the test that drifted rather than at this wrapper.
+    private func stableRender(_ view: some View,
+                              file: StaticString = #filePath, line: UInt = #line) throws -> PanelRaster {
+        try PanelRaster.settled("a row", file: file, line: line) { try render(view) }
     }
 
     /// The ONE magnitude predicate every assertion, every canary and every control in this file routes

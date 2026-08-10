@@ -652,6 +652,106 @@ final class PanelGoldenParityTests: XCTestCase {
         }
     }
 
+    // MARK: - CANARY: `PanelRaster.settled` genuinely LOOPS and genuinely THROWS
+
+    // Proof that the settle loop issue #911 consolidated is not vacuous. A `settled` that returned its
+    // producer's FIRST raster unconditionally silently reinstates the exact #824 confound the helper exists
+    // to remove, and the consumer suites catch it only when the rasterizer happens to be COLD — the renders
+    // they compare are already stable most of the time. MEASURED under exactly that mutation, each suite run
+    // alone in a fresh process: `PanelAppearanceVariantTests` reds ONE of its seven —
+    // `testTheIncreasedContrastAppearanceDoesNotReachThePanelRender`, at 849 bytes against its expected 0 —
+    // and `PanelInteractionStateTests` stays fully green at eleven of eleven. So the coverage is one
+    // conditional catch, not a gate; worse, the one red MISREPORTS the defect, since that pin reads a
+    // non-zero delta as "the increased-contrast axis became reachable". That is the same always-green shape
+    // issue #918 closed elsewhere,
+    // and consolidating three copies into one is only a win if the one copy is HARDER to relax than the
+    // three were. So the loop is driven directly, by a stub producer whose output sequence is chosen rather
+    // than rendered.
+    //
+    // Pure in-memory rasters, no `ImageRenderer` → same-run, cross-machine immune, runs in the required job.
+    func testSettledLoopsUntilTwoConsecutiveRastersAgree() throws {
+        // A, B, C, C — the settled value is the FOURTH raster and is NOT the first, so an implementation
+        // that skips the loop is caught by both the call count and the returned bytes.
+        let sequence = [Self.stubRaster(1), Self.stubRaster(2), Self.stubRaster(3), Self.stubRaster(3)]
+        var calls = 0
+        let settled = try PanelRaster.settled("the #911 loop canary") {
+            defer { calls += 1 }
+            return sequence[min(calls, sequence.count - 1)]
+        }
+        XCTAssertEqual(calls, 4,
+                       "`settled` called its producer \(calls) time(s) for a sequence that first agrees on "
+                       + "the fourth — it is not looping until two consecutive rasters match, so the #824 "
+                       + "cold-raster confound it exists to remove is back and invisible")
+        XCTAssertEqual(settled.bytes, sequence[3].bytes,
+                       "`settled` returned a raster other than the SETTLED one — the steady render is what "
+                       + "callers compare, and returning any other attempt reinstates the confound")
+        XCTAssertNotEqual(settled.bytes, sequence[0].bytes,
+                          "`settled` handed back its producer's FIRST raster — that removes the control "
+                          + "entirely, and the consumer suites only catch it on a cold rasterizer")
+
+        // …and even a producer that is stable from the outset is called TWICE: agreement is what returns,
+        // never the mere fact that a raster was produced.
+        var stableCalls = 0
+        let stable = Self.stubRaster(9)
+        let immediate = try PanelRaster.settled("the #911 already-stable canary") {
+            stableCalls += 1
+            return stable
+        }
+        XCTAssertEqual(stableCalls, 2,
+                       "a producer that never drifts was called \(stableCalls) time(s) — `settled` must "
+                       + "observe AGREEMENT between two consecutive rasters, not return the first one it got")
+        XCTAssertEqual(immediate.bytes, stable.bytes, "the settled raster is not the one the stub produced")
+    }
+
+    // The other direction, and the one that keeps the reasoning from drifting: a producer that NEVER settles
+    // must throw rather than hand back its last cold attempt, and the thrown message must still name WHICH
+    // caller drifted (one helper now serves several suites) and still carry the #824 reasoning for not
+    // absorbing the drift into a looser threshold. Asserting on that message is what makes a quiet softening
+    // of it a RED test instead of an unreviewed comment edit.
+    func testSettledThrowsAndNamesItsCallerRatherThanReturningAnUnsettledRaster() throws {
+        var calls = 0
+        var thrown: Error?
+        XCTAssertThrowsError(try PanelRaster.settled("the #911 never-settles canary") {
+            defer { calls += 1 }
+            return Self.stubRaster(UInt8(calls))   // every attempt differs from the one before it
+        }, "a producer that never repeats itself returned normally — `settled` handed a caller an UNSETTLED "
+           + "raster, which is exactly the cold-raster comparison issue #824 says means nothing") {
+            thrown = $0
+        }
+        XCTAssertEqual(calls, 8,
+                       "`settled` made \(calls) attempt(s) before giving up — the bound is 8, the same bound "
+                       + "the three copies #911 consolidated all carried")
+
+        let message = String(describing: try XCTUnwrap(thrown, "no error was captured"))
+        XCTAssertTrue(message.contains("the #911 never-settles canary"),
+                      "the failure does not name its caller: \(message). One shared helper serving several "
+                      + "suites must still say WHICH surface drifted, or a red tells you nothing about where")
+        XCTAssertTrue(message.contains("PanelGoldenParityTests.swift"),
+                      "the failure does not name the call SITE: \(message). `file`/`line` default at the "
+                      + "caller so a red points at the test that drifted, not at the wrapper it went through")
+        for fragment in ["#824", "NOT absorbed by relaxing"] {
+            XCTAssertTrue(message.contains(fragment),
+                          "the failure no longer carries '\(fragment)': \(message). That reasoning is the "
+                          + "whole reason #911 consolidated these copies — losing it from the one remaining "
+                          + "home is the silent drift the consolidation was meant to make impossible")
+        }
+
+        // The bound is a parameter, not a constant baked into the loop.
+        var boundedCalls = 0
+        XCTAssertThrowsError(try PanelRaster.settled("the #911 attempt-bound canary", attempts: 3) {
+            defer { boundedCalls += 1 }
+            return Self.stubRaster(UInt8(boundedCalls))
+        })
+        XCTAssertEqual(boundedCalls, 3, "`attempts:` did not bound the loop — got \(boundedCalls) attempt(s)")
+    }
+
+    /// A 1×1 opaque raster keyed by `seed` — distinct seeds give rasters `byteDelta` reports as differing,
+    /// equal seeds give ones it reports as identical. Deliberately synthetic: the canaries above are about
+    /// the LOOP, and driving them through a real render would make what the producer returns unchooseable.
+    private static func stubRaster(_ seed: UInt8) -> PanelRaster {
+        PanelRaster(width: 1, height: 1, bytes: [seed, seed, seed, 255])
+    }
+
     // MARK: - CANARY: the STRESS goldens can FAIL (semantic mutation, same predicate)
 
     // The three canaries above prove the METRIC can fire. None of them proves anything about the four
@@ -1239,6 +1339,98 @@ struct PanelRaster {
             }
         }
         return Double(ink) / Double(raster.width * raster.height)
+    }
+
+    // MARK: Settling
+
+    /// Thrown by `settled` when a producer never reaches a steady state inside its attempt bound.
+    ///
+    /// The message carries the whole reason NOT to relax a predicate to absorb the drift, so that reasoning
+    /// travels WITH the failure rather than living only in a comment a later edit can quietly soften — and it
+    /// names the CALLER, because one helper serving several suites must still say which surface drifted.
+    /// `testSettledThrowsAndNamesItsCallerRatherThanReturningAnUnsettledRaster` asserts both halves, so
+    /// neither can be dropped silently.
+    struct NeverSettled: Error, CustomStringConvertible, LocalizedError {
+        let subject: String
+        let attempts: Int
+        let file: StaticString
+        let line: UInt
+
+        var description: String {
+            let path = String(describing: file)
+            let site = path.split(separator: "/").last.map(String.init) ?? path
+            return "\(subject) (\(site):\(line)) never rasterized the same way twice in \(attempts) attempts, "
+                + "so no comparison of it can mean anything. Expected the ±1/255 cold-raster settle issue "
+                + "#824 describes; a cell that never settles is a bigger finding than #824 and should be "
+                + "diagnosed there, NOT absorbed by relaxing this suite's predicate"
+        }
+
+        var errorDescription: String? { description }
+    }
+
+    /// A render proven REPRODUCIBLE in this process before it is compared at byte granularity.
+    ///
+    /// THE ONE COPY (issue #911). This loop — its `0..<8` bound, its `byteDelta(...).differing == 0`
+    /// predicate, and above all the reasoning below — existed in three near-verbatim copies, which is three
+    /// places for that reasoning to drift, and the drift is SILENT: a copy that quietly relaxes its bound
+    /// still passes. `PanelAppearanceVariantTests.stableRender` and `PanelInteractionStateTests.stableRender`
+    /// are now thin wrappers over this one, so neither can fork the bound or the predicate.
+    /// `testSettledLoopsUntilTwoConsecutiveRastersAgree` and
+    /// `testSettledThrowsAndNamesItsCallerRatherThanReturningAnUnsettledRaster` — earlier in this file, with
+    /// the other primitive canaries — prove this helper genuinely loops and genuinely throws. An
+    /// always-return-the-first implementation is caught by the consumer suites only when the rasterizer
+    /// happens to be cold (measured:
+    /// `PanelAppearanceVariantTests.testTheIncreasedContrastAppearanceDoesNotReachThePanelRender` did red at
+    /// 849 bytes), and a flaky catch is not a gate — which is why those two canaries drive the loop directly
+    /// instead.
+    ///
+    /// The THIRD copy, `PanelRenderHarness.warmUpIfNeeded()`, deliberately stays its own: the `Menubar` app
+    /// target takes `sources: - Sources` (the whole directory), so `Sources/PanelRenderHarness.swift`
+    /// compiles into the SHIPPING APP as well as into this bundle, while `PanelRaster` is declared in this
+    /// test-only file. The harness must therefore compile in a target where this type does not exist, and so
+    /// cannot reference it. Its own `rawBytes` says the same thing from the other side.
+    ///
+    /// WHY THIS IS NEEDED, and why it is not a loosened tolerance. `PanelRenderHarness`'s process-level
+    /// warm-up discards renders until two consecutive agree, but it warms the `healthy` fixture in the
+    /// LIGHT scheme only — so the first renders of any other cell still carry cold pixels, differing from
+    /// the steady state by ±1/255 on a few hundred bytes. That is issue #824, an open and separately
+    /// tracked rasterizer artifact, and it is exactly what this suite tripped over first: `healthy/dark`
+    /// reported 849 differing bytes at worst channel 1 between the plain and high-contrast appearances,
+    /// which reads as "the appearance reached the render" and is nothing of the sort.
+    ///
+    /// The fix is to remove the confound, not to widen the comparison. Absorbing it into a tolerance —
+    /// switching the pin to `diffFraction`'s 64/255 threshold, or allowing "worst channel ≤ 1" — would also
+    /// swallow a real but faint high-contrast effect, which is precisely the signal the pin exists to
+    /// detect. So each cell is rendered until two consecutive rasters are byte-identical and the STEADY
+    /// one is what gets compared; the strict predicate survives intact. Same self-calibrating shape as the
+    /// harness's own warm-up (no tuned iteration count), and it fails loudly rather than silently
+    /// returning a cold raster.
+    ///
+    /// (The two paragraphs above are carried verbatim from `PanelAppearanceVariantTests.stableRender`, which
+    /// is the suite "this suite" names. The paragraph below is carried verbatim from
+    /// `PanelInteractionStateTests.stableRender`. Neither was reworded in the move — the point of #911 is
+    /// that this reasoning stops having three drifting homes, not that it gets tidied.)
+    ///
+    /// Render until two consecutive rasters agree to the BYTE — the #760 control for the ±1/255 cold-raster
+    /// settle issue #824 describes. Loosening a threshold to absorb that drift instead is exactly what
+    /// issue #824 asks callers not to do, so this settles the input rather than blunting the predicate.
+    ///
+    /// `subject` names WHAT was being settled and is the caller's to supply; `file`/`line` default to the
+    /// wrapper's own defaulted parameters, so a failure names the TEST that drifted rather than the wrapper
+    /// it went through. The tail THROWS rather than recording a failure and handing back the last cold
+    /// attempt: a caller that continues on an unsettled raster produces cascading nonsense, and a thrown
+    /// error cannot be walked past without the `try` being visibly softened.
+    static func settled(_ subject: String,
+                        attempts: Int = 8,
+                        file: StaticString = #filePath, line: UInt = #line,
+                        _ produce: () throws -> PanelRaster) throws -> PanelRaster {
+        var previous: PanelRaster?
+        for _ in 0..<attempts {
+            let current = try produce()
+            if let previous, byteDelta(previous, current).differing == 0 { return current }
+            previous = current
+        }
+        throw NeverSettled(subject: subject, attempts: attempts, file: file, line: line)
     }
 
     // MARK: Mutation (canary)
