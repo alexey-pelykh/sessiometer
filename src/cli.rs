@@ -12781,9 +12781,7 @@ spare  22222222-2222\n\
                     panic!("{name:?} is excused but this test cannot resolve its value")
                 });
             assert!(
-                value
-                    .split(|c: char| !c.is_ascii_alphanumeric())
-                    .all(str::is_empty),
+                !carries_words(value),
                 "{name:?} is excused from the prose scan but carries WORDS ({value:?}) — a \
                  word-bearing string is operator prose and belongs in ADVISORY_SURFACES, whatever \
                  the recorded reason says"
@@ -12803,12 +12801,23 @@ spare  22222222-2222\n\
     /// operator would actually see, rather than trying to parse string literals out of a function
     /// body.
     ///
-    /// The residual limit, stated rather than left as an unexplained gap: this covers the inline
-    /// prose of `health_cell` and `legacy_health_tags`, not every inline literal in the file. No
-    /// declaration-reading tripwire can enumerate those, so a NEW function that renders operator
-    /// prose from inline literals needs a line here — the same obligation `ADVISORY_SURFACES`
-    /// carries for a new constant, minus the tripwire that enforces it. Issue #1138 tracks
-    /// closing that asymmetry.
+    /// The scope limit, and it is now ENFORCED rather than merely stated (issue #1138): this
+    /// scans the inline prose of `health_cell` and `legacy_health_tags`, and nothing else in the
+    /// file. What used to make that dangerous was that a NEW function rendering operator prose
+    /// from inline literals owed this list a line with no tripwire asking for it — the obligation
+    /// [`ADVISORY_SURFACES`] carries for a new constant, minus the enforcement.
+    /// [`INLINE_PROSE_REGISTER`] closes that: no declaration-reading tripwire can enumerate
+    /// inline literals, but a LEXER can, and
+    /// [`every_function_spelling_inline_prose_is_dispositioned`] reddens until the new function
+    /// is dispositioned.
+    ///
+    /// What that register does NOT do is scan those surfaces. Measured while mechanising this, the
+    /// functions in its `Unscanned` arm render operator text from inline literals that no framing
+    /// scan reaches — so the two `Scanned` entries are this list, and the rest is enumerated debt.
+    /// The arm's own cardinality pin is the number, deliberately in one place. Issue #1167 carries
+    /// widening the firewall over them; widening it is a scoping decision of the kind issues #1123
+    /// and #1139 each made deliberately for one audience — but by different means, which is the
+    /// point of citing both (see the register's own doc).
     fn rendered_advisory_surfaces() -> Vec<(String, String)> {
         use CredentialHealth::{AtRisk, Dead, Degraded, Healthy, Stale, Unknown};
         let mut out = Vec::new();
@@ -12845,6 +12854,645 @@ spare  22222222-2222\n\
         out
     }
 
+    // --- the inline-literal completeness tripwire (issue #1138) -------------------------------
+
+    /// Whether `value` carries a WORD — the one notion of a word the prose guards share, so no two
+    /// can silently disagree about what they are looking at (the reason
+    /// `crate::framing_vocabulary` hoisted its tokenizer for the scanners).
+    ///
+    /// Deliberately the LOOSEST reading, a single ASCII alphanumeric: `n/a` and `32` are as much
+    /// a shipped string as a sentence is. A value it wrongly admits costs one register line; one
+    /// it wrongly drops is a surface no tripwire owns, which is the failure class these gates
+    /// exist to end — the same asymmetry [`is_str_shaped`] resolves the same way.
+    fn carries_words(value: &str) -> bool {
+        !value
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .all(str::is_empty)
+    }
+
+    /// A raw string literal beginning at `at`, and the index just past it — `None` if `at` does
+    /// not begin one. Every spelling Rust accepts: the optional `b` / `c` prefix, and any hash
+    /// count. Enumerated as a GRAMMAR rather than as the single spelling this file happens to use
+    /// (`request_shutdown`'s `r#""ok":true"#`), for the reason
+    /// [`the_declaration_parser_recognises_every_declaration_spelling`] records one level down: a
+    /// scanner you evade by spelling a literal differently is not a scanner.
+    ///
+    /// A raw string honours no escapes, so only a `"` trailed by the same hash count closes it.
+    fn raw_string_at(src: &[char], at: usize) -> Option<(String, usize)> {
+        if at > 0 && (src[at - 1].is_ascii_alphanumeric() || src[at - 1] == '_') {
+            return None; // an `r` inside an identifier (`for`, `char`) opens nothing
+        }
+        let mut i = at;
+        if matches!(src.get(i), Some('b' | 'c')) {
+            i += 1;
+        }
+        if src.get(i) != Some(&'r') {
+            return None;
+        }
+        i += 1;
+        let hashes = src[i..].iter().take_while(|c| **c == '#').count();
+        i += hashes;
+        if src.get(i) != Some(&'"') {
+            return None;
+        }
+        i += 1;
+        let body = i;
+        while i < src.len() {
+            if src[i] == '"' && (1..=hashes).all(|k| src.get(i + k) == Some(&'#')) {
+                return Some((src[body..i].iter().collect(), i + 1 + hashes));
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// An ordinary or byte string literal beginning at `at`, and the index just past it — `None`
+    /// if `at` does not begin one. A backslash escapes whatever follows it, which is what carries
+    /// the scan across the `\`-newline continuations several shipped messages here are built from
+    /// (`daemon_stop`'s four, `render_canary`'s four) and across an escaped `\"`.
+    ///
+    /// The value is returned with its escapes INTACT — this is a completeness scan over what the
+    /// source spells, not an evaluator, and un-escaping would only add a way to be wrong.
+    fn quoted_string_at(src: &[char], at: usize) -> Option<(String, usize)> {
+        let mut i = at;
+        if matches!(src.get(i), Some('b' | 'c')) {
+            i += 1;
+        }
+        if src.get(i) != Some(&'"') {
+            return None;
+        }
+        i += 1;
+        let mut value = String::new();
+        while i < src.len() {
+            match src[i] {
+                '\\' => {
+                    value.push('\\');
+                    if let Some(escaped) = src.get(i + 1) {
+                        value.push(*escaped);
+                    }
+                    i += 2;
+                }
+                '"' => return Some((value, i + 1)),
+                other => {
+                    value.push(other);
+                    i += 1;
+                }
+            }
+        }
+        None
+    }
+
+    /// The length of the char literal beginning at `at`, or `None` for a LIFETIME (`'a`,
+    /// `'static`), which must be left alone. Told apart by the closing quote rather than by a
+    /// keyword list.
+    ///
+    /// Load-bearing beyond tidiness: a `'"'` would otherwise open a string and swallow the rest of
+    /// the file as one literal. This file spells `' '`, `'*'`, `'\n'`, `'f'`, `'h'`, `'v'`, `'V'`
+    /// and `&'static str` in its non-test code, so both arms are exercised by the real subject.
+    fn char_literal_len(src: &[char], at: usize) -> Option<usize> {
+        if src.get(at) != Some(&'\'') {
+            return None;
+        }
+        if src.get(at + 1) == Some(&'\\') {
+            // An escape, so the closing quote is never the character at `at + 2` — start past it,
+            // or `'\''` would measure itself as `'\'`. Bounded so an unclosed lifetime cannot run
+            // the search to the end of the file.
+            let limit = src.len().min(at + 12);
+            return (at + 3..limit)
+                .find(|k| src[*k] == '\'')
+                .map(|k| k + 1 - at);
+        }
+        (src.get(at + 2) == Some(&'\'')).then_some(3)
+    }
+
+    /// Every string literal `source`'s non-test code spells INSIDE a function body, paired with
+    /// the function that spells it — the population [`every_prose_constant_is_dispositioned`] is
+    /// structurally blind to, because an inline literal has no declaration to key off.
+    ///
+    /// Takes the source as an argument rather than reaching for `include_str!` so the canary can
+    /// drive THIS function over a deliberately broken subject: a gate whose predicate cannot be
+    /// pointed at a known-bad input can only be verified by inspection, which ADR-0031 § 4
+    /// CONSTRAINT-A rejects.
+    ///
+    /// A real lexer rather than a line filter, and this file's own contents earn the cost three
+    /// times over: `///` doc comments are its densest source of quotes and apostrophes, several
+    /// shipped messages are single literals spanning a dozen lines through `\` continuations, and
+    /// `request_shutdown` spells a quote-bearing raw string. A scanner that mis-lexes any one of
+    /// those desynchronizes and reports a population unrelated to the file — while still looking
+    /// like it read something.
+    ///
+    /// TOP-LEVEL literals are deliberately excluded: those are declarations, and
+    /// [`every_prose_constant_is_dispositioned`] already owns every one of them. Two tripwires
+    /// sharing a subject is how each ends up assuming the other covered it.
+    fn inline_literals(source: &str) -> Vec<(String, String)> {
+        // Non-test code only, at this file's own column-0 `#[cfg(test)]` — the same structural
+        // boundary [`every_cli_usage_construction_site_is_scanned`] draws, for the same reason:
+        // the test module spells operator-shaped strings freely in its own assertions, and none of
+        // them ship.
+        let src: Vec<char> = source
+            .lines()
+            .take_while(|line| !line.starts_with("#[cfg(test)]"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .chars()
+            .collect();
+
+        let mut out = Vec::new();
+        // Each open function body, with the brace depth it opened at.
+        let mut scopes: Vec<(String, usize)> = Vec::new();
+        let mut pending: Option<String> = None;
+        let mut depth = 0usize;
+        let mut i = 0usize;
+
+        while i < src.len() {
+            // Comments FIRST. A doc comment here is prose ABOUT strings — quotes, apostrophes and
+            // `//` alike — so lexing one as code is the single likeliest way to lose the place.
+            if src[i] == '/' && src.get(i + 1) == Some(&'/') {
+                while i < src.len() && src[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if src[i] == '/' && src.get(i + 1) == Some(&'*') {
+                let mut nesting = 1usize;
+                i += 2;
+                while i < src.len() && nesting > 0 {
+                    if src[i] == '/' && src.get(i + 1) == Some(&'*') {
+                        nesting += 1;
+                        i += 2;
+                    } else if src[i] == '*' && src.get(i + 1) == Some(&'/') {
+                        nesting -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            if let Some((value, next)) = raw_string_at(&src, i) {
+                push_literal(&mut out, &scopes, depth, value);
+                i = next;
+                continue;
+            }
+            if let Some((value, next)) = quoted_string_at(&src, i) {
+                push_literal(&mut out, &scopes, depth, value);
+                i = next;
+                continue;
+            }
+            if src[i] == '\'' {
+                i += char_literal_len(&src, i).unwrap_or(1);
+                continue;
+            }
+            // `fn NAME`, remembered until its opening brace — so a signature broken across lines,
+            // or carrying a `where` clause, still binds the body that follows it.
+            if src[i] == 'f'
+                && src.get(i + 1) == Some(&'n')
+                && (i == 0 || !(src[i - 1].is_ascii_alphanumeric() || src[i - 1] == '_'))
+                && src.get(i + 2).is_some_and(|c| c.is_whitespace())
+            {
+                let mut j = i + 2;
+                while src.get(j).is_some_and(|c| c.is_whitespace()) {
+                    j += 1;
+                }
+                let start = j;
+                while src
+                    .get(j)
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
+                {
+                    j += 1;
+                }
+                if j > start {
+                    pending = Some(src[start..j].iter().collect());
+                    i = j;
+                    continue;
+                }
+            }
+            match src[i] {
+                '{' => {
+                    depth += 1;
+                    if let Some(name) = pending.take() {
+                        scopes.push((name, depth));
+                    }
+                }
+                '}' => {
+                    if scopes.last().is_some_and(|(_, opened)| *opened == depth) {
+                        scopes.pop();
+                    }
+                    depth = depth.saturating_sub(1);
+                }
+                // A bodiless signature (a trait method, an `extern` declaration) must not leave a
+                // name waiting to capture the next unrelated block.
+                ';' => pending = None,
+                _ => {}
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// Record one literal against the function whose body spells it.
+    ///
+    /// The two literals that belong to NO function are told apart by brace depth, and the
+    /// distinction is the seam between the two tripwires rather than a detail. At depth 0 a
+    /// literal is a top-level declaration, which [`every_prose_constant_is_dispositioned`] owns,
+    /// so it is dropped here. NESTED but outside any function — an associated `const` in an
+    /// `impl`, an item in an inner `mod` — is owned by NEITHER: that gate's parser is anchored at
+    /// column 0 on purpose, because it reads the whole file and would otherwise collect the test
+    /// module's own indented fixtures. So a nested declaration lands here, under
+    /// [`ASSOCIATED_ITEM`], rather than in nobody's subject.
+    ///
+    /// This file's non-test code spells no such string today (its four nested consts are a
+    /// `&'static [Self]` and three `i64`s), so the arm is empty and reddens if that changes.
+    fn push_literal(
+        out: &mut Vec<(String, String)>,
+        scopes: &[(String, usize)],
+        depth: usize,
+        value: String,
+    ) {
+        match scopes.last() {
+            Some((name, _)) => out.push((name.clone(), value)),
+            None if depth > 0 => out.push((ASSOCIATED_ITEM.to_owned(), value)),
+            None => {}
+        }
+    }
+
+    /// The bucket [`push_literal`] files a nested-but-function-less declaration under. Spelled as
+    /// a non-identifier so it can never collide with a real function name.
+    const ASSOCIATED_ITEM: &str = "<associated item>";
+
+    /// What a function's inline literals are, for the framing firewall's purposes.
+    ///
+    /// Every arm is a statement about REACHABILITY, never about editorial quality — deliberately.
+    /// "Is this string prose?" is the judgement the whole firewall exists to replace, so a register
+    /// built on it would record opinions and defend them. "Does a scan reach it?" and "does an
+    /// operator ever see it?" are questions about the code.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum InlineProse {
+        /// A framing scan reaches this function's inline prose; the reason names which one.
+        Scanned,
+        /// Its literals never reach an operator: argv tokens matched against input, cross-surface
+        /// wire identifiers, control frames, environment keys, ANSI codes, and interpolation-only
+        /// skeletons whose only words are the field names being substituted.
+        NotRendered,
+        /// It renders operator-facing text from inline literals and NO framing scan reaches it.
+        /// The debt — counted, so it cannot grow quietly.
+        Unscanned,
+    }
+
+    use InlineProse::{NotRendered, Scanned, Unscanned};
+
+    /// Every function in this file's non-test code that spells a word-bearing string literal in
+    /// its body, with what that literal population IS and why.
+    ///
+    /// This is the inline-literal counterpart to the pairing [`ADVISORY_SURFACES`] /
+    /// [`NOT_OPERATOR_PROSE`] carry for declared constants, and it exists because the granularity
+    /// question turned out to be the whole of issue #1138. Measured against this file rather than
+    /// predicted:
+    ///
+    /// - Per LITERAL is unusable. Most of this file's inline literals are argv tokens matched
+    ///   against input — the `parse_*` entries below hold the bulk of them — and the rest of the
+    ///   noise is wire identifiers, ANSI codes and interpolation skeletons. Worse than the ratio
+    ///   is the CHURN: a new flag on `parse_log` would owe the gate a line, which is how a gate
+    ///   teaches its readers to bump past it.
+    /// - Narrowing by EMITTING POSITION (a literal inside `push_str(` / `format!(`) is refuted by
+    ///   shipped code: `render_roster` binds `" · disabled"` through a `let` before interpolating
+    ///   it, so that filter misses operator prose already in the tree, and a one-line hoist would
+    ///   defeat it anywhere else. A completeness tripwire with false negatives reads as covering
+    ///   a surface it does not reach — precisely the defect issue #918 was opened about.
+    /// - Narrowing by SIGNATURE (`-> String`, the "rendering functions" issue #1138 proposed) is
+    ///   tempting and blind: `refresh_tag` returns `Option<String>` and renders ` — claude
+    ///   /login`, the exact cue the issue was opened about.
+    ///
+    /// So the subject is every function body holding a word-bearing literal, and the granularity
+    /// is the FUNCTION. That is what makes the 27 no-prose entries a one-time cost rather than a
+    /// running tax: the register is consulted again only when a function is ADDED, which is the
+    /// event the obligation is about.
+    ///
+    /// **What this gate does NOT do.** It disposes; it does not scan. Every `Unscanned` entry
+    /// below says a surface is unscanned and the run stays green, because extending the #160
+    /// firewall over those surfaces is a scoping decision of the kind issues #1123 and #1139 each
+    /// made deliberately for ONE audience — and by DIFFERENT means, which is why citing them as a
+    /// single precedent would be wrong: #1123 amended the ADR and earned a measured exemption set,
+    /// while #1139 deliberately did neither, scanning its central lists whole with per-(variant,
+    /// token) carve-outs instead (`docs/adr/0020-stats-framing-guard-permits-neutral-runway.md`
+    /// § "Issue #1139 applied this ADR without amending it — deliberately" records why). What the
+    /// two share is that each was a deliberate scoping act, not something a coverage ticket may
+    /// settle in passing. Issue #1167 carries it. What changes
+    /// today is that the hole is enumerated and its size is pinned, instead of being described in
+    /// one function's doc comment as a residual.
+    ///
+    /// Keyed on the function NAME, so two same-named functions in different `impl` blocks share
+    /// one entry. The total-literal pin in [`every_function_spelling_inline_prose_is_dispositioned`]
+    /// is what closes that: a second `new` carrying a literal moves the count even though it moves
+    /// no name.
+    const INLINE_PROSE_REGISTER: &[(&str, InlineProse, &str)] = &[
+        // --- reached by a framing scan ---------------------------------------------------------
+        ("health_cell", Scanned, "`rendered_advisory_surfaces` drives it over its whole input space"),
+        ("legacy_health_tags", Scanned, "same driver, through `health_cell`'s `health: None` fallback"),
+        ("hint", Scanned, "every `usage_hint`, scanned through ALL_HELP_TOPICS"),
+        ("from", Scanned, "the lexopt fold's usage hint; the `status --json=1` case renders it"),
+        ("unexpected", Scanned, "three CliUsage messages the `status --zzz` / `-z` / `log zzz` cases render"),
+        ("required_value", Scanned, "the CliUsage message the `stats --period` case renders"),
+        ("parse_config", Scanned, "argv tokens, plus the two CliUsage messages `config zzz` / `config path --origin` render"),
+        ("parse_daemon", Scanned, "argv tokens, plus the CliUsage message `daemon zzz` renders"),
+        ("parse_service", Scanned, "argv tokens, plus the CliUsage message `service zzz` renders"),
+        ("parse_use", Scanned, "argv tokens, plus the CliUsage message `use zzz --next` renders"),
+        // --- never reaches an operator ---------------------------------------------------------
+        ("parse", NotRendered, "argv: the two root flags"),
+        ("parse_export", NotRendered, "argv: `export`'s flags"),
+        ("parse_import", NotRendered, "argv: `import`'s flags"),
+        ("parse_list", NotRendered, "argv: `list`'s only flag"),
+        ("parse_log", NotRendered, "argv: `log`'s flags"),
+        ("parse_positional", NotRendered, "argv: the shared `--help` probe"),
+        ("parse_reliability", NotRendered, "argv: `reliability`'s flags"),
+        ("parse_run", NotRendered, "argv: `run`'s flags"),
+        ("parse_stats", NotRendered, "argv: `stats`' flags"),
+        ("parse_status", NotRendered, "argv: `status`'s flags"),
+        ("parse_subcommand", NotRendered, "argv: the eighteen verb names, matched against input"),
+        ("cross_surface_id", NotRendered, "the eight cross-surface fault identifiers (issue #768) — a machine contract"),
+        ("query_status", NotRendered, "the `{\"cmd\":\"status\"}` control frame"),
+        ("should_colorize", NotRendered, "the three colour environment keys"),
+        ("color_decision", NotRendered, "the `TERM` value that means no colour, plus its `0` sentinel"),
+        ("sgr", NotRendered, "ANSI SGR parameter numbers"),
+        ("severity_line", NotRendered, "the SGR wrapper skeleton"),
+        ("render_cells", NotRendered, "the per-cell SGR wrapper and the line-join skeleton"),
+        ("daemon_fault_line", NotRendered, "the plain-branch line-join skeleton"),
+        ("pad_end", NotRendered, "the display-width pad skeleton"),
+        ("expiry_table_cell", NotRendered, "the horizon-bracket skeleton around `expiry_cell`"),
+        ("new", NotRendered, "`StatusRow`'s active-marker skeleton"),
+        ("socket_shutdown", NotRendered, "interpolates its two callers' words; `daemon_stop` authors them"),
+        ("status", NotRendered, "interpolates the serialized `--json` snapshot"),
+        // --- operator-facing, and no framing scan reaches it (issue #1167) ---------------------
+        ("access_token_expiry_cell", Unscanned, "the `-v` access-token clock's three states"),
+        ("expiry_cell", Unscanned, "the EXPIRY column's `lapsed` state"),
+        ("expiry_tag", Unscanned, "`list`'s expiry tag"),
+        ("refresh_tag", Unscanned, "`list`'s refresh tag — and its ` — claude /login` is the cue issue #1138 named"),
+        ("render_access_token_expiry", Unscanned, "the `-v` block's heading and row skeleton"),
+        ("humanize_until", Unscanned, "the compact time-until words (`now`, `<1m`)"),
+        ("reset_cell", Unscanned, "the RESET column's `n/a` gap"),
+        ("pct", Unscanned, "the percent column's `n/a` gap — the same operator-facing absence as `reset_cell`"),
+        ("status_columns", Unscanned, "the seven `status` column headers"),
+        ("render_roster", Unscanned, "`list`'s parked marker and account-count noun"),
+        ("word", Unscanned, "`import`'s four outcome nouns"),
+        ("import_report", Unscanned, "the import tally sentence"),
+        ("duplicate_label_notice", Unscanned, "the post-import ambiguous-label notice"),
+        ("non_adoption_notice", Unscanned, "the post-import active-account notice"),
+        ("flip_confirmation", Unscanned, "`enable` / `disable`'s confirmations"),
+        ("set_enabled", Unscanned, "`enable` / `disable` — the verb `RotationLabelRequired` prints back at the operator"),
+        ("remove_account", Unscanned, "`remove` — the verb `RotationLabelRequired` prints back at the operator"),
+        ("remove_confirmation", Unscanned, "`remove`'s confirmation"),
+        ("export", Unscanned, "the export passphrase prompt"),
+        ("import", Unscanned, "the import passphrase prompt"),
+        ("run", Unscanned, "the daemon's start and stand-down lines"),
+        ("daemon_stop", Unscanned, "`daemon stop`'s four outcome messages"),
+        ("render_daemon_status", Unscanned, "`daemon status`'s three verdicts"),
+        ("management_suffix", Unscanned, "the managed / unmanaged suffix both daemon verbs append"),
+        ("request_shutdown", Unscanned, "two control frames, plus two failure sentences carried inside an `Error::Io` — the construction-site residual issue #1152 records"),
+        ("render_snapshot_age", Unscanned, "the snapshot-age line"),
+        ("render_next_swap", Unscanned, "the next-swap footer and its four reasons"),
+        ("out_of_capacity_phrase", Unscanned, "the blocked-fleet phrase both footers share"),
+        ("render_cornered", Unscanned, "the CORNERED alarm"),
+        ("render_blind_active", Unscanned, "the blind-active line"),
+        ("render_blind_preempt_swap", Unscanned, "the preemptive-swap notice"),
+        ("render_keychain_locked", Unscanned, "the locked-keychain fault line"),
+        ("render_canonical_scrub", Unscanned, "the scrubbed-login fault lines"),
+        ("render_canary", Unscanned, "the four keychain-canary fault lines"),
+        ("render_systemic_refresh_failure", Unscanned, "the refresh-mechanism-down fault lines"),
+        ("render_landing_overshoot", Unscanned, "the landing-overshoot line"),
+        ("render_expiry_cohort", Unscanned, "the expiry-cohort line"),
+        ("render_schema_mismatch", Unscanned, "the schema-mismatch refusal"),
+        ("render_peak_runway_advisory", Unscanned, "the peak-runway tuning advisory"),
+        ("render_config_validate", Unscanned, "`config validate`'s verdict"),
+        ("render_config_origin", Unscanned, "`config show`'s heading, provenance tags and section lines"),
+        ("version_line", Unscanned, "the version banner's program name and `env!` key"),
+    ];
+
+    /// The completeness tripwire for inline-literal prose (issue #1138) — the counterpart to
+    /// [`every_prose_constant_is_dispositioned`] on the axis that one is structurally blind to.
+    ///
+    /// That gate reads DECLARATIONS, so `cell.push_str("claude /login")` is invisible to it
+    /// whatever grammar [`declared_str_constant`] accepts. Issue #1123 closed the KNOWN instance
+    /// by rendering ([`rendered_advisory_surfaces`]) and recorded the general case as a residual
+    /// in that function's doc; a limit stated in one function's doc comment is reachable only by
+    /// whoever is already reading that function, which is not the person adding a new one.
+    ///
+    /// So the obligation is mechanical now: a function that spells a word-bearing literal must
+    /// appear in [`INLINE_PROSE_REGISTER`], or this reddens. It disposes rather than scans — see
+    /// that register for what the three arms mean and for the measurement that chose this
+    /// granularity over the two narrower ones.
+    #[test]
+    fn every_function_spelling_inline_prose_is_dispositioned() {
+        let literals: Vec<(String, String)> = inline_literals(include_str!("cli.rs"))
+            .into_iter()
+            .filter(|(_, value)| carries_words(value))
+            .collect();
+
+        let mut spelled: Vec<&str> = literals.iter().map(|(name, _)| name.as_str()).collect();
+        spelled.sort_unstable();
+        spelled.dedup();
+        let mut registered: Vec<&str> = INLINE_PROSE_REGISTER
+            .iter()
+            .map(|(name, _, _)| *name)
+            .collect();
+        registered.sort_unstable();
+
+        assert_eq!(
+            spelled, registered,
+            "every function in src/cli.rs's non-test code that spells a word-bearing string \
+             literal must be dispositioned in INLINE_PROSE_REGISTER — an undispositioned one is \
+             operator-facing text that no tripwire owns, which is what issue #918 was opened about"
+        );
+        // Cardinality on BOTH populations, because neither implies the other. The names would
+        // agree at zero if the lexer silently matched nothing; and the literal total is what
+        // catches a second same-named function, since the register keys on the name alone.
+        assert_eq!(
+            spelled.len(),
+            76,
+            "expected 76 functions spelling an inline word-bearing literal; the count moved — \
+             disposition the new one, then update this"
+        );
+        assert_eq!(
+            literals.len(),
+            272,
+            "expected 272 inline word-bearing literals; the count moved — check whether the \
+             function that gained one is still dispositioned correctly, then update this"
+        );
+
+        // Per-arm cardinality, so the DEBT is pinned rather than merely listed: a surface moved
+        // into `Unscanned` without anyone deciding to would otherwise land silently among 42
+        // entries that already say so. Shrinking this number is the progress issue #1167 tracks.
+        for (arm, expected) in [(Scanned, 10), (NotRendered, 24), (Unscanned, 42)] {
+            let actual = INLINE_PROSE_REGISTER
+                .iter()
+                .filter(|(_, disposition, _)| *disposition == arm)
+                .count();
+            assert_eq!(
+                actual, expected,
+                "expected {expected} {arm:?} entries in INLINE_PROSE_REGISTER, found {actual}"
+            );
+        }
+        // The `every_excusal_is_reasoned` discipline, applied to this register: an entry without a
+        // reason is indistinguishable from an oversight, and the reason is what a reader adding
+        // the next function copies the shape of.
+        for (name, disposition, reason) in INLINE_PROSE_REGISTER {
+            assert!(
+                !reason.trim().is_empty(),
+                "{name:?} is dispositioned {disposition:?} with no reason recorded"
+            );
+        }
+    }
+
+    /// The names [`every_function_spelling_inline_prose_is_dispositioned`] compares against the
+    /// register, extracted so the canary below can drive the IDENTICAL predicate over a
+    /// deliberately broken subject rather than over a paraphrase of it (ADR-0031 § 4
+    /// CONSTRAINT-A: a canary must run through the same predicate the real assertion uses).
+    fn functions_spelling_inline_prose(source: &str) -> Vec<String> {
+        let mut names: Vec<String> = inline_literals(source)
+            .into_iter()
+            .filter(|(_, value)| carries_words(value))
+            .map(|(name, _)| name)
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    /// CONSTRAINT-A for the tripwire above (ADR-0031 § 4): the gate is observed to REDDEN on a
+    /// subject carrying the defect, not merely read and believed. Both cases are driven through
+    /// [`functions_spelling_inline_prose`], the predicate the real assertion compares with.
+    ///
+    /// The payload is the one issue #1123's merge review actually shipped past a fully green run,
+    /// which is why this gate exists rather than a hypothetical.
+    ///
+    /// The second case is the one that settles the SUBJECT rather than the gate. Hoisting the
+    /// literal into a `let` before interpolating it is an ordinary refactor, and it is what a
+    /// scanner keyed on emitting position (`push_str(` / `format!(`) would lose — which is not
+    /// hypothetical either: `render_roster` already spells `" · disabled"` that way today. Both
+    /// shapes must land, or the tripwire is one `let` away from blind.
+    #[test]
+    fn the_inline_prose_tripwire_bites_on_a_new_rendering_function() {
+        for (shape, body) in [
+            (
+                "pushed directly",
+                "    cell.push_str(\"your credential is critical, you should upgrade soon\");",
+            ),
+            (
+                "hoisted through a `let`",
+                "    let cue = \"your credential is critical, you should upgrade soon\";\n    \
+                 cell.push_str(cue);",
+            ),
+        ] {
+            let injected = format!(
+                "const SOMETHING: &str = \"top level, owned by the other tripwire\";\n\
+                 fn a_new_operator_surface() -> String {{\n\
+                 {body}\n\
+                 }}\n\
+                 #[cfg(test)]\n\
+                 mod tests {{\n\
+                 fn a_test_helper() {{ let _ = \"test prose never ships\"; }}\n\
+                 }}\n"
+            );
+            let spelled = functions_spelling_inline_prose(&injected);
+            assert_eq!(
+                spelled,
+                ["a_new_operator_surface"],
+                "the scan must see inline prose {shape}, and must see ONLY that: a top-level \
+                 declaration belongs to `every_prose_constant_is_dispositioned`, and the test \
+                 module's own strings do not ship"
+            );
+            // …and that IS a red run, because the register cannot hold a name it has never seen.
+            // Stated as the real comparison rather than left as an inference about it.
+            let registered: Vec<&str> = INLINE_PROSE_REGISTER
+                .iter()
+                .map(|(name, _, _)| *name)
+                .collect();
+            assert!(
+                !registered.contains(&"a_new_operator_surface"),
+                "the canary's function must be absent from the register, or it proves nothing"
+            );
+        }
+    }
+
+    /// The lexer is the one textual link in this completeness chain, so it is tested directly
+    /// rather than only through its caller — the discipline
+    /// [`the_declaration_parser_recognises_every_declaration_spelling`] applies to the other one,
+    /// and for a sharper reason here: a line filter over this file does not merely miss things, it
+    /// DESYNCHRONIZES. Mis-lex one doc comment and every literal after it is attributed to the
+    /// wrong function, or swallowed into one enormous string — and the run still reports a
+    /// population, which is what makes the failure survive review.
+    ///
+    /// Each case below is a construct this file's own non-test code actually spells.
+    #[test]
+    fn the_inline_literal_lexer_reads_rust_rather_than_grepping_for_quotes() {
+        let source = "\
+/// A doc comment that says \"quoted\" and isn't shy about apostrophes — nor about // slashes.
+fn commented() {
+    // A line comment mentioning \"a decoy\" and a lone ' apostrophe.
+    let _ = \"kept\";
+}
+/* a block /* nested */ comment holding \"another decoy\" */
+fn escaped() {
+    let _ = \"an escaped \\\" quote, then a \\
+        continuation\";
+}
+fn raw() {
+    let _ = r#\"\"ok\":true\"#;
+}
+fn chars() {
+    let _ = '\"';
+    let _ = '\\'';
+    let _: &'static str = \"after a lifetime\";
+    let _ = \"tail\";
+}
+fn closures() {
+    let _ = [1].iter().map(|n| { if *n > 0 { \"inner\" } else { \"other\" } });
+}
+fn bodiless_neighbour();
+fn after_the_semicolon() {
+    let _ = \"bound to the right function\";
+}
+ const TOP_LEVEL: &str = \"a declaration, owned by the other tripwire\";
+impl Nested {
+    const INDENTED: &'static str = \"nested, owned by NEITHER unless this catches it\";
+}
+";
+        // That leading space is load-bearing, and not for this test. This fixture's lines are
+        // lines of THIS FILE too, and `every_prose_constant_is_dispositioned` reads the whole
+        // file for `const` at column 0 — so an unindented fixture declaration is picked up as a
+        // real one and reddens that gate instead of this one. (Observed, not feared.) The space
+        // is invisible here: this lexer keys on brace depth, never on indentation.
+        let lexed = inline_literals(source);
+        let found: Vec<(&str, &str)> = lexed
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("commented", "kept"),
+                (
+                    "escaped",
+                    "an escaped \\\" quote, then a \\\n        continuation"
+                ),
+                ("raw", "\"ok\":true"),
+                ("chars", "after a lifetime"),
+                ("chars", "tail"),
+                ("closures", "inner"),
+                ("closures", "other"),
+                ("after_the_semicolon", "bound to the right function"),
+                (
+                    ASSOCIATED_ITEM,
+                    "nested, owned by NEITHER unless this catches it"
+                ),
+            ],
+            "the lexer must skip comments of both kinds, carry escapes and `\\`-continuations, \
+             read a raw string's quote-bearing body, leave char literals and lifetimes alone, \
+             attribute a closure's literals to the enclosing function, not let a bodiless \
+             signature capture the next block, drop a column-0 declaration to the tripwire that \
+             owns it, and catch a NESTED one that neither tripwire's parser would otherwise reach"
+        );
+    }
+
     /// The completeness tripwire for the advisory guard — the counterpart to
     /// [`every_help_constant_is_scanned`], and the reason a new advisory cannot ship unscanned.
     ///
@@ -12859,9 +13507,21 @@ spare  22222222-2222\n\
     ///
     /// Its reach is DECLARATIONS, and the boundary is worth stating because it was mistaken once:
     /// prose built from INLINE literals inside a function body has no declaration to key off and
-    /// is invisible here, whatever the grammar in [`declared_str_constant`] accepts.
-    /// [`rendered_advisory_surfaces`] covers the known instance of that by scanning rendered
-    /// output instead, and records what remains uncovered.
+    /// is invisible here, whatever the grammar in [`declared_str_constant`] accepts. That other
+    /// half has its own tripwire now —
+    /// [`every_function_spelling_inline_prose_is_dispositioned`], over
+    /// [`INLINE_PROSE_REGISTER`] (issue #1138) — and the pointer belongs HERE, at the gate a
+    /// reader actually meets when they add a shipped string, rather than only in the doc of the
+    /// function that happens to implement the other half.
+    ///
+    /// The two partition the file's shipped strings between them: this one owns what is DECLARED,
+    /// that one owns what a function body SPELLS. A string falling through both would be the
+    /// defect issue #918 was opened about, one axis over. State the seam precisely, because the
+    /// closure is not self-evident: this gate's parser is anchored at column 0 and reads the whole
+    /// file, so an item placed AFTER the test module would be invisible to it — what forecloses
+    /// that is clippy's `items_after_test_module`, which the required `-D warnings` turns into a
+    /// build failure. The partition therefore holds, but it rests on three things rather than two,
+    /// and a change that relaxes that lint reopens the gap.
     ///
     /// Reads this file's own source via `include_str!`, so the check cannot be skipped by an
     /// unexpected working directory — the same compile-time-input discipline the help tripwire and
