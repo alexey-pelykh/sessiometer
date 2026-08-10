@@ -73,7 +73,7 @@
 // whole table means running the default suite as well as the measurement test:
 //
 //   identical re-render .............................................. 0.000000  ← testMeasureSeparations
-//   re-render seeded 1 / 7 / 29 s earlier (clock-drift window) ....... 0.000000  ← testMeasureSeparations
+//   re-render seeded 1 / 7 / 24 s earlier (clock-drift window) ....... 0.000000  ← testMeasureSeparations
 //   golden PNG round-trip (write → read → compare) .................... 0.000000  ← testMeasureSeparations
 //   same fixture under aqua vs darkAqua host appearance .............. 0.000000  ← testRendersDoNotDepend…
 //                                                                                 (no host Dark-Mode dep)
@@ -140,8 +140,10 @@
 // offsets every clock-relative fixture instant 30 s PAST a `humanizeUntil` unit boundary, so a render that
 // lands anywhere in the next 30 s formats to the identical string — and identical strings rasterize to
 // identical bytes, hence 0.000000 rather than "close". `testRendersSurviveTheClockDriftWindow` drives that
-// by MUTATION (re-seeding as if the fixtures were built 1 / 7 / 29 s ago, which is the real-world drift
-// direction) instead of asserting it.
+// by MUTATION (re-seeding as if the fixtures were built 1 / 7 / 24 s ago, which is the real-world drift
+// direction) instead of asserting it. The ladder stops at 24 rather than at the guard because it must
+// survive its OWN render latency; the offsets it can no longer reach are swept without a rasterizer by
+// `testEveryClockRelativeFixtureInstantKeepsTheFullGuard` (issue #1128).
 
 #if DEBUG
 import AppKit
@@ -217,6 +219,58 @@ final class PanelGoldenParityTests: XCTestCase {
 
     private static func wallClock() -> Int64 { Int64(Date().timeIntervalSince1970) }
 
+    // MARK: - The clock-drift ladder and the latency it reserves (issue #1128)
+
+    /// The seed-to-raster latency the clock-drift ladder RESERVES, in whole seconds.
+    ///
+    /// Both clocks TRUNCATE — the seed is `Int64(Date().timeIntervalSince1970)` above, and the panel reads
+    /// `Int64(context.date.timeIntervalSince1970)` (`StatusPanelView`) — so the offset a render actually
+    /// formats against is the INTEGER `floor(seed + latency) - floor(seed)`, which is
+    /// `floor(frac + latency)` for a truncation phase `frac` uniform on `[0, 1)`. That gives an exact
+    /// guarantee rather than a probability: since `frac < 1`, a latency of AT MOST `B` seconds can never
+    /// push the integer offset past `B`, so a ladder whose top is `B` below the last safe lag cannot cross
+    /// a boundary at all. The converse holds too — crossing REQUIRES latency strictly greater than `B` —
+    /// which is why the assertion on this budget below is a complete explanation of any crossing, not a
+    /// heuristic alongside one.
+    ///
+    /// 5 s is ~65× the worst this test MEASURES on arm64 / macOS 26.5.2 / Xcode 26.6 (0.077 s, #824
+    /// settling included) and ~24× the GitHub `macos-latest` runner (0.204 s) — the machine class the
+    /// failure this reserve exists for actually reproduced on. Both numbers are the gate's own reading,
+    /// not a division of the test's wall time by its render count, which over-reads by folding in the
+    /// diffing. It is not a guess about the future either: `testRendersSurviveTheClockDriftWindow`
+    /// MEASURES its own worst latency and fails with that number when it exceeds this, so a machine slow
+    /// enough to matter says so instead of reddening a pixel comparison.
+    private static let seedToRasterBudgetSecs: Int64 = 5
+
+    /// The largest lag the ladder may carry: the last integer offset that is still safe, minus the budget.
+    ///
+    /// The last SAFE offset is `boundaryGuardSecs - 1`, not `boundaryGuardSecs`, and that `- 1` is the past
+    /// direction rather than an off-by-one cushion. A `generatedAt` age of `X + G` seconds has `G` of its
+    /// 60 s `humanizeUntil` plateau already spent, so it flips AT offset `60 - G` — 30 at the current `G`,
+    /// one second EARLIER than a future instant `now + X + G`, which survives offset `G` and flips just
+    /// past it. The ages bind, so 29 is the last offset every fixture in the catalog survives — and
+    /// `testEveryClockRelativeFixtureInstantKeepsTheFullGuard` MEASURES that rather than trusting this
+    /// paragraph. See `PanelRenderHarness.boundaryGuardSecs`.
+    private static var clockDriftLadderTop: Int64 {
+        PanelRenderHarness.boundaryGuardSecs - 1 - seedToRasterBudgetSecs
+    }
+
+    /// The seed lags `testRendersSurviveTheClockDriftWindow` (and the calibration run) drive by mutation.
+    /// Derived from the guard rather than written out, so the two cannot drift apart silently — and
+    /// `testTheDriftLadderFitsInsideTheGuardWithItsReservedBudget` re-derives the safe window from the
+    /// catalog and fails if this derivation ever stops being true.
+    private static var clockDriftLadder: [Int64] { [1, 7, clockDriftLadderTop] }
+
+    /// The worst seed-to-raster latency observed since `resetSeedToRasterMeasurement()`, in seconds.
+    /// Written by every rasterizing `render` below; read by the clock-drift gate.
+    private static var worstSeedToRasterSecs: Double = 0
+
+    private static func resetSeedToRasterMeasurement() { worstSeedToRasterSecs = 0 }
+
+    /// The seed the non-rendering boundary sweep runs at — a LITERAL, so that gate has no wall clock in it
+    /// at all. Representative rather than sampled: see the sweep's own comment.
+    private static let sweepSeed: Int64 = 1_780_000_000
+
     /// Render cache — 44 `ImageRenderer` passes are the expensive part of this suite and several tests need
     /// the same set. Keyed by filename; only ever holds un-lagged renders (`seedLag == 0`).
     private static var cache: [String: PanelRaster] = [:]
@@ -237,6 +291,11 @@ final class PanelGoldenParityTests: XCTestCase {
     private func render(_ cell: Cell, seedLag: Int64 = 0, cached: Bool = true,
                         file: StaticString = #filePath, line: UInt = #line) -> PanelRaster? {
         if cached, seedLag == 0, let hit = Self.cache[cell.name] { return hit }
+        // Start the span BEFORE the seed read, so what it measures is an UPPER bound on the real gap
+        // between the seed and `TimelineView`'s own `context.date` (issue #1128). That direction matters:
+        // the drift gate turns this number into a hard assertion, and an upper bound can only make it fire
+        // early — an under-measurement would let a crossing through while reporting the latency as fine.
+        let seedReadAt = Date()
         let now = Self.wallClock() - seedLag
         guard let fixture = PanelRenderHarness.fixtures(now: now).first(where: { $0.name == cell.fixture }) else {
             XCTFail("no fixture named \(cell.fixture) in the harness catalog", file: file, line: line)
@@ -250,6 +309,10 @@ final class PanelGoldenParityTests: XCTestCase {
                 """, file: file, line: line)
             return nil
         }
+        // Closed HERE rather than in a `defer`: the normalization below is comparison plumbing that runs
+        // after every clock has been read, so folding it in would inflate the reported latency without
+        // making the bound any safer.
+        Self.worstSeedToRasterSecs = max(Self.worstSeedToRasterSecs, -seedReadAt.timeIntervalSinceNow)
         guard let raster = PanelRaster.normalize(cg) else {
             XCTFail("could not normalize \(cell.name) into an sRGB RGBA8 buffer", file: file, line: line)
             return nil
@@ -395,7 +458,7 @@ final class PanelGoldenParityTests: XCTestCase {
     // against `TimelineView`'s own clock (issue #326) — so the rendered TEXT, and therefore the pixels,
     // depend on that gap. `PanelRenderHarness.boundaryGuardSecs` places every clock-relative instant 30 s
     // past a `humanizeUntil` unit boundary so the whole window formats identically. This drives it by
-    // MUTATION: re-seed as if the fixtures had been built 1 / 7 / 29 s ago (the real-world direction — a
+    // MUTATION: re-seed as if the fixtures had been built 1 / 7 / 24 s ago (the real-world direction — a
     // render is always later than its seed) and require an unchanged render (drift 0, the gate metric).
     //
     // The BYTE delta is measured here too, and it is ALSO zero — the seed lag moves no bytes at all, which
@@ -419,12 +482,18 @@ final class PanelGoldenParityTests: XCTestCase {
     // across 40 lone invocations on the #824 commit: 38 report `worst delta 0 over up to 0 bytes`, against
     // 15 out of 15 reproducing the 882-byte red on the parent commit.
     //
-    // The other 2 of those 40 are NOT this: they report a worst delta in the 200s over ~450 bytes, which is
-    // a TEXT change and therefore the second arm of the message below — the 29 s lag against a 30 s
-    // `boundaryGuardSecs` leaves about one second of margin, so the sub-second seed truncation plus render
-    // latency can cross a `humanizeUntil` boundary. That is a margin defect in this test rather than a
-    // fixture-offset defect, it is pre-existing, and settling every render makes a render slower and so
-    // widens it. Tracked as issue #1128; do not absorb it into a tolerance here either.
+    // The other 2 of those 40 were NOT this: a worst delta in the 200s over ~450 bytes, which is a TEXT
+    // change and therefore the second arm of the message below. That was a margin defect in this test, and
+    // issue #1128 removed it — the ladder's top used to be 29 against a 30 s guard, which reserved ZERO
+    // seconds for this test's own render latency, so any latency at all could carry the truncated seed past
+    // a `humanizeUntil` boundary. It cost a real merge: PR #1140, whose diff was comment-only, went red on
+    // this test at `worst delta 208/255 over 459 bytes` on the GitHub runner and passed on a re-run of the
+    // same commit. The top is now `boundaryGuardSecs - 1 - seedToRasterBudgetSecs`, and the budget is
+    // MEASURED against rather than hoped for: a latency inside it CANNOT cross (both clocks truncate, so
+    // the offset a render formats against is `floor(frac + latency)` and `frac < 1`), and a latency outside
+    // it is asserted on by name below. The distinguishing signature is unchanged and still how a red here
+    // gets diagnosed: worst delta 1 over a few hundred bytes is the COLD-RASTER reading (#824), worst delta
+    // in the hundreds is a boundary crossing. Neither is ever absorbed into a tolerance.
     //
     // `atSeed` is rendered UNCACHED below for the same reason `testAnIdenticalRerenderScoresExactlyZero`
     // renders both of its sides uncached: the lagged renders already bypass the cache, so caching only this
@@ -432,6 +501,13 @@ final class PanelGoldenParityTests: XCTestCase {
     // against a fresh render. Symmetry, not a fix; measured NOT to change the outcome in any of the three
     // scenarios tried (isolated, full-class, cache-populated-while-cold).
     func testRendersSurviveTheClockDriftWindow() throws {
+        Self.resetSeedToRasterMeasurement()
+        let budget = Self.seedToRasterBudgetSecs
+        /// The reading as of the failure being reported — `render` keeps it current, so this is read at the
+        /// moment a message is BUILT, not captured once up front.
+        func latencyReading() -> String {
+            String(format: "%.3fs", Self.worstSeedToRasterSecs) + " against a \(budget)s budget"
+        }
         var worstByteDelta = 0
         var worstByteCount = 0
         for cell in [Cell(fixture: "healthy", scheme: .light),
@@ -439,34 +515,184 @@ final class PanelGoldenParityTests: XCTestCase {
                      Cell(fixture: "disconnected", scheme: .light),
                      Cell(fixture: "blind-cornered", scheme: .dark)] {
             let atSeed = try XCTUnwrap(render(cell, cached: false))
-            for lag: Int64 in [1, 7, 29] {
+            for lag in Self.clockDriftLadder {
                 let drifted = try XCTUnwrap(render(cell, seedLag: lag))
+                // The latency reading is interpolated into the message rather than left to the assertion
+                // below it, because THIS is the failure a reader sees first and the number is the whole
+                // diagnosis: inside budget the crossing cannot be latency, so it is a fixture that lost its
+                // guard; outside budget it is the machine, and nothing about the fixtures has changed.
                 XCTAssertEqual(PanelRaster.diffFraction(atSeed, drifted), 0.0, accuracy: 0.0,
                                "\(cell.name) rendered differently when its fixture was seeded \(lag)s earlier "
                                + "— a clock-relative string crossed a humanizeUntil boundary inside the "
-                               + "\(PanelRenderHarness.boundaryGuardSecs)s guard window, so this gate would "
-                               + "redden at random. Move the offending fixture offset off the boundary.")
+                               + "\(PanelRenderHarness.boundaryGuardSecs)s guard window. Worst seed-to-raster "
+                               + "latency so far: \(latencyReading()). OVER budget → the machine is the "
+                               + "cause, not the fixtures. INSIDE budget → a fixture instant lost its guard, "
+                               + "and `testEveryClockRelativeFixtureInstantKeepsTheFullGuard` names which one.")
                 let (differing, worst) = PanelRaster.byteDelta(atSeed, drifted)
                 worstByteDelta = max(worstByteDelta, worst)
                 worstByteCount = max(worstByteCount, differing)
             }
         }
-        print(String(format: "[panel-goldens] seed-latency byte jitter: worst delta %d over up to %d bytes",
-                     worstByteDelta, worstByteCount))
+        print("[panel-goldens] seed-latency byte jitter: worst delta \(worstByteDelta) over up to "
+              + "\(worstByteCount) bytes (worst seed-to-raster \(latencyReading()), "
+              + "ladder \(Self.clockDriftLadder.map(String.init).joined(separator: "/"))s)")
         XCTAssertEqual(worstByteDelta, 0,
                        "renders seeded seconds apart differ by \(worstByteDelta)/255 on some channel "
                        + "(up to \(worstByteCount) bytes) while scoring 0.000000 under the gate metric. "
                        + "Sub-threshold drift the metric is too coarse to see — the committed goldens stop "
                        + "being byte-reproducible, so a re-bless churns files that did not change and the "
                        + "`Panel-Goldens-Rebaselined:` audit trail stops being readable. "
-                       + "DIAGNOSE, do not re-run (issue #821): a worst delta of exactly 1 over a few "
+                       + "DIAGNOSE, do not re-run: a worst delta of exactly 1 over a few "
                        + "hundred bytes is the COLD-RASTER signature, not a clock failure — it means a "
                        + "raster reached this comparison un-settled, so look at `PanelRenderHarness`'s "
                        + "steady state (issue #824) before the clock. A worst delta above 1, or a byte "
                        + "count in the thousands, is the real subject of this test: a clock-relative string "
                        + "crossed a `humanizeUntil` boundary inside the "
-                       + "\(PanelRenderHarness.boundaryGuardSecs)s guard window — move the offending "
-                       + "fixture offset off the boundary rather than relaxing this assertion")
+                       + "\(PanelRenderHarness.boundaryGuardSecs)s guard window. Read the worst "
+                       + "seed-to-raster latency (\(latencyReading())) FIRST — over budget is a slow "
+                       + "machine, inside budget is a fixture instant that lost its guard. Never relax "
+                       + "this assertion")
+
+        // The cause, asserted on its own so it reddens even when it is caught EARLY — before any render is
+        // slow enough to actually cross. The threshold is exact rather than cautious: both clocks truncate,
+        // so a render formats against `floor(frac + latency)` with `frac` in `[0, 1)`, and a latency of at
+        // most `budget` therefore cannot push that integer past `budget`. Crossing REQUIRES exceeding it.
+        XCTAssertLessThanOrEqual(Self.worstSeedToRasterSecs, Double(budget),
+                                 "seed-to-raster latency reached \(latencyReading()). That is this gate's "
+                                 + "PRECONDITION, not a panel defect: the ladder's top lag "
+                                 + "(\(Self.clockDriftLadderTop)s) plus a latency this large can carry a "
+                                 + "clock-relative string over a `humanizeUntil` boundary, so any byte "
+                                 + "delta reported above is explained by the machine. Make the render "
+                                 + "faster, or re-derive `seedToRasterBudgetSecs` — which lowers the "
+                                 + "ladder's top with it, and never relaxes a tolerance")
+    }
+
+    // MARK: - Gate: the guard the ladder rests on, DERIVED from the catalog rather than assumed
+
+    // The rasterizing gate above can only sweep offsets it has margin to survive, so lowering its top arm
+    // for issue #1128 took the 25…29 s band out of its reach. These two take that band back, and more, by
+    // dropping the rasterizer entirely: the crossing is an INTEGER-second property of the fixture instants
+    // and the two formatters they reach, so it can be computed rather than rendered. No `ImageRenderer`, no
+    // wall clock, no latency term — the same answer on every machine, every run.
+    //
+    // What this buys over the arm it replaces: the ladder rendered 4 of the 44 cells at 3 offsets each; this
+    // walks EVERY fixture in the catalog at EVERY whole-second offset across the guard, which is the class
+    // of defect the top arm existed for (a new fixture instant seeded without its `boundaryGuardSecs`). What
+    // it does NOT cover, stated rather than implied: a clock-dependence that reaches the pixels WITHOUT
+    // passing through a catalog instant and one of these formatters — a view reading `Date()` directly, say.
+    // The rasterizing ladder is still the only thing that would see that, which is why it keeps its top arm
+    // as high as its own latency budget allows rather than being retired.
+    //
+    // The seed is a LITERAL, and that is not a sampled special case: every offset in the catalog is written
+    // relative to `now` and every formatter here is integer-second arithmetic on a difference, so the answer
+    // is independent of the absolute epoch. A wall-clock seed would only add nondeterminism to a test whose
+    // whole value is not having any.
+
+    /// Every clock-relative READING one fixture produces at wall-clock `t`, each labelled with the site a
+    /// failure has to name to be actionable.
+    ///
+    /// Routed through the panel's OWN now-consuming formatters rather than a re-derivation of their
+    /// rounding — `StatusPanelFormat` has exactly four sources of clock-relative output (the reset cells,
+    /// the expiry cell and its tint, the next-swap footer / cornered relief clause, and the snapshot age),
+    /// and all four are read here. Both reset windows are read, not only the one `resetIn` picks:
+    /// `weeklyExhausted` is a wire field, so which of the two reaches the cell is a property of the daemon's
+    /// payload rather than of this catalog.
+    private func clockRelativeReadings(_ fixture: PanelRenderFixture,
+                                       at t: Int64) -> [(site: String, text: String)] {
+        var out: [(site: String, text: String)] = []
+        func add(_ site: String, _ text: String?) { out.append((fixture.name + "." + site, text ?? "—")) }
+
+        if let generatedAt = fixture.generatedAt {
+            add("generatedAt/age", StatusPanelFormat.snapshotAgeText(generatedAt: generatedAt, now: t))
+            add("generatedAt/stale",
+                String(describing: StatusPanelFormat.snapshotIsStale(generatedAt: generatedAt, now: t)))
+        }
+        for (index, row) in fixture.rows.enumerated() {
+            add("row\(index).resetIn",
+                StatusPanelFormat.resetIn(weeklyExhausted: row.weeklyExhausted,
+                                          sessionResetsAt: row.sessionResetsAt,
+                                          weeklyResetsAt: row.weeklyResetsAt, now: t))
+            add("row\(index).sessionResetsAt", StatusPanelFormat.resetCell(row.sessionResetsAt, now: t))
+            add("row\(index).weeklyResetsAt", StatusPanelFormat.resetCell(row.weeklyResetsAt, now: t))
+            add("row\(index).expiryLine", StatusPanelFormat.expiryLineCell(row.expiry, now: t))
+            add("row\(index).expirySeverity",
+                String(describing: StatusPanelFormat.expirySeverity(row.expiry, now: t)))
+        }
+        add("rosterShowsExpiry",
+            String(describing: StatusPanelFormat.rosterShowsExpiry(fixture.rows.map(\.expiry), now: t)))
+        add("nextSwapFooter", StatusPanelFormat.nextSwapFooter(fixture.nextSwap, now: t))
+        add("corneredRemedy", StatusPanelFormat.corneredRemedy(fixture.nextSwap, now: t))
+        return out
+    }
+
+    /// The smallest whole-second offset past the seed at which ANY catalog reading changes, and the site
+    /// that changes first. `nil` when nothing changes within `ceiling`.
+    private func firstBoundaryCrossing(seededAt now: Int64,
+                                       ceiling: Int64) -> (offset: Int64, site: String)? {
+        let catalog = PanelRenderHarness.fixtures(now: now)
+        let atSeed = catalog.map { clockRelativeReadings($0, at: now) }
+        for offset in 1...ceiling {
+            for (index, fixture) in catalog.enumerated() {
+                let later = clockRelativeReadings(fixture, at: now + offset)
+                for (before, after) in zip(atSeed[index], later) where before.text != after.text {
+                    return (offset, before.site)
+                }
+            }
+        }
+        return nil
+    }
+
+    /// The catalog's own promise: every clock-relative instant it seeds is a FULL `boundaryGuardSecs` from
+    /// the next boundary. This is what the rasterizing ladder's top arm used to probe at one offset.
+    func testEveryClockRelativeFixtureInstantKeepsTheFullGuard() throws {
+        let guardSecs = PanelRenderHarness.boundaryGuardSecs
+        let ceiling = guardSecs * 4
+        let crossing = firstBoundaryCrossing(seededAt: Self.sweepSeed, ceiling: ceiling)
+        let firstCrossing = crossing?.offset ?? ceiling + 1
+        print("[panel-goldens] catalog boundary sweep: first crossing at +\(firstCrossing)s "
+              + "(\(crossing?.site ?? "nothing within +\(ceiling)s")), guard \(guardSecs)s")
+        XCTAssertGreaterThanOrEqual(firstCrossing, guardSecs,
+                                    "`\(crossing?.site ?? "?")` changes its rendered text only "
+                                    + "\(firstCrossing)s after the seed, inside the \(guardSecs)s "
+                                    + "`PanelRenderHarness.boundaryGuardSecs` every fixture instant is "
+                                    + "supposed to keep from a `humanizeUntil` boundary. A fixture instant "
+                                    + "was seeded without its guard — add `+ guardSecs` to it (or subtract "
+                                    + "it, for a `generatedAt` age). This is the defect the clock-drift "
+                                    + "gate reddens at random for; here it is named and reproducible")
+    }
+
+    /// The invariant issue #1128 was actually about: the lag ladder plus the latency it reserves must land
+    /// strictly inside the window measured above.
+    ///
+    /// This is the deterministic falsifier for the OLD arrangement, and it needs no timing at all to be
+    /// one: the top used to be `boundaryGuardSecs - 1` = 29, so `29 + budget >= 30` for any budget of 1 s
+    /// or more — the old ladder reserved ZERO seconds for this test's own render latency, and that is the
+    /// whole defect stated as arithmetic. Note the one case this assertion does NOT reach: because the
+    /// derived top is `G - 1 - budget`, `top + budget` is identically `G - 1`, so a budget of 0 recreates
+    /// the old ladder exactly and passes HERE — it is the latency assertion below that reds on it, since a
+    /// real render always costs more than zero. It is equally the mechanical answer to the other candidate #1128 lists,
+    /// raising `boundaryGuardSecs`: at 45 the sweep above measures 15, not 45, because the `generatedAt`
+    /// ages spend the guard from the far end of the same plateau — so this reddens with both numbers rather
+    /// than leaving the reader to rediscover why.
+    func testTheDriftLadderFitsInsideTheGuardWithItsReservedBudget() throws {
+        let guardSecs = PanelRenderHarness.boundaryGuardSecs
+        let ceiling = guardSecs * 4
+        let crossing = firstBoundaryCrossing(seededAt: Self.sweepSeed, ceiling: ceiling)
+        let firstCrossing = crossing?.offset ?? ceiling + 1
+        let top = try XCTUnwrap(Self.clockDriftLadder.max(), "the clock-drift ladder is empty")
+        XCTAssertEqual(top, Self.clockDriftLadderTop, "the ladder's top arm is no longer its derived top")
+        let worstOffset = top + Self.seedToRasterBudgetSecs
+        print("[panel-goldens] drift ladder margin: top \(top)s + budget "
+              + "\(Self.seedToRasterBudgetSecs)s = \(worstOffset)s against a first crossing at "
+              + "+\(firstCrossing)s")
+        XCTAssertLessThan(worstOffset, firstCrossing,
+                          "the clock-drift ladder's top lag (\(top)s) plus the seed-to-raster latency it "
+                          + "reserves (\(Self.seedToRasterBudgetSecs)s) reaches offset \(worstOffset)s, at "
+                          + "or past the \(firstCrossing)s where `\(crossing?.site ?? "?")` changes its "
+                          + "text. `testRendersSurviveTheClockDriftWindow` would then redden on timing "
+                          + "rather than on a defect — which is exactly issue #1128. Lower "
+                          + "`seedToRasterBudgetSecs` (it lowers the ladder with it) or restore the guard; "
+                          + "do NOT widen a tolerance in that test")
     }
 
     // MARK: - Cross-machine robustness: the render ignores the HOST process's appearance
@@ -1195,7 +1421,7 @@ final class PanelGoldenParityTests: XCTestCase {
         lines.append(String(format: "  identical re-render ................ %.6f", PanelRaster.diffFraction(a, b)))
 
         // Clock-drift window.
-        for lag: Int64 in [1, 7, 29] {
+        for lag in Self.clockDriftLadder {
             let drifted = try XCTUnwrap(render(probe, seedLag: lag))
             lines.append(String(format: "  re-seeded %2ds earlier ............. %.6f",
                                 lag, PanelRaster.diffFraction(a, drifted)))

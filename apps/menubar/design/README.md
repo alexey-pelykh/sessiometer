@@ -378,8 +378,23 @@ whole table means running the default suite too.
 >
 > The 2 of those 40 that were not green failed for an unrelated, pre-existing reason with a distinguishable
 > signature — a worst delta in the *hundreds* over ~450 bytes, a text change rather than the ±1/255 raster
-> one. The 29 s lag in that test sits against a 30 s `boundaryGuardSecs`, leaving about a second of margin
-> for the sub-second seed truncation plus render latency. Tracked as issue #1128.
+> one. That was issue #1128, and it is closed: the lag ladder's top used to be 29 s against a 30 s
+> `boundaryGuardSecs`, which reserved **nothing** for the test's own seed-to-raster latency, so any latency
+> at all could carry a truncated seed over a `humanizeUntil` boundary. The top is now
+> `boundaryGuardSecs - 1 - seedToRasterBudgetSecs` (24 s, reserving 5 s), the test measures its own latency
+> and fails with that number when it exceeds the reserve, and the offsets the ladder no longer reaches are
+> swept without a rasterizer by `testEveryClockRelativeFixtureInstantKeepsTheFullGuard`. **The signature
+> guidance still stands and is still how a red here is read**: worst delta 1 over a few hundred bytes is
+> cold-raster (#824); worst delta in the hundreds is a boundary crossing.
+>
+> Raising `boundaryGuardSecs` was the other candidate and it is the wrong lever — measured, not argued.
+> The constant is spent in *both* directions on the same 60 s plateau: a countdown gets `G` seconds of
+> post-seed margin and first crosses at `G + 1`, a `generatedAt` age first crosses at `60 - G` so its
+> margin is `59 - G`. The window every fixture survives is therefore `min(G, 59 - G)`, maximised at
+> `G = 29` and `G = 30` alike — a tie, both worth 29 s — and 30 is the one in use. Setting it to 45 makes
+> the catalog sweep report a first crossing
+> at **+15 s** instead of +30 — half the margin, on the `stale` / `disconnected` ages that are the observed
+> failure. Both new gates redden with those numbers, so the lever answers for itself.
 
 **What the relative gate does and does not cover.** The primary check —
 `testEachFreshRenderIsNearestToItsOwnGolden` — asks that a fresh render's closest same-size golden be
