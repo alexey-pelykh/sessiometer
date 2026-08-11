@@ -23,11 +23,21 @@
 //! nothing else interpolates account data onto this channel. Identity is always
 //! the stable handle — never an email, never a token.
 //!
-//! Note for #15: a handle is an operator-chosen label; config validation forbids
-//! an *empty* label but not whitespace, so a label containing a space or `=` would
-//! split the `key=val` grammar into extra FIELDS. Enforcing the handle charset that
-//! far is the meter's job (#15); this module localizes the surface but does not
-//! police it — with the one exception the next section states.
+//! Note for #15: a handle is an operator-chosen label, and NOTHING constrains its
+//! charset. Config validation rejects a label only when it is empty after `trim`
+//! (`config::validate`); the `[A-Za-z0-9_-]{1,128}` rule is the `account_uuid`'s
+//! alone (issue #1052); and the meter scans for token, blob and email SHAPES, never
+//! a charset. So a label containing a space or `=` splits the `key=val` grammar into
+//! extra FIELDS, and no component prevents it — by decision, not by omission
+//! (ADR-0034, issue #1185): the label is written VERBATIM, and the obligation to
+//! survive one belongs to each READER of the durable log. What this module owes, it
+//! owes as a reader — see [`last_swap_at`] and [`last_refresh_outcomes`], which read
+//! the event key by field POSITION rather than by substring. Readers outside it do not
+//! yet meet that bar ([`crate::log`]'s `field`, [`crate::reliability`]'s `parse_events`
+//! and [`crate::usage_stats`]'s `parse_swap_events`, all of which tokenize on
+//! whitespace); ADR-0034 names them. The list carries the count deliberately — an
+//! earlier revision said "two" and omitted the third, which this file already named
+//! beside `parse_events` further down.
 //!
 //! The one FREE-FORM value on this channel is the resolved `claude` path
 //! ([`Event::RefreshBinaryResolved`], issue #786) — a filesystem location, still
@@ -2951,18 +2961,24 @@ impl EventLog {
 /// log — which records every swap through [`Event::to_log_line`] — is the only
 /// source a standalone command can read. Both a normal `event=swap` (now including
 /// the `use` verb's own `reason=manual|forced`) and an `event=emergency_swap` update
-/// the daemon's cooldown floor, so both count here. Best-effort: an unreadable file
-/// or an unparseable timestamp yields `None`, so a one-shot manual swap is never
-/// blocked by a missing or corrupt log (the cooldown then reads as inactive).
+/// the daemon's cooldown floor, so both count here. The event key is read by field
+/// POSITION — `event=` is always the second field — so a free-form handle spelling
+/// ` event=swap ` inside its own value cannot make a non-swap line answer this query
+/// (ADR-0034, issue #1185). Best-effort: an unreadable file or an unparseable timestamp
+/// yields `None`, so a one-shot manual swap is never blocked by a missing or corrupt log
+/// (the cooldown then reads as inactive).
 pub(crate) fn last_swap_at(path: &std::path::Path) -> Option<SystemTime> {
     let text = std::fs::read_to_string(path).ok()?;
     // Scan from the END: the log is append-only chronological, so the last swap
-    // line is the most recent swap. The surrounding spaces anchor the event key so
-    // a label that merely contains the text cannot be mistaken for it.
-    let line = text
-        .lines()
-        .rev()
-        .find(|line| line.contains(" event=swap ") || line.contains(" event=emergency_swap "))?;
+    // line is the most recent swap. The event key is read by POSITION — the second
+    // whitespace-delimited field — so a handle that merely spells the text cannot
+    // be mistaken for it (issue #1185).
+    let line = text.lines().rev().find(|line| {
+        matches!(
+            line.split(' ').nth(1),
+            Some("event=swap" | "event=emergency_swap")
+        )
+    })?;
     let raw_ts = line.strip_prefix("ts=")?.split(' ').next()?;
     let epoch = crate::usage::epoch_from_rfc3339(raw_ts)?;
     // The log only ever writes post-epoch instants; guard the cast so a malformed
@@ -2982,12 +2998,17 @@ pub(crate) fn last_swap_at(path: &std::path::Path) -> Option<SystemTime> {
 /// chronological log; the last `refresh` line for a handle is its most recent outcome.
 ///
 /// One pass (not one read per account): later lines overwrite earlier, so each handle
-/// ends mapped to its newest outcome. The account field is anchored between the literal
-/// ` event=refresh account=` prefix and the ` outcome=` that always immediately follows
-/// it (the [`Event::to_log_line`] grammar), so a handle is matched verbatim — a handle
-/// that merely *contains* ` outcome=` truncates to "no recognized outcome" (skipped)
-/// rather than mis-attributing. Best-effort like [`last_swap_at`]: an absent/unreadable
-/// log yields an empty map, so `list` simply omits the refresh tag.
+/// ends mapped to its newest outcome. A handle is free-form and may spell any of this
+/// reader's own landmarks (ADR-0034, issue #1185), so neither end of the account field is
+/// found by substring search: the line is a refresh line only when `event=refresh` is its
+/// SECOND field — a position no later value can occupy — and the handle then runs from
+/// `account=` to the LAST ` outcome=` on the line. That last one is always the writer's,
+/// because [`Event::to_log_line`] emits `outcome=` once and every field after it is a
+/// number or an enum token (`expires_*`, `rotated`, `reason`, `backoff_secs`,
+/// `window_secs`). A handle carrying a space, an `=`, or the literal text ` outcome=` is
+/// therefore matched WHOLE, and no line is attributed to an account that did not write it.
+/// Best-effort like [`last_swap_at`]: an absent/unreadable log yields an empty map, so
+/// `list` simply omits the refresh tag.
 ///
 /// Non-secret: the event log is itself a redaction-metered surface (issue #15) — every
 /// line is a handle / enum / timestamp — so the returned handles and outcomes carry no
@@ -3001,10 +3022,18 @@ pub(crate) fn last_refresh_outcomes(
     };
     for line in text.lines() {
         // ts=… event=refresh account={handle} outcome={token}[ expires_before=…][ expires_after=…]
-        let Some((_, rest)) = line.split_once(" event=refresh account=") else {
+        //
+        // The event key is field 1 by POSITION, and the handle runs to the LAST ` outcome=` on
+        // the line — the two things a free-form handle cannot forge (issue #1185).
+        let mut fields = line.splitn(3, ' ');
+        let _ts = fields.next();
+        if fields.next() != Some("event=refresh") {
+            continue;
+        }
+        let Some(rest) = fields.next().and_then(|rest| rest.strip_prefix("account=")) else {
             continue;
         };
-        let Some((handle, after)) = rest.split_once(" outcome=") else {
+        let Some((handle, after)) = rest.rsplit_once(" outcome=") else {
             continue;
         };
         let token = after.split(' ').next().unwrap_or(after);
@@ -5468,6 +5497,38 @@ mod tests {
     }
 
     #[test]
+    fn every_event_line_carries_its_event_key_as_the_second_field() {
+        // Issue #1185. `last_swap_at` and `last_refresh_outcomes` select a line by the POSITION
+        // of its event key rather than by substring, because a free-form handle can spell any
+        // substring but cannot occupy a field ahead of itself. That is only sound while the
+        // grammar this module documents — `ts=<RFC3339> event=<name> …` — actually holds for
+        // EVERY variant, so it is asserted here rather than argued: total over `Event` by
+        // construction (see the two-layer note above `declared_variant_names`), so a future
+        // variant that renders differently fails this test instead of silently un-anchoring
+        // both readers.
+        for event in &every_event_variant() {
+            let line = event.to_log_line(at_epoch(0));
+            let mut fields = line.split(' ');
+            let ts = fields.next();
+            assert_eq!(
+                ts.map(|ts| ts.starts_with("ts=")),
+                Some(true),
+                "the timestamp is field 0: {line}"
+            );
+            assert!(
+                !ts.unwrap().contains(char::is_whitespace),
+                "an RFC 3339 stamp is space-free, so it occupies exactly one field: {line}"
+            );
+            let event_field = fields.next();
+            assert_eq!(
+                event_field.map(|field| field.starts_with("event=")),
+                Some(true),
+                "the event key is field 1 — the position both readers select on: {line}"
+            );
+        }
+    }
+
+    #[test]
     fn credential_health_line_carries_the_handle_and_state_token() {
         // Issue #119 (+ #427 `degraded`): the health-transition event is the handle + a bare
         // rollup token — never a token, an expiry, or an email. Each rollup state renders its
@@ -5744,10 +5805,10 @@ ts=1970-01-01T00:00:40Z event=monitor_401 account=c consecutive=1\n";
         // `use` verb's swap cooldown (#63/#10) — a production path that would otherwise be
         // covered only transitively. The daemon emits the clear on the relief swap's OWN tick,
         // immediately AFTER the swap line, so the clear is the LAST line exactly when the
-        // cooldown is most load-bearing. `last_swap_at` scans from the end for a SPACE-ANCHORED
-        // ` event=swap ` / ` event=emergency_swap `, so it must walk past the clear and still
-        // return the swap's instant — never `None` (which would read as "cooldown inactive" and
-        // wrongly permit an immediate second swap).
+        // cooldown is most load-bearing. `last_swap_at` scans from the end for a line whose
+        // SECOND field is `event=swap` / `event=emergency_swap`, so it must walk past the clear
+        // and still return the swap's instant — never `None` (which would read as "cooldown
+        // inactive" and wrongly permit an immediate second swap).
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sessiometer.log");
         std::fs::write(
@@ -5777,8 +5838,8 @@ ts=1970-01-01T00:00:20Z event=all_exhausted_cleared\n",
         // `use` verb's swap cooldown (#63/#10) — the same production path issue #800's sibling
         // test guards. Both new kinds land AFTER the swap on their own tick (the daemon pushes
         // each clear post-`decide_action`), so they are the last lines exactly when the cooldown
-        // matters most. `last_swap_at` scans from the end for a SPACE-ANCHORED ` event=swap ` /
-        // ` event=emergency_swap `, so it must walk past both and still return the swap's instant
+        // matters most. `last_swap_at` scans from the end for a line whose SECOND field is
+        // `event=swap` / `event=emergency_swap`, so it must walk past both and still return it
         // — never `None`, which would read as "cooldown inactive" and wrongly permit an immediate
         // second swap.
         //
@@ -5808,6 +5869,53 @@ ts=1970-01-01T00:00:40Z event=fleet_runway_recovered\n",
         )
         .unwrap();
         assert_eq!(last_swap_at(&path), None);
+    }
+
+    #[test]
+    fn last_swap_at_ignores_a_swap_shaped_handle_on_a_non_swap_line() {
+        // Issue #1185. `label` is free-form by design (README: written VERBATIM as the account
+        // handle), so an operator-chosen handle can carry the literal text this reader anchors
+        // on. A handle spelled `a event=swap b` renders that text INSIDE a non-swap line, and a
+        // substring scan then reads a `monitor_401` as the fleet's most recent swap — fabricating
+        // a cooldown floor that blocks a `use` swap the operator is entitled to (#63/#10).
+        //
+        // The event key is the SECOND whitespace-delimited field on every line this module
+        // writes (`ts=<RFC3339> event=<name> …`, and an RFC 3339 stamp is space-free), so the
+        // field POSITION is what distinguishes the real key from a handle that merely spells it.
+        //
+        // Both vintages of the durable log (issue #1092 / PR #1183): a handle carrying a raw
+        // control byte reads as that byte on a pre-#1183 line and as `%09` on a post-#1183 one,
+        // and neither space nor `=` is a control character — so the swap-shaped text renders
+        // identically either way, and the reader must reject BOTH.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessiometer.log");
+        for handle in ["a\tb event=swap c", "a%09b event=swap c"] {
+            std::fs::write(
+                &path,
+                format!(
+                    "ts=1970-01-01T00:00:40Z event=monitor_401 account={handle} consecutive=1\n"
+                ),
+            )
+            .unwrap();
+            assert_eq!(
+                last_swap_at(&path),
+                None,
+                "a handle spelling ` event=swap ` must not make a monitor_401 line answer the \
+                 cooldown query (handle: {handle:?})"
+            );
+
+            // And with a REAL swap earlier in the log, the reader returns THAT instant — not the
+            // later, nearer, swap-shaped non-swap line. Scanning from the end must walk past it.
+            std::fs::write(
+                &path,
+                format!(
+                    "ts=1970-01-01T00:00:10Z event=swap from=a to=b reason=session session_pct=97\n\
+ts=1970-01-01T00:00:40Z event=monitor_401 account={handle} consecutive=1\n"
+                ),
+            )
+            .unwrap();
+            assert_eq!(last_swap_at(&path), Some(at_epoch(10)));
+        }
     }
 
     #[test]
@@ -5880,9 +5988,9 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
 
     #[test]
     fn last_refresh_outcomes_matches_a_handle_with_a_space_verbatim() {
-        // A handle is operator free text that may contain spaces; the account field is
-        // anchored between ` event=refresh account=` and the ` outcome=` that always
-        // follows it, so `my work` is matched whole rather than truncated at the space.
+        // A handle is operator free text that may contain spaces; the account field runs
+        // from `account=` to the LAST ` outcome=` on a line whose second field is
+        // `event=refresh`, so `my work` is matched whole rather than truncated at the space.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sessiometer.log");
         std::fs::write(
@@ -5894,6 +6002,77 @@ ts=1970-01-01T00:00:40Z event=refresh account=work outcome=dead rotated=false\n"
         assert_eq!(
             outcomes.get("my work"),
             Some(&RefreshEventOutcomeKind::Refreshed)
+        );
+    }
+
+    #[test]
+    fn last_refresh_outcomes_attributes_an_outcome_shaped_handle_to_its_own_account() {
+        // Issue #1185. The sibling of the space case above, and the one the anchoring alone does
+        // NOT survive: a handle spelled `<text> outcome=refreshed x` puts a SECOND ` outcome=` on
+        // the line, and splitting at the FIRST one truncates the handle to `<text>` and reads the
+        // handle's own text as the outcome. If the roster also holds an account genuinely named
+        // `<text>` — the truncation PREFIX, not some shorter word inside it — the offline `list`
+        // view (#120) then shows IT with a refresh outcome it never had, overwriting its real one.
+        //
+        // Both log lines below are therefore derived from the same `sib`, deliberately. An earlier
+        // revision named the sibling `my` while the hostile handle truncated to `my work`, so the
+        // second assertion held before AND after the fix and pinned nothing.
+        //
+        // The writer emits `outcome=` exactly once and every field after it is a number or an
+        // enum token (`expires_*`, `rotated`, `reason`, `backoff_secs`, `window_secs`), so the
+        // LAST ` outcome=` on the line is always the writer's and everything before it is the
+        // handle, whole.
+        //
+        // Both vintages of the durable log (issue #1092 / PR #1183): the tab reads raw on a
+        // pre-#1183 line and as `%09` on a post-#1183 one; the outcome-shaped text is unchanged
+        // by either, so both must attribute to their own full handle.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessiometer.log");
+        for sib in ["my\twork", "my%09work"] {
+            let handle = format!("{sib} outcome=refreshed x");
+            std::fs::write(
+                &path,
+                format!(
+                    "ts=1970-01-01T00:00:10Z event=refresh account={sib} outcome=dead\n\
+ts=1970-01-01T00:00:20Z event=refresh account={handle} outcome=no_change\n"
+                ),
+            )
+            .unwrap();
+            let outcomes = last_refresh_outcomes(&path);
+            assert_eq!(
+                outcomes.get(handle.as_str()),
+                Some(&RefreshEventOutcomeKind::NoChange),
+                "the handle is matched whole, up to the writer's own `outcome=` ({handle:?})"
+            );
+            assert_eq!(
+                outcomes.get(sib),
+                Some(&RefreshEventOutcomeKind::Dead),
+                "the account the pre-fix reader truncated TO keeps its own outcome ({handle:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn last_refresh_outcomes_ignores_a_refresh_shaped_handle_on_another_event() {
+        // Issue #1185, the prefix half. The `account=` value of ANY event can spell this reader's
+        // ` event=refresh account=` anchor — including the login-FAILURE path, which logs an
+        // `account_uuid` harvested from `~/.claude.json` BEFORE the roster charset gate (#1052)
+        // applies (issue #1092 / PR #1183 states that ordering). A substring scan then reads a
+        // `login` line as a refresh outcome for whatever account the hostile value names.
+        //
+        // `event=` is the second field on every line, so position — not a substring — is what
+        // selects a real refresh line.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessiometer.log");
+        std::fs::write(
+            &path,
+            "ts=1970-01-01T00:00:10Z event=login account=z event=refresh account=work outcome=dead \
+outcome=failed\n",
+        )
+        .unwrap();
+        assert!(
+            last_refresh_outcomes(&path).is_empty(),
+            "a login line must not report a refresh outcome for any account"
         );
     }
 
