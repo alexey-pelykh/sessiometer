@@ -1653,10 +1653,11 @@ mod tests {
         out
     }
 
-    /// The non-test region of `source` — everything above the file's `#[cfg(test)] mod …` line.
+    /// The non-test region of `source` — everything above the file's `#[cfg(test)] mod … {` line.
     ///
-    /// The boundary is `#[cfg(test)]` IMMEDIATELY followed by a column-0 `mod`, and the second
-    /// half is load-bearing rather than defensive. `INLINE_PROSE_REGISTER`'s lexer cuts at the
+    /// The boundary is `#[cfg(test)]` IMMEDIATELY followed by a column-0 `mod` that OPENS A
+    /// BLOCK rather than declaring one, and the second half is load-bearing rather than
+    /// defensive. `INLINE_PROSE_REGISTER`'s lexer cuts at the
     /// first line *starting with* `#[cfg(test)]`, which is correct for `src/cli.rs` and wrong
     /// here: this very file carries a column-0 `#[cfg(test)]` on a test-only `use` up in its
     /// import block, far above [`resolve_target`]. Under that rule this gate would stop at that
@@ -1664,21 +1665,46 @@ mod tests {
     /// [`the_non_test_boundary_survives_a_cfg_test_import`] pins it against exactly that.
     ///
     /// The `mod` half must sit at column 0, which is a deliberate BIAS rather than an oversight.
-    /// Two files carry no boundary of that shape and are therefore scanned whole:
-    /// `src/daemon/socket.rs`, which has no test module at all (three `#[cfg(test)]` helpers, and
-    /// its suite lives in `src/daemon.rs`), and `src/redaction.rs`, whose `mod tests` is nested
-    /// and indented inside `mod meter`. Accepting an indented `mod` would exclude redaction's
-    /// test block — and would also cut at the FIRST such block in any future file, discarding the
-    /// production code below it. Between over-scanning and under-scanning, this gate takes
-    /// over-scanning every time: a stray test helper costs ONE register line and says so loudly,
-    /// while a truncated scan is a green run over a subject that was never read. Neither file
-    /// contributes a read today.
+    /// Accepting an INDENTED `mod` would cut at the first nested test block in any future file,
+    /// discarding the production code below it. Between over-scanning and under-scanning, this
+    /// gate takes over-scanning every time: a stray test helper costs ONE register line and says
+    /// so loudly, while a truncated scan is a green run over a subject that was never read.
+    ///
+    /// **Seven of the fifty-nine files under `src/` therefore carry no boundary at all and are
+    /// scanned whole** — measured, not assumed, and worth stating because the bias only stays
+    /// cheap while that set stays inert (none of the seven contributes a read today). Three
+    /// classes: four files have no `#[cfg(test)]` whatsoever, their suites living in a sibling
+    /// (`config/test_support.rs`, `daemon/peer_auth.rs`, `daemon/run_loop.rs`,
+    /// `daemon/snapshot.rs` — the last two are covered from `daemon.rs` and `snapshot_build.rs`);
+    /// `daemon/socket.rs` carries `#[cfg(test)]` helpers but no test module; and two are cut by
+    /// a spelling rather than by a nesting — `main.rs` DECLARES its test modules
+    /// (`mod cross_surface;`, per the trailing-`{` rule below), and `redaction.rs` opens its
+    /// test-only block as `pub(crate) mod meter {`, which does not start with `mod `.
+    ///
+    /// The trailing-`{` requirement is that same bias applied to the shape that actually shipped
+    /// broken (issue #1197). A test module can be DECLARED rather than opened — `#[cfg(test)]` /
+    /// `mod test_support;`, pointing at a whole file of helpers elsewhere — and that declaration
+    /// satisfies "next line starts with `mod `" exactly as `mod tests {` does while enclosing
+    /// nothing at all. `src/config.rs` carries one at its line 57, so the unqualified rule cut
+    /// that file to its first 56 lines and threw away `struct Account` and `impl Account` below
+    /// them: the type this gate is named for, reporting green over 3% of it. `src/main.rs` was
+    /// cut the same way, inertly — 23 of its 88 lines, no reads either side.
+    ///
+    /// The predicate demands an OPENING BRACE rather than merely rejecting a `;`, and the
+    /// difference is not pedantic: `mod test_support; // helpers live elsewhere` ends with neither,
+    /// so a rule phrased as "does not end with `;`" restores the whole defect through a COMMENT —
+    /// and `src/config.rs:53` already carries one two lines above that very block. Demanding the
+    /// brace fails toward over-scan on every unrecognized shape, which is the bias above.
+    /// [`the_non_test_boundary_survives_a_cfg_test_import`] pins both arms, against synthetic
+    /// fixtures and against `src/config.rs` itself.
     fn non_test_region(source: &str) -> String {
         let lines: Vec<&str> = source.lines().collect();
         let end = (0..lines.len())
             .find(|&i| {
                 lines[i].starts_with("#[cfg(test)]")
-                    && lines.get(i + 1).is_some_and(|n| n.starts_with("mod "))
+                    && lines
+                        .get(i + 1)
+                        .is_some_and(|n| n.starts_with("mod ") && n.trim_end().ends_with('{'))
             })
             .unwrap_or(lines.len());
         lines[..end].join("\n")
@@ -1711,6 +1737,14 @@ mod tests {
     struct Scan {
         /// `(enclosing function, field)` per identity-field read.
         reads: Vec<(String, String)>,
+        /// `(function, definition site)` per DISTINCT reading function — the site being the
+        /// index of its opening brace, which is unique per definition even when the name is not.
+        ///
+        /// [`HANDLE_READ_REGISTER`] keys on the name alone, so two same-named functions that
+        /// both read an identity field collapse to one register row and inherit one disposition
+        /// — silently, since the name-set comparison still balances. This is what makes that
+        /// collision visible; [`every_handle_read_is_dispositioned`] asserts one site per name.
+        read_sites: Vec<(String, usize)>,
         /// Every function whose body calls [`resolve_target`].
         resolver_callers: Vec<String>,
     }
@@ -1719,8 +1753,9 @@ mod tests {
         let src: Vec<char> = source.chars().collect();
         let mut out = Vec::new();
         let mut callers: Vec<String> = Vec::new();
-        // Each open function body, with the brace depth it opened at.
-        let mut scopes: Vec<(String, usize)> = Vec::new();
+        let mut sites: Vec<(String, usize)> = Vec::new();
+        // Each open function body, with the brace depth it opened at and the index of that brace.
+        let mut scopes: Vec<(String, usize, usize)> = Vec::new();
         let mut pending: Option<String> = None;
         let mut depth = 0usize;
         let mut i = 0usize;
@@ -1796,13 +1831,13 @@ mod tests {
             if src[i] == '{' {
                 depth += 1;
                 if let Some(name) = pending.take() {
-                    scopes.push((name, depth));
+                    scopes.push((name, depth, i));
                 }
                 i += 1;
                 continue;
             }
             if src[i] == '}' {
-                if scopes.last().is_some_and(|(_, at)| *at == depth) {
+                if scopes.last().is_some_and(|(_, at, _)| *at == depth) {
                     scopes.pop();
                 }
                 depth = depth.saturating_sub(1);
@@ -1810,15 +1845,16 @@ mod tests {
                 continue;
             }
             if let Some(next) = resolver_call_at(&src, i) {
-                if let Some((name, _)) = scopes.last() {
+                if let Some((name, _, _)) = scopes.last() {
                     callers.push(name.clone());
                 }
                 i = next;
                 continue;
             }
             if let Some((field, next)) = identity_field_at(&src, i) {
-                if let Some((name, _)) = scopes.last() {
+                if let Some((name, _, site)) = scopes.last() {
                     out.push((name.clone(), field));
+                    sites.push((name.clone(), *site));
                 }
                 i = next;
                 continue;
@@ -1827,8 +1863,11 @@ mod tests {
         }
         callers.sort_unstable();
         callers.dedup();
+        sites.sort_unstable();
+        sites.dedup();
         Scan {
             reads: out,
+            read_sites: sites,
             resolver_callers: callers,
         }
     }
@@ -1998,9 +2037,13 @@ mod tests {
     /// is not an operator handle.
     ///
     /// Keyed on the function NAME, so two same-named functions in different modules share one
-    /// entry (`account_uuid` and `refresh` each do). The read-total pin in
-    /// [`every_handle_read_is_dispositioned`] is what closes that: a second same-named function
-    /// gaining a read moves the count even though it moves no name.
+    /// entry. [`MULTI_SITE_READERS`] is what closes that: every name whose reads come from more
+    /// than one definition must be listed there with the reason one disposition covers both, and
+    /// [`every_handle_read_is_dispositioned`] compares that list against the measured sites in
+    /// each direction. A crate-wide read TOTAL stood in for this until issue #1197 — it moved
+    /// when a second same-named function gained a read, but it also moved on every unrelated
+    /// commit anywhere in `src/`, so it reported the collision it was for and a hundred things
+    /// it was not.
     const HANDLE_READ_REGISTER: &[(&str, HandleRead, &str)] = &[
         // --- the shared resolver, and the sites that read a handle after routing through it ----
         ("resolve_target", SharedResolver, "the one resolver: label OR account-uuid, refusing on zero and on many (#17, OQ-1)"),
@@ -2031,6 +2074,7 @@ mod tests {
         ("recovery_pending", NotHandleResolution, "membership of an account's uuid in the quarantined / excluded uuid sets"),
         ("resolve_via_display", NotHandleResolution, "matches the DISPLAYED credential's uuid to a roster index — the credential is the input, not the operator"),
         ("restash_account", NotHandleResolution, "compares a roster account's uuid to the displayed credential's before restashing"),
+        ("stash", NotHandleResolution, "`Account::stash` DERIVES the keychain key from the uuid — a formatting read with no comparison, so there is nothing here to resolve first-match-wins"),
         ("run_sweep", NotHandleResolution, "the refresh sweep's per-account uuid membership checks, plus the handles its events carry"),
         // --- a handle read off an ALREADY-RESOLVED account or index ----------------------------
         //
@@ -2111,6 +2155,19 @@ mod tests {
         ("serve_control", NotHandleResolution, "the control request's own `label` field, forwarded into a `CaptureCommand`"),
     ];
 
+    /// Names that read an identity field from MORE THAN ONE definition, and why ONE
+    /// [`HANDLE_READ_REGISTER`] row honestly covers every site.
+    ///
+    /// The register keys on the bare function name, so two same-named readers collapse into one
+    /// row and the second inherits the first's disposition for free — while the name-set
+    /// comparison in [`every_handle_read_is_dispositioned`] still balances, because a set cannot
+    /// count. This list is what makes each such collision a written claim: a NEW one fails that
+    /// test, and so does an entry here whose collision has since gone away.
+    const MULTI_SITE_READERS: &[(&str, &str)] = &[
+        ("account_uuid", "the accessor on the OAuth state record (`src/claude_state.rs`) and on the migration artifact (`src/migration.rs`) — both return `&self.account_uuid` on a type that is not a roster account, so the single `NotHandleResolution` row states the same fact about each"),
+        ("refresh", "`impl PokeEngine for RealPokeEngine` (`src/poke.rs`) and `impl RefreshEngine for RealRefreshEngine` (`src/refresh_tick.rs`) — two unrelated traits, not one abstraction, but both forward an ALREADY-CHOSEN account's `account_uuid` into `refresh::refresh_account`, so neither resolves a handle and the shared row is exact for both. A THIRD same-named reader would not be covered by that reasoning; it reds this check and needs its own"),
+    ];
+
     /// The names [`every_handle_read_is_dispositioned`] compares against the register, extracted
     /// so the canaries can drive the IDENTICAL predicate over a deliberately broken subject
     /// rather than over a paraphrase of it (ADR-0031 § 4 CONSTRAINT-A).
@@ -2138,10 +2195,16 @@ mod tests {
         let mut reads = 0usize;
         let mut spelled: Vec<String> = Vec::new();
         let mut callers: Vec<String> = Vec::new();
-        for (_, text) in &sources {
+        let mut sites: Vec<(String, String, usize)> = Vec::new();
+        for (path, text) in &sources {
             let scan = handle_reads(&non_test_region(text));
             reads += scan.reads.len();
             spelled.extend(scan.reads.into_iter().map(|(name, _)| name));
+            sites.extend(
+                scan.read_sites
+                    .into_iter()
+                    .map(|(name, at)| (name, path.clone(), at)),
+            );
             callers.extend(scan.resolver_callers);
         }
         spelled.sort_unstable();
@@ -2160,33 +2223,71 @@ mod tests {
              #1186 was opened about"
         );
 
-        // Cardinality on all three populations, because none implies the others. The names would
-        // agree at zero if the walk found no files or the lexer matched nothing — a degenerate
-        // subject reporting as a clean run, which is the failure mode a source lint dies of. The
-        // read total is additionally what catches a SECOND same-named function, since the
-        // register keys on the name alone.
-        assert_eq!(
-            sources.len(),
-            59,
-            "expected 59 `.rs` files under src/; the count moved — if a module was added, it is \
-             now scanned, so check its dispositions and update this"
+        // Cardinality as FLOORS, never as crate-wide exact totals. The names above would agree at
+        // zero if the walk found no files or the lexer matched nothing — a degenerate subject
+        // reporting as a clean run, which is the failure mode a source lint dies of. A floor
+        // catches that collapse and nothing else, which is the whole intent: an exact crate-wide
+        // total reds on any commit that adds or removes an identity read ANYWHERE, so it taxes
+        // PRs that never touch this gate and teaches its reader to re-bless a number rather than
+        // check a disposition. These are collapse detectors set far below the live figures, not
+        // targets — raise one only if the tree ever shrinks past it, and never to track growth.
+        assert!(
+            sources.len() >= 40,
+            "only {} `.rs` files found under src/ — the walk collapsed, so every assertion above \
+             passed over a subject that was never read",
+            sources.len()
         );
-        assert_eq!(
-            spelled.len(),
-            83,
-            "expected 83 functions reading an Account identity field; the count moved — \
-             disposition the new one, then update this"
-        );
-        assert_eq!(
-            reads, 156,
-            "expected 156 identity-field reads; the count moved — check whether the function that \
-             gained one is still dispositioned correctly, then update this"
+        assert!(
+            reads >= 100,
+            "only {reads} identity-field reads found across the crate — the lexer collapsed, so \
+             every assertion above passed over a subject that was never read"
         );
 
+        // A name whose reads come from more than one definition must be an ACKNOWLEDGED collision.
+        // HANDLE_READ_REGISTER keys on the name alone, so a second same-named reader inherits the
+        // first one's disposition while the name-set comparison above still balances — a set
+        // cannot count. Compared in both directions, so a NEW collision fails and so does a
+        // MULTI_SITE_READERS entry whose collision has gone away. The crate-wide read total stood
+        // in for this until issue #1197; it does so directly now, and names the sites.
+        sites.sort();
+        let mut collided: Vec<String> = sites
+            .windows(2)
+            .filter(|pair| pair[0].0 == pair[1].0)
+            .map(|pair| pair[0].0.clone())
+            .collect();
+        collided.dedup();
+        let mut acknowledged: Vec<String> = MULTI_SITE_READERS
+            .iter()
+            .map(|(name, _)| (*name).to_owned())
+            .collect();
+        acknowledged.sort_unstable();
+        let measured: Vec<String> = collided
+            .iter()
+            .map(|name| {
+                let at: Vec<String> = sites
+                    .iter()
+                    .filter(|(spelled, _, _)| spelled == name)
+                    .map(|(_, path, at)| format!("{path} char {at}"))
+                    .collect();
+                format!("{name} ({})", at.join(", "))
+            })
+            .collect();
+        assert_eq!(
+            collided,
+            acknowledged,
+            "the names reading an identity field from more than one definition must be exactly \
+             those listed in MULTI_SITE_READERS, each with the reason ONE register disposition \
+             covers every site — measured: [{}]",
+            measured.join("; ")
+        );
+
+        // Per-disposition counts stay exact: the register they mirror is fifty lines up in THIS
+        // file, so the reader who moves one is looking straight at the number that must move with
+        // it. That is what the crate-wide totals above could never be.
         for (arm, expected) in [
             (SharedResolver, 1),
             (ViaSharedResolver, 4),
-            (NotHandleResolution, 78),
+            (NotHandleResolution, 79),
         ] {
             let actual = HANDLE_READ_REGISTER
                 .iter()
@@ -2312,7 +2413,9 @@ mod tests {
     /// is correct for `src/cli.rs` and wrong for this file, which carries one in its import block
     /// on a test-only `use`, far above [`resolve_target`]. Under that rule the gate would stop at
     /// that import and never see the resolver it protects — a green run over a truncated subject.
-    /// Both halves are asserted: the import must NOT cut, and the real test module MUST.
+    /// Every arm of the rule is asserted here: a `#[cfg(test)]` on an import must NOT cut, one on
+    /// an INDENTED `mod` must NOT cut, one on a module DECLARATION (`mod test_support;`) must NOT
+    /// cut, and one on a column-0 inline `mod tests {` MUST.
     #[test]
     fn the_non_test_boundary_survives_a_cfg_test_import() {
         let source = "use crate::a;\n\
@@ -2351,12 +2454,59 @@ mod tests {
             "an indented test module must NOT cut the scan — the code below it is production"
         );
 
-        // …and the same rule, over the real file this trap lives in.
+        // The third shape, and the one that actually shipped broken (issue #1197): a `#[cfg(test)]`
+        // on a module DECLARATION — `mod test_support;`, a whole file's worth of test helpers
+        // living elsewhere. It satisfies "next line starts with `mod `" exactly as an inline
+        // `mod tests {` does, so the unqualified rule cut `src/config.rs` at its line 57 and
+        // discarded `struct Account` and `impl Account` below it: the very type this gate is
+        // named for, scanned at 3% of its length, reporting green.
+        let declaration = [
+            "mod render;",
+            "#[cfg(test)]",
+            "mod test_support;",
+            "mod validate;",
+            "fn production(a: &Account) -> String { a.label.clone() }",
+        ]
+        .join("\n");
+        assert_eq!(
+            functions_reading_a_handle(&declaration),
+            ["production"],
+            "a `#[cfg(test)]` on a module DECLARATION must not cut the scan — the declaration \
+             names a file, and the production code below it is still production"
+        );
+
+        // …and the same declaration wearing a trailing COMMENT, which is why the rule demands an
+        // opening brace rather than merely rejecting a `;`. Phrased the weaker way, this shape
+        // restores the entire defect through a comment — and `src/config.rs:53` already carries
+        // one two lines above the block this fixture is modelled on.
+        let commented = [
+            "mod render;",
+            "#[cfg(test)]",
+            "mod test_support; // helpers live in config/test_support.rs",
+            "fn production(a: &Account) -> String { a.label.clone() }",
+        ]
+        .join("\n");
+        assert_eq!(
+            functions_reading_a_handle(&commented),
+            ["production"],
+            "a commented module declaration must not cut the scan either — a comment cannot be \
+             what decides whether this gate reads the file that defines `Account`"
+        );
+
+        // …and the same rule, over the two real files that hold the trap: the resolver's own,
+        // and `Account`'s.
         let this_file = std::fs::read_to_string("src/use_account.rs").expect("readable");
         assert!(
             non_test_region(&this_file).contains("pub(crate) fn resolve_target"),
             "the non-test region of src/use_account.rs must still contain the resolver — if it \
              does not, every assertion above is running on a truncated subject"
+        );
+        let config = std::fs::read_to_string("src/config.rs").expect("readable");
+        assert!(
+            non_test_region(&config).contains("impl Account {"),
+            "the non-test region of src/config.rs must still contain `impl Account` — it sits \
+             BELOW that file's `#[cfg(test)] mod test_support;`, so this is the assertion that \
+             fails if the declaration clause is ever dropped"
         );
     }
 
