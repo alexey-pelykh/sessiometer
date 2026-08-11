@@ -793,9 +793,10 @@ mod tests {
             // …and the SERIALIZED form, in the same walk. The invariant issue #1070 actually buys
             // is a property of the BYTES ("absent, not `null`"), and `skip_serializing_if` is the
             // only thing delivering it — an attribute no other gate in either language reads. The
-            // five wire goldens all carry `"refresh_health":null`, so they never serialize this
-            // struct at all and cannot witness a regression here; asserting the value alone would
-            // leave `#[serde(default)]` (which emits `"rotated":null`) passing every test.
+            // committed status/watch goldens either render `"refresh_health":null` or carry no
+            // account at all, so none of them serializes this struct and none can witness a
+            // regression here; asserting the value alone would leave `#[serde(default)]` (which
+            // emits `"rotated":null`) passing every test.
             let json = serde_json::to_string(&view).expect("RefreshHealth serializes");
             assert_eq!(
                 json.contains("\"rotated\""),

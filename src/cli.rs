@@ -15293,8 +15293,8 @@ impl Nested {
         /// An all-quiet roster row: enabled, in no fault state, with no readings and no known
         /// resets. Every fixture row below is written as its DELTA from this via struct-update
         /// syntax, so a call site states exactly what it varies — `quiet("unseen")` says "nothing
-        /// was ever read for this account" far more legibly than ten positional arguments whose
-        /// meanings are invisible at the call site. Spelling the base out field by field here
+        /// was ever read for this account" far more legibly than a wall of positional arguments
+        /// whose meanings are invisible at the call site. Spelling the base out field by field here
         /// keeps the complete, auditable input a golden fixture wants.
         ///
         /// A local builder rather than the `status_line_resets` helper above, because the goldens
@@ -15427,7 +15427,7 @@ impl Nested {
         /// wide-glyph label, a disabled row, a quarantined one.
         ///
         /// The base roster deliberately keeps `expiry: None` on every row (see [`quiet`]): that is
-        /// what makes the other eight `status` goldens pin the column's ELISION, which is a
+        /// what makes every other `status` golden pin the column's ELISION, which is a
         /// load-bearing behaviour in its own right (issue #883 — a fleet whose credentials carry no
         /// deadline must show no column rather than a wall of `—`). Populating the shared base would
         /// have destroyed that coverage to gain this; a separate roster pins BOTH directions.
@@ -15559,7 +15559,7 @@ impl Nested {
                     ),
                 ),
                 // The REFRESH-token expiry surfaces (issues #878/#882/#883/#879), pinned by #886.
-                // The eight cases above all carry `expiry: None`, so they pin the column's
+                // The cases above all carry `expiry: None`, so they pin the column's
                 // ELISION; these pin the POPULATED render — the four horizon cells side by side,
                 // the fleet cohort line, and the shed-first degradation.
                 Case::new(
@@ -15696,7 +15696,7 @@ impl Nested {
             };
 
             // The `EXPIRY` column materialized at all — the elision rule's other direction, which
-            // the eight all-`None` cases pin and this one must not.
+            // the all-`None` cases pin and this one must not.
             assert!(
                 text.lines()
                     .next()

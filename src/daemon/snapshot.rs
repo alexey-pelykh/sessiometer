@@ -1205,12 +1205,12 @@ pub(crate) struct AccountExpiry {
     ///
     /// `skip_serializing_if` keeps an ungrouped account's key OFF the wire, so the common
     /// unsynchronized fleet still serializes byte-identically to a pre-#879 frame and the
-    /// `build/fixtures/wire-*.json` goldens — all four of which carry no cohort — stay unchanged
-    /// across this bump. **The key's mere APPEARANCE was the wire-contract change**, and #879 paid
-    /// the full ritual for it: the MINOR [`STATUS_SCHEMA_VERSION`] bump to 1.13, the golden
-    /// regeneration, and the current-daemon Swift fixture lockstep. Note what that byte-identity
-    /// means for anyone extending this: a gate CANNOT tell you when a new grouping reaches the wire,
-    /// because the goldens go on passing. The same is true of the
+    /// status/watch goldens that carry no cohort gained no key across this bump — only their
+    /// version stamp moved. **The key's mere APPEARANCE was the wire-contract change**,
+    /// and #879 paid the full ritual for it: the MINOR [`STATUS_SCHEMA_VERSION`] bump to 1.13, the
+    /// golden regeneration, and the current-daemon Swift fixture lockstep. Note what that
+    /// byte-identity means for anyone extending this: a gate CANNOT tell you when a new grouping
+    /// reaches the wire, because the goldens go on passing. The same is true of the
     /// `assert!(!frame.contains("cohort_id"))` in
     /// `account_line_encodes_the_expiry_modifier_only_once_the_account_has_been_polled`, which
     /// hand-builds its own `AccountExpiry` and so pins only that an ungrouped account stays quiet.
@@ -1452,7 +1452,7 @@ pub(crate) fn refresh_health_view(health: &AccountHealth) -> Option<RefreshHealt
         // an exchange ran. Dropping the `.unwrap_or` is the whole of it here — the accessor already
         // returns exactly the `Option` the wire now wants — and it completes AC-5 across all four
         // emitting surfaces. The cost is a MINOR `STATUS_SCHEMA_VERSION` bump (1.13 → 1.14) with
-        // the five status/watch goldens regenerated and the Swift mirror re-typed to `Bool?`; see
+        // the status/watch goldens regenerated and the Swift mirror re-typed to `Bool?`; see
         // [`STATUS_SCHEMA_VERSION`] for why minor, and for the one asymmetric consequence.
         rotated: outcome.rotated(),
         consecutive_failures: health.consecutive_refresh_failures,
