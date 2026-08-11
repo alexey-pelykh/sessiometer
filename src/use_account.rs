@@ -1671,8 +1671,17 @@ mod tests {
     /// so loudly, while a truncated scan is a green run over a subject that was never read.
     ///
     /// **Seven of the fifty-nine files under `src/` therefore carry no boundary at all and are
-    /// scanned whole** — measured, not assumed, and worth stating because the bias only stays
-    /// cheap while that set stays inert (none of the seven contributes a read today). Three
+    /// scanned whole** — measured, not assumed, and worth stating because the bias's cost is
+    /// exactly what those files' TEST-ONLY regions contribute, read as production. Today that is
+    /// nothing: `config/test_support.rs` (entirely test-only), `redaction.rs`'s `mod meter`,
+    /// `main.rs`'s declared test modules and `socket.rs`'s `#[cfg(test)]` helpers hold no
+    /// identity-field read between them. Their PRODUCTION reads are a separate matter and are not
+    /// part of the over-scan — three of the seven carry one (`daemon/run_loop.rs:69`,
+    /// `daemon/snapshot.rs:991`, `daemon/socket.rs:835`, that last being why `serve_control` sits
+    /// in [`HANDLE_READ_REGISTER`]) and each is dispositioned like any other. Re-check with
+    /// `git grep -nE '\.(label|account_uuid)\b' -- <the seven>`; through PR #1198 this paragraph
+    /// asserted the stronger and false "none of the seven contributes a read", which the register
+    /// two screens below already contradicted (issue #1203). Three
     /// classes: four files have no `#[cfg(test)]` whatsoever, their suites living in a sibling
     /// (`config/test_support.rs`, `daemon/peer_auth.rs`, `daemon/run_loop.rs`,
     /// `daemon/snapshot.rs` — the last two are covered from `daemon.rs` and `snapshot_build.rs`);
