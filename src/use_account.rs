@@ -1722,9 +1722,21 @@ mod tests {
     /// Every read of an [`Account`] identity field in `source`'s non-test code, as
     /// `(enclosing function, field)`.
     ///
-    /// The subject is the field read, and it is the irreducible one: `label` and `account_uuid`
+    /// The subject is the field READ, and that is the irreducible one: `label` and `account_uuid`
     /// are plain `pub(crate)` fields with no accessors, so code that resolves an operator's handle
-    /// MUST read one. Two narrower subjects were measured against the tree and both are refuted:
+    /// MUST read one.
+    ///
+    /// **The SPELLING of that read is not irreducible, and this paragraph claimed it was** until
+    /// issue #1202. Rust reads a field without ever writing a `.`, by binding it in a pattern, and
+    /// [`identity_field_at`] matches the `.`-access token alone. Measured against the real
+    /// instrument, `let crate::config::Account { label, .. } = account;` inside a first-match-wins
+    /// `position` closure passed the gate — a seventh label-resolving site landing silent, which
+    /// is the whole of what issue #1186 opened this gate to prevent. The inference "must read one,
+    /// therefore matching the read is enough" was sound; it just was not a statement about the
+    /// token being matched. [`braced_binding_at`] is the second spelling, and the two arms
+    /// together are what the sentence above now describes.
+    ///
+    /// Two narrower subjects were measured against the tree and both are refuted:
     ///
     /// - **Only reads next to a comparison** (`==`, `.eq`) misses a `let` hoist, and such hoists
     ///   already ship — including inside `cli::apply_enabled` (`let label = account.label.clone()`),
@@ -1739,6 +1751,44 @@ mod tests {
     /// would fill the register with entries no reader can act on. `Account` grows an accessor
     /// only by someone editing `src/config.rs`, where
     /// [`the_identity_fields_stay_plain_fields`] is waiting.
+    ///
+    /// **The braced-pattern family, enumerated rather than left implicit** (issue #1202's last
+    /// acceptance criterion). Every member below is one rule — a field name bound as SHORTHAND
+    /// directly inside a braced group — so they are covered together rather than one at a time,
+    /// and each is a case in
+    /// [`the_handle_read_tripwire_bites_on_a_braced_pattern_binding`]:
+    ///
+    /// | Spelling | Seen | Why |
+    /// |---|---|---|
+    /// | `let Account { label, .. } = a` | yes | the issue's probe, and the `let Type { … }` destructures already established in the tree |
+    /// | `if let` / `while let` | yes | the same braced group; the leading keyword is not read |
+    /// | a `match` arm's struct pattern | yes | `cli::execute` ships one, and it is a register row as of this change |
+    /// | a closure parameter | yes | a braced group inside the call's parens |
+    /// | a destructuring `fn` parameter | yes | attributed to the function being declared — it binds before the body brace opens, so `handle_reads` reaches for `pending` rather than an open scope |
+    /// | `ref` / `mut` prefixes | yes | skipped before the enclosing token is read; `src/capture.rs:432` spells `mut roster` |
+    /// | a RENAMED binding (`Account { label: h, .. }`) | **no** | textually identical to a struct DEFINITION's `label: String` and a struct LITERAL's `label: expr`, so admitting it admits every declared field in the crate |
+    /// | a tuple-struct pattern (`Account(label, ..)`) | n/a | positional patterns cannot bind a NAMED field, and `Account`'s identity fields are named — [`the_identity_fields_stay_plain_fields`] is what keeps that true |
+    ///
+    /// The destructures the tree already ships were run through the widened scan rather than
+    /// read: every one of them binds other fields (`mut roster`, `tunables`, `size`, `outcome`,
+    /// `major` / `minor`, …) and not an identity field, so none of them owes a register row. That
+    /// is a measurement with a short shelf life, and it is not what holds — what holds is that a
+    /// destructure which starts binding one now REDS [`every_handle_read_is_dispositioned`] like
+    /// any other read. The gate is the record; this sentence only says how it was checked.
+    ///
+    /// The rename is the one open residual, and it is a cheap bypass — cheaper than the `.`-access
+    /// one this change closes, since it is a single extra token. It is not closed here because
+    /// closing it needs the scanner to tell a pattern from a type ascription, which means lexing
+    /// Rust rather than matching a shape: `src/cli.rs`'s `inline_literals` pays that price because
+    /// its subject is every literal in a file, and the subject here is one field name. It is
+    /// pinned OPEN by the canary above, so a future widening that closes it reds a test and brings
+    /// its reader back to this table rather than silently making it false.
+    ///
+    /// What rides along, deliberately: a struct LITERAL's field-init shorthand is the same tokens
+    /// as a pattern (`Self { raw, account_uuid }`), so a WRITE is filed as a read. That is the
+    /// over-scan bias [`non_test_region`] states, and it is cheap here — a literal shorthand needs
+    /// a local named exactly `label`, which is a handle that came from somewhere.
+    ///
     /// One pass's findings. Both populations come out of ONE lexer deliberately: they are
     /// compared against each other (a `ViaSharedResolver` entry must appear in
     /// [`Scan::resolver_callers`]), and two lexers that could disagree about where a function
@@ -1748,6 +1798,11 @@ mod tests {
         reads: Vec<(String, String)>,
         /// `(function, definition site)` per DISTINCT reading function — the site being the
         /// index of its opening brace, which is unique per definition even when the name is not.
+        ///
+        /// A read bound by a destructuring PARAMETER contributes to [`Scan::reads`] but NOT here:
+        /// it is matched before its function's body brace exists, and the pattern's own brace is
+        /// not a definition site — filing it as one would report a function whose parameter and
+        /// body each read an identity field as a two-definition collision. See `handle_reads`.
         ///
         /// [`HANDLE_READ_REGISTER`] keys on the name alone, so two same-named functions that
         /// both read an identity field collapse to one register row and inherit one disposition
@@ -1775,6 +1830,12 @@ mod tests {
         let mut compared: Vec<(String, usize)> = Vec::new();
         // Each open function body, with the brace depth it opened at and the index of that brace.
         let mut scopes: Vec<(String, usize, usize)> = Vec::new();
+        // Every delimiter currently open, innermost last. `depth` counts braces only and cannot
+        // answer the question [`braced_binding_at`] asks — whether a bare `label` sits directly
+        // in a BRACED group (`Account { label, .. }`) or in a parenthesised one
+        // (`run_login(login, store, stash, existing, label, claude_json)`, `src/capture.rs:762`).
+        // Both spell the same three tokens; only the enclosing delimiter tells them apart.
+        let mut delims: Vec<char> = Vec::new();
         let mut pending: Option<String> = None;
         let mut depth = 0usize;
         let mut i = 0usize;
@@ -1847,11 +1908,34 @@ mod tests {
                 i += 1;
                 continue;
             }
+            if matches!(src[i], '(' | '[') {
+                delims.push(src[i]);
+                i += 1;
+                continue;
+            }
+            if matches!(src[i], ')' | ']') {
+                delims.pop();
+                i += 1;
+                continue;
+            }
             if src[i] == '{' {
                 depth += 1;
-                if let Some(name) = pending.take() {
-                    scopes.push((name, depth, i));
+                // A pending `fn` binds to the brace that opens its BODY, and a brace opened
+                // INSIDE the parameter list is not that brace — it is a destructuring parameter
+                // (`fn park(Account { label, .. }: &Account) { … }`). Binding the scope there
+                // opened it at the pattern and closed it at the pattern's `}`, leaving the whole
+                // body with no enclosing scope: every read in it was attributed to nothing and
+                // dropped. That is a total bypass of this gate, in the same family as the one
+                // issue #1202 is about, and the delimiter stack is what makes the two braces
+                // distinguishable. Nothing in the tree spells it today — measured, and
+                // [`the_handle_read_tripwire_bites_on_a_braced_pattern_binding`] is what keeps
+                // the arm honest rather than decorative.
+                if delims.last() != Some(&'(') {
+                    if let Some(name) = pending.take() {
+                        scopes.push((name, depth, i));
+                    }
                 }
+                delims.push('{');
                 i += 1;
                 continue;
             }
@@ -1860,6 +1944,7 @@ mod tests {
                     scopes.pop();
                 }
                 depth = depth.saturating_sub(1);
+                delims.pop();
                 i += 1;
                 continue;
             }
@@ -1870,8 +1955,26 @@ mod tests {
                 i = next;
                 continue;
             }
-            if let Some((field, next)) = identity_field_at(&src, i) {
-                if let Some((name, _, site)) = scopes.last() {
+            let matched = identity_field_at(&src, i).or_else(|| {
+                (delims.last() == Some(&'{'))
+                    .then(|| braced_binding_at(&src, i))
+                    .flatten()
+            });
+            if let Some((field, next)) = matched {
+                // A destructuring PARAMETER binds before its function's body brace opens, so
+                // there is no open scope to attribute it to and `pending` — the function being
+                // declared — is the honest owner. No SITE is recorded for it: the site is the
+                // body brace, which has not been reached, and inventing the pattern brace
+                // instead would file a function whose parameter AND body each read one as a
+                // two-definition collision that does not exist. What that costs is exactly this:
+                // [`MULTI_SITE_READERS`] cannot see a name colliding through parameter bindings
+                // ALONE. The name set above still catches such a function, and nothing in the
+                // tree spells the shape at all — measured.
+                let in_param_pattern =
+                    pending.is_some() && delims.len() >= 2 && delims[delims.len() - 2] == '(';
+                if let (true, Some(name)) = (in_param_pattern, &pending) {
+                    out.push((name.clone(), field));
+                } else if let Some((name, _, site)) = scopes.last() {
                     if read_is_compared(&src, i, next) {
                         compared.push((name.clone(), i));
                     }
@@ -2041,6 +2144,89 @@ mod tests {
             k += 1;
         }
         if src.get(k) == Some(&'(') {
+            return None;
+        }
+        Some((name, j))
+    }
+
+    /// `label` / `account_uuid` bound by NAME inside a braced pattern at `at`, and the index just
+    /// past it — the spelling that reads the field without ever writing a `.` (issue #1202).
+    ///
+    /// The caller supplies the half this function cannot see: it runs only when the INNERMOST
+    /// open delimiter is `{`. That is the whole discriminator, and it is what makes the rule
+    /// below safe to state so loosely. `Account { label, .. }` and `run_login(…, label, …)` spell
+    /// the same three tokens; the first sits in a braced group and the second in a parenthesised
+    /// one, and `src/capture.rs:237` and `:762` already ship the second in production code this
+    /// gate scans — `:762` measured, by removing the test and reading what the register then
+    /// refused. `:237` is not reached by that measurement: `label` is last in that call, so it is
+    /// followed by `)`, and the CLOSE test below admits only `,` or `}`.
+    ///
+    /// SHORTHAND only — the name must both OPEN its entry (preceded by `{` or `,`, through an
+    /// optional `ref` / `mut`, which `src/capture.rs:432` already spells as `mut roster`) and
+    /// CLOSE it (followed by `,` or `}`). That is not a narrowing for its own sake: it is what
+    /// keeps a struct DEFINITION out, since a declared field is always `label: Type` and can
+    /// never be shorthand. The cost is the renamed binding, recorded as a residual at
+    /// [`HANDLE_READ_REGISTER`] and pinned open by
+    /// [`the_handle_read_tripwire_bites_on_a_braced_pattern_binding`].
+    ///
+    /// One rule covers the whole family — `let`, `if let`, `while let`, a `match` arm, a
+    /// destructuring `fn` parameter and a closure parameter are all a braced group whose entries
+    /// are field names, and none of them is spelled with a `.`. What rides along is the struct
+    /// LITERAL's field-init shorthand (`Self { raw, account_uuid }`, `src/claude_state.rs:122`),
+    /// which is textually identical to the pattern and stays. Admitting it is the same over-scan
+    /// bias [`non_test_region`] takes: a literal shorthand needs a local named exactly `label`,
+    /// which is itself a handle that came from somewhere, so the register row it costs is a row
+    /// about a real handle rather than noise.
+    fn braced_binding_at(src: &[char], at: usize) -> Option<(String, usize)> {
+        // A left word boundary, and neither a field access nor a path segment: `.label` is
+        // [`identity_field_at`]'s, and `Foo::label` is a path rather than a binding.
+        if at > 0 && {
+            let prev = src[at - 1];
+            prev.is_ascii_alphanumeric() || prev == '_' || prev == '.' || prev == ':'
+        } {
+            return None;
+        }
+        let mut j = at;
+        while src
+            .get(j)
+            .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
+        {
+            j += 1;
+        }
+        let name: String = src[at..j].iter().collect();
+        if name != "label" && name != "account_uuid" {
+            return None;
+        }
+        // It CLOSES its entry — so `label: String` in a struct declaration is not a binding, and
+        // neither is a bare `label` used as an expression (`return label;`).
+        let mut k = j;
+        while src.get(k).is_some_and(|c| c.is_whitespace()) {
+            k += 1;
+        }
+        if !matches!(src.get(k), Some(',' | '}')) {
+            return None;
+        }
+        // …and it OPENS one, through an optional `ref` / `mut`. Without this a block's TAIL
+        // EXPRESSION reads as a field binding: in `{ let _ = 1; label }` the name is followed by
+        // `}` exactly as a shorthand entry is, and only what PRECEDES it tells the two apart.
+        // (A tail expression sitting directly after the `{` is not separated by this test and is
+        // admitted — the over-scan the doc comment above accepts.)
+        let mut b = at;
+        loop {
+            while b > 0 && src[b - 1].is_whitespace() {
+                b -= 1;
+            }
+            let mut w = b;
+            while w > 0 && (src[w - 1].is_ascii_alphanumeric() || src[w - 1] == '_') {
+                w -= 1;
+            }
+            let word: String = src[w..b].iter().collect();
+            if word != "ref" && word != "mut" {
+                break;
+            }
+            b = w;
+        }
+        if !matches!(src.get(b.checked_sub(1)?), Some('{' | ',')) {
             return None;
         }
         Some((name, j))
@@ -2276,16 +2462,28 @@ mod tests {
         // The lexer is textual and cannot resolve types, so these ride along. They are cheap to
         // carry and the alternative — teaching the scanner about types — is what would make it
         // evadable.
+        //
+        // Four of them ride along on the SPELLING as well as on the type, and arrived together
+        // when [`braced_binding_at`] taught the scan to see a field bound by name (issue #1202):
+        // `execute` and `to_log_line` bind one in a `match` arm, `parse_subcommand` and
+        // `from_object` write one as a struct literal's field-init shorthand. Every one of them
+        // is an enum-variant or record field on `Command`, `Event` or the OAuth state record
+        // rather than on an `Account`, so the section they are in is the right one — but the
+        // reason they were INVISIBLE until #1202 is the spelling, not the type.
         ("account_uuid", NotHandleResolution, "`&self.account_uuid` on the OAuth state record and on the migration artifact, not on a roster account"),
         ("cached_viability_for", NotHandleResolution, "`AccountStatusLine.label` — a daemon WIRE line, and a duplicated handle there returns None rather than guessing"),
         ("capture", NotHandleResolution, "`CaptureReport.label`"),
         ("capture_failure", NotHandleResolution, "`CaptureCommand.label` — the name being ASSIGNED to a new account"),
+        ("execute", NotHandleResolution, "`Command::Capture { label }` / `Command::Login { label }` — a MATCH ARM binding the operator's CLI positional out of the parsed command and handing it to `capture` / `login`, which ASSIGN it to a new account. Nothing is matched against the roster here"),
+        ("from_object", NotHandleResolution, "`Self { raw, account_uuid }` — the OAuth state record building ITSELF from `~/.claude.json`'s `accountUuid`, written as a struct literal's field-init shorthand. Not a roster account, and a write rather than a read"),
         ("daemon_marks_quarantined", NotHandleResolution, "matches BOTH the daemon's wire line (`AccountStatusLine.label`) and the roster (`Account.label`) since issue #1086 — but it COUNTS bearers on each side and refuses on either being non-unique, exactly as the registered `label_bearers` does. Counting is not resolving"),
         ("import_report", NotHandleResolution, "`AccountImport.label` — per-entry import outcomes"),
-        ("new", NotHandleResolution, "`AccountStatusLine.label` — `StatusRow`'s rendered account cell"),
+        ("new", NotHandleResolution, "`AccountStatusLine.label` — `StatusRow`'s rendered account cell — and, since issue #1202 taught the scan to see a field bound by name, `ManagedAccount { account_uuid, .. }`, the migration artifact naming its own key. Neither type is a roster `Account`; see MULTI_SITE_READERS"),
+        ("parse_subcommand", NotHandleResolution, "`|label| Command::Capture { label }` — packs the operator's CLI positional INTO the parsed command, the same string `execute` unpacks and the same direction: a name being carried to an ASSIGNMENT, never compared with a roster handle"),
         ("perform_socket_capture", NotHandleResolution, "`CaptureCommand.label` — the name being ASSIGNED to a new account"),
         ("reconcile_login", NotHandleResolution, "`CaptureReport.label`"),
         ("serve_control", NotHandleResolution, "the control request's own `label` field, forwarded into a `CaptureCommand`"),
+        ("to_log_line", NotHandleResolution, "`Event::UncapturedLogin { account_uuid }` — a MATCH ARM binding the event's OWN uuid payload to render it into the `acct=` field of a log line. Only the `Event` definition binds one; the `Diagnostic` one at `src/observability.rs:3252` does not, so this stays a single-site row"),
     ];
 
     /// Names that read an identity field from MORE THAN ONE definition, and why ONE
@@ -2298,6 +2496,7 @@ mod tests {
     /// test, and so does an entry here whose collision has since gone away.
     const MULTI_SITE_READERS: &[(&str, &str)] = &[
         ("account_uuid", "the accessor on the OAuth state record (`src/claude_state.rs`) and on the migration artifact (`src/migration.rs`) — both return `&self.account_uuid` on a type that is not a roster account, so the single `NotHandleResolution` row states the same fact about each"),
+        ("new", "`StatusRow::new` (`src/cli.rs`) reads an `AccountStatusLine.label` for a rendered cell, and `ManagedAccount::new` (`src/migration.rs`) writes the migration artifact's own `account_uuid` from its parameter of that name. Different types, different directions, and NEITHER is a roster `Account` — which is the one fact the shared `NotHandleResolution` row states, so it is exact for both. The migration site was invisible until issue #1202: it is a struct literal's field-init shorthand, which carries no `.`"),
         ("refresh", "`impl PokeEngine for RealPokeEngine` (`src/poke.rs`) and `impl RefreshEngine for RealRefreshEngine` (`src/refresh_tick.rs`) — two unrelated traits, not one abstraction, but both forward an ALREADY-CHOSEN account's `account_uuid` into `refresh::refresh_account`, so neither resolves a handle and the shared row is exact for both. A THIRD same-named reader would not be covered by that reasoning; it reds this check and needs its own"),
     ];
 
@@ -2324,7 +2523,13 @@ mod tests {
     ///   `Plain` while its use is a comparison. The PRESENCE question above still sees the read,
     ///   and this is the same `let` hoist
     ///   [`the_handle_read_tripwire_bites_on_a_seventh_site`] already ships as its second shape —
-    ///   there the hoist is caught, because a new function is a new name.
+    ///   there the hoist is caught, because a new function is a new name. Since issue #1202 a
+    ///   braced-pattern binding reaches this same residual BY CONSTRUCTION rather than by
+    ///   accident: the bound name is followed by `,` or `}`, never by an operator, so the
+    ///   presence question sees it and the shape question cannot. That is not a new hole — it is
+    ///   this one, reached by a second spelling — and
+    ///   [`the_handle_read_tripwire_bites_on_a_braced_pattern_binding`] asserts it so that a
+    ///   widening of either scan cannot quietly contradict this bullet.
     /// - **Equality reached through a hash** — `HashSet::insert`, `HashMap::entry` / `get`. Those
     ///   compare by hash rather than by operator, and one ships in `config::validate`
     ///   (`uuids.insert(account.account_uuid.clone())`, the uuid-uniqueness rule). A roster
@@ -2549,7 +2754,7 @@ mod tests {
         for (arm, expected) in [
             (SharedResolver, 1),
             (ViaSharedResolver, 4),
-            (NotHandleResolution, 79),
+            (NotHandleResolution, 83),
         ] {
             let actual = HANDLE_READ_REGISTER
                 .iter()
@@ -2585,6 +2790,238 @@ mod tests {
                 "{name:?} is dispositioned {disposition:?} with no reason recorded"
             );
         }
+    }
+
+    /// CONSTRAINT-A for the braced-pattern arm (ADR-0031 § 4) — issue #1202's probe, committed
+    /// as the canary that issue asks for rather than left in its prose.
+    ///
+    /// The defect: [`identity_field_at`] matches a `.`-access, and Rust reads a field without a
+    /// `.` through pattern binding. The probe below was measured against the real instrument and
+    /// passed it — a seventh first-match-wins label-resolving site landing silent, which is the
+    /// gap issue #1186 was opened about, reached by spelling rather than by structure.
+    ///
+    /// Driven through [`functions_reading_a_handle`], the predicate the real assertion compares
+    /// with, so this canary cannot pass over a paraphrase of the gate.
+    ///
+    /// Every member of the family is here rather than the probe alone, because ONE rule covers
+    /// them and a rule is only demonstrated by the set it spans: the `let` the issue names, the
+    /// `if let` and `match` arm it asks about, the closure parameter and the destructuring `fn`
+    /// parameter that share the shape, and the `ref` / `mut` prefixes — of which the tree spells
+    /// only `mut`, at `src/capture.rs:432`, `ref` being covered by the same two lines and pinned
+    /// here rather than claimed. Each carries the same positive control — the fixture's own `#[cfg(test)]`
+    /// helper reads an identity field on EVERY run, so an assertion of `["apply_park"]` is
+    /// simultaneously evidence the scan reached the production code and evidence it stopped at
+    /// the test boundary. A scan that matched nothing would fail both halves rather than pass
+    /// quietly.
+    #[test]
+    fn the_handle_read_tripwire_bites_on_a_braced_pattern_binding() {
+        // Built by joining lines rather than with `\`-continuations, for the reason
+        // [`the_non_test_boundary_survives_a_cfg_test_import`] records: that escape eats the
+        // next line's leading whitespace, and these fixtures' `#[cfg(test)]` must stay at column 0.
+        let injected = |signature: &str, body: &[&str]| {
+            let mut lines = vec![signature];
+            lines.extend_from_slice(body);
+            lines.extend_from_slice(&[
+                "}",
+                "#[cfg(test)]",
+                "mod tests {",
+                "fn a_test_helper(a: &Account) -> String { a.label.clone() }",
+                "}",
+            ]);
+            lines.join("\n")
+        };
+        const SIG: &str = "fn apply_park(roster: &[Account], query: &str) -> Option<usize> {";
+
+        for (spelling, signature, body) in [
+            // The issue's probe, verbatim: a `let` destructure of a fully-qualified path, inside
+            // the closure of a first-match-wins `position`.
+            (
+                "a `let` destructure (issue #1202's probe)",
+                SIG,
+                &[
+                    "    roster.iter().position(|account| {",
+                    "        let crate::config::Account { label, .. } = account;",
+                    "        label == query",
+                    "    })",
+                ][..],
+            ),
+            (
+                "an `if let`",
+                SIG,
+                &[
+                    "    if let Account { label, .. } = &roster[0] {",
+                    "        return (label == query).then_some(0);",
+                    "    }",
+                    "    None",
+                ][..],
+            ),
+            (
+                "a `match` arm's struct pattern",
+                SIG,
+                &[
+                    "    match &roster[0] {",
+                    "        Account { account_uuid, .. } => (account_uuid == query).then_some(0),",
+                    "    }",
+                ][..],
+            ),
+            (
+                "a closure parameter",
+                SIG,
+                &["    roster.iter().position(|Account { label, .. }| label == query)"][..],
+            ),
+            (
+                "a `ref` binding",
+                SIG,
+                &[
+                    "    let Account { ref label, .. } = &roster[0];",
+                    "    (label == query).then_some(0)",
+                ][..],
+            ),
+            (
+                "a `mut` binding",
+                SIG,
+                &[
+                    "    let Account { mut label, .. } = roster[0].clone();",
+                    "    (label == query).then_some(0)",
+                ][..],
+            ),
+            // A destructuring PARAMETER, which binds before the body brace opens. Attributed to
+            // the function being declared rather than dropped — see `handle_reads`.
+            (
+                "a destructuring `fn` parameter",
+                "fn apply_park(Account { label, .. }: &Account, query: &str) -> Option<usize> {",
+                &["    (label == query).then_some(0)"][..],
+            ),
+            // The case above cannot see the parameter-list brace guard: its one read comes from
+            // the PARAMETER under both guard states — via `in_param_pattern` when the guard is
+            // present, via the wrongly-pushed scope when it is absent. So the parameter here
+            // binds NO identity field and the BODY reads one. Without the guard the scope binds
+            // to the pattern brace and closes at the pattern's `}`, leaving the body's read with
+            // no enclosing scope to attribute it to, and it is dropped.
+            (
+                "a body read beneath a destructuring `fn` parameter",
+                "fn apply_park(Account { .. }: &Account, roster: &[Account], query: &str) -> Option<usize> {",
+                &["    roster.iter().position(|a| a.label == query)"][..],
+            ),
+        ] {
+            let source = injected(signature, body);
+            assert_eq!(
+                functions_reading_a_handle(&source),
+                ["apply_park"],
+                "the scan must see a seventh site whose handle read is spelled as {spelling}, \
+                 and must see ONLY that: the fixture's own test-module read is not production \
+                 resolution, and its presence is what proves the scan ran at all"
+            );
+            // …and that IS a red run, because the register cannot hold a name it has never seen.
+            // Stated as the real membership rather than left as an inference about it.
+            assert!(
+                !HANDLE_READ_REGISTER
+                    .iter()
+                    .any(|(name, _, _)| *name == "apply_park"),
+                "the canary's function must be absent from the register, or it proves nothing"
+            );
+        }
+
+        // The negative control, and the reason `handle_reads` tracks every delimiter rather
+        // than only braces. Asserted as a PAIR differing in one character, because either half
+        // alone passes for the wrong reason: `is_empty()` is satisfied by a scan that matched
+        // nothing anywhere, and the positive half is satisfied by a scan that matches everything.
+        // Together they are the discrimination. Without the delimiter test the scan files
+        // ordinary argument lists as handle reads — measured on this tree by removing it:
+        // `run_login_locked` starts reporting `run_login(…, label, …)` (`src/capture.rs:762`) and
+        // `login` starts reporting the tuple pattern `Ok((outcome, label, count))` (`:276`), and
+        // every future one would too. `capture_locked`'s `run_capture(…, label)` (`:237`) does
+        // NOT — `label` is last there, and the CLOSE test admits `,` or `}` rather than `)`.
+        let delimited = |open: &str, close: &str| {
+            injected(
+                "fn report(actual: &str, expected: &str) {",
+                &[&format!(
+                    "    check{open} actual, label, expected {close});"
+                )],
+            )
+        };
+        assert!(
+            functions_reading_a_handle(&delimited("(", "")).is_empty(),
+            "a bare `label` in a PARENTHESISED list is an argument, not a field binding"
+        );
+        assert_eq!(
+            functions_reading_a_handle(&delimited("( Thing {", "}")),
+            ["report"],
+            "…and the SAME tokens inside a braced group ARE a field binding — the pair is what \
+             proves the delimiter is doing the work rather than the identifier"
+        );
+
+        // The residual the shorthand rule leaves open, pinned rather than left in prose: a
+        // RENAMED binding. `Account { label: handle, .. }` reads the field and calls it something
+        // else, and that spelling is textually identical to a struct DEFINITION's `label: String`
+        // and to a struct LITERAL's `label: expr` — so admitting it would admit every declared
+        // field in the crate. Paired with its shorthand twin for the reason above: alone, the
+        // `is_empty()` half would be satisfied by a fixture that stopped producing its subject.
+        // If a future widening starts seeing the rename, this reds and sends its reader to the
+        // note in HANDLE_READ_REGISTER.
+        let bound_as = |binding: &str| {
+            injected(
+                SIG,
+                &[
+                    &format!("    let Account {{ {binding}, .. }} = &roster[0];"),
+                    "    (handle == query).then_some(0)",
+                ],
+            )
+        };
+        assert!(
+            functions_reading_a_handle(&bound_as("label: handle")).is_empty(),
+            "the rename residual: a field bound under a DIFFERENT name is NOT seen, and \
+             HANDLE_READ_REGISTER says so"
+        );
+        assert_eq!(
+            functions_reading_a_handle(&bound_as("label")),
+            ["apply_park"],
+            "…and the same fixture in shorthand IS seen — so the `is_empty()` above is the \
+             rename being invisible, not the fixture having stopped producing a subject"
+        );
+
+        // The backward half of the shorthand rule: the name must OPEN its entry, not merely
+        // close one. Without it a block's TAIL EXPRESSION reads as a field binding — `label`
+        // alone on the last line is followed by `}` exactly as a shorthand entry is, and only
+        // what precedes it tells the two apart. Paired, for the reason the two pairs above are.
+        assert!(
+            functions_reading_a_handle(&injected(
+                "fn handle(label: String) -> String {",
+                &["    let _ = 1;", "    label"],
+            ))
+            .is_empty(),
+            "a block's tail expression is a USE of a binding, not a field bound by one: it \
+             closes an entry it never opened"
+        );
+        assert_eq!(
+            functions_reading_a_handle(&injected(
+                "fn handle(a: &Account) -> String {",
+                &["    let Account { label, .. } = a;", "    label"],
+            )),
+            ["handle"],
+            "…and the identical tail expression IS seen once a braced pattern above it opened \
+             the entry — the pair is what proves the backward test discriminates"
+        );
+
+        // The shape question is deliberately unmoved by any of this. A pattern binding is
+        // followed by `,` or `}`, never by an operator, so it lands in the hoist residual
+        // COMPARING_READERS already documents — one binding away from its comparison, exactly
+        // like the `let handle = a.label.clone()` that residual is written about. Asserted so
+        // that a future widening of the SHAPE scan cannot quietly contradict that paragraph.
+        let probe = injected(
+            SIG,
+            &[
+                "    roster.iter().position(|account| {",
+                "        let crate::config::Account { label, .. } = account;",
+                "        label == query",
+                "    })",
+            ],
+        );
+        assert!(
+            functions_comparing_a_handle(&probe).is_empty(),
+            "a pattern binding is a READ, not a comparison operand — it reaches its `==` through \
+             a binding, which is the hoist residual COMPARING_READERS records"
+        );
     }
 
     /// The compliant set, pinned from the other side (issue #1186).
