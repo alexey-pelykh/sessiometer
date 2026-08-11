@@ -403,8 +403,8 @@ sites**, not four commands. **It did not, until #1005 — read this paragraph in
 resolution is the "RESOLVED 2026-08-06" note below.** `use` refused with
 `Error::UseTargetAmbiguous` (`resolve_target`, `src/use_account.rs`; exit code 6 per `Error::exit_code`, `src/error.rs`), and so did
 **`poke`** (`src/poke.rs:290`) and **the daemon's control-socket swap** (`src/daemon/commands.rs:99`),
-because all three share `resolve_target` — whose doc states it *"NEVER guesses"*
-(`src/use_account.rs:438-441`). `enable`/`disable` (`apply_enabled`) and `remove`
+because all three share `resolve_target` — whose doc comment states it *"NEVER guesses"*
+(`resolve_target`, `src/use_account.rs`). `enable`/`disable` (`apply_enabled`) and `remove`
 (`apply_remove`) did not reach that resolver **at all**: each did an exact-label
 `.find()`/`.position()` and silently took the **first** match. Which behaviour was correct was a
 decision, not a design — and it was taken.

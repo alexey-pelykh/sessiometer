@@ -5495,6 +5495,11 @@ async fn set_enabled(query: Option<String>, enabled: bool) -> Result<()> {
         // no-op flip (nothing changed on disk, so nothing to reload).
         crate::capture::notify_daemon_roster_reload().await;
     }
+    // Name the RESOLVED account, not `query` — which since #1005 may be an account-uuid, and
+    // echoing 36 hex characters back would name nothing the operator typed or recognizes. WHICH
+    // of the two handles in scope this hands over is pinned by
+    // `the_confirmations_name_the_resolved_handle` (issue #1088): the choice is made here in the
+    // I/O shell, where no unit test reaches it, and swapping it survived the whole suite.
     println!("{}", flip_confirmation(outcome, &label, enabled));
     Ok(())
 }
@@ -5592,7 +5597,9 @@ async fn remove_account(query: Option<String>) -> Result<()> {
     // (#139) — best-effort, so it never swaps to an account whose stash is gone.
     crate::capture::notify_daemon_roster_reload().await;
     // Name the REMOVED account's label, not `query` — which since #1005 may be an
-    // account-uuid, and echoing that back would not tell the operator which handle went.
+    // account-uuid, and echoing that back would not tell the operator which handle went. Pinned
+    // by `the_confirmations_name_the_resolved_handle` (issue #1088), for the same reason as the
+    // flip above: the choice is made here in the I/O shell, where no unit test reaches it.
     println!("{}", remove_confirmation(&removed.label));
     Ok(())
 }
@@ -8217,6 +8224,265 @@ spare  22222222-2222\n\
         assert_eq!(remove_confirmation("work"), "removed `work`");
         // #15: the confirmation carries only the operator label, never a secret.
         assert!(!remove_confirmation("work").contains('@'));
+    }
+
+    // --- the confirmations' handle choice (issue #1088) --------------------
+
+    /// The argument list of each confirmation call site in this file's NON-TEST code, verbatim
+    /// between the parentheses.
+    ///
+    /// Since issue #1005 `enable`, `disable` and `remove` resolve through
+    /// [`crate::use_account::resolve_target`], so the `query` an operator typed may be an
+    /// account-uuid. Both shells deliberately echo the handle the RESOLVER produced instead, and
+    /// the comments at those two call sites say exactly that.
+    ///
+    /// Every OTHER link in that chain is asserted behaviourally: the policy half returns the
+    /// RESOLVED label ([`apply_enabled_flips_the_resolved_account_and_reports_change`],
+    /// [`apply_remove_drops_the_resolved_account_and_returns_it`]) and the formatters render
+    /// whatever they are handed ([`flip_confirmation_reflects_changed_vs_already_in_state`],
+    /// [`remove_confirmation_names_the_label`]). What no unit test reached is the step this pins —
+    /// WHICH of the two strings in scope the async shell hands over. Handing over the wrong one
+    /// survived the whole suite at both sites, which is what issue #1088 was opened about;
+    /// [`the_resolved_handle_gate_bites_on_each_measured_mutation`] records the three measured
+    /// mutations, and why one of them appears to be caught already but is not.
+    ///
+    /// It is NOT the only untested step in that shell, and this pin is not a coverage bound. The
+    /// shell's own binding of `label` from [`apply_enabled`]'s return is a second one: rebind it to
+    /// `query`, leaving the pinned call site byte-identical, and the whole suite stays green —
+    /// measured — while the formatter is handed the raw query, which since #1005 may be the uuid.
+    /// Closing that one needs the shell seamed, which the paragraph below places out of scope.
+    ///
+    /// So the argument list is pinned here, as a CLOSED allow-list: a site whose spelling changes
+    /// reddens and must be re-blessed deliberately. That is the same spirit as
+    /// [`INLINE_PROSE_REGISTER`] and `use_account`'s `HANDLE_READ_REGISTER`, which pin axes a
+    /// compiler cannot check — but deliberately NOT the same strength, and the gap is worth
+    /// stating. Those two extract their subjects FROM SOURCE and assert set-equality both ways, so
+    /// a brand-new site reddens them. This one iterates its own list and freezes `len() == 2`: it
+    /// catches a changed spelling at either pinned site, and a second call to an already-pinned
+    /// formatter ([`sole_call_arguments`] refuses any cardinality but one) — but a NEW confirmation
+    /// formatter whose own call site prints the raw `query` passes it. Measured: adding one reddens
+    /// [`INLINE_PROSE_REGISTER`]'s sweep and nothing else, and once that is dispositioned the way
+    /// its own failure messages instruct, the suite is green and this gate never fired. Enumerating
+    /// confirmation sites from source is a real extension, not a wording fix. It is a source pin
+    /// rather than a behavioural test because
+    /// the choice is made inside an `async fn` that reaches for `Config::load`, the real keychain
+    /// and a live daemon socket; seaming those is the restructuring issue #1088 placed out of
+    /// scope, and the file's standing shape is pure functions tested, I/O shell not.
+    const CONFIRMATION_CALL_ARGUMENTS: &[(&str, &str)] = &[
+        ("flip_confirmation", "outcome, &label, enabled"),
+        ("remove_confirmation", "&removed.label"),
+    ];
+
+    /// Handles a confirmation must never name in place of the resolved label, with the reason.
+    ///
+    /// Stated separately from the exact pin above so the PROPERTY survives a re-blessing: renaming
+    /// the `label` binding is an ordinary refactor that legitimately moves the pin, and a reader
+    /// updating it to match would carry a swapped argument through with it.
+    const HANDLES_NO_CONFIRMATION_MAY_NAME: &[(&str, &str)] = &[
+        (
+            "query",
+            "the operator's raw input, which since #1005 may be an account-uuid",
+        ),
+        (
+            "account_uuid",
+            "the resolved account's uuid — the right account, under a handle nobody typed",
+        ),
+    ];
+
+    /// This file's non-test source, cut at its own column-0 `#[cfg(test)]` — the same structural
+    /// boundary [`inline_literals`] and [`every_cli_usage_construction_site_is_scanned`] draw, for
+    /// the same reason: the test module spells these call shapes freely in its own assertions.
+    fn non_test_source(source: &str) -> String {
+        source
+            .lines()
+            .take_while(|line| !line.starts_with("#[cfg(test)]"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The argument list of the SOLE call to `name` in `region`, verbatim between its parentheses.
+    ///
+    /// Panics unless exactly one call is present, so a renamed formatter cannot leave the gate
+    /// scanning nothing and a second site cannot be silently averaged with the first — the
+    /// degenerate subject a source lint dies of. A DECLARATION is skipped by its `fn ` prefix; a
+    /// doc-comment mention never matches at all, because a match must be followed by `(`.
+    ///
+    /// Takes the region as an argument rather than reaching for `include_str!` so the canary can
+    /// drive THIS function over a mutated subject rather than over a paraphrase of it (ADR-0031
+    /// § 4 CONSTRAINT-A).
+    fn sole_call_arguments(region: &str, name: &str) -> String {
+        let mut found: Vec<String> = Vec::new();
+        for (at, _) in region.match_indices(name) {
+            let head = &region[..at];
+            if head
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                continue;
+            }
+            if head.ends_with("fn ") {
+                continue;
+            }
+            let Some(args) = region[at + name.len()..].trim_start().strip_prefix('(') else {
+                continue;
+            };
+            let mut depth = 1usize;
+            let mut end = None;
+            for (offset, ch) in args.char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(offset);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            found.push(args[..end.expect("a call site with unbalanced parentheses")].to_owned());
+        }
+        assert_eq!(
+            found.len(),
+            1,
+            "expected exactly one call to `{name}` in src/cli.rs's non-test code, found {}",
+            found.len()
+        );
+        found.remove(0)
+    }
+
+    /// Issue #1088: each confirmation names the handle the RESOLVER produced — never the
+    /// operator's raw `query`, never the resolved account's uuid.
+    #[test]
+    fn the_confirmations_name_the_resolved_handle() {
+        let region = non_test_source(include_str!("cli.rs"));
+
+        // The corpus canary comes FIRST, because every assertion below passes identically over a
+        // region truncated before the code it means to read. This file's boundary is its `mod
+        // tests`, and these two say so rather than assume it.
+        assert!(
+            region.contains("fn remove_confirmation("),
+            "the non-test region stops before the confirmations it is supposed to read"
+        );
+        assert!(
+            !region.contains("fn the_confirmations_name_the_resolved_handle"),
+            "the non-test region ran past this file's `mod tests` boundary"
+        );
+
+        // Cardinality on both registers, because the loops below iterate them: an emptied one
+        // makes every assertion inside pass without evaluating anything, which is the shape of a
+        // green run over no subject at all. The two sites are also what issue #1088's second
+        // criterion asks for by name — the `enable` / `disable` flip AND the removal.
+        assert_eq!(
+            CONFIRMATION_CALL_ARGUMENTS.len(),
+            2,
+            "both confirmation sites must be pinned — the flip and the removal"
+        );
+        for verb in ["flip_confirmation", "remove_confirmation"] {
+            assert!(
+                CONFIRMATION_CALL_ARGUMENTS
+                    .iter()
+                    .any(|(name, _)| *name == verb),
+                "`{verb}`'s call site is no longer pinned"
+            );
+        }
+        assert!(
+            !HANDLES_NO_CONFIRMATION_MAY_NAME.is_empty(),
+            "the forbidden-handle half must have something to check"
+        );
+
+        for (formatter, expected) in CONFIRMATION_CALL_ARGUMENTS {
+            let actual = sole_call_arguments(&region, formatter);
+            assert_eq!(
+                &actual, expected,
+                "the call site now reads `{formatter}({actual})`. If that is a deliberate \
+                 refactor, re-bless it in CONFIRMATION_CALL_ARGUMENTS — but confirm FIRST that it \
+                 still passes the handle `resolve_target` produced, which is the swap issue #1088 \
+                 was opened about"
+            );
+            for (forbidden, why) in HANDLES_NO_CONFIRMATION_MAY_NAME {
+                assert!(
+                    !actual.contains(forbidden),
+                    "`{formatter}({actual})` names `{forbidden}` — {why}"
+                );
+            }
+        }
+    }
+
+    /// CONSTRAINT-A for the gate above (ADR-0031 § 4): it is observed to REDDEN on this file
+    /// carrying the real defect, rather than read and believed.
+    ///
+    /// The payloads are the three mutations measured AGAINST a full `cargo test` on this tree, and
+    /// driven through [`sole_call_arguments`] — the predicate the real assertions read. Two of the
+    /// three survive that suite; the third is caught, but only incidentally and in another file,
+    /// which the paragraph below sets out.
+    ///
+    /// The third payload is the one that settles the SUBJECT rather than the gate. `remove`'s
+    /// literal swap to `&query` does fail today, but incidentally and in another file:
+    /// `use_account`'s `every_handle_read_is_dispositioned` reddens because the swap deletes
+    /// `remove_account`'s only identity-field read, not because anything asserts which handle gets
+    /// printed. Hand the resolved UUID over instead and the read stays, that register balances,
+    /// and the operator gets 36 hex characters — measured surviving. A gate resting on that
+    /// coincidence would also stop covering the moment `remove_account` gained any other `.label`
+    /// read, which is why the pin above is its own gate rather than a note pointing at that one.
+    #[test]
+    fn the_resolved_handle_gate_bites_on_each_measured_mutation() {
+        let region = non_test_source(include_str!("cli.rs"));
+
+        for (mutation, formatter, mutated) in [
+            (
+                "the flip echoes the query",
+                "flip_confirmation",
+                "outcome, &query, enabled",
+            ),
+            (
+                "the removal echoes the query",
+                "remove_confirmation",
+                "&query",
+            ),
+            (
+                "the removal echoes the resolved uuid",
+                "remove_confirmation",
+                "&removed.account_uuid",
+            ),
+        ] {
+            // The spelling to mutate AWAY from is read out of the register rather than restated
+            // here, so a deliberate re-blessing flows into this canary instead of silently leaving
+            // it mutating a spelling the file no longer carries — which would still pass, on a
+            // subject that no longer exists.
+            let (_, blessed) = CONFIRMATION_CALL_ARGUMENTS
+                .iter()
+                .find(|(name, _)| *name == formatter)
+                .expect("every mutated formatter must be one the register pins");
+            let injected = region.replace(
+                &format!("{formatter}({blessed})"),
+                &format!("{formatter}({mutated})"),
+            );
+            assert_ne!(
+                injected, region,
+                "{mutation}: the mutation did not apply. Either the file already carries it, or \
+                 the register's `{blessed}` is not the spelling at the call site — this canary \
+                 proved nothing either way"
+            );
+
+            // The SAME predicate the real gate reads, over the mutated file.
+            let seen = sole_call_arguments(&injected, formatter);
+            assert_eq!(
+                seen, mutated,
+                "{mutation}: the extractor must read the mutated argument list back"
+            );
+            assert_ne!(seen, *blessed, "{mutation}: the pin must redden");
+            // …and the forbidden-handle half bites independently of the pin, which is the whole
+            // point of stating the two separately: a re-blessed pin still catches this.
+            assert!(
+                HANDLES_NO_CONFIRMATION_MAY_NAME
+                    .iter()
+                    .any(|(forbidden, _)| seen.contains(forbidden)),
+                "{mutation}: the forbidden-handle half must catch `{formatter}({seen})` too"
+            );
+        }
     }
 
     // --- status: response → text (issue #8) --------------------------------
