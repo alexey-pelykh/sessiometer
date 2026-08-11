@@ -1500,9 +1500,11 @@ fn compute_landing(inputs: &Inputs, samples: &[Sample]) -> Landing {
                 window_end.min(before_reactivation)
             });
         // Peak absolute session over the parked window (readings strictly after the swap, through the
-        // effective end). The `is_finite` guard drops a NaN/inf reading, which would otherwise clamp to
-        // the u8 cap (255) below and fabricate a max-value breach (and poison the issue #597 tail
-        // calibration). `None` ⇒ no reading of the parked account in view — an unmeasured anchor.
+        // effective end). The `is_finite` guard drops a NaN/inf reading, which would otherwise reach
+        // the clamp below and FABRICATE a landing — 255 for `+∞`, but 0 for `NaN` and `−∞`, since the
+        // saturating float→int cast floors both — poisoning the issue #597 tail calibration either
+        // way: once as a max-value breach, once as a spotless one.
+        // `None` ⇒ no reading of the parked account in view — an unmeasured anchor.
         let peak = by_acct
             .get(swap.acct.as_str())
             .into_iter()
@@ -3334,9 +3336,11 @@ ts=2026-07-11T00:02:00Z event=usage_velocity acct=u-A session_pct_per_min=-0.15 
     // WHAT THE CANARY BELOW COVERS, AND WHAT IT DOES NOT. Issue #1179 enumerates five `is_finite()`
     // sites in this module and reports none of them canaried. The tests here reach exactly ONE —
     // the `usage_velocity` arm's `.filter(|v| v.is_finite() && *v > 0.0)` in `parse_events`. The
-    // other four are accounted for individually, because "write a canary" turned out to be the
-    // wrong verdict for every one of them; stated here rather than left implied, so the next reader
-    // does not take one gate's coverage for the family's.
+    // rest are accounted for individually below, because "write a canary" was not the same verdict
+    // for each: the two `record_blind_projection` INPUT filters are behaviour-preserving to delete,
+    // its RESULT guard was already covered, and `compute_landing`'s post-swap window stayed open
+    // until issue #1210 canaried it, over in the landing cluster. Stated here rather than left
+    // implied, so the next reader does not take one gate's coverage for the family's.
     //
     //   - `record_blind_projection`'s `rate` and `inflation` INPUT filters: not canary-able, and
     //     not an unguarded gate either. Every non-finite input reaches `projected_pct` still
@@ -3352,14 +3356,20 @@ ts=2026-07-11T00:02:00Z event=usage_velocity acct=u-A session_pct_per_min=-0.15 
     //     `blind_projection_error_classifies_corruption_apart_from_coverage` — deleting it reds
     //     both. #1179 read the comment on the first as awareness rather than coverage; it is
     //     coverage, and it is what makes the bullet above true.
-    //   - `compute_landing`'s post-swap sample window (`s.session.is_finite()`): still UNCANARIED,
-    //     and deliberately left so. Nothing reaches it through the real parse path: those samples
-    //     are `serde_json`-decoded from `usage-samples.jsonl`, and JSON has no infinity — `1e400`
-    //     decodes to `Err("number out of range")` and `Infinity` to `Err("expected value")`, with
-    //     the round trip closed at the other end too, since serializing `f64::INFINITY` writes
-    //     `null`, which then fails to decode as `f64`. Pinning it would mean building a `Sample` in
-    //     memory, asserting the filter's arithmetic while implying a reachable hazard the store's
-    //     own decoder forecloses. Recorded as a finding rather than faked into a green here.
+    //   - `compute_landing`'s post-swap sample window (`s.session.is_finite()`): CANARIED since
+    //     issue #1210, in the landing cluster rather than here — by
+    //     `landing_refuses_a_non_finite_parked_reading_rather_than_fabricating_one` and
+    //     `landing_keeps_the_finite_peak_when_a_non_finite_reading_shares_the_window`, which sit
+    //     beside the other `compute_landing` tests they share fixtures and idiom with. #1179 left it
+    //     deliberately UNcanaried, on the grounds that nothing reaches it through the real parse
+    //     path — those samples are `serde_json`-decoded from `usage-samples.jsonl`, and JSON has no
+    //     infinity — so pinning it would assert the filter's arithmetic while implying a reachable
+    //     hazard the store's own decoder forecloses. #1210 overrode the VERDICT and kept the
+    //     reasoning: an unpinned guard is one a later reader deletes as dead weight, however its
+    //     hazard is reached. What answers the objection is that the reachability claim is no longer
+    //     prose — `the_sample_store_cannot_carry_a_non_finite_session_reading` asserts the decoder
+    //     really does foreclose it, so the canary states its own status (defence in depth against an
+    //     in-memory `Sample`) instead of implying a stronger one.
 
     /// A `usage_velocity` line whose recomputed rate is not finite, in the shapes a garbled durable
     /// log can carry it — all the same gate, approached from different sides.
@@ -5519,6 +5529,167 @@ ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct
             "no measured episode → percentile is None, not a passing 0"
         );
         assert_eq!(r.landing.p100_met(), None);
+    }
+
+    /// The non-finite `session` readings a parked-window peak must refuse (issue #1210). Each is
+    /// exercised in its OWN isolated window below, because their harms differ and one masks another:
+    /// `reduce(f64::max)` IGNORES a NaN, so a NaN sitting beside a finite reading never reaches
+    /// `peak` at all. Only a NaN that is its window's SOLE reading is observable, and isolating every
+    /// shape is what keeps each of them separately falsifiable.
+    ///
+    /// The harms are not the same size, which is why the shapes are named rather than counted. A
+    /// positive infinity clamps to the `u8` cap and fabricates a 255 % landing — the max-value breach
+    /// the guard's own comment names, which lands in `post_swap_tail` and poisons the issue #597 tail
+    /// calibration. NaN and a negative infinity instead cast to 0, fabricating a PERFECT landing:
+    /// quieter, and still a lie, because it also moves the anchor out of `n_unmeasured` into the
+    /// measured population the percentiles summarize. The guard refuses all three the same way, so
+    /// the assertion below is one shape-named sweep rather than three bespoke expectations.
+    const NON_FINITE_PARKED_READINGS: &[(&str, f64)] = &[
+        ("a positive infinity", f64::INFINITY),
+        ("a NaN", f64::NAN),
+        ("a negative infinity", f64::NEG_INFINITY),
+    ];
+
+    /// The premise the canary rests on, asserted rather than assumed: a non-finite `session` reading
+    /// cannot arrive from `usage-samples.jsonl`, so the guard at the peak filter is defence in depth
+    /// against an in-memory `Sample` — NOT a live filter on the store's own output.
+    ///
+    /// Issue #1179 reasoned exactly this out in prose and concluded the site was not worth canarying,
+    /// on the grounds that pinning it would assert the filter's arithmetic while implying a reachable
+    /// hazard the decoder forecloses. Issue #1210 overrode the verdict, not the reasoning: an
+    /// unpinned guard is one a later reader deletes as dead weight regardless of how its hazard is
+    /// reached. This test is what makes the override honest — the reachability claim stops being
+    /// prose a reader must take on trust, so the canary can state its own status instead of implying
+    /// a stronger one.
+    ///
+    /// What it pins is exactly `serde_json`'s non-finite policy against `Sample`'s derived impls, and
+    /// nothing wider. A change to either — the policy, `session`'s type, its serde attributes — REDs
+    /// here. A store that adopted a DIFFERENT serialization format would leave this green while
+    /// voiding its premise, because no assertion in it reaches the store's own writer; the canary
+    /// below would silently become load-bearing with nothing here saying so.
+    #[test]
+    fn the_sample_store_cannot_carry_a_non_finite_session_reading() {
+        for (shape, session) in NON_FINITE_PARKED_READINGS {
+            // The near end of the round trip: `f64::INFINITY` has no JSON spelling, so `serde_json`
+            // writes `null` — which is then not an `f64` on the way back in.
+            let encoded = serde_json::to_string(&sample(0, "work", *session))
+                .expect("a Sample always serializes");
+            assert!(
+                serde_json::from_str::<Sample>(&encoded).is_err(),
+                "{shape} survived a store round trip: {encoded}"
+            );
+        }
+        // The far end, for a file written by something other than that serializer (a torn write, a
+        // hand-concatenated log — the same corruption class the #1179 fixtures stand for): JSON has
+        // no infinity literal, and a decimal that OVERFLOWS `f64` is rejected rather than saturated
+        // into one, so no byte sequence in the store decodes to a non-finite reading.
+        // Positive control FIRST, and it is not decoration: every assertion in the loop below is an
+        // `is_err()`, so one typo in a field name would make all six "fail to decode" for a reason
+        // that has nothing to do with `session` and void the whole loop silently. Measured —
+        // misspelling `provider` here leaves the entire suite green without this.
+        let control = r#"{"ts":0,"provider":"claude","acct":"work","session":0.42,"weekly":0.1}"#;
+        assert_eq!(
+            serde_json::from_str::<Sample>(control)
+                .expect("the control spelling must decode, or the loop below proves nothing")
+                .session,
+            0.42,
+            "the control line must decode to its own `session`, or an `is_err()` below could be \
+             any field's fault"
+        );
+        for spelling in ["Infinity", "-Infinity", "NaN", "1e400", "-1e400", "null"] {
+            let line = format!(
+                r#"{{"ts":0,"provider":"claude","acct":"work","session":{spelling},"weekly":0.1}}"#
+            );
+            assert!(
+                serde_json::from_str::<Sample>(&line).is_err(),
+                "`session:{spelling}` decoded — the parked-window guard is load-bearing against real \
+                 store data, not defence in depth"
+            );
+        }
+    }
+
+    /// The canary (issue #1210): a non-finite reading of the parked account leaves its anchor
+    /// UNMEASURED — the same coverage gap
+    /// [`landing_swap_without_a_post_swap_sample_is_unmeasured_not_zero`] pins for an empty window —
+    /// rather than being fabricated into a landing.
+    ///
+    /// Deleting `&& s.session.is_finite()` from the peak filter REDs this, and reds it naming the
+    /// shape: the message prints every admitted shape beside the reading it fabricated, so the
+    /// positive infinity's `Some(255)` with `post_swap_tail: 1` — the max-value breach — is
+    /// distinguishable at a glance from the quieter `Some(0)` the other two produce.
+    ///
+    /// Non-vacuous against an ANCHOR-less fixture, and only that. The expectation includes
+    /// `n_unmeasured: 1`, which holds only if the swap anchor actually PARSED — a fixture that
+    /// quietly stopped producing one reads `0` there and REDs. It does NOT pin the JOIN, and saying
+    /// otherwise would overstate it: under the live guard the reading is dropped either way, so
+    /// "no sample joined" and "a sample joined and was filtered out" are indistinguishable at this
+    /// assertion. Measured — relabelling the sample so nothing can match `from=work` leaves this
+    /// green. The join is pinned by the shared-window canary below, and by that alone.
+    #[test]
+    fn landing_refuses_a_non_finite_parked_reading_rather_than_fabricating_one() {
+        // On target at 96, so nothing here can classify as a gap-crossing (that needs >= 99): any
+        // breach this test ever sees is therefore a fabricated post-swap tail.
+        let log = "\
+ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct=96
+";
+        let fabricated: Vec<(&str, usize, usize, Option<u8>, usize)> = NON_FINITE_PARKED_READINGS
+            .iter()
+            .map(|(shape, session)| {
+                let samples = [sample(epoch("2026-07-11T00:02:00Z"), "work", *session)];
+                let r = aggregate(&parse_events(log, None), &samples, None);
+                (
+                    *shape,
+                    r.landing.n_measured,
+                    r.landing.n_unmeasured,
+                    r.landing.p100,
+                    r.landing.post_swap_tail,
+                )
+            })
+            // Collected rather than asserted inside the loop, so a mutation report names EVERY shape
+            // that got through instead of stopping at the first.
+            .filter(|o| (o.1, o.2, o.3, o.4) != (0, 1, None, 0))
+            .collect();
+        assert!(
+            fabricated.is_empty(),
+            "every shape must leave its anchor unmeasured — (n_measured, n_unmeasured, p100, \
+             post_swap_tail) should read (0, 1, None, 0); these fabricated a landing instead: \
+             {fabricated:?}"
+        );
+    }
+
+    /// What that refusal BUYS, pinned on a window that HAS an honest landing: a missing guard would
+    /// not merely invent coverage where there was none, it would OVERWRITE a comfortably-on-target
+    /// 42 % with the `u8` cap — converting a clean episode into a max-value `post_swap_tail` breach
+    /// and handing the issue #597 tail calibration a 255 that never happened.
+    ///
+    /// The finite reading is load-bearing twice, exactly as the #1179 canary's control line is. It
+    /// proves the join is LIVE on this fixture — an unwired one reads `n_measured: 0, p100: None`
+    /// here and fails, rather than passing over an empty window — and it is the value the infinity
+    /// destroys, so the mutation's failure names `Some(255)` against it directly.
+    #[test]
+    fn landing_keeps_the_finite_peak_when_a_non_finite_reading_shares_the_window() {
+        let log = "\
+ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct=96
+";
+        let samples = [
+            sample(epoch("2026-07-11T00:02:00Z"), "work", 0.42),
+            sample(epoch("2026-07-11T00:03:00Z"), "work", f64::INFINITY),
+        ];
+        let r = aggregate(&parse_events(log, None), &samples, None);
+        assert_eq!(
+            r.landing.n_measured, 1,
+            "the finite reading must still land — an empty join would pass the exclusion vacuously"
+        );
+        assert_eq!(
+            r.landing.p100,
+            Some(42),
+            "the honest peak must survive the poisoned reading beside it"
+        );
+        assert_eq!(
+            r.landing.post_swap_tail, 0,
+            "42 is nowhere near the ceiling, so any breach here is fabricated"
+        );
+        assert_eq!(r.landing.p100_met(), Some(true));
     }
 
     #[test]
