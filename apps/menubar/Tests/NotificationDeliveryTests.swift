@@ -135,6 +135,179 @@ enum NotificationLeakScan {
     }
 }
 
+// MARK: - The FRAMING vocabulary + its scanner (DERIVED from Rust, never hand-copied)
+//
+// WHY THIS EXISTS (issue #1219). This file used to carry its own list —
+// `["buy", "purchase", "upgrade", "cancel", "bypass", "beat", "need more"]` — maintained by hand in a
+// language that cannot reach `crate::framing_vocabulary`. That is the exact hazard issue #918 hoisted
+// the vocabulary to end and #1134 closed on the Rust side: a second definition of the banned set that
+// nothing asserts agrees with the first. The cross-language boundary made it worse rather than better —
+// no Rust change could red this copy.
+//
+// It was NARROWER than "a snapshot of `src/cli.rs`'s pre-#1134 `EXPIRY_HELP_BANNED_TOKENS`" suggests,
+// and the difference is why the fix is a derivation rather than a top-up. Read against that constant as
+// it stood at 7efaad1^, this list carried only its FIRST group — issue #885's enumerated acquisitive
+// call — and none of the recommendation (`should`, `must`, `recommend`, …) or alarmist projection
+// (`forecast`, `imminent`, `soon`, …) groups that constant already had. The value judgements
+// (`healthy`, `critical`, `risk`, …) were absent from both, and arrived on the central list. Its
+// seventh member came from a third place again: `need more` was a member of the sibling
+// `EXPIRY_HELP_BANNED_PHRASES`, so folding a two-word phrase into a token list is this file's own
+// conflation rather than one it inherited.
+//
+// THE DECISION, of the three shapes issue #1219 put up. This is shape 1 (single source of truth), but
+// realised by READING `src/framing_vocabulary.rs` at test time rather than by emitting a JSON fixture
+// under `build/fixtures/`. A fixture is a SECOND artifact whose agreement with the first then needs its
+// own gate; reading the source leaves exactly ONE definition, so "the two lists disagree" is not a state
+// this repo can be in. It is also the pattern this very file already uses — `presenterSource()` reads
+// `Sources/UserNotificationPresenter.swift` for the completeness pin, as `StatusItemChromeTests` does
+// for the glyph table.
+//
+// The fixture shape had one real advantage over this and it is worth stating rather than burying:
+// `build/fixtures/**` is in the `swift` job's path filter, so a re-emitted fixture re-runs this guard in
+// the same PR that changes the vocabulary — which is precisely the residual recorded below and kept.
+// The trade taken is one definition plus a stated detection latency, over two definitions plus a gate
+// holding them equal.
+//
+// Shape 3 — "the two guards are legitimately independent" — was WEIGHED AND REFUSED for the banned
+// list, and ACCEPTED for the imperative one. §D-STA-6 / SUR-001 is one firewall, and
+// `framing_vocabulary`'s module doc names its subject as "the FRAMING contract every operator-facing
+// prose surface owes". A notification renders on the LOCK SCREEN; it is such a surface, so its
+// vocabulary is shared, not merely similar. The imperative list below is the other way round: the
+// central list bans four groups and the imperative MOOD is deliberately not one of them (that module's
+// own words: "ZERO central tokens, because BANNED_TOKENS never banned the imperative MOOD"), so it has
+// no central counterpart to derive from and stays local — recorded here rather than left implicit.
+//
+// WHAT THIS SURFACE IS MEASURED AGAINST, and it is a measurement rather than a guess — issue #1219 names
+// that measurement as the first step of any fix, since it had not been taken. Every shipped title+body
+// was scanned against the whole central vocabulary and both phrases through the central tokenizer: zero
+// hits. So this audience takes `BANNED_TOKENS` WHOLE with NO exemption set — the strictest row of
+// `framing_vocabulary`'s table, alongside stats and the `Error` templates — and the screen below is not
+// carrying a carve-out it never earned. The count is deliberately not written down here: the screen
+// re-runs that measurement on every run, which a number in a comment cannot.
+//
+// WHAT THIS DOES NOT REACH. `src/**` is not in the `swift` job's path filter (`apps/menubar/**`,
+// `build/fixtures/**`, `.github/workflows/ci.yml`), so a PR that edits `BANNED_TOKENS` alone does not
+// re-run this guard: a central token that a notification string spends would redden the NEXT
+// `apps/menubar/**` PR instead of the one that introduced it. That is a detection-LATENCY residual, not
+// a drift one — there is still only one list — and it is strictly better than the copy it replaces,
+// which could not redden at all. Closing it is a one-line addition of this file's dependency to that
+// filter; it is deliberately not taken here, because a path-filter edit is a change to the gates
+// themselves (`CLAUDE.md` § Before you push) and now also has to move that file's verbatim enumeration
+// of the filters, so it is a change to argue on its own rather than ride in on a test fix.
+
+enum FramingVocabularyScan {
+
+    /// A parse that produced no usable vocabulary. Thrown, never returned as an empty list: a screen
+    /// derived from nothing passes everything, which is the degenerate green this whole suite exists to
+    /// refuse (`NotificationLeakScan`'s `unreadable` is the same decision one layer down).
+    enum ParseFailure: Error, CustomStringConvertible {
+        case constantNotFound(String)
+        case unterminated(String)
+        case noMembers(String)
+
+        var description: String {
+            switch self {
+            case .constantNotFound(let name):
+                return "src/framing_vocabulary.rs declares no `pub const \(name): &[&str] = &[` — the "
+                     + "constant was renamed or restructured, so this file's framing screen has no "
+                     + "vocabulary and would pass everything. Re-point the parser at its new shape."
+            case .unterminated(let name):
+                return "`\(name)` in src/framing_vocabulary.rs is not terminated by `];` — the parse "
+                     + "cannot tell where the list ends."
+            case .noMembers(let name):
+                return "`\(name)` in src/framing_vocabulary.rs parsed to ZERO members. A screen with an "
+                     + "empty vocabulary is green over every input, so this is a failure and not a pass."
+            }
+        }
+    }
+
+    /// `src/framing_vocabulary.rs` — the ONE definition of this contract, resolved relative to this
+    /// source file exactly as `presenterSource()` resolves its sibling.
+    static func vocabularySourceURL() -> URL {
+        URL(fileURLWithPath: #filePath)      // apps/menubar/Tests/NotificationDeliveryTests.swift
+            .deletingLastPathComponent()     // apps/menubar/Tests
+            .deletingLastPathComponent()     // apps/menubar
+            .deletingLastPathComponent()     // apps
+            .deletingLastPathComponent()     // <repo root>
+            .appendingPathComponent("src/framing_vocabulary.rs")
+    }
+
+    /// The members of a `pub const <name>: &[&str] = &[ … ];` in Rust source.
+    ///
+    /// Line comments are stripped BEFORE any literal is extracted, and that ordering is load-bearing
+    /// rather than tidy: `BANNED_TOKENS`' own group comments quote the very words they introduce
+    /// (`// Imperatives / recommended actions (issue #160: "add / buy / upgrade / cancel /`), so
+    /// extracting first would admit `add / buy / upgrade / cancel /` as a single "token" — an entry no
+    /// tokenizer can ever match, silently widening the list with a dead member.
+    static func rustStringList(named name: String, in source: String) throws -> [String] {
+        let uncommented = source
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { line -> Substring in
+                guard let comment = line.range(of: "//") else { return line }
+                return line[..<comment.lowerBound]
+            }
+            .joined(separator: "\n")
+
+        guard let decl = uncommented.range(of: "pub const \(name): &[&str] = &[") else {
+            throw ParseFailure.constantNotFound(name)
+        }
+        guard let end = uncommented.range(of: "];", range: decl.upperBound..<uncommented.endIndex) else {
+            throw ParseFailure.unterminated(name)
+        }
+        // Odd-indexed components of a split on `"` are the quoted literals.
+        let parts = String(uncommented[decl.upperBound..<end.lowerBound]).components(separatedBy: "\"")
+        guard parts.count >= 3, parts.count % 2 == 1 else { throw ParseFailure.noMembers(name) }
+        return stride(from: 1, to: parts.count, by: 2).map { parts[$0] }
+    }
+
+    /// The tokenizer, in parity with `crate::framing_vocabulary::words_of`: ANSI SGR runs dropped first,
+    /// then whole lowercase words split on non-ASCII-alphanumeric boundaries, in READING ORDER.
+    ///
+    /// The SGR half is inert on this surface — a notification body carries no escape codes — and is
+    /// implemented anyway because parity is the point of the whole change, not a nicety: a second
+    /// answer to "what counts as a word" is half of what issue #1219 filed. It is covered rather than
+    /// merely written, by the colour-wrapped case in `testTheSharedScannerMatchesTheRustWordSemantics`.
+    static func words(of text: String) -> [String] {
+        var plain = ""
+        var inEscape = false
+        for character in text {
+            if inEscape {
+                if character == "m" { inEscape = false }
+            } else if character == "\u{1B}" {
+                inEscape = true
+            } else {
+                plain.append(character)
+            }
+        }
+        return plain
+            .split(whereSeparator: { !($0.isASCII && ($0.isLetter || $0.isNumber)) })
+            .map { $0.lowercased() }
+    }
+
+    /// Whether `phrase`'s own words appear as ADJACENT words in `words` — parity with
+    /// `phrase_present`, so a neutral render never false-trips (`laptop update` is not `top up`).
+    ///
+    /// The pattern goes through `words(of:)` too, which is what lets this carry the local imperative
+    /// patterns unchanged: `don't forget` tokenizes on both sides identically, and `please` no longer
+    /// needs the trailing space the retired substring scan used to keep it off `pleasant`.
+    static func phrasePresent(_ phrase: String, in words: [String]) -> Bool {
+        let parts = self.words(of: phrase)
+        guard !parts.isEmpty, words.count >= parts.count else { return false }
+        return (0...(words.count - parts.count)).contains {
+            Array(words[$0..<($0 + parts.count)]) == parts
+        }
+    }
+
+    /// EVERY hit in `text`: single banned words in list order, then adjacent-word phrases — parity with
+    /// `scan_all_with`. Every hit rather than the first, so a second banned token cannot hide behind a
+    /// pinned first one, and so a failure names WHICH word it tripped on.
+    static func hits(in text: String, tokens: [String], phrases: [String]) -> [String] {
+        let textWords = words(of: text)
+        return tokens.filter { token in textWords.contains(token) }
+             + phrases.filter { phrasePresent($0, in: textWords) }
+    }
+}
+
 // MARK: - Tests
 
 @MainActor
@@ -518,56 +691,267 @@ final class NotificationDeliveryTests: XCTestCase {
         }
     }
 
-    /// §D-STA-6's banned tokens: the vocabulary of buying or evading capacity.
+    /// The tokens this surface ADDS to the central vocabulary, and the whole of what it contributes
+    /// beyond it — mirroring `src/cli.rs`'s `EXPIRY_HELP_EXTRA_TOKENS`, which is the same derivation
+    /// run the same way round (add to the central set, never re-list it).
     ///
-    /// Declared ONCE and shared with the canary below rather than duplicated into it, which is what
-    /// lets that canary be a canary at all: checked against its own second copy it would only ever
-    /// prove that the copy catches an offending string, so a token typo'd or dropped HERE — precisely
-    /// the silent inertness the canary names — would leave both tests green.
-    private static let bannedTokens = ["buy", "purchase", "upgrade", "cancel", "bypass", "beat", "need more"]
+    /// `beat` is a circumvention CALL of the same class as the central `bypass`, which `BANNED_TOKENS`
+    /// carries. This one it does not, and issue #1134 records why it stays local rather than joining:
+    /// `beat` is a HOMOGRAPH this crate spends neutrally — `src/daemon/socket.rs` calls the `watch`
+    /// liveness frame a "beat" in its comments and names its interval local that — and the central list
+    /// is scanned by an audience with no exemption set at all. On a notification the word has one
+    /// reading, outrunning a limit, which is where the ban is earned, so that is where it lives.
+    /// `src/cli.rs`'s `EXPIRY_HELP_EXTRA_TOKENS` holds that reasoning and is also where §D-STA-6's
+    /// enumeration ("beat/bypass limits") is quoted from — the design record itself is not reachable
+    /// from this clone, so this is a second-hand reading and says so.
+    ///
+    /// It is the one member of the retired hand copy with NO central equivalent at all: five of the
+    /// other six are central verbatim, and `need more` has one in the token `need`, which catches the
+    /// same sentence a word earlier. `testTheDerivedVocabularyStillCarriesEveryTokenTheHandCopyDid`
+    /// drives all three of those rather than leaving them as prose.
+    private static let extraTokens = ["beat"]
 
     /// Imperative / urgency framings this project has already refused on operator-facing surfaces.
-    /// Shared with the canary for the same reason as `bannedTokens`.
-    private static let imperativeTokens = ["you must", "act now", "immediately", "right away",
-                                           "don't forget", "please "]
+    ///
+    /// LOCAL on purpose, and this is the one place issue #1219's third shape — "the two guards are
+    /// legitimately independent" — is the right answer. `framing_vocabulary` bans four groups and the
+    /// imperative MOOD is deliberately not among them ("ZERO central tokens, because `BANNED_TOKENS`
+    /// never banned the imperative MOOD"), so there is no central list to derive these from; deriving
+    /// them would mean inventing one. They are patterns rather than tokens and run through the shared
+    /// scanner's adjacent-word path, which is why `please` has lost the trailing space the retired
+    /// substring scan needed to keep it off `pleasant` — a word boundary does that correctly, and also
+    /// catches it at the end of a sentence, where `"please "` did not.
+    private static let imperativePatterns = ["you must", "act now", "immediately", "right away",
+                                             "don't forget", "please"]
+
+    /// `src/framing_vocabulary.rs`'s `BANNED_TOKENS` and `BANNED_PHRASES`, parsed from the source that
+    /// declares them. Throws rather than degrading to an empty list — see `ParseFailure`.
+    private func centralVocabulary() throws -> (tokens: [String], phrases: [String]) {
+        let url = FramingVocabularyScan.vocabularySourceURL()
+        let source = try XCTUnwrap(try? String(contentsOf: url, encoding: .utf8),
+                                   "could not read \(url.path) — the framing screen cannot derive its "
+                                   + "vocabulary, so no framing verdict in this file is about the "
+                                   + "contract src/framing_vocabulary.rs defines")
+        return (tokens: try FramingVocabularyScan.rustStringList(named: "BANNED_TOKENS", in: source),
+                phrases: try FramingVocabularyScan.rustStringList(named: "BANNED_PHRASES", in: source))
+    }
+
+    /// The derivation reaches the WHOLE central list, and every member it returns is one the shared
+    /// tokenizer can actually match.
+    ///
+    /// A parser that truncated — at the first group comment, at the first blank line — would return a
+    /// plausible-looking list and leave the screen silently narrower than it reads. So this asserts a
+    /// representative of each of the four editorial groups `BANNED_TOKENS` documents, in list order:
+    /// `add` opens the imperatives, `healthy` the value judgements, `should` the recommendations, and
+    /// `soon` is the alarmist group's last entry and the list's, which is the tail canary.
+    func testTheFramingVocabularyIsDerivedFromTheRustSourceOfTruth() throws {
+        let (tokens, phrases) = try centralVocabulary()
+
+        for (group, representative) in [("imperatives (first entry)", "add"),
+                                        ("imperatives", "buy"),
+                                        ("value judgements", "healthy"),
+                                        ("recommendation framing", "should"),
+                                        ("alarmist projection (last entry)", "soon")] {
+            XCTAssertTrue(tokens.contains(representative),
+                          "the parse of BANNED_TOKENS is missing '\(representative)' from its \(group) "
+                          + "group — it did not read the whole list, so this file's framing screen is "
+                          + "narrower than it reads")
+        }
+
+        // A comment fragment admitted as a token would be multi-word, so it could never match — a dead
+        // entry that widens the list on paper and not in fact.
+        for token in tokens {
+            XCTAssertEqual(FramingVocabularyScan.words(of: token), [token],
+                           "'\(token)' does not survive the shared tokenizer as one whole lowercase "
+                           + "word, so it can never match: the parse admitted something that is not a "
+                           + "token (a comment fragment, or a member the tokenizer would split)")
+        }
+
+        for phrase in ["top up", "get more"] {
+            XCTAssertTrue(phrases.contains(phrase),
+                          "BANNED_PHRASES no longer carries the acquisitive call '\(phrase)' — if that "
+                          + "is deliberate centrally, this assertion is the record that it changed")
+        }
+        for phrase in phrases {
+            XCTAssertGreaterThan(FramingVocabularyScan.words(of: phrase).count, 1,
+                                 "'\(phrase)' is a single word in BANNED_PHRASES — it belongs in "
+                                 + "BANNED_TOKENS, and matched here it is a phrase that cannot span")
+        }
+    }
+
+    /// The derived list gives up NOTHING the hand copy this change retired was carrying.
+    ///
+    /// The retired list was `["buy", "purchase", "upgrade", "cancel", "bypass", "beat", "need more"]`.
+    /// Five of those are central verbatim and are asserted so here, so a central deletion cannot
+    /// silently narrow this surface. The remaining two are the interesting ones
+    /// and neither is asserted in prose: `beat` is the local extra above, and `need more` is SUBSUMED —
+    /// any text where that phrase matched contains the word `need`, which the central list carries, so
+    /// it is still caught, one word earlier, and now also when spelled without `more`. That is the same
+    /// reasoning `src/cli.rs`'s `scan_expiry_help` records for dropping its own `need more`, and it is
+    /// proven below by driving the sentence rather than by repeating the argument.
+    func testTheDerivedVocabularyStillCarriesEveryTokenTheHandCopyDid() throws {
+        let (tokens, _) = try centralVocabulary()
+
+        for token in ["buy", "purchase", "upgrade", "cancel", "bypass"] {
+            XCTAssertTrue(tokens.contains(token),
+                          "BANNED_TOKENS no longer carries '\(token)', which the hand-copied list "
+                          + "this file retired was screening for: deriving the vocabulary must not "
+                          + "have cost this surface coverage it already had")
+        }
+
+        XCTAssertFalse(tokens.contains("beat"),
+                       "'beat' is now central. Issue #1134 kept it local because src/daemon/socket.rs "
+                       + "spends the word neutrally for the watch liveness frame — if that judgement "
+                       + "was revisited centrally, drop it from `extraTokens` rather than screening "
+                       + "for it twice")
+        XCTAssertTrue(Self.extraTokens.contains("beat"),
+                      "'beat' is neither central nor a local extra — the retired hand copy screened "
+                      + "for it and this change would have dropped it")
+
+        XCTAssertEqual(FramingVocabularyScan.hits(in: "we need more capacity",
+                                                  tokens: tokens + Self.extraTokens, phrases: []),
+                       ["need"],
+                       "the retired list's 'need more' is only safe to drop because the central 'need' "
+                       + "catches the same sentence one word earlier — it does not")
+    }
 
     /// The §D-STA-6 / SUR-001 neutral-framing firewall, applied to the surface that renders on a LOCK
     /// SCREEN (issue #935). Operator-facing strings state facts; they do not instruct, forecast, or
     /// reach for the vocabulary of buying capacity.
     ///
-    /// Enumerated over every case for the same reason as above — a firewall that only covers the
-    /// strings that existed when it was written is not a firewall. It is a token screen, deliberately
-    /// mechanical: it cannot judge tone, and the imperative check below is a keyword list rather than
-    /// a grammar. What it does guarantee is that the specific phrasings this project has already ruled
-    /// out cannot reappear in a notification without reddening.
-    func testNoEventContentReachesForABannedOrImperativeFraming() {
+    /// Enumerated over every case for the same reason as the suites above — a firewall that only covers
+    /// the strings that existed when it was written is not a firewall. It remains deliberately
+    /// mechanical: it cannot judge tone, and the imperative half is a pattern list rather than a
+    /// grammar. What it guarantees is that the vocabulary this project has already ruled out cannot
+    /// reappear in a notification without reddening — and since issue #1219 that vocabulary is the
+    /// central one, whole, rather than a hand-copied subset of it.
+    func testNoEventContentReachesForABannedOrImperativeFraming() throws {
+        let (tokens, phrases) = try centralVocabulary()
+        let banned = tokens + Self.extraTokens
+
         for event in AccountEvent.allCases {
-            let text = (event.notificationTitle + " " + event.notificationBody).lowercased()
-            for token in Self.bannedTokens {
-                XCTAssertFalse(text.contains(token),
-                               "\(event) content contains the §D-STA-6 banned token '\(token)': \(text)")
-            }
-            for token in Self.imperativeTokens {
-                XCTAssertFalse(text.contains(token),
-                               "\(event) content is imperative-framed via '\(token)': \(text)")
-            }
+            let text = event.notificationTitle + " " + event.notificationBody
+            XCTAssertEqual(FramingVocabularyScan.hits(in: text, tokens: banned, phrases: phrases), [],
+                           "\(event) content spends §D-STA-6 banned framing: \(text)")
+            XCTAssertEqual(FramingVocabularyScan.hits(in: text, tokens: [],
+                                                      phrases: Self.imperativePatterns), [],
+                           "\(event) content is imperative-framed: \(text)")
         }
     }
 
-    /// CANARY for the screen above: it must be able to FAIL. A screen that passes everything is not
-    /// evidence, and this one is a substring list — the class of check most likely to be silently
-    /// inert (a typo'd token, a case-folding slip) while reporting green.
+    /// CANARY for the screen above: it must be able to FAIL, and to fail for the STATED reason.
     ///
-    /// It therefore asserts against the SAME `Self.bannedTokens` / `Self.imperativeTokens` the screen
-    /// consumes. A local copy of the lists would make this test vacuous in the one case it is here to
-    /// cover: the copy would keep catching the offending string while the screen's own list sat typo'd.
-    func testTheNeutralFramingScreenCatchesABannedFraming() {
-        let offending = "You must act now — upgrade the plan.".lowercased()
+    /// It routes the offending string through the SAME `FramingVocabularyScan.hits` and the SAME
+    /// derived vocabulary the screen consumes — a local copy of either would make this vacuous in the
+    /// one case it exists to cover, staying green over an offending string while the screen's own
+    /// derivation sat broken. And it asserts WHICH words came back rather than that something did: a
+    /// scan that reported a hit for the wrong reason is a screen whose verdicts cannot be read.
+    func testTheNeutralFramingScreenCatchesABannedFraming() throws {
+        let (tokens, phrases) = try centralVocabulary()
+        let offending = "You must act now — upgrade the plan. Top up to get more, and beat the limit."
 
-        XCTAssertTrue(Self.bannedTokens.contains { offending.contains($0) },
-                      "the banned-token list does not catch a deliberately offending string")
-        XCTAssertTrue(Self.imperativeTokens.contains { offending.contains($0) },
-                      "the imperative list does not catch a deliberately offending string")
+        let banned = FramingVocabularyScan.hits(in: offending, tokens: tokens + Self.extraTokens,
+                                                phrases: phrases)
+        for expected in ["must", "upgrade", "beat", "top up", "get more"] {
+            XCTAssertTrue(banned.contains(expected),
+                          "the derived banned vocabulary does not catch '\(expected)' in a "
+                          + "deliberately offending string; it reported \(banned)")
+        }
+
+        let imperative = FramingVocabularyScan.hits(in: offending, tokens: [],
+                                                    phrases: Self.imperativePatterns)
+        for expected in ["you must", "act now"] {
+            XCTAssertTrue(imperative.contains(expected),
+                          "the imperative pattern list does not catch '\(expected)' in a deliberately "
+                          + "offending string; it reported \(imperative)")
+        }
+    }
+
+    /// The shared scanner decides what a WORD is the way `crate::framing_vocabulary::words_of` does,
+    /// pinned on the cases that module and `src/cli.rs` pin for themselves.
+    ///
+    /// This is a parity of pinned BEHAVIOUR, not a proof of equivalence — nothing here can execute the
+    /// Rust function. What it buys is that a divergence introduced on either side reddens on one of
+    /// them rather than on neither.
+    ///
+    /// The middle block is why the tokenizer had to change in the same commit as the vocabulary, and it
+    /// is measured rather than argued: under the retired SUBSTRING scan, widening this file to the
+    /// central list would have reddened two of the three shipped events — `rotated` containing `rotate`
+    /// and `needed` containing `need` — both of them spuriously. The two assertions that the substring
+    /// test does match are the positive control for that claim; without them "the word scan returns
+    /// nothing" is equally consistent with a body that spends nothing banned in any sense. That the
+    /// scanner itself is not universally empty is pinned by the `at-risk` / `At Risk` / `risk!`
+    /// assertions above, which require it to return a hit — not by these two, which never invoke it.
+    func testTheSharedScannerMatchesTheRustWordSemantics() throws {
+        let (tokens, phrases) = try centralVocabulary()
+
+        // Whole words on non-alphanumeric boundaries: the three spellings framing_vocabulary pins.
+        for spelling in ["at-risk", "At Risk", "risk!"] {
+            XCTAssertEqual(FramingVocabularyScan.hits(in: spelling, tokens: tokens, phrases: []),
+                           ["risk"], "'\(spelling)' must tokenize to the banned word 'risk'")
+        }
+        XCTAssertEqual(FramingVocabularyScan.hits(in: "saturated", tokens: tokens, phrases: []), [],
+                       "'saturated' contains no banned WORD — a substring scan is what trips here")
+
+        // The two shipped bodies whose acceptance depends on this decision, and the retired scan's
+        // verdict on the same text.
+        for body in ["Sessiometer rotated to a different account.",
+                     "No account has capacity right now — action needed."] {
+            XCTAssertEqual(FramingVocabularyScan.hits(in: body, tokens: tokens, phrases: []), [],
+                           "the shipped body '\(body)' spends no banned WORD")
+        }
+        XCTAssertTrue("sessiometer rotated to a different account.".contains("rotate"),
+                      "the retired substring scan would NOT have tripped on 'rotated' — if that is so, "
+                      + "the tokenizer change carries no weight and this rationale is wrong")
+        XCTAssertTrue("no account has capacity right now — action needed.".contains("need"),
+                      "the retired substring scan would NOT have tripped on 'needed' — same")
+
+        // Adjacent-word phrases, never raw substrings.
+        XCTAssertEqual(FramingVocabularyScan.hits(in: "laptop update", tokens: [], phrases: phrases), [],
+                       "'laptop update' is not the acquisitive call 'top up'")
+        XCTAssertEqual(FramingVocabularyScan.hits(in: "please top up now", tokens: [], phrases: phrases),
+                       ["top up"], "an adjacent-word acquisitive call must match")
+
+        // ANSI SGR runs are stripped, so a colour-wrapped banned word tokenizes intact rather than as
+        // the single word `31mupgrade` (src/cli.rs pins the same case).
+        XCTAssertEqual(FramingVocabularyScan.hits(in: "\u{1B}[31mupgrade\u{1B}[0m", tokens: tokens,
+                                                  phrases: []),
+                       ["upgrade"], "an SGR-wrapped banned word must still tokenize to that word")
+    }
+
+    /// CANARY for the derivation itself: a vocabulary that cannot be parsed must REDDEN, never degrade
+    /// into an empty list. An empty list is the degenerate green — a screen with no vocabulary passes
+    /// every string, and reports it as a pass.
+    ///
+    /// The final case is the positive control: the same parser over well-formed synthetic source
+    /// returns its members AND drops the one quoted inside a comment, so the three failures above are
+    /// about the defect each names rather than about a parser that rejects everything.
+    func testTheVocabularyParserFailsLoudRatherThanReturningNothing() {
+        XCTAssertThrowsError(
+            try FramingVocabularyScan.rustStringList(named: "BANNED_TOKENS",
+                                                     in: "pub const OTHER: &[&str] = &[\"buy\"];"),
+            "a renamed or restructured constant must fail, not yield an empty screen")
+        XCTAssertThrowsError(
+            try FramingVocabularyScan.rustStringList(named: "BANNED_TOKENS",
+                                                     in: "pub const BANNED_TOKENS: &[&str] = &[];"),
+            "an empty central list must fail — it would pass every notification string")
+        XCTAssertThrowsError(
+            try FramingVocabularyScan.rustStringList(
+                named: "BANNED_TOKENS",
+                in: "pub const BANNED_TOKENS: &[&str] = &[\n    // \"buy\",\n];"),
+            "a list whose every member is commented out is empty, not clean")
+        XCTAssertThrowsError(
+            try FramingVocabularyScan.rustStringList(
+                named: "BANNED_TOKENS",
+                in: "pub const BANNED_TOKENS: &[&str] = &[\"buy\","),
+            "an unterminated list must fail — the parse cannot tell where the list ends")
+
+        XCTAssertEqual(
+            try FramingVocabularyScan.rustStringList(
+                named: "BANNED_TOKENS",
+                in: "pub const BANNED_TOKENS: &[&str] = &[\n    \"buy\", // \"upgrade\"\n    \"cancel\",\n];"),
+            ["buy", "cancel"],
+            "the parser must return the declared members and admit no word quoted in a comment")
     }
 
     /// `.loginExpiring` NAMES THE VERB that replaces the credential, and names no other (issue #935).
