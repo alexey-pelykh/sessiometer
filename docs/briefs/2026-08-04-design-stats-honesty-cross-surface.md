@@ -37,13 +37,21 @@ a contract neither surface can move alone.
 
 ## What your two interventions changed
 
+> **Editorial note added 2026-08-11 (issue #1105).** This is a dated record and its claims are
+> **left as written** — they were true on 2026-08-04 and correcting them would falsify the record.
+> Two exceptions, both of which were *never* true rather than merely overtaken: the CLI render was
+> called `fleet_line`, which has never been a Rust item (the band is `render_summary`; the runway's
+> own line is `fleet_runway_line`), and the accompanying line citation is dropped rather than
+> re-pinned. Both claims below have since been delivered — the runway line by issue #1028, the
+> `, 64% covered` wording by issue #1029.
+
 - **"0 covered — covered WHAT?"** → **R-21**. You caught implementation vocabulary leaking into a
   user-facing string. It's a field name (`all_high_covered_secs`). Worth knowing: **the CLI has the
   same defect today** — it renders `, 64% covered`. Both surfaces are now in scope for it.
-- **"for CLI this line needs to be printed"** → **R-20**, and this one was load-bearing. `fleet_line`
-  emits the runway *only* under `runway_secs: Some(_)` (`stats.rs:1729`, doc: *"Rendered ONLY when the
-  pool has a finite runway"*). So the meaningful-rate floor would have made the line **vanish more
-  often** — the corrective work would have made the surface quieter, not more honest.
+- **"for CLI this line needs to be printed"** → **R-20**, and this one was load-bearing.
+  `render_summary` emits the runway *only* under `runway_secs: Some(_)` (doc: *"Rendered ONLY when
+  the pool has a finite runway"*). So the meaningful-rate floor would have made the line **vanish
+  more often** — the corrective work would have made the surface quieter, not more honest.
 
 I also had a factual error in the PRD that this check caught: I'd claimed the CLI leaves the counted
 set unstated. It doesn't — it already prints `(1 of 6 counted)`. The open surface is the panel only.

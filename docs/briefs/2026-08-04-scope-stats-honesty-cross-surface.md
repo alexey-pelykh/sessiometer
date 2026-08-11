@@ -96,17 +96,26 @@ are unused here):
 
 ## Your two interventions, and what they changed
 
+> **Editorial note added 2026-08-11 (issue #1105).** This is a dated record and its claims are
+> **left as written** — they were true on 2026-08-04 and correcting them would falsify the record.
+> Two exceptions, both of which were *never* true rather than merely overtaken: the CLI render was
+> called `fleet_line`, which has never been a Rust item (the band is `render_summary`; the runway's
+> own line is `fleet_runway_line`), and the mock's aggregate callout was pinned as `:943/:1020` —
+> neither of which is a `class="agg"` frame — so it is re-anchored to the frames themselves rather
+> than re-pinned. Both claims below have since been delivered — the runway line by issue #1028, the
+> `, 64% covered` wording by issue #1029.
+
 Both were rejections of an options menu, and both were right to be.
 
 - **"0 covered — covered WHAT?"** → **R-21**. The word was the field name `all_high_covered_secs`
   leaking into a user-facing string. Worth knowing: **the CLI has the same defect today**, rendering
   `, 64% covered`. Both surfaces are in scope for it.
 
-- **"for CLI this line needs to be printed"** → **R-20**, and this one was load-bearing. `fleet_line`
-  emits the runway *only* under `runway_secs: Some(_)` (doc: *"Rendered ONLY when the pool has a finite
-  runway"*). So the meaningful-rate floor, shipped alone, would have made the line **vanish more
-  often** — the corrective work would have made the surface *quieter*, not more honest. That is
-  premortem P2 landing in reality before it shipped.
+- **"for CLI this line needs to be printed"** → **R-20**, and this one was load-bearing.
+  `render_summary` emits the runway *only* under `runway_secs: Some(_)` (doc: *"Rendered ONLY when
+  the pool has a finite runway"*). So the meaningful-rate floor, shipped alone, would have made the
+  line **vanish more often** — the corrective work would have made the surface *quieter*, not more
+  honest. That is premortem P2 landing in reality before it shipped.
 
 After the second rejection I stopped asking and decided the copy under the two constraints you gave,
 recorded as explicitly correctable. It is in the design brief's copy table — correct it freely; it is
@@ -170,7 +179,7 @@ The carry-forward into each item's `## Build Reference` was audited green at Sta
 | Gap/coverage semantics, both surfaces | `hq/strategy/design-stats.md` § D-STA-9 | parity-surface | *"Missing sample = UNKNOWN (never 0/exhausted/healthy); per-period coverage = seen÷expected; low-coverage annotated."* Rationale is normative: *"a daemon-down week must not read as 'underused → cancel'."* |
 | Roster block render | `hq/strategy/design-stats.md` § D-STA-5, :129 | visual-mock | Source of the `—` gap sentinel. Its `≥95%` is *"an illustration of the shape, not a pinned value"* — the menubar once hardcoded `≥90%` from an earlier version of that line: **an illustration read as a spec** |
 | CLI ↔ panel state parity | `hq/strategy/design-menubar.md` § R-2 | parity-surface | *"a divergence between them is a bug"* — STATE-parity, not glyph-parity |
-| Stats tab aggregate callout | `apps/menubar/design/menubar-preview.html` (`.agg`, :943/:1020) | visual-mock | The panel's build reference. **Depicts only the happy path** — no gap-state frame exists |
+| Stats tab aggregate callout | `apps/menubar/design/menubar-preview.html` (its two `class="agg"` frames) | visual-mock | The panel's build reference. **Depicts only the happy path** — no gap-state frame exists |
 | Severity/parity contract | `build/fixtures/cross-surface-severity.json` + `src/cross_surface.rs` (ADR-0026 / #768) | parity-surface | Byte-pinned manifest, two independent conformers. **The roster/stats aggregate is in neither the pinned set nor the declared-`uncovered_axes` set** |
 | Panel goldens | `apps/menubar/design/renders/panel-goldens/**` | render | Rebaseline needs `Panel-Goldens-Rebaselined:` |
 | CLI goldens | `build/fixtures/cli-renders/**` | render | Rebaseline needs `CLI-Goldens-Rebaselined:` |
