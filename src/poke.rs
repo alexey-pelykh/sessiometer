@@ -294,7 +294,7 @@ async fn poke_named<E: PokeEngine, N: RestoreNotifier>(
         });
     }
     let report = engine.refresh(account).await?;
-    let quarantined = daemon_marks_quarantined(daemon_status, &account.label);
+    let quarantined = daemon_marks_quarantined(daemon_status, roster, &account.label);
     let restore = resolve_restore(account, &report, quarantined, notifier).await;
     println!(
         "{}",
@@ -340,7 +340,7 @@ async fn poke_all<E: PokeEngine, N: RestoreNotifier>(
             // re-stashed refresh of a quarantined one ALSO clears its quarantine via the
             // #275 signal (#428), so a swept account recovers exactly as a named poke does.
             Ok(report) => {
-                let quarantined = daemon_marks_quarantined(daemon_status, &account.label);
+                let quarantined = daemon_marks_quarantined(daemon_status, roster, &account.label);
                 let restore = resolve_restore(account, &report, quarantined, notifier).await;
                 poke_outcome(&report, restore)
             }
@@ -490,20 +490,70 @@ fn poke_line(label: &str, outcome: &str) -> String {
 /// [`should_restore`] then decides which actually recover (a Degraded account's refresh
 /// succeeds and clears; a Dead one's refresh returns `dead` and stays put — see there).
 ///
-/// A `None` snapshot (no daemon reachable) or a `label` absent from the snapshot is NOT
-/// quarantined: an indeterminate verdict `poke` reports with its plain wording (#163 AC-3),
-/// never a fabricated daemon-state claim. Matching is by label — the only account handle the
-/// wire [`AccountStatusLine`] carries (issue #15: never the uuid or email) — the same key
-/// `status` renders by; a renamed/stale label simply misses and degrades to the plain wording.
-fn daemon_marks_quarantined(daemon_status: Option<&StatusResponse>, label: &str) -> bool {
+/// A `None` snapshot (no daemon reachable), a `label` absent from the snapshot, or a `label`
+/// that is not a unique key are all NOT quarantined: an indeterminate verdict `poke` reports
+/// with its plain wording (#163 AC-3), never a fabricated daemon-state claim.
+///
+/// Matching is by label — the only account handle the wire [`AccountStatusLine`] carries
+/// (issue #15: never the uuid or email) — the same key `status` renders by; a renamed/stale
+/// label simply misses and degrades to the plain wording. But labels are operator handles and
+/// are NOT required to be unique (see [`resolve_target`]), so the label carries a verdict ONLY
+/// while it names EXACTLY ONE account on BOTH sides: once in `roster`, and once in the
+/// snapshot. Either count off and the bearers are indistinguishable from a label alone, so
+/// poke claims nothing rather than attributing the earliest match's state to whichever account
+/// it was handed (issue #1086) — the same degrade-rather-than-guess shape `use`'s
+/// `cached_viability_for` already takes for this lookup.
+///
+/// BOTH counts, because each catches a misattribution the other misses. The snapshot side
+/// catches a roster the daemon knows better than this process does (an account removed from
+/// `config.toml` since); the roster side catches the reverse — the daemon adopts a new roster
+/// only when a reload is SIGNALLED (issue #139), so its snapshot legitimately lags, and a
+/// second bearer added on disk leaves the wire with one line that is NOT necessarily the poked
+/// account's.
+///
+/// The cost is stated rather than hidden: on an ambiguous label poke stops clearing
+/// quarantines as well as stops fabricating them, so a genuinely quarantined bearer keeps its
+/// plain wording and is left to the daemon's #106 refresh sweep WHEN `[refresh]` is enabled, or
+/// to a `login`/reconcile. Both halves of that are narrower than they look, and neither should be
+/// read as a promise. ADR-0008's other daemon-side revival, #42's `note_poll_outcome`
+/// live-recovery, is scoped to the STUCK ACTIVE — and poke excludes the active account by
+/// construction — so it cannot apply here at all. The #106 sweep is the only one left, and this
+/// same file records it as conditional (`QUARANTINE_CLEARED` above: "a sweep that never runs with
+/// `[refresh]` off"). With refresh disabled there is NO daemon-side revival, and the fallback is
+/// `login`/reconcile alone.
+/// Making the wire disambiguate instead would mean carrying a stable per-account key on a
+/// surface #15 restricts to the operator-authored handle. RESIDUAL, unclosable without such a
+/// key: a label REASSIGNED to a different account between the snapshot and the current roster
+/// matches once on each side and still reads the stale bearer's line — the same residual
+/// `cached_viability_for` records for `use`. Bounded: the verdict drives the report wording
+/// and a `#275 Restored` signal that is a no-op for an unknown or already-healthy uuid
+/// (ADR-0008).
+fn daemon_marks_quarantined(
+    daemon_status: Option<&StatusResponse>,
+    roster: &[Account],
+    label: &str,
+) -> bool {
     let Some(status) = daemon_status else {
         return false;
     };
-    status
-        .accounts
-        .iter()
-        .find(|line| line.label == label)
-        .is_some_and(line_is_quarantined)
+    if sole(roster.iter().filter(|account| account.label == label)).is_none() {
+        return false;
+    }
+    sole(status.accounts.iter().filter(|line| line.label == label)).is_some_and(line_is_quarantined)
+}
+
+/// The one and only element of `candidates`, or `None` when it holds zero or more than one —
+/// the "exactly one match, else no answer" primitive [`daemon_marks_quarantined`] applies to
+/// each side of its label lookup. Short-circuits on the second MATCH: it pulls at most two items
+/// from `candidates`, but where `candidates` is a filter — as it is at both call sites — the
+/// second pull drives that filter until it finds a second match or exhausts the underlying
+/// iterator. So on a UNIQUE label, which is the common case and the hot path, it walks the whole
+/// roster exactly as a count would. Cost is nil at roster scale; the claim is narrowed here
+/// because an earlier wording said "rather than a count of the whole roster", which is false for
+/// the case that matters.
+fn sole<T>(mut candidates: impl Iterator<Item = T>) -> Option<T> {
+    let only = candidates.next()?;
+    candidates.next().is_none().then_some(only)
 }
 
 /// Resolve ONE status line's quarantine the same way `status` does (`cli::health_cell`): the
@@ -846,6 +896,11 @@ mod tests {
 
     #[test]
     fn daemon_marks_quarantined_reads_the_named_line_or_degrades_to_not_quarantined() {
+        let roster = vec![
+            acct("work", "u-A"),
+            acct("gone", "u-B"),
+            acct("spare", "u-C"),
+        ];
         let snap = status_snapshot(vec![
             status_line("work", Some(CredentialHealth::Degraded), false),
             status_line("gone", Some(CredentialHealth::Dead), false),
@@ -853,13 +908,63 @@ mod tests {
         ]);
         // Each account's OWN verdict is read, by label — a Degraded 401-streak (#427) and a
         // proven-Dead credential (#261) are both quarantined; a Healthy one is not.
-        assert!(daemon_marks_quarantined(Some(&snap), "work"));
-        assert!(daemon_marks_quarantined(Some(&snap), "gone"));
-        assert!(!daemon_marks_quarantined(Some(&snap), "spare"));
+        assert!(daemon_marks_quarantined(Some(&snap), &roster, "work"));
+        assert!(daemon_marks_quarantined(Some(&snap), &roster, "gone"));
+        assert!(!daemon_marks_quarantined(Some(&snap), &roster, "spare"));
         // No daemon reachable (None) → indeterminate → not quarantined (plain wording, AC-3).
-        assert!(!daemon_marks_quarantined(None, "work"));
+        assert!(!daemon_marks_quarantined(None, &roster, "work"));
         // A label the daemon does not list → indeterminate → not quarantined.
-        assert!(!daemon_marks_quarantined(Some(&snap), "ghost"));
+        assert!(!daemon_marks_quarantined(Some(&snap), &roster, "ghost"));
+    }
+
+    #[test]
+    fn daemon_marks_quarantined_needs_the_label_unique_on_both_sides() {
+        // Issue #1086 at the predicate: the label is a valid key only while it names exactly
+        // one account in the roster AND one line on the wire. The `Dead` verdict below is
+        // deliberately the same in all four cases, so what varies is only the KEY's validity.
+        let dead = || status_line("work", Some(CredentialHealth::Dead), false);
+
+        // Unique on both sides → the verdict is readable. The control for the three below.
+        let unique = vec![acct("work", "u-A")];
+        assert!(daemon_marks_quarantined(
+            Some(&status_snapshot(vec![dead()])),
+            &unique,
+            "work"
+        ));
+        // Duplicated in the ROSTER, one line on the wire (a snapshot lagging a signalled
+        // reload, #139): the single line need not be the caller's account → no claim.
+        let dup_roster = vec![acct("work", "u-A"), acct("work", "u-B")];
+        assert!(!daemon_marks_quarantined(
+            Some(&status_snapshot(vec![dead()])),
+            &dup_roster,
+            "work"
+        ));
+        // Duplicated on the WIRE, unique in the roster (the daemon still lists an account
+        // dropped from `config.toml`): the earliest line is a guess → no claim.
+        assert!(!daemon_marks_quarantined(
+            Some(&status_snapshot(vec![dead(), dead()])),
+            &unique,
+            "work"
+        ));
+        // Duplicated on both sides — the issue's own scenario.
+        assert!(!daemon_marks_quarantined(
+            Some(&status_snapshot(vec![dead(), dead()])),
+            &dup_roster,
+            "work"
+        ));
+    }
+
+    #[test]
+    fn sole_yields_the_single_element_and_nothing_for_zero_or_many() {
+        assert_eq!(sole([7].into_iter()), Some(7));
+        assert_eq!(sole(std::iter::empty::<u8>()), None);
+        assert_eq!(sole([7, 9].into_iter()), None);
+        // Short-circuits: a third element is never pulled, so an ambiguity verdict costs two
+        // steps of the filtered iterator rather than a walk of the whole roster.
+        let mut pulled = 0;
+        let counted = [1, 2, 3, 4].into_iter().inspect(|_| pulled += 1);
+        assert_eq!(sole(counted), None);
+        assert_eq!(pulled, 2);
     }
 
     #[test]
@@ -958,7 +1063,7 @@ mod tests {
         let restore = resolve_restore(
             &account,
             &report,
-            daemon_marks_quarantined(Some(&snap), "work"),
+            daemon_marks_quarantined(Some(&snap), std::slice::from_ref(&account), "work"),
             &notifier,
         )
         .await;
@@ -995,7 +1100,7 @@ mod tests {
         let restore = resolve_restore(
             &account,
             &report,
-            daemon_marks_quarantined(Some(&snap), "work"),
+            daemon_marks_quarantined(Some(&snap), std::slice::from_ref(&account), "work"),
             &notifier,
         )
         .await;
@@ -1031,7 +1136,7 @@ mod tests {
         let restore = resolve_restore(
             &account,
             &report,
-            daemon_marks_quarantined(Some(&snap), "work"),
+            daemon_marks_quarantined(Some(&snap), std::slice::from_ref(&account), "work"),
             &notifier,
         )
         .await;
@@ -1057,7 +1162,7 @@ mod tests {
         let restore = resolve_restore(
             &account,
             &report,
-            daemon_marks_quarantined(Some(&snap), "work"),
+            daemon_marks_quarantined(Some(&snap), std::slice::from_ref(&account), "work"),
             &notifier,
         )
         .await;
@@ -1078,7 +1183,7 @@ mod tests {
         let restore = resolve_restore(
             &account,
             &refreshed,
-            daemon_marks_quarantined(None, "work"),
+            daemon_marks_quarantined(None, std::slice::from_ref(&account), "work"),
             &notifier,
         )
         .await;
@@ -1096,7 +1201,7 @@ mod tests {
         let restore = resolve_restore(
             &account,
             &refreshed,
-            daemon_marks_quarantined(Some(&unknown), "work"),
+            daemon_marks_quarantined(Some(&unknown), std::slice::from_ref(&account), "work"),
             &notifier,
         )
         .await;
@@ -1120,7 +1225,7 @@ mod tests {
         let restore = resolve_restore(
             &account,
             &report,
-            daemon_marks_quarantined(Some(&snap), "work"),
+            daemon_marks_quarantined(Some(&snap), std::slice::from_ref(&account), "work"),
             &notifier,
         )
         .await;
@@ -1130,6 +1235,227 @@ mod tests {
             "a dead credential is never falsely un-quarantined"
         );
         assert_eq!(poke_outcome(&report, restore), "dead — needs re-login");
+    }
+
+    // --- issue #1086: a duplicated label is not a usable key for the daemon's verdict ----
+    //
+    // `poke` resolves its target by label OR uuid (`resolve_target`), then asks the daemon's
+    // snapshot for that account's quarantine verdict keyed on the LABEL — the only account
+    // handle the wire carries (issue #15). A duplicated label is a legal, documented roster
+    // state, and the lookup took the FIRST bearer's line, so the verdict could belong to a
+    // sibling. It drives more than the wording: `resolve_restore` sends the `#275 Restored`
+    // signal for the POKED account's uuid on the strength of it, so a wrong verdict is a
+    // WRITE, not only a misreport.
+    //
+    // All four drive the whole hermetic core (`run_poke`), never the predicate directly, so
+    // their source is untouched by the fix — the same bytes RED before it and GREEN after.
+    // The pair of `refresh` results is the one `should_restore` fires on (a fresh, re-stashed
+    // token), which is what makes the verdict observable at all.
+
+    /// The `Refreshed { rotated } + re_stashed` cycle `should_restore` gates on — the only
+    /// input that turns a quarantine verdict into an observable signal.
+    fn restashed_refresh() -> FakeRefresh {
+        FakeRefresh::Report(report(RefreshOutcome::Refreshed { rotated: true }, true))
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_labels_verdict_does_not_depend_on_bearer_order() {
+        // The issue's core claim, as a property: with two `work` accounts of DIFFERING daemon
+        // health, the verdict poke acts on must not flip when the pair is listed the other way
+        // round. A first-match `.find()` makes it flip — one order yields the healthy sibling's
+        // line, the reverse yields the dead one's — so the same `poke u-healthy` sends a
+        // `Restored` signal in one order and not the other. Ordering is not a property of the
+        // account being poked, so any order-sensitive answer is a guess.
+        async fn sent_for_order(dead_first: bool) -> Vec<String> {
+            let (roster, lines) = if dead_first {
+                (
+                    vec![acct("work", "u-dead"), acct("work", "u-healthy")],
+                    vec![
+                        status_line("work", Some(CredentialHealth::Dead), false),
+                        status_line("work", Some(CredentialHealth::Healthy), false),
+                    ],
+                )
+            } else {
+                (
+                    vec![acct("work", "u-healthy"), acct("work", "u-dead")],
+                    vec![
+                        status_line("work", Some(CredentialHealth::Healthy), false),
+                        status_line("work", Some(CredentialHealth::Dead), false),
+                    ],
+                )
+            };
+            let engine = FakePokeEngine::new().with_result("u-healthy", restashed_refresh());
+            let notifier = FakeRestoreNotifier::new();
+            run_poke(
+                &roster,
+                Some("u-healthy"),
+                None,
+                0,
+                &engine,
+                Some(&status_snapshot(lines)),
+                &notifier,
+            )
+            .await
+            .unwrap();
+            notifier.sent()
+        }
+
+        let dead_first = sent_for_order(true).await;
+        let healthy_first = sent_for_order(false).await;
+        assert_eq!(
+            dead_first, healthy_first,
+            "the verdict poke acts on must not depend on which bearer the roster/wire lists first",
+        );
+        assert!(
+            dead_first.is_empty(),
+            "and the order-independent answer must be the indeterminate one — poke cannot tell \
+             the bearers apart from a label, so it claims nothing",
+        );
+    }
+
+    #[tokio::test]
+    async fn named_poke_of_a_healthy_duplicate_does_not_inherit_a_dead_siblings_quarantine() {
+        // The issue's failure scenario, in the direction where the defect FABRICATES: the uuid
+        // resolves `u-healthy` unambiguously, but the label lookup lands on the dead sibling
+        // that sorts first — so poke sends a `Restored` for an account the daemon never
+        // quarantined and reports the quarantine "cleared". Both are claims about a DIFFERENT
+        // account's state.
+        let roster = vec![acct("work", "u-dead"), acct("work", "u-healthy")];
+        let engine = FakePokeEngine::new().with_result("u-healthy", restashed_refresh());
+        let snap = status_snapshot(vec![
+            status_line("work", Some(CredentialHealth::Dead), false),
+            status_line("work", Some(CredentialHealth::Healthy), false),
+        ]);
+        let notifier = FakeRestoreNotifier::new();
+        run_poke(
+            &roster,
+            Some("u-healthy"),
+            None,
+            0,
+            &engine,
+            Some(&snap),
+            &notifier,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            engine.refreshed(),
+            vec!["u-healthy"],
+            "the uuid still resolves the right account to refresh — only the verdict was wrong",
+        );
+        assert!(
+            notifier.sent().is_empty(),
+            "no un-quarantine may be emitted off a sibling's verdict; got {:?}",
+            notifier.sent(),
+        );
+    }
+
+    #[tokio::test]
+    async fn sweeping_poke_emits_no_restore_for_either_bearer_of_a_duplicated_label() {
+        // The widened path (issue #1086 comment): a bare `sessiometer poke` consults
+        // `resolve_target` for nothing, so no uuid is needed to reach the defect. It sweeps
+        // both near-expiry bearers and hands each the SAME first-match verdict — the dead
+        // one's — so both receive a `Restored` signal, including the healthy one.
+        let now = 1_000_000;
+        let soon = now + 60_000;
+        let roster = vec![acct("work", "u-dead"), acct("work", "u-healthy")];
+        let engine = FakePokeEngine::new()
+            .with_expiry("u-dead", Some(soon))
+            .with_expiry("u-healthy", Some(soon))
+            .with_result("u-dead", restashed_refresh())
+            .with_result("u-healthy", restashed_refresh());
+        let snap = status_snapshot(vec![
+            status_line("work", Some(CredentialHealth::Dead), false),
+            status_line("work", Some(CredentialHealth::Healthy), false),
+        ]);
+        let notifier = FakeRestoreNotifier::new();
+        run_poke(&roster, None, None, now, &engine, Some(&snap), &notifier)
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.refreshed(),
+            vec!["u-dead", "u-healthy"],
+            "both parked bearers are still swept — the sweep itself is not the defect",
+        );
+        assert!(
+            notifier.sent().is_empty(),
+            "neither bearer may be un-quarantined off a verdict the label cannot attribute; \
+             got {:?}",
+            notifier.sent(),
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_roster_label_degrades_even_when_the_daemon_lists_one_line() {
+        // The half a wire-side match count alone does NOT catch, and the reason this fix goes
+        // past `use_account::cached_viability_for`'s shape. The daemon adopts a new roster only
+        // when a reload is SIGNALLED (issue #139), so its snapshot legitimately lags the
+        // on-disk roster: two `work` accounts on disk, one `work` line on the wire. Counting
+        // wire matches finds exactly one and reads it as unambiguous — but that single line
+        // belongs to whichever bearer the daemon knew, and attributing it to the poked account
+        // is the same guess by a longer route.
+        let roster = vec![acct("work", "u-known"), acct("work", "u-added-since")];
+        let engine = FakePokeEngine::new().with_result("u-added-since", restashed_refresh());
+        let snap = status_snapshot(vec![status_line(
+            "work",
+            Some(CredentialHealth::Dead),
+            false,
+        )]);
+        let notifier = FakeRestoreNotifier::new();
+        run_poke(
+            &roster,
+            Some("u-added-since"),
+            None,
+            0,
+            &engine,
+            Some(&snap),
+            &notifier,
+        )
+        .await
+        .unwrap();
+        assert!(
+            notifier.sent().is_empty(),
+            "a label duplicated in the ROSTER is unusable as a key even when the daemon's \
+             lagging snapshot lists it once; got {:?}",
+            notifier.sent(),
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_wire_label_degrades_even_when_the_roster_is_unique() {
+        // The MIRROR of the test above, and the reason it exists: the two conjuncts had asymmetric
+        // coverage. Dropping the roster gate reddens that test through the whole `run_poke` path;
+        // dropping the WIRE gate reddened only the predicate-direct unit test, so the conjunct
+        // this issue was actually filed about had no end-to-end pin. This is it.
+        //
+        // The lag runs the other way here: one `work` on disk, two `work` lines on the wire — a
+        // sibling REMOVED from the roster whose line the daemon has not dropped yet, again per
+        // #139's signalled-reload. A roster-side count finds exactly one and reads it as a usable
+        // key; the wire still cannot say which line is the poked account's.
+        let roster = vec![acct("work", "u-kept")];
+        let engine = FakePokeEngine::new().with_result("u-kept", restashed_refresh());
+        let snap = status_snapshot(vec![
+            status_line("work", Some(CredentialHealth::Dead), false),
+            status_line("work", Some(CredentialHealth::Dead), false),
+        ]);
+        let notifier = FakeRestoreNotifier::new();
+        run_poke(
+            &roster,
+            Some("u-kept"),
+            None,
+            0,
+            &engine,
+            Some(&snap),
+            &notifier,
+        )
+        .await
+        .unwrap();
+        assert!(
+            notifier.sent().is_empty(),
+            "a label duplicated on the WIRE is unusable as a key even when the on-disk roster \
+             carries it exactly once; got {:?}",
+            notifier.sent(),
+        );
     }
 
     #[tokio::test]
