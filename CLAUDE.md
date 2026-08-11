@@ -46,8 +46,8 @@ Do not paraphrase the flags. `--all-features` and `--document-private-items` are
 crate is binary-only with no `[features]` table), so dropping them still passes — until someone adds
 a feature or a `[lib]` target, at which point your local gate silently stops predicting CI.
 
-These five do **not** cover four other jobs, and every one of those runs locally too. Run the matching
-one when you touch its paths:
+These five do **not** cover the other path-filtered jobs in `ci.yml`, and every one of those runs
+locally too. Run the matching one when you touch its paths:
 
 - `src/**`, `Cargo.toml`, `Cargo.lock` → **`msrv`**, the one that surprises people: it re-runs
   `cargo build --verbose` + `cargo test --verbose` on a **different toolchain** (`RUST_MSRV` in
@@ -57,7 +57,18 @@ one when you touch its paths:
   then `cargo deny check advisories sources licenses`.
 - `apps/menubar/**` → **`swift`**: `./scripts/check-menubar-zero-egress.sh`, then the app build
   below.
+- the same paths as `swift` → **`panel-goldens`**, the panel-appearance drift check, and the one job
+  here the row above does **not** get you: the app build below leaves both committed-golden
+  comparisons *skipped*, and the CI job is soft (§ Before you merge below), so neither surface can
+  tell you the panel drifted. Its armed command is in § Menu-bar app below.
 - `Formula/**` → **`formula`**: `./scripts/check-formula.sh` (`brew style` + `brew audit --strict`).
+
+↳ Convention only — nothing reconciles this list against `ci.yml`, and that was decided rather than
+assumed: a check is buildable, but it lands in `scripts/**` plus the `doc-gates` job — gate paths, so
+it carries `Gate-Change-Acknowledged:` and re-runs every Rust job — which makes it its own change to
+argue for, not a rider on a docs fix. Until then, re-derive the list rather than trusting it: `grep
+-B2 'if: needs.changes' .github/workflows/ci.yml | grep name:` prints every path-filtered job, and
+all of them but `test` belong above.
 
 The toolchain is **not** pinned in-repo — there is no `rust-toolchain.toml`. CI pins `RUST_STABLE`
 and `RUST_MSRV` in `ci.yml`, and `-D warnings` behaviour is toolchain-sensitive, so prefix
@@ -77,6 +88,27 @@ cd apps/menubar && xcodegen generate && xcodebuild test \
 ```
 
 ↳ `swift` job in `.github/workflows/ci.yml`
+
+That run does **not** compare the panel against its committed goldens. `PanelGoldenParityTests`'
+two golden comparisons `XCTSkipUnless` on `SESSIOMETER_PANEL_GOLDEN_GATE`, so they skip and the run
+still ends `** TEST SUCCEEDED **`. Arm them separately — the `TEST_RUNNER_` prefix is what reaches
+the test process, and a bare `SESSIOMETER_…` stops at `xcodebuild`, leaving the tests skipped and the
+run green having compared nothing:
+
+```sh
+cd apps/menubar && xcodegen generate && TEST_RUNNER_SESSIOMETER_PANEL_GOLDEN_GATE=1 xcodebuild test \
+  -project Menubar.xcodeproj -scheme Menubar -configuration Debug \
+  -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO \
+  -only-testing:MenubarTests/PanelGoldenParityTests/testEveryRenderMatchesItsCommittedGolden \
+  -only-testing:MenubarTests/PanelGoldenParityTests/testEachFreshRenderIsNearestToItsOwnGolden
+```
+
+Read the result off the drift line, never off `TEST SUCCEEDED`: a real pass prints a
+`[panel-goldens] max drift …` line naming the worst cell and the ceiling it was measured against,
+and `Executed 2 tests, with 2 tests skipped` means nothing was compared.
+
+↳ `panel-goldens` job in `.github/workflows/ci.yml`. Re-baselining, the ceiling, and what a red
+means: `apps/menubar/design/README.md` § Panel golden drift gate.
 
 ## Before you merge
 
@@ -110,7 +142,8 @@ normal submit pipeline, and not a licence to hand-roll a merge chain.
 **`ci-ok` is the only check that must be green.** A path-skipped job reports `skipping`, and skipped
 counts as a pass — do not wait for every context to report. `panel-goldens` is a deliberately
 **soft** gate: every step is `continue-on-error`, so it always reports pass and can never tell you
-the panel drifted.
+the panel drifted. Its verdict is in the job's step summary, never in its status; the only way to
+have that answer before you push is to have armed it yourself (§ Before you push).
 
 ## Commit and issue conventions [override]
 
