@@ -133,27 +133,7 @@ an observation but fails the instant a purchase call is appended.
   paraphrase. The runway surfaces (#543 / #544) remain responsible for neutral wording, with
   this guard as the regression net.
 
-## Related
-
-- Code: `src/framing_vocabulary.rs` — `BANNED_TOKENS`, `BANNED_PHRASES`, `scan_banned`.
-  The vocabulary and scanner lived in `src/stats.rs` when this ADR was accepted; issue #918
-  hoisted them so `src/cli.rs` could scan `--help` against the same list. That MOVE changed no
-  boundary — the lists kept their content and ordering, and `--help` scans a subset derived from
-  them rather than a second copy. The boundary itself was later amended: issue #1123 settled the
-  non-acquisitive remedy directive as permitted on operator advisories (§ Status → Amended
-  2026-08-10), which is a change to what this ADR settles rather than to where the code lives.
-  The central lists remain untouched by it — and by issue #1139, which added a fifth audience
-  (see below) without amending this ADR.
-- Code: `src/stats.rs` — the assertions stayed put:
-  `framing_guard_permits_neutral_runway_but_bans_the_acquisitive_call` and
-  `summary_render_carries_no_banned_token_but_the_guard_bites_on_injection`.
-- Issues: #542 (the 2026-07-15 amendment) · #541 (runway umbrella) · #160 (the framing guard) ·
-  #918 (the vocabulary's relocation) · **#1123 (the 2026-08-10 amendment — the non-acquisitive
-  remedy directive, permitted on operator advisories)** · #376 / #397 (the clear-and-FOLLOWABLE
-  operator-guidance requirement that amendment rests on) · #543 / #544 (the runway surfaces) ·
-  #158 / #159 (`--json` / charts) · #1139 (see below) · #1151 (the one violation it found).
-
-### Issue #1139 applied this ADR without amending it — deliberately
+## Issue #1139 applied this ADR without amending it — deliberately
 
 Issue #1139 took `Error`'s authored `#[error(...)]` templates inside the firewall as a fifth
 audience, and had to judge three tokens the shipped messages already spend. It recorded the
@@ -188,3 +168,24 @@ The one thing #1139 did add is a mechanism, not a boundary: this audience gets *
 and scans the central lists whole, because `Error` is dozens of independent messages rather than one
 surface, so its carve-outs are per-(variant, token). See `src/framing_vocabulary.rs`'s module doc
 § "The fifth audience has no exemption set".
+
+## Related
+
+- Code: `src/framing_vocabulary.rs` — `BANNED_TOKENS`, `BANNED_PHRASES`, `scan_banned`.
+  The vocabulary and scanner lived in `src/stats.rs` when this ADR was accepted; issue #918
+  hoisted them so `src/cli.rs` could scan `--help` against the same list. That MOVE changed no
+  boundary — the lists kept their content and ordering, and `--help` scans a subset derived from
+  them rather than a second copy. The boundary itself was later amended: issue #1123 settled the
+  non-acquisitive remedy directive as permitted on operator advisories (§ Status → Amended
+  2026-08-10), which is a change to what this ADR settles rather than to where the code lives.
+  The central lists remain untouched by it — and by issue #1139, which added a fifth audience
+  without amending this ADR (§ Issue #1139 applied this ADR without amending it — deliberately).
+- Code: `src/stats.rs` — the assertions stayed put:
+  `framing_guard_permits_neutral_runway_but_bans_the_acquisitive_call` and
+  `summary_render_carries_no_banned_token_but_the_guard_bites_on_injection`.
+- Issues: #542 (the 2026-07-15 amendment) · #541 (runway umbrella) · #160 (the framing guard) ·
+  #918 (the vocabulary's relocation) · **#1123 (the 2026-08-10 amendment — the non-acquisitive
+  remedy directive, permitted on operator advisories)** · #376 / #397 (the clear-and-FOLLOWABLE
+  operator-guidance requirement that amendment rests on) · #543 / #544 (the runway surfaces) ·
+  #158 / #159 (`--json` / charts) · #1139 (the fifth audience — applied this ADR without
+  amending it) · #1151 (the one violation it found).
