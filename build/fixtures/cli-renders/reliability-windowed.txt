@@ -10,9 +10,9 @@ landing-point session_pct (post-swap peak of the outgoing account): no reason=se
 
 observed session velocity (session_pct_per_min, positive climbs only; the v_peak reserve-coupling calibration input)
   measured n=1 usage_velocity samples
-  P50  = 0.20 %/min
-  P90  = 0.20 %/min
-  P100 = 0.20 %/min  vs assumed v_peak 6.95 %/min  [ok]
+  P50  = 0.2000 %/min
+  P90  = 0.2000 %/min
+  P100 = 0.2000 %/min  vs assumed v_peak 6.9500 %/min  [ok]
 
 time blind & near-limit: 0s (sum of blind_window duration_secs where near_limit=true)
   uncensored episodes: entered=1 exited=1 swapped_away=0 never_recovered=0 anchor_lost=0
