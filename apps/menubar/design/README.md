@@ -107,8 +107,11 @@ Light shown here:
 - the Stats aggregate callout has a **second, mock-unauthored form**. When the daemon had no
   configured roster the census degraded to whoever held samples, and the panel says so by narrowing
   the subject — `All sampled accounts ≥95% at once …` rather than `All accounts …`, which in that
-  regime would be false (#866, the panel half of the CLI's own `, sampled accounts` qualifier from
-  #836). The mock draws only the configured form, so this is a state it does not author rather than
+  regime the panel cannot establish (#866, the panel half of the CLI's own `, sampled accounts`
+  qualifier from #836). Not that it *would be false*, which this row claimed until #1224: with no
+  roster there is no set for "all" to have been measured against, and the sampled set is no subset
+  of one either, since it admits an orphan handle the configured roster excludes (#314, #864). The
+  mock draws only the configured form, so this is a state it does not author rather than
   one it disagrees with; the goldens likewise pin only the configured render. Drawing the frame is
   tracked on **#1037** (*the panel mock depicts only the happy path*) — as its own row, because the
   regime is an axis orthogonal to that issue's three *measurability* frames, and the two axes cross

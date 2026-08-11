@@ -484,7 +484,14 @@ final class StatsTests: XCTestCase {
     }
 
     /// The degraded census names its set by narrowing the SUBJECT — in that regime "All accounts" is
-    /// not merely unqualified, it is false: the census demonstrably did not see them all.
+    /// not merely unqualified, it is a claim the branch cannot ESTABLISH: `censusOverRoster == false`
+    /// is `roster.is_none()`, so `all_high` (`src/usage_stats.rs`) censused whoever held samples and
+    /// no roster remains for "all" to have been measured against. NOT "demonstrably false", which is
+    /// what this doc said until issue #1224 — that would need the sampled set to be a SUBSET of the
+    /// configured roster, and it is not one: it admits an orphan handle the roster excludes (issue
+    /// #314), so the two differ in both directions (issue #864). The narrowing itself was never in
+    /// question — the render is right under either ground — which is why the expected string below
+    /// is unchanged by that correction.
     func testDegradedCensusNamesItsSampledSet() {
         XCTAssertEqual(censusText(false),
                        "All sampled accounts ≥95% at once — 3 episodes (1h40m) · swaps 28 · last 7 days")
