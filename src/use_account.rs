@@ -1836,15 +1836,17 @@ mod tests {
         // (`run_login(login, store, stash, existing, label, claude_json)`, `src/capture.rs:762`).
         // Both spell the same three tokens; only the enclosing delimiter tells them apart.
         //
-        // That is the INNERMOST delimiter, and it is the answer to that question alone. The other
-        // question asked of this stack below — which brace opens a pending `fn`'s body — is a
-        // question about its DEPTH, and answering that one innermost-first is the bypass issue
-        // #1223 records.
+        // That is the INNERMOST delimiter, and it is the answer to that question alone. The two
+        // other questions asked of this stack below — which brace opens a pending `fn`'s body,
+        // and which `;` ends its declaration — are questions about its DEPTH, and answering
+        // either one innermost-first is a bypass: issues #1223 and #1225 respectively.
         let mut delims: Vec<char> = Vec::new();
         let mut pending: Option<String> = None;
-        // The delimiter depth `pending` was captured AT. Its body brace is the one that opens
-        // back at that same depth; every brace deeper than it belongs to the signature. Captured
-        // at the `fn` token, so any delimiter already enclosing the declaration is counted in it.
+        // The delimiter depth `pending` was captured AT, and the answer to both questions the
+        // signature poses: its body brace is the one that opens back at that same depth, and the
+        // `;` that ENDS its declaration is the one that sits at it. Every brace and every `;`
+        // deeper than this belongs to the signature. Captured at the `fn` token, so any
+        // delimiter already enclosing the declaration is counted in it.
         let mut pending_depth = 0usize;
         let mut depth = 0usize;
         let mut i = 0usize;
@@ -1912,9 +1914,16 @@ mod tests {
                 }
             }
             // A bodiless signature (`fn probe(&self);` in a trait) must not capture the next
-            // unrelated block.
+            // unrelated block — and only THAT `;` ends a declaration. The one terminating a
+            // declaration sits at the delimiter depth the `fn` token was read at; a `;` nested
+            // inside the signature (`[u8; N]`, in a parameter or a return type) sits deeper, and
+            // clearing on it left the body brace with no `pending` to bind, dropping every read
+            // in that body from this gate (issue #1225). Same depth question as the body-brace
+            // arm below, asked one token earlier.
             if src[i] == ';' {
-                pending = None;
+                if delims.len() == pending_depth {
+                    pending = None;
+                }
                 i += 1;
                 continue;
             }
@@ -1950,12 +1959,25 @@ mod tests {
                 // latent, and [`the_handle_read_tripwire_bites_on_a_braced_pattern_binding`] is
                 // what keeps the arm honest rather than decorative.
                 //
-                // The residual, in the one direction this depth test does NOT reach: a `;`
-                // NESTED in a signature (`[u8; N]`) clears `pending` above before this arm is
-                // ever consulted, so such a function binds no scope and its whole body is
-                // dropped — the same total bypass through a different root, and unlike the two
-                // above it is LIVE (`src/migration.rs:748`, whose body happens to read no
-                // identity field). Issue #1225, deliberately not widened into here.
+                // The third root of the same total bypass — a `;` NESTED in a signature
+                // (`[u8; N]`), which cleared `pending` above before this arm was ever consulted
+                // — is closed by asking the SAME depth question one token earlier (issue #1225).
+                // It was the one of the three the tree actually spelled.
+                //
+                // What that leaves unreached is not another token. `pending` is written in
+                // exactly three places in this function — set at the `fn` above, cleared by that
+                // `;` arm, taken here — so there is no sibling clear to widen either guard to.
+                // Re-derive with `git grep -nE 'pending = (None|Some)|pending\.take' --
+                // src/use_account.rs`, reading past the one prose line that quotes those
+                // spellings — the mutation table in the pinning test below — since the grep
+                // cannot tell code from a comment about it.
+                //
+                // Both guards instead share ONE assumption: that a signature leaves `delims`
+                // balanced. Within the `fn` grammar it does — a `;` there can only sit inside an
+                // array type or a block, and both `[` and `{` are pushed — but `<` and `>` are
+                // not tracked at all, so a construct that opens or closes a tracked delimiter
+                // where this lexer does not see it puts BOTH depth tests off by the same amount
+                // at once, and neither is then a question about `;` or about braces.
                 if delims.len() == pending_depth {
                     if let Some(name) = pending.take() {
                         scopes.push((name, depth, i));
@@ -3122,6 +3144,207 @@ mod tests {
             functions_comparing_a_handle(&probe).is_empty(),
             "a pattern binding is a READ, not a comparison operand — it reaches its `==` through \
              a binding, which is the hoist residual COMPARING_READERS records"
+        );
+    }
+
+    /// A `;` NESTED in a `fn` signature does not end the declaration (issue #1225), and a `;`
+    /// TERMINATING a bodiless one still does.
+    ///
+    /// One canary for both, because they are one arm's two directions and neither assertion
+    /// means anything alone: each half is GREEN under the mutation that reds the other, which is
+    /// what makes the pair a discrimination rather than two agreeable facts (ADR-0031 § 4
+    /// CONSTRAINT-A). Four mutations were RUN, and each red was read for its value rather than
+    /// for being red:
+    ///
+    /// | mutation of the `;` arm | what reds |
+    /// |---|---|
+    /// | restore the unconditional `pending = None` | every case of half one, each to `[]` — bar the attribution one, which reds to `["apply_park"]` — and the live-site case to `[]`. The bodiless half stays GREEN |
+    /// | delete the clear outright | ONLY the bodiless half, to `["apply_park", "probe"]`. Half one stays GREEN |
+    /// | `delims.last() != Some(&'[')` — the innermost-delimiter form | ONLY half one's last row, to `[]` |
+    /// | `delims.is_empty()` — a fixed depth 0 rather than the captured one | ONLY the bodiless half, to `["apply_park", "probe"]` |
+    ///
+    /// The first two are the pair. The third is #1223's lesson asked one token over, and the
+    /// fourth is why `pending_depth` is captured at the `fn` token rather than assumed.
+    ///
+    /// What the defect cost was a whole BODY rather than a read: `pending` cleared mid-signature
+    /// leaves the body brace with no function to bind, so every read in that body is attributed
+    /// to nothing and dropped, and the gate goes on reporting green over a function it stopped
+    /// looking at. That is the same total bypass the destructuring-parameter family in
+    /// [`the_handle_read_tripwire_bites_on_a_braced_pattern_binding`] pins, reached through a
+    /// different token — and it was the one of the three the tree actually SPELLED, which the
+    /// last case here measures on the tree rather than on a fixture.
+    ///
+    /// Driven through [`functions_reading_a_handle`] for the reason that test records: so this
+    /// cannot pass over a paraphrase of the gate.
+    #[test]
+    fn a_semicolon_nested_in_a_signature_does_not_end_the_declaration() {
+        // Whole items rather than a signature plus a body, because several of these fixtures
+        // declare more than one. Joined rather than `\`-continued for the reason
+        // [`the_non_test_boundary_survives_a_cfg_test_import`] records: that escape eats the
+        // next line's leading whitespace, and the `#[cfg(test)]` below must stay at column 0.
+        let injected = |items: &[&str]| {
+            let mut lines: Vec<&str> = items.to_vec();
+            lines.extend_from_slice(&[
+                "#[cfg(test)]",
+                "mod tests {",
+                "fn a_test_helper(a: &Account) -> String { a.label.clone() }",
+                "}",
+            ]);
+            lines.join("\n")
+        };
+
+        // Half one: the `;` the fix stops honouring. Each fixture's read sits in the BODY, so a
+        // name here means the body brace bound its function; `[]` means it bound nothing. The
+        // `#[cfg(test)]` helper reads an identity field on every run, so asserting exactly one
+        // name is simultaneously evidence the scan reached the production code and evidence it
+        // stopped at the test boundary — a scan that matched nothing fails both halves.
+        for (spelling, reader, items) in [
+            // The shape that ISOLATES this root from issue #1223's: no brace anywhere in the
+            // signature, so the parameter-list brace guard cannot be what drops it.
+            (
+                "a parameter's array type, with no brace anywhere",
+                "apply_park",
+                &[
+                    "fn apply_park(buf: [u8; 4], roster: &[Account], query: &str) -> Option<usize> {",
+                    "    roster.iter().position(|a| a.label == query)",
+                    "}",
+                ][..],
+            ),
+            // The RETURN-type position, which is where the crate's live instance spells it.
+            (
+                "a RETURN type's array",
+                "apply_park",
+                &[
+                    "fn apply_park(roster: &[Account], query: &str) -> Option<[u8; 4]> {",
+                    "    roster.iter().position(|a| a.label == query).map(|_| [0u8; 4])",
+                    "}",
+                ][..],
+            ),
+            // The shape issue #1223 was FILED against and fixed the wrong half of: with that
+            // depth-guarded brace arm in place this still came back `[]`, which is what
+            // separated the two roots rather than folding this into that fix.
+            (
+                "an array length spelled as a braced const expression",
+                "apply_park",
+                &[
+                    "fn apply_park(buf: [u8; { SIZE }], roster: &[Account], query: &str) -> Option<usize> {",
+                    "    roster.iter().position(|a| a.label == query)",
+                    "}",
+                ][..],
+            ),
+            // …and that block carrying a `;` of its OWN, one declaration-depth down. This is the
+            // row that pins DEPTH rather than the innermost delimiter, exactly as #1223's pair
+            // does one question over: a guard spelled `delims.last() != Some(&'[')` satisfies
+            // every other case here — at their `;` the innermost open delimiter really is `[` —
+            // and reds only this one, where it is `{`. Measured. Its `fn` is also the only one
+            // here declared below depth 0, but that is exercise rather than discrimination: a
+            // guard comparing against a fixed 0 is caught by the bodiless half below, and this
+            // row stays green under it. Measured too, rather than assumed from the shape.
+            (
+                "a signature block carrying its own `;`, one delimiter deeper than the file",
+                "described",
+                &[
+                    "trait Probe {",
+                    "    fn described(&self, buf: [u8; { let n = 4; n }], r: &[Account], q: &str) -> Option<usize> {",
+                    "        r.iter().position(|a| a.label == q)",
+                    "    }",
+                    "}",
+                ][..],
+            ),
+        ] {
+            assert_eq!(
+                functions_reading_a_handle(&injected(items)),
+                [reader],
+                "a `;` inside a signature must not end the declaration, and this one is spelled \
+                 as {spelling}: `[]` here is the body brace binding no function at all, which \
+                 drops every read in that body and leaves this gate green over it"
+            );
+        }
+
+        // …and the same root with a DIFFERENT observable, which is why the four above are not
+        // the whole half. When the dropped function is nested inside another, its body read does
+        // not vanish — the enclosing scope is still open, so the read is filed under the WRONG
+        // name and the population stays the same size. A gate asserting only that something was
+        // seen passes on that; only the name separates them.
+        let nested = injected(&[
+            "fn apply_park(roster: &[Account], query: &str) -> Option<usize> {",
+            "    fn inner(buf: [u8; 4], r: &[Account], q: &str) -> Option<usize> {",
+            "        r.iter().position(|a| a.label == q)",
+            "    }",
+            "    inner([0u8; 4], roster, query)",
+            "}",
+        ]);
+        assert_eq!(
+            functions_reading_a_handle(&nested),
+            ["inner"],
+            "a read in a nested `fn` whose signature carries a `;` belongs to that `fn`: naming \
+             `apply_park` instead means `inner` never bound a scope and its body landed on the \
+             function enclosing it — the same defect, silently rather than emptily"
+        );
+
+        // Half two: the `;` the fix must go on honouring, and the reason the unconditional clear
+        // was written. A bodiless declaration ends at its `;`; if it does not, `pending` survives
+        // to bind the next brace at its depth — here the associated const's initializer block —
+        // and `probe` is filed as a reader of a body it does not have. That is what the arm's own
+        // comment claims, asserted rather than trusted.
+        let bodiless = injected(&[
+            "trait Probe {",
+            "    fn probe(&self) -> Option<usize>;",
+            "    const SEEN: usize = { DEFAULTS.label.len() };",
+            "}",
+            "fn apply_park(roster: &[Account], query: &str) -> Option<usize> {",
+            "    roster.iter().position(|a| a.label == query)",
+            "}",
+        ]);
+        assert_eq!(
+            functions_reading_a_handle(&bodiless),
+            ["apply_park"],
+            "a bodiless declaration must not capture the block that follows it: `probe` \
+             appearing here is that block bound as its body, which is the bug the clear exists \
+             against and the one a `;` guard widened too far reintroduces"
+        );
+
+        // The live instance, measured on the real tree rather than retyped (issue #1225's third
+        // acceptance criterion). The signature below is READ from `src/migration.rs` at test
+        // time, so this cannot pass over a paraphrase that lost the property it is about.
+        //
+        // The body is synthetic because it has to be: `derive_key` reads no identity field
+        // today, and the fix is therefore invisible in what this gate reports over the tree —
+        // the whole-tree scan (reads, sites, resolver callers and compared reads) comes out
+        // IDENTICAL with the guard and without it, measured by diffing the two. What moved is
+        // the site's reachability, and only a read placed in that body can observe it.
+        let migration = crate_sources()
+            .into_iter()
+            .find(|(path, _)| path.ends_with("migration.rs"))
+            .map(|(_, text)| non_test_region(&text))
+            .expect("`src/migration.rs` is one of the files this gate scans");
+        let live = migration
+            .lines()
+            .find(|line| line.trim_start().starts_with("fn derive_key("))
+            .expect(
+                "`src/migration.rs` declares `derive_key`, the live `;`-in-signature site issue \
+                 #1225 measured; if it has moved or been renamed, re-derive the site rather than \
+                 dropping this case",
+            )
+            .to_string();
+        assert!(
+            live.contains(';'),
+            "…and it is the subject only because that signature CARRIES a nested `;`, which \
+             this one no longer does: {live}"
+        );
+        assert_eq!(
+            functions_reading_a_handle(&injected(&[
+                &live,
+                "    if passphrase.label == \"probe\" {",
+                "        return Err(Error::MigrationCryptoParams(\"probe\"));",
+                "    }",
+                "    unreachable!()",
+                "}",
+            ])),
+            ["derive_key"],
+            "an identity-field read added to the REAL `derive_key` body must be seen: `[]` here \
+             is the live site still dropping its whole body, with \
+             `every_handle_read_is_dispositioned` green while it does"
         );
     }
 
