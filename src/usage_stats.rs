@@ -270,15 +270,25 @@ pub(crate) struct AccountStats {
     /// Sampled seconds spent at/above the session cap — the summed forward-coverage
     /// windows of the cap-hit samples (gap-honest: a gap adds nothing).
     ///
-    /// Still purely CADENCE-anchored ([`validity_windows`]), unlike the two censuses, which anchor
-    /// a qualifying reading to its own carried expiry. Since issue #1030 that is an observable
-    /// divergence rather than a bookkeeping detail: production runs `session_cap ==
-    /// high_threshold`, so the SAME readings at the SAME water can report a small
+    /// Purely CADENCE-anchored ([`validity_windows`]) and DECIDED to stay so — unlike the two
+    /// censuses, which anchor a qualifying reading to its own carried expiry. Since issue #1030
+    /// that is an observable divergence rather than a bookkeeping detail: production runs
+    /// `session_cap == high_threshold`, so the SAME readings at the SAME water report a small
     /// `time_at_cap_secs` beside a large `all_high_secs` — one saturated account polled hourly for
-    /// a day reports 7 200 s here against 86 400 s there. Both figures are honest under their own
-    /// rule and `stats` prints them side by side. Widening this one was deliberately out of
-    /// #1030's scope (it would move `time_at_cap_secs` for every account, which is a separate
-    /// ratified metric with its own consumers); reconciling the two is issue #1098.
+    /// a day reports 7 200 s here against 86 400 s there, which
+    /// `the_two_at_water_figures_diverge_by_an_order_of_magnitude_on_one_reading_set` asserts
+    /// rather than recalls. Both figures are honest under their own rule and `stats` prints them
+    /// side by side.
+    ///
+    /// Issue #1098 settled which of the three ways out to take:
+    /// `docs/adr/0035-at-cap-time-stays-cadence-bounded.md` keeps this metric cadence-bounded and
+    /// makes the asymmetry legible on the rendered surface instead
+    /// (`crate::stats`'s `validity_rule_line`). The short of it — anchoring here would not close
+    /// the complaint, only move it: this metric renders in the same table ROW as `coverage`, which
+    /// is `seen ÷ expected` against the poll cadence and cannot follow an anchor, so an anchored
+    /// figure would read the whole window beside a fractional `cov` with no denominator to
+    /// reconcile them — the same test pins both halves of that pair. Read the ADR before
+    /// re-deriving it.
     pub(crate) time_at_cap_secs: i64,
     /// The fraction of the period's observations made while THIS account was the active
     /// (swapped-in) credential, from the swap-active spans. Across all accounts these
@@ -1665,6 +1675,79 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
     }
 
     // --- time at cap ----------------------------------------------------------
+
+    /// The #1098 divergence, ASSERTED rather than recalled: at the ONE water production measures
+    /// both figures at, over ONE reading set, `time_at_cap_secs` and `all_high_secs` are an order
+    /// of magnitude apart. Every doc that quotes those two numbers — this module's
+    /// `AccountStats::time_at_cap_secs`, `crate::stats`'s `validity_rule_line`, ADR-0035 — points
+    /// here, so the figures move with the behaviour instead of going stale in prose.
+    ///
+    /// SYNTHETIC deliberately, for the same structural reason `high_windows`'s own gate is: the
+    /// frozen corpus holds no account that is both at the water and polled at
+    /// `exhausted_poll_secs`, which is exactly the regime that produces the gap. It does witness a
+    /// smaller version — see the assertion at the foot, which prices the same anchoring on real
+    /// data so this test cannot be read as the only evidence there is.
+    #[test]
+    fn the_two_at_water_figures_diverge_by_an_order_of_magnitude_on_one_reading_set() {
+        // One account, 24 hourly readings at 0.95, each carrying a 5 h session reset — a saturated
+        // peer held out of rotation and polled at `exhausted_poll_secs` against a 300 s cadence.
+        // A single-account roster, so the census's intersection is this account's own high windows
+        // and the two figures are computed over LITERALLY the same readings.
+        let period = Period::new(0, 24 * 3600);
+        let samples: Vec<Sample> = (0..24)
+            .map(|i| {
+                let ts = i * 3600;
+                sample(ts, "work", 0.95, 0.10).with_resets(Some(ts + 5 * 3600), None)
+            })
+            .collect();
+        let params = AggregateParams::new(300, 0.95, 0.95);
+        let report =
+            aggregate_with_roster(&samples, &[], period, &params, Some(&roster(&["work"])));
+        let a = &report.per_account["work"];
+
+        // The premise: ONE water, and every reading qualifies for BOTH figures. Without this the
+        // comparison below would be between two different populations and would say nothing.
+        assert_eq!(
+            params.session_cap, params.high_threshold,
+            "the fixture no longer measures both figures at one water, which is the whole premise"
+        );
+        assert_eq!(
+            (a.cap_hits as usize, samples.len()),
+            (24, 24),
+            "every reading must be a cap-hit for the two figures to run over one population"
+        );
+
+        assert_eq!(
+            (a.time_at_cap_secs, report.roster.all_high_secs),
+            (7_200, 86_400),
+            "the cadence-bounded / session-anchored gap moved. Both rules are deliberate — see \
+             `AccountStats::time_at_cap_secs` and ADR-0035 — so this is a signal that one of them \
+             changed, not a number to re-baseline"
+        );
+        assert_eq!(
+            report.roster.all_high_secs,
+            period.duration(),
+            "the anchored census no longer covers the whole window, so the fixture stopped \
+             exercising the regime it was built for"
+        );
+
+        // `coverage` is the reason anchoring THIS metric was rejected rather than merely deferred:
+        // it renders in the same table row and is a SAMPLE-COUNT ratio against the poll cadence, so
+        // it cannot follow an anchor. An anchored `time_at_cap_secs` here would be the whole window
+        // — the second figure pinned above, since both would then run on `high_windows` — beside
+        // the coverage asserted here.
+        assert_eq!(
+            (a.seen, a.expected as i64),
+            (24, 288),
+            "the coverage denominator is the poll cadence, not the anchor"
+        );
+        assert!(
+            a.coverage < 0.09,
+            "coverage reads {} — the fixture is no longer sparsely polled, so it no longer \
+             demonstrates what an anchored at-cap figure would sit beside",
+            a.coverage
+        );
+    }
 
     #[test]
     fn time_at_cap_sums_covering_windows_and_a_gap_does_not_extend_it() {
@@ -3340,6 +3423,63 @@ ts=2026-01-01T00:05:00Z event=swap from=work to=play reason=session session_pct=
             "held time moved across the two horizons — reset-anchored spans barely notice the \
              staleness knob, so this is a window that has stopped being anchored to its reset. \
              Order is (at 300, at 3600); the near figure is the same one the gate above pins"
+        );
+    }
+
+    /// The same anchoring, priced on the FROZEN corpus rather than a constructed fixture — so the
+    /// decision in ADR-0035 rests on real data as well as on the synthetic worst case above.
+    ///
+    /// The corpus reaches the census's water on two accounts only (`a1`, `a2`; the other four peak
+    /// below 0.16 — see
+    /// `on_the_replay_corpus_the_utilisation_census_is_unknown_because_the_drain_was_weekly`), and
+    /// neither is sparsely polled, so the gap here is a factor of a few rather than the order of
+    /// magnitude above. That is the honest shape of the evidence: real data witnesses the
+    /// divergence, and cannot witness its worst case.
+    #[test]
+    fn on_the_replay_corpus_anchoring_at_cap_time_would_move_it_by_a_factor_of_a_few() {
+        let period = Period::new(CORPUS_START, CORPUS_END);
+        let samples = replay_samples();
+        // 0.80 — the module's own default water, and the only one this corpus reaches at all. At
+        // the shipped 0.95 `a1` drops out entirely (peak 0.94), which would leave one witness.
+        let water = 0.80;
+        let params = AggregateParams::new(300, water, water);
+        let report = aggregate_with_roster(
+            &samples,
+            &[],
+            period,
+            &params,
+            Some(&roster(&REPLAY_ROSTER)),
+        );
+
+        let mut witnessed = 0;
+        for handle in REPLAY_ROSTER {
+            let stats = &report.per_account[handle];
+            if stats.cap_hits == 0 {
+                continue;
+            }
+            witnessed += 1;
+            let group: Vec<&Sample> = samples.iter().filter(|s| s.acct == handle).collect();
+            let (highs, _) = high_windows(&group, period, params.stale_after_secs, water);
+            let anchored: i64 = highs.iter().map(|(lo, hi)| hi - lo).sum();
+            assert!(
+                anchored > stats.time_at_cap_secs,
+                "`{handle}`: anchoring did not widen the at-cap span ({anchored} vs {}), so this \
+                 corpus no longer prices the alternative ADR-0035 rejects",
+                stats.time_at_cap_secs
+            );
+            assert!(
+                anchored < stats.time_at_cap_secs * 10,
+                "`{handle}`: anchoring moved the at-cap span by an order of magnitude ({anchored} \
+                 vs {}) on REAL data. The synthetic gate above owns that claim; if the corpus now \
+                 shows it too, ADR-0035's evidence section understates the case and should say so",
+                stats.time_at_cap_secs
+            );
+        }
+        assert_eq!(
+            witnessed, 2,
+            "expected exactly `a1` and `a2` to reach the 0.80 water — a corpus that witnesses a \
+             different number of accounts is a different fixture, and the factor above was \
+             measured over this one"
         );
     }
 

@@ -1717,14 +1717,23 @@ fn render_text(report: &Report, config_unreadable: Option<&str>) -> String {
 
     out.push('\n');
     // The bottom roster block (§D-STA-5): the aggregate-only summary (lowest-utilisation +
-    // fleet-runway), then the config-regime caveat, then the roster line — ONE contiguous
-    // block, no blank line between. The summary carries no trailing newline, so the
-    // terminating `\n` here abuts whatever follows. The caveat sits directly ABOVE the line it
-    // qualifies (issue #836) so it is read before the census number, not after it.
+    // fleet-runway), then the validity-rule note, then the config-regime caveat, then the roster
+    // line — ONE contiguous block, no blank line between. The summary carries no trailing newline,
+    // so the terminating `\n` here abuts whatever follows. Both caveats sit directly ABOVE the line
+    // they qualify (issue #836) so they are read before the census number, not after it.
+    //
+    // The validity-rule note (issue #1098) is emitted only when the accounts table above rendered,
+    // because `t@cap` is the column it qualifies — see `validity_rule_line`. It precedes the
+    // config caveat so #836's rule keeps its tightest form: the SET qualifier stays adjacent to the
+    // cells it degrades, with the rule statement — which is true of every render, degraded or not —
+    // above it rather than wedged between.
     let band = render_summary(report);
     if !band.is_empty() {
         out.push_str(&band);
         out.push('\n');
+    }
+    if has_live || has_orphans {
+        out.push_str(&validity_rule_line());
     }
     if let Some(line) = config_regime_line(config_unreadable) {
         out.push_str(&line);
@@ -1921,6 +1930,57 @@ fn config_regime_line(reason: Option<&str>) -> Option<String> {
              not the configured roster — {reason}\n"
         )
     })
+}
+
+/// The VALIDITY-RULE note the numeric view places above the roster block: `t@cap` sums each at-cap
+/// reading's plain poll interval, while the all-accounts-high census runs each high reading out to
+/// its own carried session reset (issue #1030). Both figures are honest under their own rule; they
+/// are not the same span, and until issue #1098 nothing on the rendered surface said so.
+///
+/// # Why it names BOTH figures
+///
+/// Production measures them at ONE water: [`params_from`] passes `Config::swap_threshold` as the
+/// cap AND as the census threshold, the same value twice. So the two are computed at the same line,
+/// over the same readings, and print on the same render — `t@cap` in the accounts table,
+/// `all-accounts-high` in the roster line beneath it. At the poll sparsity issue #1030 exists for
+/// they diverge by an order of magnitude over identical samples, which
+/// `the_two_at_water_figures_diverge_by_an_order_of_magnitude_on_one_reading_set`
+/// (`crate::usage_stats`) pins rather than leaves as a recalled measurement.
+///
+/// Naming ONE of them would be issue #864's defect at one issue's remove: a qualified figure beside
+/// an unqualified one reads as though the unqualified one were rule-independent. So this note
+/// states both rules or it states neither — which is also why it is one sentence rather than a
+/// qualifier on each, since the census cell's parenthetical has a peer on the table side only in
+/// the column header, and `t@cap` has no room for a rule.
+///
+/// # Why the NUMERIC surface only
+///
+/// The contradiction is a COMPARISON, so it exists only where both figures render. [`tty_columns`]
+/// carries no `t@cap` — the chart view shows the census alone, with nothing on the page to compare
+/// it against — so annotating it there would qualify a column the reader cannot see. The `--json`
+/// wire carries both and gets the same statement on [`AccountWire::time_at_cap_secs`] rather than a
+/// new key; see there for why no schema move was made.
+///
+/// # Why it is NOT gated on either figure having fired
+///
+/// It states what the two metrics COUNT, never that either counted anything — a rule, not a
+/// reading. That is the same dispositional register [`config_regime_line`]'s verb had to be moved
+/// into (issue #864), and it is why this line is safe directly above a roster line rendering `—`:
+/// it asserts nothing the `—` denies. The consequence is deliberate — the note is byte-identical on
+/// every numeric render, so a reader learns the rule once and it cannot appear to come and go with
+/// the data.
+///
+/// Gated instead on the ACCOUNTS TABLE having rendered, which is where `t@cap` lives: an empty
+/// window (`no per-account usage in this window`) has no column to qualify, and a note naming one
+/// there would describe a surface that is not on the page.
+fn validity_rule_line() -> String {
+    // No implementation vocabulary (R-21): the reader gets `t@cap` as the header spells it, "poll
+    // interval" and "session reset" as the daemon's own concepts — never `validity_windows`,
+    // `high_windows` or `stale_after_secs`. "Covers" is the word both window functions' docs use
+    // for the span a reading is valid over, so one vocabulary reaches the surface intact.
+    "t@cap covers at most one poll interval per at-cap reading; all-accounts-high covers each high \
+     reading to its own session reset — so the two can differ widely on the same readings\n"
+        .to_owned()
 }
 
 /// The capacity-holds cell of the roster line (§D-STA-5, issue #803): `capacity holds (session
@@ -2571,6 +2631,21 @@ struct AccountWire {
     session: DimWire,
     weekly: DimWire,
     cap_hits: u32,
+    /// Sampled seconds at/above the session cap: each at-cap reading's CADENCE-bounded forward
+    /// window, summed. Deliberately NOT the rule `all_high_secs` uses — that census runs each high
+    /// reading out to its own carried session reset (issue #1030), so at the ONE water production
+    /// measures both at, over the same readings, these two fields can differ by an order of
+    /// magnitude (issue #1098). Neither is wrong; they are not the same span, and this wire carries
+    /// NO discriminator between the rules — a consumer that compares them without knowing this is
+    /// reading a contradiction into two consistent numbers.
+    ///
+    /// The human surface states the distinction in prose ([`validity_rule_line`]); putting it on
+    /// the wire is a schema change, deliberately not made here — the same call `FleetWire`'s
+    /// `runway_secs` documents, and for the same reason: the rules are compile-time behaviour, not
+    /// data, so the field a consumer would need is a new always-present key. That reshapes
+    /// `StatsWire`, moves `JSON_SCHEMA_VERSION`, and drags the hand-maintained Swift `StatsWire`
+    /// mirror plus its fixtures with it — see `docs/adr/0035-at-cap-time-stays-cadence-bounded.md`,
+    /// which weighs that against a documented asymmetry and records why the doc wins.
     time_at_cap_secs: i64,
     contribution_share: f64,
     /// Neutral utilisation-level descriptor from the session peak (issue #160 consumes it).
@@ -2640,6 +2715,10 @@ struct RosterWire {
     swap_count: u32,
     swaps: SwapsWire,
     all_high_episodes: u32,
+    /// Total duration of those episodes, measured over SESSION-EXPIRY-ANCHORED windows since issue
+    /// #1030: a high reading covers until its own carried reset, not merely one poll interval. That
+    /// is a DIFFERENT rule from `AccountWire::time_at_cap_secs`, which stays cadence-bounded — see
+    /// there before comparing the two at the one water production measures both at (issue #1098).
     all_high_secs: i64,
     /// The session-utilisation water each account had to be at/above, as a FRACTION —
     /// the same units as every other utilisation on this wire (`session_ceiling` / 100).
@@ -4505,6 +4584,13 @@ mod tests {
         // no workflow parses piped column positions; `--json schema:1` is the machine contract. It
         // still pins the exact bytes so a future SILENT reflow (reordered / re-spaced columns) is
         // caught — the circular `piped == render_text` check cannot see a layout regression.
+        //
+        // The validity-rule note above the roster line is issue #1098's: this view is the only one
+        // rendering BOTH `t@cap` and the all-accounts-high census, and until it landed nothing said
+        // the two were measured under different rules. It is spelled out here rather than
+        // interpolated from `validity_rule_line` on purpose — an interpolated expectation cannot
+        // fail when the note itself is rewritten, which is exactly the change this golden is here
+        // to make visible.
         let mut r = charts_report(
             &[
                 ("aa", stat(3, ds(0.30, 0.90, 0.85), 0.40, 0.60)),
@@ -4527,6 +4613,7 @@ mod tests {
              aa       saturated  100%         30/90/85          0/40/0     0     0s    60%  0.9%/min     ~2h\n\
              bb       underused  100%         10/15/12          0/20/0     0     0s    40%         —       —\n\
              \n  lowest utilisation: bb (session mean 10%)\n\
+             t@cap covers at most one poll interval per at-cap reading; all-accounts-high covers each high reading to its own session reset — so the two can differ widely on the same readings\n\
              roster: 0 swaps (0 session, 0 weekly, 0 manual, 0 forced, 0 emergency) · all-accounts-high (≥95%): 0 episodes (0s) · capacity holds: —\n",
         );
     }
@@ -6783,6 +6870,200 @@ mod tests {
         assert_eq!(
             report.summary.roster.swap_count, 1,
             "roster stays roster-wide despite the filter"
+        );
+    }
+
+    // --- issue #1098: the surface states which rule each at-water figure used -------------
+
+    /// The numeric render of the canonical fixture, with an optional config fault — the ONE
+    /// surface carrying both figures this note reconciles.
+    fn numeric_render(config_unreadable: Option<&str>) -> String {
+        render_text(&report_fixture(), config_unreadable)
+    }
+
+    #[test]
+    fn the_numeric_render_states_the_rule_each_at_water_figure_was_measured_under() {
+        // THE reported defect (issue #1098): `params_from` passes `Config::swap_threshold` as
+        // BOTH the cap and the census water, so `t@cap` and `all-accounts-high` are computed at
+        // one line over one reading set — and since issue #1030 anchored only the census, they can
+        // sit an order of magnitude apart on one render with nothing saying why
+        // (`crate::usage_stats`'s
+        // `the_two_at_water_figures_diverge_by_an_order_of_magnitude_on_one_reading_set` pins the
+        // gap itself).
+        let out = numeric_render(None);
+        let note = validity_rule_line();
+        assert!(
+            out.contains(&note),
+            "the numeric render carries no validity-rule note:\n{out}"
+        );
+
+        // Asserted per CLAUSE, not as one `contains`, because the defect the note exists to end is
+        // an ASYMMETRY: a render naming one figure's rule and not the other's reads as though the
+        // unnamed one were rule-independent — issue #864's defect, one issue on. So dropping
+        // either half must RED, and a whole-string check would let a rewrite quietly shed one.
+        for clause in [
+            "t@cap covers at most one poll interval per at-cap reading",
+            "all-accounts-high covers each high reading to its own session reset",
+        ] {
+            assert!(
+                note.contains(clause),
+                "the note stopped stating `{clause}` — one qualified figure beside an unqualified \
+                 one is the defect, not the fix: {note}"
+            );
+        }
+        // The names are the ones the surface itself renders — the column header and the census
+        // label — so a reader binds each clause to the figure in front of them without a glossary.
+        assert!(
+            out.contains("t@cap") && out.contains("all-accounts-high"),
+            "the note names figures this render does not show:\n{out}"
+        );
+        // Authored English on the human surface answers to the same framing guard every other
+        // rendered string here does (issue #160 / SUR-001).
+        assert_eq!(
+            scan_banned(&note),
+            None,
+            "the validity-rule note must not editorialise: {note}"
+        );
+    }
+
+    #[test]
+    fn the_validity_rule_note_is_identical_whether_or_not_either_figure_fired() {
+        // The note states what the two metrics COUNT, never that either counted anything — so it
+        // is safe directly above a roster line rendering `—`, and it must not appear to come and
+        // go with the data. This is the dispositional-verb rule issue #864 had to move
+        // `config_regime_line` onto, asserted here as a byte-identity rather than as a phrasing
+        // preference: a note that varied with the reading would be asserting one.
+        let mut fired = report_fixture();
+        fired.summary.roster.all_high_episodes = 3;
+        fired.summary.roster.all_high_secs = 6_000;
+        fired.summary.roster.all_high_covered_secs = fired.summary.period.duration();
+        let mut untaken = report_fixture();
+        untaken.summary.roster.all_high_episodes = 0;
+        untaken.summary.roster.all_high_secs = 0;
+        untaken.summary.roster.all_high_covered_secs = 0;
+
+        let note = validity_rule_line();
+        for (label, report) in [("fired", &fired), ("untaken", &untaken)] {
+            let out = render_text(report, None);
+            assert!(
+                out.contains(&note),
+                "the {label} census dropped the validity-rule note:\n{out}"
+            );
+        }
+        // The premise, so the pair above is not two renders of the same census: one really does
+        // carry a number and the other really is the `—` arm.
+        assert!(
+            render_text(&fired, None).contains("3 episodes"),
+            "the `fired` half stopped rendering a census number"
+        );
+        assert!(
+            render_text(&untaken, None).contains("all-accounts-high (≥80%): —"),
+            "the `untaken` half stopped rendering the gap sentinel"
+        );
+    }
+
+    #[test]
+    fn the_validity_rule_note_is_read_before_the_figures_it_qualifies() {
+        // Placement is load-bearing, not cosmetic — the same reason issue #836 put the config
+        // caveat directly ABOVE the roster line. A rule stated after the numbers is read after the
+        // reader has already compared them.
+        let reason = wire_config_reason(&Error::ConfigParse("x".into()));
+        let out = numeric_render(Some(reason));
+        let note = validity_rule_line();
+        let caveat = config_regime_line(Some(reason)).expect("a reason, a caveat");
+        let at = |needle: &str| {
+            out.find(needle)
+                .unwrap_or_else(|| panic!("the numeric render is missing `{needle}`:\n{out}"))
+        };
+        assert!(
+            at(&note) < at(&caveat) && at(&caveat) < at("roster:"),
+            "the roster block is note → config caveat → roster line, so the SET qualifier stays \
+             adjacent to the cells it degrades:\n{out}"
+        );
+        assert!(
+            at("t@cap") < at(&note),
+            "the note qualifies the table above it, so the table must render first:\n{out}"
+        );
+    }
+
+    #[test]
+    fn the_chart_render_states_no_at_cap_rule_because_it_shows_no_at_cap_column() {
+        // The contradiction is a COMPARISON, so it exists only where both figures render. The
+        // chart view shows the census alone, and a note naming `t@cap` there would qualify a
+        // column the reader cannot see.
+        //
+        // BOTH halves are asserted: "no note" alone would pass just as happily on a chart render
+        // that had silently grown a `t@cap` column, which is the state where the note IS owed.
+        let charts = render_human(
+            &two_account_charts(),
+            TermEnv {
+                cols: Some(200),
+                color: false,
+                ascii: false,
+            },
+            None,
+        );
+        assert!(
+            !charts.contains("t@cap"),
+            "the chart view grew an at-cap column, so it now owes the note it is exempt \
+             from:\n{charts}"
+        );
+        assert!(
+            !charts.contains(&validity_rule_line()),
+            "the chart view carries a note for a column it does not render:\n{charts}"
+        );
+        assert!(
+            charts.contains("all-accounts-high"),
+            "the premise: the chart view DOES render the census, so the exemption is about the \
+             missing peer and not about the block being absent:\n{charts}"
+        );
+    }
+
+    #[test]
+    fn an_empty_window_states_no_validity_rule() {
+        // With no accounts there is no table, hence no `t@cap` column to qualify — and a note
+        // naming one would describe a surface that is not on the page. This is the same rule the
+        // census's set qualifier follows on its `—` arm (issue #836), for the same reason.
+        let mut empty = report_fixture();
+        empty.summary.per_account.clear();
+        empty.orphans.clear();
+        let out = render_text(&empty, None);
+        assert!(
+            out.contains("no per-account usage in this window"),
+            "the premise: this fixture renders the empty-window arm:\n{out}"
+        );
+        assert!(
+            !out.contains(&validity_rule_line()),
+            "the empty window qualifies a column it does not render:\n{out}"
+        );
+        assert!(
+            out.contains("roster:"),
+            "the roster line still foots the empty render:\n{out}"
+        );
+    }
+
+    #[test]
+    fn an_orphan_only_window_still_states_the_validity_rule() {
+        // The gate is the TABLE, not the live roster: a window whose only rows are #314 orphans
+        // still renders the `t@cap` column, so it still owes the note. Gating on `has_live` alone
+        // would leave exactly this render with an unqualified column.
+        let mut orphans_only = report_fixture();
+        let moved: Vec<(String, AccountStats)> = orphans_only
+            .summary
+            .per_account
+            .iter()
+            .map(|(h, a)| (h.clone(), *a))
+            .collect();
+        orphans_only.summary.per_account.clear();
+        orphans_only.orphans = moved.into_iter().collect();
+        let out = render_text(&orphans_only, None);
+        assert!(
+            out.contains("not in roster (") && out.contains("t@cap"),
+            "the premise: this fixture renders an orphan table with the at-cap column:\n{out}"
+        );
+        assert!(
+            out.contains(&validity_rule_line()),
+            "an orphan-only table renders `t@cap` unqualified:\n{out}"
         );
     }
 
