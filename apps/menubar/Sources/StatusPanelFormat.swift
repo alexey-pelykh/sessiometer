@@ -2500,10 +2500,25 @@ enum StatusPanelFormat {
     /// accounts)`, `src/stats.rs` `roster_line`). Same fact, same vocabulary, different grammar,
     /// because the two surfaces are different parts of speech: the CLI's is the metric's NAME, a
     /// fixed identifier it can only annotate, while this one is a sentence — and in the degraded
-    /// regime "All accounts" is not a heading to qualify but a claim that is false, since the
-    /// census demonstrably did not see them all. `nil` (a pre-#866 daemon) drops the qualifier by
-    /// the same rule the `nil` water above follows, and `true` needs no qualifier because the
-    /// unqualified sentence already states it.
+    /// regime "All accounts" is not a heading to qualify but a CLAIM, one this branch cannot
+    /// ESTABLISH. `nil` (a pre-#866 daemon) drops the qualifier by the same rule the `nil` water
+    /// above follows, and `true` needs no qualifier because the unqualified sentence already
+    /// states it.
+    ///
+    /// WHY "cannot establish" and not "is false", which is what this comment said until issue
+    /// #1224. `censusOverRoster == false` IS `roster.is_none()`, and `all_high`
+    /// (`src/usage_stats.rs`) then takes its census from the handles that held samples with no
+    /// other set in scope — so whether anyone was left out is exactly the fact the absent roster
+    /// withholds. There is no reference set here for an omission to be demonstrated against. Nor
+    /// is the sampled set a SUBSET of the configured roster, which is what a demonstrated omission
+    /// would need: it ADMITS an orphan handle the roster excludes (issue #314), so the two differ
+    /// in BOTH directions — the point issue #864 established, carried on the wire by
+    /// `RosterWire::census_over_roster` (`src/stats.rs`) and mirrored on `StatsRoster`
+    /// (`WireModel.swift`). The distinction earns its place because it is what makes a
+    /// parenthetical the wrong INSTRUMENT here rather than merely the wrong grammar: annotating
+    /// leaves the unestablished subject standing and hangs a qualifier off it, while narrowing
+    /// replaces it with the one set this branch can vouch for. The render is the same either way;
+    /// only its ground moves.
     ///
     /// THE SECOND SUPPRESSION, added by issue #1029 as the previous revision of this comment said it
     /// would be: an UNMEASURABLE census (`coveredSecs == 0`) drops the set qualifier too, because
