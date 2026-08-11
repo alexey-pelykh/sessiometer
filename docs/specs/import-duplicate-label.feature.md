@@ -166,14 +166,15 @@ the pre-existing `resolve_target_reports_ambiguous_for_a_duplicated_label_and_ne
 > the other three agree passes with `remove` still silently deleting the wrong account's credentials,
 > which is the case OQ-1 said should drive the policy — and did.
 
-## Scenario: every label-resolving site agrees on a duplicate  · Cap-3.2
+## Scenario: every site that RESOLVES a label agrees on a duplicate  · Cap-3.2
 
     Given a roster carrying label L under two different account_uuids
-    When each label-resolving site is given L
+    When each site that resolves L to a single account is given L
     Then use, poke and the daemon's control-socket swap all refuse identically
     And enable, disable and remove refuse identically too
     But not by asserting only the four commands R-6a used to name
     But not by treating this as one policy over one resolver — there were two mechanisms
+    But not by reading "label-resolving" as every site that compares a label
 
 *Binds*: three per-site refusals — `apply_enabled_refuses_a_duplicate_label_without_touching_the_roster`
 and `apply_remove_refuses_a_duplicate_label_without_touching_the_roster` (`src/cli.rs`), plus the
@@ -186,6 +187,43 @@ The set-level half — that no SEVENTH site grows its own resolver — is bound 
 `every_handle_read_is_dispositioned` and `resolve_target_has_exactly_the_five_known_call_sites`
 (`src/use_account.rs`, issue #1186). Per-site tests cannot carry it: each proves that THAT site
 refuses, and a site that does not exist yet has no test to fail.
+
+> **The title was a universal over the wrong set, and the set it named is larger than this rule.**
+> *Corrected 2026-08-11 (thirteenth pass, issue #1062); this scenario read "every label-resolving
+> site agrees on a duplicate", and no surface here bounded "label-resolving".* A site this scenario
+> never named compares an operator-supplied handle against the roster with the **identical key set** —
+> `refresh_tick::account_listed_in`, which matches `entry == &account.label || entry ==
+> &account.account_uuid`, the same either/or `use_account::resolve_target` filters on. Its handles
+> come from `[refresh].accounts`, whose own doc comment (`config::RefreshConfig`) says each is
+> *"named by its `list` label OR `account_uuid` (the same resolution `poke` and `use` key on)"*. It
+> does **not** refuse: it folds with `.any()`, so a duplicated label admits **both** bearers.
+>
+> **That is correct, and the scenario title was what was wrong.** `account_listed_in` is a
+> *membership* predicate over a config-supplied set — it returns `bool`, selects nothing, and has no
+> index to be ambiguous about, so `UseTargetAmbiguous` is not expressible in it. The alternative
+> readings are worse in the direction that matters: admitting neither bearer silently stops
+> refreshing an account the operator did name, and a token then expires — the failure the refresh
+> tick exists to prevent. Refusing at load would reject a config the roster may not even have made
+> ambiguous yet. So the rule R-6a states is over sites that resolve a handle **to one account**, and
+> this scenario now says so in its title, its *When* and a fourth *But not*.
+>
+> **The code already dispositions it; only these documents did not.** `COMPARING_READERS`
+> (`src/use_account.rs`, issue #1186) files `account_listed_in` under its *compared against a LABEL*
+> heading — the section whose preamble demands each member account for what it does *instead* of
+> taking the first match — with the reason recorded in the row. `every_handle_read_is_dispositioned`
+> walks every `.rs` file under `src/` outside its `#[cfg(test)]` region and fails on any handle read
+> that is not registered, so the enumeration is a gate rather than a claim. What the gate cannot do
+> is notice that a document restated its result as a wider universal, which is the defect corrected
+> here.
+>
+> **The residual, stated in the direction it fails to reach.** Admitting both bearers means an
+> operator who writes `accounts = ["L"]` against a duplicated `L` gets both accounts in the sweep,
+> in `recovery_pending`'s wake-cadence gate, and in the `sweepable` count `refresh_tick::mechanism_is_observable`
+> compares against `MAX_SWEEP_EXCLUSIONS` — so a duplicate can carry that gate over its threshold
+> and let the #787 startup preflight run where a unique roster would have held it back. Accepted,
+> not fixed here: with `L` duplicated there is no string the operator can write that names one
+> bearer, so the remedy is the same account-uuid remedy Cap-3.2's sibling scenario already gives.
+> Tracked separately if it is ever to change; this scenario asserts nothing about it.
 
 > **Two mechanisms, six call sites — and `remove` was the one that did damage.** Before this change:
 >

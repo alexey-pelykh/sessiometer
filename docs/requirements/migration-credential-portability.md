@@ -398,8 +398,11 @@ silently — **including when both colliding entries arrive in the same artifact
 > scenarios green.
 
 **R-6a** — *Where* a duplicate-label roster exists, the system **shall** handle it **consistently**
-across every site that resolves an operator label — which is **two different mechanisms over six call
-sites**, not four commands. **It did not, until #1005 — read this paragraph in the past tense; the
+across every site that resolves an operator label **to a single account** — which is **two different
+mechanisms over six call sites**, not four commands. Sites that merely *compare* a handle without
+selecting one are outside this requirement; the scoping note below names the one that shares this
+requirement's key set, and `COMPARING_READERS` (`src/use_account.rs`) is the full enumeration.
+**It did not, until #1005 — read this paragraph in the past tense; the
 resolution is the "RESOLVED 2026-08-06" note below.** `use` refused with
 `Error::UseTargetAmbiguous` (`resolve_target`, `src/use_account.rs`; exit code 6 per `Error::exit_code`, `src/error.rs`), and so did
 **`poke`** (`src/poke.rs:290`) and **the daemon's control-socket swap** (`src/daemon/commands.rs:99`),
@@ -422,8 +425,62 @@ decision, not a design — and it was taken.
 > blast radius — `AccountLabelNotFound` and `UseTargetNotFound` are distinct errors with distinct exit
 > codes.
 >
-> Enumerated from source rather than sampled — re-run `.tmp/enumerate.py`. Three prior passes each
-> reported one more member of this set, which is what sampling a finite set looks like.
+> Enumerated from source rather than sampled. Three prior passes each reported one more member of
+> this set, which is what sampling a finite set looks like. The enumeration is now a **committed
+> gate** rather than an instruction: `every_handle_read_is_dispositioned` and
+> `resolve_target_has_exactly_the_five_known_call_sites` (`src/use_account.rs`, issue #1186) walk
+> every `.rs` file under `src/` outside its `#[cfg(test)]` region and fail on an unregistered handle
+> read or a changed resolver-caller set, so a seventh site **under a new name** reddens a test
+> instead of waiting for a fourteenth reader. It does not close every hole, and the source says so:
+> `COMPARING_READERS`'s preamble enumerates the residuals it leaves — chief among them a resolver
+> grown inside an **already-registered** name under a **non-equality** predicate, which that
+> preamble records as measured and GREEN — and concludes that "the hole is narrowed rather than
+> closed". To see the set by eye rather than by gate, read `HANDLE_READ_REGISTER` and
+> `COMPARING_READERS` in `src/use_account.rs`.
+>
+> *Amended 2026-08-11 (issue #1062): this said "re-run `.tmp/enumerate.py`". No such file was ever
+> committed — `.tmp/` is gitignored scratch, and it was reclaimed with the PR worktree — so the one
+> instruction that would have let a reader re-derive instead of re-sample pointed at nothing from
+> the moment it was written (`efa1a3e`, and repeated in `3b6a203`). The gate named above is the
+> replacement, and it is stronger than the script would have been: it runs on every `cargo test`
+> rather than on request. This class of defect is invisible to `scripts/check-doc-citations.sh`,
+> which reads frontmatter values, not prose.*
+
+> **A derivation only closes the axis you point it at — and this one was pointed at *resolution*.**
+> *Added 2026-08-11 (thirteenth pass, issue #1062), which was run specifically to falsify the
+> twelfth pass's closure and did.* A site absent from every enumeration here compares an operator-supplied handle against the
+> roster with the **identical key set** as `resolve_target`: `refresh_tick::account_listed_in`
+> matches `entry == &account.label || entry == &account.account_uuid`, and its handles come from
+> `[refresh].accounts`, documented in `config::RefreshConfig` as *"named by its `list` label OR
+> `account_uuid` (the same resolution `poke` and `use` key on)"*. It drives the sweep's allowlist
+> leg, `recovery_pending`'s wake-cadence gate, and `refresh_tick::mechanism_is_observable`'s
+> `sweepable` count.
+>
+> **It is not another call site of this requirement, and the fix is the wording rather than the
+> code.** The fold differs and the difference is the point: `resolve_target` collects matches and
+> refuses on many, while `account_listed_in` folds with `.any()` and returns a `bool`. There is no
+> index for it to be ambiguous about, so `Error::UseTargetAmbiguous` is not expressible in it, and
+> both alternatives are worse in the direction that matters — admitting neither bearer silently
+> stops refreshing an account the operator did name, which is the token expiry the refresh tick
+> exists to prevent. So R-6a's scope is *resolution to a single account*, stated in its first
+> sentence above, and `account_listed_in` is deliberately outside it.
+>
+> **What was actually false was the universal, and it was false in these documents only.**
+> `COMPARING_READERS` (`src/use_account.rs`, issue #1186) already files `account_listed_in` under
+> its *compared against a LABEL* heading, whose preamble requires each member to account for what
+> it does instead of taking the first match. That landed after this PRD's twelfth pass and closed
+> the code side; no surface here absorbed it, and R-6a went on reading as a universal over "every
+> site that resolves an operator label" with an enumeration that stopped at six. A gate cannot
+> notice that a document restated its result more widely than the result supports.
+>
+> **Residual, stated in the direction it fails to reach.** Both bearers of a duplicated `L` enter
+> the sweep and `recovery_pending`'s wake-cadence gate under `accounts = ["L"]`, and both are counted in the
+> `sweepable` total `mechanism_is_observable` compares against `MAX_SWEEP_EXCLUSIONS` — so a
+> duplicate can carry that gate over its threshold and admit the #787 startup preflight where a
+> unique roster would have held it back, against a comparison its own doc comment calls
+> *"deliberately CONSERVATIVE"*. Accepted rather than fixed here: with `L` duplicated no string
+> names one bearer, so the remedy is the account-uuid remedy R-6a already provides. Changing it is
+> a refresh-tick decision, not a migration one, and this requirement asserts nothing about it.
 
 `Origin: AI-inferred-expansion`.
 `Ratification: user-ratified 2026-08-06 (OQ-1 resolved — refuse on ambiguity, everywhere)`.
@@ -689,8 +746,9 @@ Under R-9's model the applied payload *can* narrow to the roster, but the defaul
 **live-credential file**, which is what makes this urgent. `Origin: council-added` (`security-architect`, rounds 1 and 2).
 `Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item E11)`.
 
-**R-13** — *When* `export` runs, the system **shall** determine whether this machine's daemon is
-running and surface it **on stderr**.
+**R-13** — *When* `export` runs, the system **shall** determine whether this machine **will refresh
+the exported credentials** — a daemon running now, or one launchd is due to start — and surface it
+**on stderr**.
 
 > **stderr, never stdout — the stream is load-bearing, not a detail.** *Added 2026-08-05 (twelfth
 > pass); no surface named a stream, and the design's Interface-Change table said `export` **stdout**.*
@@ -709,6 +767,35 @@ the existing control socket, via the read-only `daemon_liveness()` probe (`src/c
 shared by `daemon status` and `daemon restart` — **not** `notify_daemon_roster_reload()`
 (`src/capture.rs:335`), which is documented BEST-EFFORT, returns `()`, and swallows a connect
 refusal, so it cannot answer the tri-state question this requirement asks.
+
+> **Liveness was the wrong axis, and deepening it could not have found that.** *Corrected 2026-08-11
+> (thirteenth pass, issue #1062); this requirement read "determine whether this machine's daemon is
+> **running**", and every pass since has refined the liveness probe rather than questioned it.*
+> `cli::daemon_liveness` is documented as *"The daemon **process** liveness"* — a point-in-time read
+> of the control socket with the single-instance lock as fallback. It answers *is a daemon up right
+> now?*; the hazard is *will this machine rotate the refresh token after I leave?*, and those come
+> apart in two states launchd reaches routinely:
+>
+> - **Between respawns.** The agent plist is `RunAtLoad` true with a conditional `KeepAlive` of
+>   `{SuccessfulExit: false}` (`service::render_plist`), so a daemon that exited non-zero is respawned.
+>   While launchd throttles that respawn the job is in the domain with no process —
+>   `AgentSupervision::RegisteredIdle`, whose doc comment contains *"or it is simply between respawns"* —
+>   and the socket, the lock and therefore the probe all correctly report nothing running.
+> - **Stopped, but registered for next login.** `daemon stop` boots the agent out of the domain and
+>   **leaves the plist on disk**, stated in `AgentSupervision::Unregistered`'s own doc comment.
+>   `service::stop_managed` even prints *"It returns at next login"* — so the product already told
+>   the operator the daemon is coming back, on the very command that made the export look safe.
+>
+> Supervision alone does not cover the second (it reads `Unregistered`, exactly as a machine with no
+> service installed does), so the predicate is liveness **×** `service::agent_supervision` **×**
+> `service::is_managed`. **The codebase never treated liveness as sufficient**: `daemon_status` and
+> `daemon_restart` each pair the probe with `agent_supervision`, and `daemon_stop` dispatches on
+> supervision alone (`src/cli.rs`). This requirement was the only surface reading it on its own.
+>
+> The two probes named above are read-only and already exist; nothing new is proposed here beyond
+> asking all three questions instead of one. What changes downstream is AC-13's *Given* and
+> Cap-10.1's branch enumeration, both corrected in the same pass.
+
 `Origin: council-added` (`security-architect`).
 `Ratification: user-ratified 2026-08-04 (scope-membership B/amendment, item E12)`.
 
@@ -839,10 +926,27 @@ local log is 2026-07-14, so no dead line is inside its sample. The requirement i
 ### Operator Documentation
 
 **R-8** — The system **shall** publish a migration runbook stating the safe sequence — **halt the
-source's refresh (stop the source daemon) → export → import → `use --force <label>` → start the
-target; never resume the source against the same credentials** — and stating why (the source's next
-refresh invalidates the artifact). The runbook **shall** name the **forcing** form, and **shall not**
-name `use <label>` unqualified. No such document exists.
+source's refresh (stop the source daemon **and** ensure launchd will not bring it back) → export →
+import → `use --force <label>` → start the target; never resume the source against the same
+credentials** — and stating why (the source's next refresh invalidates the artifact). The runbook
+**shall** name the **forcing** form, and **shall not** name `use <label>` unqualified. No such
+document exists.
+
+> **"Stop the source daemon" does not halt a managed source, and this sequence said it did.**
+> *Corrected 2026-08-11 (thirteenth pass, issue #1062), the same axis error R-13 carries.* On a
+> managed install `daemon stop` boots the agent out of the launchd domain but **leaves the plist on
+> disk, registered for next login** — `AgentSupervision::Unregistered`'s doc comment says so, and
+> `service::stop_managed` prints *"It returns at next login; `sessiometer service uninstall` removes
+> it for good."* while performing the stop. So an operator following this runbook verbatim halts the
+> refresh for the current login session only, exports, and has the source rotate the shared refresh
+> token at their next login — the exact hazard the sequence exists to prevent, reached by obeying it.
+> The runbook must therefore name the persistent halt (`service uninstall`, or an equivalent the
+> operator can verify), not just `daemon stop`.
+>
+> This is why R-13's warning is scoped to *will this machine refresh* rather than *is a daemon up*:
+> after a correct-looking `daemon stop` every liveness probe reads `NotRunning`, so the warning built
+> to catch exactly this operator would have stayed silent for them.
+
 `Origin: AI-inferred-expansion (category: docs)`.
 
 > **`--force` is mandatory here, not stylistic (corrected 2026-08-04).** This sequence read
@@ -987,13 +1091,29 @@ doc-comment on the allowlist constant, which records what was decided but not wh
 destroyed, *Then* it is. **BUT NOT** advice printed without a mechanism; **BUT NOT** restricted to the
 `--plaintext` path, since an encrypted artifact is still a live-credential file behind one passphrase.
 
-**AC-13 (R-13)** — *Given* the source daemon is **`Responsive` or `AliveUnresponsive`, or the probe
-returns `Err`** — three of `daemon_liveness()`'s **four** outcomes; it is `Result<DaemonLiveness>`
-(`src/cli.rs:1885`) over a tri-state enum (`:1870-1878`) — *When*
-`export` runs, *Then* the operator is told, because the artifact will be invalidated by the next
-refresh. **BUT NOT** a warning printed unconditionally regardless of daemon state, which trains
+**AC-13 (R-13)** — *Given* the source machine **will refresh** — the liveness probe reports
+`Responsive` or `AliveUnresponsive` or returns `Err` (three of `daemon_liveness()`'s **four**
+outcomes; it is `Result<DaemonLiveness>` over the tri-state `enum DaemonLiveness`, both in
+`src/cli.rs` — cited by symbol rather than by line, which has already drifted once),
+**or** launchd holds a job for the agent (`AgentSupervision::RegisteredIdle` or `Supervising`),
+**or** an agent plist is on disk (`service::is_managed`) — **or either of those two probes returns
+`Err`**, on the same fail-closed reasoning the liveness `Err` arm takes: both are `Result`-typed
+(`service::agent_supervision` shells out to `launchctl`; `service::is_managed` resolves a home
+directory), and an errored probe has not established that launchd will leave this machine alone —
+*When* `export` runs, *Then* the operator is told, because the artifact will be invalidated by the next
+refresh. **BUT NOT** a warning printed unconditionally regardless of machine state, which trains
 dismissal; **BUT NOT** blocking the export — the operator may have a reason; **BUT NOT** treating
-`AliveUnresponsive` as "not running"; **BUT NOT** mapping the `Err` arm to the quiet branch — see below.
+`AliveUnresponsive` as "not running"; **BUT NOT** mapping the `Err` arm to the quiet branch — see
+below; **BUT NOT** reading `NotRunning` as sufficient for quiet, which is the axis error #1062
+records.
+
+> **`NotRunning` is necessary for quiet and not sufficient.** *Added 2026-08-11 (thirteenth pass,
+> issue #1062).* The three disjuncts above are the same question asked of three probes, because a
+> daemon launchd is throttling between respawns, and one booted out with its plist left registered
+> for next login, both drive the liveness probe to a confident and correct `NotRunning`. R-13's
+> corrected note carries the full derivation; the consequence for this AC is that its *Given* is a
+> disjunction over the product, not an enumeration of one probe's variants. The note below remains
+> exactly right about that probe — it is the axis it sits on that moved.
 
 > **The probe has FOUR outcomes, and this AC fails closed on the two that are not `NotRunning`.**
 > *`Err` added 2026-08-05 (tenth pass); the eighth pass added it to the spec and #1050 and left this
@@ -1001,8 +1121,10 @@ dismissal; **BUT NOT** blocking the export — the operator may have a reason; *
 > AC-16/OQ-5.* `daemon_liveness()` returns `Result<DaemonLiveness>` (`src/cli.rs:1885`), so the `Err`
 > arm sits alongside the three `Ok` variants. An errored probe has **not** established the daemon is
 > absent; if it is in fact running it will refresh and invalidate the artifact — so it warns, on the
-> same fail-closed reasoning this note already makes for `AliveUnresponsive`. Only `NotRunning` is
-> quiet, which is what keeps RSK-1's dismissal-training failure closed.
+> same fail-closed reasoning this note already makes for `AliveUnresponsive`. Of this probe's four
+> outcomes only `NotRunning` can be quiet, which is what keeps RSK-1's dismissal-training failure
+> closed. *(Amended 2026-08-11, issue #1062: this read "only `NotRunning` is quiet" — true of the
+> probe, and read by every later pass as though it were true of the machine.)*
 >
 > *Original note (sixth pass); every AC, capability and scenario here was previously two-state:*
 > `DaemonLiveness` (`src/cli.rs:1870-1878`) is `Responsive` / `AliveUnresponsive` / `NotRunning`, and
@@ -1142,10 +1264,14 @@ read, *Then* an operator can tell which slot each value came from.
 not a display change.
 
 **AC-8 (R-8)** — *Given* an operator about to migrate, *When* they consult the docs, *Then* the safe
-sequence and its rationale are present, *And* the adoption step names **`use --force <label>`**.
+sequence and its rationale are present, *And* the adoption step names **`use --force <label>`**,
+*And* the halt step names a halt that **survives the next login** — `service uninstall`, or an
+equivalent the operator can verify — not `daemon stop` alone.
 **BUT NOT** as a comment in `src/migration.rs`; **BUT NOT** omitting the "never resume the source"
 step, which is the step this incident violated; **BUT NOT** naming `use <label>` unqualified — the
-runbook's reader is by construction in the active-account case, where that form is the AC-2a no-op.
+runbook's reader is by construction in the active-account case, where that form is the AC-2a no-op;
+**BUT NOT** naming `daemon stop` as the whole halt, which on a managed install stops the refresh for
+the current login session only (R-8's note).
 
 **Coverage criterion spanning R-2 / R-4 (M2)** — the existing suite covers byte-faithful round-trip,
 config-only artifacts, report redaction, and conflict policy (§ 9). It does **not** cover: the
@@ -1195,7 +1321,7 @@ PAST:    < 1.0 — true-by-construction on any `dead` line with a parseable non-
 ## 6. Success Criteria
 
 1. A migration performed per R-8's runbook leaves **zero** accounts requiring `claude /login`.
-2. A migration performed **against** the runbook (source left running) produces a **warning before**
+2. A migration performed **against** the runbook (the source machine still due to refresh) produces a **warning before**
    the damage, not a `dead` classification four minutes after it.
 3. `status` after an import never shows a value that contradicts what was imported (R-7).
 4. The #262 spike's two open sub-questions carry recorded n=1 evidence (R-1).
