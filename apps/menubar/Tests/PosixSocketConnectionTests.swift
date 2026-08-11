@@ -288,18 +288,26 @@ final class PosixSocketConnectionTests: XCTestCase {
     //
     // The stranded reader THREAD is covered transitively, not separately: `descriptor.retire()` is the
     // reader's last statement after its loop ends, so observing the release IS observing that the
-    // reader is no longer blocked. What that leaves uncovered is a backstop that released the number
-    // WITHOUT waking the reader — a bare `Darwin.close(raw)` in `deinit`.
+    // reader is no longer blocked. What that leaves uncovered is a backstop that frees the number while
+    // a reader can still issue a `read()` against it — a bare `Darwin.close(raw)` in `deinit`, which
+    // this test cannot see: freeing the number is exactly what its probe waits for, so that mutant
+    // SATISFIES this test rather than failing it.
     //
-    // NOTHING GATES THAT, and an earlier revision of this comment wrongly said
-    // `testTeardownDoesNotStrandAReaderOnAReusedDescriptor` did. It does not: that test calls
-    // `close()` EXPLICITLY on the abandoned connection, so `shutdown()` wakes the reader before
-    // `deinit` is ever reached, and it never drives the deinit-only path this one exists for. Measured
-    // rather than argued — with `deinit { Darwin.close(descriptor.raw) }` substituted, the full bundle
-    // passes, that test included. It is the same mistake this file's own #899 reasoning warns about
-    // one paragraph up: a gate that drives the explicit path cannot see the implicit one. Tracked as
-    // issue #1187; asserting on the thread directly would need thread enumeration this bundle has no
-    // mechanism for, which is why it is filed rather than attempted here.
+    // THAT IS NOW GATED, one section down, by
+    // `testDroppingAConnectionWithoutClosingItDoesNotStrandAReaderOnAReusedDescriptor` (issue #1187),
+    // and deliberately not by widening this one. This comment has now been wrong about that gap twice,
+    // and both corrections are recorded rather than quietly replaced. In flight on PR #1178 it claimed
+    // `testTeardownDoesNotStrandAReaderOnAReusedDescriptor` already covered it — it does not, because
+    // that test calls `close()` EXPLICITLY on its abandoned connection, so `shutdown()` wakes the reader
+    // before `deinit` is ever reached; the judge gate that caught that is what filed #1187. The wording
+    // that then landed with it, in the same commit, called the gap a backstop that releases the number
+    // "WITHOUT waking the reader", which names the wrong mechanism. Measured out of
+    // process on Darwin 25.5.0, with a thread first parked in `read()` on an AF_UNIX SOCK_STREAM fd for
+    // 300 ms and confirmed still blocked: a plain `close()` of that descriptor DOES wake it, returning
+    // -1/EBADF. The hazard never required the reader to stay asleep — only that the number becomes
+    // reusable while a reader has yet to issue its next syscall. The gate below is written against that
+    // instead, which is also why it needed no thread enumeration, the mechanism #1187 expected to be
+    // the blocker.
     func testDroppingAConnectionWithoutClosingItRetiresTheDescriptor() async throws {
         let pair = try makeSocketPair()
         // Deliberately AFTER the verdict below — see the EOF bullet above.
@@ -343,6 +351,94 @@ final class PosixSocketConnectionTests: XCTestCase {
         // reissue — the exact #859 hazard this class exists to gate. The `defer` above is the reclaim:
         // closing the peer delivers the EOF that ends the reader's loop, and the reader retires its own
         // descriptor.
+    }
+
+    // MARK: - Deinit-only teardown does not strand a reader on a reused descriptor (issue #1187)
+
+    // The soak above drives the EXPLICIT teardown path; this drives the IMPLICIT one. Both gate the
+    // same #859 hazard — the descriptor NUMBER released while a reader can still `read()` it — and the
+    // soak cannot reach this path by construction: it calls `close()` on its abandoned connection, so
+    // `shutdown()` wakes that reader long before `deinit`.
+    //
+    // Why this needed a different OBSERVABLE rather than a stronger assertion on the one above, which
+    // is what issue #1187 was filed to establish. The obvious candidate was the reader's own terminal
+    // side-effect: `continuation.finish()` is the last thing it does that `lines` can observe, so a
+    // stream that never finished would mean a reader that was never woken. It does not discriminate.
+    // Measured out of process on Darwin 25.5.0, with a thread first parked in `read()` on an AF_UNIX
+    // SOCK_STREAM fd for 300 ms and confirmed still blocked: a plain `close()` of that descriptor WAKES
+    // it, returning -1/EBADF. So under `deinit { Darwin.close(descriptor.raw) }` the loop still ends,
+    // the stream still finishes, and the number is still released — every reader-liveness observable is
+    // green on the mutant, and a gate built on one passes it. That is how this was found: the first
+    // version of this test asserted exactly that and survived its own canary.
+    //
+    // This does not contradict `FileDescriptorOwner`'s doc comment, and the distinction is the whole
+    // point. That comment says `close()` is not a RELIABLE wake — "need not return at all" — which is a
+    // statement about what teardown may not DEPEND on, not a promise that the reader stays blocked. A
+    // reader that does wake is not evidence of safety either way, because the hazard was never the
+    // stuck thread; it is the number becoming reusable while a reader can still issue a syscall against
+    // it. So the only observable that separates the two deinits is the cross-wiring itself, and this is
+    // the soak above with the explicit `close()` deleted:
+    //   * shipped `deinit { close() }` → `shutdown()` keeps the number RESERVED until the reader
+    //     retires it, so the fresh `socket()` below cannot be handed it while that reader lives.
+    //   * `deinit { Darwin.close(descriptor.raw) }` → the number is free immediately, `socket()` returns
+    //     the lowest free one, and the abandoned reader's first `read()` lands on the fresh connection
+    //     — consuming its bytes, or retiring its number out from under it. This observable does not
+    //     separate those two, and does not try to: every measured failure reported the fresh stream
+    //     FINISHING with no payload, which is what both produce once the peer is closed. What is gated
+    //     is the hazard, not which of its two shapes occurred.
+    //
+    // The connection is therefore constructed and dropped with nothing in between, rather than parked in
+    // `read()` first: the drop should land while the reader thread is still starting, which is #859's
+    // primary shape. Both shapes are hazardous under the mutant and this gate separates neither — a
+    // reader that has NOT yet entered `read()` issues it against the reissued number and takes the
+    // payload, while one already blocked wakes with EBADF, ends its loop, and then runs
+    // `descriptor.retire()`, closing a number the process may already have handed to the fresh
+    // connection. Both end that connection's stream with no payload, which is what is asserted.
+    //
+    // What this gate is SILENT on, stated so the pair is not misread as one gate: `deinit` deleted
+    // outright. Then nothing frees the number at all, so it can never be reissued and nothing is
+    // stolen — this test passes on that tree. That direction is
+    // `testDroppingAConnectionWithoutClosingItRetiresTheDescriptor` above, and the two stand in the same
+    // relation on this path that #859 and #899 do on the explicit one: that one gates release-NEVER,
+    // this one gates release-TOO-EARLY. Neither subsumes the other.
+    //
+    // Iteration count: this gates a RACE, so a single pass would mean little, exactly as the soak above
+    // records for its own 20. Measured with the mutant substituted: run ALONE, 18 of 20 iterations
+    // failed in each of four runs — 72 of 80 — and the two survivors were a different pair every time
+    // (6/7, then 4/10, 11/20, 8/19), so this is a per-iteration rate near 90% rather than two
+    // structurally unreachable iterations. Run inside the full bundle it was 20 of 20, the rate being
+    // load-dependent in the same direction the soak above records for its own. A spurious green needs
+    // every iteration to miss at once. Against the shipped `deinit` the loop is deterministic, since
+    // the number cannot be reissued while that reader can still read it, so the iterations cost only
+    // their own microseconds.
+    func testDroppingAConnectionWithoutClosingItDoesNotStrandAReaderOnAReusedDescriptor() async throws {
+        for iteration in 1...20 {
+            // Dropped with NO `close()`: `deinit` is the only teardown, which is the whole subject. The
+            // `_ =` discard is what makes the drop happen HERE, at the end of this statement, rather
+            // than at the end of the iteration, where an iteration-scoped local would put it — as in
+            // the soak above, whose abandoned connection is therefore already torn down by its
+            // explicit `close()` before `deinit` runs.
+            do {
+                let abandoned = try makeSocketPair()
+                _ = PosixSocketConnection(fd: abandoned.conn)
+                Darwin.close(abandoned.peer)
+            }
+
+            // A fresh connection, on the descriptor number a deinit-only teardown may just have freed.
+            let pair = try makeSocketPair()
+            let connection = PosixSocketConnection(fd: pair.conn)
+            let collector = LineCollector(); collector.consume(connection.lines)
+
+            writeBytes(pair.peer, "not-stolen")
+            Darwin.close(pair.peer)
+
+            try await XCTAssertNextLine(
+                collector, "not-stolen",
+                "iteration \(iteration): a connection dropped without close() left a reader on this "
+                    + "descriptor number, which then consumed these bytes or retired the number")
+
+            connection.close()
+        }
     }
 
     // MARK: - Fixtures
