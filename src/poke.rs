@@ -52,6 +52,12 @@
 //! prove the refresh token — a genuinely `dead` credential, a `no change`, or a refresh a
 //! concurrent change kept from re-stashing — is reported as-is (a dead credential still points
 //! at `claude /login`). No daemon reachable, or a non-dead verdict, keeps the plain wording.
+//!
+//! A label MORE THAN ONE account carries cannot key that verdict at all (issue #1086), and a
+//! cycle that proved a fresh token then SAYS SO — the daemon's verdict could not be read, so any
+//! quarantine still stands — rather than printing the bare `refreshed` a never-quarantined
+//! account gets, which read as a false all-clear on the one path the product routes operators
+//! down to clear a quarantine (issue #1200).
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -294,8 +300,8 @@ async fn poke_named<E: PokeEngine, N: RestoreNotifier>(
         });
     }
     let report = engine.refresh(account).await?;
-    let quarantined = daemon_marks_quarantined(daemon_status, roster, &account.label);
-    let restore = resolve_restore(account, &report, quarantined, notifier).await;
+    let verdict = daemon_verdict(daemon_status, roster, &account.label);
+    let restore = resolve_restore(account, &report, verdict, notifier).await;
     println!(
         "{}",
         poke_line(&account.label, &poke_outcome(&report, restore))
@@ -340,8 +346,8 @@ async fn poke_all<E: PokeEngine, N: RestoreNotifier>(
             // re-stashed refresh of a quarantined one ALSO clears its quarantine via the
             // #275 signal (#428), so a swept account recovers exactly as a named poke does.
             Ok(report) => {
-                let quarantined = daemon_marks_quarantined(daemon_status, roster, &account.label);
-                let restore = resolve_restore(account, &report, quarantined, notifier).await;
+                let verdict = daemon_verdict(daemon_status, roster, &account.label);
+                let restore = resolve_restore(account, &report, verdict, notifier).await;
                 poke_outcome(&report, restore)
             }
             // Secret-free: every `Error` Display is redaction-safe (issue #15).
@@ -383,22 +389,34 @@ fn outcome_label(report: &RefreshReport) -> &'static str {
     }
 }
 
-/// Whether a completed cycle warrants clearing the daemon quarantine (issue #428): the
-/// daemon currently has the account OUT OF ROTATION (`quarantined_per_daemon`, resolved by
-/// [`daemon_marks_quarantined`] — a `Degraded` access-token 401-streak (issue #427) or a
-/// proven-`Dead` verdict (#261)) AND the cycle produced a fresh, re-stashed token — the exact
+/// Whether a completed cycle PROVED the refresh token: a fresh token that was also re-stashed.
+/// The credential-side half of [`should_restore`]'s gate, hoisted because it answers a second
+/// question too — it is the ONLY cycle outcome for which the daemon's verdict changes anything
+/// `poke` does. A `no change` / `dead` / not-re-stashed cycle reports the same line whatever the
+/// daemon says (the refresh token was never exercised, was cleared, or its fresh result was
+/// discarded by a concurrent change), which is why a verdict that could not be read costs the
+/// operator nothing there and is reported here (issue #1200, [`Restore::Unattributable`]).
+fn proven_refresh(report: &RefreshReport) -> bool {
+    matches!(report.outcome, RefreshOutcome::Refreshed { .. }) && report.re_stashed
+}
+
+/// Whether a completed cycle warrants clearing the daemon quarantine (issue #428): the daemon
+/// currently has the account OUT OF ROTATION ([`DaemonVerdict::Quarantined`], resolved by
+/// [`daemon_verdict`] — a `Degraded` access-token 401-streak (issue #427) or a proven-`Dead`
+/// verdict (#261)) AND the cycle [proved the refresh token](proven_refresh) — the exact
 /// condition that used to merely PRINT a "still dead" stall (#163), now the trigger to
 /// actually un-quarantine via the `#275 Restored` signal so the daemon re-polls through the
-/// fresh stash. A `no change` / `dead` / not-re-stashed cycle is NOT a proven refresh (the
-/// refresh token was never exercised, was cleared, or its fresh result was discarded by a
-/// concurrent change), so it never fires: a `Degraded` account whose refresh SUCCEEDS recovers
-/// here (the fix for issue #427 — its refresh token was always valid), while a genuinely dead
-/// credential — whose refresh returns `dead`, not `Refreshed` — is filtered out and still
-/// points at `claude /login`.
-fn should_restore(report: &RefreshReport, quarantined_per_daemon: bool) -> bool {
-    quarantined_per_daemon
-        && matches!(report.outcome, RefreshOutcome::Refreshed { .. })
-        && report.re_stashed
+/// fresh stash. A `Degraded` account whose refresh SUCCEEDS recovers here (the fix for issue
+/// #427 — its refresh token was always valid), while a genuinely dead credential — whose
+/// refresh returns `dead`, not `Refreshed` — is filtered out and still points at
+/// `claude /login`.
+///
+/// Both conjuncts are REQUIRED, and only [`Quarantined`](DaemonVerdict::Quarantined) satisfies
+/// the first: an [`Unattributable`](DaemonVerdict::Unattributable) verdict never fires the send,
+/// which is #1086's degrade-rather-than-guess, unchanged. What issue #1200 adds is downstream of
+/// this predicate, in [`resolve_restore`] — the REPORT, not the write.
+fn should_restore(report: &RefreshReport, verdict: DaemonVerdict) -> bool {
+    verdict == DaemonVerdict::Quarantined && proven_refresh(report)
 }
 
 /// What the issue-#428 quarantine-clear attempt did for a completed cycle — threaded into
@@ -417,27 +435,47 @@ enum Restore {
     /// read, or the exchange failed): the fresh token IS stashed, but the quarantine persists
     /// until the daemon is signalled again.
     Undelivered,
+    /// No attempt was POSSIBLE (issue #1200): the cycle [proved a fresh, re-stashed
+    /// token](proven_refresh) — the one input that makes the un-quarantine actionable — but the
+    /// label is not a unique key on both sides, so the daemon's verdict could not be attributed
+    /// to this account ([`DaemonVerdict::Unattributable`]). Any quarantine therefore stands, and
+    /// the line says so. Distinct from [`Skipped`](Self::Skipped) precisely because the operator
+    /// is routed to `poke` BY a quarantine cue: reporting a plain `refreshed` here is the false
+    /// all-clear #163 was opened about, arrived at by a different route.
+    Unattributable,
 }
 
 /// Resolve the issue-#428 quarantine-clear for a completed cycle: if the cycle warrants it
 /// ([`should_restore`]), send the `#275 Restored` signal through `notifier` and report whether
-/// it reached the daemon; otherwise [`Restore::Skipped`]. The single place both poke modes
-/// attempt the un-quarantine — keeping the pure send decision out of the I/O and the message
-/// layer. Safe + idempotent at the daemon (an unknown / already-healthy uuid is a no-op,
-/// ADR-0008), and best-effort: a failed send is reported honestly, never fatal.
+/// it reached the daemon; otherwise classify why not. The single place both poke modes attempt
+/// the un-quarantine — keeping the pure send decision out of the I/O and the message layer.
+/// Safe + idempotent at the daemon (an unknown / already-healthy uuid is a no-op, ADR-0008),
+/// and best-effort: a failed send is reported honestly, never fatal.
+///
+/// The non-sending half is two outcomes, not one (issue #1200). A cycle that did not prove a
+/// fresh token is [`Skipped`](Restore::Skipped) whatever the daemon says — the verdict could not
+/// have changed its line, so an unreadable one costs nothing. A cycle that DID prove one, over a
+/// label that is not a unique key, is [`Unattributable`](Restore::Unattributable): the verdict
+/// would have decided between clearing the quarantine and reporting a plain `refreshed`, and it
+/// could not be read, so the line reports the degrade instead of picking the reassuring half of
+/// it. NO signal is sent in either case — #1086's refusal to guess is untouched here; what this
+/// adds is what the operator is told about it.
 async fn resolve_restore<N: RestoreNotifier>(
     account: &Account,
     report: &RefreshReport,
-    quarantined_per_daemon: bool,
+    verdict: DaemonVerdict,
     notifier: &N,
 ) -> Restore {
-    if !should_restore(report, quarantined_per_daemon) {
-        return Restore::Skipped;
+    if should_restore(report, verdict) {
+        return match notifier.send_restored(&account.account_uuid).await {
+            Ok(()) => Restore::Cleared,
+            Err(_) => Restore::Undelivered,
+        };
     }
-    match notifier.send_restored(&account.account_uuid).await {
-        Ok(()) => Restore::Cleared,
-        Err(_) => Restore::Undelivered,
+    if verdict == DaemonVerdict::Unattributable && proven_refresh(report) {
+        return Restore::Unattributable;
     }
+    Restore::Skipped
 }
 
 /// The honest per-account outcome text for a completed cycle, given the resolved issue-#428
@@ -446,15 +484,20 @@ async fn resolve_restore<N: RestoreNotifier>(
 /// A [`Cleared`](Restore::Cleared) / [`Undelivered`](Restore::Undelivered) restore means the
 /// account was daemon-quarantined AND the refresh re-stashed a fresh token: the line reports
 /// the un-quarantine RESULT ([`QUARANTINE_CLEARED`] / [`RESTORE_UNDELIVERED`]) rather than a
-/// bare `"refreshed"` that would read as "healthy" while hiding the quarantine. Every
-/// [`Skipped`](Restore::Skipped) cycle — a healthy or `Unknown ⚪` verdict, no daemon
-/// reachable, a genuinely `dead` credential, a `no change`, or a refresh a concurrent change
-/// kept from re-stashing — carries its own plain classification unchanged, a true statement of
-/// the cycle that ran, never a fabricated liveness claim.
+/// bare `"refreshed"` that would read as "healthy" while hiding the quarantine. An
+/// [`Unattributable`](Restore::Unattributable) restore means the refresh re-stashed a fresh token
+/// but the label named more than one account, so the line reports THAT
+/// ([`VERDICT_UNATTRIBUTABLE`]) — the same reason the two above do not print `"refreshed"`, on
+/// the one remaining path that used to (issue #1200). Every [`Skipped`](Restore::Skipped) cycle —
+/// a healthy or `Unknown ⚪` verdict, no daemon reachable, a genuinely `dead` credential, a
+/// `no change`, or a refresh a concurrent change kept from re-stashing — carries its own plain
+/// classification unchanged, a true statement of the cycle that ran, never a fabricated liveness
+/// claim.
 fn poke_outcome(report: &RefreshReport, restore: Restore) -> String {
     match restore {
         Restore::Cleared => QUARANTINE_CLEARED.to_owned(),
         Restore::Undelivered => RESTORE_UNDELIVERED.to_owned(),
+        Restore::Unattributable => VERDICT_UNATTRIBUTABLE.to_owned(),
         Restore::Skipped => outcome_label(report).to_owned(),
     }
 }
@@ -475,6 +518,27 @@ const QUARANTINE_CLEARED: &str = "token refreshed; cleared the daemon quarantine
 const RESTORE_UNDELIVERED: &str = "token refreshed and stashed, but the daemon could not be \
      reached to clear the quarantine — it persists until the daemon is signalled again";
 
+/// The issue-#1200 report for a cycle that refreshed and re-stashed a token but whose account
+/// the daemon's verdict could not be pinned on, because more than one account carries its label
+/// ([`DaemonVerdict::Unattributable`]).
+///
+/// It states three things, and each one is load-bearing. The refresh SUCCEEDED and was stashed —
+/// true, and the half a bare `refreshed` already conveyed. The verdict could not be READ, and
+/// why — so the operator learns that `poke` did not silently decide the account was fine. And
+/// any quarantine STILL STANDS — the half #163 was opened about, since the operator arrived here
+/// from `status`'s `degraded — run 'sessiometer poke'` cue and would otherwise read `refreshed`
+/// as the cue being answered.
+///
+/// The remedy names the property, not a command: labels live in `config.toml` (the CLI's
+/// `config` verb is read-only diagnostics), and this line is reached from BOTH poke modes, so
+/// pointing at one invocation would be wrong for the other. Non-secret (issue #15): a
+/// classification plus the label-uniqueness fact the operator can already see in `status`, no
+/// token, and not even the label itself — [`poke_line`] has already printed that.
+const VERDICT_UNATTRIBUTABLE: &str = "token refreshed and stashed, but this label does not name \
+     exactly one account both here and in the daemon's view, so the daemon's verdict for this \
+     one could not be read — any quarantine still stands; give the accounts distinct labels, or \
+     restart the daemon so it re-reads the roster, and poke again";
+
 /// `<label>: <outcome>` — one per-account report line (the label is the non-secret
 /// handle, issue #15).
 fn poke_line(label: &str, outcome: &str) -> String {
@@ -490,9 +554,11 @@ fn poke_line(label: &str, outcome: &str) -> String {
 /// [`should_restore`] then decides which actually recover (a Degraded account's refresh
 /// succeeds and clears; a Dead one's refresh returns `dead` and stays put — see there).
 ///
-/// A `None` snapshot (no daemon reachable), a `label` absent from the snapshot, or a `label`
-/// that is not a unique key are all NOT quarantined: an indeterminate verdict `poke` reports
-/// with its plain wording (#163 AC-3), never a fabricated daemon-state claim.
+/// A `None` snapshot (no daemon reachable) and a `label` the snapshot does not list are
+/// [`NotQuarantined`](DaemonVerdict::NotQuarantined): there is no verdict to fabricate a claim
+/// from, and `poke` keeps its plain wording (#163 AC-3). A `label` that is not a unique key is
+/// [`Unattributable`](DaemonVerdict::Unattributable) instead — a different fact, and since issue
+/// #1200 a differently-reported one: a verdict EXISTS and cannot be pinned on this account.
 ///
 /// Matching is by label — the only account handle the wire [`AccountStatusLine`] carries
 /// (issue #15: never the uuid or email) — the same key `status` renders by; a renamed/stale
@@ -502,7 +568,12 @@ fn poke_line(label: &str, outcome: &str) -> String {
 /// snapshot. Either count off and the bearers are indistinguishable from a label alone, so
 /// poke claims nothing rather than attributing the earliest match's state to whichever account
 /// it was handed (issue #1086) — the same degrade-rather-than-guess shape `use`'s
-/// `cached_viability_for` already takes for this lookup.
+/// `cached_viability_for` already takes for this lookup. Since issue #1200 that degrade is its
+/// own state rather than a bare `false`, so a caller can tell "nothing to clear" apart from
+/// "could not tell". `use`'s lookup still collapses the two — its `Option<Viability>` is `None`
+/// for an absent line and for a duplicated one alike — which costs it nothing, because a `use`
+/// with no usable cached verdict falls through to the same live poll either way. `poke` has no
+/// such fallthrough: the collapse IS its answer, which is why only this side needed widening.
 ///
 /// BOTH counts, because each catches a misattribution the other misses. The snapshot side
 /// catches a roster the daemon knows better than this process does (an account removed from
@@ -511,16 +582,18 @@ fn poke_line(label: &str, outcome: &str) -> String {
 /// second bearer added on disk leaves the wire with one line that is NOT necessarily the poked
 /// account's.
 ///
-/// The cost is stated rather than hidden: on an ambiguous label poke stops clearing
-/// quarantines as well as stops fabricating them, so a genuinely quarantined bearer keeps its
-/// plain wording and is left to the daemon's #106 refresh sweep WHEN `[refresh]` is enabled, or
-/// to a `login`/reconcile. Both halves of that are narrower than they look, and neither should be
-/// read as a promise. ADR-0008's other daemon-side revival, #42's `note_poll_outcome`
-/// live-recovery, is scoped to the STUCK ACTIVE — and poke excludes the active account by
-/// construction — so it cannot apply here at all. The #106 sweep is the only one left, and this
-/// same file records it as conditional (`QUARANTINE_CLEARED` above: "a sweep that never runs with
-/// `[refresh]` off"). With refresh disabled there is NO daemon-side revival, and the fallback is
-/// `login`/reconcile alone.
+/// The cost is stated rather than hidden — and, since issue #1200, stated to the OPERATOR too: on
+/// an ambiguous label poke stops clearing quarantines as well as stops fabricating them, so a
+/// genuinely quarantined bearer is left to the daemon's #106 refresh sweep WHEN `[refresh]` is
+/// enabled, or to a `login`/reconcile. What #1200 changed is the report, not that fallback: a cycle
+/// that proved a fresh token now carries [`VERDICT_UNATTRIBUTABLE`] rather than the bare
+/// `refreshed` a never-quarantined account gets. Both halves of the fallback are narrower than they
+/// look, and neither should be read as a promise. ADR-0008's other daemon-side revival, #42's
+/// `note_poll_outcome` live-recovery, is scoped to the STUCK ACTIVE — and poke excludes the active
+/// account by construction — so it cannot apply here at all. The #106 sweep is the only one left,
+/// and this same file records it as conditional (`QUARANTINE_CLEARED` above: "a sweep that never
+/// runs with `[refresh]` off"). With refresh disabled there is NO daemon-side revival, and the
+/// fallback is `login`/reconcile alone.
 /// Making the wire disambiguate instead would mean carrying a stable per-account key on a
 /// surface #15 restricts to the operator-authored handle. RESIDUAL, unclosable without such a
 /// key: a label REASSIGNED to a different account between the snapshot and the current roster
@@ -528,32 +601,88 @@ fn poke_line(label: &str, outcome: &str) -> String {
 /// `cached_viability_for` records for `use`. Bounded: the verdict drives the report wording
 /// and a `#275 Restored` signal that is a no-op for an unknown or already-healthy uuid
 /// (ADR-0008).
-fn daemon_marks_quarantined(
+fn daemon_verdict(
     daemon_status: Option<&StatusResponse>,
     roster: &[Account],
     label: &str,
-) -> bool {
+) -> DaemonVerdict {
     let Some(status) = daemon_status else {
-        return false;
+        return DaemonVerdict::NotQuarantined;
     };
-    if sole(roster.iter().filter(|account| account.label == label)).is_none() {
-        return false;
+    match lookup(roster.iter().filter(|account| account.label == label)) {
+        Lookup::Ambiguous => return DaemonVerdict::Unattributable,
+        // Unreachable from either production call site — both pass a roster account's OWN label,
+        // so the roster matches at least once. Answered rather than asserted: a label naming no
+        // account is ABSENT, not ambiguous, and reporting an ambiguity over it would be the
+        // fabrication this whole lookup exists to refuse.
+        Lookup::Absent => return DaemonVerdict::NotQuarantined,
+        Lookup::Sole(_) => {}
     }
-    sole(status.accounts.iter().filter(|line| line.label == label)).is_some_and(line_is_quarantined)
+    match lookup(status.accounts.iter().filter(|line| line.label == label)) {
+        Lookup::Sole(line) if line_is_quarantined(line) => DaemonVerdict::Quarantined,
+        Lookup::Sole(_) | Lookup::Absent => DaemonVerdict::NotQuarantined,
+        Lookup::Ambiguous => DaemonVerdict::Unattributable,
+    }
 }
 
-/// The one and only element of `candidates`, or `None` when it holds zero or more than one —
-/// the "exactly one match, else no answer" primitive [`daemon_marks_quarantined`] applies to
-/// each side of its label lookup. Short-circuits on the second MATCH: it pulls at most two items
-/// from `candidates`, but where `candidates` is a filter — as it is at both call sites — the
-/// second pull drives that filter until it finds a second match or exhausts the underlying
-/// iterator. So on a UNIQUE label, which is the common case and the hot path, it walks the whole
-/// roster exactly as a count would. Cost is nil at roster scale; the claim is narrowed here
-/// because an earlier wording said "rather than a count of the whole roster", which is false for
-/// the case that matters.
-fn sole<T>(mut candidates: impl Iterator<Item = T>) -> Option<T> {
-    let only = candidates.next()?;
-    candidates.next().is_none().then_some(only)
+/// What the daemon's snapshot says about a poked account's rotation, as far as that account's
+/// LABEL can carry the answer — the input to both the issue-#428 un-quarantine decision
+/// ([`should_restore`]) and the reported wording ([`poke_outcome`]).
+///
+/// Three states rather than the bool this was until issue #1200, because collapsing the third
+/// into the second is a real cost to the operator: `poke` is the remedy `status` routes them to
+/// for a quarantine, so "no quarantine to clear" and "could not tell whether there is one" are
+/// the two answers that must not read alike.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonVerdict {
+    /// The daemon has this account OUT OF ROTATION — a `Degraded` access-token 401-streak (issue
+    /// #427), a proven-`Dead` credential (#261), or a pre-#119 daemon's legacy `quarantined`
+    /// flag (#42). The one verdict the #428 restore may act on.
+    Quarantined,
+    /// Nothing to clear, as far as poke can tell. Folds the three cases that are behaviourally
+    /// identical — an in-rotation line, no daemon reachable, and a label the snapshot does not
+    /// list — because each leaves the line carrying the cycle's own plain classification,
+    /// unchanged since #163. They are folded rather than enumerated deliberately: a state no
+    /// caller branches on is decoration.
+    NotQuarantined,
+    /// A verdict EXISTS and cannot be attributed to this account: the label is not a unique key
+    /// on both sides, so the snapshot's line(s) belong to bearers a label cannot tell apart
+    /// (issue #1086). Never fires the restore — that is #1086's refusal to guess, unchanged —
+    /// but it is reported (issue #1200), which the bool it replaced could not do.
+    Unattributable,
+}
+
+/// How many items a label matched on one side of [`daemon_verdict`]'s lookup.
+///
+/// Three-way rather than the `Option` "exactly one match, else no answer" primitive this
+/// replaced: that answer collapses ABSENT and AMBIGUOUS, and issue #1200 turns on telling them
+/// apart — nothing to attribute versus a verdict that exists and cannot be attributed.
+///
+/// Short-circuits on the second MATCH: it pulls at most two items from `candidates`, but where
+/// `candidates` is a filter — as it is at both call sites — the second pull drives that filter
+/// until it finds a second match or exhausts the underlying iterator. So on a UNIQUE label,
+/// which is the common case and the hot path, it walks the whole roster exactly as a count
+/// would. Cost is nil at roster scale; the claim is narrowed here because an earlier wording
+/// said "rather than a count of the whole roster", which is false for the case that matters.
+enum Lookup<T> {
+    /// No match at all.
+    Absent,
+    /// Exactly one match — the only case that yields a usable answer.
+    Sole(T),
+    /// More than one match: the bearers are indistinguishable from the label alone.
+    Ambiguous,
+}
+
+/// Classify `candidates` into [`Lookup`] — see there for the short-circuit and its cost.
+fn lookup<T>(mut candidates: impl Iterator<Item = T>) -> Lookup<T> {
+    let Some(first) = candidates.next() else {
+        return Lookup::Absent;
+    };
+    if candidates.next().is_some() {
+        Lookup::Ambiguous
+    } else {
+        Lookup::Sole(first)
+    }
 }
 
 /// Resolve ONE status line's quarantine the same way `status` does (`cli::health_cell`): the
@@ -895,7 +1024,7 @@ mod tests {
     }
 
     #[test]
-    fn daemon_marks_quarantined_reads_the_named_line_or_degrades_to_not_quarantined() {
+    fn daemon_verdict_reads_the_named_line_or_degrades_to_not_quarantined() {
         let roster = vec![
             acct("work", "u-A"),
             acct("gone", "u-B"),
@@ -908,98 +1037,151 @@ mod tests {
         ]);
         // Each account's OWN verdict is read, by label — a Degraded 401-streak (#427) and a
         // proven-Dead credential (#261) are both quarantined; a Healthy one is not.
-        assert!(daemon_marks_quarantined(Some(&snap), &roster, "work"));
-        assert!(daemon_marks_quarantined(Some(&snap), &roster, "gone"));
-        assert!(!daemon_marks_quarantined(Some(&snap), &roster, "spare"));
-        // No daemon reachable (None) → indeterminate → not quarantined (plain wording, AC-3).
-        assert!(!daemon_marks_quarantined(None, &roster, "work"));
-        // A label the daemon does not list → indeterminate → not quarantined.
-        assert!(!daemon_marks_quarantined(Some(&snap), &roster, "ghost"));
+        let q = DaemonVerdict::Quarantined;
+        let clear = DaemonVerdict::NotQuarantined;
+        assert_eq!(daemon_verdict(Some(&snap), &roster, "work"), q);
+        assert_eq!(daemon_verdict(Some(&snap), &roster, "gone"), q);
+        assert_eq!(daemon_verdict(Some(&snap), &roster, "spare"), clear);
+        // No daemon reachable (None) → no verdict to read → plain wording (AC-3). NOT
+        // `Unattributable`: there is nothing to attribute, which is why #1200 leaves this arm
+        // exactly where #163 put it.
+        assert_eq!(daemon_verdict(None, &roster, "work"), clear);
+        // A label matching NEITHER side: absent, not ambiguous. Reached through the roster
+        // lookup, whose `Absent` arm is unreachable from production — this is the one caller
+        // that exercises it, and it must not answer `Unattributable`.
+        assert_eq!(daemon_verdict(Some(&snap), &roster, "ghost"), clear);
+        // A label the ROSTER carries once and the daemon does not list at all: absent on the
+        // wire side. The operator was never routed here — `status` renders from that same
+        // snapshot, so an account with no line shows no cue.
+        let rosters_only = vec![acct("offline", "u-D")];
+        assert_eq!(daemon_verdict(Some(&snap), &rosters_only, "offline"), clear);
     }
 
     #[test]
-    fn daemon_marks_quarantined_needs_the_label_unique_on_both_sides() {
+    fn daemon_verdict_separates_an_ambiguous_label_from_an_absent_one() {
         // Issue #1086 at the predicate: the label is a valid key only while it names exactly
         // one account in the roster AND one line on the wire. The `Dead` verdict below is
         // deliberately the same in all four cases, so what varies is only the KEY's validity.
+        //
+        // Issue #1200 is the second axis: each non-unique case must answer `Unattributable`
+        // and NOT `NotQuarantined`, because those two now print different lines. Asserting
+        // `!= Quarantined` would pass over the defect this issue is about.
         let dead = || status_line("work", Some(CredentialHealth::Dead), false);
 
         // Unique on both sides → the verdict is readable. The control for the three below.
         let unique = vec![acct("work", "u-A")];
-        assert!(daemon_marks_quarantined(
-            Some(&status_snapshot(vec![dead()])),
-            &unique,
-            "work"
-        ));
+        assert_eq!(
+            daemon_verdict(Some(&status_snapshot(vec![dead()])), &unique, "work"),
+            DaemonVerdict::Quarantined,
+        );
         // Duplicated in the ROSTER, one line on the wire (a snapshot lagging a signalled
         // reload, #139): the single line need not be the caller's account → no claim.
         let dup_roster = vec![acct("work", "u-A"), acct("work", "u-B")];
-        assert!(!daemon_marks_quarantined(
-            Some(&status_snapshot(vec![dead()])),
-            &dup_roster,
-            "work"
-        ));
+        assert_eq!(
+            daemon_verdict(Some(&status_snapshot(vec![dead()])), &dup_roster, "work"),
+            DaemonVerdict::Unattributable,
+        );
         // Duplicated on the WIRE, unique in the roster (the daemon still lists an account
         // dropped from `config.toml`): the earliest line is a guess → no claim.
-        assert!(!daemon_marks_quarantined(
-            Some(&status_snapshot(vec![dead(), dead()])),
-            &unique,
-            "work"
-        ));
+        assert_eq!(
+            daemon_verdict(
+                Some(&status_snapshot(vec![dead(), dead()])),
+                &unique,
+                "work"
+            ),
+            DaemonVerdict::Unattributable,
+        );
         // Duplicated on both sides — the issue's own scenario.
-        assert!(!daemon_marks_quarantined(
-            Some(&status_snapshot(vec![dead(), dead()])),
-            &dup_roster,
-            "work"
-        ));
+        assert_eq!(
+            daemon_verdict(
+                Some(&status_snapshot(vec![dead(), dead()])),
+                &dup_roster,
+                "work"
+            ),
+            DaemonVerdict::Unattributable,
+        );
+        // And the discriminator #1200 turns on, at the wire side where production reaches it:
+        // a roster-unique label the snapshot does not list is ABSENT, so it keeps the plain
+        // wording rather than reporting an ambiguity that does not exist.
+        assert_eq!(
+            daemon_verdict(Some(&status_snapshot(vec![])), &unique, "work"),
+            DaemonVerdict::NotQuarantined,
+        );
     }
 
     #[test]
-    fn sole_yields_the_single_element_and_nothing_for_zero_or_many() {
-        assert_eq!(sole([7].into_iter()), Some(7));
-        assert_eq!(sole(std::iter::empty::<u8>()), None);
-        assert_eq!(sole([7, 9].into_iter()), None);
+    fn lookup_separates_absent_from_sole_from_ambiguous() {
+        assert!(matches!(lookup([7].into_iter()), Lookup::Sole(7)));
+        assert!(matches!(lookup(std::iter::empty::<u8>()), Lookup::Absent));
+        assert!(matches!(lookup([7, 9].into_iter()), Lookup::Ambiguous));
         // Short-circuits: a third element is never pulled, so an ambiguity verdict costs two
         // steps of the filtered iterator rather than a walk of the whole roster.
         let mut pulled = 0;
         let counted = [1, 2, 3, 4].into_iter().inspect(|_| pulled += 1);
-        assert_eq!(sole(counted), None);
+        assert!(matches!(lookup(counted), Lookup::Ambiguous));
         assert_eq!(pulled, 2);
     }
 
     #[test]
     fn should_restore_only_on_a_quarantined_verdict_plus_a_restashed_refresh() {
+        let restashed = || report(RefreshOutcome::Refreshed { rotated: true }, true);
         // The one firing case (issue #428): daemon-quarantined + a fresh, re-stashed token.
-        assert!(should_restore(
-            &report(RefreshOutcome::Refreshed { rotated: true }, true),
-            true
-        ));
+        assert!(should_restore(&restashed(), DaemonVerdict::Quarantined));
         // Same cycle, but the daemon does NOT mark it quarantined → nothing to clear.
-        assert!(!should_restore(
-            &report(RefreshOutcome::Refreshed { rotated: true }, true),
-            false
-        ));
+        assert!(!should_restore(&restashed(), DaemonVerdict::NotQuarantined));
+        // Same cycle over a label that names more than one account: still no send. Issue #1200
+        // changes what this cycle is REPORTED as, never whether it writes — a `Restored` off an
+        // unattributable verdict is the misattribution #1086 closed.
+        assert!(!should_restore(&restashed(), DaemonVerdict::Unattributable));
         // A quarantined verdict, but the cycle did not PROVE the refresh token, so it never fires:
         // - a refresh a concurrent change kept from re-stashing (no fresh stash to re-poll),
         assert!(!should_restore(
             &report(RefreshOutcome::Refreshed { rotated: true }, false),
-            true
+            DaemonVerdict::Quarantined
         ));
         // - no refresh happened (the refresh token was never exercised),
         assert!(!should_restore(
             &report(RefreshOutcome::NoChange, false),
-            true
+            DaemonVerdict::Quarantined
         ));
         // - a genuinely dead credential (still needs re-login),
-        assert!(!should_restore(&report(RefreshOutcome::Dead, false), true));
+        assert!(!should_restore(
+            &report(RefreshOutcome::Dead, false),
+            DaemonVerdict::Quarantined
+        ));
         // - an errored cycle.
         assert!(!should_restore(
             &report(
                 RefreshOutcome::Error(RefreshErrorReason::SpawnFailed),
                 false
             ),
-            true
+            DaemonVerdict::Quarantined
         ));
+    }
+
+    #[test]
+    fn proven_refresh_is_the_one_cycle_a_verdict_can_change() {
+        // The hoisted conjunct, pinned on its own: only a fresh token that also re-stashed
+        // qualifies. It gates the #428 send AND the #1200 report, so a widening here would
+        // silently start reporting an ambiguity on cycles the verdict could not have altered.
+        assert!(proven_refresh(&report(
+            RefreshOutcome::Refreshed { rotated: true },
+            true
+        )));
+        assert!(proven_refresh(&report(
+            RefreshOutcome::Refreshed { rotated: false },
+            true
+        )));
+        assert!(!proven_refresh(&report(
+            RefreshOutcome::Refreshed { rotated: true },
+            false
+        )));
+        assert!(!proven_refresh(&report(RefreshOutcome::NoChange, false)));
+        assert!(!proven_refresh(&report(RefreshOutcome::Dead, false)));
+        assert!(!proven_refresh(&report(
+            RefreshOutcome::Error(RefreshErrorReason::SpawnFailed),
+            false
+        )));
     }
 
     #[test]
@@ -1015,6 +1197,17 @@ mod tests {
         assert_eq!(
             poke_outcome(&refreshed, Restore::Undelivered),
             RESTORE_UNDELIVERED
+        );
+        // An UNATTRIBUTABLE restore → the #1200 line. Asserted against the plain wording too,
+        // because AC-1 is exactly that the two differ: the same cycle, the same `refreshed`
+        // classification underneath, and an operator who can tell the cases apart.
+        assert_eq!(
+            poke_outcome(&refreshed, Restore::Unattributable),
+            VERDICT_UNATTRIBUTABLE
+        );
+        assert_ne!(
+            poke_outcome(&refreshed, Restore::Unattributable),
+            poke_outcome(&refreshed, Restore::Skipped),
         );
         // A SKIPPED restore → the cycle's own plain classification, unchanged.
         assert_eq!(poke_outcome(&refreshed, Restore::Skipped), "refreshed");
@@ -1063,7 +1256,7 @@ mod tests {
         let restore = resolve_restore(
             &account,
             &report,
-            daemon_marks_quarantined(Some(&snap), std::slice::from_ref(&account), "work"),
+            daemon_verdict(Some(&snap), std::slice::from_ref(&account), "work"),
             &notifier,
         )
         .await;
@@ -1100,7 +1293,7 @@ mod tests {
         let restore = resolve_restore(
             &account,
             &report,
-            daemon_marks_quarantined(Some(&snap), std::slice::from_ref(&account), "work"),
+            daemon_verdict(Some(&snap), std::slice::from_ref(&account), "work"),
             &notifier,
         )
         .await;
@@ -1136,7 +1329,7 @@ mod tests {
         let restore = resolve_restore(
             &account,
             &report,
-            daemon_marks_quarantined(Some(&snap), std::slice::from_ref(&account), "work"),
+            daemon_verdict(Some(&snap), std::slice::from_ref(&account), "work"),
             &notifier,
         )
         .await;
@@ -1162,7 +1355,7 @@ mod tests {
         let restore = resolve_restore(
             &account,
             &report,
-            daemon_marks_quarantined(Some(&snap), std::slice::from_ref(&account), "work"),
+            daemon_verdict(Some(&snap), std::slice::from_ref(&account), "work"),
             &notifier,
         )
         .await;
@@ -1183,7 +1376,7 @@ mod tests {
         let restore = resolve_restore(
             &account,
             &refreshed,
-            daemon_marks_quarantined(None, std::slice::from_ref(&account), "work"),
+            daemon_verdict(None, std::slice::from_ref(&account), "work"),
             &notifier,
         )
         .await;
@@ -1201,7 +1394,7 @@ mod tests {
         let restore = resolve_restore(
             &account,
             &refreshed,
-            daemon_marks_quarantined(Some(&unknown), std::slice::from_ref(&account), "work"),
+            daemon_verdict(Some(&unknown), std::slice::from_ref(&account), "work"),
             &notifier,
         )
         .await;
@@ -1225,7 +1418,7 @@ mod tests {
         let restore = resolve_restore(
             &account,
             &report,
-            daemon_marks_quarantined(Some(&snap), std::slice::from_ref(&account), "work"),
+            daemon_verdict(Some(&snap), std::slice::from_ref(&account), "work"),
             &notifier,
         )
         .await;
@@ -1235,6 +1428,61 @@ mod tests {
             "a dead credential is never falsely un-quarantined"
         );
         assert_eq!(poke_outcome(&report, restore), "dead — needs re-login");
+    }
+
+    #[tokio::test]
+    async fn an_unattributable_verdict_is_reported_only_where_it_cost_the_operator_something() {
+        // The scoping decision issue #1200's third arm rests on, and the one a wider reading
+        // would get wrong: an unreadable verdict is worth saying ONLY on a cycle whose line the
+        // verdict would otherwise have changed.
+        //
+        // That is exactly `proven_refresh`. A `no change`, a `dead` and a refresh a concurrent
+        // change kept from re-stashing print the same text whether the daemon has the account
+        // quarantined, in rotation, or unreadable — `should_restore` filters all three out
+        // before the verdict is consulted — so announcing an ambiguity there would be noise
+        // attached to a decision it did not touch. A `dead` credential in particular must keep
+        // pointing at `claude /login`, which is the correct action however the label resolves.
+        let account = acct("dupe", "u-A");
+        let notifier = FakeRestoreNotifier::new();
+        let verdict = DaemonVerdict::Unattributable;
+
+        let restashed = report(RefreshOutcome::Refreshed { rotated: true }, true);
+        assert_eq!(
+            resolve_restore(&account, &restashed, verdict, &notifier).await,
+            Restore::Unattributable,
+        );
+
+        for (report, plain) in [
+            (
+                report(RefreshOutcome::Refreshed { rotated: true }, false),
+                "refreshed but not re-stashed (a concurrent change took precedence)",
+            ),
+            (report(RefreshOutcome::NoChange, false), "no change"),
+            (report(RefreshOutcome::Dead, false), "dead — needs re-login"),
+            (
+                report(
+                    RefreshOutcome::Error(RefreshErrorReason::SpawnFailed),
+                    false,
+                ),
+                "error",
+            ),
+        ] {
+            let restore = resolve_restore(&account, &report, verdict, &notifier).await;
+            assert_eq!(
+                restore,
+                Restore::Skipped,
+                "a cycle the verdict could not have changed must not report an ambiguity",
+            );
+            assert_eq!(poke_outcome(&report, restore), plain);
+        }
+
+        // And no arm of this sends: #1086's refusal to guess is what #1200 reports, not what it
+        // relaxes. Asserted last so it covers every case above, the firing one included.
+        assert!(
+            notifier.sent().is_empty(),
+            "an unattributable verdict never signals the daemon; got {:?}",
+            notifier.sent(),
+        );
     }
 
     // --- issue #1086: a duplicated label is not a usable key for the daemon's verdict ----
@@ -1247,8 +1495,9 @@ mod tests {
     // signal for the POKED account's uuid on the strength of it, so a wrong verdict is a
     // WRITE, not only a misreport.
     //
-    // All four drive the whole hermetic core (`run_poke`), never the predicate directly, so
-    // their source is untouched by the fix — the same bytes RED before it and GREEN after.
+    // Every one of them drives the whole hermetic core (`run_poke`), never the predicate
+    // directly, so their source is untouched by the fix — the same bytes RED before it and
+    // GREEN after.
     // The pair of `refresh` results is the one `should_restore` fires on (a fresh, re-stashed
     // token), which is what makes the verdict observable at all.
 
@@ -1824,6 +2073,47 @@ mod tests {
         );
     }
 
+    /// Re-exec this test binary to run the `#[ignore]`d payload `child_fn`, returning its
+    /// `(stdout, stderr, exit code)`.
+    ///
+    /// The re-exec is what makes the streams observable AT ALL: `println!` and `eprintln!` route
+    /// through the thread-local capture libtest installs, so in-process both arrive empty.
+    /// `--nocapture` on a child process is the pattern `crate::paths`'s launchd cases use.
+    ///
+    /// `child_var` is set on the child and asserted UNSET here — a parent that re-exec'd itself
+    /// would do so forever — and the payload asserts it SET, so a stray direct `--ignored` run of
+    /// a payload that exits the process is a loud failure rather than someone else's suite
+    /// vanishing.
+    ///
+    /// Shared by both parents rather than copied: the arguments below are the whole contract, and
+    /// two hand-maintained copies of it would drift — the second one silently, since a wrong
+    /// filter selects nothing and libtest exits 0 on an empty selection. Which is why each parent
+    /// still asserts its own payload's `_RAN` sentinel.
+    fn run_child_payload(child_var: &str, child_fn: &str) -> (String, String, Option<i32>) {
+        assert!(
+            std::env::var_os(child_var).is_none(),
+            "{child_var} is set — this parent is running inside its own child",
+        );
+        let module = module_path!();
+        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("the test binary must know its own path"),
+        )
+        .arg(format!("{module}::{child_fn}"))
+        .arg("--exact")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .arg("--test-threads=1")
+        .env(child_var, "1")
+        .output()
+        .expect("the child test binary must run");
+        (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+            output.status.code(),
+        )
+    }
+
     /// Environment variable set on the re-exec'd child. Read by BOTH sides: the parent asserts it
     /// is unset (a parent running inside its own child would re-exec forever), the payload asserts
     /// it is set (so an accidental direct `--ignored` run is a loud failure, not a process exit
@@ -1864,25 +2154,7 @@ mod tests {
         // refusal's words, that an empty capture satisfies perfectly. The sentinel is what
         // separates "the child ran and printed nothing there" from "the child never ran": a
         // drifted filter selects zero tests and libtest exits 0, which without it reads as a pass.
-        assert!(
-            std::env::var_os(AMBIGUITY_CHILD_VAR).is_none(),
-            "{AMBIGUITY_CHILD_VAR} is set — this parent is running inside its own child",
-        );
-        let module = module_path!();
-        let module = module.split_once("::").map_or(module, |(_, rest)| rest);
-        let output = std::process::Command::new(
-            std::env::current_exe().expect("the test binary must know its own path"),
-        )
-        .arg(format!("{module}::{AMBIGUITY_CHILD_FN}"))
-        .arg("--exact")
-        .arg("--ignored")
-        .arg("--nocapture")
-        .arg("--test-threads=1")
-        .env(AMBIGUITY_CHILD_VAR, "1")
-        .output()
-        .expect("the child test binary must run");
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        let (stdout, stderr, status) = run_child_payload(AMBIGUITY_CHILD_VAR, AMBIGUITY_CHILD_FN);
 
         assert!(
             stderr.contains(AMBIGUITY_CHILD_RAN),
@@ -1897,7 +2169,7 @@ mod tests {
         // 2. …carrying exit 6. A per-account report is an exit-0 event, so this alone separates
         //    the two channels for every caller that only reads a status.
         assert_eq!(
-            output.status.code(),
+            status,
             Some(6),
             "the refusal must exit 6.\nstdout: {stdout}\nstderr: {stderr}",
         );
@@ -1950,6 +2222,187 @@ mod tests {
         let _ = writeln!(std::io::stderr(), "{AMBIGUITY_CHILD_RAN}");
         // `main`'s tail, verbatim. An `Ok` exits 0 having said whatever it already printed on
         // fd 1 — which is precisely what a swallowed refusal looks like from outside.
+        match result {
+            Ok(()) => std::process::exit(0),
+            Err(err) => {
+                eprintln!("sessiometer: {err}");
+                std::process::exit(i32::from(err.exit_code()));
+            }
+        }
+    }
+
+    /// The sibling of [`AMBIGUITY_CHILD_VAR`] for the issue-#1200 payload.
+    const UNATTRIBUTABLE_CHILD_VAR: &str = "SESSIOMETER_POKE_UNATTRIBUTABLE_CHILD";
+
+    /// The `#[ignore]`d issue-#1200 payload's function name — see [`AMBIGUITY_CHILD_FN`] for why
+    /// a drift here is silent and what the `_RAN` sentinel below does about it.
+    const UNATTRIBUTABLE_CHILD_FN: &str = "poke_unattributable_child_payload";
+
+    /// Written to fd 2 by the issue-#1200 payload before it exits, proving to its parent that the
+    /// payload really ran.
+    const UNATTRIBUTABLE_CHILD_RAN: &str = "poke-unattributable-child-ran";
+
+    /// The exact outcome text an ambiguous label earns, pinned as a literal rather than read from
+    /// [`VERDICT_UNATTRIBUTABLE`] — for the reason [`AMBIGUITY_REFUSAL`] is pinned: re-deriving
+    /// it would make the assertion agree with whatever the const says, including a rewording that
+    /// stopped saying the verdict was unreadable or that the quarantine still stands, which are
+    /// the two halves issue #1200 is about.
+    const UNATTRIBUTABLE_REPORT: &str = "token refreshed and stashed, but this label does not \
+         name exactly one account both here and in the daemon's view, so the daemon's verdict \
+         for this one could not be read — any quarantine still stands; give the accounts \
+         distinct labels, or restart the daemon so it re-reads the roster, and poke again";
+
+    #[test]
+    fn an_ambiguous_label_reports_the_unreadable_verdict_instead_of_a_bare_refreshed() {
+        // AC-1 and AC-2 together, on the surface AC-1 names: `poke`'s OUTPUT. The child drives
+        // the whole `run_poke` path — not `daemon_verdict`, not `poke_outcome` — over a roster
+        // the daemon has Degraded, every account refreshing and re-stashing.
+        //
+        // This is what reds against the silent degrade. Before this change every report line read
+        // `refreshed`, so the ambiguous ones were byte-identical to the `solo` control — an
+        // operator who ran `poke` off `status`'s `degraded — run 'sessiometer poke'` cue got the
+        // same sentence a never-quarantined account gets, and the 🟠 was still there next
+        // `status`.
+        //
+        // TWO ambiguous labels, because the verdict has two conjuncts and one of them hides the
+        // other. `dupe` is duplicated in the ROSTER, which short-circuits before the wire is
+        // consulted at all; `lagging` is unique on disk and duplicated on the WIRE (a sibling
+        // removed from `config.toml` whose line the daemon has not dropped, #139's signalled
+        // reload). Measured, not assumed: with `dupe` alone, collapsing the wire conjunct back
+        // into "not quarantined" left this test GREEN — the same asymmetric coverage the sibling
+        // `an_ambiguous_wire_label_degrades_even_when_the_roster_is_unique` exists to close one
+        // layer down, reproduced here in the OUTPUT dimension until `lagging` was added.
+        //
+        // The sentinel and the `solo` control are what stop this passing over nothing. A drifted
+        // child filter selects zero tests and libtest exits 0, so the sentinel fires before any
+        // report assertion is reached and names that cause; the count assertion below would catch
+        // an empty stdout too (measured: it reds `left: 0 / right: 3`), and the control proves the
+        // harness observes a real line, positively, in the same run.
+        let (stdout, stderr, status) =
+            run_child_payload(UNATTRIBUTABLE_CHILD_VAR, UNATTRIBUTABLE_CHILD_FN);
+        assert!(
+            stderr.contains(UNATTRIBUTABLE_CHILD_RAN),
+            "the payload did not run — a drifted name selects nothing and libtest exits 0 on an \
+             empty selection.\nstdout: {stdout}\nstderr: {stderr}",
+        );
+        // The sweep indents its per-account lines by two spaces and the named mode does not, so
+        // both modes are read through one trim rather than two shapes.
+        let report_lines = |prefix: &str| -> Vec<String> {
+            stdout
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with(prefix))
+                .map(str::to_owned)
+                .collect()
+        };
+
+        // 1. Both ambiguous labels report, from BOTH modes. `dupe` is visited twice by the
+        //    SWEEP (once per bearer) and once by the account-uuid NAMED poke — the only way to
+        //    reach a duplicated label by name, since `poke dupe` itself refuses (the sibling
+        //    test above). `lagging` is one roster account, so once each way. A short count means
+        //    a mode, or a conjunct, never printed.
+        for (label, want) in [("dupe:", 3), ("lagging:", 2)] {
+            let lines = report_lines(label);
+            assert_eq!(
+                lines.len(),
+                want,
+                "every swept bearer and every named poke of `{label}` must \
+                 report.\nstdout: {stdout}",
+            );
+            // 2. …each stating the verdict could not be read and the quarantine still stands.
+            //    The equality is what reds pre-change, where every one of them read `refreshed`.
+            let expected = format!("{label} {UNATTRIBUTABLE_REPORT}");
+            for line in &lines {
+                assert_eq!(
+                    line, &expected,
+                    "an ambiguous label must not report the bare classification a \
+                     never-quarantined account gets.\nstdout: {stdout}",
+                );
+            }
+        }
+        // 3. The control, and the positive assertion the two above lack: the SAME cycle over an
+        //    unambiguous label still prints the plain wording, unchanged. AC-1 is that these two
+        //    differ, which needs both halves observed — and this one fails loudly on an empty
+        //    capture.
+        assert_eq!(
+            report_lines("solo:"),
+            vec!["solo: refreshed".to_owned()],
+            "an unambiguous, in-rotation account keeps its plain classification.\nstdout: {stdout}",
+        );
+        // 4. Both cycles completed: a report is an exit-0 event, so a refusal or a propagated
+        //    error would have taken a different path through `main`'s tail entirely.
+        assert_eq!(
+            status,
+            Some(0),
+            "both pokes must complete.\nstdout: {stdout}\nstderr: {stderr}",
+        );
+    }
+
+    /// The child payload of
+    /// [`an_ambiguous_label_reports_the_unreadable_verdict_instead_of_a_bare_refreshed`]: a
+    /// sweeping `poke`, then a named `poke <account-uuid>` of one bearer of each ambiguous label,
+    /// then `main`'s tail verbatim — so the parent observes exactly the stream an operator does.
+    ///
+    /// `#[ignore]`d because it is not a test in its own right: it asserts nothing about `poke`
+    /// and it EXITS the process, so it must never join an ordinary run.
+    #[tokio::test]
+    #[ignore = "child payload; re-exec'd by its parent, never run directly"]
+    async fn poke_unattributable_child_payload() {
+        use std::io::Write as _;
+
+        assert!(
+            std::env::var_os(UNATTRIBUTABLE_CHILD_VAR).is_some(),
+            "{UNATTRIBUTABLE_CHILD_VAR} is unset — this payload exits the process and is only \
+             meaningful under its parent",
+        );
+        let now = 1_000_000;
+        let soon = now + 60_000;
+        // `dupe` twice on disk; `lagging` and `solo` once each. Every account parked and near
+        // expiry, so the sweep visits all four.
+        let roster = vec![
+            acct("dupe", "u-A"),
+            acct("dupe", "u-B"),
+            acct("lagging", "u-C"),
+            acct("solo", "u-D"),
+        ];
+        let mut engine = FakePokeEngine::new();
+        for uuid in ["u-A", "u-B", "u-C", "u-D"] {
+            engine = engine
+                .with_expiry(uuid, Some(soon))
+                .with_result(uuid, restashed_refresh());
+        }
+        // The issue's scenario: the daemon HAS quarantined the ambiguous accounts, which is why
+        // `status` sent the operator here. `dupe` is ambiguous in the ROSTER; `lagging` is
+        // ambiguous on the WIRE alone — one account on disk, two lines the daemon has not dropped
+        // yet (#139's signalled reload). `solo` is unique on both sides and in rotation — the
+        // control.
+        let snap = status_snapshot(vec![
+            status_line("dupe", Some(CredentialHealth::Degraded), false),
+            status_line("dupe", Some(CredentialHealth::Degraded), false),
+            status_line("lagging", Some(CredentialHealth::Degraded), false),
+            status_line("lagging", Some(CredentialHealth::Degraded), false),
+            status_line("solo", Some(CredentialHealth::Healthy), false),
+        ]);
+        let notifier = FakeRestoreNotifier::new();
+        let mut result = run_poke(&roster, None, None, now, &engine, Some(&snap), &notifier).await;
+        // And by account-uuid — the only way a NAMED poke reaches a duplicated label — for one
+        // bearer of each, so both modes cross both conjuncts.
+        for uuid in ["u-A", "u-C"] {
+            let named = run_poke(
+                &roster,
+                Some(uuid),
+                None,
+                now,
+                &engine,
+                Some(&snap),
+                &notifier,
+            )
+            .await;
+            result = result.and(named);
+        }
+        // Straight to the stderr HANDLE, and BEFORE the exit below: the parent's proof that the
+        // payload ran at all.
+        let _ = writeln!(std::io::stderr(), "{UNATTRIBUTABLE_CHILD_RAN}");
         match result {
             Ok(()) => std::process::exit(0),
             Err(err) => {

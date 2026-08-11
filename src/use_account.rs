@@ -2507,7 +2507,7 @@ mod tests {
         ("capture_failure", NotHandleResolution, "`CaptureCommand.label` — the name being ASSIGNED to a new account"),
         ("execute", NotHandleResolution, "`Command::Capture { label }` / `Command::Login { label }` — a MATCH ARM binding the operator's CLI positional out of the parsed command and handing it to `capture` / `login`, which ASSIGN it to a new account. Nothing is matched against the roster here"),
         ("from_object", NotHandleResolution, "`Self { raw, account_uuid }` — the OAuth state record building ITSELF from `~/.claude.json`'s `accountUuid`, written as a struct literal's field-init shorthand. Not a roster account, and a write rather than a read"),
-        ("daemon_marks_quarantined", NotHandleResolution, "matches BOTH the daemon's wire line (`AccountStatusLine.label`) and the roster (`Account.label`) since issue #1086 — but it COUNTS bearers on each side and refuses on either being non-unique, exactly as the registered `label_bearers` does. Counting is not resolving"),
+        ("daemon_verdict", NotHandleResolution, "matches BOTH the daemon's wire line (`AccountStatusLine.label`) and the roster (`Account.label`) since issue #1086 — but it COUNTS bearers on each side and refuses on either being non-unique, exactly as the registered `label_bearers` does. Counting is not resolving. Issue #1200 renamed it from `daemon_marks_quarantined` and widened its ANSWER from a bool to a three-state verdict, so a non-unique label is now told apart from an absent one; both are still refusals, and neither selects a bearer"),
         ("import_report", NotHandleResolution, "`AccountImport.label` — per-entry import outcomes"),
         ("new", NotHandleResolution, "`AccountStatusLine.label` — `StatusRow`'s rendered account cell — and, since issue #1202 taught the scan to see a field bound by name, `ManagedAccount { account_uuid, .. }`, the migration artifact naming its own key. Neither type is a roster `Account`; see MULTI_SITE_READERS"),
         ("parse_subcommand", NotHandleResolution, "`|label| Command::Capture { label }` — packs the operator's CLI positional INTO the parsed command, the same string `execute` unpacks and the same direction: a name being carried to an ASSIGNMENT, never compared with a roster handle"),
@@ -2604,7 +2604,7 @@ mod tests {
         // the first match: refuse on non-unique, or test membership and select nothing at all.
         ("account_listed_in", "the `[refresh].accounts` allowlist — a MEMBERSHIP test over a config-supplied set, returning a bool rather than an index, and a duplicated label there legitimately admits BOTH bearers"),
         ("cached_viability_for", "`AccountStatusLine.label` on a daemon WIRE line: it pulls a second match and returns None when one exists, rather than taking the first"),
-        ("daemon_marks_quarantined", "both sides — the wire line and the roster — filtered through `sole()`, which is None on zero AND on more than one (issue #1086). Refusing is not resolving"),
+        ("daemon_verdict", "both sides — the wire line and the roster — filtered through `lookup()`, which since issue #1200 separates zero from more-than-one where the `sole()` it replaced returned None for both (issue #1086). Refusing is not resolving, and separating two kinds of refusal is not either"),
     ];
 
     /// The names [`every_handle_read_is_dispositioned`] compares against the register, extracted
