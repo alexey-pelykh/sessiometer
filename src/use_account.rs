@@ -1756,6 +1756,15 @@ mod tests {
         read_sites: Vec<(String, usize)>,
         /// Every function whose body calls [`resolve_target`].
         resolver_callers: Vec<String>,
+        /// Every function holding at least one read that is COMPARED rather than formatted or
+        /// forwarded, as `(function, char index of the read)`.
+        ///
+        /// [`HANDLE_READ_REGISTER`] keys on the function NAME and asks only whether that name
+        /// reads an identity field AT ALL, so a name already in it absorbs any further read for
+        /// free — including a first-match-wins lookup grown inside a function registered for
+        /// forwarding a uuid (issue #1199). This is the second question, asked per read:
+        /// [`COMPARING_READERS`] is the set that must declare every name appearing here.
+        compared_reads: Vec<(String, usize)>,
     }
 
     fn handle_reads(source: &str) -> Scan {
@@ -1763,6 +1772,7 @@ mod tests {
         let mut out = Vec::new();
         let mut callers: Vec<String> = Vec::new();
         let mut sites: Vec<(String, usize)> = Vec::new();
+        let mut compared: Vec<(String, usize)> = Vec::new();
         // Each open function body, with the brace depth it opened at and the index of that brace.
         let mut scopes: Vec<(String, usize, usize)> = Vec::new();
         let mut pending: Option<String> = None;
@@ -1862,6 +1872,9 @@ mod tests {
             }
             if let Some((field, next)) = identity_field_at(&src, i) {
                 if let Some((name, _, site)) = scopes.last() {
+                    if read_is_compared(&src, i, next) {
+                        compared.push((name.clone(), i));
+                    }
                     out.push((name.clone(), field));
                     sites.push((name.clone(), *site));
                 }
@@ -1874,11 +1887,115 @@ mod tests {
         callers.dedup();
         sites.sort_unstable();
         sites.dedup();
+        compared.sort_unstable();
+        compared.dedup();
         Scan {
             reads: out,
             read_sites: sites,
             resolver_callers: callers,
+            compared_reads: compared,
         }
+    }
+
+    /// Whether the identity-field read spanning `at..end` is COMPARED — an operand of `==` or
+    /// `!=` — rather than formatted, forwarded or assigned.
+    ///
+    /// This is the read SHAPE, and it is a second question about a read the name-keyed register
+    /// has already absorbed. `refresh` forwards `&account.account_uuid` into the refresher and is
+    /// registered for exactly that; the probe in issue #1199 adds
+    /// `.position(|a| a.label == "probe")` to that same body, and nothing about the FIRST question
+    /// moves — the name set is unchanged, the definition site is unchanged. The shape moves.
+    ///
+    /// `==` / `!=` rather than a list of search combinators, deliberately. Every `.position` /
+    /// `.find` / `.any` / `.filter` over an identity field in this crate's production code
+    /// reaches it through a closure that compares it with `==` — measured, not assumed, and
+    /// re-checkable with `git grep -nE '\.(position|find|any|filter)\(' -- src` — so the
+    /// combinator's name was never what made one visible. The operator is both the narrower
+    /// subject and the wider net: it also catches the hand-rolled `for` loop that no list of
+    /// combinator names contains.
+    ///
+    /// What it does NOT see is stated at [`COMPARING_READERS`], with the canary that pins each
+    /// residual open rather than leaving it to be discovered.
+    fn read_is_compared(src: &[char], at: usize, end: usize) -> bool {
+        comparison_follows(src, end) || comparison_precedes(src, at)
+    }
+
+    /// `==` / `!=` at `i`, and not `<=` / `>=` (whose second char is the same `=`).
+    fn equality_operator_at(src: &[char], i: usize) -> bool {
+        matches!(src.get(i), Some('=' | '!')) && src.get(i + 1) == Some(&'=')
+    }
+
+    /// `a.label == query`, looking THROUGH the two wrappers that already ship between a read and
+    /// its operator: an argument-less postfix conversion (`a.label.as_str() == query`) and a
+    /// call the read sits inside (`Some(a.account_uuid.as_str()) == active_uuid`, which is
+    /// `poke::is_active` verbatim). A scan that stopped at the first `.clone()` or the first `)`
+    /// would file both of those as formatting reads — and `is_active` is registered, in prose, as
+    /// a comparison, so the register would have contradicted the measurement on day one.
+    fn comparison_follows(src: &[char], end: usize) -> bool {
+        let mut i = end;
+        loop {
+            while src.get(i).is_some_and(|c| c.is_whitespace()) {
+                i += 1;
+            }
+            // Out of a call the read is an argument of. Only a paren opened BEFORE the read can
+            // close here: one opened after it is part of the postfix chain below, which is
+            // consumed whole.
+            if src.get(i) == Some(&')') {
+                i += 1;
+                continue;
+            }
+            if src.get(i) != Some(&'.') {
+                break;
+            }
+            let mut j = i + 1;
+            while src
+                .get(j)
+                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
+            {
+                j += 1;
+            }
+            let method: String = src[i + 1..j].iter().collect();
+            // The operator written as a method. Nothing in the tree spells it this way today, so
+            // this arm carries no register row — it is here because issue #1199 named `.eq` as a
+            // comparison shape, and a scan that saw `==` but not `.eq(` would be one token from
+            // blind.
+            if EQUALITY_METHODS.contains(&method.as_str()) && src.get(j) == Some(&'(') {
+                return true;
+            }
+            if j > i + 1 && src.get(j) == Some(&'(') && src.get(j + 1) == Some(&')') {
+                i = j + 2;
+                continue;
+            }
+            break;
+        }
+        equality_operator_at(src, i)
+    }
+
+    /// `==` and `!=` spelled as a method call, which is the same comparison.
+    const EQUALITY_METHODS: &[&str] = &["eq", "ne", "eq_ignore_ascii_case"];
+
+    /// `query == &account.label` — the same comparison written the other way round. Walks back
+    /// over the receiver path (`self.account`, `a`), an optional borrow, and any call the read is
+    /// an argument of (`query == Some(&a.label)`), then looks for the operator.
+    fn comparison_precedes(src: &[char], at: usize) -> bool {
+        let mut i = at;
+        loop {
+            while i > 0 && {
+                let c = src[i - 1];
+                c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '&'
+            } {
+                i -= 1;
+            }
+            if i > 0 && src[i - 1] == '(' {
+                i -= 1;
+                continue;
+            }
+            break;
+        }
+        while i > 0 && src[i - 1].is_whitespace() {
+            i -= 1;
+        }
+        i >= 2 && equality_operator_at(src, i - 2)
     }
 
     /// A CALL to [`resolve_target`] at `at`, and the index just past its name. The `fn` arm above
@@ -2045,6 +2162,13 @@ mod tests {
     /// either route it through [`resolve_target`] or write down, here, why the string it matches
     /// is not an operator handle.
     ///
+    /// It also does not — and cannot — see a seventh site added INSIDE a function this list
+    /// already names. "Does this function read an identity field?" is a question a name answers
+    /// once, so every further read a registered name grows is absorbed for free: issue #1199
+    /// measured a first-match-wins lookup dropped into `RealPokeEngine::refresh`, and nothing
+    /// here moved. [`COMPARING_READERS`] is the second question, asked per read rather than per
+    /// name, and it is where the residual that survives BOTH is written down.
+    ///
     /// Keyed on the function NAME, so two same-named functions in different modules share one
     /// entry. [`MULTI_SITE_READERS`] is what closes that: every name whose reads come from more
     /// than one definition must be listed there with the reason one disposition covers both, and
@@ -2177,12 +2301,95 @@ mod tests {
         ("refresh", "`impl PokeEngine for RealPokeEngine` (`src/poke.rs`) and `impl RefreshEngine for RealRefreshEngine` (`src/refresh_tick.rs`) — two unrelated traits, not one abstraction, but both forward an ALREADY-CHOSEN account's `account_uuid` into `refresh::refresh_account`, so neither resolves a handle and the shared row is exact for both. A THIRD same-named reader would not be covered by that reasoning; it reds this check and needs its own"),
     ];
 
+    /// Every function that COMPARES an identity field — an operand of `==` or `!=` — and why
+    /// that comparison is not first-match-wins resolution of an operator's handle.
+    ///
+    /// [`HANDLE_READ_REGISTER`] asks whether a function reads an identity field AT ALL, which is
+    /// a question a name can only answer once. A name already in it therefore absorbs every
+    /// further read for free, and issue #1199 measured the consequence: a first-match-wins lookup
+    /// dropped into `RealPokeEngine::refresh` — registered for FORWARDING a uuid into the
+    /// refresher — moved nothing that register can see. Not the name set, not the definition
+    /// site, not [`MULTI_SITE_READERS`]. This list is the second question, asked per read rather
+    /// than per name, and it is what that probe moves.
+    ///
+    /// Compared in both directions, so a function that GAINS a comparison reds, and so does an
+    /// entry here whose comparison has gone away.
+    ///
+    /// **What the shape scan does not see**, stated here rather than left to be discovered, and
+    /// each pinned by [`the_shape_gate_bites_on_a_comparison_grown_inside_a_registered_reader`]
+    /// so that closing one reds a test and brings a reader back to this paragraph:
+    ///
+    /// - **A comparison hoisted through a binding** — `let handle = a.label.clone();` and a
+    ///   `handle == query` some lines below. The read is followed by `;`, so its shape is
+    ///   `Plain` while its use is a comparison. The PRESENCE question above still sees the read,
+    ///   and this is the same `let` hoist
+    ///   [`the_handle_read_tripwire_bites_on_a_seventh_site`] already ships as its second shape —
+    ///   there the hoist is caught, because a new function is a new name.
+    /// - **Equality reached through a hash** — `HashSet::insert`, `HashMap::entry` / `get`. Those
+    ///   compare by hash rather than by operator, and one ships in `config::validate`
+    ///   (`uuids.insert(account.account_uuid.clone())`, the uuid-uniqueness rule). A roster
+    ///   pre-indexed into a label-keyed map and looked up by an operator string would resolve
+    ///   without ever writing `==`.
+    /// - **A non-equality predicate applied to the read** — `a.label.starts_with(q)`,
+    ///   `.ends_with`, `.contains`, `.cmp(&q) == Ordering::Equal`. Unlike the two above this IS
+    ///   reachable in one line, and a prefix-match resolver (`sessiometer use wo` → `work`) is the
+    ///   plausible one; measured, `[account].iter().position(|a| a.label.starts_with("probe"))`
+    ///   injected into a registered reader leaves this gate GREEN. Nothing in the tree spells it
+    ///   today — a `git grep -nE` over `src` for any of those four methods applied to a `label` or
+    ///   `account_uuid` read returns nothing — which is why the equality operator was chosen over
+    ///   a combinator list, rather than because the shape is unreachable.
+    ///
+    /// So the hole is narrowed rather than closed, and this is where the edge is written down as
+    /// far as it has been measured. The first two residuals are not reachable in one line — both
+    /// need a second statement or a data structure — which is the reason for stopping here rather
+    /// than teaching the scan to follow a binding across a body.
+    const COMPARING_READERS: &[(&str, &str)] = &[
+        // --- the resolver ----------------------------------------------------------------------
+        ("resolve_target", "IS the resolver — the one place an operator-supplied string is compared against a roster handle and a match SELECTED, and it counts every match rather than taking the first (#17, OQ-1)"),
+        // --- compared against an account-UUID ----------------------------------------------------
+        //
+        // Unique by construction: `config::validate` rejects a duplicated uuid, so there is no
+        // ambiguity here to refuse on. Only LABELS are un-unique, which is what R-6a is about.
+        ("apply_import", "matches an INCOMING artifact account's uuid to a local roster index, and compares that same uuid against the ACTIVE one for the adoption check"),
+        ("apply_refresh_observation", "matches a poll observation's own account-uuid back to its roster index"),
+        ("apply_refresh_restore", "matches a restore outcome's account-uuid back to its roster index"),
+        ("is_active", "compares an account's uuid to the ACTIVE uuid `active.rs` read from the credential"),
+        ("overlay_labels", "finds the account bearing a settings-overlay uuid and ASSIGNS it a label — the uuid is the config's, and the label is the output rather than the query"),
+        ("plan_capture", "matches the freshly captured OAuth account's uuid; the label is the name being ASSIGNED to it"),
+        ("reconcile_restored", "matches a restored credential's uuid back to its roster index"),
+        ("reconcile_roster", "re-indexes the roster across a config reload, by uuid"),
+        ("recovery_pending", "membership of an account's uuid in the quarantined / excluded uuid sets"),
+        ("resolve_via_display", "matches the DISPLAYED credential's uuid to a roster index — the credential is the input, not the operator"),
+        ("restash_account", "`!=` between a roster account's uuid and the displayed credential's, before restashing"),
+        ("run_sweep", "the sweep's per-account membership checks against the excluded and quarantined uuid lists"),
+        // --- compared against a LABEL ------------------------------------------------------------
+        //
+        // The un-unique field, so each of these owes an account of what it does INSTEAD of taking
+        // the first match: refuse on non-unique, or test membership and select nothing at all.
+        ("account_listed_in", "the `[refresh].accounts` allowlist — a MEMBERSHIP test over a config-supplied set, returning a bool rather than an index, and a duplicated label there legitimately admits BOTH bearers"),
+        ("cached_viability_for", "`AccountStatusLine.label` on a daemon WIRE line: it pulls a second match and returns None when one exists, rather than taking the first"),
+        ("daemon_marks_quarantined", "both sides — the wire line and the roster — filtered through `sole()`, which is None on zero AND on more than one (issue #1086). Refusing is not resolving"),
+    ];
+
     /// The names [`every_handle_read_is_dispositioned`] compares against the register, extracted
     /// so the canaries can drive the IDENTICAL predicate over a deliberately broken subject
     /// rather than over a paraphrase of it (ADR-0031 § 4 CONSTRAINT-A).
     fn functions_reading_a_handle(source: &str) -> Vec<String> {
         let mut names: Vec<String> = handle_reads(&non_test_region(source))
             .reads
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    /// The names compared against [`COMPARING_READERS`], extracted for the same reason and used
+    /// by the same canary.
+    fn functions_comparing_a_handle(source: &str) -> Vec<String> {
+        let mut names: Vec<String> = handle_reads(&non_test_region(source))
+            .compared_reads
             .into_iter()
             .map(|(name, _)| name)
             .collect();
@@ -2205,8 +2412,10 @@ mod tests {
         let mut spelled: Vec<String> = Vec::new();
         let mut callers: Vec<String> = Vec::new();
         let mut sites: Vec<(String, String, usize)> = Vec::new();
+        let mut compared: Vec<(String, String, usize)> = Vec::new();
         for (path, text) in &sources {
-            let scan = handle_reads(&non_test_region(text));
+            let region = non_test_region(text);
+            let scan = handle_reads(&region);
             reads += scan.reads.len();
             spelled.extend(scan.reads.into_iter().map(|(name, _)| name));
             sites.extend(
@@ -2214,6 +2423,13 @@ mod tests {
                     .into_iter()
                     .map(|(name, at)| (name, path.clone(), at)),
             );
+            compared.extend(scan.compared_reads.into_iter().map(|(name, at)| {
+                // Reported as `path:line`, because this message's whole job is to take its reader
+                // to the comparison it is asking about. `at` is a CHAR index, and the region is a
+                // line-prefix of the file, so the count is the file's own line number.
+                let line = region.chars().take(at).filter(|c| *c == '\n').count() + 1;
+                (name, path.clone(), line)
+            }));
             callers.extend(scan.resolver_callers);
         }
         spelled.sort_unstable();
@@ -2288,6 +2504,43 @@ mod tests {
              those listed in MULTI_SITE_READERS, each with the reason ONE register disposition \
              covers every site — measured: [{}]",
             measured.join("; ")
+        );
+
+        // The read SHAPE, which is the question the two set comparisons above cannot ask (issue
+        // #1199). Both key on a function NAME, so a name already registered absorbs any further
+        // read it grows — including a first-match-wins lookup dropped into a body registered for
+        // forwarding a uuid. Measured: that probe leaves the name set, the site set and every
+        // per-disposition count exactly where they were. It moves this.
+        //
+        // A SET, not a count, so it is silent on every commit that does not change what a
+        // function compares — the property issue #1197 removed the crate-wide read total to get.
+        compared.sort();
+        // Two comparisons can share a line (`entry == &a.label || entry == &a.account_uuid` is
+        // one, at `refresh_tick.rs:420`). One line is one place to look.
+        compared.dedup();
+        let mut comparing: Vec<String> = compared.iter().map(|(name, _, _)| name.clone()).collect();
+        comparing.dedup();
+        let mut declared: Vec<String> = COMPARING_READERS
+            .iter()
+            .map(|(name, _)| (*name).to_owned())
+            .collect();
+        declared.sort_unstable();
+        let locate = |name: &String| {
+            let at: Vec<String> = compared
+                .iter()
+                .filter(|(spelled, _, _)| spelled == name)
+                .map(|(_, path, line)| format!("{path}:{line}"))
+                .collect();
+            format!("{name} ({})", at.join(", "))
+        };
+        assert_eq!(
+            comparing,
+            declared,
+            "the functions COMPARING an identity field (`==` / `!=`) must be exactly those listed \
+             in COMPARING_READERS, each with the reason its comparison is not first-match-wins \
+             resolution of an operator handle. A name that gained one is a resolver grown inside \
+             a body already registered for reading — measured: [{}]",
+            comparing.iter().map(locate).collect::<Vec<_>>().join("; ")
         );
 
         // Per-disposition counts stay exact: the register they mirror is fifty lines up in THIS
@@ -2414,6 +2667,123 @@ mod tests {
                 "the canary's function must be absent from the register, or it proves nothing"
             );
         }
+    }
+
+    /// CONSTRAINT-A for the SHAPE half (ADR-0031 § 4) — the probe from issue #1199, committed as
+    /// the canary that issue asks for rather than left in its prose.
+    ///
+    /// The subject is `RealPokeEngine::refresh` reduced to its identity read: a body forwarding
+    /// an already-chosen account's uuid into the refresher, under a name
+    /// [`HANDLE_READ_REGISTER`] already carries. The mutation is the issue's probe — a
+    /// first-match-wins label lookup dropped into that same body.
+    ///
+    /// Both halves are asserted, because only the pair is evidence. The probe must move the
+    /// shape question, AND it must leave the two older questions exactly where they were. That
+    /// second half is not decoration: it is the measured reason this gate had to exist at all,
+    /// and it is what stops the assertion below from one day passing for a reason it does not
+    /// claim — a future widening that made the NAME question move on this probe would leave
+    /// every assertion here green while the sentence above it went false.
+    #[test]
+    fn the_shape_gate_bites_on_a_comparison_grown_inside_a_registered_reader() {
+        // Built by joining lines rather than with `\`-continuations, for the reason
+        // [`the_non_test_boundary_survives_a_cfg_test_import`] records: that escape eats the
+        // next line's leading whitespace, and this fixture's `#[cfg(test)]` must stay at column 0.
+        let body = |extra: &str| {
+            [
+                "impl PokeEngine for RealPokeEngine {",
+                "    async fn refresh(&self, account: &Account) -> Result<RefreshReport> {",
+                extra,
+                "        refresh::refresh_account(&self.stash, &account.account_uuid).await",
+                "    }",
+                "}",
+                "#[cfg(test)]",
+                "mod tests {",
+                "    fn a_test_helper(roster: &[Account], q: &str) -> bool {",
+                "        roster.iter().any(|a| a.label == q)",
+                "    }",
+                "}",
+            ]
+            .join("\n")
+        };
+        let forwarding = body("");
+        let probed = body(
+            "        let _seventh: Option<usize> = [account].iter().position(|a| a.label == \"probe\");",
+        );
+
+        // Neither older question can tell these two apart. Issue #1199's measurement, re-run
+        // here against the real predicates rather than quoted from the issue.
+        assert_eq!(
+            functions_reading_a_handle(&forwarding),
+            functions_reading_a_handle(&probed),
+            "the probe must leave the READ question unmoved — `refresh` reads an identity field \
+             either way, which is precisely why HANDLE_READ_REGISTER cannot see this"
+        );
+        assert_eq!(
+            handle_reads(&non_test_region(&forwarding)).read_sites,
+            handle_reads(&non_test_region(&probed)).read_sites,
+            "…and the SITE question with it: the probe adds no definition, so the collision \
+             check MULTI_SITE_READERS drives is unmoved too"
+        );
+
+        // The shape question moves, and moves only on the probe.
+        assert!(
+            functions_comparing_a_handle(&forwarding).is_empty(),
+            "a forwarded uuid is not a comparison — and the fixture's own test module compares \
+             one on every run, so a scan that reached past the boundary would report a resolver \
+             in every file that tests one"
+        );
+        assert_eq!(
+            functions_comparing_a_handle(&probed),
+            ["refresh"],
+            "the probe must be seen as a COMPARISON inside `refresh`, the name it hides behind"
+        );
+
+        // …and that IS a red run. Stated as the two real memberships rather than left as an
+        // inference about them: `refresh` is registered as a READER, deliberately not as a
+        // comparer, so the set comparison in `every_handle_read_is_dispositioned` cannot balance.
+        assert!(
+            HANDLE_READ_REGISTER
+                .iter()
+                .any(|(name, _, _)| *name == "refresh"),
+            "the canary's function must be REGISTERED, or it re-demonstrates the #1186 hole \
+             instead of the #1199 one"
+        );
+        assert!(
+            !COMPARING_READERS.iter().any(|(name, _)| *name == "refresh"),
+            "…and absent from COMPARING_READERS, or the probe's name would balance and the \
+             mutation would prove nothing"
+        );
+
+        // The same probe with the operator spelled as a method. Nothing in the tree writes it
+        // that way, so that arm of the scan has no register row holding it up and this assertion
+        // is the only thing between it and decoration.
+        let via_method = body(
+            "        let _seventh: Option<usize> = [account].iter().position(|a| a.label.eq(\"probe\"));",
+        );
+        assert_eq!(
+            functions_comparing_a_handle(&via_method),
+            ["refresh"],
+            "`.eq(…)` is the same comparison as `==`, and issue #1199 named it as one"
+        );
+
+        // The two residuals [`COMPARING_READERS`] documents, pinned OPEN rather than left in
+        // prose — an unasserted limit is one that quietly closes or quietly widens, and either
+        // way the paragraph promising it stops being true without anything saying so. If a
+        // future widening starts seeing one of these, this reds and sends its reader there.
+        let hoisted = body(
+            "        let handle = account.label.clone();\n        let _ = handle == \"probe\";",
+        );
+        assert!(
+            functions_comparing_a_handle(&hoisted).is_empty(),
+            "the hoist residual: a comparison one binding away from its read is NOT seen, and \
+             COMPARING_READERS says so"
+        );
+        let hashed = body("        let _ = uuids.insert(account.account_uuid.clone());");
+        assert!(
+            functions_comparing_a_handle(&hashed).is_empty(),
+            "the hash residual: equality reached through a set or a map is NOT seen either — \
+             this is `config::validate`'s uuid-uniqueness rule, and COMPARING_READERS says so"
+        );
     }
 
     /// The boundary rule, pinned against the shape that would silently blind this whole gate.
