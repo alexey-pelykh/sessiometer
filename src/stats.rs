@@ -1277,6 +1277,10 @@ impl FleetRunway {
 /// A `Some` whose [`FleetRunwayState`] is not `Known` is a COUNTED fleet whose runway is an explicit
 /// unknown ([`fleet_runway_state`] classifies which). Every such state still surfaces the cardinality
 /// and is STATED rather than omitted at the render (R-3 / R-20).
+///
+/// This is also where a BROKEN computation is recorded (issue #1036 — [`fleet_runway_fault`]): one
+/// fault per computation, emitted on the way past rather than at each surface that displays the
+/// result. Recording it cannot alter the reading — the value is returned either way (REQ-STA-B-001).
 fn fleet_runway(report: &Report) -> Option<FleetRunway> {
     if report.velocity.is_empty() {
         return None; // the per-account overlay never ran — a bare aggregate carries no fleet
@@ -1305,11 +1309,82 @@ fn fleet_runway(report: &Report) -> Option<FleetRunway> {
     if counted == 0 {
         return None; // nothing to aggregate — no fleet figure to state
     }
-    Some(FleetRunway {
+    let fleet = FleetRunway {
         state: fleet_runway_state(total_headroom, total_rate),
         counted,
         observed,
-    })
+    };
+    // The fault is recorded HERE, at the aggregation boundary, and nowhere else (issue #1036,
+    // design D-F): one fault per computation, not one per surface that happens to display it. The
+    // CLI text render, the `stats` wire and the daemon's warn probe all reach the classification
+    // through this one function, so a render-side emission would log the same broken computation
+    // once per surface — and would miss the daemon probe, which renders nothing at all.
+    //
+    // Fail-open, which is what REQ-STA-B-001 demands of a diagnostic write on the daemon path
+    // ("SHALL NOT block, delay, or alter the swap loop"): the computed value is returned either
+    // way and nothing branches on the write, so no outcome of recording the fault can change the
+    // reading, reorder the tick, or reach the swap decision. The MECHANISM is the one the issue
+    // named as the discipline to follow — the history-append precedent in `crate::daemon`
+    // (`usage-sample write skipped`), an unbuffered `eprintln!` on the same tick — and this
+    // inherits its properties verbatim, including that `eprintln!` panics if the stderr write
+    // itself fails. That is a property of the established precedent rather than of this call, and
+    // changing it here alone would leave the two diagnostics on the same tick behaving differently.
+    if let Some(fault) = fleet_runway_fault(fleet, total_headroom, total_rate) {
+        eprintln!("{fault}");
+    }
+    Some(fleet)
+}
+
+/// The operator-facing fault line for a fleet-runway computation that could not be performed, or
+/// `None` when there is nothing to report (issue #1036 — R-15's "record it as a fault rather than
+/// rendering it", at the boundary design D-F names).
+///
+/// ONLY [`Unmeasurable`](FleetRunwayState::Unmeasurable) is a fault. The other three states are
+/// outcomes, not breakages, and the distinction is the whole content of this function:
+///
+/// - [`Known`](FleetRunwayState::Known) computed a figure.
+/// - [`Flat`](FleetRunwayState::Flat) measured every counted account and found none of it burning.
+/// - [`BeyondWeeklyWindow`](FleetRunwayState::BeyondWeeklyWindow) is a BOUND on a well-formed
+///   reading, and an ordinary fleet with ample head-room and a modest burn trips it routinely —
+///   the gate is on the RATIO. `docs/specs/fleet-runway-degeneracy.feature.md` carries this as an
+///   amendment recorded against the delivered #1028: R-15 was drafted expecting one lumped
+///   "non-finite, saturated, or implausible" case, and #1028 split it into a benign bound and a
+///   genuine breakage. Faulting on the bound would raise a defect signal on a healthy fleet, which
+///   is why the amendment reserves the fault for the broken case and this function honours it.
+///
+/// **This is a fail-closed backstop, and today it cannot fire from a well-formed [`Report`].**
+/// [`replay_velocity_ema`] is non-negative by construction (a drop resets) and `weekly_headroom` is
+/// `.max(0.0)` over a finite subtraction, so the pooled sums [`fleet_runway`] passes in are finite
+/// and non-negative and land in one of the other three states. That is a property of TODAY's
+/// upstream guarantees, not of this classification: `Unmeasurable` means one of those guarantees
+/// broke, which is precisely a fault worth recording and precisely why it must not be silent when
+/// it does. The arm is exercised directly rather than through a `Report`, for the reason
+/// [`fleet_runway_phrase`] is — a string only a degenerate input can produce is the one that ships
+/// unread.
+///
+/// The pooled inputs are named in the line because stderr is the operator-scoped sink that keeps
+/// FULL detail (the two-sink split issues #627 + #642 draw for the malformed-config fault), and
+/// they are the entire evidence for which upstream guarantee gave way. They are NOT on any
+/// user-facing stat string, which keeps R-21 intact.
+///
+/// REQ-STA-SUR-001: the line states what happened and carries no imperative remedy — it is scanned
+/// against the central banned vocabulary by its test, the same guard the rendered phrases pass,
+/// rather than by inspection. Named plainly rather than linked, as `src/cli.rs`'s shipping-code
+/// references to it are: `crate::framing_vocabulary` is `#[cfg(test)]`, so an intra-doc link from
+/// a non-test item does not resolve under `cargo doc`.
+fn fleet_runway_fault(fleet: FleetRunway, headroom: f64, rate: f64) -> Option<String> {
+    match fleet.state {
+        FleetRunwayState::Unmeasurable => Some(format!(
+            "sessiometer: fleet-runway fault: pooled head-room {headroom:?} over rate {rate:?} \
+             is not a usable measurement ({} of {} counted) — no runway stated",
+            fleet.counted, fleet.observed
+        )),
+        // Exhaustive rather than a wildcard: a fifth state must be classified here deliberately,
+        // not defaulted into silence (or into a spurious fault) by a match arm nobody revisited.
+        FleetRunwayState::Known(_)
+        | FleetRunwayState::Flat
+        | FleetRunwayState::BeyondWeeklyWindow => None,
+    }
 }
 
 /// The plausibility bound on a fleet runway: ONE weekly window.
@@ -8993,6 +9068,162 @@ mod tests {
         // would be invisible on the surface that reports it.
         let distinct: std::collections::HashSet<_> = phrases.iter().map(|(_, p)| p).collect();
         assert_eq!(distinct.len(), 4, "each state states its own condition");
+    }
+
+    #[test]
+    fn only_a_broken_fleet_runway_computation_records_a_fault() {
+        // Issue #1036 / R-15. The discriminating half is the three states that must NOT fault:
+        // a function returning `Some` unconditionally would satisfy "the broken case is recorded"
+        // and be wrong, and `BeyondWeeklyWindow` is the arm where being wrong is expensive — an
+        // ordinary fleet with ample head-room trips that bound routinely, so faulting on it would
+        // raise a defect signal on a healthy fleet. `docs/specs/fleet-runway-degeneracy.feature.md`
+        // carries that as an amendment against the delivered #1028; this is the amendment enforced.
+        let counted = FleetRunway {
+            state: FleetRunwayState::Unmeasurable,
+            counted: 2,
+            observed: 3,
+        };
+        for state in [
+            FleetRunwayState::Known(50_000),
+            FleetRunwayState::Flat,
+            FleetRunwayState::BeyondWeeklyWindow,
+        ] {
+            assert_eq!(
+                fleet_runway_fault(FleetRunway { state, ..counted }, 1.18, 1e-310),
+                None,
+                "{state:?} is an outcome, not a breakage — it records no fault"
+            );
+        }
+
+        // ...and the one that IS a breakage does record one. Paired with the loop above, this is
+        // what makes the function discriminating rather than merely quiet or merely loud.
+        let fault =
+            fleet_runway_fault(counted, f64::NAN, -1.0).expect("a broken computation faults");
+
+        // The pooled inputs ARE the evidence for which upstream guarantee gave way — stderr is the
+        // operator-scoped sink that keeps full detail (the #627 / #642 two-sink split), so the
+        // R-21 ban on implementation vocabulary that governs the rendered phrase does not reach
+        // here. Asserting them by value rather than asserting the whole string keeps this from
+        // being a golden-string test (premortem P6).
+        for evidence in ["NaN", "-1.0", "2 of 3 counted"] {
+            assert!(
+                fault.contains(evidence),
+                "the fault carries {evidence:?} as evidence: {fault}"
+            );
+        }
+        assert!(
+            fault.starts_with("sessiometer: "),
+            "the fault is prefixed like every other line this binary writes: {fault}"
+        );
+
+        // REQ-STA-SUR-001: a fault message states what happened, not what to do about it. Scanned
+        // by the same central guard the rendered phrases pass, not by eye — `warn`, `critical`,
+        // `fix`, `should` and the rest of the vocabulary are exactly what a fault line reaches for.
+        assert_eq!(
+            scan_banned(&fault),
+            None,
+            "the fault states the condition and prescribes nothing: {fault}"
+        );
+
+        // The cardinality is READ from the value, not hard-coded around it: a fault that always
+        // said `2 of 3` would pass the containment check above on any fleet.
+        let other = fleet_runway_fault(
+            FleetRunway {
+                counted: 5,
+                observed: 9,
+                ..counted
+            },
+            f64::INFINITY,
+            1.0,
+        )
+        .expect("still a breakage");
+        assert!(
+            other.contains("5 of 9 counted") && other.contains("inf"),
+            "the line reports THIS computation, not a fixed one: {other}"
+        );
+    }
+
+    #[test]
+    fn no_well_formed_report_reaches_the_fleet_runway_fault() {
+        // The companion to the test above, and the reason this fault is a BACKSTOP rather than a
+        // live signal: `replay_velocity_ema` is non-negative by construction and `weekly_headroom`
+        // is `.max(0.0)` over a finite subtraction, so every state a real `Report` can produce is
+        // one of the three that record nothing. Stated as a test so the claim in
+        // `fleet_runway_fault`'s doc is checked rather than asserted, and so that a future change
+        // making `Unmeasurable` reachable from a report fails HERE — where the reachability claim
+        // lives — instead of silently turning a backstop into a routine log line.
+        let now = epoch("2026-07-01T12:00:00Z");
+        let reports = [
+            (
+                "known",
+                velocity_report(
+                    vec![
+                        sample(now - 900, "work", 0.60, 0.50),
+                        sample(now - 600, "work", 0.65, 0.60),
+                        sample(now - 300, "work", 0.70, 0.70),
+                    ],
+                    now,
+                ),
+            ),
+            (
+                "flat",
+                velocity_report(
+                    vec![
+                        sample(now - 900, "work", 0.60, 0.60),
+                        sample(now - 600, "work", 0.60, 0.60),
+                        sample(now - 300, "work", 0.60, 0.60),
+                    ],
+                    now,
+                ),
+            ),
+            (
+                "out-of-window",
+                velocity_report(
+                    vec![
+                        sample(now - 900, "work", 0.60, 0.50),
+                        sample(now - 600, "work", 0.60, 0.50),
+                        sample(now - 300, "work", 0.60, 0.50 + f64::EPSILON),
+                    ],
+                    now,
+                ),
+            ),
+            // A POOLED fleet, and the reason it is here: every fixture above counts ONE account,
+            // so a bound written for a single account's fraction and mis-applied to the Σ would
+            // pass this sweep untouched. Three counted accounts at 0.20 weekly pool 2.25 of
+            // head-room — over any per-account ceiling — so the aggregation dimension is exercised.
+            (
+                "pooled",
+                velocity_report(
+                    vec![
+                        sample(now - 900, "work", 0.30, 0.10),
+                        sample(now - 600, "work", 0.35, 0.15),
+                        sample(now - 300, "work", 0.40, 0.20),
+                        sample(now - 900, "home", 0.30, 0.10),
+                        sample(now - 600, "home", 0.35, 0.15),
+                        sample(now - 300, "home", 0.40, 0.20),
+                        sample(now - 900, "spare", 0.30, 0.10),
+                        sample(now - 600, "spare", 0.35, 0.15),
+                        sample(now - 300, "spare", 0.40, 0.20),
+                    ],
+                    now,
+                ),
+            ),
+        ];
+        for (label, report) in &reports {
+            let fleet = fleet_runway(report).expect("a counted fleet");
+            assert_ne!(
+                fleet.state,
+                FleetRunwayState::Unmeasurable,
+                "{label}: a well-formed report never lands in the fault state"
+            );
+        }
+        // The sweep is not vacuous on a degenerate fixture: the three genuinely differ, so
+        // "none of them faults" is a statement about three states rather than about one repeated.
+        let states: std::collections::HashSet<_> = reports
+            .iter()
+            .map(|(_, r)| format!("{:?}", fleet_runway(r).unwrap().state))
+            .collect();
+        assert_eq!(states.len(), 4, "four distinct readings were exercised");
     }
 
     #[test]
