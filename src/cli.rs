@@ -5642,7 +5642,7 @@ mod tests {
     // spends. One scanner per audience; the exemption sets are measured, not inherited.
     use crate::framing_vocabulary::{
         help_banned_tokens, scan_advisory_banned, scan_banned, scan_help_banned, scan_usage_banned,
-        ADVISORY_EXEMPT_TOKENS, USAGE_EXEMPT_TOKENS,
+        scan_with, ADVISORY_EXEMPT_TOKENS, BANNED_PHRASES, USAGE_EXEMPT_TOKENS,
     };
     use std::path::PathBuf;
 
@@ -12410,76 +12410,69 @@ spare  22222222-2222\n\
         ("STATS_USAGE", STATS_USAGE),
     ];
 
-    /// The framing vocabulary the expiry help must never reach for (issue #885 / §D-STA-6): the
-    /// acquisitive CALL the issue enumerates, plus the recommendation and alarmist-projection
-    /// framing that turns a stated deadline into a call to action.
+    /// The tokens this guard ADDS to the repo-wide `--help` subset — the whole of what it
+    /// contributes beyond
+    /// `every_help_surface_carries_no_banned_framing_but_the_guard_bites_on_injection`, which
+    /// already scans these same surfaces. That overlap is ASSERTED rather than argued, in
+    /// [`the_expiry_guard_still_earns_its_extras_against_the_central_list`] below, because the
+    /// remedy that test names — delete this guard — is only safe while it holds.
     ///
-    /// Deliberately NARROWER than the central `BANNED_TOKENS`, and the difference is the point:
-    /// that list bans `remove` / `disable` / `enable`, which are this CLI's own COMMAND NAMES and
-    /// appear in `ROOT_USAGE` as such, and `add`, which `STATUS_USAGE` — a surface scanned right
-    /// here — spends on its own `-v` line ("add each account's access-token expiry").
+    /// `beat` is the circumvention CALL §D-STA-6 enumerates — "beat/bypass limits", the same list
+    /// that carries buy / purchase / upgrade / cancel — of the same class as the central `bypass`,
+    /// which [`crate::framing_vocabulary::BANNED_TOKENS`] already carries. This one it does not,
+    /// and that gap is this guard's entire reason to still exist: issue #918 KEPT it on exactly
+    /// that ground. Issue #885 is the SURFACE this guard scans, not the source of the list.
     ///
-    /// Issue #918 settled that repo-wide: the vocabulary moved to `crate::framing_vocabulary`,
-    /// `--help` is now scanned in FULL by
-    /// `every_help_surface_carries_no_banned_framing_but_the_guard_bites_on_injection`, and those
-    /// four mechanical verbs are the measured exemption set. This narrower guard is KEPT rather
-    /// than folded in, because it is not redundant: it uniquely contributes `beat`, a token the
-    /// central list does not carry. That relationship is asserted, not asserted-in-prose, by
-    /// `the_repo_wide_help_guard_subsumes_the_expiry_guard_bar_its_own_extras` below — so if the
-    /// central list ever grows `beat`, this guard becomes genuinely redundant and that test says
-    /// so.
-    const EXPIRY_HELP_BANNED_TOKENS: &[&str] = &[
-        // The acquisitive call (issue #885's enumerated list).
-        "buy",
-        "purchase",
-        "upgrade",
-        "cancel",
-        "bypass",
-        "beat",
-        // Recommendation framing — "you should re-login".
-        "should",
-        "must",
-        "ought",
-        "recommend",
-        "recommended",
-        "suggest",
-        "consider",
-        "advise",
-        // Alarmist projection framing — a deadline is a FACT, never a forecast.
-        "forecast",
-        "predict",
-        "projected",
-        "anticipate",
-        "imminent",
-        "soon",
-    ];
+    /// It stays LOCAL rather than joining the central list, which issue #1134 asked directly, and
+    /// the reason is that `beat` is a HOMOGRAPH this crate already spends neutrally:
+    /// `src/daemon/socket.rs` calls the `watch` liveness frame a "beat" throughout. The central
+    /// list is scanned by every audience in that module's table, one of them (`Error`'s
+    /// templates, issue #1139) with NO exemption set at all, so banning `beat` there would put it
+    /// in front of the daemon's own liveness vocabulary. Measured: no scanned surface spells the
+    /// bare word today — `socket.rs` uses it only in comments and a local — so the exposure is
+    /// prospective, and its redemption would be a per-variant ledger entry. On the surfaces below
+    /// the word has one reading — outrunning a refresh-token
+    /// deadline — which is where the ban is earned, so that is where it lives. The cost of that
+    /// choice is stated rather than hidden: `beat` remains unscanned on every OTHER
+    /// operator-facing surface.
+    const EXPIRY_HELP_EXTRA_TOKENS: &[&str] = &["beat"];
 
-    /// Acquisitive calls spanning adjacent words, which the single-token scan misses — the same
-    /// shape `stats.rs`'s `BANNED_PHRASES` guards, including issue #885's `need more`.
-    const EXPIRY_HELP_BANNED_PHRASES: &[&str] = &["need more", "top up", "get more"];
+    /// The token list [`scan_expiry_help`] scans against: the repo-wide help subset (issue #918)
+    /// plus [`EXPIRY_HELP_EXTRA_TOKENS`], DERIVED on every call rather than hand-listed.
+    ///
+    /// Issue #1134: this used to be a hand-maintained token list beside its own inline word-split
+    /// — a second definition of "what counts as a word" that nothing asserted agreed with
+    /// `crate::framing_vocabulary`'s, and which already diverged (that tokenizer strips ANSI SGR
+    /// runs; this one did not). Deriving the list is the rule
+    /// `crate::framing_vocabulary::banned_tokens_except` applies to the exemption-based
+    /// audiences, run the other way round: this audience ADDS to the central subset instead of
+    /// subtracting from it, so a token added centrally is covered here on the next run without a
+    /// second edit.
+    ///
+    /// The derivation also STRENGTHENS the guard, and the direction is worth being exact about.
+    /// The hand list carried no value-judgement token at all — no `healthy`, no `critical`, no
+    /// `risk` — so "the EXPIRY column is healthy" cleared it. That was never a live gap, because
+    /// the repo-wide help guard scans these same constants and does carry them; what it was is a
+    /// second list to maintain, drifting from the first in both directions at once.
+    fn expiry_banned_tokens() -> Vec<&'static str> {
+        help_banned_tokens()
+            .into_iter()
+            .chain(EXPIRY_HELP_EXTRA_TOKENS.iter().copied())
+            .collect()
+    }
 
-    /// The first banned token or phrase in `text`, or `None` when it is clean. Matches whole
-    /// lowercase WORDS on non-alphanumeric boundaries, mirroring `stats.rs`'s `scan_banned`, so
-    /// `bypasses` does not trip `bypass` and an account handle never false-trips.
+    /// The first banned token or acquisitive phrase in `text`, or `None` when it is clean —
+    /// [`crate::framing_vocabulary::scan_with`], the ONE tokenizer every framing guard shares,
+    /// over [`expiry_banned_tokens`] and the central `BANNED_PHRASES`.
+    ///
+    /// The phrase list is the central one UNCHANGED, where this guard used to add `need more`.
+    /// That extra is not dropped coverage but a provably DEAD entry: `scan_with` matches every
+    /// token before any phrase, and any text where the phrase `need more` matches contains the
+    /// word `need`, which the derived token list above carries. So the sentence is still caught —
+    /// on `need`, one word earlier, and now also when it is spelled without `more`. The bite
+    /// assertion below reports `need` rather than `need more` for exactly this reason.
     fn scan_expiry_help(text: &str) -> Option<&'static str> {
-        let words: Vec<String> = text
-            .split(|c: char| !c.is_ascii_alphanumeric())
-            .filter(|w| !w.is_empty())
-            .map(str::to_ascii_lowercase)
-            .collect();
-        if let Some(hit) = EXPIRY_HELP_BANNED_TOKENS
-            .iter()
-            .copied()
-            .find(|b| words.iter().any(|w| w == b))
-        {
-            return Some(hit);
-        }
-        EXPIRY_HELP_BANNED_PHRASES.iter().copied().find(|phrase| {
-            let parts: Vec<&str> = phrase.split(' ').collect();
-            words
-                .windows(parts.len())
-                .any(|win| win.iter().zip(&parts).all(|(w, p)| w.as_str() == *p))
-        })
+        scan_with(text, &expiry_banned_tokens(), BANNED_PHRASES)
     }
 
     /// Issue #885 AC1–AC3: the operator-facing help states the per-account expiry cell, the
@@ -12568,7 +12561,27 @@ spare  22222222-2222\n\
         );
         assert_eq!(
             scan_expiry_help(&format!("{STATUS_USAGE}\nRunning out — need more seats.")),
-            Some("need more")
+            Some("need"),
+            "the acquisitive call is caught on the central token, one word before the phrase"
+        );
+
+        // The token this guard exists FOR (issue #918 kept it on this one contribution alone),
+        // and until issue #1134 nothing asserted it fires at all — every bite above is a token
+        // the repo-wide help guard already carries, so the whole set would have passed with
+        // `beat` absent from the list.
+        assert_eq!(
+            scan_expiry_help(&format!("{STATUS_USAGE}\nYou can beat the deadline.")),
+            Some("beat"),
+            "`beat` is this guard's only unique contribution — it must bite"
+        );
+
+        // Derivation control, in the direction the hand list was WEAK: a value judgement. The
+        // old list carried none, so this line cleared the expiry guard entirely and was caught
+        // only by the repo-wide scan over the same constants.
+        assert_eq!(
+            scan_expiry_help(&format!("{STATUS_USAGE}\nYour credential is healthy.")),
+            Some("healthy"),
+            "the derived list must carry the central value-judgement group the hand list omitted"
         );
 
         // …and it does NOT bite the permitted FACT: the deadline itself, its `lapsed` state, and
@@ -12961,39 +12974,122 @@ spare  22222222-2222\n\
         }
     }
 
-    /// The two help guards' relationship, ASSERTED rather than described: the repo-wide scan
-    /// covers everything issue #885's narrower expiry guard covers, bar two extras that keep the
-    /// older guard worth its lines.
+    /// The two help guards' division of labour, ASSERTED rather than described — and since issue
+    /// #1134 derived one from the other, what is left to assert has NARROWED to exactly the half
+    /// that is still contingent.
+    ///
+    /// Subsumption itself is no longer a claim: [`expiry_banned_tokens`] IS
+    /// [`help_banned_tokens`] plus [`EXPIRY_HELP_EXTRA_TOKENS`], so the repo-wide subset cannot
+    /// fail to be contained. What remains open is whether those extras are still EARNED — an
+    /// extra the central list has since grown is a dead entry that reads like a live carve-in,
+    /// the mirror of the dead exemption `every_help_exemption_is_still_earned_by_the_shipped_help`
+    /// guards against. When the central list grows `beat`, this reddens, and the remedy is to
+    /// DELETE this guard: it would then contribute nothing the repo-wide scan does not, over
+    /// constants that scan already covers.
+    ///
+    /// A structural claim needs a control or it is decoration, so the containment half is proved
+    /// by DIFFERENCE rather than by construction: a central token the hand list omitted must now
+    /// be present. Both halves would pass over an empty derivation; neither would over a wrong one.
     #[test]
-    fn the_repo_wide_help_guard_subsumes_the_expiry_guard_bar_its_own_extras() {
+    fn the_expiry_guard_still_earns_its_extras_against_the_central_list() {
         let repo_wide = help_banned_tokens();
-        let mut extra: Vec<&str> = EXPIRY_HELP_BANNED_TOKENS
+        let mut still_earned: Vec<&str> = EXPIRY_HELP_EXTRA_TOKENS
             .iter()
             .copied()
             .filter(|token| !repo_wide.contains(token))
             .collect();
-        extra.sort_unstable();
+        still_earned.sort_unstable();
         assert_eq!(
-            extra,
+            still_earned,
             ["beat"],
-            "the expiry guard's only unique TOKEN should be `beat`; if this set changed, the two \
-             guards' division of labour changed with it"
+            "the expiry guard's only unique TOKEN should be `beat`, and still absent centrally; \
+             if the central list grew it, this guard is now redundant — delete it rather than \
+             widen this test"
         );
 
-        // Its phrase list carries one extra too — `need more` — but the repo-wide scan already
-        // catches that sentence on the single token `need`, so the phrase is not a coverage gap.
-        let mut extra_phrases: Vec<&str> = EXPIRY_HELP_BANNED_PHRASES
-            .iter()
-            .copied()
-            .filter(|phrase| !crate::framing_vocabulary::BANNED_PHRASES.contains(phrase))
-            .collect();
-        extra_phrases.sort_unstable();
-        assert_eq!(extra_phrases, ["need more"]);
-        assert_eq!(
-            scan_help_banned("running out — need more seats"),
-            Some("need"),
-            "`need more` is covered repo-wide by the single token `need`"
+        // …and the remedy that names — DELETE this guard — is only safe while the repo-wide scan
+        // actually reaches every constant below. That is the premise the whole division of
+        // labour rests on, so it is asserted here rather than argued in the doc above.
+        let scanned_repo_wide: Vec<&str> = help_surfaces().iter().map(|(name, _)| *name).collect();
+        for (name, _) in EXPIRY_HELP_SURFACES {
+            assert!(
+                scanned_repo_wide.contains(name),
+                "{name} is scanned by the expiry guard but NOT repo-wide — deleting this guard \
+                 once `beat` goes central would drop that surface's coverage entirely"
+            );
+        }
+
+        // The containment control. `healthy` is central, was NOT in the hand list this derivation
+        // replaced, and is the group that list omitted wholesale — so its presence here is
+        // evidence the derivation is wired, not merely declared.
+        let derived = expiry_banned_tokens();
+        assert!(
+            derived.contains(&"healthy"),
+            "the derived list must carry the central tokens the hand list lacked"
         );
+        assert_eq!(
+            derived.len(),
+            repo_wide.len() + EXPIRY_HELP_EXTRA_TOKENS.len(),
+            "the derived list is not exactly the repo-wide subset plus the extras — a duplicate \
+             or a smuggled token leaves every containment check below green"
+        );
+        for token in &repo_wide {
+            assert!(
+                derived.contains(token),
+                "{token:?} is scanned repo-wide on --help but not by the expiry guard, which \
+                 derives from that same subset"
+            );
+        }
+
+        // The phrase list is now the central one unchanged. The `need more` extra it used to add
+        // was provably dead — `scan_with` matches every token before any phrase, and text where
+        // that phrase matches always contains the word `need`, which the derived list carries. So
+        // the sentence is still caught, one word earlier, and now also without the `more`.
+        assert_eq!(
+            scan_expiry_help("running out — need more seats"),
+            Some("need"),
+            "`need more` is covered by the single central token `need`"
+        );
+        assert_eq!(
+            scan_expiry_help("running out — we need seats"),
+            Some("need"),
+            "and now also when the sentence omits `more`, which the phrase could not catch"
+        );
+    }
+
+    /// Issue #1134's subject, proved rather than argued: the expiry guard reaches the SAME
+    /// tokenizer as every other framing scan, so it can no longer disagree with them about what
+    /// counts as a word.
+    ///
+    /// ANSI is the divergence the issue names, and it is a live concern in this file rather than
+    /// a hypothetical — `render_cells` wraps table cells in SGR runs. The constants this
+    /// guard scans carry none today, which is why it was filed as a drift hazard and not a
+    /// defect; the point of the assertion is that the hazard is now closed at the root instead of
+    /// resting on those constants staying plain.
+    ///
+    /// The inline split this replaced is what makes the first assertion discriminating rather
+    /// than decorative: it split on every non-alphanumeric char, so `\x1b[31mupgrade` tokenised
+    /// as the single word `31mupgrade` and the banned word inside it was invisible.
+    #[test]
+    fn the_expiry_guard_shares_the_one_tokenizer() {
+        // A colour-wrapped banned word tokenises intact — the SGR run is stripped, not split on.
+        assert_eq!(
+            scan_expiry_help("\x1b[31mupgrade\x1b[0m your plan"),
+            Some("upgrade"),
+            "an SGR-wrapped word must tokenise intact, as it does for every other framing scan"
+        );
+        // …and the extra this guard owns goes through that same tokenizer, so the carve-in cannot
+        // be the one place the old word-split survived.
+        assert_eq!(
+            scan_expiry_help("\x1b[33mbeat\x1b[0m the deadline"),
+            Some("beat")
+        );
+
+        // The other tokenizer properties, asserted here too rather than inherited by argument:
+        // case folding, punctuation boundaries, and `bypasses` not tripping `bypass`.
+        assert_eq!(scan_expiry_help("you SHOULD re-login."), Some("should"));
+        assert_eq!(scan_expiry_help("nothing bypasses it"), None);
+        assert_eq!(scan_expiry_help("a heartbeat every 30s"), None);
     }
 
     // --- the framing guard, over operator advisories and usage prose (issue #1123) ----
