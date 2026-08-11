@@ -2194,6 +2194,16 @@ where
     ///   counted-but-FLAT fleet, and an `Unmeasurable` one all HOLD the guard: neither fire nor
     ///   re-arm, so a momentary store hiccup or flat-burn reading never fabricates a crossing or a
     ///   recovery.
+    /// - **Holding is not calling the fleet healthy, and issue #1036 is where that stopped being
+    ///   silent** — for ONE of those four cases. The hold itself is unchanged and deliberately so:
+    ///   an unknown supplies no evidence, so firing would fabricate a figure and re-arming would
+    ///   fabricate a recovery, and #1028 already gave the edge the one unknown that DOES carry
+    ///   evidence (`BeyondWeeklyWindow`) its own arm. What changed is upstream: an `Unmeasurable`
+    ///   reading now records a fault where it is computed
+    ///   ([`crate::stats`]'s `fleet_runway_fault`), on this same probe call, so the broken
+    ///   computation this helper declines to act on is visible instead of merely absent. The other
+    ///   three stay silent here and there, correctly — a `None` aggregate and a `Flat` fleet are
+    ///   honest degradation rather than breakage, and nothing in this helper reports them.
     /// - **`BeyondWeeklyWindow` is NOT one of those unknowns for the recovery question**
     ///   (issue #1028). It states no figure — so it can never FIRE — but it does establish that the
     ///   pool outlasts a week, which settles "is the fleet at/above the line?" for any threshold at
@@ -2294,9 +2304,9 @@ where
         // Only a KNOWN runway may FIRE — the payload states a figure, so an unknown must never
         // fabricate one. This is the asymmetry that keeps the saturated-`i64::MAX` defect fixed:
         // an implausible reading can no longer clear a genuine signal, and cannot raise one either.
-        // Issue #1036 filed that exposure against this function; its own deliverable — RECORDING an
-        // implausible computation as a fault, at the aggregation boundary rather than here — is
-        // deliberately not part of this change.
+        // Issue #1036 filed that exposure against this function; its own deliverable — RECORDING a
+        // BROKEN computation as a fault — landed at the aggregation boundary rather than here, in
+        // `crate::stats`'s `fleet_runway_fault`, so this helper still emits no diagnostics at all.
         let FleetRunwayState::Known(runway_secs) = fleet.state else {
             return; // UNKNOWN → hold the guard: neither fire nor re-arm
         };
