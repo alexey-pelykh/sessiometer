@@ -47,28 +47,54 @@ crate is binary-only with no `[features]` table), so dropping them still passes 
 a feature or a `[lib]` target, at which point your local gate silently stops predicting CI.
 
 These five do **not** cover the other path-filtered jobs in `ci.yml`, and every one of those runs
-locally too. Run the matching one when you touch its paths:
+locally too. Run the matching one when you touch its paths. `.github/workflows/ci.yml` is in all
+three filters, so editing it re-runs every one of them.
 
-- `src/**`, `Cargo.toml`, `Cargo.lock` → **`msrv`**, the one that surprises people: it re-runs
+**`msrv` and `deny` share one trigger, and it is much wider than dependency work.** Both are
+`if: needs.changes.outputs.rust == 'true'`, and so is `test`, whose commands are the five above. The
+`rust` filter is `src/**`, `Cargo.toml`, `Cargo.lock`, `deny.toml`, `build/fixtures/**`,
+`scripts/**`, `.cargo/**`, `build.rs`, `**/build.rs`, `rust-toolchain.toml`, `rust-toolchain`,
+`rustfmt.toml`, `clippy.toml`, `.github/workflows/ci.yml`, and `src/**` is the entry that gets
+missed. **An ordinary source edit owes both jobs**: any change under `src/**` puts the PR in this
+filter, whether or not it touches a dependency. The wording this replaced named only the
+dependency-shaped paths under `deny`, so a `src/**`-only diff read as "`deny` not owed" — a false
+line that went into commit bodies, where squash-merge makes it permanent.
+
+Every path list in this section is a copy, and `ci.yml` wins wherever they disagree. Print the live
+filters block with `awk '/filters: \|/,/^  [a-z-]+:$/' .github/workflows/ci.yml`; it stops at the
+next two-space key rather than at a blank line, so it over-prints rather than truncating in silence.
+
+- the `rust` filter → **`msrv`**, the one that surprises people: it re-runs
   `cargo build --verbose` + `cargo test --verbose` on a **different toolchain** (`RUST_MSRV` in
   `ci.yml`), so a newer-std API or a dependency bump passes all five above and still fails here.
   Reproduce with `cargo +<RUST_MSRV> build && cargo +<RUST_MSRV> test`.
-- a dependency, `Cargo.toml`, `deny.toml` → **`deny`**: `./scripts/check-no-security-framework.sh`,
-  then `cargo deny check advisories sources licenses`.
-- `apps/menubar/**` → **`swift`**: `./scripts/check-menubar-zero-egress.sh`, then the app build
-  below.
+- the `rust` filter → **`deny`**, whose two checks differ in what they need locally. The first,
+  `./scripts/check-no-security-framework.sh`, runs off `cargo metadata` and `jq`. The second,
+  `cargo deny check advisories sources licenses`, needs `cargo-deny`, which is not part of the
+  toolchain — `cargo install --locked cargo-deny`, or `brew install cargo-deny`. Run both; if you
+  ran only the first, say so rather than reporting the job as run.
+- `apps/menubar/**`, `build/fixtures/**` or `.github/workflows/ci.yml` → **`swift`**:
+  `./scripts/check-menubar-zero-egress.sh`, then the app build below. The fixtures are in that
+  filter because the Swift byte-drift guard pins against the Rust-emitted wire goldens, so a golden
+  re-baseline touching no `apps/menubar/**` path still owes this job — and `panel-goldens` with it.
 - the same paths as `swift` → **`panel-goldens`**, the panel-appearance drift check, and the one job
   here the row above does **not** get you: the app build below leaves both committed-golden
   comparisons *skipped*, and the CI job is soft (§ Before you merge below), so neither surface can
   tell you the panel drifted. Its armed command is in § Menu-bar app below.
-- `Formula/**` → **`formula`**: `./scripts/check-formula.sh` (`brew style` + `brew audit --strict`).
+- `Formula/**`, `scripts/check-formula.sh` or `.github/workflows/ci.yml` → **`formula`**:
+  `./scripts/check-formula.sh` (`brew style` + `brew audit --strict`). Its own guard is in that
+  filter — and `scripts/**` puts that guard in the `rust` filter too, so editing it re-runs `test`,
+  `msrv` and `deny` as well.
 
-↳ Convention only — nothing reconciles this list against `ci.yml`, and that was decided rather than
-assumed: a check is buildable, but it lands in `scripts/**` plus the `doc-gates` job — gate paths, so
-it carries `Gate-Change-Acknowledged:` and re-runs every Rust job — which makes it its own change to
-argue for, not a rider on a docs fix. Until then, re-derive the list rather than trusting it: `grep
--B2 'if: needs.changes' .github/workflows/ci.yml | grep name:` prints every path-filtered job, and
-all of them but `test` belong above.
+↳ Convention only — nothing reconciles these lists against `ci.yml`. That is a decision rather than
+an oversight: such a check lands in `scripts/**` plus the `doc-gates` job, both gate paths, so it is
+a change to the gates themselves and has to be argued on its own rather than ridden in on a docs
+fix. Enumerating the filters verbatim, as this section now does, widens the copy and raises what
+that check would be worth — the case is stronger than it was, and still not made here. Until it is,
+re-derive both halves rather than trusting either: the `awk` above prints the live filters, and
+`grep -B2 'if: needs.changes' .github/workflows/ci.yml | grep name:` prints every path-filtered job
+(all of them but `test` belong above). The `grep` prints no paths at all, so it cannot tell you a
+row's trigger has drifted — which is the half that actually went wrong here.
 
 The toolchain is **not** pinned in-repo — there is no `rust-toolchain.toml`. CI pins `RUST_STABLE`
 and `RUST_MSRV` in `ci.yml`, and `-D warnings` behaviour is toolchain-sensitive, so prefix
