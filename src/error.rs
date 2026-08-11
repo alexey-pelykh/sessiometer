@@ -1578,8 +1578,58 @@ pub(crate) mod tests {
     /// an operator, so scanning them would report a firewall breach every other paragraph while
     /// telling an operator nothing. And dropping them first means the variant identifier is
     /// simply the next word after the attribute, with no doc block to walk over.
+    ///
+    /// # What that cut costs, and the check that makes the cost loud
+    ///
+    /// The filter is a LINE filter, so it cannot tell a `//` that opens a comment from a `//`
+    /// that is CHARACTERS INSIDE a template — a URL split across a `\` line continuation being
+    /// the way to write one by accident. Such a line is deleted mid-literal; the walk below never
+    /// meets the closing quote, `in_string` stays true past the attribute's own `)`, and the walk
+    /// runs on and swallows the NEXT attribute whole. One variant's prose then goes unscanned,
+    /// and issue #1162 is what that cost before this paragraph existed: the condition surfaced
+    /// only as a cardinality drop, whose message read as "you added a variant" and sent its
+    /// reader to bump the pin — defeating the backstop that caught it.
+    ///
+    /// So the walk checks ITSELF, below: every `#[error(` in the source it actually read must
+    /// have STARTED a parsed attribute. That is a self-consistency property, not a second model
+    /// of Rust — it needs no lexer, and it is blind to the CAUSE, so it reports the swallow
+    /// however one came about. Its reach is exactly that, and no further, in TWO directions —
+    /// both stated here because a passage that bounded only the covered one would read as if the
+    /// residual were handled:
+    ///
+    /// - A walk that overran the LAST attribute in the file passes no further occurrence, moves
+    ///   neither count, and is not visible here — the identifier assertions in the cardinality
+    ///   pin's test are what stand in front of that one.
+    /// - A `//` line the literal continues PAST is not visible either, and this is the sibling of
+    ///   the very accident described above. Deleting it leaves an EVEN number of quotes behind,
+    ///   so `in_string` parity survives, the walk still meets its closing quote, both counts
+    ///   agree — and the line's characters are simply gone from the scanned template. Nothing ran
+    ///   past anything, so no swallow exists to detect. Measured: a template spelling
+    ///   `see https:\` / `//example.invalid you should upgrade now \` / `for details` leaves the
+    ///   whole suite green, while the same tokens on a KEPT line red
+    ///   [`every_error_template_carries_no_banned_framing_beyond_the_pinned_ledger`]. That
+    ///   spelling is as silent after this check as before it.
+    ///
+    /// The check is deliberately not a fix: a template that wants a `//` continuation line still
+    /// cannot have one, and it now says so for the swallowing spelling instead of lying about a
+    /// count. Teaching the filter to skip lines inside a literal
+    /// means lexing this file (comments, char literals, raw strings), which `src/cli.rs`'s
+    /// `inline_literals` pays for because its subject is every literal in a file; here the
+    /// subject is one attribute kind, and the same asymmetry `split_attr` settles for escapes
+    /// applies — a false RED costs one edit, paid by the author who caused it, while a false
+    /// GREEN is a firewall breach nobody learns about.
     fn error_prose() -> Vec<ErrorProse> {
-        let source: Vec<char> = include_str!("error.rs")
+        error_prose_of(include_str!("error.rs"))
+    }
+
+    /// [`error_prose`]'s walk, over source supplied by the caller.
+    ///
+    /// Takes the source as an argument rather than reaching for `include_str!` so the canary can
+    /// drive THIS function over a deliberately broken subject rather than over a paraphrase of it
+    /// (ADR-0031 § 4 CONSTRAINT-A) — the shipped file cannot hold the desync being guarded
+    /// against, because holding it is what breaks the guard.
+    fn error_prose_of(raw: &str) -> Vec<ErrorProse> {
+        let source: Vec<char> = raw
             .lines()
             .take_while(|line| !line.starts_with("#[cfg(test)]"))
             .filter(|line| !line.trim_start().starts_with("//"))
@@ -1638,6 +1688,33 @@ pub(crate) mod tests {
             });
             i = j;
         }
+
+        // The walk checks itself — see this function's caller for why. Each parsed attribute
+        // began at one `#[error(` occurrence, so the two counts can only disagree by the walk
+        // having run PAST an occurrence and consumed it. Comparing them needs no model of Rust
+        // and reports the swallow whatever caused it.
+        let occurrences = source
+            .windows(needle.len())
+            .filter(|window| *window == &needle[..])
+            .count();
+        let parsed = out.len();
+        assert_eq!(
+            parsed, occurrences,
+            "the `#[error(...)]` walk DESYNCED: the source it read holds {occurrences} \
+             `#[error(` occurrences but only {parsed} of them started an attribute it parsed. \
+             This is NOT a variant being added or removed — that moves both counts together and \
+             reddens the cardinality pin in \
+             `every_error_template_is_scanned_and_the_parse_cannot_be_evaded` instead. The walk \
+             ran past an attribute and swallowed it, so at least one variant's prose is now \
+             UNSCANNED by the framing guard. The known cause is this function's comment filter: \
+             it drops every line whose trimmed form opens with `//`, BEFORE the parse, so a \
+             template continuation line that opens that way — a URL split across a `\\` line \
+             continuation is how one gets written by accident — is deleted from inside the \
+             literal, and the walk never meets its closing quote. Do NOT resolve this by bumping \
+             the cardinality pin: that pin is the backstop that caught this, and raising it hides \
+             the unscanned variant behind a green suite (issue #1162). Rewrite the template so \
+             that no continuation line of it opens with a comment marker"
+        );
         out
     }
 
@@ -2022,15 +2099,28 @@ pub(crate) mod tests {
     fn every_error_template_is_scanned_and_the_parse_cannot_be_evaded() {
         let prose = error_prose();
 
-        // CARDINALITY, pinned rather than compared — the degenerate-subject guard. Growing the
-        // enum is expected and cheap: add the variant, bump this in the same commit.
+        // CARDINALITY, pinned rather than compared — the degenerate-subject guard. Two very
+        // different things move this number, and issue #1162 is what conflating them cost: the
+        // remedy for one of them DEFEATS the other. Growing the enum is expected and cheap, and
+        // bumping the pin is the whole remedy. A walk that desynced and swallowed an attribute
+        // also lands here, and bumping the pin for THAT buries an unscanned variant under a green
+        // suite. `error_prose_of` now separates them before this line runs, which is why the
+        // message below can say which one this is rather than leaving the reader to guess.
         assert_eq!(
             prose.len(),
             87,
-            "the `#[error(...)]` count moved. A new variant is scanned automatically (that is \
-             the point), but the subject's SIZE is pinned so a parse that matched fewer cannot \
-             pass silently — which is issue #918's failure, one variant down instead of one \
-             surface down"
+            "the `#[error(...)]` count moved, and a variant having been ADDED OR REMOVED is the \
+             EXPECTED cause: `error_prose_of`'s self-consistency check ran first and found that \
+             every `#[error(` in the source started an attribute it parsed, which rules out the \
+             walk having desynced and swallowed one (issue #1162 — that failure arrives with its \
+             own message, naming a `//` continuation line inside a template as its known cause). \
+             It does NOT rule out a SUBJECT truncated early: a column-0 `#[cfg(test)]` above the \
+             enum cuts the subject short, and the self-check then passes 0 == 0 and lands here \
+             too — so check this count against the enum you can actually see before bumping. If \
+             it does match, the remedy IS to bump this pin, in the commit that moved the enum. A \
+             new variant is scanned automatically (that is the point); the subject's SIZE is \
+             pinned so a parse that matched fewer cannot pass silently — which is issue #918's \
+             failure, one variant down instead of one surface down"
         );
 
         // The names are real, distinct variant identifiers — not `]`, whitespace, or a repeat
@@ -2116,6 +2206,166 @@ pub(crate) mod tests {
             Vec::<&str>::new(),
             "the interpolated import-floor constant carries banned framing"
         );
+    }
+
+    /// Issue #1162's canary: the two conditions that move the `#[error(...)]` count are told
+    /// apart BEFORE either reaches an author, and the one whose obvious remedy would DEFEAT the
+    /// guard is the one that says so.
+    ///
+    /// The three fixtures are the same enum three ways, and the differences between them are the
+    /// whole argument:
+    ///
+    /// - `CLEAN` and `SPLIT` spell the SAME two messages. The only edit between them is where a
+    ///   line break falls inside the first template — a cosmetic wrap of a long URL, the kind of
+    ///   change that gets made without a thought. `CLEAN` parses both attributes; `SPLIT` is
+    ///   deleted mid-literal by the comment filter and the walk swallows the second attribute
+    ///   whole, leaving `SecondVariant`'s prose unscanned by the framing guard.
+    /// - `GROWN` is `CLEAN` plus a genuine third variant — the OTHER thing that moves the count.
+    ///
+    /// So the discrimination is demonstrated rather than asserted by inspection, which ADR-0031
+    /// § 4 CONSTRAINT-A is what rejects: the walk is silent for `GROWN` (whose count change flows
+    /// on to the cardinality pin, whose message is then entitled to say a variant moved) and loud
+    /// for `SPLIT`. Before this canary the two were indistinguishable at the point of failure —
+    /// both surfaced only as a smaller count, and the cardinality pin's message read as "you
+    /// added a variant", so its reader bumped the pin and sealed the unscanned variant behind a
+    /// green suite. That is why the message assertions below include the PROHIBITION and not just
+    /// the diagnosis: a message that named the desync correctly and still left bumping the pin
+    /// looking reasonable would reproduce the defect with better wording.
+    ///
+    /// Driving `error_prose_of` rather than a transcription of it is what makes this a canary
+    /// instead of a second implementation to keep in sync. The shipped file cannot host the
+    /// fixture, because hosting it is precisely what breaks the guard.
+    #[test]
+    fn a_desynced_walk_names_itself_instead_of_sending_its_reader_to_bump_the_cardinality_pin() {
+        // A raw string, so `\` is a backslash and the newlines are real — these are the
+        // characters `error_prose` reads out of a file, not a Rust literal's rendering of them.
+        // The same construction, and for the same reason, as
+        // `split_attr_resolves_every_modeled_escape_exactly_as_rustc_does`.
+        const CLEAN: &str = r#"
+    #[error("consult the rate-limit notes at https://example.invalid/limits")]
+    FirstVariant,
+    #[error("a second message, whose prose is the thing at stake")]
+    SecondVariant,
+"#;
+        const SPLIT: &str = r#"
+    #[error("consult the rate-limit notes at https:\
+             //example.invalid/limits")]
+    FirstVariant,
+    #[error("a second message, whose prose is the thing at stake")]
+    SecondVariant,
+"#;
+        const GROWN: &str = r#"
+    #[error("consult the rate-limit notes at https://example.invalid/limits")]
+    FirstVariant,
+    #[error("a second message, whose prose is the thing at stake")]
+    SecondVariant,
+    #[error("a third message, added the ordinary way")]
+    ThirdVariant,
+"#;
+
+        // The control, and it is load-bearing: it is what proves the fixture is a subject the
+        // walk handles, so the refusal below can only be the line break.
+        let clean: Vec<String> = error_prose_of(CLEAN)
+            .into_iter()
+            .map(|p| p.variant)
+            .collect();
+        assert_eq!(
+            clean,
+            ["FirstVariant", "SecondVariant"],
+            "the CLEAN fixture is meant to be an unremarkable subject the walk reads whole — if \
+             it does not, this canary proves nothing about the line break, which is the ONLY \
+             thing that differs in the fixture below"
+        );
+
+        // A real variant addition passes the self-check untouched. This is the other half of the
+        // discrimination: the count moved, nothing is wrong with the walk, and the failure the
+        // author gets is the cardinality pin's — whose message may therefore say a variant moved.
+        //
+        // Caught rather than called plainly, because an over-firing check panics INSIDE the walk:
+        // a bare call would redden with the desync refusal's own text and this assertion's
+        // reasoning — the thing a reader needs in order to act — would never be printed.
+        let grown = match std::panic::catch_unwind(|| error_prose_of(GROWN)) {
+            Ok(parsed) => parsed,
+            Err(payload) => panic!(
+                "growing the enum tripped the walk's self-check, which must stay INVISIBLE to \
+                 it. The check exists to tell a desync apart from a changed variant count; one \
+                 that fires on BOTH has stopped discriminating, and the cardinality pin's \
+                 message — which now tells its reader a desync was ruled out — is lying. The \
+                 refusal raised was: {:?}",
+                payload
+                    .downcast_ref::<String>()
+                    .map_or("<not a String>", String::as_str)
+            ),
+        };
+        assert_eq!(
+            grown.len(),
+            3,
+            "the GROWN fixture must parse as three attributes — if the walk silently reads fewer, \
+             the half of this canary that proves a real addition flows THROUGH to the cardinality \
+             pin is passing over a subject it never actually read"
+        );
+
+        let payload = match std::panic::catch_unwind(|| error_prose_of(SPLIT)) {
+            Ok(parsed) => panic!(
+                "the walk did not refuse a source whose template carries a continuation line \
+                 opening with a comment marker — it returned {} attribute(s) and reported \
+                 nothing. The second variant's prose is unscanned and the framing guard is \
+                 green over it, which is issue #1162's hole exactly",
+                parsed.len()
+            ),
+            Err(payload) => payload,
+        };
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_else(|| "<the panic payload was not a String>".to_owned());
+
+        // Each fragment is one claim the author has to receive for the message to be worth
+        // more than the one it replaced. Reword the message and this list is the checklist of
+        // what the rewording must preserve.
+        for (fragment, why) in [
+            (
+                "DESYNCED",
+                "the message must CLASSIFY the failure. Issue #1162 is not that the guard \
+                 missed this — it caught it — but that what it printed described a different \
+                 condition",
+            ),
+            (
+                "NOT a variant being added or removed",
+                "the message must rule OUT the reading that misdirected the author, in its own \
+                 words. Naming the right cause while leaving the wrong one available is how the \
+                 original message failed",
+            ),
+            (
+                "//",
+                "the message must name the KNOWN cause in the characters the author will search \
+                 their own template for. A reader who has just wrapped a URL cannot act on \
+                 `the walk desynced` alone",
+            ),
+            (
+                "Do NOT resolve this by bumping",
+                "the message must forbid the remedy that DEFEATS the backstop. The diagnosis \
+                 alone is not enough: bumping the pin makes the suite green, which is exactly \
+                 what a reader takes as confirmation the fix was right",
+            ),
+            (
+                "holds 2 ",
+                "the message must report the OCCURRENCE count it read, or its reader cannot see \
+                 that anything was swallowed",
+            ),
+            (
+                "only 1 ",
+                "the message must report how many of those started an attribute — the gap \
+                 between these two numbers IS the swallowed attribute, and it is what makes the \
+                 diagnosis checkable rather than asserted",
+            ),
+        ] {
+            assert!(
+                message.contains(fragment),
+                "the desync refusal never says {fragment:?}, so its reader does not get this: \
+                 {why}. The message was: {message}"
+            );
+        }
     }
 
     /// Issue #1139's guard: no authored error template spends central FRAMING vocabulary that
