@@ -42,7 +42,7 @@ covered only the first row and is superseded*:
 | **Export flag surface** | removal of `--no-secrets`; `PLAINTEXT_WARNING` wording (`src/migration.rs:538`) | R-10, R-10a, R-10b |
 | **Config portability** | the allowlist, `claude_bin` refusal, `kdf_*` monotonic floor, `conflict_policy`, rot-guard | R-11 … R-11f |
 | **Artifact lifetime** | `import --shred` | R-12 |
-| **Source-side prevention** | export-time daemon-liveness probe | R-13 |
+| **Source-side prevention** | export-time will-this-machine-refresh probe: liveness × supervision × registration | R-13 |
 | **Observability** | artifact digest on both events + requested scope on the `import` event; refusal signal | R-14, R-14a |
 | **Input validation** | `account_uuid` shape | R-15 |
 | **Backward-import break** | the `[credential]` block vs `deny_unknown_fields` | R-16 |
@@ -195,6 +195,9 @@ Two separable pieces:
 - **R-6a (consistency)** — a **product decision this design does not settle**. Today `use <label>`
   refuses (`Error::UseTargetAmbiguous`, exit 6) while `apply_enabled` silently takes the earliest
   entry (`src/cli.rs:5150-5163`). Both behaviours are defensible in isolation; having both is not.
+  **Scope**: "consistency" is over sites that resolve a handle to a **single account**. A site that
+  merely tests membership with the same key set — `refresh_tick::account_listed_in` — is deliberately
+  outside it; the derivation and the reasoning are in § 5, beneath the mechanism table (issue #1062).
 
 **Options for R-6a**, surfaced for decision (§ 14 Open Questions, OQ-1):
 
@@ -447,9 +450,25 @@ Liveness is locally probeable via the existing control socket. Use `daemon_liven
 status` and `daemon restart`. Do **not** wire this to `notify_daemon_roster_reload()`
 (`src/capture.rs:335`): its own doc comment declares it BEST-EFFORT and it returns `()`, so a
 connect refusal is indistinguishable from a live daemon. Design:
-`export` probes, and warns when the daemon is live — the one moment the operator can still act.
-Warning **only** when live, never unconditionally, so it does not train dismissal (RSK-1's failure
+`export` probes, and warns when the machine will refresh — the one moment the operator can still act.
+Warning **only** then, never unconditionally, so it does not train dismissal (RSK-1's failure
 mode).
+
+> **"Will this machine refresh?" is not "is the daemon up?".** *Corrected 2026-08-11 (thirteenth
+> pass, issue #1062); this paragraph read "warns when the daemon is live", and every earlier pass
+> refined the liveness probe without asking whether liveness was the right axis.* `daemon_liveness()`
+> is documented as *"The daemon **process** liveness"* — point-in-time, socket plus lock. Two states
+> make it answer `NotRunning` correctly on a machine that will still rotate the token: a daemon
+> launchd is throttling **between respawns** under the plist's `RunAtLoad` + `KeepAlive
+> {SuccessfulExit: false}` (`AgentSupervision::RegisteredIdle`, whose doc comment says exactly that),
+> and one **stopped but registered for next login** — `daemon stop` boots the agent out and leaves
+> the plist on disk, and `service::stop_managed` prints *"It returns at next login"* while doing it.
+> So the probe is liveness **×** `service::agent_supervision` **×** `service::is_managed`; the last
+> is needed because `AgentSupervision::Unregistered` reads identically on a stopped-but-installed
+> machine and on one that never installed the service. All three are read-only and already exist —
+> nothing new is proposed, only asking all three. **The rest of the codebase already does**:
+> `daemon_status` and `daemon_restart` each pair liveness with supervision, and `daemon_stop`
+> dispatches on supervision alone. R-13 was the only surface reading liveness on its own.
 
 **R-14 — correlation.** `Event::Export` and `Event::Import` both gain a sha256 artifact digest; the
 **`import`** event additionally gains the operator-**requested** scope (never the artifact's claimed
@@ -513,7 +532,7 @@ rows, including the entire security core:*
 | `src/cli.rs::apply_import` | apply the portability allowlist before adopting any non-roster value; emit a refusal line per refused key | R-11, R-11a … R-11c, R-11e |
 | **new** `src/config.rs::portability` | the allowlist itself (non-portable by default) + the `kdf_*` monotonic-floor comparator + the compile-time rot-guard that fails when a new `Config` key carries no classification | R-11, R-11b, R-11d |
 | `src/cli.rs::parse_export` | **remove** `--no-secrets`; strict-usage error stating roster-without-secrets is no longer supported (there is no replacement to name — R-9c/AD-5) | R-10 (form is OQ-4-gated) |
-| `src/cli.rs::export` | daemon-liveness probe via `daemon_liveness()` (`src/cli.rs:1885`) before writing | R-13 |
+| `src/cli.rs::export` | will-this-machine-refresh probe before writing: `daemon_liveness()` (`src/cli.rs`) **and** `service::agent_supervision` **and** `service::is_managed`, behind one seam (see Cap-10.1's note). *Amended 2026-08-11 (#1062): read "daemon-liveness probe" alone* | R-13 |
 | `src/migration.rs` | `PLAINTEXT_WARNING` wording (`src/migration.rs:538`); `[credential]` forward-tolerance + version-floor message | R-10b, R-16 |
 | `src/observability.rs` | sha256 artifact digest on **both** events + requested scope on the **`import`** event only (export has none — R-9c/AD-5); allowlist-refusal signal | R-14, R-14a |
 | `src/config.rs::Account` | `account_uuid` shape validation before it reaches `stash()` | R-15 |
@@ -524,7 +543,9 @@ rows, including the entire security core:*
 > **Superseded 2026-08-06 by #1005: OQ-1 resolved toward the first row, and the second row's two call
 > sites were routed into it — there is now ONE mechanism over six sites.** The table below records the
 > pre-fix state, which is what makes the divergence it describes legible; read it in the past tense.
-> Derived from source rather than sampled (`.tmp/enumerate.py`):
+> Derived from source rather than sampled, and **scoped to sites that resolve a handle to a single
+> account** — see the scoping note below the table for the membership test that shares the key set
+> and is deliberately outside this row set:
 >
 > | Mechanism | Matches | On a duplicate label | Call sites |
 > |---|---|---|---|
@@ -539,7 +560,49 @@ rows, including the entire security core:*
 >
 > **How this was found matters.** Three prior passes each reported one more member of this set
 > (a fourth enum variant, a fourth outcome, a fifth verb) because an adversarial reader *samples* a
-> set. This table is *derived* — re-run `.tmp/enumerate.py` rather than trusting the count here.
+> set. This table is *derived* — and since issue #1186 the derivation is a **committed gate**:
+> `every_handle_read_is_dispositioned` and `resolve_target_has_exactly_the_five_known_call_sites`
+> (`src/use_account.rs`) walk every `.rs` file under `src/` outside its `#[cfg(test)]` region and
+> fail on an unregistered handle read or a changed resolver-caller set. Read `HANDLE_READ_REGISTER`
+> and `COMPARING_READERS` in that file for the set by eye; trust the gate, not the count here.
+>
+> *Amended 2026-08-11 (issue #1062): this said "re-run `.tmp/enumerate.py`" here and above the
+> table. That file was never committed — `.tmp/` is gitignored scratch reclaimed with the PR
+> worktree — so the one instruction offering a reader a re-derivation instead of a re-sample
+> resolved to nothing from the moment it was written.*
+
+> **A derivation only closes the axis you point it at, and this one was pointed at *resolution*.**
+> *Added 2026-08-11 (thirteenth pass, issue #1062), run specifically to falsify the twelfth pass's
+> closure.* A site absent from the table above compares an operator-supplied handle against the
+> roster with the **identical key set**: `refresh_tick::account_listed_in` matches
+> `entry == &account.label || entry == &account.account_uuid`, and its handles come from
+> `[refresh].accounts`, which `config::RefreshConfig` documents as *"named by its `list` label OR
+> `account_uuid` (the same resolution `poke` and `use` key on)"*. It drives the sweep's allowlist
+> leg, `recovery_pending`'s wake-cadence gate, and `refresh_tick::mechanism_is_observable`'s
+> `sweepable` count.
+>
+> | | `use_account::resolve_target` | `refresh_tick::account_listed_in` |
+> |---|---|---|
+> | Key set | `label` **or** `account_uuid` | identical |
+> | Fold | collect, then match on the count | `.any()` |
+> | Returns | a roster **index** | a `bool` |
+> | On a duplicate | `Error::UseTargetAmbiguous` — refuses | admits **both** bearers |
+>
+> **A note on the count, because two conventions are in play.** These documents say *six sites*, counting operator-facing verbs; the code's own gate says *five*, counting functions that call `resolve_target` — `enable` and `disable` share `apply_enabled`, so the six verbs reach the resolver through five call sites. `resolve_target_has_exactly_the_five_known_call_sites`'s doc comment states both numbers together. Neither is wrong; they count different things, and this is the one place that says so.
+>
+> **It is not a third row of the table above, and the correction is to the wording rather than to
+> the code.** A membership predicate selects nothing, so it has no index to be ambiguous about and
+> `UseTargetAmbiguous` is not expressible in it; and both alternatives are worse in the direction
+> that matters — admitting neither bearer silently stops refreshing an account the operator did
+> name, which is the token expiry the refresh tick exists to prevent. So R-6a and Cap-3.2 are scoped
+> to *resolution to a single account*, which is what the amended row-set caption now says.
+>
+> **The code closed this before these documents did.** `COMPARING_READERS` (`src/use_account.rs`,
+> issue #1186) files `account_listed_in` under its *compared against a LABEL* heading, whose
+> preamble requires each member to account for what it does instead of taking the first match. That
+> landed after the twelfth pass; nothing here absorbed it, and the surfaces went on stating a
+> universal over "every label-resolving site" that the code had already qualified. A completeness
+> gate over source cannot see a document restating its result more widely than the result supports.
 
 **Untouched by design**: `src/swap.rs` (reused, not modified).
 
@@ -616,9 +679,9 @@ rows, including the entire security core:*
 
 ```
 SOURCE (A)                                   TARGET (B)
-  stop daemon              ── R-8 ──►  (source no longer rotates)
+  stop daemon + uninstall  ── R-8 ──►  (source no longer rotates)
   export
-   ├─ PROBES daemon liveness; WARNS if live, never blocks      (R-13)
+   ├─ PROBES will-this-machine-refresh; WARNS if it will, never blocks  (R-13)
    ├─ WARNS on --plaintext (reworded)                          (R-10b)
    ├─ no --no-secrets flag — removed, strict-usage error       (R-10; OQ-4)
    └─ LOGS sha256 digest (export has no operator scope)        (R-14)
@@ -645,7 +708,7 @@ SOURCE (A)                                   TARGET (B)
 ```
 
 The failure on 2026-07-31 was the **first arrow** never happening: A kept its daemon running and
-refreshed 4 minutes before B replayed. R-13's liveness probe is the mechanization of that arrow —
+refreshed 4 minutes before B replayed. R-13's probe is the mechanization of that arrow —
 which is why it sits on the **source** side: the hazard is preventable there and undetectable at the
 target (§ 1, the one-sentence design position).
 
@@ -669,7 +732,7 @@ documents. No migration of on-disk state; no `format_version` change (§ 4.2).
 | artifact format | **none** | v1 preserved (C-1, C-4) |
 | `import` flags | `--accounts`, `--settings`, `--shred` | additive, opt-in; **default unchanged** (AD-9) |
 | `export` flags | **`--no-secrets` REMOVED** | **breaking** — the only breaking CLI change in this scope. Path undecided (OQ-4) |
-| `export` **stderr** | daemon-liveness warning when the local daemon is live | additive; conditional, never unconditional (R-13). **stderr, never stdout** — with `PATH` omitted `export` writes the artifact itself to stdout (`src/cli.rs:4559-4565`), and the existing `PLAINTEXT_WARNING` already takes this rule with the reason stated in the code: *"Warn on stderr — never stdout, which may carry the artifact"* (`src/cli.rs:4472-4474`). A warning on stdout prepends its bytes to the artifact, which then fails `preamble.magic != MAGIC` (`src/migration.rs:360`) — the warning built to save the migration destroys it, and only on the branch where it fires |
+| `export` **stderr** | warning when this machine will refresh (liveness, supervision, or a registered plist) | additive; conditional, never unconditional (R-13). **stderr, never stdout** — with `PATH` omitted `export` writes the artifact itself to stdout (`src/cli.rs:4559-4565`), and the existing `PLAINTEXT_WARNING` already takes this rule with the reason stated in the code: *"Warn on stderr — never stdout, which may carry the artifact"* (`src/cli.rs:4472-4474`). A warning on stdout prepends its bytes to the artifact, which then fails `preamble.magic != MAGIC` (`src/migration.rs:360`) — the warning built to save the migration destroys it, and only on the branch where it fires |
 | `import` stdout | per-key refusal lines from the portability allowlist | additive; C-3 applies |
 | config adoption | **on an existing-config target**: non-portable keys were already dropped (`apply_import` keeps `local` wholesale) → now refused **and reported**. **On a fresh target**: they were **adopted** → now **refused**, a real behaviour change, not just a new line | **behaviour change** on the fresh-target path (`src/cli.rs:4744-4750`). Reading the Change cell as "only a new report line" is exactly the misreading Cap-8.7 exists to catch |
 | `Event::Export` | `+ artifact_sha256` | additive; aggregate-only redaction preserved. **No `+ scope`** — export takes no narrowing flag (R-9c/AD-5), so it has none to log |
@@ -709,7 +772,7 @@ stash writes. What § 4.1 declines to add is a second writer of the canonical
 | Cap-2.2 | Warning fires even when derived deadlines are unreadable (fail-closed) | unit | R-4, P2 |
 | Cap-2.3 | An already-expired artifact additionally reports expiry | unit | R-4a |
 | Cap-3.1 | Same-label/different-uuid import warns — with a target that is **not** a clone of the source | unit | R-6 |
-| Cap-3.2 | `use` / `enable` / `disable` / **`remove`** agree on duplicate-label resolution — `remove` is not optional: it is the only irreversible one (deletes a keychain stash), so a test omitting it passes while the case that motivated R-6a stays unasserted | unit | R-6a |
+| Cap-3.2 | Every site that resolves a handle **to a single account** agrees on a duplicate: `use` / **`poke`** / **the daemon control-socket swap** / `enable` / `disable` / **`remove`** — six verbs over five call sites (`enable` and `disable` share `apply_enabled`). `remove` is not optional: it is the only irreversible one (deletes a keychain stash), so a test omitting it passes while the case that motivated R-6a stays unasserted. **Scoped deliberately**: `refresh_tick::account_listed_in` shares the key set but is a membership test admitting both bearers — § 5's scoping note beneath the mechanism table says why it is out, and it must not be asserted here | unit | R-6a |
 | Cap-4.2 | **All four rotation-emitting surfaces drop the field** — `event=refresh` (`src/observability.rs:2155`), `event=poll_refresh` (`:2173`), `event=keep_warm` (`:2191`), and the **versioned `status`/`watch` wire** (`src/daemon/snapshot.rs:1403`, `rotated: health.refresh_token_rotated.unwrap_or(false)`), whose consumer is Swift (`apps/menubar/Sources/WireModel.swift:98`). The renders read `RefreshReport.refresh_token_rotated` (`src/refresh.rs:284`), a **sibling of** `outcome` — so Cap-4.1 and AD-3's reshape are both satisfiable with all three untouched. Assert the rendered line, not the type | unit (render) | R-5 |
 | Cap-4.1 | `rotated` is unrepresentable on **every non-`Refreshed` outcome** — `NoChange`, `Dead`, `Error` (all three, `src/refresh.rs:225-240`). Asserting only `Dead`/`Error` lets an implementation keep `rotated` on `NoChange`, a live outcome (`src/observability.rs:180`) whose `rotated` is derived independently of its expiry test. Excludes `refreshed_not_restashed`, an *event* outcome mapped from `Refreshed` where `rotated` is meaningful | unit (type-level) | R-5 |
 | Cap-5.1 | `status` distinguishes canonical-sourced from stash-sourced EXPIRY | unit | R-7 |
@@ -734,7 +797,7 @@ stash writes. What § 4.1 declines to add is a second writer of the canonical
 | Cap-8.7 | **The allowlist binds with no scope flag at all, on a fresh target** — the shipped hazard and the *default* path (AD-9). Cap-8.1/8.2/8.3 all put `--settings` in their *When*, so an implementation hanging the allowlist off the `--settings` branch passes all three while leaving § 1's code-execution path reachable by default | integration | **R-11**, R-11a, AD-9 |
 | Cap-9.1 | `import --shred` removes the source artifact after a successful apply | integration | R-12 |
 | Cap-9.2 | Shred is not claimed as secure erase in help or docs | unit (text assertion) | R-12 |
-| Cap-10.1 | `export` warns on **`Responsive`, `AliveUnresponsive` and the `Err` arm**, and is quiet **only** on `NotRunning` — **four** branches. `daemon_liveness()` is `Result<DaemonLiveness>` (`src/cli.rs:1885`) over a tri-state enum (`:1870-1878`), so `Err` sits alongside the three `Ok` variants and must be mapped, not left to the implementer. A wedged daemon still holds the lock and still refreshes; an errored probe has not established the daemon is absent — both fail **closed** | integration (see note) | R-13 |
+| Cap-10.1 | `export` warns whenever this machine **will refresh**, and is quiet only when all three probes agree it will not. Liveness (`daemon_liveness()`, `Result<DaemonLiveness>`, over the tri-state `enum DaemonLiveness`, both in `src/cli.rs` — by symbol, not by line) warns on **`Responsive`, `AliveUnresponsive` and the `Err` arm** — `Err` must be mapped, not left to the implementer, since a wedged daemon still holds the lock and still refreshes and an errored probe has not established the daemon is absent; both fail **closed**. Supervision (`service::agent_supervision`) warns on `Supervising` and on **`RegisteredIdle`**, a daemon launchd is throttling between respawns. Registration (`service::is_managed`) warns on a plist left on disk by `daemon stop`, which `AgentSupervision::Unregistered` cannot distinguish from a machine that never installed the service. **Both of those two probes are `Result`-typed as well, and their `Err` arms warn on the same fail-closed reasoning** — `agent_supervision` shells out to `launchctl`, `is_managed` resolves a home directory, and neither failing establishes that launchd will leave this machine alone; leaving them to the implementer is the omission this capability's own `Err`-must-be-mapped rule exists to prevent. **Assert the product, not the tri-state**: a test enumerating only `daemon_liveness()`'s four outcomes passes while two reachable states ship silence — the axis error issue #1062 records, and the one every earlier pass deepened rather than questioned | integration (see note) | R-13 |
 > **Cap-10.1 needs a seam, and the design must name it.** *Added 2026-08-05 (ninth pass); the row was
 > typed `unit`.* `daemon_liveness()` takes **no parameters** (`src/cli.rs:1885`) and resolves
 > `paths::control_socket()` / `paths::daemon_lock()` from `support_dir()`, which `src/paths.rs:531-532`
@@ -743,7 +806,7 @@ stash writes. What § 4.1 declines to add is a second writer of the canonical
 > hermetically constructible: `Responsive` needs a real listener at the native socket path,
 > `AliveUnresponsive` needs the real lock flocked, `Err` is reachable but not from a *hermetic* test
 > without the seam (**corrected 2026-08-05, twelfth pass — this read "`Err` is not reachable at all",
-> which is false against source and contradicted Cap-10.1 seven lines above**: `daemon_liveness()`
+> which is false against source and contradicted the Cap-10.1 row this note hangs beneath**: `daemon_liveness()`
 > has three `?` sites — `control_socket()?`, `daemon_lock()?` and `is_held(…)?`, `src/cli.rs:1886-1888`
 > — and `is_held` returns `Err(Error::Io(..))` on a non-`NotFound` open error
 > (`src/daemon/seams.rs:393`) and a non-`EWOULDBLOCK` flock error (`:408`). Once the seam this same
@@ -756,7 +819,22 @@ stash writes. What § 4.1 declines to add is a second writer of the canonical
 > weaken `support_dir()` to make this testable: its non-overridability is a deliberate decision (#7),
 > and reversing it to serve a test is the same test-pressure-decides-design failure Cap-8.6 warns
 > about. Without a seam the test author writes a machine-state-dependent test or silently drops
-> branches — losing the four-branch enumeration that IS this capability.
+> branches — losing the branch enumeration that IS this capability.
+>
+> **The seam has to cover all three probes, not just liveness.** *Added 2026-08-11 (thirteenth pass,
+> issue #1062), with the axis correction the Cap-10.1 row now carries.* The other two are unseamed in
+> the same way and for the same reason: `service::agent_supervision` shells out to
+> `/bin/launchctl print` against the caller's live GUI login domain, and `service::is_managed` reads
+> `agent_plist()`, resolved from `paths::launch_agents_dir()`. Neither takes a parameter, so a test
+> over the widened predicate is machine-state-dependent in three ways rather than one — and the two
+> new states are precisely the ones a developer's own machine is least likely to be sitting in, so
+> the branches that ship silence are the branches a state-dependent test is least likely to exercise.
+> Take one composite verdict at the `export` call site — a single "will this machine refresh?" seam
+> the three probes feed — rather than three separate parameters: the capability is the conjunction,
+> and a test that can stub the parts independently can still be written against a *disjunction* that
+> was never asserted as one. `src/service.rs` already establishes the pattern this should follow:
+> `ensure_managed` takes its `&Path` precisely so the file-existence half is exercised hermetically
+> against a temp dir while the launchctl calls stay out of the test, and its doc comment says so.
 
 | Cap-10.2 | Export and import events carry a **matching artifact digest**; the **import** event additionally carries the operator-**requested** scope (export has none to carry — R-9c/AD-5) | unit | R-14, R-14a |
 | Cap-11.1 | A **malformed or over-length** `account_uuid` is rejected before a stash name is derived — **not** the empty case, which `src/config/validate.rs:281-284` already rejects on the import parse path (asserting it would be green over unimplemented work) | unit | R-15 |
@@ -834,7 +912,7 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
 | R-11f | ✅ **Yes** | ADR; conventions exist |
 | R-10b | ✅ **Yes** | `PLAINTEXT_WARNING` is a string constant (`src/migration.rs:538`); Cap-7.8 |
 | R-12 | ⚠️ **Yes as unlink; NOT as secure erase** | APFS gives no reliable overwrite-in-place. Deliverable must not claim more (§ 4.9) |
-| R-13 | ✅ **Yes** for the probe; ⚠️ **the capability needs a seam** | `daemon_liveness()` (`src/cli.rs:1885`) already gives a read-only tri-state answer (plus its `Err` arm); reuse it rather than the best-effort notify at `src/capture.rs:335`. But it takes **no parameters** and resolves `paths::control_socket()` / `paths::daemon_lock()` from `support_dir()`, which is *deliberately* never env-overridable (`src/paths.rs:531-532`, issue #7) — so Cap-10.1 is not hermetically constructible as written (see its note) |
+| R-13 | ✅ **Yes** for all three probes; ⚠️ **the capability needs a seam** | `daemon_liveness()` (`src/cli.rs`) already gives a read-only tri-state answer (plus its `Err` arm); reuse it rather than the best-effort notify at `src/capture.rs:335`. `service::agent_supervision` and `service::is_managed` are read-only too and likewise already exist, so the widened predicate (#1062) costs no new capability. But none of the three takes **parameters**: liveness resolves `paths::control_socket()` / `paths::daemon_lock()` from `support_dir()`, which is *deliberately* never env-overridable (`src/paths.rs:531-532`, issue #7); supervision shells out to `/bin/launchctl print` against the live login domain; registration reads `paths::launch_agents_dir()`. So Cap-10.1 is not hermetically constructible as written, in three ways rather than one (see its note) |
 | R-14 / R-14a | ✅ **Yes** | Additive event fields; digest is a pure function over the artifact bytes |
 | R-15 | ✅ **Yes**, and cheaper than assumed | Parse-time validation; severity bounded — `stash()` reaches no filesystem path |
 | R-16 | 🚧 **Partly — the released-binary half is unfixable** | We cannot patch already-shipped binaries; only the version-floor message and forward-tolerance are in reach (OQ-5) |
@@ -852,7 +930,7 @@ Per PRD § 5: `ImportAdoptionCompleteness` MUST 1.0 (Cap-1.1/1.2), `StalenessDis
 | RSK-7 | The allowlist rots — a new `Config` key is added unclassified and auto-adopts | **High** | R-11d, and it must be the compile-error form if the type shape allows. An unenforced allowlist is a denylist with extra steps |
 | RSK-8 | AD-9 (default = everything) is silently retained if AD-8 is later reversed or weakened | **High** | AD-9 records the coupling explicitly: reversing AD-8 requires re-deciding AD-9 **first** |
 | RSK-9 | `--shred` is read as secure erase and the operator stops treating the artifact as sensitive | Medium | Cap-9.2 asserts the help text does not claim it; § 4.9 states the APFS limit plainly |
-| RSK-10 | R-13's liveness warning becomes unconditional through drift, training dismissal — the RSK-1 failure mode on a second surface | Medium | Cap-10.1 asserts the warning fires **only** when the daemon is live |
+| RSK-10 | R-13's warning becomes unconditional through drift, training dismissal — the RSK-1 failure mode on a second surface | Medium | Cap-10.1 asserts the warning fires **only** when the machine will refresh, and pins a quiet branch that all three probes must agree on. *(Amended 2026-08-11, issue #1062: read "only when the daemon is live", which Cap-10.1 no longer asserts — the quiet branch is a conjunction, and the widened predicate makes this risk's fail-open direction the cheaper one to drift into.)* |
 | RSK-11 | R-15 is restated downstream as a path-traversal finding, manufacturing a severity the evidence does not support | Medium | PRD R-15 and AC-15 both state the bound and forbid the framing; `stash()`'s call sites were swept and reach no filesystem path |
 
 ### Open Questions
