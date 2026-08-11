@@ -1966,7 +1966,17 @@ pub(crate) mod tests {
             return Vec::new();
         };
         let mut defects = Vec::new();
-        if !(issue.starts_with('#') && issue[1..].chars().all(|c| c.is_ascii_digit())) {
+        // The digit run is asserted NON-EMPTY in its own right, which is the half issue #1182
+        // was opened over: `all` over an empty iterator is vacuously TRUE, so `"#"` cleared the
+        // old `issue[1..].chars().all(..)` by carrying no digit that could fail it, and cleared
+        // `why.contains(issue)` too, since any reasoning that spells a `#` at all satisfies it. A
+        // reference structurally incapable of naming one is an untracked violation that reads as
+        // tracked. `strip_prefix` also retires the slice: the empty string was safe before only
+        // because `starts_with` short-circuited ahead of `issue[1..]`, and a guard that depends
+        // on the order of its own conjuncts is one reorder from panicking. Both inputs are
+        // pinned in `the_violation_bookkeeping_bites_over_a_ledger_that_carries_no_violation`.
+        let digits = issue.strip_prefix('#').unwrap_or_default();
+        if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
             defects.push(format!(
                 "{}: {issue:?} is not an issue reference",
                 entry.variant
@@ -2256,10 +2266,15 @@ pub(crate) mod tests {
             // design — the ledger carries no debt since issue #1151 — so the rules themselves are
             // proved to still bite in
             // `the_violation_bookkeeping_bites_over_a_ledger_that_carries_no_violation`, which
-            // covers each of the three sub-predicates with a case that reddens when only that one
-            // is dropped. The digit run needed its own (`"#abc"`): the `"1151"` case short-
-            // circuits on the missing `#` and never reaches it, so for one revision that conjunct
-            // was carried by this comment rather than by a test.
+            // gives each conjunct a case that reddens when that conjunct is dropped. Several of
+            // its cases share an arm rather than owning one: a reference carrying no `#`
+            // (`"1151"`), one whose digit run is empty (`"#"`), and the empty string all fail
+            // `digits.is_empty()`, since `strip_prefix` folds a missing `#` into an empty run.
+            // They are kept apart because they arrived as separate defects and can separate
+            // again — `"#"` is issue #1182, which the digit-CLASS arm alone let through, and the
+            // empty string is the input the old `issue[1..]` slice relied on `starts_with`
+            // short-circuiting ahead of. The digit-class arm needs its own case too (`"#abc"`),
+            // and for one revision was carried by this comment rather than by a test.
             assert_eq!(
                 violation_defects(entry),
                 Vec::<String>::new(),
@@ -2352,12 +2367,13 @@ pub(crate) mod tests {
             "an untracked violation is an exemption with a disapproving tone"
         );
 
-        // RED, and it is the case that proves the SECOND conjunct rather than the first. `1151`
-        // above fails on `starts_with('#')` and short-circuits, so with only that case the digit
-        // run is never evaluated: replacing `c.is_ascii_digit()` with `true` leaves the whole
-        // suite green. Measured on an independent review of this branch, which is how the hole
-        // was found. This case has the `#` and reaches the digit run, so it is the one that
-        // reddens when that half is dropped.
+        // RED, and it is the case that proves the digit-CLASS arm rather than the emptiness one.
+        // `1151` above carries no `#`, so `strip_prefix` leaves it an empty run and the
+        // `is_empty()` arm short-circuits the `||`: with only that case the class check is never
+        // evaluated, and replacing `c.is_ascii_digit()` with `true` leaves the whole suite green.
+        // Measured on an independent review of this branch, which is how the hole was found. This
+        // case has the `#` and a non-empty run behind it, so it reaches the class check and is
+        // the one that reddens when that half is dropped.
         //
         // `why` is overridden rather than inherited from `sound`, and that is what isolates the
         // rule: the reasoning must CITE the reference, so a `why` that does not mention `#abc`
@@ -2371,6 +2387,37 @@ pub(crate) mod tests {
             }),
             vec!["Synthetic: \"#abc\" is not an issue reference".to_owned()],
             "the reference's tail must be digits — a `#` alone does not make it an issue number"
+        );
+
+        // RED, and the one-character case `"#abc"` above cannot reach. `all` over an EMPTY
+        // iterator is vacuously TRUE, so a bare `#` satisfied the digit run by carrying no digit
+        // that could fail it — issue #1182. It defeats the SECOND rule in the same breath, which
+        // is why `why` is inherited from `sound` here rather than overridden: `contains("#")`
+        // is satisfied by any reasoning that spells a `#`, which `sound`'s citation of #1151 does.
+        // Both halves green over a reference that names nothing was the whole defect.
+        assert_eq!(
+            violation_defects(&LedgerEntry {
+                verdict: Verdict::Violation("#"),
+                ..sound
+            }),
+            vec!["Synthetic: \"#\" is not an issue reference".to_owned()],
+            "a `#` with no digits behind it tracks nothing — an untracked violation that reads \
+             as tracked"
+        );
+
+        // RED, and it pins a property this fix could LOSE rather than one it adds. The empty
+        // string was already rejected, but by a different conjunct: `starts_with('#')`
+        // short-circuited ahead of the `issue[1..]` slice, which is equally what kept it from
+        // panicking on a zero-length reference. The predicate no longer slices, so that ordering
+        // is gone and so is the guarantee riding on it — issue #1182's third criterion offered
+        // keep-the-ordering or assert-it, and this is the assertion.
+        assert_eq!(
+            violation_defects(&LedgerEntry {
+                verdict: Verdict::Violation(""),
+                ..sound
+            }),
+            vec!["Synthetic: \"\" is not an issue reference".to_owned()],
+            "an empty tracking reference is rejected, and reaching that verdict must not panic"
         );
 
         // RED: tracked at a real issue, but the reasoning cites a DIFFERENT one — the drift a
