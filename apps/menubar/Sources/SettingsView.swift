@@ -243,7 +243,43 @@ struct SettingsView: View {
     // MARK: - Footer: Save + apply status
 
     private var footer: some View {
-        HStack(spacing: CGFloat(SettingsFormat.footerInterElementSpacing)) {
+        // TOP-ALIGNED, not `HStack`'s default `.center` (issue #1118). The build reference authors this:
+        // `menubar-preview.html`'s `.win-foot` rule carries `align-items:flex-start`, under a comment that
+        // maps the rule to this exact row (`applyStatus | Spacer | Save`, `.padding(12)`, 12 pt gaps), and
+        // the `settings-loaded-{light,dark}` frames render it against a two-line status. So it is an
+        // AUTHORED value on a rule modelling this footer, not incidental CSS — read it as the oracle, per
+        // `design/README.md` § "The Settings window (#763)".
+        //
+        // WHY IT ONLY MATTERS NOW: the two alignments differ only when the status label exceeds one line.
+        // Before #844 that state was reachable but unbounded (the label wrapped to 10+ lines), so this was
+        // the least of that row's problems; after #844 clamped it, the TWO-line label is the bounded steady
+        // state for the ordinary version-skew trigger — the normal rendering rather than a pathological one.
+        // It covers every `applyStatus` arm, including `.rejected`, which #944 clamped to the same limit.
+        //
+        // MEASURED, not eyeballed, by rendering THIS view — loaded form, a dirtied tunable so Save is
+        // enabled, apply landed on the `.daemonError` version-skew string — at the shipped 460×560 through
+        // `ImageRenderer` and reading the drawn pixels, `.center` against `.top`. That is an OFFLINE render,
+        // not a screenshot of the live window. Against the two-line label the Save bezel's top moves UP
+        // 4.0 pt while the label itself does not move, landing the bezel 12.5 pt under the footer's
+        // `Divider()` — `footerPadding`, i.e. flush with the top of the content box, which is exactly what
+        // `align-items:flex-start` does. It is NOT inert at one line: there the bezel does not move and the
+        // STATUS LABEL rises 4.0 pt instead, from centred-against-the-taller-button to top-aligned. That is
+        // the mock's treatment too — `align-items:flex-start` governs BOTH children of `.win-foot`.
+        //
+        // THE OTHER HALF OF #1118, measured rather than assumed, and it needs no code: the mock also sets
+        // `align-items:flex-start` on `.win-status` itself (icon-to-text, with `margin-top:1px` on the SVG).
+        // SwiftUI's `Label` already carries that TREATMENT — against a two-line title the icon's ink top
+        // sits 0.5 pt ABOVE the title's, so it rides the FIRST LINE rather than centring on the block
+        // (centred would put it 8.5 pt lower). It is not pixel-identical: the mock's extra `margin-top:1px`
+        // nudges its icon DOWN where SwiftUI's sits marginally up, ~1.5 pt apart. That is the mock's
+        // hex/pixel values being directional rather than targets, not a divergence to close — so no
+        // `.alignmentGuide` or `.firstTextBaseline` is warranted, and adding one would be inventing a
+        // precision the reference does not claim.
+        //
+        // No automated gate reaches any of this: `SettingsView` is outside the `MenubarTests` bundle by
+        // design (`project.yml` — a separate window surface, not the panel), and the Settings window has no
+        // render harness, so `design/build-comparison.py` has no `STATES` row for it by construction.
+        HStack(alignment: .top, spacing: CGFloat(SettingsFormat.footerInterElementSpacing)) {
             applyStatus
             Spacer()
             Button(SettingsFormat.saveTitle) { Task { await model.apply() } }
