@@ -5878,10 +5878,16 @@ mod tests {
 
     #[test]
     fn a_measured_capacity_census_renders_its_counts_boundary_and_bound_marker() {
-        // The MEASURED branch, pinned as an exact string. Every other render assertion and all
-        // eleven goldens exercise only the `—` branch, so without this the whole cell was
-        // ungated: a mutation transposing the session/weekly counts AND dropping the `≥` marker
-        // passed the entire suite. Both of those are exactly what this asserts.
+        // The MEASURED branch, pinned as ONE exact end-of-line string. No committed golden
+        // reaches this branch at all — every `stats-*` fixture renders the `—` arm — so the
+        // measured cell is gated by the unit assertions here and by nothing a fixture sees.
+        //
+        // Those assertions check the cell's parts piecewise: its boundary, its `≥` marker, a
+        // calm zero, its set qualifier. This one pins the whole composition instead, and it is
+        // the only one matching THROUGH the duration to a sub-hour remainder — the others either
+        // stop their `contains` before the duration or pin a round `≥0s` / `≥1h`. So truncating
+        // the bound to whole hours leaves every part intact, renders `29h` where 106_080 s is
+        // `29h28m`, and reddens this assertion alone.
         let line = capacity_line(7, 2, 5, 106_080, CENSUS_WINDOW);
         assert!(
             line.ends_with(
