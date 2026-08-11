@@ -8557,6 +8557,330 @@ mod tests {
         }
     }
 
+    // --- AC: the gate-3 + gate-4 PAIRING at the call site (issue #1117) --------------
+
+    /// `source` above its `#[cfg(test)] mod … {` boundary.
+    ///
+    /// A LOCAL copy of the rule `use_account::non_test_region` derives (issues #1186 / #1197);
+    /// that one is private to its own test module and its doc carries the full reasoning. Two
+    /// halves, both load-bearing: `#[cfg(test)]` must be IMMEDIATELY followed by a column-0
+    /// `mod …`, because `#[cfg(test)]` also sits at column 0 on test-only `use`s and `impl`s
+    /// elsewhere in this crate; and that `mod` must OPEN A BLOCK, because a DECLARED test module
+    /// (`mod test_support;`) encloses nothing and cutting there discards production code. Failing
+    /// toward OVER-scan is deliberate — a stray test helper costs one edit and says so, while a
+    /// truncated scan is a green run over a subject that was never read.
+    fn non_test_region(source: &str) -> String {
+        let lines: Vec<&str> = source.lines().collect();
+        let end = (0..lines.len())
+            .find(|&i| {
+                lines[i].starts_with("#[cfg(test)]")
+                    && lines
+                        .get(i + 1)
+                        .is_some_and(|n| n.starts_with("mod ") && n.trim_end().ends_with('{'))
+            })
+            .unwrap_or(lines.len());
+        lines[..end].join("\n")
+    }
+
+    /// Every call site of [`checked_runway_secs`] in this file's non-test code, as
+    /// `(the caller's start anchor, its gate-3 bound, the line it hands the quotient over on)`.
+    ///
+    /// TWO entries because the decision exists at two scopes (issue #1075): the pooled fleet and
+    /// the per-account dimension. #1117 is about the first; the second is the SAME shape with the
+    /// same bypass available, and [`checked_runway_secs`]'s own doc already claims the property
+    /// for both callers — so gating one and not the other would leave that doc half-true.
+    /// [`every_gate_4_call_site_in_this_file_is_registered`] pins this list against the file, so a
+    /// third caller cannot arrive unexamined — including one that spells its call exactly as a
+    /// registered site does, which the register would otherwise deduplicate away.
+    const GATE_4_CALL_SITES: [(&str, &str, &str); 2] = [
+        (
+            "fn fleet_runway_state(headroom: f64, rate: f64) -> FleetRunwayState {",
+            "secs > FLEET_RUNWAY_PLAUSIBLE_MAX_SECS as f64",
+            "match checked_runway_secs(secs) {",
+        ),
+        (
+            "fn runway_secs(\n    rate: Option<f64>,",
+            "secs > max_plausible_secs as f64",
+            "checked_runway_secs(secs)",
+        ),
+    ];
+
+    /// Every spelling of an `as` cast to an integer, which is what gate 4 exists to displace.
+    ///
+    /// `as _` is in the list because it INFERS `i64` from `Known`'s field and would otherwise walk
+    /// straight through a list of named types. The tokenization assumes rustfmt's normal form —
+    /// exactly one space after `as` — which is what `cargo fmt --all --check` guarantees.
+    const SATURATING_CAST_SPELLINGS: [&str; 13] = [
+        "as i8", "as i16", "as i32", "as i64", "as i128", "as isize", "as u8", "as u16", "as u32",
+        "as u64", "as u128", "as usize", "as _",
+    ];
+
+    /// `source`'s text from `anchor` to the next COLUMN-0 `}` — one whole free function.
+    ///
+    /// Both failures are loud rather than silent: an anchor matching anything other than exactly
+    /// one item, and a window with no close brace, each panic asking to be re-anchored. A guard
+    /// that slid or collapsed must not be able to report clean.
+    fn gate_4_caller_body<'a>(source: &'a str, anchor: &str) -> &'a str {
+        assert_eq!(
+            source.matches(anchor).count(),
+            1,
+            "`{anchor}` no longer identifies exactly one item — re-anchor this guard"
+        );
+        let from = &source[source.find(anchor).expect("just counted exactly one")..];
+        let end = from
+            .find("\n}\n")
+            .expect("the caller has no column-0 close brace — re-anchor this guard");
+        &from[..end]
+    }
+
+    /// The composite property over ONE caller's body text: gate 4 is CALLED, and no integer cast
+    /// appears anywhere beside it. Empty result = the pairing holds.
+    ///
+    /// Both halves fail toward RED, deliberately and in opposite ways. The call site is matched as
+    /// a WHOLE TRIMMED LINE, so no comment can satisfy it. The casts are matched over the RAW body
+    /// INCLUDING comments, so no comment can hide one — the cost is that a body comment which
+    /// spells `as i64` reds this check, and the remedy is to put that prose in the function's DOC
+    /// comment, above the window, which is where it already lives today. That asymmetry is
+    /// `split_attr`'s and [`crate::error`]'s: a false RED costs one edit, paid by the author who
+    /// caused it, while a false GREEN is a firewall breach nobody learns about.
+    fn gate_4_pairing_faults(body: &str, call_site: &str) -> Vec<String> {
+        let mut faults = Vec::new();
+        if !body.lines().any(|line| line.trim() == call_site) {
+            faults.push(format!(
+                "the gate-4 call site `{call_site}` is gone — gate 3's bounded quotient no longer \
+                 reaches the checked conversion"
+            ));
+        }
+        for spelling in SATURATING_CAST_SPELLINGS {
+            if body.contains(spelling) {
+                faults.push(format!(
+                    "`{spelling}` appears in the body — a float→int `as` cast SATURATES rather \
+                     than refusing (issue #1028); convert through `checked_runway_secs`"
+                ));
+            }
+        }
+        faults
+    }
+
+    /// The composite property #1117 records as prose: gate 3 bounds the input AND gate 4 refuses
+    /// what gate 3 would not.
+    ///
+    /// A SOURCE assertion rather than a behavioural one, because no behavioural one exists. Gate 3
+    /// has already bounded `secs` to non-negative and within the caller's own window before the
+    /// call, so on the whole reachable domain `checked_runway_secs(secs)` and `secs as i64` agree
+    /// on every input — the two are observationally identical, and telling them apart would need
+    /// [`FleetRunwayState::Unmeasurable`] to be reachable, which #1081's AC 3 forbids and this
+    /// leaves untouched. Measured at base `f6d627f`, this file's parent commit: deleting the call
+    /// site entirely left the ENTIRE suite green (2133 passed, 0 failed). What is left to gate is
+    /// therefore the TEXT, and the precedent is
+    /// `paths::t19_the_resolver_introduces_no_platform_conditional`,
+    /// which is a source assertion for the same reason — the condition it guards has no build that
+    /// can see it either.
+    ///
+    /// What this does NOT reach, in each direction it fails to reach. It is bounded to the two
+    /// registered bodies, so a saturating cast anywhere else in this file is none of its business.
+    /// And it constrains where the conversion is CALLED, not what the caller does with its `None`:
+    /// rewriting the fleet's backstop arm to `FleetRunwayState::Known(0)` keeps the call site,
+    /// writes no cast, and PASSES here — measured, not reasoned. That arm is unreachable today, so
+    /// such a rewrite is inert rather than a defect; what it would silently cost is the fail-closed
+    /// backstop itself, and only if gate 3 were later relaxed.
+    /// [`the_pairing_guard_refuses_the_call_site_bypass_it_exists_to_catch`] does redden on it, but
+    /// only because its mutation needle stops matching — a re-anchor signal, not detection, and the
+    /// two are worth keeping apart. Gate 4's own direct test
+    /// ([`checked_runway_secs_refuses_every_figure_a_saturating_cast_would_state`]) covers the
+    /// conversion; this covers the pairing; neither covers the other.
+    #[test]
+    fn every_gate_4_call_site_pairs_the_checked_conversion_rather_than_casting() {
+        let region = non_test_region(include_str!("stats.rs"));
+        for (anchor, gate_3, call_site) in GATE_4_CALL_SITES {
+            let body = gate_4_caller_body(&region, anchor);
+            // Canary the window before trusting a clean result off it: it must span gate 3, which
+            // is the half that makes the pairing a pairing at all.
+            assert!(
+                body.contains(gate_3),
+                "the window at `{anchor}` does not reach gate 3 (`{gate_3}`) — it slid or \
+                 truncated, and a clean result off it would be a green run over nothing"
+            );
+            let faults = gate_4_pairing_faults(body, call_site);
+            assert!(faults.is_empty(), "in `{anchor}`: {faults:#?}");
+        }
+    }
+
+    /// CONSTRAINT-A for the guard above (ADR-0031 § 4): it is observed to REDDEN on the defect,
+    /// not read and believed.
+    ///
+    /// Every case drives [`gate_4_pairing_faults`] — the predicate the real assertion uses — over
+    /// the REAL shipped body text with a mutation applied, rather than over a paraphrase of it.
+    /// The shipped file cannot host the bypass, because hosting it is the defect. Each `assert_ne!`
+    /// on the mutated text is load-bearing: a `replace` whose needle drifted would silently leave
+    /// the body clean and every case below would then pass for the wrong reason.
+    #[test]
+    fn the_pairing_guard_refuses_the_call_site_bypass_it_exists_to_catch() {
+        let region = non_test_region(include_str!("stats.rs"));
+        let (anchor, _, call_site) = GATE_4_CALL_SITES[0];
+        let clean = gate_4_caller_body(&region, anchor);
+        assert!(
+            gate_4_pairing_faults(clean, call_site).is_empty(),
+            "control: the shipped body must hold, or every refusal below proves nothing"
+        );
+
+        // The exact tidy-up #1117 measured surviving the entire suite — "remove the arm the code
+        // itself calls unreachable". Both halves must fire: the call site is gone AND a saturating
+        // cast took its place.
+        let bypassed = clean.replace(
+            concat!(
+                "    match checked_runway_secs(secs) {\n",
+                "        Some(secs) => FleetRunwayState::Known(secs),\n",
+                "        None => FleetRunwayState::Unmeasurable,\n",
+                "    }",
+            ),
+            "    FleetRunwayState::Known(secs as i64)",
+        );
+        assert_ne!(
+            bypassed, clean,
+            "the bypass did not apply — re-anchor this canary"
+        );
+        let faults = gate_4_pairing_faults(&bypassed, call_site);
+        assert!(
+            faults.iter().any(|f| f.contains("as i64")),
+            "the saturating cast must be named: {faults:#?}"
+        );
+        assert!(
+            faults.iter().any(|f| f.contains(call_site)),
+            "the lost call site must be named: {faults:#?}"
+        );
+
+        // The two halves DISCRIMINATE — neither verdict is carried by the other. Drop the call
+        // site without introducing a cast, and only the call-site fault fires.
+        let unpaired = clean.replace("match checked_runway_secs(secs) {", "match Some(secs) {");
+        assert_ne!(
+            unpaired, clean,
+            "the un-pairing did not apply — re-anchor this canary"
+        );
+        let faults = gate_4_pairing_faults(&unpaired, call_site);
+        assert!(
+            faults.iter().any(|f| f.contains(call_site)),
+            "a bypass that adds no cast must still be refused: {faults:#?}"
+        );
+        assert!(
+            !faults.iter().any(|f| f.contains("as i64")),
+            "and must not be reported as a cast, because none was written: {faults:#?}"
+        );
+
+        // ...and a comment cannot stand in for the call site. The line rule matches a whole
+        // TRIMMED line precisely so that commenting the pairing out is a bypass like any other;
+        // a `contains` rule would read this body as intact.
+        let commented = clean.replace(
+            "    match checked_runway_secs(secs) {",
+            "    // match checked_runway_secs(secs) {",
+        );
+        assert_ne!(
+            commented, clean,
+            "the comment-out did not apply — re-anchor this canary"
+        );
+        let faults = gate_4_pairing_faults(&commented, call_site);
+        assert!(
+            faults.iter().any(|f| f.contains(call_site)),
+            "a commented-out call site must be refused, not read as intact: {faults:#?}"
+        );
+
+        // ...and the converse: keep the call site, smuggle a cast in beside it.
+        let cast_beside = clean.replace(
+            "    let secs = (headroom / rate).round();",
+            "    let secs = (headroom / rate).round();\n    let _shadow = secs as i64;",
+        );
+        assert_ne!(
+            cast_beside, clean,
+            "the cast did not apply — re-anchor this canary"
+        );
+        let faults = gate_4_pairing_faults(&cast_beside, call_site);
+        assert!(
+            faults.iter().any(|f| f.contains("as i64")),
+            "a cast beside an intact call site must be refused: {faults:#?}"
+        );
+        assert!(
+            !faults.iter().any(|f| f.contains(call_site)),
+            "and the call site must not be reported lost, because it is not: {faults:#?}"
+        );
+
+        // `as _` earns its place in the list: it INFERS `i64` from `Known`'s field, so a list of
+        // named target types alone would wave it straight through.
+        let inferred = clean.replace(
+            "        Some(secs) => FleetRunwayState::Known(secs),",
+            "        Some(_) => FleetRunwayState::Known(secs as _),",
+        );
+        assert_ne!(
+            inferred, clean,
+            "the inferred cast did not apply — re-anchor this canary"
+        );
+        let faults = gate_4_pairing_faults(&inferred, call_site);
+        assert!(
+            faults.iter().any(|f| f.contains("as _")),
+            "a cast whose target is inferred must be refused too: {faults:#?}"
+        );
+
+        // The per-account caller carries the same bypass, and the same guard bites on it.
+        let (anchor, _, call_site) = GATE_4_CALL_SITES[1];
+        let clean = gate_4_caller_body(&region, anchor);
+        assert!(
+            gate_4_pairing_faults(clean, call_site).is_empty(),
+            "control: the shipped per-account body must hold, or the refusal below proves nothing"
+        );
+        let bypassed = clean.replace("\n    checked_runway_secs(secs)", "\n    Some(secs as i64)");
+        assert_ne!(
+            bypassed, clean,
+            "the bypass did not apply — re-anchor this canary"
+        );
+        let faults = gate_4_pairing_faults(&bypassed, call_site);
+        assert!(
+            faults.iter().any(|f| f.contains("as i64")),
+            "the per-account saturating cast must be named: {faults:#?}"
+        );
+        assert!(
+            faults.iter().any(|f| f.contains(call_site)),
+            "the per-account lost call site must be named: {faults:#?}"
+        );
+    }
+
+    /// The register above, pinned from the other side: a THIRD caller of gate 4 must not be able
+    /// to arrive without the pairing guard examining it.
+    ///
+    /// Stated as a property rather than a count, so it does not go stale on landing. The positive
+    /// controls are what stop it passing vacuously — a cut that lost the subject, or a filter that
+    /// stopped matching, yields an empty `unregistered` and would otherwise read as clean.
+    #[test]
+    fn every_gate_4_call_site_in_this_file_is_registered() {
+        let region = non_test_region(include_str!("stats.rs"));
+        assert!(
+            region.contains("fn checked_runway_secs("),
+            "the non-test cut lost gate 4's own definition — an empty scan is not a clean one"
+        );
+        for (_, _, call_site) in GATE_4_CALL_SITES {
+            assert_eq!(
+                region
+                    .lines()
+                    .filter(|line| line.trim() == call_site)
+                    .count(),
+                1,
+                "`{call_site}` must appear EXACTLY once in the scanned region: zero and the scan \
+                 below sees nothing, while a second caller spelling its call identically would be \
+                 filtered out with the first and never examined"
+            );
+        }
+        let unregistered: Vec<&str> = region
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.contains("checked_runway_secs("))
+            .filter(|line| !line.starts_with("fn checked_runway_secs("))
+            .filter(|line| !GATE_4_CALL_SITES.iter().any(|(_, _, site)| line == site))
+            .collect();
+        assert!(
+            unregistered.is_empty(),
+            "gate 4 has a call site outside GATE_4_CALL_SITES, so the pairing guard never \
+             examined it — register it there: {unregistered:#?}"
+        );
+    }
+
     #[test]
     fn fleet_runway_state_separates_flat_from_unmeasurable_from_out_of_window() {
         // The three unknowns are DISTINCT, and the distinction is load-bearing: the daemon's warn
