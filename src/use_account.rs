@@ -1835,8 +1835,17 @@ mod tests {
         // in a BRACED group (`Account { label, .. }`) or in a parenthesised one
         // (`run_login(login, store, stash, existing, label, claude_json)`, `src/capture.rs:762`).
         // Both spell the same three tokens; only the enclosing delimiter tells them apart.
+        //
+        // That is the INNERMOST delimiter, and it is the answer to that question alone. The other
+        // question asked of this stack below — which brace opens a pending `fn`'s body — is a
+        // question about its DEPTH, and answering that one innermost-first is the bypass issue
+        // #1223 records.
         let mut delims: Vec<char> = Vec::new();
         let mut pending: Option<String> = None;
+        // The delimiter depth `pending` was captured AT. Its body brace is the one that opens
+        // back at that same depth; every brace deeper than it belongs to the signature. Captured
+        // at the `fn` token, so any delimiter already enclosing the declaration is counted in it.
+        let mut pending_depth = 0usize;
         let mut depth = 0usize;
         let mut i = 0usize;
 
@@ -1897,6 +1906,7 @@ mod tests {
                 }
                 if j > start {
                     pending = Some(src[start..j].iter().collect());
+                    pending_depth = delims.len();
                     i = j;
                     continue;
                 }
@@ -1921,16 +1931,32 @@ mod tests {
             if src[i] == '{' {
                 depth += 1;
                 // A pending `fn` binds to the brace that opens its BODY, and a brace opened
-                // INSIDE the parameter list is not that brace — it is a destructuring parameter
-                // (`fn park(Account { label, .. }: &Account) { … }`). Binding the scope there
-                // opened it at the pattern and closed it at the pattern's `}`, leaving the whole
-                // body with no enclosing scope: every read in it was attributed to nothing and
-                // dropped. That is a total bypass of this gate, in the same family as the one
-                // issue #1202 is about, and the delimiter stack is what makes the two braces
-                // distinguishable. Nothing in the tree spells it today — measured, and
-                // [`the_handle_read_tripwire_bites_on_a_braced_pattern_binding`] is what keeps
-                // the arm honest rather than decorative.
-                if delims.last() != Some(&'(') {
+                // anywhere INSIDE the signature is not that brace — it is a destructuring
+                // parameter (`fn park(Account { label, .. }: &Account) { … }`). Binding the
+                // scope there opened it at the pattern and closed it at the pattern's `}`,
+                // leaving the whole body with no enclosing scope: every read in it was
+                // attributed to nothing and dropped. That is a total bypass of this gate, in the
+                // same family as the one issue #1202 is about.
+                //
+                // What tells the two braces apart is DEPTH, not the innermost delimiter: the
+                // body brace is the one that opens back at the depth the `fn` token was read at.
+                // Asking only what the innermost delimiter is (`delims.last() != Some(&'(')`)
+                // answers the question for a FLAT pattern and re-opens the bypass for anything
+                // nested inside it, because at the inner `{` of `Wrapper { inner: Account { … } }`
+                // the innermost delimiter is `{` rather than `(` (issue #1223). No signature in
+                // the tree opens a brace at all today — measured over the non-test regions with
+                // an instrument canaried against both shapes, so it is the tree that is clean and
+                // not the scan that is broken — which makes both the flat and the nested case
+                // latent, and [`the_handle_read_tripwire_bites_on_a_braced_pattern_binding`] is
+                // what keeps the arm honest rather than decorative.
+                //
+                // The residual, in the one direction this depth test does NOT reach: a `;`
+                // NESTED in a signature (`[u8; N]`) clears `pending` above before this arm is
+                // ever consulted, so such a function binds no scope and its whole body is
+                // dropped — the same total bypass through a different root, and unlike the two
+                // above it is LIVE (`src/migration.rs:748`, whose body happens to read no
+                // identity field). Issue #1225, deliberately not widened into here.
+                if delims.len() == pending_depth {
                     if let Some(name) = pending.take() {
                         scopes.push((name, depth, i));
                     }
@@ -1970,8 +1996,13 @@ mod tests {
                 // [`MULTI_SITE_READERS`] cannot see a name colliding through parameter bindings
                 // ALONE. The name set above still catches such a function, and nothing in the
                 // tree spells the shape at all — measured.
-                let in_param_pattern =
-                    pending.is_some() && delims.len() >= 2 && delims[delims.len() - 2] == '(';
+                //
+                // Deeper than the depth the `fn` was read at, with that `fn` still pending:
+                // the match is inside the signature. Depth again rather than the second-innermost
+                // delimiter, and for the same reason — a nested pattern puts `{` there, so
+                // asking whether `delims[len - 2]` is `(` sees the outer pattern brace and not
+                // the parameter list (issue #1223).
+                let in_param_pattern = pending.is_some() && delims.len() > pending_depth;
                 if let (true, Some(name)) = (in_param_pattern, &pending) {
                     out.push((name.clone(), field));
                 } else if let Some((name, _, site)) = scopes.last() {
@@ -2903,6 +2934,30 @@ mod tests {
                 "fn apply_park(Account { .. }: &Account, roster: &[Account], query: &str) -> Option<usize> {",
                 &["    roster.iter().position(|a| a.label == query)"][..],
             ),
+            // …and the same shape one level deeper (issue #1223). These two are a PAIR, and each
+            // half reds under a mutation the other survives — which is the whole reason both are
+            // here. Deleting the guard outright reds the FLAT case above. Narrowing it to the
+            // INNERMOST delimiter (`delims.last() != Some(&'(')`) leaves that flat case green —
+            // at its pattern brace the innermost open delimiter really is `(` — and reds only
+            // this one, because at the inner `{` of a nested pattern the innermost delimiter is
+            // `{`. A guard that asks about depth instead answers both. Measured by mutation per
+            // ADR-0031 § 4 CONSTRAINT-A, not by reading the arm.
+            (
+                "a body read beneath a NESTED destructuring `fn` parameter",
+                "fn apply_park(Wrapper { inner: Account { .. }, .. }: &Wrapper, roster: &[Account], query: &str) -> Option<usize> {",
+                &["    roster.iter().position(|a| a.label == query)"][..],
+            ),
+            // …and the mirror-image half, which is what pins `in_param_pattern`'s own depth test.
+            // Here the NESTED pattern binds the identity field and the body reads nothing, so the
+            // read can only arrive through the parameter arm. Under the second-innermost-delimiter
+            // form (`delims[len - 2] == '('`) that arm sees the outer PATTERN brace instead of the
+            // parameter list, the read is filed nowhere at all, and this reds with `[]` — the same
+            // total bypass one question over. Measured by mutation per ADR-0031 § 4 CONSTRAINT-A.
+            (
+                "an identity field bound INSIDE a nested `fn` parameter pattern",
+                "fn apply_park(Wrapper { inner: Account { label, .. }, .. }: &Wrapper, query: &str) -> Option<usize> {",
+                &["    (label == query).then_some(0)"][..],
+            ),
         ] {
             let source = injected(signature, body);
             assert_eq!(
@@ -2921,6 +2976,52 @@ mod tests {
                 "the canary's function must be absent from the register, or it proves nothing"
             );
         }
+
+        // A `fn` is not always declared at the depth the file opens at, and the depth its body
+        // brace is recognised by has to be captured where the `fn` token is READ — with every
+        // enclosing delimiter already on the stack. `bar` below sits inside a closure inside a
+        // call, so it opens at depth 2 and its body brace closes back to depth 2; an
+        // implementation comparing against a fixed 0, or capturing the depth at the `(` after
+        // the name, never binds it and the read inside it lands on the ENCLOSING function
+        // instead. That is the mutation this reds under — not the innermost-delimiter form,
+        // which resolves this case correctly. So it pins a property the fix must not break
+        // rather than the defect the fix closes, and it is the one case here whose subject is
+        // which function a read is attributed to rather than whether it is seen at all.
+        let nested_fn = injected(
+            SIG,
+            &[
+                "    foo(|| { fn bar(r: &[Account], q: &str) -> Option<usize> {",
+                "        r.iter().position(|a| a.label == q)",
+                "    } });",
+                "    None",
+            ],
+        );
+        assert_eq!(
+            functions_reading_a_handle(&nested_fn),
+            ["bar"],
+            "a read inside a `fn` nested in a closure belongs to that `fn`, not to the function \
+             enclosing it: `apply_park` reads nothing here, and naming it would mean the nested \
+             body brace was never recognised as one"
+        );
+        // …and the NAME alone cannot say that, which the mutation above was what established.
+        // A `pending` that is never taken is never cleared either, so `in_param_pattern` stays
+        // true for a signature that in effect never ended, and the body's read is filed under
+        // the same name `bar` by the parameter arm instead — identical here, and the assertion
+        // above passes on it. The SITE is what separates the two, because a parameter read
+        // deliberately records none (see [`Scan::read_sites`]): under the correct binding there
+        // is exactly one, and under that mutation there are none.
+        let sites: Vec<String> = handle_reads(&non_test_region(&nested_fn))
+            .read_sites
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            sites,
+            ["bar"],
+            "the nested read must be attributed through an open BODY scope, which records a \
+             definition site — a name filed by the parameter arm instead records none, and \
+             would leave this empty while the assertion above still passed"
+        );
 
         // The negative control, and the reason `handle_reads` tracks every delimiter rather
         // than only braces. Asserted as a PAIR differing in one character, because either half
