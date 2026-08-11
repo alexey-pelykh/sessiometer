@@ -3329,6 +3329,182 @@ ts=2026-07-11T00:02:00Z event=usage_velocity acct=u-A session_pct_per_min=-0.15 
         );
     }
 
+    // --- issue #1179: canarying the `is_finite()` guards ----------------------
+    //
+    // WHAT THE CANARY BELOW COVERS, AND WHAT IT DOES NOT. Issue #1179 enumerates five `is_finite()`
+    // sites in this module and reports none of them canaried. The tests here reach exactly ONE —
+    // the `usage_velocity` arm's `.filter(|v| v.is_finite() && *v > 0.0)` in `parse_events`. The
+    // other four are accounted for individually, because "write a canary" turned out to be the
+    // wrong verdict for every one of them; stated here rather than left implied, so the next reader
+    // does not take one gate's coverage for the family's.
+    //
+    //   - `record_blind_projection`'s `rate` and `inflation` INPUT filters: not canary-able, and
+    //     not an unguarded gate either. Every non-finite input reaches `projected_pct` still
+    //     non-finite: `corrected_anchor` is a `u8`, and the arm's own gate leaves
+    //     `blind_secs > BLIND_GATE_SECS`, hence `>= 1`, so the `x × 0` escape does not exist —
+    //     a NaN propagates through both the product and the sum, an infinity times a non-zero
+    //     finite stays infinite, and `inf × 0` is NaN. The RESULT guard therefore catches every
+    //     line either filter would have, landing it in the same `malformed` bucket by the same
+    //     `return`. Deleting either is behaviour-preserving, so no test can distinguish it: they
+    //     are defence in depth, not coverage debt.
+    //   - `record_blind_projection`'s `projected_pct` RESULT guard: ALREADY canaried, by
+    //     `blind_projection_error_never_publishes_a_non_finite_percentile` and
+    //     `blind_projection_error_classifies_corruption_apart_from_coverage` — deleting it reds
+    //     both. #1179 read the comment on the first as awareness rather than coverage; it is
+    //     coverage, and it is what makes the bullet above true.
+    //   - `compute_landing`'s post-swap sample window (`s.session.is_finite()`): still UNCANARIED,
+    //     and deliberately left so. Nothing reaches it through the real parse path: those samples
+    //     are `serde_json`-decoded from `usage-samples.jsonl`, and JSON has no infinity — `1e400`
+    //     decodes to `Err("number out of range")` and `Infinity` to `Err("expected value")`, with
+    //     the round trip closed at the other end too, since serializing `f64::INFINITY` writes
+    //     `null`, which then fails to decode as `f64`. Pinning it would mean building a `Sample` in
+    //     memory, asserting the filter's arithmetic while implying a reachable hazard the store's
+    //     own decoder forecloses. Recorded as a finding rather than faked into a green here.
+
+    /// A `usage_velocity` line whose recomputed rate is not finite, in the shapes a garbled durable
+    /// log can carry it — all the same gate, approached from different sides.
+    ///
+    /// The two `session_delta_pct` shapes put the infinity in directly: `str::parse::<f64>` accepts
+    /// both spellings and yields `f64::INFINITY` (`"inf"` by name, `"1e400"` by overflow), which
+    /// [`non_finite_rate_reaches_the_filter_rather_than_failing_to_parse`] asserts rather than
+    /// assumes — were either a parse ERROR, the sample would drop one combinator earlier and this
+    /// fixture would be testing nothing.
+    ///
+    /// The `quotient overflows` shape is the one worth reading twice: both ingredients parse finite
+    /// and pass every companion predicate (`1e-320` is subnormal, so `*secs > 0.0` holds), and the
+    /// DIVISION overflows. It is the twin of the `rate=1e300 inflation=1e300` product overflow that
+    /// [`blind_projection_error_never_publishes_a_non_finite_percentile`] pins, and it is why this
+    /// guard belongs on the RESULT of the recomputation rather than on its inputs.
+    ///
+    /// None of these is emittable: `session_delta_pct` is an `i16` and `elapsed_secs` a whole-second
+    /// count on [`crate::observability::Event::UsageVelocity`], so the daemon cannot write any of
+    /// them. That is the point — this reader is deliberately tolerant of whatever is on disk (a torn
+    /// write, an interleaved append, a hand-concatenated log), the same corruption class the
+    /// `rate=oops` / `rate=NaN` fixtures in
+    /// [`blind_projection_error_classifies_corruption_apart_from_coverage`] already stand for.
+    const NON_FINITE_VELOCITY_LINES: &[(&str, &str)] = &[
+        (
+            "session_delta_pct spelled as an infinity",
+            "ts=2026-07-11T00:00:00Z event=usage_velocity acct=u-A session_pct_per_min=inf weekly_pct_per_min=0.01 elapsed_secs=300 session_delta_pct=inf weekly_delta_pct=0\n",
+        ),
+        (
+            "session_delta_pct overflowing f64 on parse",
+            "ts=2026-07-11T00:01:00Z event=usage_velocity acct=u-B session_pct_per_min=inf weekly_pct_per_min=0.01 elapsed_secs=300 session_delta_pct=1e400 weekly_delta_pct=0\n",
+        ),
+        (
+            "finite ingredients whose quotient overflows",
+            "ts=2026-07-11T00:02:00Z event=usage_velocity acct=u-C session_pct_per_min=inf weekly_pct_per_min=0.01 elapsed_secs=1e-320 session_delta_pct=42 weekly_delta_pct=0\n",
+        ),
+    ];
+
+    /// The premise [`observed_peak_excludes_a_non_finite_recomputed_rate`] rests on, asserted so it
+    /// cannot rot into a vacuous pass: the infinity must actually REACH the `is_finite()` filter. If
+    /// `"inf"` or `"1e400"` failed to parse, `.and_then(|v| v.parse::<f64>().ok())` would drop the
+    /// sample first, the exclusion would be attributable to the parse rather than to the guard, and
+    /// deleting the guard would leave the canary green — a gate proving nothing while reading as
+    /// coverage.
+    ///
+    /// The `> 0.0` assertion is why the guard is not redundant with its own companion predicate:
+    /// `f64::INFINITY > 0.0` is TRUE, so "simplifying" `is_finite() && *v > 0.0` down to `*v > 0.0`
+    /// on the reasonable-looking grounds that a positivity check subsumes a finiteness one admits
+    /// every positive infinity in the file.
+    #[test]
+    fn non_finite_rate_reaches_the_filter_rather_than_failing_to_parse() {
+        // Bound through `str::parse` rather than written as `f64::INFINITY` literals, so these are
+        // values the real parse path produced — the claim under test — and not constants a reader
+        // (or the optimizer) can fold away without ever touching the parser.
+        let named = "inf".parse::<f64>().expect("the named spelling must PARSE");
+        let overflowed = "1e400"
+            .parse::<f64>()
+            .expect("an overflowing literal must PARSE");
+        assert_eq!(
+            (named, overflowed),
+            (f64::INFINITY, f64::INFINITY),
+            "both spellings must reach the filter as infinities, or the canary excludes for the wrong reason"
+        );
+        assert!(
+            named > 0.0,
+            "the companion `> 0.0` predicate does NOT cover for a missing `is_finite()`"
+        );
+        // And the quotient-overflow shape's ingredients are individually finite and individually
+        // admissible, so its exclusion is likewise the guard on the RESULT doing the work.
+        let secs = "1e-320".parse::<f64>().expect("a subnormal parses");
+        assert!(
+            secs.is_finite() && secs > 0.0,
+            "{secs} clears every input-side gate"
+        );
+        assert!(
+            !(42.0f64 / (secs / 60.0)).is_finite(),
+            "yet the quotient overflows — which is why the guard sits on the result"
+        );
+    }
+
+    /// The canary (issue #1179): a non-finite recomputed rate is EXCLUDED from the session-velocity
+    /// distribution, asserted per shape so each is separately falsifiable.
+    ///
+    /// Every shape is checked before asserting, rather than one `assert!` per iteration, so the
+    /// mutation report names ALL the shapes that got through instead of stopping at the first.
+    /// Deleting `v.is_finite() &&` from the arm's filter REDs this, and reds it for the stated
+    /// reason: the message prints each offending shape beside the `[inf]` it admitted, which no
+    /// parse failure could produce.
+    #[test]
+    fn observed_peak_excludes_a_non_finite_recomputed_rate() {
+        let admitted: Vec<(&str, Vec<f64>)> = NON_FINITE_VELOCITY_LINES
+            .iter()
+            .map(|(shape, line)| (*shape, parse_events(line, None).session_velocities))
+            .filter(|(_, rates)| !rates.is_empty())
+            .collect();
+        assert!(
+            admitted.is_empty(),
+            "no garbled shape may enter the distribution; these did: {admitted:?}"
+        );
+    }
+
+    /// What that exclusion BUYS, pinned on the verdict rather than on the vector: an infinity that
+    /// reached the distribution would become `p100`, and `inf <= V_PEAK_SESSION_PCT_PER_MIN + 1e-9`
+    /// is false — so one garbled line would flip the honesty verdict this SLI exists to publish, and
+    /// send an operator re-calibrating a constant that is still sound.
+    ///
+    /// The 4.20 %/min control line is load-bearing twice over. It proves the arm is LIVE on this
+    /// fixture — were the whole block malformed, the equality below would fail rather than pass on
+    /// an empty distribution, the cardinality-zero trap this module refuses elsewhere — and it holds
+    /// `p100` under the assumed peak, so `v_peak_honest` reads `Some(true)` on the shipped tree and
+    /// `Some(false)` under the mutation. Internally consistent like every fixture here: `42 / (600 /
+    /// 60)` is exactly the rendered `4.20`, bit-for-bit.
+    #[test]
+    fn a_garbled_rate_never_flips_the_v_peak_honesty_verdict() {
+        let mut log = String::from(
+            "ts=2026-07-11T00:03:00Z event=usage_velocity acct=u-D session_pct_per_min=4.20 weekly_pct_per_min=0.01 elapsed_secs=600 session_delta_pct=42 weekly_delta_pct=0\n",
+        );
+        for (_, line) in NON_FINITE_VELOCITY_LINES {
+            log.push_str(line);
+        }
+        let inputs = parse_events(&log, None);
+        // Asserted on the CONTENTS, not on a count: under the mutation this prints
+        // `[4.2, inf, inf, inf]`, naming the live control and every admitted infinity at once.
+        assert_eq!(
+            inputs.session_velocities,
+            vec![4.2],
+            "only the control may reach the distribution — a live arm with no infinity in it"
+        );
+        let r = aggregate(&inputs, &[], None);
+        assert_eq!(r.observed_peak.p100, Some(4.2));
+        assert_eq!(
+            r.observed_peak.v_peak_honest(),
+            Some(true),
+            "the constant still bounds the real peak — only a garbage line said otherwise"
+        );
+        // The renderers never see it either — the same two-surface discipline the blind arm's
+        // non-finite guard keeps.
+        let human = render_human(&r);
+        assert!(!human.contains("inf"), "no inf in human text: {human}");
+        let json = render_json(&r).expect("wire serializes");
+        assert!(
+            json.contains("\"v_peak_honest\": true"),
+            "the wire must carry the unflipped verdict: {json}"
+        );
+    }
+
     /// The `<=` boundary of [`ObservedPeak::v_peak_honest`]: a max recorded at EXACTLY the assumed
     /// peak is still honest — the constant bounds the observation, so nothing needs re-calibrating.
     ///
