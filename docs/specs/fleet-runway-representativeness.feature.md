@@ -23,7 +23,8 @@ Scenario: the CLI already satisfies this
   Given the runway is computed from 1 of 6 rostered accounts
    When the CLI renders the fleet line
    Then the counted set is stated alongside the figure
-    # Already true — `fleet_line` prints "({counted} of {observed} counted)" (stats.rs:1735). An
+    # Already true — `fleet_runway_line` prints "({counted} of {observed} counted)". (Earlier drafts
+    # called this render `fleet_line`; that has never been a Rust item — issue #1105.) An
     # earlier draft of this scope claimed the CLI left it unstated; that was wrong, and checking it
     # is what surfaced R-20. The open surface is the panel.
 

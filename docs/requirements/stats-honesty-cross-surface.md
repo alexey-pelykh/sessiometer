@@ -51,6 +51,17 @@ cannot reach the HQ — an executor in a firewalled subprocess, a fresh clone, a
 the sibling checkout moves. The `parent-requirements:` frontmatter path is **provenance, not a
 dereferenceable dependency**.
 
+**Why HQ citations still carry line numbers, and in-repo ones no longer do.** Issue #1105 converted
+every citation this document and its siblings make into `src/**` and `apps/menubar/**` from a line
+number to a greppable anchor — a symbol, or a selector for the design mock — because a line number
+silently re-points at plausible-looking other material as the file moves. HQ citations are
+deliberately left as `file:line` — a decision, not an omission. They are not convertible (the
+referent is in another repo, so there is no symbol this repo can grep), and the failure mode is
+weaker in both directions: a reader without HQ access cannot follow the pointer at all, and a reader
+with it sees at once whether it resolved. The **quoted claim beside each one is the load-bearing
+part**; the line is a convenience for whoever holds the sibling checkout. Treat an HQ line number as
+unverified from here.
+
 ## 1. Problem Statement
 
 **Current state.** On a week in which the operator's entire six-account fleet was saturated and
@@ -90,15 +101,19 @@ governing rule as a **keystone**:
 
 The Rust producer restates it at the field, twice, in the imperative:
 
-> `src/usage_stats.rs:288` — *"Surfaces **MUST** consult the denominator and render UNKNOWN rather
-> than a bare `0` — an unmeasurable period is not a calm one (issue #804, REQ-STA-B-008)."*
-> `src/usage_stats.rs:341` — *"Surfaces **MUST** consult it and render their own gap sentinel,
-> **exactly as REQ-STA-B-008 already requires** of the utilisation census."*
+> `RosterStats::all_high_episodes` (`src/usage_stats.rs`) — *"Surfaces **MUST** consult the
+> denominator and render UNKNOWN rather than a bare `0` — an unmeasurable period is not a calm one
+> (issue #804, REQ-STA-B-008)."*
+> `RosterStats::capacity_hold_covered_secs` (same file) — *"Surfaces **MUST** consult it and render
+> their own gap sentinel, **exactly as REQ-STA-B-008 already requires** of the utilisation census."*
 
-The CLI obeys. The panel never received the field: `StatsRoster` in `apps/menubar/Sources/WireModel.swift`
-decodes **five** keys and `all_high_covered_secs` is not among them, so
-`StatusPanelFormat.statsAggregateText` (`:2218-2224`) renders episodes and duration unconditionally.
-The value it needs **is already on the wire** (`RosterWire`, `src/stats.rs:2101`, serialized `:2351`).
+The CLI obeys. The panel had never received the field: at authoring, `StatsRoster` in
+`apps/menubar/Sources/WireModel.swift` decoded **five** keys, `all_high_covered_secs` was not among
+them, and `StatusPanelFormat.statsAggregateText` rendered episodes and duration unconditionally. The
+value it needed **was already on the wire** — `RosterWire::all_high_covered_secs`, populated by
+`roster_wire` — so the gap was Swift-consumer-side only. *(Since delivered — issue #1029:
+`StatsRoster` now decodes `allHighCoveredSecs` and `StatusPanelFormat.statsCensusReading` gates on
+it. The diagnosis below is what this PRD was written from, and is kept as written.)*
 
 So the root cause is **not** that anyone disagreed about honesty. It is that **the honesty rule is
 enforced by memory, one surface at a time.** The repo owns a mechanism that would have caught this —
@@ -220,7 +235,8 @@ scope. `pending-user` = pipeline-authored beyond that selection; **not yet ratif
 **R-1** — *When* a stat measurement's coverage denominator is zero, the system **shall** report that
 measurement as UNKNOWN on **every** surface that renders it, and **shall not** render a numeric value.
 `Origin: user-stated` ("why there are 0s and 0 episodes … wtf").
-`Traces to: REQ-STA-B-008 [keystone]; usage_stats.rs:288, :341.` `Ratification: n/a`
+`Traces to: REQ-STA-B-008 [keystone]; RosterStats::all_high_episodes and
+RosterStats::capacity_hold_covered_secs in src/usage_stats.rs.` `Ratification: n/a`
 
 **R-2** — *Where* a measurement renders as UNKNOWN, that render **shall** be distinguishable from a
 measured zero **and** from a healthy quiet period.
@@ -245,8 +261,10 @@ reporting it **shall** state the counted set.
 `Origin: enrichment-expanded (F3).` `Traces to: counted/observed are already carried on the wire
 ("counted":2,"observed":6).` **Already satisfied on the CLI** — `render_summary` prints
 `({counted} of {observed} counted)` alongside the figure. The open surface is the panel (R-17).
-*(Sibling docs call the CLI render `fleet_line`, a name that has never been a Rust item; tracked as
-#1105.)* `Ratification: user-ratified (scope membership 2026-08-04)`
+*(Sibling docs used to call this render `fleet_line`, a name that has never been a Rust item;
+corrected throughout by issue #1105. The band is `render_summary`; the runway's own line is
+`fleet_runway_line`, wording it via `fleet_runway_phrase`.)*
+`Ratification: user-ratified (scope membership 2026-08-04)`
 
 **R-20** — Every roster-block fact **shall** be printed in every state, on every surface that reports
 it. A fact whose value is UNKNOWN **shall not** be rendered by omitting its line.
@@ -300,8 +318,9 @@ fleet-runway — the panel renders one of the four.` `Ratification: user-ratifie
 as the CLI is — including the counted set (R-5), the refusals (R-3, R-6), and the no-forecast
 constraint (R-7).
 `Origin: user-stated (scope amendment 2026-08-04)` — promoted from the § 8 open question after the
-panel was found to ship a `fleetRunwayWarnSecs` tunable (`SettingsModel.swift:48`, `ConfigWire.swift:45`,
-labelled "Fleet Runway") for a figure it never displays. `Traces to: design-stats.md:115, which
+panel was found to ship a `fleetRunwayWarnSecs` tunable (`TunableField.fleetRunwayWarnSecs`,
+`TunablesView.fleetRunwayWarnSecs`, labelled "Fleet Runway") for a figure it never displays.
+`Traces to: design-stats.md:115, which
 specifies the roster block as lowest-utilisation + all-accounts-high + swaps + capacity holds +
 fleet-runway — with R-9 and R-17 the panel reaches three of the four.` `Ratification: n/a (operator-selected)`
 **No wire work**: the fleet block is already serialized (`runway_secs` / `counted` / `observed`,
@@ -436,7 +455,8 @@ GIVEN a fleet whose combined weekly burn rate is a decayed EMA of ~1e-11
 WHEN the fleet runway is computed
 THEN the runway is reported as UNKNOWN
 AND the reader is told it is unknown
-BUT NOT does any surface print a duration (787,037 days at that rate today)
+BUT NOT does any surface print a duration (787,037 days at that rate — the quotient, not a
+        capture; refused since issue #1028 by fleet_runway_state's FLEET_RUNWAY_PLAUSIBLE_MAX_SECS)
 BUT NOT is the line silently omitted, leaving absence to read as "no problem"
 BUT NOT does the figure survive by being clamped to a large-but-plausible number (see P7)
 ```
@@ -531,11 +551,14 @@ SCALE: fraction of reachable (measurement × failed-precondition) combinations t
        UNKNOWN rather than a numeric value, across both surfaces
 METER: enumerate the reachable combinations from the § 7 state matrix; assert each in test
 GOAL:  1.0
-NOW:   CLI 2/6 — correct on both coverage-denominator cases (census, capacity holds), wrong on all
-       four runway-degeneracy cases (§ 7 rows 8-11). The CLI is the reference implementation for
-       COVERAGE gating only; it is not a clean surface overall.
-       Panel 0/1 of what it renders today (the census, § 7 row 3), heading to 0/6 as R-9 and R-17
-       make the other five states reachable there.
+NOW:   at authoring (2026-08-04), CLI 2/6 — correct on both coverage-denominator cases (census,
+       capacity holds), wrong on all four runway-degeneracy cases (§ 7 rows 8-11); Panel 0/1 of
+       what it rendered (the census, § 7 row 3), heading to 0/6 as R-9 and R-17 make the other
+       five states reachable there.
+       Since: issue #1028 closed rows 9-11 and issue #1029 closed the panel's census, so CLI 5/6
+       (row 8 alone — an unrepresentative counted set, #1034) and Panel 1/1 of what it renders.
+       The CLI is the reference implementation for COVERAGE gating only; it is not a clean surface
+       overall, and the panel's denominator still grows with R-9 and R-17.
 ```
 ```
 TAG:   RunwayPlausibility
@@ -544,7 +567,8 @@ METER: property test over rate ∈ [1e-300, 1e3] and headroom ∈ [0, roster-max
 GOAL:  no input produces a reported figure outside the plausibility bound; degenerate inputs
        produce UNKNOWN
 CONSTRAINT: no saturating cast is reachable on the reporting path
-NOW:   rate 1e-11 → 787,037 days · rate 1e-300 → i64::MAX
+NOW:   at authoring, rate 1e-11 → 787,037 days · rate 1e-300 → i64::MAX. Both refused since
+       issue #1028: each is BeyondWeeklyWindow, and no saturating cast remains on the path.
 ```
 ```
 TAG:   CrossSurfaceStateAgreement
@@ -603,13 +627,12 @@ correct or says it does not know.* Nothing in between.
 ## 7. State Matrix — measurement × precondition × surface
 
 **A snapshot, not a live view.** The CLI and Panel columns below record what each surface did **at
-authoring, 2026-08-04**; work since has overtaken parts of **both** columns — row 3's Panel cell, for
-one, is the reading issue #1029 was filed to end. Where this table and a requirement block above
-disagree, the requirement block is authoritative. Only R-20 and R-21 carry delivery notes, though, so
-a row whose authoritative block is some other requirement — row 3's Required cell routes to R-1 and
-R-8 — is not disambiguated by that rule and has to be checked against the code. The rows are kept as authored
-because the requirements were derived from them; re-auditing them against current code is tracked as
-#1105.
+authoring, 2026-08-04**, and are kept as authored because the requirements were derived from them.
+Work since has overtaken parts of **both** columns. Where this table and a requirement block above
+disagree, the requirement block is authoritative — but only R-20 and R-21 carry delivery notes, so a
+row whose authoritative block is some other requirement (row 3's Required cell routes to R-1 and
+R-8) is not disambiguated by that rule. **§ 7a below closes that gap**: every row is re-audited there
+against the code, so no row has to be checked by the reader (issue #1105).
 
 Panel column: **✗** = renders a confident value it should not, **∅** = metric absent entirely.
 Every ∅ below is now in scope to close — capacity holds via R-9, the runway via **R-17**.
@@ -631,16 +654,61 @@ Every ∅ below is now in scope to close — capacity holds via R-9, the runway 
 Row 10 is the subtle one: the guard then *worked* at exactly zero and the line vanished. Silent
 absence is the same misinformation in a quieter register — the operator reads "no problem".
 
+## 7a. Re-audit of § 7 against the code
+
+Every row above re-read against the source, per issue #1105. Rows are cited by the symbol that
+decides them, never by line. Each superseding claim is anchored to the **issue** that changed it —
+issue numbers do not decay, whereas "as of commit X" would be stale on landing. Rows still open are
+anchored to the issue still holding them open, so this block ages with the tracker rather than
+silently.
+
+**Superseded** — the cell was true at authoring and is not true now:
+
+| Row | Cell | Superseded by | The surface now |
+|---|---|---|---|
+| 2 | CLI `N episodes (Xh, 64% covered)` | #1029 | `roster_line` annotates `, all in view {n}% of the window` — the field name no longer leaks (R-21) |
+| 2 | Panel "share dropped ✗" | #1029 | `StatusPanelFormat.statsCensusReading` states the same share, in the same words |
+| 3 | Panel **`0 episodes (0s)` ✗** | #1029 | `statsCensusReading` returns `not measurable: never all in view at the same moment` |
+| 9 | CLI **`~648427 days` ✗** | #1028 | `fleet_runway_state` returns `BeyondWeeklyWindow` past `FLEET_RUNWAY_PLAUSIBLE_MAX_SECS`; `fleet_runway_phrase` words it `unknown — more than a week at the current combined rate` |
+| 10 | CLI "line silently omitted ✗" | #1028 | `render_summary` prints the line in every state of a counted fleet; a zero combined rate is `FleetRunwayState::Flat`, worded `unknown — no combined usage measured` |
+| 11 | CLI **`i64::MAX` ✗** | #1028 | the saturating `as i64` is gone (`checked_runway_secs`); an overflowing quotient is folded into `BeyondWeeklyWindow`, because it is the strongest evidence the pool outlasts a week |
+
+**Still standing** — the cell holds as written, and why:
+
+- Row **1** (CLI and Panel, fully covered): both still render the plain `N episodes (Xh)`.
+- Rows **3** and **5**, CLI `—`: `roster_line` still degrades the census, and `capacity_holds_cell`
+  still degrades the holds cell, to the shared `—` sentinel.
+- Rows **4** and **5** (Panel **∅**): capacity holds are still absent from the panel — R-9, open as
+  issue #1031.
+- Rows **6** through **11** (Panel **∅**): the fleet runway is still absent from the panel — R-17,
+  open as issue #1032. Only the `fleetRunwayWarnSecs` *setting* ships, which is that issue's subject.
+  The absence is total rather than confined to rows 6–8: `runway_secs` does not occur anywhere under
+  `apps/menubar/` (canaried against `all_high_covered_secs`, which returns four hits in the same
+  tree), so rows **9**, **10** and **11** hold on the same ground.
+- Row **4** (CLI): `capacity_holds_cell` still formats `{holds} ({s} session / {w} weekly) · ≥{dur}`
+  (`src/stats.rs`, the `capacity holds (session ≥…)` format string).
+- Row **6** (CLI): the hour arm of the runway phrase still renders `~Xh` — `fleet_runway_phrase`'s
+  `Known` arm through `fmt_runway_days` (`src/stats.rs`, the `"~{}h"` format).
+- Row **7** (CLI ✅) and row **8** (CLI ✗): `fleet_runway_line` still states `({counted} of {observed} counted)`
+  in every state, and the runway is still computed from whichever accounts survive
+  `account_velocity`'s staleness gate, unrepresentative or not. R-6's refusal has not shipped —
+  issue #1034, gated on spike #1033.
+
+**Limits of this re-audit.** It reads the Rust and Swift render paths named above, at the state of
+this branch. It does **not** re-run the surfaces, so it reports what the code emits, not a captured
+render; and it does not revisit the *Required* column, which states requirements rather than
+behaviour and is unaffected by delivery.
+
 ## 8. Assumption Registry
 
 | ID | Assumption | Importance | Evidence | Verdict | Cheapest test | Hedge while open |
 |---|---|---|---|---|---|---|
 | ~~A-1~~ | ~~Both coverage denominators mean the same thing~~ | **HIGH** | **RESOLVED 2026-08-04 — PARTLY CONFIRMED, and the residue is R-18.** Both censuses use the **same** intersection rule (`intersect(&prev, &covering)`, same short-circuit, same ⊆ invariant). What differs is the **validity-window anchoring**: `all_high()` → `validity_windows()`, cadence-only (`hi = next.min(s.ts + stale_after)`); `capacity_holds()` → `blocked_windows()`, which extends a blocked reading to its **carried expiry** (`anchored_hi = cadence_hi.max(relief_at)`). That single difference produced 0 vs 386747 s over the same window and roster | ~~test~~ | — | Still gate each measurement on **its own** denominator (the rule is shared; the anchoring is not). R-18 closes the anchoring gap; do **not** unify the two helpers as part of it |
-| A-2 | `all_high_covered_secs == 0` is a *measured* nil, not a sentinel | HIGH | `usage_stats.rs:299-301` states it explicitly — *"That zero is a measured quantity, not a sentinel — jointly-covered time really was nil"* | **decided** | — | — |
+| A-2 | `all_high_covered_secs == 0` is a *measured* nil, not a sentinel | HIGH | the doc comment on `RosterStats::all_high_covered_secs` states it explicitly — *"That zero is a measured quantity, not a sentinel — jointly-covered time really was nil"* | **decided** | — | — |
 | A-3 | A principled plausibility bound for the runway exists — roster-size × weekly-window, rather than an arbitrary constant | MED | Weekly windows *reset*, so a runway far beyond one window is arguably meaningless already. **Not verified** — `weekly_headroom` may aggregate across accounts in a way that legitimately exceeds one window | **test** | Read the `weekly_headroom` derivation; check whether 6 accounts × 7 d is the natural ceiling | Require *refusal* (R-3), never a clamp. A clamped figure is P7 |
-| A-4 | Pinning the roster axis needs no wire change | MED | Both coverage fields verified already serialized (`stats.rs:2351`, `:2352`) | **test** | Attempt the pin; DG-3 gates it | If false, the item exceeds appetite → surface, do not absorb |
+| A-4 | Pinning the roster axis needs no wire change | MED | Both coverage fields verified already serialized by `roster_wire` onto `RosterWire` | **test** | Attempt the pin; DG-3 gates it | If false, the item exceeds appetite → surface, do not absorb |
 | A-5 | The operator wants the panel to *say* UNKNOWN rather than hide the row | MED | Inferred from the complaint's shape ("0 episodes… wtf" is an objection to a **wrong** statement) — but never asked | **surface** | R-13 ratification (DG-1) | Assume state-it-visibly; it is the reversible choice |
-| A-6 | The staleness gate is why five accounts are excluded | HIGH | `stats.rs:970,986` + live `counted 1–2 / observed 6` while five sat at weekly 97–100 % | **decided** | — | — |
+| A-6 | The staleness gate is why five accounts are excluded | HIGH | `account_velocity`'s `stale_after_secs` early return, which also withholds the `weekly_headroom` an excluded account would have contributed, + live `counted 1–2 / observed 6` while five sat at weekly 97–100 % | **decided** | — | — |
 | A-7 | R-6's refusal will not disable the runway permanently | **HIGH** | **None.** Idle accounts are *always* stale under one-account-per-tick polling, so a naive R-6 may never report again. This is premortem P4 | **test** | Replay a week of real history through the proposed predicate; count how often it reports | Do not ship R-6 without this replay. Descope per DG-2 rather than ship a metric that never fires |
 
 ### Premortem (Phase 0, de-anchored — findings the ISO sweep cannot enumerate)
@@ -667,10 +735,11 @@ absence is the same misinformation in a quieter register — the operator reads 
 
 ### Resolved operator question (2026-08-04)
 
-The panel exposes a **`fleetRunwayWarnSecs` setting** (`SettingsModel.swift:48`, `ConfigWire.swift:45`,
-labelled "Fleet Runway" / "Runway warning (s)") for a figure **the panel never displays** — a warning
-threshold tunable for a metric not visible on that surface. Found during Stage-1 grounding, outside the
-operator's bounded nine-item selection, so it was surfaced rather than silently absorbed.
+The panel exposes a **`fleetRunwayWarnSecs` setting** (`TunableField.fleetRunwayWarnSecs`,
+`TunablesView.fleetRunwayWarnSecs`, labelled "Fleet Runway" / "Runway warning (s)") for a figure
+**the panel never displays** — a warning threshold tunable for a metric not visible on that
+surface. Found during Stage-1 grounding, outside the operator's bounded nine-item selection, so it
+was surfaced rather than silently absorbed.
 
 **Ruling: promote into scope.** The runway becomes a panel surface — **R-17**, feature
 `runway-on-panel`, the tenth item. The setting stops being an orphan, and the panel reaches three of
@@ -724,11 +793,11 @@ arose.
 | R-9 | REQ-STA-B-010; `design-stats.md:115` roster-block composition | ratified parent |
 | R-10 | `design-menubar.md` R-2, re-ratified `/council` 2026-07-09 | ratified parent |
 | R-11, R-12 | `build/fixtures/cross-surface-severity.json` + `src/cross_surface.rs`, ADR-0026 / #768 | in-repo contract |
-| R-13 | `apps/menubar/design/menubar-preview.html` `.agg` frame (943, 1020); project CLAUDE.md | build reference |
-| R-5, R-6, R-15 | `src/stats.rs:970, 986, 1095, 1107, 1133`; `src/daemon.rs` `check_fleet_runway_warn` | code forensics |
+| R-13 | `apps/menubar/design/menubar-preview.html`, its two `class="agg"` frames; project CLAUDE.md | build reference |
+| R-5, R-6, R-15 | `src/stats.rs` `account_velocity` (the `stale_after_secs` gate and `weekly_headroom`), `fleet_runway` (its honest-degradation gate and — since issue #1028 — `fleet_runway_state`), `current_fleet_runway`; `src/daemon.rs` `check_fleet_runway_warn` | code forensics |
 | R-14 | Issue #866 body vs. `apps/menubar/Sources/WireModel.swift` | contradiction |
 | R-16 | Absence of any test asserting the panel's unmeasurable render or a saturated runway; premortem P6 | coverage gap |
-| R-17 | Operator scope amendment 2026-08-04, from the orphaned `fleetRunwayWarnSecs` tunable (`SettingsModel.swift:48`, `ConfigWire.swift:45`) vs. `design-stats.md:115` roster-block composition | user-stated |
+| R-17 | Operator scope amendment 2026-08-04, from the orphaned `fleetRunwayWarnSecs` tunable (`TunableField.fleetRunwayWarnSecs`, `TunablesView.fleetRunwayWarnSecs`) vs. `design-stats.md:115` roster-block composition | user-stated |
 | R-18 | Second operator scope amendment 2026-08-04. Mechanism: `config.rs` `DEFAULT_EXHAUSTED_POLL_SECS = 3600` vs `AggregateParams::new` (`stale_after_secs` = `poll_secs` = 300) vs `usage_stats.rs` `validity_windows()` (`hi = next.min(s.ts + stale_after)`). Precedent: `blocked_windows()` `anchored_hi = cadence_hi.max(relief_at)`, ratified by REQ-STA-B-010 | code forensics + user-stated |
 | R-19 | Necessary companion to R-18 — REQ-STA-B-010 carries the anchoring rule at requirement level for capacity holds; the symmetric census change belongs at the same level | enrichment-expanded |
 | R-20 | Operator, 2026-08-04: *"for CLI this line needs to be printed."* Verified against `render_summary`, which then emitted the runway line only when the figure was finite (since delivered — issue #1028) | user-stated |
@@ -736,10 +805,12 @@ arose.
 | All | Live captures 2026-08-03: `all_high_covered_secs: 0`; `fleet: {runway_secs: 9223372036854775807, counted: 2, observed: 6}`; `capacity_holds: 6, capacity_hold_covered_secs: 386747` | self-verifying (A) |
 
 **Verified-not-assumed** (each checked at `cb3eaca`, not carried from memory):
-- `all_high_covered_secs` **is** on the Rust wire (`stats.rs:2101`, serialized `:2351`) — the gap is
-  Swift-consumer-side only. *(This corrected my own initial hypothesis, which had it missing from the wire.)*
-- `capacity_hold*` **is** on the Rust wire (`stats.rs:2107-2122`, serialized `:2352`) — so R-9 is
-  decode + render, **not** a schema bump.
+- `all_high_covered_secs` **is** on the Rust wire (`RosterWire::all_high_covered_secs`, serialized
+  by `roster_wire`) — the gap was Swift-consumer-side only. *(This corrected my own initial
+  hypothesis, which had it missing from the wire.)*
+- `capacity_hold*` **is** on the Rust wire (`RosterWire::capacity_holds`, `::capacity_holds_session`,
+  `::capacity_holds_weekly`, `::capacity_hold_secs_lower_bound`, `::capacity_hold_covered_secs`, all
+  serialized by `roster_wire`) — so R-9 is decode + render, **not** a schema bump.
 - `fleet-runway` has **zero** occurrences in `prd-stats.md`.
 - `REQ-STA-B-008` appears in **no** `.md` file in the code repo (canary-verified: the `REQ-STA` prefix
   is absent from all of them) — it lives only in Rust comments here, and is defined in the private HQ.

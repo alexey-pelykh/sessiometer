@@ -42,7 +42,7 @@ that explained the downtime was CLI-only.
 
 ## 3. Context and Scope
 
-Two render surfaces (`stats` CLI `roster_line`/`fleet_line`; SwiftUI Stats tab `StatusPanelFormat`)
+Two render surfaces (`stats` CLI `roster_line`/`render_summary`; SwiftUI Stats tab `StatusPanelFormat`)
 over one aggregation core (`usage_stats.rs`) reached through one wire (`RosterWire`/`FleetRunway`),
 plus one parity contract (`cross_surface.rs` + byte-pinned manifest) and one build reference
 (`menubar-preview.html`). The daemon consumes the same runway via `current_fleet_runway()`.
@@ -61,7 +61,9 @@ without (c) leaves the next metric to repeat the defect.
 
 ### D-A (was D2/D3) — Runway degeneracy: refuse, never clamp
 
-`stats.rs:1107` today: `(total_rate > 0.0).then(|| (total_headroom / total_rate).round() as i64)`.
+`fleet_runway` at authoring: `(total_rate > 0.0).then(|| (total_headroom / total_rate).round() as i64)`.
+*(Delivered — issue #1028. That expression is gone; `fleet_runway_state` decides the four-arm
+`FleetRunwayState` instead, and `checked_runway_secs` replaces the saturating cast.)*
 
 **Decision.** Replace the exactly-zero test with a *result-side* plausibility gate, not an input-side
 epsilon, and eliminate the saturating cast:
@@ -78,8 +80,8 @@ metric cannot make. The exact bound is derived immediately below.
 
 **Bound — A-3 RESOLVED 2026-08-04: ONE weekly window (~7 d), not roster × window.**
 
-Derivation, from `stats.rs:986`: `weekly_headroom = (weekly_ceiling - last.weekly).max(0.0)` — a usage
-**fraction**, and `weekly_rate` is fraction-per-second, so `headroom / rate` is seconds (dimensionally
+Derivation, from `account_velocity`: `weekly_headroom = (weekly_ceiling - last.weekly).max(0.0)` —
+a usage **fraction**, and `weekly_rate` is fraction-per-second, so `headroom / rate` is seconds (dimensionally
 sound). The computation **ignores replenishment entirely**: it asks "how long to drain the pooled
 head-room at the pooled burn", as if no window ever reset. But every account's weekly quota resets on
 its own ~7-day cycle. **Therefore any runway exceeding one weekly window asserts the fleet drains with
@@ -120,10 +122,16 @@ introduce a second, independently-chosen water; that is the exact drift B-010 ex
 ### D-C (was D1) — UNKNOWN vocabulary, both surfaces
 
 **Constraints given by the operator, both verified against code:**
-- **R-21** — no implementation vocabulary. `covered` is a field name; the CLI's `, 64% covered`
-  (`stats.rs:1453`) has the same defect as the proposed panel copy did.
-- **R-20** — the line is printed in every state. `fleet_line` (`stats.rs:1729`) currently emits the
-  runway **only** under `runway_secs: Some(_)`, so R-3 would otherwise make it vanish more often.
+- **R-21** — no implementation vocabulary. `covered` is a field name; the CLI's `, 64% covered`, in
+  `roster_line`'s census annotation, had the same defect as the proposed panel copy did. *(Both
+  delivered — issue #1029. `roster_line` now annotates `, all in view {n}% of the window`, and
+  `StatusPanelFormat.statsCensusReading` says the same thing on the panel; a test asserts the old
+  wording is absent from the render.)*
+- **R-20** — the line is printed in every state. At authoring, `render_summary` — the band these
+  requirements call `fleet_line`, which has never been a Rust item — emitted the runway **only**
+  under `runway_secs: Some(_)`, so R-3 would otherwise have made it vanish more often. *(Delivered —
+  issue #1028: the line is printed in every state of a counted fleet, and `fleet_runway_phrase`
+  words each unknown rather than dropping the line.)*
 
 **Decision — author-chosen, explicitly correctable** (the operator declined to pick from a menu; these
 satisfy the two constraints they did state):
