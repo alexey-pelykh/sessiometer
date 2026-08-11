@@ -1078,10 +1078,26 @@ struct StatsRoster: Decodable, Equatable {
     let allHighCoveredSecs: Int64?
 
     /// WHICH SET the census above intersected over (issue #866): `true` when the daemon had the
-    /// CONFIGURED roster, `false` when it did not and the census degraded to whoever held samples
-    /// — where an unsampled account cannot withhold the metric, so it fires on strictly less
-    /// evidence. Carried for the same reason the water above is: without it the two regimes render
-    /// as identical bytes and a reader cannot tell which number they hold.
+    /// CONFIGURED roster, `false` when it did not and the census degraded to whoever held samples.
+    /// Carried for the same reason the water above is: without it the two regimes render as
+    /// identical bytes and a reader cannot tell which number they hold.
+    ///
+    /// It is NOT a direction. Under the fallback an unsampled account cannot withhold the metric,
+    /// but it also ADMITS an orphan handle the configured regime excludes (issue #314), so it can fire
+    /// LESS readily too — as a measured zero that carries no gap sentinel — and for holds the
+    /// regime can re-attribute a SESSION/WEEKLY cause without moving the count at all. The two sets
+    /// differ in BOTH directions and neither fires more readily in general (issue #864); `false` is
+    /// not the weaker-evidence regime, and a consumer must not rank the two.
+    ///
+    /// It is NOT census-specific either, despite the name. This is `Report::census_over_roster`,
+    /// which is `roster.is_some()` — the state of the very argument BOTH aggregates select their
+    /// census from, not a census-specific derivation. The name is the census's only because issue
+    /// #866 put it on the wire for the census; issue #864 established that the fact is shared, and
+    /// annotated the capacity-holds figures with it CLI-side, so a consumer may read it as
+    /// qualifying every figure in this block that names a set. `StatsRoster` decodes no
+    /// `capacity_*` key today, so no Swift consumer can act on the wider scope yet — it is stated
+    /// for whoever adds one, which is the only path by which the narrower reading could reach a
+    /// render.
     ///
     /// OPTIONAL only for the pre-#866 daemon that never sent the key. The CURRENT daemon always
     /// sends it (`RosterWire` deliberately does NOT `skip_serializing_if` it — eliding the `false`
