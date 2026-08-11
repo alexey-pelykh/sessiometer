@@ -1119,7 +1119,7 @@ impl Error {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     // The FRAMING firewall over this file's authored prose (issue #1139) — see the
     // `--- the FRAMING firewall ---` section at the foot of this module.
@@ -1639,6 +1639,24 @@ mod tests {
             i = j;
         }
         out
+    }
+
+    /// Every `Error` variant's identifier, in declaration order.
+    ///
+    /// [`error_prose`] is the walk; this is the same walk read for its NAMES rather than its
+    /// prose, published `pub(crate)` for `crate::daemon`'s redaction meter, whose list of
+    /// representative values is asserted complete against it (issue #1085).
+    ///
+    /// What makes this the DECLARED set rather than an approximation of it is `thiserror`,
+    /// which refuses to compile a variant carrying no `#[error(...)]` — so walking the
+    /// attributes is walking the variants. And what makes it worth publishing rather than
+    /// letting each consumer parse this file for itself is the scrutiny already pointed at
+    /// THIS walk: [`every_error_template_is_scanned_and_the_parse_cannot_be_evaded`] pins its
+    /// cardinality, rejects a name that is not an identifier, and canaries the extraction
+    /// against templates chosen to break a walk that truncates. A private second copy would
+    /// inherit none of that and would need its own.
+    pub(crate) fn declared_variant_names() -> Vec<String> {
+        error_prose().into_iter().map(|p| p.variant).collect()
     }
 
     /// Split an `#[error(...)]` body into its concatenated string literals and its non-literal

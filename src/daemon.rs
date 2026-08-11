@@ -15282,16 +15282,52 @@ mod tests {
         }
     }
 
-    /// One representative value of EVERY [`Error`] variant — the error-message
-    /// channel. Each carries only structural fields (paths, counts, codes, static
-    /// field/op names); none can carry a token or email by construction, and the
-    /// METER confirms the Display format strings hold to that.
+    /// One representative value of EVERY [`Error`] variant — the error-message channel.
+    ///
+    /// Each carries only structural fields (paths, counts, codes, static field/op names), the
+    /// fixture roster's own low-entropy labels, or a synthetic low-entropy placeholder standing
+    /// in for free-form operator input (`"unknown flag `--forc`"`, `"fortnight"`); none can
+    /// carry a token or email by construction, and the METER confirms the `Display` format
+    /// strings hold to that.
+    ///
+    /// EVERY is asserted rather than promised by the name. Through issue #1085 this said EVERY
+    /// and listed 30 of the declared variants, and nothing could notice: a list that is too
+    /// short renders a corpus that is perfectly clean for the variants it does contain, so the
+    /// meter went on passing over roughly a third of its subject for as long as the shortfall
+    /// lasted. The under-asserted property was redaction (issue #15) — a new variant leaking a
+    /// secret through its `Display` was green by default — which is exactly the class that must
+    /// not rest on someone remembering. [`every_error_variant_enumerates_every_declared_variant`]
+    /// is what closes it; keep the entries in DECLARATION order so this list reads against the
+    /// enum.
     fn every_error_variant() -> Vec<Error> {
         vec![
             Error::Unimplemented("usage polling (#5)"),
             Error::UnknownCommand("bogus".to_owned()),
+            Error::CliUsage {
+                message: "unknown flag `--forc`".to_owned(),
+                usage_hint: "sessiometer use --help",
+            },
+            Error::StatsPeriodInvalid("fortnight".to_owned()),
+            Error::StatsSinceInvalid("7x".to_owned()),
+            Error::StatsPeriodSinceConflict,
+            Error::StatsSerialize("boom"),
+            Error::ReliabilitySerialize("boom"),
+            Error::ReliabilitySinceInvalid("7x".to_owned()),
+            Error::LogSinceInvalid("7x".to_owned()),
+            Error::LogSerialize("boom"),
+            Error::LogChannelInvalid("both".to_owned()),
+            Error::LogFollowAllUnsupported,
             Error::HomeUnresolved,
             Error::ForeignOwnership(PathBuf::from("/home/op/.config/sessiometer")),
+            Error::UserUnresolved,
+            Error::LoginShellUnresolved,
+            Error::LoginShellPathUnharvested {
+                shell: PathBuf::from("/bin/zsh"),
+                reason: "exit status 1",
+            },
+            Error::UnsafeIsolatedDir {
+                path: PathBuf::from("/home/op/.config/sessiometer/isolated"),
+            },
             Error::CredentialNotFound,
             Error::CredentialAmbiguous { count: 2 },
             Error::KeychainLocked { op: "read" },
@@ -15299,6 +15335,7 @@ mod tests {
                 op: "write",
                 code: 1,
             },
+            Error::NonAsciiConfigDir,
             Error::ConfigNotFound {
                 path: PathBuf::from("/home/op/.config/sessiometer/config.toml"),
             },
@@ -15308,6 +15345,14 @@ mod tests {
             Error::ConfigTargetMaxSessionAboveTrigger {
                 target_max_session_usage: 95,
                 trigger: 90,
+            },
+            Error::ConfigPeakRunwayUnsatisfiable {
+                trigger: 90,
+                near_limit_poll_secs: 60,
+                horizon_secs: 900,
+                window_secs: 120,
+                bound_pct: 0,
+                v_peak_pct_per_min: 1.25,
             },
             Error::ClaudeStateNotFound {
                 path: PathBuf::from("/home/op/.claude.json"),
@@ -15320,7 +15365,14 @@ mod tests {
             Error::OauthAccountFieldMissing {
                 field: "accountUuid",
             },
+            Error::OauthAccountFieldMalformed {
+                field: "accountUuid",
+                rule: "is not a uuid".to_owned(),
+            },
             Error::RotationLabelRequired { verb: "disable" },
+            Error::AccountUuidNotFound {
+                account_uuid: "11111111-1111-1111-1111-111111111111".to_owned(),
+            },
             Error::StashIncomplete {
                 service: "Sessiometer/11111111-1111-1111-1111-111111111111".to_owned(),
             },
@@ -15339,9 +15391,159 @@ mod tests {
             Error::UsageParse("no session (five_hour) dimension".to_owned()),
             Error::AlreadyRunning,
             Error::DaemonNotRunning,
+            Error::LaunchctlFailed("exit status 113".to_owned()),
+            Error::NoManagedService,
+            Error::UnmanagedDaemonNoRestart,
+            Error::UseTargetRequired,
+            Error::UseNextRequiresDaemon,
+            Error::UseNextNoViableTarget {
+                detail: "every account is weekly-exhausted".to_owned(),
+            },
+            Error::UseNextUnresolved {
+                detail: "the daemon has not finished warming up".to_owned(),
+            },
+            Error::UseTargetNotFound {
+                query: "work".to_owned(),
+            },
+            Error::UseTargetAmbiguous {
+                query: "w".to_owned(),
+                count: 2,
+            },
+            Error::ActiveAccountUnresolved,
+            Error::UseTargetWeeklyExhausted {
+                label: "spare".to_owned(),
+            },
+            Error::UseCooldownActive,
+            Error::UseTargetQuarantined {
+                label: "spare".to_owned(),
+            },
+            Error::UseViabilityUnverifiable {
+                label: "spare".to_owned(),
+            },
             Error::SwapLockBusy,
+            Error::SwapWrongIdentityRestash,
+            Error::CanaryDrift {
+                displayed: "work".to_owned(),
+                matched: "spare".to_owned(),
+            },
+            Error::CanaryUnparseableCanonical,
+            Error::CanaryProbeNotLive {
+                verdict: "inconclusive",
+            },
+            Error::DaemonSwapFailed,
+            Error::PokeTargetActive {
+                label: "work".to_owned(),
+            },
+            Error::ClaudeBinaryNotFound,
+            Error::LoginRequiresTty,
+            Error::SharedCredentialMutated,
+            Error::MigrationBadMagic,
+            Error::MigrationUnsupportedVersion {
+                found: 2,
+                supported: 1,
+            },
+            Error::MigrationMalformed {
+                line: 5,
+                column: 12,
+            },
+            Error::MigrationInvalid("no accounts in the artifact"),
+            Error::MigrationEmptyPassphrase,
+            Error::MigrationEncryptFailed,
+            Error::MigrationDecryptFailed,
+            Error::MigrationCryptoParams("unsupported kdf"),
+            Error::MigrationImportPathRequired,
+            Error::MigrationImportConfigRejected {
+                detail: "unknown key `frobnicate`".to_owned(),
+            },
+            Error::MigrationImportVerifyFailed,
+            Error::MigrationImportIncomplete { failed: 2 },
+            Error::UsageStoreSerialize("boom"),
+            Error::UsageRollupMalformed {
+                line: 5,
+                column: 12,
+            },
+            Error::UsageStoreBusy,
             Error::Io(std::io::Error::other("boom")),
         ]
+    }
+
+    /// Issue #1085: [`every_error_variant`] covers every declared [`Error`] variant, enforced
+    /// rather than trusted.
+    ///
+    /// The DECLARED side is `crate::error`'s own walk of `src/error.rs`, published for this
+    /// (`declared_variant_names`). `thiserror` refuses to compile a variant carrying no
+    /// `#[error(...)]`, so that walk over the attributes is a walk over the variants, and
+    /// `every_error_template_is_scanned_and_the_parse_cannot_be_evaded` already holds it honest.
+    /// The COVERED side is read off each value's DERIVED `Debug`, whose leading identifier is
+    /// the variant name — derived, so unlike a hand-written second list it cannot fall out of
+    /// step with the enum.
+    ///
+    /// Comparing SETS, in both directions, is what makes this self-maintaining and
+    /// self-canarying. There is no cardinal to bump as the enum grows, and the degenerate
+    /// readings that would make a comparison meaningless fail it instead of passing it: a
+    /// truncated source walk leaves covered names the declared set no longer contains, and a
+    /// `Debug` reading that stopped yielding identifiers leaves every declared name missing.
+    /// Only the both-sides-empty case escapes that symmetry, so it is asserted directly.
+    ///
+    /// # Why this rather than a compile-time exhaustive `match`
+    ///
+    /// Issue #1085 weighed the two, and a `match` mapping each variant to its name is not the
+    /// stronger option here — it is not even a substitute. It forces an ARM to exist for a new
+    /// variant, which is not the property wanted: add the variant, add the arm, and the
+    /// representative list is still short with nothing red. Closing that needs this comparison
+    /// anyway, and the `match` would then be a second list of every variant maintained beside
+    /// the first, bought to fail one gate earlier — earlier by very little, since both are
+    /// `#[cfg(test)]` and neither is reached by `cargo build` at all, leaving only the gap
+    /// between compiling the test target and running it. What it costs is worth more than that:
+    /// a `non-exhaustive patterns` error names neither the list to edit nor the property that
+    /// broke, where the assertions below name the missing variant and say what a representative
+    /// may carry.
+    #[test]
+    fn every_error_variant_enumerates_every_declared_variant() {
+        use std::collections::BTreeSet;
+
+        // `#[derive(Debug)]` renders a variant as `RosterEmpty`, `CliUsage { .. }` or `Io(..)`,
+        // so the leading identifier run IS the variant name.
+        let covered: BTreeSet<String> = every_error_variant()
+            .iter()
+            .map(|err| {
+                format!("{err:?}")
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect()
+            })
+            .collect();
+        let declared: BTreeSet<String> = crate::error::tests::declared_variant_names()
+            .into_iter()
+            .collect();
+
+        assert!(
+            !declared.is_empty() && !covered.is_empty(),
+            "one side of the comparison is empty, and two empty sets agree with each other — \
+             declared {}, covered {}",
+            declared.len(),
+            covered.len()
+        );
+
+        let missing: Vec<&String> = declared.difference(&covered).collect();
+        assert!(
+            missing.is_empty(),
+            "these `Error` variants are declared in src/error.rs but have no representative \
+             in `every_error_variant`, so the redaction METER (#15) never renders their \
+             `Display` and a secret in one of those messages would not be caught: \
+             {missing:?}. Add a value for each, in declaration order, carrying only \
+             structural fields (paths, counts, codes, static names), the fixture roster's own \
+             labels, or a synthetic low-entropy placeholder"
+        );
+
+        let unknown: Vec<&String> = covered.difference(&declared).collect();
+        assert!(
+            unknown.is_empty(),
+            "`every_error_variant` produced names that src/error.rs does not declare: \
+             {unknown:?}. Either the source walk truncated or `Error` stopped deriving \
+             `Debug` — until that is resolved the missing-variant check above is reading a \
+             subject it does not understand"
+        );
     }
 
     #[tokio::test]
@@ -15675,6 +15877,25 @@ mod tests {
         // Cardinality: a gate that passes on an empty/degraded corpus is no
         // evidence (issue #15). Prove every channel actually contributed its
         // expected non-secret content before trusting the clean verdict.
+        //
+        // The error channel is first because it is where that rule was WEAKEST until issue
+        // #1085: the loop above renders whatever `every_error_variant` returns, so a list that
+        // is empty or short yields a corpus clean by ABSENCE.
+        //
+        // Not clean by absence at EVERY assertion, and the difference is worth stating rather
+        // than rounding off. This channel was already pinned further down, by
+        // `corpus.contains("daemon not running")` under the label "error channel missing" — a
+        // live pin (`Error::DaemonNotRunning` was in the pre-#1085 list), so a short list would
+        // have reddened THERE. What it could not catch is the case that matters: that Display
+        // interpolates NOTHING, so it proves the channel rendered without proving the scanner
+        // ever saw an operator-supplied value on it. The pin below is `UseTargetNotFound`'s,
+        // which interpolates an operator-supplied query — the class this channel most needs to
+        // be genuinely scanned for. `every_error_variant_enumerates_every_declared_variant` is
+        // what keeps the list complete; this is what proves it reached the corpus.
+        assert!(
+            corpus.contains("no account matches `work`"),
+            "error channel: the `Error` Display sweep contributed nothing"
+        );
         assert!(
             corpus.contains("event=swap from=work to=spare"),
             "log channel: swap event missing"
@@ -16110,7 +16331,12 @@ mod tests {
 
         // Cardinality (issue #15): a gate that passes on an empty corpus is no
         // evidence. Prove the loop actually surfaced each swap on a real channel before
-        // trusting the clean verdict.
+        // trusting the clean verdict — the error channel included, for the reason the sibling
+        // test above spells out (issue #1085).
+        assert!(
+            corpus.contains("no account matches `work`"),
+            "error channel: the `Error` Display sweep contributed nothing"
+        );
         assert!(
             corpus.contains("event=swap from=spare to=work"),
             "log channel: the B→A swap event is missing"
