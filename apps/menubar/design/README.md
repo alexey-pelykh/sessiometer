@@ -1211,9 +1211,34 @@ yellow ≈ 1.2:1 there), so the in-panel auth-glyph tint (`healthColor`), its de
 `%`-text (`pctColor`) resolve to **asset-catalog color sets** — `HealthOK` / `UtilGreen` / `UtilAmber`
 / `UtilOrange` / `UtilRed`, mirroring the mock's `--ok` / `--ut-*` families with Any/Dark **plus
 Increased-Contrast** variants. For these, the mock hex values ARE the targets, not directional. The
-meter **bar fill** (`barColor`) stays on the bright system colors (≈ the mock's `--u-*` fill family): a
-bar is a non-text fill (3:1), so it needs no darker tint. The menu-bar status-item glyph is unaffected —
-it is a monochrome **template** image (shape-encoded, `StatusGauge`), never health-tinted.
+menu-bar status-item glyph is unaffected — it is a monochrome **template** image (shape-encoded,
+`StatusGauge`), never health-tinted.
+
+**The meter bar fill keeps the bright colors, but its old justification is retired (#831).** The bar
+fill (`barColor`) does stay on the system-bright colors (≈ the mock's `--u-*` fill family) — but
+not, as this file claimed until now, because *a bar is a non-text fill (3:1), so it needs no darker
+tint*. Issue #831 measured that premise and refuted it: against the `--track` the fill sits on, in
+light, it records `.green` **1.61**, `.orange` **1.67**, `.red` **2.59**, and reports the mock's own
+`--u-*` tokens failing identically — so the shortfall is a property of the **design**, not a Swift
+drift. Those are #831's measurements, not a re-measurement here; see **#831** for the rest of them
+(the vs-panel-base column, and dark).
+
+What makes the bar defensible is a **compensating control**, not an exemption: it never carries its
+value alone. `UsageBar` is `.accessibilityHidden(true)` and the exact percent sits beside it as
+text. `StatusPanelFormatTests`'
+`testTheMeterBarFillIsCarriedByTheAdjacentPercentTextNotByItsOwnContrast` (#759) is where that
+argument is written down — but read its own SCOPE paragraph before relying on it, because that test
+pins the **formatter** and the amber/red tint contrast, not the view. By its own account, deleting
+the percent `Text` from `UsageMeter` leaves it green; only `PanelGoldenParityTests`' rasters catch
+that, and they are env-gated behind `SESSIOMETER_PANEL_GOLDEN_GATE` with a soft CI job. Read that
+test for the hole it records too: on the **healthy / green** band *neither* channel clears its bar —
+the fill at 2.08 vs the panel base (#831) and the `--ut-g` percent text at 4.10:1 (**#830**) — so
+green is the one band where this compensating-control argument does not actually hold. Each issue
+owns one half. So do **not** widen "fills only need 3:1, and these clear it" to a fill with *no*
+adjacent text; that one would be a real violation. `UsageMeter.barColor` in
+`Sources/StatusPanelRoster.swift` already carries this same correction. Whether the `--u-*` family
+should itself be darkened is the open decision in **#831** — this file records the measured position
+only and changes no token value.
 
 ## The 9 states
 
