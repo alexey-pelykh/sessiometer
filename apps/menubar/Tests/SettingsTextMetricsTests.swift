@@ -187,13 +187,21 @@ final class SettingsTextMetricsTests: XCTestCase {
     ///
     /// The two KEY NAMES are read from `TunableField` rather than typed, so the fixture tracks the
     /// shipped wire keys instead of freezing a copy — the discipline `staleKeyDetail` above applies to
-    /// serde's field list. The prose between them is a MODEL of a Rust string literal this bundle cannot
-    /// call, which is the same claim `TextMetrics`' header makes about the layout primitives: stated,
-    /// not glossed.
+    /// serde's field list. The prose between them WAS only a MODEL of a Rust string literal this bundle
+    /// cannot call — stated rather than glossed, the same claim `TextMetrics`' header makes about the
+    /// layout primitives. Since issue #1248 it is more than that: the whole string is PINNED to
+    /// `build/fixtures/config-set-reject-details.json`, which the Rust crate emits from
+    /// `Config::validate` itself, and `ConfigSetRejectDetailParityTests` holds this literal to it. So a
+    /// change to the Rust message reddens the Rust pin until the golden is re-emitted, and re-emitting
+    /// reddens the Swift side until this literal follows. That gate is the ONLY reason this is `static`
+    /// rather than an instance member: it is read from another test class.
     ///
     /// `1..=95` is the SHIPPED default ceiling (`DEFAULT_SESSION_CEILING`, `src/config.rs`); the daemon
-    /// interpolates whatever the operator submitted. Measured, that value's own digits do not move the
-    /// verdict — at a ceiling of 90 the string is the same length and 0.09 pt wider.
+    /// interpolates whatever the operator submitted, and the emitter passes that same constant so the
+    /// golden models the case this fixture claims to — which puts a MOVE of the constant inside the gate
+    /// too, the one half of this copy no message-text edit would disturb. Measured, that value's own
+    /// digits do not move the verdict — at a ceiling of 90 the string is the same length and 0.09 pt
+    /// wider.
     ///
     /// It is NOT the only `ConfigInvalid` remedy that overruns the slot, only the WIDEST and the one
     /// issue #944 names. Two others reach three lines by the same route, and each figure is quoted WITH
@@ -204,11 +212,10 @@ final class SettingsTextMetricsTests: XCTestCase {
     /// `exhausted_poll_secs` keeps growing to 953.08 pt at a nine-digit `got` — so neither is a bound on
     /// the other. One fixture regardless, because each extra transcription is another copy of a Rust
     /// literal that can drift unobserved.
-    private var zeroTargetRemedyDetail: String {
+    static let zeroTargetRemedyDetail: String =
         "\(TunableField.targetMaxSessionUsage.rawValue) = 0 admits no swap target and silently disables "
-            + "proactive swapping; it must be in 1..=95. Raise it toward "
-            + "\(TunableField.sessionCeiling.rawValue) to admit more targets."
-    }
+        + "proactive swapping; it must be in 1..=95. Raise it toward "
+        + "\(TunableField.sessionCeiling.rawValue) to admit more targets."
 
     // MARK: - AC-1: every sentence the extracted seam can render is present, non-empty and distinct
 
@@ -678,7 +685,7 @@ final class SettingsTextMetricsTests: XCTestCase {
         // THE STRUCTURAL FACT, first, because every measurement below rests on it: on the `.invalid` path
         // the label is the daemon's message ITSELF. This is also this arm's "clamp the drawing, never the
         // truth" assertion — its strongest possible form, since here the two strings are one.
-        XCTAssertEqual(SettingsFormat.rejectionText(.invalid, zeroTargetRemedyDetail), zeroTargetRemedyDetail,
+        XCTAssertEqual(SettingsFormat.rejectionText(.invalid, Self.zeroTargetRemedyDetail), Self.zeroTargetRemedyDetail,
                        "the `invalid` reason no longer renders the daemon's `detail` as the label — if the "
                        + "message is now being edited or wrapped, re-derive this whole section; the hazard "
                        + "it measures is that the daemon's own text has no app sentence bounding it")
@@ -727,7 +734,7 @@ final class SettingsTextMetricsTests: XCTestCase {
                              + "clamp against the reference (`design/README.md` § The Settings window)")
 
         // …and the daemon's remedy does NOT fit, by a wide margin. Reported in points, not merely flagged.
-        let long = SettingsFormat.rejectionText(.invalid, zeroTargetRemedyDetail)
+        let long = SettingsFormat.rejectionText(.invalid, Self.zeroTargetRemedyDetail)
         let required = TextMetrics.width(long, bodyFont)
         XCTAssertTrue(TextMetrics.overflows(long, bodyFont, budget: budget),
                       "the issue #414 zero-target remedy (\(long.count) characters, "
@@ -779,7 +786,7 @@ final class SettingsTextMetricsTests: XCTestCase {
                            "\(reason.rawValue): the LABEL is EMPTY with no detail")
             XCTAssertFalse(SettingsFormat.rejectionTooltip(reason, nil).isEmpty,
                            "\(reason.rawValue): the tooltip the clamp relies on is EMPTY with no detail")
-            XCTAssertFalse(SettingsFormat.rejectionTooltip(reason, zeroTargetRemedyDetail).isEmpty,
+            XCTAssertFalse(SettingsFormat.rejectionTooltip(reason, Self.zeroTargetRemedyDetail).isEmpty,
                            "\(reason.rawValue): the tooltip the clamp relies on is EMPTY with a detail")
         }
     }
@@ -833,8 +840,8 @@ final class SettingsTextMetricsTests: XCTestCase {
 
         // The `.invalid` path must NOT double the message: there the label already IS the detail, and a
         // tooltip repeating it would be the "merely repeated the label" defect in a new costume.
-        let invalidTooltip = SettingsFormat.rejectionTooltip(.invalid, zeroTargetRemedyDetail)
-        XCTAssertEqual(invalidTooltip, zeroTargetRemedyDetail,
+        let invalidTooltip = SettingsFormat.rejectionTooltip(.invalid, Self.zeroTargetRemedyDetail)
+        XCTAssertEqual(invalidTooltip, Self.zeroTargetRemedyDetail,
                        "on `.invalid` the label IS the daemon's message, so the tooltip must be that "
                        + "message once — got: \(invalidTooltip)")
 
