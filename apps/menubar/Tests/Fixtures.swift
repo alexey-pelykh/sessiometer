@@ -564,13 +564,19 @@ enum Fixtures {
     /// `ConfigSetAck` (no `result` key). A version-skewed client sent a renamed/stale tunable (a pre-#606
     /// `session_trigger`) that the daemon's strict `deny_unknown_fields` re-parse refuses BEFORE the run
     /// loop, so it writes `error_with_detail("malformed request", <serde message>)` (`src/daemon/socket.rs`,
-    /// issue #628) — ZERO writes. The `detail` is serde's key-naming message for `SetTunables` (its 15 fields
+    /// issue #628) — ZERO writes. The `detail` is serde's key-naming message for `SetTunables` (its 19 fields
     /// in declaration order); serde additionally appends an input-dependent ` at line 1 column N` positional
     /// suffix, elided here as behaviorally irrelevant — every consumer substring-matches the key or renders
     /// the string verbatim, exactly as the daemon's own #628 test asserts `.contains("session_trigger")`. The
     /// client surfaces this so the operator sees "this app is out of date" instead of an opaque `.undecodable`.
+    ///
+    /// PINNED (issue #1112) to `build/fixtures/config-set-reject-details.json`, which the Rust crate emits
+    /// from `SetTunables` itself; `ConfigSetRejectDetailParityTests` holds this literal to it. Before that
+    /// gate existed the copy had drifted: the four `canary_*` settables landed in `44fcd0f`, `3f6a921` and
+    /// `1f30a82` (2026-07-23 … 2026-07-28) and this enumeration went on naming 15 keys, with every test
+    /// still green — the drift #1112 was filed for, found in its own fixture.
     static let configSetErrorStaleKey = #"""
-    {"error":"malformed request","detail":"unknown field `session_trigger`, expected one of `poll_secs`, `exhausted_poll_secs`, `near_limit_poll_secs`, `cooldown_secs`, `target_max_session_usage`, `session_ceiling`, `weekly_ceiling`, `session_blind_swap_secs`, `session_blind_risk_band`, `session_velocity_horizon_secs`, `session_velocity_min_project_above`, `session_velocity_ema_alpha_pct`, `monitor_401_n`, `monitor_recovery_m`, `fleet_runway_warn_secs`"}
+    {"error":"malformed request","detail":"unknown field `session_trigger`, expected one of `poll_secs`, `exhausted_poll_secs`, `near_limit_poll_secs`, `cooldown_secs`, `target_max_session_usage`, `session_ceiling`, `weekly_ceiling`, `session_blind_swap_secs`, `session_blind_risk_band`, `session_velocity_horizon_secs`, `session_velocity_min_project_above`, `session_velocity_ema_alpha_pct`, `monitor_401_n`, `monitor_recovery_m`, `fleet_runway_warn_secs`, `canary_drift_override`, `canary_nostashmatch_override`, `canary_online_probe`, `canary_online_probe_strict`"}
     """#
 
     /// `config-set` rejected: `fleet_runway_warn_secs` (issues #650/#692) outside its
@@ -582,8 +588,10 @@ enum Fixtures {
     ///
     /// The ceiling was `2592000` (30 d) until issue #1076 narrowed it to one weekly window — the widest
     /// line the runway model can rank, above which the alarm could fire but never clear. This fixture is a
-    /// COPY of a Rust-side string with nothing cross-checking the two, so it is updated by hand when that
-    /// message changes; `30` keeps tripping the floor either way, so the band text is the only stale part.
+    /// COPY of a Rust-side string, and since issue #1112 the two ARE cross-checked: it is PINNED to
+    /// `build/fixtures/config-set-reject-details.json` by `ConfigSetRejectDetailParityTests`, so a change to
+    /// `Config::validate`'s message reddens the Rust pin and re-emitting it reddens this side until the
+    /// literal follows. `30` keeps tripping the floor whatever the ceiling is.
     static let configSetRejectedFleetRunwayInvalid = #"""
     {"result":"rejected","reason":"invalid","detail":"fleet_runway_warn_secs must be 0 (disabled) or in 60..=604800 (one weekly window; a longer warn line could never clear), got 30"}
     """#
