@@ -143,7 +143,7 @@ final class SettingsTextMetricsTests: XCTestCase {
     /// primitives — stated, not glossed.
     ///
     /// It is deliberately a LOWER BOUND, and the direction matters. `TunableField` enumerates the 15
-    /// APP-EDITABLE keys, but the Rust `SetTunables` it is rejected against (`src/config.rs`:1091) also
+    /// APP-EDITABLE keys, but the Rust `SetTunables` it is rejected against (`src/config.rs`) also
     /// carries four `canary_*` overrides (`canary_drift_override`, `canary_nostashmatch_override`,
     /// `canary_online_probe`, `canary_online_probe_strict`) — so serde's real message names 19 fields and
     /// runs ~110 characters LONGER than this fixture's ~425. Understating the hazard cannot flip an
