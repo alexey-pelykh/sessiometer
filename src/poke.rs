@@ -568,12 +568,23 @@ fn poke_line(label: &str, outcome: &str) -> String {
 /// snapshot. Either count off and the bearers are indistinguishable from a label alone, so
 /// poke claims nothing rather than attributing the earliest match's state to whichever account
 /// it was handed (issue #1086) — the same degrade-rather-than-guess shape `use`'s
-/// `cached_viability_for` already takes for this lookup. Since issue #1200 that degrade is its
-/// own state rather than a bare `false`, so a caller can tell "nothing to clear" apart from
-/// "could not tell". `use`'s lookup still collapses the two — its `Option<Viability>` is `None`
-/// for an absent line and for a duplicated one alike — which costs it nothing, because a `use`
-/// with no usable cached verdict falls through to the same live poll either way. `poke` has no
-/// such fallthrough: the collapse IS its answer, which is why only this side needed widening.
+/// `cached_viability_for` takes for this lookup.
+///
+/// That equivalence is exact only since issue #1201, and #1193 recorded it too early: `use` had
+/// the SNAPSHOT count and not the roster one, so its lookup was left alone here as though it had
+/// already been measured against both. It had not. A uuid query resolves where an ambiguous
+/// label is refused, so `use` reached that lookup with a target the roster could not tell from
+/// its same-labelled sibling, and #1201 measured the consequence end-to-end — a viable account
+/// refused on a lagging line that was not its own. #1201 applied the roster count there; both
+/// sites now hold both counts, and the residual below is the one they share.
+///
+/// The two lookups still differ on a SECOND axis, which is the one this side widened alone.
+/// Since issue #1200 poke's degrade is its own state rather than a bare `false`, so a caller can
+/// tell "nothing to clear" apart from "could not tell". `use`'s lookup still collapses the two —
+/// its `Option<Viability>` is `None` for an absent line and for a duplicated one alike — which
+/// costs it nothing, because a `use` with no usable cached verdict falls through to the same
+/// live poll either way. `poke` has no such fallthrough: the collapse IS its answer, which is
+/// why only this side needed the STATE split.
 ///
 /// BOTH counts, because each catches a misattribution the other misses. The snapshot side
 /// catches a roster the daemon knows better than this process does (an account removed from
@@ -598,9 +609,9 @@ fn poke_line(label: &str, outcome: &str) -> String {
 /// surface #15 restricts to the operator-authored handle. RESIDUAL, unclosable without such a
 /// key: a label REASSIGNED to a different account between the snapshot and the current roster
 /// matches once on each side and still reads the stale bearer's line — the same residual
-/// `cached_viability_for` records for `use`. Bounded: the verdict drives the report wording
-/// and a `#275 Restored` signal that is a no-op for an unknown or already-healthy uuid
-/// (ADR-0008).
+/// `cached_viability_for` records for `use` — on the matching pair of counts issue #1201 gave
+/// that lookup, and not before it. Bounded: the verdict drives the report wording and a
+/// `#275 Restored` signal that is a no-op for an unknown or already-healthy uuid (ADR-0008).
 fn daemon_verdict(
     daemon_status: Option<&StatusResponse>,
     roster: &[Account],
@@ -1636,8 +1647,9 @@ mod tests {
 
     #[tokio::test]
     async fn an_ambiguous_roster_label_degrades_even_when_the_daemon_lists_one_line() {
-        // The half a wire-side match count alone does NOT catch, and the reason this fix goes
-        // past `use_account::cached_viability_for`'s shape. The daemon adopts a new roster only
+        // The half a wire-side match count alone does NOT catch, and the reason this fix went
+        // past the shape `use_account::cached_viability_for` had when this was written — a gap
+        // issue #1201 has since closed on that side too. The daemon adopts a new roster only
         // when a reload is SIGNALLED (issue #139), so its snapshot legitimately lags the
         // on-disk roster: two `work` accounts on disk, one `work` line on the wire. Counting
         // wire matches finds exactly one and reads it as unambiguous — but that single line

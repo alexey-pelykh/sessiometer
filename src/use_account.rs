@@ -154,9 +154,14 @@ impl ManualSwapNotifier for ControlSocketNotifier {
 trait CachedViabilitySource {
     /// The daemon's cached viability verdict for `account`, or `None` when there is
     /// no usable cached reading — no daemon running, the exchange failed, the
-    /// target's handle is absent or duplicated in the reply, or the daemon's last
-    /// poll for it failed. `None` is the signal to fall back to a single live poll.
-    async fn cached_viability(&self, account: &Account) -> Option<Viability>;
+    /// target's handle is absent or non-unique on either side of the `roster`/reply
+    /// pair, or the daemon's last poll for it failed. `None` is the signal to fall
+    /// back to a single live poll.
+    ///
+    /// `roster` is the LOCAL roster the target was resolved against. It is carried
+    /// because the reply keys on the label alone, which is not a unique handle — see
+    /// [`cached_viability_for`], which owns that count and the reason for it.
+    async fn cached_viability(&self, roster: &[Account], account: &Account) -> Option<Viability>;
 }
 
 /// The real [`CachedViabilitySource`]: ask the daemon's control socket for `status`
@@ -172,14 +177,14 @@ struct ControlSocketCache {
 }
 
 impl CachedViabilitySource for ControlSocketCache {
-    async fn cached_viability(&self, account: &Account) -> Option<Viability> {
+    async fn cached_viability(&self, roster: &[Account], account: &Account) -> Option<Viability> {
         // A live daemon answers instantly; a missing / wedged daemon must never hang
         // `use`, so a timeout — like any other exchange failure — is a cache MISS.
         let response = tokio::time::timeout(CONTROL_SOCKET_TIMEOUT, self.query_status())
             .await
             .ok()? // timed out → MISS
             .ok()?; // no daemon / I/O / malformed reply → MISS
-        cached_viability_for(&response, &account.label)
+        cached_viability_for(&response, roster, &account.label)
     }
 }
 
@@ -204,24 +209,61 @@ impl ControlSocketCache {
 }
 
 /// The daemon's cached viability for the account with handle `label`, or `None`
-/// when the `status` reply carries no usable verdict for it (issue #75). The handle
-/// must match EXACTLY ONE line: labels are operator handles and NOT guaranteed
-/// unique (see [`resolve_target`]), and the wire reply carries only the handle
-/// (issue #15: never the account-uuid), so a zero- or multiple-match is treated as
-/// "no usable cached reading" → live fallback rather than guessing.
+/// when no usable verdict can be ATTRIBUTED to it (issue #75). The handle carries a
+/// verdict only while it names EXACTLY ONE account on BOTH sides — once in `roster`,
+/// once in the wire reply — because labels are operator handles and NOT guaranteed
+/// unique (see [`resolve_target`]) while the reply carries only the handle (issue
+/// #15: never the account-uuid). Either count off and the bearers are
+/// indistinguishable from a label alone, so this returns `None` — "no usable cached
+/// reading", the caller's live fallback — rather than guessing. The same both-counts
+/// shape [`crate::poke`]'s `daemon_verdict` takes, and for the same reason (issue
+/// #1086).
 ///
-/// A consequence of keying on the handle: in the exotic case where the running
-/// daemon is STALE *and* a handle has since been reassigned to a different
-/// account-uuid, the cached reading cannot be cross-checked against the uuid, so
-/// the verdict returned is the stale account's — a bounded, recoverable mismatch
-/// (the swap still operates on the correct target's stash; the daemon's next cycle
-/// or a `--force` corrects a wrong refusal). Closing it would mean widening the
-/// non-secret wire contract with the account-uuid, out of scope for this gate.
-fn cached_viability_for(response: &StatusResponse, label: &str) -> Option<Viability> {
+/// BOTH counts, because each catches a misattribution the other misses. The WIRE
+/// count catches a roster the daemon knows better than this process does. The ROSTER
+/// count catches the reverse, and it is the one issue #1201 added: the daemon adopts
+/// a new roster only when a reload is SIGNALLED (issue #139), so its snapshot
+/// legitimately lags, and a second bearer added on disk leaves the wire with ONE line
+/// that is not necessarily the named account's. `resolve_target` shuts the label door
+/// on that roster — a duplicated label is refused outright — but it resolves a UUID
+/// query without complaint, and everything past it keys on the label, so the uuid is
+/// the door the wire count alone leaves open.
+///
+/// Degrading costs `use` almost nothing, which is why it degrades on a count `poke`
+/// had to weigh: the fallback is a single live poll of the target's OWN stashed token
+/// ([`poll_viability`]), keyed by account-uuid through the stash name, so it cannot
+/// mistake the bearer. The cost is one usage request against issue #75's "zero
+/// requests when a daemon is up" — and only in a roster that duplicates a label,
+/// which is already the shape `resolve_target` refuses to resolve by name.
+///
+/// RESIDUAL, unclosable without a stable per-account key on the wire: a label
+/// REASSIGNED to a different account-uuid between the snapshot and the current roster
+/// names one account on each side, passes both counts, and still reads the stale
+/// bearer's line. Bounded — the verdict drives a refusal or a permit, never which
+/// stash is written, so the swap still operates on the correct target and the daemon's
+/// next cycle or a `--force` corrects a wrong refusal. This is the same residual
+/// `poke`'s `daemon_verdict` records, and closing it would mean carrying a stable
+/// per-account key on a surface issue #15 restricts to the operator-authored handle —
+/// the alternative #1086 weighed and rejected for `poke`, over the SAME wire type this
+/// side reads.
+fn cached_viability_for(
+    response: &StatusResponse,
+    roster: &[Account],
+    label: &str,
+) -> Option<Viability> {
+    // ROSTER side (issue #1201). Zero bearers is unreachable from either production
+    // call site — both pass a roster account's OWN label — and degrades identically
+    // to a duplicated one, which is the safe answer for a label naming nothing here.
+    let mut bearers = roster.iter().filter(|account| account.label == label);
+    bearers.next()?;
+    if bearers.next().is_some() {
+        return None;
+    }
+    // WIRE side (issue #75). A duplicated handle cannot be disambiguated from the
+    // reply alone, which carries no account-uuid to break the tie.
     let mut matches = response.accounts.iter().filter(|line| line.label == label);
     let line = matches.next()?;
     if matches.next().is_some() {
-        // A duplicated handle: cannot disambiguate from the wire reply alone.
         return None;
     }
     cached_viability_of(line)
@@ -317,6 +359,7 @@ impl SwapTarget {
     async fn resolve<R: CachedViabilitySource, P: RosterPoller>(
         cache: &R,
         poller: &P,
+        roster: &[Account],
         account: &Account,
         active_stash: &str,
         weekly_ceiling: f64,
@@ -328,7 +371,7 @@ impl SwapTarget {
         if in_cooldown {
             return Ok(GateOutcome::Refused(Refusal::Cooldown));
         }
-        match gate_viability(cache, poller, account, weekly_ceiling).await? {
+        match gate_viability(cache, poller, roster, account, weekly_ceiling).await? {
             Viability::Viable => Ok(GateOutcome::Proceed(SwapTarget {
                 incoming_stash: account.stash(),
             })),
@@ -396,6 +439,7 @@ async fn poll_viability<P: RosterPoller>(
 async fn gate_viability<R, P>(
     cache: &R,
     poller: &P,
+    roster: &[Account],
     account: &Account,
     weekly_ceiling: f64,
 ) -> Result<Viability>
@@ -403,7 +447,7 @@ where
     R: CachedViabilitySource,
     P: RosterPoller,
 {
-    if let Some(cached) = cache.cached_viability(account).await {
+    if let Some(cached) = cache.cached_viability(roster, account).await {
         return Ok(cached);
     }
     // Cache MISS → a single live poll (today's behaviour). A `429` here is the
@@ -527,6 +571,7 @@ fn force_warning(viability: Viability, label: &str) -> Option<String> {
 async fn warn_if_forcing_onto_non_viable<R, P>(
     cache: &R,
     poller: &P,
+    roster: &[Account],
     target: &Account,
     weekly_ceiling: f64,
 ) -> Result<()>
@@ -534,7 +579,7 @@ where
     R: CachedViabilitySource,
     P: RosterPoller,
 {
-    let viability = match cache.cached_viability(target).await {
+    let viability = match cache.cached_viability(roster, target).await {
         Some(cached) => Some(cached),
         None => match poll_viability(poller, target, weekly_ceiling).await {
             Ok(viability) => Some(viability),
@@ -678,7 +723,14 @@ where
         // Warn-and-proceed if forcing onto a non-viable target, exactly as a normal
         // forced swap does; a locked keychain on the viability poll still aborts (ZERO
         // writes) — the always-enforced safety.
-        warn_if_forcing_onto_non_viable(seams.cache, seams.poller, target, weekly_ceiling).await?;
+        warn_if_forcing_onto_non_viable(
+            seams.cache,
+            seams.poller,
+            &config.roster,
+            target,
+            weekly_ceiling,
+        )
+        .await?;
         // Adopt: skip the outgoing re-stash, install the target (steps 3–5), lock-wrapped
         // (#64) so a concurrent daemon swap cannot interleave. SAFETY still holds inside
         // the engine: the canonical is probed for a LOCK before any write (ZERO writes on
@@ -711,13 +763,20 @@ where
         let (swap_target, reason) = if force {
             // `--force` bypasses the POLICY gates (cooldown, weekly-exhausted,
             // already-active), but still WARNS when forcing onto a non-viable target.
-            warn_if_forcing_onto_non_viable(seams.cache, seams.poller, target, weekly_ceiling)
-                .await?;
+            warn_if_forcing_onto_non_viable(
+                seams.cache,
+                seams.poller,
+                &config.roster,
+                target,
+                weekly_ceiling,
+            )
+            .await?;
             (SwapTarget::forced(target), SwapReason::Forced)
         } else {
             match SwapTarget::resolve(
                 seams.cache,
                 seams.poller,
+                &config.roster,
                 target,
                 &active_stash,
                 weekly_ceiling,
@@ -1345,7 +1404,11 @@ mod tests {
     }
 
     impl CachedViabilitySource for FakeCache {
-        async fn cached_viability(&self, _account: &Account) -> Option<Viability> {
+        async fn cached_viability(
+            &self,
+            _roster: &[Account],
+            _account: &Account,
+        ) -> Option<Viability> {
             self.calls.set(self.calls.get() + 1);
             self.verdict
         }
@@ -1479,11 +1542,16 @@ mod tests {
     }
 
     /// [`run_with`] over a caller-supplied `config` rather than the shared [`config_ab`]
-    /// fixture — for the one case whose subject IS the roster's shape (a duplicated label,
+    /// fixture — for the cases whose subject IS the roster's shape (a duplicated label,
     /// issue #1087), which the fixture cannot express.
-    async fn run_on(
+    ///
+    /// Generic over the cache seam rather than fixed to [`FakeCache`], so a test can drive
+    /// this whole path with the PRODUCTION [`ControlSocketCache`] over a real socket — which
+    /// is what issue #1201 needed and could not have: a scripted verdict proves what the gate
+    /// does with an answer, never which answer the real lookup returns for which account.
+    async fn run_on<R: CachedViabilitySource>(
         config: Config,
-        cache: &FakeCache,
+        cache: &R,
         query: &str,
         force: bool,
         in_cooldown: bool,
@@ -2524,7 +2592,7 @@ mod tests {
         // rather than on an `Account`, so the section they are in is the right one — but the
         // reason they were INVISIBLE until #1202 is the spelling, not the type.
         ("account_uuid", NotHandleResolution, "`&self.account_uuid` on the OAuth state record and on the migration artifact, not on a roster account"),
-        ("cached_viability_for", NotHandleResolution, "`AccountStatusLine.label` — a daemon WIRE line, and a duplicated handle there returns None rather than guessing"),
+        ("cached_viability_for", NotHandleResolution, "matches BOTH the daemon's wire line (`AccountStatusLine.label`) and the roster (`Account.label`) since issue #1201 — but it COUNTS bearers on each side and refuses on either being non-unique, exactly as `poke`'s `daemon_verdict` does. Counting is not resolving"),
         ("capture", NotHandleResolution, "`CaptureReport.label`"),
         ("capture_failure", NotHandleResolution, "`CaptureCommand.label` — the name being ASSIGNED to a new account"),
         ("execute", NotHandleResolution, "`Command::Capture { label }` / `Command::Login { label }` — a MATCH ARM binding the operator's CLI positional out of the parsed command and handing it to `capture` / `login`, which ASSIGN it to a new account. Nothing is matched against the roster here"),
@@ -2625,7 +2693,7 @@ mod tests {
         // The un-unique field, so each of these owes an account of what it does INSTEAD of taking
         // the first match: refuse on non-unique, or test membership and select nothing at all.
         ("account_listed_in", "the `[refresh].accounts` allowlist — a MEMBERSHIP test over a config-supplied set, returning a bool rather than an index, and a duplicated label there legitimately admits BOTH bearers"),
-        ("cached_viability_for", "`AccountStatusLine.label` on a daemon WIRE line: it pulls a second match and returns None when one exists, rather than taking the first"),
+        ("cached_viability_for", "both sides since issue #1201 — the daemon WIRE line and the roster: it pulls a second match on each and returns None when one exists, rather than taking the first"),
         ("daemon_verdict", "both sides — the wire line and the roster — filtered through `lookup()`, which since issue #1200 separates zero from more-than-one where the `sole()` it replaced returned None for both (issue #1086). Refusing is not resolving, and separating two kinds of refusal is not either"),
     ];
 
@@ -3835,7 +3903,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_viability_for_requires_a_unique_handle_match() {
+    fn cached_viability_for_requires_a_unique_handle_match_on_both_sides() {
         // A unique handle match → its verdict.
         let unique = StatusResponse {
             systemic_refresh_failure: None,
@@ -3853,12 +3921,17 @@ mod tests {
             ],
             next_swap: None,
         };
+        let roster = [
+            acct("work", "u-A"),
+            acct("spare", "u-B"),
+            acct("ghost", "u-G"),
+        ];
         assert_eq!(
-            cached_viability_for(&unique, "spare"),
+            cached_viability_for(&unique, &roster, "spare"),
             Some(Viability::Viable)
         );
         // A handle absent from the reply → no cached reading → live fallback.
-        assert_eq!(cached_viability_for(&unique, "ghost"), None);
+        assert_eq!(cached_viability_for(&unique, &roster, "ghost"), None);
         // A DUPLICATED handle cannot be disambiguated from the wire reply alone
         // (labels are not unique, and the reply carries no account-uuid) → live
         // fallback, never a guess.
@@ -3878,7 +3951,32 @@ mod tests {
             ],
             next_swap: None,
         };
-        assert_eq!(cached_viability_for(&duped, "dup"), None);
+        assert_eq!(
+            cached_viability_for(&duped, &[acct("dup", "u-D")], "dup"),
+            None
+        );
+        // And the ROSTER side (issue #1201), which the wire count cannot see: ONE `dup` line
+        // on the wire, TWO bearers on disk. The reply is perfectly unambiguous and still
+        // cannot be attributed — the daemon adopts a new roster only on a signalled reload
+        // (#139), so its single line need not be the named account's.
+        let sole = StatusResponse {
+            accounts: vec![status_line("dup", false, true, Some(99))],
+            ..status_reply(Vec::new())
+        };
+        assert_eq!(
+            cached_viability_for(&sole, &[acct("dup", "u-D"), acct("dup", "u-E")], "dup"),
+            None,
+            "two local bearers make the sole wire line un-attributable",
+        );
+        assert_eq!(
+            cached_viability_for(&sole, &[acct("dup", "u-D")], "dup"),
+            Some(Viability::WeeklyExhausted),
+            "one bearer on each side is the only shape that carries a verdict",
+        );
+        // ZERO local bearers is unreachable from either production call site — both pass a
+        // roster account's OWN label — and is answered rather than left to inference: a label
+        // naming no local account degrades exactly like a duplicated one.
+        assert_eq!(cached_viability_for(&sole, &[], "dup"), None);
     }
 
     // --- acceptance: viable use (#63) ---------------------------------------
@@ -4214,8 +4312,9 @@ mod tests {
         };
 
         let cache = ControlSocketCache { socket };
+        let roster = [acct("work", "u-A"), acct("spare", "u-B")];
         let target = acct("spare", "u-B");
-        let (_, verdict) = tokio::join!(server, cache.cached_viability(&target));
+        let (_, verdict) = tokio::join!(server, cache.cached_viability(&roster, &target));
         assert_eq!(
             verdict,
             Some(Viability::Viable),
@@ -4231,8 +4330,210 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("daemon.sock"); // never bound
         let cache = ControlSocketCache { socket };
+        let roster = [acct("work", "u-A"), acct("spare", "u-B")];
         let target = acct("spare", "u-B");
-        assert_eq!(cache.cached_viability(&target).await, None);
+        assert_eq!(cache.cached_viability(&roster, &target).await, None);
+    }
+
+    /// The lagging-daemon half of the issue-#1201 reproduction: serve exactly one `status`
+    /// reply on `listener`, then return. Split out so the test body below reads as the
+    /// scenario rather than as socket plumbing.
+    async fn serve_one_status(listener: tokio::net::UnixListener, response: &StatusResponse) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let wire = serde_json::to_string(response).unwrap();
+        let (stream, _addr) = listener.accept().await.unwrap();
+        let mut buffered = tokio::io::BufReader::new(stream);
+        let mut request = String::new();
+        buffered.read_line(&mut request).await.unwrap();
+        assert_eq!(request.trim_end(), r#"{"cmd":"status"}"#);
+        buffered.write_all(wire.as_bytes()).await.unwrap();
+        buffered.write_all(b"\n").await.unwrap();
+        buffered.flush().await.unwrap();
+    }
+
+    /// A `status` reply carrying `accounts` and nothing else set — the shape the cache
+    /// lookup reads (every other field is inert to [`cached_viability_of`]).
+    fn status_reply(accounts: Vec<AccountStatusLine>) -> StatusResponse {
+        StatusResponse {
+            systemic_refresh_failure: None,
+            systemic_refresh_source: None,
+            canonical_scrub: None,
+            keychain_locked: false,
+            canary: None,
+            expiry_cohort: None,
+            recent_blind_preempt_swap: None,
+            recent_landing_overshoot: None,
+            refresh_enabled: None,
+            accounts,
+            next_swap: None,
+        }
+    }
+
+    /// The roster on DISK for the pair below: two `work` bearers with distinct uuids, which
+    /// `config_ab`'s fixture cannot express. Rebuilt per run because `run_on` consumes it.
+    fn dup_work_config() -> Config {
+        let mut config = config_ab();
+        config.roster = vec![acct("work", "u-A"), acct("work", "u-B")];
+        config
+    }
+
+    /// A snapshot from a daemon that has NOT reloaded the roster (issue #139): ONE `work`
+    /// line, weekly-exhausted, and it belongs to `u-A`. Built from the daemon's own
+    /// pre-reload roster rather than hand-listed, so "the single line is u-A's" is a property
+    /// of the fixture and not of a comment.
+    fn lagging_status() -> StatusResponse {
+        let daemon_roster = [acct("work", "u-A")];
+        let reply = status_reply(
+            daemon_roster
+                .iter()
+                .map(|account| status_line(&account.label, false, true, Some(99)))
+                .collect(),
+        );
+        assert_eq!(reply.accounts.len(), 1, "one line, and it is u-A's");
+        reply
+    }
+
+    #[tokio::test]
+    async fn a_uuid_named_target_is_not_answered_by_a_same_labelled_siblings_reading() {
+        // Issue #1201, driven through the real `use` path rather than the predicate: two
+        // accounts labelled `work`, the operator names the SECOND by uuid, and the daemon's
+        // snapshot predates it. The roster count degrades, the gate falls through to `u-B`'s
+        // OWN stashed token, and the swap proceeds.
+        //
+        // Why the uuid is the door. `resolve_target` refuses an ambiguous LABEL — asserted
+        // below rather than assumed — but resolves a UUID query without complaint, and every
+        // step past it keys on the label alone. Before this issue the wire count was the only
+        // one, so the sole `work` line was read as `u-B`'s verdict; the same fixture measured
+        // `Err(UseTargetWeeklyExhausted)` with ZERO live polls, i.e. a viable account refused
+        // on its sibling's reading with the one lookup that could not have mistaken the
+        // bearer never run.
+        //
+        // Real here: the socket, the production `ControlSocketCache`, `resolve_target`, and
+        // the gate. Faked: only the seams `use` already injects (store, stash, poller,
+        // notifier) — so no scripted verdict stands in for the lookup under test.
+        use tokio::net::UnixListener;
+
+        let disk = dup_work_config();
+        assert!(
+            matches!(
+                resolve_target(&disk.roster, "work"),
+                Err(Error::UseTargetAmbiguous { count: 2, .. })
+            ),
+            "the LABEL is ambiguous and refused: {:?}",
+            resolve_target(&disk.roster, "work"),
+        );
+        assert_eq!(
+            resolve_target(&disk.roster, "u-B").unwrap(),
+            1,
+            "the UUID resolves to the second bearer without complaint",
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let lagging = lagging_status();
+        let cache = ControlSocketCache { socket };
+        let (_, (result, store, _stash, calls, log)) = tokio::join!(
+            serve_one_status(listener, &lagging),
+            run_on(
+                dup_work_config(),
+                &cache,
+                "u-B",
+                false,
+                false,
+                Probe::Live { weekly: 0.10 },
+            ),
+        );
+        assert!(
+            result.is_ok(),
+            "`u-B` is viable on its own token and must not inherit `u-A`'s reading: {result:?}",
+        );
+        assert_eq!(
+            calls, 1,
+            "the cache degraded, so exactly one live poll — of `u-B`'s own stashed token, \
+             keyed by uuid — classified the named account",
+        );
+        assert_eq!(canonical(&store).await, b"B-token", "the swap reached u-B");
+        assert!(log.contains("event=swap"), "log: {log}");
+    }
+
+    #[tokio::test]
+    async fn a_lagging_daemons_reading_still_answers_for_a_labels_only_local_bearer() {
+        // The other half, and the one that keeps the fix above from being "stop using the
+        // cache": the SAME lagging reply, read against a roster where the label has exactly
+        // ONE local bearer. The cached verdict is honoured, the gate refuses, and issue #75's
+        // "zero usage-endpoint requests when a daemon is up" holds — so the roster count
+        // narrows the lookup to the case it cannot attribute, rather than switching it off.
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        // `spare` (u-B) is the only bearer of its label on BOTH sides; the reply's one line
+        // carries its exhausted reading.
+        let reply = status_reply(vec![status_line("spare", false, true, Some(99))]);
+        let cache = ControlSocketCache { socket };
+        let (_, (result, store, _stash, calls, log)) = tokio::join!(
+            serve_one_status(listener, &reply),
+            run_on(config_ab(), &cache, "u-B", false, false, Probe::Locked,),
+        );
+        assert!(
+            matches!(result, Err(Error::UseTargetWeeklyExhausted { ref label }) if label == "spare"),
+            "the cached verdict still gates a uniquely-labelled target: {result:?}",
+        );
+        assert_eq!(
+            calls, 0,
+            "a HIT issues no usage request (the poller here would abort if consulted)",
+        );
+        assert_eq!(
+            canonical(&store).await,
+            b"A-token",
+            "the refusal writes nothing"
+        );
+        assert!(!log.contains("event=swap"), "log: {log}");
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_wire_label_degrades_even_when_the_roster_is_unique() {
+        // The mirror of the pair above, and it exists because mutating the two counts
+        // SEPARATELY is what showed the coverage was asymmetric: dropping the roster count
+        // reddens a unit test AND a full `run_use` path, while dropping the wire count reddened
+        // the unit test alone — so the conjunct that predates this issue had no end-to-end pin
+        // at all. Here `spare` names exactly one account on disk and TWO lines on a wire this
+        // process cannot reconcile, so the cached verdict is un-attributable from the other
+        // direction and the same live fallback runs.
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let reply = status_reply(vec![
+            status_line("spare", false, true, Some(99)),
+            status_line("spare", false, false, Some(10)),
+        ]);
+        let cache = ControlSocketCache { socket };
+        let (_, (result, store, _stash, calls, log)) = tokio::join!(
+            serve_one_status(listener, &reply),
+            run_on(
+                config_ab(),
+                &cache,
+                "u-B",
+                false,
+                false,
+                Probe::Live { weekly: 0.10 },
+            ),
+        );
+        assert!(
+            result.is_ok(),
+            "two `spare` lines carry no attributable verdict, so the gate polls: {result:?}",
+        );
+        assert_eq!(
+            calls, 1,
+            "exactly one live poll classified the named account"
+        );
+        assert_eq!(canonical(&store).await, b"B-token", "the swap reached u-B");
+        assert!(log.contains("event=swap"), "log: {log}");
     }
 
     // --- daemon-routed swap (issue #167): request_swap + ack mapping ---------
