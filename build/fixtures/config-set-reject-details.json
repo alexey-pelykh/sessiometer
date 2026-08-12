@@ -1,0 +1,4 @@
+{
+  "config_set_error_stale_key": "unknown field `session_trigger`, expected one of `poll_secs`, `exhausted_poll_secs`, `near_limit_poll_secs`, `cooldown_secs`, `target_max_session_usage`, `session_ceiling`, `weekly_ceiling`, `session_blind_swap_secs`, `session_blind_risk_band`, `session_velocity_horizon_secs`, `session_velocity_min_project_above`, `session_velocity_ema_alpha_pct`, `monitor_401_n`, `monitor_recovery_m`, `fleet_runway_warn_secs`, `canary_drift_override`, `canary_nostashmatch_override`, `canary_online_probe`, `canary_online_probe_strict`",
+  "config_set_rejected_fleet_runway_invalid": "fleet_runway_warn_secs must be 0 (disabled) or in 60..=604800 (one weekly window; a longer warn line could never clear), got 30"
+}
