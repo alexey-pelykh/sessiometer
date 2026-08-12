@@ -57,28 +57,41 @@
 // reddens the moment that fixture follows a re-emitted golden. Guarded transitively, not
 // hand-maintained — the distinction naming only the prose would blur.
 //
-// One thing this gate DOES now reach that it did not (issue #1248): the golden's own key set.
-// `RejectDetails` below and the Rust `ConfigSetRejectDetails` it mirrors both IGNORE unknown JSON
-// keys, so a fourth entry emitted Rust-side used to decode clean on both sides and be read by
-// nobody, with every test green. `testTheGoldenHasNoEntryThisGateDoesNotRead` compares the golden's
-// top-level keys against the three read here, so such an entry reddens instead. Read its scope
-// exactly: it proves no golden entry is missing from `readKeys`. It does NOT prove each read key is
-// compared against a Swift copy — that stays enumerated, one test per key below — and it does NOT
-// prove a name in `readKeys` reaches a `RejectDetails` field at all: adding a name here without the
-// field and the comparison satisfies this test while leaving that entry unread. The opposite
-// direction was already loud and stays so: a dropped or renamed key fails `RejectDetails`' decode
-// here, and an empty golden fails the Rust pin's own decode before any comparison runs.
+// One thing this gate DOES now reach that it did not (issues #1248, #1254): the golden's own key
+// set. `RejectDetails` below and the Rust `ConfigSetRejectDetails` it mirrors both IGNORE unknown
+// JSON keys, so a fourth entry emitted Rust-side used to decode clean on both sides and be read by
+// nobody, with every test green. `testTheGoldensKeysAreExactlyTheRejectDetailsFields` compares the
+// golden's top-level keys against `RejectDetails`' own stored properties, so such an entry reddens
+// instead. Read that scope exactly, because it is narrower than the name suggests: it proves those
+// two sets are EQUAL, and says nothing about the assertions below. A field that has a golden entry
+// but no `XCTAssertEqual` above passes it — measured, not assumed (issue #1254) — so "every entry
+// is compared" still rests on the enumeration below, one test per key. What it does close is the
+// direction that used to be open by construction: an entry can no longer be emitted and declared
+// read while reaching no field at all.
 //
-// Two bounds on that, both measured rather than assumed. It does not reach the RUST end of the same
-// hole: `ConfigSetRejectDetails` (src/config/settings.rs) carries no `deny_unknown_fields`, and a
-// golden holding an unread fourth key leaves that pin GREEN — only this side reddens. Reaching that
-// end only matters for a hand-edited golden, which the repo already says to regenerate instead, so
-// it is recorded here rather than closed. And it is a dedicated test rather than an unknown-key
-// rejection inside `RejectDetails`' decode, which was the other way to close this: Swift has no
-// `deny_unknown_fields`, so that route needs a hand-written `init(from:)` enumerating the very same
-// key set — no more exhaustive-by-construction, and it would report a coverage gap as a DECODING
-// failure in every test that touches `committed()`, burying which key is unread. This way one test
-// reddens and names it.
+// #1248 asserted that against `readKeys`, a hand-maintained `Set<String>` beside the struct rather
+// than the struct itself, which left `readKeys` ⊋ `RejectDetails` passing: a name added there AND
+// to the golden, with no field and no comparison, satisfied the check while leaving the entry
+// unread — measured green across the whole suite (issue #1254). Two spellings are why it was
+// written that way: `Mirror` yields camelCase labels and the golden is snake case. The bridge here
+// is the DECODER's own `.convertFromSnakeCase`, not a hand-written converter, which would have
+// been a third hand-maintained spelling in a file whose defect was the second one. `readKeys` is
+// gone, so no third enumeration is left to drift.
+//
+// The two directions fail differently, which is what a maintainer actually sees. A golden entry
+// reaching no field reddens THAT comparison and names it. A field with no golden entry never gets
+// there: `committed()` fails to decode first, loudly, as it always has.
+//
+// Two further bounds on that key-set gate, both measured rather than assumed. It does not reach the
+// RUST end of the same hole: `ConfigSetRejectDetails` (src/config/settings.rs) carries no
+// `deny_unknown_fields`, and a golden holding an unread fourth key leaves that pin GREEN — only
+// this side reddens. Reaching that end only matters for a hand-edited golden, which the repo
+// already says to regenerate instead, so it is recorded here rather than closed. And it is a
+// dedicated test rather than an unknown-key rejection inside `RejectDetails`' decode, which was the
+// other way to close this: Swift has no `deny_unknown_fields`, so that route needs a hand-written
+// `init(from:)` enumerating the very same key set — no more exhaustive-by-construction, and it
+// would report a coverage gap as a DECODING failure in every test that touches `committed()`,
+// burying which key is unread. This way one test reddens and names it.
 
 import XCTest
 
@@ -87,7 +100,9 @@ final class ConfigSetRejectDetailParityTests: XCTestCase {
     /// The committed golden's shape. All three fields are non-optional ON PURPOSE: a renamed or
     /// dropped key fails the decode loudly instead of defaulting to an empty string that would then
     /// compare equal to nothing and pass. Unknown keys are the direction this shape does NOT catch —
-    /// `testTheGoldenHasNoEntryThisGateDoesNotRead` below covers that one.
+    /// `testTheGoldensKeysAreExactlyTheRejectDetailsFields` below covers that one, by reflecting
+    /// over these very properties: a field added here is picked up with no second declaration
+    /// anywhere, which is the point (issue #1254).
     private struct RejectDetails: Decodable {
         let configSetErrorStaleKey: String
         let configSetRejectedFleetRunwayInvalid: String
@@ -99,6 +114,24 @@ final class ConfigSetRejectDetailParityTests: XCTestCase {
     /// decoder would make a decoder bug able to mask a drifted fixture.
     private struct DetailEnvelope: Decodable {
         let detail: String
+    }
+
+    /// Accepts whatever key the decoder hands it, so `allKeys` below reports the object's real
+    /// keys instead of a fixed set this file would have to enumerate.
+    private struct AnyKey: CodingKey {
+        let stringValue: String
+        var intValue: Int? { nil }
+        init?(stringValue: String) { self.stringValue = stringValue }
+        init?(intValue: Int) { return nil }
+    }
+
+    /// A JSON object's top-level key names, taken from the keyed container so that the surrounding
+    /// decoder's `keyDecodingStrategy` has already been applied to them.
+    private struct TopLevelKeys: Decodable {
+        let names: [String]
+        init(from decoder: Decoder) throws {
+            names = try decoder.container(keyedBy: AnyKey.self).allKeys.map(\.stringValue)
+        }
     }
 
     /// Repo-root `build/fixtures/config-set-reject-details.json` resolved from this test file's own
@@ -113,19 +146,28 @@ final class ConfigSetRejectDetailParityTests: XCTestCase {
             .appendingPathComponent("build/fixtures/config-set-reject-details.json")
     }
 
-    /// The golden keys this gate reads — one per `RejectDetails` field above, spelled as they
-    /// appear in the JSON. `committed()` decodes with `.convertFromSnakeCase`; the cardinality
-    /// check below compares raw keys, so these stay snake case. A name here with no entry in the
-    /// golden fails that check, and a `RejectDetails` field with no entry in the golden fails the
-    /// decode. This list can still disagree with `RejectDetails` in ONE direction, and nothing
-    /// here catches it: a name added here AND to the golden, with no matching field and no
-    /// comparison below, passes both. Keeping the two in step is a hand discipline — add all
-    /// three at once, per the failure message on the cardinality check.
-    private static let readKeys: Set<String> = [
-        "config_set_error_stale_key",
-        "config_set_rejected_fleet_runway_invalid",
-        "zero_target_remedy_detail",
-    ]
+    /// The golden's top-level keys, in both spellings this file has to reconcile: as WRITTEN in
+    /// the JSON (snake case), and as the DECODER produces them (camelCase, through the same
+    /// `.convertFromSnakeCase` `committed()` sets). The second is the spelling `RejectDetails`'
+    /// field names are matched against, so it is the one the gate below compares; the first is
+    /// carried only so a failure can name the offender as the golden spells it.
+    ///
+    /// Read from a keyed container's `allKeys` rather than from a `[String: String]` decode, and
+    /// that is not a style choice: the dictionary path does NOT apply the key strategy — measured
+    /// on Swift 6.3.3, it hands the keys back unconverted — so it would compare snake case against
+    /// camelCase field names and never match. Going through a container makes the bridge between
+    /// the two spellings the decoder's OWN conversion step rather than a hand-written camel/snake
+    /// helper, which would be a third hand-maintained spelling in a file whose defect (issue
+    /// #1254) was the second one.
+    private static func goldenKeys() throws -> (asWritten: [String], asDecoded: [String]) {
+        let data = try Data(contentsOf: goldenURL())
+        let converting = JSONDecoder()
+        converting.keyDecodingStrategy = .convertFromSnakeCase
+        return (
+            asWritten: try JSONDecoder().decode(TopLevelKeys.self, from: data).names,
+            asDecoded: try converting.decode(TopLevelKeys.self, from: data).names
+        )
+    }
 
     private func committed() throws -> RejectDetails {
         let url = Self.goldenURL()
@@ -188,22 +230,39 @@ final class ConfigSetRejectDetailParityTests: XCTestCase {
 
     /// Issue #1248: coverage above is ENUMERATED — one test per entry — and nothing made it
     /// exhaustive. Both structs on this wire ignore unknown JSON keys, so an entry emitted
-    /// Rust-side with no Swift copy pinned to it decoded clean and passed unread. Compare the key
-    /// SETS rather than a count: a count is blind to a same-size rename, and the set names the
-    /// offender in the failure.
-    func testTheGoldenHasNoEntryThisGateDoesNotRead() throws {
-        let raw = try JSONDecoder().decode(
-            [String: String].self, from: Data(contentsOf: Self.goldenURL()))
-        let present = Set(raw.keys)
+    /// Rust-side with no Swift copy pinned to it decoded clean and passed unread. Issue #1254: that
+    /// check compared the golden against a hand-maintained name list beside `RejectDetails` rather
+    /// than against the struct, so an entry could be emitted, listed as read, and still reach no
+    /// field. This compares the golden's keys against the struct's own properties instead.
+    ///
+    /// Only one direction can fail HERE, by construction. `committed()` requires every field's key
+    /// to be present, so by the time this comparison runs the fields are already a subset of the
+    /// golden's keys, and the only difference that can remain is a golden entry reaching no field.
+    /// The opposite case — a field with no golden entry — fails earlier, in that decode, and is not
+    /// silent. Compare SETS rather than counts: a count is blind to a same-size rename.
+    func testTheGoldensKeysAreExactlyTheRejectDetailsFields() throws {
+        let keys = try Self.goldenKeys()
+
+        // The conversion is the bridge, so prove first that it does not COLLAPSE two golden keys
+        // onto one name — `foo_bar` and `fooBar` both convert to `fooBar`. A collapse would drop an
+        // entry from the set below and hide precisely what this test exists to find.
         XCTAssertEqual(
-            present, Self.readKeys,
-            "the committed golden's entries are not the ones this gate reads. Emitted but unread "
-                + "(nothing here is pinned to these): \(present.subtracting(Self.readKeys).sorted()). "
-                + "Read here but absent from the golden: "
-                + "\(Self.readKeys.subtracting(present).sorted()). For an emitted-but-unread entry, "
-                + "add a `RejectDetails` field, a `readKeys` name and a comparison above — or drop it "
-                + "from `ConfigSetRejectDetails` (src/config/settings.rs) and re-emit. For one read "
-                + "here but absent from the golden, re-emit the golden or drop the name"
+            Set(keys.asDecoded).count, keys.asWritten.count,
+            "two of the golden's keys convert to the same name, so the comparison below cannot see "
+                + "them both. As written: \(keys.asWritten.sorted()). As decoded: "
+                + "\(keys.asDecoded.sorted())"
+        )
+
+        let fields = Set(
+            Mirror(reflecting: try committed()).children.map { $0.label ?? "<unlabelled>" })
+        XCTAssertEqual(
+            Set(keys.asDecoded), fields,
+            "the committed golden holds entries that reach no `RejectDetails` field, so nothing "
+                + "here is pinned to them: \(Set(keys.asDecoded).subtracting(fields).sorted()) "
+                + "(the golden spells its keys \(keys.asWritten.sorted())). Add a `RejectDetails` "
+                + "field AND a comparison above — the field alone turns this test green while "
+                + "leaving the entry uncompared, which this check cannot see — or drop the entry "
+                + "from `ConfigSetRejectDetails` (src/config/settings.rs) and re-emit the golden"
         )
     }
 
