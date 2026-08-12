@@ -226,8 +226,8 @@ impl ControlSocketCache {
 /// legitimately lags, and a second bearer added on disk leaves the wire with ONE line
 /// that is not necessarily the named account's. `resolve_target` shuts the label door
 /// on that roster — a duplicated label is refused outright — but it resolves a UUID
-/// query without complaint, and everything past it keys on the label, so the uuid is
-/// the door the wire count alone leaves open.
+/// query without complaint, and the wire lookup past it keys on the label, so the uuid
+/// is the door the wire count alone leaves open.
 ///
 /// Degrading costs `use` almost nothing, which is why it degrades on a count `poke`
 /// had to weigh: the fallback is a single live poll of the target's OWN stashed token
@@ -1406,9 +1406,33 @@ mod tests {
     impl CachedViabilitySource for FakeCache {
         async fn cached_viability(
             &self,
-            _roster: &[Account],
-            _account: &Account,
+            roster: &[Account],
+            account: &Account,
         ) -> Option<Viability> {
+            // The VERDICT is scripted; the ROSTER is not ignored (issue #1246). Every
+            // production call site threads `&config.roster` beside a target taken FROM
+            // that roster, so the account is always a bearer — the same by-construction
+            // guarantee [`cached_viability_for`]'s roster count leans on ("Zero bearers
+            // is unreachable from either production call site"), checked here by uuid
+            // identity rather than by that comment's label bearership. A seam that
+            // discarded this parameter is what let the roster go unpinned at two of the
+            // three sites that thread it.
+            //
+            // NECESSARY, not sufficient: this fires on an EMPTY or target-omitting roster
+            // at ANY site, in EVERY test that installs this fake, and that is its whole
+            // value — it is a standing floor under new call sites. It cannot see a roster
+            // that contains the target and is still the wrong one; only the
+            // `ControlSocketCache`-over-a-real-socket tests pin the lookup's semantics,
+            // per site.
+            assert!(
+                roster
+                    .iter()
+                    .any(|bearer| bearer.account_uuid == account.account_uuid),
+                "the cache was handed a roster with no bearer for `{}` ({}): the caller \
+                 threaded a roster the target is not in",
+                account.label,
+                account.account_uuid,
+            );
             self.calls.set(self.calls.get() + 1);
             self.verdict
         }
@@ -4461,8 +4485,10 @@ mod tests {
     #[tokio::test]
     async fn a_lagging_daemons_reading_still_answers_for_a_labels_only_local_bearer() {
         // The other half, and the one that keeps the fix above from being "stop using the
-        // cache": the SAME lagging reply, read against a roster where the label has exactly
-        // ONE local bearer. The cached verdict is honoured, the gate refuses, and issue #75's
+        // cache": an identically-SHAPED lagging reply — one line, exhausted, built here
+        // rather than reused from `lagging_status()` because `config_ab`'s bearer is
+        // `spare` — read against a roster where the label has exactly ONE local bearer.
+        // The cached verdict is honoured, the gate refuses, and issue #75's
         // "zero usage-endpoint requests when a daemon is up" holds — so the roster count
         // narrows the lookup to the case it cannot attribute, rather than switching it off.
         use tokio::net::UnixListener;
@@ -4534,6 +4560,105 @@ mod tests {
         );
         assert_eq!(canonical(&store).await, b"B-token", "the swap reached u-B");
         assert!(log.contains("event=swap"), "log: {log}");
+    }
+
+    // --- the roster at the two `--force` sites (issue #1246) -----------------
+    //
+    // `run_use` threads `&config.roster` into the cache lookup from THREE places: the
+    // gated path (`SwapTarget::resolve`, pinned by the trio above), and the two that
+    // reach it through `warn_if_forcing_onto_non_viable` — adopt-target recovery and
+    // the plain `--force` bypass. The two below pin those. Each drives the PRODUCTION
+    // `ControlSocketCache` over a real socket, because the roster only changes an
+    // answer inside `cached_viability_for`; the older force-path tests run on
+    // `FakeCache`, whose verdict is scripted, so no roster it is handed can change it.
+    //
+    // The shape both use: a target whose label bears exactly once on BOTH sides is a
+    // cache HIT, so the poller is never consulted — and the poller is armed with
+    // `Probe::Locked`, which ABORTS if it ever is. Substituting `&[]` for the roster
+    // at the site under test counts zero bearers, discards the verdict, and issues
+    // that poll, so `calls == 0` is the assertion that carries the pin.
+
+    #[tokio::test]
+    async fn a_forced_swap_reads_a_uniquely_labelled_targets_cached_verdict() {
+        // The `--force` site. `--force` bypasses the POLICY gate but still consults the
+        // daemon's cached verdict to decide whether to WARN, and that lookup is the one
+        // issue #75 prices: zero usage-endpoint requests while a daemon is up. An empty
+        // roster there would discard a perfectly good verdict on every forced swap and
+        // poll live instead — the exact cost the doc comment weighs as the price of
+        // degrading, paid unconditionally.
+        use tokio::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        // `spare` (u-B) bears its label exactly once in `config_ab` and once on the wire.
+        let reply = status_reply(vec![status_line("spare", false, true, Some(99))]);
+        let cache = ControlSocketCache { socket };
+        let (_, (result, store, _stash, calls, log)) = tokio::join!(
+            serve_one_status(listener, &reply),
+            run_on(config_ab(), &cache, "u-B", true, false, Probe::Locked),
+        );
+        assert_eq!(
+            calls, 0,
+            "the forced path must read the cached verdict: a roster counting zero bearers \
+             for `spare` degrades to a live poll, and this poller aborts if consulted",
+        );
+        // …and the path was actually WALKED — `calls == 0` alone is also what a forced
+        // swap that never reached the lookup would report.
+        assert!(
+            result.is_ok(),
+            "`--force` warns on the exhausted target and proceeds: {result:?}",
+        );
+        assert_eq!(canonical(&store).await, b"B-token", "the swap reached u-B");
+        assert!(
+            log.contains("event=swap from=work to=spare reason=forced"),
+            "log: {log}",
+        );
+    }
+
+    #[tokio::test]
+    async fn an_adopting_forced_swap_reads_a_uniquely_labelled_targets_cached_verdict() {
+        // The adopt-target site (#212): the canonical is scrubbed and the display cleared,
+        // so the normal re-stash swap cannot run and `--force` installs the target directly.
+        // It reaches the SAME `warn_if_forcing_onto_non_viable`, threading its own copy of
+        // the roster, and nothing pinned that copy — the recovery path is the one an
+        // operator hits when a session is already broken, so degrading it to a live poll
+        // costs a usage request exactly when the credential state is least dependable.
+        use tokio::net::UnixListener;
+
+        let (store, stash) = seeded_store_and_stash().await;
+        store.set_not_found(true); // the scrubbed canonical → the adopt branch
+        let (_json_dir, json) = claude_json_for("u-UNKNOWN"); // display cleared too
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let reply = status_reply(vec![status_line("spare", false, true, Some(99))]);
+        let cache = ControlSocketCache { socket };
+        let (_, (result, calls, log)) = tokio::join!(
+            serve_one_status(listener, &reply),
+            run_use_over_cache(&cache, &store, &stash, &json, "spare", true, Probe::Locked),
+        );
+        assert_eq!(
+            calls, 0,
+            "adopt-target must read the cached verdict too: a roster counting zero bearers \
+             for `spare` degrades to a live poll, and this poller aborts if consulted",
+        );
+        // …and this is the ADOPT branch, not the ordinary forced swap: the sentinel `from=`
+        // is what distinguishes them, and it is only reachable with the canonical gone.
+        assert!(
+            result.is_ok(),
+            "adopt warns on the exhausted target and recovers: {result:?}",
+        );
+        assert_eq!(
+            canonical(&store).await,
+            b"B-token",
+            "adopted spare into the absent canonical",
+        );
+        assert!(
+            log.contains("event=swap from=(unknown) to=spare reason=forced"),
+            "log: {log}",
+        );
     }
 
     // --- daemon-routed swap (issue #167): request_swap + ack mapping ---------
@@ -5143,6 +5268,28 @@ mod tests {
         force: bool,
         probe: Probe,
     ) -> (Result<()>, String) {
+        let (result, _calls, log) =
+            run_use_over_cache(&FakeCache::miss(), store, stash, json, query, force, probe).await;
+        (result, log)
+    }
+
+    /// [`run_use_over`] over a caller-supplied cache seam rather than the
+    /// [`FakeCache::miss`] default, also reporting the live-poll count — what the
+    /// ADOPT-TARGET recovery path needs to be driven against the PRODUCTION
+    /// [`ControlSocketCache`] (issue #1246). Generic over the seam for exactly the
+    /// reason [`run_on`] is: a scripted verdict proves what the path does with an
+    /// answer, never which answer the real lookup returns for which roster — and the
+    /// roster is the subject here. `run_on` cannot stand in: it seeds a PRESENT
+    /// canonical that resolves, so `adopt` is never true and this site never runs.
+    async fn run_use_over_cache<R: CachedViabilitySource>(
+        cache: &R,
+        store: &FakeCredentialStore,
+        stash: &FakeAccountStash,
+        json: &Path,
+        query: &str,
+        force: bool,
+        probe: Probe,
+    ) -> (Result<()>, u32, String) {
         let config = config_ab();
         let log_dir = tempfile::tempdir().unwrap();
         let log_path = log_dir.path().join("sessiometer.log");
@@ -5151,14 +5298,13 @@ mod tests {
         let lock_dir = tempfile::tempdir().unwrap();
         let lock_path = lock_dir.path().join("swap.lock");
         let notifier = FakeNotifier::ok();
-        let cache = FakeCache::miss();
         let result = run_use(
             &config,
             query,
             force,
             false,
             Seams {
-                cache: &cache,
+                cache,
                 poller: &poller,
                 store,
                 stash,
@@ -5170,7 +5316,7 @@ mod tests {
         )
         .await;
         let log_text = std::fs::read_to_string(&log_path).unwrap_or_default();
-        (result, log_text)
+        (result, poller.calls.get(), log_text)
     }
 
     #[tokio::test]
