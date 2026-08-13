@@ -47,11 +47,16 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'deny.toml'
-              # `include_str!` compile-time inputs for the migration tests (src/migration.rs), the
-              # wire goldens (src/daemon/snapshot_build.rs, src/stats.rs) and the CLI full-output
-              # render goldens (build/fixtures/cli-renders/**, issue #767); a fixture-only edit is
-              # still a Rust-affecting change and must run the Rust jobs — for the render goldens
-              # especially, since a golden-only PR is exactly the shape a silent re-baseline takes.
+              # `include_str!` compile-time inputs; a fixture-only edit is still a Rust-affecting
+              # change and must run the Rust jobs — for the render goldens especially, since a
+              # golden-only PR is exactly the shape a silent re-baseline takes. Consumers, complete
+              # as measured — re-derive rather than trust this list, which has drifted before
+              # (issue #1252):
+              #   git grep -A2 'include_str!(concat!' -- src | grep build/fixtures
+              # src/migration.rs (frozen v1 artifacts), src/daemon/snapshot_build.rs + src/stats.rs
+              # (wire goldens), src/render_golden.rs (cli-renders/**, issue #767),
+              # src/config/settings.rs (config-set-reject-details.json), src/cross_surface.rs
+              # (cross-surface-severity.json), src/usage_stats.rs (capacity-replay corpus + oracle).
               - 'build/fixtures/**'
               - 'scripts/**'
               # Cargo auto-detects these inputs, so a PR that adds one must run the Rust jobs — else
