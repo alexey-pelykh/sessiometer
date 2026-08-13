@@ -846,6 +846,17 @@ private struct UsageMeter: View {
 
 /// A capsule fill proportional to `fraction` (0…1), with a minimum sliver so a live-but-tiny percent
 /// never reads as empty; a zero/failed reading shows a bare track. The number carries the real value.
+///
+/// The `.accessibilityHidden(true)` at the end of `body` is limb 2 of the compensating control that makes
+/// this bar defensible at its measured contrast (`UsageMeter.barColor` above; `design/README.md`), and
+/// `MeterCompensatingControlTests` (#1251) pins it — deleting it fails the required `swift` job. Note what
+/// that gate does NOT say: today the modifier is a redundant second guard, because each roster row already
+/// collapses to a SINGLE accessibility element — a switchable row through its `Button` wrap, a
+/// non-switchable one through `.accessibilityElement(children: .ignore)` — which discards this subtree
+/// either way (measured — deleting the modifier moves neither a raster nor a role histogram). It is pinned
+/// because it is the guard the argument names, and the one left the moment a row stops collapsing: an
+/// `.ignore` becoming a `.combine`, or the `Button` wrap being undone, which `AccountRowView`'s ROW-ACTION
+/// CARDINALITY note already records as mandatory if a row ever gains a second action.
 private struct UsageBar: View {
     /// The panel's uniform Dynamic Type multiplier (issue #756), injected once by `StatusPanelView`.
     @Environment(\.panelScale) private var scale
