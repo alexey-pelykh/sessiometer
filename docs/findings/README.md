@@ -26,6 +26,7 @@ decision, and gives the fix items a stable citation for *why*.
 | [0950](0950-help-on-disabled-button.md) | Does `.help()` surface a tooltip on a `.disabled()` Button? | #950 | — |
 | [0953](0953-help-nesting-inside-a-row-button.md) | Does a `.help()` on a child inside a row `Button` surface on hover? (**not established**) | #953 | — |
 | [0981](0981-reachability-predicate.md) | Can a source-as-data predicate tell a variable-sourced size-class injection from a literal one? (**yes**, within three bounds, after four traps) | #981 | #748 |
+| [1177](1177-scrollview-raster-route.md) | Can anything rasterize the panel's scroll boundary, and is it worth switching to? (**yes** — route 1 taken, execution deferred to #1261) | #1177 | — |
 
 ## Conventions
 
