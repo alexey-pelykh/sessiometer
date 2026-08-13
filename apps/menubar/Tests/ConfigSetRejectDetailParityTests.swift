@@ -92,6 +92,60 @@
 // `init(from:)` enumerating the very same key set — no more exhaustive-by-construction, and it
 // would report a coverage gap as a DECODING failure in every test that touches `committed()`,
 // burying which key is unread. This way one test reddens and names it.
+//
+// Issue #1256 asked whether an explicit `CodingKeys: String, CaseIterable` carrying snake_case raw
+// values should replace the gate above — closing the same hole at compile time, and carrying no
+// test of its own. Measured on Swift 6.3.3 (swiftlang-6.3.3.1.3) and DECLINED: the premise holds in
+// one direction, and not in the one this file was built for.
+//
+// The compiler does hold cases and fields 1:1. An orphan case is refused — `type 'RejectDetails'
+// does not conform to protocol 'Decodable'`, noting `CodingKey case 'configSetRejectedInvalid' does
+// not match any stored properties`. So is a field with no case: `cannot automatically synthesize
+// 'Decodable' because 'configSetRejectedInvalid' does not have a matching CodingKey and does not
+// have a default value`. Read that second message literally, because the refusal is CONDITIONAL: a
+// field carrying a default (`let x: String = "..."`, or a `var`) compiles with no case at all, and
+// only a no-default field is caught — an Optional counting as no-default. The three fields above
+// have no defaults, so the check would bind them; that is a property of how this struct is written,
+// not of `CodingKeys`.
+//
+// What no version of it checks is the RAW VALUES, which is the whole question. A correctly named
+// case carrying a misspelled one — `configSetErrorStaleKey = "config_set_error_stale_ky"` —
+// compiles clean, with no diagnostics: the compiler matches case NAMES against field names and
+// never reads the golden, so it has no oracle for what the JSON spells. That typo lands at runtime
+// as `DecodingError.keyNotFound` on the misspelled key. Loud rather than silent — but runtime, and
+// a spelling this file would from then on be hand-maintaining.
+//
+// And the direction this gate exists for is not compile-closable at all. A golden carrying a fourth
+// entry that reaches no case still decodes clean under `CodingKeys`: Swift ignores unknown keys
+// with one or without. The golden is a file read at runtime, and no compile-time construct can see
+// it. So adopting would not REMOVE this test — it would change what the test compares, golden keys
+// against `CodingKeys.allCases` raw values instead of against the fields. That comparison does work
+// (measured) and would pin the raw values too.
+//
+// So the reason to decline is not that it fails. It is that `RejectDetails`' stored properties are
+// currently the ONLY Swift-side enumeration of this key set: `.convertFromSnakeCase` matches the
+// golden's keys against those property names, so no key spelling is hand-written anywhere on the
+// matching path (the snake_case strings below sit in assertion MESSAGES, which nothing matches
+// against). `CodingKeys` adds a second enumeration plus
+// three hand-written strings, then spends its compile-time check binding the second back to the
+// first: the drift it closes is drift that adopting it introduces, while the drift that remains —
+// golden against Swift — still needs this test either way. It would also add one mode that does not
+// exist today: two raw values SWAPPED between correctly named cases compile AND decode clean,
+// filling each field from the other's entry. The key-set comparison cannot see that, the two sets
+// staying equal; only the parity assertions and `testTheGoldenIsNotDegenerate` below compare field
+// CONTENTS, which is where a swap surfaces.
+//
+// Stated fairly, it is a defensible shape rather than a refuted one, and not a repeat of #1248's
+// `readKeys` (a `Set<String>` with no compiler binding at all, which is how `readKeys` ⊋
+// `RejectDetails` passed). It is also what production already does: `.convertFromSnakeCase` appears
+// nowhere under `Sources/`, where `WireModel.swift` and `ConfigWire.swift` hand-write their
+// snake_case raw values throughout. A judgment call, recorded here so it is not re-litigated a
+// third time.
+//
+// The switching cost is measured too, and is why this is not a free swap: explicit raw values are
+// incompatible with `.convertFromSnakeCase`, which `committed()` sets. A `CodingKeys`-carrying
+// struct read through that decoder fails with `DecodingError.keyNotFound: Key
+// 'config_set_error_stale_key' not found`, and decodes only once the strategy is removed.
 
 import XCTest
 
