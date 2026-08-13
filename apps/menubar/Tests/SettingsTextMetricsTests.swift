@@ -74,11 +74,12 @@
 //      satisfy the other's gate.
 //
 //   2. The hazard is much larger than "can be long". The issue #628 `detail` this arm interpolates is
-//      serde's own `deny_unknown_fields` message, which names EVERY expected tunable — so the string that
-//      reaches the footer is ~535 characters and ~2 700 pt wide in a 328 pt slot, not a long sentence. The
-//      fixture below reconstructs it from the SHIPPED field list (`TunableField.allCases`) rather than
-//      pasting it, so it tracks the wire instead of freezing a copy — which makes the fixture itself a
-//      deliberate ~425-character LOWER bound; see `staleKeyDetail` for why that direction is the safe one.
+//      serde's own `deny_unknown_fields` message, which names EVERY expected tunable — so what reaches the
+//      footer is a multiple of the 328 pt slot, not a long sentence; the gate below asserts at least 3×
+//      and reports the live character count and width when it fires. The fixture below reconstructs it
+//      from the SHIPPED field list (`TunableField.allCases`) rather than pasting it, so it tracks the wire
+//      instead of freezing a copy — which makes the fixture itself a deliberate LOWER bound; see
+//      `staleKeyDetail` for why that direction is the safe one.
 //
 //   3. Settings does NOT participate in the panel's `\.panelScale` Dynamic Type scaling (issue #756) —
 //      `panelScale` appears in no Settings source. Its FONTS still scale (they are system text styles)
@@ -146,7 +147,7 @@ final class SettingsTextMetricsTests: XCTestCase {
     /// APP-EDITABLE keys, but the Rust `SetTunables` it is rejected against (`src/config.rs`) also
     /// carries four `canary_*` overrides (`canary_drift_override`, `canary_nostashmatch_override`,
     /// `canary_online_probe`, `canary_online_probe_strict`) — so serde's real message names 19 fields and
-    /// runs ~110 characters LONGER than this fixture's ~425. Understating the hazard cannot flip an
+    /// runs exactly 110 characters LONGER than this fixture. Understating the hazard cannot flip an
     /// overflow assertion, whereas hardcoding the four Rust-only names here would plant a second copy that
     /// drifts the moment the daemon gains a key. So the fixture stays derived, and the shortfall is stated
     /// rather than closed.
