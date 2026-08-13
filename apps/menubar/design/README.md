@@ -1229,16 +1229,42 @@ text. `StatusPanelFormatTests`'
 `testTheMeterBarFillIsCarriedByTheAdjacentPercentTextNotByItsOwnContrast` (#759) is where that
 argument is written down — but read its own SCOPE paragraph before relying on it, because that test
 pins the **formatter** and the amber/red tint contrast, not the view. By its own account, deleting
-the percent `Text` from `UsageMeter` leaves it green; only `PanelGoldenParityTests`' rasters catch
-that, and they are env-gated behind `SESSIOMETER_PANEL_GOLDEN_GATE` with a soft CI job. Read that
-test for the hole it records too: on the **healthy / green** band *neither* channel clears its bar —
-the fill at 2.08 vs the panel base (#831) and the `--ut-g` percent text at 4.10:1 (**#830**) — so
-green is the one band where this compensating-control argument does not actually hold. Each issue
-owns one half. So do **not** widen "fills only need 3:1, and these clear it" to a fill with *no*
-adjacent text; that one would be a real violation. `UsageMeter.barColor` in
-`Sources/StatusPanelRoster.swift` already carries this same correction. Whether the `--u-*` family
-should itself be darkened is the open decision in **#831** — this file records the measured position
-only and changes no token value.
+the percent `Text` from `UsageMeter` leaves it green.
+
+**Both limbs are pinned by `MeterCompensatingControlTests` (#1251), which runs in the required
+`swift` job** — so deleting either one now fails a merge. Read what that gate *compares* before
+leaning on it: it reads `Sources/StatusPanelRoster.swift` as **text**, checking that `UsageMeter`
+still calls `Text(StatusPanelFormat.pct(…))` and that `UsageBar` still carries
+`.accessibilityHidden(true)`, each scoped to that type's own body. It renders nothing, so it cannot
+tell you the percent is legible, unclipped, or drawn at all — only that the view code still asks for
+it. It is also scoped to each type's *braces* rather than to its rendered chain, so a modifier
+relocated onto a sibling subview inside those braces, one excluded by an `#if`, or one left on a type
+the meter no longer renders all satisfy it — the test file's header enumerates these, each measured.
+The render-side half is still `PanelGoldenParityTests`' rasters, still `XCTSkipUnless`-gated on
+`SESSIOMETER_PANEL_GOLDEN_GATE` and still on a `continue-on-error` job, so that half still cannot
+fail a merge (§ Panel golden drift gate).
+
+Two things #1251 measured, at `578c834`, that belong with this argument. Deleting the percent `Text`
+*does* redden the armed rasters — `Executed 1 test, with 31 failures`, 30 of them panel-height drift
+(the percent cell is the tallest thing in the meter row). Deleting `.accessibilityHidden(true)` from
+`UsageBar` reddens **nothing at all**: not a pixel (`max drift 0.000000 over 44 cells`, armed), and
+not the accessibility role histogram of any fixture — because each roster row already collapses to a
+single accessibility element (a switchable row through its `Button` wrap, a non-switchable one
+through `.accessibilityElement(children: .ignore)`), discarding the bar's subtree either way. The
+switchable arm is the one the fixtures exercise, so `Button` is what actually collapses them. So in
+today's composition that modifier is a redundant *second* guard. It is pinned because it is the guard
+this argument names, and because it becomes the only one the moment a row stops collapsing — an
+`.ignore` becoming a `.combine`, or the `Button` wrap being undone, which `AccountRowView`'s
+ROW-ACTION CARDINALITY note already records as mandatory if a row ever gains a second action.
+
+Read `StatusPanelFormatTests`' case for the hole it records too: on the **healthy / green** band
+*neither* channel clears its bar — the fill at 2.08 vs the panel base (#831) and the `--ut-g`
+percent text at 4.10:1 (**#830**) — so green is the one band where this compensating-control
+argument does not actually hold. Each issue owns one half. So do **not** widen "fills only need 3:1,
+and these clear it" to a fill with *no* adjacent text; that one would be a real violation.
+`UsageMeter.barColor` in `Sources/StatusPanelRoster.swift` already carries this same correction.
+Whether the `--u-*` family should itself be darkened is the open decision in **#831** — this file
+records the measured position only and changes no token value.
 
 ## The 9 states
 
