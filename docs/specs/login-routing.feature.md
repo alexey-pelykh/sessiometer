@@ -65,8 +65,9 @@ Scenario: the label is non-secret and is not argv
   Given the operator supplies a label
    When the child is spawned
    Then the label does not appear in the child's argv
-    # src/isolated_spawn.rs:111 — argv stays &'static [&'static str]. That compile-time
-    # no-injection guarantee is preserved precisely because the label travels elsewhere.
+    # SpawnPlan::argv in src/isolated_spawn.rs — argv stays &'static [&'static str]. That
+    # compile-time no-injection guarantee is preserved precisely because the label travels
+    # elsewhere.
 ```
 
 ## Rule 4 — observation without re-issuing
