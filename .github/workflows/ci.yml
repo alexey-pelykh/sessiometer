@@ -102,6 +102,25 @@ jobs:
               # and the cross-language drift would land uncaught. (Broad build/fixtures/** matches the
               # rust filter above; an unrelated migration-fixture edit just re-runs swift, which passes.)
               - 'build/fixtures/**'
+              # The zero-egress guard this job runs (the step below). `swift` is the ONLY job that
+              # invokes it, so without this entry a guard-only diff left `swift` skipped, `ci-ok`
+              # counted the skip as a pass, and the guard reported green having never executed — the
+              # asymmetry being that `scripts/**` in the `rust` filter above still ran test + msrv +
+              # deny, three jobs with no stake in it. Observed on PR #1265, whose entire purpose was
+              # to widen that guard's forbidden-import and forbidden-symbol lists (issue #1266).
+              # Re-derive the "only job" claim rather than trusting it, with — anchored on the
+              # `run:` FIELD, because a substring test also matches this very comment (issue #1258
+              # is the precedent: a re-derivation command that misreports is the mechanism, not a
+              # detail):
+              #   awk '/^  [a-z-]+:$/{job=$1} $1=="run:" && $2 ~ /scripts/ {print job, $2}' \
+              #     .github/workflows/ci.yml
+              # Exact path rather than `scripts/**`, mirroring `scripts/check-formula.sh` in the
+              # formula filter above: `scripts/**` would put a macOS runner and a full Xcode build
+              # behind every unrelated top-level script edit. Two costs of being exact, both real —
+              # this output also gates `panel-goldens`, so a guard-only diff now pays for that job
+              # too; and a NEW script wired into `swift` needs its own entry, which is what the
+              # re-derivation above is for.
+              - 'scripts/check-menubar-zero-egress.sh'
               - '.github/workflows/ci.yml'
 
   # Full gate: format, lints, docs, build, tests. `-D warnings` clippy/rustdoc behavior is
