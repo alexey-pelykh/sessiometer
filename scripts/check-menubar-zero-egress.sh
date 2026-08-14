@@ -79,6 +79,20 @@ fi
 #        NetworkExtension     VPN / content-filter host networking
 #        SystemConfiguration  SCNetworkReachability / dynamic-store host probes
 #        CFNetwork            CFURL / CFStream host networking
+#        AuthenticationServices  ASWebAuthenticationSession — an OAuth flow hosted IN the app
+#        WebKit               WKWebView & friends — arbitrary remote URLs loaded in-process
+#
+#      Those last two are not networking frameworks in the obvious sense, and that is
+#      exactly why they are named: do NOT drop them as unrelated to egress. They are
+#      egress BY HOSTING. A WKWebView loads arbitrary remote URLs in-process, and an
+#      ASWebAuthenticationSession runs a credential-bearing OAuth flow inside the app —
+#      the single thing the routed-login design forbids ("no credential, code, or token
+#      is handled by app code": docs/requirements/gui-cli-capability-parity.md AC-1;
+#      login is routed to the daemon over the socket, ADR-0011, so the app never hosts
+#      the flow). Neither carries any of the imports above, and the symbol rule below
+#      cannot see them either — ASWebAuthenticationSession does not contain the
+#      substring `URLSession` — so until R-17 (same doc) both passed this gate green:
+#      the two APIs that would most directly defeat its own rationale.
 #
 #   2. Forbidden host-networking SYMBOLS that ride in through the always-allowed
 #      Foundation (so they carry no forbidden import to anchor on), plus the
@@ -87,6 +101,19 @@ fi
 #      with no plausible benign identifier containing them:
 #        URLSession URLRequest NSURLConnection
 #        NWConnection NWListener NWEndpoint NWBrowser NWPath
+#        ASWebAuthenticationSession
+#
+#      ASWebAuthenticationSession is belt-and-suspenders in the same sense as the
+#      Network.* types, and for a measured reason: under `swiftc -typecheck` it does
+#      not resolve with AppKit+Foundation alone ("cannot find 'ASWebAuthenticationSession'
+#      in scope"), so its `import AuthenticationServices` is mandatory and rule 1 already
+#      rejects it. It is named here anyway because it is the one concrete type R-17 exists
+#      to stop. There is deliberately NO `WKWebView` twin: WebKit vends a large family of
+#      `WK*` types, so naming one would under-cover (WKNavigationDelegate, WKUIDelegate
+#      and every other member carrying no `WKWebView` substring slip) while reading like
+#      the contract, and a bare `WK` is nowhere near distinctive enough for the substring
+#      test above. `import WebKit` is measurably the complete chokepoint, so rule 1
+#      carries WebKit on its own, by design.
 #
 #   3. Forbidden STORE ARTIFACTS — the daemon's offline usage store, which the app must
 #      never read directly (it gets the usage series over the socket, #356). Matched as
@@ -100,9 +127,9 @@ fi
 hits="$(
     awk '
         { code = $0; sub(/\/\/.*/, "", code) }
-        code ~ /^[[:space:]]*(@[A-Za-z_]+[[:space:]]+)?import([[:space:]]+[a-z]+)?[[:space:]]+(Security|Network|NetworkExtension|SystemConfiguration|CFNetwork)([[:space:]]|\.|$)/ \
-            { printf "%s:%d: forbidden import (keychain/host-networking) -> %s\n", FILENAME, FNR, $0; next }
-        code ~ /(URLSession|URLRequest|NSURLConnection|NWConnection|NWListener|NWEndpoint|NWBrowser|NWPath)/ \
+        code ~ /^[[:space:]]*(@[A-Za-z_]+[[:space:]]+)?import([[:space:]]+[a-z]+)?[[:space:]]+(Security|Network|NetworkExtension|SystemConfiguration|CFNetwork|AuthenticationServices|WebKit)([[:space:]]|\.|$)/ \
+            { printf "%s:%d: forbidden import (keychain / host-networking / in-app web or OAuth host) -> %s\n", FILENAME, FNR, $0; next }
+        code ~ /(URLSession|URLRequest|NSURLConnection|NWConnection|NWListener|NWEndpoint|NWBrowser|NWPath|ASWebAuthenticationSession)/ \
             { printf "%s:%d: forbidden host-networking symbol -> %s\n", FILENAME, FNR, $0 }
         code ~ /(usage-samples|usage-rollup)/ \
             { printf "%s:%d: forbidden store-path read (socket client, not a store reader) -> %s\n", FILENAME, FNR, $0 }
@@ -136,7 +163,10 @@ if [ -n "$hits" ] || [ -n "$ent_hits" ]; then
         echo "no Network.framework/NWConnection, no URLSession/URLRequest, no Security.framework"
         echo "keychain access (credentials are the daemon's job), no network entitlement, and no"
         echo "direct read of the daemon's usage store (the usage series comes over the socket via"
-        echo "the daemon 'stats' verb, #356 — never from usage-samples/usage-rollup directly)."
+        echo "the daemon 'stats' verb, #356 — never from usage-samples/usage-rollup directly). It"
+        echo "also never hosts a web view or an OAuth flow itself (no WebKit, no"
+        echo "AuthenticationServices): login is routed to the daemon, so no credential, code or"
+        echo "token is ever handled by app code."
         echo "If this surface is genuinely intended it is an architecture change — reconsider it"
         echo "against ADR-0011, don't relax the gate."
     } >&2
