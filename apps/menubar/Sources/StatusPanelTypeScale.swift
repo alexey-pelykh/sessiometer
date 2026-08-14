@@ -214,7 +214,10 @@ extension EnvironmentValues {
 /// `ScrollView` — with a definite 200×120 frame, with a definite 200×300 frame (taller than the content,
 /// so nothing is even scrolled out), and under `fixedSize`. All four. It is the container, not the bound.
 /// `PanelScrollBoundaryTests.testImageRendererStillCannotDrawAScrollView` is that measurement, kept
-/// running: the day the platform starts drawing them, it goes RED and this whole seam should be deleted.
+/// running. What reddens it is `ImageRenderer` starting to draw them — ONE RASTERIZER's blind spot, not
+/// the platform's, which issue #1177 measured. So redness here is one of two routes to deleting this
+/// seam; the other is swapping the harness off `ImageRenderer`, which reddens nothing here and which
+/// **#1261** carries.
 ///
 /// WHY A SEAM AND NOT A WORKAROUND. Left unhandled, every committed golden would rasterize its header and
 /// tab bar over an empty body — 44 blank-bodied PNGs that still diff clean against each other, which is

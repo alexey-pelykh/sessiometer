@@ -658,11 +658,11 @@ final class PanelScrollBoundaryTests: XCTestCase {
     /// The premise the render bypass rests on, kept running so it cannot rot into folklore.
     ///
     /// `PanelRenderHarness` rasterizes the panel with `\.panelScrollBoundaryEnabled` FALSE because
-    /// `ImageRenderer` draws a `ScrollView`'s frame and none of its content. That is a claim about the
-    /// PLATFORM, and platforms change — so it is measured here rather than asserted in a comment. The
-    /// control is the load-bearing half: the identical body rendered WITHOUT a scroll view must carry ink,
-    /// or a rig that draws nothing at all would satisfy the ScrollView half perfectly and this test would
-    /// be pinning its own brokenness.
+    /// `ImageRenderer` draws a `ScrollView`'s frame and none of its content. That is a claim about ONE
+    /// RASTERIZER — this file used to call it a claim about the platform, and issue #1177 measured that it
+    /// is not — so it is measured here rather than asserted in a comment. The control is the load-bearing
+    /// half: the identical body rendered WITHOUT a scroll view must carry ink, or a rig that draws nothing
+    /// at all would satisfy the ScrollView half perfectly and this test would be pinning its own brokenness.
     ///
     /// Three ScrollView cases, because the tempting reading — "it clips what is scrolled out of view" —
     /// would predict that a viewport TALLER than its content renders fine. Measured, it does not: 300 pt of
@@ -672,6 +672,13 @@ final class PanelScrollBoundaryTests: XCTestCase {
     /// `composingScrollBoundaries`, let the harness render the panel as it composes, re-bless the goldens
     /// (the bodies will move — that is the point), and delete this test. A pin that merely tolerated the
     /// limitation would rot into a permanent allowance nobody revisits.
+    ///
+    /// REDNESS HERE IS NOT THE ONLY SIGNAL, and reading it as one is what issue #1177 corrected. This test
+    /// can only ever report on `ImageRenderer`; the bypass exists because the HARNESS uses `ImageRenderer`,
+    /// which is a choice rather than a constraint. `testAppKitDrawsScrollContentWhereImageRendererDoesNot`
+    /// below measures a rig that draws the same `ScrollView` today, with this test green — so a route to
+    /// dropping the bypass opened without anything reddening, and that route is where the removal above
+    /// is now tracked. Keep both: this one still owns the verdict on the rasterizer the harness runs.
     func testImageRendererStillCannotDrawAScrollView() throws {
         let body = VStack(spacing: 4) {
             ForEach(0..<6) { i in
@@ -707,8 +714,11 @@ final class PanelScrollBoundaryTests: XCTestCase {
         for (shape, measured) in cases {
             XCTAssertEqual(measured, 0, accuracy: 0.0001, """
                 `ImageRenderer` DREW a ScrollView (\(shape) scored \(measured) ink against a \(control) \
-                control) — the platform limitation the render bypass works around is gone. Delete the \
-                bypass rather than re-pin it; see this test's doc comment for the sequence.
+                control) — the blind spot the render bypass works around is ONE RASTERIZER's, not the \
+                platform's, and that rasterizer's is now gone. The bypass does not come out on this \
+                redness alone: this test's doc comment carries the sequence, and \
+                `testAppKitDrawsScrollContentWhereImageRendererDoesNot` carries the other route to the \
+                same removal.
                 """)
         }
     }
@@ -762,6 +772,169 @@ final class PanelScrollBoundaryTests: XCTestCase {
         // Degenerate-subject guard: an empty catalog would satisfy every assertion above.
         XCTAssertGreaterThan(checked, 20,
                              "expected the whole (fixture × theme) catalog, compared \(checked) cells")
+    }
+
+    /// ROUTE 1 of issue #1177, measured: `ImageRenderer`'s blind spot is not the platform's.
+    ///
+    /// The sibling above pins what `ImageRenderer` will not draw, and that is a fact about ONE rasterizer.
+    /// Its guidance reads redness as the signal that the bypass has become unnecessary, and this is the
+    /// measurement showing redness is not the only one: `NSHostingView` drawn into an explicitly-sized
+    /// `NSBitmapImageRep` rasterizes the same `ScrollView`'s content today, while that test stays green.
+    ///
+    /// BOTH rigs are canaried on the SAME body in the SAME run. A rig that drew nothing at all would score
+    /// zero on a `ScrollView` too, and the zero would look like evidence — which is the mistake this whole
+    /// seam exists to avoid, so the comparison is run as a controlled pair rather than as two numbers from
+    /// two places.
+    ///
+    /// The SCALE half is what makes the route usable rather than merely true. The golden gate needs
+    /// machine-INDEPENDENT rasters, and AppKit's own backing scale follows the display — measured 1.0 in
+    /// this process, so a rig that inherited it would emit @1x goldens here and @2x on a Retina machine.
+    /// Sizing the rep in PIXELS while setting its POINT size separately takes the display back out of the
+    /// answer; `BarGlyphRenderer.newRep` already rasterizes the status-item glyph exactly that way, so this
+    /// is the repo's existing technique rather than a new one, which is most of why the route is credible.
+    ///
+    /// WHAT THIS DELIBERATELY DOES NOT MEASURE: whether the whole PANEL renders faithfully through this
+    /// rig. The subject is a synthetic body, because swapping the harness's rasterizer is expected to
+    /// re-baseline all 44 committed goldens and move pinned constants in the eight suites that render
+    /// through it — that is the follow-up's work, and asserting it here would be claiming a migration
+    /// this change has not run.
+    /// The decision and its cost are recorded in `design/README.md` § The scroll boundary.
+    func testAppKitDrawsScrollContentWhereImageRendererDoesNot() throws {
+        let body = VStack(spacing: 4) {
+            ForEach(0..<6) { i in
+                Text("ROW \(i) ————————").font(.system(size: 14)).foregroundStyle(.black)
+            }
+        }
+        .frame(maxWidth: .infinity)
+
+        // Rig A, the shipped one. Opaque background for the same reason the sibling gives: `inkCoverage`
+        // scores departure from the CORNER pixel, and black text over a transparent corner agrees with it
+        // on every channel.
+        func imageRendererInk(_ view: some View) throws -> Double {
+            let renderer = ImageRenderer(content: view.background(Color.white))
+            renderer.scale = PanelRenderHarness.scale
+            let cg = try XCTUnwrap(renderer.cgImage, "rig A rendered nothing at all")
+            return PanelRaster.inkCoverage(try XCTUnwrap(PanelRaster.normalize(cg)))
+        }
+
+        // Rig B, the candidate. The rep is built at an EXPLICIT pixel size with its point size set to the
+        // view's own size, so the context maps 1 pt to `scale` px whatever the display says.
+        func appKit(_ view: some View, size: CGSize,
+                    scale: Int = Int(PanelRenderHarness.scale))
+            throws -> (ink: Double, cg: CGImage, repSize: CGSize) {
+            let host = NSHostingView(rootView: AnyView(view.background(Color.white)))
+            host.frame = CGRect(origin: .zero, size: size)
+            host.layoutSubtreeIfNeeded()
+            let rep = try XCTUnwrap(NSBitmapImageRep(
+                bitmapDataPlanes: nil,
+                pixelsWide: Int(size.width) * scale, pixelsHigh: Int(size.height) * scale,
+                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0), "rig B built no bitmap")
+            rep.size = size
+            host.cacheDisplay(in: host.bounds, to: rep)
+            let cg = try XCTUnwrap(rep.cgImage, "rig B rendered nothing at all")
+            return (PanelRaster.inkCoverage(try XCTUnwrap(PanelRaster.normalize(cg))), cg, rep.size)
+        }
+
+        // The body's own laid-out height, so the control and the TALLER-viewport case below are stated
+        // against a measured number rather than a guessed one.
+        let sizing = NSHostingView(rootView: AnyView(body.frame(width: 200)))
+        sizing.frame = CGRect(x: 0, y: 0, width: 200, height: 1)
+        let contentHeight = sizing.fittingSize.height
+        XCTAssertGreaterThan(contentHeight, 0, "the body laid out to nothing; every case below is vacuous")
+
+        // MARK: both rigs see ink — neither zero below is a broken rig
+        let controlA = try imageRendererInk(body.frame(width: 200).fixedSize(horizontal: false,
+                                                                            vertical: true))
+        XCTAssertGreaterThan(controlA, 0.02, """
+            rig A's CONTROL drew nothing (\(controlA) ink) — six rows of black text over white. Nothing \
+            below is evidence about anything; `ImageRenderer` itself is broken here.
+            """)
+        let controlB = try appKit(body.frame(width: 200), size: CGSize(width: 200, height: contentHeight))
+        XCTAssertGreaterThan(controlB.ink, 0.02, """
+            rig B's CONTROL drew nothing (\(controlB.ink) ink) against rig A's \(controlA) on the same \
+            body — so rig B cannot draw AT ALL, and its ScrollView scores below would be worthless.
+            """)
+
+        // MARK: the decisive comparison, both rigs on the same subject in the same run
+        let viewports: [(String, CGSize)] = [
+            ("200×120, SHORTER than the content", CGSize(width: 200, height: 120)),
+            ("200×300, TALLER than the content", CGSize(width: 200, height: 300)),
+        ]
+        for (shape, size) in viewports {
+            let a = try imageRendererInk(ScrollView { body }.frame(width: size.width, height: size.height))
+            XCTAssertEqual(a, 0, accuracy: 0.0001, """
+                rig A DREW a ScrollView (\(shape) scored \(a) ink) — see \
+                `testImageRendererStillCannotDrawAScrollView`, which owns that verdict and its remedy.
+                """)
+            let b = try appKit(ScrollView { body }, size: size)
+            XCTAssertGreaterThan(b.ink, 0.02, """
+                rig B scored \(b.ink) ink on a ScrollView (\(shape)) against a \(controlB.ink) control on \
+                the same body — so AppKit no longer draws what `ImageRenderer` will not, and issue \
+                #1177's recorded route 1 has lost its premise. Re-decide the route; do not relax this.
+                """)
+        }
+
+        // MARK: the raster is sized by the ARGUMENT, not by the display
+        //
+        // The technique has TWO halves and the pixel assertion below only covers one. Sizing the rep in
+        // pixels fixes how big the raster IS; setting its POINT size fixes the scale the content is DRAWN
+        // at. Delete `rep.size = size` and the pixel assertion still passes at every scale — measured —
+        // because the rep then reports its pixel dimensions as its point size, the context maps 1 pt to
+        // 1 px, and the content lands at unit scale in a corner of a correctly-sized raster. Both halves
+        // are pinned here for that reason: the construction, and the drawn result it is supposed to buy.
+        let viewport = CGSize(width: 200, height: 300)
+        var inkByScale: [Int: Double] = [:]
+        for scale in [1, 2] {
+            let r = try appKit(ScrollView { body }, size: viewport, scale: scale)
+            XCTAssertEqual([r.cg.width, r.cg.height], [Int(viewport.width) * scale,
+                                                       Int(viewport.height) * scale], """
+                a 200×300 pt view at scale \(scale) rasterized \(r.cg.width)×\(r.cg.height) px — rig B is \
+                taking its scale from somewhere other than the argument (this display reports \
+                \(NSScreen.main?.backingScaleFactor.description ?? "no main screen")), which would make \
+                every golden it emits depend on the machine that rendered it.
+                """)
+            XCTAssertGreaterThan(r.ink, 0.02,
+                                 "rig B rasterized a correctly-sized but BLANK raster at scale \(scale)")
+            XCTAssertEqual(r.repSize, viewport, """
+                rig B's rep reports \(r.repSize) as its POINT size at scale \(scale) rather than the \
+                view's own \(viewport) — so the context maps 1 pt to 1 px and the content is drawn at \
+                unit scale into a corner of an otherwise correctly-sized raster. The pixel assertion \
+                above cannot see this; it is the other half of the technique.
+                """)
+            inkByScale[scale] = r.ink
+        }
+
+        // Ink coverage is a FRACTION of the raster, so content that scales WITH the raster holds it
+        // roughly constant — it drifts up only from antialiasing on thin glyph strokes. Content drawn at
+        // unit scale instead leaves most of the raster undrawn, so the corner `inkCoverage` scores against
+        // becomes the UNDRAWN pixel and coverage collapses onto the drawn region's own area fraction,
+        // 1/scale². Measured: 0.0440 → 0.0602 correct (×1.37), 0.0440 → 0.2486 with `rep.size` unset
+        // (×5.65). The bound is deliberately loose because the antialiasing drift is real and the failure
+        // it separates is four times larger.
+        //
+        // That separation SHRINKS as scale rises — the mutant measures ×2.51 at scale 3 and ×1.41 at 4 —
+        // so re-pointed at [1, 4] or wider this limb would pass the mutation it exists to catch. The
+        // `repSize` assertion above is the half that catches it at every scale, because the unset rep
+        // reports its pixel dimensions whatever the scale.
+        //
+        // KNOWN BOUND, the other way: this limb is a RATIO, so it cannot see an error whose drawn region
+        // scales WITH the raster — the two cancel. Measured, with `cacheDisplay` given a half-width,
+        // half-height rect: `cacheDisplay(in:)` widens that rect back to the view's FULL width, so what is
+        // drawn is HALF the raster at both scales — full width, bottom half in raster coordinates
+        // (x[0…199] y[150…299] at scale 1, x[0…399] y[300…599] at scale 2). Coverage runs 0.4942 →
+        // 0.4997, a factor of ×1.011, and nothing in this section reddens. The raster is correctly sized,
+        // `rep.size` is correctly set, and coverage clears the 0.02 floor, so `repSize` does not separate
+        // this one either. What this section pins is the SCALE the content is drawn at — never that the
+        // viewport was drawn in full.
+        let ink1 = try XCTUnwrap(inkByScale[1]), ink2 = try XCTUnwrap(inkByScale[2])
+        XCTAssertLessThan(ink2, ink1 * 2, """
+            rig B's ink coverage went \(ink1) → \(ink2) from scale 1 to 2, a factor of \(ink2 / ink1). \
+            Coverage is a fraction of the raster, so drawing the same content at twice the scale into \
+            twice the raster should hold it near-constant; a jump means the content was drawn at unit \
+            scale into part of the raster rather than at the scale the argument asked for, leaving the \
+            rest of it undrawn.
+            """)
     }
 }
 #endif
