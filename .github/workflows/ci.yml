@@ -51,13 +51,27 @@ jobs:
               # change and must run the Rust jobs — for the render goldens especially, since a
               # golden-only PR is exactly the shape a silent re-baseline takes. Consumers, complete
               # as measured — re-derive rather than trust this list, which has drifted before
-              # (issue #1252):
-              #   git grep -A2 'include_str!(concat!' -- src | grep build/fixtures
+              # (issues #1252, #1258). Grep the whole `build/` tree, NOT `build/fixtures`: scoping
+              # the re-derivation to the subdirectory the filter already covers is self-confirming,
+              # and is how the ledger below stayed missing (issue #1258):
+              #   git grep -A2 'include_str!(concat!' -- src | grep build/
               # src/migration.rs (frozen v1 artifacts), src/daemon/snapshot_build.rs + src/stats.rs
               # (wire goldens), src/render_golden.rs (cli-renders/**, issue #767),
               # src/config/settings.rs (config-set-reject-details.json), src/cross_surface.rs
-              # (cross-surface-severity.json), src/usage_stats.rs (capacity-replay corpus + oracle).
+              # (cross-surface-severity.json), src/usage_stats.rs (capacity-replay corpus + oracle),
+              # src/cc_version.rs (the range ledger below).
               - 'build/fixtures/**'
+              # The CC_SUPPORTED_{MIN,MAX} range ledger — an `include_str!` input of the TEST build
+              # (src/cc_version.rs `the_baked_range_matches_the_ledger`), and a ledger-only edit is
+              # precisely the shape in which the baked constants get left behind. Nothing else
+              # catches it: scripts/check-cc-version.sh reads the same ledger but is wired into no
+              # workflow and is advisory by its own header, so it is not a backstop (issue #1258).
+              # Exact path rather than `build/**`: the three other tracked files under `build/`
+              # (release-checklist.md, rollback.md, smoke-test.md) are release-process prose with
+              # no Rust consumer, and `build/**` would make editing one pay for `test` + `msrv`
+              # (a second full build + test on the MSRV toolchain) + `deny`. The cost of being
+              # exact is that a NEW `build/` ledger needs its own entry — re-derive as above.
+              - 'build/version-compat.md'
               - 'scripts/**'
               # Cargo auto-detects these inputs, so a PR that adds one must run the Rust jobs — else
               # `deny` (no-Security.framework linkage + supply-chain gates) silently skips and the
