@@ -85,14 +85,15 @@ Findings:
 the slash-command shape to the `auth login` subcommand shape.**
 
 Concretely: `SpawnPlan::login`'s `argv` moves from `&["/login"]` to `&["auth", "login", "--claudeai"]`
-(`src/isolated_spawn.rs:141`). That single change simultaneously removes the TTY requirement, removes
+(`SpawnPlan::login` in `src/isolated_spawn.rs`). That single change simultaneously removes the TTY requirement, removes
 the need for the onboarding seed, removes the operator's manual `/exit` at the end of a capture, and
 unlocks routing. `argv` **stays** `&'static [&'static str]`, preserving the compile-time no-injection
-guarantee (`src/isolated_spawn.rs:111`) — the operator's label is not argv.
+guarantee (the `argv` field of `SpawnPlan`, `src/isolated_spawn.rs`) — the operator's label is
+not argv.
 
 **Three prerequisites are binding and must land before or with the argv change:**
 
-1. **Scrub the refresh-token triple.** `SPAWN_ENV_REMOVE` (`src/isolated_spawn.rs:67-71`) removes
+1. **Scrub the refresh-token triple.** `SPAWN_ENV_REMOVE` (`src/isolated_spawn.rs`) removes
    `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, and `CLAUDE_SECURESTORAGE_CONFIG_DIR`. It does
    **not** remove `CLAUDE_CODE_OAUTH_REFRESH_TOKEN`, `CLAUDE_CODE_OAUTH_SCOPES`, or
    `CLAUDE_CODE_OAUTH_CLIENT_ID`. `auth login` short-circuits on an inherited refresh token, writing

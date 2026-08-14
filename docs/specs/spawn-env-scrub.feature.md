@@ -4,10 +4,11 @@ Issue #1009 · PRD R-13 / AC-4 · design § 5.1 SP-1 · ADR-0032 prerequisite 1
 
 Example Mapping: 🟦 4 rules · 🟩 7 examples · 🟥 0 open
 
-> **Why this spec exists at all.** The defect is currently **inert** — under today's argv
-> (`&["/login"]`) an inherited refresh token changes nothing. It becomes a wrong-account credential
-> write the moment #1020 lands. A spec written only against observable behaviour today would be
-> empty, so these scenarios are written against the argv the project is moving to.
+> **Why this spec exists at all.** The defect's refresh-token half is currently **inert** — under
+> today's argv (`&["/login"]`) an inherited refresh token changes nothing, though an inherited
+> client id already reaches the login child's OAuth requests. That half becomes a wrong-account
+> credential write the moment #1020 lands. A spec written only against observable behaviour today
+> would be thin, so these scenarios are written against the argv the project is moving to.
 
 ## Rule 1 — the three refresh variables are scrubbed
 
@@ -23,7 +24,7 @@ Scenario: the three already-scrubbed variables stay scrubbed
         and CLAUDE_SECURESTORAGE_CONFIG_DIR
    When the isolated spawn seam constructs the child environment
    Then none of the three is present
-    # Regression guard. The change is an addition to SPAWN_ENV_REMOVE (src/isolated_spawn.rs:67-71),
+    # Regression guard. The change is an addition to SPAWN_ENV_REMOVE (src/isolated_spawn.rs),
     # and an addition is exactly the edit that can drop a neighbour.
 ```
 
@@ -34,8 +35,9 @@ Scenario: both spawn plans share one scrub
   Given the login plan and the refresh plan
    When each constructs its child environment
    Then both have the full SPAWN_ENV_REMOVE set removed
-    # src/isolated_spawn.rs:137 records that the login plan is built specifically to prove the
-    # scrub applies to it too. One seam, one scrub — a second copy would drift.
+    # SpawnPlan::login's doc comment in src/isolated_spawn.rs records that the login plan is
+    # built specifically to prove the scrub applies to it too. One seam, one scrub — a second
+    # copy would drift.
 ```
 
 ## Rule 3 — CONSTRAINT: the gate must be falsifiable

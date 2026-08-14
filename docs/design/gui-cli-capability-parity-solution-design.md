@@ -26,7 +26,7 @@ issues it — not an app rewrite.
 | C-3 | `swap.lock` must never be held for a human-paced flow. | PRD R-10 |
 | C-4 | The shared `Claude Code-credentials` item stays byte-for-byte unchanged. | Login engine safety invariant; PRD AC-5 |
 | C-5 | The isolated login dir's **fixed** path must not change — its hash names the suffixed isolated keychain item the #133 reaper targets. | `src/paths.rs:225-234`; `src/refresh.rs:952` |
-| C-6 | Login spawn `argv` stays `&'static [&'static str]`. | `src/isolated_spawn.rs:111` |
+| C-6 | Login spawn `argv` stays `&'static [&'static str]`. | `SpawnPlan::argv` in `src/isolated_spawn.rs` |
 | C-7 | CLI verbs keep their daemon-*independent* standalone writes. Parity is GUI-client-scoped only. | PRD § 1b |
 | C-8 | The frozen `watch` stream contract is not to be disturbed casually. | `src/daemon/socket.rs:8` |
 
@@ -61,10 +61,14 @@ Four strategic calls:
 
 **SP-1 — scrub the refresh-token triple.** Add `CLAUDE_CODE_OAUTH_REFRESH_TOKEN`,
 `CLAUDE_CODE_OAUTH_SCOPES`, `CLAUDE_CODE_OAUTH_CLIENT_ID` to `SPAWN_ENV_REMOVE`
-(`src/isolated_spawn.rs:67-71`). Inert under today's `/login` argv; under `auth login` an inherited
-refresh token short-circuits the browser entirely and harvests the **wrong account** while every
-existing check passes. Ordering is the whole point: this landing *after* the argv change is a live
-vulnerability window.
+(`src/isolated_spawn.rs`). Inert under today's `/login` argv for
+`CLAUDE_CODE_OAUTH_REFRESH_TOKEN` only. `CLAUDE_CODE_OAUTH_CLIENT_ID` is read by CC's general
+OAuth config resolver, so scrubbing it changes both children's behaviour — a wanted change, not a
+no-op. `CLAUDE_CODE_OAUTH_SCOPES` has a second read site outside the login handler whose
+reachability is not established, so it is not claimed inert either (issue #1009). Under
+`auth login` an inherited refresh token short-circuits the browser entirely and harvests the
+**wrong account** while every existing check passes. Ordering is the whole point: this landing
+*after* the argv change is a live vulnerability window.
 
 **SP-2 — close the zero-egress gate hole.** `scripts/check-menubar-zero-egress.sh` lists neither
 `AuthenticationServices` nor `WebKit`, and `ASWebAuthenticationSession` does not contain the
@@ -117,7 +121,7 @@ Phases per PRD § 5: `idle` · `starting` · `awaiting-browser` · `harvesting` 
 ### 5.3 argv change
 
 `SpawnPlan::login`'s `argv`: `&["/login"]` → `&["auth", "login", "--claudeai"]`
-(`src/isolated_spawn.rs:141`). Stays `&'static` (C-6). Removes the TTY requirement, the onboarding
+(`SpawnPlan::login` in `src/isolated_spawn.rs`). Stays `&'static` (C-6). Removes the TTY requirement, the onboarding
 seed, and the operator's manual `/exit` in one edit (ADR-0032). `--console` / `--sso` remain available
 if account-type selection is ever needed.
 
@@ -153,10 +157,10 @@ it exactly once per new verb, at the cheapest possible moment.
 
 | Component | New/changed | Where |
 |---|---|---|
-| `SPAWN_ENV_REMOVE` | changed (SP-1) | `src/isolated_spawn.rs:67-71` |
+| `SPAWN_ENV_REMOVE` | changed (SP-1) | `src/isolated_spawn.rs` |
 | zero-egress gate lists | changed (SP-2) | `scripts/check-menubar-zero-egress.sh` |
 | `login.lock` acquire/release | new (SP-3) | `src/paths.rs`, `src/login.rs`, `src/refresh.rs:962` |
-| `SpawnPlan::login.argv` | changed | `src/isolated_spawn.rs:141` |
+| `SpawnPlan::login.argv` | changed | `src/isolated_spawn.rs` |
 | onboarding seed | removed | `src/login.rs` |
 | `login` / `login-status` commands | new | `src/daemon/socket.rs` |
 | `reliability` / `log` / `poke` / `remove` commands | new | `src/daemon/socket.rs` |

@@ -868,8 +868,11 @@ pub(crate) const LOGIN_SHELL_HARVEST_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// The [`SPAWN_ENV_REMOVE`] scrub is applied LAST, exactly as on the `claude` spawn
 /// paths and for the same reason, which is sharper here than anywhere else: a login
-/// shell sources ARBITRARY user rc files, so it must never inherit
-/// `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` / `CLAUDE_SECURESTORAGE_CONFIG_DIR`.
+/// shell sources ARBITRARY user rc files, so it must never inherit ANY name on that
+/// list. The names are deliberately NOT repeated here — this sentence spelled out three
+/// of them until issue #1009 grew the list to six, and a prose copy of a shared list
+/// goes half-complete the moment the list grows, at the seam this same doc calls the
+/// sharpest.
 /// This command is the THIRD parametrization
 /// `isolated_spawn::tests::all_parametrizations_apply_the_full_scrub_set` asserts the
 /// complete set against — a dropped entry there is a silent isolation regression here.

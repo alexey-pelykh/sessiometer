@@ -58,16 +58,69 @@ const SPAWN_TIMEOUT: Duration = Duration::from_secs(40);
 ///     keychain service-name derivation (#100, [`crate::keychain`]), so an inherited one would
 ///     mis-target the read away from the item we seeded.
 ///
+/// The OAuth refresh triple below is issue #1009 / PRD R-13, added BEFORE the login argv moves to
+/// the `auth login` form (#1020, ADR-0032 prerequisite 1) rather than alongside it. Every
+/// mechanism named below was read out of the shipping CC binary — walked at 2.1.232 and
+/// re-checked at 2.1.227, 2.1.228 and 2.1.229; all four agree. The three do not share one
+/// justification, so they do not get one sentence:
+///   - `CLAUDE_CODE_OAUTH_REFRESH_TOKEN` — the entry point, and a credential in its own right.
+///     CC's `auth login` handler SHORT-CIRCUITS on an inherited refresh token: it exchanges the
+///     token, writes the credential, prints `Login successful.` and exits 0 — the browser flow
+///     sits BELOW that block and is never reached. Under today's `/login` argv the handler is not
+///     entered at all, so this entry is inert on arrival — which is the point of landing it first.
+///     Once argv moves, an inherited token captures the WRONG account while every existing safety
+///     check still passes: nothing is malformed, so nothing objects. That hazard carries a
+///     PRECONDITION worth stating, because the sentence travels without it: the capture is SILENT
+///     only if `CLAUDE_CODE_OAUTH_SCOPES` is inherited too — see the next entry.
+///   - `CLAUDE_CODE_OAUTH_SCOPES` — a REQUIRED CONJUNCT of that same short-circuit, and so the
+///     stronger of the two levers rather than the make-weight an earlier draft of this comment
+///     called it. The handler reads it immediately after the refresh token and, if it is absent,
+///     writes `CLAUDE_CODE_OAUTH_SCOPES is required when using CLAUDE_CODE_OAUTH_REFRESH_TOKEN.`
+///     to stderr and exits 1. Scrubbing THIS one alone therefore downgrades the silent
+///     wrong-account capture above into a loud, harmless failure. It is NOT confined to that
+///     handler, though, and an earlier draft of this comment said it was — claiming this name
+///     and the refresh token were "each read at exactly one site, inside the login handler".
+///     The INSTRUMENT was the defect: a `process.env.<NAME>` grep cannot see a read through
+///     CC's typed accessor over `process.env`, whose getter re-reads `process.env[name]` on
+///     each property access. Counting BOTH forms across 2.1.227-2.1.232, canaried each way (a
+///     known-present name matches, an invented one matches nothing): this one has 2 read sites
+///     — the login handler, plus a scope-list helper OUTSIDE it reached through the accessor —
+///     against 1 for `CLAUDE_CODE_OAUTH_REFRESH_TOKEN` and 2 for `CLAUDE_CODE_OAUTH_CLIENT_ID`.
+///     Of the triple only the refresh token is confined to the login handler.
+///   - `CLAUDE_CODE_OAUTH_CLIENT_ID` — feeds the `client_id` of the OAuth token exchange, so an
+///     inherited one performs that exchange under a FOREIGN CLIENT IDENTITY. It reaches the field
+///     by two routes: the short-circuit passes it explicitly, and the exchange itself falls back
+///     to CC's general OAuth config resolver, which applies the same variable. That general
+///     resolver is why it is NOT confined to `auth login` — the same reason, and the same
+///     measurement, as the second read site noted for `CLAUDE_CODE_OAUTH_SCOPES` above.
+///
+///     It does NOT re-target the keychain service name — and the temptation to say it does is
+///     WRITTEN DOWN, so it is worth disarming here. `build/version-compat.md` records
+///     `OAUTH_FILE_SUFFIX` as non-empty "**only** for a custom OAuth client id". That is a
+///     NECESSARY-condition phrasing; it does not license the converse, which is the direction a
+///     mis-targeting claim would need. At 2.1.227-2.1.232 it holds in NEITHER direction: the
+///     suffix is set by the deployment environment (`""` on prod, `-local-oauth` on a local
+///     build) or by the allow-listed `CLAUDE_CODE_CUSTOM_OAUTH_URL` branch (`-custom-oauth`),
+///     while the client-id read sits AFTER that branch and assigns `CLIENT_ID` alone. That file
+///     is pinned to 2.1.181-2.1.217, predates this work, and is NOT corrected from here. So this
+///     entry is not of the `CLAUDE_SECURESTORAGE_CONFIG_DIR` mis-targeting class above: the
+///     empty-suffix form [`crate::keychain`] hardcodes is not something a client id can move.
+///
 /// Kept as a named list (not inline `env_remove` calls), applied by [`SpawnPlan::build_command`]
 /// — and, for the issue #783 login-shell PATH harvest, by
 /// [`crate::paths::build_login_shell_env_command`] — so the
 /// `all_parametrizations_apply_the_full_scrub_set` test can assert the set is applied for EVERY
 /// parametrization — a dropped entry is a silent isolation regression on whichever caller drops
-/// it.
+/// it. That test derives its expectation FROM this list, so it cannot notice a name deleted from
+/// the list itself; `the_oauth_refresh_triple_is_scrubbed_by_name` spells the #1009 three out
+/// literally for exactly that reason.
 pub(crate) const SPAWN_ENV_REMOVE: &[&str] = &[
     "CLAUDE_CODE_OAUTH_TOKEN",
     "ANTHROPIC_API_KEY",
     "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+    "CLAUDE_CODE_OAUTH_SCOPES",
+    "CLAUDE_CODE_OAUTH_CLIENT_ID",
 ];
 
 /// Retries on the isolated item's teardown delete (a transient locked keychain may clear);
@@ -117,8 +170,9 @@ pub(crate) struct SpawnPlan {
 
 impl SpawnPlan {
     /// The refresh parametrization: `claude -p <benign>`, all stdio nulled, killed after
-    /// [`SPAWN_TIMEOUT`]. Byte-for-byte equivalent to the pre-#131 inline spawn (guarded by the
-    /// `refresh_plan_builds_the_legacy_command` test).
+    /// [`SPAWN_TIMEOUT`]. Equivalent to the pre-#131 inline spawn in argv and stdio; its scrub is
+    /// a strict SUPERSET since issue #1009 widened [`SPAWN_ENV_REMOVE`] (guarded by the
+    /// `refresh_plan_builds_the_legacy_command` test, whose doc records the divergence).
     pub(crate) fn refresh() -> Self {
         Self {
             argv: &["-p", BENIGN_PROMPT],
@@ -450,9 +504,84 @@ mod tests {
         );
     }
 
-    /// AC2 (issue #131): the refresh path's built command is byte-identical to the pre-#131 inline
-    /// spawn — same argv, same env set + scrub, all stdio nulled. Guards the behavior-preserving
-    /// contract of the extraction.
+    /// Issue #1009 / PRD R-13, the falsifiable half: the OAuth refresh triple is scrubbed, named
+    /// LITERALLY rather than derived from [`SPAWN_ENV_REMOVE`].
+    ///
+    /// [`all_parametrizations_apply_the_full_scrub_set`] above builds its expectation FROM the
+    /// const, so it is green for whatever the const happens to say — it passed before this issue
+    /// and would pass again the day a name is deleted from the list. An expectation taken from the
+    /// thing under test cannot detect that thing being wrong, so the names are spelled out here
+    /// and checked against what each seam actually builds. The pre-#1009 entries are checked
+    /// alongside them because an ADDITION is precisely the edit that drops a neighbour
+    /// (`docs/specs/spawn-env-scrub.feature.md` Rule 1).
+    ///
+    /// Asserted on the built command, not on a spawned child: `env_remove` records an explicit
+    /// `None`, so the removal is observable whether or not this process happens to carry the var —
+    /// the exhaustive check a live child cannot give without mutating process-global environment
+    /// (same reasoning as `paths::tests::the_harvest_command_scrubs_the_full_credential_set`).
+    #[test]
+    fn the_oauth_refresh_triple_is_scrubbed_by_name() {
+        // Spelled out, deliberately NOT `SPAWN_ENV_REMOVE`: deleting a name from that list must
+        // fail this test, naming the variable it dropped.
+        const REQUIRED: &[&str] = &[
+            // The issue #1009 / R-13 triple.
+            "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+            "CLAUDE_CODE_OAUTH_SCOPES",
+            "CLAUDE_CODE_OAUTH_CLIENT_ID",
+            // Their pre-existing neighbours, guarded against the drop an addition invites.
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+        ];
+
+        // Every seam that constructs a child environment through this scrub — the two `claude`
+        // parametrizations and the issue #783 login-shell harvest.
+        let seams = [
+            ("the refresh spawn", scrubbed_vars(&SpawnPlan::refresh())),
+            (
+                "the login spawn",
+                scrubbed_vars(&SpawnPlan::login(SPAWN_TIMEOUT)),
+            ),
+            (
+                "the login-shell PATH harvest",
+                scrubbed_vars_of(&crate::paths::build_login_shell_env_command(Path::new(
+                    "/bin/zsh",
+                ))),
+            ),
+        ];
+
+        for (seam, scrubbed) in seams {
+            for var in REQUIRED {
+                assert!(
+                    scrubbed.contains(&OsString::from(*var)),
+                    "{seam} does not remove {var} from the child environment it constructs, so an \
+                     inherited {var} would reach the child"
+                );
+            }
+        }
+    }
+
+    /// AC2 (issue #131): the refresh path's built command is the pre-#131 inline spawn — same
+    /// argv, same env set, all stdio nulled. Guards the behavior-preserving contract of the
+    /// extraction.
+    ///
+    /// The scrub half is no longer byte-identical, and deliberately: issue #1009 widened
+    /// [`SPAWN_ENV_REMOVE`] by the OAuth refresh triple, and the list is shared, so the refresh
+    /// child now has a strict SUPERSET of the pre-#131 removals. That is the intended blast radius
+    /// of a single named list. Only ONE of the three, `CLAUDE_CODE_OAUTH_REFRESH_TOKEN`, is read
+    /// solely inside CC's `auth login` handler, which this `-p` child never enters, so scrubbing
+    /// THAT one changes what the child inherits and not what it does. The other two are not
+    /// claimed as inert here. `CLAUDE_CODE_OAUTH_CLIENT_ID` is read by CC's general OAuth config
+    /// resolver, so an inherited one could reach this child's own token exchange; closing that is
+    /// a behaviour change, and a wanted one. `CLAUDE_CODE_OAUTH_SCOPES` has a SECOND read site
+    /// outside the login handler — a scope-list helper, reached through CC's typed accessor over
+    /// `process.env`, which a `process.env.<NAME>` grep does not see and an earlier draft of this
+    /// comment therefore missed. Whether that helper is reachable from this `-p` child was NOT
+    /// established here; this entry rides the refresh token's ordering argument, not a measured
+    /// inertness claim of its own.
+    /// The expectation below stays spelled out literally rather than derived from the const: it is
+    /// the one place the whole env map is pinned by hand, and a derived one could not catch the
+    /// const itself losing an entry.
     #[test]
     fn refresh_plan_builds_the_legacy_command() {
         let plan = SpawnPlan::refresh();
@@ -464,7 +593,7 @@ mod tests {
         let args: Vec<&OsStr> = std.get_args().collect();
         assert_eq!(args, [OsStr::new("-p"), OsStr::new("say pong")]);
 
-        // env: CLAUDE_CONFIG_DIR + the four DISABLE_* set (Some), the three scrub vars removed
+        // env: CLAUDE_CONFIG_DIR + the DISABLE_* guards set (Some), every scrub var removed
         // (None). Order-independent (BTreeMap).
         let expected: BTreeMap<OsString, Option<OsString>> = [
             ("CLAUDE_CONFIG_DIR", Some("/tmp/iso")),
@@ -475,6 +604,10 @@ mod tests {
             ("CLAUDE_CODE_OAUTH_TOKEN", None),
             ("ANTHROPIC_API_KEY", None),
             ("CLAUDE_SECURESTORAGE_CONFIG_DIR", None),
+            // The issue #1009 / R-13 refresh triple.
+            ("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", None),
+            ("CLAUDE_CODE_OAUTH_SCOPES", None),
+            ("CLAUDE_CODE_OAUTH_CLIENT_ID", None),
         ]
         .into_iter()
         .map(|(k, v)| (OsString::from(k), v.map(OsString::from)))
