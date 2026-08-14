@@ -15,9 +15,10 @@
 //
 // CONSTRAINT-A (issue #748): each gate whose verdict runs through a DERIVED predicate ships a canary
 // proving that predicate can FAIL, driven through the SAME comparison the real assertion uses. That is
-// the dispatch gates (the canaries are mutant parsers — precedence-blind, and presence-rather-than-value
-// gallery matching) and the cross-language budget gate (an under-bound and a hair-margin budget run
-// through the same clearance and headroom comparisons). The rest compare a returned value directly.
+// the dispatch gates (the canaries are mutant parsers — precedence-blind, presence-rather-than-value
+// gallery matching, and gallery-before-refusal) and the cross-language budget gate (an under-bound and
+// a hair-margin budget run through the same clearance and headroom comparisons). The rest compare a
+// returned value directly.
 
 import XCTest
 
@@ -65,7 +66,8 @@ final class AppLaunchPlanTests: XCTestCase {
     }
 
     // Precedence is observable when more than one is supplied, so it is pinned rather than left to
-    // whichever `if` happens to be written first in the delegate.
+    // whichever `if` happens to be written first in the delegate. This covers the three WELL-FORMED rungs;
+    // where issue #850's refusal rung sits between them is pinned by the two tests further down.
     func testDispatchPrecedenceIsPanelThenBarGlyphsThenGallery() {
         XCTAssertEqual(mode(argv("--render-bar-glyphs", "b", "--render-panel", "p"),
                             ["SESSIOMETER_GLYPH_GALLERY": "1"]),
@@ -89,20 +91,69 @@ final class AppLaunchPlanTests: XCTestCase {
                        "the value after the flag is taken verbatim — no flag-shaped-value rejection ships")
     }
 
-    // A render flag with no following argument falls through to `.normal` — so a mistyped invocation
-    // SILENTLY launches the real app and installs a live status item instead of reporting the mistake.
-    // Asserted as the shipped behaviour it is, and filed rather than changed under a coverage item
-    // (acting on it changes the app's CLI surface). See issue #850.
-    func testATrailingToolFlagWithNoDirectorySilentlyFallsThroughToANormalLaunch() {
-        XCTAssertEqual(mode(argv("--render-panel")), .normal)
-        XCTAssertEqual(mode(argv("--render-bar-glyphs")), .normal)
-        // The condition IS nameable — the dispatch just does not act on it yet.
-        XCTAssertTrue(AppLaunchPlan.toolFlagMissingDirectory(arguments: argv("--render-panel")),
-                      "the missing-directory condition must be detectable even while dispatch ignores it")
-        XCTAssertTrue(AppLaunchPlan.toolFlagMissingDirectory(arguments: argv("--render-bar-glyphs")))
-        XCTAssertFalse(AppLaunchPlan.toolFlagMissingDirectory(arguments: argv("--render-panel", "dir")))
-        XCTAssertFalse(AppLaunchPlan.toolFlagMissingDirectory(arguments: argv()),
-                       "no flag at all is not a missing-directory case")
+    // AC-1's dispatch half (issue #850). A render flag with no following argument has no output directory,
+    // so there is nothing to render: it resolves to its OWN mode, which `main.swift` reports before exiting
+    // non-zero. This test is the tripwire the issue named — until #850 it asserted the opposite, that the
+    // invocation SILENTLY fell through to `.normal` and installed a live status item.
+    func testATrailingToolFlagWithNoDirectoryIsRefusedRatherThanLaunched() {
+        XCTAssertEqual(mode(argv("--render-panel")), .toolFlagMissingDirectory(flag: "--render-panel"))
+        XCTAssertEqual(mode(argv("--render-bar-glyphs")), .toolFlagMissingDirectory(flag: "--render-bar-glyphs"))
+        // The condition carries WHICH flag, so the report can name the one the operator mistyped.
+        XCTAssertEqual(AppLaunchPlan.missingDirectoryFlag(in: argv("--render-panel")), "--render-panel")
+        XCTAssertEqual(AppLaunchPlan.missingDirectoryFlag(in: argv("--render-bar-glyphs")), "--render-bar-glyphs")
+        XCTAssertNil(AppLaunchPlan.missingDirectoryFlag(in: argv("--render-panel", "dir")))
+        XCTAssertNil(AppLaunchPlan.missingDirectoryFlag(in: argv()),
+                     "no flag at all is not a missing-directory case")
+    }
+
+    // The refusal rung sits BELOW both well-formed render modes: a well-formed flag still wins, so nothing
+    // that rendered before #850 stops rendering now. Note the second case — the trailing flag is the
+    // HIGHER-precedence one, and it still loses to the well-formed lower-precedence flag.
+    func testAWellFormedFlagStillOutranksATrailingOne() {
+        XCTAssertEqual(mode(argv("--render-panel", "p", "--render-bar-glyphs")),
+                       .renderPanel(outputDirectory: "p"),
+                       "--render-panel is well formed — a trailing --render-bar-glyphs must not refuse it")
+        XCTAssertEqual(mode(argv("--render-bar-glyphs", "b", "--render-panel")),
+                       .renderBarGlyphs(outputDirectory: "b"),
+                       "--render-bar-glyphs is well formed — a trailing --render-panel must not refuse it")
+    }
+
+    // ...and ABOVE the gallery: an EXPLICIT malformed flag outranks the AMBIENT opt-in. Otherwise a
+    // SESSIOMETER_GLYPH_GALLERY inherited from a shell profile would swallow the operator's mistake into a
+    // gallery launch — which is the same silent wrong mode, and does not exit either, so a script waiting
+    // for a render still hangs.
+    func testATrailingFlagOutranksTheGalleryOptIn() {
+        XCTAssertEqual(mode(argv("--render-panel"), ["SESSIOMETER_GLYPH_GALLERY": "1"]),
+                       .toolFlagMissingDirectory(flag: "--render-panel"))
+        XCTAssertEqual(mode(argv("--render-bar-glyphs"), ["SESSIOMETER_GLYPH_GALLERY": "1"]),
+                       .toolFlagMissingDirectory(flag: "--render-bar-glyphs"))
+    }
+
+    // AC-1's REPORT half. `main.swift` cannot live in this bundle, so the sentence it writes is a plain
+    // value here — the same split `degradeReason` uses. It must name the flag that was actually mistyped:
+    // a report that does not is no better than the silent launch it replaced.
+    func testTheRefusalReportNamesTheFlagThatWasMistyped() {
+        for flag in [AppLaunchPlan.renderPanelFlag, AppLaunchPlan.renderBarGlyphsFlag] {
+            let message = AppLaunchPlan.missingDirectoryMessage(flag: flag)
+            XCTAssertTrue(message.contains(flag), "the report must name the flag: \(message)")
+            XCTAssertTrue(message.lowercased().contains("directory"),
+                          "it must say WHAT is missing, not merely that something is: \(message)")
+            XCTAssertFalse(message.hasPrefix(" "), "\(flag): it is written as its own line — no leading padding")
+            XCTAssertFalse(message.hasSuffix("\n"), "\(flag): the trailing newline belongs to the writer")
+        }
+        XCTAssertNotEqual(AppLaunchPlan.missingDirectoryMessage(flag: AppLaunchPlan.renderPanelFlag),
+                          AppLaunchPlan.missingDirectoryMessage(flag: AppLaunchPlan.renderBarGlyphsFlag),
+                          "two flags must not read identically — naming the one at fault is the whole point")
+    }
+
+    // AC-1's EXIT half. Non-zero is the contract: a zero exit tells a script the render it asked for
+    // succeeded. The specific value additionally says WHICH failure, so a caller can tell a malformed
+    // invocation from a render that ran and failed.
+    func testAMalformedToolInvocationExitsNonZero() {
+        XCTAssertNotEqual(AppLaunchPlan.missingDirectoryExitCode, 0,
+                          "a zero exit would report the mistake and then claim success")
+        XCTAssertEqual(AppLaunchPlan.missingDirectoryExitCode, EX_USAGE,
+                       "sysexits' command-line-usage error — the conventional code for exactly this")
     }
 
     // A release build compiles the tool surface out entirely, so its ONLY reachable mode is `.normal`.
@@ -113,12 +164,20 @@ final class AppLaunchPlanTests: XCTestCase {
             (argv("--render-bar-glyphs", "b"), [:]),
             (argv(), ["SESSIOMETER_GLYPH_GALLERY": "1"]),
             (argv("--render-panel", "p", "--render-bar-glyphs", "b"), ["SESSIOMETER_GLYPH_GALLERY": "1"]),
+            // AC-3 (issue #850): the refusal is DEBUG-only like the surface it guards. A release build
+            // must not print a usage error and exit for a flag it does not implement — `mode`'s opening
+            // `guard toolModesAvailable` short-circuits before the rung is ever consulted.
+            (argv("--render-panel"), [:]),
+            (argv("--render-bar-glyphs"), [:]),
         ]
         for (arguments, environment) in everyToolInvocation {
             XCTAssertEqual(mode(arguments, environment, toolModes: false), .normal,
                            "\(arguments.dropFirst()) + \(environment) must be inert in a release build")
         }
-        XCTAssertEqual(everyToolInvocation.count, 4, "every tool entry point must be checked, not a sample")
+        // Deliberately moved 4 → 6 by issue #850: a trailing flag is a tool entry point that now resolves
+        // to its own mode in DEBUG, so leaving it out would exempt the new case from the release-inertness
+        // claim this test exists to make.
+        XCTAssertEqual(everyToolInvocation.count, 6, "every tool entry point must be checked, not a sample")
     }
 
     // This suite runs under `xcodebuild test` in Debug, so the build-flavour constant must report true
@@ -152,6 +211,23 @@ final class AppLaunchPlanTests: XCTestCase {
         let zeroed = ["SESSIOMETER_GLYPH_GALLERY": "0"]
         XCTAssertNotEqual(presenceMatched(zeroed), mode(argv(), zeroed),
                           "the presence-matching canary agreed with the real parser — the exact-value gate cannot fail")
+
+        // (c) a parser that consults the gallery BEFORE the refusal rung — the placement #850 rejected —
+        // disagrees on a trailing flag with the gallery opted in
+        func galleryBeforeRefusal(_ arguments: [String], _ environment: [String: String]) -> AppLaunchMode {
+            if environment[AppLaunchPlan.glyphGalleryEnvironmentKey] == AppLaunchPlan.glyphGalleryEnabledValue {
+                return .glyphGallery
+            }
+            if let flag = AppLaunchPlan.missingDirectoryFlag(in: arguments) {
+                return .toolFlagMissingDirectory(flag: flag)
+            }
+            return .normal
+        }
+        let trailing = argv("--render-panel")
+        let gallery = ["SESSIOMETER_GLYPH_GALLERY": "1"]
+        XCTAssertNotEqual(galleryBeforeRefusal(trailing, gallery), mode(trailing, gallery),
+                          "the gallery-first canary agreed with the real parser — the refusal-outranks-gallery "
+                          + "gate cannot fail")
     }
 
     // MARK: - Degrade-loudly wording
