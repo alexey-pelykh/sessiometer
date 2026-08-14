@@ -99,10 +99,14 @@ Light shown here:
   `PanelRenderHarness` renders with the scroll boundaries bypassed. Every capture therefore shows each
   state's body at its full intrinsic height, where the live panel clamps at the budget and scrolls the
   excess. That is honest exactly while no state reaches the budget, which holds for every fixture at the
-  default text size and is pinned per fixture by `testTheRenderBypassIsANoOpAtTheGoldenSizeClass`; the
-  platform premise itself is pinned by `testImageRendererStillCannotDrawAScrollView`, which reddens the day
-  the seam should be deleted. **A regression inside a scrolled body would not be visible to the golden
-  gate** — tracked as **#1177**, which includes "accept the gap" among its routes
+  default text size and is pinned per fixture by `testTheRenderBypassIsANoOpAtTheGoldenSizeClass`. The
+  blankness is **one rasterizer's** limit and not the platform's — #1177 measured that — and
+  `testImageRendererStillCannotDrawAScrollView` pins that rasterizer's half of it, building its own
+  `ImageRenderer`: what reddens it is `ImageRenderer` starting to draw a `ScrollView`. That is one of the
+  two routes to deleting the seam. The other is swapping the harness's rasterizer for the AppKit one, which
+  reddens nothing here and which **#1261** carries. **A regression inside a scrolled body is not visible to
+  the golden gate** until one of them lands — the gap is **tracked for removal, not accepted**
+  (#1177 → #1261); § The scroll boundary below carries the measurement and the rejected alternatives
 - no provider secondary line — the wire carries no `provider` field yet (#173)
 - the Stats aggregate callout has a **second, mock-unauthored form**. When the daemon had no
   configured roster the census degraded to whoever held samples, and the panel says so by narrowing
@@ -1545,6 +1549,21 @@ shows each state's body in full rather than as the popover bounds it. That is fa
 text size* and only there, which is pinned per-fixture by
 `PanelScrollBoundaryTests.testTheRenderBypassIsANoOpAtTheGoldenSizeClass`. At `.accessibility3` a capture
 shows more than the popover does.
+
+**That bypass is now tracked for removal, not accepted (#1177 → #1261).** The blankness is a limit of
+**one rasterizer**, not of the platform: measured, `NSHostingView` drawn into an explicitly-sized
+`NSBitmapImageRep` draws the same `ScrollView`'s content that `ImageRenderer` renders blank, at a scale
+taken from an argument rather than from the display — the technique `BarGlyphRenderer` already uses for
+the status-item glyph. The evidence, the two rejected alternatives, and what the switch costs are in
+[`docs/findings/1177-scrollview-raster-route.md`](../../../docs/findings/1177-scrollview-raster-route.md);
+the controlled comparison is committed as
+`PanelScrollBoundaryTests.testAppKitDrawsScrollContentWhereImageRendererDoesNot`.
+
+Two things a reader should not over-read. The measurement was taken on a **synthetic body**, so whether
+the whole panel renders faithfully through that rig is **open** — #1261 has to establish it first. And
+until #1261 lands, **the gap stands**: the boundary's clipping, its scroll indicators, and the pinned
+chrome against a scrolled body have no raster gate, and none of them was added to the manual checklists
+above — a checklist is what *accepting* the gap would have looked like, and the gap was not accepted.
 
 **To ratify, overrule, or refine**, the questions actually open are: the 856 pt figure (or a
 screen-adaptive rule); whether the Swap action and the fault banner are the right things to pin; and
