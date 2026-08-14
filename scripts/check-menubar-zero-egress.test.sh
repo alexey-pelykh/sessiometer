@@ -2,9 +2,11 @@
 # Self-contained falsifier + regression test for check-menubar-zero-egress.sh
 # (issue #328). Builds throwaway menu-bar source trees and exercises the guard
 # across the cases that define its contract — in particular proving it goes RED on
-# a forbidden import / host-networking symbol / network entitlement, and GREEN on
-# clean sources (including sources whose COMMENTS name a forbidden framework, which
-# must NOT be a violation). Run locally:  ./scripts/check-menubar-zero-egress.test.sh
+# a forbidden import / host-networking symbol / in-app web or OAuth host (R-17 and
+# AC-7 of docs/requirements/gui-cli-capability-parity.md) / network entitlement,
+# and GREEN on clean sources (including sources whose COMMENTS name a forbidden
+# framework, which must NOT be a violation). Run locally:
+#   ./scripts/check-menubar-zero-egress.test.sh
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -140,6 +142,43 @@ check "comment naming a store artifact is GREEN" 0 "$(run "$storecomment")"
 empty="$work/empty"
 mkdir -p "$empty"
 check "missing Sources dir is RED (fail-closed)" 1 "$(run "$empty")"
+
+# Case 14: `import AuthenticationServices` -> RED. AC-7 of
+# docs/requirements/gui-cli-capability-parity.md, directly: this framework vends
+# ASWebAuthenticationSession, which would host the OAuth flow inside the app. Before
+# R-17 this passed the gate GREEN — this case is the falsifier that pins the fix.
+asimp="$(new_tree asimp)"
+printf 'import AuthenticationServices\n' >> "$asimp/Sources/main.swift"
+check "import AuthenticationServices is RED" 1 "$(run "$asimp")"
+
+# Case 15: `import WebKit` -> RED. The other half of AC-7: a WKWebView loads arbitrary
+# remote URLs in-process. Also GREEN before R-17.
+wkimp="$(new_tree wkimp)"
+printf 'import WebKit\n' >> "$wkimp/Sources/main.swift"
+check "import WebKit is RED" 1 "$(run "$wkimp")"
+
+# Case 16: the bare ASWebAuthenticationSession SYMBOL, with no forbidden import on the
+# line -> RED. This is the limb the pre-R-17 symbol list could not see, because
+# ASWebAuthenticationSession does not contain the substring `URLSession`; it proves the
+# symbol rule fires on its own rather than riding on Case 14's import.
+assym="$(new_tree assym)"
+printf 'let s = ASWebAuthenticationSession(url: u, callbackURLScheme: nil) { _, _ in }\n' \
+    >> "$assym/Sources/WatchTransport.swift"
+check "ASWebAuthenticationSession symbol alone is RED" 1 "$(run "$assym")"
+
+# Case 17: the decl-kind form for a newly-listed framework -> RED (the Case 7 property,
+# re-proved for the R-17 entries rather than assumed to carry over).
+wkdecl="$(new_tree wkdecl)"
+printf 'import class WebKit.WKWebView\n' >> "$wkdecl/Sources/main.swift"
+check "decl-kind import (import class WebKit.X) is RED" 1 "$(run "$wkdecl")"
+
+# Case 18: a comment naming the newly-listed frameworks is NOT a violation -> GREEN.
+# The Case 8 / Case 12 code-only discipline, held for the R-17 entries too — the guard
+# must not red a source file that documents WHY the app hosts no web view or OAuth flow.
+r17comment="$(new_tree r17comment)"
+printf '// login is routed to the daemon: no WebKit, no AuthenticationServices, no ASWebAuthenticationSession\n' \
+    >> "$r17comment/Sources/WatchTransport.swift"
+check "comment naming WebKit/AuthenticationServices is GREEN" 0 "$(run "$r17comment")"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
