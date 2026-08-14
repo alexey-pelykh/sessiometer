@@ -1171,3 +1171,70 @@ here and in the README `## Prerequisites`; `scripts/check-cc-version.sh` gates b
   unstable across versions — the `#466` canary keys on the stable `tengu_oauth_*` event strings.
 
 CC 2.1.217 · macOS 26.5.2 / 25F84 · sessiometer #552.
+
+---
+
+# Issue #769 — reaping by service alone (the acct-less `delete-generic-password` contract)
+
+Where `# Issue #552`'s `$USER`-first `acct` observation finally bit. That entry recorded the
+derivation as **latent, not currently biting** and named the isolated item as the exposed seam;
+**#711** then replicated `uq()` so the *seeding* side computes whatever CC would. #769 is the other
+half: the startup orphan **reap** re-derived that same `acct` in a *different process*, so a `$USER`
+that changed between the crashing daemon and the restarting one addressed a different name at an
+identical, path-hash-derived service. `delete-generic-password` exited 44, which `delete` maps to
+`Ok(())` by design, the strand-signalling dir was removed anyway, and a credential-bearing item
+survived silently. The fix reaps by enumerating the **service**, which is `$USER`-independent.
+
+This records the `/usr/bin/security` behaviours the acct-less arm of that reap rests on, verified
+against a **throwaway** keychain (never the login keychain) on macOS 26.5.2 / 25F84, Darwin 25.x,
+2026-08-14. They are CC-independent — `security` is an Apple binary and no part of this contract
+involves Claude Code — but they *are* macOS-version-sensitive, which is why they are filed here and
+not only at their use site.
+
+## Finding — a service-only delete removes exactly ONE match, then 44 ✅
+
+`delete-generic-password -s <service> <keychain>` with **no `-a`** removes **one** matching item per
+call and exits **0**; once none is left it exits **44** (`errSecItemNotFound`). Probed with two
+items seeded under one service under distinct `acct`s, counting items between calls (one item is two
+`dump-keychain` lines — the `0x00000007` label blob and `"svce"` — verified before counting, so the
+progression is items and not a grep artifact):
+
+| Call | Exit | Items left under the service |
+|---|---|---|
+| 1 | `0` | 1 |
+| 2 | `0` | 0 |
+| 3 | `44` | 0 |
+
+**Load-bearing for the delete ORDER, not merely the count.** A service-only delete takes an
+*arbitrary* match, so issuing one while acct-bearing items are still present could consume one of
+*those* instead of the acct-less item it was for — leaving the acct-less item behind with the sweep
+reporting success. `ReapTargets::plan` therefore drains every acct-addressed delete first, leaving
+only acct-less items under the service, so each service-only delete can reach nothing else. That
+argument is sound *only* while one call removes exactly one item.
+
+## Finding — `add-generic-password` refuses a call without `-a` ✅
+
+`add-generic-password -s <service> -w <blob> <keychain>` with no `-a` is rejected outright: exit
+**2** — the same usage/parse code `# Issue #39` records — printing `-a  Specify account name
+(required)`. So nothing this crate or Claude Code writes **through the CLI** can land an acct-less
+item under an isolated service; the arm is reachable only by a **Security-framework** writer. That
+is why its composition is unit-tested (`IsolatedService::delete_args`, `ReapTargets::plan`) rather
+than exercised end-to-end — a real-CLI test cannot create the item it would need.
+
+## What would falsify this
+
+Either half breaking turns the reap from correct into silently lossy, so re-verify on a **macOS
+major bump** — the trigger the `## Provenance` block above already sets for keychain mechanics:
+
+- **A service-only delete that removes *all* matches, or *none*, per call.** Removing all would make
+  the drain-first ordering unnecessary but harmless. Removing none — or erroring where it now exits
+  `0` — would strand every acct-less item while the sweep still reports a clean count.
+- **`add-generic-password` accepting a call without `-a`.** The acct-less arm would become
+  CLI-reachable, invalidating the stated reason it carries no end-to-end test; it would then be
+  worth one, and the present unit tests would understate the coverage owed.
+
+Recorded at the use site in `src/keychain.rs` (`ReapTargets::acctless`), where the contract is
+load-bearing, and here, where it is re-walked: a doc comment is not re-verified on an OS bump, which
+is the whole reason both exist. Keep the two in step.
+
+CC-independent (Apple `/usr/bin/security`) · macOS 26.5.2 / 25F84 · sessiometer #769.
