@@ -31,6 +31,15 @@
 //! item whenever `$USER` diverges from passwd, and the only symptom would be a
 //! misleading `Not logged in`.
 //!
+//! A third path reaches the `acct` from neither end: the startup orphan **reap**
+//! (issues #103 / #133) sweeps what a `SIGKILL`ed process left behind, so it runs in a
+//! DIFFERENT process from the one that seeded — the only scenario it exists for. It
+//! therefore cannot re-derive the name: `$USER` may have changed at the same uid since
+//! #711 made the derivation `$USER`-first, while the path-hash-derived service has
+//! not, so a delete under a re-derived `acct` returns `errSecItemNotFound` and is
+//! swallowed as idempotent success while the credential stays. That path enumerates
+//! the SERVICE and names no `acct` at all ([`IsolatedServiceReaper`], issue #769).
+//!
 //! The mechanism and the facts this module depends on were verified empirically
 //! before implementation — see `build/version-compat.md` (the issue #16 ledger):
 //! the store is the legacy file-based `login.keychain-db`, every call pins that
@@ -723,17 +732,19 @@ fn block_attr(block: &str, name: &str) -> Option<Vec<u8>> {
         .and_then(decode_attr_value)
 }
 
-/// Parse `security dump-keychain` output: find every generic-password item whose
-/// service is the resolved `service`, then enforce uniqueness — 0 → not found,
-/// >1 → ambiguous, exactly 1 → that item's `acct`.
+/// Every generic-password item in a `security dump-keychain` whose service is
+/// `service`, as that item's `acct` — `None` for a service-match carrying no `acct`
+/// attribute at all.
 ///
-/// `service` is the config-dir-resolved canonical name (issue #100), so under a
-/// non-default `CLAUDE_CONFIG_DIR` this matches the **suffixed** item, not the bare
-/// base.
-fn parse_resolve(service: &str, dump: &str) -> Result<OsString> {
-    // One entry per service-matching item (its `acct`, if present). Count ALL
-    // matches — including any with an absent `acct` — so a malformed item can
-    // never mask an ambiguity by going uncounted.
+/// The one enumeration shared by both service-scoped passes: [`parse_resolve`], which
+/// enforces uniqueness over it for the CANONICAL item, and [`parse_reap_targets`],
+/// which reaps ALL of it for an ISOLATED one (issue #769). Keeping a single parser
+/// means the resolve and the reap can never disagree about what "an item under this
+/// service" is — a divergence would let the reap skip something the resolve counts.
+///
+/// `service` is the config-dir-resolved name (issue #100), so under a non-default
+/// `CLAUDE_CONFIG_DIR` this matches the **suffixed** item, not the bare base.
+fn service_matches(service: &str, dump: &str) -> Vec<Option<Vec<u8>>> {
     let mut matches: Vec<Option<Vec<u8>>> = Vec::new();
     // Each item block begins with a `keychain: "<path>"` header line.
     for block in dump.split("\nkeychain: ") {
@@ -744,6 +755,17 @@ fn parse_resolve(service: &str, dump: &str) -> Result<OsString> {
             matches.push(block_attr(block, "acct"));
         }
     }
+    matches
+}
+
+/// Parse `security dump-keychain` output: find every generic-password item whose
+/// service is the resolved `service`, then enforce uniqueness — 0 → not found,
+/// >1 → ambiguous, exactly 1 → that item's `acct`.
+fn parse_resolve(service: &str, dump: &str) -> Result<OsString> {
+    // One entry per service-matching item (its `acct`, if present). ALL matches are
+    // counted — including any with an absent `acct` — so a malformed item can never
+    // mask an ambiguity by going uncounted.
+    let mut matches = service_matches(service, dump);
     match matches.len() {
         0 => Err(Error::CredentialNotFound),
         // Exactly one item, but a usable `acct` is required to address it; a
@@ -754,6 +776,88 @@ fn parse_resolve(service: &str, dump: &str) -> Result<OsString> {
             .map(OsString::from_vec)
             .ok_or(Error::CredentialNotFound),
         n => Err(Error::CredentialAmbiguous { count: n }),
+    }
+}
+
+/// Everything a service-scoped reap must delete under ONE isolated service
+/// (issue #769), split by how each item has to be addressed.
+///
+/// Deliberately NOT a `Vec<Option<OsString>>`: the two arms are deleted by different
+/// `security` invocations and in a mandatory order (see [`ReapTargets::plan`]), so
+/// keeping them apart in the type stops a future edit from flattening the distinction
+/// the order rests on.
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+struct ReapTargets {
+    /// The `acct` of every service-matching item that carries one. Each is deleted by
+    /// its own `(service, acct)` pair, WHATEVER name it holds — that is the whole
+    /// point of issue #769: the reaping process never re-derives a name and never
+    /// compares one, so a `$USER` that changed since the item was seeded is
+    /// immaterial.
+    accts: Vec<OsString>,
+    /// How many service-matching items carry NO `acct`. Such an item cannot be named
+    /// by `-a`, so it is deleted by service alone — but it is COUNTED here rather
+    /// than dropped, because it is an item under our own ephemeral service and may
+    /// hold a live credential, which is exactly what the reap exists to remove.
+    /// [`parse_resolve`] above already refuses to let such an item go uncounted; this
+    /// refuses to let one go unreaped.
+    ///
+    /// Measured against `/usr/bin/security` on macOS 26.5.2 / 25F84 before relying on
+    /// either half: `delete-generic-password -s <service> <keychain>` with no `-a` exits 0
+    /// having removed one matching item and 44 once none is left, and
+    /// `add-generic-password` rejects a call without `-a` outright — so nothing this
+    /// crate or Claude Code writes through the CLI can land here, and the arm is
+    /// reachable only via a Security-framework writer. That is also why its
+    /// composition is unit-tested rather than exercised end-to-end: the arguments
+    /// ([`IsolatedService::delete_args`]) and the ordering ([`ReapTargets::plan`])
+    /// each have a test, while a real-CLI test cannot create the item it would need.
+    ///
+    /// The same contract is recorded in `build/version-compat.md` (`# Issue #769`),
+    /// which is the copy re-walked on a macOS major bump — this comment is not, which
+    /// is why both exist. Keep the two in step.
+    acctless: usize,
+}
+
+/// Parse `security dump-keychain` output into the [`ReapTargets`] under `service` —
+/// the `$USER`-independent half of the isolated orphan reap (issue #769).
+///
+/// The service is the only identity used. Under an isolated config dir that service
+/// is path-hash-derived from an ephemeral dir this process owns
+/// ([`service_for_config_dir`]), so every item it matches is ours by construction and
+/// a sibling `CLAUDE_CONFIG_DIR` profile — which hashes to a DIFFERENT suffix — can
+/// never appear in the result (the #133 safety AC).
+fn parse_reap_targets(service: &str, dump: &str) -> ReapTargets {
+    let (accts, acctless) = service_matches(service, dump).into_iter().fold(
+        (Vec::new(), 0),
+        |(mut accts, acctless), acct| match acct {
+            Some(bytes) => {
+                accts.push(OsString::from_vec(bytes));
+                (accts, acctless)
+            }
+            None => (accts, acctless + 1),
+        },
+    );
+    ReapTargets { accts, acctless }
+}
+
+impl ReapTargets {
+    /// The deletes this sweep must issue, IN ORDER: every acct-addressed one first
+    /// (`Some(acct)`), then exactly one service-only delete (`None`) per acct-less
+    /// match.
+    ///
+    /// The order is load-bearing, which is why it is a pure function with its own test
+    /// rather than a loop shape inside [`reap`](IsolatedServiceReaper::reap). A
+    /// service-only delete removes an ARBITRARY match, so issuing one while
+    /// acct-bearing items are still present could
+    /// consume one of THOSE instead of the acct-less item it is for — leaving the
+    /// acct-less item behind and no one the wiser. Draining the addressed items first
+    /// leaves only acct-less items under the service, so each service-only delete can
+    /// reach nothing else.
+    fn plan(&self) -> Vec<Option<&OsStr>> {
+        self.accts
+            .iter()
+            .map(|acct| Some(acct.as_os_str()))
+            .chain(std::iter::repeat_n(None, self.acctless))
+            .collect()
     }
 }
 
@@ -1105,6 +1209,176 @@ impl IsolatedKeychain for IsolatedKeychainItem {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+    }
+}
+
+/// The seam the startup orphan reapers drive (issues #103 / #133): delete EVERY
+/// isolated keychain item under ONE service, whatever `acct` each carries.
+///
+/// A separate trait from [`IsolatedKeychain`], not another method on it, because the
+/// two address items from opposite ends and only one of them may name an `acct`. A
+/// live [`IsolatedKeychain`] session seeds, reads back and tears down WITHIN one
+/// process, so the `acct` it derives ([`claude_code_acct_from`]) is the same one it
+/// seeded under by construction. A reap runs in a DIFFERENT process from the one that
+/// seeded — that is the entire scenario it exists for, a `SIGKILL`ed cycle swept at
+/// the next daemon start — so it has no such guarantee, and since issue #711 made the
+/// derivation `$USER`-first rather than uid-derived, a `$USER` that changed between
+/// the two processes yields a different name at the same uid. The reaper therefore
+/// carries NO `acct` at all (see [`IsolatedService`]): there is no name for it to get
+/// wrong. (issue #769)
+pub(crate) trait IsolatedServiceReaper {
+    /// Delete every item under this reaper's service, returning how many were
+    /// actually deleted — `0` is the ordinary clean-start case (nothing was
+    /// stranded), and the count is what lets a caller's operator-facing line claim a
+    /// reap only when one provably happened.
+    async fn reap(&self) -> Result<usize>;
+}
+
+/// An isolated keychain SERVICE addressed with no `acct` — the production
+/// [`IsolatedServiceReaper`], driving `/usr/bin/security` against the login keychain.
+///
+/// Deliberately holds `service` and nothing else identifying: the field an
+/// [`IsolatedKeychainItem`] would also carry, the derived `acct`, is ABSENT rather
+/// than merely unused, so no future edit can re-introduce the cross-process
+/// derivation issue #769 removed. Constructed from the same `config_dir` the engine
+/// spawns under, through the same #100 derivation, so it names exactly the service
+/// that engine's items live under and no other.
+pub(crate) struct IsolatedService {
+    /// The config-dir-suffixed service ([`service_for_config_dir`]) whose items are
+    /// swept. The ONLY identity the reap ever names.
+    service: String,
+    /// Keychain to operate on. `None` is production (the login keychain); `Some` pins
+    /// a throwaway keychain for the real-CLI reap test.
+    keychain: Option<PathBuf>,
+}
+
+impl IsolatedService {
+    /// The reaper for the isolated artifacts a `claude` spawned under `config_dir`
+    /// leaves behind, operating on the login keychain. The service is derived by #100
+    /// — the SAME derivation [`IsolatedKeychainItem::new`] seeds under, never a
+    /// re-normalization — so the reap addresses precisely the engine's own items.
+    pub(crate) fn new(config_dir: &OsStr) -> Result<Self> {
+        Ok(Self {
+            service: service_for_config_dir(config_dir)?,
+            keychain: None,
+        })
+    }
+
+    /// Reaper pinned to a specific keychain file (real-CLI test only — drives the
+    /// real `security` against a throwaway keychain, never the login keychain).
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn for_keychain(config_dir: &OsStr, keychain: PathBuf) -> Result<Self> {
+        Ok(Self {
+            service: service_for_config_dir(config_dir)?,
+            keychain: Some(keychain),
+        })
+    }
+
+    /// The keychain path to pin on every call.
+    fn keychain_path(&self) -> Result<PathBuf> {
+        match &self.keychain {
+            Some(kc) => Ok(kc.clone()),
+            None => paths::login_keychain(),
+        }
+    }
+
+    /// Enumerate what sits under this service right now.
+    ///
+    /// `dump-keychain` (no `-d`) like the canonical [`RealCredentialStore::resolve`]:
+    /// metadata only, so it raises no prompt, decrypts no secret, and works on a
+    /// locked keychain — which matters here, since a reap runs at daemon start where
+    /// the keychain may well still be locked. The dump covers the whole keychain but
+    /// never leaves this function: [`parse_reap_targets`] keeps only this service's
+    /// items, and nothing renders the text.
+    async fn enumerate(&self, keychain: &Path) -> Result<ReapTargets> {
+        let output = Command::new(SECURITY)
+            .arg("dump-keychain")
+            .arg(keychain)
+            .stdin(Stdio::null())
+            .output()
+            .await?;
+        if !output.status.success() {
+            return Err(keychain_error(
+                "isolated reap enumerate",
+                output.status.code().unwrap_or(-1),
+            ));
+        }
+        // Metadata text (attribute names + quoted/hex values), not secret data; a
+        // lossy decode is safe and never touches a token.
+        Ok(parse_reap_targets(
+            &self.service,
+            &String::from_utf8_lossy(&output.stdout),
+        ))
+    }
+
+    /// `delete-generic-password` arguments: `-a <acct>` pins one enumerated item;
+    /// `None` names the service alone, which deletes an arbitrary ONE of its
+    /// remaining items (the only way to reach an item that carries no `acct`).
+    fn delete_args(&self, keychain: &Path, acct: Option<&OsStr>) -> Vec<OsString> {
+        let mut args: Vec<OsString> = vec![
+            "delete-generic-password".into(),
+            "-s".into(),
+            self.service.as_str().into(),
+        ];
+        if let Some(acct) = acct {
+            args.push("-a".into());
+            args.push(acct.to_owned());
+        }
+        args.push(keychain.as_os_str().to_owned());
+        args
+    }
+
+    /// Delete one item under this service. `Ok(true)` deleted it, `Ok(false)` found
+    /// it already absent (exit 44 — it vanished between the enumeration and this
+    /// call), `Err` anything else.
+    ///
+    /// The false arm is why the reap can report a count at all. An
+    /// [`IsolatedKeychainItem::delete`](IsolatedKeychain::delete) folds exit 44 into
+    /// `Ok(())` because its whole contract is idempotent teardown, which leaves its
+    /// caller unable to tell a delete from a miss; here the enumeration has already
+    /// established that the item existed, so a 44 is a distinguishable outcome and is
+    /// reported as one rather than counted as a reap.
+    async fn delete_one(&self, keychain: &Path, acct: Option<&OsStr>) -> Result<bool> {
+        let output = Command::new(SECURITY)
+            .args(self.delete_args(keychain, acct))
+            .stdin(Stdio::null())
+            .output()
+            .await?;
+        if output.status.success() {
+            return Ok(true);
+        }
+        match output.status.code().unwrap_or(-1) {
+            // 44 == errSecItemNotFound.
+            44 => Ok(false),
+            code => Err(keychain_error("isolated reap delete", code)),
+        }
+    }
+}
+
+impl IsolatedServiceReaper for IsolatedService {
+    async fn reap(&self) -> Result<usize> {
+        let keychain = self.keychain_path()?;
+        let targets = self.enumerate(&keychain).await?;
+        let mut deleted = 0;
+        let mut first_err = None;
+        // Every delete is ATTEMPTED even after one fails — the items are independent
+        // orphans, so a single locked/erroring one must not strand the rest — and the
+        // FIRST error is surfaced for the caller's log and retry. The delete ORDER
+        // belongs to [`ReapTargets::plan`], which owns why it matters.
+        for acct in targets.plan() {
+            match self.delete_one(&keychain, acct).await {
+                Ok(true) => deleted += 1,
+                Ok(false) => {}
+                Err(err) => first_err = first_err.or(Some(err)),
+            }
+        }
+        match first_err {
+            // The count is DROPPED on the error path, which is the safe direction:
+            // its only consumer states a reap happened, and under-reporting makes
+            // that claim weaker, never false.
+            Some(err) => Err(err),
+            None => Ok(deleted),
+        }
     }
 }
 
@@ -1638,6 +1912,152 @@ class: "genp"
             parse_resolve(SERVICE_BASE, dump),
             Err(Error::CredentialAmbiguous { count: 2 })
         ));
+    }
+
+    // --- isolated service reap (#769): address the service, never a re-derived acct ---
+    //
+    // A dump holding SEVERAL items under one service — the state repeated crashes under
+    // differing `$USER` values leave behind, and the state `parse_resolve` above rejects
+    // as ambiguous for the canonical item but the isolated reap must sweep whole.
+    const MANY_UNDER_ONE_SERVICE: &str = r#"keychain: "/tmp/x.keychain-db"
+class: "genp"
+    "acct"<blob>="user-a"
+    "svce"<blob>="Claude Code-credentials"
+keychain: "/tmp/x.keychain-db"
+class: "genp"
+    "acct"<blob>="user-b"
+    "svce"<blob>="Claude Code-credentials"
+keychain: "/tmp/x.keychain-db"
+class: "genp"
+    "acct"<blob>="user-a"
+    "svce"<blob>="Claude Code-credentials-deadbeef"
+"#;
+
+    #[test]
+    fn parse_reap_targets_returns_every_acct_under_the_service() {
+        // All of them, in dump order, and nothing from the sibling service — the parse-level
+        // half of the #133 safety AC.
+        assert_eq!(
+            parse_reap_targets(SERVICE_BASE, MANY_UNDER_ONE_SERVICE),
+            ReapTargets {
+                accts: vec![OsString::from("user-a"), OsString::from("user-b")],
+                acctless: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_reap_targets_is_empty_for_a_service_with_no_items() {
+        // The ordinary clean-start case: nothing was stranded, so the sweep has nothing
+        // to delete and its caller stays silent.
+        assert_eq!(
+            parse_reap_targets("Claude Code-credentials-nosuch", MANY_UNDER_ONE_SERVICE),
+            ReapTargets {
+                accts: Vec::new(),
+                acctless: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_reap_targets_decodes_a_hex_acct() {
+        // Hex-rendered attributes are the same codec `parse_resolve` uses; an `acct` the
+        // dump chose to hex-render is still addressable and must not be skipped.
+        let dump = r#"keychain: "/tmp/x.keychain-db"
+class: "genp"
+    "acct"<blob>=0x616C696365
+    "svce"<blob>="Claude Code-credentials"
+"#;
+        assert_eq!(
+            parse_reap_targets(SERVICE_BASE, dump).accts,
+            vec![OsString::from("alice")]
+        );
+    }
+
+    #[test]
+    fn parse_reap_targets_counts_an_acctless_match_rather_than_dropping_it() {
+        // A service-match carrying no `acct` cannot be named by `-a`, but it is an item
+        // under our own ephemeral service and may hold a live credential — so it is
+        // counted for a service-only delete, not silently left behind.
+        let dump = r#"keychain: "/tmp/x.keychain-db"
+class: "genp"
+    "svce"<blob>="Claude Code-credentials"
+keychain: "/tmp/x.keychain-db"
+class: "genp"
+    "acct"<blob>="user-a"
+    "svce"<blob>="Claude Code-credentials"
+"#;
+        assert_eq!(
+            parse_reap_targets(SERVICE_BASE, dump),
+            ReapTargets {
+                accts: vec![OsString::from("user-a")],
+                acctless: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn the_reap_and_the_resolve_enumerate_the_same_items() {
+        // Both passes run off `service_matches`, so what the canonical resolve treats as
+        // "the item under this service" is exactly what the reap deletes. Pinned because a
+        // second, drifting enumeration is how the reap would come to skip something.
+        let resolved = parse_resolve(SERVICE_BASE, ONE_MATCH).unwrap();
+        assert_eq!(
+            parse_reap_targets(SERVICE_BASE, ONE_MATCH).accts,
+            [resolved]
+        );
+    }
+
+    #[test]
+    fn a_reap_plan_drains_addressed_items_before_any_service_only_delete() {
+        // The ordering invariant: a service-only delete removes an ARBITRARY match, so it
+        // may only run once no acct-bearing item is left for it to consume.
+        let targets = ReapTargets {
+            accts: vec![OsString::from("user-a"), OsString::from("user-b")],
+            acctless: 2,
+        };
+        assert_eq!(
+            targets.plan(),
+            vec![
+                Some(OsStr::new("user-a")),
+                Some(OsStr::new("user-b")),
+                None,
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn isolated_service_delete_args_name_the_service_and_only_an_enumerated_acct() {
+        let kc = Path::new("/tmp/login.keychain-db");
+        let svc = IsolatedService {
+            service: "Claude Code-credentials-deadbeef".to_owned(),
+            keychain: None,
+        };
+        // An enumerated `acct` is pinned as read from the dump — never compared against,
+        // or replaced by, one this process would derive (issue #769).
+        assert_eq!(
+            svc.delete_args(kc, Some(OsStr::new("user-a"))),
+            vec![
+                OsString::from("delete-generic-password"),
+                OsString::from("-s"),
+                OsString::from("Claude Code-credentials-deadbeef"),
+                OsString::from("-a"),
+                OsString::from("user-a"),
+                OsString::from(kc),
+            ]
+        );
+        // With no `acct` there is no `-a` at all — the service alone, which is the only
+        // way to reach an item that carries none.
+        assert_eq!(
+            svc.delete_args(kc, None),
+            vec![
+                OsString::from("delete-generic-password"),
+                OsString::from("-s"),
+                OsString::from("Claude Code-credentials-deadbeef"),
+                OsString::from(kc),
+            ]
+        );
     }
 
     #[tokio::test]
