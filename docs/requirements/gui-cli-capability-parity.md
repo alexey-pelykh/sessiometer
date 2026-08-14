@@ -190,7 +190,7 @@ environment scrub **shall** additionally remove `CLAUDE_CODE_OAUTH_REFRESH_TOKEN
 `CLAUDE_CODE_OAUTH_SCOPES`, and `CLAUDE_CODE_OAUTH_CLIENT_ID`.
 
 > Rationale — **this is a security prerequisite, not a cleanup.** `SPAWN_ENV_REMOVE`
-> (`src/isolated_spawn.rs:67-71`) scrubs `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, and
+> (`src/isolated_spawn.rs`) scrubs `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, and
 > `CLAUDE_SECURESTORAGE_CONFIG_DIR` — not the refresh-token triple. Claude Code's `auth login`
 > short-circuits on an inherited refresh token, writing a credential and exiting 0 **with no browser
 > at all**. Under the current argv (`/login`) this is inert; the moment argv becomes `auth login`, an
@@ -199,7 +199,8 @@ environment scrub **shall** additionally remove `CLAUDE_CODE_OAUTH_REFRESH_TOKEN
 
 **R-14** *(ubiquitous)* — The login spawn's `argv` **shall** remain `&'static [&'static str]`.
 
-> Rationale — the compile-time no-injection guarantee (`src/isolated_spawn.rs:111`). The operator's
+> Rationale — the compile-time no-injection guarantee (the `argv` field of `SpawnPlan`,
+> `src/isolated_spawn.rs`). The operator's
 > label is not argv and does not weaken this.
 
 ### DeferredCapabilities
@@ -330,8 +331,8 @@ question, not a defect.
 | R-7, R-8, R-9 | `src/daemon/socket.rs:28-33` — routed `capture`, the 1:1 template, incl. its explicit REQ-MBR-C-005 satisfaction note | A |
 | R-10, R-11 | `src/paths.rs:235-237`, `:264`; `src/refresh.rs:952`, `:962`; `src/login.rs:338` | A |
 | R-12 | Inferred from the socket's request/reply shape vs a ~180 s command | **C** (inference) |
-| R-13 | `src/isolated_spawn.rs:67-71` (the scrub list, read directly) + a static read of the shipping Claude Code binary's `authLogin` short-circuit | A / **C** |
-| R-14 | `src/isolated_spawn.rs:111` | A |
+| R-13 | `SPAWN_ENV_REMOVE` in `src/isolated_spawn.rs` (the scrub list, read directly) + a static read of the shipping Claude Code binary's `authLogin` short-circuit | A / **C** |
+| R-14 | `SpawnPlan::argv` in `src/isolated_spawn.rs` | A |
 | R-15, R-16 | #999 + `src/cli.rs:4549-4611`; `src/migration.rs:67-69`, `:809-819`; `src/cli.rs:4370-4374` | A |
 | R-17 | `scripts/check-menubar-zero-egress.sh` — absence of both names from either list | A |
 | Login is routable at all | Empirical spike, Claude Code 2.1.220, 2026-07-31 → **ADR-0032** | A |
@@ -380,8 +381,9 @@ harvested).
 
 R-13 and R-17 deserve explicit note: neither was asked for, and both **block** work rather than
 enabling it. They are included because the ruling's direction makes their absence dangerous — R-13
-turns an inert scrub gap into a wrong-account credential write the moment argv changes, and R-17
-leaves the gate blind to exactly the APIs a login feature invites. Both are cheap.
+closes a scrub gap whose refresh-token half is inert today and becomes a wrong-account credential
+write the moment argv changes, and R-17 leaves the gate blind to exactly the APIs a login feature
+invites. Both are cheap.
 
 ## Change Log
 
