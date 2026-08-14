@@ -174,9 +174,16 @@ final class StatusItemChromeTests: XCTestCase {
     // MARK: - Panel geometry: clamp ORDER on an over-wide panel (pinned, not fixed)
 
     // `min(max(x, lo), hi)` resolves to `hi` when `hi < lo` — i.e. a panel wider than the visible frame
-    // minus both insets ends up hanging off the LEFT edge, not the right. Unreachable at shipped sizes
-    // (a ~360 pt panel against a ≥1280 pt display), so this pins the behaviour rather than "fixing" a
-    // state no operator can reach. If the panel ever becomes width-flexible, this test is the tripwire.
+    // minus both insets ends up hanging off the LEFT edge, not the right. Still unreachable at shipped
+    // sizes, so this pins the behaviour rather than "fixing" a state no operator can reach — but on a
+    // RE-MEASURED ground, because the tripwire this note used to promise has already fired. The panel
+    // became width-flexible with issue #756 (`PanelMetrics.scaledWidth`, applied at the root
+    // `.frame(width:)`), so the "~360 pt panel" cited here before was the DEFAULT size class only. At
+    // `PanelTypeScale.ceiling` it measures 894.50 pt, against the 1264 pt a 1280-pt-wide display leaves
+    // after both insets — 1280 × 800 being the default of the narrowest Mac this app's macOS 13 deployment
+    // target supports (the 12-inch MacBook, 2017; `StatusPanelFormat.smallestPlausibleDisplayHeight` carries
+    // the assumption). `PanelCeilingFitTests` (issue #983) is what now holds the widest panel this app can
+    // render to that precondition, so this test pins the CLAMP ORDER and that suite pins the reachability.
     func testAnOverWidePanelResolvesToTheRightBoundByClampOrder() {
         let narrowScreen = NSRect(x: 0, y: 0, width: 300, height: 900)
         let icon = NSRect(x: 150, y: 900, width: 24, height: 24)

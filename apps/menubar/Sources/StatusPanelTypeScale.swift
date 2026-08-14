@@ -71,6 +71,24 @@
 // and is re-measured here at `f66a341`; the panel's own height at the ceiling is now its 856 pt budget,
 // and 1300.50 is what the tab's CONTENT comes to inside the boundary.)
 //
+// THE CEILING FITS, and that is now a measurement rather than a property of this paragraph. Issue #983
+// asked whether the panel AT `.accessibility3` lands on a screen — a question the numbers above state
+// without answering, since a width with nothing to compare it to is not a verdict. `PanelCeilingFitTests`
+// renders all 22 harness states at the ceiling and puts the footprint against the smallest display this
+// app's deployment target PLAUSIBLY presents (1440 × 900 pt): 894.50 pt wide against 1424 pt of room, and
+// at or under the 856 pt height budget, with the app's own `StatusItemChrome.panelFrame` placing the result
+// wholly on-screen from every status-item position. Read the height half as BOUNDED AND SCROLLABLE, never
+// as fits-without-scrolling — sixteen of the twenty-two states are at the bound here.
+//
+// PLAUSIBLY, not "the smallest it presents" — the word carries a real limit and dropping it overstates the
+// verdict. macOS 13 also supports the 12-inch MacBook (2017), which defaults to 1280 × 800 pt. The WIDTH
+// verdict above is untouched by that (894.50 pt clears 1280 pt too); the HEIGHT verdict is the 1440 × 900
+// display's alone, which is #818's fixed budget behaving as RECORDED rather than a gap in this measurement.
+// RECORDED, NOT RATIFIED — `design/README.md` § The scroll boundary (#818) carries that bound as DECIDED
+// IN CODE, PENDING RATIFICATION, and `StatusPanelFormat` says the same beside the constant. Issue #1176
+// carries deriving the budget from the live screen. `smallestPlausibleDisplayHeight` owns the full
+// statement of the assumption; this paragraph must not restate it more strongly than that one does.
+//
 // The popover-height ceiling that used to sit alongside this one was a PRE-EXISTING, orthogonal limit — a
 // long enough roster overflowed at the default text size too — and it is now FIXED rather than merely
 // tracked: issue #818 bounds the panel at `StatusPanelFormat.panelHeightBudget` and puts each state's
