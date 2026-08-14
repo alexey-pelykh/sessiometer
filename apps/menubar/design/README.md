@@ -761,7 +761,8 @@ menu-bar chrome, and `main.swift` is top-level entry code that cannot live in a 
 
 Here is where every surface of those two files went. **25 rows: 9 covered by this item, 6 already covered
 elsewhere (one of those with an OS-wiring half that only a human can see, so it also appears below), 8
-routed to the 8-step manual checklist below, and 2 filed as defects.** Nothing is left silent.
+routed to the 8-step manual checklist below, 1 closed since by issue #850, and 1 still filed as a
+defect.** Nothing is left silent.
 
 | Surface | Disposition |
 |---|---|
@@ -788,7 +789,7 @@ routed to the 8-step manual checklist below, and 2 filed as defects.** Nothing i
 | `start()` presentation-stream consumption + its idempotence guard | Manual, step 1 |
 | Activation policy (`.accessory`), `applicationWillTerminate` | Manual, step 7 |
 | Notifier-before-`store.start` ordering | Manual, step 5 |
-| Tool flag with no output directory falls through to a normal launch | Filed: issue #850 |
+| Tool flag with no output directory → report + non-zero exit | Since: `AppLaunchPlanTests` (#850) |
 | Control-client `.failure → nil` degrade mapping (×4 call sites) | Filed: issue #853 |
 
 Two rows deserve their reasoning stated, because both were originally mis-filed here and the correction

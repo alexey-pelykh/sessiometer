@@ -21,7 +21,8 @@ import Foundation
 
 /// How this process was launched. The three tool modes are DEBUG-only design/parity instruments — they
 /// render committable artefacts and then exit (or, for the gallery, stand up bare status items and wire
-/// nothing else). A release build has exactly one mode, `.normal`.
+/// nothing else); `.toolFlagMissingDirectory` is the DEBUG-only REFUSAL that answers a tool flag supplied
+/// without the directory it needs. A release build has exactly one mode, `.normal`.
 enum AppLaunchMode: Equatable {
     /// `--render-panel <dir>` (#355/#754) — render the panel fixtures to PNGs for the design-parity
     /// oracle, then exit. Never wires the status item.
@@ -29,6 +30,9 @@ enum AppLaunchMode: Equatable {
     /// `--render-bar-glyphs <dir>` (#525) — render every status-item glyph as it appears in the bar
     /// (template-tinted, per appearance, @1x + @2x, plus menu-open), then exit.
     case renderBarGlyphs(outputDirectory: String)
+    /// A tool flag supplied as the LAST argument, with no output directory after it (#850) — there is
+    /// nothing to render, so the app reports the mistake on stderr and exits non-zero instead of launching.
+    case toolFlagMissingDirectory(flag: String)
     /// `SESSIOMETER_GLYPH_GALLERY=1` (#437) — install one real `NSStatusItem` per `StatusGlyph` and wire
     /// nothing else, so on-device shape-distinctness can be captured from ACTUAL status items. Unlike the
     /// render modes the app keeps RUNNING afterwards, so the items stay live to screenshot.
@@ -62,14 +66,22 @@ enum AppLaunchPlan {
 
     /// Resolve the launch mode from process state.
     ///
-    /// Precedence — `--render-panel`, then `--render-bar-glyphs`, then the gallery environment variable,
-    /// then normal — is the pre-extraction `AppDelegate` dispatch order, preserved. This function is now
-    /// the ONLY place it is expressed: the delegate switches on an already-resolved mode, so its case
-    /// order says nothing. Order is observable when more than one is supplied, so it is pinned by test.
+    /// Precedence — `--render-panel`, then `--render-bar-glyphs`, then a tool flag MISSING its output
+    /// directory, then the gallery environment variable, then normal — is the pre-extraction `AppDelegate`
+    /// dispatch order with issue #850's refusal rung inserted. This function is the ONLY place it is
+    /// expressed: the delegate switches on an already-resolved mode, so its case order says nothing. Order
+    /// is observable when more than one is supplied, so it is pinned by test.
     ///
     /// A render flag needs a FOLLOWING argument to be a render mode. Supplied as the last argument it has
-    /// no output directory, and dispatch falls through — see `toolFlagMissingDirectory` for the honesty
-    /// problem that creates, which this function reports rather than papers over.
+    /// none, and resolves to `.toolFlagMissingDirectory` — see `missingDirectoryFlag`.
+    ///
+    /// That rung sits BELOW both well-formed render modes and ABOVE the gallery, deliberately. A
+    /// well-formed higher-precedence flag still wins, so `--render-panel p --render-bar-glyphs` renders the
+    /// panel exactly as it always did and nothing that worked stops working. But an EXPLICIT malformed flag
+    /// outranks the AMBIENT gallery opt-in: letting a `SESSIOMETER_GLYPH_GALLERY=1` inherited from a shell
+    /// profile turn a mistyped `--render-panel` into a gallery launch is the same silent-wrong-mode
+    /// dishonesty as turning it into a normal launch, and the gallery does not exit either — so a script
+    /// waiting for a render would still hang.
     static func mode(arguments: [String],
                      environment: [String: String],
                      toolModesAvailable: Bool) -> AppLaunchMode {
@@ -81,25 +93,44 @@ enum AppLaunchPlan {
         if let directory = directoryArgument(after: renderBarGlyphsFlag, in: arguments) {
             return .renderBarGlyphs(outputDirectory: directory)
         }
+        if let flag = missingDirectoryFlag(in: arguments) {
+            return .toolFlagMissingDirectory(flag: flag)
+        }
         if environment[glyphGalleryEnvironmentKey] == glyphGalleryEnabledValue {
             return .glyphGallery
         }
         return .normal
     }
 
-    /// Whether a tool flag was supplied WITHOUT the output directory it needs — the case `mode(...)`
-    /// resolves to `.normal`, which means a mistyped `--render-panel` silently launches the real app and
-    /// installs a live status item instead of reporting the missing argument.
+    /// The tool flag supplied WITHOUT the output directory it needs, or `nil` when none was. `mode(...)`
+    /// resolves this to `.toolFlagMissingDirectory`, which `main.swift` reports via
+    /// `missingDirectoryMessage` before exiting `missingDirectoryExitCode` (issue #850). Until #850 it
+    /// resolved to `.normal` instead, so a mistyped `--render-panel` silently launched the real app and
+    /// installed a live status item rather than reporting the missing argument.
     ///
-    /// Exposed as its own predicate so the condition is nameable and assertable even though dispatch does
-    /// not yet act on it. Filed as issue #850 rather than changed under an issue #764 coverage item:
-    /// acting on it is a behaviour change to the app's CLI surface, not coverage.
-    static func toolFlagMissingDirectory(arguments: [String]) -> Bool {
+    /// It returns the FLAG rather than a bare yes/no so the report can name the one the operator actually
+    /// mistyped. At most one flag can ever be in this state, so that answer is unambiguous: only the LAST
+    /// argument satisfies `index + 1 >= count`, and there is exactly one last argument.
+    static func missingDirectoryFlag(in arguments: [String]) -> String? {
         for flag in [renderPanelFlag, renderBarGlyphsFlag] {
-            if let index = arguments.firstIndex(of: flag), index + 1 >= arguments.count { return true }
+            if let index = arguments.firstIndex(of: flag), index + 1 >= arguments.count { return flag }
         }
-        return false
+        return nil
     }
+
+    /// The operator-facing sentence for a tool flag supplied without its output directory, written to
+    /// stderr by `main.swift`. Like `degradeReason` it is a plain value so it can be asserted from the
+    /// headless bundle — `main.swift` cannot be. It names the flag the operator actually mistyped and the
+    /// shape it wants, and nothing they cannot act on: no path, no issue number, no internal vocabulary.
+    /// The trailing newline belongs to the writer, not to the sentence.
+    static func missingDirectoryMessage(flag: String) -> String {
+        "\(flag): missing output directory (usage: \(flag) <dir>)"
+    }
+
+    /// The exit status for that refusal. Non-zero is what makes a script notice at all; `EX_USAGE`
+    /// (sysexits.h) additionally says WHICH kind of failure, so a caller can tell a malformed invocation
+    /// from a render that ran and failed.
+    static let missingDirectoryExitCode: Int32 = EX_USAGE
 
     /// The argument following `flag`, or `nil` when the flag is absent or is the last argument. Both
     /// quirks below are the pre-extraction `arguments[idx + 1]` behaviour, preserved deliberately rather
