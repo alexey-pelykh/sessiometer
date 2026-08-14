@@ -2674,73 +2674,121 @@ fn red_line(body: &str, emphasize: bool) -> String {
     severity_line(body, Severity::Red, emphasize)
 }
 
-/// The daemon-level payload faults (ADR-0026): faults that ride ALONGSIDE a healthy roster, which no
-/// per-account `AUTH` cell reflects — the shared vault is one item and the refresh mechanism is one
-/// process, so neither has a row to live on. Enumerated ONCE here so their cross-surface severity
-/// RANK has a single home; #575 caught the CLI and the menubar panel ranking them in OPPOSITE order
-/// precisely because each render site re-derived the rank independently.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DaemonPayloadFault {
-    /// #498 — the login keychain is LOCKED, the shared credential is UNREADABLE.
-    KeychainLocked,
-    /// #469 — the shared credential is readable but EMPTIED and auto-recovery gave up.
-    CanonicalScrubExhausted,
-    /// #714 — the behavioral canary found identity DRIFT (the resolved credential
-    /// byte-matches a DIFFERENT account's stash than the displayed active) and the
-    /// override is off: credential writes are REFUSED until cleared.
-    CanaryDriftRefusing,
-    /// #714 — the canary's fresh resolution probe found MORE THAN ONE matching
-    /// keychain item: no unique write target, credential writes REFUSED (no override).
-    CanaryAmbiguous,
-    /// #730/#738 — the resolved canonical matches NO stash AND parses as no Claude Code
-    /// credential, so it is overwhelmingly an UNRELATED secret: credential writes are
-    /// REFUSED rather than clobber it. Act-now, like its two siblings above.
-    ///
-    /// Declared last of the three purely as a CONVENTION: the canary reports ONE verdict
-    /// at a time, so no snapshot can hold this and a drift together and nothing here ever
-    /// arbitrates between them. What the position does buy is a stable reading order for
-    /// the band — the two above are POSITIVE identity failures (a known-wrong match, a
-    /// broken uniqueness rule) while this is the precautionary "unrecognized item, refuse
-    /// to overwrite" case. Only the cross-FAULT edges are real arbitration (the vault pair
-    /// above, systemic below), and those are what the rank tests exercise.
-    CanaryRefusedUnparseableCanonical,
-    /// #378 — the refresh MECHANISM is down (N consecutive all-error sweeps).
-    SystemicRefreshFailure,
-    /// #714 — identity DRIFT stands but `canary_drift_override` lets writes proceed
-    /// (each logged): a standing, operator-acknowledged alarm, not a block.
-    CanaryDriftOverridden,
-    /// #469 — scrubbed, but the daemon is adopting a live account back; may self-heal.
-    CanonicalScrubRecovering,
+/// Declare `DaemonPayloadFault` and its `ALL` rank list from ONE set of tokens (issue #919).
+///
+/// `ALL` is the single home of the cross-surface severity RANK (ADR-0026): the parity module's
+/// `manifest_from_source` builds `daemon_fault_ranks` and `arbitration_edges` from it,
+/// `build/fixtures/cross-surface-severity.json` is emitted from that, and the panel's
+/// `CrossSurfaceSeverityParityTests` walks whatever the manifest holds. While that list was a
+/// hand-written literal, the enum and the list were two places that had to agree and nothing made
+/// them: a new variant is a compile error in every total MATCH, but never in a list literal. A
+/// ninth fault added to the enum and to all three matches and NOT to the list was therefore
+/// invisible — unranked, with every gate green over the same 8-fault manifest, which is the issue
+/// #575 mechanism ADR-0026 exists to close.
+///
+/// Rust cannot enumerate a variant set on its own and the derive that would is a dependency this
+/// crate does not carry, so the variants are still spelled by hand — but only ONCE, with the list
+/// expanded from that spelling. Attributes ride through verbatim in both positions, which is what
+/// keeps each variant's #378/#469/#498/#714/#730/#738 provenance and reading-order rationale
+/// attached to the variant it explains, and keeps `ALL`'s own `#[cfg(test)]` at the declaration
+/// rather than buried in this expansion.
+///
+/// Deliberately NOT general — the one caller is directly below. `cross_surface_id` and `severity`
+/// stay outside it on purpose: they are total matches, which the compiler already makes
+/// exhaustive, and ordinary source is what `cargo fmt` formats.
+macro_rules! daemon_payload_faults {
+    (
+        $(#[$enum_meta:meta])*
+        enum $fault:ident {
+            $(
+                $(#[$variant_meta:meta])*
+                $variant:ident,
+            )+
+        }
+
+        $(#[$all_meta:meta])*
+        const ALL;
+    ) => {
+        $(#[$enum_meta])*
+        enum $fault {
+            $(
+                $(#[$variant_meta])*
+                $variant,
+            )+
+        }
+
+        impl $fault {
+            $(#[$all_meta])*
+            const ALL: &'static [Self] = &[$(Self::$variant,)+];
+        }
+    };
 }
 
-impl DaemonPayloadFault {
-    /// Every fault, in DECLARATION order — which IS the canonical worst-first rank (ADR-0026), the
-    /// same order [`render_status`] prints them in and the same order the panel's
+daemon_payload_faults! {
+    /// The daemon-level payload faults (ADR-0026): faults that ride ALONGSIDE a healthy roster,
+    /// which no per-account `AUTH` cell reflects — the shared vault is one item and the refresh
+    /// mechanism is one process, so neither has a row to live on. Enumerated ONCE here so their
+    /// cross-surface severity RANK has a single home; #575 caught the CLI and the menubar panel
+    /// ranking them in OPPOSITE order precisely because each render site re-derived the rank
+    /// independently.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum DaemonPayloadFault {
+        /// #498 — the login keychain is LOCKED, the shared credential is UNREADABLE.
+        KeychainLocked,
+        /// #469 — the shared credential is readable but EMPTIED and auto-recovery gave up.
+        CanonicalScrubExhausted,
+        /// #714 — the behavioral canary found identity DRIFT (the resolved credential
+        /// byte-matches a DIFFERENT account's stash than the displayed active) and the
+        /// override is off: credential writes are REFUSED until cleared.
+        CanaryDriftRefusing,
+        /// #714 — the canary's fresh resolution probe found MORE THAN ONE matching
+        /// keychain item: no unique write target, credential writes REFUSED (no override).
+        CanaryAmbiguous,
+        /// #730/#738 — the resolved canonical matches NO stash AND parses as no Claude Code
+        /// credential, so it is overwhelmingly an UNRELATED secret: credential writes are
+        /// REFUSED rather than clobber it. Act-now, like its two siblings above.
+        ///
+        /// Declared last of the three purely as a CONVENTION: the canary reports ONE verdict
+        /// at a time, so no snapshot can hold this and a drift together and nothing here ever
+        /// arbitrates between them. What the position does buy is a stable reading order for
+        /// the band — the two above are POSITIVE identity failures (a known-wrong match, a
+        /// broken uniqueness rule) while this is the precautionary "unrecognized item, refuse
+        /// to overwrite" case. Only the cross-FAULT edges are real arbitration (the vault pair
+        /// above, systemic below), and those are what the rank tests exercise.
+        CanaryRefusedUnparseableCanonical,
+        /// #378 — the refresh MECHANISM is down (N consecutive all-error sweeps).
+        SystemicRefreshFailure,
+        /// #714 — identity DRIFT stands but `canary_drift_override` lets writes proceed
+        /// (each logged): a standing, operator-acknowledged alarm, not a block.
+        CanaryDriftOverridden,
+        /// #469 — scrubbed, but the daemon is adopting a live account back; may self-heal.
+        CanonicalScrubRecovering,
+    }
+
+    /// Every fault, in DECLARATION order — which IS the canonical worst-first rank (ADR-0026),
+    /// the same order [`render_status`] prints them in and the same order the panel's
     /// `daemonFaultBanner` arbitrates in.
     ///
-    /// Hand-written, because Rust cannot enumerate a variant set without a derive this crate does
-    /// not carry — so be precise about what that costs. A ninth variant is a compile error in three
-    /// TOTAL matches ([`Self::severity`], [`Self::cross_surface_id`], and the one in
-    /// `cross_surface_rank_is_the_declaration_order`), which is what routes its author to this
-    /// list; and that test's count assertion reddens if a fault is DROPPED from the list. What
-    /// nothing catches is a variant added to the enum and to all three matches but never added
-    /// HERE: it would go unranked, and both gates would still read the same 8-fault manifest and
-    /// report green. Stating that boundary beats letting the list read as provably exhaustive.
+    /// GENERATED from the variant list above, by the `daemon_payload_faults!` invocation this
+    /// declaration sits inside (issue #919), so the enum and the rank are ONE declaration: a
+    /// variant cannot reach one without reaching the other. That is the property the hand-written
+    /// literal could not have, and its absence was the defect — a ninth fault added to the enum
+    /// and to every match but not to the list went unranked while all three gates read the same
+    /// 8-fault manifest and reported green.
+    ///
+    /// The compiler still does the rest: a new variant is an error in three TOTAL matches
+    /// ([`Self::severity`], [`Self::cross_surface_id`], and the one in
+    /// `cross_surface_rank_is_the_declaration_order`), so its author is still routed to state the
+    /// fault's band on every surface. What changed is that forgetting the LIST is no longer
+    /// expressible.
     ///
     /// Test-only: the shipping binary reaches each fault through its own renderer and never needs
     /// the list.
     #[cfg(test)]
-    const ALL: &'static [Self] = &[
-        Self::KeychainLocked,
-        Self::CanonicalScrubExhausted,
-        Self::CanaryDriftRefusing,
-        Self::CanaryAmbiguous,
-        Self::CanaryRefusedUnparseableCanonical,
-        Self::SystemicRefreshFailure,
-        Self::CanaryDriftOverridden,
-        Self::CanonicalScrubRecovering,
-    ];
+    const ALL;
+}
 
+impl DaemonPayloadFault {
     /// This fault's stable CROSS-SURFACE identifier (issue #768) — the name the committed
     /// `build/fixtures/cross-surface-severity.json` manifest and the menubar panel's parity gate
     /// both key on. Deliberately NOT a wire field: the wire carries `keychain_locked`,
@@ -16852,10 +16900,13 @@ impl Nested {
 
         #[test]
         fn cross_surface_rank_is_the_declaration_order() {
-            // `ALL` is hand-written, so this is the guard that it is actually EXHAUSTIVE: the
-            // match below is total, so a ninth variant fails to compile until it is added to the
-            // arm list, and the count assertion catches a variant added to the enum and to this
-            // match but forgotten in `ALL`.
+            // `ALL` is generated from the enum's own variant list (issue #919), so
+            // EXHAUSTIVENESS is no longer this test's to guard — a variant that is not in the list
+            // is a variant that was never declared. What is still this test's: the BAND each fault
+            // ranks at, pinned by the total match below, which a ninth variant fails to compile
+            // until it answers; and the two SHAPE tripwires — a duplicated id, and the count,
+            // which is a degenerate-subject guard first (an emptied list passes every assertion
+            // inside the loop) and the re-emit-the-manifest prompt second.
             let mut seen = std::collections::BTreeSet::new();
             for fault in DaemonPayloadFault::ALL {
                 assert!(
@@ -16886,8 +16937,8 @@ impl Nested {
                 seen.len(),
                 8,
                 "DaemonPayloadFault::ALL lists {} faults, expected 8 — the daemon-payload fault \
-                 set changed shape. Add (or drop) the variant in ALL, then re-emit the manifest so \
-                 the panel is handed the new rank",
+                 set changed shape. Re-emit the manifest so the panel is handed the new rank, then \
+                 update this count",
                 seen.len()
             );
         }
