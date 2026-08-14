@@ -2527,7 +2527,6 @@ mod tests {
         // the config itself produced, and it is unique by construction (`config::validate`
         // rejects a duplicated uuid — only LABELS are un-unique, which is why R-6a is about
         // labels). Refusing on ambiguity here would refuse on an impossible condition.
-        ("account_listed_in", NotHandleResolution, "the `[refresh].accounts` allowlist membership rule — a config-supplied set, and a duplicated label there legitimately admits BOTH bearers"),
         ("apply_refresh_observation", NotHandleResolution, "matches a poll observation's own account-uuid back to its roster index"),
         ("apply_refresh_restore", NotHandleResolution, "matches a restore outcome's account-uuid back to its roster index"),
         ("is_active", NotHandleResolution, "compares an account's uuid to the ACTIVE uuid `active.rs` read from the credential"),
@@ -2540,6 +2539,21 @@ mod tests {
         ("restash_account", NotHandleResolution, "compares a roster account's uuid to the displayed credential's before restashing"),
         ("stash", NotHandleResolution, "`Account::stash` DERIVES the keychain key from the uuid — a formatting read with no comparison, so there is nothing here to resolve first-match-wins"),
         ("run_sweep", NotHandleResolution, "the refresh sweep's per-account uuid membership checks, plus the handles its events carry"),
+        // --- a MEMBERSHIP test, which takes no match at all ------------------------------------
+        //
+        // Held out of the SYSTEM-supplied section above, whose reasoning is false here on all
+        // three of its clauses (issue #1243): the string an operator typed into
+        // `[refresh].accounts` is a handle THEY supplied, not one the daemon, the OAuth capture
+        // or the config produced; it may be a `list` LABEL as readily as an account-uuid —
+        // `config::RefreshConfig` documents an entry as either — so uniqueness by construction
+        // does not hold; and there is no first match to be correct about, because nothing is
+        // selected. That last clause is the whole reason this is not resolution: the read folds
+        // to a bool rather than an index, so a duplicated label legitimately admits BOTH bearers
+        // instead of one of them silently winning. `COMPARING_READERS` asks the second question
+        // of the same function and lands in the same place, naming the shape "test membership
+        // and select nothing at all"; a reader auditing THIS register alone should not come away
+        // with a different answer, which is what filing it above did.
+        ("account_listed_in", NotHandleResolution, "the `[refresh].accounts` allowlist membership rule — a config-supplied set, and a duplicated label there legitimately admits BOTH bearers"),
         // --- a handle read off an ALREADY-RESOLVED account or index ----------------------------
         //
         // The index came from the daemon's own scheduler, from an enumeration of the whole
