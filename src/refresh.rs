@@ -209,7 +209,7 @@ use zeroize::Zeroizing;
 
 use crate::error::Result;
 use crate::isolated_spawn::{ClaudeRefresh, IsolatedSession, SpawnClaude};
-use crate::keychain::{Credential, IsolatedKeychain};
+use crate::keychain::{Credential, IsolatedKeychain, IsolatedServiceReaper};
 use crate::paths;
 use crate::stash::{AccountStash, StashedAccount};
 use crate::swap::{SwapLock, SWAP_LOCK_MAX_WAIT};
@@ -884,13 +884,19 @@ pub(crate) async fn stored_credential_clocks<S: AccountStash>(
 /// in flight, so any isolated artifact belonging to a roster account is — by
 /// construction — such an orphan, safe to delete.
 ///
-/// For each `account_uuid` the reap reconstructs the EXACT `(item, dir)` pair
-/// [`refresh_account`] creates — an `IsolatedKeychainItem` over
-/// [`paths::isolated_refresh_dir`] — reusing the #100/#102 derivation verbatim rather
-/// than re-deriving a (possibly divergent) normalization, so it addresses precisely the
-/// engine's own items. Because the only keychain service it ever names is that
-/// roster-derived one, it can never touch another `CLAUDE_CONFIG_DIR` profile the user
-/// runs (the issue's safety AC).
+/// For each `account_uuid` the reap derives the EXACT service
+/// [`refresh_account`]'s items live under — [`paths::isolated_refresh_dir`] through the
+/// #100/#102 derivation verbatim, never a re-derived (possibly divergent)
+/// normalization — and sweeps every item beneath it. Because the only keychain service
+/// it ever names is that roster-derived one, it can never touch another
+/// `CLAUDE_CONFIG_DIR` profile the user runs (the issue's safety AC).
+///
+/// It names a service and NO `acct`. The crashed process seeded under an `acct` this
+/// one cannot re-derive — since issue #711 that derivation is `$USER`-first rather than
+/// uid-derived, so a `$USER` that changed between the two processes yields a different
+/// name at the same uid, and a delete under it would return `errSecItemNotFound` and be
+/// swallowed as success while the credential stayed. Enumerating the service instead is
+/// `$USER`-independent (issue #769 — [`IsolatedServiceReaper`]).
 ///
 /// Best-effort, like teardown: a per-account failure (a momentarily-locked keychain, an
 /// FS error) is logged and the sweep moves on — a reap failure must never block the
@@ -905,29 +911,36 @@ pub(crate) async fn reap_orphans(account_uuids: &[String]) {
     }
 }
 
-/// Reap one account's isolated-refresh orphan: delete its isolated keychain item and
-/// remove its dir, reconstructing both exactly as [`refresh_account`] does so the
-/// targets are byte-identical to the artifacts the engine creates.
+/// Reap one account's isolated-refresh orphan: sweep every isolated keychain item
+/// under the account's own service and remove its dir, deriving that service exactly
+/// as [`refresh_account`] does so the target is the engine's own artifacts and no
+/// others.
+///
+/// Addressed by SERVICE, never by `(service, acct)`: the item was seeded by a process
+/// that has since died, so the `acct` it was seeded under is not this process's to
+/// re-derive (issue #769 — see [`IsolatedServiceReaper`]).
 async fn reap_orphan(account_uuid: &str) -> Result<()> {
     let iso_dir = paths::isolated_refresh_dir(account_uuid)?;
-    let item = crate::keychain::IsolatedKeychainItem::new(iso_dir.as_os_str())?;
-    reap_isolated(&item, &iso_dir).await
+    let reaper = crate::keychain::IsolatedService::new(iso_dir.as_os_str())?;
+    reap_isolated(&reaper, &iso_dir).await.map(drop)
 }
 
-/// Delete an isolated keychain `item` and remove its `dir` (issue #103). Generic over
-/// the [`IsolatedKeychain`] seam so the hermetic tests drive a fake and the macOS
-/// real-CLI test drives a throwaway-keychain item, while production passes the real
-/// item + dir from [`reap_orphan`].
+/// Sweep an isolated service's keychain items and remove its `dir` (issue #103),
+/// returning how many items were deleted. Generic over the [`IsolatedServiceReaper`]
+/// seam so the hermetic tests drive a fake and the macOS real-CLI test drives a
+/// throwaway keychain, while production passes the real reaper + dir from
+/// [`reap_orphan`].
 ///
-/// Both deletes are idempotent — an already-absent item ([`delete`](IsolatedKeychain::delete)
-/// maps `errSecItemNotFound` to `Ok`) and an already-absent dir are each success, so a
-/// non-orphaned account is a clean no-op. Both are ATTEMPTED regardless of the other's
-/// outcome — they are independent orphans, so a momentarily-locked keychain must not
-/// strand the dir — and the first error (if any) is surfaced for the caller's log.
-async fn reap_isolated<K: IsolatedKeychain>(item: &K, dir: &Path) -> Result<()> {
-    let item_result = item.delete().await;
+/// Both halves are idempotent — a service with no items left and an already-absent
+/// dir are each success — so a non-orphaned account is a clean `Ok(0)` no-op. Both
+/// are ATTEMPTED regardless of the other's outcome (they are independent orphans, so
+/// a momentarily-locked keychain must not strand the dir) and the first error, if
+/// any, is surfaced for the caller's log — item error first, matching the order the
+/// two are attempted in.
+async fn reap_isolated<R: IsolatedServiceReaper>(reaper: &R, dir: &Path) -> Result<usize> {
+    let reap_result = reaper.reap().await;
     let dir_result = remove_dir_if_present(dir);
-    item_result.and(dir_result)
+    reap_result.and_then(|deleted| dir_result.map(|()| deleted))
 }
 
 /// Remove `dir` and its contents, treating an already-absent dir as success — the FS
@@ -956,8 +969,8 @@ const LOGIN_REAP_RETRY_WAIT: Duration = Duration::from_millis(100);
 /// **0700** login dir ([`paths::isolated_login_dir`], `<support>/login`) and RAII-tears both down on
 /// every graceful exit — but a SIGKILL / power-loss leaves that credential-bearing item + dir
 /// stranded. This sweeps that one login isolation root: derive its #100-suffixed service EXACTLY as
-/// the engine does ([`IsolatedKeychainItem::new`](crate::keychain::IsolatedKeychainItem::new)) and
-/// reap the matching item + dir.
+/// the engine does ([`service_for_config_dir`](crate::keychain::service_for_config_dir)) and reap
+/// every item under it, plus the dir.
 ///
 /// **Scan-based, NOT roster-derived**: a fresh login discovers its account only AFTER it completes,
 /// so a crashed login's orphan is keyed by no roster uuid — the fixed login dir is the sole target
@@ -967,40 +980,44 @@ const LOGIN_REAP_RETRY_WAIT: Duration = Duration::from_millis(100);
 /// different suffix. It never enumerates the keychain by a `Claude Code-credentials-*` prefix.
 ///
 /// Best-effort with retry (a per-start failure is logged and retried on the next daemon / `login`
-/// start); a genuinely-stranded root is logged when swept — deliberately not phrased as a confirmed
-/// reap, since the item delete cannot distinguish "deleted" from "already absent" and the
-/// `$USER`-derived `acct` (issue #711) is no longer uid-stable across processes (issue #769) — and
-/// the common clean-start case is silent. Run at daemon start (in `cli`, beside [`reap_orphans`])
-/// and at `login` start (in [`crate::login`]).
+/// start), and the common clean-start case is silent. Run at daemon start (in `cli`, beside
+/// [`reap_orphans`]) and at `login` start (in [`crate::login`]).
 pub(crate) async fn reap_login_orphan() {
     if let Err(err) = reap_login_orphan_inner().await {
         eprintln!("sessiometer: isolated-login orphan reap skipped: {err}");
     }
 }
 
-/// The fallible body of [`reap_login_orphan`], separated so the thin wrapper owns the single log
-/// site (mirrors [`reap_orphans`] → [`reap_orphan`]). Reconstructs the isolated item under the fixed
-/// login dir EXACTLY as the engine does, so the reaped item is byte-identical to the artifact a
-/// crashed login left.
+/// The fallible body of [`reap_login_orphan`], separated so the thin wrapper owns the single
+/// failure log site (mirrors [`reap_orphans`] → [`reap_orphan`]). Derives the login service exactly
+/// as the engine does, so the swept items are the artifacts a crashed login left.
 async fn reap_login_orphan_inner() -> Result<()> {
     let iso_dir = paths::isolated_login_dir()?;
-    // A PRESENT login dir means a crashed login stranded an orphan (a graceful teardown / clean
-    // shutdown removed it). Captured PRE-reap and used ONLY to keep the common clean-start case
-    // silent — the reap is attempted regardless (hence a presence-probe hiccup degrades to `false`,
-    // never skips the delete), so a dir-gone/item-stranded tail (a prior reap that removed the dir
-    // but failed the item delete) is still cleaned.
+    // A PRESENT login dir means a crashed login stranded a root (a graceful teardown / clean
+    // shutdown removed it). Captured PRE-reap because the reap itself removes the dir, and used
+    // ONLY to keep the common clean-start case silent — the reap is attempted regardless (hence a
+    // presence-probe hiccup degrades to `false`, never skips the sweep), so a dir-gone/item-stranded
+    // tail (a prior reap that removed the dir but failed the item delete) is still cleaned.
     let stranded = iso_dir.try_exists().unwrap_or(false);
-    let item = crate::keychain::IsolatedKeychainItem::new(iso_dir.as_os_str())?;
-    reap_login_isolated(&item, &iso_dir).await?;
-    if stranded {
-        // "swept", not "reaped": the item delete treats an already-absent item as
-        // success (exit 44), so a clean return does NOT prove an item was deleted.
-        // Since issue #711 the `acct` is `$USER`-derived rather than uid-stable, so a
-        // `$USER` that changed between the crashed process and this one addresses a
-        // different name and the delete is a silent no-op — claiming a reap here
-        // would be an operator-facing false success. Closing that addressing gap
-        // (reap by enumerating the service, which is `$USER`-independent) is tracked
-        // as issue #769; this line only refuses to overstate what it knows.
+    let reaper = crate::keychain::IsolatedService::new(iso_dir.as_os_str())?;
+    let deleted = reap_login_isolated(&reaper, &iso_dir).await?;
+    // Two claims of different strength, and never the stronger one on weaker evidence.
+    //
+    // A confirmed reap is now sayable: the sweep enumerates the service and reports what it
+    // actually deleted (issue #769), so a non-zero count IS a credential-bearing item removed. It
+    // is reported whether or not the dir was there — the dir-gone/item-stranded tail is precisely
+    // the state the pre-#769 reaper left behind, and it deserves a line rather than silence.
+    //
+    // A zero count is NOT reported as "nothing was stranded". Zero also arises when a retry ran
+    // after an earlier attempt had already deleted something (that attempt's count is lost with its
+    // error), so the weaker "swept the root" — which claims only what the pre-reap probe saw — is
+    // all a zero count supports.
+    if deleted > 0 {
+        eprintln!(
+            "sessiometer: reaped a stranded isolated-login orphan under {} ({deleted} keychain item deleted)",
+            iso_dir.display()
+        );
+    } else if stranded {
         eprintln!(
             "sessiometer: swept the stranded isolated-login root under {}",
             iso_dir.display()
@@ -1009,19 +1026,19 @@ async fn reap_login_orphan_inner() -> Result<()> {
     Ok(())
 }
 
-/// The retrying login-orphan reap core — generic over the [`IsolatedKeychain`] seam so the hermetic
-/// tests drive fakes (a multi-item keychain for the sibling-untouched safety AC, a flaky one for the
-/// retry) with zero real keychain. Retries the whole [`reap_isolated`] — both halves are idempotent,
-/// so re-running after a partial success is safe — up to [`LOGIN_REAP_RETRIES`] attempts; the last
-/// outcome is surfaced for the caller's log.
-async fn reap_login_isolated<K: IsolatedKeychain>(item: &K, dir: &Path) -> Result<()> {
-    let mut result = reap_isolated(item, dir).await;
+/// The retrying login-orphan reap core — generic over the [`IsolatedServiceReaper`] seam so the
+/// hermetic tests drive fakes (a multi-item keychain for the sibling-untouched safety AC, a flaky
+/// one for the retry) with zero real keychain. Retries the whole [`reap_isolated`] — both halves are
+/// idempotent, so re-running after a partial success is safe — up to [`LOGIN_REAP_RETRIES`]
+/// attempts; the last outcome, including its deleted count, is surfaced for the caller.
+async fn reap_login_isolated<R: IsolatedServiceReaper>(reaper: &R, dir: &Path) -> Result<usize> {
+    let mut result = reap_isolated(reaper, dir).await;
     for _ in 1..LOGIN_REAP_RETRIES {
         if result.is_ok() {
             break;
         }
         tokio::time::sleep(LOGIN_REAP_RETRY_WAIT).await;
-        result = reap_isolated(item, dir).await;
+        result = reap_isolated(reaper, dir).await;
     }
     result
 }
@@ -1733,11 +1750,99 @@ mod tests {
     // `crate::isolated_spawn` (#131). The cycle's teardown-on-error is still covered here by
     // `a_hard_failure_still_tears_down_the_isolated_session`.
 
-    // --- orphan reap (#103): SIGKILL / power-loss leaves no live isolated item ----
+    // --- orphan reap (#103 / #133): SIGKILL / power-loss leaves no live isolated item ----
     //
     // Teardown (above) covers graceful exit; the reap covers the gap teardown CANNOT —
     // a crashed cycle whose `Drop` never ran. `reap_isolated` is the generic core,
     // driven by the fake seam here and the real `/usr/bin/security` CLI in `real_cli`.
+
+    /// The shared item map behind [`FakeKeychainWorld`] and its reaper views: the
+    /// `(service, acct)` pair every generic-password item is addressed by, to its blob.
+    type FakeItems = Rc<RefCell<std::collections::BTreeMap<(String, String), Vec<u8>>>>;
+
+    /// A keychain modeled as `(service, acct) -> blob`, plus per-service REAPER views — the
+    /// fake behind every hermetic reap test.
+    ///
+    /// Keying on the PAIR rather than the service alone is the point (issue #769). The real
+    /// `security` addresses a generic-password item by both, so an item seeded under one
+    /// `acct` is simply not reachable by a delete naming another — `errSecItemNotFound`,
+    /// which the isolated teardown maps to success. A fake keyed by service alone cannot
+    /// express that miss at all, so it would pass whether or not the reaper re-derived a
+    /// name, and every reap test built on it would be vacuous.
+    #[derive(Clone, Default)]
+    struct FakeKeychainWorld {
+        items: FakeItems,
+    }
+
+    impl FakeKeychainWorld {
+        fn seed(&self, service: &str, acct: &str, blob: &[u8]) {
+            self.items
+                .borrow_mut()
+                .insert((service.to_string(), acct.to_string()), blob.to_vec());
+        }
+        fn has(&self, service: &str, acct: &str) -> bool {
+            self.items
+                .borrow()
+                .contains_key(&(service.to_string(), acct.to_string()))
+        }
+        /// How many items sit under `service`, whatever `acct` each carries.
+        fn count_under(&self, service: &str) -> usize {
+            self.items
+                .borrow()
+                .keys()
+                .filter(|(svc, _)| svc == service)
+                .count()
+        }
+        fn reaper(&self, service: &str) -> FakeServiceReaper {
+            FakeServiceReaper {
+                service: service.to_string(),
+                items: self.items.clone(),
+                fails_left: RefCell::new(0),
+            }
+        }
+        /// A reaper whose first `fails` sweeps report a locked keychain before touching
+        /// anything — the transient-lock case the login reap retries past.
+        fn flaky_reaper(&self, service: &str, fails: u32) -> FakeServiceReaper {
+            FakeServiceReaper {
+                service: service.to_string(),
+                items: self.items.clone(),
+                fails_left: RefCell::new(fails),
+            }
+        }
+    }
+
+    /// A service-scoped reaper over a [`FakeKeychainWorld`]: deletes EVERY `acct` under its
+    /// one service and reports the count, modeling what the real `IsolatedService` does with
+    /// a `dump-keychain` enumeration plus one delete per match.
+    struct FakeServiceReaper {
+        service: String,
+        items: FakeItems,
+        fails_left: RefCell<u32>,
+    }
+
+    impl IsolatedServiceReaper for FakeServiceReaper {
+        async fn reap(&self) -> Result<usize> {
+            {
+                let mut fails_left = self.fails_left.borrow_mut();
+                if *fails_left > 0 {
+                    *fails_left -= 1;
+                    return Err(Error::KeychainLocked {
+                        op: "isolated reap delete",
+                    });
+                }
+            }
+            let mut items = self.items.borrow_mut();
+            let victims: Vec<_> = items
+                .keys()
+                .filter(|(svc, _)| *svc == self.service)
+                .cloned()
+                .collect();
+            for key in &victims {
+                items.remove(key);
+            }
+            Ok(victims.len())
+        }
+    }
 
     #[tokio::test]
     async fn reap_isolated_deletes_a_stranded_item_and_its_dir() {
@@ -1745,13 +1850,16 @@ mod tests {
         let iso_dir = tmp.path().join("refresh/u-1");
         paths::create_isolated_dir(&iso_dir).unwrap();
         // An orphan: a secret-bearing isolated item + its dir, both present at start.
-        let keychain = FakeIsolatedKeychain::empty();
-        keychain.seed(b"secret-bearing-orphan").await.unwrap();
+        let world = FakeKeychainWorld::default();
+        world.seed("svc-u-1", "the-seeding-user", b"secret-bearing-orphan");
 
-        reap_isolated(&keychain, &iso_dir).await.unwrap();
+        let deleted = reap_isolated(&world.reaper("svc-u-1"), &iso_dir)
+            .await
+            .unwrap();
 
+        assert_eq!(deleted, 1, "the reap must report the item it deleted");
         assert!(
-            keychain.item.borrow().is_none(),
+            !world.has("svc-u-1", "the-seeding-user"),
             "the reap must delete the stranded isolated item"
         );
         assert!(
@@ -1762,51 +1870,41 @@ mod tests {
 
     #[tokio::test]
     async fn reap_isolated_is_an_idempotent_no_op_when_nothing_is_stranded() {
-        // The common case: a clean prior shutdown left no orphan. An absent item
-        // (the fake starts empty) and an absent dir (never created) are both success.
+        // The common case: a clean prior shutdown left no orphan. An empty service (the
+        // world starts empty) and an absent dir (never created) are both success, and the
+        // zero count is what keeps the caller's operator line silent.
         let tmp = tempfile::tempdir().unwrap();
         let iso_dir = tmp.path().join("refresh/u-1");
-        let keychain = FakeIsolatedKeychain::empty();
+        let world = FakeKeychainWorld::default();
 
-        reap_isolated(&keychain, &iso_dir).await.unwrap();
+        let deleted = reap_isolated(&world.reaper("svc-u-1"), &iso_dir)
+            .await
+            .unwrap();
 
-        assert!(keychain.item.borrow().is_none());
+        assert_eq!(deleted, 0);
         assert!(!iso_dir.exists());
     }
 
     #[tokio::test]
-    async fn reap_isolated_removes_the_dir_even_when_the_item_delete_fails() {
-        // Independent orphans: a momentarily-locked keychain (delete → Err) must not
-        // strand the dir. The reap attempts both and surfaces the delete error.
-        struct LockedDelete;
-        impl IsolatedKeychain for LockedDelete {
-            async fn seed(&self, _blob: &[u8]) -> Result<()> {
-                Err(Error::KeychainLocked { op: "seed" })
-            }
-            async fn read_back(&self) -> Result<Credential> {
-                Err(Error::CredentialNotFound)
-            }
-            async fn delete(&self) -> Result<()> {
-                Err(Error::KeychainLocked {
-                    op: "isolated delete",
-                })
-            }
-            fn delete_blocking(&self) {}
-        }
-
+    async fn reap_isolated_removes_the_dir_even_when_the_item_sweep_fails() {
+        // Independent orphans: a momentarily-locked keychain (sweep → Err) must not
+        // strand the dir. The reap attempts both and surfaces the sweep error.
         let tmp = tempfile::tempdir().unwrap();
         let iso_dir = tmp.path().join("refresh/u-1");
         paths::create_isolated_dir(&iso_dir).unwrap();
+        let world = FakeKeychainWorld::default();
 
-        let result = reap_isolated(&LockedDelete, &iso_dir).await;
+        // `u32::MAX` failures: this reaper never succeeds, so the sweep error is
+        // whatever the caller sees rather than an artifact of a retry budget.
+        let result = reap_isolated(&world.flaky_reaper("svc-u-1", u32::MAX), &iso_dir).await;
 
         assert!(
             matches!(result, Err(Error::KeychainLocked { .. })),
-            "a failed item delete must be surfaced"
+            "a failed item sweep must be surfaced"
         );
         assert!(
             !iso_dir.exists(),
-            "the dir must be removed even when the item delete fails"
+            "the dir must be removed even when the item sweep fails"
         );
     }
 
@@ -1838,6 +1936,28 @@ mod tests {
         assert_ne!(b, foreign);
     }
 
+    #[tokio::test]
+    async fn the_reap_sweeps_every_acct_accumulated_under_one_isolated_service() {
+        // Issue #769, hermetically: repeated crashes under DIFFERENT `$USER` values leave
+        // several items under the one path-hash-derived service. The sweep is scoped by
+        // service and names no `acct`, so it takes all of them in one pass — a reaper that
+        // re-derived a single name would leave every item but its own behind.
+        let tmp = tempfile::tempdir().unwrap();
+        let iso_dir = tmp.path().join("login");
+        paths::create_isolated_dir(&iso_dir).unwrap();
+        let world = FakeKeychainWorld::default();
+        world.seed("svc-login", "user-a", b"orphan-from-the-first-crash");
+        world.seed("svc-login", "user-b", b"orphan-from-the-second-crash");
+        world.seed("svc-login", "claude-code-user", b"orphan-from-the-fallback");
+
+        let deleted = reap_isolated(&world.reaper("svc-login"), &iso_dir)
+            .await
+            .unwrap();
+
+        assert_eq!(deleted, 3, "every acct under the service must be reaped");
+        assert_eq!(world.count_under("svc-login"), 0);
+    }
+
     /// The reap end-to-end against the real `/usr/bin/security` CLI on a throwaway
     /// keychain (issue #103): seed an orphan exactly as the engine would, then prove
     /// `reap_isolated` deletes the real item and removes the dir. macOS-only — the CLI
@@ -1845,25 +1965,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn reap_isolated_reaps_a_real_seeded_orphan() {
-        use crate::keychain::IsolatedKeychainItem;
+        use crate::keychain::{IsolatedKeychainItem, IsolatedService};
         use std::ffi::OsString;
-        use std::process::Command as StdCommand;
 
-        const SECURITY: &str = "/usr/bin/security";
+        let kc = ThrowawayKeychain::create("reap-real");
         let tmp = tempfile::tempdir().unwrap();
-        let kc = tmp.path().join("test.keychain-db");
-        assert!(StdCommand::new(SECURITY)
-            .args(["create-keychain", "-p", ""])
-            .arg(&kc)
-            .status()
-            .expect("spawn create-keychain")
-            .success());
-        assert!(StdCommand::new(SECURITY)
-            .args(["unlock-keychain", "-p", ""])
-            .arg(&kc)
-            .status()
-            .expect("spawn unlock-keychain")
-            .success());
 
         // The orphan dir + the isolated item the engine would create for it. The dir
         // path doubles as the config dir → the #100-suffixed service, exactly as
@@ -1873,7 +1979,7 @@ mod tests {
         let item = IsolatedKeychainItem::for_keychain(
             iso_dir.as_os_str(),
             OsString::from("reap-acct"),
-            kc.clone(),
+            kc.path().to_owned(),
         )
         .unwrap();
         item.seed(br#"{"claudeAiOauth":{"refreshToken":"sk-ant-ort-ORPHAN"}}"#)
@@ -1882,10 +1988,13 @@ mod tests {
         // Sanity: the orphan really is present before the reap.
         item.read_back().await.expect("orphan present pre-reap");
 
-        reap_isolated(&item, &iso_dir)
+        let reaper =
+            IsolatedService::for_keychain(iso_dir.as_os_str(), kc.path().to_owned()).unwrap();
+        let deleted = reap_isolated(&reaper, &iso_dir)
             .await
             .expect("reap the orphan");
 
+        assert_eq!(deleted, 1, "the reap must report the real item it deleted");
         assert!(
             matches!(item.read_back().await, Err(Error::CredentialNotFound)),
             "the reap must delete the real isolated item"
@@ -1894,19 +2003,174 @@ mod tests {
             !iso_dir.exists(),
             "the reap must remove the real isolated dir"
         );
+    }
 
-        let _ = StdCommand::new(SECURITY)
-            .arg("delete-keychain")
-            .arg(&kc)
-            .status();
+    /// **Issue #769 regression gate, against the real `/usr/bin/security`.**
+    ///
+    /// The scenario the reapers exist for, with the one twist that broke them: the process
+    /// that seeded the orphan derived `acct = user-a` (its `$USER`), was `SIGKILL`ed, and
+    /// the process that reaps derives `user-b` at the same uid — while the service, being
+    /// path-hash-derived, is identical. Reaping by a re-derived `acct` issues
+    /// `delete-generic-password -a user-b`, which exits 44 (`errSecItemNotFound`), which
+    /// the isolated teardown maps to `Ok` — so the credential-bearing item survives, the
+    /// dir that would signal it is removed anyway, and nothing is logged.
+    ///
+    /// Measured RED on the unfixed tree with exactly this seed/reap pair expressed against
+    /// its API (`IsolatedKeychainItem::for_keychain(.., "user-b", ..)` in place of the
+    /// reaper below): "a credential-bearing isolated item survived the reap".
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn the_reap_takes_an_orphan_seeded_under_a_divergent_user() {
+        use crate::keychain::{IsolatedKeychainItem, IsolatedService};
+        use std::ffi::OsString;
+
+        let kc = ThrowawayKeychain::create("reap-divergent");
+        let tmp = tempfile::tempdir().unwrap();
+        let iso_dir = tmp.path().join("refresh/u-1");
+        paths::create_isolated_dir(&iso_dir).unwrap();
+
+        // The CRASHED process seeded under `$USER=user-a`.
+        let seeded = IsolatedKeychainItem::for_keychain(
+            iso_dir.as_os_str(),
+            OsString::from("user-a"),
+            kc.path().to_owned(),
+        )
+        .unwrap();
+        seeded
+            .seed(br#"{"claudeAiOauth":{"refreshToken":"sk-ant-ort-ORPHAN"}}"#)
+            .await
+            .expect("seed the orphan item");
+        seeded.read_back().await.expect("orphan present pre-reap");
+
+        // What the restarting process WOULD have derived, `$USER` having changed to
+        // `user-b` at the same uid. It is built only to establish that the divergent name
+        // genuinely cannot reach the seeded item — without that, a reap "succeeding" under
+        // it would prove nothing, and the silent miss this test guards is exactly the case
+        // where it cannot. The reaper below derives no name at all.
+        let divergent = IsolatedKeychainItem::for_keychain(
+            iso_dir.as_os_str(),
+            OsString::from("user-b"),
+            kc.path().to_owned(),
+        )
+        .unwrap();
+        assert!(
+            matches!(divergent.read_back().await, Err(Error::CredentialNotFound)),
+            "the divergent acct must not reach the seeded item (else this proves nothing)"
+        );
+
+        let reaper =
+            IsolatedService::for_keychain(iso_dir.as_os_str(), kc.path().to_owned()).unwrap();
+        let deleted = reap_isolated(&reaper, &iso_dir).await.expect("reap");
+
+        assert_eq!(deleted, 1, "the divergently-seeded item must be reaped");
+        assert!(
+            matches!(seeded.read_back().await, Err(Error::CredentialNotFound)),
+            "issue #769: a credential-bearing isolated item survived the reap"
+        );
+        assert!(!iso_dir.exists(), "the reap must remove the isolated dir");
+    }
+
+    /// **Issue #133 safety AC, against the real `/usr/bin/security`.**
+    ///
+    /// The sweep enumerates a service, so the AC that it can NEVER touch a sibling
+    /// `CLAUDE_CONFIG_DIR` profile now rests on the enumeration being service-scoped —
+    /// which only a real keychain holding both items can show. The sibling is seeded under
+    /// the SAME `acct` as the orphan, so nothing but the service separates them.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn the_real_reap_leaves_a_sibling_config_dir_profile_untouched() {
+        use crate::keychain::{IsolatedKeychainItem, IsolatedService};
+        use std::ffi::OsString;
+
+        let kc = ThrowawayKeychain::create("reap-sibling");
+        let tmp = tempfile::tempdir().unwrap();
+        let iso_dir = tmp.path().join("login");
+        paths::create_isolated_dir(&iso_dir).unwrap();
+
+        let acct = || OsString::from("the-same-user");
+        let orphan =
+            IsolatedKeychainItem::for_keychain(iso_dir.as_os_str(), acct(), kc.path().to_owned())
+                .unwrap();
+        // A second real profile the operator legitimately runs, NOT under our ephemeral
+        // dir — it path-hashes to a different service.
+        let sibling = IsolatedKeychainItem::for_keychain(
+            std::ffi::OsStr::new("/Users/someone/.claude"),
+            acct(),
+            kc.path().to_owned(),
+        )
+        .unwrap();
+        orphan.seed(b"login-orphan-secret").await.unwrap();
+        sibling.seed(b"the-operators-own-profile").await.unwrap();
+
+        let reaper =
+            IsolatedService::for_keychain(iso_dir.as_os_str(), kc.path().to_owned()).unwrap();
+        let deleted = reap_isolated(&reaper, &iso_dir).await.expect("reap");
+
+        assert_eq!(deleted, 1, "only the orphan is the reap's to take");
+        assert!(
+            matches!(orphan.read_back().await, Err(Error::CredentialNotFound)),
+            "the login orphan must be reaped"
+        );
+        assert!(
+            sibling.read_back().await.is_ok(),
+            "the sibling `CLAUDE_CONFIG_DIR` profile must be left untouched"
+        );
+    }
+
+    /// A throwaway keychain for the real-CLI reap tests, deleted on `Drop` so a panicking
+    /// assertion cannot leave one behind (an early return past a trailing `delete-keychain`
+    /// is exactly how these leak).
+    #[cfg(target_os = "macos")]
+    struct ThrowawayKeychain {
+        /// Owns the containing temp dir for the keychain's lifetime; never read.
+        _dir: tempfile::TempDir,
+        path: std::path::PathBuf,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl ThrowawayKeychain {
+        const SECURITY: &'static str = "/usr/bin/security";
+
+        fn create(name: &str) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("{name}.keychain-db"));
+            for args in [["create-keychain", "-p", ""], ["unlock-keychain", "-p", ""]] {
+                assert!(
+                    std::process::Command::new(Self::SECURITY)
+                        .args(args)
+                        .arg(&path)
+                        .status()
+                        .expect("spawn security")
+                        .success(),
+                    "{args:?} must succeed"
+                );
+            }
+            Self { _dir: dir, path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for ThrowawayKeychain {
+        fn drop(&mut self) {
+            // Best-effort: the temp dir goes either way, but `delete-keychain` also drops
+            // it from the process's dynamic search list.
+            let _ = std::process::Command::new(Self::SECURITY)
+                .arg("delete-keychain")
+                .arg(&self.path)
+                .status();
+        }
     }
 
     // --- login orphan reap (#133): a crashed `claude /login` leaves the login isolation root ---
     //
-    // The login counterpart of the roster reap above. The generic reap behavior (delete item +
-    // remove dir, idempotency) is already covered by `reap_isolated_*`; these add the two things
-    // the login path introduces — the negative SAFETY AC (a sibling `CLAUDE_CONFIG_DIR` profile is
-    // NEVER swept) and the "best-effort with retry".
+    // The login counterpart of the roster reap above. The generic reap behavior (sweep the
+    // service + remove the dir, idempotency) is already covered by `reap_isolated_*`; these add
+    // the two things the login path introduces — the negative SAFETY AC (a sibling
+    // `CLAUDE_CONFIG_DIR` profile is NEVER swept) and the "best-effort with retry".
 
     #[test]
     fn the_login_reap_targets_only_the_login_isolation_root() {
@@ -1936,69 +2200,14 @@ mod tests {
         assert_ne!(login_svc, refresh_svc);
     }
 
-    /// A shared keychain modeled as a `service -> blob` map, plus per-service item VIEWS — the fake
-    /// for the safety AC, where the keychain holds MORE than the one item being reaped. A view's
-    /// `delete` removes ONLY its own service's entry, so reaping one view proves the reap never
-    /// sweeps siblings (there is no keychain-wide enumeration seam to sweep them WITH).
-    #[derive(Clone, Default)]
-    struct FakeKeychainWorld {
-        items: Rc<RefCell<std::collections::BTreeMap<String, Vec<u8>>>>,
-    }
-
-    impl FakeKeychainWorld {
-        fn seed(&self, service: &str, blob: &[u8]) {
-            self.items
-                .borrow_mut()
-                .insert(service.to_string(), blob.to_vec());
-        }
-        fn has(&self, service: &str) -> bool {
-            self.items.borrow().contains_key(service)
-        }
-        fn view(&self, service: String) -> FakeKeychainView {
-            FakeKeychainView {
-                service,
-                items: self.items.clone(),
-            }
-        }
-    }
-
-    /// A single-service view into a [`FakeKeychainWorld`], implementing the isolated-item seam.
-    struct FakeKeychainView {
-        service: String,
-        items: Rc<RefCell<std::collections::BTreeMap<String, Vec<u8>>>>,
-    }
-
-    impl IsolatedKeychain for FakeKeychainView {
-        async fn seed(&self, blob: &[u8]) -> Result<()> {
-            self.items
-                .borrow_mut()
-                .insert(self.service.clone(), blob.to_vec());
-            Ok(())
-        }
-        async fn read_back(&self) -> Result<Credential> {
-            self.items
-                .borrow()
-                .get(&self.service)
-                .cloned()
-                .map(Credential::new)
-                .ok_or(Error::CredentialNotFound)
-        }
-        async fn delete(&self) -> Result<()> {
-            self.items.borrow_mut().remove(&self.service);
-            Ok(())
-        }
-        fn delete_blocking(&self) {
-            self.items.borrow_mut().remove(&self.service);
-        }
-    }
-
     #[tokio::test]
     async fn the_login_reap_leaves_a_sibling_config_dir_profile_untouched() {
         // Safety AC (#133) made behavioral: a keychain holds BOTH a crashed-login orphan AND a
         // sibling `CLAUDE_CONFIG_DIR` profile the operator legitimately runs. The reap — scoped to
-        // the login dir's #100 service — deletes ONLY the login item; the sibling survives, because
+        // the login dir's #100 service — sweeps ONLY the login items; the sibling survives, because
         // the reap NEVER enumerates the keychain by a `Claude Code-credentials-*` prefix (which
-        // WOULD have swept the sibling too).
+        // WOULD have swept the sibling too). Both are seeded under the SAME `acct`, so the service
+        // is the only thing separating them.
         use crate::keychain::service_for_config_dir;
 
         let tmp = tempfile::tempdir().unwrap();
@@ -2012,17 +2221,22 @@ mod tests {
         assert_ne!(login_svc, sibling_svc);
 
         let world = FakeKeychainWorld::default();
-        world.seed(&login_svc, b"login-orphan-secret");
-        world.seed(&sibling_svc, b"the-operators-own-profile");
+        world.seed(&login_svc, "the-same-user", b"login-orphan-secret");
+        world.seed(&sibling_svc, "the-same-user", b"the-operators-own-profile");
 
-        // Reap the LOGIN item's view — exactly the service the production reaper derives.
-        reap_login_isolated(&world.view(login_svc.clone()), &login_dir)
+        // Reap the LOGIN service — exactly the one the production reaper derives.
+        let deleted = reap_login_isolated(&world.reaper(&login_svc), &login_dir)
             .await
             .unwrap();
 
-        assert!(!world.has(&login_svc), "the login orphan must be reaped");
+        assert_eq!(deleted, 1);
+        assert_eq!(
+            world.count_under(&login_svc),
+            0,
+            "the login orphan must be reaped"
+        );
         assert!(
-            world.has(&sibling_svc),
+            world.has(&sibling_svc, "the-same-user"),
             "the sibling `CLAUDE_CONFIG_DIR` profile must be left untouched"
         );
         assert!(
@@ -2033,50 +2247,24 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn the_login_reap_retries_a_transient_keychain_lock_then_succeeds() {
-        // "Best-effort with retry" (#133): a momentarily-locked keychain (delete → Err on the first
+        // "Best-effort with retry" (#133): a momentarily-locked keychain (sweep → Err on the first
         // attempt) must not strand the credential-bearing orphan — the reap retries and converges.
         // `start_paused` fast-forwards the inter-retry waits, so the test never sleeps in real time.
-        struct FlakyDelete {
-            fails_left: RefCell<u32>,
-            deleted: RefCell<bool>,
-        }
-        impl IsolatedKeychain for FlakyDelete {
-            async fn seed(&self, _blob: &[u8]) -> Result<()> {
-                Ok(())
-            }
-            async fn read_back(&self) -> Result<Credential> {
-                Err(Error::CredentialNotFound)
-            }
-            async fn delete(&self) -> Result<()> {
-                let mut fails_left = self.fails_left.borrow_mut();
-                if *fails_left > 0 {
-                    *fails_left -= 1;
-                    return Err(Error::KeychainLocked {
-                        op: "isolated login delete",
-                    });
-                }
-                *self.deleted.borrow_mut() = true;
-                Ok(())
-            }
-            fn delete_blocking(&self) {
-                *self.deleted.borrow_mut() = true;
-            }
-        }
-
         let tmp = tempfile::tempdir().unwrap();
         let iso_dir = tmp.path().join("login");
         paths::create_isolated_dir(&iso_dir).unwrap();
-        let item = FlakyDelete {
-            fails_left: RefCell::new(1),
-            deleted: RefCell::new(false),
-        };
+        let world = FakeKeychainWorld::default();
+        world.seed("svc-login", "the-seeding-user", b"login-orphan-secret");
 
-        reap_login_isolated(&item, &iso_dir).await.unwrap();
+        let deleted = reap_login_isolated(&world.flaky_reaper("svc-login", 1), &iso_dir)
+            .await
+            .unwrap();
 
-        assert!(
-            *item.deleted.borrow(),
-            "the reap must retry past a transient lock and delete the item"
+        assert_eq!(
+            deleted, 1,
+            "the reap must retry past a transient lock and report the item it deleted"
         );
+        assert_eq!(world.count_under("svc-login"), 0);
         assert!(!iso_dir.exists(), "the reap must remove the isolated dir");
     }
 
