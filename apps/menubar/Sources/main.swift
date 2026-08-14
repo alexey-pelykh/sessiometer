@@ -47,8 +47,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         #if DEBUG
         // Design-parity / debug TOOL modes — not product paths, and DEBUG-only by construction, so a
         // release build has exactly one reachable mode. Which mode this process launched in is a pure
-        // argv+env decision (issue #764): `AppLaunchPlan.mode` owns it — including the precedence between
-        // the three, and the exact-`"1"` gallery opt-in — and `AppLaunchPlanTests` covers it headlessly.
+        // argv+env decision (issue #764): `AppLaunchPlan.mode` owns it — including the precedence among
+        // them, where issue #850's malformed-invocation refusal sits in it, and the exact-`"1"` gallery
+        // opt-in — and `AppLaunchPlanTests` covers it headlessly.
         // This shell only ACTS on the resolved mode. Dispatch runs here so the full AppKit environment
         // (fonts, system colors) is up before either renderer draws.
         switch AppLaunchPlan.mode(arguments: CommandLine.arguments,
@@ -66,6 +67,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // `NSStatusItem` template tinting is applied by the system and is invisible to `ImageRenderer`.
             RenderBarGlyphTool.run(outputDir: outputDirectory)
             exit(0)
+
+        case .toolFlagMissingDirectory(let flag):
+            // Issue #850: the flag arrived with no output directory after it, so there is nothing to
+            // render. Report which flag and exit non-zero, rather than falling through to a real launch
+            // the operator never asked for — one that installs a live status item and, because it never
+            // exits, hangs a script that was waiting for a render.
+            FileHandle.standardError.write(
+                Data((AppLaunchPlan.missingDirectoryMessage(flag: flag) + "\n").utf8))
+            exit(AppLaunchPlan.missingDirectoryExitCode)
 
         case .glyphGallery:
             // Issue #437: installs one real menu-bar status item per StatusGlyph — the four bespoke template
