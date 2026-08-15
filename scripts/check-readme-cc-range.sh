@@ -20,9 +20,10 @@
 #
 # THE RULE
 #   The README's `## Prerequisites` section must state the ledger's canonical claim
-#   VERBATIM, as one contiguous unit, modulo markdown emphasis and line wrapping.
+#   VERBATIM, as one contiguous unit, modulo markdown emphasis and line wrapping —
+#   and must state no OTHER claim in that same shape.
 #
-# Four design choices carry the weight:
+# Five design choices carry the weight:
 #
 #   1. ONE UNIT, not two loose substrings. Issue #712 measured the alternative: a
 #      README stating a STALE range while mentioning the new bound in an unrelated
@@ -62,10 +63,54 @@
 #      copy outside the section and fails only on the surface actually pinned, which
 #      is the failure a maintainer can act on.
 #
+#      Scoping NARROWED the masking defect; it did not close it, and this paragraph
+#      read as though it had until issue #1317. Containment is not exclusivity: a
+#      `## Prerequisites` stating the correct claim AND a stale range satisfied the
+#      containment test below, so the substitution survived one level further in —
+#      inside the pinned section rather than elsewhere in the file. Choice 5 closes
+#      that; what remains open after it is stated there rather than left to be found.
+#
 #      A MISSING or duplicated `## Prerequisites` heading is exit 2, never a pass:
 #      the pin is expressed as a section NAME, so a restructure that renames or
 #      moves it must be re-pointed deliberately rather than silently unpinned. A
 #      guard that evaluated no section is not green.
+#
+#   5. EXCLUSIVE within that section, not merely contained (issue #1317). The section
+#      must state the ledger's claim and NO OTHER statement in that claim's shape.
+#      Containment alone asks only whether the right sentence is PRESENT, so the drift
+#      shape this surface actually takes — a widening that adds a sentence and leaves
+#      the old one behind — passed. Measured on the real tree before choosing: guard,
+#      ledger and README verbatim with one stale bullet prepended INSIDE the section,
+#      exit 0 with a message identical to the unmutated control's, so the guard was
+#      blind to the difference rather than quiet about it.
+#
+#      This is NOT the exactly-once rule choice 4 rejected, and the difference is a
+#      measurement rather than an argument — the unit being counted decides it. Counting
+#      version-range PAIRS finds TWO in the live, wholly-correct section: the CC range
+#      and the host range, both of them inside the canonical claim itself. That reading
+#      is RED on a file with nothing wrong with it, which is choice 4's rejection
+#      re-derived here rather than inherited. Counting whole CLAIM-shaped statements
+#      finds one there and two on the mutant above. That is the rule below — and it is
+#      not a new invention: it is the ledger-side check this script already runs
+#      (`claim_count > 1`) turned on the other document. A document that states the
+#      range two ways cannot be trusted about which way it means.
+#
+#      DISTINCT statements, so a section legitimately restating the SAME correct claim
+#      twice stays green; counting occurrences instead would re-introduce the false RED
+#      that made the wrong unit unusable. T12's permission is untouched — it pins a
+#      second correct copy OUTSIDE the section, and this rule reads only within it.
+#
+#      Exit 1, where the ledger's own two-ways case is exit 2. The asymmetry is the two
+#      documents' ROLES: an inconsistent AUTHORITY means nothing can be compared, while
+#      an inconsistent COPY is simply wrong, and deleting the stale sentence is a fix a
+#      maintainer can act on.
+#
+#      RESIDUAL, stated rather than left to be discovered: this pins the claim's SHAPE,
+#      so a stale range inside the section that is NOT claim-shaped — a bare `X`–`Y`
+#      carrying no `on macOS … / Darwin …` clause — still passes. Widening the shape to
+#      any version-range pair is exactly the reading measured RED above, so closing this
+#      last step costs the correct file. Pinned green by T17 so it cannot move in either
+#      direction unmeasured.
 #
 # A claim that cannot be CONSTRUCTED is a FAILURE (exit 2), never a pass. A gate that
 # goes green because it found nothing to compare is the same write-only-copy failure
@@ -75,8 +120,9 @@
 # README.md is tracked and its absence means nothing was evaluated).
 #
 # Exit codes:
-#   0  the README states the ledger's canonical claim
-#   1  DRIFT — the README's copy disagrees with the ledger
+#   0  the README states the ledger's canonical claim, and no other one
+#   1  DRIFT — the README's copy disagrees with the ledger (its claim is absent from
+#      the pinned section, or that section ALSO states a claim the ledger does not)
 #   2  could not determine (README or ledger missing, no claim constructible, or the
 #      README has no single `## Prerequisites` section to check)
 #
@@ -181,10 +227,42 @@ section="$(awk '
 
 section_norm="$(printf '%s' "$section" | normalize)"
 
+# Design choice 5: containment is not exclusivity. Every statement in the CLAIM'S SHAPE,
+# with FREE bounds — `claim_re` pins the ledger's specific bounds, and a stale sentence by
+# definition carries the OLD ones, so it is invisible to that pattern and needs this one.
+# `[^\`]+` cannot cross a backtick, so a match cannot span two adjacent statements.
+shape_re="\`[0-9]+\.[0-9]+\.[0-9]+\`–\`[0-9]+\.[0-9]+\.[0-9]+\` on macOS \`[^\`]+\`–\`[^\`]+\` / Darwin \`[^\`]+\`"
+# SUBTRACTING the claim is what keeps a section restating the SAME correct claim twice
+# green (T16): `grep -v` drops EVERY line equal to the claim, not merely the first, so no
+# copy survives into `others`. Not `sort -u` — measured, removing that stage alone leaves
+# the whole suite green, T16 included, and it can only shorten a non-empty list rather than
+# empty one, so it decides no exit code here. What it does own is the DIAGNOSTIC below: a
+# stale statement repeated twice is listed and counted once rather than twice. `-x` is
+# belt-and-braces — without it a line merely CONTAINING the claim would be dropped, which
+# this shape cannot produce (`grep -o` returns non-overlapping matches and the shape cannot
+# nest inside itself), so no fixture exercises it either.
+others="$(printf '%s' "$section_norm" | grep -oE "$shape_re" | sort -u | grep -vxF -- "$claim" || true)"
+
 if printf '%s' "$section_norm" | grep -qF -- "$claim"; then
-    echo "ok: README.md \`## Prerequisites\` states the ledger's verified range — ${claim}"
-    echo "    (1 claim compared: the Claude Code range and the host range, as one unit)"
-    exit 0
+    if [[ -z "$others" ]]; then
+        echo "ok: README.md \`## Prerequisites\` states the ledger's verified range — ${claim}"
+        echo "    (1 claim compared: the Claude Code range and the host range, as one unit;"
+        echo "     and that section states no other claim in the same shape)"
+        exit 0
+    fi
+
+    # The claim is present AND so is a range claim the ledger does not make. A reader who
+    # lands on the stale sentence reads a range that was never verified, so the correct
+    # copy beside it does not redeem the section.
+    other_count="$(printf '%s\n' "$others" | wc -l | tr -d '[:space:]')"
+    echo "error: README.md \`## Prerequisites\` states the ledger's claim AND ${other_count} other range" >&2
+    echo "       claim(s) the ledger does not make:" >&2
+    printf '%s\n' "$others" | sed 's/^/         /' >&2
+    echo "       ledger states: ${claim}" >&2
+    echo "       this is the shape a range widening leaves behind — a new sentence added and" >&2
+    echo "       the old one left in place. A correct copy in the same section does not redeem" >&2
+    echo "       a stale one a reader can land on: delete or update the statement(s) above." >&2
+    exit 1
 fi
 
 # Drift. Report WHICH half moved: the sentence carries two independently-copied data and

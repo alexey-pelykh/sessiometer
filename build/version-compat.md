@@ -42,7 +42,11 @@ Consumers of this range:
   requires the README's `## Prerequisites` section — that section specifically, not the file at
   large — to state it verbatim as one contiguous unit, covering both the CC range and the host
   range (`on macOS … / Darwin …`), which has no machine-readable form anywhere — only this
-  section's prose and the README's copy of it.
+  section's prose and the README's copy of it. Since #1317 it also requires that section to
+  state **no other** claim in that shape: containment alone was satisfied by a section carrying
+  the correct sentence beside a stale one, which is the shape a widening leaves behind, so
+  widening the range means deleting the superseded sentence rather than adding a new one next
+  to it. Distinct statements, so restating the same correct claim twice is not drift.
   Until #1279 this copy was pinned by nothing and stayed correct only until someone widened the
   other two consumers.
 - [`scripts/check-cc-version.sh`](../scripts/check-cc-version.sh) re-verifies the installed `claude`
