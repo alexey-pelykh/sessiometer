@@ -17,6 +17,31 @@
 #   admissible when the cited file is STABLE, because then the number keeps
 #   meaning what it meant.
 #
+#   A SYMBOL, not a word that merely occurs. An ALL-CAPS token in running prose
+#   — `CLI`, `MUST`, `NEVER`, `ACL` — is not an identifier, and it satisfied the
+#   shape test below only by accident: `[A-Za-z]+[A-Z]...` cannot tell an acronym
+#   apart from CamelCase. `docs/requirements/gui-cli-capability-parity.md` cited
+#   the verb table as `src/cli.rs:741-765` and passed on the token `CLI`, while
+#   the range had already drifted off the table onto `parse`'s doc comment — the
+#   exact silent rot this file exists to stop, waved through by its own check
+#   (issue #1319). Backticks remain the escape hatch: an author who means a real
+#   all-caps constant writes `MAX_RETRIES`-style prose as code, and it counts.
+#
+#   THE BAR IS "IS IT AN IDENTIFIER", NOT "HOW MANY LINES DOES IT HIT". The
+#   tempting rule — refuse an anchor that does not narrow the file enough — was
+#   measured against this corpus and INVERTS. Re-derive it and see:
+#
+#       for t in apply_import MUST; do
+#           printf '%-14s %s\n' "$t" "$(git grep -cE \
+#             "(^|[^A-Za-z0-9_])${t}([^A-Za-z0-9_]|$)" HEAD -- src/cli.rs | cut -d: -f3)"
+#       done
+#
+#   `apply_import` — this file's own worked example of a GOOD anchor, quoted in
+#   the failure message below — hits many times more lines than the prose word
+#   `MUST` does. Any ceiling that refuses the prose refuses the symbol first. The
+#   two populations overlap on line count and separate on shape, so shape is what
+#   is tested.
+#
 # Three design choices carry the weight.
 #
 #   1. SCOPE IS THE PR'S OWN DIFF, not the tree. The corpus already carries a
@@ -167,37 +192,73 @@ churn() { # <path> -> commit count
 # takes in this corpus's prose. "Occurs in the file" (rather than "is defined
 # there") is the deliberate bar: the point is to leave a reader something to
 # grep for, and a type or field name serves that as well as a `fn` does.
+# The shape only an identifier takes, and the subset of it that is an acronym
+# rather than an identifier. Written as one shape and a subtraction, so the two
+# can never drift apart: what the check declines is exactly what the hint names.
+IDENT_SHAPE='^([A-Za-z0-9]*_[A-Za-z0-9_]*|[A-Za-z]+[A-Z][A-Za-z0-9]*)$'
+ACRONYM_SHAPE='^[A-Z0-9]+$'
+
+# Set by anchored() when it refused an ALL-CAPS prose token that DOES occur in
+# the cited file — i.e. the tokens that would have anchored the citation before
+# issue #1319. Named in the failure so "name a symbol" cannot read as nonsense to
+# an author looking straight at a word they believe is one.
+declined=""
+
+occurs() { # <token> <file> -> 0 if the token appears in the cited file
+    # Read the cited file AT THE REF, like every other read here. Process
+    # substitution rather than `git show ... | grep -q`: under this script's
+    # `pipefail` that pipeline reports FAILURE on a hit, because `grep -q` exits
+    # at the first match and SIGPIPEs `git show`. Every anchored citation then
+    # reads as unanchored, so the run does not fail loudly — it inflates the
+    # violation count. Measured rather than assumed, by swapping the two forms
+    # and diffing `--audit HEAD`; the size of the gap is a corpus figure, so by
+    # choice 1 above it is not written down here.
+    grep -qE "(^|[^A-Za-z0-9_])${1}([^A-Za-z0-9_]|\$)" \
+        <(git show "${head_sha}:${2}" 2>/dev/null)
+}
+
 anchored() { # <doc-line> <cited-file>  -> 0 if anchored
     local line="$1" file="$2" stripped tok
+    declined=""
     stripped="$(printf '%s' "$line" | sed -E "s#${CITATION_RE}##g")"
     for tok in $(
         {
             # Inside backticks the author has already declared "this is code", so
             # any identifier counts — `classify`, `export` and `stash` are real
-            # single-word `fn` names and would fail a shape test.
+            # single-word `fn` names and would fail a shape test. That declaration
+            # is also the escape hatch for a genuine all-caps constant, which the
+            # subtraction below would otherwise refuse.
             printf '%s' "$stripped" \
                 | grep -oE '`[^`]*`' \
                 | tr -c 'A-Za-z0-9_' '\n' \
                 | grep -E '^[A-Za-z_][A-Za-z0-9_]*$'
             # Outside them, require a shape only an identifier takes, or every
-            # English word on the line becomes a candidate anchor.
+            # English word on the line becomes a candidate anchor — MINUS the
+            # acronyms that shape admits by accident (issue #1319). A screaming
+            # constant keeps its underscore, so it is not in the subtraction.
             printf '%s' "$stripped" \
                 | tr -c 'A-Za-z0-9_' '\n' \
-                | grep -E '^([A-Za-z0-9]*_[A-Za-z0-9_]*|[A-Za-z]+[A-Z][A-Za-z0-9]*)$'
+                | grep -E "$IDENT_SHAPE" \
+                | grep -vE "$ACRONYM_SHAPE"
         } | sort -u
     ); do
         [ "${#tok}" -ge 3 ] || continue
-        # Read the cited file AT THE REF, like every other read here. Process
-        # substitution rather than `git show ... | grep -q`: under this script's
-        # `pipefail` that pipeline reports FAILURE on a hit, because `grep -q`
-        # exits at the first match and SIGPIPEs `git show`. Every anchored
-        # citation then reads as unanchored, so the run does not fail loudly —
-        # it inflates the violation count. Measured rather than assumed, by
-        # swapping the two forms and diffing `--audit HEAD`; the size of the gap
-        # is a corpus figure, so by choice 1 above it is not written down here.
-        if grep -qE "(^|[^A-Za-z0-9_])${tok}([^A-Za-z0-9_]|\$)" \
-            <(git show "${head_sha}:${file}" 2>/dev/null); then
+        if occurs "$tok" "$file"; then
             return 0
+        fi
+    done
+    # Unanchored. Report which prose acronyms were declined, if any, so the
+    # remedy the failure prescribes is the one this line actually needs.
+    for tok in $(
+        printf '%s' "$stripped" \
+            | tr -c 'A-Za-z0-9_' '\n' \
+            | grep -E "$IDENT_SHAPE" \
+            | grep -E "$ACRONYM_SHAPE" \
+            | sort -u
+    ); do
+        [ "${#tok}" -ge 3 ] || continue
+        if occurs "$tok" "$file"; then
+            declined="${declined:+${declined}, }${tok}"
         fi
     done
     return 1
@@ -232,7 +293,11 @@ check_line() { # <doc> <lineno> <line>
             continue
         fi
         if ! anchored "$line" "$path"; then
-            fail "  ${doc}:${lineno}  ${cite}  -> bare line number into a churning file (${c} commits in the last ${WINDOW}); name a symbol"
+            if [ -n "$declined" ]; then
+                fail "  ${doc}:${lineno}  ${cite}  -> bare line number into a churning file (${c} commits in the last ${WINDOW}); ${declined} occurs in ${path} but is prose, not a symbol — name a real one, or backtick it if it is code"
+            else
+                fail "  ${doc}:${lineno}  ${cite}  -> bare line number into a churning file (${c} commits in the last ${WINDOW}); name a symbol"
+            fi
         fi
     done
 }
@@ -291,6 +356,10 @@ if [ "$violations" -gt 0 ]; then
         echo
         echo "Keeping the range as a secondary locator is fine — \`apply_import\` (\`src/cli.rs:4726-4813\`)"
         echo "passes, because the symbol survives the drift the number does not."
+        echo
+        echo "An ALL-CAPS word in running prose is not a symbol — \`CLI\`, \`MUST\` and \`ACL\` all occur"
+        echo "in src/, and none of them re-derives anything (issue #1319). If the token really is a"
+        echo "constant, backtick it and it counts."
         echo
         echo "Is the file churning? Threshold is ${THRESHOLD} commits over the last ${WINDOW}:"
         echo "    git rev-list --count \"\$(git rev-list --max-count=1 --skip=$((WINDOW - 1)) HEAD)..HEAD\" -- <file>"
