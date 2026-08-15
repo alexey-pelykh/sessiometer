@@ -640,7 +640,9 @@ code — and the maintainer has ruled the forward direction out of the model. `O
 > *Recovered 2026-08-05 (twelfth pass) from PR #1057, which authored these twelve files in parallel
 > from the same `/scope` run and merged first. That branch carried the HQ provenance layer; this one
 > had lost it. Everything else #1057 held is present here or superseded by a later review pass — the
-> reconciliation is recorded in the PR body.*
+> reconciliation is recorded in the commit body of `efa1a3e` — the commit that landed THIS branch
+> (PR #1054), not `386a6a2`, which is the commit of #1057, the number this paragraph already names.
+> A PR body reaches no clone under this repo's squash-merge; a commit body does.*
 
 **R-10a** — *Where* R-10 removes a **shipped** flag, the removal **shall** follow a decided path:
 hard-remove with a strict-usage error stating that roster-without-secrets is no longer supported, or

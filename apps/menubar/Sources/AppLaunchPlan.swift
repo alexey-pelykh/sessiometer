@@ -15,7 +15,8 @@
 // false" as startup decisions to extract. Both were extracted already, by #170: they live in
 // `LoginItemModel` (`registerAppLoginItemOnLaunch`, `canStartDaemon`, `reconcileDaemonAgentRegistration`)
 // and are covered by `LoginItemModelTests` against a fake `SMAppService` seam. This file does not
-// re-model them; see the issue #764 PR body for the measurement.
+// re-model them; the measurement is in the commit body of `3d4271c` (the issue #764 change). This repo
+// squash-merges, so the PR body it was written in reaches no clone, and the commit body does.
 
 import Foundation
 

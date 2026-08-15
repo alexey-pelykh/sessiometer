@@ -11,7 +11,8 @@
 // to do on first launch" and "when `canStartDaemon` is false" as startup decisions to extract; #170
 // already extracted both into `LoginItemModel` (`registerAppLoginItemOnLaunch`, `canStartDaemon`,
 // `reconcileDaemonAgentRegistration`), covered by `LoginItemModelTests` against a fake `SMAppService`.
-// See the issue #764 PR body for the measurement, and `design/README.md` for what stays manual.
+// The measurement is in the commit body of `3d4271c` (the issue #764 change) — this repo squash-merges,
+// so the PR body it was written in reaches no clone — and `design/README.md` holds what stays manual.
 //
 // CONSTRAINT-A (issue #748): each gate whose verdict runs through a DERIVED predicate ships a canary
 // proving that predicate can FAIL, driven through the SAME comparison the real assertion uses. That is
