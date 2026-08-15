@@ -2536,7 +2536,8 @@ mod tests {
         ("run_use", ViaSharedResolver, "`use <label>` — reads the resolved target's label for the swap confirmation"),
         // --- matched by an identifier the SYSTEM supplied, never an operator handle -------------
         //
-        // What holds for EVERY row here is the provenance: the string is an account-uuid the
+        // What holds for EVERY row here is the provenance of the identifier this section is
+        // ABOUT — not of every string a row touches: that identifier is an account-uuid the
         // daemon, the OAuth capture or the config itself produced, and it is unique by
         // construction (`config::validate` rejects a duplicated uuid — only LABELS are un-unique,
         // which is why R-6a is about labels). Where a row does compare that uuid against
@@ -2551,8 +2552,23 @@ mod tests {
         // any case: it is what makes the string not an operator handle, which is the whole question
         // this section answers. First-match is a corollary that only arises once something is
         // matched, so a row that matches nothing does not weaken it — it simply never reaches it.
+        //
+        // Scoped to the identifier this section is ABOUT, rather than to every string a row
+        // touches, and issue #1334 is why: written as a universal over rows, the opening sentence
+        // was silent about the OTHER reads two of its own rows perform. `run_sweep` and
+        // `apply_refresh_restore` each read an `Account.label` as well — the handle each carries
+        // into the event it emits, which is neither an account-uuid nor unique, exactly as the
+        // parenthesis above says of labels. `overlay_labels` and `plan_capture` touch a label too,
+        // but WRITE rather than read it. Every other row here reads `account_uuid` and nothing
+        // else. Re-derived against the tree rather than taken from the issue, and each of those
+        // rows discloses its own label below — which is where a reader checks this, not here.
+        //
+        // Silence about a row's OTHER reads is not falsity, which is why the judges who found this
+        // on PR #1327 graded it non-blocking. It is closed anyway because it is that PR's own
+        // standard applied one banner over: issue #1311 exists because a clause reading as a
+        // universal was false for rows beneath it, and this widening had gone the same way.
         ("apply_refresh_observation", NotHandleResolution, "matches a poll observation's own account-uuid back to its roster index"),
-        ("apply_refresh_restore", NotHandleResolution, "matches a restore outcome's account-uuid back to its roster index"),
+        ("apply_refresh_restore", NotHandleResolution, "matches a restore outcome's account-uuid back to its roster index, plus the handle its `CredentialRestored` carries"),
         ("is_active", NotHandleResolution, "compares an account's uuid to the ACTIVE uuid `active.rs` read from the credential"),
         ("overlay_labels", NotHandleResolution, "applies the settings overlay to the account bearing that uuid, and ASSIGNS a label rather than matching one"),
         ("plan_capture", NotHandleResolution, "matches the freshly captured OAuth account's uuid; the label is the name being ASSIGNED to it"),
