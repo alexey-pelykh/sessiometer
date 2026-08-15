@@ -699,12 +699,14 @@ Issue #762 put the Settings window's copy and its two hardcoded field widths und
 (`Tests/SettingsTextMetricsTests`). Three surfaces stayed out of reach of that gate — window/activation
 lifecycle, the `⌘S` key event, and runtime affordances (spinner, focus ring, hover tooltip) — and they
 are listed here rather than left silent, since the issue's AC-4 is explicit that an untestable surface
-must be named as such. They expand to the seven steps below because two of them have a stopped-daemon and
+must be named as such. A fourth joined when issue #763 landed the design reference: the rendered form
+itself, which now has something to be compared against and still has nothing automated to compare it
+(issue #1119). They expand to the steps below because two of them have a stopped-daemon and
 a running-daemon half, and because issues #844 and #944 added a second runtime affordance — the footer's
 clamped apply-status label, one step per arm since the two have different triggers — whose drawing no
 headless bundle can observe. Everything else the gate could not reach has a tracked owner instead: the
 accessibility tree is issue #840, the design reference is § The Settings window below (issue #763,
-landed), and Dynamic Type is the
+landed), the harness that would automate the parity check is issue #1324, and Dynamic Type is the
 pinned defect issue #845.
 
 Run these with the daemon RUNNING (so the form loads) unless a step says otherwise:
@@ -746,6 +748,19 @@ Run these with the daemon RUNNING (so the form loads) unless a step says otherwi
       malform `config.toml` by hand and save: the label says only that the file couldn't be read, and
       the tooltip must add the daemon's parse error under it — that error names the line and column,
       and this tooltip is the only surface carrying it.
+- [ ] **Design parity against the four frames** (issues #763, #1119). The one step that wants the daemon
+      BOTH ways. Open Settings with it running and again with it stopped, and compare each against its
+      frame in § The Settings window below — `settings-loaded-{light,dark}` and
+      `settings-disconnected-{light,dark}`, so both appearances. This is the only check the rendered
+      form gets: no harness renders it (issue #1324 — `RenderPanelTool` draws the panel only), and
+      `SettingsTextMetricsTests` models text with CoreText rather than observing SwiftUI's `Form`
+      layout pass, so where that pass puts the title/value column boundary is settled here or nowhere.
+      Check what the frames actually author: zone order (General and Notifications ABOVE the
+      daemon-config gate), the tunable row anatomy (label, then a true 96 pt value cell), and the
+      footer's two-line clamp. Read the `loaded` pair's cut-off bottom edge as CORRECT — the form is
+      taller than the fixed 460×560 box. And do not read the frames as authority on the Accounts
+      section, the loading placeholder, or any apply-status arm but `.failed`: they render none of
+      those (§ The Settings window, register R-11), so a difference there is not a defect found.
 
 Not on this list on purpose: the per-field COPY, the Save enable/disable rule, and whether a value or
 label fits its field. Those are measured in `SettingsTextMetricsTests` and do not need a human.
@@ -1432,9 +1447,11 @@ four attention shapes. Frames: `settings-loaded-{light,dark}` and `settings-disc
 **These four frames pair with nothing, deliberately.** `design/build-comparison.py` has **no `STATES`
 row** for them, because `RenderPanelTool` renders the *panel* only — there is no Settings capture for
 `cap()` to load, and it fails loudly on a missing PNG. The comparison tool iterates `STATES`, so an
-unpaired frame is ignored by construction rather than breaking the tool. If a Settings render harness
-is ever built, that is when these earn `STATES` rows — the same sequence #752 → #753 followed for the
-pathological-content frames.
+unpaired frame is ignored by construction rather than breaking the tool. Naming one in `STATES` today
+would in fact fail a step earlier than that: the tool indexes the mock by scanning `.pop` blocks, and
+these four are `.win`, so `design()` would report no such frame before `cap()` ever looked for a PNG.
+Building the harness is issue #1324, and that is when these earn `STATES` rows — the same sequence
+#752 → #753 followed for the pathological-content frames.
 
 **Why the `loaded` form is cut off, why the `disconnected` one is not, and why both are correct.**
 The window is a FIXED 460×560 content box (`setContentSize`, and the style mask carries no

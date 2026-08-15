@@ -43,8 +43,10 @@
 //     `PanelReachabilityLintTests` established for a source file this bundle deliberately does not
 //     compile. That proves the clamp and its `.help` recovery are WRITTEN on each chain with the shared
 //     constants as their arguments — never that SwiftUI honours them, which stays #840's;
-//   * that the copy is GOOD. It is inferred product copy on a surface with no ratified design
-//     reference (issue #763) — this gate checks it exists and is distinct, never that it is right.
+//   * that the copy is GOOD. It is inferred product copy: the design reference issue #763 landed
+//     (`design/README.md` § "The Settings window (#763)") authors this window's STRUCTURE and its
+//     GEOMETRY — zone order, tunable row anatomy, the footer clamp — and ratifies none of its
+//     sentences. This gate checks each one exists and is distinct, never that it is right.
 //
 // CONSTRAINT-A (issue #748) — NO GATE WITHOUT A PROVEN FALSIFIER. `testTheCanaryOverflowsWhileEveryShipped
 // SettingsStringFits` pushes a deliberately over-wide fixture through the SAME `TextMetrics.overflows`
@@ -94,12 +96,33 @@
 //   |---|----------------------------------------------------------------|-------------------------------------|-------|
 //   | 1 | Accessibility role/label of every Toggle, TextField, Button    | needs the live AX tree              | issue #840 (its AC-2/AC-4) |
 //   | 2 | The decorative icon in `loadFailureSection`, verified ABSENT   | ditto — annotation ≠ absence        | issue #840 (its AC-3) |
-//   | 3 | The `LabeledContent` title/value column split                   | a `Form` decision with no frame     | issue #763 (no ratified reference) |
-//   | 4 | Rendered pixels of the form                                     | no design reference exists yet      | issue #763 |
+//   | 3 | The `LabeledContent` title/value column split                   | `Form` allocates it at layout time  | manual — `design/README.md` (tunable row); issue #846 (account row) |
+//   | 4 | Rendered pixels of the form                                     | no Settings render harness exists   | manual — `design/README.md`; issue #1324 (harness) |
 //   | 5 | Dynamic Type behaviour of the two fixed cells                   | pinned below as a defect, not fixed | issue #845 |
 //   | 6 | `ProgressView` spin, focus ring, `.help` HOVER rendering        | runtime, not an attribute           | manual — `design/README.md` |
 //   | 7 | ⌘S actually reaching `apply()`                                  | needs a key event into a live window| manual — `design/README.md` (issue #761 closed GO, suite unbuilt) |
 //   | 8 | `SettingsWindowController` activation-policy + single-instance   | `NSApp`/`NSWindow` global state     | manual — `design/README.md` |
+//
+// ROWS 3 AND 4 CHANGED OWNERS WHEN ISSUE #763 LANDED (issue #1119). Both once routed to #763 itself
+// and called the window a surface with no ratified design reference. It has one — `design/README.md`
+// § "The Settings window (#763)" plus four `settings-*` frames in the mock — and the AC-2 section far
+// below already builds against it, so the table contradicted this file's own body. Neither row's real
+// blocker was ever the reference alone:
+//
+//   * Row 3. `Form` allocates the title and value columns during its own layout pass, which the first
+//     caveat above states outright this file does not observe — so a CoreText model cannot settle the
+//     split whatever the mock authors. The reference does now author ONE of the two `LabeledContent`
+//     sites: the `loaded` frames carry the tunable row anatomy (label + a true 96 pt value cell), so a
+//     human can check that half against them. It authors NOTHING for the other, deliberately — the
+//     Accounts section is unrendered in all four frames, so no width rule exists for its 160 pt label
+//     cell, and that cell's measured overflow is issue #846. Hence one row and two routes.
+//   * Row 4. The reference exists; the HARNESS does not. `RenderPanelTool` and `PanelRenderHarness`
+//     render the panel only, and `design/build-comparison.py` indexes the mock's `.pop` blocks while
+//     the Settings frames are `.win` — so they are not merely unpaired, they are unreachable by name.
+//     Building it is issue #1324. Until that lands the route is a human comparing the built window
+//     against the four frames, which is a step in the Settings checklist as of this change — ADDED
+//     there rather than asserted here, because routing to a checklist that lacks the step is the exact
+//     defect the next paragraph records an adversarial review catching in this file's first draft.
 //
 // Rows 6–8 are written into `design/README.md`'s new "Settings window pre-release checklist" by this
 // same change — every one of them as a step an operator can actually run, verified item-by-item rather
@@ -522,7 +545,9 @@ final class SettingsTextMetricsTests: XCTestCase {
         // left PII-freedom to the operator) and issue #445's whole identity-disambiguation kit exists
         // because real rosters carry exactly this shape — so this content is reachable, common, and 12.94
         // pt too wide for the field it lands in. Filed as issue #846; NOT fixed here (widening the field
-        // is a `Form` column decision, and issue #763 owns the missing design reference for that).
+        // is a `Form` column decision, and the reference issue #763 landed authors no width rule for a
+        // cell no frame renders — `design/README.md` § "The Settings window (#763)" leaves the Accounts
+        // section unrendered in all four frames, deliberately, so #846 carries this alone).
         let realisticAddress = "oleksii@company-one.com"
         let addressWidth = TextMetrics.width(realisticAddress, bodyFont)
         XCTAssertTrue(TextMetrics.overflows(realisticAddress, bodyFont, budget: budget),
