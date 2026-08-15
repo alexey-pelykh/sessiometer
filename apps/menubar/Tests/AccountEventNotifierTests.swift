@@ -210,7 +210,13 @@ final class AccountEventNotifierTests: XCTestCase {
 
     /// The clock these tests run against, and the horizon offsets they hang off it. Absolute rather
     /// than `Date()`-relative so every band is a stable byte and nothing flips mid-suite.
-    private static let expiryNow: Int64 = 1_893_456_000
+    ///
+    /// `expiryNow` alone is `nonisolated`: `within(_:inDays:from:)` takes it as a DEFAULT ARGUMENT, which
+    /// this target's Swift 5 language mode evaluates outside the actor — so an isolated read there warns on
+    /// every build (issue #1109). Safe because it is an immutable `Sendable` `Int64` — the same split
+    /// `PanelGeometry` makes for its ceiling arithmetic. `day` and `spacing` are only ever read as
+    /// `Self.…` from main-actor bodies, so they stay isolated.
+    private nonisolated static let expiryNow: Int64 = 1_893_456_000
     private static let day: Int64 = 86_400
     private static let spacing = AccountEventDeriver.expiryNotificationSpacingSecs
 
