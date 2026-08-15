@@ -203,7 +203,13 @@ point size while the allowance grows linearly.
 **R-7** *(event-driven)* — **When** the panel renders at `PanelTypeScale.ceiling`
 (`.accessibility3`, ×2.3529), it **shall** be verified to fit a supported display.
 
-> Currently unverified **because unreachable**. `StatusPanelTypeScale.swift:68-71` records the
+> ~~Currently unverified **because unreachable**.~~ **VERIFIED 2026-08-15 — IT FITS**
+> (`PanelCeilingFitTests`, issue #983): **894.50 pt** wide against the **1424 pt** of room a
+> 1440 × 900 display leaves, and at the **856 pt** height bound. Measured, **not** ratified — A-6
+> (§ 7) carries the resolution and that distinction. The authoring-time rationale that admitted this
+> requirement is retained below, and reads as of 2026-07-30.
+>
+> `StatusPanelTypeScale.swift:68-71` records the
 > shipped consequence: at ×2.3529 "the healthy panel is already **894 pt wide** and the Stats tab
 > **1322 pt tall**, and the panel has NO `ScrollView`". The panel does **not** hold width fixed —
 > `StatusPanelView.swift:60` defines `scaledWidth(_ scale:) = width * scale`, so 380 pt is the width
@@ -398,7 +404,7 @@ undetected.
 | **A-3** | Activation policy explains A-1↔A-2 | **this pipeline, hypothesis** | 🟡 | R-1's 2×2 | Policy column differs | Do not build on it |
 | ~~**A-4**~~ | ~~A producer-side gate is feasible from a test bundle excluding `StatusItemController.swift`~~ | this pipeline | 🟢 | ~~Stage 2 feasibility spike~~ | — | **RESOLVED 2026-07-30 — FEASIBLE at T2** (design § 6 verdict, § 14). The exclusion bars a *compiled* gate, not a *source-as-data* one. No longer an open assumption |
 | **A-5** | The operator wants an in-app text-size control if the OS path is absent | **unvalidated** | 🔴 | Ask at the R-3 decision | Circuit-breaker fires | "Ship no driver" stays live |
-| **A-6** | The panel at `.accessibility3` fits a supported display | never measured | 🟡 | R-7 | Render at ceiling | Ceiling may need lowering |
+| ~~**A-6**~~ | ~~The panel at `.accessibility3` fits a supported display~~ | ~~never measured~~ | 🟢 | ~~R-7~~ | ~~Render at ceiling~~ | ~~Ceiling may need lowering~~ **RESOLVED 2026-08-15 — FITS** (`PanelCeilingFitTests`, issue #983): at the ceiling the panel is **894.50 pt** wide against the **1424 pt** of room a 1440 × 900 display leaves, and it meets the **856 pt** height bound there. The ceiling stands. **Measured, not ratified** — that height bound is #818's, carried as *decided in code, pending ratification*, and #1176 carries deriving it from the live screen. No longer an open assumption |
 | **A-7** | `design-menubar.md` § D-UX-SETTINGS is authoritative for #845 | design SoT | 🟡 | — | Marked `RATIFICATION-PENDING` (#763) | Re-ratify before conforming |
 | **A-9** | `.regularMaterial` is `NSVisualEffectView`-backed, so macOS substitutes the opaque fill itself under Reduce Transparency | **this pipeline, uncited platform premise** | 🔴 | **T3 manual check before designing #868** | Observe the real panel with the setting on | Weakened by: the app drops `NSPopover` (`StatusItemController.swift:90`) and ADR-0031 § Decision 6 finds the renderer ignores system a11y settings — so it is not observable via the render path either |
 | **A-8** | macOS Text Size reaches only apps that adopt Apple's **"preferred reading size"** opt-in, and this app has **not** adopted it | `StatusPanelTypeScale.swift:75-79` — **committed in-tree, provenance unstated** (neither measured-here nor issue-traced) | 🔴 | **R-1's pre-probe** (see R-1b) | Adopt the opt-in in a throwaway build and re-read the delivery cell | **Do not let the 2×2 kill D-A without testing this** |
@@ -442,7 +448,8 @@ preference failure). Observability: **the reachability gate IS the observability
 Matrix State 3 visible. No new runtime telemetry; a display preference is not an operational signal.
 
 **9.4 Performance & Scalability** — Bounded by `PanelTypeScale.ceiling` (`.accessibility3`), already
-clamped via `.dynamicTypeSize(...ceiling)`. R-7 covers the one live risk (screen fit at the ceiling).
+clamped via `.dynamicTypeSize(...ceiling)`. R-7 covered the one live risk (screen fit at the
+ceiling); it is measured and the panel fits — A-6 (§ 7) carries the verdict.
 No scalability dimension — one panel, one user, no load.
 
 **9.5 Operational** — `N/A — no deploy, migration, or runbook impact`, **unless** R-10 selects daemon
@@ -487,3 +494,4 @@ cannot be lost between stages.
 | 2026-07-30 | Corrected at the pre-submit gate, three rounds. **R-1a inverted** — the app *does* declare `LSUIElement` (`Info.plist:25-26`); a plist read is a false *positive*, not a false negative (propagated to #971 and #817). **R-1b + A-8 added** — `StatusPanelTypeScale.swift:75-79` names a "preferred reading size" opt-in the 2×2's axes cannot vary, so adoption is now a mandatory pre-probe and the circuit-breaker is gated on it. **A-9 added** — the `NSVisualEffectView` substitution premise under #868 was uncited. **R-7 re-based** off `:68-71` (the shipped ceiling arithmetic) rather than `:52-53` (a rejected alternative's). **`SetTunables` corrected** 15 → **19** fields (15 int + 4 boolean canary overrides), and its citation moved off the read-side `TunablesView`. |
 | | `dor_status` remains **passed-with-findings**; it was originally recorded against a requirement set that did not contain R-1b, and R-1b's own source (A-8) is graded 🔴, so the verdict is unchanged rather than upgraded. |
 | 2026-07-30 | Corrected at the **post-submit** external-review gate (PR #994), which reviewed the PR as a submitted artifact and so could see what four per-file rounds structurally could not: the links *between* artifacts. Every one of its findings was cross-artifact; not one was a defect in the prose, and all 29 `file:line` citations survived a citation-by-citation attack. **A-4 RESOLVED** — the design delivered its FEASIBLE verdict (T2, § 14) while this PRD still said "Stage 2 owes a verdict" in three places; that leak ran *design → PRD*, the one direction the design's own write-back rule had no row for, now added. **R-5c + AC-4a + Cap-1.3 added** — the design assigned row-3 closure a T3 obligation, but no manual checklist covers the text-size axis at all (`design/README.md:497-516` has four steps, none of them text size), so the obligation had no owner; "T3 was never run" was a misdiagnosis of "no T3 step exists". **ADR-A status unified** — § 16b said `ratified` where § 12 says `PROPOSED`. **Appetite anchor 21 → 20 items** (ADR-0031 and #748's own body both say 20). Affordance-instance labels unbackticked — `PanelTextScale` is one letter from the real enum `PanelTypeScale` and is not a code symbol. |
+| 2026-08-15 | **A-6 RESOLVED — the panel FITS at its ceiling.** `PanelCeilingFitTests` (issue #983, PR #1274) renders all 22 harness states at `.accessibility3` and measures the footprint against 1440 × 900 pt: **894.50 pt** wide against the **1424 pt** of room the display leaves, and at the **856 pt** height bound (900 − 24 − 20). Struck in § 7 per the design's own write-back rule; R-7's rationale and § 9.4 no longer read as unmeasured. The design followed at its § 5.4 inventory, § 11 Cap-3.1 tier (**T3 → T1** — the delivered gate is an in-process render, not the anticipated manual pass), § 13, § 14 Feasibility Summary + risk row, and § 16. **Measured, not ratified**: the 856 pt bound is #818's, carried as *decided in code, pending ratification*, and #1176 carries deriving it from the live screen — untouched here. |

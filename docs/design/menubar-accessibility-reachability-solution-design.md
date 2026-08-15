@@ -137,7 +137,7 @@ not daemon-owned state, so S-B does not violate it — it falls outside it.
 | `ReachabilityGate` | R-5, R-5a, R-5b | test (polarity per FORK-1) |
 | `TextSizeManualStep` | **R-5c** | manual checklist authoring — the T3 half of row-3 closure |
 | `OverlapBudgetGate` | R-6, R-6a | test |
-| `ScreenFitVerification` | R-7 | manual + recorded measurement |
+| `ScreenFitVerification` | R-7 | ~~manual~~ **test** + recorded measurement — `PanelCeilingFitTests` (#983), a T1 in-process render, not the manual pass this row anticipated |
 | `SettingsCellScaling` | R-8, R-8a | production, **premise-gated on R-1** |
 | `DisplaySettingRenderings` | R-9, R-9a, R-9b | design decision → ratification → manual verification |
 | `PanelSizeClassReference` | R-12 | design artifact (mock frames or recorded `none`) |
@@ -229,7 +229,7 @@ k=1.0, which is today's behaviour. Fail-open by construction.
 | **Cap-1.3** | A manual text-size step exists in the Appearance-settings checklist and observes the driver **delivered** | TextSizeManualStep | **T3** |
 | Cap-2.1 | Content-sized elements stay within allowance at all 12 classes — 7 distinct factors measured, the 5 clamp-aliases asserted as aliases | OverlapBudgetGate | T1 |
 | Cap-2.2 | The overlap predicate is non-tautological | OverlapBudgetGate | T1 |
-| Cap-3.1 | Panel fits a supported display at `.accessibility3` | ScreenFit | T3 |
+| Cap-3.1 | Panel fits a supported display at `.accessibility3` | ScreenFit | ~~T3~~ **T1** — delivered 2026-08-15 as an in-process render measurement (`PanelCeilingFitTests`, #983), which is T1 by the table below |
 | Cap-4.1 | Settings cells scale with their fonts | SettingsCellScaling | T1 |
 | Cap-5.1 | Display-setting renderings are ratified and match | DisplaySettingRenderings | T3 |
 | Cap-6.1 | Status item byte-identical at every class | brand lock | T1 |
@@ -241,9 +241,9 @@ them by *where the stimulus originates*, which is what decides whether a gate ca
 
 | Tier | Mechanism | Can it see the producer? | Capabilities |
 |---|---|---|---|
-| **T1** in-process, driveable | Render harness / metrics, own stimulus | ❌ no | Cap-2.1, 2.2, 4.1, 6.1 |
+| **T1** in-process, driveable | Render harness / metrics, own stimulus | ❌ no | Cap-2.1, 2.2, **3.1**, 4.1, 6.1 |
 | **T2** source-as-data lint | Reads excluded sources as bytes | ✅ **yes** | Cap-1.1, 1.2 |
-| **T3** manual-only | Real app, real OS setting | ✅ yes | **Cap-1.3**, 3.1, 5.1 |
+| **T3** manual-only | Real app, real OS setting | ✅ yes | **Cap-1.3**, ~~3.1~~, 5.1 |
 
 **T2 is not a new mechanism — it is an existing gate *kind* promoted to a first-class tier row.**
 ADR-0031 already recognises it, in two separate passages of § Decision 1 (quoted apart rather than
@@ -285,7 +285,8 @@ directions in one run. AI-augmented testing: **N/A — no AI/LLM in system.**
 ## 13. Quality Requirements
 
 Bounded by `PanelTypeScale.ceiling` (`.accessibility3`), already clamped. No latency/throughput
-dimension — one panel, one user. R-7 is the sole live performance-adjacent risk (geometry, not speed).
+dimension — one panel, one user. R-7 was the sole performance-adjacent risk (geometry, not speed);
+it is measured and the panel fits — § 14's screen-fit verdict.
 
 ## 14. Risks and Open Questions
 
@@ -298,7 +299,7 @@ dimension — one panel, one user. R-7 is the sole live performance-adjacent ris
 | `OverlapBudgetGate` | FEASIBLE | #896 already identifies the two allowances and the non-tautological surface |
 | `SettingsCellScaling` | **UNCERTAIN → premise-gated** | Blocked on R-1 (A-2). May be void. Not a blocker: R-8a already routes it |
 | `DisplaySettingRenderings` | **UNCERTAIN → ratification-gated** | Blocked on operator (R-9a), not on technique |
-| `ScreenFitVerification` | FEASIBLE | Manual render at the ceiling |
+| `ScreenFitVerification` | **FEASIBLE — VERIFIED** | ~~Manual render at the ceiling~~ **R-7 RESOLVED — see verdict below.** Delivered as a committed T1 render measurement, not the manual pass |
 | `TextSizePreference` | FEASIBLE | Only under D-B |
 | `PanelSizeClassReference` | FEASIBLE | Mock authoring is established practice |
 
@@ -311,6 +312,23 @@ dimension — one panel, one user. R-7 is the sole live performance-adjacent ris
 > Residual risk is the *predicate*, not the *access* — hence FEASIBLE-WITH-SPIKE, spike scoped to
 > the non-literal-source clause (§ 5.2).
 
+> **R-7 SCREEN-FIT VERDICT — IT FITS, 2026-08-15.** `PanelCeilingFitTests` (issue #983) renders all
+> 22 harness fixtures at `PanelTypeScale.ceiling` and puts the footprint against the smallest display
+> the deployment target plausibly presents, 1440 × 900 pt. The two axes are different claims and are
+> recorded as such. **Width is a fit against available room**: 894.50 pt against the 1424 pt left
+> after `StatusItemChrome.screenInset` on both edges — 529.50 pt spare. **Height is a bound being
+> held**: the 856 pt `panelHeightBudget` (900 − 24 − 20), which sixteen of the twenty-two states
+> meet exactly, so that half reads *bounded and scrollable*, never *fits without scrolling*. The
+> ceiling therefore stands where `PanelTypeScale.ceiling` puts it, and the manual pass this design
+> anticipated is superseded — the measurement is in-process, which is why Cap-3.1 moves T3 → T1
+> (§ 11).
+>
+> **Measured is not ratified**, and this verdict does not touch that. The 856 pt bound is #818's,
+> carried as *decided in code, pending ratification* (`apps/menubar/design/README.md` § The scroll
+> boundary (#818), and beside `StatusPanelFormat.panelHeightBudget`); #1176 carries deriving it from
+> the live screen. Nor does it generalise downward: the width verdict holds at or above 1024 pt, the
+> height verdict is 1440 × 900's alone. What it discharges is PRD A-6, and nothing further.
+
 **No INFEASIBLE must-have components. Feasibility gate: PASS.**
 
 ### Risk Register (Phase 4.2)
@@ -322,7 +340,7 @@ dimension — one panel, one user. R-7 is the sole live performance-adjacent ris
 | Positive gate satisfied by a semantically-dead literal injection | 2×3 | **6 MED** | § 5.2 non-literal-source clause → SPIKE-2 |
 | #868 renderings decided in an implementation PR without ratification | 2×3 | **6 MED** | R-9a hard gate; items carry ratification as an AC |
 | #845 implemented against a false premise | 2×3 | **6 MED** | R-8a premise-gate; sequenced after R-1 |
-| Panel does not fit at the ceiling → ceiling must drop after the driver ships | 2×2 | 4 MED | R-7 verified **before** the driver lands |
+| ~~Panel does not fit at the ceiling → ceiling must drop after the driver ships~~ **CLOSED 2026-08-15 — measured, it fits** | 2×2 | ~~4 MED~~ **—** | ~~R-7 verified **before** the driver lands~~ Verified ahead of any driver by `PanelCeilingFitTests` (#983): 894.50 pt against 1424 pt of room, at the 856 pt height bound. The ceiling does not drop. Residual is the height BUDGET below 900 pt, which is #1176's question, not the ceiling's |
 | Scope creep into #832 / VoiceOver | 1×2 | 2 LOW | PRD § 1b explicit Out-of-scope |
 
 **No unmitigated HIGH risks. Risk gate: PASS.**
@@ -404,7 +422,7 @@ a rabbit hole.
 | R-5, R-5a, R-5b | Testing Arch | § 5.2, § 11 | Cap-1.1, Cap-1.2 | covered |
 | **R-5c** | Testing Arch | § 11 (gap + T3 tier) | **Cap-1.3** | covered |
 | R-6, R-6a | Testing Arch | § 11 | Cap-2.1, Cap-2.2 | covered |
-| R-7 | Testing Arch | § 11 T3 | Cap-3.1 | covered |
+| R-7 | Testing Arch | § 11 T1 | Cap-3.1 | covered |
 | R-8, R-8a | Technical Arch | § 5.4 | Cap-4.1 | covered |
 | R-9, R-9a, R-9b | UI/Visual | § 10, § 11 T3 | Cap-5.1 | covered |
 | R-10 | Technical Arch, API | § 5.3, § 8 | — | covered |
