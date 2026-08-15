@@ -190,10 +190,12 @@ final class PanelCeilingFitTests: XCTestCase {
     /// Both axes, every state, and the measured margin reported either way — a verdict with no number
     /// behind it is the judgement call AC-2 refuses.
     ///
-    /// The method name says "SmallestSupported" and the header explains why that is a shorthand rather than
-    /// a floor: macOS 13 also supports the 12-inch MacBook (2017) at 1280 × 800 pt. The width verdict holds
-    /// there too; the height verdict does not generalise below 900 pt and is not claimed to.
-    func testThePanelFitsTheSmallestSupportedDisplayAtTheCeiling() throws {
+    /// The name says PLAUSIBLE where AC-1 says "a supported display", and that gap is the AC mapping rather
+    /// than a slip: macOS 13 also supports the 12-inch MacBook (2017) at 1280 × 800 pt, so what is measured
+    /// here is a display small enough to be worth designing against, never the deployment target's floor.
+    /// The width verdict holds there too; the height verdict does not generalise below 900 pt and is not
+    /// claimed to.
+    func testThePanelFitsTheSmallestPlausibleDisplayAtTheCeiling() throws {
         var report: [String] = []
         for fixture in fixtures() {
             let box = try XCTUnwrap(Self.footprint(fixture, PanelTypeScale.ceiling),
@@ -344,7 +346,11 @@ final class PanelCeilingFitTests: XCTestCase {
     /// frame less both insets — and called that unreachable because "the panel is ~360 pt". At the ceiling
     /// it is 894.50 pt, so the ground moved by ×2.35 even though the conclusion held. Asserted here rather
     /// than left as prose.
-    func testTheAppsOwnPlacementKeepsTheCeilingPanelOnTheSmallestSupportedDisplay() throws {
+    ///
+    /// The display in the name is the PLAUSIBLE one; the MARK above quotes AC-1's "supported". That seam is
+    /// the header's `PLAUSIBLY IS NOT "SMALLEST"` paragraph, which owns what it costs each axis — and this
+    /// verdict reads BOTH, since `visibleFrame` carries the 900 pt height as well as the 1440 pt width.
+    func testTheAppsOwnPlacementKeepsTheCeilingPanelOnTheSmallestPlausibleDisplay() throws {
         let fixture = try XCTUnwrap(fixtures().first { $0.name == "healthy" }, "no `healthy` fixture")
         let box = try XCTUnwrap(Self.footprint(fixture, PanelTypeScale.ceiling))
         let size = NSSize(width: box.width, height: box.height)
