@@ -3419,7 +3419,7 @@ impl<W: Write> DiagnosticLog<W> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::time::Duration;
 
@@ -5162,6 +5162,23 @@ mod tests {
     /// Anchored at `CARGO_MANIFEST_DIR`, so the scan is tied to the crate under test whatever
     /// the test CWD — the same idiom as the `usage.rs` egress meta-tests.
     ///
+    /// `pub(crate)` because the shape it guards is not confined to the sweeps below: any
+    /// hand-maintained list of variants has the same hole, and the fix is the same scan. Issue
+    /// #1386 is the second consumer — `crate::reliability`'s
+    /// `poll_refresh_trigger_tokens_all_reach_a_named_bucket`, which replays every
+    /// [`PollRefreshTrigger`] through the emitter and had no way to know its list was short. This
+    /// follows `crate::error::tests::declared_variant_names`, published `pub(crate)` for
+    /// `crate::daemon`'s redaction meter on the same reasoning (issue #1085): what makes a walk
+    /// worth publishing rather than re-writing per consumer is the scrutiny already pointed at
+    /// THIS one — the two-layer note above, the empty-parse refusal below, and `split_top_level`'s
+    /// under-matching rules. A private second copy would inherit none of it.
+    ///
+    /// The scan reads THIS file, so it answers for enums declared here and no others. That is not
+    /// a limitation worth generalizing away on speculation: both live consumers name an enum from
+    /// this file, and a caller naming one that is not here fails loudly rather than passing
+    /// vacuously — the header lookup below refuses a declaration it cannot find, and the parse
+    /// refuses a body it read nothing out of.
+    ///
     /// This set is layer 2's ground truth, so where it could diverge from the COMPILER's variant
     /// set a variant would be forced to have a match arm but not a sample — reopening the very
     /// hole issue #891 closes, one level down. Divergence is therefore avoided in the parser
@@ -5170,7 +5187,7 @@ mod tests {
     /// (so `A, B,` on one line yields both). Over-matching is safe — a name that is not really
     /// a variant lands in `declared`, goes unsampled, and FAILS loudly; it is under-matching
     /// that would pass quietly, and that is what these two rules remove.
-    fn declared_variant_names(enum_name: &str) -> std::collections::BTreeSet<String> {
+    pub(crate) fn declared_variant_names(enum_name: &str) -> std::collections::BTreeSet<String> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/observability.rs");
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
