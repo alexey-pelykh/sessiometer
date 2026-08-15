@@ -303,13 +303,16 @@ where
     /// account — with the issue #643 credential re-probe. When the revived account's health
     /// verdict is the terminal 🔴 `Dead` (its [`last_refresh_outcome`](AccountHealth::last_refresh_outcome)
     /// latched `Dead`), drive an IMMEDIATE isolated refresh (the always-wired #162/#426
-    /// `poll_refresh` engine) and fold a genuinely SUCCESSFUL refresh into the verdict, so a fixed
+    /// `poll_refresh` engine) and fold that re-probe's outcome into the verdict, so a fixed
     /// credential returns to 🟢 within a cycle instead of latching 🔴 for a full ~8h access-token
     /// lifetime until the next natural near-expiry sweep. Recovery from `Dead` stays gated on a real
     /// successful refresh, NEVER a usage-poll 200 (the false-recovery guard issue #427 established: a
     /// usage 200 exercises the ACCESS token and says nothing about the REFRESH token, which is
     /// exactly what `Dead` asserts) — a still-dead re-stash whose fresh credential ALSO fails to
-    /// refresh keeps the honest 🔴.
+    /// refresh keeps the honest 🔴. That gate reads the `Dead` VERDICT alone, and the ladder has a
+    /// THIRD arm: a transient engine error is INCONCLUSIVE, not a death, so
+    /// [`fold_recovery_outcome`](Self::fold_recovery_outcome) un-quarantines on it too — to
+    /// `AtRisk`, preserving the #275 guarantee on every arm but the confirmed-`Dead` one.
     ///
     /// When the account is NOT `Dead` (a bare `Degraded` quarantine, whose access-token 401-streak a
     /// re-login clears WITHOUT needing a refresh), the isolated engine is unwired (a hermetic
@@ -339,8 +342,8 @@ where
         }
     }
 
-    /// Re-probe a revived PARKED account's credential with ONE isolated refresh and fold a
-    /// genuinely SUCCESSFUL result into its health (issue #643). Only called from
+    /// Re-probe a revived PARKED account's credential with ONE isolated refresh and fold the result
+    /// into its health (issue #643). Only called from
     /// [`reconcile_restored`](Self::reconcile_restored) when the account is `Dead`, `poll_refresh`
     /// is wired, AND it is not the active one — so the engine `as_ref()` is always `Some`. The
     /// isolated #102 engine rotates the server-side refresh token but CAS-writes only the account's
@@ -348,9 +351,11 @@ where
     /// reactive #162 poll path drives. Emits one durable [`Event::PollRefresh`] for the ACTION
     /// (mirroring [`refresh_retry`](Self::refresh_retry)) under its OWN
     /// [`PollRefreshTrigger::Recovery`] — issue #1367, which is also what keeps this firing out of
-    /// [`crate::reliability`]'s poll-driven loss bucket — then folds a live outcome via
-    /// [`fold_recovery_outcome`](Self::fold_recovery_outcome); a `Dead` re-stash (still dead) or a
-    /// transient engine error leaves the honest 🔴 standing.
+    /// [`crate::reliability`]'s poll-driven loss bucket — then folds the outcome, WHATEVER it is,
+    /// through [`fold_recovery_outcome`](Self::fold_recovery_outcome)'s three-way ladder: a LIVE
+    /// re-stash un-quarantines, a transient engine error un-quarantines anyway (to `AtRisk` —
+    /// INCONCLUSIVE is not a death, so the #275 guarantee holds), and only a re-probe that comes
+    /// back definitively `Dead` leaves the honest 🔴 standing.
     pub(super) async fn reprobe_dead_parked_credential(&mut self, idx: usize) -> Vec<Event> {
         let refreshed = match self.poll_refresh.as_ref() {
             Some(engine) => engine.refresh(&self.roster[idx]).await,
