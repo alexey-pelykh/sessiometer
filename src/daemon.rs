@@ -6024,12 +6024,15 @@ mod tests {
     }
 
     /// A control seam that yields `Restored(uuid)` exactly once, then never resolves
-    /// (issue #275) — so the run loop un-quarantines the named account on its first idle,
+    /// (issue #275) — so the run loop reconciles the named account on its first idle,
     /// then idles normally on every later poll. The on-demand-restore analog of
-    /// [`OnceRosterReload`]: drives the live `Idle::Restored => apply_refresh_restore`
-    /// wiring that `NoControl` never does. Holds the target `uuid` and clones it into the
-    /// payload each `serve` (which borrows `&self`), mirroring the real socket path where
-    /// the uuid arrives in the request line.
+    /// [`OnceRosterReload`]: drives the live `Idle::Restored => reconcile_restored`
+    /// wiring that `NoControl` never does — whether that reconcile takes the plain
+    /// un-quarantine or the issue-#643 isolated re-probe is decided inside it, on the named
+    /// account's verdict AND whether the isolated engine is wired AND the account is parked.
+    /// Holds the target `uuid` and clones it into the payload each
+    /// `serve` (which borrows `&self`), mirroring the real socket path where the uuid
+    /// arrives in the request line.
     pub(super) struct OnceRestored {
         uuid: String,
         fired: Cell<bool>,

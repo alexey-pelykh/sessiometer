@@ -93,13 +93,21 @@ pub(crate) enum ControlSignal {
     RosterReloadRequested,
     /// An authenticated peer (the `login` verb re-logging in a parked account; in
     /// principle a manual operator) asked to un-quarantine the account with this
-    /// `uuid` WITHOUT making it active (issue #275). The run loop applies the existing
+    /// `uuid` WITHOUT making it active (issue #275). The run loop hands it to
+    /// [`Daemon::reconcile_restored`], which forks on the named account's own verdict
+    /// (issue #643). A bare `Degraded` quarantine takes the existing
     /// [`Daemon::apply_refresh_restore`] primitive — the same one the #106 refresh
     /// sweep drives — which flips `quarantined` off, resets `recovery_successes`, and
-    /// emits [`Event::CredentialRestored`], with NO canonical write and NO
-    /// active-account change. Unlike the two payload-less signals above it CARRIES the
-    /// target `uuid` (the reason this enum is not `Copy`). Idempotent at the primitive:
-    /// an unknown or already-non-quarantined `uuid` is a logged no-op. Decoupled from
+    /// emits [`Event::CredentialRestored`]. A `Dead` PARKED account is instead re-probed
+    /// with an isolated refresh of its OWN, reaching that primitive only when that
+    /// re-probe does not itself come back `Dead` — so a credential the re-probe confirms
+    /// dead KEEPS its quarantine, while a TRANSIENT re-probe error un-quarantines anyway.
+    /// NO canonical write and NO active-account change on either fork.
+    /// Unlike the two payload-less signals above it CARRIES the target `uuid` (the
+    /// reason this enum is not `Copy`). Idempotent where there is nothing to do: an
+    /// unknown `uuid` short-circuits in `reconcile_restored` ahead of the fork, and an
+    /// already-non-quarantined account is a no-op at the primitive — though a `Dead`
+    /// verdict is re-probed whether or not the quarantine flag is set. Decoupled from
     /// the sweep (which is starved, #260), so this is the RELIABLE on-demand
     /// un-quarantine path for a re-logged-in parked account.
     Restored(String),
@@ -609,9 +617,10 @@ pub(crate) fn control_reply(
         // produces NO signal (a stranger can never un-quarantine an account). Auth is checked
         // FIRST, so a stranger learns nothing about the request's well-formedness. A `restored`
         // that parses but carries no `uuid` has no target to restore, so it is malformed-safe
-        // like an unparseable line. The idempotent unknown-/already-restored no-op lives in
-        // `apply_refresh_restore` (run-loop side, where `&mut Daemon` is available); this pure
-        // reply always acks a well-formed authenticated request and lets the primitive decide.
+        // like an unparseable line. The idempotent unknown-uuid no-op lives in
+        // `reconcile_restored` (run-loop side, where `&mut Daemon` is available), which
+        // short-circuits there ahead of its un-quarantine / re-probe fork; this pure reply always
+        // acks a well-formed authenticated request and lets that dispatch decide.
         Ok(request) if request.cmd == "restored" => {
             if peer_authenticated {
                 match request.uuid {

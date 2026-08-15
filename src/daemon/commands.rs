@@ -2828,7 +2828,7 @@ mod tests {
     #[test]
     fn control_reply_restored_authenticated_signals_a_restore() {
         // Issue #275: an authenticated same-user peer's `restored` acks and yields the
-        // `Restored(uuid)` signal the run loop applies via `apply_refresh_restore` — carrying
+        // `Restored(uuid)` signal the run loop hands to `reconcile_restored` — carrying
         // the exact uuid from the request line, un-touched.
         let snap = StatusSnapshot::default();
         let (reply, signal) = control_reply(r#"{"cmd":"restored","uuid":"u-B"}"#, &snap, true);
@@ -3067,12 +3067,19 @@ mod tests {
     #[tokio::test]
     async fn run_loop_restored_control_command_un_quarantines_without_activating() {
         // Issue #275: the run loop's idle select must route a `Restored(uuid)` control signal
-        // into `apply_refresh_restore` — un-quarantining the named PARKED account and logging its
+        // into `reconcile_restored` — un-quarantining the named PARKED account and logging its
         // edge-triggered `credential_restored` — WITHOUT a canonical write or an active-account
         // change. This is the on-demand un-quarantine path, decoupled from the #106 sweep (which is
         // starved, #260). The control-driven analog of `run_loop_emits_refresh_events_and_applies_restores`:
         // a regression turning the `Some(Restored) => break` arm into a `continue`, or dropping the
-        // post-idle `apply_refresh_restore` call, would leave `spare` quarantined and fail here.
+        // post-idle reconcile, would leave `spare` quarantined and fail here.
+        //
+        // Which of `reconcile_restored`'s two forks (issue #643) this exercises is pinned by the
+        // setup below, on two independent grounds: `Daemon::new` leaves `poll_refresh` unwired, and
+        // the account's `last_refresh_outcome` is never set to `Dead`. Either alone routes it to the
+        // plain `apply_refresh_restore`, so this test says nothing about the `Dead` re-probe fork —
+        // `run_loop_restored_reprobes_a_dead_parked_account_through_the_idle_select` in
+        // `refresh_fold.rs` is what pins that one.
         let roster = vec![account("u-A", "work"), account("u-B", "spare")];
         let store = store_holding(b"A-token").await;
         let stash = stash_with(&[
@@ -3120,9 +3127,9 @@ mod tests {
         .await
         .unwrap();
 
-        // The signal reached `apply_refresh_restore` through the idle select: `spare` is
-        // un-quarantined in memory and its edge-triggered `credential_restored` rode the event log
-        // exactly once — no sweep involved.
+        // The signal reached `apply_refresh_restore` through the idle select's `reconcile_restored`
+        // dispatch, on its plain-un-quarantine fork: `spare` is un-quarantined in memory and its
+        // edge-triggered `credential_restored` rode the event log exactly once — no sweep involved.
         assert!(
             !daemon.state.accounts[1].health.quarantined,
             "the restored account is un-quarantined"

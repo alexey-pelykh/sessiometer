@@ -46,7 +46,7 @@
 //! clears the quarantine AT THE SOURCE (issue #428): it sends the existing `#275 Restored`
 //! control signal — the same authenticated, non-activating un-quarantine primitive
 //! `login`/reconcile already uses (ADR-0008), reused with NO new socket surface and NO new
-//! spawn path — so the daemon un-quarantines and re-polls through the fresh stash, and the
+//! spawn path — so the daemon reconciles the account on its own verdict (issue #643), and the
 //! reported line states the quarantine was cleared (superseding #163's vacuous `claude /login`
 //! / "next refresh sweep" cue, which was false with `[refresh]` off). A cycle that did NOT
 //! prove the refresh token — a genuinely `dead` credential, a `no change`, or a refresh a
@@ -127,9 +127,14 @@ impl PokeEngine for RealPokeEngine {
 /// an in-memory fake exactly as [`PokeEngine`] injects the refresh engine. Reused with NO
 /// new socket surface and NO new spawn path (ADR-0008 explicitly reuses this one primitive).
 trait RestoreNotifier {
-    /// Best-effort: `Ok(())` once the daemon has RECEIVED the signal (it applies the existing
-    /// `apply_refresh_restore` primitive — un-quarantine + re-tick, no canonical write, no
-    /// active-account change), `Err` when no daemon is reachable or the exchange fails.
+    /// Best-effort: `Ok(())` once the daemon has RECEIVED the signal, `Err` when no daemon is
+    /// reachable or the exchange fails. RECEIPT is the whole of it — the daemon acks a well-formed
+    /// authenticated request from its pure control handler and decides afterwards, in
+    /// `reconcile_restored` (`src/daemon/refresh_fold.rs`), which fork the uuid takes: a `Degraded`
+    /// quarantine the plain un-quarantine + re-tick (`apply_refresh_restore`), a `Dead` PARKED one
+    /// an isolated re-probe of its own first (`reprobe_dead_parked_credential`, issue #643) that
+    /// KEEPS the quarantine when the re-probe comes back definitively `Dead`. No canonical write
+    /// and no active-account change on either fork.
     async fn send_restored(&self, uuid: &str) -> Result<()>;
 }
 
@@ -404,12 +409,13 @@ fn proven_refresh(report: &RefreshReport) -> bool {
 /// currently has the account OUT OF ROTATION ([`DaemonVerdict::Quarantined`], resolved by
 /// [`daemon_verdict`] — a `Degraded` access-token 401-streak (issue #427) or a proven-`Dead`
 /// verdict (#261)) AND the cycle [proved the refresh token](proven_refresh) — the exact
-/// condition that used to merely PRINT a "still dead" stall (#163), now the trigger to
-/// actually un-quarantine via the `#275 Restored` signal so the daemon re-polls through the
-/// fresh stash. A `Degraded` account whose refresh SUCCEEDS recovers here (the fix for issue
-/// #427 — its refresh token was always valid), while a genuinely dead credential — whose
-/// refresh returns `dead`, not `Refreshed` — is filtered out and still points at
-/// `claude /login`.
+/// condition that used to merely PRINT a "still dead" stall (#163), now the trigger to send the
+/// `#275 Restored` signal so the daemon reconciles the account on its own verdict — clearing a
+/// `Degraded` quarantine outright, and a `Dead` one only when the daemon's own isolated re-probe
+/// of that fresh stash does not itself come back `Dead` (issue #643) — a TRANSIENT re-probe error
+/// clears it too. A `Degraded` account whose refresh SUCCEEDS recovers here (the fix for issue
+/// #427 — its refresh token was always valid), while a genuinely dead credential — whose refresh
+/// returns `dead`, not `Refreshed` — is filtered out and still points at `claude /login`.
 ///
 /// Both conjuncts are REQUIRED, and only [`Quarantined`](DaemonVerdict::Quarantined) satisfies
 /// the first: an [`Unattributable`](DaemonVerdict::Unattributable) verdict never fires the send,
@@ -428,8 +434,10 @@ enum Restore {
     /// daemon-quarantined, or no fresh re-stashed token to re-poll through. The line carries
     /// the cycle's own plain classification.
     Skipped,
-    /// The `restored` signal was DELIVERED: the daemon un-quarantines and re-polls through
-    /// the fresh stash, so the account recovers on the next tick — no re-login needed.
+    /// The `restored` signal was DELIVERED: the daemon reconciles the account on its own
+    /// verdict (issue #643), so it recovers on the next tick with no re-login needed — unless
+    /// that verdict is `Dead` and the daemon's own isolated re-probe of the fresh stash
+    /// confirms the death, which KEEPS the quarantine.
     Cleared,
     /// The signal could NOT be delivered (the daemon went away since the pre-cycle status
     /// read, or the exchange failed): the fresh token IS stashed, but the quarantine persists
@@ -502,11 +510,19 @@ fn poke_outcome(report: &RefreshReport, restore: Restore) -> String {
     }
 }
 
-/// The issue-#428 confirmation for a poke that refreshed a quarantined account AND cleared the
-/// daemon quarantine via the `#275 Restored` signal: the token is fresh and the daemon will
-/// re-poll through it — superseding #163's `claude /login` / "next refresh sweep" cue, which
-/// promised a sweep that never runs with `[refresh]` off. Non-secret (issue #15): a
-/// classification + a recovery statement, no token.
+/// The issue-#428 confirmation for a poke that refreshed a quarantined account AND delivered the
+/// `#275 Restored` signal: the token is fresh and the daemon has been told — superseding #163's
+/// `claude /login` / "next refresh sweep" cue, which promised a sweep that never runs with
+/// `[refresh]` off. Non-secret (issue #15): a classification + a recovery statement, no token.
+///
+/// The signal is acked on RECEIPT, so this line states an outcome the daemon has not carried out
+/// yet, and since issue #643 the two can genuinely diverge: `reconcile_restored` re-probes a `Dead`
+/// account's credential, and `fold_recovery_outcome` KEEPS the quarantine when that re-probe is
+/// itself definitively `Dead`. Narrow, because [`should_restore`] fires only once poke has proved a
+/// refresh against the very stash the daemon re-probes, and a TRANSIENT re-probe error
+/// un-quarantines anyway (🟡 `AtRisk`, not 🔴) — but reachable, and the wording is an
+/// operator-facing promise rather than a doc claim. Tracked as issue #1347; changing the string is
+/// a behaviour change, so it is deliberately not made here.
 const QUARANTINE_CLEARED: &str = "token refreshed; cleared the daemon quarantine — the account \
      will recover on the next poll (no re-login needed)";
 
