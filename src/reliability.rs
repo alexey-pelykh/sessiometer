@@ -227,12 +227,23 @@ pub(crate) const LANDING_WINDOW_SECS: i64 = 15 * 60;
 /// every swap SLI reads, so not one prior figure moves. That is the issue #881 acceptance ("the
 /// existing swap-out SLI partition is unchanged in meaning") holding BY CONSTRUCTION rather than by
 /// a filter — diff a schema:9 and a schema:10 readout of one log and only the added key differs.
+/// Bumped `10 → 11` (issue #1367) when `refresh_token_loss.by_mechanism` gained `parked_recovery`
+/// — ADDITIVE in KEYS (a new always-present field; every schema:10 key is byte-identical), and,
+/// like `8 → 9`, carrying a value-domain correction with no key change: `poll_retry` no longer
+/// counts the issue #643 re-probe the `restored` control signal drives, which shares the
+/// `event=poll_refresh` name but involves no poll and no 401. `by_mechanism.total()` is unchanged —
+/// the observations moved buckets, none left the set — so `accounts` and `confirmed_unrecoverable`
+/// do not move either. The correction is NOT retroactive, and this is the one place a consumer can
+/// read that: the discriminating `trigger=` VALUE did not exist on the line before #1367, so over
+/// any window predating it `parked_recovery` reads `0` and `poll_retry` still carries both
+/// populations. A schema:11 readout of an OLD log is not a corrected schema:10 readout of it; it is
+/// the same wrong split under a new key.
 ///
 /// `pub(crate)` so the number [`crate::cli`]'s `RELIABILITY_USAGE` advertises to script authors is
 /// held against this one by a test instead of by hand (issue #913) — tied so the two cannot drift,
 /// the way [`LANDING_WINDOW_SECS`] ties the offline window to the runtime detector's. Nothing else
 /// outside this module reads it.
-pub(crate) const JSON_SCHEMA_VERSION: u32 = 10;
+pub(crate) const JSON_SCHEMA_VERSION: u32 = 11;
 
 /// Parsed `reliability` options (issues #455/#494). A plain comparable value so the CLI parser
 /// is unit-testable by value, like `StatsArgs`.
@@ -533,37 +544,61 @@ struct Inputs {
     horizon_ts: Option<i64>,
 }
 
-/// WHICH refresh mechanism observed each refresh-token loss (issue #881) — the three durable
-/// families that carry a [`crate::observability::RefreshEventOutcome`], counted separately.
+/// WHICH refresh mechanism observed each refresh-token loss (issue #881) — the durable families
+/// that carry a [`crate::observability::RefreshEventOutcome`], counted separately.
 ///
-/// Published rather than summed away because the three cover DIFFERENT parts of the fleet, so the
-/// split is the operator's first diagnostic: a loss seen only on `keep_warm` is the ACTIVE account
-/// lapsing under a live session, one seen only on `sweep` is a parked spare rotting unnoticed, and
-/// `poll_retry` is a parked account caught at its first usage-401. Same total, different problem.
+/// Published rather than summed away because the buckets cover DIFFERENT parts of the fleet and
+/// different causes, so the split is the operator's first diagnostic: a loss seen only on
+/// `keep_warm` is the ACTIVE account lapsing under a live session, one seen only on `sweep` is a
+/// parked spare rotting unnoticed, `poll_retry` is a parked account caught at its first usage-401,
+/// and `parked_recovery` is a recovery attempt that did NOT fix the credential. Same total,
+/// different problem — and a different next action.
 ///
 /// It is also this readout's own evidence that the classification predicate is not inert: the
-/// counts show the union genuinely spans three producers instead of resting on one that may never
+/// counts show the union genuinely spans several producers instead of resting on one that may never
 /// fire (issue #719's lesson — see [`Inputs::refresh_token_loss_confirmed`]).
+///
+/// The buckets are NOT one-per-event-name: `event=poll_refresh` splits in two on its `trigger=`
+/// (issue #1367). See [`RefreshTokenLossByMechanism::parked_recovery`] for why, and
+/// [`parse_events`] for the sub-split that fills them.
 #[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
 struct RefreshTokenLossByMechanism {
     /// `event=refresh outcome=dead` — the periodic isolated-refresh sweep (issue #105), which walks
     /// PARKED accounts on a cadence. The only mechanism that reaches an account nothing else touched.
     sweep: u32,
-    /// `event=poll_refresh outcome=dead` — the poll-path refresh-then-retry (issue #162/#255), fired
-    /// on the FIRST usage-401 of a streak in the hope a merely-expired ACCESS token is revived. A
-    /// `dead` here means the retry found the REFRESH token itself gone. Never the active account.
+    /// `event=poll_refresh trigger=poll_401 outcome=dead` — the poll-path refresh-then-retry (issue
+    /// #162/#255), fired on the FIRST usage-401 of a streak in the hope a merely-expired ACCESS
+    /// token is revived. A `dead` here means the retry found the REFRESH token itself gone. Never
+    /// the active account.
     poll_retry: u32,
-    /// `event=keep_warm outcome=dead` — the in-place ACTIVE-account keep-warm (issue #282). A `dead`
-    /// here is the sharpest signal in the set: the account serving live traffic cannot re-mint.
+    /// `event=poll_refresh trigger=recovery outcome=dead` — the issue #643 re-probe of a `Dead`
+    /// PARKED credential, driven by the `restored` control signal. NOT a re-login count: that
+    /// signal has two senders — a non-activating revive on the `login` verb ([`crate::capture`]),
+    /// and a [`crate::poke`] cycle that proved a fresh token against a quarantined account, which
+    /// involves no login anywhere in its path. Split out from `poll_retry` by issue #1367: it rides
+    /// the same event name but nothing polled and no 401 occurred, so folding it in reported live
+    /// traffic that never happened. A `dead` here says the recovery attempt did NOT take — the most
+    /// actionable line in the set, and the one an operator is most likely to be looking for at the
+    /// moment they read this.
+    ///
+    /// Deliberately the PARKED half only. The ACTIVE half of the same #643 fix renders
+    /// `event=keep_warm trigger=recovery` and counts in `keep_warm`, which stays correct because
+    /// that bucket is keyed on the mechanism's fleet coverage (the active account) rather than on a
+    /// trigger — unlike `poll_retry`, whose own definition names a condition.
+    parked_recovery: u32,
+    /// `event=keep_warm outcome=dead` — the in-place ACTIVE-account keep-warm (issue #282), on any
+    /// of its three triggers. A `dead` here is the sharpest signal in the set: the account serving
+    /// live traffic cannot re-mint.
     keep_warm: u32,
 }
 
 impl RefreshTokenLossByMechanism {
-    /// Every `outcome=dead` observation in view, across all three mechanisms — the raw evidence
-    /// count. Saturating, matching the per-mechanism counters' own overflow discipline.
+    /// Every `outcome=dead` observation in view, across all mechanisms — the raw evidence count.
+    /// Saturating, matching the per-mechanism counters' own overflow discipline.
     fn total(self) -> u32 {
         self.sweep
             .saturating_add(self.poll_retry)
+            .saturating_add(self.parked_recovery)
             .saturating_add(self.keep_warm)
     }
 }
@@ -1259,6 +1294,17 @@ fn parse_events(text: &str, cutoff: Option<i64>) -> Inputs {
             // `Inputs::refresh_token_loss_confirmed`) — it is counted below as corroboration,
             // never as the key.
             //
+            // Those three families are still the whole predicate; what issue #1367 changed is that
+            // `poll_refresh` no longer maps to one BUCKET. It carried a hard-coded
+            // `trigger=poll_401` while issue #643 was already emitting it for a second, unrelated
+            // condition, so its lines were a mixed population reported as one. The split below
+            // separates them GOING FORWARD ONLY: every line written before #1367 renders the same
+            // `poll_401` regardless of which origin produced it, so a recovery-driven death in that
+            // stretch is indistinguishable from a poll-driven one, reads as `poll_retry`, and stays
+            // that way. The historical split is wrong and cannot be repaired by re-reading the log —
+            // the discriminating information was never written down. Read a `--since` window that
+            // predates the fix accordingly, including the enumeration above.
+            //
             // SCOPE BOUND, stated rather than glossed: `outcome=dead` is Claude Code's `invalid_grant`
             // scrub, which covers a token that LAPSED on its deadline and one that was REVOKED. The
             // signal that would split those is the `refreshTokenExpiresAt` horizon issue #878 reads,
@@ -1272,9 +1318,29 @@ fn parse_events(text: &str, cutoff: Option<i64>) -> Inputs {
                     let m = &mut inputs.refresh_token_loss_by_mechanism;
                     match family {
                         "refresh" => m.sweep = m.sweep.saturating_add(1),
-                        "poll_refresh" => m.poll_retry = m.poll_retry.saturating_add(1),
+                        // `poll_refresh` is the ONE family whose event name does not identify the
+                        // mechanism on its own (issue #1367): the reactive #162 poll path and the
+                        // #643 `restored` re-probe both emit it, so the sub-split reads `trigger=`.
+                        // Keyed POSITIVELY on `recovery`; every other token — including a future
+                        // `PollRefreshTrigger` variant this reader predates, and a line from a
+                        // daemon old enough to have rendered the hard-coded literal — falls to
+                        // `poll_retry`, which is what those lines actually say. That default is the
+                        // reason a new variant must revisit THIS line as well as the enum: adding
+                        // one and stopping at the emitter re-creates exactly the #1367 defect,
+                        // silently. What forces the visit is
+                        // `poll_refresh_trigger_tokens_all_reach_a_named_bucket`, which fails to
+                        // COMPILE on an unnamed variant rather than merely asserting against one.
+                        "poll_refresh" => {
+                            if fields.get("trigger").copied() == Some("recovery") {
+                                m.parked_recovery = m.parked_recovery.saturating_add(1);
+                            } else {
+                                m.poll_retry = m.poll_retry.saturating_add(1);
+                            }
+                        }
                         // `_` is `keep_warm` and nothing else — the arm's own pattern admits
                         // exactly these three tokens, so widening it means revisiting this line.
+                        // Its own `trigger=` is deliberately NOT read: all three keep-warm triggers
+                        // act on the ACTIVE account, which is what this bucket means.
                         _ => m.keep_warm = m.keep_warm.saturating_add(1),
                     }
                     // A line with no parseable `account=` still counts as an observation above but
@@ -2286,11 +2352,12 @@ fn render_human(r: &Report) -> String {
         "refresh-token loss (credential lifecycle — cure is `sessiometer login`; NOT a swap-out failure, and folded into no SLI above)\n",
     );
     out.push_str(&format!(
-        "  accounts observed lost: {} (from {} dead-refresh observations: sweep={} poll-retry={} keep-warm={})\n",
+        "  accounts observed lost: {} (from {} dead-refresh observations: sweep={} poll-retry={} parked-recovery={} keep-warm={})\n",
         loss.accounts,
         m.total(),
         m.sweep,
         m.poll_retry,
+        m.parked_recovery,
         m.keep_warm,
     ));
     out.push_str(&format!(
@@ -2300,7 +2367,7 @@ fn render_human(r: &Report) -> String {
     out
 }
 
-// --- rendering: JSON wire (schema:10) ---------------------------------------
+// --- rendering: JSON wire (schema:11) ---------------------------------------
 
 /// The stable `--json` document. Field names are OWNED by this wire contract (decoupled from
 /// the internal aggregate types), so an internal refactor cannot silently break the schema.
@@ -2368,8 +2435,17 @@ struct RefreshTokenLossWire {
 struct RefreshTokenLossByMechanismWire {
     /// `event=refresh outcome=dead` — the periodic isolated-refresh sweep over PARKED accounts.
     sweep: u32,
-    /// `event=poll_refresh outcome=dead` — the first-usage-401 refresh-then-retry on a parked account.
+    /// `event=poll_refresh trigger=poll_401 outcome=dead` — the first-usage-401 refresh-then-retry
+    /// on a parked account.
     poll_retry: u32,
+    /// `event=poll_refresh trigger=recovery outcome=dead` — the issue #643 re-probe the `restored`
+    /// control signal drives (a `login` revive, or a `poke` that proved a fresh token against a
+    /// quarantined account — no login on that path), split out of `poll_retry` by issue #1367. A
+    /// `dead` here means the credential is still dead after that recovery attempt, NOT that a
+    /// re-login failed. Lines written before that split carry the poll trigger whatever their
+    /// origin, so this reads `0` over any window predating it while `poll_retry` still holds both
+    /// populations.
+    parked_recovery: u32,
     /// `event=keep_warm outcome=dead` — the in-place ACTIVE-account keep-warm. The sharpest signal.
     keep_warm: u32,
 }
@@ -2747,6 +2823,7 @@ fn reliability_wire(r: &Report) -> ReliabilityWire {
             by_mechanism: RefreshTokenLossByMechanismWire {
                 sweep: r.refresh_token_loss.by_mechanism.sweep,
                 poll_retry: r.refresh_token_loss.by_mechanism.poll_retry,
+                parked_recovery: r.refresh_token_loss.by_mechanism.parked_recovery,
                 keep_warm: r.refresh_token_loss.by_mechanism.keep_warm,
             },
             confirmed_unrecoverable: r.refresh_token_loss.confirmed_unrecoverable,
@@ -2916,12 +2993,17 @@ ts=2026-07-19T07:20:00Z event=refresh account=oleksii@pelykh.com outcome=no_chan
     #[test]
     fn the_refresh_token_loss_predicate_fires_on_every_real_dead_refresh_line() {
         let inputs = parse_events(LIVE_REPLAY_REFRESH_TOKEN_LOSS_LOG, None);
-        // 6 real `outcome=dead` lines, split exactly as the live log splits them.
+        // 6 real `outcome=dead` lines, split exactly as the live log splits them. All three
+        // `poll_refresh` lines read `trigger=poll_401` because that is the only token any daemon
+        // predating issue #1367 could write, whatever produced them — so `parked_recovery` is 0
+        // here BY CONSTRUCTION, not by observation, and this fixture is also the demonstration that
+        // the corrected split does not reach backwards. See `parse_events`' `poll_refresh` arm.
         assert_eq!(
             inputs.refresh_token_loss_by_mechanism,
             RefreshTokenLossByMechanism {
                 sweep: 1,
                 poll_retry: 3,
+                parked_recovery: 0,
                 keep_warm: 2,
             },
             "the predicate must match every real dead-refresh line, on all three mechanisms"
@@ -3025,6 +3107,90 @@ ts=2026-07-19T08:05:00Z event=credential_unrecoverable account=oleksii@pelykhcon
         );
     }
 
+    /// Issue #1367: `event=poll_refresh` is the one family whose name does not identify the
+    /// mechanism, so the split reads `trigger=`. Both origins are replayed here through the SAME
+    /// event name, at the SAME outcome, differing only in that token — which is the whole content
+    /// of the fix.
+    #[test]
+    fn a_recovery_triggered_poll_refresh_death_is_not_counted_as_a_poll_driven_retry() {
+        let log = "\
+ts=2026-07-19T09:00:00Z event=poll_refresh account=spare trigger=poll_401 outcome=dead rotated=true
+ts=2026-07-19T09:01:00Z event=poll_refresh account=spare trigger=recovery outcome=dead rotated=true
+";
+        let inputs = parse_events(log, None);
+        assert_eq!(
+            inputs.refresh_token_loss_by_mechanism,
+            RefreshTokenLossByMechanism {
+                sweep: 0,
+                poll_retry: 1,
+                parked_recovery: 1,
+                keep_warm: 0,
+            },
+            "the recovery re-probe must not report a usage-401 that never happened"
+        );
+        // Neither line LEFT the evidence set — the correction moves observations between buckets,
+        // it does not drop any. This is what keeps `accounts` and the `total` unchanged across the
+        // schema:10 → schema:11 bump.
+        assert_eq!(inputs.refresh_token_loss_by_mechanism.total(), 2);
+        assert_eq!(inputs.refresh_token_loss_accounts.len(), 1);
+    }
+
+    /// The gate the issue asked for. Adding a [`crate::observability::PollRefreshTrigger`] variant
+    /// and stopping at the emitter re-creates the #1367 defect silently: the classifier's `else`
+    /// arm absorbs the new token into `poll_retry`, and every existing assertion stays green while
+    /// a second population is quietly reported as poll-driven again.
+    ///
+    /// What stops that is `expected_bucket` below being an EXHAUSTIVE match with no wildcard, so a
+    /// new variant does not COMPILE here until someone names the bucket it belongs in. That is a
+    /// deliberately stronger gate than a failing assertion — the fall-through is silent by nature,
+    /// so the check has to fire before the code can run at all. It does not, and cannot, decide
+    /// whether the answer given is the right one; it only makes the question unskippable.
+    ///
+    /// Each variant is then rendered THROUGH the real emitter (never a hand-typed token, which
+    /// could only ever agree with itself) and fed to the real parser, so the two ends of the
+    /// contract are checked against each other rather than against a shared assumption.
+    #[test]
+    fn poll_refresh_trigger_tokens_all_reach_a_named_bucket() {
+        use crate::observability::{Event, PollRefreshTrigger, RefreshEventOutcome};
+        use std::time::{Duration, UNIX_EPOCH};
+
+        /// Which bucket each trigger must land in. Exhaustive on purpose — extend it when the
+        /// enum grows, and extend `EVERY_TRIGGER` with it so the new variant is actually replayed.
+        fn expected_bucket(trigger: PollRefreshTrigger) -> RefreshTokenLossByMechanism {
+            match trigger {
+                PollRefreshTrigger::Poll401 => RefreshTokenLossByMechanism {
+                    poll_retry: 1,
+                    ..RefreshTokenLossByMechanism::default()
+                },
+                PollRefreshTrigger::Recovery => RefreshTokenLossByMechanism {
+                    parked_recovery: 1,
+                    ..RefreshTokenLossByMechanism::default()
+                },
+            }
+        }
+        const EVERY_TRIGGER: &[PollRefreshTrigger] =
+            &[PollRefreshTrigger::Poll401, PollRefreshTrigger::Recovery];
+
+        for &trigger in EVERY_TRIGGER {
+            let line = Event::PollRefresh {
+                account: "spare".to_owned(),
+                trigger,
+                outcome: RefreshEventOutcome::Dead,
+            }
+            .to_log_line(UNIX_EPOCH + Duration::from_secs(1_784_000_000));
+            let inputs = parse_events(&format!("{line}\n"), None);
+            assert_eq!(
+                inputs.refresh_token_loss_by_mechanism,
+                expected_bucket(trigger),
+                "{trigger:?} rendered `{line}`, which the classifier did not route to the bucket \
+                 this test names for it"
+            );
+            // Whichever bucket claimed it, the observation stayed in the evidence set — the
+            // correction moves lines between buckets and drops none.
+            assert_eq!(inputs.refresh_token_loss_by_mechanism.total(), 1);
+        }
+    }
+
     /// A dead line whose `account=` is missing still counts as EVIDENCE but cannot join the
     /// account set — the tolerant-drop precedent (a landing anchor missing `from=` feeds the pct
     /// and opens no window). The gap between the two figures is where such a line is visible.
@@ -3049,6 +3215,7 @@ ts=2026-07-19T08:05:00Z event=credential_unrecoverable account=oleksii@pelykhcon
             RefreshTokenLossByMechanism {
                 sweep: 1,
                 poll_retry: 3,
+                parked_recovery: 0,
                 keep_warm: 0,
             },
             "the two pre-cutoff keep_warm losses must fall outside the window"
@@ -3141,7 +3308,7 @@ ts=2026-07-11T00:14:00Z event=refresh account=spare outcome=dead rotated=false
         assert!(text.contains("NOT a swap-out failure"));
         assert!(text.contains("sessiometer login"));
         assert!(text.contains("accounts observed lost: 3"));
-        assert!(text.contains("sweep=1 poll-retry=3 keep-warm=2"));
+        assert!(text.contains("sweep=1 poll-retry=3 parked-recovery=0 keep-warm=2"));
     }
 
     /// The `--json` contract: the block is on the wire, under the bumped schema, with the shape a
@@ -3149,7 +3316,7 @@ ts=2026-07-11T00:14:00Z event=refresh account=spare outcome=dead rotated=false
     /// the bump to a payload-shape change, so the two must be pinned together or a later edit can
     /// add a key and leave the version behind.
     #[test]
-    fn the_json_wire_carries_the_loss_block_under_schema_10() {
+    fn the_json_wire_carries_the_loss_block_under_schema_11() {
         let r = aggregate(
             &parse_events(LIVE_REPLAY_REFRESH_TOKEN_LOSS_LOG, None),
             &[],
@@ -3157,12 +3324,16 @@ ts=2026-07-11T00:14:00Z event=refresh account=spare outcome=dead rotated=false
         );
         let json: serde_json::Value =
             serde_json::from_str(&render_json(&r).expect("serializes")).expect("valid JSON");
-        assert_eq!(json["schema"], 10);
+        assert_eq!(json["schema"], 11);
         let loss = &json["refresh_token_loss"];
         assert_eq!(loss["accounts"], 3);
         assert_eq!(loss["observations"], 6);
         assert_eq!(loss["by_mechanism"]["sweep"], 1);
         assert_eq!(loss["by_mechanism"]["poll_retry"], 3);
+        // 0 because every `poll_refresh` line in this real-log replay predates issue #1367 and so
+        // renders the poll trigger whatever produced it — the schema:11 key exists on the wire, and
+        // reads honestly, over a window whose lines cannot populate it.
+        assert_eq!(loss["by_mechanism"]["parked_recovery"], 0);
         assert_eq!(loss["by_mechanism"]["keep_warm"], 2);
         assert_eq!(loss["confirmed_unrecoverable"], 0);
         // No `targets` / `met`: this block gates nothing, deliberately — it is the population a
@@ -4052,7 +4223,7 @@ ts=2026-07-11T00:04:00Z event=swap from=c to=d reason=session session_pct=100
                 // rather than only in a `contains` assertion so its position (last, after the 429
                 // line) and its zero wording are both regression-locked.
                 "refresh-token loss (credential lifecycle — cure is `sessiometer login`; NOT a swap-out failure, and folded into no SLI above)\n",
-                "  accounts observed lost: 0 (from 0 dead-refresh observations: sweep=0 poll-retry=0 keep-warm=0)\n",
+                "  accounts observed lost: 0 (from 0 dead-refresh observations: sweep=0 poll-retry=0 parked-recovery=0 keep-warm=0)\n",
                 "  confirmed unrecoverable (automated recovery exhausted): 0\n",
             )
         );
@@ -4070,7 +4241,7 @@ ts=2026-07-11T00:04:00Z event=swap from=c to=d reason=session session_pct=100
     }
 
     #[test]
-    fn json_render_is_stable_schema_10() {
+    fn json_render_is_stable_schema_11() {
         // The whole-log default: `window` is null and every field except the #635-renamed
         // velocity-projection key (`projective_swap_out_pct`, schema:6) is byte-identical to
         // schema:1–5 — the additive contract (#494/#539/#595/#608/#636/#591) plus the one #635
@@ -4100,12 +4271,18 @@ ts=2026-07-11T00:04:00Z event=swap from=c to=d reason=session session_pct=100
         // unlike the 8→9 bump, nothing above moved even in meaning. This document is the direct
         // evidence for that acceptance: read it against the schema:9 expectation in git history and
         // exactly two things differ — the version integer and the appended block.
+        //
+        // schema:11 (issue #1367) adds `refresh_token_loss.by_mechanism.parked_recovery` — ADDITIVE
+        // in keys, and carrying a value-domain correction `poll_retry` cannot show here: FIXTURE_LOG
+        // has no dead-refresh line at all, so both read 0 and only the key and the version differ.
+        // The correction itself is pinned where it can actually fire, by
+        // `a_recovery_triggered_poll_refresh_death_is_not_counted_as_a_poll_driven_retry`.
         let out = render_json(&fixture_report()).expect("integer wire serializes");
         assert_eq!(
             out,
             concat!(
                 "{\n",
-                "  \"schema\": 10,\n",
+                "  \"schema\": 11,\n",
                 "  \"window\": null,\n",
                 "  \"swap_overshoot\": {\n",
                 "    \"n\": 2,\n",
@@ -4225,6 +4402,7 @@ ts=2026-07-11T00:04:00Z event=swap from=c to=d reason=session session_pct=100
                 "    \"by_mechanism\": {\n",
                 "      \"sweep\": 0,\n",
                 "      \"poll_retry\": 0,\n",
+                "      \"parked_recovery\": 0,\n",
                 "      \"keep_warm\": 0\n",
                 "    },\n",
                 "    \"confirmed_unrecoverable\": 0\n",
@@ -4869,8 +5047,8 @@ ts=2026-07-10T00:00:00Z event=swap from=a to=b reason=session session_pct=97
         ))
         .expect("serializes");
         assert!(
-            out.contains("\"schema\": 10,"),
-            "schema bumped to 10: {out}"
+            out.contains("\"schema\": 11,"),
+            "schema bumped to 11: {out}"
         );
         assert!(
             out.contains(concat!(
@@ -5890,6 +6068,11 @@ ts=2026-07-10T00:00:00Z event=swap from=work to=spare reason=session session_pct
         /// capacity casualty), `blind_window` reconciliations both near-limit and not, an
         /// uncensored `blind_enter`/`blind_exit` pair (#591), usage backoffs of both classes
         /// plus a clear, and a `usage_velocity` observation (#608).
+        ///
+        /// One event per family stopped being one event per BUCKET at issue #1367: `poll_refresh`
+        /// now splits on `trigger=`, so both of its origins appear — on the SAME account, so the
+        /// added line moves the observation count and deliberately not the account count, which is
+        /// the distinction between those two figures made visible in the rendered bytes.
         const GOLDEN_LOG: &str = "\
 ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=session session_pct=94
 ts=2026-07-11T00:05:00Z event=swap from=spare to=work reason=weekly session_pct=42
@@ -5907,6 +6090,7 @@ ts=2026-07-11T00:41:00Z event=usage_backoff acct=u-B class=transient consecutive
 ts=2026-07-11T00:45:00Z event=usage_backoff_cleared acct=u-A
 ts=2026-07-11T00:45:00Z event=keep_warm account=work trigger=reactive outcome=dead rotated=true
 ts=2026-07-11T00:46:00Z event=poll_refresh account=spare trigger=poll_401 outcome=dead rotated=true
+ts=2026-07-11T00:46:30Z event=poll_refresh account=spare trigger=recovery outcome=dead rotated=true
 ts=2026-07-11T00:47:00Z event=refresh account=spare outcome=dead expires_before=1970-01-01T00:00:00Z expires_after=1970-01-01T00:00:00Z rotated=false window_secs=0
 ts=2026-07-11T00:48:00Z event=refresh account=third outcome=refreshed expires_before=2026-07-11T00:00:00Z expires_after=2026-07-11T08:00:00Z rotated=false window_secs=28800
 ts=2026-07-11T00:49:00Z event=credential_unrecoverable account=spare

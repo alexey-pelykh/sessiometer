@@ -1200,7 +1200,7 @@ USAGE:
     --since <d> bound all four indicators to events at/after now - <duration>. <duration> is a
                 non-negative integer with a unit: s, m, h, d, w (e.g. 30m, 24h, 7d, 2w). Omit for
                 the whole-log aggregate (the default).
-    --json      print the readout as JSON (schema:10, for scripts) instead of the text view
+    --json      print the readout as JSON (schema:11, for scripts) instead of the text view
     -h, --help  print this help
 
 READ-ONLY: it reads ~/Library/Logs/sessiometer/sessiometer.log and makes no live call, so it
