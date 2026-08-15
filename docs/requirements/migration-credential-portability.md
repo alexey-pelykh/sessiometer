@@ -883,7 +883,7 @@ headline count (`141 rotated=true, 0 rotated=false`) from this field.
 > differently from the other three.** *Added 2026-08-05 (twelfth pass); this requirement named
 > `docs/findings/0465-*` as the consumer, and the whole artifact set costed R-5 as a log-format
 > change.* `refresh_fold` folds the value into daemon state on **every** outcome — its own comment
-> says *"Armed for EVERY outcome, including `Dead` / `Error`"* (`src/daemon/refresh_fold.rs:557`) —
+> says *"Armed for EVERY outcome, including `Dead` / `Error`"* (`src/daemon/refresh_fold.rs:563`) —
 > and `refresh_health_view` projects it onto the `status`/`watch` wire as
 > `rotated: health.refresh_token_rotated.unwrap_or(false)` (`src/daemon/snapshot.rs:1403`). The
 > consumer is Swift: `apps/menubar/Sources/WireModel.swift:98`, asserted in
