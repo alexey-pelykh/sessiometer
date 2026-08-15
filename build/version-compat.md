@@ -36,14 +36,25 @@ failure-mode and does not re-verify the findings the range records.)
 Consumers of this range:
 
 - The **README** states it for users (`## Prerequisites`) — the user-facing surface required
-  because a released binary must declare which CC it was verified against.
+  because a released binary must declare which CC it was verified against. Pinned by
+  [`scripts/check-readme-cc-range.sh`](../scripts/check-readme-cc-range.sh), which the `doc-gates`
+  CI job runs on **every** PR: it rebuilds this section's claim from the two lines above and
+  requires the README's `## Prerequisites` section — that section specifically, not the file at
+  large — to state it verbatim as one contiguous unit, covering both the CC range and the host
+  range (`on macOS … / Darwin …`), which has no machine-readable form anywhere — only this
+  section's prose and the README's copy of it.
+  Until #1279 this copy was pinned by nothing and stayed correct only until someone widened the
+  other two consumers.
 - [`scripts/check-cc-version.sh`](../scripts/check-cc-version.sh) re-verifies the installed `claude`
   against the two lines above, and also asserts the README still states this range (so the
   user-facing copy can't silently drift); the pre-release
   [`build/release-checklist.md`](release-checklist.md) runs it as an **advisory provenance
   check** — an out-of-range `claude` informs the release rather than blocking it (#716; the
   stale-README arm is the one exit-1 cause the checklist still says to fix before tagging,
-  since that means the *published* provenance is wrong).
+  since that means the *published* provenance is wrong). It is **not** the CI backstop for the
+  README, and cannot be: it is wired into no workflow, and its README verdict is computed before
+  a `claude --version` probe but only reported after it, so where no `claude` exists it exits 2
+  with the verdict unprinted. `check-readme-cc-range.sh` above is the arm that runs in CI (#1279).
 - [`src/cc_version.rs`](../src/cc_version.rs) bakes the two values in as constants and surfaces them
   as a neutral provenance line in `sessiometer --version` (issue #716) — a record printed always,
   with no `claude` probe (the #715 runtime advisory was removed in #716). A shipped binary cannot
@@ -56,8 +67,10 @@ When a CC bump moves the installed version **above** `CC_SUPPORTED_MAX`, re-veri
 version-sensitive findings below — at minimum **H3** (fresh-start adoption) and the **#100**
 keychain-service derivation (`n1()`) — then widen the range here and update the two consumers
 that copy it: the README's `## Prerequisites` range, and the `CC_SUPPORTED_MIN` /
-`CC_SUPPORTED_MAX` constants in `src/cc_version.rs`. `scripts/check-cc-version.sh` catches a
-stale README; `cargo test` catches stale constants.
+`CC_SUPPORTED_MAX` constants in `src/cc_version.rs`. The `doc-gates` job's
+`scripts/check-readme-cc-range.sh` catches a stale README on every PR; `cargo test` catches stale
+constants; `scripts/check-cc-version.sh` re-checks the README at release time as well, but runs
+only when a maintainer invokes it.
 
 The acceptance record for issue [#16](https://github.com/alexey-pelykh/sessiometer/issues/16): a
 one-time empirical verification of the macOS credential mechanism, run **before** the swap engine
@@ -1182,7 +1195,9 @@ observable check stays open — the mitigations (#467/#468) rest on behavior las
 The header protocol's bar for widening is "*at minimum* **H3** and the **#100** derivation". Both
 are re-verified above (#100 by direct decode; H3 by 40 production swaps), and #101's read/save/store
 model plus #466's scrub shape are re-verified alongside. The range moves to `2.1.181`–`2.1.217`
-here and in the README `## Prerequisites`; `scripts/check-cc-version.sh` gates both.
+here and in the README `## Prerequisites`; the `doc-gates` job's
+`scripts/check-readme-cc-range.sh` gates the README copy on every PR and `cargo test` gates the
+constants.
 
 ## Provenance
 

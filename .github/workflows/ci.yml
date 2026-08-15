@@ -443,6 +443,33 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Assert every committed doc citation resolves in a fresh clone
         run: ./scripts/check-doc-citations.sh
+      # README-vs-ledger range drift (issue #1279). The second step. The job's header explains why
+      # a second check lands here as a step rather than as another job; the #1056 gate that header
+      # names is still open. Three surfaces carry build/version-compat.md's range; two were pinned
+      # (src/cc_version.rs bakes the constants and `the_baked_range_matches_the_ledger`
+      # holds them to the ledger, which `sessiometer --version` then formats) and the
+      # README's user-facing copy was pinned by nothing, staying correct only until
+      # someone widened the other two.
+      #
+      # Hosted HERE rather than as a Rust test, and that is the load-bearing choice.
+      # `include_str!`-ing README.md from a test would make it a Rust build input, which
+      # obliges an entry in the `rust` path filter above — and the filter's own comment
+      # already argues the cost of exactly that for `build/version-compat.md`: a
+      # prose-only edit would then pay for `test` + `msrv` (a second full build+test on
+      # the MSRV toolchain) + `deny`. README.md is the most-edited prose file in the repo,
+      # so it is the worst candidate for that treatment, and forgetting the filter entry
+      # reproduces issue #1258 on a new file. This job is UNFILTERED, so the check instead
+      # runs on every PR at no marginal cost, covering a README-only edit, a ledger-only
+      # edit and a constants-only edit without any filter reasoning at all. A step rather
+      # than a job, so `ci-ok.needs` is unchanged (this job's header explains why).
+      #
+      # It does NOT replace scripts/check-cc-version.sh, which keeps the same README arm
+      # as a release-time advisory. That script cannot serve as a CI backstop: it is wired
+      # into no workflow, and its README verdict is computed before a `claude --version`
+      # probe but only reported after it, so on a runner with no `claude` it exits 2 with
+      # the verdict unprinted. This one execs nothing and reads two committed files.
+      - name: Assert the README states the ledger's verified Claude Code range
+        run: ./scripts/check-readme-cc-range.sh
 
   # Gate-integrity acknowledgment (issue #317). `ci-ok` and the invariants it rolls
   # up live in PR-mutable files — this workflow, `scripts/**`, `deny.toml`, `.cargo/**`.
