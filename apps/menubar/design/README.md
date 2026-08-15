@@ -902,12 +902,12 @@ Run these against a real build:
       Then DENY it and confirm the app stays usable and silent — no in-app re-prompt, no error banner.
       Finally, with notifications toggled off at launch, turn them on in Settings (`⌘,`) and confirm the
       prompt fires at that point (the toggle drives `onRequestAuthorization`).
-- [ ] **Notification rendering.** Force a swap (`sessiometer swap`) and confirm a notification appears
-      reading "Active account switched" / "Sessiometer rotated to a different account", and **that it
-      names no account** — this is the manual half of the redaction guarantee, on the lock screen, which
-      is where the exposure actually is. Then trigger a second swap and confirm you now have TWO
-      notifications stacked under Sessiometer rather than one replacing the other (the per-post identity),
-      and that they group under the app rather than into sub-threads.
+- [ ] **Notification rendering.** Trigger a swap (`sessiometer use <other-account>`) and confirm a
+      notification appears reading "Active account switched" / "Sessiometer rotated to a different
+      account", and **that it names no account** — this is the manual half of the redaction guarantee,
+      on the lock screen, which is where the exposure actually is. Then trigger a second swap and confirm
+      you now have TWO notifications stacked under Sessiometer rather than one replacing the other (the
+      per-post identity), and that they group under the app rather than into sub-threads.
 - [ ] **Expiry notification rendering** (#935). With at least one account inside the configured horizon
       (`[credential].expiry_horizon_secs` — widen it temporarily rather than waiting a week), confirm a
       notification appears reading "A login is inside its expiry horizon" / "One account's refresh token
