@@ -184,10 +184,17 @@ final class AppIconGridTests: XCTestCase {
     ///     corner. Catches ONE squared corner, which moves the aggregate by a quarter of the deficit and
     ///     would stay inside its threshold.
     ///   • **aggregate upper bound, the sizes whose canvas `256` divides**: the body box is filled to
-    ///     95.71 %, not 100 %. Reads the deficit's MAGNITUDE, so an `rx` shrunk to near-nothing — which
-    ///     leaves every corner pixel empty and sails through the per-corner read — is caught. Scoped,
+    ///     95.71 %, not 100 %. Reads the deficit's MAGNITUDE, so it catches a radius that shrank without
+    ///     vanishing — still wide enough to keep the corner pixel off a full 255, which is the whole of
+    ///     what the per-corner read above asks. Note the direction, because this prose had it backwards
+    ///     until issue #1149: shrinking `rx` drives the corner pixel TOWARD fully covered, not toward
+    ///     empty. At the declared radius it measures 0 from canvas 32 up and ~150 at canvas 16 — the arc
+    ///     has taken the pixel — and it climbs as the radius falls, reaching 255 at 16/256/512/1024 but
+    ///     capping under it at 32/64/128, where the box's corner pixel is only partly covered by the body
+    ///     to begin with (`AppIconGrid.isExactOnPixelGrid` measures that, and what it costs). Scoped,
     ///     because the model divides by the measured box and only there is that box the ideal body;
-    ///     `AppIconGrid`'s `squareFillThreshold` carries the measurement that bounds it.
+    ///     `AppIconGrid`'s `squareFillThreshold` carries the measurement that bounds it, and the radius
+    ///     set it therefore admits.
     ///   • **aggregate LOWER bound, the same sizes**: the box is filled to 95.71 %, not to *anything less*.
     ///     Without it the fill is bounded from above only, so a body box can be arbitrarily empty and still
     ///     pass — a real icon shrunk to 60 % of its box, with the box held by four alpha-254 pixels,
