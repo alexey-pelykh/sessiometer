@@ -54,6 +54,12 @@ Consumers of this range:
   the correct sentence beside a stale one, which is the shape a widening leaves behind, so
   widening the range means deleting the superseded sentence rather than adding a new one next
   to it. Distinct statements, so restating the same correct claim twice is not drift.
+  Since #1354 that same exclusivity rule binds **this file** — whole-file, not one section, and
+  exit 2 rather than 1 because an inconsistent authority means nothing can be compared. So a
+  superseded range recorded here must be written as a bare `X`–`Y` pair, WITHOUT the
+  `on macOS … / Darwin …` clause: with that clause it is a second claim in the canonical shape
+  and `doc-gates` fails. That is already this file's convention (see #552's widening record); the
+  rule makes it enforced rather than merely habitual.
   Until #1279 this copy was pinned by nothing and stayed correct only until someone widened the
   other two consumers.
 - [`scripts/check-cc-version.sh`](../scripts/check-cc-version.sh) re-verifies the installed `claude`
