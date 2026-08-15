@@ -345,9 +345,10 @@ TEST_RUNNER_SESSIOMETER_PANEL_GOLDENS=update xcodebuild test \
   -only-testing:MenubarTests/PanelGoldenParityTests/testRegenerateGoldensWhenExplicitlyRequested
 ```
 
-The `TEST_RUNNER_` prefix is required: `xcodebuild` forwards only prefixed variables into the test
-process (stripping the prefix). A bare `SESSIOMETER_PANEL_GOLDENS=update` reaches `xcodebuild` and not the
-test, which then **skips** — writing nothing while exiting 0.
+The `TEST_RUNNER_` prefix is required: `xcodebuild` forwards a `TEST_RUNNER_`-prefixed variable into the
+test process with the prefix stripped, and the bare `SESSIOMETER_PANEL_GOLDENS` does not arrive at all. So
+a bare `SESSIOMETER_PANEL_GOLDENS=update` reaches `xcodebuild` and not the test, which then **skips** —
+writing nothing while exiting 0.
 
 Then **look at the new renders** (a reference you have not looked at is not a reference) and record why
 they changed:
