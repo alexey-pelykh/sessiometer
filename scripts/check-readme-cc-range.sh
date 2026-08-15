@@ -21,9 +21,10 @@
 # THE RULE
 #   The README's `## Prerequisites` section must state the ledger's canonical claim
 #   VERBATIM, as one contiguous unit, modulo markdown emphasis and line wrapping —
-#   and must state no OTHER claim in that same shape.
+#   and must state no OTHER claim in that same shape. The ledger is held to that same
+#   exclusivity rule, over the whole file (issue #1354).
 #
-# Five design choices carry the weight:
+# Six design choices carry the weight:
 #
 #   1. ONE UNIT, not two loose substrings. Issue #712 measured the alternative: a
 #      README stating a STALE range while mentioning the new bound in an unrelated
@@ -90,10 +91,17 @@
 #      and the host range, both of them inside the canonical claim itself. That reading
 #      is RED on a file with nothing wrong with it, which is choice 4's rejection
 #      re-derived here rather than inherited. Counting whole CLAIM-shaped statements
-#      finds one there and two on the mutant above. That is the rule below — and it is
-#      not a new invention: it is the ledger-side check this script already runs
-#      (`claim_count > 1`) turned on the other document. A document that states the
-#      range two ways cannot be trusted about which way it means.
+#      finds one there and two on the mutant above. That is the rule below.
+#
+#      This paragraph used to add that the rule was "not a new invention: the ledger-side
+#      check this script already runs (`claim_count > 1`) turned on the other document."
+#      As an argument about principle that is sound, and the principle still holds — a
+#      document that states the range two ways cannot be trusted about which way it means.
+#      As a description of the two MECHANISMS it was wrong, and issue #1354 measured the
+#      gap: `claim_count > 1` counts matches of `claim_re`, which PINS the ledger's own
+#      bounds, so it caught only the same bounds restated with a different HOST half. The
+#      README rule below has always used FREE bounds. The two were never the same check,
+#      and the difference ran the wrong way — see choice 6.
 #
 #      DISTINCT statements, so a section legitimately restating the SAME correct claim
 #      twice stays green; counting occurrences instead would re-introduce the false RED
@@ -112,6 +120,25 @@
 #      last step costs the correct file. Pinned green by T17 so it cannot move in either
 #      direction unmeasured.
 #
+#   6. The LEDGER is held to choice 5's rule too (issue #1354). Until it was, the
+#      authority was held to a WEAKER exclusivity standard than the copy it authorises:
+#      a ledger stating its canonical claim beside a stale one carrying different bounds
+#      matched `claim_re` exactly once and passed, while the same shape of drift in the
+#      README was caught by the free-bounds rule of choice 5. Measured against this guard
+#      both as PR #1343 left it and as the commit before it left it — exit 0 in both, so
+#      the gap is pre-existing rather than introduced by the change that added choice 5.
+#
+#      Same shape, same unit, two deliberate differences. WHOLE-FILE rather than scoped:
+#      the README may legitimately restate the range under another heading (T12), whereas
+#      a second authoritative-shaped claim anywhere in the ledger leaves a reader unable
+#      to tell which one the constants mean. And exit 2 rather than 1, which is choice 5's
+#      own role argument unchanged. Measured green on the real ledger before choosing — it
+#      holds exactly ONE claim-shaped statement, because it records superseded ranges as
+#      bare pairs with no host clause and reserves the full shape for the authoritative
+#      sentence. That is now self-enforcing: if it ever stops being one, this arm says so.
+#      The ledger-side residual is therefore the same one choice 5 states, and the
+#      ledger's existing convention already lives inside it; T20 pins it green.
+#
 # A claim that cannot be CONSTRUCTED is a FAILURE (exit 2), never a pass. A gate that
 # goes green because it found nothing to compare is the same write-only-copy failure
 # this script exists to end, one level up — hence also the absent-README exit 2, which
@@ -123,8 +150,9 @@
 #   0  the README states the ledger's canonical claim, and no other one
 #   1  DRIFT — the README's copy disagrees with the ledger (its claim is absent from
 #      the pinned section, or that section ALSO states a claim the ledger does not)
-#   2  could not determine (README or ledger missing, no claim constructible, or the
-#      README has no single `## Prerequisites` section to check)
+#   2  could not determine (README or ledger missing, no claim constructible, the ledger
+#      states a claim the ledger's own constants do not support, or the README has no
+#      single `## Prerequisites` section to check)
 #
 # Run locally:  ./scripts/check-readme-cc-range.sh
 set -euo pipefail
@@ -183,6 +211,14 @@ max_re="${max//./\\.}"
 # ledger needs this pattern revisited, not silently skipped.
 claim_re="\`${min_re}\`–\`${max_re}\` on macOS \`[^\`]+\`–\`[^\`]+\` / Darwin \`[^\`]+\`"
 
+# The SAME sentence with FREE bounds. Both documents are checked for exclusivity against
+# this one, and it is defined here — beside `claim_re`, not at either use site — because the
+# relationship between the two patterns is the whole design: `claim_re` is this shape with
+# the ledger's own bounds substituted in, so its matches are a strict SUBSET of this one's.
+# That is what makes "every claim-shaped statement, minus the canonical one" a well-formed
+# question on either document (issue #1354).
+shape_re="\`[0-9]+\.[0-9]+\.[0-9]+\`–\`[0-9]+\.[0-9]+\.[0-9]+\` on macOS \`[^\`]+\`–\`[^\`]+\` / Darwin \`[^\`]+\`"
+
 # Newline-separated rather than an array: macOS ships bash 3.2, where `mapfile` does not
 # exist, and this must run on a maintainer's Mac as readily as on the ubuntu CI runner.
 claims="$(normalize < "$ledger" | grep -oE "$claim_re" | sort -u || true)"
@@ -207,6 +243,61 @@ if [[ "$claim_count" -gt 1 ]]; then
 fi
 claim="$(printf '%s\n' "$claims" | head -n1)"
 
+# EXCLUSIVE within the ledger too, not merely self-consistent about its own bounds
+# (issue #1354). The two checks above are anchored on `claim_re`, which PINS the bounds
+# read from CC_SUPPORTED_{MIN,MAX} — so a ledger stating its canonical claim beside a
+# stale one carrying DIFFERENT bounds matches that pattern exactly once and passes both.
+# Measured on the fixture tree before choosing, against this guard as PR #1343 left it and
+# as the commit before it left it: exit 0 either way, and the pass text byte-identical to a
+# clean run's. What `claim_count > 1` actually catches is narrower than the rationale it
+# was given — the SAME bounds stated with different HOST halves (T10, exit 2).
+#
+# That left the AUTHORITY held to a weaker exclusivity standard than the COPY it
+# authorises: the README arm below has always used the free-bounds shape, so the document
+# that merely REPEATS the range could not carry a contradictory second claim while the
+# document that DEFINES it could. This closes that direction with the same rule, and the
+# unit is the same one design choice 5 settled on — whole CLAIM-shaped statements, not
+# version-range PAIRS, which is the reading measured RED on a wholly-correct file.
+#
+# WHOLE-FILE, where the README arm is scoped to one section, and the asymmetry that
+# remains is deliberate rather than an unfinished symmetry: the README may legitimately
+# restate the range under another heading (T12 pins that permission), whereas a second
+# authoritative-shaped claim ANYWHERE in the ledger leaves a reader unable to tell which
+# one the constants mean. Measured on the real ledger before choosing: exactly ONE
+# claim-shaped statement. Its widening history is written as bare pairs
+# (`2.1.197` → `2.1.217`) with no `on macOS … / Darwin …` clause, so the ledger's own
+# convention for recording superseded ranges already lives inside what this rule permits.
+#
+# Exit 2, matching the two checks above rather than the README arm's exit 1: the role
+# asymmetry those document is unchanged — an inconsistent AUTHORITY means nothing can be
+# compared, while an inconsistent COPY is simply wrong.
+#
+# RESIDUAL, the ledger-side twin of the one design choice 5 states: this pins the claim's
+# SHAPE, so a stale range in the ledger carrying no host clause still passes — which is
+# precisely what its widening history relies on. Pinned green by T20 so it cannot move
+# unmeasured in either direction.
+#
+# Built exactly as the README arm's `others` is, and the SUBTRACTION is what carries it:
+# expressed as "more than one claim-shaped OCCURRENCE" this rule would go RED on a ledger
+# restating its own claim verbatim (T19). `sort -u` decides no exit code here — measured,
+# dropping it alone leaves the whole suite green, because `grep -vxF` drops every line
+# equal to the claim rather than the first; what it owns is the diagnostic below, where a
+# statement repeated twice is listed once. Same finding as the README arm's.
+ledger_others="$(normalize < "$ledger" | grep -oE "$shape_re" | sort -u | grep -vxF -- "$claim" || true)"
+if [[ -n "$ledger_others" ]]; then
+    other_count="$(printf '%s\n' "$ledger_others" | wc -l | tr -d '[:space:]')"
+    echo "error: $ledger states its canonical range claim AND ${other_count} other claim(s) in the" >&2
+    echo "       same shape, carrying different bounds:" >&2
+    printf '%s\n' "$ledger_others" | sed 's/^/         /' >&2
+    echo "       its CC_SUPPORTED_MIN/MAX lines (${min}-${max}) support only: ${claim}" >&2
+    echo "       the ledger is the AUTHORITY for this range, so it must state it exactly one way" >&2
+    echo "       before the README can be checked against it — a reader landing on the statement(s)" >&2
+    echo "       above reads a range the constants do not support. Delete or update them, or, if" >&2
+    echo "       one is a superseded range being recorded deliberately, state it without the" >&2
+    echo "       \`on macOS ... / Darwin ...\` clause, as this ledger's other widening records do." >&2
+    exit 2
+fi
+
 # The PINNED SURFACE is the README's `## Prerequisites` section, not the whole file.
 # Scoping here is what makes the failure text below true; see design choice 4.
 heading_count="$(grep -cE '^## Prerequisites[[:space:]]*$' "$readme" || true)"
@@ -229,9 +320,9 @@ section_norm="$(printf '%s' "$section" | normalize)"
 
 # Design choice 5: containment is not exclusivity. Every statement in the CLAIM'S SHAPE,
 # with FREE bounds — `claim_re` pins the ledger's specific bounds, and a stale sentence by
-# definition carries the OLD ones, so it is invisible to that pattern and needs this one.
-# `[^\`]+` cannot cross a backtick, so a match cannot span two adjacent statements.
-shape_re="\`[0-9]+\.[0-9]+\.[0-9]+\`–\`[0-9]+\.[0-9]+\.[0-9]+\` on macOS \`[^\`]+\`–\`[^\`]+\` / Darwin \`[^\`]+\`"
+# definition carries the OLD ones, so it is invisible to that pattern and needs `shape_re`
+# (defined above, shared with the ledger arm). `[^\`]+` cannot cross a backtick, so a
+# match cannot span two adjacent statements.
 # SUBTRACTING the claim is what keeps a section restating the SAME correct claim twice
 # green (T16): `grep -v` drops EVERY line equal to the claim, not merely the first, so no
 # copy survives into `others`. Not `sort -u` — measured, removing that stage alone leaves
@@ -248,6 +339,10 @@ if printf '%s' "$section_norm" | grep -qF -- "$claim"; then
         echo "ok: README.md \`## Prerequisites\` states the ledger's verified range — ${claim}"
         echo "    (1 claim compared: the Claude Code range and the host range, as one unit;"
         echo "     and that section states no other claim in the same shape)"
+        # Names the ledger arm too, so the pass text reports everything that was actually
+        # evaluated rather than half of it. A gate whose green understates its own coverage
+        # is how the ledger arm's absence went unnoticed for as long as it did (issue #1354).
+        echo "    (and the ledger itself states that claim exactly one way, whole-file)"
         exit 0
     fi
 

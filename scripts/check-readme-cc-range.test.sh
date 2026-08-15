@@ -23,14 +23,23 @@
 #        present, so a stale claim beside it in the same section passes (issue #1317)
 #   T16  kills T15's rule written as a COUNT of claim-shaped statements rather than a
 #        count of DISTINCT ones, which goes RED on a section restating itself correctly
+#   T18  kills a guard applying T15's exclusivity rule to the README ONLY — so the
+#        LEDGER, the authority, may carry a second claim with different bounds that the
+#        bounds-pinned `claim_count > 1` rule cannot see (issue #1354)
+#   T19  kills T18's rule written as a COUNT of claim-shaped statements rather than a
+#        SUBTRACTION of the canonical one, which goes RED on a ledger restating its own
+#        claim correctly — T16's role on the other document
 #
-# T11/T12 and T15/T16 are two RED/GREEN pairs of the same shape, one section apart: each
-# pins a masking defect closed and, beside it, the correct file the over-broad fix would
-# have rejected. A suite without them goes green on every defect this gate exists to
-# prevent — or red on files with nothing wrong with them.
+# T11/T12, T15/T16 and T18/T19 are three RED/GREEN pairs of the same shape: each pins a
+# masking defect closed and, beside it, the correct file the over-broad fix would have
+# rejected. A suite without them goes green on every defect this gate exists to prevent —
+# or red on files with nothing wrong with them.
 #
-# T17 is not a falsifier but a BOUNDARY: it pins the residual T15's rule leaves open, so
-# that widening or narrowing it is a deliberate, measured act rather than a silent one.
+# T17 and T20 are not falsifiers but BOUNDARIES: they pin the residual T15's and T18's
+# rules leave open — on the README and on the ledger respectively — so that widening or
+# narrowing it is a deliberate, measured act rather than a silent one. T20 carries extra
+# weight: the real ledger records its superseded range as a bare pair with no host clause,
+# so that residual is not merely tolerated there but relied upon.
 #
 # MUTATION-VALIDATED. A suite that passes against the correct implementation is no
 # evidence it would catch a wrong one, so each falsifier was checked against the mutant
@@ -150,6 +159,10 @@ default_ledger
     printf -- '  `29.x`. This is provenance, not a compatibility gate.\n'
 } | write_readme
 check "real README shape (bold + wrapped mid-claim) passes" 0 "$(run)"
+# The pass text must name BOTH arms. Exit 0 alone cannot distinguish a guard that checked
+# the ledger for exclusivity from one that skipped it, which is exactly the gap issue #1354
+# closed — so the green is pinned to report what it evaluated, not merely that it passed.
+check_out "  and the pass text reports the ledger arm ran" "the ledger itself states that claim exactly one way"
 
 # T2 (#712): README states a STALE range and mentions the new MAX in an unrelated
 # sentence. Both bounds appear as substrings, so a two-independent-greps check passes —
@@ -227,6 +240,12 @@ printf -- '\nA later section restates it as `3.2.100`–`3.2.140` on macOS `30.1
 printf -- '- verified against **`3.2.100`–`3.2.140`** on macOS `30.1.1`–`30.1.2` / Darwin `29.x`.\n' \
     | write_readme
 check "ledger stating the claim two ways cannot determine" 2 "$(run)"
+# The exit code alone stopped distinguishing this from T18 when issue #1354 gave the ledger
+# a second exit-2 rule over the same document. This case is the CONSTRUCTIBILITY one — two
+# claims share the ledger's bounds, so which is canonical is unanswerable — and it must keep
+# reporting that rather than T18's "the constants support only ..." text, which presupposes
+# a canonical claim was picked.
+check_out "  and it reports the ledger as self-inconsistent" "states the range claim 2 different ways"
 
 # T11: THE round-3 falsifier, and the defect that motivated scoping. The pinned
 # `## Prerequisites` section states a STALE range while a CORRECT copy of the whole
@@ -358,6 +377,74 @@ default_ledger
     printf -- '- Superseded: an earlier note gave `3.2.100`–`3.2.120`, with no host clause.\n'
 } | write_readme
 check "a bare non-claim-shaped stale range in the section PASSES (stated residual)" 0 "$(run)"
+
+# T18 (#1354): THE round-5 falsifier, and the one that runs on the OTHER document. The
+# LEDGER states its canonical claim AND, further down, a stale one carrying DIFFERENT
+# bounds — the same shape of drift T15 pins on the README, a widening that adds a sentence
+# and leaves the old one behind. The two checks above it are anchored on `claim_re`, which
+# PINS the bounds read from CC_SUPPORTED_{MIN,MAX}, so the stale sentence is invisible to
+# them: `claim_count` is 1 and the guard exits 0, having compared the README against an
+# authority that says two things. Measured at exit 0 against this guard both as PR #1343
+# left it and as the commit before it left it, so the defect is pre-existing rather than
+# introduced by the change that added T15.
+#
+# The direction is what makes it worth a falsifier of its own: until this, the document
+# that DEFINES the supported range could carry a contradictory second claim silently while
+# the document that merely REPEATS it could not. Exit 2, not 1 — an inconsistent AUTHORITY
+# means nothing can be compared — and the diagnosis must quote the unsupported statement.
+default_ledger
+printf -- '\n## A superseded section\n\nThe range was `3.2.100`–`3.2.120` on macOS `30.1.1`–`30.1.2` / Darwin `29.x`.\n' \
+    >> "$work/build/version-compat.md"
+printf -- '- verified against **`3.2.100`–`3.2.140`** on macOS `30.1.1`–`30.1.2` / Darwin `29.x`.\n' \
+    | write_readme
+check "a stale claim with DIFFERENT bounds in the ledger cannot determine" 2 "$(run)"
+check_out "  and the diagnosis quotes the unsupported statement" \
+    '`3.2.100`–`3.2.120` on macOS `30.1.1`–`30.1.2` / Darwin `29.x`'
+# The stale claim sits under its OWN heading, well away from the machine-readable bounds:
+# this arm reads the WHOLE ledger, deliberately, where the README arm reads one section.
+# Scoping it to the range section would drop this case.
+check_out "  and it names the ledger's authority role" "the ledger is the AUTHORITY"
+
+# T19 (#1354): the PERMISSION that keeps T18's rule from being the count design choice 4
+# rejected — T16's role on the other document. The ledger states its canonical claim TWICE,
+# verbatim, and is entirely right: a sentence restated in a later section is not a second
+# claim, it is the same one. SUBTRACTING the canonical claim is what makes this GREEN;
+# expressing the rule as "more than one claim-shaped OCCURRENCE" instead goes RED on a
+# wholly-correct ledger, which is the trade design choice 5 measured and declined, one
+# document over. Mutation-checked against exactly that rule: exit 2 where 0 is right.
+#
+# It is the SUBTRACTION that carries this, not the `sort -u` before it — measured, dropping
+# that stage alone leaves the whole suite green, this case included, because `grep -vxF`
+# drops EVERY line equal to the claim rather than the first. Same finding as the README
+# arm's, on the other document, and it is why this case pins the rule's SHAPE rather than
+# any single stage of the pipeline.
+default_ledger
+printf -- '\n## Restated for emphasis\n\nStill `3.2.100`–`3.2.140` on macOS `30.1.1`–`30.1.2` / Darwin `29.x`.\n' \
+    >> "$work/build/version-compat.md"
+printf -- '- verified against **`3.2.100`–`3.2.140`** on macOS `30.1.1`–`30.1.2` / Darwin `29.x`.\n' \
+    | write_readme
+check "the SAME correct claim stated twice in the LEDGER passes" 0 "$(run)"
+
+# T20 (#1354): the ledger-side RESIDUAL, pinned GREEN so it cannot move unmeasured — T17's
+# role on the other document, and load-bearing rather than merely tolerated. T18's rule pins
+# the claim's SHAPE, so a superseded range in the ledger carrying no `on macOS … / Darwin …`
+# clause is not claim-shaped and passes. That is exactly how the real ledger records its
+# history: its widening records are written as bare pairs, and it holds exactly ONE
+# claim-shaped statement.
+#
+# So the cost of closing this step was measured on the real ledger, not argued: widening
+# the shape to any version-range pair takes that file to exit 2, and among the statements
+# it then reports as unsupported is the host half of the canonical claim itself — design
+# choice 5's "counting PAIRS finds TWO inside the claim" argument, re-derived here on the
+# document that also carries superseded ranges on purpose. Anyone closing this last step
+# must turn this case RED deliberately and re-derive that cost rather than inherit this
+# comment.
+default_ledger
+printf -- '\n## Verdict — range widened to `3.2.100`–`3.2.140`\n\nSuperseded: the range had been pinned at `3.2.100`–`3.2.120`.\n' \
+    >> "$work/build/version-compat.md"
+printf -- '- verified against **`3.2.100`–`3.2.140`** on macOS `30.1.1`–`30.1.2` / Darwin `29.x`.\n' \
+    | write_readme
+check "a bare non-claim-shaped superseded range in the LEDGER passes (stated residual)" 0 "$(run)"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
