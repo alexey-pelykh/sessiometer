@@ -250,6 +250,92 @@ final class AccountSwapTests: XCTestCase {
                        "the poll must read @MainActor-isolated phase on the main actor, never off it")
     }
 
+    // MARK: - Calibration: the budget this suite replaced (issue #948, carried per issue #1100)
+
+    // WHICH OF `d1b41bf`'s NUMBERS THIS TREE CAN RE-DERIVE, AND WHICH IT CANNOT.
+    //
+    // The commit that fixed issue #948 published two classes of figure in its permanent body, and they
+    // have different standing. Recorded here because a squash-merged body cannot be amended, so the
+    // label has to live somewhere a reader of this code actually lands.
+    //
+    // LOAD-DEPENDENT — ONE-TIME ATTESTATION, NO IN-REPO WITNESS. Verbatim from that body:
+    //
+    //     Under 112 spinners on 14 cores: 21/250 failures before, 0/250 after, plus 0/500 on an
+    //     extended confirmation. Idle (0/200 both) and whole-class (0/150 both) arms are
+    //     inconclusive and are not offered as evidence.
+    //
+    // Nothing in this tree re-derives those counts, and nothing should. A harness that yields its
+    // finding only when hand-fed a load generator would be a second unverified artifact in
+    // verification costume, not evidence — the reason PR #1095 ran its own probe and then deliberately
+    // did NOT commit it. The pre-fix arm additionally needs a second source tree, which no single
+    // checkout can hold. Labelling them is the whole repair available: they are known-but-not-carryable,
+    // not unknown, and unlabelled they would read as something a reader could reproduce and quietly
+    // fail to.
+    //
+    // LOAD-INDEPENDENT — CARRIED. Two of that commit's load-bearing claims do have witnesses here:
+    //
+    //   - "the poll has to read @MainActor state on the main actor" — `testTheWaitObservesPhaseOnThe`
+    //     `MainActor` above, asserted structurally rather than by timing and checked in both directions.
+    //   - "10 000 yields was ~10 ms on an idle host, and SHORTER the faster the host" — the calibration
+    //     below, which re-derives it on whatever host runs it, under no artificial load at all.
+    //
+    // The convention: CONTRIBUTING.md § Measurements published in a commit body.
+
+    /// Print the budget calibration (`SESSIOMETER_SWAP_MEASURE=1`) — the command that re-derives the
+    /// `~10 ms` figure in `waitUntil`'s comment below. Off by default, and it ASSERTS NOTHING: the
+    /// number is a property of the host, so it is reported. Asserting on it would be a wall-clock timing
+    /// assertion, which is the exact flake class issue #948 removed from this suite.
+    private var isMeasuring: Bool {
+        ProcessInfo.processInfo.environment["SESSIOMETER_SWAP_MEASURE"] == "1"
+    }
+
+    /// Time `count` turns of `Task.yield()` OFF the main actor. Not annotated, so it inherits the
+    /// enclosing (non-isolated) class and runs on the global cooperative executor — which is precisely
+    /// where the pre-#948 nonisolated helper's poll ran, and so where its "10 000 yields" were spent.
+    private static func timeYieldsOffTheMainActor(_ count: Int) async -> Duration {
+        let start = ContinuousClock.now
+        for _ in 0 ..< count { await Task.yield() }
+        return start.duration(to: ContinuousClock.now)
+    }
+
+    private static func milliseconds(_ duration: Duration) -> Double {
+        Double(duration.components.seconds) * 1_000 + Double(duration.components.attoseconds) / 1e15
+    }
+
+    // Prints what "10 000 yields" is worth in wall-clock time on THIS host, on both executors — the
+    // cooperative pool the broken poll actually ran on, and the main actor the fixed one runs on —
+    // beside the deadline that replaced it. The ratio is the finding: a budget denominated in turns of
+    // an executor is not a duration, and it SHRINKS as the host gets faster, which is why a host-idle
+    // reading here is the honest instrument for it and an artificial load would not be.
+    @MainActor
+    func testMeasureTheBudgetThatReplacedTheYieldCount() async throws {
+        try XCTSkipUnless(isMeasuring, "calibration run only: SESSIOMETER_SWAP_MEASURE=1")
+
+        let turns = 10_000                              // the pre-#948 budget, verbatim
+        let deadline: Duration = Self.waitUntilBudget   // the committed one, read from its own constant
+
+        var lines = ["", "=== waitUntil budget calibration (issue #948, carried per issue #1100) ==="]
+
+        let offActor = await Self.timeYieldsOffTheMainActor(turns)
+        let start = ContinuousClock.now
+        for _ in 0 ..< turns { await Task.yield() }
+        let onActor = start.duration(to: ContinuousClock.now)
+
+        lines.append("  \(turns) yields, cooperative pool ..."
+                     + String(format: " %9.3f ms   <- what the PRE-FIX poll bought", Self.milliseconds(offActor)))
+        lines.append("  \(turns) yields, main actor ......."
+                     + String(format: " %9.3f ms", Self.milliseconds(onActor)))
+        lines.append(String(format: "  committed wall-clock deadline .... %9.3f ms   <- what replaced it",
+                            Self.milliseconds(deadline)))
+        lines.append(String(format: "  deadline / pre-fix budget ........ %9.1f x", Self.milliseconds(deadline)
+                            / max(Self.milliseconds(offActor), .leastNormalMagnitude)))
+        lines.append("")
+        lines.append("  Host-dependent by construction — a faster host makes the FIRST row smaller and")
+        lines.append("  leaves the third unchanged. That divergence is the defect issue #948 removed.")
+
+        print(lines.joined(separator: "\n"))
+    }
+
     // MARK: - StatusPanelFormat: row viability (the CLIENT-VISIBLE subset of `swap_command_verdict`)
 
     func testViableRowHasNoSwitchBlock() {
@@ -675,9 +761,14 @@ final class AccountSwapTests: XCTestCase {
     // is no product latency here for it to hide. Put an `await` ahead of one of those assignments and
     // that stops being true, and this number would start masking the thing it is meant to expose. That
     // argument covers THIS suite's waits, which is why the budget is fixed rather than per-call.
+    //
+    // Hoisted to a named constant rather than kept local so the calibration above reads THIS value
+    // instead of restating it — a second copy of the number is exactly the drift issue #1100 is about.
+    private static let waitUntilBudget: Duration = .seconds(5)
+
     @MainActor
     private func waitUntil(_ predicate: () -> Bool, _ label: String) async throws {
-        let budget: Duration = .seconds(5)
+        let budget = Self.waitUntilBudget
         let deadline = ContinuousClock.now.advanced(by: budget)
         while !predicate() {
             guard ContinuousClock.now < deadline else {
