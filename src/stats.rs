@@ -9472,6 +9472,491 @@ mod tests {
         );
     }
 
+    // --- AC: an unmeasurable reading states no number, and no runway states an absurd
+    //         one (issue #1038) --------------------------------------------------------
+    //
+    // Two defects reached a shipped surface with the whole suite green: the panel printing
+    // `0 episodes (0s)` for a census that was never measurable (issue #1029), and the CLI
+    // printing `accounts last ~648427 days` (issue #1028). Both fixes have landed; what
+    // follows is the coverage that would have caught them, written against the corrected tree.
+    //
+    // ATTRIBUTE THAT FIGURE TO THE RIGHT FAULT, because the two #1028 compounds are reachable
+    // from different places on the rate axis and only one of them is where `~648427` lives:
+    //
+    //   * THE ZERO GUARD, which is the one that printed it. `total_rate > 0.0` admits a decayed
+    //     EMA of `1e-11`, and at the reported head-room that quotient is ~787,000 days — the
+    //     reported order. A vanishing burn read as a real one.
+    //   * THE SATURATING `as i64`, whose signature is far larger and unmistakable: `i64::MAX`
+    //     seconds, ~106,751,991,167,300 days. Eight orders past the reported figure.
+    //
+    // Both are swept below and counted separately. Collapsing them into "a saturating cast"
+    // loses the small-rate end of the axis — the end the reported defect was actually reachable
+    // from, and the end no hand-written example thinks to visit.
+    //
+    // Two disciplines run through this section, both of them the reason it exists rather than
+    // relying on the neighbouring per-fix tests:
+    //
+    //   * SEMANTIC, NOT GOLDEN. The failure mode to design against is a test asserting `—`
+    //     that a later "improvement" back to `0` simply rebaselines past. So an absence is
+    //     asserted as INVARIANCE UNDER THE NUMERATOR — feed the same cell two different counts
+    //     and require identical bytes — which no rewording can satisfy accidentally and no
+    //     rebaseline can quietly relax. Its discriminating half is the MEASURED state, where
+    //     the same two counts must render differently: together they say the numerator is
+    //     GATED, not that the formatter ignores its inputs.
+    //   * SWEPT, NOT ENUMERATED. `1e-11` — the rate that printed the reported figure — is not
+    //     a value any hand-written example reaches for, which is precisely why every
+    //     hand-written example missed it. The runway properties below sweep the rate axis
+    //     across its whole representable range instead.
+
+    /// The whole-second duration a rendered runway STATES, or `None` when it states none.
+    ///
+    /// `~` is the FIGURE MARKER on this surface: [`fmt_runway_hours`] and [`fmt_runway_days`]
+    /// are the only producers of a runway magnitude and both lead with it, while every refusing
+    /// state renders a clause carrying none. So "is there a `~`" is exactly "was a duration
+    /// stated", independently of the words around it — which is what lets the callers below
+    /// survive a rewording of any phrase. Digits elsewhere on the line (`≥95%`, `2 of 3
+    /// counted`) are not figures and are not matched.
+    ///
+    /// A `~` NOT followed by a magnitude in a unit this knows PANICS rather than answering
+    /// `None`. Reading an unrecognised render as "no figure stated" would make every caller
+    /// vacuous the moment a formatter changed — they would keep passing, over nothing.
+    ///
+    /// SATURATING on the multiply, deliberately: an overflowing magnitude is exactly the
+    /// `~106751991167300 days` class being refused, and saturating toward `i64::MAX` keeps it
+    /// above every bound rather than wrapping back under one.
+    fn stated_runway_secs(rendered: &str) -> Option<i64> {
+        let tail = rendered.split_once('~')?.1;
+        let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let magnitude: i64 = digits
+            .parse()
+            .unwrap_or_else(|_| panic!("a `~` marks a stated magnitude: {rendered:?}"));
+        let unit = &tail[digits.len()..];
+        let secs = if unit.starts_with(" day") {
+            magnitude.saturating_mul(DAY_SECS)
+        } else if unit.starts_with('h') {
+            magnitude.saturating_mul(HOUR_SECS)
+        } else if unit.starts_with('m') {
+            magnitude.saturating_mul(60)
+        } else if unit.starts_with('s') {
+            magnitude
+        } else {
+            panic!(
+                "unrecognised runway unit in {rendered:?} — teach this reader the new form \
+                 rather than letting its callers go vacuous"
+            )
+        };
+        Some(secs)
+    }
+
+    /// A deterministic, equidistributed offset in `[0, 1)` for sweep index `i` — the fractional
+    /// part of `i · φ⁻¹`.
+    ///
+    /// Its job is to DE-ALIGN the sample lattice from the round grid, so a sweep cannot pass by
+    /// visiting only the values a bound or a formatter happens to be exact at. That holds for
+    /// every `i >= 1`. Index 0 is the exception and it is not an oversight: `(0 · φ⁻¹).fract()`
+    /// is exactly `0.0`, so the first sample of each axis sits ON its low endpoint rather than
+    /// just inside it — rate `1e-300`, head-room `0`. That is wanted twice over: an endpoint
+    /// swept is an endpoint visited, and `1e-300` is the extreme the saturating cast was
+    /// reachable from, so both runway properties' red-baseline witnesses sit at that rate.
+    /// The golden-ratio sequence is low-discrepancy by construction, so it fills the interval
+    /// more evenly at every prefix length than a PRNG draw would — and it needs neither a seed
+    /// nor a second copy of the `Lcg` the `usage_stats` property tests keep in their own module.
+    fn golden_offset(i: usize) -> f64 {
+        (i as f64 * 0.618_033_988_749_895).fract()
+    }
+
+    /// The largest weekly head-room ONE account can contribute to the pool. Head-room is a usage
+    /// FRACTION — `(weekly_ceiling − weekly_now).max(0.0)` — and `Tunables::weekly_ceiling` is a
+    /// `u8` percent, so nothing an operator can configure exceeds this.
+    fn max_account_headroom() -> f64 {
+        f64::from(u8::MAX) / 100.0
+    }
+
+    #[test]
+    fn prop_no_swept_pooled_input_states_a_fleet_runway_past_one_weekly_window() {
+        // LAYER 1. The property the reported defect violated, over the rate axis it was reachable
+        // from: no pooled input renders a runway outside the plausibility bound. Asserted on the
+        // RENDERED LINE rather than on `FleetRunwayState`, because a figure an operator reads is
+        // what `~648427 days` was — a classification that refuses correctly and a formatter that
+        // states something anyway is a defect this would still catch.
+        //
+        // 303 decades of rate is not padding: the reproduction's `1e-11` and the `1e-300` that
+        // saturated to `i64::MAX` sit 289 decades apart, and both are inside the range.
+        const RATE_STEPS: usize = 1_212; // four samples per decade over 1e-300 .. 1e3
+        const HEADROOM_STEPS: usize = 128;
+        // The pool sums one account's head-room per counted account, so the roster factor is the
+        // only free parameter. Set far past any real roster — the capture in issue #1028 observed
+        // six — so the large-head-room corner cannot be said to have been dodged.
+        let max_pooled_headroom = max_account_headroom() * 64.0;
+        let bound = FLEET_RUNWAY_PLAUSIBLE_MAX_SECS;
+
+        // The reader is canaried against a figure it MUST see before anything relies on its
+        // silence. Without this, a `~` that stopped being the figure marker would turn every
+        // `None` below into a pass over nothing.
+        assert_eq!(
+            stated_runway_secs(&fleet_runway_line(FleetRunway {
+                state: FleetRunwayState::Known(bound),
+                counted: 1,
+                observed: 1,
+            })),
+            Some(7 * DAY_SECS),
+            "the reader sees the largest figure the bound admits"
+        );
+
+        let mut stated = 0_u32;
+        let mut refused = 0_u32;
+        let mut past_the_bound = 0_u32;
+        let mut would_have_saturated = 0_u32;
+
+        for i in 0..=RATE_STEPS {
+            // The offset is in `[0, 1)`, so `t` is too and the exponent stays inside the stated
+            // range rather than being jittered past its own endpoints.
+            let t = (i as f64 + golden_offset(i)) / (RATE_STEPS as f64 + 1.0);
+            let rate = 10f64.powf(-300.0 + 303.0 * t);
+            for j in 0..=HEADROOM_STEPS {
+                let u = (j as f64 + golden_offset(j)) / (HEADROOM_STEPS as f64 + 1.0);
+                let headroom = max_pooled_headroom * u;
+
+                // What the PRE-FIX code did with this very input, tallied before the assertion so
+                // the sweep can prove it reaches the defect's region instead of merely passing
+                // everywhere. `as i64` is the saturating cast the defect shipped, reproduced
+                // deliberately.
+                let unbounded = (headroom / rate).round();
+                if !unbounded.is_finite() || unbounded > bound as f64 {
+                    past_the_bound += 1;
+                }
+                if unbounded as i64 == i64::MAX {
+                    would_have_saturated += 1;
+                }
+
+                let line = fleet_runway_line(FleetRunway {
+                    state: fleet_runway_state(headroom, rate),
+                    counted: 2,
+                    observed: 3,
+                });
+                match stated_runway_secs(&line) {
+                    Some(secs) => {
+                        stated += 1;
+                        assert!(
+                            (0..=bound).contains(&secs),
+                            "head-room {headroom} at rate {rate:e} states {secs}s, outside the \
+                             one-weekly-window bound of {bound}s: {line}"
+                        );
+                    }
+                    None => refused += 1,
+                }
+            }
+        }
+
+        // The CARDINALITY of what was swept, paired with the pass: a loop that silently stopped
+        // short would satisfy every assertion below over a fraction of the intended domain, and
+        // "no input violated the bound" is only worth its words alongside how many inputs there
+        // were.
+        let swept = (RATE_STEPS + 1) * (HEADROOM_STEPS + 1);
+        assert_eq!(
+            stated as usize + refused as usize,
+            swept,
+            "every one of the {swept} swept inputs was classified"
+        );
+
+        // Neither branch is vacuous...
+        assert!(
+            stated > 0,
+            "no swept input stated a figure at all — a function refusing everything would pass \
+             the bound assertion on all {} inputs",
+            (RATE_STEPS + 1) * (HEADROOM_STEPS + 1)
+        );
+        assert!(
+            refused > 0,
+            "every swept input stated a figure — the sweep never reached the refusing region"
+        );
+        // ...and the sweep demonstrably VISITS the defect, in both of its forms. Without these two
+        // the property could hold over a range that never contained the bug.
+        assert!(
+            past_the_bound > 0,
+            "no swept quotient exceeded one weekly window — the sweep never reached the region \
+             where the pre-fix guard printed a figure"
+        );
+        assert!(
+            would_have_saturated > 0,
+            "no swept input reproduces the saturating cast that printed i64::MAX \
+             (106,751,991,167,300 days) — the sweep never reached the reported defect"
+        );
+    }
+
+    #[test]
+    fn prop_no_swept_account_input_states_a_runway_past_its_dimension_bound() {
+        // LAYER 1, one account down (issue #1075 carried both of #1028's faults here until it
+        // landed). The two dimensions reset on different cadences and so carry DIFFERENT bounds,
+        // which is why the sweep runs per-dimension rather than against one shared ceiling: a
+        // single bound would either wave absurd session figures through or refuse legitimate
+        // weekly ones.
+        const RATE_STEPS: usize = 1_212;
+        const HEADROOM_STEPS: usize = 128;
+        let ceiling = max_account_headroom();
+
+        for (dimension, bound, rendered) in [
+            ("session", SESSION_RUNWAY_PLAUSIBLE_MAX_SECS, true),
+            // No cell renders this arm — `runway_cell` reads `session_runway_secs` alone — so
+            // there is nothing to read a figure back out of, and the assertion is on the value
+            // itself, which is what `weekly_runway_secs` carries to the wire. NOT to the fleet
+            // pool: that sums `weekly_headroom` and `weekly_rate`, never this quotient, which is
+            // `None` for a flat account whose head-room is positive (see the field's own doc).
+            ("weekly", WEEKLY_RUNWAY_PLAUSIBLE_MAX_SECS, false),
+        ] {
+            let mut stated = 0_u32;
+            let mut refused = 0_u32;
+            let mut past_the_bound = 0_u32;
+
+            for i in 0..=RATE_STEPS {
+                let t = (i as f64 + golden_offset(i)) / (RATE_STEPS as f64 + 1.0);
+                let rate = 10f64.powf(-300.0 + 303.0 * t);
+                for j in 0..=HEADROOM_STEPS {
+                    let u = (j as f64 + golden_offset(j)) / (HEADROOM_STEPS as f64 + 1.0);
+                    let headroom = ceiling * u;
+                    // A non-zero reading under the trigger, so the subtraction is exercised rather
+                    // than reduced to `trigger - 0`. Both stay inside what a `u8` ceiling admits.
+                    let current = ceiling * golden_offset(i + j);
+                    let trigger = current + headroom;
+
+                    if (headroom / rate).round() > bound as f64 {
+                        past_the_bound += 1;
+                    }
+
+                    let secs = runway_secs(Some(rate), current, trigger, bound);
+                    match secs {
+                        Some(secs) => {
+                            stated += 1;
+                            assert!(
+                                (0..=bound).contains(&secs),
+                                "{dimension}: head-room {headroom} at rate {rate:e} yields \
+                                 {secs}s, outside its {bound}s window"
+                            );
+                        }
+                        None => refused += 1,
+                    }
+
+                    if rendered {
+                        let cell = runway_cell(Some(&AccountVelocity {
+                            session_runway_secs: secs,
+                            ..AccountVelocity::default()
+                        }));
+                        if let Some(shown) = stated_runway_secs(&cell) {
+                            assert!(
+                                (0..=bound).contains(&shown),
+                                "{dimension}: the cell states {shown}s, outside its {bound}s \
+                                 window: {cell}"
+                            );
+                        }
+                    }
+                }
+            }
+
+            let swept = (RATE_STEPS + 1) * (HEADROOM_STEPS + 1);
+            assert_eq!(
+                stated as usize + refused as usize,
+                swept,
+                "{dimension}: every one of the {swept} swept inputs was classified"
+            );
+            assert!(stated > 0, "{dimension}: no swept input stated a figure");
+            assert!(refused > 0, "{dimension}: no swept input was refused");
+            assert!(
+                past_the_bound > 0,
+                "{dimension}: no swept quotient exceeded its own window — the sweep never \
+                 reached the region the pre-#1075 code printed from"
+            );
+        }
+    }
+
+    #[test]
+    fn every_reachable_census_state_states_a_count_only_when_one_was_measured() {
+        // LAYER 2, the census. THREE states, enumerated from `roster_line`'s branch structure
+        // rather than from a count: the denominator is zero, or it is short of the period, or it
+        // covers it. (The panel's mirror carries a FOURTH — an absent denominator, which only an
+        // `Option` can express; `StatsTests.swift` enumerates that one.)
+        //
+        // Asserted as invariance under the NUMERATOR, so no wording is pinned: a cell that states
+        // a count must move when the count moves, and one that states none must not.
+        // GREEN AT THE PRE-FIX BASELINE, deliberately kept and said so rather than dropped: at
+        // `cb3eaca` this cell ALREADY gated on its denominator (`all_high_covered_secs > 0`), so
+        // there was no CLI census defect for it to catch — issue #1029's own report says as much
+        // ("The CLI gets this right"). What was live there was the panel's mirror, which is red at
+        // that commit and is enumerated in `StatsTests.swift`. This half locks the semantic in
+        // against the reverse drift: the two surfaces must not part company again, and the CLI is
+        // the one that currently holds the line.
+        for (state, covered, states_a_count) in [
+            ("unmeasurable", 0, false),
+            ("partly measured", CENSUS_WINDOW / 2, true),
+            ("wholly measured", CENSUS_WINDOW, true),
+        ] {
+            let quiet = census_line(0, 0, covered, 0.95);
+            let busy = census_line(7, 6_000, covered, 0.95);
+            assert_eq!(
+                quiet != busy,
+                states_a_count,
+                "{state}: the census cell must {} its numerator\n  quiet: {quiet}  busy: {busy}",
+                if states_a_count { "state" } else { "withhold" }
+            );
+        }
+    }
+
+    #[test]
+    fn every_reachable_census_state_states_a_share_only_when_one_was_measurable() {
+        // The census states TWO numeric facts, and the test above gates only the first. This is
+        // the second: the coverage share, which REQ-STA-B-008 requires of a low-coverage period
+        // ("low-coverage periods SHALL be annotated") and which must not be stated where nothing
+        // was measured or where everything was.
+        //
+        // Asserted as invariance under the DENOMINATOR, holding the state fixed — two coverages
+        // that land in the same branch must render alike unless a share is stated, in which case
+        // they must differ because the share tracks what was measured. Nothing about the wording
+        // of the annotation is pinned, so a rewording keeps this honest and a silent removal does
+        // not.
+        //
+        // GREEN AT THE PRE-FIX BASELINE, like its numerator sibling: `cb3eaca` already annotated
+        // the partly-covered branch. What it annotated with was `, {n}% covered` — the field's own
+        // name on an operator-facing string, the second defect issue #1029 reports — and that is a
+        // leak this axis deliberately does NOT pin, because a test that named the words would be
+        // the golden assertion this issue exists to argue against.
+        for (state, a, b, states_a_share) in [
+            ("unmeasurable", 0, -1, false),
+            (
+                "partly measured",
+                CENSUS_WINDOW / 2,
+                CENSUS_WINDOW / 4,
+                true,
+            ),
+            ("wholly measured", CENSUS_WINDOW, CENSUS_WINDOW * 2, false),
+        ] {
+            let first = census_line(3, 6_000, a, 0.95);
+            let second = census_line(3, 6_000, b, 0.95);
+            assert_eq!(
+                first != second,
+                states_a_share,
+                "{state}: the census must {} a share\n  at {a}: {first}  at {b}: {second}",
+                if states_a_share { "state" } else { "withhold" }
+            );
+        }
+    }
+
+    #[test]
+    fn every_reachable_capacity_hold_state_states_a_count_only_when_one_was_measured() {
+        // LAYER 2, capacity holds — TWO states, the same shape one cell over. This aggregate
+        // selects its census from the same roster by the same rule, so it degrades on its own
+        // denominator and must withhold its own numerator when it does.
+        // GREEN AT THE PRE-FIX BASELINE for the same reason the census half is, and kept for the
+        // same reason: `capacity_hold_covered_secs == 0` already returned the sentinel at
+        // `cb3eaca`. No panel mirror exists at all — `StatsRoster` decodes no `capacity_*` key —
+        // so this cell has one surface and this is it.
+        for (state, covered, states_a_count) in [
+            ("unmeasurable", 0, false),
+            ("measured", CENSUS_WINDOW, true),
+        ] {
+            let quiet = capacity_line(0, 0, 0, 0, covered);
+            let busy = capacity_line(7, 2, 5, 106_080, covered);
+            assert_eq!(
+                quiet != busy,
+                states_a_count,
+                "{state}: the capacity cell must {} its numerator\n  quiet: {quiet}  busy: {busy}",
+                if states_a_count { "state" } else { "withhold" }
+            );
+        }
+    }
+
+    #[test]
+    fn every_reachable_runway_state_states_a_duration_only_when_it_has_one() {
+        // LAYER 2, the runway — SEVEN states across two surfaces, which is where the enumeration
+        // parts company with the issue's own "runway ×6": the fleet line has FIVE (four
+        // classifications plus the no-counted-fleet case that renders no line at all) and the
+        // per-account cell has two. Every refusal is asserted through the READER above, on the
+        // magnitude, rather than against a phrase — so a reworded unknown stays covered and a
+        // reworded figure fails loudly instead of passing silently.
+        for (state, states_a_duration) in [
+            (FleetRunwayState::Known(300_000), true),
+            (FleetRunwayState::Flat, false),
+            (FleetRunwayState::BeyondWeeklyWindow, false),
+            (FleetRunwayState::Unmeasurable, false),
+        ] {
+            let line = fleet_runway_line(FleetRunway {
+                state,
+                counted: 2,
+                observed: 3,
+            });
+            let shown = stated_runway_secs(&line);
+            assert_eq!(
+                shown.is_some(),
+                states_a_duration,
+                "{state:?} must {} a duration: {line}",
+                if states_a_duration {
+                    "state"
+                } else {
+                    "withhold"
+                }
+            );
+            if let Some(secs) = shown {
+                assert!(
+                    (0..=FLEET_RUNWAY_PLAUSIBLE_MAX_SECS).contains(&secs),
+                    "{state:?} states {secs}s, outside the one-weekly-window bound: {line}"
+                );
+            }
+        }
+
+        // The fifth fleet state: no counted fleet at all, so no line rather than a stated unknown.
+        // Reached through a bare `build_report`, whose velocity overlay never ran.
+        let now = epoch("2026-07-01T12:00:00Z");
+        let store = data(vec![sample(now - 300, "work", 0.60, 0.50)], "");
+        let window = plan_window(Some("day"), None, now, &store).unwrap();
+        let bare = build_report(&store, window, vec![], None, &params(), 0);
+        assert!(
+            fleet_runway(&bare).is_none(),
+            "precondition: no counted fleet"
+        );
+        assert!(
+            !render_text(&bare, None).contains("accounts last"),
+            "a fleet with nothing to count states no runway line at all"
+        );
+
+        // The per-account cell: a figure when the four gates pass, and the gap sentinel for each
+        // way they can fail. Enumerated by PRECONDITION, because the cell collapses all four
+        // refusals into one render and a single example would leave three of them unexercised.
+        let bound = SESSION_RUNWAY_PLAUSIBLE_MAX_SECS;
+        for (precondition, rate, current, trigger, states_a_duration) in [
+            (
+                "measured burn under the bound",
+                Some(1e-4),
+                0.50,
+                0.80,
+                true,
+            ),
+            ("rate unknown", None, 0.50, 0.80, false),
+            ("rate not a measurement", Some(f64::NAN), 0.50, 0.80, false),
+            ("no head-room left", Some(1e-4), 0.80, 0.80, false),
+            ("quotient past the window", Some(1e-11), 0.50, 0.80, false),
+        ] {
+            let cell = runway_cell(Some(&AccountVelocity {
+                session_runway_secs: runway_secs(rate, current, trigger, bound),
+                ..AccountVelocity::default()
+            }));
+            let shown = stated_runway_secs(&cell);
+            assert_eq!(
+                shown.is_some(),
+                states_a_duration,
+                "{precondition}: the cell must {} a duration: {cell}",
+                if states_a_duration {
+                    "state"
+                } else {
+                    "withhold"
+                }
+            );
+            if let Some(secs) = shown {
+                assert!(
+                    (0..=bound).contains(&secs),
+                    "{precondition}: the cell states {secs}s, outside its {bound}s window: {cell}"
+                );
+            }
+        }
+    }
+
     // --- AC: --json schema:1 stays byte-stable vs #158/#159 --------------------------
 
     /// The frozen schema:1 wire. #160 is HUMAN-render only — it adds no field, no

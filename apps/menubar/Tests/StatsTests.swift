@@ -759,6 +759,62 @@ final class StatsTests: XCTestCase {
                        "an empty roster is unmeasurable, not calm")
     }
 
+    /// THE SEMANTIC, pinned so it survives a rebaseline (issue #1038). Every assertion in this
+    /// section pins a STRING; this pins the property those strings exist to provide. The failure
+    /// mode it is written against is a year from now: someone "improves" the empty render back to
+    /// `0` and rebaselines the goldens without reading them. A golden-only assertion records what
+    /// the code did, not what it must do — so an absence is asserted here as INVARIANCE UNDER THE
+    /// NUMERATOR: feed the same state two different counts and require identical bytes. No
+    /// rewording can satisfy that accidentally, and no rebaseline can quietly relax it.
+    ///
+    /// FOUR states, enumerated from `statsCensusReading`'s branch structure rather than from a
+    /// count — one more than the CLI's `roster_line` has, because only an `Option` denominator can
+    /// express "an older daemon never told us". Its counterpart is
+    /// `every_reachable_census_state_states_a_count_only_when_one_was_measured` (`src/stats.rs`),
+    /// which enumerates the other three.
+    ///
+    /// The MEASURED rows are the discriminating half, not padding: without them a renderer that
+    /// ignored its inputs entirely would satisfy every invariance assertion above.
+    func testEveryCensusStateStatesACountOnlyWhenOneWasMeasured() {
+        let cases: [(state: String, covered: Int64?, statesACount: Bool)] = [
+            ("denominator never reported", nil, true),
+            ("unmeasurable", 0, false),
+            ("partly measured", weekSecs / 2, true),
+            ("wholly measured", weekSecs, true),
+        ]
+        for c in cases {
+            let quiet = coverageText(c.covered, episodes: 0, secs: 0)
+            let busy = coverageText(c.covered, episodes: 7, secs: 6000)
+            XCTAssertEqual(quiet != busy, c.statesACount,
+                           "\(c.state): the census must \(c.statesACount ? "state" : "withhold")"
+                           + " its numerator\n  quiet: \(quiet)\n  busy:  \(busy)")
+        }
+    }
+
+    /// THE SECOND NUMERIC FACT the callout states, and the other half of the panel's enumeration.
+    /// `statsCensusReading` states a COUNT (gated above) and a SHARE, and the two are gated on
+    /// different conditions: the count on whether the denominator is positive, the share on whether
+    /// it is short of the window. A test of one says nothing about the other.
+    ///
+    /// Asserted as invariance under the DENOMINATOR with the state held fixed — two coverages
+    /// inside the same branch render alike unless a share is stated, in which case they must differ
+    /// because the share tracks what was measured. The `nil` state carries no second value to vary
+    /// and is covered by the count axis alone; the other three are here.
+    func testEveryCensusStateStatesAShareOnlyWhenOneWasMeasurable() {
+        let cases: [(state: String, a: Int64, b: Int64, statesAShare: Bool)] = [
+            ("unmeasurable", 0, -1, false),
+            ("partly measured", weekSecs / 2, weekSecs / 4, true),
+            ("wholly measured", weekSecs, weekSecs * 2, false),
+        ]
+        for c in cases {
+            let first = coverageText(c.a, episodes: 3, secs: 6000)
+            let second = coverageText(c.b, episodes: 3, secs: 6000)
+            XCTAssertEqual(first != second, c.statesAShare,
+                           "\(c.state): the census must \(c.statesAShare ? "state" : "withhold")"
+                           + " a share\n  at \(c.a): \(first)\n  at \(c.b): \(second)")
+        }
+    }
+
     /// The pre-#804 wire shape decodes rather than throwing — the compat half of the drop above, and
     /// the shape a daemon predating BOTH the water and the denominator sends.
     func testPre804RosterWithoutTheDenominatorStillDecodes() throws {
