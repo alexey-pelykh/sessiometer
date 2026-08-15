@@ -35,8 +35,11 @@
 # MUTATION-VALIDATED. A suite that passes against the correct implementation is no
 # evidence it would catch a wrong one, so each falsifier was checked against the mutant
 # it targets — the guard was rewritten to the wrong rule and the test confirmed RED. The
-# mutation log is in the PR body for issue #1279. T14 was added later (issue #1314), and
-# T15-T17 later still (issue #1317); each one's mutation log is in its own commit body.
+# original cases' mutation log is in the commit body of `fe186c3` (the change that closed
+# issue #1279): this repo squash-merges, so a PR body reaches no clone and only a commit
+# body is followable. That log names every mutant of that round but T5's and T9's. T14 was
+# added later (issue #1314), and T15-T17 later still (issue #1317); each one's mutation
+# log is in its own commit body.
 #
 # The fixture ledger carries a range and a host range independent of the repo's real
 # ones, so a future range widening never touches this test.
