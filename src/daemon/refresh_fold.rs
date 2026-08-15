@@ -164,7 +164,9 @@ where
     /// Every firing pushes ONE durable [`Event::PollRefresh`] onto `events` (issue #255): the
     /// isolated-refresh ACTION the durable log previously lacked — until now only the DOWNSTREAM
     /// poll outcome reached it (via [`note_poll_outcome`](Self::note_poll_outcome)), so the log
-    /// showed a `CredentialDead` edge but not the poll-refresh that preceded it.
+    /// showed a `CredentialDead` edge but not the poll-refresh that preceded it. That line carries
+    /// [`PollRefreshTrigger::Poll401`] (issue #1367), separating it from the SAME event's other
+    /// origin — [`reprobe_dead_parked_credential`](Self::reprobe_dead_parked_credential).
     pub(super) async fn refresh_retry(&self, i: usize, events: &mut Vec<Event>) -> Result<Usage> {
         let refreshed = match self.poll_refresh.as_ref() {
             Some(engine) => engine.refresh(&self.roster[i]).await,
@@ -180,6 +182,10 @@ where
         // (`Err`) is an `Error` outcome — mirroring `refresh_tick`'s `error_refresh_event`.
         events.push(Event::PollRefresh {
             account: self.roster[i].label.clone(),
+            // The reactive #162 origin (issue #1367): this path fires on a usage-401 and nothing
+            // else. The sibling `reprobe_dead_parked_credential` emits the SAME event under
+            // `Recovery`, which is why the token is a carried field rather than a literal.
+            trigger: PollRefreshTrigger::Poll401,
             // The AC-3 rotation flag on the poll path (issue #279) now rides INSIDE the outcome
             // (issue #1004): the completed cycle's own signal on a refreshed classification, and
             // structurally absent otherwise — including an engine that could not even run (`Err`).
@@ -340,7 +346,9 @@ where
     /// isolated #102 engine rotates the server-side refresh token but CAS-writes only the account's
     /// STASH, never the live canonical — parked-account-safe (issue #253), the SAME engine the
     /// reactive #162 poll path drives. Emits one durable [`Event::PollRefresh`] for the ACTION
-    /// (mirroring [`refresh_retry`](Self::refresh_retry)), then folds a live outcome via
+    /// (mirroring [`refresh_retry`](Self::refresh_retry)) under its OWN
+    /// [`PollRefreshTrigger::Recovery`] — issue #1367, which is also what keeps this firing out of
+    /// [`crate::reliability`]'s poll-driven loss bucket — then folds a live outcome via
     /// [`fold_recovery_outcome`](Self::fold_recovery_outcome); a `Dead` re-stash (still dead) or a
     /// transient engine error leaves the honest 🔴 standing.
     pub(super) async fn reprobe_dead_parked_credential(&mut self, idx: usize) -> Vec<Event> {
@@ -358,6 +366,11 @@ where
         // poll-path refresh does.
         let mut events = vec![Event::PollRefresh {
             account: self.roster[idx].label.clone(),
+            // Issue #1367: the `restored` origin, NOT the reactive #162 one. From #643 until then
+            // this line rendered the hard-coded `poll_401` literal `refresh_retry` shares, so every
+            // recovery re-probe wrote a durable event blaming a 401 that never happened — and
+            // `reliability`'s per-mechanism split counted it as a poll-driven retry.
+            trigger: PollRefreshTrigger::Recovery,
             outcome,
         }];
         // Read the freshly re-stashed access-token expiry (the sweep reads it the same way) so the
@@ -1780,6 +1793,7 @@ mod tests {
                 poll_refreshes,
                 vec![Event::PollRefresh {
                     account: "spare".to_owned(),
+                    trigger: PollRefreshTrigger::Poll401,
                     outcome: expected,
                 }],
                 "report {report_outcome:?} (hard_error={hard_error}) must emit exactly one \
@@ -1855,6 +1869,7 @@ mod tests {
             vec![
                 Event::PollRefresh {
                     account: "spare".to_owned(),
+                    trigger: PollRefreshTrigger::Recovery,
                     outcome: RefreshEventOutcome::Refreshed { rotated: true },
                 },
                 Event::CredentialRestored {
@@ -1905,6 +1920,7 @@ mod tests {
             events,
             vec![Event::PollRefresh {
                 account: "spare".to_owned(),
+                trigger: PollRefreshTrigger::Recovery,
                 outcome: RefreshEventOutcome::Refreshed { rotated: true },
             }],
             "no CredentialRestored — there was no quarantine to lift (Case B)",
@@ -1958,6 +1974,7 @@ mod tests {
             events,
             vec![Event::PollRefresh {
                 account: "spare".to_owned(),
+                trigger: PollRefreshTrigger::Recovery,
                 outcome: RefreshEventOutcome::Dead,
             }],
             "the action is logged; the #261 operator signal does NOT re-fire (already latched)",
@@ -2010,6 +2027,7 @@ mod tests {
             vec![
                 Event::PollRefresh {
                     account: "spare".to_owned(),
+                    trigger: PollRefreshTrigger::Recovery,
                     outcome: RefreshEventOutcome::Error,
                 },
                 Event::CredentialRestored {

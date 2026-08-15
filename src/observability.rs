@@ -357,14 +357,50 @@ impl RefreshEventReason {
     }
 }
 
+/// What prompted an isolated PARKED-account poll-refresh cycle (issue #1367) — the `trigger=`
+/// token of an [`Event::PollRefresh`] line, and the parked-side sibling of [`KeepWarmTrigger`].
+///
+/// The line carried a hard-coded `poll_401` literal from issue #255 until now, on the premise that
+/// the reactive #162 poll path was the only condition that reached it. Issue #643 falsified that
+/// premise without noticing: it routed the `restored`-driven re-probe of a `Dead` PARKED credential
+/// (`reprobe_dead_parked_credential`) through the SAME event, so every recovery re-probe wrote a
+/// durable line blaming a 401 that never happened. #643 DID add [`KeepWarmTrigger::Recovery`] for
+/// the active-side re-probe in the same change; this enum is the parked-side equivalent it omitted.
+///
+/// A non-secret classification only — never a token or email.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PollRefreshTrigger {
+    /// The reactive #162 poll path: the FIRST usage-401 of a streak episode on a parked account,
+    /// where one isolated refresh plus a re-poll may revive a merely-expired ACCESS token before
+    /// the 401 advances the #42 death streak.
+    Poll401,
+    /// The issue #643 recovery re-probe: a `restored` control signal named an account carrying the
+    /// terminal 🔴 `Dead` verdict, so the daemon drove one isolated refresh on the spot rather than
+    /// latching the stale verdict until the next natural sweep. Operator-initiated — no usage-401
+    /// is involved, and the SAME `recovery` token [`KeepWarmTrigger::Recovery`] renders for the
+    /// active-side half of that same fix.
+    Recovery,
+}
+
+impl PollRefreshTrigger {
+    /// The `trigger=` token — the same grep vocabulary the rest of the event log uses, and
+    /// deliberately the same `recovery` spelling [`KeepWarmTrigger`] renders, so one grep finds
+    /// both halves of the issue #643 re-probe.
+    fn as_str(self) -> &'static str {
+        match self {
+            PollRefreshTrigger::Poll401 => "poll_401",
+            PollRefreshTrigger::Recovery => "recovery",
+        }
+    }
+}
+
 /// What prompted an in-place ACTIVE-account keep-warm cycle (issue #282) — the `trigger=`
-/// token of an [`Event::KeepWarm`] line. Unlike the poll-path [`Event::PollRefresh`]'s fixed
-/// `poll_401` literal, keep-warm fires from three distinct conditions, so the discriminant is a
-/// carried enum field: a `proactive` mint scheduled before the active token nears expiry, a
-/// `reactive` backstop mint on an active usage-401 (revive the canonical before the 401 counts
-/// toward the #42 death streak), or a `recovery` mint forced when an account that is `Dead` on
-/// `use`-activation is re-probed on the spot (issue #643). A non-secret classification only —
-/// never a token or email.
+/// token of an [`Event::KeepWarm`] line. Keep-warm fires from three distinct conditions, so the
+/// discriminant is a carried enum field: a `proactive` mint scheduled before the active token
+/// nears expiry, a `reactive` backstop mint on an active usage-401 (revive the canonical before
+/// the 401 counts toward the #42 death streak), or a `recovery` mint forced when an account that
+/// is `Dead` on `use`-activation is re-probed on the spot (issue #643). A non-secret
+/// classification only — never a token or email.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeepWarmTrigger {
     /// A scheduled mint fired because the active token entered its (staggered) near-expiry
@@ -1389,29 +1425,33 @@ pub(crate) enum Event {
         /// token or handle — the #15 single-surface guarantee holds.
         backoff_secs: Option<u64>,
     },
-    /// The `#162` poll-path refresh-then-retry fired for the PARKED `account` (issue #255): on
-    /// the FIRST usage-401 of a streak episode the daemon ran ONE isolated refresh (the #102
-    /// engine) plus a single re-poll, hoping a merely-expired access token is revived before it
-    /// counts toward the #42 death streak. This records the *action* — that an isolated refresh
-    /// fired and how it classified — the durable complement to the DOWNSTREAM poll outcome
-    /// ([`Event::Monitor401`] / [`Event::CredentialDead`]) that
+    /// One isolated refresh of the PARKED `account` fired (issue #255). This records the *action*
+    /// — that an isolated refresh fired and how it classified — the durable complement to the
+    /// DOWNSTREAM poll outcome ([`Event::Monitor401`] / [`Event::CredentialDead`]) that
     /// [`crate::daemon`]'s `note_poll_outcome` already logs. `outcome` is the same non-secret
     /// [`RefreshEventOutcome`] projection [`Event::Refresh`] carries (one shared refresh-outcome
-    /// vocabulary); the trigger is the fixed `poll_401` — the only condition that fires this path,
-    /// and never for the ACTIVE account (issue #253). `account` is the HANDLE (operator label),
-    /// never a token or email — the #15 single-surface guarantee.
+    /// vocabulary). Never fires for the ACTIVE account, on either path (issue #253). `account` is
+    /// the HANDLE (operator label), never a token or email — the #15 single-surface guarantee.
+    ///
+    /// `trigger` names WHICH condition fired it — [`PollRefreshTrigger`], two-valued since issue
+    /// #1367. Read that enum for why the field exists rather than the `poll_401` literal this line
+    /// rendered from #255 until then; the short version is that issue #643 gave the event a second
+    /// origin (the `restored`-driven re-probe of a `Dead` parked credential) and left the literal
+    /// standing. `trigger` is ALSO what [`crate::reliability`]'s refresh-token-loss split reads to
+    /// keep the two origins in separate buckets.
     PollRefresh {
         account: String,
+        trigger: PollRefreshTrigger,
         outcome: RefreshEventOutcome,
     },
     /// The in-place ACTIVE-account keep-warm (issue #282, the FOURTH refresh mechanism) ran one
     /// cycle for `account`: the daemon minted a fresh token by driving `claude` and — on a real
     /// refresh — PROMOTED it to the canonical `Claude Code-credentials` item a live session reads
     /// (never the STASH the #253-excluded engine writes). Records the *action* — that a keep-warm
-    /// fired, what `trigger`ed it ([`KeepWarmTrigger::Proactive`] near-expiry schedule vs
-    /// [`KeepWarmTrigger::Reactive`] active-401 backstop), and how it classified. `outcome` is the
-    /// same non-secret [`RefreshEventOutcome`] projection [`Event::Refresh`] / [`Event::PollRefresh`]
-    /// carry (one shared refresh-outcome vocabulary): `refreshed_not_restashed` on a real mint (a
+    /// fired, what `trigger`ed it (the three [`KeepWarmTrigger`] conditions), and how it classified.
+    /// `outcome` is the same non-secret [`RefreshEventOutcome`] projection [`Event::Refresh`] /
+    /// [`Event::PollRefresh`] carry (one shared refresh-outcome vocabulary):
+    /// `refreshed_not_restashed` on a real mint (a
     /// keep-warm PROMOTES rather than re-stashes, so it never renders `refreshed`), else
     /// `no_change` / `dead` / `error`. `account` is the HANDLE (operator label), never a token or
     /// email — the #15 single-surface guarantee.
@@ -2290,20 +2330,27 @@ impl Event {
                     "ts={ts} event=refresh account={account} outcome={outcome}{before}{after}{rotated}{reason}{backoff}{window}"
                 )
             }
-            Event::PollRefresh { account, outcome } => {
-                // The isolated poll-refresh ACTION (issue #255). The trigger is the fixed
-                // `poll_401` — the only condition that fires the #162 path — rendered as a literal
-                // (a single-valued discriminant needs no enum field); `outcome` reuses the SAME
-                // non-secret token vocabulary `event=refresh` renders. The DISTINCT `poll_refresh`
-                // event name keeps it clear of the periodic #106 `event=refresh` line that the
-                // `list` view's [`last_refresh_outcomes`] reader parses.
+            Event::PollRefresh {
+                account,
+                trigger,
+                outcome,
+            } => {
+                // The isolated poll-refresh ACTION (issue #255). `trigger=` carries the
+                // reactive-401-vs-recovery discriminant as a CARRIED field (issue #1367) — it was a
+                // hard-coded `poll_401` literal until then, on a single-condition premise issue
+                // #643 had already falsified by routing its parked re-probe through this event.
+                // `outcome` reuses the SAME non-secret token vocabulary `event=refresh` renders. The
+                // DISTINCT `poll_refresh` event name keeps it clear of the periodic #106
+                // `event=refresh` line that the `list` view's [`last_refresh_outcomes`] reader
+                // parses.
                 // `rotated=` trails `outcome=` (issue #279) — the same non-secret rotation
                 // signal `event=refresh` carries, on the poll path, and omitted on the same
                 // three non-refreshed outcomes for the same reason (issue #1004).
+                let trigger = trigger.as_str();
                 let rotated = rotated_field(*outcome);
                 let outcome = outcome.as_str();
                 format!(
-                    "ts={ts} event=poll_refresh account={account} trigger=poll_401 outcome={outcome}{rotated}"
+                    "ts={ts} event=poll_refresh account={account} trigger={trigger} outcome={outcome}{rotated}"
                 )
             }
             Event::KeepWarm {
@@ -2312,11 +2359,13 @@ impl Event {
                 outcome,
             } => {
                 // The in-place keep-warm ACTION (issue #282). `trigger=` carries the
-                // proactive-vs-reactive discriminant (a two-valued condition, unlike
-                // `poll_refresh`'s fixed `poll_401`); `outcome` reuses the SAME non-secret token
-                // vocabulary `event=refresh` renders. The DISTINCT `keep_warm` event name keeps it
-                // clear of both the periodic #106 `event=refresh` line and the #162 `poll_refresh`
-                // line — three separate refresh mechanisms, three separate event names.
+                // proactive / reactive / recovery discriminant (three-valued since issue #643);
+                // `outcome` reuses the SAME non-secret token vocabulary `event=refresh` renders.
+                // The DISTINCT `keep_warm` event name keeps it
+                // clear of both the periodic #106 `event=refresh` line and the `poll_refresh`
+                // line — three separate refresh mechanisms, three separate event names. The
+                // `poll_refresh` sibling carries its own `trigger=` too (issue #1367), so the
+                // token vocabularies are read per event name, never pooled.
                 let trigger = trigger.as_str();
                 // Omitted on the three non-refreshed outcomes, as on the sibling lines (#1004).
                 let rotated = rotated_field(*outcome);
@@ -4794,12 +4843,13 @@ mod tests {
 
     #[test]
     fn poll_refresh_line_carries_handle_trigger_and_outcome() {
-        // Issue #255: the #162 poll-refresh ACTION renders the redacted handle, the fixed
-        // `trigger=poll_401`, and the outcome token — the SAME vocabulary `event=refresh` uses,
-        // under a DISTINCT `poll_refresh` event name (so it never collides with the periodic
-        // #106 refresh line the `list` view's `last_refresh_outcomes` reader parses).
+        // Issue #255: the #162 poll-refresh ACTION renders the redacted handle, the trigger, and
+        // the outcome token — the SAME vocabulary `event=refresh` uses, under a DISTINCT
+        // `poll_refresh` event name (so it never collides with the periodic #106 refresh line the
+        // `list` view's `last_refresh_outcomes` reader parses).
         let dead = Event::PollRefresh {
             account: "spare".to_owned(),
+            trigger: PollRefreshTrigger::Poll401,
             outcome: RefreshEventOutcome::Dead,
         }
         .to_log_line(at_epoch(0));
@@ -4811,6 +4861,7 @@ mod tests {
         // trails it (issue #279), and no expiry fields ride this line (unlike `event=refresh`).
         let refreshed = Event::PollRefresh {
             account: "spare".to_owned(),
+            trigger: PollRefreshTrigger::Poll401,
             outcome: RefreshEventOutcome::Refreshed { rotated: true },
         }
         .to_log_line(at_epoch(0));
@@ -4821,6 +4872,51 @@ mod tests {
             )
         );
         assert!(!refreshed.contains("expires_"), "got: {refreshed}");
+    }
+
+    #[test]
+    fn poll_refresh_trigger_renders_the_recovery_origin_distinctly() {
+        // Issue #1367: the parked recovery re-probe (#643) shares this event with the reactive
+        // #162 poll path, so the ONLY thing separating them on the durable line is `trigger=`.
+        // Pinned as a whole line, both origins side by side, because the defect this replaced was
+        // precisely that the two rendered byte-identically.
+        let poll_401 = Event::PollRefresh {
+            account: "spare".to_owned(),
+            trigger: PollRefreshTrigger::Poll401,
+            outcome: RefreshEventOutcome::Dead,
+        }
+        .to_log_line(at_epoch(0));
+        let recovery = Event::PollRefresh {
+            account: "spare".to_owned(),
+            trigger: PollRefreshTrigger::Recovery,
+            outcome: RefreshEventOutcome::Dead,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            recovery,
+            format!("{TS0} event=poll_refresh account=spare trigger=recovery outcome=dead")
+        );
+        assert_ne!(
+            poll_401, recovery,
+            "the two origins must not render the same line"
+        );
+        // The `recovery` token is deliberately the one `event=keep_warm` already renders for the
+        // ACTIVE half of the same #643 fix, so one grep finds both halves. The EVENT NAME is what
+        // keeps them apart — which is also how `reliability` buckets them.
+        let active_half = Event::KeepWarm {
+            account: "spare".to_owned(),
+            trigger: KeepWarmTrigger::Recovery,
+            outcome: RefreshEventOutcome::Dead,
+        }
+        .to_log_line(at_epoch(0));
+        assert!(
+            active_half.contains(" trigger=recovery "),
+            "got: {active_half}"
+        );
+        assert!(
+            active_half.contains(" event=keep_warm "),
+            "got: {active_half}"
+        );
     }
 
     #[test]
@@ -4980,6 +5076,7 @@ mod tests {
                 .to_log_line(at_epoch(0)),
                 Event::PollRefresh {
                     account: "work".to_owned(),
+                    trigger: PollRefreshTrigger::Poll401,
                     outcome,
                 }
                 .to_log_line(at_epoch(0)),
@@ -5320,6 +5417,7 @@ mod tests {
             },
             Event::PollRefresh {
                 account: "work".to_owned(),
+                trigger: PollRefreshTrigger::Recovery,
                 outcome: RefreshEventOutcome::RefreshedNotReStashed { rotated: true },
             },
             Event::KeepWarm {
