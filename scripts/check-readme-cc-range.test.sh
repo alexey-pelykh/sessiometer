@@ -19,14 +19,24 @@
 #   T13  kills a scoped guard that passes when the pinned section is absent
 #   T14  kills a scoped guard that passes when the pinned section is DUPLICATED —
 #        T13's other half, which one `-ne 1` enforces and a `-lt 1` mutant drops
+#   T15  kills a CONTAINMENT-ONLY scoped guard — one asking whether the claim is
+#        present, so a stale claim beside it in the same section passes (issue #1317)
+#   T16  kills T15's rule written as a COUNT of claim-shaped statements rather than a
+#        count of DISTINCT ones, which goes RED on a section restating itself correctly
 #
-# A suite without them goes green on every defect this gate exists to prevent.
+# T11/T12 and T15/T16 are two RED/GREEN pairs of the same shape, one section apart: each
+# pins a masking defect closed and, beside it, the correct file the over-broad fix would
+# have rejected. A suite without them goes green on every defect this gate exists to
+# prevent — or red on files with nothing wrong with them.
+#
+# T17 is not a falsifier but a BOUNDARY: it pins the residual T15's rule leaves open, so
+# that widening or narrowing it is a deliberate, measured act rather than a silent one.
 #
 # MUTATION-VALIDATED. A suite that passes against the correct implementation is no
 # evidence it would catch a wrong one, so each falsifier was checked against the mutant
 # it targets — the guard was rewritten to the wrong rule and the test confirmed RED. The
-# mutation log is in the PR body for issue #1279. T14 was added later (issue #1314);
-# its mutation log is in that commit's body.
+# mutation log is in the PR body for issue #1279. T14 was added later (issue #1314), and
+# T15-T17 later still (issue #1317); each one's mutation log is in its own commit body.
 #
 # The fixture ledger carries a range and a host range independent of the repo's real
 # ones, so a future range widening never touches this test.
@@ -298,6 +308,53 @@ An unrelated section stating no range at all.
 EOF
 check "a DUPLICATED pinned section cannot determine" 2 "$(run)"
 check_out "  and it reports how many headings it found" "found 2"
+
+# T15 (#1317): THE round-4 falsifier, and the defect scoping NARROWED rather than closed.
+# The pinned section states the ledger's claim AND, above it, a stale one of the kind a
+# range widening leaves behind. Containment — `grep -qF -- "$claim"` — is satisfied by the
+# correct sentence, so the containment-only guard this extends exits 0 on this fixture with
+# a message byte-identical to the one it prints on a clean one (measured against that guard,
+# not inferred): blind to the difference, not merely quiet about it.
+# That is T11's defect one section in — there a correct copy under ANOTHER heading masked
+# a stale sentence, here a correct copy under the SAME one does. RED, and the diagnosis
+# must quote the statement the ledger does not make, since "they disagree" is not
+# actionable when the section also contains a sentence that is entirely right.
+default_ledger
+{
+    printf -- '- Legacy note: verified against **`3.2.100`–`3.2.120`** on macOS `30.1.1`–`30.1.2` / Darwin `29.x`.\n'
+    printf -- '- verified against **`3.2.100`–`3.2.140`** on macOS `30.1.1`–`30.1.2` / Darwin `29.x`.\n'
+} | write_readme
+check "a stale claim BESIDE the correct one in the pinned section is REJECTED" 1 "$(run)"
+check_out "  and the diagnosis quotes the stale statement" \
+    '`3.2.100`–`3.2.120` on macOS `30.1.1`–`30.1.2` / Darwin `29.x`'
+
+# T16 (#1317): the PERMISSION that keeps T15's rule from being the exactly-once rule
+# design choice 4 rejected, merely rescoped — T12's role one section in. The pinned
+# section states the correct claim TWICE, and is entirely right. A rule counting
+# claim-shaped OCCURRENCES goes RED here; counting DISTINCT ones is what makes it GREEN.
+# Without this case, tightening the guard to a count would pass the whole suite while
+# newly rejecting a correct README, which is the trade #1292 measured and declined.
+default_ledger
+{
+    printf -- '- verified against **`3.2.100`–`3.2.140`** on macOS `30.1.1`–`30.1.2` / Darwin `29.x`.\n'
+    printf -- '- Restated for emphasis: `3.2.100`–`3.2.140` on macOS `30.1.1`–`30.1.2` / Darwin `29.x`.\n'
+} | write_readme
+check "the SAME correct claim stated twice in the section PASSES" 0 "$(run)"
+
+# T17 (#1317): the RESIDUAL, pinned GREEN so it cannot move in either direction
+# unmeasured. T15's rule pins the claim's SHAPE, so a stale range inside the section that
+# carries no `on macOS … / Darwin …` clause is not claim-shaped and still passes. This is
+# a boundary marker, not an endorsement: closing this last step means counting
+# version-range PAIRS instead, and that reading is RED on a wholly-correct section — the
+# live README's holds two such pairs, the CC range and the host range, both of them inside
+# the canonical claim itself. Anyone widening the shape must turn this case RED
+# deliberately and re-derive that cost rather than inherit this comment.
+default_ledger
+{
+    printf -- '- verified against **`3.2.100`–`3.2.140`** on macOS `30.1.1`–`30.1.2` / Darwin `29.x`.\n'
+    printf -- '- Superseded: an earlier note gave `3.2.100`–`3.2.120`, with no host clause.\n'
+} | write_readme
+check "a bare non-claim-shaped stale range in the section PASSES (stated residual)" 0 "$(run)"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
