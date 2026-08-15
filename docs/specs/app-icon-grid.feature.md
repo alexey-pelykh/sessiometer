@@ -37,9 +37,12 @@ Requirements: PRD R-2, R-2a.
 
     Given macOS applies no mask of its own — it is not iOS
     And the rounding therefore lives in the artwork, as it does in every peer app measured
+    And the ideal body is the canvas × 824/1024 square, which is exact where the measured box is rounded
+    And its fill divides the alpha summed over every pixel that square can touch by that square's area
+    And "can touch" means its ideal edges rounded OUTWARD — never to nearest, never the measured box
     When the emitted app-icon raster is inspected at each declared size
     Then no corner of its own body box is fully opaque
-    And where 256 divides the canvas, that box's fill stays at or below the rounded-vs-square boundary
+    And that ideal body's fill stays at or below the rounded-vs-square boundary
     But not by pinning the declared 22.36 % radius
 
 > **INVERTED 2026-08-10 (#1141).** Until this date the scenario above asked for the opposite — *"the
@@ -59,11 +62,28 @@ Requirements: PRD R-2, R-2a.
 >
 > **What the shipped gate actually reaches**, so this scenario is not read as more:
 > `AppIconGridTests.testEveryEmittedSizeKeptItsBakedCornerRadius` runs the corner half
-> (`AppIconGrid.cornerAlphas`) on all ten declared rasters and the aggregate half
-> (`AppIconGrid.squareFillThreshold`) on the five whose canvas 256 divides. Both key on opacity
-> **magnitude**, so a uniformly translucent square satisfies them — they hold in the one regime the
-> producer generates, an opaque `rsvg-convert` pass per size (**#1148**). And the radius set they accept
-> is much wider than the declared 22.36 % (**#1149**). Both are tracked; neither is corrected here.
+> (`AppIconGrid.cornerAlphas`) and both aggregate bounds (`AppIconGrid.squareFillThreshold`,
+> `circleFillThreshold`) on all ten declared rasters. The aggregate half ran on only the five whose
+> canvas 256 divides until **#1160** re-based it on `AppIconGrid.idealBodyFill`, whose denominator is the
+> ideal body area rather than the measured box and so is exact at every canvas. The scenario's own
+> aggregate clause was restated in the same change — it had carried both retired terms, the `256 |
+> canvas` scope and the measured-box denominator, and a clause here is an instruction to a test author,
+> so leaving it would have specified the bound this change removed. All three reads key on
+> opacity **magnitude**, so a uniformly translucent square satisfies them — they hold in the one regime
+> the producer generates, an opaque `rsvg-convert` pass per size (**#1148**). And the radius set they
+> accept is much wider than the declared 22.36 % (**#1149**). Both issues are closed, and both limits are
+> stated at the predicates that carry them — the opacity regime at `AppIconGrid.peakAlpha`, the admitted
+> radius band at `squareFillThreshold`. Neither is corrected here.
+> What the corner half alone can reach off the pixel grid is narrower still, and is **#1320**.
+>
+> **Why the numerator is spelled out above** and not left to the denominator's `Given`, which is how
+> #1160 first restated this clause: the region is the half a test author would otherwise have to invent,
+> and the obvious invention is wrong. Summing over the MEASURED box against the same ideal-body
+> denominator reads **85.8808 %** at canvas 16 where the correct region reads 95.5661 % — under the
+> 87.1234 % floor this gate also asserts, so the mistake ships as a RED on correct artwork rather than
+> as a slightly different number. It diverges only off the pixel grid (95.4303 % against 95.7143 % at
+> canvas 128, and byte-identical at the other five canvases), which is what makes it easy to write and
+> hard to see.
 
 ## Scenario: the other three icon.svg consumers are untouched  · Cap-4.2
 
