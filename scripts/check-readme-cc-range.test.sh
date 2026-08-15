@@ -3,7 +3,7 @@
 # Builds a throwaway tree the guard resolves relative to its own location and exercises
 # the cases that define its contract.
 #
-# Ten of these are FALSIFIERS — each fails against a specific wrong implementation:
+# The falsifiers below each fail against a specific wrong implementation:
 #
 #   T2   kills a two-independent-substrings check (issue #712's measured defect)
 #   T3   kills a guard that pins the Claude Code range and leaves the HOST range
@@ -17,13 +17,16 @@
 #   T12  kills the rejected alternative to T11's fix: requiring the claim to occur
 #        exactly ONCE in the file, which goes RED on a legitimate second copy
 #   T13  kills a scoped guard that passes when the pinned section is absent
+#   T14  kills a scoped guard that passes when the pinned section is DUPLICATED —
+#        T13's other half, which one `-ne 1` enforces and a `-lt 1` mutant drops
 #
 # A suite without them goes green on every defect this gate exists to prevent.
 #
 # MUTATION-VALIDATED. A suite that passes against the correct implementation is no
 # evidence it would catch a wrong one, so each falsifier was checked against the mutant
 # it targets — the guard was rewritten to the wrong rule and the test confirmed RED. The
-# mutation log is in the PR body for issue #1279.
+# mutation log is in the PR body for issue #1279. T14 was added later (issue #1314);
+# its mutation log is in that commit's body.
 #
 # The fixture ledger carries a range and a host range independent of the repo's real
 # ones, so a future range widening never touches this test.
@@ -31,7 +34,7 @@
 # Every fixture README is written through write_readme, which wraps the case's body in
 # the `## Prerequisites` heading the guard pins and closes it with an unrelated trailing
 # section — the real README's shape. Cases needing a specific multi-section layout
-# (T11-T13) build their fixture directly instead.
+# (T11-T14) build their fixture directly instead.
 #
 # Run locally:  ./scripts/check-readme-cc-range.test.sh
 set -euo pipefail
@@ -267,6 +270,34 @@ cat > "$work/README.md" <<'EOF'
 EOF
 check "an absent pinned section cannot determine" 2 "$(run)"
 check_out "  and it says the section is what is missing" "'## Prerequisites' heading"
+
+# T14: the pinned section is DUPLICATED — a correct `## Prerequisites` and, further down,
+# a stale second one of the kind a restructure leaves behind. The guard enforces both
+# halves of "exactly one heading" with a single `-ne 1`, so a `-lt 1` mutant keeps T13's
+# missing-section behaviour and drops this one silently: it reads the FIRST section, finds
+# the correct claim there and exits 0, having never looked at the stale copy a reader
+# scrolling to the second heading would land on. That is the guard's own motivating defect
+# — a correct copy masking a stale one — one level in. Exit 2, naming the count: which of
+# two sections is the pinned one is not the guard's to guess, so the pin must be re-pointed
+# deliberately.
+default_ledger
+cat > "$work/README.md" <<'EOF'
+# sessiometer (fixture README)
+
+## Prerequisites
+
+- verified against **`3.2.100`–`3.2.140`** on macOS `30.1.1`–`30.1.2` / Darwin `29.x`.
+
+## Quickstart
+
+An unrelated section stating no range at all.
+
+## Prerequisites
+
+- Legacy note: verified against **`3.2.100`–`3.2.120`** on macOS `30.1.1`–`30.1.2` / Darwin `29.x`.
+EOF
+check "a DUPLICATED pinned section cannot determine" 2 "$(run)"
+check_out "  and it reports how many headings it found" "found 2"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
