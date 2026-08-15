@@ -11,8 +11,8 @@ formulation:
   ui-visual: complete
   testing-architecture: complete
 features:
-  expiry-placement: {stage: design, tracks: {ux-ia: complete, ui-visual: complete}}
-  icon-grid: {stage: design, tracks: {technical-architecture: complete}}
+  expiry-placement: {stage: delivered, tracks: {ux-ia: complete, ui-visual: complete}}   # DELIVERED per § 5b; #951, c5f851d
+  icon-grid: {stage: delivered, tracks: {technical-architecture: complete}}   # DELIVERED per § 5b; #952, 12ee1c4
   chip-affordance: {stage: delivered, tracks: {ui-visual: complete}}   # ADR-STUB-1 DECIDED → option (d); #956, 0ab82fc
   row-affordance-coverage: {stage: design, tracks: {ux-ia: complete}}
   axis-disposition-gate: {stage: design, tracks: {testing-architecture: complete}}

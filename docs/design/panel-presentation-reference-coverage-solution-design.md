@@ -215,7 +215,7 @@ ADR-STUB-1), Context + Options recorded, Decision left OPEN.
 ## 6. Runtime View — Task Flows
 
 **Flow: user decides whether a row is actionable.** Today: the only at-rest signal is the chip's tint,
-whose contrast is ~~unmeasured and probably ~2.1~~ **measured at 1.91:1 light / 2.70:1 dark (#949) and
+whose contrast is ~~unmeasured and probably ≈2.1~~ **measured at 1.91:1 light / 2.70:1 dark (#949) and
 since lifted to 3.34:1 both appearances (#956, `0ab82fc`)**. Hovering produces a real response (+57.9 % chip ink,
 −7.50 lum wash, ~10× the control) — but hover is *discovery-by-accident*. Five of ten row states have no
 tooltip at all; six have no hover response (PRD § 7). Target: every state has at least one at-rest signal
