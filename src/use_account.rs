@@ -2679,16 +2679,16 @@ mod tests {
         // reads merely print, which misses the control write, and that the verdict read does not
         // print, which the doc comment it cited in the same breath contradicts. The daemon-side
         // landing went wrong on its own axis and by the same mechanism: it named
-        // `apply_refresh_restore`, which is what `RestoreNotifier`'s doc comment in `src/poke.rs`
-        // names on the SEND side — symbol and "un-quarantine + re-tick" both — and not what the
-        // receiving end calls. A neighbouring comment is not the dispatch; the trace above is read
-        // forward from the control handler. That send-side wording is stale the same way and is
-        // left alone here (issue #1335 enumerates the family it belongs to): it is a claim about a
-        // different file, made by a different scope, and this diff touches neither. Falsifiable
-        // rather than argued: pin the verdict in `poke_all` and leave `poke_named`'s read intact,
-        // and exactly one test reds per destination — the swept `Restored` send disappears, and the
-        // swept report line drops to the bare classification — while the named lines print
-        // byte-identically.
+        // `apply_refresh_restore` — the symbol, and the "un-quarantine + re-tick" phrasing, that
+        // `RestoreNotifier`'s doc comment in `src/poke.rs` carried on the SEND side, and that the
+        // receiving end does not call. A neighbouring comment is not the dispatch; the trace above
+        // is read forward from the control handler. That send-side wording carried the same
+        // staleness and has since been re-pointed (issue #1335): its doc now names
+        // `reconcile_restored` and scopes `apply_refresh_restore` to the `Degraded` fork.
+        // Falsifiable rather than argued: pin the verdict in `poke_all` and leave `poke_named`'s
+        // read intact, and exactly one test reds per destination — the swept `Restored` send
+        // disappears, and the swept report line drops to the bare classification — while the
+        // named lines print byte-identically.
         //
         // Both lists are left as examples rather than extended to cover what they miss, for the
         // one reason `HandleRead`'s own doc comment gives one scope up: a closed list reads as a
