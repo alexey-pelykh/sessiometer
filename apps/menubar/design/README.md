@@ -885,16 +885,26 @@ elsewhere, 4 routed to the checklist below.** Nothing is left silent.
 | The OS authorization prompt, and a denial | Manual, step 3 |
 | How Notification Center actually renders and stacks a delivered notification | Manual, step 4 |
 
-Run these against a real build:
+Run these against a real build with the daemon RUNNING unless a step says otherwise. The roster is not
+uniform across these steps — the ones that depend on it say what they need:
 
-- [ ] **Capture in a live panel.** With an EMPTY roster, open the panel: the onboarding card appears
-      with a real, focusable label field (not the blank box the PNGs show). Click into it and type — the
-      keystrokes must land, which is the whole point of `AccountCaptureModel.panelKeyRequest` re-asserting
-      the panel key. Press Return to submit, and on a second attempt press Esc to cancel: Esc must resign
-      focus and return the card to idle so an outside click can dismiss the panel again. Then repeat the
-      whole step through the status item's right-click **Add account…** surface (#394). (Every phase's
-      tree is gated automatically; that a live `FloatingPanel` routes keys into it is not — it overrides
-      `canBecomeKey` precisely so this works.)
+- [ ] **Capture in a live panel.** With an EMPTY roster, open the panel: the onboarding card appears with a
+      real, focusable label field (not the blank box the PNGs show). Reach that state by starting the daemon
+      with a roster and `sessiometer remove`-ing every account, in that order: `run` refuses to start on an
+      empty roster at all (`Config::require_roster`), while `remove` signals a roster reload that takes a
+      RUNNING daemon to zero accounts without a restart — which is what leaves a daemon answering with the
+      empty roster this card renders for. Mind what that route COSTS: `remove` also deletes each account's
+      keychain stash — its own doc comment calls it the destructive sibling of `disable` — so run the two
+      notification-rendering steps below (4 and 5), which need a populated roster, BEFORE this one, or expect
+      an interactive `sessiometer login` per account to rebuild what they need. `disable` is not a cheaper
+      substitute: it keeps the roster entry, so the snapshot still carries the account, and
+      `HonestStateMachine` reaches this card's state only on a ZERO-account one. Click into the field and type
+      — the keystrokes must land, which is the whole point of `AccountCaptureModel.panelKeyRequest`
+      re-asserting the panel key. Press Return to submit, and on a second attempt press Esc to cancel: Esc
+      must resign focus and return the card to idle so an outside click can dismiss the panel again. Then
+      repeat the whole step through the status item's right-click **Add account…** surface (#394). (Every
+      phase's tree is gated automatically; that a live `FloatingPanel` routes keys into it is not — it
+      overrides `canBecomeKey` precisely so this works.)
 - [ ] **Capture-card fidelity.** Compare that same first-run card against the mock's onboarding frames in
       `menubar-preview.html`. The gate measures that the copy FITS and that the controls are reachable;
       whether the card LOOKS like the ratified design is a human judgement, and the field is the one
@@ -902,13 +912,57 @@ Run these against a real build:
 - [ ] **Notification authorization.** On a fresh install, confirm the OS permission prompt appears once.
       Then DENY it and confirm the app stays usable and silent — no in-app re-prompt, no error banner.
       Finally, with notifications toggled off at launch, turn them on in Settings (`⌘,`) and confirm the
-      prompt fires at that point (the toggle drives `onRequestAuthorization`).
-- [ ] **Notification rendering.** Trigger a swap (`sessiometer use <other-account>`) and confirm a
-      notification appears reading "Active account switched" / "Sessiometer rotated to a different
-      account", and **that it names no account** — this is the manual half of the redaction guarantee,
-      on the lock screen, which is where the exposure actually is. Then trigger a second swap and confirm
-      you now have TWO notifications stacked under Sessiometer rather than one replacing the other (the
-      per-post identity), and that they group under the app rather than into sub-threads.
+      REQUEST fires at that point (the toggle drives `onRequestAuthorization`). What that confirms is the
+      wiring, not a second OS prompt — the OS asks at most once per install, so after the denial above it
+      answers from its record and shows nothing. Read it in Console.app: subsystem `org.sessiometer.menubar`,
+      category `notify`, `notification authorization granted=false` — logged at INFO level, so turn on
+      **Action → Include Info Messages** first, or Console's default view filters out the one line you came
+      for and working wiring reads as broken. Headless, same filter as that menu item: `log show --info --last
+      5m --predicate 'subsystem == "org.sessiometer.menubar"'`; drop `--info` and this line disappears while
+      the failure path (`notifyLog.error`) stays visible, so an empty default view is not evidence either way.
+      Seeing the PROMPT itself again takes another fresh install.
+- [ ] **Notification rendering.** Preconditions first, because without them this step reads as a broken
+      presenter. Notification authorization GRANTED at the OS — step 3 above has you DENY it, and
+      `UserNotificationPresenter.present` then calls `center.add` with no authorization check, so the
+      step delivers nothing and reports nothing in the app. The one surface that can report it is the `notify`
+      filter step 3 builds: `center.add`'s completion handler logs `failed to post notification: …` there at
+      ERROR level, which the default view shows without `--info`. The OS prompts at most once per install, so
+      re-enabling the Settings toggle does not undo a denial: restore it in System Settings, or start from a
+      fresh install. Leave that toggle ON too — it gates the post independently. At least TWO accounts, with
+      every account you swap TO viable — not quarantined, not weekly-exhausted, either of which the default
+      pre-swap gate refuses with zero writes — and the app already CONNECTED before the first swap. The
+      notification is not emitted by the CLI: `AccountEventDeriver` raises `.swapped` only when the active
+      label differs between two consecutive `.connected` snapshots off the daemon's `watch` stream, so a first
+      snapshot only seeds its baseline and a drop clears it — a daemon restart ACROSS a swap swallows that
+      swap rather than announcing it. With no daemon at all, `sessiometer use` still swaps — successfully, and
+      without a notification.
+      Trigger a swap (`sessiometer use <other-account>`) and confirm a notification appears reading
+      "Active account switched" / "Sessiometer rotated to a different account.", and **that it names no
+      account** — this is the manual half of the redaction guarantee, on the lock screen, which is where
+      the exposure actually is. Then swap again naming a DIFFERENT target than the first — a third
+      account, or back to the one you started on, either being a real swap — waiting out the pre-swap
+      cooldown (`[tunables].cooldown_secs`, default 60 s, never zero) or bypassing it: `sessiometer use
+      <target> --force`. A different target, because re-running the SAME one **without `--force`** is a
+      no-op success with no write — the daemon's own already-active verdict while it is up
+      (`src/daemon/commands.rs`), the standalone pre-swap gate when it is not (`src/use_account.rs`
+      module doc, under its *pre-swap gate (default, without --force)* heading) — so no active label
+      changes and nothing fires. The cooldown you are waiting out splits the same way: the daemon's own
+      in-memory last-swap record while it is up (`src/daemon/commands.rs`), and the durable event log
+      only when no daemon answers (`src/use_account.rs`). With the daemon up, as this section requires,
+      the log-derived value `use` computes is not what gates you — it is reached only on the daemon's `no
+      active account` fall-through, which your first swap has already ruled out by leaving an active
+      account in place. Restarting the daemon between the two swaps drops that in-memory cooldown
+      outright; the notification survives it, so long as you let the app reconnect and re-seed its
+      baseline before you swap again. Neither refusal is a false PASS — the no-op reports that the target is
+      already active and exits 0, the cooldown exits non-zero naming `--force` itself — but both produce
+      "no second notification", which is the reading this step would otherwise have you take as a failure
+      of the per-post identity. Forcing the SAME target is a third outcome and the one that reads most
+      like a delivered swap: `--force` bypasses the already-active gate on both paths, so the run
+      proceeds as a self-swap, prints a completed-swap confirmation `X → X` and exits 0 having written —
+      and still fires nothing, because the active label never changed and `AccountEventDeriver` needs it
+      to differ. Same silence, and here not even a refusal to read it off. Confirm you now have TWO
+      notifications stacked under Sessiometer rather than one replacing the other (that identity), and that
+      they group under the app rather than into sub-threads.
 - [ ] **Expiry notification rendering** (#935). With at least one account inside the configured horizon
       (`[credential].expiry_horizon_secs` — widen it temporarily rather than waiting a week), confirm a
       notification appears reading "A login is inside its expiry horizon" / "One account's refresh token
