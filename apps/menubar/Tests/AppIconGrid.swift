@@ -159,10 +159,41 @@ enum AppIconGrid {
     ///    way a given canvas rounds. Canvas 16 is the proof the estimator has no model at all off the grid:
     ///    correcting its denominator the same way predicts a fill of **110.17 %**, which is not a quantity —
     ///    an inward-rounded box also CLIPS its own numerator, and neither error is modelled here.
-    /// 3. **The residual is closed by the producer, not by the gate.** What escapes at 16/32/64/128 is an
-    ///    `rx` shrunk but not to zero — it empties the corner pixel, so the per-corner read accepts it, and
-    ///    it barely dents the area. `brand/generate.sh` renders ONE `icon.svg` at every size, so such a
-    ///    regression appears at 256/512/1024 too, where both bounds run over it.
+    /// 3. **The residual is closed by the producer, not by the gate.** `brand/generate.sh` renders ONE
+    ///    `icon.svg` at every size, so a radius regression that reaches these four canvases reaches
+    ///    256/512/1024 as well, where both bounds run over it. That coupling is what actually holds the
+    ///    carved-out sizes — and it carries the whole load rather than part of it, which the paragraph
+    ///    below measures.
+    ///
+    /// **WHAT IT LEAVES UNCOVERED** (issue #1149), measured rather than reasoned, because a carve-out is
+    /// only as cheap as this list is short. At canvas 16/32/64/128 the sole rounding evidence is
+    /// `cornerAlphas`, and all it asks is that the body box's corner pixel is not FULLY covered. Three
+    /// things clear that bar:
+    ///
+    ///   • **A hollow body.** The suite's own hollow-body canary — a real icon shrunk to 60 % of its box,
+    ///     the box held by four alpha-254 pins — reads 33.54–36.51 % fill and prints `body-fill floor not
+    ///     asserted` at all four of these canvases, against `REJECTED` at 256/512/1024. That printed line
+    ///     is the carve-out's cost, restated by the gate on every run.
+    ///   • **A radius shrunk but not gone.** Only the aggregate reads a deficit's MAGNITUDE, and no
+    ///     magnitude is read here. How wide the band is even where it IS read: `squareFillThreshold`.
+    ///   • **An `rx` dropped OUTRIGHT — at 32/64/128, though not at 16.** This is the one that is easy to
+    ///     get backwards, so it is derived here. Off the grid the ideal body edge lands mid-pixel, so the
+    ///     box's own corner pixel is only partly covered by the body BEFORE any rounding. Measured at
+    ///     mid-height on the shipped rasters, where the edge is straight, the left-edge pixel reads 112 /
+    ///     223 / 192 / 130 at canvas 16 / 32 / 64 / 128 — the 43.75 / 87.5 / 75 / 50 % coverage the ideal
+    ///     edges predict, so the rasterizer integrates coverage exactly as `bodyFill` assumes. A hard
+    ///     square therefore puts that corner pixel at the product of its two edge coverages: at canvas 16
+    ///     the 43.75 % pixel falls BELOW the alpha ≥ `opaqueAlpha` contour, so the box starts one pixel in
+    ///     at a column wholly inside the body and the corner reads a full 255 — caught. At 32 and 64 the
+    ///     edge pixel is inside the box and the corner reads 0.875² → 195 and 0.75² → 143; at 128 the box
+    ///     is 104×103 at (12,13), half-covered in x and whole in y → 128. All three are under 255, so the
+    ///     per-corner read accepts them. At those canvases it is not a weakened rounding check; it is not
+    ///     a rounding check at all, and reason 3 above is the entirety of what holds them.
+    ///
+    /// `squaredCorners` reports green over that last point and cannot do otherwise — it fills the MEASURED
+    /// BOX opaque, writing 255 into that corner pixel by construction, where the producer would emit the
+    /// ideal body's own antialiased edge. The two subjects coincide only where this predicate holds. The
+    /// gap is **#1320**; it is recorded here rather than closed here, because closing it moves a predicate.
     ///
     /// The principled route to the whole ladder is not a wider carve-out but a different estimator: divide
     /// by the IDEAL body area, which is exact at every canvas, instead of by the measured box. That is a
@@ -269,7 +300,26 @@ enum AppIconGrid {
     /// read 93.7493 (32), 93.7726 (64), 94.5127 (128) — LOW, because the box rounds outward and carries
     /// margin — and 98.8617 (16), HIGH, because there the box rounds INWARD and clips the body's own outer
     /// edge, at a 12-pixel body where half a pixel per edge is 7 % of the denominator. So this half of the
-    /// rounding check is asserted only where `isExactOnPixelGrid`; `cornerAlphas` covers every size.
+    /// rounding check is asserted only where `isExactOnPixelGrid`; `cornerAlphas` covers every size —
+    /// though that predicate records how little the corner half reaches once the canvas is off the grid.
+    ///
+    /// **THE RADIUS SET THIS ACCEPTS, so no reader takes it for a radius pin** (issue #1149). Because the
+    /// threshold is the MIDPOINT of the same one-parameter family the constants above use,
+    /// `fill(k) = 1 − (4 − π)k²`, solving `fill(k) = (fill(k_declared) + 1)/2` gives `k = k_declared/√2`
+    /// exactly — the `(4 − π)` cancels, so the admitted shrink is **29.29 %** of whatever radius the
+    /// artwork declares, not a figure fitted to the current one. Against today's `cornerRadiusRatio` that
+    /// is `k ≥ 0.1581`, an `rx` down to **162** on the 1024 master against the declared 229. Paired with
+    /// `circleFillThreshold` at the other end (`k ≤ 0.3873`, `rx ≤ 396`), the band actually asserted is
+    /// `k ∈ [0.1581, 0.3873]` around a declared 0.2236.
+    ///
+    /// That band is the two-hypothesis discrimination these constants were derived for — rounded against
+    /// hard-cornered here, rounded against inscribed-circle there — and it is NOT a statement about the
+    /// radius's value. Both endpoints are functions of `cornerRadiusRatio`, so an `rx` legitimately
+    /// changed in `icon.svg` moves them with it and the discrimination survives; what does not exist, at
+    /// either endpoint, is any assertion that the emitted radius is 22.36 %. Pinning that would mean
+    /// fitting a threshold to what the rasterizer happens to do today, which is the trade `edgeTolerance`
+    /// and this constant both refuse — so the pin belongs upstream, in `icon.svg` and the
+    /// `cornerRadiusRatio` read from it, not here.
     static let squareFillThreshold = (roundedFill + squareFill) / 2
 
     /// The largest corner radius the rounded-rect model admits: half the body span, where the four
@@ -308,7 +358,7 @@ enum AppIconGrid {
     ///
     /// What it therefore rejects, stated as thresholds rather than as the three rasters that motivated it:
     /// any uniform alpha scale below **91.03 %** of full; any corner radius past **0.3873** of the body span
-    /// (`rx` beyond 397 on the 1024 master, against the declared 229); and any pinned body more than
+    /// (`rx` beyond 396 on the 1024 master, against the declared 229); and any pinned body more than
     /// **4.59 %** linearly short of its own bounding box.
     ///
     /// Scoped to `isExactOnPixelGrid` for exactly the reason the upper bound is — the model divides by the
