@@ -122,7 +122,11 @@ enum ViewLogStyleDivergence {
 @MainActor
 private enum ViewLogCardHarness {
 
-    static let cardSize = CGSize(width: 320, height: 150)
+    /// `nonisolated` because `inkCoverage(of:size:)` takes it as a DEFAULT ARGUMENT, which this target's
+    /// Swift 5 language mode evaluates outside the actor — so an isolated read there warns on every build
+    /// (issue #1109). Safe because it is an immutable `Sendable` `CGSize`; only the RENDER needs the main
+    /// actor — the same split `PanelRenderHarness` makes for its naming/scale surface.
+    nonisolated static let cardSize = CGSize(width: 320, height: 150)
 
     /// One `DaemonLogCard`, wired with the minimum the view actually reads: a store (for the banner's
     /// account count), the #776 availability probe, and the accent pin.
