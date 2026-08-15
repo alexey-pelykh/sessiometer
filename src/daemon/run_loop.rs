@@ -662,12 +662,16 @@ where
             // Reconcile the revived account the `restored` control command named (#275 +
             // issue #643): a bare `Degraded` quarantine takes the plain on-demand
             // un-quarantine (`apply_refresh_restore`); a `Dead` PARKED account additionally
-            // drives an immediate isolated refresh (`reprobe_dead_parked_credential`), folding
-            // a genuinely successful result to 🟢 or leaving an honest 🔴 — no active-account
-            // change either way — BEFORE looping back to re-tick. Any `CredentialUnrecoverable`
-            // edge is LOGGED here but deliberately NOT surfaced as a macOS notify (the operator
-            // just ran `claude /login`; don't toast "run claude /login" at them). An unknown or
-            // non-`Dead`, non-quarantined uuid yields no events: an idempotent, silent no-op.
+            // drives an immediate isolated refresh (`reprobe_dead_parked_credential`), whose
+            // outcome `fold_recovery_outcome` folds three ways — a live result clears the `Dead`
+            // latch (a fixed credential reads 🟢 within the cycle), a transient engine error
+            // un-quarantines anyway (to `AtRisk`: INCONCLUSIVE is not a death, so the #275
+            // guarantee holds), and only a definitively `Dead` re-probe leaves the honest 🔴 — no
+            // active-account change on any of them — BEFORE looping back to re-tick. Any
+            // `CredentialUnrecoverable` edge is LOGGED here but deliberately NOT surfaced as a
+            // macOS notify (the operator just ran `claude /login`; don't toast "run claude /login"
+            // at them). An unknown or non-`Dead`, non-quarantined uuid yields no events: an
+            // idempotent, silent no-op.
             Idle::Restored(uuid) => {
                 for event in daemon.reconcile_restored(&uuid).await {
                     emit_best_effort(log, &event);
