@@ -3,8 +3,20 @@
 # (issue #1058). Builds a throwaway git repo and exercises the guard across the
 # cases that define its contract — in particular proving it goes RED on the exact
 # defect the issue reports (a bare line number into a churning file) and GREEN on
-# the two things it must never block: a symbol-anchored citation, and a bare line
-# number into a file that does not move.
+# the two things it must never block: a citation whose symbol occurs AT the lines
+# it cites, or cites none at all, and a bare line number into a file that does
+# not move.
+#
+# The second contract half is issue #1338: anchoring is scoped to the CITED
+# RANGE, not the whole file — and on BOTH sides of it, since the symbol must sit
+# at or after the range start AND at or before its end. Each side is pinned by
+# its own pair differing in the range alone: `stable_anchor_symbol` cited `1-9`
+# against `3-9` for the lower bound, `JSONWire` cited `1-4` against `1-3` for the
+# upper. The upper pair is not decoration — it was added because neutering ONLY
+# the upper bound was measured to leave this entire suite green, so the bound the
+# rule half rests on was asserted by nothing. The same scoping governs the
+# DECLINED-acronym report, and its pair — `CLI` cited `1-9` against `3-9` — was
+# found by the same measurement and added for the same reason.
 #
 # Three of the assertions this file EXECUTES exist because a green suite
 # is not by itself evidence that the code CI runs was executed. (Assertions, not
@@ -48,6 +60,11 @@ mkdir -p docs/specs src
 # statement about its shape in prose, not about it being absent — the whole point
 # of issue #1319), a SCREAMING_SNAKE constant and a caps-prefixed TYPE, both of
 # which are real identifiers the acronym subtraction must not swallow.
+# All four sit on lines 1-4, ABOVE the churn, and that placement is load-bearing
+# twice over since issue #1338: the shape cases cite `1-9` so that a token's
+# SHAPE is the only thing under test, and `3-9` — the same file, the same symbol,
+# a range that excludes line 1 — is what makes the misplaced-anchor pair differ
+# in the range alone. Appending churn below them keeps both stable.
 cat > src/churny.rs <<'RUST'
 fn stable_anchor_symbol() {}
 // CLI entry point. Named here so the acronym is present in the cited file.
@@ -118,35 +135,118 @@ check "bare line number into a churning file is REJECTED" 1 "$rc"
 run 'Given the verbs parsed by `stable_anchor_symbol` in `src/churny.rs`'
 check "symbol citation with no line number is ACCEPTED" 0 "$rc"
 
+run 'Given the roster merge (`stable_anchor_symbol`, `src/churny.rs:1-9`)'
+check "range whose symbol occurs INSIDE it is ACCEPTED (number stays a locator)" 0 "$rc"
+
+# --- The anchor must be AT the citation, not merely in the file (issue #1338) -
+# The pair above and below differs in THE RANGE ALONE: `stable_anchor_symbol` is
+# on line 1, so `1-9` contains it and `3-9` does not. The symbol is equally real,
+# equally present in the file and equally backticked in both. Widening the
+# exemption back to the file — drop the range arguments from `occurs` in
+# `anchored()` — turns the REJECT below green, and NOT it alone. The blast
+# radius was MEASURED rather than reasoned about, because it is wider than it
+# looks: the same mutation also greens the `1-3` upper-bound rejection below and
+# the single-line `:2` rejection further down, and it reds the two POSITIVE
+# message assertions here, since a case that stops failing prints no message left
+# to assert on. (The negative one — that the refusal picks no side — passes
+# VACUOUSLY for that same reason, which is exactly why it is not the only one.)
+# Performing the same widening the other way, by deleting the ranged arm inside
+# `occurs()`, reds that set AND one more — the declined-token message assertion
+# below — because `occurs()` serves the acceptance loop and the acronym loop
+# both, while `anchored()`'s acceptance call serves only the first. That extra
+# RED is the only thing that tells the two widenings apart. And that is how the
+# defect shipped: an ADR cited the verb table as `src/cli.rs:741-765` while the
+# range sat on `parse_import`'s tail, `parse`'s doc comment and `fn parse`, and
+# rode through on the backticked word `login`.
 run 'Given the roster merge (`stable_anchor_symbol`, `src/churny.rs:3-9`)'
-check "symbol-anchored range is ACCEPTED (the number may stay as a locator)" 0 "$rc"
+check "symbol occurring in the file but OUTSIDE the cited range is REJECTED" 1 "$rc"
+# The author has already done what "name a symbol" asks, so that instruction would
+# read as nonsense here. What the guard has MEASURED is that the two disagree;
+# which of them is wrong it cannot see, and the corpus carries both readings — a
+# citation landing on an item's doc comment, with the item's own name a line past
+# the cited end, is a RIGHT range whose author must not be told to move it. So the
+# refusal names the symbol and the lines, prescribes the remedy for BOTH readings,
+# and asserts neither. Three separate assertions because they fail separately: a
+# message can name the symbol while still picking a side.
+names=1; both=1; asserted=0
+case "$out" in *stable_anchor_symbol*"NOT within lines 3-9"*) names=0 ;; esac
+case "$out" in *"re-derive the range from the symbol"*"widen the range"*) both=0 ;; esac
+case "$out" in *"so the number has drifted"*) asserted=1 ;; esac
+check "refusal names the symbol and the lines it is absent from" 0 "$names"
+check "refusal prescribes the remedy for BOTH readings" 0 "$both"
+check "refusal does NOT assert which of the two is wrong" 0 "$asserted"
+
+# Containment is TWO-SIDED and everything else here exercises only its LOWER
+# half: every other case that puts the symbol OUTSIDE the range puts it before
+# the range START, so the upper bound could be deleted outright without
+# reddening one of them (it was, and not one moved). `JSONWire` is on line 4, so
+# `1-4` ends ON it and `1-3` stops one line short: the mirror image. The REJECT
+# half below is the ONLY assertion in this file that reds when the upper bound
+# alone is neutered — print `${first},$p` in place of `${first},${last}` and it
+# is the one line that changes. It is also the direction the real corpus leans:
+# swept with `--audit`, most misplaced anchors sit PAST the cited end, not
+# before its start.
+run 'The `JSONWire` payload is built at src/churny.rs:1-4'
+check "range ENDING on the symbol is ACCEPTED (the upper bound is inclusive)" 0 "$rc"
+
+run 'The `JSONWire` payload is built at src/churny.rs:1-3'
+check "symbol one line PAST the cited range end is REJECTED" 1 "$rc"
+
+# A citation with no `-` is a one-line range, which is the only place the `first`
+# extraction runs without a suffix to strip. Off by ONE line is the whole
+# difference between these two, so the boundary is proven rather than assumed.
+run 'The entry point is `stable_anchor_symbol` at src/churny.rs:1.'
+check "single-line citation ON the symbol is ACCEPTED" 0 "$rc"
+
+run 'The entry point is `stable_anchor_symbol` at src/churny.rs:2.'
+check "single-line citation one line OFF the symbol is REJECTED" 1 "$rc"
 
 # --- A prose ACRONYM is not a symbol (issue #1319) ---------------------------
-# The reported defect. `CLI` OCCURS in the cited file — the seed puts it there on
+# The reported defect. `CLI` OCCURS at the cited lines — the seed puts it there on
 # purpose — so this pair is not "the token is missing"; it is the guard declining
 # a token whose only qualification is that the CamelCase shape test cannot tell an
 # acronym apart from an identifier. The two cases differ in BACKTICKS ALONE, which
 # is what makes the rule falsifiable: refusing both would be a ban on the word,
 # and accepting both is the defect. Delete the subtraction in `anchored()` and the
 # first goes green.
-run 'The CLI parses 18 verbs at src/churny.rs:3-9'
+run 'The CLI parses 18 verbs at src/churny.rs:1-9'
 check "unbackticked ALL-CAPS prose token is REFUSED as an anchor" 1 "$rc"
 case "$out" in
     *CLI*prose*) check "refusal NAMES the declined token, so 'name a symbol' is legible" 0 0 ;;
     *) check "refusal NAMES the declined token, so 'name a symbol' is legible" 0 1 ;;
 esac
 
-run 'The `CLI` parses 18 verbs at src/churny.rs:3-9'
+run 'The `CLI` parses 18 verbs at src/churny.rs:1-9'
 check "backticking the SAME token accepts it — the escape hatch is real" 0 "$rc"
+
+# The DECLINED report is range-scoped too (issue #1338), and only its MESSAGE can
+# say so: the citation is unanchored either way, so this case and the `1-9` one
+# above BOTH exit 1 and an exit-code assertion would pass straight over the
+# regression. `CLI` is on line 2, so `1-9` contains it and `3-9` does not — the
+# range is the only variable, exactly as in the misplaced-anchor pair above.
+# Un-range-scoping that loop — `occurs "$tok" "$file"` in place of the ranged
+# call — was MEASURED before this pair was written: it left every assertion in
+# this file green, while making the guard report that `CLI` occurs at lines it
+# has zero hits in and prescribe backticking it, a remedy that would not anchor
+# the citation. Under that mutation the message assertion below is the one and
+# only line in this file that reds; the exit-code assertion above does not move.
+run 'The CLI parses 18 verbs at src/churny.rs:3-9'
+check "acronym OUTSIDE the cited range is still REJECTED" 1 "$rc"
+case "$out" in
+    *"CLI occurs at those lines"*)
+        check "refusal does NOT claim the declined token occurs at those lines" 0 1 ;;
+    *)
+        check "refusal does NOT claim the declined token occurs at those lines" 0 0 ;;
+esac
 
 # The subtraction is "all-caps", not "starts with caps" and not "shouty". Both of
 # these are real Rust identifiers and both must survive it; a subtraction written
 # over `^[A-Z0-9_]+$` kills the first, and one written over a stricter camel rule
 # kills the second.
-run 'Retries are capped by MAX_RETRIES at src/churny.rs:3-9'
+run 'Retries are capped by MAX_RETRIES at src/churny.rs:1-9'
 check "SCREAMING_SNAKE constant still anchors (underscore is not an acronym)" 0 "$rc"
 
-run 'The JSONWire payload is built at src/churny.rs:3-9'
+run 'The JSONWire payload is built at src/churny.rs:1-9'
 check "caps-prefixed CamelCase type still anchors" 0 "$rc"
 
 # --- Line numbers stay legitimate for stable files ---------------------------

@@ -321,17 +321,22 @@ caught it (issue #1058).
 
 The rule:
 
-> Cite a **symbol** for a file that churns; a bare **line number** only for one
-> that does not. Never carry a line number across a rebase without re-deriving it.
+> Cite a **symbol** for a file that churns, and one that occurs **at the lines you
+> cite**; a bare **line number** only for a file that does not churn. Never carry a
+> line number across a rebase without re-deriving it.
 
 A line number is fine as a *secondary* locator — `` `apply_import`
-(`src/cli.rs:4726-4813`) `` is the preferred form, because when the range drifts
-the symbol still names the truth and a reader can grep their way back. That
-example is not hypothetical and its range has *already* drifted since it was
-written, which is the point: `apply_import` still finds it in one grep, and no
-number is quoted here to replace the stale one, because a fresh one would be
-stale in turn. What rots is a number left as the **sole** referent, with nothing
-beside it to re-derive from. That is the shape the guard below rejects.
+(`src/cli.rs:4726-4813`) `` is the preferred form, because the symbol and the
+number then check each other. That example is not hypothetical, and it is also
+the limit of what the guard sees: the range was authored as `apply_import`
+itself, the definition has since moved elsewhere in the file, and it passes
+today only because the caller inside those lines names it. Re-derive the range
+when you touch a citation rather than carrying a stale one across. What rots is
+a number with nothing beside it to re-derive from — and a symbol the range does
+not point at is nothing beside it. `login` occurs all over `src/cli.rs` and at
+not one of the lines `src/cli.rs:741-765`, which is how that range sat rotted in
+an ADR while the same range, cited without the word, was reported (issue #1338).
+Both shapes are what the guard below rejects.
 
 "Churns" is not a judgment call — measure it:
 
@@ -431,21 +436,24 @@ every merge, so read them from the tool rather than from prose.
 - [`scripts/check-doc-citation-rot.sh`](scripts/check-doc-citation-rot.sh)
   — a CI guard (the `doc-gates` job in
   [`.github/workflows/ci.yml`](.github/workflows/ci.yml)) that fails the build when a
-  PR ADDS a `src/<file>.rs:NNN` citation under `docs/` that will rot silently: a bare
-  line number, with no symbol named beside it, into a file the PR's own history shows
-  is churning — or, whatever the churn, one pointing past the file's EOF or at a file
-  no clone has. Scoped to the PR's diff rather than the tree, because a backlog of such
-  citations already exists and a gate that is red on arrival is a gate nobody reads
-  (issue #1058);
-  the convention it enforces is § Citing source locations in docs/ above. It refuses to
+  PR ADDS a `src/<file>.rs:NNN` citation under `docs/` that will rot silently: a line
+  number into a file the PR's own history shows is churning, with no symbol named
+  beside it that occurs AT the cited lines — or, whatever the churn, one pointing past
+  the file's EOF or at a file no clone has. Scoped to the PR's diff rather than the
+  tree, because a backlog of such citations already exists and a gate that is red on
+  arrival is a gate nobody reads (issue #1058); the convention it enforces is
+  § Citing source locations in docs/ above. It refuses to
   run against a shallow clone rather than reporting the green that a depth-1 checkout —
   whose one grafted commit is parentless, collapsing every churn count to 1 and every
   file to "stable" — would otherwise manufacture. Falsifier peer:
   [`scripts/check-doc-citation-rot.test.sh`](scripts/check-doc-citation-rot.test.sh),
   which proves it goes RED on the shape issue #1058 reports (a bare range into a
-  churning file) and GREEN on both things it must never block — a symbol-anchored
-  range, and a bare line number into a file that does not move. It exercises that
-  shape over its own throwaway fixture, which has no `src/cli.rs` in it.
+  churning file) and GREEN on both things it must never block — a range whose symbol
+  occurs INSIDE it, and a bare line number into a file that does not move. Anchoring
+  is scoped to the range on BOTH sides, and each side is pinned by a pair differing
+  in the range alone, so the scoping is falsifiable rather than asserted (issue
+  #1338). It exercises that shape over its own throwaway fixture, which has no
+  `src/cli.rs` in it.
 - `cargo deny check advisories sources licenses` — the supply-chain gates configured
   in [`deny.toml`](deny.toml).
 - [`docs/adr/`](docs/adr/) — Architecture Decision Records for the load-bearing
