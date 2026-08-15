@@ -15,7 +15,9 @@
 // `HonestStateMachineTests` as an exhaustive 10-row table; the one-distinct-silhouette-per-state brand
 // lock is already held by `StatusGaugeTests.testEveryGlyphMapsToADistinctAsset` (asset injectivity) and
 // `BarGlyphParityTests` (rendered pairwise distinctness in every context). Re-extracting a verbatim
-// forward would add a tautological seam, not coverage — see the issue #764 PR body for the measurement.
+// forward would add a tautological seam, not coverage — the measurement is in the commit body of
+// `3d4271c` (the issue #764 change). This repo squash-merges, so the PR body it was written in reaches
+// no clone, and the commit body does.
 //
 // The controller keeps everything that genuinely needs AppKit: creating the `NSStatusItem`, hosting the
 // SwiftUI panel, installing the global event monitor, and applying the frame this file computes.
