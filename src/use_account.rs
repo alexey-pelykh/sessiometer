@@ -2536,11 +2536,21 @@ mod tests {
         ("run_use", ViaSharedResolver, "`use <label>` — reads the resolved target's label for the swap confirmation"),
         // --- matched by an identifier the SYSTEM supplied, never an operator handle -------------
         //
-        // These DO compare an identity field against something, and every one of them is correct
-        // to take the first match: the string is an account-uuid the daemon, the OAuth capture or
-        // the config itself produced, and it is unique by construction (`config::validate`
-        // rejects a duplicated uuid — only LABELS are un-unique, which is why R-6a is about
-        // labels). Refusing on ambiguity here would refuse on an impossible condition.
+        // What holds for EVERY row here is the provenance: the string is an account-uuid the
+        // daemon, the OAuth capture or the config itself produced, and it is unique by
+        // construction (`config::validate` rejects a duplicated uuid — only LABELS are un-unique,
+        // which is why R-6a is about labels). Where a row does compare that uuid against
+        // something, it is therefore correct to take the first match, and refusing on ambiguity
+        // would refuse on an impossible condition.
+        //
+        // Stated that way round because the comparison is NOT universal here, though this banner
+        // asserted it was until issue #1311: `stash` reads the uuid and compares it against
+        // nothing — `Account::stash` is `format!("{STASH_PREFIX}{}", self.account_uuid)`, which
+        // is why it is absent from `COMPARING_READERS` and why its row below says there is
+        // nothing to resolve first-match-wins. The provenance clause is the one doing the work in
+        // any case: it is what makes the string not an operator handle, which is the whole question
+        // this section answers. First-match is a corollary that only arises once something is
+        // matched, so a row that matches nothing does not weaken it — it simply never reaches it.
         ("apply_refresh_observation", NotHandleResolution, "matches a poll observation's own account-uuid back to its roster index"),
         ("apply_refresh_restore", NotHandleResolution, "matches a restore outcome's account-uuid back to its roster index"),
         ("is_active", NotHandleResolution, "compares an account's uuid to the ACTIVE uuid `active.rs` read from the credential"),
@@ -2571,22 +2581,89 @@ mod tests {
         // Being a membership test does NOT by itself put a row here, and the title says
         // OPERATOR-supplied because that is the half which selects (issue #1280). `run_sweep`
         // and `recovery_pending` above fold `.any(…)` over the excluded / quarantined sets to a
-        // bool exactly as this does, so the SYSTEM banner's clause (a) is loose for them too —
-        // but the daemon BUILT both sets by cloning roster `account_uuid`s (`refresh_exclusions`
-        // takes the active index and the ranked target, `refresh_quarantined` filters on
-        // in-memory health), so clauses (b) and (c) hold there and the banner is exact where it
-        // is load-bearing. It is the CONJUNCTION that selects this row: operator-supplied AND
-        // selecting nothing. Either half alone reaches rows that belong where they are — the
-        // membership half reaches those two, and the operator-supplied half reaches `execute`,
-        // `parse_subcommand` and the other capture-path rows below, which carry the operator's
-        // string to an ASSIGNMENT rather than testing it against the roster.
+        // bool exactly as this does, so the SYSTEM banner's "correct to take the first match" is
+        // loose for them too — but the daemon BUILT both sets by cloning roster `account_uuid`s
+        // (`refresh_exclusions` takes the active index and the ranked target,
+        // `refresh_quarantined` filters on in-memory health), so its provenance and uniqueness
+        // clauses hold there and the banner is exact where it is load-bearing. It is the
+        // CONJUNCTION that selects this row: operator-supplied AND selecting nothing. Either half
+        // alone reaches rows that belong where they are — the membership half reaches those two,
+        // and the operator-supplied half reaches `execute`, `parse_subcommand` and the other
+        // capture-path rows below, which carry the operator's string to an ASSIGNMENT rather than
+        // testing it against the roster.
+        //
+        // The SYSTEM banner's clauses are NAMED above rather than lettered, and issue #1311 is
+        // why: from #1280 until then this paragraph wrote "clause (a)" and "clauses (b) and (c)",
+        // and NOTHING in this file letters them. Two bindings were available and they disagree —
+        // #1280 enumerates that banner in its own reading order, first-match first, while the
+        // #1243 paragraph opening THIS banner enumerates provenance, then uniqueness, then
+        // first-match. Under the first the sentence was right; under the second it read
+        // "provenance is loose for them, and first-match holds", which is false on both halves and
+        // contradicted by its own next clause. No lettering is adopted in either direction: a
+        // clause named by its own words is the one reference both orders agree on, and it needs no
+        // key the file does not carry.
         ("account_listed_in", NotHandleResolution, "the `[refresh].accounts` allowlist membership rule — a config-supplied set, and a duplicated label there legitimately admits BOTH bearers"),
         // --- a handle read off an ALREADY-RESOLVED account or index ----------------------------
         //
         // The index came from the daemon's own scheduler, from an enumeration of the whole
         // roster, or from a resolver call that already happened. Nothing here matches an operator
-        // string against anything; the read turns a chosen account into a handle for an event, a
-        // snapshot field, or a rendered cell.
+        // string against anything to SELECT an account, and that — not what the read is
+        // afterwards for — is the whole criterion.
+        //
+        // The read commonly turns a chosen account into a handle for an event, a snapshot field
+        // or a rendered cell, and until issue #1311 this banner said those three WERE the section.
+        // They are examples, and the closed reading was false for rows sitting under it. Measured
+        // against the tree: `validate` folds `account_uuid` into a `HashSet` for the uniqueness
+        // rule and rejects an empty label, producing an error string — a gate, and the destination
+        // is a refusal; `label_bearers` builds a `HashMap<String, usize>` and, as its row says,
+        // the count is the point. And `gather_payload` carries the handle into the export
+        // artifact's payload, `refresh_exclusions` / `refresh_quarantined` into the `Vec<String>`
+        // control lists the refresh tick consumes — destinations the three do not name either.
+        // `poke_all` was weighed with those and belongs with them, on the same ground. It reads
+        // `&account.label` TWICE, and the two reads OVERLAP in one destination and diverge in the
+        // other — which is why each is traced here to every place it lands, rather than to one
+        // apiece. The `poke_line` read goes straight into `format!("{label}: {outcome}")` and is
+        // printed: a rendered cell, and that is where it ends. The `poke::daemon_verdict` read
+        // reaches BOTH. The `DaemonVerdict` it answers with is what `should_restore` gates on, so
+        // on the passing branch `resolve_restore` sends the `#275 Restored` signal over the
+        // control socket, where the daemon dispatches it — `ControlSignal::Restored` out of the
+        // control handler, then the run loop's `Idle::Restored` arm — to `reconcile_restored`
+        // (`src/daemon/refresh_fold.rs`). That call forks on the same verdict split that got the
+        // signal sent, and the two branches land in different places: a `Degraded` quarantine
+        // takes the plain un-quarantine, `apply_refresh_restore`, while a `Dead` one — parked,
+        // isolated engine wired — is routed instead to `reprobe_dead_parked_credential` (issue
+        // #643), which runs a refresh of its OWN first and reaches that same primitive only
+        // through `fold_recovery_outcome`, only when that refresh does not itself come back
+        // `Dead` (a still-dead re-probe keeps the quarantine). Both branches decide the very flag
+        // `refresh_quarantined` reads, and the loop re-ticks after — the refresh-control surface
+        // `refresh_exclusions` / `refresh_quarantined` feed, reached from the far side of the
+        // process boundary. And the `Restore` that same call returns is what `poke_outcome` maps to
+        // the outcome text `poke_line` prints, so the verdict decides the printed line too. That
+        // CONJUNCTION is what makes this an exception: one of the destinations — the control write
+        // — is not an event, a snapshot field or a rendered cell, and the read reaches it AS WELL
+        // AS one that is on the list, not instead of it. `DaemonVerdict`'s own doc comment is the
+        // repo saying so in its own words: it names the verdict the input to BOTH the issue-#428
+        // un-quarantine decision (`should_restore`) and the reported wording (`poke_outcome`).
+        // Neither flat answer survives that sentence, and this banner has carried both — that both
+        // reads merely print, which misses the control write, and that the verdict read does not
+        // print, which the doc comment it cited in the same breath contradicts. The daemon-side
+        // landing went wrong on its own axis and by the same mechanism: it named
+        // `apply_refresh_restore`, which is what `RestoreNotifier`'s doc comment in `src/poke.rs`
+        // names on the SEND side — symbol and "un-quarantine + re-tick" both — and not what the
+        // receiving end calls. A neighbouring comment is not the dispatch; the trace above is read
+        // forward from the control handler. That send-side wording is stale the same way and is
+        // left alone here (issue #1335 enumerates the family it belongs to): it is a claim about a
+        // different file, made by a different scope, and this diff touches neither. Falsifiable
+        // rather than argued: pin the verdict in `poke_all` and leave `poke_named`'s read intact,
+        // and exactly one test reds per destination — the swept `Restored` send disappears, and the
+        // swept report line drops to the bare classification — while the named lines print
+        // byte-identically.
+        //
+        // Left as examples rather than extended to cover them, for the reason `HandleRead`'s own
+        // doc comment gives one scope up: a closed list reads as a MENU, and a destination it does
+        // not name gets filed under the nearest item instead of showing that the criterion above
+        // is what decided the row. The destination is where a reader CHECKS the row; the absence
+        // of a selecting match is what PUTS it here.
         ("active_blind_projection", NotHandleResolution, "keys the blind-projection map by label for `status`"),
         ("apply_import", NotHandleResolution, "the import merge — matches an INCOMING artifact account's uuid, and reports per-entry labels"),
         ("blind_swap", NotHandleResolution, "the blind-swap episode events' account / from / to handles"),
@@ -2656,6 +2733,28 @@ mod tests {
         // is an enum-variant or record field on `Command`, `Event` or the OAuth state record
         // rather than on an `Account`, so the section they are in is the right one — but the
         // reason they were INVISIBLE until #1202 is the spelling, not the type.
+        //
+        // TWO of the rows below are DELIBERATE exceptions to the title, recorded here (issue
+        // #1311) because a reader taking their justification from it inherits something false.
+        // `daemon_verdict` and `cached_viability_for` each read a wire-line `label`
+        // (`AccountStatusLine`) — which is what filed them here — AND filter `roster.iter()` on
+        // `account.label`, a field on the very type this title excludes. Both rows already say so;
+        // the title does not. Each row also dates its second side (#1086, #1201), so the reading
+        // is that the wire-line read put them here and the roster-side read arrived later without
+        // the banner being revisited. The ride-along rationale above therefore covers only half of
+        // what they do: unlike every other row here, neither would leave the register if the
+        // scanner could resolve types, and `COMPARING_READERS` records both sides for both.
+        //
+        // They stay because one disposition honestly covers both sides. The two reads are the SAME
+        // act — count the bearers, refuse on non-unique, select nobody — so nothing about the
+        // classification turns on which type the field sits on, and splitting the row would file
+        // one act under two banners. What the `Account.label` half is NOT is resolution: at every
+        // production call site the string counted is a roster account's OWN label — `poke_named`
+        // and `cached_viability` both take it from the index `resolve_target` already returned
+        // (`run_use` resolves its target the same way `poke_named` does, and hands that account to
+        // both `gate_viability` and `warn_if_forcing_onto_non_viable`), `poke_all` alone from the
+        // account it is iterating — never an operator query, and a second bearer produces a
+        // refusal rather than a winner.
         ("account_uuid", NotHandleResolution, "`&self.account_uuid` on the OAuth state record and on the migration artifact, not on a roster account"),
         ("cached_viability_for", NotHandleResolution, "matches BOTH the daemon's wire line (`AccountStatusLine.label`) and the roster (`Account.label`) since issue #1201 — but it COUNTS bearers on each side and refuses on either being non-unique, exactly as `poke`'s `daemon_verdict` does. Counting is not resolving"),
         ("capture", NotHandleResolution, "`CaptureReport.label`"),
