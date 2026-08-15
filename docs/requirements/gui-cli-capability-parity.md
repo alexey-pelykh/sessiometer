@@ -23,7 +23,8 @@ artifacts: {}
 
 ### 1.1 Statement
 
-Sessiometer ships two operator surfaces. The CLI parses **18 verbs** (`src/cli.rs:741-765`):
+Sessiometer ships two operator surfaces. The CLI parses **18 verbs** (`parse_subcommand` in
+`src/cli.rs`):
 `capture`, `login`, `run`, `service`, `daemon`, `config`, `status`, `list`, `use`, `disable`,
 `enable`, `remove`, `poke`, `stats`, `reliability`, `log`, `export`, `import`. The daemon's control
 socket — the *only* channel the menu-bar app can speak (ADR-0011) — serves **11 commands**
@@ -285,10 +286,11 @@ for the reconcile write — never for the interactive span (R-10).
 
 ## 5b. Feature Completeness
 
-The `Routability` table (R-2) is the completeness oracle. It is complete when every verb parsed at
-`src/cli.rs:741-765` carries a classification. **A test shall assert the table's verb set equals the
-parser's verb set** — otherwise a verb added later is silently unclassified and R-3 never fires,
-which is exactly how the `capture`/`login` split went unrecorded for the life of the project.
+The `Routability` table (R-2) is the completeness oracle. It is complete when every verb parsed by
+`parse_subcommand` (`src/cli.rs`) carries a classification. **A test shall assert the table's verb
+set equals the parser's verb set** — otherwise a verb added later is silently unclassified and R-3
+never fires, which is exactly how the `capture`/`login` split went unrecorded for the life of the
+project.
 
 ## 6. Success Criteria
 
@@ -326,7 +328,7 @@ question, not a defect.
 
 | Requirement | Source | Reliability |
 |---|---|---|
-| R-1, R-2, R-3 | Operator ruling 2026-07-31; verb inventories at `src/cli.rs:741-765` and `src/daemon/socket.rs:7-46` | **A** (direct observation) + **B** (ratified) |
+| R-1, R-2, R-3 | Operator ruling 2026-07-31; verb inventories at `parse_subcommand` (`src/cli.rs`) and `src/daemon/socket.rs:7-46` | **A** (direct observation) + **B** (ratified) |
 | R-4, R-5, R-6 | Audit finding F-3 (2026-07-31); `DaemonLog.swift:120-125`, `SettingsView.swift:90` as the shipped `launch` precedent | A |
 | R-7, R-8, R-9 | `src/daemon/socket.rs:28-33` — routed `capture`, the 1:1 template, incl. its explicit REQ-MBR-C-005 satisfaction note | A |
 | R-10, R-11 | `src/paths.rs:235-237`, `:264`; `src/refresh.rs:952`, `:962`; `src/login.rs:338` | A |

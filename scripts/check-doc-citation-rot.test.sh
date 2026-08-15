@@ -6,7 +6,7 @@
 # the two things it must never block: a symbol-anchored citation, and a bare line
 # number into a file that does not move.
 #
-# Three of the fifteen assertions this file EXECUTES exist because a green suite
+# Three of the assertions this file EXECUTES exist because a green suite
 # is not by itself evidence that the code CI runs was executed. (Assertions, not
 # top-level cases: the two units differ here, and the third of the three shares a
 # guard invocation with an assertion that was already present.) Two of them reach
@@ -43,7 +43,17 @@ mkdir -p docs/specs src
 # A file that moves. 20 commits clears the shipped threshold of 15 without the
 # test having to override it — the default is what CI runs, so the default is
 # what gets proven here.
-printf 'fn stable_anchor_symbol() {}\n' > src/churny.rs
+# The seed carries three tokens beyond the plain symbol, each load-bearing for a
+# case below: an ACRONYM that genuinely OCCURS in the file (so refusing it is a
+# statement about its shape in prose, not about it being absent — the whole point
+# of issue #1319), a SCREAMING_SNAKE constant and a caps-prefixed TYPE, both of
+# which are real identifiers the acronym subtraction must not swallow.
+cat > src/churny.rs <<'RUST'
+fn stable_anchor_symbol() {}
+// CLI entry point. Named here so the acronym is present in the cited file.
+const MAX_RETRIES: u32 = 3;
+struct JSONWire;
+RUST
 for i in $(seq 1 20); do
     printf 'fn churn_%s() {}\n' "$i" >> src/churny.rs
     git add src/churny.rs
@@ -110,6 +120,34 @@ check "symbol citation with no line number is ACCEPTED" 0 "$rc"
 
 run 'Given the roster merge (`stable_anchor_symbol`, `src/churny.rs:3-9`)'
 check "symbol-anchored range is ACCEPTED (the number may stay as a locator)" 0 "$rc"
+
+# --- A prose ACRONYM is not a symbol (issue #1319) ---------------------------
+# The reported defect. `CLI` OCCURS in the cited file — the seed puts it there on
+# purpose — so this pair is not "the token is missing"; it is the guard declining
+# a token whose only qualification is that the CamelCase shape test cannot tell an
+# acronym apart from an identifier. The two cases differ in BACKTICKS ALONE, which
+# is what makes the rule falsifiable: refusing both would be a ban on the word,
+# and accepting both is the defect. Delete the subtraction in `anchored()` and the
+# first goes green.
+run 'The CLI parses 18 verbs at src/churny.rs:3-9'
+check "unbackticked ALL-CAPS prose token is REFUSED as an anchor" 1 "$rc"
+case "$out" in
+    *CLI*prose*) check "refusal NAMES the declined token, so 'name a symbol' is legible" 0 0 ;;
+    *) check "refusal NAMES the declined token, so 'name a symbol' is legible" 0 1 ;;
+esac
+
+run 'The `CLI` parses 18 verbs at src/churny.rs:3-9'
+check "backticking the SAME token accepts it — the escape hatch is real" 0 "$rc"
+
+# The subtraction is "all-caps", not "starts with caps" and not "shouty". Both of
+# these are real Rust identifiers and both must survive it; a subtraction written
+# over `^[A-Z0-9_]+$` kills the first, and one written over a stricter camel rule
+# kills the second.
+run 'Retries are capped by MAX_RETRIES at src/churny.rs:3-9'
+check "SCREAMING_SNAKE constant still anchors (underscore is not an acronym)" 0 "$rc"
+
+run 'The JSONWire payload is built at src/churny.rs:3-9'
+check "caps-prefixed CamelCase type still anchors" 0 "$rc"
 
 # --- Line numbers stay legitimate for stable files ---------------------------
 run 'The fallback path is at src/quiet.rs:12 in the parser.'
