@@ -399,7 +399,34 @@ enum StatusPanelFormat {
     /// The smallest logical display height a Mac meeting this app's deployment target (macOS 13.0, see
     /// `apps/menubar/project.yml`) plausibly presents: the 13-inch Retina MacBook Air / Pro default scaled
     /// mode is 1440 × 900 points. Logical points, not pixels — the panel is laid out in points.
+    ///
+    /// PLAUSIBLE, NOT A FLOOR — the hedge is load-bearing, and this paragraph is why it must survive every
+    /// restatement. macOS 13 supports the 12-inch MacBook (2017), whose panel is 2304 × 1440 px and which
+    /// macOS renders at 2560 × 1600 backing pixels by default, i.e. **1280 × 800 points**; its scaled modes
+    /// are 1440 × 900, 1280 × 800 and 1024 × 640, so 1440 × 900 is that machine's LARGEST mode rather than
+    /// the deployment target's smallest. Read this constant as "a display small enough to be worth designing
+    /// against", NEVER as "the smallest display macOS 13 presents" — that reading is false, and it is the
+    /// one a reader reconstructs if the hedge is dropped anywhere downstream.
+    ///
+    /// What that costs each axis differs, and only one of them is open. `PanelCeilingFitTests`' WIDTH
+    /// verdict is unaffected: 894.50 pt clears the 1264 pt a 1280 pt display leaves and the 1008 pt a
+    /// 1024 pt one does. The HEIGHT verdict is this display's alone — 800 pt would leave 756 pt against an
+    /// 856 pt budget — which is #818's fixed-budget decision behaving as RECORDED. Recorded, NOT ratified:
+    /// the paragraph above states this budget is PENDING DESIGN-OWNER RATIFICATION, and that is still its
+    /// status. Issue #1176 carries the screen-derived budget that would retire the assumption entirely.
     static let smallestPlausibleDisplayHeight: Double = 900
+
+    /// The OTHER half of that same display — 1440 points wide. Its twin above already names the mode
+    /// (`1440 × 900`) in prose; this makes the width a value so the horizontal question can be ASKED, and
+    /// so the pair cannot drift into disagreeing about which display they describe.
+    ///
+    /// NOTHING LAYS OUT WITH IT, unlike every other constant in this file, and that asymmetry is the design
+    /// rather than an omission. The panel's height needs a bound because its content grows without limit
+    /// (see `panelHeightBudget`); its width is a `.frame(width:)` on a known constant times the type scale,
+    /// so there is no bound to impose — only a claim to check. `PanelCeilingFitTests` (issue #983) is the
+    /// checker: it measures the rasterized panel at `PanelTypeScale.ceiling` against this width less
+    /// `StatusItemChrome.screenInset` on both edges, which is the room the app's own placement leaves.
+    static let smallestPlausibleDisplayWidth: Double = 1440
 
     /// The macOS menu bar the panel hangs below. `NSStatusBar.system.thickness` measures 22.0; 24 is used
     /// instead because the budget should err toward being GENEROUS to the panel.

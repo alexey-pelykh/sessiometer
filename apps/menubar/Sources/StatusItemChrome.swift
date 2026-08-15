@@ -91,8 +91,14 @@ enum StatusItemChrome {
         //
         // Clamp ORDER is load-bearing and is pinned by test: `min(max(x, lo), hi)` resolves to `hi` when
         // `hi < lo`, i.e. when the panel is wider than the visible frame minus both insets — it would then
-        // hang off the LEFT edge rather than the right. Unreachable at shipped sizes (the panel is ~360 pt
-        // against a ≥1280 pt display), so this is documented and pinned as-is, not "fixed" speculatively.
+        // hang off the LEFT edge rather than the right. Still unreachable at shipped sizes, but the ground
+        // has been re-measured rather than left where it was: this note used to read "the panel is ~360 pt",
+        // which is the DEFAULT size class only. The panel scales (#756), and at `PanelTypeScale.ceiling` it
+        // measures 894.50 pt — clearing both the 1424 pt a 1440 pt display leaves after both insets and the
+        // 1264 pt a 1280 pt one does, 1280 × 800 being the default of the narrowest Mac the macOS 13
+        // deployment target supports. So the branch is documented and pinned as-is, not "fixed"
+        // speculatively, and `PanelCeilingFitTests` (#983) now holds the WIDEST panel this app can render to
+        // that precondition instead of a comment asserting it.
         var x = iconFrame.midX - size.width / 2
         x = min(max(x, visibleFrame.minX + screenInset), visibleFrame.maxX - size.width - screenInset)
 
