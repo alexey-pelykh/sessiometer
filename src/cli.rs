@@ -2696,6 +2696,21 @@ fn red_line(body: &str, emphasize: bool) -> String {
 /// Deliberately NOT general — the one caller is directly below. `cross_surface_id` and `severity`
 /// stay outside it on purpose: they are total matches, which the compiler already makes
 /// exhaustive, and ordinary source is what `cargo fmt` formats.
+///
+/// The invocation below is PAREN-delimited and its marker is `const ALL: _;` rather than
+/// `const ALL;`. Both are load-bearing for `cargo fmt`, and neither works alone (issue #1271).
+/// `rustfmt` leaves a BRACE-delimited invocation body verbatim unconditionally — even a body that
+/// parses cleanly — while a paren- or bracket-delimited one IS formatted, provided the body parses
+/// as Rust. `const ALL;` does not parse; `const ALL: _;` does, and the `_` is honest: the macro is
+/// what supplies the type. So `! { … }` with either marker is unformatted, and `! ( … )` with a
+/// bare `const ALL;` is unformatted too.
+///
+/// Do not tidy either back. Restoring braces, or dropping the `: _`, silently un-gates the ~60
+/// lines below and NOTHING reports it: `cargo fmt --all --check` — the repo's first and cheapest
+/// push gate — passes a region it does not read, so the pass looks identical either way. To
+/// verify it is still armed, mis-indent a variant and confirm `cargo fmt --all --check` FAILS; a
+/// pass over an already-clean body proves nothing. This rests on `rustfmt`'s current macro
+/// handling, which no gate here pins — if that changes, the region goes quietly unguarded again.
 macro_rules! daemon_payload_faults {
     (
         $(#[$enum_meta:meta])*
@@ -2707,7 +2722,7 @@ macro_rules! daemon_payload_faults {
         }
 
         $(#[$all_meta:meta])*
-        const ALL;
+        const ALL: _;
     ) => {
         $(#[$enum_meta])*
         enum $fault {
@@ -2724,7 +2739,7 @@ macro_rules! daemon_payload_faults {
     };
 }
 
-daemon_payload_faults! {
+daemon_payload_faults!(
     /// The daemon-level payload faults (ADR-0026): faults that ride ALONGSIDE a healthy roster,
     /// which no per-account `AUTH` cell reflects — the shared vault is one item and the refresh
     /// mechanism is one process, so neither has a row to live on. Enumerated ONCE here so their
@@ -2785,8 +2800,8 @@ daemon_payload_faults! {
     /// Test-only: the shipping binary reaches each fault through its own renderer and never needs
     /// the list.
     #[cfg(test)]
-    const ALL;
-}
+    const ALL: _;
+);
 
 impl DaemonPayloadFault {
     /// This fault's stable CROSS-SURFACE identifier (issue #768) — the name the committed
