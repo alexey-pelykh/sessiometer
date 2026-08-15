@@ -1324,12 +1324,20 @@ fn parse_events(text: &str, cutoff: Option<i64>) -> Inputs {
                         // Keyed POSITIVELY on `recovery`; every other token — including a future
                         // `PollRefreshTrigger` variant this reader predates, and a line from a
                         // daemon old enough to have rendered the hard-coded literal — falls to
-                        // `poll_retry`, which is what those lines actually say. That default is the
-                        // reason a new variant must revisit THIS line as well as the enum: adding
-                        // one and stopping at the emitter re-creates exactly the #1367 defect,
-                        // silently. What forces the visit is
-                        // `poll_refresh_trigger_tokens_all_reach_a_named_bucket`, which fails to
-                        // COMPILE on an unnamed variant rather than merely asserting against one.
+                        // `poll_retry`, which is what those lines actually say. That default is
+                        // silent by nature: a variant whose lines are NOT poll-driven, added at the
+                        // emitter and nowhere else, re-creates exactly the #1367 defect with every
+                        // assertion green. What prices it is
+                        // `poll_refresh_trigger_tokens_all_reach_a_named_bucket`, and it takes both
+                        // of that test's layers to reach THIS line (issue #1386). Its
+                        // `expected_bucket` fails to COMPILE until the variant is named — but names
+                        // it there, in the test module, and answering it there is not an answer
+                        // about this line. What reaches this line is the replay: since #1386 the
+                        // list of variants replayed is checked against the enum's own source, so a
+                        // new variant is rendered through the emitter and parsed back HERE, and the
+                        // assertion fails whenever the bucket named for it is not the one this
+                        // `else` hands it. A variant that really does belong in `poll_retry` needs
+                        // no edit here, and is asked for none.
                         "poll_refresh" => {
                             if fields.get("trigger").copied() == Some("recovery") {
                                 m.parked_recovery = m.parked_recovery.saturating_add(1);
@@ -3140,22 +3148,36 @@ ts=2026-07-19T09:01:00Z event=poll_refresh account=spare trigger=recovery outcom
     /// arm absorbs the new token into `poll_retry`, and every existing assertion stays green while
     /// a second population is quietly reported as poll-driven again.
     ///
-    /// What stops that is `expected_bucket` below being an EXHAUSTIVE match with no wildcard, so a
-    /// new variant does not COMPILE here until someone names the bucket it belongs in. That is a
-    /// deliberately stronger gate than a failing assertion — the fall-through is silent by nature,
-    /// so the check has to fire before the code can run at all. It does not, and cannot, decide
-    /// whether the answer given is the right one; it only makes the question unskippable.
+    /// Two layers close that — the same pair `crate::observability`'s issue #891 sweeps use over
+    /// `Event` and `Diagnostic`. Only the first was here until issue #1386.
     ///
-    /// Each variant is then rendered THROUGH the real emitter (never a hand-typed token, which
+    /// LAYER 1, at COMPILE TIME. `expected_bucket` below is an EXHAUSTIVE match with no wildcard,
+    /// so a new variant does not compile until someone names the bucket it belongs in. That fires
+    /// before the code can run at all, which is what a silent fall-through needs.
+    ///
+    /// LAYER 2, at TEST TIME. Layer 1 forces an ARM, not a REPLAY. `EVERY_TRIGGER` is a separate
+    /// `const` the compiler has nothing to say about, so a variant could be named above and never
+    /// exercised — the hole reopening one step later. Measured on issue #1386: a third variant
+    /// added to the enum, given an `as_str` arm and a bucket, and left out of that list ran the
+    /// whole suite to `0 failed`, while the classifier routed its token to `poll_retry` — the
+    /// #1367 defect, one variant over. Adding it to the list alone turned that assertion red. The
+    /// comparison beside the list is what makes the list say so.
+    ///
+    /// Neither layer can decide whether the bucket NAMED for a variant is the RIGHT one; nothing
+    /// mechanical can. Together they make the question unskippable and the answer tested.
+    ///
+    /// Each replayed variant is rendered THROUGH the real emitter (never a hand-typed token, which
     /// could only ever agree with itself) and fed to the real parser, so the two ends of the
     /// contract are checked against each other rather than against a shared assumption.
     #[test]
     fn poll_refresh_trigger_tokens_all_reach_a_named_bucket() {
         use crate::observability::{Event, PollRefreshTrigger, RefreshEventOutcome};
+        use std::collections::BTreeSet;
         use std::time::{Duration, UNIX_EPOCH};
 
-        /// Which bucket each trigger must land in. Exhaustive on purpose — extend it when the
-        /// enum grows, and extend `EVERY_TRIGGER` with it so the new variant is actually replayed.
+        /// Which bucket each trigger must land in — layer 1. Exhaustive on purpose: the enum
+        /// grows and this stops compiling until the new variant is named here. Extending
+        /// `EVERY_TRIGGER` to match is layer 2's job, and is no longer left to this sentence.
         fn expected_bucket(trigger: PollRefreshTrigger) -> RefreshTokenLossByMechanism {
             match trigger {
                 PollRefreshTrigger::Poll401 => RefreshTokenLossByMechanism {
@@ -3170,6 +3192,36 @@ ts=2026-07-19T09:01:00Z event=poll_refresh account=spare trigger=recovery outcom
         }
         const EVERY_TRIGGER: &[PollRefreshTrigger] =
             &[PollRefreshTrigger::Poll401, PollRefreshTrigger::Recovery];
+
+        // Layer 2. Writing a list down does not make it complete, and nothing above this line
+        // reaches it, so it is held against the variants the enum's own SOURCE declares — the
+        // issue #891 scan, published by `crate::observability::tests` for this consumer.
+        //
+        // Derived `Debug` supplies the replayed side: these variants are fieldless, so `{:?}`
+        // renders the declaration's own spelling and cannot fall out of step with it the way a
+        // second hand-written list would. That is the issue #1085 idiom `crate::daemon`'s
+        // redaction meter already uses against the sibling scan in `crate::error`.
+        //
+        // Compared BOTH ways. Declared-but-unreplayed is the hole issue #1386 closes;
+        // replayed-but-undeclared means the scan has drifted onto the wrong enum or stopped early,
+        // which would quietly weaken this check rather than fail it. An emptied `EVERY_TRIGGER`
+        // fails the first direction, and a scan that parsed nothing fails inside the scan itself,
+        // so neither degenerate reading survives as a pass.
+        let declared = crate::observability::tests::declared_variant_names("PollRefreshTrigger");
+        let replayed: BTreeSet<String> = EVERY_TRIGGER
+            .iter()
+            .map(|trigger| format!("{trigger:?}"))
+            .collect();
+        let unreplayed: Vec<&String> = declared.difference(&replayed).collect();
+        let undeclared: Vec<&String> = replayed.difference(&declared).collect();
+        assert!(
+            unreplayed.is_empty() && undeclared.is_empty(),
+            "issue #1386: `EVERY_TRIGGER` must replay EVERY declared `PollRefreshTrigger` \
+             variant — naming one in `expected_bucket` does not exercise it.\n  declared but \
+             never replayed (nothing checks which bucket the classifier hands its token): \
+             {unreplayed:?}\n  replayed but absent from the enum source (the scan has drifted): \
+             {undeclared:?}"
+        );
 
         for &trigger in EVERY_TRIGGER {
             let line = Event::PollRefresh {
