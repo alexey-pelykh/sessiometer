@@ -147,7 +147,7 @@ explicit force, matching CLI semantics.
 
 A `Routability` classification table — one row per CLI verb, each `routed` · `routable` ·
 `structurally-unroutable`, the last requiring a stated structural reason — **plus a test asserting
-the table's verb set equals the set parsed at `src/cli.rs:741-765`.**
+the table's verb set equals the set parsed by `parse_subcommand` (`src/cli.rs:772-804`).**
 
 This is the durable half of the whole design. The `capture`/`login` split went unrecorded for the
 project's life because nothing forced the question. A test that fails on an unclassified verb forces

@@ -13,9 +13,14 @@
 # THE RULE
 #   A `src/<file>.rs:NNN` citation must leave behind something a reader can
 #   RE-DERIVE the location from — a SYMBOL named on the same line that actually
-#   occurs in the cited file. A bare number as the sole referent is only
+#   occurs AT THE CITED LINES. A bare number as the sole referent is only
 #   admissible when the cited file is STABLE, because then the number keeps
 #   meaning what it meant.
+#
+#   AT THE CITED LINES, not merely somewhere in the file (issue #1338). A symbol
+#   the range does not point at re-derives nothing, so it cannot be what earns
+#   the exemption; see § Anchor detection below for the rotted ADR citation that
+#   rode through on one, and for the ways an author clears it.
 #
 #   A SYMBOL, not a word that merely occurs. An ALL-CAPS token in running prose
 #   — `CLI`, `MUST`, `NEVER`, `ACL` — is not an identifier, and it satisfied the
@@ -185,13 +190,38 @@ churn() { # <path> -> commit count
 }
 
 # --- Anchor detection --------------------------------------------------------
-# Does the doc line name a symbol that actually occurs in the cited file? The
+# Does the doc line name a symbol that actually occurs AT THE CITED LINES? The
 # citation text itself is stripped first, or `cli` from `src/cli.rs` would anchor
 # a citation to itself. A candidate anchor is any token carrying `_`, any
 # CamelCase token, or any backticked token — the three shapes a Rust identifier
-# takes in this corpus's prose. "Occurs in the file" (rather than "is defined
-# there") is the deliberate bar: the point is to leave a reader something to
-# grep for, and a type or field name serves that as well as a `fn` does.
+# takes in this corpus's prose. "Occurs" (rather than "is defined") is the
+# deliberate bar: the point is to leave a reader something to grep for, and a
+# type or field name serves that as well as a `fn` does.
+#
+# WITHIN THE RANGE, not merely somewhere in the file (issue #1338). Anchoring
+# exempts a citation from the bare-number rule on the theory that the symbol
+# lets a reader RE-DERIVE the location — but a symbol the range does not point
+# at re-derives nothing, and the exemption then buys permanent immunity for
+# whatever numbers sit beside it. That is not hypothetical:
+# `docs/adr/0032-login-is-daemon-routable-tty-gate-is-ours.md` cited the verb
+# table as `src/cli.rs:741-765` while the range sat on the tail of `parse_import`,
+# `parse`'s doc comment and `fn parse` itself, and rode through on the backticked
+# word `login` —
+# a real identifier occurring throughout `src/cli.rs`, and nowhere at all inside
+# the cited range. Prose about a file names identifiers from that file almost by
+# construction, so the file-scoped exemption was weakest exactly where the file
+# is largest and churns most. Scoping it to the range makes the citation
+# SELF-CHECKING: the symbol and the number have to agree, or one of them is
+# wrong. WHICH one is not something this check can see — it measures the
+# disagreement and nothing else — so the failure it raises says so, and
+# prescribes the remedy for both readings rather than picking one.
+#
+# The remedies this leaves are all cheap, and the failure below prescribes each
+# of them. Widen or correct the range so it covers the symbol; name a symbol that
+# is already inside it; or drop the range and cite the symbol alone, which is not
+# a `path:NNN` citation at all and is never inspected. None of them is the bulk
+# conversion issue #1058 rules out.
+#
 # The shape only an identifier takes, and the subset of it that is an acronym
 # rather than an identifier. Written as one shape and a subtraction, so the two
 # can never drift apart: what the check declines is exactly what the hint names.
@@ -199,12 +229,36 @@ IDENT_SHAPE='^([A-Za-z0-9]*_[A-Za-z0-9_]*|[A-Za-z]+[A-Z][A-Za-z0-9]*)$'
 ACRONYM_SHAPE='^[A-Z0-9]+$'
 
 # Set by anchored() when it refused an ALL-CAPS prose token that DOES occur in
-# the cited file — i.e. the tokens that would have anchored the citation before
+# the cited RANGE — i.e. the tokens that would have anchored the citation before
 # issue #1319. Named in the failure so "name a symbol" cannot read as nonsense to
-# an author looking straight at a word they believe is one.
+# an author looking straight at a word they believe is one. Range-scoped like the
+# acceptance test, so its prescribed remedy — backtick it — is one that would
+# actually work; a token outside the range would not anchor even backticked.
 declined=""
 
-occurs() { # <token> <file> -> 0 if the token appears in the cited file
+# Set by anchored() when the line DOES name a real symbol that occurs in the
+# cited file but NOT inside the cited range (issue #1338). It gets its own
+# message because the author has already done what "name a symbol" asks, so
+# repeating that instruction would read as nonsense.
+#
+# WHAT IS OBSERVED IS THE DISAGREEMENT, NOT ITS CAUSE. That the symbol and the
+# number contradict each other is measured. Which of the TWO is wrong is an
+# inference this check has no evidence for, and the corpus carries both
+# readings: sweep it with `--audit` and most of these reports have their named
+# symbol sitting PAST the cited end rather than before its start, and a large
+# share of those cite a range made entirely of comment lines — the shape of a
+# citation aimed at an item's doc comment, whose own name is just below it. At
+# least one such range is RIGHT — `export`'s doc comment in `src/cli.rs` is
+# cited for a sentence it literally contains ("with no `path`, to standard
+# output"), and `async fn export` sits just past the cited end. Tell that author
+# the number drifted and to re-derive the range from the symbol, and they move a
+# correct citation onto a signature that does not say it. So the message states
+# the disagreement, gives the remedy for BOTH readings, and asserts neither.
+# (Named by symbol rather than by line, deliberately: a comment about citation
+# rot that carries a rot-able citation is its own counter-example.)
+elsewhere=""
+
+occurs() { # <token> <file> [<first> <last>] -> 0 if the token appears there
     # Read the cited file AT THE REF, like every other read here. Process
     # substitution rather than `git show ... | grep -q`: under this script's
     # `pipefail` that pipeline reports FAILURE on a hit, because `grep -q` exits
@@ -213,13 +267,25 @@ occurs() { # <token> <file> -> 0 if the token appears in the cited file
     # violation count. Measured rather than assumed, by swapping the two forms
     # and diffing `--audit HEAD`; the size of the gap is a corpus figure, so by
     # choice 1 above it is not written down here.
-    grep -qE "(^|[^A-Za-z0-9_])${1}([^A-Za-z0-9_]|\$)" \
-        <(git show "${head_sha}:${2}" 2>/dev/null)
+    #
+    # With <first>/<last> the search is confined to those lines — the range-scoped
+    # question, "is the symbol AT the citation". Without them it is the whole-file
+    # question, asked only to tell a MISPLACED anchor apart from an ABSENT one.
+    # `sed` prints its whole selection rather than quitting at the range end, so it
+    # never SIGPIPEs `git show` either.
+    if [ "$#" -ge 4 ]; then
+        grep -qE "(^|[^A-Za-z0-9_])${1}([^A-Za-z0-9_]|\$)" \
+            <(git show "${head_sha}:${2}" 2>/dev/null | sed -n "${3},${4}p")
+    else
+        grep -qE "(^|[^A-Za-z0-9_])${1}([^A-Za-z0-9_]|\$)" \
+            <(git show "${head_sha}:${2}" 2>/dev/null)
+    fi
 }
 
-anchored() { # <doc-line> <cited-file>  -> 0 if anchored
-    local line="$1" file="$2" stripped tok
+anchored() { # <doc-line> <cited-file> <first-line> <last-line>  -> 0 if anchored
+    local line="$1" file="$2" first="$3" last="$4" stripped tok
     declined=""
+    elsewhere=""
     stripped="$(printf '%s' "$line" | sed -E "s#${CITATION_RE}##g")"
     for tok in $(
         {
@@ -243,8 +309,14 @@ anchored() { # <doc-line> <cited-file>  -> 0 if anchored
         } | sort -u
     ); do
         [ "${#tok}" -ge 3 ] || continue
-        if occurs "$tok" "$file"; then
+        if occurs "$tok" "$file" "$first" "$last"; then
             return 0
+        fi
+        # A real symbol, present in the file, absent from the cited lines: the
+        # citation contradicts itself. Collected rather than returned on, because
+        # a later token may still anchor the line properly.
+        if occurs "$tok" "$file"; then
+            elsewhere="${elsewhere:+${elsewhere}, }${tok}"
         fi
     done
     # Unanchored. Report which prose acronyms were declined, if any, so the
@@ -257,7 +329,7 @@ anchored() { # <doc-line> <cited-file>  -> 0 if anchored
             | sort -u
     ); do
         [ "${#tok}" -ge 3 ] || continue
-        if occurs "$tok" "$file"; then
+        if occurs "$tok" "$file" "$first" "$last"; then
             declined="${declined:+${declined}, }${tok}"
         fi
     done
@@ -266,11 +338,15 @@ anchored() { # <doc-line> <cited-file>  -> 0 if anchored
 
 # --- The check ---------------------------------------------------------------
 check_line() { # <doc> <lineno> <line>
-    local doc="$1" lineno="$2" line="$3" cite path last n c
+    local doc="$1" lineno="$2" line="$3" cite path first last n c
 
     for cite in $(printf '%s' "$line" | grep -oE "$CITATION_RE" || true); do
         inspected=$((inspected + 1))
         path="${cite%%:*}"
+        # `first` and `last` coincide for a single-line citation, which carries no
+        # `-`: both suffix strips are then no-ops and the range is that one line.
+        first="${cite#*:}"
+        first="${first%%-*}"
         last="${cite##*:}"
         last="${last##*-}"
 
@@ -292,11 +368,13 @@ check_line() { # <doc> <lineno> <line>
         if [ "$c" -lt "$THRESHOLD" ]; then
             continue
         fi
-        if ! anchored "$line" "$path"; then
-            if [ -n "$declined" ]; then
-                fail "  ${doc}:${lineno}  ${cite}  -> bare line number into a churning file (${c} commits in the last ${WINDOW}); ${declined} occurs in ${path} but is prose, not a symbol — name a real one, or backtick it if it is code"
+        if ! anchored "$line" "$path" "$first" "$last"; then
+            if [ -n "$elsewhere" ]; then
+                fail "  ${doc}:${lineno}  ${cite}  -> the line names ${elsewhere}, which occurs in ${path} but NOT within lines ${first}-${last} — the symbol and the number disagree (${c} commits in the last ${WINDOW}), and which of them is wrong is not something this check can see: if the number drifted, re-derive the range from the symbol; if the range is right and the symbol merely sits outside it, widen the range to cover the symbol or name one that is inside. Dropping the range and citing the symbol alone clears it either way"
+            elif [ -n "$declined" ]; then
+                fail "  ${doc}:${lineno}  ${cite}  -> bare line number into a churning file (${c} commits in the last ${WINDOW}); ${declined} occurs at those lines but is prose, not a symbol — name a real one, or backtick it if it is code"
             else
-                fail "  ${doc}:${lineno}  ${cite}  -> bare line number into a churning file (${c} commits in the last ${WINDOW}); name a symbol"
+                fail "  ${doc}:${lineno}  ${cite}  -> bare line number into a churning file (${c} commits in the last ${WINDOW}); name a symbol that occurs at those lines"
             fi
         fi
     done
@@ -355,7 +433,14 @@ if [ "$violations" -gt 0 ]; then
         echo "    the verbs parsed by \`parse_subcommand\` in \`src/cli.rs\`"
         echo
         echo "Keeping the range as a secondary locator is fine — \`apply_import\` (\`src/cli.rs:4726-4813\`)"
-        echo "passes, because the symbol survives the drift the number does not."
+        echo "passes, because \`apply_import\` occurs INSIDE those lines, so the symbol and the number"
+        echo "agree — which is what this check measures, and all it measures."
+        echo
+        echo "That is also the whole of the anchoring rule (issue #1338): a symbol somewhere ELSE in"
+        echo "the file exempts nothing. \`login\` occurs all over src/cli.rs and at not one of the"
+        echo "lines src/cli.rs:741-765, which is how that range sat rotted in an ADR while the"
+        echo "same range, cited without the word, was reported. Widen the range to cover the symbol,"
+        echo "or drop the range — a symbol with no line number is not a citation and is never checked."
         echo
         echo "An ALL-CAPS word in running prose is not a symbol — \`CLI\`, \`MUST\` and \`ACL\` all occur"
         echo "in src/, and none of them re-derives anything (issue #1319). If the token really is a"
