@@ -131,6 +131,50 @@ Before adding a dependency, weigh:
 - **Source** — it must resolve from crates.io; a git or alternate-registry source
   fails `cargo deny check sources` until vetted.
 
+## Measurements published in a commit body
+
+Squash-merge concatenates every commit body in a PR into the one commit that lands on `main`,
+and `main` carries `non_fast_forward` with no bypass actors — so a figure published in a body
+can never be corrected afterwards. Treat every number you put in one as permanent.
+
+**A load-dependent measurement — a failure count, rate, or timing observed under artificial CPU
+load, on one host, in one session — must carry one of two things:**
+
+- **A re-runnable carrier**: something committed that re-derives the figure. Env-gated and
+  skipped by default, following the idiom in
+  [`apps/menubar/Tests/PanelGoldenParityTests.swift`](apps/menubar/Tests/PanelGoldenParityTests.swift)
+  (`SESSIOMETER_PANEL_MEASURE=1` + `XCTSkipUnless`), so it costs the required suite nothing and
+  never asserts on a host-dependent number.
+- **An explicit `one-time attestation, no in-repo witness` label**, in the body, beside the
+  figures it covers.
+
+Silence is the failure mode. An unlabelled figure reads as reproducible, and the reader who
+tries to reproduce it fails at something that was never on offer. The label is not an apology —
+it distinguishes *known but not carryable* from *unknown*, which is a real difference and the
+one a later reader needs.
+
+**Do not commit a load generator to close the gap.** A harness that yields its finding only when
+hand-fed a CPU load generator is a second unverified artifact in verification costume, not
+evidence. That is why PR #1095, which set this convention, wrote such a probe, ran it, and
+deliberately did not commit it.
+
+Two claims usually travel together in these commits and only one of them is load-dependent.
+Split them, and carry the half that can be carried:
+
+- the **mechanism** ("the poll reads main-actor state from the cooperative pool") is normally
+  pinnable *structurally* — assert the property, not the timing — and belongs in a committed
+  test that runs in the required suite;
+- only the **rate** ("21/250 failures before, 0/250 after, under load") needs the label.
+
+A deterministic measurement needs neither: re-running the test re-derives it exactly, so the
+test is its own witness. `bf71ad9`'s fixed-seed LCG iteration counts are that class, not this
+one.
+
+Worked example, including the figures that are labelled and the two that turned out to be
+carryable after all:
+[`apps/menubar/Tests/AccountSwapTests.swift`](apps/menubar/Tests/AccountSwapTests.swift)
+§ Calibration, and PR #1095's own body.
+
 ## Guards and where the rationale lives
 
 - [`scripts/check-no-security-framework.sh`](scripts/check-no-security-framework.sh)
