@@ -12,7 +12,7 @@ Example Mapping: 🟦 4 rules · 🟩 8 examples · 🟥 0 open
 
 ```gherkin
 Scenario: the table covers the parser
-  Given the verbs parsed at src/cli.rs:741-765
+  Given the verbs parsed by `parse_subcommand` in `src/cli.rs`
    When the routability table is compared against them
    Then every parsed verb has exactly one row
 
