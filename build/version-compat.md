@@ -2,7 +2,14 @@
 
 ## Supported Claude Code range
 
-<!-- Machine-readable: scripts/check-cc-version.sh parses the two `CC_SUPPORTED_*` lines below.
+<!-- Machine-readable: the two `CC_SUPPORTED_*` lines below are parsed by
+     scripts/check-cc-version.sh, by scripts/check-readme-cc-range.sh (issue #1279, with the
+     same anchored grep), and by src/cc_version.rs's `the_baked_range_matches_the_ledger`
+     test, which `include_str!`s this file — so a reformat can break them independently, and
+     a new parser belongs in this list. All three key on the `-` list-item prefix, which is
+     what excludes this comment; the two greps additionally anchor that `-` at column 0,
+     which the Rust filter's `trim_start()` does not, and the Rust test additionally
+     requires a bare `x.y.z` with no trailing remainder.
      Keep the `- CC_SUPPORTED_MIN: x.y.z` / `- CC_SUPPORTED_MAX: x.y.z` format stable. -->
 
 - CC_SUPPORTED_MIN: 2.1.181
@@ -51,7 +58,7 @@ Consumers of this range:
   other two consumers.
 - [`scripts/check-cc-version.sh`](../scripts/check-cc-version.sh) re-verifies the installed `claude`
   against the two lines above, and also asserts the README still states this range (so the
-  user-facing copy can't silently drift); the pre-release
+  user-facing copy can't silently drift past a release); the pre-release
   [`build/release-checklist.md`](release-checklist.md) runs it as an **advisory provenance
   check** — an out-of-range `claude` informs the release rather than blocking it (#716; the
   stale-README arm is the one exit-1 cause the checklist still says to fix before tagging,
