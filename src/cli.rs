@@ -2705,12 +2705,20 @@ fn red_line(body: &str, emphasize: bool) -> String {
 /// what supplies the type. So `! { … }` with either marker is unformatted, and `! ( … )` with a
 /// bare `const ALL;` is unformatted too.
 ///
-/// Do not tidy either back. Restoring braces, or dropping the `: _`, un-gates the ~60 lines below
-/// as far as `cargo fmt --all --check` is concerned: the repo's first and cheapest push gate
-/// passes a region it does not read, so the pass looks identical either way. What reds instead is
+/// What the body needs is an ASCRIPTION, not that exact spelling. `const ALL: u8;` parses too, and
+/// leaves a mis-indented variant reddening `cargo fmt` just the same (measured — issues #1293,
+/// #1310). `: _` is the house spelling, and the test named below pins it EXACTLY, so re-spelling
+/// this one marker is a deliberate re-blessing rather than drift — a pin deliberately tighter than
+/// the property, which is why a red over there is not by itself proof this region went un-gated.
+///
+/// Do not tidy any of these back. Restoring braces, dropping the ascription, or deleting the
+/// marker outright — which strands the `#[cfg(test)]` and doc block above it, so the body stops
+/// parsing the same way (measured, issue #1310) — each un-gates the ~60 lines below as far as
+/// `cargo fmt --all --check` is concerned: the repo's first and cheapest push gate passes a
+/// region it does not read, so the pass looks identical either way. What reds instead is
 /// `the_daemon_payload_faults_invocation_stays_reachable_by_cargo_fmt` in this file's own test
 /// module, which asserts BOTH conditions against this source (issue #1283) — before that landed,
-/// nothing anywhere reported either edit. To confirm the FORMATTING is still armed rather than
+/// nothing anywhere reported any of them. To confirm the FORMATTING is still armed rather than
 /// merely that lint, mis-indent a variant and check `cargo fmt --all --check` FAILS; a pass over
 /// an already-clean body proves nothing. This rests on `rustfmt`'s current macro handling, which
 /// no gate here pins — if that changes, the region goes quietly unguarded again.
@@ -16984,8 +16992,11 @@ impl Nested {
         /// property above: any ascription parses, so `: u8` would leave the body just as reachable
         /// (measured — issue #1293). The pin is house style, the same precedent
         /// `CONFIRMATION_CALL_ARGUMENTS` sets, so that re-spelling the declaration's one marker is
-        /// re-blessed deliberately rather than drifting in. Its failure message says which of the
-        /// two a reader is standing in; do not read a red here as proof the region went un-gated.
+        /// re-blessed deliberately rather than drifting in. Its failure message reads `left` back
+        /// and sorts the measured edits by whether the region actually went un-gated (issue
+        /// #1310) — one of the four un-gates outright, two never do, and an EMPTY `left` falls
+        /// either way depending on what the deletion left behind — so do not read a red here, on
+        /// its own, as proof of either verdict.
         #[test]
         fn the_daemon_payload_faults_invocation_stays_reachable_by_cargo_fmt() {
             let region = non_test_source(include_str!("cli.rs"));
@@ -16998,11 +17009,16 @@ impl Nested {
             // by the very property the gate exists to check; the upper is this file's `mod tests`.
             assert!(
                 region.contains("\ndaemon_payload_faults!"),
-                "no column-0 `daemon_payload_faults!` invocation in the non-test region. TWO \
-                 edits reach this, and it cannot tell them apart: either `non_test_source` \
-                 stopped before the invocation it is supposed to read, or the macro was RENAMED \
-                 and this gate — which hard-codes the old name — was not renamed with it. Grep \
-                 the name to settle which (issue #1293)"
+                "no column-0 `daemon_payload_faults!` invocation in the non-test region. SEVERAL \
+                 edits reach this and it cannot tell them apart; three causes were measured \
+                 (issue #1310). The REGION may no longer reach the invocation — `non_test_source` \
+                 stopped early, or a column-0 `#[cfg(test)]` was introduced above the invocation, \
+                 which moves the same boundary without touching that function. Or the macro was \
+                 RENAMED and this gate — which hard-codes the old name — was not renamed with it. \
+                 Or the invocation itself was INDENTED off column 0, which this predicate reads \
+                 as absence. Grep the name to settle which: gone at both sites is the rename; \
+                 still at column 0 is the truncated region; there but indented is the third, and \
+                 that one reds `cargo fmt --all --check` as well, naming the line (issue #1293)"
             );
             assert!(
                 !region.contains("fn the_daemon_payload_faults_invocation_stays_reachable"),
@@ -17073,14 +17089,22 @@ impl Nested {
                 markers,
                 ["const ALL: _;"],
                 "the `daemon_payload_faults!` invocation body must carry exactly one marker, \
-                 spelled `const ALL: _;`. Two different edits land here and `left` tells them \
-                 apart. If the ascription is GONE (`const ALL;`), the region really is un-gated: \
-                 `rustfmt` formats this body only when it PARSES as Rust, and a bare `const ALL;` \
-                 does not — so that edit leaves the whole variant list unformatted with `cargo \
-                 fmt --all --check` still GREEN (issue #1271), which is exactly the state this \
-                 gate exists to make loud. If it is merely a DIFFERENT ascription (`: u8`), \
-                 nothing is un-gated: any ascription parses, so the body stays formatted and a \
-                 mis-indented variant still reds `cargo fmt`. The pin is exact regardless, so \
+                 spelled `const ALL: _;`. SEVERAL edits land here; `left` names the edit, and \
+                 four were measured (issue #1310). `left: [\"const ALL;\"]` — the ascription GONE \
+                 — really is un-gated: `rustfmt` formats this body only when it PARSES as Rust, \
+                 and a bare `const ALL;` does not, so that edit leaves the whole variant list \
+                 unformatted with `cargo fmt --all --check` still GREEN (issue #1271), which is \
+                 exactly the state this gate exists to make loud. `left: [\"const ALL: u8;\"]` — \
+                 merely a DIFFERENT ascription — un-gates nothing: any ascription parses, so the \
+                 body stays formatted and a mis-indented variant still reds `cargo fmt`. `left: \
+                 [\"const ALL:\"]` is the marker SPLIT across lines, benign the way a split head \
+                 is: `rustfmt` rejoins it, so it reds `cargo fmt` there first. `left: []` — the \
+                 marker gone entirely — is the one state `left` alone CANNOT settle: deleting \
+                 just that line strands the `#[cfg(test)]` and doc block above it, the body stops \
+                 parsing and the region IS un-gated, while deleting those with it leaves the body \
+                 parsing and the region gated. Both were measured, and the check that separates \
+                 them is the one the macro's declaration doc prescribes: mis-indent a variant and \
+                 see whether `cargo fmt --all --check` FAILS. The pin is exact regardless, so \
                  that re-spelling this marker is a deliberate re-blessing rather than drift — if \
                  you meant it, say so in this assertion's expected value (issue #1293)"
             );
