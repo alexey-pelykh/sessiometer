@@ -94,17 +94,32 @@ const SPAWN_TIMEOUT: Duration = Duration::from_secs(40);
 ///     resolver is why it is NOT confined to `auth login` — the same reason, and the same
 ///     measurement, as the second read site noted for `CLAUDE_CODE_OAUTH_SCOPES` above.
 ///
-///     It does NOT re-target the keychain service name — and the temptation to say it does is
-///     WRITTEN DOWN, so it is worth disarming here. `build/version-compat.md` records
-///     `OAUTH_FILE_SUFFIX` as non-empty "**only** for a custom OAuth client id". That is a
-///     NECESSARY-condition phrasing; it does not license the converse, which is the direction a
-///     mis-targeting claim would need. At 2.1.227-2.1.232 it holds in NEITHER direction: the
-///     suffix is set by the deployment environment (`""` on prod, `-local-oauth` on a local
-///     build) or by the allow-listed `CLAUDE_CODE_CUSTOM_OAUTH_URL` branch (`-custom-oauth`),
-///     while the client-id read sits AFTER that branch and assigns `CLIENT_ID` alone. That file
-///     is pinned to 2.1.181-2.1.217, predates this work, and is NOT corrected from here. So this
-///     entry is not of the `CLAUDE_SECURESTORAGE_CONFIG_DIR` mis-targeting class above: the
-///     empty-suffix form [`crate::keychain`] hardcodes is not something a client id can move.
+///     It does NOT re-target the keychain service name — worth disarming HERE, because the
+///     temptation is STRUCTURAL rather than a stale note somewhere: the client id and
+///     `OAUTH_FILE_SUFFIX`, the one field that DOES move the service name, are members of the
+///     same OAuth config object returned by the same resolver just named, so "an inherited
+///     client id reaches that config" reads as "it can reach the suffix". Two independent
+///     measurements say it cannot, re-read for this paragraph at 2.1.227, 2.1.228, 2.1.229,
+///     2.1.232 and 2.1.233 — all five agree, differing only in minified identifiers. ORDER: the
+///     suffix is set by the deployment environment baked into the build (the environment
+///     function is a hardcoded `return "prod"`, so a shipped build takes `""`; `-local-oauth` is
+///     the local-build literal) or by the allow-listed `CLAUDE_CODE_CUSTOM_OAUTH_URL` branch
+///     (`-custom-oauth`), while the client-id read sits AFTER that branch and rebinds
+///     `CLIENT_ID` alone. CLOSURE, the stronger of the two: EVERY write to `OAUTH_FILE_SUFFIX`
+///     in those binaries is a string LITERAL — `""`, `-local-oauth`, `-custom-oauth`, with no
+///     computed write anywhere, and CC's own exported `OAUTH_GLOBAL_FILE_SUFFIXES` is likewise a
+///     fixed list of literals — so no env-var value can enter the suffix by any path, ordering
+///     aside. This entry is therefore not of the `CLAUDE_SECURESTORAGE_CONFIG_DIR` mis-targeting
+///     class above: the empty-suffix form [`crate::keychain`] hardcodes is not something a
+///     client id can move.
+///
+///     That conclusion rests on no citation, deliberately. An earlier draft rested it on a
+///     sentence quoted from `build/version-compat.md`, which then recorded the suffix as
+///     non-empty "only for a custom OAuth client id". Issue #1268 corrected that record — it now
+///     states both directions and names the same two selectors — leaving this paragraph arguing
+///     against a quotation the repo no longer contained. The old wording survives there only
+///     inside its own retraction note, so a grep that lands on it is finding history, not a live
+///     claim.
 ///
 /// Kept as a named list (not inline `env_remove` calls), applied by [`SpawnPlan::build_command`]
 /// — and, for the issue #783 login-shell PATH harvest, by
