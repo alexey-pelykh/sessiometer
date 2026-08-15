@@ -376,7 +376,7 @@ into a scratch directory and `diff -rq`-ing it against `renders/panel-goldens/`)
 whole table means running the default suite too.
 
 > **The `#824` cold-raster edge this recipe used to warn about is closed — the cause, not the symptom.**
-> This block used to say: keep `-only-testing:` on that command, because `SESSIOMETER_PANEL_MEASURE=1`
+> This block used to say: keep `-only-testing:` on that command, because `TEST_RUNNER_SESSIOMETER_PANEL_MEASURE=1`
 > with the WHOLE `PanelGoldenParityTests` class reddens `testRendersSurviveTheClockDriftWindow` with
 > `worst delta 1 over up to 19 bytes` — not a panel regression but the cold-raster exposure, since
 > `testMeasureSeparations` adds a second full-catalog render pass and the warm-up covered only the
@@ -446,7 +446,7 @@ default and run only in the **non-required** `panel-goldens` CI job:
 | Assertion class | Where | Required? |
 |---|---|---|
 | renders succeed · non-blank · deterministic · clock-drift window · host-appearance independent · pairwise distinct · health-tint assets resolve · both canaries · PNG round-trip | `swift` job (default suite) | **yes** — all same-run comparisons, cross-machine immune |
-| `testEveryRenderMatchesItsCommittedGolden` · `testEachFreshRenderIsNearestToItsOwnGolden` | `panel-goldens` job (`SESSIOMETER_PANEL_GOLDEN_GATE=1`) | **no** — soft-landing |
+| `testEveryRenderMatchesItsCommittedGolden` · `testEachFreshRenderIsNearestToItsOwnGolden` | `panel-goldens` job (`TEST_RUNNER_SESSIOMETER_PANEL_GOLDEN_GATE=1`) | **no** — soft-landing |
 | `Panel-Goldens-Rebaselined:` trailer | `gate-change-ack` job | **yes** — pure git, cannot be flaky |
 
 **A golden can change bytes without changing pixels.** The gate compares decoded PIXELS, never file
@@ -458,7 +458,7 @@ oracle, back when it had been rendered on an older toolchain, differed in bytes 
 the answer.
 
 **On THIS toolchain the goldens are byte-reproducible, and that is deliberate.** Two independent
-`SESSIOMETER_PANEL_GOLDENS=update` runs produce byte-identical files, and the app's own `--render-panel`
+`TEST_RUNNER_SESSIOMETER_PANEL_GOLDENS=update` runs produce byte-identical files, and the app's own `--render-panel`
 output is byte-identical to all 44 goldens. Six of them stopped matching when #824 landed: blessed from
 cold rasters, they held pixels a settled render no longer produces, so the *goldens* were the stale side.
 Nothing failed (the drift metric is blind to ±1), so issue #1129 re-blessed those six on a commit of
