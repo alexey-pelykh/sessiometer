@@ -1332,7 +1332,7 @@ PAST:    < 1.0 — true-by-construction on any `dead` line with a parseable non-
 
 | # | Assumption | Risk | Validation |
 |---|---|---|---|
-| A-1 | `account_uuid` is stable across machines for one Anthropic account | 🟢 | **Validated** — `src/config.rs:341` ("the Claude `account_uuid`"), sourced from `oauth_account` (`src/capture.rs:449`). This is what makes R-6 a *narrow* case, not the incident's cause (§ 9 F-1) |
+| A-1 | `account_uuid` is stable across machines for one Anthropic account | 🟢 | **Validated** — `src/config.rs:341` ("the Claude `account_uuid`"), sourced from `oauth_account` (`src/capture.rs:463`). This is what makes R-6 a *narrow* case, not the incident's cause (§ 9 F-1) |
 | A-2 | Anthropic rotates the refresh token on every exchange | 🟢 | Resolved by spike #262; corroborated by this incident's `window_secs=25246` then `window_secs=0` pair |
 | A-3 | No family revocation on replay of a superseded token | 🔴 | **n=1 only.** A refreshed normally ~7 h after B's replay. One observation; the endpoint may change. R-1 must not overstate it |
 | A-4 | Grace window < 4 m 14 s | 🔴 | **n=1 only.** Derived from one interval, not a swept bound. The true window may be far smaller |

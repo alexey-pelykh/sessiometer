@@ -1857,7 +1857,7 @@ mod tests {
     /// | a `match` arm's struct pattern | yes | `cli::execute` ships one, and it is a register row as of this change |
     /// | a closure parameter | yes | a braced group inside the call's parens |
     /// | a destructuring `fn` parameter | yes | attributed to the function being declared — it binds before the body brace opens, so `handle_reads` reaches for `pending` rather than an open scope |
-    /// | `ref` / `mut` prefixes | yes | skipped before the enclosing token is read; `src/capture.rs:432` spells `mut roster` |
+    /// | `ref` / `mut` prefixes | yes | skipped before the enclosing token is read; `src/capture.rs:446` spells `mut roster` |
     /// | a RENAMED binding (`Account { label: h, .. }`) | **no** | textually identical to a struct DEFINITION's `label: String` and a struct LITERAL's `label: expr`, so admitting it admits every declared field in the crate |
     /// | a tuple-struct pattern (`Account(label, ..)`) | n/a | positional patterns cannot bind a NAMED field, and `Account`'s identity fields are named — [`the_identity_fields_stay_plain_fields`] is what keeps that true |
     ///
@@ -1925,7 +1925,7 @@ mod tests {
         // Every delimiter currently open, innermost last. `depth` counts braces only and cannot
         // answer the question [`braced_binding_at`] asks — whether a bare `label` sits directly
         // in a BRACED group (`Account { label, .. }`) or in a parenthesised one
-        // (`run_login(login, store, stash, existing, label, claude_json)`, `src/capture.rs:762`).
+        // (`run_login(login, store, stash, existing, label, claude_json)`, `src/capture.rs:776`).
         // Both spell the same three tokens; only the enclosing delimiter tells them apart.
         //
         // That is the INNERMOST delimiter, and it is the answer to that question alone. The two
@@ -2301,13 +2301,13 @@ mod tests {
     /// open delimiter is `{`. That is the whole discriminator, and it is what makes the rule
     /// below safe to state so loosely. `Account { label, .. }` and `run_login(…, label, …)` spell
     /// the same three tokens; the first sits in a braced group and the second in a parenthesised
-    /// one, and `src/capture.rs:237` and `:762` already ship the second in production code this
-    /// gate scans — `:762` measured, by removing the test and reading what the register then
+    /// one, and `src/capture.rs:237` and `:776` already ship the second in production code this
+    /// gate scans — `:776` measured, by removing the test and reading what the register then
     /// refused. `:237` is not reached by that measurement: `label` is last in that call, so it is
     /// followed by `)`, and the CLOSE test below admits only `,` or `}`.
     ///
     /// SHORTHAND only — the name must both OPEN its entry (preceded by `{` or `,`, through an
-    /// optional `ref` / `mut`, which `src/capture.rs:432` already spells as `mut roster`) and
+    /// optional `ref` / `mut`, which `src/capture.rs:446` already spells as `mut roster`) and
     /// CLOSE it (followed by `,` or `}`). That is not a narrowing for its own sake: it is what
     /// keeps a struct DEFINITION out, since a declared field is always `label: Type` and can
     /// never be shorthand. The cost is the renamed binding, recorded as a residual at
@@ -3140,7 +3140,7 @@ mod tests {
     /// them and a rule is only demonstrated by the set it spans: the `let` the issue names, the
     /// `if let` and `match` arm it asks about, the closure parameter and the destructuring `fn`
     /// parameter that share the shape, and the `ref` / `mut` prefixes — of which the tree spells
-    /// only `mut`, at `src/capture.rs:432`, `ref` being covered by the same two lines and pinned
+    /// only `mut`, at `src/capture.rs:446`, `ref` being covered by the same two lines and pinned
     /// here rather than claimed. Each carries the same positive control — the fixture's own `#[cfg(test)]`
     /// helper reads an identity field on EVERY run, so an assertion of `["apply_park"]` is
     /// simultaneously evidence the scan reached the production code and evidence it stopped at
@@ -3331,7 +3331,7 @@ mod tests {
         // nothing anywhere, and the positive half is satisfied by a scan that matches everything.
         // Together they are the discrimination. Without the delimiter test the scan files
         // ordinary argument lists as handle reads — measured on this tree by removing it:
-        // `run_login_locked` starts reporting `run_login(…, label, …)` (`src/capture.rs:762`) and
+        // `run_login_locked` starts reporting `run_login(…, label, …)` (`src/capture.rs:776`) and
         // `login` starts reporting the tuple pattern `Ok((outcome, label, count))` (`:276`), and
         // every future one would too. `capture_locked`'s `run_capture(…, label)` (`:237`) does
         // NOT — `label` is last there, and the CLOSE test admits `,` or `}` rather than `)`.

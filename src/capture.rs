@@ -348,10 +348,24 @@ pub(crate) async fn notify_daemon_roster_reload() {
 }
 
 /// Best-effort notify a running daemon to un-quarantine a revived, non-activating parked
-/// account (issue #276): resolve the control socket and send `restored <uuid>` so the daemon
-/// clears the account's `needs re-login` quarantine WITHOUT activating it. Called by
+/// account (issue #276): resolve the control socket and send `restored <uuid>`, ASKING the
+/// daemon to clear the account's `needs re-login` quarantine WITHOUT activating it. Called by
 /// [`reconcile_login`] AFTER the roster save + `roster-reload` notify, ONLY for a
 /// non-activating revive (see [`should_signal_restored`]).
+///
+/// The clear is REQUESTED, not promised — since issue #643 the daemon forks on the named
+/// account's OWN verdict, in `reconcile_restored` (`src/daemon/refresh_fold.rs`). A non-`Dead`
+/// account takes the #275 primitive (`apply_refresh_restore`), which clears the quarantine
+/// directly — and is a no-op when there is none to clear. A `Dead`-latched PARKED account is
+/// re-probed with an isolated refresh of its own first (`reprobe_dead_parked_credential`), and
+/// `fold_recovery_outcome` folds that re-probe three ways: a LIVE outcome un-quarantines, a
+/// TRANSIENT `Error` un-quarantines anyway (to `AtRisk`, preserving the #275 guarantee), and a
+/// re-probe that comes back definitively `Dead` KEEPS the quarantine — never falsely cleared.
+/// That re-probe fork carries a third condition: the isolated engine must be wired. `Daemon::new`
+/// leaves it unset and `cli::run` attaches it unconditionally (#426 hoisted it out of the
+/// `[refresh].enabled` gate), so a `Dead` PARKED account falls back to the primitive only in a
+/// hermetically built daemon.
+/// NO canonical write and NO active-account change on either fork.
 ///
 /// BEST-EFFORT, exactly like [`notify_daemon_roster_reload`] (#139) and the `use` manual-hold
 /// notify (#64): the on-disk stash + roster write is authoritative (the revive already
