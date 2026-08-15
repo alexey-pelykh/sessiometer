@@ -18,9 +18,9 @@ subsequent build items are gated on.
 ## Context
 
 The daemon's control socket serves 11 commands (`src/daemon/socket.rs:7-46`); the CLI parses 18 verbs
-(`src/cli.rs:741-765`). `login` is in the second list and not the first, and the reason held
-throughout the project was that **`login` cannot be served over a socket because it needs an
-inherited TTY**.
+(`parse_subcommand`, `src/cli.rs:772-804`). `login` is in the second list and not the first, and
+the reason held throughout the project was that **`login` cannot be served over a socket because
+it needs an inherited TTY**.
 
 That belief had real textual backing. `src/login.rs:331` calls
 `require_tty(std::io::stdout().is_terminal())`, and the module's own doc comment at `:27-29` states
