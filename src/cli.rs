@@ -16331,6 +16331,16 @@ impl Nested {
     ///    pinned is a classification rule rather than an instant the two sides could read
     ///    differently (the Swift consumer supplies its own `now`).
     ///
+    /// That enumeration is exhaustive over OBSERVERS OF THE RANK, not over this module's tests,
+    /// and the `// ---- Observer N ----` blocks below are the weaker claim: they say where a test
+    /// sits, not that everything in one is an observer. One member is deliberately outside the
+    /// four — `the_daemon_payload_faults_invocation_stays_reachable_by_cargo_fmt` (issue #1283),
+    /// which reads this file's own SOURCE TEXT to keep `cargo fmt` able to see the declaration.
+    /// It files under Observer 1 because it guards that declaration's site, but it converges on no
+    /// manifest and pins no band, so numbering it 5 would claim a fifth independent convergence
+    /// that does not exist — and the independence of the four is the whole point above. A source
+    /// lint over the same lines is not a fifth reading of them (issue #1293).
+    ///
     /// What this module does NOT do is compare the two surfaces directly — it cannot; the panel is
     /// Swift. It pins the CLI to the committed manifest;
     /// `apps/menubar/Tests/CrossSurfaceSeverityParityTests.swift` pins the panel to the SAME
@@ -16966,9 +16976,16 @@ impl Nested {
         /// TWO conditions carry that, and neither works alone (issue #1271; the macro's own
         /// declaration doc states both). The invocation must be delimited with `(` or `[` —
         /// `rustfmt` leaves a BRACE-delimited body verbatim, unconditionally, even one that parses
-        /// cleanly. AND its marker must stay `const ALL: _;` — such a body is formatted only if it
+        /// cleanly. AND its marker must carry an ascription — such a body is formatted only if it
         /// PARSES as Rust, and a bare `const ALL;` does not. Break either and the ~60 variant lines
         /// leave `cargo fmt` with nothing else in the tree reporting it.
+        ///
+        /// The marker assert pins the exact spelling `const ALL: _;`, which is TIGHTER than the
+        /// property above: any ascription parses, so `: u8` would leave the body just as reachable
+        /// (measured — issue #1293). The pin is house style, the same precedent
+        /// `CONFIRMATION_CALL_ARGUMENTS` sets, so that re-spelling the declaration's one marker is
+        /// re-blessed deliberately rather than drifting in. Its failure message says which of the
+        /// two a reader is standing in; do not read a red here as proof the region went un-gated.
         #[test]
         fn the_daemon_payload_faults_invocation_stays_reachable_by_cargo_fmt() {
             let region = non_test_source(include_str!("cli.rs"));
@@ -16981,8 +16998,11 @@ impl Nested {
             // by the very property the gate exists to check; the upper is this file's `mod tests`.
             assert!(
                 region.contains("\ndaemon_payload_faults!"),
-                "the non-test region stops before the `daemon_payload_faults!` invocation it is \
-                 supposed to read"
+                "no column-0 `daemon_payload_faults!` invocation in the non-test region. TWO \
+                 edits reach this, and it cannot tell them apart: either `non_test_source` \
+                 stopped before the invocation it is supposed to read, or the macro was RENAMED \
+                 and this gate — which hard-codes the old name — was not renamed with it. Grep \
+                 the name to settle which (issue #1293)"
             );
             assert!(
                 !region.contains("fn the_daemon_payload_faults_invocation_stays_reachable"),
@@ -17022,11 +17042,14 @@ impl Nested {
                 .next();
             assert!(
                 matches!(opener, Some('(' | '[')),
-                "`daemon_payload_faults!` is invoked with `{}`, which `cargo fmt` does not reach. \
-                 That delimiter is LOAD-BEARING, not a stylistic accident: `rustfmt` leaves a \
-                 brace-delimited macro body verbatim unconditionally, so `{{` silently returns the \
-                 whole variant list to being invisible to `cargo fmt` (issue #1271) — and nothing \
-                 else in this repo reds when it does",
+                "`daemon_payload_faults!` must be invoked with `(` or `[` on the same line as its \
+                 name; found `{}` (`?` = nothing after the name on that line). That delimiter \
+                 is LOAD-BEARING, not a stylistic accident: `rustfmt` leaves a brace-delimited \
+                 macro body verbatim unconditionally, so `{{` silently returns the whole variant \
+                 list to being invisible to `cargo fmt` (issue #1271) — and nothing else in this \
+                 repo reds when it does. A SPLIT head (`?`) is the benign case and is NOT that: \
+                 `cargo fmt` reaches it, rejoins the head and formats the body anyway, so it reds \
+                 there first and this assert is only holding the one-line form (issue #1293)",
                 opener.unwrap_or('?')
             );
 
@@ -17050,11 +17073,16 @@ impl Nested {
                 markers,
                 ["const ALL: _;"],
                 "the `daemon_payload_faults!` invocation body must carry exactly one marker, \
-                 spelled `const ALL: _;`. That `: _` is load-bearing for the same reason the \
-                 delimiter is, and is just as easy to tidy away: `rustfmt` formats this body only \
-                 when it PARSES as Rust, and a bare `const ALL;` does not — so dropping it leaves \
-                 the whole variant list unformatted with `cargo fmt --all --check` still GREEN \
-                 (issue #1271), which is exactly the state this gate exists to make loud"
+                 spelled `const ALL: _;`. Two different edits land here and `left` tells them \
+                 apart. If the ascription is GONE (`const ALL;`), the region really is un-gated: \
+                 `rustfmt` formats this body only when it PARSES as Rust, and a bare `const ALL;` \
+                 does not — so that edit leaves the whole variant list unformatted with `cargo \
+                 fmt --all --check` still GREEN (issue #1271), which is exactly the state this \
+                 gate exists to make loud. If it is merely a DIFFERENT ascription (`: u8`), \
+                 nothing is un-gated: any ascription parses, so the body stays formatted and a \
+                 mis-indented variant still reds `cargo fmt`. The pin is exact regardless, so \
+                 that re-spelling this marker is a deliberate re-blessing rather than drift — if \
+                 you meant it, say so in this assertion's expected value (issue #1293)"
             );
         }
 
