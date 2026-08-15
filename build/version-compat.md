@@ -261,7 +261,7 @@ function n1(e=""){                                      // e = "-credentials" fo
       n=t!==void 0?!t:!process.env.CLAUDE_CONFIG_DIR,    // suffix-ABSENT gate
       r=t!==void 0?t.normalize("NFC"):sr(),              // value HASHED
       o=n?"":`-${createHash("sha256").update(r).digest("hex").substring(0,8)}`;
-  return `Claude Code${OAUTH_FILE_SUFFIX}${e}${o}`       // OAUTH_FILE_SUFFIX="" for standard OAuth
+  return `Claude Code${Is().OAUTH_FILE_SUFFIX}${e}${o}`  // Is() = OAuth config; "" on prod
 }
 sr = ()=>(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(),".claude")).normalize("NFC")
 ```
@@ -278,8 +278,25 @@ So `service = "Claude Code-credentials" + suffix`, where:
 - `CLAUDE_SECURESTORAGE_CONFIG_DIR` takes **precedence** when defined: a non-empty value is the
   hashed value (and `CLAUDE_CONFIG_DIR` is not consulted); a **defined-empty** value forces the bare
   name. Replicated faithfully — a CC instance with it set would otherwise be mis-targeted.
-- `OAUTH_FILE_SUFFIX` is non-empty (`-local-oauth` / `-custom-oauth`) **only** for a custom OAuth
-  client id (`CLAUDE_CODE_OAUTH_CLIENT_ID`) — out of scope here, as in the issue.
+- `OAUTH_FILE_SUFFIX` is read from `Is()`, CC's OAuth config resolver, and has exactly two
+  selectors: the **build environment** and **`CLAUDE_CODE_CUSTOM_OAUTH_URL`**. The environment
+  function is hardcoded `return"prod"` in a shipped binary, so the base value is `""` —
+  `-local-oauth` is the local-build literal and is unreachable in a release, and the staging base
+  is `void 0`, which falls back to prod's `""`. A `CLAUDE_CODE_CUSTOM_OAUTH_URL` on CC's
+  approved-endpoint allow-list then overrides it to `-custom-oauth`; an off-list value throws
+  rather than falling through. Both directions, because the converse is the one a reader needs:
+  **an approved `CLAUDE_CODE_CUSTOM_OAUTH_URL` ⇒ `-custom-oauth`**, and **a non-empty suffix ⇒
+  that variable or a non-prod build**. `CLAUDE_CODE_OAUTH_CLIENT_ID` does **not** select it — its
+  read sits immediately after the custom-URL branch and assigns `CLIENT_ID` alone, so an inherited
+  client id cannot move CC's keychain item to a service name this crate does not read.
+
+  Through 2026-08-15 this entry read "non-empty (`-local-oauth` / `-custom-oauth`) **only** for a
+  custom OAuth client id (`CLAUDE_CODE_OAUTH_CLIENT_ID`)". That was **wrong when written, not
+  drift**: the 2.1.181 binary this section is pinned to already shows the selectors above,
+  structurally identical to 2.1.217 and 2.1.232. It was consumed as authoritative once (#1009 /
+  PR #1267), where it produced a false mechanism that an independent binary walk caught before
+  merge — `73e0a3f`'s body records the retraction, so nothing permanent carries it. Corrected
+  under issue #1268.
 
 ## Ground truth (CC's exact expression, via `node`)
 
@@ -1043,8 +1060,17 @@ Every delta is structural; the memoization is keyed on `Lgl`:
 | service fn | `n1` | `BG` |
 | config-dir fn | `sr` (plain arrow) | `rn`, **memoized** via `Ur(fn, Lgl)` |
 | `CLAUDE_CONFIG_DIR` read | direct `process.env.…` | via the `Lgl()` accessor |
-| `OAUTH_FILE_SUFFIX` | bare identifier | lazy `ks().OAUTH_FILE_SUFFIX` |
+| `OAUTH_FILE_SUFFIX` | lazy `Is().OAUTH_FILE_SUFFIX` | lazy `ks().OAUTH_FILE_SUFFIX` — rename only |
 | `createHash` | bare import | `T0c.createHash` |
+
+The `OAUTH_FILE_SUFFIX` row was corrected under issue #1268 by re-reading the `2.1.181` binary:
+the consumer was already a lazy accessor there, so that row is a rename rather than a structural
+change. That same re-read shows the `config-dir fn` and `createHash` rows are **also wrong on their
+`2.1.181` side** — `sr` is already memoized there (`sr=bn(compute, key)`, not a plain arrow) and
+`createHash` is already namespaced (`kPs.createHash`, not a bare import). Both are outside #1268's
+scope and are left for a follow-up: **do not read those two rows as verified.** The shared cause is
+that these deltas were computed against the rendering quoted in `# Issue #100` above, which elided
+the accessor prefixes, rather than against the `2.1.181` binary.
 
 `Ur`'s own definition was **not** decoded (its minified name is module-scoped and the binary carries
 many unrelated `Ur` bindings), so whether its memo invalidates on an `Lgl()` change is *unverified,
