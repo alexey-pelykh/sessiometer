@@ -32,7 +32,7 @@
 //
 // PREDICATES, NOT ASSERTIONS. Everything here returns a measurement or a verdict; nothing calls
 // `XCTAssert`. That is deliberate and is what makes CONSTRAINT-A satisfiable: `AppIconGridTests` drives
-// its canaries through the SAME `measure` / `cornerAlphas` / `bodyFill` / `peakAlpha` calls the real
+// its canaries through the SAME `measure` / `cornerAlphas` / `idealBodyFill` / `peakAlpha` calls the real
 // assertions use, so a canary that reddens is evidence about the real gate rather than about a parallel
 // simplified check.
 
@@ -135,69 +135,27 @@ enum AppIconGrid {
 
     /// True when the ideal body edges land exactly on pixel boundaries — that is, when `256 | canvas`.
     ///
-    /// Derived in `edgeTolerance` above. Two things follow, and the second is why this is a named predicate
-    /// rather than a remark in that comment: the tolerance collapses to equality, AND the measured body box
-    /// IS the ideal body rather than a rounding of it — the precondition for any measurement whose
-    /// denominator is the box.
+    /// Derived in `edgeTolerance` above, and this is the whole of what it says: where the ideal edges are
+    /// integers the half-pixel tolerance COLLAPSES TO EQUALITY — two integers within 0.5 of each other are
+    /// the same integer — so the measured body box IS the ideal body rather than a rounding of it.
     ///
-    /// **WEIGHED AND KEPT AS DERIVED, NOT WIDENED** (issue #1148 R-3). It restricts both fill bounds to 5 of
-    /// the 10 shipped rasters, and the coverage argument for loosening it is real: measured, only canvas 16
-    /// actually crosses the upper threshold (98.8617 % against 97.8535 %); 32, 64 and 128 read 93.7493,
-    /// 93.7726 and 94.5127 and would have passed, so a `canvas >= 32` cut would put 9 of 10 files under both
-    /// bounds — every raster except `icon_16x16.png`, since canvas 32 carries two of the ten
-    /// (`icon_16x16@2x` and `icon_32x32`). It is still the wrong trade, for three measured reasons:
+    /// It is a named predicate rather than a remark in that comment because the grid assertion tests it
+    /// directly: `testEveryEmittedSizeSitsOnTheMacOSAppIconGrid` asks for EQUALITY at these canvases, not
+    /// merely for tolerance. Measured on the committed set, all five land on the ideal edges to the pixel —
+    /// `[25,230]` at 256, `[50,461]` at 512, `[100,923]` at 1024 — so the stronger claim is the true one and
+    /// asserting only the tolerance there would be leaving a derived consequence unread.
     ///
-    /// 1. **It would swap a derivation for a survey.** This predicate is not a size cut-off that happens to
-    ///    start at 256 — it is the exact statement of when the model's denominator is the ideal body. Its
-    ///    name would become false, and the new cut would be scoped on which sizes happen to survive today.
-    /// 2. **The margin at 32/64/128 is rounding DIRECTION, not signal.** Those three round the box OUTWARD,
-    ///    inflating the denominator and reading LOW; canvas 16 rounds INWARD and reads +3.15 pp. At canvas 32
-    ///    the box is 26 px against an ideal 25.75 — 0.97 % per side, 1.95 % of area — which alone predicts
-    ///    93.8753 % against a measured 93.7493 %, so denominator error accounts for all but 0.13 pp of the
-    ///    95.71 → 93.75 gap. Asserting a 4.29 pp signal on a reading carrying ~1.9 pp of unmodelled error is
-    ///    asserting on noise that happens to point the safe way, and nothing in the derivation says which
-    ///    way a given canvas rounds. Canvas 16 is the proof the estimator has no model at all off the grid:
-    ///    correcting its denominator the same way predicts a fill of **110.17 %**, which is not a quantity —
-    ///    an inward-rounded box also CLIPS its own numerator, and neither error is modelled here.
-    /// 3. **The residual is closed by the producer, not by the gate.** `brand/generate.sh` renders ONE
-    ///    `icon.svg` at every size, so a radius regression that reaches these four canvases reaches
-    ///    256/512/1024 as well, where both bounds run over it. That coupling is what actually holds the
-    ///    carved-out sizes — and it carries the whole load rather than part of it, which the paragraph
-    ///    below measures.
-    ///
-    /// **WHAT IT LEAVES UNCOVERED** (issue #1149), measured rather than reasoned, because a carve-out is
-    /// only as cheap as this list is short. At canvas 16/32/64/128 the sole rounding evidence is
-    /// `cornerAlphas`, and all it asks is that the body box's corner pixel is not FULLY covered. Three
-    /// things clear that bar:
-    ///
-    ///   • **A hollow body.** The suite's own hollow-body canary — a real icon shrunk to 60 % of its box,
-    ///     the box held by four alpha-254 pins — reads 33.54–36.51 % fill and prints `body-fill floor not
-    ///     asserted` at all four of these canvases, against `REJECTED` at 256/512/1024. That printed line
-    ///     is the carve-out's cost, restated by the gate on every run.
-    ///   • **A radius shrunk but not gone.** Only the aggregate reads a deficit's MAGNITUDE, and no
-    ///     magnitude is read here. How wide the band is even where it IS read: `squareFillThreshold`.
-    ///   • **An `rx` dropped OUTRIGHT — at 32/64/128, though not at 16.** This is the one that is easy to
-    ///     get backwards, so it is derived here. Off the grid the ideal body edge lands mid-pixel, so the
-    ///     box's own corner pixel is only partly covered by the body BEFORE any rounding. Measured at
-    ///     mid-height on the shipped rasters, where the edge is straight, the left-edge pixel reads 112 /
-    ///     223 / 192 / 130 at canvas 16 / 32 / 64 / 128 — the 43.75 / 87.5 / 75 / 50 % coverage the ideal
-    ///     edges predict, so the rasterizer integrates coverage exactly as `bodyFill` assumes. A hard
-    ///     square therefore puts that corner pixel at the product of its two edge coverages: at canvas 16
-    ///     the 43.75 % pixel falls BELOW the alpha ≥ `opaqueAlpha` contour, so the box starts one pixel in
-    ///     at a column wholly inside the body and the corner reads a full 255 — caught. At 32 and 64 the
-    ///     edge pixel is inside the box and the corner reads 0.875² → 195 and 0.75² → 143; at 128 the box
-    ///     is 104×103 at (12,13), half-covered in x and whole in y → 128. All three are under 255, so the
-    ///     per-corner read accepts them. At those canvases it is not a weakened rounding check; it is not
-    ///     a rounding check at all, and reason 3 above is the entirety of what holds them.
-    ///
-    /// `squaredCorners` reports green over that last point and cannot do otherwise — it fills the MEASURED
-    /// BOX opaque, writing 255 into that corner pixel by construction, where the producer would emit the
-    /// ideal body's own antialiased edge. The two subjects coincide only where this predicate holds. The
-    /// gap is **#1320**; it is recorded here rather than closed here, because closing it moves a predicate.
-    ///
-    /// The principled route to the whole ladder is not a wider carve-out but a different estimator: divide
-    /// by the IDEAL body area, which is exact at every canvas, instead of by the measured box. That is a
-    /// change to `bodyFill` rather than to this predicate, and **#1160** tracks it.
+    /// **IT NO LONGER GATES THE FILL BOUNDS** (issue #1160). It used to, and the reason was structural
+    /// rather than incidental: `bodyFill` divides by the MEASURED box, so it needs that box to BE the ideal
+    /// body, which restricted both bounds to 5 of the 10 shipped rasters. `idealBodyFill` divides by the
+    /// ideal body AREA, which is exact at every canvas — so both bounds now run on all ten and the carve-out
+    /// is retired rather than widened. Two bodies of reasoning went with it, and neither is lost: the
+    /// weighed-and-kept argument for the carve-out (issue #1148 R-3) was an argument about the measured-box
+    /// estimator and does not survive its replacement, and the measured list of what the carve-out left
+    /// uncovered (issue #1149) is closed by the same change — a hollow body and a shrunken radius are now
+    /// read at every size. One item on that list was never about the carve-out at all: the per-corner read's
+    /// own reach off the grid, which is a property of `cornerAlphas` and is stated there, still open as
+    /// **#1320**.
     static func isExactOnPixelGrid(canvas: Int) -> Bool { canvas % 256 == 0 }
 
     /// The ideal body edges on `canvas`, in continuous pixel coordinates.
@@ -269,6 +227,12 @@ enum AppIconGrid {
     /// Alpha-weighted rather than thresholded because the quantity of interest is an AREA, and a rasterizer
     /// already integrates partial coverage into alpha. Counting pixels over a threshold would throw that
     /// integration away and leave the 12×12 body at canvas 16 measuring in steps of 0.7 %.
+    ///
+    /// **NOT the subject of the fill bounds** — `idealBodyFill` is (issue #1160). What remains here is a
+    /// BOX-RELATIVE read, and that is exactly what the mutation no-op checks want: `squaredCorners` fills
+    /// the measured box by construction, so "its box is filled to 1.0" is the statement that the mutation
+    /// happened, in the terms the mutation is defined in. Reading those through the ideal-body estimator
+    /// instead would fold the box-vs-ideal offset into a check whose whole job is to be trivially true.
     static func bodyFill(_ raster: PanelRaster, box: AppIconBodyBox) -> Double {
         var total = 0
         for y in box.minY...box.maxY {
@@ -277,31 +241,111 @@ enum AppIconGrid {
         return Double(total) / (255.0 * Double(box.width) * Double(box.height))
     }
 
-    /// What `bodyFill` reads for a rounded rectangle at `cornerRadiusRatio` — the shipped artwork.
+    /// The side of the ideal body on `canvas`, in continuous pixels: `canvas × 824/1024`. A real number,
+    /// exact at every canvas — no quantisation, and nothing read off the raster.
+    static func idealBodySide(canvas: Int) -> Double {
+        Double(canvas) * Double(bodySpan) / Double(templateCanvas)
+    }
+
+    /// The pixel rows and columns the ideal body can reach: the ideal edges rounded OUTWARD.
+    ///
+    /// `nil` for a degenerate canvas, on the same rule `bodyBox` follows — a subject that cannot carry the
+    /// measurement is refused rather than silently given a number.
+    ///
+    /// Outward, not nearest, because the region has one job: **provably contain all of the body's coverage**.
+    /// The body occupies `[near, far]` in continuous coordinates, so the pixels it can touch are
+    /// `⌊near⌋ … ⌈far⌉ − 1` — every pixel the interval intersects, including the two whose coverage is
+    /// partial. Rounding to nearest would clip exactly the antialiased fringe that carries the difference.
+    /// At canvas 16 that is pixels 1…14 against a 12-px measured box of 2…13: the outward region keeps the
+    /// two edge columns the box's inward rounding throws away.
+    ///
+    /// Where `isExactOnPixelGrid` the rounding is a no-op and this region IS the measured box — which is why
+    /// the five exact rasters read identically under both estimators, rather than nearly so.
+    static func idealBodyRegion(canvas: Int) -> ClosedRange<Int>? {
+        guard canvas > 0 else { return nil }
+        let ideal = idealEdges(canvas: canvas)
+        let lo = max(0, Int(ideal.near.rounded(.down)))
+        let hi = min(canvas - 1, Int(ideal.far.rounded(.up)) - 1)
+        guard lo <= hi else { return nil }
+        return lo...hi
+    }
+
+    /// Alpha-weighted coverage of the IDEAL body: `Σα` over `idealBodyRegion`, divided by the ideal body
+    /// area `(canvas × 824/1024)²`. `nil` when the canvas is not square or cannot carry the region.
+    ///
+    /// **WHY THE DENOMINATOR IS NOT THE MEASURED BOX** (issue #1160). `bodyFill` divides by the box, which
+    /// is the ideal body only where `256 | canvas`; off the grid the box is the ideal body ROUNDED, and the
+    /// rounding error swamps the signal the bounds discriminate. Measured, that error is not small and its
+    /// SIGN is not derivable — it depends on where `canvas × 100/1024` falls relative to the half-pixel:
+    /// canvas 16 rounds inward and `bodyFill` reads 98.8617 % (+3.15 pp against a 95.7070 % model), while
+    /// 32, 64 and 128 round outward and read 93.7493 / 93.7726 / 94.5127 (−1.96 / −1.93 / −1.19 pp). A bound
+    /// asserted on that is asserted on quantisation, which is why it was restricted to five rasters.
+    ///
+    /// This denominator is a real number computed from the canvas, so it has no quantisation at all, and the
+    /// outward-rounded numerator collects the fringe an inward-rounded box clips. Measured across the ten
+    /// shipped rasters the readings collapse onto the model: **95.5661 … 95.7143 %**, a spread of 0.1483 pp
+    /// against a model of 95.7070 % — worst deviation 0.1409 pp, at canvas 16, where the body is 12.875 px
+    /// across and a single edge pixel is 7.8 % of the side. Under `bodyFill` the same ten spread 5.11 pp.
+    ///
+    /// Two consequences beyond the coverage, both worth having:
+    ///
+    /// 1. **It does not read the measured box at all.** The region and the denominator come from the canvas,
+    ///    so a body that fails to reach its own ideal edges reads low no matter what its bounding box says. The
+    ///    hollow-body canary makes that concrete: it reconstructs a perfect box out of four pinned pixels, and those
+    ///    pins no longer buy it a DENOMINATOR. They are not inert, though, and an earlier form of this comment said
+    ///    they were: the pins land INSIDE the ideal region, so they still contribute their own four pixels to the
+    ///    numerator — 2.4036 pp of the canvas-16 reading, 0.6009 pp at 32, 0.0006 pp at 1024.
+    /// 2. **It is exact for the hypotheses the bounds discriminate.** A hard square rendered at the ideal
+    ///    edges reads 100 % here at every canvas (`squaredIdealBody` measures 99.99–100.05 %, the residual
+    ///    being alpha's own 1/255 quantisation), where the same square measured against its box reads 100 %
+    ///    only on the grid and 86.87 % at canvas 16 — the wrong side of the FLOOR.
+    ///
+    /// What it does NOT do is read WHERE the area sits: it is an area estimator, so a body missing area from
+    /// its middle rather than its corners reads the same as one missing it from the corners. Measured — a
+    /// disc of radius 0.165 × the body box's width, punched about that box's centre, passes BOTH bounds at
+    /// canvas 16, 32, 512 and 1024 (88.3269 / 87.7361 / 87.1493 / 87.1513 %), which is six of the ten
+    /// files, and is caught by the floor only at 64, 128 and 256 (86.8550 / 87.0236 / 87.1151 %). An
+    /// earlier form of this line omitted canvas 32; the set above is re-derived rather than carried. That
+    /// residual is real and unchanged by this estimator; it is tracked as **#1331** rather than implied
+    /// here.
+    static func idealBodyFill(_ raster: PanelRaster) -> Double? {
+        guard raster.width == raster.height,
+              let region = idealBodyRegion(canvas: raster.width) else { return nil }
+        var total = 0
+        for y in region {
+            for x in region { total += Int(alpha(raster, x: x, y: y)) }
+        }
+        let side = idealBodySide(canvas: raster.width)
+        return Double(total) / (255.0 * side * side)
+    }
+
+    /// What `idealBodyFill` reads for a rounded rectangle at `cornerRadiusRatio` — the shipped artwork.
     ///
     /// Four quarter-discs of radius `r = k·W` replace four `r × W` corners, removing `(4 − π)r²` of a `W²`
-    /// box, so the fill is `1 − (4 − π)k²` = 95.71 %.
+    /// body, so the fill is `1 − (4 − π)k²` = 95.71 %.
     static let roundedFill = 1 - (4 - Double.pi) * cornerRadiusRatio * cornerRadiusRatio
 
-    /// What `bodyFill` reads for a hard-cornered square: the whole box.
+    /// What `idealBodyFill` reads for a hard-cornered square: the whole body.
     static let squareFill = 1.0
 
-    /// The most a body box may be filled before it is called square.
+    /// The most the ideal body may be filled before it is called square.
     ///
     /// DERIVED AS THE MAXIMUM-MARGIN BOUNDARY between the two hypotheses this predicate discriminates —
     /// rounded at the artwork's own `rx` (95.71 %) and hard-cornered (100 %) — so it is the midpoint,
     /// 97.85 %, and neither hypothesis is favoured by the placement. A threshold fitted to the current
     /// output would instead pin whatever the rasterizer happens to do today.
     ///
-    /// **Only meaningful where `isExactOnPixelGrid`**, and that bound is measured, not assumed. The model
-    /// divides by the measured box, so it needs the box to BE the ideal body; where it is not, the
-    /// denominator error swamps the 4.29 pp signal. Measured across the ladder: {256, 512, 1024} read
-    /// 95.6927 / 95.7081 / 95.7065 % against the model's 95.7070 — agreement to 0.015 pp. The other four
-    /// read 93.7493 (32), 93.7726 (64), 94.5127 (128) — LOW, because the box rounds outward and carries
-    /// margin — and 98.8617 (16), HIGH, because there the box rounds INWARD and clips the body's own outer
-    /// edge, at a 12-pixel body where half a pixel per edge is 7 % of the denominator. So this half of the
-    /// rounding check is asserted only where `isExactOnPixelGrid`; `cornerAlphas` covers every size —
-    /// though that predicate records how little the corner half reaches once the canvas is off the grid.
+    /// **ASSERTED AT EVERY SHIPPED SIZE**, and the margin is measured rather than assumed (issue #1160).
+    /// Read through `idealBodyFill`, the ten rasters span 95.5661 … 95.7143 %, so the binding control is the
+    /// HIGHEST reading — 95.7143 % at canvas 128 — and this bound sits **2.1392 pp** above it. Against what
+    /// it must reject the separation is the other **2.1389 pp**: a hard square rendered at the ideal body
+    /// edges measures 99.9923 … 100.0515 % across the ten, and the margin is taken from the NEAREST of
+    /// those, so the two hypotheses stay a full band apart everywhere rather than only on the five rasters
+    /// the old measured-box estimator could speak about.
+    ///
+    /// It was previously scoped to `isExactOnPixelGrid`, which restricted it to 5 of the 10 rasters; that
+    /// carve-out was a property of `bodyFill`'s denominator and retired with it. The predicate itself was
+    /// not the problem and is still correct about what it says — see its own comment.
     ///
     /// **THE RADIUS SET THIS ACCEPTS, so no reader takes it for a radius pin** (issue #1149). Because the
     /// threshold is the MIDPOINT of the same one-parameter family the constants above use,
@@ -331,10 +375,10 @@ enum AppIconGrid {
     /// rectangle at all, so this is a bound on the model rather than a value read off anything.
     static let maxCornerRadiusRatio = 0.5
 
-    /// What `bodyFill` reads at that limit: `1 − (4 − π)/4 = π/4`, 78.5398 % of the box.
+    /// What `idealBodyFill` reads at that limit: `1 − (4 − π)/4 = π/4`, 78.5398 % of the body.
     static let circleFill = 1 - (4 - Double.pi) * maxCornerRadiusRatio * maxCornerRadiusRatio
 
-    /// The LEAST a body box may be filled before it is called hollow (issue #1148, R-1).
+    /// The LEAST the ideal body may be filled before it is called hollow (issue #1148, R-1).
     ///
     /// DERIVED THE SAME WAY `squareFillThreshold` IS, at the other end. That one is the maximum-margin
     /// boundary between the artwork's declared rounding (95.7070 %) and the near hypothesis, a hard-cornered
@@ -349,30 +393,61 @@ enum AppIconGrid {
     /// the box's four corners held by single pixels at alpha 254 measures a perfectly on-grid body filled to
     /// **34.41 %**, and every shipped predicate accepted it at all ten rasters.
     ///
-    /// **The margin, because the issue warned this could be tight and it is not.** The binding control is
-    /// the LOWEST exact-canvas reading, 95.6927 % at canvas 256 — the number to clear for a floor, and
-    /// itself 0.0143 pp BELOW the model rather than above it. The floor sits **8.5693 pp** under it, which
-    /// is 601× the largest deviation any exact canvas shows from the model (0.0143 pp). Against what it must
-    /// reject it is equally clear: the 48.0417 % half-transparent case is 39.08 pp below it, and the 34.67 %
-    /// hollow case 52.46 pp below.
+    /// **The margin, re-derived at every shipped size** (issue #1160). The binding control is the LOWEST
+    /// reading across the ten, which through `idealBodyFill` is 95.5661 % at canvas 16 — the number a floor
+    /// must clear. This floor sits **8.4427 pp** under it, 60× the largest deviation any raster shows from
+    /// the model (0.1409 pp, the same canvas). Against what it must reject it is clearer still: the
+    /// 47.97 % half-transparent case is 39.15 pp below it, and the 31.72 % hollow case 55.40 pp below.
+    ///
+    /// The previous statement of this margin used the LOWEST EXACT-canvas reading (95.6927 % at 256, 8.5693
+    /// pp of margin, 601× a 0.0142 pp deviation) because the bound ran on five rasters. Both the control and
+    /// the ratio move once it runs on ten: the spread it must sit under is now 0.1483 pp rather than 0.015,
+    /// which is the honest cost of the coverage and still two orders of magnitude of headroom.
     ///
     /// What it therefore rejects, stated as thresholds rather than as the three rasters that motivated it:
-    /// any uniform alpha scale below **91.03 %** of full; any corner radius past **0.3873** of the body span
-    /// (`rx` beyond 396 on the 1024 master, against the declared 229); and any pinned body more than
-    /// **4.59 %** linearly short of its own bounding box.
+    /// any uniform alpha scale below **91.02 %** of full (91.03 % against the model; 91.02 % is the measured
+    /// value that bites at every canvas, binding on the highest reading); any corner radius past **0.3873**
+    /// of the body span (`rx` beyond 396 on the 1024 master, against the declared 229); and any body more
+    /// than **4.59 %** linearly short of its IDEAL extent.
     ///
-    /// Scoped to `isExactOnPixelGrid` for exactly the reason the upper bound is — the model divides by the
-    /// measured box, and only there is that box the ideal body. That predicate carries the measurement, and
-    /// the weighed decision not to widen it.
+    /// That last one is where the estimator change buys the most. It used to read "short of its own bounding
+    /// box", which a mutant can forge: four pinned pixels reconstruct a correct-looking box around almost
+    /// nothing, which is exactly how the hollow-body canary defeats every other predicate. `idealBodyFill`
+    /// never reads the box, so the extent it measures short against is fixed by the canvas and cannot be
+    /// pinned into agreement.
     static let circleFillThreshold = (roundedFill + circleFill) / 2
 
     /// Alpha at the four corners of `box` — top-left, top-right, bottom-left, bottom-right.
     ///
     /// The per-corner half of the rounding check, and it catches what the aggregate above cannot: ONE
-    /// squared corner moves `bodyFill` by a quarter of the deficit, which stays inside the threshold. What
+    /// squared corner moves the fill by a quarter of the deficit, which stays inside the threshold. What
     /// it asserts is that the corner pixel is not FULLY covered — not that it is empty. At canvas 16 the
     /// radius is 2.88 px and the arc cuts the corner pixel at ~59 % coverage, so it measures ~150; that is
     /// the rounding being present at a coarse pixel grid, not absent.
+    ///
+    /// **WHAT IT REACHES, MEASURED** (issue #1320, restated here from `isExactOnPixelGrid` now that the fill
+    /// bounds no longer carve anything out — this was always a property of THIS predicate rather than of
+    /// that one). Off the pixel grid the ideal body edge lands mid-pixel, so the box's own corner pixel is
+    /// only partly covered by the body BEFORE any rounding is applied. Read at mid-height on the shipped
+    /// rasters, where the edge is straight, the left-edge pixel measures 112 / 223 / 192 / 130 at canvas
+    /// 16 / 32 / 64 / 128 — the 43.75 / 87.5 / 75 / 50 % coverage the ideal edges predict, so the rasterizer
+    /// integrates coverage exactly as the area model assumes. A hard square therefore puts that corner pixel
+    /// at the product of its two edge coverages: at canvas 16 the 43.75 % pixel falls BELOW the
+    /// alpha ≥ `opaqueAlpha` contour, so the box starts one pixel in at a column wholly inside the body and
+    /// the corner reads a full 255 — caught. At 32 and 64 the edge pixel is inside the box and the corner
+    /// reads 0.875² → 195 and 0.75² → 143; at 128 both ideal edges land ON the half-pixel and the contour
+    /// settles the axes differently — column 12 peaks at 130 and is kept, row 12 at 121 and is dropped — so
+    /// the box is 104×103 at (12,13) and its corner is half-covered in x and whole in y, the 130 that column
+    /// measures. All three are under 255, so at those canvases this read accepts an outright dropped `rx` —
+    /// it is not a weakened rounding check there, it is not a rounding check at all. (`squaredIdealBody`
+    /// prints 64 at that corner: it rounds a 0.5 coverage to alpha 128 and keeps the row the producer drops.)
+    ///
+    /// What holds those sizes is no longer an argument about the producer: `idealBodyFill`'s ceiling now
+    /// rejects a hard square at every canvas, which is the fix #1320 named (its option 2) and this file
+    /// landed. #1320 stays open for its other half — `squaredCorners` fills the MEASURED box, writing 255
+    /// into that corner pixel by construction, so it cannot exhibit the gap above and its green over this
+    /// predicate is not evidence off the grid. Making that canary faithful reddens this read at 32/64/128,
+    /// which is a change to what the corner half claims and belongs with the issue that measured it.
     static func cornerAlphas(_ raster: PanelRaster, box: AppIconBodyBox) -> [UInt8] {
         [alpha(raster, x: box.minX, y: box.minY),
          alpha(raster, x: box.maxX, y: box.minY),
@@ -384,15 +459,19 @@ enum AppIconGrid {
     ///
     /// **THE OPACITY REGIME, STATED AND ASSERTED AT ITS POINT OF USE** (issue #1148, R-2). Three of the
     /// reads above are ABSOLUTE and all three key on opacity magnitude: `opaqueAlpha = 128` is the
-    /// half-covered contour, `cornerAlphas < 255` means "not fully covered", and `bodyFill` divides by 255
-    /// to turn alpha into area. Every one of them interprets the byte 255 as full coverage — so ONE global
-    /// alpha scale moves all of them together, and none can then tell a rounded tile from a hard-cornered
-    /// square that has merely been made slightly transparent.
+    /// half-covered contour, `cornerAlphas < 255` means "not fully covered", and both fill estimators divide
+    /// by 255 to turn alpha into area. Every one of them interprets the byte 255 as full coverage — so ONE
+    /// global alpha scale moves all of them together, and none can then tell a rounded tile from a
+    /// hard-cornered square that has merely been made slightly transparent.
     ///
-    /// That is measured, not feared: a hard-cornered square at a uniform alpha **249** was accepted by all
-    /// three at all ten shipped rasters, its corners reading 249 (< 255, so "rounded") and its box filled to
-    /// **97.6471 %** (< 97.8535 %, so "not square"). A square is precisely what the corner half exists to
-    /// catch.
+    /// That is measured, not feared: a hard-cornered square at a uniform alpha **249** is accepted by all
+    /// three at all ten shipped rasters, its corners reading 140…249 (all < 255, so "rounded") and its
+    /// ideal body filled to **97.65 %** (< 97.8535 %, so "not square"). The corner read trails the dimming
+    /// target off the pixel grid, where the box's own corner pixel is only PARTLY covered before it is
+    /// dimmed — 190 at canvas 32, 140 at canvas 64, 249 at the other seven files — and under 255 is all the
+    /// corner half needs. A square is precisely what that half exists to catch. Widening the fill bounds
+    /// to the whole ladder (issue #1160) does not close this and was not expected to — the dimming slides
+    /// the square UNDER the ceiling by 0.20 pp at every canvas, which is the point of the mutant.
     ///
     /// So the anchor is asserted rather than assumed, and this is what makes it sound: `brand/src/icon.svg`
     /// fills its body opaque, and `brand/generate.sh` puts that through a SINGLE `rsvg-convert` pass per
@@ -448,7 +527,10 @@ enum AppIconGrid {
     /// The targeted half of the canary pair. Its bounding box is identical to the real raster's, so it
     /// PASSES the grid measurement — which is exactly the point: it isolates what the box metric is blind
     /// to, the way removing two elements from a panel row once *raised* its ink coverage
-    /// (ADR-0031 § Decision 4, "composite blindness"). Only the corner read can reject it.
+    /// (ADR-0031 § Decision 4, "composite blindness"). The corner read is what rejects it, and since issue
+    /// #1160 a fill bound does too at every size: through `idealBodyFill` it reads 86.8696 % at canvas 16 —
+    /// under the FLOOR, so rejected as a hollow body rather than as a square — and 100.0000–101.9512 % over
+    /// the CEILING at the other nine. That inversion is why the ceiling canary moved to `squaredIdealBody`.
     static func squaredCorners(_ raster: PanelRaster) -> PanelRaster? {
         guard let box = bodyBox(of: raster) else { return nil }
         // A real body colour, so the mutant is a plausible icon rather than an obviously-broken one: the
@@ -466,6 +548,66 @@ enum AppIconGrid {
             }
         }
         return PanelRaster(width: raster.width, height: raster.height, bytes: bytes)
+    }
+
+    /// A hard-cornered square occupying the IDEAL body, rendered with the edge coverage a rasterizer would
+    /// integrate — what `brand/generate.sh` would actually emit if `icon.svg`'s `rx` were dropped.
+    ///
+    /// **WHY THIS EXISTS ALONGSIDE `squaredCorners`** (issue #1160). That one fills the MEASURED box, which
+    /// is the ideal body only where `isExactOnPixelGrid`; off the grid the two subjects differ, and once the
+    /// fill bounds run on the whole ladder the difference stops being academic and changes the verdict's
+    /// SIGN. Measured through `idealBodyFill`, the measured-box square reads 101.95 % at canvas 32/64 and
+    /// 100.97 % at 128 — rejected by the ceiling, correctly, if for a slightly inflated reason — but at
+    /// canvas 16 it reads **86.87 %**, which is under the FLOOR. Filling a box that is smaller than the
+    /// ideal body does not look square there, it looks hollow. A canary rejected by the wrong bound is not
+    /// a canary for the right one, so the ceiling gets a subject that is a square at every canvas.
+    ///
+    /// Coverage is the overlap of each pixel with `[near, far]` per axis, multiplied — the same integration
+    /// `cornerAlphas` measures the shipped rasters performing (112 / 223 / 192 / 130 at the four off-grid
+    /// canvases, against 43.75 / 87.5 / 75 / 50 % predicted). So this is a render of the model rather than a
+    /// synthetic stand-in, and it reads 99.9923–100.0515 % at the ten — the residual is alpha's own 1/255
+    /// quantisation, not a modelling error.
+    ///
+    /// Its BOX parts from the producer's at canvas 128 and nowhere else — measured, box for box, at all ten.
+    /// Both ideal edges land on the half-pixel there, and rounding a 0.5 coverage to alpha 128 keeps the edge
+    /// pixel on BOTH axes, so this box is 104×104 where the shipped raster keeps only the column (130) and
+    /// drops the row (121) — 104×103. Its own fill does not move with that, being summed over the ideal
+    /// region rather than the box, but the corner pixel does, which is why `cornerAlphas` derives the
+    /// producer's corner at that canvas rather than quoting this mutant's.
+    ///
+    /// It is deliberately NOT a fix for #1320. That issue is about what `cornerAlphas` can reach off the
+    /// grid and about `squaredCorners` being unable to exhibit it; making THAT canary faithful would redden
+    /// the per-corner assertion at 32/64/128, which is a change to a shipped claim. This adds a second
+    /// subject for a second bound and leaves the first one exactly as it was.
+    static func squaredIdealBody(_ raster: PanelRaster) -> PanelRaster? {
+        guard raster.width == raster.height, let region = idealBodyRegion(canvas: raster.width) else {
+            return nil
+        }
+        let canvas = raster.width
+        let ideal = idealEdges(canvas: canvas)
+        // A real body colour, so the mutant is a plausible icon rather than an obviously-broken one.
+        let centre = ((canvas / 2) * canvas + canvas / 2) * 4
+        let body = (Double(raster.bytes[centre]), Double(raster.bytes[centre + 1]),
+                    Double(raster.bytes[centre + 2]))
+        /// How much of pixel `i` the ideal body covers along one axis, in [0, 1].
+        func coverage(_ i: Int) -> Double {
+            max(0, min(Double(i) + 1, ideal.far) - max(Double(i), ideal.near))
+        }
+
+        var bytes = [UInt8](repeating: 0, count: canvas * canvas * 4)
+        for y in region {
+            for x in region {
+                let covered = coverage(x) * coverage(y)
+                guard covered > 0 else { continue }
+                let dst = (y * canvas + x) * 4
+                // Premultiplied-last, so the colour channels carry the same coverage the alpha does.
+                bytes[dst] = UInt8((body.0 * covered).rounded())
+                bytes[dst + 1] = UInt8((body.1 * covered).rounded())
+                bytes[dst + 2] = UInt8((body.2 * covered).rounded())
+                bytes[dst + 3] = UInt8((255.0 * covered).rounded())
+            }
+        }
+        return PanelRaster(width: canvas, height: canvas, bytes: bytes)
     }
 
     /// The same artwork with every channel scaled by `scale` — a UNIFORM opacity change.
