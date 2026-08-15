@@ -2466,10 +2466,24 @@ mod tests {
         /// function whose body holds no `resolve_target` call, so the claim cannot be merely
         /// asserted.
         ViaSharedResolver,
-        /// It reads an identity field for something that is not operator-handle resolution:
-        /// matching an identifier the SYSTEM supplied, capturing a handle off an
+        /// It reads an identity field for something that is not operator-handle resolution.
+        /// That top line is the WHOLE criterion. What follows are EXAMPLES and not a closed
+        /// set: matching an identifier the SYSTEM supplied, capturing a handle off an
         /// already-resolved index for an event or a snapshot, rendering, or a field of a
         /// different type that happens to share the name.
+        ///
+        /// Illustrative rather than exhaustive DELIBERATELY (issue #1280), and the choice is
+        /// not neutral — a closed list reads as a MENU, and a shape it does not name gets
+        /// filed under the nearest item instead of earning its own. That is this list's own
+        /// history, not a hypothetical: `account_listed_in` — an OPERATOR-supplied handle
+        /// folded to a membership bool, which is none of the four — sat under the register's
+        /// SYSTEM-supplied banner until issue #1243 moved it out, and it sat there because
+        /// nothing in the four was closer. Extending the list to five would restore the
+        /// mapping and re-arm the same trap for shape six.
+        ///
+        /// So absence from the four above is evidence of NOTHING. The live enumeration is
+        /// [`HANDLE_READ_REGISTER`]'s banners: every row sits under one, and a shape that
+        /// fits none of them earns a new banner there rather than a menu item here.
         NotHandleResolution,
     }
 
@@ -2539,7 +2553,7 @@ mod tests {
         ("restash_account", NotHandleResolution, "compares a roster account's uuid to the displayed credential's before restashing"),
         ("stash", NotHandleResolution, "`Account::stash` DERIVES the keychain key from the uuid — a formatting read with no comparison, so there is nothing here to resolve first-match-wins"),
         ("run_sweep", NotHandleResolution, "the refresh sweep's per-account uuid membership checks, plus the handles its events carry"),
-        // --- a MEMBERSHIP test, which takes no match at all ------------------------------------
+        // --- an OPERATOR-supplied handle folded to a membership bool ---------------------------
         //
         // Held out of the SYSTEM-supplied section above, whose reasoning is false here on all
         // three of its clauses (issue #1243): the string an operator typed into
@@ -2553,6 +2567,19 @@ mod tests {
         // of the same function and lands in the same place, naming the shape "test membership
         // and select nothing at all"; a reader auditing THIS register alone should not come away
         // with a different answer, which is what filing it above did.
+        //
+        // Being a membership test does NOT by itself put a row here, and the title says
+        // OPERATOR-supplied because that is the half which selects (issue #1280). `run_sweep`
+        // and `recovery_pending` above fold `.any(…)` over the excluded / quarantined sets to a
+        // bool exactly as this does, so the SYSTEM banner's clause (a) is loose for them too —
+        // but the daemon BUILT both sets by cloning roster `account_uuid`s (`refresh_exclusions`
+        // takes the active index and the ranked target, `refresh_quarantined` filters on
+        // in-memory health), so clauses (b) and (c) hold there and the banner is exact where it
+        // is load-bearing. It is the CONJUNCTION that selects this row: operator-supplied AND
+        // selecting nothing. Either half alone reaches rows that belong where they are — the
+        // membership half reaches those two, and the operator-supplied half reaches `execute`,
+        // `parse_subcommand` and the other capture-path rows below, which carry the operator's
+        // string to an ASSIGNMENT rather than testing it against the roster.
         ("account_listed_in", NotHandleResolution, "the `[refresh].accounts` allowlist membership rule — a config-supplied set, and a duplicated label there legitimately admits BOTH bearers"),
         // --- a handle read off an ALREADY-RESOLVED account or index ----------------------------
         //
