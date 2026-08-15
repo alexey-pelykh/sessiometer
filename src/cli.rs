@@ -2705,12 +2705,15 @@ fn red_line(body: &str, emphasize: bool) -> String {
 /// what supplies the type. So `! { … }` with either marker is unformatted, and `! ( … )` with a
 /// bare `const ALL;` is unformatted too.
 ///
-/// Do not tidy either back. Restoring braces, or dropping the `: _`, silently un-gates the ~60
-/// lines below and NOTHING reports it: `cargo fmt --all --check` — the repo's first and cheapest
-/// push gate — passes a region it does not read, so the pass looks identical either way. To
-/// verify it is still armed, mis-indent a variant and confirm `cargo fmt --all --check` FAILS; a
-/// pass over an already-clean body proves nothing. This rests on `rustfmt`'s current macro
-/// handling, which no gate here pins — if that changes, the region goes quietly unguarded again.
+/// Do not tidy either back. Restoring braces, or dropping the `: _`, un-gates the ~60 lines below
+/// as far as `cargo fmt --all --check` is concerned: the repo's first and cheapest push gate
+/// passes a region it does not read, so the pass looks identical either way. What reds instead is
+/// `the_daemon_payload_faults_invocation_stays_reachable_by_cargo_fmt` in this file's own test
+/// module, which asserts BOTH conditions against this source (issue #1283) — before that landed,
+/// nothing anywhere reported either edit. To confirm the FORMATTING is still armed rather than
+/// merely that lint, mis-indent a variant and check `cargo fmt --all --check` FAILS; a pass over
+/// an already-clean body proves nothing. This rests on `rustfmt`'s current macro handling, which
+/// no gate here pins — if that changes, the region goes quietly unguarded again.
 macro_rules! daemon_payload_faults {
     (
         $(#[$enum_meta:meta])*
@@ -16955,6 +16958,103 @@ impl Nested {
                  set changed shape. Re-emit the manifest so the panel is handed the new rank, then \
                  update this count",
                 seen.len()
+            );
+        }
+
+        /// Issue #1283: the `daemon_payload_faults!` invocation must stay reachable by `cargo fmt`.
+        ///
+        /// TWO conditions carry that, and neither works alone (issue #1271; the macro's own
+        /// declaration doc states both). The invocation must be delimited with `(` or `[` —
+        /// `rustfmt` leaves a BRACE-delimited body verbatim, unconditionally, even one that parses
+        /// cleanly. AND its marker must stay `const ALL: _;` — such a body is formatted only if it
+        /// PARSES as Rust, and a bare `const ALL;` does not. Break either and the ~60 variant lines
+        /// leave `cargo fmt` with nothing else in the tree reporting it.
+        #[test]
+        fn the_daemon_payload_faults_invocation_stays_reachable_by_cargo_fmt() {
+            let region = non_test_source(include_str!("cli.rs"));
+
+            // Corpus canary FIRST, both directions, before anything is concluded from `region`:
+            // truncation has to red on its own terms rather than surface as the cardinality
+            // assert's `found 0` — whose message points the reader at a DUPLICATED invocation,
+            // which is the opposite fault — or masquerade as a brace. The lower bound is the
+            // invocation itself, read delimiter-agnostically so this canary cannot be satisfied
+            // by the very property the gate exists to check; the upper is this file's `mod tests`.
+            assert!(
+                region.contains("\ndaemon_payload_faults!"),
+                "the non-test region stops before the `daemon_payload_faults!` invocation it is \
+                 supposed to read"
+            );
+            assert!(
+                !region.contains("fn the_daemon_payload_faults_invocation_stays_reachable"),
+                "the non-test region ran past this file's `mod tests` boundary"
+            );
+
+            let lines: Vec<&str> = region.lines().collect();
+
+            // Every ITEM-LEVEL invocation. The anchor is column 0 plus the trailing `!`, and that
+            // pair is what makes the subject unambiguous: `macro_rules!` spells the name with no
+            // trailing `!`, and every other mention of it in the region sits in a doc comment,
+            // where the `///` prefix keeps the name from ever being the line's FIRST token, which
+            // is what `starts_with` requires. Indentation is not the discriminator — one of those
+            // doc mentions sits at column 0.
+            let sites: Vec<usize> = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| line.starts_with("daemon_payload_faults!"))
+                .map(|(at, _)| at)
+                .collect();
+            assert_eq!(
+                sites.len(),
+                1,
+                "expected exactly one item-level `daemon_payload_faults!` invocation, found {} — a \
+                 second site would let this gate pass on one while the other was un-gated",
+                sites.len()
+            );
+            let at = sites[0];
+
+            // CONDITION 1 — the delimiter. `[` is accepted alongside `(` because `rustfmt` formats
+            // both; only `{` is the hazard. Measured, not assumed: with one variant mis-indented,
+            // `cargo fmt --all --check` reds pointing straight at that variant under EITHER `(` or
+            // `[`, and goes green under `{`.
+            let opener = lines[at]["daemon_payload_faults!".len()..]
+                .trim_start()
+                .chars()
+                .next();
+            assert!(
+                matches!(opener, Some('(' | '[')),
+                "`daemon_payload_faults!` is invoked with `{}`, which `cargo fmt` does not reach. \
+                 That delimiter is LOAD-BEARING, not a stylistic accident: `rustfmt` leaves a \
+                 brace-delimited macro body verbatim unconditionally, so `{{` silently returns the \
+                 whole variant list to being invisible to `cargo fmt` (issue #1271) — and nothing \
+                 else in this repo reds when it does",
+                opener.unwrap_or('?')
+            );
+
+            // CONDITION 2 — the marker, read from the INVOCATION's body, which is the token stream
+            // `rustfmt` actually parses. The matcher's copy up at `macro_rules!` is deliberately
+            // NOT asserted: it cannot diverge from this one silently, because dropping `: _` from
+            // either site alone is a hard `no rules expected` compile error. Only dropping BOTH is
+            // quiet, and that is what this catches. Asserting the matcher too would duplicate the
+            // compiler — the same reason this file asserts the delimiter directly rather than
+            // re-checking that the variants came out formatted.
+            let body_end = lines[at + 1..]
+                .iter()
+                .position(|line| line.starts_with([')', ']', '}']))
+                .expect("the `daemon_payload_faults!` invocation never closes at column 0");
+            let markers: Vec<&str> = lines[at + 1..at + 1 + body_end]
+                .iter()
+                .map(|line| line.trim())
+                .filter(|line| line.starts_with("const ALL"))
+                .collect();
+            assert_eq!(
+                markers,
+                ["const ALL: _;"],
+                "the `daemon_payload_faults!` invocation body must carry exactly one marker, \
+                 spelled `const ALL: _;`. That `: _` is load-bearing for the same reason the \
+                 delimiter is, and is just as easy to tidy away: `rustfmt` formats this body only \
+                 when it PARSES as Rust, and a bare `const ALL;` does not — so dropping it leaves \
+                 the whole variant list unformatted with `cargo fmt --all --check` still GREEN \
+                 (issue #1271), which is exactly the state this gate exists to make loud"
             );
         }
 
