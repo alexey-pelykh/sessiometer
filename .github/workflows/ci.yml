@@ -51,10 +51,51 @@ jobs:
               # change and must run the Rust jobs — for the render goldens especially, since a
               # golden-only PR is exactly the shape a silent re-baseline takes. Consumers, complete
               # as measured — re-derive rather than trust this list, which has drifted before
-              # (issues #1252, #1258). Grep the whole `build/` tree, NOT `build/fixtures`: scoping
-              # the re-derivation to the subdirectory the filter already covers is self-confirming,
-              # and is how the ledger below stayed missing (issue #1258):
-              #   git grep -A2 'include_str!(concat!' -- src | grep build/
+              # (issues #1252, #1258). Two rules are baked into the command below: the first learned
+              # from a consumer an earlier form of it could not see, the second written ahead of one
+              # it could not see yet.
+              #
+              # Grep the whole `build/` tree, NOT `build/fixtures`: scoping the re-derivation to the
+              # subdirectory the filter already covers is self-confirming, and is how the ledger
+              # below stayed missing (issue #1258). And key on the macro being INVOKED, not on how
+              # its argument is spelled: `concat!(…)` is what `include_str!` gets passed, so the old
+              # `include_str!(concat!` keyed on the argument and read only that form, while `src/`
+              # also holds bare `include_str!("…")` sites. No bare site has ever reached `build/` —
+              # each reads a sibling `.rs` file, already covered by `src/**` — but a future
+              # `include_str!("../build/x.md")` would be exactly as invisible as that ledger was
+              # (issue #1278). Keying on the macro and its delimiter is what admits every form:
+              #   git grep -A2 -E 'include_str![[:space:]]*[({[]' -- src | grep build/
+              # A Rust macro takes `(`, `[` or `{`, so the class holds all three, and `cargo fmt`
+              # decides which spellings can reach `src/` at all: it keeps `include_str!(` and
+              # `include_str![` tight but rewrites `include_str!{` to `include_str! {`. So the space
+              # must be allowed for, and it must be spelled `[[:space:]]`, never `\s` — git grep's
+              # ERE has no `\s` and reads it as a literal `s`, silently dropping the one brace
+              # spelling `fmt` permits. Both forms land in range: the bare form carries its path on
+              # the matched line, the `concat!` form within the two lines below it. -A3 finds
+              # nothing further today.
+              # The delimiter is not a code-vs-prose discriminator, though, and prose is not the
+              # main false positive. It clears the macro's prose mentions — they live in comments
+              # and assert strings — only because each of them writes the macro bare; a doc comment
+              # quoting a whole invocation with a `build/` path would surface here. `-A2` is the
+              # wider mechanism: ANY line naming `build/` within two lines of a matching site
+              # surfaces, carrying no `include_str!` at all — which is how all 14 of today's genuine
+              # hits arrive, each path sitting below its macro rather than on it. Read the output
+              # rather than counting it.
+              # One gap outlives all of the above: the match is textual over a 3-line window, so an
+              # invocation assembling its `build/` path from a named constant carries no `build/` in
+              # range and is invisible to every form of this command. No such site exists today —
+              # every invocation's argument is a literal — but re-deriving would not be how you
+              # found out.
+              #
+              # Nothing gates this list's completeness — no test and no workflow step reconciles it
+              # against `src/`, so it is convention, exactly like the ledger's own advisory guard
+              # described below. The cheapest shape that would gate it is a `src/` source-lint test
+              # reading this file, riding the already-required `test` job with no new job and no
+              # `ci-ok.needs` entry; it is unbuilt because "has a filter entry" is a glob-match
+              # question against a list that mixes exact paths with globs, which is a code change to
+              # argue on its own rather than ride in on a docs fix. Until then, re-derive.
+              #
+              # The set that command returns, which this filter must cover:
               # src/migration.rs (frozen v1 artifacts), src/daemon/snapshot_build.rs + src/stats.rs
               # (wire goldens), src/render_golden.rs (cli-renders/**, issue #767),
               # src/config/settings.rs (config-set-reject-details.json), src/cross_surface.rs
