@@ -2605,10 +2605,41 @@ mod tests {
         ("account_listed_in", NotHandleResolution, "the `[refresh].accounts` allowlist membership rule — a config-supplied set, and a duplicated label there legitimately admits BOTH bearers"),
         // --- a handle read off an ALREADY-RESOLVED account or index ----------------------------
         //
-        // The index came from the daemon's own scheduler, from an enumeration of the whole
-        // roster, or from a resolver call that already happened. Nothing here matches an operator
-        // string against anything to SELECT an account, and that — not what the read is
-        // afterwards for — is the whole criterion.
+        // The account or index was settled BEFORE this read — commonly by the daemon's own
+        // scheduler, by an enumeration of the whole roster, or by a resolver call that already
+        // happened. Nothing here matches an operator string against anything to SELECT an
+        // account, and that — not where the index came from, and not what the read is afterwards
+        // for — is the whole criterion.
+        //
+        // Those three are examples, not the provenance, and until issue #1340 this sentence
+        // enumerated them as though they were — the same closed-list shape as the destination
+        // clause below, which #1311 opened while this one was left standing. Rows beneath it
+        // derive their account from none of the three as literally written. `run_capture` and
+        // `run_login` find theirs by STASH name, `roster.iter().find(|a| a.stash() ==
+        // stash_name)` in `src/capture.rs`; `apply_import` takes `.position(…)` on the LOCAL
+        // roster against an INCOMING migration artifact account's uuid. All three say so in their
+        // own row text, which is what the open reading leans on.
+        //
+        // The capture pair's derivation is SYSTEM-supplied, and reading it as a fourth way an
+        // OPERATOR string arrives would invert those rows rather than extend the list.
+        // `Account::stash` is `format!("{STASH_PREFIX}{}", self.account_uuid)` (`src/config.rs`),
+        // derived and never stored (issue #70) — so a stash name is a pure function of the
+        // server-assigned uuid and names exactly one roster entry, and `plan_capture` is what
+        // settled which: it either matched that uuid or pushed the entry, keying the stash by
+        // "the immutable, server-assigned account_uuid — not a positional slot" in its own words.
+        // Were a stash name an operator handle these two would not belong under this banner at
+        // all — they would be resolution, and the repair would be to move them rather than to
+        // open a sentence.
+        //
+        // `apply_import` is where this section and the SYSTEM-supplied one above overlap, and its
+        // uuid match is the half that belongs up there: the string is an account-uuid the
+        // artifact's own `config.toml` produced, `Config::from_toml_str` puts it through the same
+        // `validate` that rejects a duplicated uuid, and the local roster it is matched against
+        // carries that rule too — so first match is correct on both sides, exactly as that banner
+        // argues, and `COMPARING_READERS` records the comparison. What files the row HERE is its
+        // OTHER read: the per-entry labels its report takes off the artifact entry it is
+        // iterating. One row per NAME is what forces the choice between the two banners — the
+        // same one-row-covers-several-reads constraint `poke_all` below is weighed under.
         //
         // The read commonly turns a chosen account into a handle for an event, a snapshot field
         // or a rendered cell, and until issue #1311 this banner said those three WERE the section.
@@ -2659,11 +2690,12 @@ mod tests {
         // swept report line drops to the bare classification — while the named lines print
         // byte-identically.
         //
-        // Left as examples rather than extended to cover them, for the reason `HandleRead`'s own
-        // doc comment gives one scope up: a closed list reads as a MENU, and a destination it does
-        // not name gets filed under the nearest item instead of showing that the criterion above
-        // is what decided the row. The destination is where a reader CHECKS the row; the absence
-        // of a selecting match is what PUTS it here.
+        // Both lists are left as examples rather than extended to cover what they miss, for the
+        // one reason `HandleRead`'s own doc comment gives one scope up: a closed list reads as a
+        // MENU, and a provenance or a destination it does not name gets filed under the nearest
+        // item instead of showing that the criterion above is what decided the row. Where the
+        // index came from and where the handle lands are both where a reader CHECKS the row; the
+        // absence of a selecting match is what PUTS it here.
         ("active_blind_projection", NotHandleResolution, "keys the blind-projection map by label for `status`"),
         ("apply_import", NotHandleResolution, "the import merge — matches an INCOMING artifact account's uuid, and reports per-entry labels"),
         ("blind_swap", NotHandleResolution, "the blind-swap episode events' account / from / to handles"),
