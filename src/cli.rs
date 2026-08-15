@@ -2705,13 +2705,13 @@ fn red_line(body: &str, emphasize: bool) -> String {
 /// what supplies the type. So `! { … }` with either marker is unformatted, and `! ( … )` with a
 /// bare `const ALL;` is unformatted too.
 ///
-/// What the body needs is to PARSE, not that exact spelling — an ascription is necessary for that
-/// and not sufficient. `const ALL: u8;` parses too, and leaves a mis-indented variant reddening
-/// `cargo fmt` just the same, while a TRUNCATED `const ALL: _` keeps the ascription, stops parsing,
-/// and un-gates (measured — issues #1293, #1310, #1329). `: _` is the house spelling, and the test
-/// named below pins it EXACTLY, so re-spelling this one marker is a deliberate re-blessing rather
-/// than drift — a pin deliberately tighter than the property, which is why a red over there is not
-/// by itself proof this region went un-gated.
+/// What the body needs is to PARSE, not that exact spelling — among the `const ALL…` spellings an
+/// ascription is necessary for that and not sufficient. `const ALL: u8;` parses too, and leaves a
+/// mis-indented variant reddening `cargo fmt` just the same, while a TRUNCATED `const ALL: _` keeps
+/// the ascription, stops parsing, and un-gates (measured — issues #1293, #1310, #1329). `: _` is
+/// the house spelling, and the test named below pins it EXACTLY, so re-spelling this one marker is
+/// a deliberate re-blessing rather than drift — a pin deliberately tighter than the property, which
+/// is why a red over there is not by itself proof this region went un-gated.
 ///
 /// Do not tidy any of these back. Restoring braces, dropping the ascription, or deleting the
 /// marker outright — which strands the `#[cfg(test)]` and doc block above it, so the body stops
@@ -17101,8 +17101,8 @@ impl Nested {
                  Reproducing one is not always a single edit: the macro matches over the TOKEN \
                  stream, so the whitespace-and-comment rows below need only the invocation's \
                  marker touched, while any row that changes the marker's TOKENS — a different \
-                 ascription, none at all, the line deleted — needs the matcher's copy up at \
-                 `macro_rules!` changed with it, or the crate stops compiling and this assert \
+                 ascription, none at all, a rename, the line deleted — needs the matcher's copy up \
+                 at `macro_rules!` changed with it, or the crate stops compiling and this assert \
                  never runs (CONDITION 2 above). `left: [\"const ALL;\"]` — the ascription GONE — \
                  really is un-gated: `rustfmt` formats this body only when it PARSES as Rust, and \
                  a bare `const ALL;` does not, so that edit leaves the whole variant list \
@@ -17124,28 +17124,31 @@ impl Nested {
                  command separates the two with no perturbation at all — red at the marker's own \
                  line is a split, green is a truncation. `left: []` says only that NO line matched \
                  the filter — never that the marker is GONE. A marker still PRESENT reaches it \
-                 whenever its first two words stop reading as `const ALL`: split before the name, \
-                 a second space or a tab between the two, a comment between them — each measured, \
-                 each still compiling, each redding `cargo fmt --all --check` at the marker's own \
-                 line. A DELETED marker lands here too, and needs the matcher's copy dropped with \
-                 it or the crate stops at `unexpected end of macro invocation` before any of this \
-                 — and only for that one is the un-gating question live: deleting the line alone \
-                 strands the `#[cfg(test)]` and doc block above it, the body stops parsing and the \
-                 region IS un-gated, while deleting those with it leaves the body parsing and the \
-                 region gated. So `[]` settles nothing by itself. The check that does is the one \
-                 the macro's declaration doc prescribes — mis-indent a variant and run `cargo fmt \
-                 --all --check` — but read its DIFF here, not its exit status. That doc prescribes \
-                 the status for an otherwise CLEAN body, and every re-spelling above that \
-                 `rustfmt` itself rewrites — the splits, the extra space, the tab, the comment — \
-                 already reds that command on the marker's own line, so it exits non-zero with the \
-                 perturbation and without it. What moves is whether the mis-indented VARIANT's \
-                 line is in the diff: present, the region is gated; absent, it is not. Read that \
-                 way, every spelling above that leaves the body PARSING measured GATED — the \
-                 different ascription, and all four splits — and every spelling that stops it \
-                 parsing measured UN-GATED, the three truncations as surely as the \
-                 ascription-dropped `const ALL;` at the top. The pin is exact regardless, so that \
-                 re-spelling this marker is a deliberate re-blessing rather than drift — if you \
-                 meant it, say so in this assertion's expected value (issue #1293)"
+                 whenever its trimmed line stops BEGINNING with `const ALL`: split before the \
+                 name, a second space or a tab between those two tokens, a comment between them — \
+                 each measured, each still compiling, each redding `cargo fmt --all --check` at \
+                 the marker's own line. That is a PREFIX test, not a word one, so a renamed `const \
+                 ALLOWED: _;` reads itself back rather than landing here (measured). A DELETED \
+                 marker lands here too, and needs the matcher's copy dropped with it or the crate \
+                 stops at `unexpected end of macro invocation` before any of this — and among the \
+                 spellings above, only for that one is the un-gating question live: deleting the \
+                 line alone strands the `#[cfg(test)]` and doc block above it, the body stops \
+                 parsing and the region IS un-gated, while deleting those with it leaves the body \
+                 parsing and the region gated. So `[]` settles nothing by itself. The check that \
+                 does is the one the macro's declaration doc prescribes — mis-indent a variant and \
+                 run `cargo fmt --all --check` — but read its DIFF here, not its exit status. That \
+                 doc prescribes the status for an otherwise CLEAN body, and every re-spelling \
+                 above that `rustfmt` itself rewrites — the splits, the extra space, the tab, the \
+                 comment — already reds that command on the marker's own line, so it exits \
+                 non-zero with the perturbation and without it. What moves is whether the \
+                 mis-indented VARIANT's line is in the diff: present, the region is gated; absent, \
+                 it is not. Read that way, every spelling above that leaves the body PARSING \
+                 measured GATED — the different ascription, all four splits, the extra space, the \
+                 tab, the comment and the rename — and every spelling that stops it parsing \
+                 measured UN-GATED, the three truncations as surely as the ascription-dropped \
+                 `const ALL;` at the top. The pin is exact regardless, so that re-spelling this \
+                 marker is a deliberate re-blessing rather than drift — if you meant it, say so in \
+                 this assertion's expected value (issue #1293)"
             );
         }
 
