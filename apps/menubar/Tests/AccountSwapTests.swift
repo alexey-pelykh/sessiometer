@@ -274,17 +274,21 @@ final class AccountSwapTests: XCTestCase {
     //
     // LOAD-INDEPENDENT — CARRIED. Two of that commit's load-bearing claims do have witnesses here:
     //
-    //   - "the poll has to read @MainActor state on the main actor" — `testTheWaitObservesPhaseOnThe`
-    //     `MainActor` above, asserted structurally rather than by timing and checked in both directions.
+    //   - "the poll has to read @MainActor state on the main actor" — `testTheWaitObservesPhaseOnTheMainActor`
+    //     above, asserted structurally rather than by timing and checked in both directions.
     //   - "10 000 yields was ~10 ms on an idle host, and SHORTER the faster the host" — the calibration
     //     below, which re-derives it on whatever host runs it, under no artificial load at all.
     //
     // The convention: CONTRIBUTING.md § Measurements published in a commit body.
 
-    /// Print the budget calibration (`SESSIOMETER_SWAP_MEASURE=1`) — the command that re-derives the
-    /// `~10 ms` figure in `waitUntil`'s comment below. Off by default, and it ASSERTS NOTHING: the
-    /// number is a property of the host, so it is reported. Asserting on it would be a wall-clock timing
-    /// assertion, which is the exact flake class issue #948 removed from this suite.
+    /// Print the budget calibration (`TEST_RUNNER_SESSIOMETER_SWAP_MEASURE=1` under `xcodebuild`) — the
+    /// command that re-derives the `~10 ms` figure in `waitUntil`'s comment below. The prefix is what
+    /// reaches this process: `xcodebuild` forwards a `TEST_RUNNER_`-prefixed variable to the test runner
+    /// with the prefix stripped, and the bare `SESSIOMETER_SWAP_MEASURE` does not arrive at all — so it
+    /// stops at `xcodebuild`, leaves this skipped, and the run still ends `** TEST SUCCEEDED **` having
+    /// printed nothing. Off by default, and it ASSERTS NOTHING: the number is a property of the host, so
+    /// it is reported. Asserting on it would be a wall-clock timing assertion, which is the exact flake
+    /// class issue #948 removed from this suite.
     private var isMeasuring: Bool {
         ProcessInfo.processInfo.environment["SESSIOMETER_SWAP_MEASURE"] == "1"
     }
@@ -309,7 +313,10 @@ final class AccountSwapTests: XCTestCase {
     // reading here is the honest instrument for it and an artificial load would not be.
     @MainActor
     func testMeasureTheBudgetThatReplacedTheYieldCount() async throws {
-        try XCTSkipUnless(isMeasuring, "calibration run only: SESSIOMETER_SWAP_MEASURE=1")
+        try XCTSkipUnless(isMeasuring,
+                          "calibration run only: TEST_RUNNER_SESSIOMETER_SWAP_MEASURE=1 — the bare, "
+                          + "un-prefixed name reaches xcodebuild and not the test, which then lands "
+                          + "on this very skip")
 
         let turns = 10_000                              // the pre-#948 budget, verbatim
         let deadline: Duration = Self.waitUntilBudget   // the committed one, read from its own constant
