@@ -420,9 +420,17 @@ jobs:
       - name: Assert ci-ok.needs covers every job
         run: ./scripts/check-ci-ok-needs.sh
 
-  # Documentation gates (issue #1060). Plural on purpose: this hosts whole-tree checks
-  # over `docs/**`, and issue #1056's acceptance criteria already commit a second one, so
-  # it lands here as a step rather than as another job needing its own `ci-ok.needs` entry.
+  # Documentation gates (issue #1060). Plural on purpose: this hosts the checks over
+  # `docs/**`, and issue #1056's acceptance criteria already commit another one, so each
+  # lands here as a step rather than as another job needing its own `ci-ok.needs` entry.
+  #
+  # Two SCOPES live here as of issue #1058. `check-doc-citations.sh` and
+  # `check-readme-cc-range.sh` inspect the TREE; `check-doc-citation-rot.sh` inspects the
+  # PR's own DIFF (the pre-existing backlog makes a tree-wide version of it unclearable on
+  # arrival), which is why the checkout below is now `fetch-depth: 0` with BASE/HEAD in
+  # env. That is a strict widening: the tree-scoped checks cannot tell the two depths
+  # apart, and the range-scoped one refuses to run at depth 1 rather than reporting a green
+  # it did not measure.
   #
   # NO PATH FILTER, deliberately, and this is the load-bearing part. `ci-ok` counts a
   # `skipped` job as a PASS (its rollup admits `success` and `skipped`), so a filtered
@@ -434,13 +442,23 @@ jobs:
   # silence it exists to break.
   #
   # Not hosted in `gate-change-ack`: that job is PR-range-scoped (`fetch-depth: 0`, BASE/HEAD)
-  # because trailer guards diff a commit range. This check inspects the TREE, needs neither,
-  # and hosting it there would silently disable it on `push` builds.
+  # because trailer guards diff a commit range. This paragraph used to add that the check
+  # here "needs neither"; as of issue #1058 that is no longer true of the job — the
+  # citation-rot step brings both, which is why the checkout below carries them. What still
+  # holds is the reason itself, and it never rested on the depth: `gate-change-ack`'s guards
+  # no-op outside a PR range, so hosting a docs check there would silently disable it on
+  # `push` builds.
   doc-gates:
     name: doc-gates
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # Citation-rot churn is counted from history. The default depth-1 checkout
+          # leaves one parentless grafted commit, under which every churn count collapses
+          # to 1, every file reads as stable and that check degrades into a rubber stamp —
+          # it exits non-zero rather than allow that, so the depth is not optional here.
+          fetch-depth: 0
       - name: Assert every committed doc citation resolves in a fresh clone
         run: ./scripts/check-doc-citations.sh
       # README-vs-ledger range drift (issue #1279). The second step. The job's header explains why
@@ -470,6 +488,17 @@ jobs:
       # the verdict unprinted. This one execs nothing and reads two committed files.
       - name: Assert the README states the ledger's verified Claude Code range
         run: ./scripts/check-readme-cc-range.sh
+      # Citation rot (issue #1058). The third step, and sibling of `check-doc-citations.sh`:
+      # that one asks whether a frontmatter PATH resolves in a fresh clone, this one whether a
+      # body LINE NUMBER still means what it claimed. On `push` there is no PR
+      # range; BASE_SHA/HEAD_SHA are empty, the script falls back to this branch's merge-base
+      # with origin/main, and on main that is HEAD — nothing added, nothing to check, which
+      # it says in those words rather than claiming a clean sweep.
+      - name: Assert no PR adds a source citation that will rot silently
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: ./scripts/check-doc-citation-rot.sh
 
   # Gate-integrity acknowledgment (issue #317). `ci-ok` and the invariants it rolls
   # up live in PR-mutable files — this workflow, `scripts/**`, `deny.toml`, `.cargo/**`.

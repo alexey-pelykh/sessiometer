@@ -174,6 +174,56 @@ Worked example, including the figures that are labelled and the two that turned 
 carryable after all:
 [`apps/menubar/Tests/AccountSwapTests.swift`](apps/menubar/Tests/AccountSwapTests.swift)
 § Calibration, and PR #1095's own body.
+## Citing source locations in docs/
+
+Documents under `docs/` cite code as `src/<file>.rs:NNN`. A stale **path** fails
+loudly — the file is not there. A stale **line number** fails silently and
+plausibly, which is worse: `src/cli.rs:4549-4611`, cited as the `import` body,
+came to rest on `write_export`'s doc comment after an unrelated PR shifted the
+file. It still resolved, still looked like evidence, and still read as verified.
+That happened twice in one week, and the second time only an adversarial review
+caught it (issue #1058).
+
+The rule:
+
+> Cite a **symbol** for a file that churns; a bare **line number** only for one
+> that does not. Never carry a line number across a rebase without re-deriving it.
+
+A line number is fine as a *secondary* locator — `` `apply_import`
+(`src/cli.rs:4726-4813`) `` is the preferred form, because when the range drifts
+the symbol still names the truth and a reader can grep their way back. That
+example is not hypothetical and its range has *already* drifted since it was
+written, which is the point: `apply_import` still finds it in one grep, and no
+number is quoted here to replace the stale one, because a fresh one would be
+stale in turn. What rots is a number left as the **sole** referent, with nothing
+beside it to re-derive from. That is the shape the guard below rejects.
+
+"Churns" is not a judgment call — measure it:
+
+```sh
+# commits touching a file among the last 300 on this branch; >= 15 is churning
+git rev-list --count "$(git rev-list --max-count=1 --skip=299 HEAD)..HEAD" -- src/cli.rs
+```
+
+Those two numbers are the guard's defaults (`CITATION_CHURN_WINDOW`,
+`CITATION_CHURN_THRESHOLD`). The threshold is a **deliberate choice, not a
+derived constant**, and it is set stricter than this repo's own past practice
+rather than reconstructing it — run the guard over PR #1057
+(`./scripts/check-doc-citation-rot.sh 386a6a2^ 386a6a2`) and it goes red, so any
+claim that it merely reproduces that judgment is false. It is set low on the
+asymmetry instead: naming a symbol costs one word and never rots, so a false
+demand costs a word while a false exemption costs a silently-rotted citation.
+The window is a commit count rather than a date range on purpose — a calendar
+window would make the same commit green today and red next month because the
+window slid, not because anything changed.
+
+The guard is scoped to **the PR's own diff**, not the tree. The corpus already
+carries a backlog of bare citations into churning files, so a tree-wide gate
+would be red the day it landed and clearable only by the bulk conversion this
+convention explicitly does not ask for. Working through that backlog is a
+separate, optional job; `./scripts/check-doc-citation-rot.sh --audit` counts and
+lists it as of whatever ref you pass (default `HEAD`) — the counts move with
+every merge, so read them from the tool rather than from prose.
 
 ## Guards and where the rationale lives
 
@@ -243,6 +293,24 @@ carryable after all:
   enough to run on every `Formula/**` touch (issue #567). Its falsifier,
   [`scripts/check-formula.test.sh`](scripts/check-formula.test.sh), proves the guard
   goes RED on the stanza-order defect of issue #566.
+- [`scripts/check-doc-citation-rot.sh`](scripts/check-doc-citation-rot.sh)
+  — a CI guard (the `doc-gates` job in
+  [`.github/workflows/ci.yml`](.github/workflows/ci.yml)) that fails the build when a
+  PR ADDS a `src/<file>.rs:NNN` citation under `docs/` that will rot silently: a bare
+  line number, with no symbol named beside it, into a file the PR's own history shows
+  is churning — or, whatever the churn, one pointing past the file's EOF or at a file
+  no clone has. Scoped to the PR's diff rather than the tree, because a backlog of such
+  citations already exists and a gate that is red on arrival is a gate nobody reads
+  (issue #1058);
+  the convention it enforces is § Citing source locations in docs/ above. It refuses to
+  run against a shallow clone rather than reporting the green that a depth-1 checkout —
+  whose one grafted commit is parentless, collapsing every churn count to 1 and every
+  file to "stable" — would otherwise manufacture. Falsifier peer:
+  [`scripts/check-doc-citation-rot.test.sh`](scripts/check-doc-citation-rot.test.sh),
+  which proves it goes RED on the shape issue #1058 reports (a bare range into a
+  churning file) and GREEN on both things it must never block — a symbol-anchored
+  range, and a bare line number into a file that does not move. It exercises that
+  shape over its own throwaway fixture, which has no `src/cli.rs` in it.
 - `cargo deny check advisories sources licenses` — the supply-chain gates configured
   in [`deny.toml`](deny.toml).
 - [`docs/adr/`](docs/adr/) — Architecture Decision Records for the load-bearing
