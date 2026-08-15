@@ -846,10 +846,15 @@ pub(crate) async fn reconcile_login(
     // #276: a non-activating REVIVE did NOT re-point the canonical item, so the daemon's
     // #107 path won't clear this account's `needs re-login` quarantine — signal it to
     // un-quarantine the revived account NOW (the reliable on-demand path, since the #106
-    // sweep is starved, #260). Best-effort like the roster-reload notify above, and a
-    // daemon-side no-op when it isn't quarantined (#275); skipped when `activate` (the
-    // re-point already un-quarantines via #107) or on an onboard (a brand-new account was
-    // never quarantined). See [`should_signal_restored`].
+    // sweep is starved, #260). Best-effort like the roster-reload notify above; skipped
+    // when `activate` (the re-point already un-quarantines via #107) or on an onboard (a
+    // brand-new account was never quarantined). Daemon-side it forks on the named
+    // account's OWN verdict, NOT on the quarantine flag (#643): a non-`Dead` account takes
+    // the #275 primitive, which IS a no-op when it isn't quarantined — but a `Dead`-latched
+    // PARKED account is re-probed with an isolated refresh either way (a `claude -p` spawn
+    // and a durable `PollRefresh`), and that re-probe reaches the primitive on every
+    // outcome except `Dead`, so a transient error un-quarantines while a confirmed-dead
+    // credential KEEPS its quarantine. See [`should_signal_restored`].
     if should_signal_restored(activate, report.outcome) {
         notify_daemon_restored(&captured_uuid).await;
     }
