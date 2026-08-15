@@ -174,6 +174,141 @@ Worked example, including the figures that are labelled and the two that turned 
 carryable after all:
 [`apps/menubar/Tests/AccountSwapTests.swift`](apps/menubar/Tests/AccountSwapTests.swift)
 § Calibration, and PR #1095's own body.
+
+## Writing an acceptance criterion
+
+A merge here *is* the verification event — acceptance criteria are its precursor, not a parallel
+record. So a criterion that cannot be settled from the artifact does not raise the bar; it moves the
+decision somewhere no reviewer can reach.
+
+> A criterion specifies a **property of the artifact**, not an **activity the author performed**.
+> Where an activity is genuinely wanted, the criterion names the committed artifact that evidences
+> it — or, where nothing committed can, demands the **label** rather than the run.
+
+**An activity has no in-band carrier.** A diff can carry the *count* of a soak as prose; it can never
+carry the *performance* of the run. A criterion demanding one is therefore dischargeable only by
+author attestation — exactly the class an independent reviewer is structurally barred from accepting.
+A clean change then converts into a block by construction, and that block says nothing about the
+change.
+
+This guide already forbids one instance of the same defect: [do not write an acceptance criterion
+asserting that the Linux build works](#supported-platform-macos-only), because nothing verifies it.
+Hold the two together, because the root is identical — the criterion names something no artifact
+carries — and only the sign differs:
+
+- **No gate exists**, so the criterion cannot fail. It passes vacuously and reads as verified.
+- **Only attestation exists**, so the criterion cannot pass an independent check. A faithful
+  implementation is blocked, and the criterion looks vindicated by the blocking.
+
+Neither is a strict bar. Both are a bar pointing at nothing.
+
+**The worked example, because the failure is not obvious in the abstract.** Issue #912 carried four
+criteria and three of them were already properties — *the mechanism is confirmed with evidence*, *the
+root cause is stated*, *the fix does not weaken the assertion*. Only the fourth was not:
+
+> - [ ] Verified over a run count that could actually catch it, with the count stated. Given the
+>       observed rarity, that means a soak substantially larger than the 125 runs it took to see it
+>       once.
+
+That names an **instrument** — a soak of size N — and it pre-commits to a statistical epistemology
+*before the mechanism is known*. Its own first criterion can make the soak unnecessary, and on PR
+#1095 it did. `readAck`'s `defer` closes the connection strictly before `send` returns, and
+`CommandFakeConnection.close()` increments `closeCount` inside its lock strictly before it finishes
+the `lines` stream — so a read-phase timeout cannot return with `closeCount == 0`, and that reading
+implies the connect path *necessarily* rather than probably. The entailment is universally
+quantified and re-derivable from the tree in minutes, which makes it strictly stronger than any
+finite sample of it — and unreachable by a criterion that demands the sample. Both symbols live in
+[`ControlCommandClient.swift`](apps/menubar/Sources/ControlCommandClient.swift) and
+[`ControlCommandTransportTests.swift`](apps/menubar/Tests/ControlCommandTransportTests.swift);
+the test file records the same argument in a comment beside the test it governs.
+
+The pair that would have worked, and that #1101 proposed:
+
+> - [ ] The repaired assertion is shown insensitive to the mechanism identified above — either
+>       **(a)** by construction, with the entailment stated and checkable against the code, or
+>       **(b)** failing that, by a stated-count soak under a stated load regime whose pre-fix arm
+>       reproduces the reported failure verbatim.
+> - [ ] Either way, a **committed test drives the identified mechanism deterministically**, so a
+>       teardown regression fails CI rather than needing a soak to rediscover it.
+
+Outcome-specified, artifact-dischargeable everywhere except clause (b) — which the next paragraph
+takes up — and it admits the proof route instead of foreclosing it. Both clauses hold on `main` with
+no soak at all: the entailment above for the first, and `testSlowConnectIsBoundedByTimeout` for the
+second, which drives the connect path deterministically by putting a one-second blocking connect
+against a 150 ms budget. The second clause is the load-bearing one — it is what converts a
+regression that a soak would have to rediscover into one the required suite catches.
+
+**Clause (b) is still an activity, and that is the point of writing it down.** Where no entailment is
+available and only a performed run can settle the question, say so *in the criterion* — and have the
+criterion demand the **label** rather than the run: what was done, where its result is published, and
+that no committed artifact re-derives it. A reviewer then meets the attestation *as* attestation and
+can weigh it, instead of being handed it in verification costume. The defect was never that
+attestation exists; it is that an unlabelled demand for one is indistinguishable from a demand for
+evidence.
+
+[§ Measurements published in a commit body](#measurements-published-in-a-commit-body) is that label in
+its established form — a re-runnable carrier, or the explicit `one-time attestation, no in-repo
+witness` label — and it is the discharge to name whenever the activity falls in the class it governs.
+Check what it governs before pointing at it — not from its opening line, which is about permanence,
+but from the bolded sentence introducing its two discharges, whose class is *a load-dependent
+measurement* where this rule's is wider. An empirical walk against a live external system, or a
+check performed under the configuration that actually ships rather than in the foreground, is an
+activity with no in-band carrier and no load to depend on; both are live in this tracker today.
+Those get the same treatment — the criterion names the label — with no section to defer to.
+
+**Do not "fix" #912's criteria.** They stand as written on purpose: PR #1095 is faithful to them, the
+defect is in the criterion rather than in the implementation, and rewriting them would delete the
+only worked example this section has.
+
+Two things this does **not** say. It does not say *always soak*. Mandating the run lands back on the
+second of the two failures above — only attestation exists — which is where #912's fourth criterion
+already sat; clause (b) is the fallback, and clause (a) is stronger wherever it is reachable. And it
+does not restrict what a commit body may **state**: a soak you actually ran is worth publishing,
+§ Measurements published in a commit body governs that and is unchanged. The rule here is narrower,
+constraining only what a criterion may **demand as a condition of acceptance**.
+
+Nothing enforces any of this. No CI job reads a *criterion*. The unfiltered `doc-gates` job does
+walk every document under `docs/`, the requirements briefs included, and it reads more of them than
+their frontmatter: `check-doc-citations.sh` resolves the path-shaped frontmatter values, and
+`check-doc-citation-rot.sh` reads the **body**, holding each `src/<file>.rs:NNN` citation the PR's
+own diff adds or modifies to a symbol a reader can re-derive the line from — the tree-wide sweep is
+its `--audit` mode, which CI does not invoke. Neither reaches a criterion. An issue body is outside
+CI altogether, and *names an activity* is a prose judgment rather than a matchable pattern in any
+case.
+
+**The committed briefs under `docs/requirements/` are not exempt, and their form is no evidence that
+they are.** Where they use the `**AC-N**` block, their criteria are a *Given / When / Then* over the
+artifact — but that is a template, and an activity demand fits it exactly. Three that do, each
+passing the form:
+
+- `menubar-accessibility-reachability.md` **AC-2** rules the carrier out in its own text — *"verified
+  against a running app, not only the harness"* — where the harness is the committed artifact.
+- Its **AC-1** wants the effect of a system text-size change *"recorded ... with evidence"* for each
+  of four cells against a running signed app. Nothing committed changes a system-wide OS setting.
+- `gui-cli-capability-parity.md` **AC-1** wants *"the login completes and the account returns to
+  healthy **without the operator typing a command anywhere**"* — an operator act and a real OAuth
+  round trip, neither of which a tree can be in the state of having done.
+
+The pattern is worth more than the instances: all three sit in the two briefs whose subject is the
+running app or a live external flow, and the briefs whose subject is committed code read far
+cleaner.
+
+A fourth instance sits where nothing keyed to the `**AC-N**` form can reach it, and the blind spot
+is worth as much as the instance. `session-warmup-on-reset.md` states its acceptance as prose under
+`## 7. Success criteria` and carries no AC block at all, so any instrument counting that form passes
+over it in silence. Its first criterion discharges through R-1, which requires the measurement be
+taken *"on at least three cycles across at least two accounts"* — #912's fourth criterion again, in
+a committed brief. Its subject is a live external measurement, so it falls on the same side of the
+line as the three above rather than disturbing it.
+
+That is where the rule above has to do its work — name the committed artifact, or demand the label —
+and `menubar-accessibility-reachability.md` already works both routes itself. **AC-8** takes the
+label: *"the verification tier is recorded as manual-only"*. **AC-4a** takes the artifact, naming
+the Appearance-settings manual checklist in `apps/menubar/design/README.md` and requiring it carry a
+text-size step. That second route is the established one here:
+[ADR-0031](docs/adr/0031-ui-verification-tiers-bounded-by-structural-blindness.md) records a
+**Manual pre-release** tier whose landed evidence is the manual checklists in that same file.
+
 ## Citing source locations in docs/
 
 Documents under `docs/` cite code as `src/<file>.rs:NNN`. A stale **path** fails
