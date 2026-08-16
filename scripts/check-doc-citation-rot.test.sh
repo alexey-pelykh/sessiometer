@@ -273,8 +273,28 @@ check "bare line number into a STABLE file is ACCEPTED" 0 "$rc"
 run 'The fallback path is at src/quiet.rs:12, reached from `quiet_helper`.'
 check "symbol disagreeing with the number is REJECTED even in a STABLE file" 1 "$rc"
 
+# Two assertions, because the single one they replace named two things and
+# pinned one (issue #1406). Its body greps only for the phrase, so restoring the
+# churn parenthetical PR #1401 took out of that message — `(${c} commits in the
+# last ${WINDOW})`, after `disagree`, in `check_line`'s `elsewhere` branch —
+# left this whole suite green, measured by doing it. The second clause now has a
+# body of its own, and each name states exactly what its own test pins.
+#
+# They are a PAIR, not independents: the negative one passes VACUOUSLY if the
+# disagreement message goes away entirely, so it carries the claim only beside
+# the positive one above it. It reads that message's OWN line rather than the
+# whole output, so it says what its name says — the DEMAND branch's two messages
+# carry the churn count legitimately, and this fixture cites once today but need
+# not forever. `case` rather than `grep -q`, so that a SIGPIPE under `pipefail`
+# cannot turn a NEGATIVE assertion green — the hazard `occurs()` in the guard
+# documents and dodges with process substitution, where the same shape changes
+# the violation count silently instead of failing loudly.
 printf '%s\n' "$out" | grep -q 'the symbol and the number disagree' && rc=0 || rc=1
-check "refusal reports the disagreement, not a churn verdict" 0 "$rc"
+check "refusal reports the disagreement" 0 "$rc"
+
+disagreement="$(printf '%s\n' "$out" | grep 'the symbol and the number disagree' || true)"
+case "$disagreement" in *"commits in the last"*) rc=1 ;; *) rc=0 ;; esac
+check "the disagreement refusal carries no churn count" 0 "$rc"
 
 # A backticked PATH is one token to a reader, so it anchors nothing and — now
 # that the check above runs at any churn — must not manufacture a disagreement
