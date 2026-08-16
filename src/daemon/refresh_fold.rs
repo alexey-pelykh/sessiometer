@@ -403,7 +403,7 @@ where
     ///   confirmed-dead credential stays out of rotation and honestly 🔴 (the AC-3 regression guard);
     /// - a transient `Error` (a spawn / read-back / lock hiccup — INCONCLUSIVE, not a dead verdict)
     ///   → un-quarantine (preserving the #275 guarantee that a re-login clears the quarantine) → 🟡
-    ///   `AtRisk`, which self-heals on the next sweep rather than stranding a genuinely-fixed account.
+    ///   `AtRisk`, cleared by the next LIVE refresh outcome, rather than stranding a genuinely-fixed account.
     ///
     /// `expires_at_ms` refreshes the staleness clock ONLY when `Some` (the parked path passes the
     /// fresh stash expiry; the active path passes `None`, since
@@ -464,8 +464,11 @@ where
     /// Recovery stays gated on a genuinely SUCCESSFUL refresh (the issue #427 false-recovery guard):
     /// [`keep_warm_and_promote`](Self::keep_warm_and_promote) mints + promotes, surfacing the cycle's
     /// classified [`RefreshEventOutcome`], which [`fold_recovery_outcome`](Self::fold_recovery_outcome)
-    /// folds — a live outcome clears the `Dead` latch to 🟢; a `Dead` re-mint (CC rejected the refresh
-    /// token, or it is absent) keeps the honest 🔴. `expires_at_ms` is `None`: a real mint's
+    /// folds through its three-way ladder — a live outcome clears the `Dead` latch and un-quarantines;
+    /// a transient `Error` (the mint could not run, or ran and classified an error) un-quarantines
+    /// anyway, to `AtRisk`, because INCONCLUSIVE is not a death; and only a `Dead` re-mint (CC
+    /// rejected the refresh token, or it is absent) keeps the honest 🔴. That gate reads the `Dead`
+    /// VERDICT alone, exactly as it does on the parked fork. `expires_at_ms` is `None`: a real mint's
     /// [`promote_canonical`](Self::promote_canonical) already reconciled `access_expires_at` (issue
     /// #477), so the active path must not clobber it to `None` and false-fire `Stale`.
     pub(super) async fn reprobe_active_if_dead(&mut self) -> Vec<Event> {
@@ -486,9 +489,10 @@ where
             return Vec::new();
         };
         let mut events = Vec::new();
-        // `.promoted` is deliberately unused here (the `..`): a promote either landed a fresh token
-        // for the fold's live outcome to clear, or it didn't and the fold keeps the honest 🔴 — the
-        // recovery verdict keys on `outcome`, not on whether the canonical was rewritten.
+        // `.promoted` is deliberately unused here (the `..`): the recovery verdict keys on `outcome`,
+        // not on whether the canonical was rewritten — and the two do not partition the same way. Only
+        // a real mint hands back a credential to promote at all, so a live `NoChange` promotes nothing
+        // and a transient `Error` promotes nothing either, yet the fold un-quarantines on both.
         let KeepWarmPromote { outcome, .. } = self
             .keep_warm_and_promote(idx, &canonical, KeepWarmTrigger::Recovery, &mut events)
             .await;
@@ -1811,10 +1815,11 @@ mod tests {
     // --- issue #643: revived-account stale-Dead-latch re-probe --------------
     //
     // A non-active account whose REFRESH token died latches 🔴 `Dead` (`last_refresh_outcome ==
-    // Some(Dead)`), which clears ONLY on a genuinely successful refresh. Manual recovery
-    // (`sessiometer login` on a parked account whose ACCESS token is still valid, or `sessiometer
-    // use` activating a dead spare) never drove such a refresh — usage polls kept returning 200, so
-    // the account read stale 🔴 for a full ~8h access-token lifetime. The fix re-probes on the spot:
+    // Some(Dead)`), which no usage poll can clear — only the next refresh OUTCOME replaces it, and
+    // one that comes back `Dead` re-latches. Manual recovery (`sessiometer login` on a parked
+    // account whose ACCESS token is still valid, or `sessiometer use` activating a dead spare) never
+    // drove a refresh at all — usage polls kept returning 200, so the account read stale 🔴 for a
+    // full ~8h access-token lifetime. The fix re-probes on the spot:
     // the parked path (`reconcile_restored`) drives the isolated `poll_refresh` engine; the active
     // path (`reprobe_active_if_dead`) drives the active-safe `keep_warm` engine. Recovery stays
     // gated on a SUCCESSFUL refresh (never a usage 200 — the #427 false-recovery guard).
@@ -2252,6 +2257,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reprobe_active_if_dead_un_quarantines_a_transient_mint_error_to_at_risk_not_dead() {
+        // The ACTIVE fork's THIRD arm (issue #1392), sibling of
+        // `reconcile_restored_un_quarantines_a_transient_error_re_probe_to_at_risk_not_dead` one fork
+        // over. A mint that could not even RUN — the `Err(_)` arm: a locked keychain, an unresolvable
+        // binary, an FS error — is INCONCLUSIVE, not a proven death, so `fold_recovery_outcome`'s
+        // `!matches!(outcome, Dead)` guard un-quarantines on it here exactly as it does on the parked
+        // path, and the terminal `Dead` verdict clears to `AtRisk` instead of stranding a
+        // `use`-activated account that may well be fixed. One arm of two: a cycle that COMPLETED and
+        // classified `RefreshOutcome::Error` (a failed spawn, an unreadable read-back, a malformed
+        // blob) reaches the same `RefreshEventOutcome::Error` through `refresh_event_outcome`, and
+        // `fold_recovery_outcome` takes that value alone, so the two are indistinguishable to it.
+        // Where the two FORKS part is what happens NEXT: the parked sibling's `AtRisk` self-heals on
+        // the next sweep, but `refresh_exclusions` holds the ACTIVE account out of every sweep, so the
+        // streak behind this verdict clears only once the account is parked again and a sweep refresh
+        // comes back live. Every other test on this fork scripts a `Refreshed` or a `Dead` mint, so
+        // before this one the arm was reachable but pinned by nothing.
+        const NOW: i64 = 1_782_777_600;
+        let (daemon, outcomes, calls) = keep_warm_daemon(
+            Scripted::Ok(reading(0.10, 0.10)),
+            RefreshOutcome::Refreshed { rotated: true },
+            None,
+            Some(cred(b"FRESH-A")),
+            warm_canonical(FAR_FUTURE_MS, "rt-live"), // non-empty RT → the mint DOES get driven
+        )
+        .await;
+        // `keep_warm_daemon` scripts only COMPLETED cycles, so swap its engine for a `hard_error` one,
+        // re-using the same call counter and the same 1-hour cadence. The scripted `outcome` / `fresh`
+        // are unreachable past that flag, and are deliberately the PROMOTING pair: were the flag ever
+        // lost, the fake would hand a credential back and the canonical assertion below would red,
+        // rather than passing for the unrelated reason that nothing was scripted to promote at all.
+        let mut daemon = daemon.with_keep_warm_engine(
+            Box::new(SeamKeepWarm {
+                outcomes,
+                outcome: RefreshOutcome::Refreshed { rotated: true },
+                revive_to: None,
+                fresh: Some(cred(b"FRESH-A")),
+                calls: calls.clone(),
+                hard_error: true,
+            }),
+            Duration::from_secs(3600),
+        );
+        daemon.state.active = Some(0);
+        daemon.state.accounts[0].health.last_refresh_outcome = Some(RefreshEventOutcome::Dead);
+        daemon.state.accounts[0].health.quarantined = true;
+        // Already signaled by whatever latched `Dead`. An `Error` fold cannot re-fire the #261 operator
+        // signal in any case (that edge is keyed on a `Dead` outcome), so this only keeps the starting
+        // state honest rather than isolating a claim.
+        daemon.state.accounts[0].health.unrecoverable_signaled = true;
+
+        let events = daemon.reprobe_active_if_dead().await;
+
+        assert_eq!(
+            calls.get(),
+            1,
+            "the use-activated credential is re-probed exactly once"
+        );
+        assert!(
+            !daemon.state.accounts[0].health.quarantined,
+            "a transient mint error still lifts the quarantine (never strands a fixed account)",
+        );
+        assert_eq!(
+            daemon.store.read().await.unwrap().expose(),
+            warm_canonical(FAR_FUTURE_MS, "rt-live").expose(),
+            "a mint that could not run hands back nothing to promote — the canonical is untouched",
+        );
+        let h = &daemon.state.accounts[0].health;
+        assert_eq!(
+            credential_health(
+                h.quarantined,
+                h.last_refresh_outcome,
+                h.consecutive_refresh_failures,
+                h.access_expires_at,
+                false,
+                NOW,
+            ),
+            CredentialHealth::AtRisk,
+            "an inconclusive mint error reads AtRisk — not a false Dead, and not a false Healthy",
+        );
+        assert_eq!(
+            events,
+            vec![
+                Event::KeepWarm {
+                    account: "work".to_owned(),
+                    trigger: KeepWarmTrigger::Recovery,
+                    outcome: RefreshEventOutcome::Error,
+                },
+                Event::CredentialRestored {
+                    account: "work".to_owned(),
+                },
+            ],
+            "the re-probe logs the could-not-run keep_warm ACTION, then the un-quarantine edge",
+        );
+    }
+
+    #[tokio::test]
     async fn reprobe_active_if_dead_keeps_an_honest_dead_for_an_empty_refresh_token() {
         // AC-2 / AC-3 / invariant 4 (empty-RT): a dead (empty) refresh token cannot be revived by any
         // mint, so the active re-probe SHORT-CIRCUITS — no `claude -p` spawn, no event — and the honest
@@ -2534,6 +2634,7 @@ mod tests {
                 revive_to: None,
                 fresh: Some(fresh.clone()),
                 calls: calls.clone(),
+                hard_error: false,
             }),
             Duration::from_secs(3600),
         );

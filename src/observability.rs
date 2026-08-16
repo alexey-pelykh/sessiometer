@@ -410,9 +410,9 @@ pub(crate) enum KeepWarmTrigger {
     /// the 401 advances the #42 death streak toward a false quarantine.
     Reactive,
     /// A forced mint fired when a `use`-activated account carries the terminal 🔴 `Dead` verdict
-    /// (issue #643): the active-safe re-probe that folds a genuinely successful refresh back to
-    /// 🟢 — or leaves an honest 🔴 — instead of latching the stale `Dead` for a full access-token
-    /// lifetime until the next natural sweep.
+    /// (issue #643): the active-safe re-probe, folded three ways — a live mint clears the `Dead`
+    /// latch, a transient `Error` un-quarantines to `AtRisk`, and only a `Dead` re-mint keeps an
+    /// honest 🔴, instead of latching the stale verdict until the account is parked and swept again.
     Recovery,
 }
 
