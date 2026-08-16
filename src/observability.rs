@@ -5129,11 +5129,12 @@ pub(crate) mod tests {
     ///
     /// The job it does on EVERY line is stripping the trailing comma, and that is what makes a
     /// FIELDLESS variant visible at all: `AllExhaustedCleared,` yields `AllExhaustedCleared` —
-    /// an identifier with nothing after it, one of the three shapes `declared_variant_names`
-    /// accepts. Drop the call and the seven bare-token `Event` variants and `Diagnostic::Stop`
-    /// go undeclared. Today that fails loudly, because they are all sampled; but a bare-token
-    /// variant added LATER would be missing from BOTH sets at once, and the sweep would pass
-    /// over it in silence — which is precisely the hole issue #891 closes.
+    /// an identifier with nothing after it, which is one of the remainders the
+    /// `declares_variant` predicate inside `variant_names_in` accepts. Drop the call and the
+    /// seven bare-token `Event` variants and `Diagnostic::Stop` go undeclared. Today that fails
+    /// loudly, because they are all sampled; but a bare-token variant added LATER would be
+    /// missing from BOTH sets at once, and the sweep would pass over it in silence — which is
+    /// precisely the hole issue #891 closes.
     ///
     /// Separating variants that share a line is the secondary job: `A, B,` yields `A` and `B`,
     /// while `Monitor401 { account: String, consecutive: u32 },` yields the single whole
@@ -5237,23 +5238,92 @@ pub(crate) mod tests {
     /// hole issue #891 closes, one level down. Divergence is therefore avoided in the parser
     /// rather than delegated to convention: identifiers admit `_` (so a non-camel-case variant
     /// is still seen, not silently dropped), a body line is split on its top-level commas (so
-    /// `A, B,` on one line yields both), and a segment's leading attributes are stepped over (so
-    /// `#[allow(dead_code)] Scheduled,` yields `Scheduled` rather than nothing — issue #1397).
-    /// Over-matching is safe — a name that is not really a variant lands in `declared`, goes
-    /// unsampled, and FAILS loudly; it is under-matching that would pass quietly, and that is
-    /// what the rules above remove.
+    /// `A, B,` on one line yields both), a segment's leading attributes are stepped over (so
+    /// `#[allow(dead_code)] Scheduled,` yields `Scheduled` rather than nothing — issue #1397),
+    /// and a name may be followed by an EXPLICIT DISCRIMINANT (so `Scheduled = 3,` yields
+    /// `Scheduled` rather than nothing — issue #1410). Over-matching is safe — a name that is
+    /// not really a variant lands in `declared`, goes unsampled, and FAILS loudly; it is
+    /// under-matching that would pass quietly, and that is what the rules above remove.
     ///
-    /// They remove the shapes they name, which is NOT the same as removing under-matching, and
-    /// the difference is what a later consumer would otherwise inherit as a guarantee. The
-    /// parser models a subset of Rust's variant grammar; a spelling outside that subset yields
-    /// no name and passes vacuously, silently. The shapes known and deliberately unhandled are both
-    /// out of `cargo fmt`'s reach in the same way `#[rustfmt::skip]` puts the shape above out of
-    /// it: a variant whose declaration is produced by a MACRO is not in this file's text at all,
-    /// and a `#[cfg(…)]`-gated variant is counted whether or not the compiler kept it, so a
+    /// Safe is not free, though, and the discriminant arm is where that begins to bite — so the
+    /// rule bounding it is stated here rather than left to be re-derived. An attribute spread
+    /// over several LINES leaves its `key = value` continuations at depth 1 as well: the depth
+    /// counter moves on BRACES, and the brackets and parens an attribute is built out of do not
+    /// touch it. On the remainder test alone, such a continuation reads as a declaration. What
+    /// rejects it is the ASCII-uppercase INITIAL, which a conventionally snake_case attribute
+    /// key does not carry.
+    /// Measured on issue #1410 over synthetic text, a three-line `#[cfg(all(…))]` whose middle
+    /// line is `target_os = "macos",`, sitting above an ordinary variant: with the initial rule
+    /// dropped the scan returns `target_os` beside the variant's own name, and with it kept it
+    /// returns the variant alone. Still the loud direction — but loud about a name nobody wrote,
+    /// on a spelling that has nothing to do with this scan. Relaxing that rule is therefore not
+    /// free either, which is what the identifier-rule entry in the catalogue below turns on.
+    ///
+    /// Read that as a bound on the leading token's CASE rather than on the `key = value` FORM,
+    /// because a key may be spelled with an uppercase initial and then the form does not save
+    /// it. Measured the same way, `Bar = 1,` inside a multi-line `#[foo(…)]` scans to
+    /// `{"Anchor", "Bar", "Gated"}` — and to `{"Anchor", "Gated"}` with the `=` arm removed and
+    /// nothing else touched, so that one is a shape this arm makes reachable. A continuation
+    /// whose remainder is empty or opens a body is read on the same rule and was already:
+    /// `Foo,` inside a multi-line `#[cfg(any(…))]` carries the initial, takes the
+    /// `rest.is_empty()` arm and measures `{"Anchor", "Foo", "Gated"}` on both sides of that
+    /// removal. Both run in the loud direction, so they are recorded rather than closed; what a
+    /// later reader must not inherit is the bound stated over the remainder form.
+    ///
+    /// The rules above remove the shapes they name, which is NOT the same as removing
+    /// under-matching, and the difference is what a later consumer would otherwise inherit as a
+    /// guarantee. The parser models a subset of Rust's variant grammar; a spelling outside that
+    /// subset yields no name and passes vacuously, silently. THAT sentence is the bound. What
+    /// follows is the list of shapes KNOWN to sit outside it — a record of what has been looked
+    /// at, never a guarantee that whatever is absent from it must be unreachable or loud. A
+    /// shape not listed is unclassified, not handled.
+    ///
+    /// A variant whose declaration is produced by a MACRO is not in this file's text at all. A
+    /// `#[cfg(…)]`-gated variant is counted whether or not the compiler kept it, so a
     /// declared-but-compiled-out variant reads here as unsampled and fails LOUDLY — the safe
-    /// direction, and the reason it is left. Neither is reachable in this crate today: no enum
-    /// this scan reads is macro-generated or carries a `cfg` on a variant. Adding one puts the
-    /// weight back on this parser, so widen it in that change rather than trusting this list.
+    /// direction, and the reason it is left. Both are out of `cargo fmt`'s reach in the same way
+    /// `#[rustfmt::skip]` puts the same-line attribute above out of it, and neither is reachable
+    /// in this crate today: no enum this scan reads is macro-generated or carries a `cfg` on a
+    /// variant.
+    ///
+    /// A variant name the IDENTIFIER rule above does not admit joins them, and it is neither of
+    /// those things: it is ordinary Rust, it needs no attribute, and this scan is silent about
+    /// it. A RAW IDENTIFIER is the spelling of it a person would actually write. `r#type,` stops
+    /// the run at `r` — lowercase, so the initial rejects it, and the remainder `#type` matches
+    /// no arm either — so the variant stays out of `declared` exactly as an explicit
+    /// discriminant did before issue #1410.
+    ///
+    /// It is left unhandled, and the obvious reason to give here does not survive measurement,
+    /// so it is not given. Reading it means stepping over the `r#` and then admitting a name
+    /// with no uppercase initial, which READS like the rule bounding the discriminant arm this
+    /// scan now leans on. Scoped to the `r#` branch it is not that rule: measured on issue
+    /// #1410, stripping the escape and admitting a lowercase name BEHIND IT ONLY reads `r#type,`
+    /// as `type` while the multi-line `cfg` above still refuses `target_os`, and the only
+    /// assertion that moves is the one pinning today's drop. The two shapes are separable, so
+    /// deferring this one is a choice about scope rather than a cost the arm just added forces —
+    /// and what follows is the backstop that choice leaves standing.
+    ///
+    /// What stands between that shape and a merged tree is a LINT rather than this parser:
+    /// `non_camel_case_types` fires on `r#type,`, warn-by-default in `rustc` and an error under
+    /// the `-D warnings` clippy gate this repo runs — measured on issue #1410, in this tree.
+    /// That is a backstop of exactly the kind the same-line attribute above teaches not to lean
+    /// on: one `#[allow(non_camel_case_types)]` switches it off in band, written by whoever
+    /// wanted the keyword-shaped name to begin with.
+    ///
+    /// Other names outside the run land in this entry too, and they are not all lint-backed. A
+    /// non-ASCII initial (`Ünicode,`) draws no NAMING lint at all — measured on issue #1410 with
+    /// both spellings added to one enum and put through that same gate in a single run, where
+    /// `non_camel_case_types` named `type` and said nothing whatever about `Ünicode` — and the
+    /// run here is `is_ascii_alphanumeric`, so that one is dropped in silence with nothing else
+    /// to catch it. Widening that predicate is deliberately not done here: it is the same
+    /// `is_ascii_alphanumeric`-versus-Unicode question the sibling F3 finding raises about the
+    /// two sides of the reliability comparison. That finding has no issue of its own — it is
+    /// recorded in issue #1410's body, and the asymmetry itself is stated in band above
+    /// `crate::reliability`'s own Unicode `is_alphanumeric` run — so moving one side of it from
+    /// inside this issue would answer it blind.
+    ///
+    /// Adding any of these puts the weight back on this parser, so widen it in that change
+    /// rather than trusting this list.
     pub(crate) fn declared_variant_names(enum_name: &str) -> std::collections::BTreeSet<String> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/observability.rs");
         let text = std::fs::read_to_string(&path)
@@ -5269,8 +5339,10 @@ pub(crate) mod tests {
     /// crate's own source, nothing in it is spelled `#[allow(dead_code)] Scheduled,`, and so the
     /// LOOP BODY of [`strip_leading_attributes`] was reached by no test — measured on issue
     /// #1397, replacing the call below with a no-op reference left the whole suite at `0 failed`.
-    /// `the_variant_scan_reads_the_shapes_its_parser_names` now drives every shape the two
-    /// helpers' doc-comments name, each in the direction that comment claims.
+    /// `the_variant_scan_reads_the_shapes_its_parser_names` now drives shapes those
+    /// doc-comments name — the two helpers' and the remainder rule's own, above
+    /// [`declared_variant_names`] — each in the direction its comment claims, and records in its
+    /// own headline what it leaves undriven.
     fn variant_names_in(
         text: &str,
         enum_name: &str,
@@ -5303,10 +5375,21 @@ pub(crate) mod tests {
                         .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
                         .collect();
                     let rest = segment[name.len()..].trim_start();
-                    // A variant is an identifier that ends the segment, or is followed by its
-                    // struct/tuple body. Anything else at this depth is not a declaration.
+                    // A variant is an identifier that ends the segment, is followed by its
+                    // struct/tuple body, or is given an explicit discriminant (issue #1410).
+                    // Anything else at this depth is not a declaration.
+                    //
+                    // The uppercase initial is what BOUNDS that last arm: an attribute spread
+                    // over several lines leaves its `key = value` continuations at depth 1 too,
+                    // and a conventionally snake_case key is rejected on the initial rather than
+                    // on the remainder. The bound is the leading token's CASE, so an
+                    // uppercase-initial key IS read — see the measurement in the doc-comment
+                    // above.
                     let declares_variant = name.starts_with(|c: char| c.is_ascii_uppercase())
-                        && (rest.is_empty() || rest.starts_with('{') || rest.starts_with('('));
+                        && (rest.is_empty()
+                            || rest.starts_with('{')
+                            || rest.starts_with('(')
+                            || rest.starts_with('='));
                     if declares_variant {
                         names.insert(name);
                     }
@@ -5324,14 +5407,25 @@ pub(crate) mod tests {
         names
     }
 
-    /// Every shape `split_top_level` and `strip_leading_attributes` are written for, driven
-    /// through the parse that consumes them.
+    /// Shapes `split_top_level`, `strip_leading_attributes` and the remainder rule inside
+    /// [`variant_names_in`] are written for, driven through the parse that consumes them — but
+    /// not all of them. A comma inside `( … )`, the second nesting context `split_top_level`'s
+    /// own doc names, is not driven here; that gap is issue #1419's, filed off PR #1407.
     ///
     /// Held against synthetic text because the scan reads THIS FILE, and no enum it is pointed
-    /// at carries an attribute on a variant — so the attribute walk ran on nothing and the
-    /// shapes its doc-comment argues about had no way in. Each case is one claim from those two
-    /// doc-comments, asserted in the direction the comment makes: under-matching drops a name,
-    /// and no shape may invent one.
+    /// at carries an attribute on a variant, a discriminant, or a raw identifier — so those
+    /// walks ran on nothing and the shapes their doc-comments argue about had no way in. Each
+    /// case is one claim from those doc-comments, asserted in the direction the comment makes:
+    /// where a comment says a name is read it must appear, and where a comment says a name is
+    /// dropped or invented, that is what the case pins.
+    ///
+    /// Some cases assert a claim about a shape deliberately NOT read — the raw identifier, the
+    /// non-ASCII initial, the `target_os` an attribute's continuation line must not yield — and
+    /// some about one deliberately OVER-read, where the pinned set carries a name nobody wrote.
+    /// A catalogue entry saying a spelling is dropped is exactly as capable of going stale as
+    /// one saying a spelling is handled or over-read, and none of them has a consuming
+    /// assertion of its own to fail when it does; pinning them here is what keeps those entries
+    /// answerable to the parser.
     ///
     /// `Anchor` rides in every case for two reasons: an empty parse is a hard failure inside the
     /// scan, which would mask a case that yields nothing; and its presence proves the walk
@@ -5395,14 +5489,66 @@ pub(crate) mod tests {
             scan("    Monitor401 { account: String, consecutive: u32 },"),
             expect(&["Anchor", "Monitor401"])
         );
-        // Both non-empty remainders `declares_variant` admits, and the identifier rule that
+        // The non-empty remainders `declares_variant` admits, and the identifier rule that
         // keeps a non-camel-case variant from being silently dropped.
         assert_eq!(scan("    Wrapped(u32),"), expect(&["Anchor", "Wrapped"]));
         assert_eq!(scan("    Poll_401,"), expect(&["Anchor", "Poll_401"]));
+        // The shape issue #1410 closes. An EXPLICIT DISCRIMINANT leaves a remainder none of the
+        // other arms admits, so the variant was dropped and the consuming guard passed
+        // vacuously for it — reachable in ordinary Rust, needing no attribute, and accepted by
+        // `cargo fmt` where the issue #1397 spelling above is rewritten away.
+        assert_eq!(scan("    Scheduled = 3,"), expect(&["Anchor", "Scheduled"]));
+        // A discriminant is any const expression, so the arm tests the `=` rather than what
+        // follows it; both of these reach `declared` under the same rule.
+        assert_eq!(
+            scan("    Scheduled = 1 + 2,"),
+            expect(&["Anchor", "Scheduled"])
+        );
+        assert_eq!(
+            scan("    Scheduled = SOME_CONST,"),
+            expect(&["Anchor", "Scheduled"])
+        );
         // Only a line DIRECTLY inside the body declares: the field line below is at depth 2.
         assert_eq!(
             scan("    Monitor401 {\n        account: String,\n    },"),
             expect(&["Anchor", "Monitor401"])
+        );
+
+        // Dropped ON PURPOSE, and named in the catalogue above `declared_variant_names`
+        // rather than handled: a RAW IDENTIFIER stops the run at `r`, which is lowercase, and
+        // leaves the remainder `#type`, which matches no arm. Reading it would mean admitting a
+        // name with no uppercase initial behind the escape — which the case below does not
+        // forbid: measured, an `r#`-scoped relaxation reads this one and still refuses that
+        // one. So this assertion holds a deferral, not a constraint.
+        assert_eq!(scan("    r#type,"), expect(&["Anchor"]));
+        // The other spelling that entry names, and the one it says nothing else catches: a
+        // non-ASCII initial sits outside the ASCII run AND outside the ASCII-uppercase initial,
+        // so it is dropped in silence. Widening the run alone leaves it dropped; this reddens
+        // only when the run and the initial are BOTH taken to Unicode, which is the widening
+        // the entry defers.
+        assert_eq!(scan("    Ünicode,"), expect(&["Anchor"]));
+        // The bound on the discriminant arm. A multi-line attribute's `key = value`
+        // continuation sits at depth 1 too, because only braces move the depth counter, so the
+        // remainder rule alone would read it as a declaration. What rejects this one is the
+        // leading token's CASE, and `target_os` must not appear beside the variant it gates.
+        assert_eq!(
+            scan("    #[cfg(all(\n        target_os = \"macos\",\n    ))]\n    Gated,"),
+            expect(&["Anchor", "Gated"])
+        );
+        // The other side of that bound, and the reason it is stated over the case rather than
+        // the form: an UPPERCASE-initial key is read, so the arm above invents a name here.
+        // Loud — `Bar` lands in `declared`, goes unsampled and fails — but reachable only
+        // because of that arm, which is what makes this the pin the entry above needs.
+        assert_eq!(
+            scan("    #[foo(\n        Bar = 1,\n    )]\n    Gated,"),
+            expect(&["Anchor", "Bar", "Gated"])
+        );
+        // Same rule, remainder empty rather than `=`: a BARE uppercase continuation token takes
+        // the `rest.is_empty()` arm. Loud in the same direction and it predates the arm above —
+        // recorded rather than closed, and pinned so the entry stays answerable to the parser.
+        assert_eq!(
+            scan("    #[cfg(any(\n        Foo,\n    ))]\n    Gated,"),
+            expect(&["Anchor", "Foo", "Gated"])
         );
     }
 
