@@ -285,36 +285,65 @@ case.
 
 **The committed briefs under `docs/requirements/` are not exempt, and their form is no evidence that
 they are.** Where they use the `**AC-N**` block, their criteria are a *Given / When / Then* over the
-artifact — but that is a template, and an activity demand fits it exactly. Three that do, each
-passing the form:
+artifact — but that is a template, and an activity demand fits it exactly. The ones found so far,
+each passing the form:
 
 - `menubar-accessibility-reachability.md` **AC-2** rules the carrier out in its own text — *"verified
   against a running app, not only the harness"* — where the harness is the committed artifact.
 - Its **AC-1** wants the effect of a system text-size change *"recorded ... with evidence"* for each
   of four cells against a running signed app. Nothing committed changes a system-wide OS setting.
+- Its **AC-8**, first clause — *"the operator ratifies it before implementation"* — wants an act by a
+  person, timed before the artifact exists, with nothing committed named to evidence it. Its own
+  siblings ask instead for the **record** of a decision: **AC-3**'s finding *"is recorded with
+  evidence"*, **AC-9**'s *"the decision records daemon-vs-client"*. That is the route this clause is
+  missing — and the criterion's *other* clause is quoted below as this section's exemplar of the
+  label route, so the criterion was opened here and only half of it was carried.
 - `gui-cli-capability-parity.md` **AC-1** wants *"the login completes and the account returns to
   healthy **without the operator typing a command anywhere**"* — an operator act and a real OAuth
   round trip, neither of which a tree can be in the state of having done.
 
-The pattern is worth more than the instances: all three sit in the two briefs whose subject is the
-running app or a live external flow, and the briefs whose subject is committed code read far
+That list carries no count on purpose. It had one, and the same number was restated in the sentences
+around it, so adding a single instance meant editing every copy — the enumeration says everything the
+count said, and it cannot fall out of step with itself. A count would also claim a closure the list
+cannot have: membership is the prose judgment named above, so this is what has been argued, never
+what has been matched.
+
+The pattern is worth more than the instances: every one of them sits in the two briefs whose subject
+is the running app or a live external flow, and the briefs whose subject is committed code read far
 cleaner.
 
-A fourth instance sits where nothing keyed to the `**AC-N**` form can reach it, and the blind spot
+Another instance sits where nothing keyed to the `**AC-N**` form can reach it, and the blind spot
 is worth as much as the instance. `session-warmup-on-reset.md` states its acceptance as prose under
 `## 7. Success criteria` and carries no AC block at all, so any instrument counting that form passes
 over it in silence. Its first criterion discharges through R-1, which requires the measurement be
 taken *"on at least three cycles across at least two accounts"* — #912's fourth criterion again, in
 a committed brief. Its subject is a live external measurement, so it falls on the same side of the
-line as the three above rather than disturbing it.
+line as those above rather than disturbing it.
 
 That is where the rule above has to do its work — name the committed artifact, or demand the label —
-and `menubar-accessibility-reachability.md` already works both routes itself. **AC-8** takes the
-label: *"the verification tier is recorded as manual-only"*. **AC-4a** takes the artifact, naming
-the Appearance-settings manual checklist in `apps/menubar/design/README.md` and requiring it carry a
-text-size step. That second route is the established one here:
+and `menubar-accessibility-reachability.md` already works both routes itself. **AC-8**'s second
+clause takes the label: *"the verification tier is recorded as manual-only"* — its first clause is
+the instance listed above, which is why the two routes are read per **clause** and never per
+criterion. **AC-4a** takes the artifact, naming the Appearance-settings manual checklist in
+`apps/menubar/design/README.md` and requiring it carry a text-size step. That second route is the
+established one here:
 [ADR-0031](docs/adr/0031-ui-verification-tiers-bounded-by-structural-blindness.md) records a
 **Manual pre-release** tier whose landed evidence is the manual checklists in that same file.
+
+**Naming an instrument is not the defect by itself, and one criterion here marks the line.**
+`gui-cli-capability-parity.md` **AC-5** — *"the shared `Claude Code-credentials` keychain item is
+**byte-for-byte unchanged**, verified by hash before and after"* — reads as #912's fourth criterion
+in another costume, and has been raised as one (issue #1359). It is not, because the instrument it
+names is the shipped engine's own step rather than one an author performs: `login_capture` in
+[`src/login.rs`](src/login.rs) hashes the shared item before the spawn and hands the baseline to
+`run_login`, which re-hashes it after; a mismatch is `Error::SharedCredentialMutated`. Committed
+tests over the injected `CredentialStore` seam carry both arms in the required suite —
+`a_shared_item_mutation_during_login_is_a_hard_error` is the one that fails when the re-check is
+removed — and the solution design routes the criterion to them in as many words: *"the AC-5 hash
+assertion ... which the existing login tests already model"*. What #912's soak had and this does not
+is a stronger route it forecloses. The risk here is what a third-party child process does to a real
+keychain item, which no entailment over this tree reaches, so the hash is the only instrument there
+is. Read what a criterion **demands**, not the shape it demands it in.
 
 ## Citing source locations in docs/
 
