@@ -43,6 +43,7 @@ Requirements: PRD R-2, R-2a.
     When the emitted app-icon raster is inspected at each declared size
     Then no corner of its own body box is fully opaque
     And that ideal body's fill stays at or below the rounded-vs-square boundary
+    And that same fill stays at or above the rounded-vs-inscribed-circle boundary
     But not by pinning the declared 22.36 % radius
 
 > **INVERTED 2026-08-10 (#1141).** Until this date the scenario above asked for the opposite — *"the
@@ -66,14 +67,19 @@ Requirements: PRD R-2, R-2a.
 > `circleFillThreshold`) on all ten declared rasters. The aggregate half ran on only the five whose
 > canvas 256 divides until **#1160** re-based it on `AppIconGrid.idealBodyFill`, whose denominator is the
 > ideal body area rather than the measured box and so is exact at every canvas. The scenario's own
-> aggregate clause was restated in the same change — it had carried both retired terms, the `256 |
-> canvas` scope and the measured-box denominator, and a clause here is an instruction to a test author,
-> so leaving it would have specified the bound this change removed. All three reads key on
-> opacity **magnitude**, so a uniformly translucent square satisfies them — they hold in the one regime
-> the producer generates, an opaque `rsvg-convert` pass per size (**#1148**). And the radius set they
-> accept is much wider than the declared 22.36 % (**#1149**). Both issues are closed, and both limits are
-> stated at the predicates that carry them — the opacity regime at `AppIconGrid.peakAlpha`, the admitted
-> radius band at `squareFillThreshold`. Neither is corrected here.
+> aggregate CEILING clause was restated in the same change — it had carried both retired terms, the
+> `256 | canvas` scope and the measured-box denominator, and a clause here is an instruction to a test
+> author, so leaving it would have specified the bound this change removed. The FLOOR had no clause at
+> all until **#1395**: it shipped with **#1148** and the scenario stated only the ceiling, so a test
+> author working from these scenarios had a 1:1 target for one half of an asserted band. Both halves are
+> stated above now, and both boundaries are midpoints of the same one-parameter family — the ceiling
+> between the declared rounding and a hard-cornered square, the floor between that same rounding and the
+> circle inscribed in the ideal body. All three reads key on opacity **magnitude**, so a uniformly
+> translucent square satisfies them — they hold in the one regime the producer generates, an opaque
+> `rsvg-convert` pass per size (**#1148**). And the radius set they accept is much wider than the
+> declared 22.36 % (**#1149**). Both issues are closed, and both limits are stated at the predicates that
+> carry them — the opacity regime at `AppIconGrid.peakAlpha`, the admitted radius band at
+> `squareFillThreshold`. Neither is corrected here.
 > What the corner half alone can reach off the pixel grid is narrower still, and is **#1320**.
 >
 > **Why the numerator is spelled out above** and not left to the denominator's `Given`, which is how
