@@ -76,7 +76,7 @@ than through the starved sweep.
    (bootstrap). When a **different** account is active, both writes are skipped and
    the account is stashed + rostered **without touching the active slot**. The
    verdict is a pure `should_activate(active_uuid, captured_uuid)` helper
-   (`src/capture.rs:623`) unit-tested over its three branches; the real identity read
+   (`src/capture.rs`) unit-tested over its three branches; the real identity read
    stays in `reconcile_login` and the verdict is passed into the pure core. An
    unreadable / absent `~/.claude.json` reads as "no active account" →
    bootstrap-activate, the safe default for an operator who just ran `login`. `captured` +
@@ -100,7 +100,7 @@ than through the starved sweep.
 
    - **#276** wires `login`'s reconcile to **send** that command after a
      **non-activating REVIVE** — the pure `should_signal_restored(activate, outcome)`
-     helper (`src/capture.rs:639`), `!activate && Revived`, unit-tested over all four
+     helper (`src/capture.rs`), `!activate && Revived`, unit-tested over all four
      combinations. The best-effort `notify_daemon_restored` fires right after the
      existing `roster-reload` notify. An **activating** revive is skipped (its
      canonical re-point already un-quarantines via #107); an **onboard** is skipped (a
@@ -196,9 +196,9 @@ Net: **un-quarantine ≠ make-active.** `login B` while `A` is active keeps `A` 
   **#106** (the refresh RESTORE primitive — closed), **#132** (the isolated capture
   engine), **#15** (the redaction meter), **#64** (`peer_is_same_user` control auth),
   **#277** (documented the active-preservation semantics).
-- Code: `src/capture.rs` — `reconcile_login` (~L654), `should_activate` (~L623),
-  `should_signal_restored` (~L639), `HarvestedLogin` (~L474),
-  `notify_daemon_restored` (~L232); `src/daemon/socket.rs` — `control_reply` (~L129),
+- Code: `src/capture.rs` — `reconcile_login`, `should_activate`,
+  `should_signal_restored`, `HarvestedLogin`, `notify_daemon_restored`;
+  `src/daemon/socket.rs` — `control_reply` (~L129),
   the `restored` command (~L173), `ControlSignal::Restored` (~L61); `src/daemon/run_loop.rs`
   — the `Idle::Restored` → `apply_refresh_restore` dispatch (~L526); `src/daemon.rs` —
   `apply_refresh_restore` (~L2976) and the three un-quarantine sites
