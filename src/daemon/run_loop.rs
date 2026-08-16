@@ -645,10 +645,13 @@ where
             // Adopt the manual `use` swap (#64) — arm the cooldown so the next tick holds on
             // the operator's choice, and re-resolve active from the canonical — then, if the
             // newly-active account carries the terminal 🔴 `Dead` verdict (a forced `use` onto
-            // a dead spare, issue #643), force an immediate active-safe keep-warm re-probe so
-            // it clears to 🟢 (or an honest 🔴) within the cycle instead of latching stale
-            // `Dead` — BEFORE looping back to re-tick. The re-probe's events (incl. any
-            // LOGGED-not-notified `CredentialUnrecoverable`) are best-effort logged.
+            // a dead spare, issue #643), force an immediate active-safe keep-warm re-probe,
+            // whose outcome `fold_recovery_outcome` folds three ways — a live mint clears the
+            // `Dead` latch, a transient error un-quarantines anyway (to `AtRisk`: INCONCLUSIVE
+            // is not a death), and only a `Dead` re-mint leaves the honest 🔴 — so the verdict
+            // settles within the cycle instead of latching stale `Dead`, BEFORE looping back to
+            // re-tick. The re-probe's events (incl. any LOGGED-not-notified
+            // `CredentialUnrecoverable`) are best-effort logged.
             Idle::ManualSwapped => {
                 daemon.adopt_manual_swap().await;
                 for event in daemon.reprobe_active_if_dead().await {
@@ -692,8 +695,10 @@ where
                 let _ = tokio::time::timeout(SWAP_ACK_WRITE_TIMEOUT, write_swap_ack(stream, &ack))
                     .await;
                 // Issue #643: a socket swap-on-click (the menubar app) onto an account carrying
-                // the terminal 🔴 `Dead` verdict re-probes it on the spot — active-safe keep-warm
-                // mint → 🟢 (or an honest 🔴) — instead of latching stale `Dead`. AFTER the ack so
+                // the terminal 🔴 `Dead` verdict re-probes it on the spot — one active-safe
+                // keep-warm mint, folded three ways: a live mint clears the `Dead` latch, a
+                // transient error un-quarantines anyway (to `AtRisk`), and only a `Dead` re-mint
+                // keeps the honest 🔴 — instead of latching stale `Dead`. AFTER the ack so
                 // the waiting client is never blocked on the `claude -p` mint; the re-probe's
                 // events (incl. any LOGGED-not-notified `CredentialUnrecoverable`) are best-effort
                 // logged.

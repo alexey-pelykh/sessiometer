@@ -618,7 +618,7 @@ rows, including the entire security core:*
 >
 > **And a FOURTH surface, which is not a log line at all.** *Added 2026-08-05 (twelfth pass).*
 > `refresh_fold` also folds the value into daemon state on **every** outcome — its comment says
-> *"Armed for EVERY outcome, including `Dead` / `Error`"* (`src/daemon/refresh_fold.rs:563`) — and
+> *"Armed for EVERY outcome, including `Dead` / `Error`"* (`src/daemon/refresh_fold.rs:567`) — and
 > `refresh_health_view` projects it onto the **versioned `status`/`watch` wire**:
 > `rotated: health.refresh_token_rotated.unwrap_or(false)` (`src/daemon/snapshot.rs:1403`). Its
 > consumer is **Swift**: `apps/menubar/Sources/WireModel.swift:98`, asserted in
