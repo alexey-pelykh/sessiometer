@@ -29,6 +29,10 @@
 #   T19  kills T18's rule written as a COUNT of claim-shaped statements rather than a
 #        SUBTRACTION of the canonical one, which goes RED on a ledger restating its own
 #        claim correctly — T16's role on the other document
+#   T21  kills T15's rule read over the WHOLE README rather than within the pinned
+#        section — the SCOPE half of that rule, where T16 pins the UNIT. A stale claim
+#        under another heading is outside what the rule reads, so the whole-file
+#        reading goes RED on a correct README (issue #1353)
 #
 # T11/T12, T15/T16 and T18/T19 are three RED/GREEN pairs of the same shape: each pins a
 # masking defect closed and, beside it, the correct file the over-broad fix would have
@@ -47,8 +51,9 @@
 # original cases' mutation log is in the commit body of `fe186c3` (the change that closed
 # issue #1279): this repo squash-merges, so a PR body reaches no clone and only a commit
 # body is followable. That log names every mutant of that round but T5's and T9's. T14 was
-# added later (issue #1314), and T15-T17 later still (issue #1317); each one's mutation
-# log is in its own commit body.
+# added later (issue #1314), T15-T17 later still (issue #1317), T18-T20 after those
+# (issue #1354) and T21 after those (issue #1353); each one's mutation log is in its own
+# commit body.
 #
 # The fixture ledger carries a range and a host range independent of the repo's real
 # ones, so a future range widening never touches this test.
@@ -56,7 +61,7 @@
 # Every fixture README is written through write_readme, which wraps the case's body in
 # the `## Prerequisites` heading the guard pins and closes it with an unrelated trailing
 # section — the real README's shape. Cases needing a specific multi-section layout
-# (T11-T14) build their fixture directly instead.
+# (T11-T14, T21) build their fixture directly instead.
 #
 # Run locally:  ./scripts/check-readme-cc-range.test.sh
 set -euo pipefail
@@ -445,6 +450,41 @@ printf -- '\n## Verdict — range widened to `3.2.100`–`3.2.140`\n\nSuperseded
 printf -- '- verified against **`3.2.100`–`3.2.140`** on macOS `30.1.1`–`30.1.2` / Darwin `29.x`.\n' \
     | write_readme
 check "a bare non-claim-shaped superseded range in the LEDGER passes (stated residual)" 0 "$(run)"
+
+# T21 (#1353): the SCOPE half of T15's rule, where T16 pins the UNIT. T15's rule reads
+# only WITHIN the pinned section — design choice 5 states that in those words — and until
+# this case nothing held it there: rewriting the `others` pipeline to read the whole file
+# instead (`normalize < "$readme"` in place of `$section_norm`) left the entire suite green
+# and the real tree at exit 0, so neither surface could tell the two scopes apart.
+#
+# The mutant is not harmless, which is why this case is GREEN rather than a RED falsifier.
+# The README below is CORRECT: the pinned section states the ledger's claim and nothing
+# else, and the superseded range under `## Version history` is outside what the rule reads.
+# The whole-file reading subtracts the canonical claim, finds the historical one left over
+# and exits 1 — an unscoped reading failing in the other direction from T11's, rejecting a
+# good file rather than passing a bad one. That is the cost design choice 4 named when it
+# declined a file-wide rule, which "goes RED on a correct file" — though on a different
+# README shape: choice 4's rejected COUNT also rejects T12's second correct copy, whereas
+# this SUBTRACTION leaves T12 green and rejects only a stale claim outside the section.
+#
+# T12 cannot pin this and is why it went unpinned: its second copy OUTSIDE the section is
+# CORRECT, so `grep -vxF -- "$claim"` subtracts it at either scope and it passes both ways.
+# Only an outside claim carrying DIFFERENT bounds — invisible to `claim_re`, visible to
+# `shape_re` — separates them. Mutation-checked against exactly that whole-file rule: exit
+# 1 where 0 is right.
+default_ledger
+cat > "$work/README.md" <<'EOF'
+# sessiometer (fixture README)
+
+## Prerequisites
+
+- verified against **`3.2.100`–`3.2.140`** on macOS `30.1.1`–`30.1.2` / Darwin `29.x`.
+
+## Version history
+
+- Previously verified against `3.2.100`–`3.2.120` on macOS `30.1.1`–`30.1.2` / Darwin `29.x`.
+EOF
+check "a STALE claim OUTSIDE the pinned section PASSES" 0 "$(run)"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

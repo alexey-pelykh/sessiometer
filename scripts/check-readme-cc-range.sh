@@ -108,6 +108,12 @@
 #      that made the wrong unit unusable. T12's permission is untouched — it pins a
 #      second correct copy OUTSIDE the section, and this rule reads only within it.
 #
+#      That SCOPE is pinned by T21 (issue #1353), and it needs a case of its own because
+#      T12 cannot carry it: T12's outside copy is CORRECT, so the subtraction below drops
+#      it at either scope and it passes a whole-file reading too. What separates them is
+#      an outside claim carrying DIFFERENT bounds — legal, since this rule reads only
+#      within the section, and rejected by the whole-file reading on a correct README.
+#
 #      Exit 1, where the ledger's own two-ways case is exit 2. The asymmetry is the two
 #      documents' ROLES: an inconsistent AUTHORITY means nothing can be compared, while
 #      an inconsistent COPY is simply wrong, and deleting the stale sentence is a fix a
