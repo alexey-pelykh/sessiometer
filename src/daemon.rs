@@ -6519,13 +6519,18 @@ mod tests {
     /// throttle and the once-per-episode reactive guard), returns a scripted [`RefreshOutcome`]
     /// with a `fresh` credential to promote (on `Refreshed`), and — when `revive_to` is set —
     /// REVIVES the active account by flipping its shared [`SeamOutcomes`] entry to a live reading
-    /// (the false-death the reactive backstop rescues).
+    /// (the false-death the reactive backstop rescues). `hard_error` makes the mint itself fail —
+    /// a cycle that could not even RUN, which `keep_warm_and_promote` classifies
+    /// [`RefreshEventOutcome::Error`] — mirroring `SeamRefresh`'s flag of the same name on the
+    /// parked fork; it is read FIRST, so the scripted `outcome` / `fresh` / `revive_to` are all
+    /// unreachable past it.
     pub(super) struct SeamKeepWarm {
         pub(super) outcomes: SeamOutcomes,
         pub(super) outcome: RefreshOutcome,
         pub(super) revive_to: Option<Usage>,
         pub(super) fresh: Option<Credential>,
         pub(super) calls: Rc<Cell<u32>>,
+        pub(super) hard_error: bool,
     }
 
     impl KeepWarm for SeamKeepWarm {
@@ -6536,6 +6541,13 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<KeepWarmMint>> + 'a>> {
             Box::pin(async move {
                 self.calls.set(self.calls.get() + 1);
+                if self.hard_error {
+                    // A mint that cannot even run (a locked keychain, an unresolvable binary, an FS
+                    // error) → could-not-promote, and the `Err(_) => RefreshEventOutcome::Error` arm
+                    // of `keep_warm_and_promote`. A failed SPAWN is the sibling arm, not this one:
+                    // `keep_warm_cycle` reports it as `Ok(RefreshOutcome::Error(SpawnFailed))`.
+                    return Err(Error::SwapLockBusy);
+                }
                 if let Some(usage) = self.revive_to {
                     self.outcomes
                         .borrow_mut()
@@ -6613,6 +6625,9 @@ mod tests {
                 revive_to,
                 fresh,
                 calls: calls.clone(),
+                // Every caller scripts a COMPLETED cycle; a could-not-run mint is wired per-test by
+                // re-`with_keep_warm_engine`-ing a `hard_error` fake over this one.
+                hard_error: false,
             }),
             Duration::from_secs(3600),
         )

@@ -247,9 +247,9 @@ impl PollRefresh for RealRefreshEngine {
 pub(crate) trait KeepWarm {
     /// Mint a fresh token for `account` from its `canonical` blob and return it for the daemon
     /// to promote to the canonical item. `Ok((report, Some(credential)))` ONLY on a real refresh
-    /// ([`RefreshOutcome::Refreshed`]); `(report, None)` for `NoChange` / `Dead` / `Error` (the
-    /// daemon then leaves the canonical item untouched — a `Dead` outcome flows to the #42
-    /// streak). `Err` is a could-not-run (spawn / FS) failure the daemon treats fail-safe.
+    /// ([`RefreshOutcome::Refreshed`]); `(report, None)` for `NoChange` / `Dead` / `Error` (the daemon
+    /// then leaves the canonical item untouched — a `Dead` outcome flows to the #42 streak). `Err` is a
+    /// could-not-run (locked keychain / unresolvable binary / FS) failure the daemon treats fail-safe.
     fn keep_warm<'a>(
         &'a self,
         account: &'a Account,
