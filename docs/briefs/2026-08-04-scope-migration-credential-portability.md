@@ -31,11 +31,11 @@ Nine issues filed: umbrella **#999** + eight children **#1000–#1007**.
 ## Two things that changed during the work
 
 **A carried claim was falsified.** The investigation's working explanation — "`--overwrite` is
-uuid-keyed, so it was inert against the same-label accounts" — is **wrong**. `account_uuid` is the
-*Claude* account uuid (`src/config.rs:341`), stable across machines. The uuids matched, `--overwrite`
-did fire, the stashes **were** replaced — which is exactly how machine A's token reached machine B to
-be replayed and refused. Recorded in PRD § 9 F-1 and in #1005's scope note so the wrong narrative
-does not resurface. The incident is fully explained without it.
+uuid-keyed, so it was inert against the same-label accounts" — is **wrong**. The roster key
+`account_uuid` (`src/config.rs:343`) is the *Claude* account uuid, stable across machines. The uuids
+matched, `--overwrite` did fire, the stashes **were** replaced — which is exactly how machine A's
+token reached machine B to be replayed and refused. Recorded in PRD § 9 F-1 and in #1005's scope
+note so the wrong narrative does not resurface. The incident is fully explained without it.
 
 **A feasibility question resolved the opposite way to expectation.** R-4a asked whether a freshness
 signal is derivable from v1 data. It *is* — `credential_clocks()` reads both deadlines from the blob
