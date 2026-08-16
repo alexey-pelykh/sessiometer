@@ -56,10 +56,10 @@
 //! The signal is acked on RECEIPT, so what the reported line may promise depends on which fork
 //! the daemon then takes — and for the PARKED accounts a production poke acts on, the verdict
 //! poke already reads is what selects that fork, so it branches on it rather than guessing
-//! (issue #1347). A `Degraded` quarantine clears on the signal alone, so
-//! that line states the clear. A `Dead` one is re-probed by the daemon's own isolated refresh
-//! first and KEEPS the quarantine when that re-probe is itself definitively `Dead`, so that line
-//! states the signal and the pending re-probe instead of a clear that may not happen.
+//! (issue #1347). A `Degraded` quarantine clears on the signal alone, so that line states the
+//! clear. A `Dead` one is re-probed by the daemon's own isolated refresh first and KEEPS the
+//! quarantine when that re-probe is itself definitively `Dead`, so that line states the signal
+//! and the pending re-probe instead of a clear that may not happen.
 //!
 //! A label MORE THAN ONE account carries cannot key that verdict at all (issue #1086), and a
 //! cycle that proved a fresh token then SAYS SO — the daemon's verdict could not be read, so any
@@ -431,10 +431,10 @@ fn proven_refresh(report: &RefreshReport) -> bool {
 /// them, which is why this asks [`is_quarantined`](DaemonVerdict::is_quarantined) rather than
 /// naming a variant: issue #1347 split the quarantine verdict to change what the reported line
 /// may CLAIM, and a send that fired on only one of the two halves would silently strand every
-/// `Dead` account this exists to recover. An
-/// [`Unattributable`](DaemonVerdict::Unattributable) verdict never fires the send, which is
-/// #1086's degrade-rather-than-guess, unchanged. What issues #1200 and #1347 add is downstream
-/// of this predicate, in [`resolve_restore`] — the REPORT, not the write.
+/// `Dead` account this exists to recover. An [`Unattributable`](DaemonVerdict::Unattributable)
+/// verdict never fires the send, which is #1086's degrade-rather-than-guess, unchanged. What
+/// issues #1200 and #1347 add is downstream of this predicate, in [`resolve_restore`] — the
+/// REPORT, not the write.
 fn should_restore(report: &RefreshReport, verdict: DaemonVerdict) -> bool {
     verdict.is_quarantined() && proven_refresh(report)
 }
@@ -627,17 +627,16 @@ fn poke_line(label: &str, outcome: &str) -> String {
     format!("{label}: {outcome}")
 }
 
-/// Whether the daemon's snapshot currently has `label`'s account OUT OF ROTATION
-/// (quarantined) — the verdicts `status` projects to an action cue (mirrors `cli::health_cell`):
-/// a current daemon's rollup reading `Degraded` (an access-token 401-streak, issue #427) or
-/// `Dead` (a refresh proved the credential unrecoverable, #261), or — a pre-#119 daemon that
-/// sent no rollup (`health == None`) — its legacy `quarantined` flag (#42). Both modern states
-/// are quarantine states the #428 restore acts on, and each is answered as its OWN variant,
-/// because for a parked account of a production daemon that distinction is what selects the fork
-/// taken once the signal lands (issue #1347 — the reading, and the two further conjuncts
-/// `reconcile_restored` also requires, are [`line_verdict`]'s). The `Refreshed && re_stashed` gate
-/// in [`should_restore`] is the
-/// second conjunct: a cycle that did not prove the refresh token reaches neither fork.
+/// Whether the daemon's snapshot currently has `label`'s account OUT OF ROTATION (quarantined) —
+/// the verdicts `status` projects to an action cue (mirrors `cli::health_cell`): a current
+/// daemon's rollup reading `Degraded` (an access-token 401-streak, issue #427) or `Dead` (a
+/// refresh proved the credential unrecoverable, #261), or — a pre-#119 daemon that sent no rollup
+/// (`health == None`) — its legacy `quarantined` flag (#42). Both modern states are quarantine
+/// states the #428 restore acts on, and each is answered as its OWN variant, because for a parked
+/// account of a production daemon that distinction is what selects the fork taken once the signal
+/// lands (issue #1347 — the reading, and the two further conjuncts `reconcile_restored` also
+/// requires, are [`line_verdict`]'s). The `Refreshed && re_stashed` gate in [`should_restore`] is
+/// the second conjunct: a cycle that did not prove the refresh token reaches neither fork.
 ///
 /// A `None` snapshot (no daemon reachable) and a `label` the snapshot does not list are
 /// [`NotQuarantined`](DaemonVerdict::NotQuarantined): there is no verdict to fabricate a claim
