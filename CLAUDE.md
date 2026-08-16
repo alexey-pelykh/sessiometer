@@ -188,15 +188,32 @@ have that answer before you push is to have armed it yourself (§ Before you pus
 
 Through 2026-08-07 this section mandated a deliberately non-auto-close `Closes issue #NNN.` form and
 a separate `gh issue close NNN`; that is withdrawn — it defended against unverified merges by
-weakening the link rather than the gate. **Do not infer the convention from `main`'s history, in
-either direction.** The withdrawn form ran from 2026-07-22 to 2026-08-07 inclusive — 74 commits,
-including all three merged on the final day — and the restored form is the repo's *original* one, 83
-commits ending 2026-07-22. Both appear in deep history and neither is marked. Do not rewrite either.
+weakening the link rather than the gate. On 2026-08-16 `main`'s history was rewritten so that every
+`Closes issue #NNN.` link became the auto-closing form: 64 commits. Every issue they referenced was
+already closed, so the conversion closed nothing. The pass ran with `main-protection` lifted and
+restored field-for-field afterwards — § Before you merge's *no force-push to `main`* binds
+anyone working under the ruleset, not an owner who removes it and puts it back. **You may now
+read the `Closes` convention off `main`'s history** — that decision retires both of this
+section's earlier prohibitions: the instruction not to infer the convention from history, and
+`Do not rewrite either.`
 
-↳ Convention only — nothing parses the commit message. `git log --format='%s%n%b' -20` verifies the
-**subject** rule only: of the 20 it returns, the 16 carrying a body link all use the withdrawn form
-and none uses the mandated one. Widening the window does not help — the last commit using the
-mandated form predates `HEAD` by 126.
+Two things a widened window will hit, and neither is drift. `fda6755` and `715fa57` (both
+2026-07-22) carry `Resolves issue #NNN.` — the same keyword-plus-`issue` shape under a different
+linking keyword, equally non-auto-closing, and outside what the rewrite converted. And `34f07ba`
+and `4cf1adf` quote `Closes issue #` as *prose about the convention*; the rewrite left those alone
+while still converting `4cf1adf`'s own link line.
+
+The same pass removed `Co-authored-by: judge <judge@t.invalid>` from 42 commits — a fabricated
+co-author, whose mechanism is recorded upstream at `alexey-pelykh/.claude` issue #4251. Both edits
+were message-only: the ordered tree-SHA sequence across all 622 commits is identical before and
+after, so no content moved. Pre-rewrite history stays recoverable at tag
+`backup/pre-attribution-rewrite-20260816` (`e4b118c`).
+
+↳ Convention only — nothing parses the commit message. Check a body link's *shape*, not one literal:
+`git log --format='%b' -20 | grep -nE '^(Closes|Fixes|Resolves) issue #'` should return nothing, and
+every body link in that window should carry `Closes #NNN.`. Widen it far enough and the grep
+reaches `fda6755` and `715fa57` — history, not new drift. It never reaches `34f07ba` or
+`4cf1adf`: their `Closes issue #` sits mid-line, and this pattern is anchored.
 
 ## Branch naming
 
