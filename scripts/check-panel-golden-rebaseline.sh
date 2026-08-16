@@ -12,8 +12,10 @@
 # left no artifact whose change would show in a diff.
 #
 # So re-baselining is deliberately a two-part act:
-#   1. an explicit command — `SESSIOMETER_PANEL_GOLDENS=update` (nothing blesses a
-#      render implicitly, and there is no auto-bless-on-missing);
+#   1. an explicit command — `TEST_RUNNER_SESSIOMETER_PANEL_GOLDENS=update` (nothing
+#      blesses a render implicitly, and there is no auto-bless-on-missing). The prefix is
+#      what reaches the test process; an un-prefixed name stops at `xcodebuild` and leaves
+#      the regenerate test skipped, which is why the remedy printed below carries it;
 #   2. a recorded reason — a
 #          Panel-Goldens-Rebaselined: <reason>
 #      trailer on a commit in the PR, which this guard enforces.

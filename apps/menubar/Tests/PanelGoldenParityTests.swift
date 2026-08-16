@@ -47,7 +47,7 @@
 //   • ALWAYS ON (inside the required `swift` job) — renders succeed, carry ink, are deterministic, ignore
 //     the host process's appearance, stay pairwise distinct, and every canary trips its predicate. These
 //     prove the RIG.
-//   • SOFT, env-gated on `SESSIOMETER_PANEL_GOLDEN_GATE=1` (run only by the non-required `panel-goldens`
+//   • SOFT, env-gated on `SESSIOMETER_PANEL_GOLDEN_GATE` (run only by the non-required `panel-goldens`
 //     CI job) — `testEveryRenderMatchesItsCommittedGolden` and
 //     `testEachFreshRenderIsNearestToItsOwnGolden`. These are the committed-reference comparisons.
 // Promotion criterion (N = 10 consecutive green `panel-goldens` runs on `main`) is mirrored in
@@ -179,23 +179,36 @@ final class PanelGoldenParityTests: XCTestCase {
 
     // MARK: - Environment switches
 
-    /// Regenerate the committed goldens (`SESSIOMETER_PANEL_GOLDENS=update`). Deliberately an explicit,
-    /// named opt-in rather than an auto-bless-on-missing: the whole defect this issue fixes is a baseline
-    /// that could move as a SIDE EFFECT. Re-baselining is a decision, so it needs a command — and a
-    /// `Panel-Goldens-Rebaselined:` commit trailer, which `scripts/check-panel-golden-rebaseline.sh`
+    // ON A COMMAND LINE ALL THREE CARRY THE `TEST_RUNNER_` PREFIX; the names READ below never do, and
+    // that asymmetry is the whole trap. `xcodebuild` forwards a `TEST_RUNNER_`-prefixed variable into the
+    // test process with the prefix stripped, and an un-prefixed one does not arrive at all — it stops at
+    // `xcodebuild`, leaves the switch off, and the run still ends `** TEST SUCCEEDED **` having done
+    // nothing (the mechanism issue #1332 established). Measured again here for
+    // `SESSIOMETER_PANEL_MEASURE` at issue #1362, one variable at a time: un-prefixed,
+    // `testMeasureSeparations` reports `Executed 1 test, with 1 test skipped` and prints no calibration
+    // block; prefixed, `Executed 1 test, with 0 failures` and one block. So every spelling below that
+    // SETS a switch is the prefixed one, and `scripts/check-test-runner-env-form.sh` holds every
+    // committed surface that sets one — `NAME=` on a command line, `NAME:` in a YAML `env:` mapping —
+    // to that. Its subject includes this file's own skip messages, each of which used to land a reader
+    // who followed it back on the same skip.
+
+    /// Regenerate the committed goldens (`TEST_RUNNER_SESSIOMETER_PANEL_GOLDENS=update`). Deliberately an
+    /// explicit, named opt-in rather than an auto-bless-on-missing: the whole defect this issue fixes is a
+    /// baseline that could move as a SIDE EFFECT. Re-baselining is a decision, so it needs a command — and
+    /// a `Panel-Goldens-Rebaselined:` commit trailer, which `scripts/check-panel-golden-rebaseline.sh`
     /// enforces in CI.
     private var isUpdatingGoldens: Bool {
         ProcessInfo.processInfo.environment["SESSIOMETER_PANEL_GOLDENS"] == "update"
     }
 
-    /// Run the committed-golden comparisons (`SESSIOMETER_PANEL_GOLDEN_GATE=1`). Off by default so the
-    /// cross-machine-sensitive half of this suite lands NON-REQUIRED — see the header.
+    /// Run the committed-golden comparisons (`TEST_RUNNER_SESSIOMETER_PANEL_GOLDEN_GATE=1`). Off by
+    /// default so the cross-machine-sensitive half of this suite lands NON-REQUIRED — see the header.
     private var isGoldenGateEnabled: Bool {
         ProcessInfo.processInfo.environment["SESSIOMETER_PANEL_GOLDEN_GATE"] == "1"
     }
 
-    /// Print the calibration matrix (`SESSIOMETER_PANEL_MEASURE=1`) — the command that re-derives every
-    /// number in this file's header.
+    /// Print the calibration matrix (`TEST_RUNNER_SESSIOMETER_PANEL_MEASURE=1`) — the command that
+    /// re-derives every number in this file's header.
     private var isMeasuring: Bool {
         ProcessInfo.processInfo.environment["SESSIOMETER_PANEL_MEASURE"] == "1"
     }
@@ -754,7 +767,8 @@ final class PanelGoldenParityTests: XCTestCase {
         // planned pairs, which is the partial-subject hole its four siblings in this file are closed against.
         // 62 = the measured pair count over the 44-cell catalog's same-size groups
         // (2·C(6,2) + 4·C(4,2) + 8·C(2,2) = 30 + 24 + 8). It moves only when the catalog or a panel height
-        // does, which is a deliberate act — re-measure with SESSIOMETER_PANEL_MEASURE=1, do not tune.
+        // does, which is a deliberate act — re-measure with
+        // TEST_RUNNER_SESSIOMETER_PANEL_MEASURE=1, do not tune.
         //
         // It moved from 57 at issue #776, and the move is the point: `View log` made `starting` and
         // `crash-looping` TALLER, and by different amounts (the mock styles the action `.btn.link` in one and
@@ -1058,10 +1072,10 @@ final class PanelGoldenParityTests: XCTestCase {
     // pathological-content fixtures (issue #753), and the hole that leaves is the exact one issue #437 was
     // misread through five times: if the harness ever stopped APPLYING the hostile content — a mis-seeded
     // roster, a label sanitized on its way to the view, a percent clamped before it reached the meter — the
-    // stress fixtures would render as ordinary panels, `SESSIOMETER_PANEL_GOLDENS=update` would bless those
-    // ordinary panels, and the gate would thereafter DEFEND the neutered fixture and report green. Every
-    // other check in this file would stay green too: the renders are non-blank, deterministic, and pairwise
-    // distinct whether or not the content is hostile.
+    // stress fixtures would render as ordinary panels, `TEST_RUNNER_SESSIOMETER_PANEL_GOLDENS=update`
+    // would bless those ordinary panels, and the gate would thereafter DEFEND the neutered fixture and
+    // report green. Every other check in this file would stay green too: the renders are non-blank,
+    // deterministic, and pairwise distinct whether or not the content is hostile.
     //
     // So the mutation here is SEMANTIC, not a blot: each stress fixture is rebuilt with its pathology
     // REMOVED — the 40-char and non-Latin labels made ordinary ASCII, the same-local-part collisions made
@@ -1270,7 +1284,9 @@ final class PanelGoldenParityTests: XCTestCase {
     // because this is the one cross-machine-sensitive comparison in the suite.
     func testEveryRenderMatchesItsCommittedGolden() throws {
         try XCTSkipUnless(isGoldenGateEnabled,
-                          "committed-golden comparison is the non-required half: SESSIOMETER_PANEL_GOLDEN_GATE=1")
+                          "committed-golden comparison is the non-required half: "
+                          + "TEST_RUNNER_SESSIOMETER_PANEL_GOLDEN_GATE=1 — the bare, un-prefixed name "
+                          + "reaches xcodebuild and not the test, which then lands on this very skip")
         let all = cells()
         var checked = 0
         var worst = (name: "", drift: 0.0)
@@ -1334,7 +1350,9 @@ final class PanelGoldenParityTests: XCTestCase {
     // its denominator rose to 44. Why, and what it means for #790, is recorded at the tripwire itself.
     func testEachFreshRenderIsNearestToItsOwnGolden() throws {
         try XCTSkipUnless(isGoldenGateEnabled,
-                          "committed-golden comparison is the non-required half: SESSIOMETER_PANEL_GOLDEN_GATE=1")
+                          "committed-golden comparison is the non-required half: "
+                          + "TEST_RUNNER_SESSIOMETER_PANEL_GOLDEN_GATE=1 — the bare, un-prefixed name "
+                          + "reaches xcodebuild and not the test, which then lands on this very skip")
         // Group the GOLDENS by pixel size, then resolve each fresh render against its own size group.
         var groups: [String: [(name: String, fixture: String, raster: PanelRaster)]] = [:]
         let all = cells()
@@ -1399,7 +1417,10 @@ final class PanelGoldenParityTests: XCTestCase {
     // MARK: - Calibration: re-derive every number in this file's header
 
     func testMeasureSeparations() throws {
-        try XCTSkipUnless(isMeasuring, "calibration run only: SESSIOMETER_PANEL_MEASURE=1")
+        try XCTSkipUnless(isMeasuring,
+                          "calibration run only: TEST_RUNNER_SESSIOMETER_PANEL_MEASURE=1 — the bare, "
+                          + "un-prefixed name reaches xcodebuild and not the test, which then lands on "
+                          + "this very skip")
         let all = cells()
         var lines: [String] = ["", "=== panel golden calibration (issue #754) ==="]
 

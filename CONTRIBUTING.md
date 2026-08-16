@@ -143,8 +143,15 @@ load, on one host, in one session — must carry one of two things:**
 - **A re-runnable carrier**: something committed that re-derives the figure. Env-gated and
   skipped by default, following the idiom in
   [`apps/menubar/Tests/PanelGoldenParityTests.swift`](apps/menubar/Tests/PanelGoldenParityTests.swift)
-  (`SESSIOMETER_PANEL_MEASURE=1` + `XCTSkipUnless`), so it costs the required suite nothing and
-  never asserts on a host-dependent number.
+  (`TEST_RUNNER_SESSIOMETER_PANEL_MEASURE=1` + `XCTSkipUnless`), so it costs the required
+  suite nothing and never asserts on a host-dependent number. The `TEST_RUNNER_` prefix is
+  not decoration: `xcodebuild` forwards a prefixed variable into the test process with the
+  prefix stripped and an un-prefixed one not at all, so a bare name leaves the carrier
+  skipped while the run still ends `** TEST SUCCEEDED **` — a re-runnable carrier nobody
+  can run. `scripts/check-test-runner-env-form.sh` holds every committed surface that SETS
+  one of these switches — `NAME=` on a command line, `NAME:` in a YAML `env:` mapping — to
+  the prefixed spelling, so this sentence cannot drift back. Naming a switch without
+  setting it is unconstrained: the un-prefixed name is what the source itself reads.
 - **An explicit `one-time attestation, no in-repo witness` label**, in the body, beside the
   figures it covers.
 
@@ -469,6 +476,24 @@ every merge, so read them from the tool rather than from prose.
   over one unmoving file, so that churn cannot be what separates the demand from the
   self-check (issue #1388). It exercises those shapes over its own throwaway fixture,
   which has no `src/cli.rs` in it.
+- [`scripts/check-test-runner-env-form.sh`](scripts/check-test-runner-env-form.sh)
+  — a CI guard (the `doc-gates` job in
+  [`.github/workflows/ci.yml`](.github/workflows/ci.yml)) that fails the build when a
+  committed surface SETS one of the menubar test bundle's environment switches under its
+  un-prefixed name, or names a `TEST_RUNNER_`-prefixed switch the bundle does not read.
+  `xcodebuild` forwards a prefixed variable into the xctest process with the prefix
+  stripped and an un-prefixed one not at all, so the un-prefixed spelling leaves the switch
+  off while the run still ends `** TEST SUCCEEDED **` — including when the surface stating
+  it is the suite's own skip message, which then lands the reader back on that same skip
+  (issue #1362). Two spellings set a switch and both are held: `NAME=` on a command line,
+  and `NAME:` at key position in a YAML `env:` mapping, which is how this workflow arms the
+  panel drift gate. Naming a switch without setting it is unconstrained — the un-prefixed
+  name is what the Swift source reads. Its subject is DERIVED from those reads rather than
+  listed, and deriving nothing is exit 2 rather than a pass. Unfiltered on purpose: the
+  surfaces it holds span every path filter and one of them, § Measurements published in a
+  commit body above, is in none. Falsifier peer:
+  [`scripts/check-test-runner-env-form.test.sh`](scripts/check-test-runner-env-form.test.sh),
+  each case mutation-validated against the guard rewritten to the rule it targets.
 - `cargo deny check advisories sources licenses` — the supply-chain gates configured
   in [`deny.toml`](deny.toml).
 - [`docs/adr/`](docs/adr/) — Architecture Decision Records for the load-bearing
