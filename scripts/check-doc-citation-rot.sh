@@ -13,9 +13,51 @@
 # THE RULE
 #   A `src/<file>.rs:NNN` citation must leave behind something a reader can
 #   RE-DERIVE the location from — a SYMBOL named on the same line that actually
-#   occurs AT THE CITED LINES. A bare number as the sole referent is only
-#   admissible when the cited file is STABLE, because then the number keeps
-#   meaning what it meant.
+#   occurs AT THE CITED LINES. A bare number as the sole referent is admissible
+#   only when the cited file is STABLE — where "stable" is a BET that the number
+#   keeps meaning what it meant, not a guarantee that it does; see § The two
+#   questions.
+#
+# § THE TWO QUESTIONS, AND ONLY ONE OF THEM IS CHURN-GATED (issue #1388)
+#   Asking them as one question is what let a citation through whose own line
+#   contradicted it.
+#
+#     DEMAND — the line names no symbol at all: does this citation OWE one?
+#     SELF-CHECK — the line already names one: does it AGREE with the number?
+#
+#   Only the DEMAND is churn-gated. It is a cost imposed on an author, so the
+#   threshold decides when it is worth imposing, and issue #1058's ruling that
+#   line numbers stay legitimate for stable files governs it unchanged. The
+#   SELF-CHECK asks nothing of anybody — the author already wrote both halves —
+#   so a "stable" file has nothing to exempt, and it runs at any churn.
+#
+#   That distinction is not a refinement; the collapsed form was measurably
+#   wrong. `docs/requirements/migration-credential-portability.md` cited the
+#   `account_uuid` field's doc comment as `src/config.rs:341` and quoted its
+#   text verbatim. The quote was right and the number was right on the day it
+#   was written; a later commit inserted a two-line `pub(crate) use` re-export
+#   near the top of the file, ~280 lines above, and the cited line became
+#   `#[allow(dead_code)]`. The line said `account_uuid`, `account_uuid` did not
+#   occur at 341, and the gate certified it anyway — because `src/config.rs` sat
+#   BELOW the threshold, so the anchoring question was never asked at all.
+#   Re-derive both halves rather than trusting them, against the very PR that
+#   rewrote that line — a pinned pair of commits, so by design choice 2 below
+#   the churn count is a property of the commit and not of the day you ask:
+#
+#     git fetch origin f286778e51a06bf409d0e3e9e18214e7a41d0b18
+#     git rev-list --count "$(git rev-list --max-count=1 --skip=299 f286778)..f286778" \
+#       -- src/config.rs                                   # under $THRESHOLD
+#     ./scripts/check-doc-citation-rot.sh 9b39061 f286778  # red, on this rule
+#
+#   The old collapsed rule is NOT reproducible by raising the threshold, and
+#   that is the point rather than an inconvenience: the SELF-CHECK no longer has
+#   a churn knob to be switched off by.
+#
+#   The general fact the instance illustrates: ONE commit inserting ONE line
+#   anywhere above a citation moves it, whatever the file's churn. Churn bounds
+#   how OFTEN that bet is taken, never whether a single commit can lose it — so
+#   a threshold is a sound basis for demanding an anchor and never a sound basis
+#   for ignoring one that is already there.
 #
 #   AT THE CITED LINES, not merely somewhere in the file (issue #1338). A symbol
 #   the range does not point at re-derives nothing, so it cannot be what earns
@@ -294,8 +336,23 @@ anchored() { # <doc-line> <cited-file> <first-line> <last-line>  -> 0 if anchore
             # single-word `fn` names and would fail a shape test. That declaration
             # is also the escape hatch for a genuine all-caps constant, which the
             # subtraction below would otherwise refuse.
+            #
+            # A span carrying a `/` is a PATH, not an identifier, and is dropped
+            # whole rather than shredded into components (issue #1388). Prose
+            # about a citation names neighbouring files almost by construction,
+            # and `src/cli.rs` shreds to `src`, `cli`, `rs` — none a symbol. That
+            # is the #1319 class one step over, and left alone it MANUFACTURES
+            # disagreements now that the self-check is churn-independent:
+            # `docs/requirements/gui-cli-capability-parity.md` cites the control
+            # socket's verb inventory as `src/daemon/socket.rs:7-46`, which is
+            # correct, and names `parse_subcommand` (`src/cli.rs`) alongside it —
+            # whereupon `cli` "occurs" in socket.rs, as a bare word in prose,
+            # outside the range. Dropping the span whole, rather than filtering
+            # the components, is what keeps the rule statable: a path is one
+            # token to a reader, so it is one token here.
             printf '%s' "$stripped" \
                 | grep -oE '`[^`]*`' \
+                | grep -vE '/' \
                 | tr -c 'A-Za-z0-9_' '\n' \
                 | grep -E '^[A-Za-z_][A-Za-z0-9_]*$'
             # Outside them, require a shape only an identifier takes, or every
@@ -362,20 +419,30 @@ check_line() { # <doc> <lineno> <line>
             continue
         fi
 
-        # (b) Anchoring, required only where the number cannot be trusted to keep
-        #     its meaning.
+        # (b) Anchoring. TWO questions, and only the second is churn-gated
+        #     (issue #1388). Asking them in one breath is what let a citation
+        #     through whose own line contradicted it; see § The two questions.
         c="$(churn "$path")"
+        if anchored "$line" "$path" "$first" "$last"; then
+            continue
+        fi
+        # SELF-CHECK: the line already names a symbol, and it disagrees with the
+        # number beside it. Nothing is being demanded of the author, so the
+        # stable-file exemption has nothing to exempt — checked at any churn.
+        if [ -n "$elsewhere" ]; then
+            fail "  ${doc}:${lineno}  ${cite}  -> the line names ${elsewhere}, which occurs in ${path} but NOT within lines ${first}-${last} — the symbol and the number disagree, and which of them is wrong is not something this check can see: if the number drifted, re-derive the range from the symbol; if the range is right and the symbol merely sits outside it, widen the range to cover the symbol or name one that is inside. Dropping the range and citing the symbol alone clears it either way"
+            continue
+        fi
+        # DEMAND: the line names no symbol at all. This is what issue #1058
+        # exempts for a file whose numbers keep their meaning often enough to
+        # bet on, so it stays behind the threshold.
         if [ "$c" -lt "$THRESHOLD" ]; then
             continue
         fi
-        if ! anchored "$line" "$path" "$first" "$last"; then
-            if [ -n "$elsewhere" ]; then
-                fail "  ${doc}:${lineno}  ${cite}  -> the line names ${elsewhere}, which occurs in ${path} but NOT within lines ${first}-${last} — the symbol and the number disagree (${c} commits in the last ${WINDOW}), and which of them is wrong is not something this check can see: if the number drifted, re-derive the range from the symbol; if the range is right and the symbol merely sits outside it, widen the range to cover the symbol or name one that is inside. Dropping the range and citing the symbol alone clears it either way"
-            elif [ -n "$declined" ]; then
-                fail "  ${doc}:${lineno}  ${cite}  -> bare line number into a churning file (${c} commits in the last ${WINDOW}); ${declined} occurs at those lines but is prose, not a symbol — name a real one, or backtick it if it is code"
-            else
-                fail "  ${doc}:${lineno}  ${cite}  -> bare line number into a churning file (${c} commits in the last ${WINDOW}); name a symbol that occurs at those lines"
-            fi
+        if [ -n "$declined" ]; then
+            fail "  ${doc}:${lineno}  ${cite}  -> bare line number into a churning file (${c} commits in the last ${WINDOW}); ${declined} occurs at those lines but is prose, not a symbol — name a real one, or backtick it if it is code"
+        else
+            fail "  ${doc}:${lineno}  ${cite}  -> bare line number into a churning file (${c} commits in the last ${WINDOW}); name a symbol that occurs at those lines"
         fi
     done
 }
@@ -446,7 +513,9 @@ if [ "$violations" -gt 0 ]; then
         echo "in src/, and none of them re-derives anything (issue #1319). If the token really is a"
         echo "constant, backtick it and it counts."
         echo
-        echo "Is the file churning? Threshold is ${THRESHOLD} commits over the last ${WINDOW}:"
+        echo "Churn gates only whether a citation is ASKED for a symbol. A citation that already"
+        echo "names one is checked against its own number whatever the file does (issue #1388), so"
+        echo "a report on a quiet file is not a bug. Threshold is ${THRESHOLD} commits over the last ${WINDOW}:"
         echo "    git rev-list --count \"\$(git rev-list --max-count=1 --skip=$((WINDOW - 1)) HEAD)..HEAD\" -- <file>"
     } >&2
     exit 1
