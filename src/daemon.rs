@@ -1812,13 +1812,15 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// [`with_config_path`](Self::with_config_path); when `None`, an inbound
     /// `roster-reload` signal is a logged best-effort no-op (there is nothing to read).
     config_path: Option<PathBuf>,
-    /// The poll-path refresh-then-retry seam (issue #162), or `None` to disable it (the
-    /// hermetic-test default AND a `[refresh]`-off daemon — a 401 then flows straight to
-    /// the #42 streak exactly as before). Production wires the #102 engine
-    /// ([`RealRefreshEngine`]) via [`with_refresh_engine`](Self::with_refresh_engine), wired
-    /// on the same `[refresh].enabled` switch as the periodic tick (issue #375: `claude` is
-    /// resolved per-cycle at the spawn site, not gated on a startup resolution); when `Some`,
-    /// a usage 401 attempts one isolated refresh + re-poll before it can quarantine the account.
+    /// The poll-path refresh-then-retry seam (issue #162), or `None` to disable it — the
+    /// hermetic-test default, and ONLY that: a 401 then flows straight to the #42 streak
+    /// exactly as before. Production wires the #102 engine ([`RealRefreshEngine`]) via
+    /// [`with_refresh_engine`](Self::with_refresh_engine) UNCONDITIONALLY, above the
+    /// `[refresh].enabled` block (issue #426) — that switch gates whether the PROACTIVE
+    /// periodic tick FIRES, not whether this reactive seam is WIRED, so a `[refresh]`-off
+    /// daemon still has it `Some`. (`claude` is resolved per-cycle at the spawn site, not
+    /// gated on a startup resolution — issue #375.) When `Some`, a usage 401 attempts one
+    /// isolated refresh + re-poll before it can quarantine the account.
     poll_refresh: Option<Box<dyn PollRefresh>>,
     /// The usage-stats store maintenance seam (issue #161), or `None` to disable it (the
     /// hermetic-test default — a test with no on-disk store wires nothing, so the collector's
@@ -2329,10 +2331,12 @@ where
     /// then attempts one isolated refresh (the #102 engine) + a single re-poll BEFORE the
     /// 401 counts toward the #42 death streak, so a merely-expired access token is revived
     /// instead of quarantining a healthy account. Production wires [`RealRefreshEngine`]
-    /// (on the same `[refresh].enabled` switch as the periodic tick — the `claude` binary is
-    /// resolved per-cycle at the spawn site, issue #375); left unset, a test / feature-off daemon
-    /// behaves exactly as before. Builder-style to mirror `with_swap_lock` / `with_config_path`
-    /// and keep `new`'s args stable.
+    /// UNCONDITIONALLY, above the `[refresh].enabled` block (issue #426): that switch gates
+    /// whether the PROACTIVE periodic tick FIRES, not whether this reactive seam is WIRED —
+    /// unlike [`with_keep_warm_engine`](Self::with_keep_warm_engine), which production does
+    /// call inside the block. (The `claude` binary is resolved per-cycle at the spawn site,
+    /// issue #375.) Only a test leaves it unset, and such a daemon behaves exactly as before.
+    /// Builder-style to mirror `with_swap_lock` / `with_config_path` and keep `new`'s args stable.
     pub(crate) fn with_refresh_engine(mut self, engine: Box<dyn PollRefresh>) -> Self {
         self.poll_refresh = Some(engine);
         self
