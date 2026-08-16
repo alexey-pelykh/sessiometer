@@ -1256,11 +1256,44 @@ impl FleetRunway {
 /// - NOT an average of per-account runways: that gives equal weight to an idle spare account's long
 ///   runway and an active account's short one, and for identical accounts collapses to a single
 ///   account's runway — it is not a pool.
-/// - The pool form is honest because only ONE account burns at a time (a single active credential):
-///   an idle peer reads a flat, ~0 weekly rate, so `Σ rate` is dominated by whichever account is
-///   actually climbing, and `Σ head-room / Σ rate` is the pool's true remaining time. When several
-///   accounts genuinely burned across the window it stays a faithful, CONSERVATIVE reading of the
-///   observed combined rate — it never OVER-states runway.
+/// - The pool form is honest WHEN the idle peers are counted alongside the climbing one: only ONE
+///   account burns at a time (a single active credential), so an idle peer contributes head-room at
+///   a ~0 weekly rate, `Σ rate` is dominated by whichever account is actually climbing, and
+///   `Σ head-room / Σ rate` is the pool's true remaining time. When several accounts genuinely
+///   burned across the window it stays a faithful, CONSERVATIVE reading of the observed combined
+///   rate — it never OVER-states runway.
+///
+/// THAT PRECONDITION DOES NOT HOLD ON A LIVE ROSTER (issue #1034), and what breaks it is the
+/// exclusion gate below rather than anything in the arithmetic. An idle peer does not read a flat,
+/// ~0 weekly rate — it reads UNKNOWN, and the gate then drops it, head-room and all.
+/// [`account_velocity`] refuses a velocity once the latest reading no longer covers the window end,
+/// and that horizon is `stale_after_secs`, which [`params_from`] leaves at `poll_secs`
+/// (`AggregateParams::new`). A non-active account is re-observed only as fast as the #366 poll
+/// schedule sweeps, and once it is out of rotation the daemon's `note_exhausted_poll` widens it to
+/// `exhausted_poll_secs` — which `config::validate` pins to `poll_secs..=86_400`, so the widened
+/// window can never be NARROWER than the horizon it would have to beat, and at the shipping
+/// defaults it is `DEFAULT_EXHAUSTED_POLL_SECS` against a `DEFAULT_POLL_SECS` horizon. The idle
+/// peer's head-room therefore leaves the numerator while the climbing account's rate stays in the
+/// denominator, and the pool collapses toward whatever is still fresh — with one account counted it
+/// IS that account's own weekly runway wherever that account has one to state, the "collapses to a
+/// single account's runway — it is not a pool" form this method rejects. They part at exactly one
+/// point: at zero head-room [`runway_secs`] refuses (`current >= trigger`) while the pool divides a
+/// zero numerator by a live rate and reads `Known(0)`.
+///
+/// The exclusion is not merely CORRELATED with the condition the figure is about; one shared line
+/// causes it. `note_exhausted_poll` arms that widened cadence for a non-active account at/above the
+/// daemon's `weekly_rotation_line`, which is [`crate::swap::weekly_effective_ceiling`] — the same
+/// function [`crate::swap::viability_boundary`]'s weekly arm calls, and the same boundary
+/// REQ-STA-B-010 requires a representativeness predicate to reuse. That one line therefore decides
+/// both whether an account is near enough its ceiling to matter to this figure and how often it is
+/// observed at all. The coupling is a bias, not a set identity: this gate also drops an idle peer
+/// that merely falls behind the #366 sweep; `note_exhausted_poll` has a second arm on
+/// `session_ceiling_base`, so it also drops a session-exhausted peer nowhere near its weekly
+/// ceiling — the case a predicate reusing that one boundary would not see; and a widened poll
+/// leaves its own account fresh for the horizon that follows it. Surfacing `n of m` keeps the
+/// reading honest meanwhile; REFUSING on an unrepresentative counted set is issue #1034's second
+/// half, held until spike #1033 measures whether such a predicate would leave the runway
+/// reportable at all.
 ///
 /// HONEST DEGRADATION (the load-bearing AC): an account with an unknown / stale weekly velocity is
 /// EXCLUDED ENTIRELY — neither its head-room (numerator) nor its burn (denominator) enters. Treating
@@ -8414,6 +8447,104 @@ mod tests {
             (mixed.counted, mixed.observed),
             (2, 3),
             "the stale account is surfaced in `observed` (m) but not `counted` (n)"
+        );
+    }
+
+    #[test]
+    fn fleet_runway_pools_the_one_fresh_account_when_the_near_ceiling_peers_are_slow_polled() {
+        // Issue #1034 / AC-5. This pins what the aggregate does TODAY on the shape observed live —
+        // it is the fixture that INVERTS when R-6 lands, not an endorsement of the reading. R-6
+        // (refuse on an unrepresentative counted set) is held until spike #1033 measures whether
+        // such a predicate would leave the runway reportable at all.
+        //
+        // Five accounts sit at/above the daemon's own weekly viability line, so it takes each out
+        // of rotation and re-polls it on the widened `exhausted_poll_secs` cadence. Their latest
+        // reading is then older than the coverage horizon, their weekly velocity is UNKNOWN, and
+        // the honest-degradation gate drops them ENTIRELY. What survives is the fresh spare the
+        // daemon swapped onto — the member FURTHEST from its ceiling. That daemon-side chain is the
+        // scenario being MODELLED, not what runs here: this replays the sample shape it produces
+        // straight through `velocity_report`, so what is pinned below is the tail of the chain —
+        // `stale → excluded → the pool degenerates` — plus the fixture's own near-ceiling check.
+        let now = epoch("2026-07-01T12:00:00Z");
+        // The same boundary the daemon slow-polls on and the same one REQ-STA-B-010 requires a
+        // representativeness predicate to reuse — read from the shared helper, never a literal.
+        let near_ceiling = crate::swap::weekly_effective_ceiling(vparams().weekly_ceiling);
+        let hot = [
+            ("hot-a", 0.960),
+            ("hot-b", 0.965),
+            ("hot-c", 0.970),
+            ("hot-d", 0.975),
+            ("hot-e", 0.980),
+        ];
+        let mut samples = vec![
+            // The fresh spare: three readings inside the coverage horizon, weekly climbing 0.001
+            // per 300 s → head-room 0.95 − 0.202 = 0.748 over a rate of 0.001/300 frac/s.
+            sample(now - 900, "spare", 0.50, 0.200),
+            sample(now - 600, "spare", 0.51, 0.201),
+            sample(now - 300, "spare", 0.52, 0.202),
+        ];
+        for (handle, weekly) in hot {
+            // Not a restatement of the literals: it checks each against the line the SHARED helper
+            // derives, so a move in the ceiling fails here rather than quietly leaving the fixture
+            // no longer near-ceiling at all. A move in `WEEKLY_TAIL_MARGIN` cannot fail it, and the
+            // guard is one-sided on purpose rather than by oversight: the line is
+            // `weekly_ceiling − margin` with the const pinned `> 0.0`, so it stays strictly under
+            // 0.95 for every legal margin, while every `hot` weekly above is 0.960 or more.
+            assert!(
+                weekly >= near_ceiling,
+                "{handle} at {weekly} must sit at/above the weekly viability line {near_ceiling}"
+            );
+            // Three CLIMBING readings apiece, so the ONLY reason each is excluded is that its
+            // latest one is older than the horizon — not under-sampling, not a flat series.
+            samples.push(sample(now - 4200, handle, 0.50, weekly - 0.002));
+            samples.push(sample(now - 3900, handle, 0.51, weekly - 0.001));
+            samples.push(sample(now - 3600, handle, 0.52, weekly));
+        }
+        let report = velocity_report(samples, now);
+
+        let fleet = fleet_runway(&report).expect("a countable fleet");
+        assert_eq!(
+            (fleet.counted, fleet.observed),
+            (1, 6),
+            "every near-ceiling peer is OBSERVED, none is COUNTED"
+        );
+        for (handle, _) in hot {
+            assert_eq!(
+                report.velocity[handle].weekly_headroom, None,
+                "{handle} contributes no head-room — excluded, not zero-burned"
+            );
+            assert!(
+                report.summary.per_account["spare"].weekly.peak
+                    < report.summary.per_account[handle].weekly.peak,
+                "the counted account sits further from its ceiling than excluded {handle}"
+            );
+        }
+
+        // The pool has DEGENERATED: with one account counted, `Σ head-room ÷ Σ rate` is that
+        // account's own weekly runway — the "collapses to a single account's runway — it is not a
+        // pool" form `fleet_runway`'s method doc rejects. Same numerator, same denominator and the
+        // same rounding through `checked_runway_secs`, so this is an equality, not an approximation.
+        assert_eq!(
+            fleet.runway_secs(),
+            report.velocity["spare"].weekly_runway_secs,
+            "the fleet figure IS the surviving account's own runway"
+        );
+
+        // What HAS shipped is the honesty half (R-5): a figure is still stated, and the counted set
+        // is stated alongside it. A reader who reads only the figure has no way to tell that the
+        // one account behind it is the one member not running out.
+        let text = render_text(&report, None);
+        let line = text
+            .lines()
+            .find(|l| l.contains("accounts last"))
+            .expect("the roster block states a runway line");
+        assert!(
+            line.contains("(1 of 6 counted)"),
+            "R-5: the counted set is stated alongside the figure: {line}"
+        );
+        assert!(
+            !line.contains("unknown"),
+            "R-6 has not shipped: the unrepresentative subset still yields a figure: {line}"
         );
     }
 
