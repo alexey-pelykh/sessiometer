@@ -33,7 +33,8 @@ roster of accounts. Two independent loops touch each account:
   copy of its stash. #105 deliberately gave the tick **its own roster copy and its
   own `Clock`**, decoupled from the daemon's: the run loop threads nothing from the
   daemon into the sweep — "*the tick owns its own roster copy + clock, so the sweep
-  below needs nothing from it*" (`src/daemon/run_loop.rs:225`).
+  below needs nothing from it*", the comment over the pre-idle
+  `refresh_exclusions` read (`src/daemon/run_loop.rs:247-249`).
 
 The refresh path had **no back-off on the error path**. On a sustained failure —
 issue **#375**'s stale-`claude`-binary burst is the archetype — every cycle
@@ -115,9 +116,9 @@ timing the tick's own concern — so the state belongs where the timing lives.
    `RefreshTick`, on the tick's own clock.
    - **Pros**: keeps refresh timing wholly inside the component #105 made its
      owner; the run loop still threads **nothing** from the daemon into the sweep
-     (`run_loop.rs:225` stays true); the whole machine is unit-testable over the
-     tick's `Clock` seam with **no real clock or network**, like the existing sweep
-     tests.
+     (the `refresh_exclusions` comment stays true); the whole machine is
+     unit-testable over the tick's `Clock` seam with **no real clock or network**,
+     like the existing sweep tests.
    - **Cons**: a **new** back-off home distinct from the poll path's — two
      structurally-similar mechanisms in two files. Accepted: they are genuinely
      different timers (poll cadence vs refresh cadence) on different clocks.
@@ -128,14 +129,14 @@ timing the tick's own concern — so the state belongs where the timing lives.
    folding the outcome back in a post-idle daemon step.
    - **Pros**: one back-off "home" for both loops; visually unifies with ADR-0009.
    - **Cons**: it **re-couples the sweep's timing to the daemon's clock** — the
-     exact decoupling #105 severed (`run_loop.rs:225`). The tick would need the
-     daemon's `AccountHealth` to decide whether to skip, so the run loop must thread
-     health state *into* the sweep and the sweep's outcome *back out* — splitting
-     one state machine across a **third sweep parameter plus a post-idle fold**. It
-     also invites a later misuse: a *refresh-throttle* field sitting on
-     `AccountHealth` reads as fair game for an **activation / health** decision it
-     has no business influencing (the health machine drives quarantine and swap
-     eligibility, ADR-0007).
+     exact decoupling #105 severed (the `refresh_exclusions` comment). The tick
+     would need the daemon's `AccountHealth` to decide whether to skip, so the run
+     loop must thread health state *into* the sweep and the sweep's outcome *back
+     out* — splitting one state machine across a **third sweep parameter plus a
+     post-idle fold**. It also invites a later misuse: a *refresh-throttle* field
+     sitting on `AccountHealth` reads as fair game for an **activation / health**
+     decision it has no business influencing (the health machine drives quarantine
+     and swap eligibility, ADR-0007).
    - **Why rejected**: it trades the #105 decoupling invariant and a clean
      single-owner state machine for a cosmetic "one home" that the two clocks make
      false anyway. The poll and refresh timers are independent; their back-offs
@@ -151,8 +152,9 @@ timing the tick's own concern — so the state belongs where the timing lives.
   re-spawning at ~1/min/account. The #408 incident shape (374 spawns in 3 h) is
   bounded to a handful.
 - **The #105 decoupling invariant is preserved.** The sweep still needs nothing
-  from the daemon; `run_loop.rs:225` remains literally true. A future contributor
-  reading the run loop sees no health state threaded into the sweep.
+  from the daemon; the `refresh_exclusions` comment remains literally true. A
+  future contributor reading the run loop sees no health state threaded into the
+  sweep.
 - **Per-account and self-clearing, like the poll path.** The streak is scoped to
   one account and cleared by its first clean refresh, so one broken account never
   slows another's upkeep, and recovery needs no manual reset.
@@ -208,9 +210,9 @@ timing the tick's own concern — so the state belongs where the timing lives.
   (~L217), the early skip in `run_sweep` (~L359), the widen/clear fold (~L415), the
   emitted deltas (~L473), the apply in `sweep` (~L534), the deliberately
   back-off-unaware `recovery_pending` comment (~L490). `src/daemon/run_loop.rs` —
-  the #105 decoupling invariant the placement preserves (~L225). `src/observability.rs`
-  — the `backoff_secs=` field on the `event=refresh` error line (~L536, rendered
-  ~L805).
+  the #105 decoupling invariant the placement preserves: the `refresh_exclusions`
+  comment (~L247). `src/observability.rs` — the `backoff_secs=` field on the
+  `event=refresh` error line (~L536, rendered ~L805).
 - ADR-0009 (the poll-path per-account back-off whose *mechanism* this mirrors and
   whose *home* this deliberately does **not** share); ADR-0007 (the `AccountHealth`
   health machine Option B would have overloaded); ADR-0002 (the `security`-CLI
