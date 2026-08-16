@@ -1762,25 +1762,54 @@ mod tests {
     /// gate takes over-scanning every time: a stray test helper costs ONE register line and says
     /// so loudly, while a truncated scan is a green run over a subject that was never read.
     ///
-    /// **Seven of the fifty-nine files under `src/` therefore carry no boundary at all and are
-    /// scanned whole** — measured, not assumed, and worth stating because the bias's cost is
-    /// exactly what those files' TEST-ONLY regions contribute, read as production. Today that is
-    /// nothing: `config/test_support.rs` (entirely test-only), `redaction.rs`'s `mod meter`,
-    /// `main.rs`'s declared test modules and `socket.rs`'s `#[cfg(test)]` helpers hold no
-    /// identity-field read between them. Their PRODUCTION reads are a separate matter and are not
-    /// part of the over-scan — three of the seven carry one (`daemon/run_loop.rs:69`,
-    /// `daemon/snapshot.rs:991`, `daemon/socket.rs:835`, that last being why `serve_control` sits
-    /// in [`HANDLE_READ_REGISTER`]) and each is dispositioned like any other. Re-check with
-    /// `git grep -nE '\.(label|account_uuid)\b' -- <the seven>`; through PR #1198 this paragraph
-    /// asserted the stronger and false "none of the seven contributes a read", which the register
-    /// two screens below already contradicted (issue #1203). Three
-    /// classes: four files have no `#[cfg(test)]` whatsoever, their suites living in a sibling
-    /// (`config/test_support.rs`, `daemon/peer_auth.rs`, `daemon/run_loop.rs`,
-    /// `daemon/snapshot.rs` — the last two are covered from `daemon.rs` and `snapshot_build.rs`);
-    /// `daemon/socket.rs` carries `#[cfg(test)]` helpers but no test module; and two are cut by
-    /// a spelling rather than by a nesting — `main.rs` DECLARES its test modules
-    /// (`mod cross_surface;`, per the trailing-`{` rule below), and `redaction.rs` opens its
-    /// test-only block as `pub(crate) mod meter {`, which does not start with `mod `.
+    /// **The files under `src/` that carry no boundary at all are scanned whole**, and WHICH
+    /// files those are is derived rather than written down here. Re-derive with this function's
+    /// own predicate — `#[cfg(test)]` at column 0, next line opening a `mod … {` — over `src/`.
+    /// Neither a count nor the list it counts belongs in this paragraph: both mirror a set the
+    /// tree owns and the message does not, so both are true when written and false when read.
+    /// The count `f85b83a` wrote here is the worked example: `src/error.rs` gained its
+    /// `pub(crate) mod tests {` spelling in `8880674` afterwards, so the count described a tree
+    /// that had since moved without a character of it changing. Spelling the membership out
+    /// instead does not remove that mirror; it only makes it longer.
+    ///
+    /// The bias's cost is what those files' TEST-ONLY regions contribute, read as production,
+    /// which is why the set is worth re-deriving rather than assuming. Re-check it with
+    /// `git grep -nP '\.(label|account_uuid)\b|\.stash\(|::stash\b' -- <the derived files>`:
+    /// `-P` because `-E` matches NOTHING for `\b` here rather than erroring, and a recipe that
+    /// matches nothing at all agrees with every claim made about its output. Canary a
+    /// `\b`-carrying ALTERNATIVE alone —
+    /// `git grep -nP '\.(label|account_uuid)\b' -- src/capture.rs src/use_account.rs`, which
+    /// matches both files and returns NOTHING under `-E`. The whole recipe is the wrong canary
+    /// for that: `\.stash\(` carries no `\b`, so it matches those same two files under either
+    /// engine, and the canary would pass on exactly the run it exists to catch. A correct canary
+    /// is a pattern the two engines DISAGREE on here. The two `stash` alternatives are there
+    /// because issue #1358 made that name an identity-field read in three spellings: a recipe
+    /// left on the two field names answers false-clean once any of them lands in one of these
+    /// test regions, and one left on `\.stash\(\)` answers false-clean for the path forms
+    /// [`path_stash_call_at`] and [`path_stash_item_at`] match. It does NOT cover the
+    /// braced-pattern spelling [`braced_binding_at`] matches, since a bare `label` cannot be
+    /// grepped without matching most of the crate: this recipe scopes a paragraph, and the gate
+    /// itself is the instrument.
+    ///
+    /// READ ITS OUTPUT BY CLASS rather than expecting it to be empty — it is a whole-FILE grep
+    /// and cannot express the test-only scope this paragraph is about, so it returns each file's
+    /// production text too. A PRODUCTION read is a separate matter, dispositioned in
+    /// [`HANDLE_READ_REGISTER`] like any other and no part of the over-scan; that is why
+    /// `serve_control` sits in the register. `::stash\b` over-fires on the `crate::stash` MODULE
+    /// path, which is the over-fire direction this gate takes everywhere else. A row that is
+    /// neither — a read inside one of these files' TEST-ONLY regions — is the bias's cost
+    /// showing up, and is the one this recipe exists to surface. Through PR #1198 this paragraph
+    /// asserted the stronger and false claim that no such file contributes a read at all, which
+    /// [`HANDLE_READ_REGISTER`] already contradicted (issue #1203).
+    ///
+    /// They fall out for different reasons, and the reasons are the durable half. Some files
+    /// carry no `#[cfg(test)]` whatsoever, their suites living in a sibling — `daemon/run_loop.rs`
+    /// is covered from `daemon.rs`, `daemon/snapshot.rs` from `daemon/snapshot_build.rs`. Some carry
+    /// `#[cfg(test)]` helpers but no test module at all. And some are cut by a SPELLING rather
+    /// than by a nesting: a test module DECLARED rather than opened (`mod cross_surface;`, per
+    /// the trailing-`{` rule below), or one opened as `pub(crate) mod meter {` or
+    /// `pub(crate) mod tests {` — neither of which starts with `mod `, which is this predicate's
+    /// own requirement rather than an oversight.
     ///
     /// The trailing-`{` requirement is that same bias applied to the shape that actually shipped
     /// broken (issue #1197). A test module can be DECLARED rather than opened — `#[cfg(test)]` /
@@ -1838,11 +1867,14 @@ mod tests {
     /// - **Only functions naming the roster** (`Account` in the signature, or `roster` in the
     ///   body) drops a resolver that reaches its accounts through a differently-named field.
     ///
-    /// A read reached through a METHOD (`.account_uuid()`) is deliberately NOT a match: that
-    /// spelling belongs to the OAuth capture types, not to a roster account, and admitting it
-    /// would fill the register with entries no reader can act on. `Account` grows an accessor
-    /// only by someone editing `src/config.rs`, where
-    /// [`the_identity_fields_stay_plain_fields`] is waiting.
+    /// A read reached through a METHOD is a match for exactly one method, `.stash()`, and for
+    /// none of the others (issue #1358). `Account::stash` RETURNS an identity field wrapped in a
+    /// constant prefix, so matching an operator string against it resolves a handle as squarely
+    /// as matching `account_uuid` does; `.account_uuid()` is the OAuth capture types' accessor
+    /// rather than a roster account's field, and admitting method calls wholesale would fill the
+    /// register with entries no reader can act on. `impl Account` declaring a SECOND method is
+    /// what would make that pair of sentences stale, and [`the_identity_fields_stay_plain_fields`]
+    /// reds on exactly that — there and on an accessor for either field.
     ///
     /// **The braced-pattern family, enumerated rather than left implicit** (issue #1202's last
     /// acceptance criterion). Every member below is one rule — a field name bound as SHORTHAND
@@ -2095,12 +2127,25 @@ mod tests {
                 i = next;
                 continue;
             }
-            let matched = identity_field_at(&src, i).or_else(|| {
-                (delims.last() == Some(&'{'))
-                    .then(|| braced_binding_at(&src, i))
-                    .flatten()
-            });
-            if let Some((field, next)) = matched {
+            // The read's own START travels with it, because one arm's read begins before the
+            // position that matched it — see [`path_stash_call_at`].
+            let matched = identity_field_at(&src, i)
+                .map(|(field, next)| (field, i, next))
+                .or_else(|| {
+                    path_stash_call_at(&src, i)
+                        .map(|(start, next)| ("stash".to_owned(), start, next))
+                })
+                .or_else(|| {
+                    path_stash_item_at(&src, i)
+                        .map(|(start, next)| ("stash".to_owned(), start, next))
+                })
+                .or_else(|| {
+                    (delims.last() == Some(&'{'))
+                        .then(|| braced_binding_at(&src, i))
+                        .flatten()
+                        .map(|(field, next)| (field, i, next))
+                });
+            if let Some((field, read_start, next)) = matched {
                 // A destructuring PARAMETER binds before its function's body brace opens, so
                 // there is no open scope to attribute it to and `pending` — the function being
                 // declared — is the honest owner. No SITE is recorded for it: the site is the
@@ -2120,7 +2165,7 @@ mod tests {
                 if let (true, Some(name)) = (in_param_pattern, &pending) {
                     out.push((name.clone(), field));
                 } else if let Some((name, _, site)) = scopes.last() {
-                    if read_is_compared(&src, i, next) {
+                    if read_is_compared(&src, read_start, next) {
                         compared.push((name.clone(), i));
                     }
                     out.push((name.clone(), field));
@@ -2265,9 +2310,85 @@ mod tests {
         (src.get(k) == Some(&'(')).then_some(end)
     }
 
-    /// `.label` / `.account_uuid` read as a FIELD at `at`, and the index just past it. `None`
-    /// when `at` does not begin one, or when the name is followed by `(` — a method call on one
-    /// of the OAuth capture types rather than a roster account's field.
+    /// An [`Account`] identity read at `at`, and the index just past it — `.label` /
+    /// `.account_uuid` as a FIELD, or `.stash()`, the one METHOD that returns one. `None` when
+    /// `at` begins neither.
+    ///
+    /// The two arms answer the same question about different spellings, and the span they return
+    /// differs accordingly: a field ends at its name, while `.stash()` ends past its `)`, so that
+    /// [`read_is_compared`] looks for the operator where it actually sits.
+    ///
+    /// **The `.stash()` arm is issue #1358**, and it is not a third spelling of a field read the
+    /// way [`braced_binding_at`] is — it is a DERIVED one. `Account::stash` is
+    /// `format!("{STASH_PREFIX}{}", self.account_uuid)` (`src/config.rs`), so a comparison against
+    /// its result decides exactly what a comparison against `account_uuid` decides, one `format!`
+    /// removed. Measured on the real instrument: `roster.iter().position(|a| a.stash() ==
+    /// format!("{}{query}", crate::config::STASH_PREFIX))` dropped into `src/daemon/run_loop.rs`
+    /// left [`every_handle_read_is_dispositioned`] green, and every other test in the crate with
+    /// it — a seventh operator-handle resolver landing silent, which is the gap issue #1186
+    /// opened this gate to close.
+    ///
+    /// That miss belonged to THIS function and not to the shape scan below, and the difference is
+    /// what made it worth closing rather than recording. Every residual [`COMPARING_READERS`]
+    /// documents is shape-only: its read is still MATCHED here, so a new function carrying one
+    /// still reds on the name set, and only a body already registered can hide it. A read the scan
+    /// never matched at all is invisible to every question the gate asks — it is the gate's own
+    /// subject escaping, not an edge of the second question.
+    ///
+    /// That says which SIDE a shape falls on. It is NOT a claim that a text scan reaches every
+    /// spelling: what is closed is enumerated, and what is not is recorded with the
+    /// `cargo fmt --all --check` verdict measured for it, because that verdict is the whole
+    /// dismissal and cannot be assumed for a class. Closed: `.stash()` here,
+    /// `Account::stash(a)` and the wrapped form rustfmt emits for it ([`path_stash_call_at`]),
+    /// and the function item `Account::stash` ([`path_stash_item_at`]). Each was measured GREEN
+    /// against the real instrument before its arm existed, and each is pinned by
+    /// [`the_handle_read_tripwire_bites_on_a_stash_mediated_resolver`].
+    ///
+    /// Recorded instead, each measured as a complete working resolver dropped into
+    /// `src/daemon/run_loop.rs`'s production region:
+    ///
+    /// - Trivia between the `::` and the name. Both path arms test ADJACENT characters, so
+    ///   `Account :: stash(a)` and `Account::/* here */stash(a)` reach neither — measured, each
+    ///   left the gate green, the first at `fmt` rc 1 and the second at rc **0**. Closing them
+    ///   wants a second lexer running BACKWARD from the name, where the one that found the
+    ///   position runs forward; an error in it silently un-matches reads the forward lexer
+    ///   already finds, which is a worse failure than this record.
+    /// - A macro that EXPANDS to the read. `judge_probe_derived!(a) == query`, with the macro
+    ///   body spelling `$a.stash()`, left the gate green at `fmt` rc **0** — measured. The
+    ///   expansion is not in the text, and the body's own `.stash()` sits at file scope where no
+    ///   function owns it. No text scan follows this one, and the same is true one level up: a
+    ///   macro that GENERATES the impl block and the method escapes
+    ///   [`the_identity_fields_stay_plain_fields`] as well, recorded there with its own verdict.
+    ///   Re-derive the production `macro_rules!` sites with the boundary predicate at
+    ///   [`non_test_region`] rather than trusting a list here, and read each body directly with a
+    ///   matcher canaried against `src/capture.rs` — a green gate is not evidence about a shape
+    ///   this gate cannot see. Measured at this head, no such body expands to an identity read
+    ///   and none generates an `Account` impl, which is what makes the shape latent rather than
+    ///   live.
+    ///
+    /// A read reached through any OTHER method is still deliberately NOT a match. `.account_uuid()`
+    /// is the OAuth capture types' accessor rather than a roster account's field, and admitting
+    /// method calls wholesale would fill the register with `.clone()` and `.as_str()` entries no
+    /// reader can act on. What makes `stash` the one exception is that `impl Account` declares it
+    /// and nothing else SPELLED OUT — pinned by [`the_identity_fields_stay_plain_fields`], which
+    /// reds on a second method inside that block and on a second block written down anywhere
+    /// under `src/`, keyed on the receiver rather than on how the header is spelled and reading
+    /// through an in-file `use … as …` alias of the type. A block a MACRO generates is neither,
+    /// and is recorded there with its own measured verdict. What that check does NOT reach is
+    /// bounded and stated there rather than left as a claim of totality here. The next author then decides whether
+    /// the method derives from an identity field rather than inheriting this sentence.
+    ///
+    /// Argument-less by construction: `Account::stash` takes `&self` alone, so `.stash(…)` with
+    /// an argument is a different method and is left alone. The crate declares exactly one
+    /// `fn stash`, so the receiver never has to be resolved — re-derive with
+    /// `git grep -nE 'fn stash *\(' -- src`.
+    ///
+    /// That emptiness is read as two ADJACENT characters, so `.stash( )` — a space BETWEEN the
+    /// parens — is not matched, while whitespace between the NAME and the `(` is skipped and
+    /// `.stash ()` is. The unmatched spelling is an edge rather than a hole:
+    /// `cargo fmt --all --check`, a required gate, returns rc 1 on it, so it cannot reach a
+    /// merged tree. [`the_identity_fields_stay_plain_fields`] records it beside the other unread
+    /// shapes, each with its own verdict.
     fn identity_field_at(src: &[char], at: usize) -> Option<(String, usize)> {
         if src.get(at) != Some(&'.') {
             return None;
@@ -2281,17 +2402,236 @@ mod tests {
             j += 1;
         }
         let name: String = src[start..j].iter().collect();
-        if name != "label" && name != "account_uuid" {
-            return None;
-        }
         let mut k = j;
         while src.get(k).is_some_and(|c| c.is_whitespace()) {
             k += 1;
+        }
+        if name == "stash" {
+            // Past the `()`, so the span ENDS where the comparison would begin.
+            return (src.get(k) == Some(&'(') && src.get(k + 1) == Some(&')'))
+                .then(|| (name, k + 2));
+        }
+        if name != "label" && name != "account_uuid" {
+            return None;
         }
         if src.get(k) == Some(&'(') {
             return None;
         }
         Some((name, j))
+    }
+
+    /// A path-qualified call to [`Account::stash`] at `at`, and the index just past its closing
+    /// `)` — `Account::stash(a)`, `crate::config::Account::stash(a)`, `<Account>::stash(a)`.
+    ///
+    /// The same read the arm above matches, written as a path call instead of a method call, and
+    /// it is a dimension that admitting a METHOD introduced. `label` and `account_uuid` are plain
+    /// fields with no path-call spelling at all, so the field arms never needed one;
+    /// [`identity_field_at`] requires `src[at] == '.'` and no path form can reach it. Measured
+    /// before it was closed: a `position(|a| crate::config::Account::stash(a) == format!(…))`
+    /// resolver dropped into `src/daemon/run_loop.rs` left [`every_handle_read_is_dispositioned`]
+    /// green at `cargo fmt --all --check` rc 0, while the dotted probe in the same position reds
+    /// — so the region was scanned and only the spelling escaped. [`COMPARING_READERS`] states
+    /// the rule this follows: a read the scan never matches at all is the gate's own subject
+    /// escaping, so it is closed here rather than recorded as a residual.
+    ///
+    /// Bounded exactly as the dotted arm is. The crate declares one `fn stash`
+    /// (`git grep -nE 'fn stash *\(' -- src`), so the qualifier ahead of `::` never has to be
+    /// resolved — the same bound that lets the arm above match on the name alone. The call
+    /// carries exactly ONE argument, the receiver that `Account::stash` spells `&self`, so
+    /// `stash(a, b)` is a different method and is left alone, and a zero-argument `stash()` is
+    /// not this call either. A comma sitting last closes that one argument rather than opening a
+    /// second, and is what rustfmt emits whenever it wraps the call — so reading the comma count
+    /// alone as the arity would miss the one multi-line spelling a formatted tree can carry.
+    ///
+    /// Returns the span's START as well as its end, which the dotted arm does not have to.
+    /// [`comparison_precedes`] walks back over identifier characters, `.` and `&` — the shape of
+    /// a method-call receiver — and a `::` qualifier is none of those, so it would stop inside
+    /// `Account::stash` and report `query == Account::stash(a)` as uncompared. The qualifier is
+    /// part of the read, so the arm says where the read begins rather than leaving that to the
+    /// caller.
+    fn path_stash_call_at(src: &[char], at: usize) -> Option<(usize, usize)> {
+        const NAME: &str = "stash";
+        // Preceded by `::`, which is what separates a path call both from the `.stash()` the arm
+        // above owns and from the `fn stash` declaration itself.
+        if at < 2 || src[at - 1] != ':' || src[at - 2] != ':' {
+            return None;
+        }
+        let end = at + NAME.chars().count();
+        if src.get(at..end)?.iter().collect::<String>() != NAME {
+            return None;
+        }
+        // An identifier token is maximal: `stash_name` and `stashed` are other names. A MODULE
+        // path (`crate::stash::…`) also spells `stash` after a `::`, and is excluded by the `(`
+        // test below rather than here — its next token is a second `::`.
+        if src
+            .get(end)
+            .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
+        {
+            return None;
+        }
+        let mut k = end;
+        while src.get(k).is_some_and(|c| c.is_whitespace()) {
+            k += 1;
+        }
+        if src.get(k) != Some(&'(') {
+            return None;
+        }
+        // Past the balanced argument list, so the span ENDS where the comparison would begin —
+        // the same reason the dotted arm ends past its `()`. The top-level commas are counted
+        // while crossing it, since the arity is the bound.
+        //
+        // The same skip classes [`handle_reads`] uses are applied AGAIN here, and that is not
+        // redundant: the caller's skipping is POSITIONAL — it advances its cursor past a comment
+        // before calling this arm and never removes those characters from the slice the arm then
+        // re-reads from `k`. Measured before this walk skipped prose, `Account::stash(` /
+        // `// one, two` / `&roster[0],` / `) == query` left the gate green at
+        // `cargo fmt --all --check` rc 0, because the comment's comma counted as a second
+        // argument. A `(` or `)` inside a comment or a string moves the depth the same way.
+        let mut depth = 1usize;
+        let mut commas = 0usize;
+        // The last non-whitespace character lexed as CODE inside the list. Tracked rather than
+        // recovered by scanning back over the raw slice at the end, for the same reason: a
+        // comment sitting after rustfmt's trailing comma hides it from that scan. `None` until
+        // one is seen, which is also what makes the list NON-EMPTY — so `stash()` is not this
+        // call, and neither is a `stash(/* prose only */)`.
+        let mut last_code: Option<char> = None;
+        let mut j = k + 1;
+        while let Some(c) = src.get(j) {
+            if *c == '/' && src.get(j + 1) == Some(&'/') {
+                while j < src.len() && src[j] != '\n' {
+                    j += 1;
+                }
+                continue;
+            }
+            if *c == '/' && src.get(j + 1) == Some(&'*') {
+                let mut nesting = 1usize;
+                j += 2;
+                while j < src.len() && nesting > 0 {
+                    if src[j] == '/' && src.get(j + 1) == Some(&'*') {
+                        nesting += 1;
+                        j += 2;
+                    } else if src[j] == '*' && src.get(j + 1) == Some(&'/') {
+                        nesting -= 1;
+                        j += 2;
+                    } else {
+                        j += 1;
+                    }
+                }
+                continue;
+            }
+            if let Some(next) = raw_string_end(src, j) {
+                j = next;
+                continue;
+            }
+            if let Some(next) = quoted_string_end(src, j) {
+                j = next;
+                continue;
+            }
+            if *c == '\'' {
+                j += char_literal_len(src, j).unwrap_or(1);
+                continue;
+            }
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        // rustfmt's own output for a call it wraps ends `,\n)`, so a comma
+                        // sitting last is the end of the one argument rather than a second
+                        // one, and is discounted before the arity is read.
+                        let trailing = last_code == Some(',');
+                        return (commas == usize::from(trailing) && last_code.is_some())
+                            .then_some((path_qualifier_start(src, at), j + 1));
+                    }
+                }
+                ',' if depth == 1 => commas += 1,
+                _ => {}
+            }
+            if !c.is_whitespace() {
+                last_code = Some(*c);
+            }
+            j += 1;
+        }
+        None
+    }
+
+    /// The first character of the path qualifying a `stash` at `at` — identifier characters, the
+    /// `::` separators and the `<…>` of a qualified path (`<Account>::stash`).
+    ///
+    /// Not `.`, since no path form is reached through a field. Shared by the two path arms
+    /// because it is the same span in both: the read BEGINS at the qualifier, and
+    /// [`comparison_precedes`] walks back over a method-call receiver's shape — identifier
+    /// characters, `.` and `&` — none of which is `::`, so it would stop INSIDE `Account::stash`
+    /// and report `query == Account::stash(a)` as uncompared.
+    fn path_qualifier_start(src: &[char], at: usize) -> usize {
+        let mut start = at;
+        while start > 0 && {
+            let c = src[start - 1];
+            c.is_ascii_alphanumeric() || c == '_' || c == ':' || c == '<' || c == '>'
+        } {
+            start -= 1;
+        }
+        start
+    }
+
+    /// [`Account::stash`] named at `at` as a FUNCTION ITEM rather than called — `map(Account::stash)`,
+    /// or a `fn` pointer bound by a `let` — and the index just past the name.
+    ///
+    /// The third spelling of the one read, and the last one a text scan can reach. A function
+    /// item is a path with no call parens at the reference site, so it satisfies none of the
+    /// other arms: [`identity_field_at`] requires the name be reached through a `.`,
+    /// [`path_stash_call_at`] requires a `(` after it, and [`braced_binding_at`] requires a
+    /// braced context. Measured before this arm existed, each of
+    /// `roster.iter().map(crate::config::Account::stash).position(|s| s == query)` and a
+    /// `let derive: fn(&Account) -> String = crate::config::Account::stash;` bound one statement
+    /// ahead of its use left [`every_handle_read_is_dispositioned`] green at
+    /// `cargo fmt --all --check` rc **0**, while the path-CALL control in the same position reds
+    /// at rc 0 — so the region was scanned and only the spelling escaped, and unlike the edges
+    /// [`the_identity_fields_stay_plain_fields`] records, no formatter keeps this one out.
+    ///
+    /// A MODULE path spells `stash` after a `::` too (`crate::stash::restash_account`), and is
+    /// excluded here by the token that FOLLOWS: a second `::`. That is the same discriminator
+    /// [`path_stash_call_at`] leans on, which excludes the module path by requiring a `(`.
+    ///
+    /// The span ends at the NAME, so [`read_is_compared`] asks its question where the reference
+    /// sits — and the honest answer is normally no: a function item is a value handed onward, and
+    /// whatever compares its result compares it somewhere else entirely. That is the disposition
+    /// this arm is for. The READ question moves, so a new function carrying one reds on
+    /// [`HANDLE_READ_REGISTER`]'s name set; the SHAPE question does not, which puts a
+    /// stash-mediated resolver grown inside an ALREADY-registered body in exactly the residual
+    /// class [`COMPARING_READERS`] documents and pins open, rather than outside every question
+    /// the gate asks.
+    ///
+    /// It over-fires on a path that merely NAMES the function without reading anything — a `use`
+    /// item written inside a function body would do it. That is the direction this file's stated
+    /// bias takes, and nothing under `src/` spells it today (measured: the suite is green with
+    /// this arm live).
+    fn path_stash_item_at(src: &[char], at: usize) -> Option<(usize, usize)> {
+        const NAME: &str = "stash";
+        if at < 2 || src[at - 1] != ':' || src[at - 2] != ':' {
+            return None;
+        }
+        let end = at + NAME.chars().count();
+        if src.get(at..end)?.iter().collect::<String>() != NAME {
+            return None;
+        }
+        // An identifier token is maximal: `stash_name` and `stashed` are other names.
+        if src
+            .get(end)
+            .is_some_and(|c| c.is_ascii_alphanumeric() || *c == '_')
+        {
+            return None;
+        }
+        let mut k = end;
+        while src.get(k).is_some_and(|c| c.is_whitespace()) {
+            k += 1;
+        }
+        // A CALL belongs to `path_stash_call_at`, which carries the arity bound this arm has no
+        // argument list to apply; a `::` after the name is the `crate::stash` MODULE path.
+        if matches!(src.get(k), Some(&'(') | Some(&':')) {
+            return None;
+        }
+        Some((path_qualifier_start(src, at), end))
     }
 
     /// `label` / `account_uuid` bound by NAME inside a braced pattern at `at`, and the index just
@@ -2492,6 +2832,11 @@ mod tests {
     /// Every function in the crate's non-test code that reads an [`Account`] identity field, with
     /// what that read IS and why.
     ///
+    /// "Reads an identity field" covers the two plain fields AND `Account::stash`, the one method
+    /// WRITTEN DOWN that returns one — `format!("{STASH_PREFIX}{}", self.account_uuid)`, so a comparison
+    /// against its result decides what a comparison against `account_uuid` decides (issue #1358).
+    /// [`identity_field_at`] is where that equivalence is argued and bounded.
+    ///
     /// This is the set-level counterpart to the six per-site refusal tests (issues #1005, #1087),
     /// and it exists because those six cannot cover the property their names imply. A per-site
     /// test proves that THAT site refuses; no number of them can detect a SEVENTH site that grows
@@ -2636,6 +2981,12 @@ mod tests {
         // roster against an INCOMING migration artifact account's uuid. All three say so in their
         // own row text, which is what the open reading leans on.
         //
+        // That capture-pair comparison is MEASURED as of issue #1358, where it had until then only
+        // been described: `Account::stash` returns an identity field, so `identity_field_at` now
+        // matches `.stash()` and both rows appear in `COMPARING_READERS` under a banner of their
+        // own. The paragraph below is what that banner rests on, and it is the reason the widening
+        // classified these two rather than reddening on them.
+        //
         // The capture pair's derivation is SYSTEM-supplied, and reading it as a fourth way an
         // OPERATOR string arrives would invert those rows rather than extend the list.
         // `Account::stash` is `format!("{STASH_PREFIX}{}", self.account_uuid)` (`src/config.rs`),
@@ -2721,6 +3072,7 @@ mod tests {
         ("emergency_swap", NotHandleResolution, "the emergency-swap events' hold / from / to handles"),
         ("fold_expiry_observation", NotHandleResolution, "the expiry observation event's account uuid"),
         ("fold_recovery_outcome", NotHandleResolution, "the recovery outcome's account uuid"),
+        ("forced", NotHandleResolution, "`use --force`'s escape-hatch SwapTarget — derives the ALREADY-RESOLVED target's stash name for the swap engine"),
         ("gate_viability", NotHandleResolution, "names the already-chosen target in the viability error"),
         ("gather_auth_subset", NotHandleResolution, "keys the per-account refresh-outcome map by label while rendering `status -v`"),
         ("gather_payload", NotHandleResolution, "collects roster uuids into the export payload"),
@@ -2743,7 +3095,10 @@ mod tests {
         ("note_poll_outcome", NotHandleResolution, "the four poll-outcome events' account handles"),
         ("note_refresh_outcome", NotHandleResolution, "the refresh-outcome event's account handle"),
         ("poke_all", NotHandleResolution, "`poke` with no target — sweeps the WHOLE roster, so it resolves nothing"),
+        ("poll", NotHandleResolution, "derives the polled account's stash as the service name the stash-backed credential store reads; the account is the parameter"),
+        ("read_poll_clocks", NotHandleResolution, "derives an already-chosen account's stash to read that account's stored credential clocks"),
         ("reconcile_canonical_change", NotHandleResolution, "the canonical-change events' account handles"),
+        ("reconcile_display", NotHandleResolution, "sweeps the WHOLE roster reading each account's stash, and selects on the stashed CREDENTIAL's bytes rather than on the stash name"),
         ("recover_scrubbed_canonical", NotHandleResolution, "the scrubbed-canonical recovery events' account handles"),
         ("refresh", NotHandleResolution, "passes an already-chosen account's uuid to the refresher (`poke` and the tick each have one)"),
         ("refresh_exclusions", NotHandleResolution, "collects the excluded accounts' uuids"),
@@ -2754,15 +3109,18 @@ mod tests {
         ("render_access_token_expiry", NotHandleResolution, "widths and cells for the `-v` access-token table"),
         ("render_roster", NotHandleResolution, "`list`'s label column widths, cells and uuid column"),
         ("reprobe_dead_parked_credential", NotHandleResolution, "the dead-parked reprobe event's account handle"),
+        ("resolve", NotHandleResolution, "the `use` gate — compares the already-resolved target's stash with the OUTGOING account's own, for the AlreadyActive short-circuit, and derives the target's stash for the swap"),
+        ("resolve_account_for", NotHandleResolution, "token-first active resolution — reads every roster account's stash to find which one holds the CANONICAL credential; the credential is the input, not the operator"),
         ("resolve_active_uuid", NotHandleResolution, "reads the uuid at the ACTIVE index — the index is the input"),
         ("resolve_active_uuid_for_import", NotHandleResolution, "reads the uuid at the ACTIVE index for the import's adoption check"),
         ("resolve_restore", NotHandleResolution, "hands an already-chosen account's uuid to the restore notifier"),
         ("roster_handles", NotHandleResolution, "collects every label for `stats`"),
-        ("run", NotHandleResolution, "collects roster uuids for the migration pre-flight"),
+        ("run", NotHandleResolution, "collects roster uuids for the isolated-refresh orphan reap (`cli`), and reads every roster account's stash for the canary's stash cross-check (`canary`) — see MULTI_SITE_READERS"),
         ("run_capture", NotHandleResolution, "reads the just-captured account's label for its report; found by STASH name"),
         ("run_login", NotHandleResolution, "reads the just-logged-in account's label for its report; found by STASH name"),
         ("snapshot", NotHandleResolution, "the wire snapshot's per-account `label` field and its active handle"),
         ("status_response", NotHandleResolution, "the `status` reply's per-account `label` field"),
+        ("stored_expires_at", NotHandleResolution, "forwards an already-chosen account's stash into `refresh::stored_expires_at` (`poke` and the refresh tick each have one)"),
         ("tick", NotHandleResolution, "the tick's own events' account handles"),
         ("validate", NotHandleResolution, "config validation — enforces uuid uniqueness and label non-emptiness, and is where a duplicated LABEL is warned about (R-6) rather than resolved"),
         ("velocity_swap", NotHandleResolution, "the velocity-swap event's from / to handles"),
@@ -2831,6 +3189,8 @@ mod tests {
         ("account_uuid", "the accessor on the OAuth state record (`src/claude_state.rs`) and on the migration artifact (`src/migration.rs`) — both return `&self.account_uuid` on a type that is not a roster account, so the single `NotHandleResolution` row states the same fact about each"),
         ("new", "`StatusRow::new` (`src/cli.rs`) reads an `AccountStatusLine.label` for a rendered cell, and `ManagedAccount::new` (`src/migration.rs`) writes the migration artifact's own `account_uuid` from its parameter of that name. Different types, different directions, and NEITHER is a roster `Account` — which is the one fact the shared `NotHandleResolution` row states, so it is exact for both. The migration site was invisible until issue #1202: it is a struct literal's field-init shorthand, which carries no `.`"),
         ("refresh", "`impl PokeEngine for RealPokeEngine` (`src/poke.rs`) and `impl RefreshEngine for RealRefreshEngine` (`src/refresh_tick.rs`) — two unrelated traits, not one abstraction, but both forward an ALREADY-CHOSEN account's `account_uuid` into `refresh::refresh_account`, so neither resolves a handle and the shared row is exact for both. A THIRD same-named reader would not be covered by that reasoning; it reds this check and needs its own"),
+        ("run", "`cli::run` (`src/cli.rs`) collects the roster's `account_uuid`s for the isolated-refresh orphan reap (`refresh::reap_orphans`, issue #103), and `canary::run` (`src/canary.rs`) derives each account's stash name to cross-check the resolved canonical against what is stashed. Different files, different spellings, and NEITHER selects an account by an operator-supplied string — the first enumerates the whole roster and the second matches on stashed CREDENTIAL bytes, which is the one fact the shared `NotHandleResolution` row states. The canary site was invisible until issue #1358 taught the scan that `Account::stash` returns an identity field"),
+        ("stored_expires_at", "`impl PokeEngine for RealPokeEngine` (`src/poke.rs`) and `impl RefreshEngine for RealRefreshEngine` (`src/refresh_tick.rs`) — the same two unrelated traits `refresh` above collides through, and the same reasoning: each forwards an ALREADY-CHOSEN account's derived stash name into `refresh::stored_expires_at`, so neither resolves a handle and the shared row is exact for both. Both sites became visible with issue #1358"),
     ];
 
     /// Every function that COMPARES an identity field — an operand of `==` or `!=` — and why
@@ -2872,15 +3232,30 @@ mod tests {
     ///   `.ends_with`, `.contains`, `.cmp(&q) == Ordering::Equal`. Unlike the two above this IS
     ///   reachable in one line, and a prefix-match resolver (`sessiometer use wo` → `work`) is the
     ///   plausible one; measured, `[account].iter().position(|a| a.label.starts_with("probe"))`
-    ///   injected into a registered reader leaves this gate GREEN. Nothing in the tree spells it
-    ///   today — a `git grep -nE` over `src` for any of those four methods applied to a `label` or
-    ///   `account_uuid` read returns nothing — which is why the equality operator was chosen over
-    ///   a combinator list, rather than because the shape is unreachable.
+    ///   injected into a registered reader leaves this gate GREEN. No CODE in the tree spells it
+    ///   today: `git grep -nE '\.(label|account_uuid)\.(starts_with|ends_with|contains|cmp)\(' -- src`
+    ///   returns this bullet's own prose and nothing else. That is a whole-file grep answering
+    ///   with the paragraph that quotes the shape, which is the over-fire direction this gate
+    ///   takes everywhere — and the pattern carries no `\b`, so `-E` is not the silently-empty
+    ///   form it is at [`non_test_region`]'s recipe. That is why the equality operator was chosen
+    ///   over a combinator list, rather than because the shape is unreachable.
     ///
     /// So the hole is narrowed rather than closed, and this is where the edge is written down as
     /// far as it has been measured. The first two residuals are not reachable in one line — both
     /// need a second statement or a data structure — which is the reason for stopping here rather
     /// than teaching the scan to follow a binding across a body.
+    ///
+    /// **What does NOT belong on that list, stated because one shape was nearly filed onto it.**
+    /// Every residual above leaves the PRESENCE question intact: the read is still matched by the
+    /// presence scan ([`identity_field_at`], or [`braced_binding_at`] for the braced-pattern one),
+    /// so a new function carrying one still reds on
+    /// [`HANDLE_READ_REGISTER`]'s name set, and only a body that register already names can hide
+    /// it. That is what makes them edges of the second question and survivable. A read the scan
+    /// never matches at all has no such floor — a brand-new resolver lands silent, which is the
+    /// whole of the gap issue #1186 opened this gate to close. Issue #1358 was that: a resolver
+    /// comparing an operator string against `Account::stash`, which RETURNS `account_uuid` behind
+    /// a constant prefix, moved neither question. It was closed in [`identity_field_at`] rather
+    /// than recorded here, and the next derived-identity spelling belongs there too.
     const COMPARING_READERS: &[(&str, &str)] = &[
         // --- the resolver ----------------------------------------------------------------------
         ("resolve_target", "IS the resolver — the one place an operator-supplied string is compared against a roster handle and a match SELECTED, and it counts every match rather than taking the first (#17, OQ-1)"),
@@ -2907,6 +3282,24 @@ mod tests {
         ("account_listed_in", "the `[refresh].accounts` allowlist — a MEMBERSHIP test over a config-supplied set, returning a bool rather than an index, and a duplicated label there legitimately admits BOTH bearers"),
         ("cached_viability_for", "both sides since issue #1201 — the daemon WIRE line and the roster: it pulls a second match on each and returns None when one exists, rather than taking the first"),
         ("daemon_verdict", "both sides — the wire line and the roster — filtered through `lookup()`, which since issue #1200 separates zero from more-than-one where the `sole()` it replaced returned None for both (issue #1086). Refusing is not resolving, and separating two kinds of refusal is not either"),
+        // --- compared against a derived STASH NAME -----------------------------------------------
+        //
+        // Visible only since issue #1358, which taught the scan that `Account::stash` RETURNS an
+        // identity field. Each of these compares one `Sessiometer/<account_uuid>` against another,
+        // so each inherits the account-uuid banner's whole argument at one remove: the stash is a
+        // pure function of a uuid `config::validate` keeps unique, so it names at most one roster
+        // entry and there is no ambiguity here to refuse on. What each row owes on top of that is
+        // where its OTHER side came from — and in every case below it is the daemon, the OAuth
+        // capture or the roster itself, never a string an operator typed.
+        //
+        // These rows are why the widening had to CLASSIFY rather than red. Each names live,
+        // shipping code — most of it already dispositioned as readers one list up — so a scan that
+        // reported them as undeclared comparers would have made the register wrong about the tree
+        // in order to see a shape that has never shipped.
+        ("locked_swap", "`account.stash() == outgoing` re-finds the OUTGOING account's roster index — and `outgoing` is `self.roster[active_idx].stash()` at every caller, a stash this daemon derived from its own roster"),
+        ("resolve", "the `use` gate's AlreadyActive short-circuit — the TARGET's stash against `active_stash`, which `run_use` derived from the OUTGOING account instead: `active::resolve_account_for` reads each roster account's stash and keeps the one whose stashed credential matches the canonical, falling back to the displayed `accountUuid` (`resolve_via_display`). Both sides are roster accounts' own derived names"),
+        ("run_capture", "`roster.iter().find(|a| a.stash() == stash_name)` re-finds the account just captured, and `stash_name` is what `plan_capture` returned for the OAuth capture's server-assigned uuid — matched or pushed one statement earlier"),
+        ("run_login", "the same shape and the same provenance as `run_capture` above, on the login path"),
     ];
 
     /// The names [`every_handle_read_is_dispositioned`] compares against the register, extracted
@@ -3087,7 +3480,7 @@ mod tests {
         for (arm, expected) in [
             (SharedResolver, 1),
             (ViaSharedResolver, 4),
-            (NotHandleResolution, 83),
+            (NotHandleResolution, 90),
         ] {
             let actual = HANDLE_READ_REGISTER
                 .iter()
@@ -3710,6 +4103,417 @@ mod tests {
         }
     }
 
+    /// CONSTRAINT-A for the `.stash()` arm (ADR-0031 § 4) — issue #1358's probe, committed as the
+    /// canary rather than left in its prose.
+    ///
+    /// The defect: [`identity_field_at`] matched `.label` / `.account_uuid` as FIELDS and skipped
+    /// every method call, while `Account::stash` RETURNS one wrapped in a constant prefix. A
+    /// resolver matching an operator string against `a.stash()` therefore decides exactly what one
+    /// matching `account_uuid` decides, and was invisible: measured against the real instrument
+    /// before this arm existed, the probe below left `every_handle_read_is_dispositioned` green
+    /// and every other test in the crate with it.
+    ///
+    /// **Both questions are asserted, and that pair is the point.** Every residual
+    /// [`COMPARING_READERS`] documents moves the SHAPE question only — its read is still matched,
+    /// so a NEW function carrying one still reds on the name set and only an already-registered
+    /// body can hide it. This one moved neither, which is the gate's own subject escaping rather
+    /// than an edge of its second question, and is why it was closed instead of recorded
+    /// alongside them. That rule sorts shapes; it does not promise a text scan reaches all of
+    /// them. The three spellings it DID reach are the rows below, and the ones it does not are
+    /// enumerated with their own `fmt` verdicts at [`identity_field_at`].
+    ///
+    /// The last case pins the live sites, and deliberately: the direction issue #1358 set was that
+    /// a widening must CLASSIFY `run_capture` and `run_login` rather than red on them, and a green
+    /// gate cannot tell "classified" from "never seen". It is driven off the REAL `src/capture.rs`
+    /// rather than a fixture, so a rewrite of those call sites brings its reader back here.
+    #[test]
+    fn the_handle_read_tripwire_bites_on_a_stash_mediated_resolver() {
+        // Built by joining lines rather than with `\`-continuations, for the reason
+        // [`the_non_test_boundary_survives_a_cfg_test_import`] records: that escape eats the
+        // next line's leading whitespace, and this fixture's `#[cfg(test)]` must stay at column 0.
+        let injected = |body: &[&str]| {
+            let mut lines =
+                vec!["fn apply_park(roster: &[Account], query: &str) -> Option<usize> {"];
+            lines.extend_from_slice(body);
+            lines.extend_from_slice(&[
+                "}",
+                "#[cfg(test)]",
+                "mod tests {",
+                "    fn a_test_helper(roster: &[Account], q: &str) -> bool {",
+                "        roster.iter().any(|a| a.stash() == q)",
+                "    }",
+                "}",
+            ]);
+            lines.join("\n")
+        };
+
+        for (spelling, body) in [
+            // The issue's probe, verbatim.
+            (
+                "the read on the left of the operator",
+                &["    roster.iter().position(|a| a.stash() == format!(\"{}{query}\", crate::config::STASH_PREFIX))"][..],
+            ),
+            // The same comparison written the other way round — the read is then the operator's
+            // RIGHT operand, which is `comparison_precedes`'s half of the shape question.
+            (
+                "the read on the right of the operator",
+                &["    roster.iter().position(|a| format!(\"{STASH_PREFIX}{query}\") == a.stash())"][..],
+            ),
+            // Hoisted one statement, which is the `let` shape `COMPARING_READERS` records the
+            // SHAPE question as losing. The READ question must still bite, because a new function
+            // is a new name — that asymmetry is the whole reason this arm is a fix and the
+            // residuals recorded there are not.
+            (
+                "hoisted through a `let`",
+                &[
+                    "    let derived = roster[0].stash();",
+                    "    (derived == format!(\"{STASH_PREFIX}{query}\")).then_some(0)",
+                ][..],
+            ),
+        ] {
+            let source = injected(body);
+            assert_eq!(
+                functions_reading_a_handle(&source),
+                ["apply_park"],
+                "a stash-mediated resolver must be seen as an identity READ ({spelling}), and \
+                 ONLY it: the fixture's test module compares one on every run, so a scan reaching \
+                 past the boundary would report `a_test_helper` too"
+            );
+            // …and that IS a red run, because the register cannot hold a name it has never seen.
+            // Stated as the real membership rather than left as an inference about it.
+            assert!(
+                !HANDLE_READ_REGISTER
+                    .iter()
+                    .any(|(name, _, _)| *name == "apply_park"),
+                "the canary's function must be absent from the register, or it proves nothing"
+            );
+        }
+
+        // The shape question moves too, on the two spellings that compare in place — so a
+        // stash-mediated resolver grown inside a body ALREADY registered for reading is caught by
+        // `COMPARING_READERS` as well, exactly as issue #1199's label probe is.
+        for (spelling, body) in [
+            (
+                "on the left",
+                "    roster.iter().position(|a| a.stash() == query)",
+            ),
+            (
+                "on the right",
+                "    roster.iter().position(|a| query == a.stash())",
+            ),
+            // Whitespace between the NAME and its parens is skipped, where a space BETWEEN the
+            // parens is not — the emptiness test is two ADJACENT characters. Asserted rather than
+            // only stated, and asserted on the COMPARISON set because a comparison is pushed only
+            // from inside the arm that matched, so this row carries the read with it.
+            (
+                "with whitespace before the parens",
+                "    roster.iter().position(|a| a.stash () == query)",
+            ),
+        ] {
+            assert_eq!(
+                functions_comparing_a_handle(&injected(&[body])),
+                ["apply_park"],
+                "a stash-mediated resolver must also be seen as a COMPARISON ({spelling})"
+            );
+        }
+
+        // The negative control for the argument-less requirement. `Account::stash` takes `&self`
+        // alone, so a `stash(…)` taking an argument is a DIFFERENT method and must not be
+        // admitted — and the READ set is the instrument that controls it. The comparison set
+        // cannot: the arm returns a span two characters past the `(`, so on `.stash(query)` that
+        // span lands INSIDE the argument, and measured, deleting the arm's `)` conjunct leaves
+        // the comparison set empty and the whole suite green. The read set is asserted over a
+        // body whose only candidate is the arg-bearing call, so its emptiness is about the arm.
+        assert!(
+            functions_reading_a_handle(&injected(&[
+                "    let _ = roster[0].stash(query);",
+                "    None",
+            ]))
+            .is_empty(),
+            "`stash(…)` with an argument is not `Account::stash`, and must not be read as one"
+        );
+        // The comparison half is not worthless — it is what a span CONSUMING the argument list
+        // reds — but it needs a body carrying a real read, or an empty result cannot be told from
+        // a scan that never reached the body at all.
+        let arg_bearing = injected(&[
+            "    let _ = roster[0].stash(query) == query;",
+            "    let _handle = &roster[0].label;",
+            "    None",
+        ]);
+        assert_eq!(
+            functions_reading_a_handle(&arg_bearing),
+            ["apply_park"],
+            "the scan must have reached this body — otherwise the emptiness below says nothing"
+        );
+        assert!(
+            functions_comparing_a_handle(&arg_bearing).is_empty(),
+            "`stash(…)` with an argument is not `Account::stash`, and must not be matched"
+        );
+
+        // The PATH-CALL spelling of the same read. `identity_field_at` requires a leading `.`,
+        // so `Account::stash(a)` reached none of the cases above — measured before the arm
+        // existed, a `position(|a| crate::config::Account::stash(a) == format!(…))` resolver
+        // dropped into `src/daemon/run_loop.rs` left the gate green while the dotted probe in
+        // that same position red. It is a dimension admitting a METHOD introduced: `label` and
+        // `account_uuid` have no path-call spelling at all. Both questions are asserted, for the
+        // reason the pair is asserted above.
+        for (spelling, body) in [
+            (
+                "fully qualified by module path",
+                "    roster.iter().position(|a| crate::config::Account::stash(a) == query)",
+            ),
+            (
+                "qualified by the bare type name",
+                "    roster.iter().position(|a| Account::stash(a) == query)",
+            ),
+            (
+                "spelled as a qualified path",
+                "    roster.iter().position(|a| <Account>::stash(a) == query)",
+            ),
+            (
+                "with the read on the operator's right",
+                "    roster.iter().position(|a| query == Account::stash(a))",
+            ),
+        ] {
+            assert_eq!(
+                functions_reading_a_handle(&injected(&[body])),
+                ["apply_park"],
+                "a path-call stash resolver must be seen as an identity READ ({spelling})"
+            );
+            assert_eq!(
+                functions_comparing_a_handle(&injected(&[body])),
+                ["apply_park"],
+                "…and as a COMPARISON ({spelling}), since the span ends past the call's `)`"
+            );
+        }
+
+        // The same call wrapped across lines with a trailing comma, which is the shape rustfmt
+        // emits once the call is too long for one line. That comma closes the one argument
+        // rather than opening a second. Measured on the real instrument before it was discounted: a resolver of this
+        // shape, long enough that rustfmt wrapped it and left it wrapped, dropped into
+        // `src/daemon/run_loop.rs` left the gate green at `cargo fmt --all --check` rc 0, while
+        // the same read on one line in that position reds — so the region was scanned and only
+        // the wrapping escaped. The rows below carry a short argument because they exercise the
+        // scanner rather than the formatter. Both operand sides, because the span's START is
+        // what `comparison_precedes` walks back from, and only the right-hand one makes that
+        // walk cross a line break.
+        for (spelling, body) in [
+            (
+                "wrapped, read on the operator's left",
+                &[
+                    "    let _ = crate::config::Account::stash(",
+                    "        &roster[0],",
+                    "    ) == query;",
+                ][..],
+            ),
+            (
+                "wrapped, read on the operator's right",
+                &[
+                    "    let _ = query",
+                    "        == crate::config::Account::stash(",
+                    "            &roster[0],",
+                    "        );",
+                ][..],
+            ),
+        ] {
+            let mut lines = body.to_vec();
+            lines.push("    None");
+            let source = injected(&lines);
+            assert_eq!(
+                functions_reading_a_handle(&source),
+                ["apply_park"],
+                "a wrapped path-call stash resolver must be seen as an identity READ ({spelling})"
+            );
+            assert_eq!(
+                functions_comparing_a_handle(&source),
+                ["apply_park"],
+                "…and as a COMPARISON ({spelling})"
+            );
+        }
+
+        // The same walk crosses PROSE and LITERALS, and it has to skip both. It re-reads the raw
+        // slice from the call's `(`, so `handle_reads`' own skipping — which is POSITIONAL, and
+        // advances a cursor rather than removing characters — leaves a comment's commas and
+        // parens sitting in front of it. Measured before the walk skipped them, the first row
+        // below left the gate GREEN at `cargo fmt --all --check` rc 0: a spelling a merged tree
+        // carries, which is what separates this from the edges recorded at
+        // [`the_identity_fields_stay_plain_fields`] with an rc 1 beside them.
+        for (spelling, body) in [
+            (
+                "a comment carrying a comma inside the argument list",
+                &[
+                    "    let _ = crate::config::Account::stash(",
+                    "        // one, two",
+                    "        &roster[0],",
+                    "    ) == query;",
+                ][..],
+            ),
+            (
+                "a comment sitting after rustfmt's trailing comma",
+                &[
+                    "    let _ = crate::config::Account::stash(",
+                    "        &roster[0], // the receiver",
+                    "    ) == query;",
+                ][..],
+            ),
+            (
+                "a block comment carrying an unbalanced paren",
+                &["    let _ = Account::stash(/* not a ) */ &roster[0]) == query;"][..],
+            ),
+            (
+                "a string literal carrying an unbalanced paren",
+                &["    let _ = Account::stash(pick(\"(\")) == query;"][..],
+            ),
+            (
+                "a char literal carrying an unbalanced paren",
+                &["    let _ = Account::stash(&pick('(')) == query;"][..],
+            ),
+        ] {
+            let mut lines = body.to_vec();
+            lines.push("    None");
+            let source = injected(&lines);
+            assert_eq!(
+                functions_reading_a_handle(&source),
+                ["apply_park"],
+                "the arity walk must skip prose and literals ({spelling}) — it re-reads the raw \
+                 slice, so the caller's positional skipping does not reach it"
+            );
+            assert_eq!(
+                functions_comparing_a_handle(&source),
+                ["apply_park"],
+                "…and the span must still end past the call's own `)` ({spelling}), or the \
+                 operator is looked for in the wrong place"
+            );
+        }
+
+        // The FUNCTION-ITEM spelling: the same method NAMED rather than called. It is a path with
+        // no call parens at the reference site, so it satisfied none of the arms above — measured
+        // before `path_stash_item_at` existed, each row here left the gate green at `fmt` rc 0
+        // while the path-CALL control in the same position reds at rc 0, so the region was
+        // scanned and only the spelling escaped. Only the READ question moves on it: the value is
+        // handed onward and whatever compares it does so somewhere else, which is the residual
+        // class `COMPARING_READERS` documents rather than a shape outside every question.
+        for (spelling, body) in [
+            (
+                "mapped over the roster",
+                &["    roster.iter().map(crate::config::Account::stash).position(|s| s == query)"]
+                    [..],
+            ),
+            (
+                "bound to a `fn` pointer one statement ahead of its use",
+                &[
+                    "    let derive: fn(&Account) -> String = crate::config::Account::stash;",
+                    "    roster.iter().position(|a| derive(a) == query)",
+                ][..],
+            ),
+            (
+                "spelled as a qualified path",
+                &["    roster.iter().map(<Account>::stash).position(|s| s == query)"][..],
+            ),
+        ] {
+            let source = injected(body);
+            assert_eq!(
+                functions_reading_a_handle(&source),
+                ["apply_park"],
+                "a function-item stash reference must be seen as an identity READ ({spelling})"
+            );
+            assert!(
+                functions_comparing_a_handle(&source).is_empty(),
+                "…and not as a COMPARISON ({spelling}) — the reference is not an operand, and \
+                 claiming otherwise would put a shape in COMPARING_READERS that never compares"
+            );
+        }
+
+        // The negatives for THAT arm. An empty read set is the instrument here, so each is run
+        // twice: once alone, and once with a real function-item read added, which is what tells
+        // an unmatched spelling apart from a scan that never reached this body shape.
+        for (spelling, body) in [
+            (
+                "the `crate::stash` module path",
+                "    let _ = crate::stash::AccountStash::empty();",
+            ),
+            (
+                "a longer identifier that merely starts with the name",
+                "    let _ = Account::stash_name;",
+            ),
+        ] {
+            assert!(
+                functions_reading_a_handle(&injected(&[body, "    None"])).is_empty(),
+                "`{spelling}` is not `Account::stash`, and must not be read as one"
+            );
+            assert_eq!(
+                functions_reading_a_handle(&injected(&[
+                    body,
+                    "    let _ = crate::config::Account::stash;",
+                    "    None",
+                ])),
+                ["apply_park"],
+                "…and the scan does reach that body — otherwise the emptiness above says nothing \
+                 ({spelling})"
+            );
+        }
+
+        // The negatives for that arm, each with a read in the body so an empty result is about
+        // the arm rather than about a scan that never arrived. The arity bound is the same one
+        // the dotted arm carries: `Account::stash` takes the receiver alone.
+        for (spelling, body) in [
+            (
+                "a second argument",
+                "    let _ = Account::stash(a, b) == query;",
+            ),
+            (
+                "no argument at all",
+                "    let _ = Account::stash() == query;",
+            ),
+            (
+                "a module path rather than a type",
+                "    let _ = crate::stash::restash_account(a) == query;",
+            ),
+            // Discounting a trailing comma must not discount a real one: a second argument
+            // followed by that comma is still a second argument.
+            (
+                "a second argument carrying rustfmt's trailing comma",
+                "    let _ = Account::stash(a, b,) == query;",
+            ),
+        ] {
+            let source = injected(&[body, "    let _handle = &roster[0].label;", "    None"]);
+            assert_eq!(
+                functions_reading_a_handle(&source),
+                ["apply_park"],
+                "the scan must have reached this body — otherwise the emptiness below says \
+                 nothing ({spelling})"
+            );
+            assert!(
+                functions_comparing_a_handle(&source).is_empty(),
+                "`{spelling}` is not `Account::stash`, and must not be matched as one"
+            );
+        }
+
+        // The live sites, from the real file. `run_capture` and `run_login` each spell
+        // `roster.iter().find(|a| a.stash() == stash_name)`, and issue #1358's direction was that
+        // they be classified rather than reddened on.
+        let capture = std::fs::read_to_string("src/capture.rs")
+            .expect("`src/capture.rs` is one of the files this gate scans");
+        let comparing = functions_comparing_a_handle(&capture);
+        for live in ["run_capture", "run_login"] {
+            assert!(
+                comparing.iter().any(|name| name == live),
+                "`{live}` compares a derived stash name in `src/capture.rs` and the scan must see \
+                 it — measured: {comparing:?}"
+            );
+            assert!(
+                COMPARING_READERS.iter().any(|(name, _)| *name == live),
+                "…and COMPARING_READERS must CLASSIFY it rather than the gate redden on it"
+            );
+            assert!(
+                HANDLE_READ_REGISTER
+                    .iter()
+                    .any(|(name, _, _)| *name == live),
+                "…and it must stay a dispositioned reader"
+            );
+        }
+    }
+
     /// CONSTRAINT-A for the SHAPE half (ADR-0031 § 4) — the probe from issue #1199, committed as
     /// the canary that issue asks for rather than left in its prose.
     ///
@@ -3952,10 +4756,451 @@ mod tests {
         );
     }
 
+    /// The text after the `impl` KEYWORD opening `trimmed`, or `None` when `trimmed` does
+    /// not open an impl item.
+    ///
+    /// `impl` must be the keyword and not the head of an identifier, so what follows it is
+    /// whitespace or the `<` of a parameter list — that second arm is what an
+    /// `impl<'a> Handle<'a> for Account {` header needs, and a `"impl "` prefix test denies
+    /// it. `unsafe` (a trait declared `unsafe`) and `default` may precede the keyword.
+    fn impl_keyword_tail(trimmed: &str) -> Option<&str> {
+        let mut rest = trimmed;
+        while let Some(r) = rest
+            .strip_prefix("unsafe ")
+            .or_else(|| rest.strip_prefix("default "))
+        {
+            rest = r.trim_start();
+        }
+        rest.strip_prefix("impl")
+            .filter(|rest| rest.starts_with(|c: char| c.is_whitespace() || c == '<'))
+    }
+
+    /// `s` with every balanced `<…>` span removed.
+    ///
+    /// One pass erases the impl's parameter list, the trait's arguments, the receiver's
+    /// arguments and any const-generic braces nested inside them — which is what lets the
+    /// receiver test below read the same text no matter how the header is parameterised.
+    /// `->` is an arrow rather than a closing bracket, so `impl<F: Fn() -> u8>` closes on
+    /// the `>` after `u8`; reading the arrow as a closer would end the span early and leak
+    /// the bound's tail into the header.
+    fn without_generic_args(s: &str) -> String {
+        let chars: Vec<char> = s.chars().collect();
+        let mut out = String::new();
+        let mut depth = 0usize;
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '-' && chars.get(i + 1) == Some(&'>') {
+                if depth == 0 {
+                    out.push_str("->");
+                }
+                i += 2;
+                continue;
+            }
+            match chars[i] {
+                '<' => depth += 1,
+                '>' => depth = depth.saturating_sub(1),
+                c if depth == 0 => out.push(c),
+                _ => {}
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// Every in-file alias for [`Account`] introduced by a `use … as …` import.
+    ///
+    /// [`account_impl_headers`] decides the receiver by its LAST IDENTIFIER TOKEN, and left at
+    /// that, that is still a spelling test — one level in from the `"impl "` / `"Account {"`
+    /// prefix-and-suffix tests it replaces, but the same kind. `use crate::config::Account as
+    /// Acct;` leaves the TYPE `Account` while the header spells `Acct`, and the block hangs a
+    /// method off `Account` exactly as a plainly-spelled one does. Measured before this existed:
+    /// that block in `src/active.rs`'s production region left both gates green at
+    /// `cargo fmt --all --check` rc 0, while the identical block spelled `impl Account {` at the
+    /// identical position red — so the region was scanned and only the spelling escaped. A
+    /// renamed import is precisely "an author's spelling of it", which is the thing the receiver
+    /// test exists to see through.
+    ///
+    /// Resolved per FILE, which is where an `impl` can name the alias, and read only out of `use`
+    /// ITEMS — opened by a line whose first token is `use`, continued to the `;` — so a `as` CAST
+    /// and the `<Account as Trait>::…` of a qualified path are not read as imports. Both the
+    /// plain form and a braced group (`use crate::config::{Account as Acct, Config};`) are read,
+    /// the group across its own line breaks.
+    ///
+    /// What that leaves is an alias bound somewhere this file cannot see: a `pub use … as …`
+    /// re-export in another module, which a text scan cannot follow to the type it renames.
+    /// `cargo fmt --all --check` accepts it at rc 0, so it is a residual rather than a shape a
+    /// gate keeps out, and it is recorded at [`the_identity_fields_stay_plain_fields`] with the
+    /// rest. Nothing in the tree aliases `Account` today — re-derive with
+    /// `git grep -nP '^\s*(pub(\(crate\))? )?use .* as ' -- src`. The leading `\s*` matters
+    /// because THIS function is indented-tolerant: it keys on `trimmed.starts_with("use ")`, so
+    /// a `^use`-anchored recipe answers for a narrower set than the code actually reads. `-P`
+    /// carries that `\s*`: under `-E` it lexes as a literal `s`, leaving the pattern anchored at
+    /// column 0 — measured, the same rows as `^(pub(\(crate\))? )?use .* as `, the very set the
+    /// leading `\s*` is here to widen past, handed back without an error.
+    fn account_aliases(source: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut in_use = false;
+        for line in source.lines() {
+            let trimmed = line.trim();
+            if !in_use && !trimmed.starts_with("use ") {
+                continue;
+            }
+            for (idx, _) in trimmed.match_indices(" as ") {
+                let renames_account = trimmed[..idx]
+                    .rsplit(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .find(|token| !token.is_empty())
+                    == Some("Account");
+                if !renames_account {
+                    continue;
+                }
+                let alias: String = trimmed[idx + " as ".len()..]
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                if !alias.is_empty() {
+                    out.push(alias);
+                }
+            }
+            // The item ends at its `;`, so a group wrapped across lines is read whole.
+            in_use = !trimmed.contains(';');
+        }
+        out
+    }
+
+    /// Every `impl` block in `source` that hangs methods off [`Account`], as the header text
+    /// that opened it.
+    ///
+    /// Keyed on the RECEIVER, and that is the whole reason this is a function rather than a
+    /// line predicate. A header is a TYPE plus an author's spelling of it — parameters,
+    /// qualifiers, path prefixes, a `where` clause, and the line breaks a long one wraps at —
+    /// and every one of those is free to vary while the type stays `Account`. A check written
+    /// as a literal prefix (`"impl "`) or a literal suffix (`"Account {"`) tests the spelling,
+    /// so each new spelling is a fresh silent pass and a fresh point fix. Both spellings this
+    /// scan was widened for are ones `cargo fmt --all --check` ACCEPTS at rc 0 — the
+    /// parameterised `impl<'a> Handle<'a> for Account {`, and a header long enough that
+    /// rustfmt itself wraps it and puts the `{` on its own line — so "fmt would reject it"
+    /// does not bound the spelling space here.
+    ///
+    /// So: take the `impl` keyword ([`impl_keyword_tail`]), read forward to the block's `{`
+    /// rather than requiring it on the same line, erase the generic spans
+    /// ([`without_generic_args`]), drop a `where` clause, take the `for` tail in a trait impl,
+    /// and ask whether the receiver's LAST identifier token is `Account`. That last step is
+    /// what collapses `Account`, `crate::config::Account` and `&Account` into one case, while
+    /// `OauthAccount` and `ManagedAccount` stay out of it — an identifier token is maximal, so
+    /// neither one ends in a token spelled `Account`. `Vec<Account>` stays out too: its
+    /// arguments are erased before the receiver is read, leaving `Vec`, and a method on
+    /// `Vec<Account>` is not a method on `Account`.
+    ///
+    /// The biases are the file's: an unterminated header is read as far as it got rather than
+    /// discarded, and a receiver whose last token is `Account` counts even where the block is
+    /// a tuple or an empty `{}`. Both over-fire, and an over-fire is a red that names itself.
+    /// [`the_account_impl_scan_keys_on_the_receiver`] pins the spellings.
+    ///
+    /// The continuation stops at the first EMPTY line, which is the one place this scan
+    /// UNDER-fires, so it is stated here rather than only in the test. A blank line placed
+    /// before the receiver leaves `raw` short of it — `impl Handle for` / blank / `Account {`
+    /// is not matched, while the same header without the blank line is, and a blank line AFTER
+    /// the receiver still matches because `Account` is already read. Measured end to end in
+    /// `src/active.rs`'s production region: the escaping placement leaves the whole suite green
+    /// at `cargo fmt --all --check` rc 1, and the control reds at rc 0. That rc 1 is what bounds
+    /// it — the spelling cannot reach a merged tree — and it is why the bound stays: dropping
+    /// the break lets an unterminated header run to the end of the file and join whatever `{`
+    /// it finds there, which over-fires somewhere a reader cannot predict, in exchange for a
+    /// shape a required gate already rejects. Recorded with the other unread shapes at
+    /// [`the_identity_fields_stay_plain_fields`].
+    fn account_impl_headers(source: &str) -> Vec<String> {
+        fn header_complete(raw: &str) -> bool {
+            impl_keyword_tail(raw).is_some_and(|tail| without_generic_args(tail).contains('{'))
+        }
+        let aliases = account_aliases(source);
+        let lines: Vec<&str> = source.lines().collect();
+        let mut found = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if impl_keyword_tail(line.trim()).is_none() {
+                continue;
+            }
+            let mut raw = line.trim().to_owned();
+            let mut j = i;
+            while !header_complete(&raw) && j + 1 < lines.len() {
+                let next = lines[j + 1].trim();
+                if next.is_empty() {
+                    break;
+                }
+                j += 1;
+                raw.push(' ');
+                raw.push_str(next);
+            }
+            let tail = impl_keyword_tail(&raw).unwrap_or_default();
+            let flat = without_generic_args(tail);
+            let head = flat.split_once('{').map_or(flat.as_str(), |(h, _)| h);
+            let head = head.split_whitespace().collect::<Vec<_>>().join(" ");
+            let head = head
+                .split_once(" where ")
+                .map_or(head.as_str(), |(before, _)| before);
+            let receiver = head.rsplit_once(" for ").map_or(head, |(_, r)| r);
+            let last_token = receiver
+                .rsplit(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .find(|token| !token.is_empty());
+            let names_account = last_token == Some("Account")
+                || last_token.is_some_and(|token| aliases.iter().any(|a| a == token));
+            if names_account {
+                found.push(raw.split_whitespace().collect::<Vec<_>>().join(" "));
+            }
+        }
+        found
+    }
+
+    /// The spellings [`account_impl_headers`] must see, and the near-misses it must not.
+    ///
+    /// The point of the table is that it is a table: the scan keys on the receiver, so these
+    /// are consequences of one rule rather than cases the rule enumerates, and a spelling that
+    /// varies only in how the header is WRITTEN — parameters, qualifiers, a `where` clause, the
+    /// line breaks a long one wraps at — is covered by the same rule whether or not it is listed.
+    /// What is not covered is a spelling that renames the TYPE somewhere this file cannot read:
+    /// [`account_aliases`] resolves an alias bound by a `use … as …` in the same file, and a
+    /// `pub use … as …` re-exported from another module is out of a text scan's reach. That one
+    /// is `cargo fmt --all --check` rc 0 — measured, so it is a residual rather than a shape a
+    /// gate keeps out — and it is recorded with the other unread shapes at
+    /// [`the_identity_fields_stay_plain_fields`]. Each positive
+    /// row would otherwise hang a method off [`Account`] where
+    /// [`the_identity_fields_stay_plain_fields`] counts one block and reads the other — which
+    /// is a resolver reading an identity field with nothing asserting it was dispositioned,
+    /// the state issue #1358 was opened about.
+    #[test]
+    fn the_account_impl_scan_keys_on_the_receiver() {
+        for header in [
+            "impl Account {",
+            "impl Account{",
+            "impl crate::config::Account {",
+            "impl Handle for Account {",
+            "impl Handle for crate::config::Account {",
+            "impl Handle for &Account {",
+            "impl<'a> Handle<'a> for Account {",
+            "impl<T: From<String>> Handle<T> for Account {",
+            "impl<F: Fn() -> u8> Handle<F> for Account {",
+            "impl<const N: usize> Handle<{ N }> for Account {",
+            "impl Handle for Account where Self: Sized {",
+            "unsafe impl Send for Account {",
+        ] {
+            let source = format!("{header}\n    fn second(&self) {{}}\n}}\n");
+            assert_eq!(
+                account_impl_headers(&source).len(),
+                1,
+                "`{header}` hangs a method off `Account` and was not seen"
+            );
+        }
+
+        // A header wraps once it is long enough, and the `{` lands on its own line — this is
+        // rustfmt's OWN output for it, measured at `cargo fmt --all --check` rc 0, not a
+        // spelling a formatter would reject.
+        //
+        // Which is also what becomes of the one-line `where` row above once it carries a body:
+        // `fmt` returns rc 1 on it and rewraps it to `impl Handle for Account` / `where` /
+        // `Self: Sized,` / `{`, measured — and THAT form is rc 0 and reds this scan naming both
+        // blocks. So the row is the spelling an author writes and this one is the spelling a
+        // merged tree carries; the scan must see both, which is the point of keying on the
+        // receiver. Do not read the rc 0 above as covering every row here — the verdicts are
+        // per shape, and [`the_identity_fields_stay_plain_fields`] records the ones that differ.
+        let wrapped = "impl<'a, T: Clone + Send>\n    VeryLongTraitName<'a, T> for Account\nwhere\n    T: Default,\n{\n    fn second(&self) {}\n}\n";
+        assert_eq!(
+            account_impl_headers(wrapped),
+            ["impl<'a, T: Clone + Send> VeryLongTraitName<'a, T> for Account where T: Default, {"],
+            "a wrapped header is the same block as an unwrapped one"
+        );
+
+        // An ALIASED receiver is the same type under an author's spelling of it, which is the
+        // thing this scan exists to see through — and reading only the last identifier token
+        // does not, on its own, see through it. Each `use` form is asserted rather than assumed
+        // for the class, because [`account_aliases`] reads them by shape.
+        for (form, source) in [
+            (
+                "a plain `use … as …`",
+                "use crate::config::Account as Acct;\nimpl Acct {\n    fn second(&self) {}\n}\n",
+            ),
+            (
+                "a braced group on one line",
+                "use crate::config::{Account as Acct, Config};\nimpl Acct {\n    fn second(&self) {}\n}\n",
+            ),
+            (
+                "a braced group wrapped across lines",
+                "use crate::config::{\n    Account as Acct,\n    Config,\n};\nimpl Acct {\n    fn second(&self) {}\n}\n",
+            ),
+            (
+                "the alias as a trait-impl receiver",
+                "use crate::config::Account as Acct;\nimpl Handle for Acct {\n    fn second(&self) {}\n}\n",
+            ),
+        ] {
+            assert_eq!(
+                account_impl_headers(source).len(),
+                1,
+                "`{form}` hangs a method off `Account` under another name and was not seen"
+            );
+        }
+
+        // …and the alias must be BOUND, or the scan is matching a bare identifier. `Acct` with no
+        // import renaming `Account` is some other type entirely, and an import renaming something
+        // else does not license it either.
+        for (form, source) in [
+            (
+                "no import at all",
+                "impl Acct {\n    fn second(&self) {}\n}\n",
+            ),
+            (
+                "an import renaming another type",
+                "use crate::config::Config as Acct;\nimpl Acct {\n    fn second(&self) {}\n}\n",
+            ),
+            (
+                "a qualified path rather than an import",
+                "fn f(a: &Account) -> String {\n    <Account as Handle>::stash(a)\n}\nimpl Handle {\n    fn second(&self) {}\n}\n",
+            ),
+        ] {
+            assert!(
+                account_impl_headers(source).is_empty(),
+                "`{form}` binds no alias for `Account`, so `impl Acct {{` is another type"
+            );
+        }
+
+        for header in [
+            "impl OauthAccount {",
+            "impl ManagedAccount {",
+            "impl Handle for Vec<Account> {",
+            "impl Handle for Box<dyn AccountLike> {",
+            "impl AccountLike for Roster {",
+            "// impl Account {",
+            "/// impl Account {",
+            "impl_account_macro! {",
+        ] {
+            let source = format!("{header}\n    fn second(&self) {{}}\n}}\n");
+            assert!(
+                account_impl_headers(&source).is_empty(),
+                "`{header}` hangs no method off `Account` and was counted"
+            );
+        }
+
+        // A residual, pinned OPEN rather than left in prose. The header continuation breaks at
+        // the first EMPTY line, so a blank line placed BEFORE the receiver leaves the block
+        // unseen: `raw` is still `impl Handle for` when the loop stops, the receiver is empty and
+        // no last token is read. `cargo fmt --all --check` returns rc 1 on it, measured, which is
+        // what bounds it — the spelling cannot reach a merged tree, and that verdict is the whole
+        // dismissal. Recorded with the other unread shapes at
+        // [`the_identity_fields_stay_plain_fields`].
+        assert!(
+            account_impl_headers("impl Handle for\n\nAccount {\n    fn second(&self) {}\n}\n")
+                .is_empty(),
+            "the continuation stops at a blank line — if this now MATCHES, the residual recorded \
+             at `the_identity_fields_stay_plain_fields` has been closed and must be deleted there"
+        );
+        assert_eq!(
+            account_impl_headers("impl Handle for Account {\n    fn second(&self) {}\n}\n").len(),
+            1,
+            "…and the same header without that blank line is the control: the position is read, \
+             so the row above is about the blank line and not about a scan that never arrived"
+        );
+        // The placement is what decides it, so the claim is stated at the placement rather than
+        // for the class: a blank line AFTER the receiver is already in hand still matches.
+        assert_eq!(
+            account_impl_headers("impl Account\n\n{\n    fn second(&self) {}\n}\n").len(),
+            1,
+            "a blank line after the receiver leaves `Account` already read, and must still match"
+        );
+    }
+
     /// The method-call exclusion in [`identity_field_at`] is safe only while [`Account`]'s
     /// identity fields stay plain fields. `.account_uuid()` is deliberately not a match because
     /// that spelling belongs to the OAuth capture types — but if `Account` ever grew an accessor,
     /// a resolver could read the handle through it and pass this gate untouched.
+    ///
+    /// The METHOD surface is pinned too, and issue #1358 is why: `Account::stash` RETURNS an
+    /// identity field, and matching an operator string against it resolves a handle exactly as
+    /// matching `account_uuid` does. That went unseen for as long as this test asked only about
+    /// accessors NAMED for the fields. The scan now admits `.stash()` by name, so what has to hold
+    /// is that `stash` is the only such method WRITTEN DOWN — a statement about the impl block
+    /// rather than about two spellings, which is what the second half asserts. A new method
+    /// spelled out reds here, and its author decides whether it derives from an identity field
+    /// instead of inheriting a sentence written when `stash` was the only candidate. One a MACRO
+    /// generates does not red here; that is recorded below with the verdict measured for it.
+    ///
+    /// "One impl block, one method" is three separate questions, and narrowing any single one of
+    /// them turns a landed second method into a green run. The declaration count runs over BLOCKS
+    /// across `src/` rather than over FILES holding one, because two blocks in a single file are
+    /// two blocks; it reads each block's RECEIVER through [`account_impl_headers`] rather than
+    /// testing the header against a spelling, because a header is a type plus an author's
+    /// spelling of it and only the type is the question; and the extraction walk skips comments,
+    /// strings and char literals through the same helpers [`handle_reads`] uses, because one `}`
+    /// inside any of them ends a raw brace walk early and drops every method below that point out
+    /// of the list compared here. Each of the three presents as a SILENT pass rather than as a
+    /// failure, which is why the first two are asserted rather than reasoned about.
+    ///
+    /// The THIRD is asserted by halves, and the difference is measured rather than glossed. The
+    /// string half bites off the real file: `stash`'s body is `format!("{STASH_PREFIX}{}", …)`,
+    /// so blinding the string lexer against a method placed after a `let _suffix = "}";` reds the
+    /// block-terminator check below. The comment half bites off nothing here — `impl Account`
+    /// carries no `}` inside a comment, and removing that skip leaves the WHOLE suite green,
+    /// measured. What catches it is the terminator check rather than the skip: inject a
+    /// `// a closing brace in prose: }` into the block and the suite stays green with the skip,
+    /// and reds on `block.ends_with("\n}")` without it — both measured. So the skip is a
+    /// hardening of a guarded walk, and the guard is the check on the walk's own result.
+    ///
+    /// The receiver question is where a spelling test loses on its own terms, and the argument for
+    /// keying on the type is a measurement rather than a preference: a parameterised header
+    /// (`impl<'a> Handle<'a> for Account {`) and one long enough that rustfmt wraps it and puts
+    /// the `{` on its own line are BOTH accepted by `cargo fmt --all --check` at rc 0 — the
+    /// second because it is rustfmt's own output at that length. So "a formatter would reject
+    /// that" does not bound this question, and a check written as a literal prefix answers each
+    /// new spelling with a new point fix. [`the_account_impl_scan_keys_on_the_receiver`] carries
+    /// the spellings, as consequences of the one rule rather than as a list the rule enumerates.
+    ///
+    /// Edges left standing, each with its own `cargo fmt --all --check` verdict, because that
+    /// verdict is the whole dismissal and the paragraph above is why it cannot be assumed for a
+    /// class. A method declared as `fn` followed by a newline is not seen by the `fn ` split, and
+    /// an impl item sharing a line with the item before it is not seen by the header scan, which
+    /// starts on a line's first token; `fmt` returns rc 1 on both, measured. `.stash( )` with a
+    /// space between the parens is not matched by [`identity_field_at`], and `fmt` returns rc 1
+    /// on that too. A blank line INSIDE a header is a third: [`account_impl_headers`] breaks its
+    /// continuation at the first empty line, so `impl Handle for` / blank / `Account {` leaves
+    /// the block unseen while the same header without that blank line reds — measured in
+    /// `src/active.rs`'s production region, the escaping one at `fmt` rc 1 and the control at
+    /// rc 0. Placement is what decides it: a blank line AFTER the receiver is already in hand
+    /// still reds, since `raw` is `impl Account` by the time the loop stops. That row alone is
+    /// pinned OPEN by [`the_account_impl_scan_keys_on_the_receiver`], with both controls beside
+    /// it; the two before it are stated with their verdicts and asserted by nothing, since the
+    /// walk they escape is written inline here rather than behind a function a fixture could
+    /// call. The FIRST block is then located by the literal `\nimpl Account {`, which is
+    /// the one spelling still written down — respell `src/config.rs`'s own header and this test
+    /// panics on the `expect` rather than passing quietly.
+    ///
+    /// Two residuals here are rc 0, so no gate keeps either out of a merged tree.
+    ///
+    /// The first is an alias for [`Account`] bound by a `pub use … as …` in ANOTHER module,
+    /// imported unrenamed and used as a receiver (`use crate::config::Acct;` / `impl Acct {`).
+    /// [`account_aliases`] resolves an alias bound in the file it reads, and cannot follow a
+    /// re-export to the type it renames. Measured: that pair leaves this test green at
+    /// `cargo fmt --all --check` rc 0. What bounds it is that a method reached through it which
+    /// READS an identity field still reds on [`HANDLE_READ_REGISTER`]'s name set, and nothing in
+    /// the tree aliases `Account` today, which is what makes it latent rather than live.
+    ///
+    /// The second is a `macro_rules!` that GENERATES the block, taking the receiver as a `$t:ty`
+    /// and the field as a `$f:ident`. Both halves of this check go blind at once, for reasons
+    /// that are visible in their own source. `impl $t {` leaves [`account_impl_headers`] a last
+    /// identifier token of `t`, so the generated block is not `Account`'s and the count stays at
+    /// the one written in `src/config.rs`; and `self.$f` puts a `$` where [`identity_field_at`]
+    /// requires an identifier character, so the name lexes EMPTY and the read is not in the text
+    /// either. Measured with such a macro applied to `Account` in `src/config.rs` and a live
+    /// resolver comparing an operator string against the generated method from
+    /// `src/daemon/run_loop.rs`'s production region: `fmt`, `clippy`, `doc`, `build` and `test`
+    /// each rc 0, whole suite green, with `Account` carrying a second method returning
+    /// `Sessiometer/<account_uuid>`.
+    ///
+    /// It is strictly worse than the alias, because the backstop above does not reach it. The
+    /// same macro with its body spelling the field name LITERALLY reds on
+    /// [`HANDLE_READ_REGISTER`]'s name set — measured, attributing the read to the generated
+    /// method, exactly as that backstop predicts — and replacing the literal with the `$f`
+    /// fragment takes the read out of the text and the suite goes green. This is the same
+    /// dimension recorded for the READ scan at [`COMPARING_READERS`]: no text scan follows an
+    /// expansion. Latent rather than live — re-derive the production `macro_rules!` sites with
+    /// [`non_test_region`]'s predicate and read each body; measured at this head, none generates
+    /// an `Account` impl.
     #[test]
     fn the_identity_fields_stay_plain_fields() {
         let config = std::fs::read_to_string("src/config.rs").expect("readable");
@@ -3968,6 +5213,128 @@ mod tests {
                  `identity_field_at` before adding one"
             );
         }
+
+        // `Account` carries one impl block WRITTEN DOWN, in this file. Any second block spelled
+        // out holds methods the walk below never reaches, so its absence is asserted rather than
+        // assumed — counted per BLOCK rather than per file, and read off the RECEIVER by
+        // [`account_impl_headers`] rather than off a spelling of the header, so a path-qualified,
+        // parameterised, trait, `unsafe` or line-wrapped one is the same type gaining a method.
+        // `OauthAccount` / `ManagedAccount` are other types and are not it. A block a MACRO
+        // GENERATES is out of this scan's reach entirely and is recorded above with its verdict:
+        // `impl $t {` leaves the receiver's last identifier token as `t`.
+        let account_impl_blocks: Vec<String> = crate_sources()
+            .iter()
+            .flat_map(|(path, text)| {
+                account_impl_headers(&non_test_region(text))
+                    .into_iter()
+                    .map(|header| format!("{path}: {header}"))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            account_impl_blocks.len(),
+            1,
+            "`Account` must carry exactly one impl block — a second one holds methods the surface \
+             check below never reads, and this test reads the FIRST block only. Found: \
+             {account_impl_blocks:?}"
+        );
+
+        let start = production
+            .find("\nimpl Account {")
+            .expect("`src/config.rs` declares `impl Account`");
+        let block: String = {
+            let chars: Vec<char> = production[start..].chars().collect();
+            let open = chars
+                .iter()
+                .position(|c| *c == '{')
+                .expect("an opening brace");
+            let mut depth = 0usize;
+            let mut end = open;
+            let mut i = open;
+            while i < chars.len() {
+                // Prose first, through the same skip-classes [`handle_reads`] uses and
+                // [`the_lexer_reads_code_and_not_prose`] pins. A `}` inside a comment, a string or
+                // a char literal is not a brace: counting one ends this block at the wrong place
+                // and every method below it silently leaves the list.
+                if chars[i] == '/' && chars.get(i + 1) == Some(&'/') {
+                    while i < chars.len() && chars[i] != '\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                    let mut nesting = 1usize;
+                    i += 2;
+                    while i < chars.len() && nesting > 0 {
+                        if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                            nesting += 1;
+                            i += 2;
+                        } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                            nesting -= 1;
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    continue;
+                }
+                if let Some(next) = raw_string_end(&chars, i) {
+                    i = next;
+                    continue;
+                }
+                if let Some(next) = quoted_string_end(&chars, i) {
+                    i = next;
+                    continue;
+                }
+                if chars[i] == '\'' {
+                    i += char_literal_len(&chars, i).unwrap_or(1);
+                    continue;
+                }
+                match chars[i] {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = i;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            chars[open..=end].iter().collect()
+        };
+        // The walk's own result, checked rather than trusted: a block that did not end on its
+        // own column-0 closing brace stopped early, and the method list below it is a list of
+        // whatever happened to precede the stop.
+        assert!(
+            block.ends_with("\n}"),
+            "the `impl Account` walk did not end on the block's closing brace — everything past \
+             where it stopped is unread, so the method list under it means nothing"
+        );
+        // Text-level, and it over-fires: a `fn ` inside a doc comment on a method, or a nested
+        // helper declared inside a method body, each yields a phantom entry in this list. That is
+        // the direction this file's stated bias takes — an over-fire reds and names what it saw,
+        // where an under-fire is the silent pass the whole test exists to prevent. The two shapes
+        // this split UNDER-fires on are recorded above with their `fmt` verdicts.
+        let methods: Vec<String> = block
+            .split("fn ")
+            .skip(1)
+            .map(|rest| {
+                rest.chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            methods,
+            ["stash"],
+            "`impl Account` declares exactly one method, and `identity_field_at` admits exactly \
+             that one by name. A new method that DERIVES from `label` or `account_uuid` is a \
+             second invisible spelling of a handle read (issue #1358); one that does not is a \
+             one-line widening of this list"
+        );
     }
 
     // --- cooldown_active (pure) ---------------------------------------------
