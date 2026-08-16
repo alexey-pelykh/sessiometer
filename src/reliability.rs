@@ -3143,6 +3143,76 @@ ts=2026-07-19T09:01:00Z event=poll_refresh account=spare trigger=recovery outcom
         assert_eq!(inputs.refresh_token_loss_accounts.len(), 1);
     }
 
+    /// The variant name inside a derived-`Debug` rendering: its LEADING IDENTIFIER RUN.
+    ///
+    /// Named rather than left inline at its one call site so the property can be asserted on a
+    /// rendering that CARRIES FIELDS. No `PollRefreshTrigger` variant does, which is precisely
+    /// how the premise this replaced — that they are all fieldless, so the whole `{:?}` IS the
+    /// name — expired without anything noticing (issue #1397). A test standing on today's two
+    /// variants cannot tell the two readings apart, because on `Poll401` and `Recovery` the run
+    /// is the whole rendering.
+    ///
+    /// The predicate is byte-identical to the issue #1085 precedent in `crate::daemon`'s
+    /// redaction meter. It is Unicode `is_alphanumeric`, while the declared side of the
+    /// comparison takes `is_ascii_alphanumeric` — and that asymmetry does NOT announce itself.
+    /// Measured: on a `Café` variant the declared side's run stops at `Caf`, leaving `rest` as
+    /// `é`, which `declares_variant` refuses — so the name is dropped from `declared` entirely
+    /// rather than truncated into it. Replayed, it then fires `undeclared` alone; declared and
+    /// NOT replayed, it fires NEITHER list and passes silently, like any other spelling outside
+    /// the parser's subset.
+    ///
+    /// Inlining this back into the call site is caught by nothing, and the test below states
+    /// that bound rather than leaving it to be discovered.
+    fn replayed_variant_name(replayed: impl std::fmt::Debug) -> String {
+        format!("{replayed:?}")
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect()
+    }
+
+    /// What the run-taking buys, on the shapes the comparison below cannot itself produce.
+    ///
+    /// On a fielded variant the whole rendering is NOT the name, and comparing it against the
+    /// declared set is what made issue #1397's replay blame a drifted scan for a variant the
+    /// scan had read correctly.
+    ///
+    /// The bound of the pin, stated because it is not obvious: it holds the READING, not the
+    /// WIRING. Dropping the run out of the function above fails here, naming the rendering it
+    /// kept. Re-inlining `format!("{trigger:?}")` at the call site below does not — measured,
+    /// the whole suite stays at `0 failed` — and nothing can make it fail while every
+    /// `PollRefreshTrigger` variant is fieldless and the two readings agree on every input the
+    /// comparison has.
+    #[test]
+    fn the_replayed_name_is_the_leading_run_whether_or_not_the_variant_carries_fields() {
+        // The fields are never READ — their whole job is to make `Debug` render past the name,
+        // which is the shape under test. `Debug` does not count as a read for `dead_code`.
+        #[derive(Debug)]
+        #[allow(non_camel_case_types, dead_code)]
+        enum Probe {
+            Bare,
+            Fielded { every_secs: u32 },
+            Wrapped(u32),
+            Poll_401,
+        }
+
+        // The two shapes that broke: a struct body and a tuple body both render past the name.
+        assert_eq!(
+            replayed_variant_name(Probe::Fielded { every_secs: 60 }),
+            "Fielded"
+        );
+        assert_eq!(replayed_variant_name(Probe::Wrapped(60)), "Wrapped");
+        // A fieldless variant renders as the bare name, so the run is the identity on it — which
+        // is why the comparison below is unchanged by any of this today.
+        assert_eq!(replayed_variant_name(Probe::Bare), "Bare");
+        assert_eq!(
+            replayed_variant_name(crate::observability::PollRefreshTrigger::Poll401),
+            "Poll401"
+        );
+        // `_` and digits are part of the run, so a non-camel-case variant keeps its whole name
+        // rather than being truncated into a false mismatch against the declared side.
+        assert_eq!(replayed_variant_name(Probe::Poll_401), "Poll_401");
+    }
+
     /// The gate the issue asked for. Adding a [`crate::observability::PollRefreshTrigger`] variant
     /// and stopping at the emitter re-creates the #1367 defect silently: the classifier's `else`
     /// arm absorbs the new token into `poll_retry`, and every existing assertion stays green while
@@ -3197,10 +3267,20 @@ ts=2026-07-19T09:01:00Z event=poll_refresh account=spare trigger=recovery outcom
         // reaches it, so it is held against the variants the enum's own SOURCE declares — the
         // issue #891 scan, published by `crate::observability::tests` for this consumer.
         //
-        // Derived `Debug` supplies the replayed side: these variants are fieldless, so `{:?}`
-        // renders the declaration's own spelling and cannot fall out of step with it the way a
-        // second hand-written list would. That is the issue #1085 idiom `crate::daemon`'s
-        // redaction meter already uses against the sibling scan in `crate::error`.
+        // Derived `Debug` supplies the replayed side, read the way `crate::daemon`'s redaction
+        // meter reads it against the sibling scan in `crate::error` — the issue #1085 idiom: the
+        // LEADING IDENTIFIER RUN of the rendering is the variant name. Derived, so unlike a second
+        // hand-written list it cannot fall out of step with the declaration.
+        //
+        // Taking the run rather than the whole rendering is what keeps this pointed at the right
+        // failure. Until issue #1397 the whole `{:?}` was compared, on the stated premise that
+        // these variants are fieldless — true today, and untrue the moment one is not. Measured on
+        // that issue: a `Scheduled { every_secs: u32 }` variant, wired AND replayed, rendered
+        // `Scheduled { every_secs: 60 }`, which matched nothing declared; BOTH directions then
+        // fired and the message below blamed a drifted scan. The scan was right. `Debug` had
+        // rendered the fields, and the premise the comparison rested on had simply expired
+        // without anything noticing. The run is what the declaration and the rendering genuinely
+        // share, so it holds whether or not a variant carries fields.
         //
         // Compared BOTH ways. Declared-but-unreplayed is the hole issue #1386 closes;
         // replayed-but-undeclared means the scan has drifted onto the wrong enum or stopped early,
@@ -3208,10 +3288,7 @@ ts=2026-07-19T09:01:00Z event=poll_refresh account=spare trigger=recovery outcom
         // fails the first direction, and a scan that parsed nothing fails inside the scan itself,
         // so neither degenerate reading survives as a pass.
         let declared = crate::observability::tests::declared_variant_names("PollRefreshTrigger");
-        let replayed: BTreeSet<String> = EVERY_TRIGGER
-            .iter()
-            .map(|trigger| format!("{trigger:?}"))
-            .collect();
+        let replayed: BTreeSet<String> = EVERY_TRIGGER.iter().map(replayed_variant_name).collect();
         let unreplayed: Vec<&String> = declared.difference(&replayed).collect();
         let undeclared: Vec<&String> = replayed.difference(&declared).collect();
         assert!(

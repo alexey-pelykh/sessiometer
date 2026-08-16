@@ -5157,6 +5157,59 @@ pub(crate) mod tests {
         segments.into_iter().filter(|s| !s.is_empty()).collect()
     }
 
+    /// Step over the attributes a variant may carry AHEAD OF ITS NAME, so the identifier run
+    /// `declared_variant_names` takes below starts where the name starts.
+    ///
+    /// `#[allow(dead_code)] Scheduled,` arrives as one segment beginning with `#`, so that run is
+    /// EMPTY, the variant never enters `declared`, and layer 2 passes VACUOUSLY for it — the
+    /// silent direction this scan exists to remove. Issue #1397.
+    ///
+    /// The attribute on its OWN line already parsed, and still does: its segment yields no name
+    /// and is discarded, the variant's yields the name. `cargo fmt` rewrites the same-line
+    /// spelling into exactly that two-line form, which is why issue #1397 rated this latent —
+    /// but `fmt` is not the backstop it looks like, and the reason is worth stating rather than
+    /// re-discovering. Measured on that issue, in this tree: `#[rustfmt::skip]` on the enum
+    /// carries the same-line spelling through `cargo fmt --all --check` at exit 0, and the
+    /// variant so declared stayed out of `declared` while `cargo test` reported `0 failed` over
+    /// the whole suite — the consuming guard passing vacuously, nothing else catching it. A
+    /// silent-failure mode closed by a formatter is closed only until someone writes the one
+    /// attribute that turns the formatter off, in band, for a reason having nothing to do with
+    /// this scan. So the shape is parsed here.
+    ///
+    /// Bracket DEPTH is tracked rather than seeking the first `]`, so a nested one does not end
+    /// the attribute early. An unbalanced run returns the segment untouched: it then still opens
+    /// with `#`, yields no name, and the variant stays out of `declared` exactly as it did
+    /// before this function existed. That is the pre-existing under-match, never a wrong name —
+    /// the one direction a parser here must not invent.
+    fn strip_leading_attributes(segment: &str) -> &str {
+        let mut remainder = segment;
+        while let Some(after_hash) = remainder.strip_prefix('#') {
+            // Not `#[`: an inner `#![…]`, or something that is not an attribute at all. Either
+            // way this is not a variant declaration, so hand back the segment unchanged.
+            let Some(body) = after_hash.strip_prefix('[') else {
+                return segment;
+            };
+            let mut depth = 1i32;
+            let mut close = None;
+            for (offset, ch) in body.char_indices() {
+                match ch {
+                    '[' => depth += 1,
+                    ']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = Some(offset);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let Some(close) = close else { return segment };
+            remainder = body[close + 1..].trim_start();
+        }
+        remainder
+    }
+
     /// The variant names declared by `enum {enum_name}` in this file, parsed from its source.
     ///
     /// Anchored at `CARGO_MANIFEST_DIR`, so the scan is tied to the crate under test whatever
@@ -5183,15 +5236,46 @@ pub(crate) mod tests {
     /// set a variant would be forced to have a match arm but not a sample — reopening the very
     /// hole issue #891 closes, one level down. Divergence is therefore avoided in the parser
     /// rather than delegated to convention: identifiers admit `_` (so a non-camel-case variant
-    /// is still seen, not silently dropped), and a body line is split on its top-level commas
-    /// (so `A, B,` on one line yields both). Over-matching is safe — a name that is not really
-    /// a variant lands in `declared`, goes unsampled, and FAILS loudly; it is under-matching
-    /// that would pass quietly, and that is what these two rules remove.
+    /// is still seen, not silently dropped), a body line is split on its top-level commas (so
+    /// `A, B,` on one line yields both), and a segment's leading attributes are stepped over (so
+    /// `#[allow(dead_code)] Scheduled,` yields `Scheduled` rather than nothing — issue #1397).
+    /// Over-matching is safe — a name that is not really a variant lands in `declared`, goes
+    /// unsampled, and FAILS loudly; it is under-matching that would pass quietly, and that is
+    /// what the rules above remove.
+    ///
+    /// They remove the shapes they name, which is NOT the same as removing under-matching, and
+    /// the difference is what a later consumer would otherwise inherit as a guarantee. The
+    /// parser models a subset of Rust's variant grammar; a spelling outside that subset yields
+    /// no name and passes vacuously, silently. The shapes known and deliberately unhandled are both
+    /// out of `cargo fmt`'s reach in the same way `#[rustfmt::skip]` puts the shape above out of
+    /// it: a variant whose declaration is produced by a MACRO is not in this file's text at all,
+    /// and a `#[cfg(…)]`-gated variant is counted whether or not the compiler kept it, so a
+    /// declared-but-compiled-out variant reads here as unsampled and fails LOUDLY — the safe
+    /// direction, and the reason it is left. Neither is reachable in this crate today: no enum
+    /// this scan reads is macro-generated or carries a `cfg` on a variant. Adding one puts the
+    /// weight back on this parser, so widen it in that change rather than trusting this list.
     pub(crate) fn declared_variant_names(enum_name: &str) -> std::collections::BTreeSet<String> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/observability.rs");
         let text = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        variant_names_in(&text, enum_name, &path.display().to_string())
+    }
 
+    /// The variant names `enum {enum_name}` declares in `text`; `source` names where `text` came
+    /// from, and is used in the two failure messages and nowhere else.
+    ///
+    /// Split out of [`declared_variant_names`] so the parse can be driven by spellings THIS FILE
+    /// DOES NOT CONTAIN. The split is what makes the walk testable at all: the scan reads the
+    /// crate's own source, nothing in it is spelled `#[allow(dead_code)] Scheduled,`, and so the
+    /// LOOP BODY of [`strip_leading_attributes`] was reached by no test — measured on issue
+    /// #1397, replacing the call below with a no-op reference left the whole suite at `0 failed`.
+    /// `the_variant_scan_reads_the_shapes_its_parser_names` now drives every shape the two
+    /// helpers' doc-comments name, each in the direction that comment claims.
+    fn variant_names_in(
+        text: &str,
+        enum_name: &str,
+        source: &str,
+    ) -> std::collections::BTreeSet<String> {
         let header = format!("enum {enum_name} {{");
         let mut lines = text
             .lines()
@@ -5201,7 +5285,7 @@ pub(crate) mod tests {
             .skip_while(|line| !line.ends_with(header.as_str()));
         let opening = lines
             .next()
-            .unwrap_or_else(|| panic!("no `{header}` declaration in {}", path.display()));
+            .unwrap_or_else(|| panic!("no `{header}` declaration in {source}"));
 
         let mut depth = opening.matches('{').count() - opening.matches('}').count();
         let mut names = std::collections::BTreeSet::new();
@@ -5213,6 +5297,7 @@ pub(crate) mod tests {
             // field, shallower is past the enum.
             if depth == 1 {
                 for segment in split_top_level(line) {
+                    let segment = strip_leading_attributes(segment);
                     let name: String = segment
                         .chars()
                         .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
@@ -5234,10 +5319,91 @@ pub(crate) mod tests {
         // a hard failure rather than a silently permissive one.
         assert!(
             !names.is_empty(),
-            "parsed no variants out of `enum {enum_name}` in {} — the source scan is broken",
-            path.display()
+            "parsed no variants out of `enum {enum_name}` in {source} — the source scan is broken"
         );
         names
+    }
+
+    /// Every shape `split_top_level` and `strip_leading_attributes` are written for, driven
+    /// through the parse that consumes them.
+    ///
+    /// Held against synthetic text because the scan reads THIS FILE, and no enum it is pointed
+    /// at carries an attribute on a variant — so the attribute walk ran on nothing and the
+    /// shapes its doc-comment argues about had no way in. Each case is one claim from those two
+    /// doc-comments, asserted in the direction the comment makes: under-matching drops a name,
+    /// and no shape may invent one.
+    ///
+    /// `Anchor` rides in every case for two reasons: an empty parse is a hard failure inside the
+    /// scan, which would mask a case that yields nothing; and its presence proves the walk
+    /// reached the body at all, so an expected-empty case means the shape was dropped rather
+    /// than the header missed.
+    #[test]
+    fn the_variant_scan_reads_the_shapes_its_parser_names() {
+        let scan = |body: &str| {
+            variant_names_in(
+                &format!("enum Probe {{\n    Anchor,\n{body}\n}}\n"),
+                "Probe",
+                "<synthetic>",
+            )
+        };
+        let expect = |names: &[&str]| -> std::collections::BTreeSet<String> {
+            names.iter().map(|n| (*n).to_owned()).collect()
+        };
+
+        // The shape issue #1397 closes. Before the strip, the identifier run started at `#` and
+        // yielded the empty string, so the variant never entered the set and layer 2 passed
+        // vacuously for it.
+        assert_eq!(
+            scan("    #[allow(dead_code)] Scheduled,"),
+            expect(&["Anchor", "Scheduled"])
+        );
+        // The attribute on its OWN line already parsed, and still does: its segment yields no
+        // name and is discarded, the variant's yields the name.
+        assert_eq!(
+            scan("    #[allow(dead_code)]\n    Scheduled,"),
+            expect(&["Anchor", "Scheduled"])
+        );
+        // The walk is a loop, so a run of them is stepped over rather than just the first.
+        assert_eq!(
+            scan("    #[allow(dead_code)] #[allow(unused)] Scheduled,"),
+            expect(&["Anchor", "Scheduled"])
+        );
+        // Bracket DEPTH, not a seek to the first `]`: that seek would stop at the INNER one,
+        // leaving `] Scheduled`, whose identifier run is empty — and the variant would be dropped.
+        assert_eq!(
+            scan("    #[foo[bar]] Scheduled,"),
+            expect(&["Anchor", "Scheduled"])
+        );
+        // An UNBALANCED run returns the segment untouched. It then still opens with `#`, yields
+        // no name, and the variant stays out — the pre-existing under-match, never a wrong name.
+        assert_eq!(
+            scan("    #[allow(dead_code) Scheduled,"),
+            expect(&["Anchor"])
+        );
+        // `#` not followed by `[` is handed back the same way, for the same reason.
+        assert_eq!(
+            scan("    #![allow(dead_code)] Scheduled,"),
+            expect(&["Anchor"])
+        );
+
+        // `split_top_level`'s two jobs. The trailing comma is what makes a FIELDLESS variant
+        // visible; variants sharing a line are separated on the commas between them.
+        assert_eq!(scan("    Bare,"), expect(&["Anchor", "Bare"]));
+        assert_eq!(scan("    A, B,"), expect(&["Anchor", "A", "B"]));
+        // A comma inside a variant's own body sits at nesting depth 1 and does not split it.
+        assert_eq!(
+            scan("    Monitor401 { account: String, consecutive: u32 },"),
+            expect(&["Anchor", "Monitor401"])
+        );
+        // Both non-empty remainders `declares_variant` admits, and the identifier rule that
+        // keeps a non-camel-case variant from being silently dropped.
+        assert_eq!(scan("    Wrapped(u32),"), expect(&["Anchor", "Wrapped"]));
+        assert_eq!(scan("    Poll_401,"), expect(&["Anchor", "Poll_401"]));
+        // Only a line DIRECTLY inside the body declares: the field line below is at depth 2.
+        assert_eq!(
+            scan("    Monitor401 {\n        account: String,\n    },"),
+            expect(&["Anchor", "Monitor401"])
+        );
     }
 
     /// Assert `samples` covers every variant `enum {enum_name}` declares — layer 2 of the
