@@ -499,6 +499,34 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: ./scripts/check-doc-citation-rot.sh
+      # `TEST_RUNNER_` env-form drift (issue #1362). The fourth step, and it lands here for
+      # the same reason `check-readme-cc-range.sh` does: the surfaces it holds are spread
+      # across every path filter and one of them — CONTRIBUTING.md, the normative home of
+      # the measurement-carrier idiom — is in NO filter at all. A Swift test in the menubar
+      # bundle would have been the obvious host, and it would not run on a
+      # CONTRIBUTING-only edit; this job is unfiltered, so it covers a prose-only edit, a
+      # Swift-only rename and a workflow-only edit without any filter reasoning.
+      #
+      # What it holds: a switch the xctest bundle reads may not be SET under its
+      # un-prefixed name (`xcodebuild` never forwards that name, so the run ends
+      # `** TEST SUCCEEDED **` having done nothing), and a `TEST_RUNNER_`-prefixed name
+      # must be one the bundle actually reads (so a rename cannot leave every document
+      # confidently wrong with all gates green). Naming a switch without setting it is
+      # unconstrained — the un-prefixed name is what the Swift source itself reads.
+      #
+      # Two spellings set one, and both are held: `NAME=` on a command line, and `NAME:`
+      # at key position in a YAML `env:` mapping. The second is why THIS file is a subject
+      # of the gate it runs — the `panel-goldens` job arms the drift gate through an `env:`
+      # mapping carrying no `=` at all, and de-prefixed there both golden comparisons skip
+      # on every run while every step of that job, being `continue-on-error`, still
+      # reports pass.
+      #
+      # Neither direction is visible to any test, because no test reads prose. Hermetic —
+      # it execs nothing and reads only what git tracks. Its falsifier peer
+      # (scripts/check-test-runner-env-form.test.sh) proves both rules go red, each case
+      # mutation-validated against the guard rewritten to the wrong rule.
+      - name: Assert the TEST_RUNNER_-prefixed env form wherever a surface sets a switch
+        run: ./scripts/check-test-runner-env-form.sh
 
   # Gate-integrity acknowledgment (issue #317). `ci-ok` and the invariants it rolls
   # up live in PR-mutable files — this workflow, `scripts/**`, `deny.toml`, `.cargo/**`.
