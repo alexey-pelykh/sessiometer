@@ -301,20 +301,67 @@ declined=""
 elsewhere=""
 
 occurs() { # <token> <file> [<first> <last>] -> 0 if the token appears there
-    # Read the cited file AT THE REF, like every other read here. Process
-    # substitution rather than `git show ... | grep -q`: under this script's
-    # `pipefail` that pipeline reports FAILURE on a hit, because `grep -q` exits
-    # at the first match and SIGPIPEs `git show`. Every anchored citation then
-    # reads as unanchored, so the run does not fail loudly — it inflates the
-    # violation count. Measured rather than assumed, by swapping the two forms
-    # and diffing `--audit HEAD`; the size of the gap is a corpus figure, so by
-    # choice 1 above it is not written down here.
+    # Read the cited file AT THE REF, like every other read here.
     #
     # With <first>/<last> the search is confined to those lines — the range-scoped
-    # question, "is the symbol AT the citation". Without them it is the whole-file
-    # question, asked only to tell a MISPLACED anchor apart from an ABSENT one.
-    # `sed` prints its whole selection rather than quitting at the range end, so it
-    # never SIGPIPEs `git show` either.
+    # question, "is the symbol AT the citation". Two loops in `anchored()` ask it
+    # and only the first accepts on a hit: the acceptance loop returns 0, taking
+    # the doc line outright, while the declined-acronym loop below it records
+    # `declined` and accepts nothing. Without <first>/<last> it is the whole-file
+    # question, asked only to tell a MISPLACED anchor apart from an ABSENT one: its
+    # hit accepts nothing either, it sets `elsewhere`, and that is what routes the
+    # refusal to the SELF-CHECK message instead of to the churn-gated DEMAND.
+    #
+    # Process substitution rather than `git show ... | grep -q`, on BOTH arms.
+    # `grep -q` exits at the first match and SIGPIPEs whatever is still writing
+    # behind it, so under this script's `pipefail` that pipeline reports FAILURE on
+    # a HIT — whenever the writer has not already finished. Process substitution is
+    # not a pipeline, so `pipefail` has no writer status to read. Both halves
+    # reproduce without a corpus:
+    #
+    #     set -o pipefail
+    #     git show HEAD:src/cli.rs | grep -q parse_subcommand; echo $?    # 141
+    #     grep -q parse_subcommand <(git show HEAD:src/cli.rs); echo $?   # 0
+    #
+    # NEITHER ARM WOULD FAIL LOUDLY IF IT REGRESSED TO THE PIPE FORM. Nothing
+    # errors and no citation reports as unreadable; the run just answers a
+    # different question, quietly — which is the whole reason to dodge the hazard
+    # rather than count on noticing it. Wherever a spurious failure DOES land, this
+    # is what each one answers instead:
+    #
+    #   WHOLE-FILE — `elsewhere` is never set, so a citation whose symbol and
+    #   number contradict each other stops being reported as a disagreement and
+    #   falls through to the DEMAND, which the churn gate CAN exempt.
+    #
+    #   RANGED — a doc line the range does anchor is refused; the whole-file arm
+    #   then finds the symbol elsewhere, so it is reported as a disagreement
+    #   instead, and the churn gate CANNOT exempt that one. The acronym loop reads
+    #   through the same arm, so a line that goes on to the DEMAND also loses its
+    #   `declined` record and gets the generic wording rather than the one naming
+    #   the prose word it refused.
+    #
+    # Those two are opposite-signed, so the net is a corpus figure like any other:
+    # by choice 1 above the SIGN of the gap stays out of this file for the same
+    # reason its size does. Measured rather than assumed either way — swap the
+    # forms one arm at a time to attribute the change, and both at once for the
+    # net, diffing `--audit HEAD` against this form.
+    #
+    # "Wherever it lands" is the operative clause: NEITHER arm's exposure is
+    # structural. Both turn on the same condition — the writer must still have
+    # output pending when `grep -q` quits — so a read small enough to sit in the
+    # pipe buffer, or whose first match sits late enough to have drained the
+    # writer, exits 0 and that citation is decided exactly as before. The arms
+    # differ in how often the condition is met, not in kind. A whole source file
+    # is routinely large enough to meet it. A cited range is not: `sed -n` prints
+    # its whole selection rather than stopping at the range end, but a handful of
+    # lines is already buffered before the match is found, which is why converting
+    # the ranged arm alone looks harmless. Widen the selection past a pipe buffer
+    # and it SIGPIPEs after all, so that is a fact about the ranges this corpus
+    # cites, not a property to build on:
+    #
+    #     set -o pipefail
+    #     git show HEAD:src/cli.rs | sed -n 1,200p    | grep -q parse; echo $?  # 0
+    #     git show HEAD:src/cli.rs | sed -n 1,100000p | grep -q parse; echo $?  # 141
     if [ "$#" -ge 4 ]; then
         grep -qE "(^|[^A-Za-z0-9_])${1}([^A-Za-z0-9_]|\$)" \
             <(git show "${head_sha}:${2}" 2>/dev/null | sed -n "${3},${4}p")
