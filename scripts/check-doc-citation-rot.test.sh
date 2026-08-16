@@ -78,7 +78,15 @@ for i in $(seq 1 20); do
 done
 
 # A file that does not. One commit, ever.
+# `quiet_helper` sits on line 1 and NOWHERE else, which is what lets a citation
+# into this file name a symbol that is real, present, and not where the number
+# points — the issue #1388 shape, in a file whose churn exempts it from being
+# ASKED for one. The trailing `churny` mention is the other half: it is not a
+# symbol here at all, it is what the path `src/churny.rs` shreds to, and a doc
+# line naming that neighbouring file must not thereby "disagree" with a citation
+# into this one.
 printf 'fn quiet_helper() {}\n%s\n' "$(for i in $(seq 1 40); do echo "// line $i"; done)" > src/quiet.rs
+printf '// The moving counterpart lives in churny; see it for the churn cases.\n' >> src/quiet.rs
 
 # A pre-existing bare citation into the churning file: already in the tree at
 # base, therefore outside every PR's diff, therefore never this gate's business.
@@ -252,6 +260,28 @@ check "caps-prefixed CamelCase type still anchors" 0 "$rc"
 # --- Line numbers stay legitimate for stable files ---------------------------
 run 'The fallback path is at src/quiet.rs:12 in the parser.'
 check "bare line number into a STABLE file is ACCEPTED" 0 "$rc"
+
+# --- The two questions, separated (issue #1388) ------------------------------
+# The pair above and below differ in ONE thing: whether the doc line names a
+# symbol. Neither file moved, so churn cannot be what tells them apart — which is
+# the whole claim. A citation that OWES an anchor is exempted by a quiet file
+# (above); a citation that already CARRIES one is checked against its own number
+# anyway (below), because nothing is being demanded and there is nothing to
+# exempt. Collapsing the two is what passed `src/config.rs:341` while its own
+# line said `account_uuid`, and the collapsed form is not recoverable by moving
+# the threshold, so no `run_windowed` variant of this can exist.
+run 'The fallback path is at src/quiet.rs:12, reached from `quiet_helper`.'
+check "symbol disagreeing with the number is REJECTED even in a STABLE file" 1 "$rc"
+
+printf '%s\n' "$out" | grep -q 'the symbol and the number disagree' && rc=0 || rc=1
+check "refusal reports the disagreement, not a churn verdict" 0 "$rc"
+
+# A backticked PATH is one token to a reader, so it anchors nothing and — now
+# that the check above runs at any churn — must not manufacture a disagreement
+# either. `src/churny.rs` shreds to `src`, `churny`, `rs`; `churny` really does
+# occur in `src/quiet.rs`, on its last line, nowhere near 12.
+run 'The fallback at src/quiet.rs:12 mirrors `stable_anchor_symbol` in `src/churny.rs`.'
+check "a backticked PATH neither anchors nor manufactures a disagreement" 0 "$rc"
 
 # --- churn()'s windowed arm, and that the window really BOUNDS the count -----
 # Every case above runs on ~22 commits of fixture history, so every case above

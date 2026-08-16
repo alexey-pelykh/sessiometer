@@ -323,7 +323,9 @@ The rule:
 
 > Cite a **symbol** for a file that churns, and one that occurs **at the lines you
 > cite**; a bare **line number** only for a file that does not churn. Never carry a
-> line number across a rebase without re-deriving it.
+> line number across a rebase without re-deriving it. And once you have named a
+> symbol, it must agree with the number **whatever the file's churn** — a quiet
+> file excuses you from naming one, never from meaning it.
 
 A line number is fine as a *secondary* locator — `` `apply_import`
 (`src/cli.rs:4726-4813`) `` is the preferred form, because the symbol and the
@@ -337,6 +339,16 @@ not point at is nothing beside it. `login` occurs all over `src/cli.rs` and at
 not one of the lines `src/cli.rs:741-765`, which is how that range sat rotted in
 an ADR while the same range, cited without the word, was reported (issue #1338).
 Both shapes are what the guard below rejects.
+
+Churn governs only whether you are **asked** for a symbol, never whether the one
+you wrote is **checked** (issue #1388). The two were one question until a
+citation into `src/config.rs` — a file sitting under the threshold, so never
+asked anything — quoted the `account_uuid` doc comment's text verbatim and
+pointed two lines short of it, after an unrelated two-line insertion ~280 lines
+higher up. A quiet file is a bet that a number keeps its meaning, and one commit
+inserting one line above a citation is all it takes to lose that bet; so the bet
+is a sound basis for not demanding a symbol, and never one for ignoring a symbol
+already there.
 
 "Churns" is not a judgment call — measure it:
 
@@ -438,8 +450,9 @@ every merge, so read them from the tool rather than from prose.
   [`.github/workflows/ci.yml`](.github/workflows/ci.yml)) that fails the build when a
   PR ADDS a `src/<file>.rs:NNN` citation under `docs/` that will rot silently: a line
   number into a file the PR's own history shows is churning, with no symbol named
-  beside it that occurs AT the cited lines — or, whatever the churn, one pointing past
-  the file's EOF or at a file no clone has. Scoped to the PR's diff rather than the
+  beside it that occurs AT the cited lines — or, whatever the churn, one whose named
+  symbol contradicts its own number (issue #1388), one pointing past the file's EOF,
+  or one at a file no clone has. Scoped to the PR's diff rather than the
   tree, because a backlog of such citations already exists and a gate that is red on
   arrival is a gate nobody reads (issue #1058); the convention it enforces is
   § Citing source locations in docs/ above. It refuses to
@@ -452,8 +465,10 @@ every merge, so read them from the tool rather than from prose.
   occurs INSIDE it, and a bare line number into a file that does not move. Anchoring
   is scoped to the range on BOTH sides, and each side is pinned by a pair differing
   in the range alone, so the scoping is falsifiable rather than asserted (issue
-  #1338). It exercises that shape over its own throwaway fixture, which has no
-  `src/cli.rs` in it.
+  #1338). A third pair differs only in whether the doc line names a symbol at all,
+  over one unmoving file, so that churn cannot be what separates the demand from the
+  self-check (issue #1388). It exercises those shapes over its own throwaway fixture,
+  which has no `src/cli.rs` in it.
 - `cargo deny check advisories sources licenses` — the supply-chain gates configured
   in [`deny.toml`](deny.toml).
 - [`docs/adr/`](docs/adr/) — Architecture Decision Records for the load-bearing
