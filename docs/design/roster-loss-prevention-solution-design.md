@@ -2,7 +2,7 @@
 title: Roster Loss Prevention — Solution Design
 source: docs/requirements/roster-loss-prevention.md
 created: 2026-08-27
-status: final   # locked 2026-08-27 — both open questions resolved in-stage; see § 14 and § Design Lock
+status: locked  # 2026-08-27 — both open questions resolved in-stage; see § 14 and § Design Lock
 tracks:
   technical-architecture: complete
   data-architecture: complete
@@ -497,14 +497,20 @@ rather than omitting it (§ 14 OQ-2).
 5. **D-2 intent + D-4 core invariant + R-7 test rewrite.** Defence-in-depth at the daemon. Ships as
    one unit because D-4 cannot function without D-2.
 6. **D-6 divergence detection.** Depends on 2.
-7. **D-8 config-write lock.** Independent; explicitly the first to cut (PRD § 1b).
+7. **R-11 + R-13 — Cap-7 diagnostic honesty (§ 9).** `config validate` must stop calling an emptied
+   roster valid, and `RosterEmpty` must stop telling a bereaved operator they never captured
+   anything. Independent of 1–6; it does not prevent the loss, it stops the tooling from
+   misdescribing one after the fact. Listed because § 16 traces R-11 and R-13 to § 9 rather than to
+   a D-id, so an ordering keyed on decisions alone would omit them and anyone cutting to appetite
+   via this list would never encounter them.
+8. **D-8 config-write lock.** Independent; explicitly the first to cut (PRD § 1b).
 
-Steps 1–4 prevent the incident without steps 5–7. That is deliberate: if appetite runs out, what
+Steps 1–4 prevent the incident without steps 5–8. That is deliberate: if appetite runs out, what
 remains cut is defence-in-depth and a latent hazard, never the primary defect.
 
 ## Design Lock
 
-**LOCKED** — `status: final`, 2026-08-27.
+**LOCKED** — `status: locked`, 2026-08-27.
 
 | Gate | Verdict |
 |---|---|
@@ -514,7 +520,7 @@ remains cut is defence-in-depth and a latent hazard, never the primary defect.
 | Feasibility (§ 14) | no INFEASIBLE, no UNCERTAIN; one FEASIBLE-WITH-SPIKE (D-5's parity mechanism), which blocks only D-5 |
 
 The lock is honest rather than declared: it was withheld while OQ-1 and OQ-2 were open, and both
-were **resolved** — not waived, not deferred, not re-labelled. A `final` over an unresolved
+were **resolved** — not waived, not deferred, not re-labelled. A lock over an unresolved
 load-bearing question is a false lock that propagates downstream as authoritative and re-opens at
 the most expensive stage; that is the failure this gate exists to prevent, and it did not occur.
 

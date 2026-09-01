@@ -85,7 +85,7 @@ code is the code that ran.
 | I-5 | `login` reads the config **twice**: at `:264` it keeps only `c.login` and **discards the parsed roster**; at `:826` it re-reads, and that read feeds `run_login`. Between them sits the ~87-second interactive spawn. | `src/capture.rs:264`, `:826` |
 | I-6 | On the absent read, `login` falls through to `existing.unwrap_or_else(\|\| Config { roster: Vec::new(), … })`. | `src/capture.rs:689-697` |
 | I-7 | `reconcile_login` calls `save()` then `notify_daemon_roster_reload()`. **The write was not the harm; the notify was.** | `src/capture.rs:856`, `:859` |
-| I-8 | The daemon's handler adopts on `Ok` and **keeps its in-memory roster on `Err`**. The drop to one account therefore proves the reload *succeeded* — the daemon discarded five accounts it alone held. | `src/daemon/commands.rs:465-476` |
+| I-8 | The daemon's handler adopts on `Ok` and **keeps its in-memory roster on `Err`**. The drop to one account therefore proves the reload *succeeded* — the daemon discarded the six accounts it alone held. | `src/daemon/commands.rs:465-476` |
 | I-9 | The `Err` arm reports via `eprintln!` only. This machine has **no launchd installation**; the daemon runs from a manual `run`, so the message goes to a terminal nobody watches — and under the supported `service install` path it would have no destination at all. | `src/daemon/commands.rs:470-474` |
 | I-10 | The daemon loaded its roster **at start and never re-synced**. Every `notify_daemon_roster_reload` trigger is a write verb, and none ran between 2026-08-05 and the incident — so disk was free to diverge, unobserved, for at least 21 days. | `src/capture.rs:123`, `:859`; `src/cli.rs:4778`, `:5572`, `:5674` |
 | I-11 | **Nothing in the codebase removes `config.toml`.** Every removal site — `remove_file` or `remove_dir_all` — targets a `.tmp` sibling, an ephemeral refresh dir, an isolated spawn dir, a stale socket, or the launchd plist. What removed the file is **unattributed** — a stated ABSTAIN, not a guess. | `src/paths.rs:1192`, `:1233`, `:264`; `src/refresh.rs:949`; `src/isolated_spawn.rs:424`, `:436`; `src/cli.rs:1651`, `:1665`; `src/service.rs:370` |
@@ -591,7 +591,11 @@ precedent R-6 can propagate.
 (`src/config.rs:17-20`), so R-8's backups are credential-safe — **but** they must carry the same
 `0o600` mode as the original (`FILE_MODE`, `src/paths.rs:56`); a world-readable backup would be a
 new exposure of the account-uuid/label set. R-12's refusal reasons are redacted machine tags by
-construction and must stay so — no path, label, or count in the tag itself (AC-2).
+construction and must stay so — no path, label, count, or **account identifier** in the tag itself
+(AC-2). The account-identifier clause is not redundant with `label`: D-1's second witness is the
+usage sample store, whose records carry an `acct` field (`src/usage_store.rs`), so the witness read
+touches a field class `config.toml` does not carry. D-1 reads only non-emptiness, so nothing leaks
+as designed — the clause is here so the enumeration an implementer checks against names it.
 
 **9.2 Compliance & Regulatory.** N/A — a single-operator local tool holding no personal data beyond
 the operator's own account labels, with no data leaving the machine.
@@ -657,8 +661,8 @@ and cleanup are design decisions — a backup that grows without bound is a defe
 | 5 | Feature completeness verdict | **PASS** — § 5b, seven features verdicted, four NEAR-COMPLETE with their gaps named |
 | 6 | Requirement provenance | **PASS-WITH-FINDINGS** — see below |
 
-**Check 6 — provenance, and what was ratified when.** All nineteen requirements now trace to an
-operator ratification, in two rounds:
+**Check 6 — provenance, and what was ratified when.** Seventeen of the nineteen requirements trace
+to an operator ratification, in two rounds; the remaining two are the finding below:
 
 - **Round 1 (scope membership).** The operator ratified the closed 12-item scope set, which carries
   R-1, R-2, R-5, R-6, R-7, R-8, R-9, R-10, R-11, R-12, R-13, R-14, R-15 and R-16.

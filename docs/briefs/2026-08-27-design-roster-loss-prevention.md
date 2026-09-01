@@ -11,7 +11,7 @@ status: final   # locked — both open questions resolved in-stage
 ## Problem
 
 `sessiometer login` found no `config.toml` on disk, treated that as a first run, wrote a
-one-account file, and notified the live daemon — which discarded the five accounts it alone still
+one-account file, and notified the live daemon — which discarded the six accounts it alone still
 held. Six accounts became one. The credentials survived in the Keychain; what was lost was the
 roster that indexes them.
 

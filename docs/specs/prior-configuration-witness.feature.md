@@ -101,5 +101,6 @@ Scenario: the parsed roster is not re-derived
    When an append-only verb runs
    Then the roster used at the write is the one parsed at load
     # capture.rs:264 loads the config and keeps only `c.login`; :689-697 then rebuilds a roster from
-    # Vec::new(). Three lines apart. Re-derivation is what made the fall-through invisible.
+    # Vec::new(). 425 lines apart, in different functions — `login` (fn at :258) never carries its
+    # parsed roster to the second read. Re-derivation is what made the fall-through invisible.
 ```
