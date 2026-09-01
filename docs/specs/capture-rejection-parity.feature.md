@@ -4,9 +4,10 @@ Issue #1441 · PRD R-2 / R-12 · design D-1 / D-5
 
 Example Mapping: 🟦 3 rules · 🟩 8 examples · 🟥 0 open
 
-> `perform_socket_capture`'s roster `save_to` (`src/daemon/commands.rs:300`) reaches the same
-> empty-roster
-> fall-through as the CLI, so the menu-bar capture button reproduces the roster collapse. Fixing it
+> `perform_socket_capture` reaches the same empty-roster fall-through as the CLI — its
+> `Config::load_path` arm turns `ConfigNotFound` into `None` (`src/daemon/commands.rs:274-278`),
+> and the roster `save_to` at `:300` then writes the collapsed roster — so the menu-bar capture
+> button reproduces the roster collapse. Fixing it
 > means adding a rejection reason — and `CaptureRejection` in
 > `apps/menubar/Sources/CaptureAck.swift` is a **closed four-tag enum** whose decoder throws on an
 > unrecognized tag (line 101). A new Rust tag does not degrade in the app; it breaks the button.
