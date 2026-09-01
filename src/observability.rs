@@ -5177,6 +5177,14 @@ pub(crate) mod tests {
     /// attribute that turns the formatter off, in band, for a reason having nothing to do with
     /// this scan. So the shape is parsed here.
     ///
+    /// A BRACE inside such an attribute defeats the same-line spelling even so, and that is
+    /// [`split_top_level`]'s raw `{` count rather than this function's: the nesting never
+    /// returns to 0, so the trailing comma does not split and the segment handed back is
+    /// `Scheduled,`, whose remainder `,` the `declares_variant` predicate refuses. Measured on
+    /// issue #1428 and left there — that issue is the DEPTH walk, which [`code_brace_counts`]
+    /// reports as unmoved here — filed as issue #1437, and pinned as a drop in
+    /// `the_variant_scan_reads_the_shapes_its_parser_names` so this entry stays answerable.
+    ///
     /// Bracket DEPTH is tracked rather than seeking the first `]`, so a nested one does not end
     /// the attribute early. An unbalanced run returns the segment untouched: it then still opens
     /// with `#`, yields no name, and the variant stays out of `declared` exactly as it did
@@ -5209,6 +5217,136 @@ pub(crate) mod tests {
             remainder = body[close + 1..].trim_start();
         }
         remainder
+    }
+
+    /// The `{` and `}` counts on `line` that are CODE, skipping the ones a string literal or a
+    /// line comment carries.
+    ///
+    /// The depth walk in [`variant_names_in`] decides which lines sit DIRECTLY inside the enum
+    /// body, and it decides it by counting braces. A brace that is not a block delimiter moves
+    /// that counter exactly as a real one does, and nothing downstream can tell them apart:
+    /// measured on issue #1428, against the walk as it stood, `#[doc = "{"]` above an ordinary
+    /// variant takes the depth from 1 to 2, so the variant reads as a FIELD and scans to
+    /// `{"Anchor"}` — dropped, and dropped in SILENCE, because the only guard against a vacuous
+    /// pass is a hard failure on an EMPTY parse and a set short of one variant satisfies it.
+    /// `#[doc = "}"]` is the same defect mirrored: the depth reaches 0 and the walk leaves the
+    /// enum body a line early, measured to the same `{"Anchor"}`.
+    ///
+    /// COMMENTS were already the known carrier — [`variant_names_in`] drops whole-line ones
+    /// ahead of the walk, saying so — but that filter reads the START of a line, so a trailing
+    /// comment reached the counter intact: `Gated, // {` measured to swallow the variant on the
+    /// next line. Counting here rather than filtering there covers both, and leaves that filter
+    /// the two jobs only it can do, enumerated where it stands: keeping a comment that happens
+    /// to end in `enum Foo {` from being taken for the header, and keeping its COMMAS away from
+    /// [`split_top_level`], which splits on them whatever they sit inside — measured,
+    /// `// Covers A, B` above `Gated,` scans to `{"Anchor", "B", "Gated"}` without it, and this
+    /// counter cannot prevent that, returning `(0, 0)` for such a line.
+    ///
+    /// Carriers left UNSEEN are catalogued above [`declared_variant_names`], pinned in
+    /// `the_variant_scan_reads_the_shapes_its_parser_names` and filed as issue #1433. Some are
+    /// not merely unseen but REGRESSED — inert to the walk as it stood, which counted the real
+    /// brace beside them, and live to this one. Every arm here that SKIPS can do that: the
+    /// line-comment arm as readily as the two string arms, needing only a real brace BEHIND the
+    /// skip on the same line. Measured instances, pinned below and measured against both walks:
+    /// a quote inside a BLOCK comment, a quote inside a CHAR literal, and a `//` inside a block
+    /// comment — an ordinary URL is enough for the last. Deliberately NOT stated as a closed
+    /// class: a claim about the complement is not something a pin over enumerated shapes can
+    /// back. No enum this scan reads carries any of it, so nothing is under-swept today.
+    ///
+    /// The catalogued carriers are a BLOCK comment, a CHAR literal, and a string spanning lines
+    /// with the brace on a CONTINUATION line — a brace on such a string's opening line is
+    /// already skipped, the unterminated quote swallowing the rest of that line. The comment and
+    /// the wrapped string need state carried BETWEEN lines, which this walk does not have; the
+    /// char literal needs `'{'` told from the `'a` of a lifetime, a rule the string arms do not
+    /// need.
+    ///
+    /// NEITHER direction is safe, and that is worth stating because the skipping one reads as
+    /// though it were. Over-COUNTING is the silence above: the depth runs high and the variant
+    /// behind the brace reads as a field. Over-SKIPPING depends on the BODY it skips into, and
+    /// both cases are PINNED rather than argued, because prose about this direction has already
+    /// been wrong in both directions. A missed OPENING brace reads the field lines below it at
+    /// variant depth. A field type fitting ONE line is refused silently — `note: String` on its
+    /// remainder, which begins `:` where `declares_variant` admits only empty, `{`, `(` or `=`.
+    /// A WRAPPED type is LOUD: `cargo fmt` breaks a long one across lines, and a continuation
+    /// line is a bare uppercase identifier whose comma leaves an EMPTY remainder, so `Vec<` /
+    /// `String,` / `>,` puts `String` in the set — a name nobody wrote, which fails in
+    /// `assert_samples_every_variant`. Loud is not SAVED: either way that missed brace leaves
+    /// its `}` counted against nothing, the depth reaches 0 on the variant's own closing line,
+    /// and the walk BREAKS out of the body, dropping the variant after it.
+    /// Measured on issue #1428: `/* " */ Wrapped {`, where the quote inside the block comment
+    /// opens a string that swallows the real `{`, scans over a `note: String` body to
+    /// `{"Anchor"}` — `After` gone, nothing failing — where the same body with that brace
+    /// counted scans to `{"Anchor", "After"}`. `Wrapped` is absent from BOTH, and separating
+    /// that out is what keeps this measurement answerable: the block comment sits ahead of its
+    /// NAME, so the identifier run starts at `/` and yields nothing whatever the depth walk
+    /// does — a name-run drop, not the depth one this paragraph is about. Pinned in
+    /// `the_variant_scan_reads_the_shapes_its_parser_names` beside the carrier that reaches it.
+    /// So a new arm is answerable in BOTH directions rather than waved through on a safe one.
+    ///
+    /// One shape moves from a silent wrong answer to a LOUD one, and it is worth naming because
+    /// it reads like a regression: `depth` is `usize`, so a line whose CODE closes exceed it
+    /// underflows. That path is not new — a bare `}}` line at depth 1 panics on `attempt to
+    /// subtract with overflow` against either walk — but a `{` a string or a comment carries no
+    /// longer offsets a real `}` beside it, so `#[doc = "{"]}}` above a variant reaches it where
+    /// the walk as it stood balanced that line to depth 0 and scanned to `{"Anchor"}`. Malformed
+    /// Rust in both readings, and loud is the direction that gets diagnosed.
+    fn code_brace_counts(line: &str) -> (usize, usize) {
+        let (mut opens, mut closes) = (0usize, 0usize);
+        let bytes = line.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => {
+                    opens += 1;
+                    i += 1;
+                }
+                b'}' => {
+                    closes += 1;
+                    i += 1;
+                }
+                // A line comment runs to the end of the line, so nothing past it is code.
+                b'/' if bytes.get(i + 1) == Some(&b'/') => break,
+                // A raw string: `r"…"`, or `r#"…"#` with any run of hashes, which is what fixes
+                // its terminator — no escape applies inside one. `br"…"` arrives here too, the
+                // `b` having fallen through the default arm. A raw IDENTIFIER does not: the run
+                // of hashes must be followed by a quote, and `r#type` has a `t` there.
+                b'r' => {
+                    let mut hashes = 0;
+                    while bytes.get(i + 1 + hashes) == Some(&b'#') {
+                        hashes += 1;
+                    }
+                    if bytes.get(i + 1 + hashes) != Some(&b'"') {
+                        i += 1;
+                        continue;
+                    }
+                    i += 2 + hashes;
+                    while i < bytes.len() {
+                        let terminates = bytes[i] == b'"'
+                            && bytes.len() >= i + 1 + hashes
+                            && bytes[i + 1..i + 1 + hashes].iter().all(|b| *b == b'#');
+                        if terminates {
+                            i += 1 + hashes;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                // An ordinary string, `b"…"` included on the same reasoning as `br"…"` above.
+                // A backslash escapes the byte after it, so an escaped quote does not end it.
+                b'"' => {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] != b'"' {
+                        i += if bytes[i] == b'\\' { 2 } else { 1 };
+                    }
+                    i += 1;
+                }
+                // Byte-wise is safe for the rest: every byte of a multi-byte character is
+                // greater than any ASCII one, so none of the arms above can match inside one,
+                // and no `&str` is sliced at these offsets.
+                _ => i += 1,
+            }
+        }
+        (opens, closes)
     }
 
     /// The variant names declared by `enum {enum_name}` in this file, parsed from its source.
@@ -5322,6 +5460,17 @@ pub(crate) mod tests {
     /// `crate::reliability`'s own Unicode `is_alphanumeric` run — so moving one side of it from
     /// inside this issue would answer it blind.
     ///
+    /// The last entry is not about a NAME at all: it is a variant this scan never reaches,
+    /// because a brace ahead of it moved the DEPTH walk off the enum body. [`code_brace_counts`]
+    /// removes the carrier issue #1428 names — a string literal in an attribute — and a TRAILING
+    /// line comment with it, which that issue does not name: it quotes the whole-line comment
+    /// filter as something already in place and scopes itself to the depth counter, so the
+    /// trailing case was closed BEYOND it rather than as part of it. Others are left, filed as
+    /// issue #1433 and measured there — among them a BLOCK comment, a CHAR literal, and a string
+    /// spanning lines with the brace on a continuation line. Each drops the variant behind it in silence,
+    /// which is the failure the identifier entries above describe arriving by a different route,
+    /// so it is catalogued with them and pinned beside them.
+    ///
     /// Adding any of these puts the weight back on this parser, so widen it in that change
     /// rather than trusting this list.
     pub(crate) fn declared_variant_names(enum_name: &str) -> std::collections::BTreeSet<String> {
@@ -5352,14 +5501,38 @@ pub(crate) mod tests {
         let mut lines = text
             .lines()
             .map(str::trim)
-            // Comments may carry braces, which would corrupt the depth walk below.
+            // Keeps a comment out of the walk on two counts, neither of them the braces it
+            // carries — those are `code_brace_counts`' job now. One is the HEADER: a comment
+            // ending in `enum Foo {` would otherwise be taken for the declaration below. The
+            // other is its COMMAS, which `split_top_level` splits on whatever they sit inside,
+            // so an uppercase word ending a comment's last clause is read as a fieldless
+            // variant — measured, `// Covers A, B` above `Gated,` scans to
+            // `{"Anchor", "B", "Gated"}` without this filter. That one is a name nobody wrote,
+            // so it fails loudly rather than silently.
+            //
+            // This filter did the BRACE job for a whole-line comment and never could for a
+            // trailing one, because it reads the START of a line: measured against the walk as
+            // it stood, `// {` above `Gated,` scans to `{"Anchor", "Gated"}` with this filter
+            // and to `{"Anchor"}` without it, while `Gated, // {` scans to
+            // `{"Anchor", "Gated"}` either way.
+            //
+            // Measured on issue #1428, no comment in this file reaches it — removing it
+            // outright leaves the suite at `0 failed` — and a header so shadowed trips the
+            // empty-parse refusal below rather than parsing wrongly: measured by adding a
+            // shadowing line above `enum Diagnostic` and removing this filter, the scan panics
+            // with its own "parsed no variants" message. That refusal is not something this
+            // counter introduced: measured the same way, the walk as it stood reaches the
+            // identical message by a different route. Kept because a refusal is still a failure
+            // to diagnose, the comma reading is a name nobody wrote, and refusing both shapes
+            // costs one predicate.
             .filter(|line| !line.starts_with("//"))
             .skip_while(|line| !line.ends_with(header.as_str()));
         let opening = lines
             .next()
             .unwrap_or_else(|| panic!("no `{header}` declaration in {source}"));
 
-        let mut depth = opening.matches('{').count() - opening.matches('}').count();
+        let (opens, closes) = code_brace_counts(opening);
+        let mut depth = opens - closes;
         let mut names = std::collections::BTreeSet::new();
         for line in lines {
             if depth == 0 {
@@ -5395,7 +5568,8 @@ pub(crate) mod tests {
                     }
                 }
             }
-            depth = depth + line.matches('{').count() - line.matches('}').count();
+            let (opens, closes) = code_brace_counts(line);
+            depth = depth + opens - closes;
         }
 
         // A scan that finds nothing would let the sweeps pass vacuously, so an empty parse is
@@ -5407,21 +5581,24 @@ pub(crate) mod tests {
         names
     }
 
-    /// Shapes `split_top_level`, `strip_leading_attributes` and the remainder rule inside
-    /// [`variant_names_in`] are written for, driven through the parse that consumes them — but
-    /// not all of them. A comma inside `( … )`, the second nesting context `split_top_level`'s
-    /// own doc names, is not driven here; that gap is issue #1419's, filed off PR #1407.
+    /// Shapes `split_top_level`, `strip_leading_attributes`, [`code_brace_counts`] and the
+    /// remainder rule inside [`variant_names_in`] are written for, driven through the parse that
+    /// consumes them — but not all of them. A comma inside `( … )`, the second nesting context
+    /// `split_top_level`'s own doc names, is not driven here; that gap is issue #1419's, filed
+    /// off PR #1407.
     ///
     /// Held against synthetic text because the scan reads THIS FILE, and no enum it is pointed
-    /// at carries an attribute on a variant, a discriminant, or a raw identifier — so those
-    /// walks ran on nothing and the shapes their doc-comments argue about had no way in. Each
-    /// case is one claim from those doc-comments, asserted in the direction the comment makes:
-    /// where a comment says a name is read it must appear, and where a comment says a name is
-    /// dropped or invented, that is what the case pins.
+    /// at carries an attribute on a variant, a discriminant, a raw identifier, or a brace
+    /// anywhere but a block delimiter — so those walks ran on nothing and the shapes their
+    /// doc-comments argue about had no way in. Each case is one claim from those doc-comments,
+    /// asserted in the direction the comment makes: where a comment says a name is read it must
+    /// appear, and where a comment says a name is dropped or invented, that is what the case
+    /// pins.
     ///
     /// Some cases assert a claim about a shape deliberately NOT read — the raw identifier, the
-    /// non-ASCII initial, the `target_os` an attribute's continuation line must not yield — and
-    /// some about one deliberately OVER-read, where the pinned set carries a name nobody wrote.
+    /// non-ASCII initial, the `target_os` an attribute's continuation line must not yield, the
+    /// brace carriers issue #1433 leaves — and some about one deliberately OVER-read,
+    /// where the pinned set carries a name nobody wrote.
     /// A catalogue entry saying a spelling is dropped is exactly as capable of going stale as
     /// one saying a spelling is handled or over-read, and none of them has a consuming
     /// assertion of its own to fail when it does; pinning them here is what keeps those entries
@@ -5479,6 +5656,14 @@ pub(crate) mod tests {
             scan("    #![allow(dead_code)] Scheduled,"),
             expect(&["Anchor"])
         );
+        // A BRACE inside a same-line attribute drops the variant, and this is not the depth walk
+        // `code_brace_counts` repairs — measured, it returns `(0, 0)` here and the depth never
+        // moves. `split_top_level` counts `{` raw, so the string's brace leaves its nesting at 1,
+        // the trailing comma never splits, and the segment handed back is `Scheduled,` — an
+        // identifier whose remainder `,` `declares_variant` refuses. Filed as issue #1437 and
+        // pinned here as a DROP, unchanged by issue #1428's fix and measured identically against
+        // the parser as it stood.
+        assert_eq!(scan("    #[doc = \"{\"] Scheduled,"), expect(&["Anchor"]));
 
         // `split_top_level`'s two jobs. The trailing comma is what makes a FIELDLESS variant
         // visible; variants sharing a line are separated on the commas between them.
@@ -5512,6 +5697,58 @@ pub(crate) mod tests {
         assert_eq!(
             scan("    Monitor401 {\n        account: String,\n    },"),
             expect(&["Anchor", "Monitor401"])
+        );
+
+        // The shape issue #1428 closes. A brace inside a STRING LITERAL is not a block
+        // delimiter, but the depth walk counted it as one, so `#[doc = "{"]` took the depth
+        // from 1 to 2 and the variant below it read as a FIELD. Dropped in SILENCE: the scan's
+        // only guard against a vacuous pass is a hard failure on an EMPTY parse, and a set
+        // merely short of one variant satisfies it — `Anchor` is still in this one.
+        assert_eq!(
+            scan("    #[doc = \"{\"]\n    Gated,"),
+            expect(&["Anchor", "Gated"])
+        );
+        // The same defect in the other direction, which an open-brace case cannot reach: a
+        // closing brace took the depth to 0, and the walk left the enum body a line early.
+        assert_eq!(
+            scan("    #[doc = \"}\"]\n    Gated,"),
+            expect(&["Anchor", "Gated"])
+        );
+        // An escaped quote does not end the literal, so the brace behind it is still inside it.
+        assert_eq!(
+            scan("    #[doc = \"\\\"{\"]\n    Gated,"),
+            expect(&["Anchor", "Gated"])
+        );
+        // A RAW string is where a brace is likeliest to be written on purpose.
+        assert_eq!(
+            scan("    #[doc = r\"{\"]\n    Gated,"),
+            expect(&["Anchor", "Gated"])
+        );
+        // The case above holds even if a raw string is scanned as an ordinary one, so it pins
+        // the CLASS rather than the arm. This is the one answerable to the arm: a raw string
+        // exists to carry quotes, and read as an ordinary one it ends at the first of them,
+        // leaving the `}` behind it counted. The hashes are what fix the real terminator, so
+        // they are counted rather than assumed absent.
+        assert_eq!(
+            scan("    #[doc = r#\"{\"}\"#]\n    Gated,"),
+            expect(&["Anchor", "Gated"])
+        );
+        assert_eq!(
+            scan("    #[doc = r##\"{\"}\"##]\n    Gated,"),
+            expect(&["Anchor", "Gated"])
+        );
+        // A LINE COMMENT is the carrier the pre-walk filter already names, but that filter
+        // reads the start of a line, so a trailing one reached the counter intact.
+        assert_eq!(
+            scan("    Gated, // {\n    After,"),
+            expect(&["Anchor", "Gated", "After"])
+        );
+        // The counter still counts the braces that ARE delimiters: the nested body below opens
+        // and closes around a field line, and the variant after the string-literal brace is
+        // read at the depth that leaves.
+        assert_eq!(
+            scan("    Wrapped {\n        note: String,\n    },\n    #[doc = \"{\"]\n    After,"),
+            expect(&["Anchor", "Wrapped", "After"])
         );
 
         // Dropped ON PURPOSE, and named in the catalogue above `declared_variant_names`
@@ -5549,6 +5786,123 @@ pub(crate) mod tests {
         assert_eq!(
             scan("    #[cfg(any(\n        Foo,\n    ))]\n    Gated,"),
             expect(&["Anchor", "Foo", "Gated"])
+        );
+
+        // The carriers the issue #1428 counter still does not see, catalogued above
+        // `declared_variant_names` rather than handled and pinned here so those entries stay
+        // answerable to the parser. A BLOCK comment's braces are counted, and the variant
+        // behind one is dropped in the same silence the string-literal shape was.
+        assert_eq!(scan("    /* { */\n    Gated,"), expect(&["Anchor"]));
+        // The same carrier in its OTHER direction, which is what makes the silence symmetric
+        // and is the claim `code_brace_counts`' doc-comment now argues: a `"` inside the block
+        // comment opens a string that swallows the real `{` beside it, so the matching `}`
+        // takes the depth to 0 and the walk leaves the body a variant early. `After` goes, and
+        // nothing fails. `Wrapped` goes for a SECOND reason that outlives any brace rule — the
+        // comment sits ahead of its name, so the identifier run starts at `/` — which is why
+        // the delimiter case above carries the same `Wrapped { … }, … After,` shape with no
+        // comment on that line, and keeps both.
+        //
+        // This shape is a REGRESSION: measured, the walk as it stood scans this same input to
+        // `{"Anchor", "After"}` — right, because it counted the real `{` and a quote inside a
+        // comment was inert to it. The string arm makes that quote live.
+        //
+        // Other shapes regress the same way, and this comment deliberately does not close the
+        // set: bounding it was tried as a count, then as a definition, and each was falsified
+        // by the next reader, because a claim about the complement is not something these pins
+        // can back. What they do back is one instance each, measured against both walks. The
+        // char literal: `Quote = '"' as isize, Wrapped {` scans to `{"Anchor", "Quote",
+        // "Wrapped"}` here against `{"Anchor", "Quote", "Wrapped", "After"}` as it stood, while
+        // the same literal on its OWN line regresses nothing, there being no brace behind it to
+        // lose. The line-comment arm reaches it too, without opening any string: a `//` inside a
+        // block comment breaks the scan at that point, so `/* see https://example.com */` — an
+        // ordinary URL — swallows the brace behind it. Nothing in the enums this scan reads
+        // carries any of it (issue #1433 § Reachability), so the blast radius is zero today; it
+        // is stated because a carrier this change CREATED is not the same thing as one it merely
+        // left unseen, and #1433 — which owns these carriers — records it.
+        assert_eq!(
+            scan("    /* \" */ Wrapped {\n        note: String,\n    },\n    After,"),
+            expect(&["Anchor"])
+        );
+        // The control that separates those two mechanisms, which the case above fuses into a
+        // single `{"Anchor"}`: drop the quote and the block comment carries no string, so the
+        // real `{` IS counted, the depth holds, and `After` survives — while `Wrapped` is
+        // dropped just the same, the comment still sitting ahead of its name. Measured
+        // `{"Anchor", "After"}`. Without it either mechanism could be credited with the whole
+        // of the case above, which is how that case came to be described as restoring `Wrapped`
+        // once the brace was counted — a set no brace rule reaches.
+        assert_eq!(
+            scan("    /* x */ Wrapped {\n        note: String,\n    },\n    After,"),
+            expect(&["Anchor", "After"])
+        );
+        // The same skip over a WRAPPED field type, which is the direction the doc-comment above
+        // had wrong twice — first as uniformly loud, then as uniformly silent. It is neither:
+        // `cargo fmt` breaks a long field type across lines, and a continuation line is a bare
+        // uppercase identifier whose comma leaves an empty remainder, which is exactly the shape
+        // of a fieldless variant. So `String` enters the set — a name nobody wrote, which fails
+        // in `assert_samples_every_variant` where the simple-field case above fails nothing.
+        // Loud is still not saved: `After` is dropped here too, the walk having left the body.
+        assert_eq!(
+            scan(
+                "    /* \" */ Wrapped {\n        inner: Vec<\n            String,\n        >,\n    },\n    After,"
+            ),
+            expect(&["Anchor", "String"])
+        );
+        // Its control, holding the wrapping constant and dropping only the quote: the real `{`
+        // is counted, the depth holds, the continuation lines are read at FIELD depth where
+        // nothing admits them, and the set is the plain one. So the invented name above is
+        // answerable to the skipped brace, not to the wrapping.
+        assert_eq!(
+            scan(
+                "    /* x */ Wrapped {\n        inner: Vec<\n            String,\n        >,\n    },\n    After,"
+            ),
+            expect(&["Anchor", "After"])
+        );
+        // A CHAR literal likewise. Reading it means telling `'{'` from the `'a` of a lifetime,
+        // which is a rule the string arms do not need and this counter does not have.
+        assert_eq!(
+            scan("    Gated = '{' as isize,\n    After,"),
+            expect(&["Anchor", "Gated"])
+        );
+        // The char literal's OTHER direction, and the second instance of the regression class
+        // stated over `code_brace_counts`: a literal holding a QUOTE opens a string that runs to
+        // end of line, so a real `{` behind it on the same line is lost. Measured, the walk as
+        // it stood scans this to `{"Anchor", "Quote", "Wrapped", "After"}` — right — where this
+        // one drops `After`, the walk never having entered the body. The `'{'` case above is the
+        // over-count direction and regresses nothing; this one is why the shape is pinned rather
+        // than described. Issue #1433 owns both and carries the old-vs-new measurement.
+        assert_eq!(
+            scan("    Quote = '\"' as isize, Wrapped {\n        note: String,\n    },\n    After,"),
+            expect(&["Anchor", "Quote", "Wrapped"])
+        );
+        // Its control: the same literal on its OWN line, no brace behind it to lose. Both walks
+        // agree here, which is what confines the regression to the same-line shape.
+        assert_eq!(
+            scan("    Quote = '\"' as isize,\n    After,"),
+            expect(&["Anchor", "After", "Quote"])
+        );
+        // The line-comment arm reaches the same shape without opening any string at all: a `//`
+        // inside a BLOCK comment breaks the scan there, so an ordinary URL swallows the brace
+        // behind it. Measured, the walk as it stood scans this to `{"Anchor", "After"}` — right,
+        // having counted the real `{` — where this one drops `After`.
+        assert_eq!(
+            scan(
+                "    /* see https://example.com */ Wrapped {\n        note: String,\n    },\n    After,"
+            ),
+            expect(&["Anchor"])
+        );
+        // Its control: the same comment with no `//` inside it. Both walks agree here, which is
+        // what isolates the slashes rather than the comment.
+        assert_eq!(
+            scan("    /* see example.com */ Wrapped {\n        note: String,\n    },\n    After,"),
+            expect(&["Anchor", "After"])
+        );
+        // And a string SPANNING lines, where the asymmetry is worth pinning rather than
+        // describing: a brace on the OPENING line is already skipped, the unterminated quote
+        // swallowing the rest of that line, so it is a brace on a CONTINUATION line that is
+        // read as code. Both variants behind it are lost.
+        assert_eq!(
+            scan("    #[doc = \"a\n        {\"]\n    Gated,\n    After,"),
+            expect(&["Anchor"])
         );
     }
 
