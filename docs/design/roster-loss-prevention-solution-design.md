@@ -388,7 +388,7 @@ why no component lands worse than FEASIBLE-WITH-SPIKE.
 | **D-2's wire change touches five call sites plus the handler** and is what D-4 depends on to tell an append from a removal | 2×3=6 | MEDIUM | One message name, one handler, one enforcement point; the omitted argument *is* the fail-closed default (R-3a), so a partial rollout refuses rather than permits. Ordering (§ 17) puts D-1 + D-3 first so the incident is prevented before this lands |
 | **D-3's semantics could make durability illusory** — the naive form records the loss instead of preventing it | 2×3=6 | MEDIUM | The qualifying-write rule, plus a test that replays the incident's own sequence (delete → login → save) and asserts the last good backup is still intact and unevicted |
 | **D-5 parity drifts undetected** because `panel-goldens` is soft and always reports pass | 3×2=6 | MEDIUM | The parity assertion lives in the `test` job, which can fail — never in the golden comparison |
-| **Appetite overrun** — two weeks of evenings across eight decisions | 2×2=4 | MEDIUM | § 17's ordering is also the cut order, reversed: D-8 then D-6 go first, and neither leaves the primary defect open |
+| **Appetite overrun** — two weeks of evenings across eight decisions | 2×2=4 | MEDIUM | § 17's ordering is also the cut order, reversed: D-8, then Cap-7 (R-11/R-13), then D-6 go first, and none of the three leaves the primary defect open |
 | **D-1 false-negative**: a loss that also takes both witnesses | 1×3=3 | LOW | D-3's backup is the second line and does not depend on D-1 |
 
 **Rabbit-hole scan (Shape Up 10× test).** D-5's parity mechanism is the one candidate — but if it

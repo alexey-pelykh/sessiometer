@@ -86,11 +86,11 @@ code is the code that ran.
 | I-6 | On the absent read, `login` falls through to `existing.unwrap_or_else(\|\| Config { roster: Vec::new(), … })`. | `src/capture.rs:689-697` |
 | I-7 | `reconcile_login` calls `save()` then `notify_daemon_roster_reload()`. **The write was not the harm; the notify was.** | `src/capture.rs:856`, `:859` |
 | I-8 | The daemon's handler adopts on `Ok` and **keeps its in-memory roster on `Err`**. The drop to one account therefore proves the reload *succeeded* — the daemon discarded the six accounts it alone held. | `src/daemon/commands.rs:465-476` |
-| I-9 | The `Err` arm reports via `eprintln!` only. This machine has **no launchd installation**; the daemon runs from a manual `run`, so the message goes to a terminal nobody watches — and under the supported `service install` path it would have no destination at all. | `src/daemon/commands.rs:470-474` |
+| I-9 | The `Err` arm reports via `eprintln!` only. This machine has **no launchd installation**; the daemon runs from a manual `run`, so the message goes to a terminal nobody watches. Under `service install` it *does* land durably — `daemon_stderr_log` is threaded into the plist's `StandardErrorPath` and resolves to `logs_dir()/daemon.err.log` — but that channel is **ungoverned and opt-in**: raw process stderr, surfaced only by `log --channel diag`. Neither path puts the failure where an operator would see it. | `src/daemon/commands.rs:470-474`; `src/service.rs:89`, `:533`; `src/paths.rs:489` |
 | I-10 | The daemon loaded its roster **at start and never re-synced**. Every `notify_daemon_roster_reload` trigger is a write verb, and none ran between 2026-08-05 and the incident — so disk was free to diverge, unobserved, for at least 21 days. | `src/capture.rs:123`, `:859`; `src/cli.rs:4778`, `:5572`, `:5674` |
 | I-11 | **Nothing in the codebase removes `config.toml`.** Every removal site — `remove_file` or `remove_dir_all` — targets a `.tmp` sibling, an ephemeral refresh dir, an isolated spawn dir, a stale socket, or the launchd plist. What removed the file is **unattributed** — a stated ABSTAIN, not a guess. | `src/paths.rs:1192`, `:1233`, `:264`; `src/refresh.rs:949`; `src/isolated_spawn.rs:424`, `:436`; `src/cli.rs:1651`, `:1665`; `src/service.rs:370` |
 | I-12 | The credentials survived: all six `Sessiometer/<uuid>` Keychain items were present throughout. **What was lost was the index, not the secrets** — which is why a roster backup is a complete remedy for the loss, and why it carries no credential-exposure risk. | investigation F7 / F12; `src/config.rs:17-20` |
-| I-13 | A **second** durable witness survived alongside the Keychain, and its series is unbroken across the incident day: the usage sample store holds 1,150 distinct sample instants on 2026-08-27, 00:00:09 to 23:58:51, worst inter-sample gap 306 s against a 300 s default poll cadence. A non-empty store implies a roster existed, because the poll has no accounts to sample without one. Measured directly on the affected machine on 2026-09-01 — **not** taken from the report, and re-derivable without it. | `paths::usage_samples()` (`src/paths.rs:609`), `usage_rollup()` (`:620`); `DEFAULT_POLL_SECS` (`src/config.rs:70`) |
+| I-13 | A **second** durable witness survived alongside the Keychain, and its series is unbroken across the incident day: the usage sample store holds 1,150 distinct sample instants on 2026-08-27, 00:00:09 to 23:58:51, worst inter-sample gap 306 s. Read that against the **per-account** cadence (`DEFAULT_POLL_SECS`, 300 s), not a store-wide one: issue #80 spreads the roster one account per `poll_secs / N` sub-interval, so six accounts sample store-wide at ~50 s and no per-account cadence was missed. A non-empty store implies a roster existed, because the poll has no accounts to sample without one. Measured directly on the affected machine on 2026-09-01 — **not** taken from the report. It is re-derivable only until the raw tier ages out: `DEFAULT_STATS_RAW_RETENTION_SECS` is 14 days, so 2026-08-27's raw samples expire around 2026-09-10 and this row becomes the durable record. | `paths::usage_samples()` (`src/paths.rs:609`), `usage_rollup()` (`:620`); `DEFAULT_POLL_SECS` (`src/config.rs:70`); `DEFAULT_STATS_RAW_RETENTION_SECS` (`src/config.rs:281`) |
 
 **The transition that actually occurred was 6 → 1, not 6 → 0.** This is the single most important
 correction to make before designing a guard: an *empty-roster floor* would not have fired on this
@@ -298,7 +298,8 @@ writing (§ 1b Out of Scope).
 `config validate` **shall NOT** report a config carrying zero accounts as unqualifiedly valid.
 Today it emits `"{path} is valid (0 accounts)"` at exit 0 from
 `render_config_validate` (`src/cli.rs:2181-2189`). Nothing on that path calls
-`require_roster`: its only two call sites are `src/use_account.rs:988` and `src/poke.rs:174`.
+`require_roster`. Its three call sites are `src/use_account.rs:988`, `src/poke.rs:174`, and the
+`config.require_roster()` in `run` at `src/cli.rs:1389` — the startup gate `src/error.rs:272` names.
 
 **R-12** *(B3.4, user-ratified)*
 Where a new machine-readable refusal reason is introduced, it **shall** be present in the Rust
@@ -424,8 +425,8 @@ TAG:     ReloadObservability
 SCALE:   time from a roster-reload refusal or failure to an operator being able to see it
 METER:   inspect the durable event destination after an injected reload failure
 GOAL:    observable immediately after the event, with no terminal attached
-PAST:    never observable — eprintln! to an unattended terminal, or no destination at all
-         under `service install` (I-9)
+PAST:    not observable in practice — eprintln! to an unattended terminal on a manual
+         `run`; under `service install`, only in the ungoverned opt-in stderr log (I-9)
 ```
 
 ```
@@ -591,11 +592,12 @@ precedent R-6 can propagate.
 (`src/config.rs:17-20`), so R-8's backups are credential-safe — **but** they must carry the same
 `0o600` mode as the original (`FILE_MODE`, `src/paths.rs:56`); a world-readable backup would be a
 new exposure of the account-uuid/label set. R-12's refusal reasons are redacted machine tags by
-construction and must stay so — no path, label, count, or **account identifier** in the tag itself
-(AC-2). The account-identifier clause is not redundant with `label`: D-1's second witness is the
-usage sample store, whose records carry an `acct` field (`src/usage_store.rs`), so the witness read
-touches a field class `config.toml` does not carry. D-1 reads only non-emptiness, so nothing leaks
-as designed — the clause is here so the enumeration an implementer checks against names it.
+construction and must stay so — a bare machine code carrying no path, label, account count, or
+credential in the tag itself (AC-2; the design's § 8 states the same enumeration). D-1's second
+witness does **not** widen this surface: the usage store's `acct` field (`src/usage_store.rs:143`)
+is the same roster `label` that `config.toml` already carries (`src/config.rs:356`), and may be an
+operator-authored email since #444/#447 — but D-1 reads only non-emptiness, so no witness content
+reaches a tag at all.
 
 **9.2 Compliance & Regulatory.** N/A — a single-operator local tool holding no personal data beyond
 the operator's own account labels, with no data leaving the machine.
@@ -654,11 +656,11 @@ and cleanup are design decisions — a backup that grows without bound is a defe
 
 | # | Check | Result |
 |---|---|---|
-| 1 | Validated problem statement | **PASS** — § 1 traced to Phase 0 framing, with four rejected framings recorded |
+| 1 | Validated problem statement | **PASS** — § 1 traced to Phase 0 framing, with three rejected framings recorded |
 | 2 | Explicit out-of-scope declarations | **PASS** — § 1b, seven declarations plus appetite |
 | 3 | Success and telemetry metrics | **PASS** — § 6: four leading, two lagging, three decision gates. Lagging indicator (5) is explicitly labelled weak rather than presented as evidence |
 | 4 | Cross-cutting & non-functional concerns | **PASS** — § 9, all six subsections with content or `N/A` + rationale |
-| 5 | Feature completeness verdict | **PASS** — § 5b, seven features verdicted, four NEAR-COMPLETE with their gaps named |
+| 5 | Feature completeness verdict | **PASS** — § 5b, seven features verdicted, two NEAR-COMPLETE with their gaps named |
 | 6 | Requirement provenance | **PASS-WITH-FINDINGS** — see below |
 
 **Check 6 — provenance, and what was ratified when.** Seventeen of the nineteen requirements trace

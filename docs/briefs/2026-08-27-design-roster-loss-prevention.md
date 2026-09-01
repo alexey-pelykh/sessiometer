@@ -95,9 +95,9 @@ repo, so nothing lands worse than FEASIBLE — the single FEASIBLE-WITH-SPIKE is
 Rust↔Swift enum parity such that it can actually fail, and only D-5 waits on it.
 
 Ordering is also the cut order reversed: backup ring → event vocabulary → witness + CLI refusal →
-socket refusal + parity → intent + core invariant → divergence detection → config-write lock.
-**Steps 1–4 prevent the incident without steps 5–7**, so an appetite overrun cuts defence-in-depth
-and a latent hazard, never the primary defect.
+socket refusal + parity → intent + core invariant → divergence detection → Cap-7 diagnostic honesty
+(R-11/R-13) → config-write lock. **Steps 1–4 prevent the incident without steps 5–8**, so an
+appetite overrun cuts defence-in-depth and a latent hazard, never the primary defect.
 
 CI cost: every change is `src/**`, so each owes `test`, `msrv` and `deny`. D-5 additionally owes
 `swift` and `panel-goldens`.

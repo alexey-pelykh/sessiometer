@@ -25,9 +25,13 @@ Scenario: the menu-bar button cannot reproduce the collapse
     And the daemon holds six accounts
    When capture is invoked over the control socket
    Then it is rejected
+    And nothing is written
     And the daemon still holds six accounts
-    # Same witness rule as issue #1440, applied at commands.rs:300. One rule, two entry points —
-    # not two rules.
+    # Same witness rule as issue #1440, one rule and two entry points — not two rules. It must be
+    # applied at the config load, commands.rs:274-278. NOT at :300: that is the roster `save_to`,
+    # downstream of `capture_locked` (:286-294), which the source's own "stash-before-roster"
+    # comment (:297-299) confirms has already stashed both credential halves. R-1 requires refusal
+    # before any write (PRD :198) and R-2 binds the socket path identically (:202-203).
 
 Scenario: the menu-bar first run still works
   Given no config.toml
