@@ -6,6 +6,8 @@ projective swap-out session_pct (reason=velocity_preempt): no projective swaps o
 
 landing-point session_pct (post-swap peak of the outgoing account): no reason=session swaps observed
 
+landing-point session_pct, OPERATOR-initiated swaps: no gradeable reason=manual/forced swaps observed
+
 observed session velocity (session_pct_per_min): no usage_velocity samples observed
 
 time blind & near-limit: 0s (sum of blind_window duration_secs where near_limit=true)

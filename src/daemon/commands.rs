@@ -2593,11 +2593,12 @@ mod tests {
 
     /// Every per-account signal on [`AccountRuntime`], projected into one comparable tuple.
     ///
-    /// The EXHAUSTIVE destructure is the point (issue #668): a NINTH per-account signal added to
+    /// The EXHAUSTIVE destructure is the point (issue #668): a TENTH per-account signal added to
     /// `AccountRuntime` without a matching arm here fails to compile, so the roster-reload property
     /// below can never silently stop covering a signal — which is exactly how the pre-#668 parallel
     /// vecs drifted (a new vec was added, and the sites that had to re-key it were remembered by
-    /// hand).
+    /// hand). The ninth (issue #1453's observation-gap anchor) arrived that way: this destructure
+    /// failed to compile, which is the guard working.
     #[expect(
         clippy::type_complexity,
         reason = "the exhaustive per-signal projection IS the compile-time completeness guard"
@@ -2612,6 +2613,7 @@ mod tests {
         Option<ParkedLanding>,
         Option<swap::SessionHighWater>,
         Option<BlindAnchor>,
+        Option<ObservationGapAnchor>,
         bool,
     ) {
         let AccountRuntime {
@@ -2622,6 +2624,7 @@ mod tests {
             parked_landing,
             session_high_water,
             blind_anchor,
+            observation_gap,
             polled_once,
         } = account;
         (
@@ -2636,6 +2639,7 @@ mod tests {
             *parked_landing,
             *session_high_water,
             *blind_anchor,
+            *observation_gap,
             *polled_once,
         )
     }
@@ -2664,7 +2668,7 @@ mod tests {
     ///
     /// The pre-#668 shape made this eight independent hand-maintained re-keys, so the property held
     /// only as long as every one of them was remembered; bundling makes it one. Seeding each account
-    /// with a DISTINCT value in ALL EIGHT signals is what makes the test discriminating: a re-key
+    /// with a DISTINCT value in ALL NINE signals is what makes the test discriminating: a re-key
     /// that fell back to positional order (or dropped a signal to its default) mismatches here rather
     /// than coincidentally matching a shared fixture value.
     ///
@@ -2715,6 +2719,10 @@ mod tests {
                 at: t0 + Duration::from_secs(200 + i as u64),
                 was_active: i.is_multiple_of(2),
                 near_limit: i.is_multiple_of(3),
+            });
+            account.observation_gap = Some(ObservationGapAnchor {
+                at: t0 + Duration::from_secs(300 + i as u64),
+                was_active: i.is_multiple_of(2),
             });
             account.polled_once = i.is_multiple_of(2);
         };
@@ -4010,11 +4018,27 @@ mod tests {
         assert_eq!(daemon.state.ticks, 4);
 
         // Across the four staggered ticks (#80, interleaved #366 → A, B, A, C), A 401s
-        // twice (ticks 1, 3) and C 403s once (tick 4) → three event lines, each stamped,
-        // none carrying secret material (handles only — never a token or email). The
-        // locked account B contributes nothing per-account (#13).
+        // twice (ticks 1, 3) and C 403s once (tick 4) → three per-poll event lines, each
+        // stamped, none carrying secret material (handles only — never a token or email).
+        // The locked account B contributes nothing per-account (#13).
+        //
+        // Plus one `observation_gap_enter` for A (issue #1453), which is not a per-poll line
+        // at all: A is the ACTIVE account and every poll of it 401s, so it has never been
+        // successfully observed. `blind_enter` cannot speak for it — its entry edge needs a
+        // prior reading to anchor on — so without this line an active account the daemon has
+        // never once seen would be reported only as a credential fault, never as an
+        // unobserved one. It fires on tick 2, the first tick a full bound has elapsed since A
+        // was designated.
         let logged = std::fs::read_to_string(&log_path).unwrap();
-        assert_eq!(logged.lines().count(), 3, "three lines: {logged:?}");
+        assert_eq!(logged.lines().count(), 4, "four lines: {logged:?}");
+        assert_eq!(
+            logged
+                .lines()
+                .filter(|l| l.contains("event=observation_gap_enter"))
+                .count(),
+            1,
+            "one gap line, on the edge — not one per tick: {logged:?}"
+        );
         assert!(
             logged.lines().all(|l| l.starts_with("ts=")),
             "stamped: {logged:?}"
