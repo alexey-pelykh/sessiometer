@@ -2542,10 +2542,22 @@ where
         // incoming account — it clears `active` precisely so the resolve above does — and this is
         // where the new designation is first known. That comparison also supplies the guard for
         // free: a re-login of the account that was ALREADY active resolves back to the same index,
-        // changes no designation, and must not restart the peer sweep. It cannot double-fire with
-        // the swap paths either — those run outside a tick, so their write is already reflected in
-        // `active_before_tick`. On the first tick of a run it sees `None -> Some(_)` and clears a
-        // schedule that is still empty: a no-op, and the rebuild below was happening regardless.
+        // changes no designation, and must not restart the peer sweep.
+        //
+        // It cannot double-fire with the swap paths either, and the reason is ORDERING WITHIN THE
+        // TICK rather than location relative to it — most of them run INSIDE this function, below.
+        // `recover_scrubbed_canonical` and `decide_action` (which reaches `emergency_swap`,
+        // `blind_swap` and `velocity_swap`) are all called from `tick` further down, so their
+        // `record_swap` commits strictly AFTER this comparison and cannot influence it; the next
+        // tick then captures their write in `active_before_tick`, finds `active` already `Some`,
+        // skips the re-resolve, and compares equal. Only `perform_socket_swap` and
+        // `adopt_manual_swap` run outside a tick at all. **This block must therefore stay ABOVE
+        // `decide_action`** — relocating it below would put a same-tick swap between the capture
+        // and the comparison and produce a genuine double-invalidation.
+        //
+        // On the first tick of a run it sees `None -> Some(_)` and clears a schedule that is still
+        // empty (`DecisionState` derives `Default`): a no-op, and the rebuild below was happening
+        // regardless.
         if self.state.active != active_before_tick {
             self.invalidate_poll_schedule();
         }
@@ -3116,9 +3128,22 @@ where
     /// which never reads `poll_schedule`, so re-deriving that vector cannot move a tick's timing,
     /// add a tick, or add a request. It changes only WHICH index a tick polls.
     ///
-    /// Callers must invalidate only on an ACTUAL change. Re-deriving the vector for an active that
-    /// did not change restarts the peer sweep for nothing, and nothing here bounds peer coverage
-    /// under repeated changes of active (`ADR-0012` § Status, tracked at #1455).
+    /// **Also called on a ROSTER change** — [`reconcile_roster`](Self::reconcile_roster) — whose
+    /// reason is the older and narrower one: INDEX VALIDITY, the vector held old roster indices. A
+    /// change of active moves no index, so that reason never reached it, which is precisely why the
+    /// active case went uncovered until #1452. Two reasons, one operation.
+    ///
+    /// Callers should invalidate only on an ACTUAL change: re-deriving the vector for an active
+    /// that did not change restarts the peer sweep for nothing, and nothing bounds peer coverage
+    /// under repeated changes of active (`ADR-0012` § Status, tracked at #1455). Two callers are
+    /// deliberately unconditional, and neither is an oversight:
+    ///
+    /// - [`record_swap`](Self::record_swap) — the shape the ratified solution design § 5 **B-1**
+    ///   specifies (unlike **B-2**, which is guarded). It is reachable with no change of
+    ///   designation only via `use --force <active>`, the display-repair self-swap that
+    ///   `swap_command_verdict` admits as `Swap` rather than `AlreadyActive` under `force`.
+    /// - `reconcile_roster` — pre-existing index-validity behaviour; a reload that changed nothing
+    ///   still invalidates.
     fn invalidate_poll_schedule(&mut self) {
         self.state.poll_schedule.clear();
         self.state.poll_pos = 0;
@@ -12723,41 +12748,40 @@ mod tests {
     // --- issue #1451: the mid-cycle change-of-active regression oracle ------
     //
     // Pre-authored from the solution design AHEAD of its fix (issue #1452), so that whoever
-    // implements the fix does not get to bind the assertions grading it. The two positive
-    // oracles below are `#[ignore]`d for exactly as long as that separation lasts, and the
-    // reason is mechanical rather than a matter of taste: `main` is protected by a ruleset
+    // implements the fix did not get to bind the assertions grading it. The two positive
+    // oracles below landed `#[ignore]`d for exactly as long as that separation lasted, and the
+    // reason was mechanical rather than a matter of taste: `main` is protected by a ruleset
     // whose only required check is `ci-ok`, `ci-ok` needs the `test` job, and that job runs a
     // bare `cargo test` — so a test that is RED on purpose cannot be merged while it runs.
-    // Landing them ignored is what puts the assertions into `main`'s history BEFORE the fix,
-    // which is the whole point of filing them separately; removing the two attributes — and
-    // nothing else about them — belongs to the fix rather than to this change (issue #1452).
+    // Landing them ignored is what put the assertions into `main`'s history BEFORE the fix,
+    // which is the whole point of having filed them separately.
     //
-    // What that costs, and what pays it back. An ignored test is compiled (and linted) but not
-    // RUN, so it is CI-inert until un-ignored. Two things bound that. The negative case below
-    // is NOT ignored, so the fixture and the tick helper both stay exercised by every CI run
-    // and cannot rot unnoticed. And the RED demonstration is not deferred to a promise — it was
-    // measured before the attributes were applied, and it is reproducible from this tree on
-    // demand:
+    // **#1452 has since landed and both attributes are removed** — the two oracles now RUN on
+    // every CI run, and going green is the fix's AC-4. Nothing here is `#[ignore]`d any more, so
+    // `cargo test -- --ignored a_mid_cycle` — the on-demand recipe this comment used to offer —
+    // now selects ZERO tests and reports a green `ok` over an empty subject. Do not read that as
+    // a pass. The RED demonstration is reproducible only against a tree WITHOUT the fix: check
+    // out this file's parent commit, or neutralise the three `invalidate_poll_schedule` call
+    // sites (`record_swap`, `adopt_manual_swap`, and the change-of-active guard in `tick`) and
+    // run `cargo test -- a_mid_cycle`. Both then fail at their AC-3 LATENCY assertion with a
+    // first sight of 75 s against a 30 s bound. A pass there would have falsified the diagnosis
+    // rather than confirmed it, and would have sent #1451 back to analysis instead of on to the
+    // fix — as would a failure at any of the earlier assertions, which grade the setup and the
+    // request budget, not the latency.
     //
-    //     cargo test -- --ignored a_mid_cycle
-    //
-    // Both fail at their AC-3 LATENCY assertion with a first sight of 75 s against a 30 s
-    // bound. A pass there would falsify the diagnosis rather than confirm it, and would send
-    // #1451 back to analysis instead of on to the fix — as would a failure at any of the
-    // earlier assertions, which grade the setup and the request budget, not the latency.
-    //
-    // WHAT THIS LOCK DOES NOT COVER, stated here so the boundary travels with it. #1451's AC-2
-    // enumerates two active-changing paths and both are covered below. `ADR-0012` § Status →
-    // Amended 2026-09-02 (#1454) — which landed after this oracle was authored — enumerates a
-    // THIRD, and warns that "a mechanism that covers only the two swap seams leaves that one
-    // carrying the whole defect": `reconcile_canonical_change` (`src/daemon/canonical.rs`) drops
-    // `state.active` to `None` when an out-of-band login repoints the canonical at a different
-    // roster account, and `tick`'s top-of-tick resolve re-designates it within the same tick.
-    // That is an `active` write and not a `poll_schedule` write, so an enumeration of schedule
-    // writes does not find it — and neither does this lock. Going GREEN here is therefore
-    // evidence about the two swap seams and about nothing else; widening the enumeration is
-    // #1452's to carry, and it is recorded there rather than silently absorbed into this
-    // issue's ratified scope.
+    // WHAT THIS LOCK DID NOT COVER, kept because the boundary is still worth knowing. #1451's
+    // AC-2 enumerates two active-changing paths and both are covered by the two oracles below.
+    // `ADR-0012` § Status → Amended 2026-09-02 (#1454) — which landed after this oracle was
+    // authored — enumerates a THIRD, and warns that "a mechanism that covers only the two swap
+    // seams leaves that one carrying the whole defect": `reconcile_canonical_change`
+    // (`src/daemon/canonical.rs`) drops `state.active` to `None` when an out-of-band login
+    // repoints the canonical at a different roster account, and `tick`'s top-of-tick resolve
+    // re-designates it within the same tick. That is an `active` write and not a
+    // `poll_schedule` write, so an enumeration of schedule writes does not find it — and neither
+    // did this lock. Widening the enumeration was #1452's to carry, and it did:
+    // `a_mid_cycle_out_of_band_login_observes_the_new_active_within_the_bound` and
+    // `an_out_of_band_relogin_of_the_active_account_does_not_disturb_the_schedule` cover that
+    // third path and sit directly below the negative case.
 
     /// How many ticks the oracles below observe after a change of active. Five is what the
     /// pre-fix gap costs on this fixture and two is the bound, so eight leaves the measurement
@@ -13263,7 +13287,6 @@ mod tests {
         // deliberately NOT committed, which is what makes the next tick classify it `Changed`.
         // Nothing forces `state.active` by hand — the daemon must reach `reserve` through its own
         // re-stash and re-resolve, or this would prove nothing about the path under test.
-        let requests_before_the_change = daemon.poller.requests();
         daemon.store.write(&cred(b"D-token")).await.unwrap();
         assert_eq!(
             daemon.state.active,
@@ -13304,13 +13327,13 @@ mod tests {
              {spacings:?} against {expected_spacing:?} per tick (N = {rotation_len} distinct \
              rotation accounts)"
         );
-        assert_eq!(
-            requests,
-            daemon.poller.requests() - requests_before_the_change,
-            "every usage request in this window must be one the ticks accounted for, but the \
-             poller saw {} across the whole change against {requests} counted per tick",
-            daemon.poller.requests() - requests_before_the_change
-        );
+        // The absolute count is what carries AC-2 / `ADR-0012` Decision 3 here. A per-tick-versus-
+        // total cross-check was deliberately NOT added alongside it: `tick_and_report_the_polled_account`
+        // derives each tick's count from consecutive non-overlapping reads of the same monotonic
+        // counter, so summing the deltas telescopes to `final - initial` by construction and the
+        // comparison could never fail — it would read as a third rate assertion while measuring
+        // nothing. Nothing outside the ticks can reach the poller anyway: the whole window holds
+        // one credential-store write, one `assert_eq!`, and a clock advance per iteration.
         assert_eq!(
             requests, POST_CHANGE_TICKS as u32,
             "an out-of-band login must not add requests: the {POST_CHANGE_TICKS} ticks after it \
@@ -13364,9 +13387,14 @@ mod tests {
         // the assertion at the end cannot be satisfied by whatever the re-login left behind.
         let next_by_the_undisturbed_schedule = schedule_before[cursor];
 
-        // A fresh token for `work`, the account already active: no stash matches these bytes, so
-        // the resolver falls through to its `~/.claude.json` display step — which names `u-A` —
-        // and re-designates index 0. Exactly the shape of an in-place refresh.
+        // A fresh token for `work`, the account already active — exactly the shape of an in-place
+        // refresh. TWO resolutions follow, and they run on different signals: DETECTION, inside
+        // `reconcile_canonical_change`, finds no stash matching these bytes and falls through to
+        // the `~/.claude.json` display step, which names `u-A`; that is what identifies the account
+        // to re-stash, and only the re-stash succeeding clears `state.active` at all.
+        // RE-DESIGNATION, in `tick`'s own resolve — the one the guard under test compares — then
+        // walks the stashes first and matches the freshly re-stashed `A-token-v2` on `u-A`, never
+        // reaching the display fallback.
         daemon.store.write(&cred(b"A-token-v2")).await.unwrap();
 
         // Drive the tick that detects it. The structural assertions below are read AFTER this
@@ -13375,6 +13403,27 @@ mod tests {
         // cursor legitimately advances by the one entry this tick consumed.
         let (_, polled, _) = tick_and_report_the_polled_account(&mut daemon).await;
 
+        // The re-login WAS detected — otherwise everything below passes vacuously. Every other
+        // assertion here is equally satisfied by nothing having happened: `active` is `Some(0)`
+        // because it already was, and an untouched schedule is what an undetected change leaves
+        // too. Only `restash_account` writes this token into `u-A`'s stash, and the `state.active`
+        // clear that the guard under test then re-resolves sits inside the same success arm — so
+        // this is the one observable proving the path ran. Its sibling
+        // `an_adopted_manual_swap_to_the_same_account_does_not_disturb_the_schedule` needs no such
+        // assertion: its stimulus is a direct call, which cannot silently not-run.
+        // Compared with `Credential::matches` rather than `assert_eq!`: `Credential` deliberately
+        // implements no `Debug`, so a secret can never reach a panic message.
+        assert!(
+            daemon
+                .stash
+                .read("Sessiometer/u-A")
+                .await
+                .expect("`work`'s stash must be readable")
+                .credential
+                .matches(&cred(b"A-token-v2")),
+            "the re-login must have been DETECTED and re-stashed onto `work` — without that, \
+             `state.active` was never cleared and every assertion below holds vacuously"
+        );
         assert_eq!(
             daemon.state.active,
             Some(0),
