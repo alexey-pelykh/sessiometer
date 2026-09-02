@@ -12800,6 +12800,21 @@ mod tests {
     /// active one slot earlier and leaves a single tick of margin, where one mis-counted tick
     /// would flip the verdict in either direction.
     ///
+    /// The scripting this fixture relies on is documented where the body that carries it now
+    /// lives, on [`four_account_daemon_with_cooldown`] — read it there. This is a thin delegate at
+    /// the cooldown value every caller of THIS name had before the parameter existed, so its
+    /// behaviour is unchanged; the properties are the delegate's to state.
+    async fn four_account_daemon() -> FakeDaemon {
+        four_account_daemon_with_cooldown(0).await
+    }
+
+    /// A four-account daemon (`work` active, then `spare`, `backup`, `reserve`) carrying an
+    /// explicit post-swap cooldown floor, in seconds — the fixture the issue #1455 churn
+    /// measurements below need, and the reason that constant is a parameter at all. Everything
+    /// else in this file wants `0` and reaches it through [`four_account_daemon`]: the baseline
+    /// oracles take no swap decision of their own, so the cooldown is inert for them and pinning
+    /// it at zero keeps their state minimal.
+    ///
     /// Every account is scripted far below every trigger (0.10 session / 0.10 weekly against a
     /// 95 ceiling and an 80 floor), so no tick takes a swap decision of its own and the only
     /// change of active in these tests is the one the test drives. That every account is
@@ -12807,7 +12822,26 @@ mod tests {
     /// what makes a request and a moved `last_reading_at` stamp the same event, which
     /// `tick_and_report_the_polled_account` asserts rather than assumes — script one account
     /// `Scripted::Transient` and that assertion fails loudly instead of silently under-counting.
-    async fn four_account_daemon() -> FakeDaemon {
+    /// Both properties belong to THIS function, which holds the `.ok(…)` calls; the
+    /// [`four_account_daemon`] wrapper delegates here and states neither.
+    ///
+    /// `cooldown_secs` reaches TWO fields, because `tunables` feeds it to both. `cooldown_secs`
+    /// becomes `Daemon::cooldown_base`, the floor `perform_socket_swap` enforces between two
+    /// operator-driven swaps; `cooldown_strategy` becomes the draw the AUTONOMOUS swap gates take
+    /// (the reactive, blind-preempt and velocity paths in `decide_action`). Raising this therefore
+    /// defers autonomous swaps as well, which a caller wanting only the operator gate must account
+    /// for. Neither field is on the cadence path — `next_subinterval` reads neither — so no value
+    /// here changes a tick's timing, and both strategies stay `fixed`, so none of it draws RNG.
+    ///
+    /// The two fields do NOT track each other below the config floor, and the wrapper's own `0` is
+    /// the case that shows it: every autonomous draw is
+    /// `cooldown_strategy.draw(&mut self.rng, COOLDOWN_SECS_LO, COOLDOWN_SECS_HI)` and
+    /// `Strategy::draw` ends in `clamp`, with `COOLDOWN_SECS_LO` = `config::COOLDOWN_SECS_FLOOR`,
+    /// so any `cooldown_secs` under that floor reaches `cooldown_base` verbatim and the autonomous
+    /// gates at the floor. Inert wherever nothing scripts an autonomous swap — which is everywhere
+    /// this fixture is used today — and a trap for the first caller who picks a small value in
+    /// order to model a tight autonomous floor.
+    async fn four_account_daemon_with_cooldown(cooldown_secs: u64) -> FakeDaemon {
         let roster = vec![
             account("u-A", "work"),
             account("u-B", "spare"),
@@ -12826,7 +12860,7 @@ mod tests {
         // Keep the temp `~/.claude.json` alive for the daemon's lifetime by leaking the guard —
         // these are short-lived unit-test daemons (as `three_account_daemon`).
         std::mem::forget(dir);
-        let tun = tunables(95, 80, 0);
+        let tun = tunables(95, 80, cooldown_secs);
         Daemon::new(
             roster,
             FakeRosterPoller::new()
@@ -12857,9 +12891,11 @@ mod tests {
     /// the stamp: a tick polling an account whose stamp is already `None` leaves it `None`, and
     /// the diff then reports "polled nothing" for a request that did go out — a THIRD honest-
     /// `None` case, and the only dishonest one of the three. What rules it out here is the
-    /// FIXTURE rather than this helper — every account in `four_account_daemon` is scripted
-    /// `Ok` — so the two views are asserted to AGREE below instead of that property being left
-    /// unstated.
+    /// FIXTURE rather than this helper — every account in `four_account_daemon_with_cooldown` is
+    /// scripted `Ok`, which is the body `four_account_daemon` delegates to — so the two views are
+    /// asserted to AGREE below instead of that property being left unstated. Cited on the
+    /// PARAMETERISED fixture deliberately: callers reach it under both names, and the property is
+    /// the delegate's.
     ///
     /// Counting requests rather than ticks-that-polled is what makes this the real `ADR-0012`
     /// Decision 3 guard: the poller counts every call it receives, wherever in the daemon it
@@ -12920,9 +12956,10 @@ mod tests {
             restamped, requests as usize,
             "the stamp diff and the request count disagree: {restamped} account(s) restamped \
              ({polled:?}) against {requests} request(s) on the wire — under \
-             `four_account_daemon`'s all-`Ok` scripting every request stamps exactly one \
-             account, so either this fixture is no longer all-`Ok` or a request went out that \
-             the scheduled poll does not account for"
+             `four_account_daemon_with_cooldown`'s all-`Ok` scripting (reached under that name or \
+             via the `four_account_daemon` wrapper) every request stamps exactly one account, so \
+             either this fixture is no longer all-`Ok` or a request went out that the scheduled \
+             poll does not account for"
         );
         (spacing, polled.first().copied(), requests)
     }
@@ -13452,6 +13489,672 @@ mod tests {
              to {}, but it sits at {}",
             cursor + 1,
             daemon.state.poll_pos
+        );
+    }
+
+    // --- issue #1455: peer coverage under REPEATED changes of active -------------------------
+    //
+    // #1452's fix restarts the peer sweep on every change of active: `invalidate_poll_schedule`
+    // clears the vector AND zeroes the cursor, so the next tick rebuilds from the head. That is
+    // the shape the ratified solution design specifies, and `ADR-0012` § Status accepts its cost
+    // only as far as that record derived it — the peer bound under Decision 4 is derived over an
+    // UNINTERRUPTED traversal, and the record says outright that "nothing in this ADR bounds peer
+    // coverage under repeated changes of active … Tracked at #1455", explicitly NOT pre-ratified
+    // by Decision 4's "peers are only swap targets" argument, which is about a RELAXED cadence
+    // rather than an unbounded one. `invalidate_poll_schedule`'s own doc comment repeats it. The
+    // two measurements below are what that tracking asked for.
+    //
+    // THE ARITHMETIC, derived from `build_poll_schedule` and `next_poll_index` rather than
+    // assumed. The schedule is `[a, p₁, a, p₂, …, a, p_{N-1}]`, so peer `pₖ` sits at index `2k-1`
+    // and needs `2k` uninterrupted ticks to be reached, while ticks are `poll_secs / N` apart. A
+    // change of active arriving every `C` seconds therefore lets the cursor reach only
+    // `⌊C·N / poll_secs⌋` entries, and every peer past that index is not merely re-observed late —
+    // it is never reached AT ALL. The answer to AC-1 is therefore NO: the `2·poll_secs` peer bound
+    // does not survive churn, and what replaces it is not a larger bound but the absence of one.
+    //
+    // WHY THAT MATTERS BEYOND CADENCE, and it is the coupling `ADR-0012` § Status names as not
+    // pre-ratified: a peer's carried reading is what `pick_target` ranks swap targets by, so an
+    // unobserved peer is not simply stale — it is ranked on a reading from before the churn began.
+    //
+    // WHAT THESE TWO TESTS ARE. Characterization locks on behaviour that is CURRENT and NOT
+    // endorsed. They pin the collapse so it can neither deepen nor disappear in silence, and they
+    // pin the `ADR-0012` Decision 3 rate guarantees that DO survive it. Repairing the collapse is
+    // not #1455's to carry — #1455 is a `test` item, and its acceptance is the measurement plus
+    // the records it asks for — so the repair is tracked separately at #1464. Whoever lands it
+    // should INVERT these locks into positive peer-coverage oracles rather than delete them: the
+    // rate assertions they carry are what keeps a repair admissible under the same record.
+    //
+    // WHAT THEY DELIBERATELY DO NOT DO. Neither drives a daemon RESTART. #1356 reports that
+    // `DecisionState` is `Default`-constructed with `last_swap` restored from nothing, so a
+    // restart clears the cooldown outright — which makes "restart it and see" destructive to the
+    // very state under test anywhere in this area. The second test reaches the same
+    // no-floor-at-all condition through a path that never had a cooldown to clear, so nothing here
+    // needs to restart anything.
+
+    /// How many churn rounds the AC-1 measurement drives. Five carries the window to 2.5× the
+    /// `2·poll_secs` peer bound on this fixture, so a starved peer's measured gap is unambiguously
+    /// past the bound rather than marginally so — and an account that IS covered gets several
+    /// sightings, which is what makes the two outcomes distinguishable rather than a coin flip on
+    /// window length.
+    const CHURN_ROUNDS: usize = 5;
+
+    /// What a churn window observed: for every roster index, the offsets from the window's start
+    /// at which it was actually POLLED, plus the per-tick spacings and the total usage requests
+    /// the window put on the wire.
+    ///
+    /// Sightings come from `tick_and_report_the_polled_account`, so each one is a poll that
+    /// HAPPENED — the schedule is never consulted, and a slot the tick consumed and then filtered
+    /// contributes nothing. Reading the schedule instead would claim coverage that no request
+    /// backs, which is the exact opposite of what these measurements are for.
+    struct ChurnObservations {
+        sightings: Vec<Vec<Duration>>,
+        spacings: Vec<Duration>,
+        elapsed: Duration,
+        requests_at_open: u32,
+        requests: u32,
+    }
+
+    impl ChurnObservations {
+        /// Open a measurement window on `daemon`. The request baseline is taken HERE, so
+        /// everything the caller does between this call and its last [`observe`](Self::observe) —
+        /// including every change of active it commits — falls inside the window `requests`
+        /// covers. Deliberate: a repair that bought peer coverage by polling from INSIDE the swap
+        /// path would otherwise sit in the blind spot between two tick windows and no per-tick
+        /// count would ever see it.
+        fn open(daemon: &FakeDaemon) -> Self {
+            Self {
+                sightings: vec![Vec::new(); daemon.roster.len()],
+                spacings: Vec::new(),
+                elapsed: Duration::ZERO,
+                requests_at_open: daemon.poller.requests(),
+                requests: 0,
+            }
+        }
+
+        /// Drive `ticks` ticks at the daemon's own declared cadence and fold what they polled into
+        /// this record.
+        async fn observe(&mut self, daemon: &mut FakeDaemon, ticks: usize) {
+            for _ in 0..ticks {
+                let (spacing, polled, _) = tick_and_report_the_polled_account(daemon).await;
+                self.spacings.push(spacing);
+                self.elapsed += spacing;
+                if let Some(i) = polled {
+                    self.sightings[i].push(self.elapsed);
+                }
+            }
+            self.requests = daemon.poller.requests() - self.requests_at_open;
+        }
+
+        /// The longest stretch roster index `i` went UNOBSERVED inside the window: from the
+        /// window's start to its first sighting, between consecutive sightings, and from its last
+        /// sighting to the window's end — so an account seen once at the very start and never
+        /// again reports the whole tail rather than a flattering zero.
+        ///
+        /// An account never polled at all reports the WHOLE window. That is the honest answer and
+        /// not a saturation artifact: its true gap is unbounded, and the window is the only lower
+        /// bound a finite measurement can establish for it.
+        ///
+        /// The LEADING segment is window-relative, and that makes every result here a LOWER bound:
+        /// an account last polled shortly before [`open`](Self::open) has the part of its gap that
+        /// predates the window silently dropped, so a real stretch can be reported shorter than it
+        /// was. The error is one-directional — [`starved`](Self::starved) can omit an account that
+        /// truly exceeded the bound, never invent one — which is the safe direction for a lock
+        /// asserting that a collapse is present.
+        fn worst_gap(&self, i: usize) -> Duration {
+            let mut worst = Duration::ZERO;
+            let mut previous = Duration::ZERO;
+            for &at in &self.sightings[i] {
+                worst = worst.max(at.saturating_sub(previous));
+                previous = at;
+            }
+            worst.max(self.elapsed.saturating_sub(previous))
+        }
+
+        /// Every roster index whose [`worst_gap`](Self::worst_gap) exceeded `bound`, in roster
+        /// order.
+        ///
+        /// STRICTLY exceeded: a gap of exactly `bound` is reported healthy. That matches #1455
+        /// AC-1's "re-observed WITHIN `2·poll_secs`", which reads inclusively, rather than
+        /// `build_poll_schedule`'s doc comment, which derives the uninterrupted peer interval to be
+        /// strictly `< 2·poll_secs` — the two disagree only at the boundary, and the acceptance
+        /// criterion is what this measurement is graded against. The boundary no longer decides
+        /// anything either way: both callers additionally assert their exact per-account gaps, so a
+        /// gap arriving at the bound reddens there whatever this predicate says about it.
+        fn starved(&self, bound: Duration) -> Vec<usize> {
+            (0..self.sightings.len())
+                .filter(|&i| self.worst_gap(i) > bound)
+                .collect()
+        }
+
+        /// The per-account worst gaps, for a failure message that names WHICH account and by how
+        /// much rather than only that something was starved.
+        fn worst_gaps(&self) -> Vec<Duration> {
+            (0..self.sightings.len())
+                .map(|i| self.worst_gap(i))
+                .collect()
+        }
+    }
+
+    /// Commit a change of active to `target_idx` the way the engine does — the canonical is
+    /// written FIRST, then the swap is recorded.
+    ///
+    /// The store write is load-bearing rather than ceremony: `record_swap` primes the canonical
+    /// watch with the INCOMING stash's token, so a canonical still holding the departing account's
+    /// bytes would classify `Changed` on the next tick and `reconcile_canonical_change` would
+    /// re-stash and re-resolve active out from under the measurement. The two #1451 oracles do
+    /// this once each; the churn below does it many times, which is the whole reason it is a
+    /// helper.
+    async fn commit_change_of_active(daemon: &mut FakeDaemon, target_idx: usize) {
+        const TOKENS: [&[u8]; 4] = [b"A-token", b"B-token", b"C-token", b"D-token"];
+        const STASHES: [&str; 4] = [
+            "Sessiometer/u-A",
+            "Sessiometer/u-B",
+            "Sessiometer/u-C",
+            "Sessiometer/u-D",
+        ];
+        daemon.store.write(&cred(TOKENS[target_idx])).await.unwrap();
+        let at = daemon.clock.now();
+        daemon
+            .record_swap(target_idx, STASHES[target_idx], at)
+            .await;
+        // NOT a stimulus guard, and labelling it one would stop the next reader adding the real
+        // guard: `record_swap`'s FIRST statement assigns `state.active`, and nothing between it
+        // and here reads or writes that field, so this cannot fail. It characterizes that
+        // unconditional designation write — if `record_swap` ever stops designating, this says so
+        // at the call site rather than surfacing downstream as a mangled window. The stimulus
+        // proper is graded by EFFECT, on the exact per-account gaps each caller asserts; the store
+        // write above is what those rest on, and a drift between it and the fixture's roster
+        // shows up there, never here.
+        assert_eq!(
+            daemon.state.active,
+            Some(target_idx),
+            "`record_swap` must designate roster index {target_idx} as active"
+        );
+    }
+
+    /// Drive `rounds` rounds of {change of active, then `ticks_per_round` ticks} and return what
+    /// the whole window observed. `next_active(round)` supplies the roster index each round
+    /// changes TO.
+    async fn observe_change_of_active_churn(
+        daemon: &mut FakeDaemon,
+        rounds: usize,
+        ticks_per_round: usize,
+        next_active: impl Fn(usize) -> usize,
+    ) -> ChurnObservations {
+        let mut observations = ChurnObservations::open(daemon);
+        for round in 0..rounds {
+            commit_change_of_active(daemon, next_active(round)).await;
+            observations.observe(daemon, ticks_per_round).await;
+        }
+        observations
+    }
+
+    #[tokio::test]
+    async fn peer_coverage_collapses_under_change_of_active_churn_at_the_cooldown_floor() {
+        // Issue #1455 AC-1, and the answer it records is NO. Back-to-back changes of active at the
+        // cooldown floor do not leave every enabled non-quarantined peer re-observed within
+        // `2·poll_secs`; the last peer in the interleave is not re-observed at all. Asserted over
+        // FIVE changes rather than one — AC-1's "BUT NOT asserted only for a single swap" — which
+        // is also what distinguishes this from the #1451 oracles above: they measure the INCOMING
+        // active's first sight after one change, and a mechanism can satisfy that perfectly while
+        // starving every peer, because the incoming active is exactly the account a rebuild puts
+        // at index 0.
+        let mut daemon = four_account_daemon_with_cooldown(60).await;
+        warmed_tick(&mut daemon).await;
+
+        // The contract, derived from the daemon's own state exactly as the #1451 / #1452 oracles
+        // derive theirs. `interval` is `poll_secs`; the per-tick spacing is `poll_secs / N` with
+        // `rotation_len` as the divisor (the count of DISTINCT rotation accounts, never the ~2N
+        // schedule length); and the PEER bound is `2·poll_secs` — NOT the `2·poll_secs / N` the
+        // oracles above use, which binds the ACTIVE account. `2·poll_secs` is what
+        // `build_poll_schedule`'s doc comment claims for peers ("a peer re-observes every
+        // `2·poll_secs·(N-1)/N`, which is `< 2·poll_secs` for all N") and what AC-1 restates.
+        // Exact here because the `tunables` fixture pins the #540 near-limit cap — the one thing
+        // that may legitimately return LESS than the floor — to its `0` kill-switch.
+        let interval = daemon.next_poll_interval();
+        let rotation_len = daemon.rotation_len();
+        let expected_spacing = interval / rotation_len.max(1) as u32;
+        let peer_bound = interval * 2;
+
+        // ABSOLUTE anchor for the Decision 3 rate assertions below, and what lets them fail for
+        // the reason they name. Every rate quantity in this test — `expected_spacing`,
+        // `peer_bound`, the per-tick spacing vector, `ticks_per_round` — is derived from
+        // `next_poll_interval()` and `rotation_len()`, the same two accessors that produce the
+        // spacings being graded. A uniform change to EITHER rescales expectation and observation
+        // in lockstep, so the cadence tightening `ADR-0012` Decision 1 rejects and Decision 3
+        // forbids passes every assertion below unseen: return 52 s from `next_poll_interval`, or
+        // divide by `poll_schedule.len()` instead of `rotation_len`, and nothing here reddens.
+        // These pin the derivation to the fixture's own literals, which the daemon does not
+        // compute — so a rate regression reddens HERE, naming the rate, rather than in a gap
+        // vector that points the reader at the measurement.
+        assert_eq!(
+            (interval, rotation_len),
+            (Duration::from_secs(60), 4),
+            "this fixture is four rotation accounts at `poll_secs = 60`; the cadence derived below \
+             is a Decision 3 guard only while it stays anchored to those literals"
+        );
+        let cooldown = daemon.cooldown_base;
+        // The round length below divides WHOLE SECONDS, so the guard has to hold for whole seconds
+        // too: a sub-second spacing is non-zero as a `Duration` and zero as `as_secs()`, which
+        // would turn the intended diagnostic into a divide-by-zero panic. Unreachable at this
+        // fixture's 60 s interval over four accounts; guarded because the guard's own wording would
+        // otherwise tell a future editor the division is protected when it is not.
+        assert!(
+            cooldown.as_secs() >= expected_spacing.as_secs() && expected_spacing.as_secs() > 0,
+            "this measurement models churn at the COOLDOWN FLOOR over a running cadence, so the \
+             per-tick spacing must be a non-zero whole number of seconds and the cooldown must be \
+             at least one of them: cooldown {cooldown:?}, per-tick spacing {expected_spacing:?}"
+        );
+        // One cooldown window's worth of ticks — the most the cursor can ever advance between two
+        // operator-driven swaps taken as fast as the gate permits. BOTH operands are truncated to
+        // whole seconds and the two truncations pull the quotient in OPPOSITE directions, so the
+        // resulting round length is ASSERTED against the cooldown below rather than reasoned about
+        // here. An earlier form of this comment reasoned only about the numerator and told the
+        // next reader the bias always ran one way; at a 63 s interval it runs the other.
+        let ticks_per_round = (cooldown.as_secs() / expected_spacing.as_secs()) as usize;
+
+        // The direction that matters, asserted rather than claimed: one modelled round must be no
+        // LONGER than the cooldown, so this window models changes of active arriving at least as
+        // fast as the gate permits and therefore errs toward reporting MORE starvation than the
+        // floor allows, never less. Exact here (4 x 15 s against 60 s).
+        //
+        // It is also the only thing tying the modelled PERIOD to the gate's own value. Everything
+        // below drives `record_swap` directly, for the reason given at the churn loop, so nothing
+        // else in this test consults `perform_socket_swap`'s `in_cooldown` derivation — without
+        // this, "churn at the COOLDOWN FLOOR" would be a claim in a test name and nowhere else.
+        assert!(
+            expected_spacing * ticks_per_round as u32 <= cooldown,
+            "one modelled round ({:?}) must not exceed the cooldown floor ({cooldown:?}), or this \
+             window models LESS churn than the gate permits and under-reports starvation",
+            expected_spacing * ticks_per_round as u32
+        );
+
+        // CONTROL, and it is what keeps the result below a measurement rather than an artifact of
+        // the fixture: one UNINTERRUPTED sweep — the traversal `ADR-0012` Decision 4 derives the
+        // peer bound over — must observe EVERY account. A fixture that could not do that would
+        // starve its peers for reasons having nothing to do with churn, and the churn assertion
+        // would then report a starved set while measuring nothing about churn at all.
+        //
+        // Asserted on SIGHTING PRESENCE, not on `starved(peer_bound)`, and the difference is the
+        // whole value of this block. One uninterrupted sweep spans `2·poll_secs·(N-1)/N`, which
+        // `build_poll_schedule` derives to be `< 2·poll_secs` for all N — so a control window of
+        // exactly one sweep is SHORTER than `peer_bound`, `worst_gap` is capped at the window's own
+        // length, and `starved(peer_bound)` would be empty over ANY observations, including none.
+        // That version passed for arithmetic reasons rather than for anything it observed: it could
+        // not fail, so it could not discharge the duty the paragraph above assigns it. Requiring
+        // each account to have been polled at least ONCE is falsifiable — regress the peer half of
+        // the poll filter and the control reddens here instead of surfacing as a phantom deepening
+        // of the collapse. Scope that mutation PAST warm-up when re-deriving it (measured: gate it
+        // on `state.warmed_up`, and the control reports roster indices [1, 2, 3] never polled). An
+        // UNSCOPED peer filter never reaches this block: `warmed_tick` latches `warmed_up` only
+        // once every scheduled account has been polled at least once, so filtering peers from the
+        // first tick panics in that helper's bounded warm-up loop instead — a red that says
+        // nothing about whether THIS assertion can fail.
+        let cycle_len = daemon.state.poll_schedule.len();
+        let mut control = ChurnObservations::open(&daemon);
+        control.observe(&mut daemon, cycle_len).await;
+        let unseen: Vec<usize> = (0..daemon.roster.len())
+            .filter(|&i| control.sightings[i].is_empty())
+            .collect();
+        assert_eq!(
+            unseen,
+            Vec::<usize>::new(),
+            "CONTROL: one uninterrupted {cycle_len}-entry sweep must poll every account at least \
+             once, but roster indices {unseen:?} were never polled — the fixture cannot cover its \
+             own peers, so nothing below measures churn"
+        );
+        // A second control asserting `control.starved(peer_bound).is_empty()` used to stand here and
+        // has been REMOVED rather than kept as disclosed-vacuous ceremony. It restated
+        // `build_poll_schedule`'s peer-bound claim, but for the reason given above it could not
+        // fail for ANY roster size — one sweep spans `2·poll_secs·(N-1)/N < 2·poll_secs` for all N,
+        // so `worst_gap`, capped at the window's own length, is under `peer_bound` whatever was
+        // observed. An assertion that no regression can redden, carrying a `CONTROL:` label, reads
+        // to a later counter as a second control and to a later editor as a second guarantee; the
+        // `unseen` assertion above is the whole of the falsifiable control. The claim it restated
+        // is not lost: it is the peer bound the churn measurement below is graded against.
+
+        // The starvation precondition, asserted on the SETUP rather than the outcome: a cooldown
+        // window SHORTER than a full sweep is what leaves peers past the cursor's reach. At
+        // `ticks_per_round >= cycle_len` the cursor would walk the vector to its end every round
+        // and there would be nothing here to measure.
+        assert!(
+            ticks_per_round < cycle_len,
+            "the cooldown floor ({cooldown:?}) must be shorter than one full sweep — \
+             {ticks_per_round} ticks against a {cycle_len}-entry schedule — or the cursor reaches \
+             every peer each round and this measures nothing"
+        );
+
+        // Churn at the cooldown floor: the active flaps between `work` and `spare` — the shape a
+        // swap-away that is swapped back has — with exactly one cooldown window of ticks between
+        // changes. `record_swap` is driven directly rather than through `perform_socket_swap`
+        // because what is modelled is the RATE the gate permits, and that gate's ENFORCEMENT — the
+        // `in_cooldown` derivation inside `perform_socket_swap` — is separately reported as pinned
+        // by no test (#1356): routing through it would rest this measurement on the one thing that
+        // issue says is unverified. Narrow deliberately: #1356 finds the cooldown's ARMING pinned
+        // and its enforcement on the socket-`swap` path unpinned, and the pure-core verdict tests
+        // in `src/daemon/commands.rs` (`swap_command_verdict_rejects_each_non_viable_target_without_force`)
+        // do pin the cooldown DECISION — so an unqualified "the cooldown gate is untested" would
+        // read as contradicting tests a reader finds first.
+        //
+        // This fixture's cooldown-to-interval ratio (60 s : 60 s) is FIVE TIMES more forgiving
+        // than the shipped defaults (`DEFAULT_COOLDOWN_SECS` 60 against `DEFAULT_POLL_SECS` 300,
+        // `src/config.rs`): ticks per cooldown window are `cooldown·N / poll_secs`, so this fixture
+        // gives the cursor N and the shipped defaults give it N/5, at every roster size. The
+        // measurement below therefore understates the shipped collapse rather than exaggerating
+        // it. At this fixture's own N = 4 the shipped figure is 0.8 — less than a single tick per
+        // window — but that number is N-dependent and the 5× ratio is not, so it is the ratio that
+        // carries the claim.
+        let observations =
+            observe_change_of_active_churn(&mut daemon, CHURN_ROUNDS, ticks_per_round, |round| {
+                (round + 1) % 2
+            })
+            .await;
+
+        // `ADR-0012` Decision 3 FIRST, so a reading that came from polling MORE is caught before
+        // any coverage number is believed. Both halves hold here and must go on holding: what
+        // follows is a SCHEDULING collapse, not a rate one, and a repair that bought peer coverage
+        // with extra requests or a tighter cadence would be inadmissible under the same record.
+        let ticks = CHURN_ROUNDS * ticks_per_round;
+        assert_eq!(
+            observations.spacings,
+            vec![expected_spacing; ticks],
+            "repeated changes of active are rate-neutral (ADR-0012 Decision 3), so every tick must \
+             stay at the `poll_secs / N` floor: the churn window ticked {:?} against \
+             {expected_spacing:?} per tick (N = {rotation_len} distinct rotation accounts)",
+            observations.spacings
+        );
+        assert_eq!(
+            observations.requests, ticks as u32,
+            "{CHURN_ROUNDS} changes of active must add no requests of their own: the window put \
+             {} usage requests on the wire across {ticks} ticks, against the exactly one per tick \
+             the #80 stagger issues (the count is taken from before the FIRST change, so a poll \
+             issued from inside the swap path is inside it)",
+            observations.requests
+        );
+
+        // THE FINDING. `reserve` (roster index 3) is the LAST peer in the interleave — schedule
+        // index 5 of 6 — so reaching it needs six uninterrupted ticks and one cooldown window
+        // supplies four. Every change restarts the cursor at the head, so across the whole
+        // window it is never reached at all.
+        //
+        // The collapse is a CONSEQUENCE of #1452's chosen fix shape rather than a pre-existing
+        // condition it failed to fix, and that is measurable rather than argued: neutralise the
+        // two statements inside `invalidate_poll_schedule` (leaving all four call sites in place)
+        // and this same window reports worst per-account gaps of [75s, 90s, 90s, 90s] — every one
+        // inside the 120s bound, nothing starved at all. The fix bought the incoming active's
+        // continuity, which the two #1451 oracles above measure, with the peers' coverage. That is
+        // the trade `ADR-0012` § Status declines to pre-ratify.
+        assert_eq!(
+            observations.starved(peer_bound),
+            vec![3],
+            "#1455 AC-1 measurement: under {CHURN_ROUNDS} changes of active one cooldown window \
+             ({cooldown:?}) apart, exactly roster index 3 (`reserve`) exceeds the 2·poll_secs peer \
+             bound ({peer_bound:?}); worst per-account gaps {:?} over a {:?} window. This is a \
+             CHARACTERIZATION lock on current, un-endorsed behaviour — ADR-0012 § Status leaves \
+             peer coverage under repeated changes of active unbounded and tracks it at #1455 — so \
+             a change here is a real change in coverage, in EITHER direction: fewer starved \
+             accounts means the repair tracked at #1464 landed and this lock should be \
+             INVERTED into a positive peer-coverage oracle, more means the collapse deepened",
+            observations.worst_gaps(),
+            observations.elapsed
+        );
+        // The sharper half, and the reason the assertion above understates it: `reserve`'s gap is
+        // not a large number, it is the absence of one. It was never polled ONCE, so the gap that
+        // assertion reports is only the window's own length — extend the window and the number
+        // grows with it. That is what "unbounded" means here, and it is the difference between the
+        // relaxed peer cadence Decision 4 pre-ratifies and what churn actually does.
+        assert!(
+            observations.sightings[3].is_empty(),
+            "roster index 3 (`reserve`) must not have been polled at all in the churn window, but \
+             it was seen at {:?} — peer coverage improved, so re-derive this whole measurement \
+             rather than adjusting the assertion",
+            observations.sightings[3]
+        );
+        // The GAPS THEMSELVES, and not only which of them cross the bound. Two distinct blind
+        // spots close here, both of which leave every assertion above green:
+        //
+        // - The starved SET is insensitive to whether the churn stimulus did anything. Nothing
+        //   after `commit_change_of_active`'s own post-condition re-checks `state.active`, so a
+        //   regression re-designating index 0 at the top of each round — schedule rebuilt as
+        //   `[0,1,0,2,0,3]` every round instead of alternating — still ticks 20 times at 15 s,
+        //   still issues 20 requests, still starves exactly {3} and still never polls `reserve`.
+        //   Only the shape of the covered accounts' gaps moves, from [3,3,4] to [2,4,4] ticks. The
+        //   sibling below guards its own stimulus with a per-tick `state.active` assertion; this
+        //   is the equivalent guard for a stimulus that is committed per ROUND rather than per
+        //   tick, and it is strictly stronger, because it grades the effect and not the intent.
+        // - `starved` is a ONE-directional metric asked, as an equality, to carry a
+        //   two-directional claim. `worst_gap`'s leading segment is window-relative, so an account
+        //   entering the window already part-way through a gap has that part silently dropped
+        //   (index 1 enters 60 s unobserved here, index 2 30 s) — it can omit an account that
+        //   truly exceeded the bound, never invent one. A deepening therefore need not change set
+        //   MEMBERSHIP at all. It cannot fail to change these numbers.
+        //
+        // Stated in TICKS of the derived spacing rather than as literal seconds, so the arithmetic
+        // stays legible against the trajectory `build_poll_schedule` produces and a fixture retune
+        // reddens here — loudly, with both vectors printed — instead of silently re-basing the
+        // figures that `ADR-0012` § Status and issues #1356 / #1464 quote from this test.
+        let ticks_u32 = ticks as u32;
+        assert_eq!(
+            observations.worst_gaps(),
+            vec![
+                expected_spacing * 3,
+                expected_spacing * 3,
+                expected_spacing * 4,
+                expected_spacing * ticks_u32,
+            ],
+            "#1455 AC-1 measurement, exact: the worst per-account gaps over the {ticks}-tick churn \
+             window must be [3, 3, 4, {ticks}] ticks of {expected_spacing:?}. `reserve`'s entry is \
+             the WHOLE window because it is never polled — extend the window and that entry grows \
+             with it, which is what distinguishes an unbounded gap from a large one. These four \
+             values are quoted verbatim by issues #1356 and #1464, and this window's LENGTH by \
+             `ADR-0012` § Status, so a change here makes those records wrong: re-derive the \
+             measurement and update all three rather than re-basing this assertion"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_out_of_band_login_seam_churns_the_schedule_with_no_cooldown_to_bound_it() {
+        // Issue #1455 AC-2, the half that is TESTABLE here. AC-1's whole "bounded in practice"
+        // premise is that changes of active are rate-limited by the swap cooldown. That premise
+        // fails twice over, and the two failures are different sizes:
+        //
+        // - On the SWAP path the floor exists and a daemon restart clears it — `DecisionState`
+        //   derives `Default` and nothing restores `last_swap` from disk, so it is `None` at every
+        //   start (#1356). It clears the floor for exactly ONE swap, though: `record_swap` re-arms
+        //   `last_swap` immediately, so only a daemon that restarts before every swap sustains a
+        //   tighter rate. This harness can already model any rate on that path — its fixture opens
+        //   at `last_swap: None`, which IS the post-restart state, and `commit_change_of_active`
+        //   drives `record_swap`, which reads no cooldown — so the 60 s period the measurement
+        //   above uses is a CHOICE modelling the gate's floor, not a limit the harness imposes.
+        //   Shortening it walks toward the same limit the window below already pins, through a
+        //   seam whose rate the floor does bound absent that restart loop; #1356 carries the
+        //   record instead of a third near-duplicate lock.
+        // - On the THIRD change-of-active seam there is no floor to clear in the first place. An
+        //   out-of-band `claude /login` repoints the canonical at a different roster account,
+        //   `reconcile_canonical_change` drops `state.active` and `tick`'s top-of-tick resolve
+        //   re-designates it within the same tick. No swap is recorded, so the cooldown gate in
+        //   `perform_socket_swap` is never consulted — this path is bounded only by the tick
+        //   cadence itself, with no restart needed to get there. THAT is what this test drives,
+        //   and it is why the answer to AC-2 is that the gap widens rather than closes.
+        //
+        // The result is the extreme case of the arithmetic above: with a change every tick the
+        // cursor never advances past schedule index 0, which a rebuild always fills with the
+        // incoming active — so NO peer is ever polled, and the starved set grows from the single
+        // account the cooldown-floor measurement above reports to every account the canonical
+        // never flaps TO. The two the canonical does flap between stay covered, because each is
+        // polled on the tick it becomes active.
+        //
+        // The `60` is INERT on this path and is held deliberately rather than left over: no swap is
+        // recorded, so `cooldown_base` is never read and the autonomous gates never engage (every
+        // account is scripted far below every trigger). Verified rather than assumed — building
+        // this at `four_account_daemon()`'s `0` leaves the test passing unchanged. It is held
+        // because this window is compared DIRECTLY against the cooldown-floor one above
+        // ("strictly worse than the {3} that measurement reports"), and a comparison between two
+        // windows built on differently-configured fixtures would confound the seam under test with
+        // the fixture. Only the seam driven differs; everything else is held constant.
+        let mut daemon = four_account_daemon_with_cooldown(60).await;
+        warmed_tick(&mut daemon).await;
+
+        let interval = daemon.next_poll_interval();
+        let rotation_len = daemon.rotation_len();
+        let expected_spacing = interval / rotation_len.max(1) as u32;
+        let peer_bound = interval * 2;
+
+        // ABSOLUTE anchor for the Decision 3 rate assertions below, and what lets them fail for
+        // the reason they name. Every rate quantity in this test — `expected_spacing`,
+        // `peer_bound`, the per-tick spacing vector, `ticks_per_round` — is derived from
+        // `next_poll_interval()` and `rotation_len()`, the same two accessors that produce the
+        // spacings being graded. A uniform change to EITHER rescales expectation and observation
+        // in lockstep, so the cadence tightening `ADR-0012` Decision 1 rejects and Decision 3
+        // forbids passes every assertion below unseen: return 52 s from `next_poll_interval`, or
+        // divide by `poll_schedule.len()` instead of `rotation_len`, and nothing here reddens.
+        // These pin the derivation to the fixture's own literals, which the daemon does not
+        // compute — so a rate regression reddens HERE, naming the rate, rather than in a gap
+        // vector that points the reader at the measurement.
+        assert_eq!(
+            (interval, rotation_len),
+            (Duration::from_secs(60), 4),
+            "this fixture is four rotation accounts at `poll_secs = 60`; the cadence derived below \
+             is a Decision 3 guard only while it stays anchored to those literals"
+        );
+        let cycle_len = daemon.state.poll_schedule.len();
+        // Three full sweeps' worth of ticks, so "never observed" cannot be read as "the window was
+        // too short to reach them": the window is three times the traversal that DOES reach every
+        // peer, and comfortably past the `2·poll_secs` bound.
+        let ticks = 3 * cycle_len;
+
+        // CONTROL, carrying the same duty the sibling measurement's does and for the same reason: a
+        // fixture that could not poll its own peers would report a starved set while measuring
+        // nothing about churn. Window length is NOT that control — the paragraph above rules out
+        // only the "too short to reach them" reading, and a peer-poll regression starves peers at
+        // any window length.
+        //
+        // The gap this closes is specific and was measured. Gate the peer half of `tick`'s poll
+        // filter on `state.warmed_up` and this test, WITHOUT the block below, stays green: roster
+        // indices 0 and 1 are still polled on the ticks they are ACTIVE rather than as peers, 2 and
+        // 3 are never polled, and every assertion at the foot of this test holds — it would report
+        // the AC-2 finding while measuring a poll-filter regression. `warmed_tick` above does not
+        // cover this: `note_polled` latches `warmed_up` only once every scheduled account has been
+        // polled, so a regression scoped past that flag warms up normally and starves afterwards.
+        //
+        // Relying on the sibling to redden instead would be a control held by another test, and one
+        // scheduled to dissolve: `ADR-0012` § Status and both test headers record the obligation to
+        // INVERT these locks when #1464 lands.
+        let mut control = ChurnObservations::open(&daemon);
+        control.observe(&mut daemon, cycle_len).await;
+        let unseen: Vec<usize> = (0..daemon.roster.len())
+            .filter(|&i| control.sightings[i].is_empty())
+            .collect();
+        assert_eq!(
+            unseen,
+            Vec::<usize>::new(),
+            "CONTROL: with no login driven, one uninterrupted {cycle_len}-entry sweep must poll \
+             every account at least once, but roster indices {unseen:?} were never polled — the \
+             fixture cannot cover its own peers, so nothing below measures the login seam"
+        );
+
+        let mut observations = ChurnObservations::open(&daemon);
+        for tick in 0..ticks {
+            // The login itself, alternating the canonical between `spare` and `work`. Both tokens
+            // match an existing stash, so `resolve_account_for` lands on that account directly
+            // rather than falling through to the `~/.claude.json` display step. The canonical
+            // watch is deliberately left uncommitted, which is what makes the next tick classify
+            // this `Changed`; `record_swap` is never called, so no cooldown is armed OR consulted
+            // anywhere in this window.
+            let (token, expected): (&[u8], usize) = if tick % 2 == 0 {
+                (b"B-token", 1)
+            } else {
+                (b"A-token", 0)
+            };
+            daemon.store.write(&cred(token)).await.unwrap();
+            observations.observe(&mut daemon, 1).await;
+            // Read every tick, because everything below holds vacuously if the repoint was not
+            // DETECTED: an undetected login leaves active where it was and the schedule standing,
+            // which is indistinguishable from nothing having happened.
+            assert_eq!(
+                daemon.state.active,
+                Some(expected),
+                "the tick observing an out-of-band login must have re-designated active to roster \
+                 index {expected}, but tick {tick} left it at {:?}",
+                daemon.state.active
+            );
+        }
+
+        // The cooldown was never armed — the observable proof that no floor was in play here, and
+        // that this window says nothing about the swap path's gate either way.
+        assert!(
+            daemon.state.last_swap.is_none(),
+            "no swap is recorded on this path, so the cooldown must never have been armed — a \
+             `last_swap` here means the window exercised the swap seam after all and its \
+             no-cooldown claim does not hold"
+        );
+
+        // `ADR-0012` Decision 3 first, exactly as above: the seam may reorder the schedule and may
+        // never add a request or tighten the cadence.
+        assert_eq!(
+            observations.spacings,
+            vec![expected_spacing; ticks],
+            "an out-of-band login is rate-neutral (ADR-0012 Decision 3), so every tick must stay \
+             at the `poll_secs / N` floor: the window ticked {:?} against {expected_spacing:?} per \
+             tick (N = {rotation_len} distinct rotation accounts)",
+            observations.spacings
+        );
+        assert_eq!(
+            observations.requests, ticks as u32,
+            "an out-of-band login on every tick must add no requests of its own: the window put {} \
+             usage requests on the wire across {ticks} ticks, against the exactly one per tick the \
+             #80 stagger issues",
+            observations.requests
+        );
+
+        // THE FINDING, and it is strictly worse than the cooldown-floor one above: `backup` and
+        // `reserve` — every account that is not one of the two the canonical flaps between — are
+        // never polled at all, so the starved set is {2, 3} where the floor-limited churn starves
+        // only {3}. The cooldown is what bought that difference, and this path does not have one.
+        assert_eq!(
+            observations.starved(peer_bound),
+            vec![2, 3],
+            "#1455 AC-2 measurement: with a change of active on EVERY tick — the rate this seam \
+             permits, having no cooldown to bound it — roster indices 2 (`backup`) and 3 \
+             (`reserve`) exceed the 2·poll_secs peer bound ({peer_bound:?}); worst per-account \
+             gaps {:?} over a {:?} window. Strictly worse than the {{3}} the cooldown-floor \
+             measurement reports, which is the answer to AC-2: clearing or bypassing the floor \
+             widens the gap rather than closing it. CHARACTERIZATION lock — the repair is tracked \
+             at #1464 and should INVERT this rather than delete it",
+            observations.worst_gaps(),
+            observations.elapsed
+        );
+        assert!(
+            observations.sightings[2].is_empty() && observations.sightings[3].is_empty(),
+            "neither `backup` nor `reserve` may have been polled at all in this window, but they \
+             were seen at {:?} and {:?} — peer coverage improved, so re-derive this measurement \
+             rather than adjusting the assertion",
+            observations.sightings[2],
+            observations.sightings[3]
+        );
+        // The GAPS THEMSELVES, for the reasons given at the sibling measurement's equivalent
+        // assertion: the starved SET is insensitive to a change in the covered accounts' coverage,
+        // and `worst_gap`'s window-relative leading segment means a real deepening need not move
+        // set membership at all. `backup` and `reserve` report the WHOLE window because neither is
+        // ever polled. In ticks of the derived spacing, so a fixture retune reddens loudly here
+        // rather than silently re-basing the figures `ADR-0012` § Status and issues #1356 / #1464
+        // quote from this test.
+        let ticks_u32 = ticks as u32;
+        assert_eq!(
+            observations.worst_gaps(),
+            vec![
+                expected_spacing * 2,
+                expected_spacing * 2,
+                expected_spacing * ticks_u32,
+                expected_spacing * ticks_u32,
+            ],
+            "#1455 AC-2 measurement, exact: the worst per-account gaps over the {ticks}-tick login \
+             window must be [2, 2, {ticks}, {ticks}] ticks of {expected_spacing:?} — the two \
+             accounts the canonical flaps between are re-polled every other tick, and the two it \
+             never flaps to are not polled at all. These four values are quoted verbatim by \
+             issues #1356 and #1464, and this window's LENGTH by `ADR-0012` § Status, so a change \
+             here makes those records wrong: re-derive the measurement and update all three rather \
+             than re-basing this assertion"
         );
     }
 

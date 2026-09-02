@@ -87,6 +87,33 @@ Neither artifact was wrong about the case it covered; both were silent about the
   Decision 4 says about peers being *only* swap targets — that argument is about a *relaxed* cadence,
   not an unbounded one, and stale peer readings feed target ranking. Tracked at **#1455**.
 
+**Measured 2026-09-02 (#1455) — the second limit above is not merely underived: the peer bound does
+not hold, and tracking of the repair moves to #1464.** Peer `pₖ` sits at schedule index `2k-1`, so
+reaching it costs `2k` uninterrupted ticks, while a change of active arriving every `C` seconds lets
+the cursor reach `⌊C·N / poll_secs⌋` entries — every peer past that index is not re-observed LATE, it
+is not re-observed at all. Sharp reading of "peer" there: an account the churn itself designates
+active is polled on the tick it becomes so, and both locks below flap between two accounts for that
+reason. Rotate the active across ALL four instead and the last account IS re-observed, at 135 s —
+still over the 120 s bound, so still a breach, but a bounded one. The unbounded case is the account
+churn never designates, which is the shape an operator swapping between a working pair produces. `peer_coverage_collapses_under_change_of_active_churn_at_the_cooldown_floor`
+and `the_out_of_band_login_seam_churns_the_schedule_with_no_cooldown_to_bound_it` (`src/daemon.rs`)
+pin it: on a four-account fixture at `poll_secs = 60` against a `2·poll_secs` peer bound of 120 s, a
+change of active once per 60 s cooldown window leaves the last peer in the interleave unpolled across
+a 300 s window, and driving the out-of-band-login seam — which records no swap and so consults no
+cooldown at all — leaves two of the three peers unpolled across 270 s. Neutralising
+`invalidate_poll_schedule` over the same window starves nobody — worst gaps `[75s, 90s, 90s, 90s]` —
+so this is the price of the delivered mechanism rather than a condition that predated it. That
+counterfactual is a MANUAL probe, re-run against the revision this paragraph landed on and pinned by
+no assertion, unlike every other figure here; re-derive it before leaning on it, and treat a change
+to `build_poll_schedule`'s interleave or to `next_poll_index`'s rebuild point as invalidating it. **Decision 3 survives intact** — both locks
+assert the per-tick spacing and the one-request-per-tick budget, and both hold — which is what keeps
+a repair admissible. Read **EVERY** **#1455** reference in this record — the two above, and the two
+below it in Decision 4's annotation and in § Related's 2026-09-02 amendment bullet — as pointing at the
+MEASUREMENT and nothing further; the repair, and the obligation to invert those two locks rather
+than delete them, are **#1464**. Scoped to the whole record deliberately: an earlier form of this
+sentence said "the two references above", which left a reader who followed it still meeting two
+later pointers that present #1455 as the live tracker for a bound whose repair has moved.
+
 **Decision 3 is carried forward intact, and it is what keeps a repair admissible.** The tick divisor
 is `rotation_len()` — the count of DISTINCT rotation accounts taken from the roster, **not** the
 schedule length — so `next_subinterval()` keeps consecutive ticks `poll_secs / N` apart. **This
