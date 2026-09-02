@@ -188,9 +188,11 @@ pub(crate) fn assert_matches_goldens(surface: &str, cases: &[Case], goldens: &[(
 
 /// Where two renders first diverge, in the terms a reader needs: a 1-based line number and the
 /// two lines, `{:?}`-formatted so a lost padding space or a stray escape is VISIBLE rather than
-/// swallowed by the terminal. Prepended to the full dump above — `reliability-full` is 51 lines,
-/// and printing two of them side by side leaves the maintainer to eyeball 102 column-aligned
-/// lines for what is usually one missing space. That is not a diagnosis.
+/// swallowed by the terminal. Prepended to the full dump above — the reliability renders run to
+/// dozens of lines, and printing two of them side by side leaves the maintainer to eyeball twice
+/// that many column-aligned lines for what is usually one missing space. That is not a diagnosis.
+/// (Stated without a count deliberately: the goldens grow whenever a readout does, and a number
+/// here would be stale the first time one did — as it was.)
 fn first_divergence(rendered: &str, golden: &str) -> String {
     let mut golden_lines = golden.lines();
     let mut rendered_lines = rendered.lines();

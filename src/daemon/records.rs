@@ -5,7 +5,8 @@
 //!
 //! The plain data the decision core carries between ticks, in file order: what a tick DECIDED
 //! ([`TickAction`] / [`TickOutcome`]), the retained anchors and records it keys off ([`LastSwap`],
-//! [`LastGood`], [`BlindAnchor`], [`BlindPreemptSwapRecord`], [`ParkedLanding`], [`VelocityEma`]),
+//! [`LastGood`], [`BlindAnchor`], [`ActiveDesignation`], [`ObservationGapAnchor`],
+//! [`BlindPreemptSwapRecord`], [`ParkedLanding`], [`VelocityEma`]),
 //! the tick-local poll back-off ([`TickBackoff`]), and the socket-swap re-validation verdict
 //! ([`SwapVerdict`]) — plus [`blind_active_view`], the pure `&self`-free projection of the retained
 //! pre-blind anchor onto the `status` wire (issue #479). None holds a `Clock`, a seam, or any I/O:
@@ -235,6 +236,69 @@ pub(super) struct BlindAnchor {
     /// blind — the same tag [`Event::BlindWindow`] carries, evaluated ONCE at entry (the anchor is
     /// fixed for a whole episode) and carried through to the exit.
     pub(super) near_limit: bool,
+}
+
+/// When the ACTIVE designation last CHANGED, and to whom (issue #1453) — the origin the
+/// observation-gap instrument measures a freshly-designated active from.
+///
+/// DELIBERATELY NOT [`LastSwap`], which is the nearest-looking record and is the wrong one. That
+/// slot is a COOLDOWN floor: `adopt_manual_swap` arms it even when the adoption could not resolve an
+/// account, and even for a duplicate notification naming the account already active — both correct
+/// for a cooldown, both a designation change that did not happen. In the other direction
+/// `reconcile_canonical_change` DOES change the active (it clears `state.active`, and the next tick
+/// re-resolves) without writing `LastSwap` at all, because it is not a swap. Keying on the
+/// designation itself covers every path that can change it, present and future, rather than on the
+/// enumerated subset that happens to swap.
+///
+/// Carries the account UUID, not a roster index, so it survives a roster reindex untouched — the
+/// same reason [`crate::daemon::LandingOvershootRecord`] carries a label. An account that leaves the
+/// roster leaves a designation naming nothing, which no reader can match and the next resolve
+/// replaces.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct ActiveDesignation {
+    /// The account UUID (#15) that became active.
+    pub(super) account_uuid: String,
+    /// When it became active — monotonic ([`Instant`]), the SAME clock the anchors use.
+    /// Process-local: never serialized.
+    pub(super) at: Instant,
+}
+
+/// A per-account OBSERVATION-GAP anchor (issue #1453): the instant an open observation-gap episode
+/// is measured from, so the [`Event::ObservationGapEnter`] / [`Event::ObservationGapExit`] pair is
+/// edge-triggered rather than re-emitted every tick the gap persists.
+///
+/// The instant is the LATER of the account's last completed reading and the swap that made it
+/// active — see [`Daemon::note_observation_gap`] for why. In steady state those coincide (the active
+/// is the account being polled most often); they diverge exactly when an account is promoted from
+/// peer, where the reading can be a whole sweep older than the promotion.
+///
+/// DELIBERATELY SEPARATE from [`BlindAnchor`] despite the shared episode shape, because the two
+/// record disjoint failures. `BlindAnchor` opens on a poll that RAN AND FAILED — its entry edge is
+/// `(None, Err(_))`, so it needs an `Err` to exist at all. This one opens on a poll that was never
+/// ATTEMPTED, where there is no outcome of any kind to key on, only elapsed time. Merging them would
+/// mean one anchor answering "is this account erroring?" and "is this account unobserved?" at once,
+/// and an account can be either without being the other.
+///
+/// Held one-per-roster-slot and touched by nothing but its own episode edges, for the same reason
+/// `BlindAnchor` is: the gap this instrument exists to catch is OPENED by a change of active, so an
+/// anchor any swap path reset would be cleared by the very event it is measuring.
+///
+/// Carries no usage reading. The gap is a question about TIME — how long since this account was last
+/// seen — and the reading at the far end of it is by definition not yet known.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct ObservationGapAnchor {
+    /// The instant the gap is measured from: the LATER of when this account was last SEEN and the
+    /// change of active designation ([`ActiveDesignation`] — deliberately NOT [`LastSwap`], for the
+    /// two reasons that type's own doc gives). "Last seen" is `last_reading_at` OR, where a failed
+    /// poll has cleared that slot, the [`BlindAnchor::at`] that retained it. Monotonic
+    /// ([`Instant`]), the SAME clock [`BlindAnchor::at`] and the swap cooldown use. Process-local:
+    /// never serialized.
+    pub(super) at: Instant,
+    /// Whether this account was the ACTIVE one when the gap opened. `true` on every episode the
+    /// daemon opens today (the entry edge is active-scoped), and carried anyway because it is what
+    /// makes the exit's `swapped_away` tail interpretable: the pair states which population an
+    /// episode belongs to rather than leaving a log reader to infer it from the emitter.
+    pub(super) was_active: bool,
 }
 
 /// The most recent #452 bounded-blindness PREEMPTIVE swap, retained so `status` can NARRATE it

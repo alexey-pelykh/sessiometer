@@ -138,6 +138,7 @@
 use crate::error::{Error, Result};
 use crate::usage::epoch_from_rfc3339;
 use crate::usage_store::Sample;
+use crate::use_account::ADOPT_UNKNOWN_FROM;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// SLO target: swap-out `session_pct` **P100 must be `< 99`** — no `reason=session` swap fires
@@ -237,13 +238,21 @@ pub(crate) const LANDING_WINDOW_SECS: i64 = 15 * 60;
 /// read that: the discriminating `trigger=` VALUE did not exist on the line before #1367, so over
 /// any window predating it `parked_recovery` reads `0` and `poll_retry` still carries both
 /// populations. A schema:11 readout of an OLD log is not a corrected schema:10 readout of it; it is
-/// the same wrong split under a new key.
+/// the same wrong split under a new key. Bumped `11 → 12` (issue #1453) when the operator-initiated
+/// landing partition added the top-level `operator_landing` object — ADDITIVE (a new always-present
+/// field; every schema:11 key is byte-identical). Like `9 → 10`'s key addition and unlike `8 → 9`
+/// it carries NO value-domain correction: the new block folds `reason=manual` / `reason=forced`
+/// anchors, a population every prior block EXCLUDED by its `reason=session` filter, so not one prior
+/// figure moves — diff a schema:11 and a schema:12 readout of one log and only the added key
+/// differs. The exclusion itself is left in place deliberately rather than widened: `session_pct=0`
+/// on a manual swap is a correct record of "not session-triggered", so folding those swaps into
+/// `swap_overshoot` would corrupt the #363 gate with readings no daemon decision produced.
 ///
 /// `pub(crate)` so the number [`crate::cli`]'s `RELIABILITY_USAGE` advertises to script authors is
 /// held against this one by a test instead of by hand (issue #913) — tied so the two cannot drift,
 /// the way [`LANDING_WINDOW_SECS`] ties the offline window to the runtime detector's. Nothing else
 /// outside this module reads it.
-pub(crate) const JSON_SCHEMA_VERSION: u32 = 11;
+pub(crate) const JSON_SCHEMA_VERSION: u32 = 12;
 
 /// Parsed `reliability` options (issues #455/#494). A plain comparable value so the CLI parser
 /// is unit-testable by value, like `StatsArgs`.
@@ -358,8 +367,9 @@ fn read_usage_samples() -> Result<Vec<Sample>> {
     crate::usage_store::read_samples(&crate::paths::usage_samples()?)
 }
 
-/// A `reason=session` swap-out anchor for the landing-point reconstruction (issue #595): the
-/// instant a parked account's post-swap window opens, plus the join key and the decision reading.
+/// A swap-out anchor for the landing-point reconstruction (issue #595): the instant a parked
+/// account's post-swap window opens, plus the join key and — where the swap had one — the decision
+/// reading. Carries `reason=session` anchors and, since issue #1453, operator-initiated ones.
 #[derive(Debug, Clone, PartialEq)]
 struct SwapOut {
     /// The swap instant (epoch seconds) — the window origin; landing samples are `> ts`.
@@ -369,7 +379,13 @@ struct SwapOut {
     acct: String,
     /// The decision-point `session_pct` logged at the swap — separates a gap-crossing (already
     /// ≥ ceiling here) from a post-swap tail (fired below, landed at/over).
-    decision_pct: u8,
+    ///
+    /// `None` for an OPERATOR-initiated swap (issue #1453), which has no decision reading at all: it
+    /// records `session_pct=0` because it was not session-triggered, so reading that `0` as a
+    /// decision would classify every operator rescue as a post-swap tail — a breach class invented
+    /// out of a field that means "not applicable". An anchor without a reading is still a perfectly
+    /// good WINDOW, which is what the landing reconstruction needs.
+    decision_pct: Option<u8>,
     /// Whether this swap resolved an `all_exhausted` capacity hold (issue #719): the outgoing
     /// account was pinned at the ceiling because NO viable target existed, not because a reaction
     /// was late. `true` when this swap's `to=` matches the `hold=` of the latest STILL-OPEN
@@ -469,6 +485,19 @@ struct Inputs {
     /// feeds `swap_out_pcts` but cannot be an anchor (there is no window to open), so it is dropped
     /// here (the tolerant-drop precedent).
     session_swaps: Vec<SwapOut>,
+    /// OPERATOR-INITIATED swap-out anchors for the landing-point SLI (issue #1453): the same
+    /// (ts, outgoing account) windows as `session_swaps`, for `reason=manual` and `reason=forced`.
+    ///
+    /// Kept in their OWN vec rather than folded into `session_swaps`, because the two populations
+    /// cannot share a percentile without one of them lying. An operator swap records
+    /// `session_pct=0` DELIBERATELY — it was not session-triggered, and that `0` is the token which
+    /// says so (`crate::observability::SwapReason`) — so it carries no decision reading to enter a
+    /// decision-point distribution or to classify a breach against. What it DOES carry is a real
+    /// parked account and a real instant, which is all the landing reconstruction needs, and the
+    /// operator's own rescue of an at-limit active is exactly the event this readout was blind to.
+    /// The segregation is the issue #719 precedent applied to a second population: publish it beside
+    /// the gate rather than inside it, so no existing figure changes meaning.
+    operator_swaps: Vec<SwapOut>,
     /// Every re-activation edge (issue #595): the (ts, re-activated account) of any `event=swap`,
     /// `event=emergency_swap`, `event=restash`, or `event=canonical_recovered`, so the landing window
     /// of a previously-parked account can be closed at the instant it becomes active again
@@ -1083,11 +1112,53 @@ fn parse_events(text: &str, cutoff: Option<i64>) -> Inputs {
                     }
                     continue;
                 }
+                // OPERATOR-INITIATED swaps (issue #1453): `reason=manual` / `reason=forced`, an
+                // operator's own `sessiometer use`. Anchored for the LANDING reconstruction only,
+                // then skipped past the decision-point accounting below.
+                //
+                // Until this arm existed they fell through the `reason != session` filter and were
+                // graded by nothing at all — which is a hole precisely where it hurts most: the
+                // defining event of a post-swap observation incident is the operator noticing an
+                // at-limit active and rescuing it by hand. The rescue was invisible to every SLI in
+                // this file, so a fix to the observation gap would move no readout and could not be
+                // shown to have worked.
+                //
+                // They enter as anchors WITHOUT a decision reading (see `SwapOut::decision_pct`),
+                // which is what lets them be graded without touching what the daemon records: the
+                // `session_pct=0` on the line stays deliberate and unread, and the landing is
+                // reconstructed from the usage samples exactly as a session swap's is. Kept in
+                // their own partition, so no figure published before this bump changes meaning.
+                if matches!(fields.get("reason").copied(), Some("manual" | "forced")) {
+                    if let (Some(ts), Some(from)) = (
+                        fields.get("ts").copied().and_then(epoch_from_rfc3339),
+                        // The adopt-target recovery emits `from=(unknown)` — a redaction-safe
+                        // SENTINEL, not a roster label, for the case where the departing account
+                        // could not be named at all (`crate::use_account`). It shares no namespace
+                        // with `Sample.acct`, so an anchor keyed on it can never join a usage
+                        // sample: it would sit in `n_unmeasured` on every run forever, reported as a
+                        // sample-coverage gap the operator could go looking for and never find. Drop
+                        // it here, on the same tolerant terms a swap line missing `from=` is
+                        // dropped — an anchor that cannot open a window is not an anchor.
+                        fields
+                            .get("from")
+                            .copied()
+                            .filter(|from| *from != ADOPT_UNKNOWN_FROM),
+                    ) {
+                        inputs.operator_swaps.push(SwapOut {
+                            ts,
+                            acct: from.to_owned(),
+                            decision_pct: None,
+                            held: held_by_exhaustion,
+                        });
+                    }
+                    continue;
+                }
                 // SESSION-triggered swaps only. A weekly swap fires while session is BELOW its
                 // trigger, so its session_pct is a low, incidental value — not a session
                 // overshoot — and weekly cadence is out of scope for this session-limit-latency
-                // increment (prd-swap-latency.md §6). manual/forced (session_pct=0) and
-                // emergency_swap (no session_pct field) are likewise not session overshoots.
+                // increment (prd-swap-latency.md §6). manual/forced (handled above, and
+                // `session_pct=0`) and emergency_swap (no session_pct field) are likewise not
+                // session overshoots.
                 if fields.get("reason").copied() != Some("session") {
                     continue;
                 }
@@ -1111,7 +1182,7 @@ fn parse_events(text: &str, cutoff: Option<i64>) -> Inputs {
                         inputs.session_swaps.push(SwapOut {
                             ts,
                             acct: from.to_owned(),
-                            decision_pct: pct,
+                            decision_pct: Some(pct),
                             held: held_by_exhaustion,
                         });
                     }
@@ -1488,6 +1559,51 @@ impl Landing {
     }
 }
 
+/// The OPERATOR-INITIATED landing partition (issue #1453): where each `reason=manual` /
+/// `reason=forced` swap-out left its parked account — the same post-swap peak [`Landing`] measures,
+/// over the population that readout excluded.
+///
+/// It excluded them for a good reason and a bad consequence. The `reason != session` filter is
+/// correct for SLI 1: a manual swap records `session_pct=0` because it was not session-triggered,
+/// so folding that `0` into the decision-point distribution would drag the percentiles toward a
+/// number no daemon decision ever made. But the same filter runs ahead of the landing anchors, and
+/// the landing reconstruction never reads `session_pct` at all — it joins the usage samples — so the
+/// exclusion cost nothing it was protecting and hid the one event class an operator most needs
+/// graded: their own manual rescue of an at-limit active, which is the defining action of a
+/// post-swap observation incident.
+///
+/// Published BESIDE [`Landing`] rather than merged into it, the issue #719 precedent: a merge would
+/// silently change what an already-published `landing.p95` counts, and the two populations answer
+/// different questions — one grades the daemon's reaction, the other grades where the fleet ends up
+/// when a human has to intervene.
+///
+/// Deliberately carries NO breach classes and NO `p100_met`. Both would need a decision reading to
+/// be meaningful, and an operator swap has none: an SLO verdict here would be a gate on a number the
+/// daemon never chose. `n_at_or_over_ceiling` is the honest remainder — how many rescues still ended
+/// up at/over the ceiling — stated as a count rather than dressed as a class.
+#[derive(Debug, PartialEq)]
+struct OperatorLanding {
+    /// Operator-initiated swap anchors in view (already `--since`-windowed), capacity-holds
+    /// excluded — the coverage denominator.
+    swaps_total: usize,
+    /// Anchors with ≥1 post-swap sample of the parked account — the subject the percentiles
+    /// summarize.
+    n_measured: usize,
+    /// Anchors with NO post-swap sample in the window: a sample-coverage gap, reported rather than
+    /// fabricated as a `0` landing.
+    n_unmeasured: usize,
+    p50: Option<u8>,
+    p90: Option<u8>,
+    p100: Option<u8>,
+    /// Measured episodes that landed at/over [`SLO_SWAP_P100_MAX`]. NOT a breach class — see the
+    /// type doc: with no decision reading there is nothing to say the swap fired below it.
+    n_at_or_over_ceiling: usize,
+    /// Anchors excluded as `all_exhausted` capacity holds (issue #719), on the same terms
+    /// [`Landing::capacity_held`] excludes them: the outgoing account was pinned with no viable
+    /// target, so its at-ceiling landing is a fleet-capacity limit whoever pressed the button.
+    capacity_held: usize,
+}
+
 /// The observed session-velocity distribution SLI (issue #608): percentiles of the session climb
 /// rate RECOMPUTED from each `usage_velocity` line's own ingredients — `session_delta_pct` over
 /// `elapsed_secs` — rather than parsed back out of the line's `{:.2}`-rendered
@@ -1531,41 +1647,52 @@ impl ObservedPeak {
     }
 }
 
-/// Reconstruct the landing-point SLI (issue #595) by joining the parsed swap anchors with the raw
-/// usage samples. Pure and total: no clock, no I/O — the samples are read once in [`run`] and passed
-/// in, so the whole aggregation stays a function of the two file contents (and the `--since` cutoff,
-/// already applied to `inputs`).
-fn compute_landing(inputs: &Inputs, samples: &[Sample]) -> Landing {
-    // Index the samples by roster label once, so each anchor scans only ITS account's readings
-    // rather than re-sweeping the whole store. The label is the join key (swap `from=` ↔
-    // `Sample.acct`) and stays INTERNAL — no label reaches the rendered output. Group order is
-    // irrelevant: the peak below is an order-independent filter + `reduce(f64::max)` over the window.
-    let mut by_acct: BTreeMap<&str, Vec<&Sample>> = BTreeMap::new();
-    for s in samples {
-        by_acct.entry(s.acct.as_str()).or_default().push(s);
-    }
+/// One anchor set folded against the usage samples (issues #595 / #1453) — the shared half of the
+/// landing reconstruction, so the `reason=session` gate and the operator-initiated partition are
+/// measured the IDENTICAL way and any difference between them is a property of the population
+/// rather than of two hand-copied loops. The CLASSIFICATION is deliberately not shared: what a
+/// landing means depends on whether the swap had a decision reading, and only one of the two
+/// populations does.
+struct LandingFold {
+    /// `(landing_pct, decision_pct)` for every anchor that had at least one post-swap sample, in
+    /// anchor order. The decision reading rides along because the breach classes are a question
+    /// about the PAIR — where it fired against where it landed — not about the landing alone.
+    measured: Vec<(u8, Option<u8>)>,
+    /// Anchors with NO post-swap sample in the window: a sample-coverage gap, reported honestly
+    /// rather than fabricated as a `0` landing.
+    n_unmeasured: usize,
+    /// Anchors excluded as `all_exhausted` capacity holds (issue #719).
+    capacity_held: usize,
+}
 
-    let mut landing_pcts: Vec<f64> = Vec::new();
-    let mut n_unmeasured = 0usize;
-    let mut gap_crossing = 0usize;
-    let mut post_swap_tail = 0usize;
-    let mut capacity_held = 0usize;
-
-    for swap in &inputs.session_swaps {
+/// Fold one set of swap anchors against the indexed usage samples.
+///
+/// Pure and total: no clock, no I/O. `by_acct` is the sample index (built once by the caller);
+/// `reactivations` closes a parked window early when the account goes active again.
+fn fold_landings(
+    by_acct: &BTreeMap<&str, Vec<&Sample>>,
+    reactivations: &[Reactivation],
+    anchors: &[SwapOut],
+) -> LandingFold {
+    let mut fold = LandingFold {
+        measured: Vec::new(),
+        n_unmeasured: 0,
+        capacity_held: 0,
+    };
+    for swap in anchors {
         // Capacity holds (issue #719) are excluded from the landing SLO entirely — the outgoing
         // account was pinned at the ceiling with no viable target (a fleet-capacity limit), so its
         // at-ceiling "landing" is not a reaction-latency overshoot. Counted separately, so it neither
-        // inflates the percentiles nor masquerades as a `gap_crossing` breach.
+        // inflates the percentiles nor masquerades as a breach.
         if swap.held {
-            capacity_held += 1;
+            fold.capacity_held += 1;
             continue;
         }
         let window_end = swap.ts.saturating_add(LANDING_WINDOW_SECS);
         // The parked window closes at the earliest re-activation of THIS account after the swap, when
         // one falls inside the window — samples at/after it read the now-ACTIVE account, not the
         // parked tail (`active_at != acct`). No re-activation ⇒ the full bounded window.
-        let effective_end = inputs
-            .reactivations
+        let effective_end = reactivations
             .iter()
             .filter(|si| si.acct == swap.acct && si.ts > swap.ts)
             .map(|si| si.ts.saturating_sub(1)) // strictly before the re-activation instant
@@ -1593,34 +1720,105 @@ fn compute_landing(inputs: &Inputs, samples: &[Sample]) -> Landing {
                 // clamp into u8 without wrapping — an over-100 landing keeps its true rounded value up to
                 // the u8 cap (255), clamping only an implausibly huge reading rather than overflowing.
                 let landing_pct = (peak * 100.0).round().clamp(0.0, u8::MAX as f64) as u8;
-                landing_pcts.push(f64::from(landing_pct));
-                if swap.decision_pct >= SLO_SWAP_P100_MAX {
-                    gap_crossing += 1;
-                } else if landing_pct >= SLO_SWAP_P100_MAX {
-                    post_swap_tail += 1;
-                }
+                fold.measured.push((landing_pct, swap.decision_pct));
             }
-            None => n_unmeasured += 1,
+            None => fold.n_unmeasured += 1,
         }
     }
+    fold
+}
 
-    let n = landing_pcts.len();
+/// Percentiles over one fold's measured landings. `None` when nothing was measured —
+/// cardinality-zero is not a passing `0` (the [`SwapOvershoot`] discipline).
+fn landing_percentiles(fold: &LandingFold) -> (Option<u8>, Option<u8>, Option<u8>) {
+    let pcts: Vec<f64> = fold
+        .measured
+        .iter()
+        .map(|(landing, _)| f64::from(*landing))
+        .collect();
     let pct = |p: f64| -> Option<u8> {
-        (n > 0).then(|| crate::percentile::percentile(&landing_pcts, p) as u8)
+        (!pcts.is_empty()).then(|| crate::percentile::percentile(&pcts, p) as u8)
     };
-    Landing {
+    (pct(0.50), pct(0.90), pct(1.0))
+}
+
+/// Reconstruct BOTH landing-point partitions (issues #595 / #1453) by joining the parsed swap
+/// anchors with the raw usage samples. Pure and total: no clock, no I/O — the samples are read once
+/// in [`run`] and passed in, so the whole aggregation stays a function of the two file contents (and
+/// the `--since` cutoff, already applied to `inputs`).
+///
+/// Returns the two partitions TOGETHER because they share one sample index: building it twice would
+/// be the only alternative, and splitting them into two entry points would invite the index to drift
+/// apart from the reactivation edges it is joined against.
+fn compute_landing(inputs: &Inputs, samples: &[Sample]) -> (Landing, OperatorLanding) {
+    // Index the samples by roster label once, so each anchor scans only ITS account's readings
+    // rather than re-sweeping the whole store. The label is the join key (swap `from=` ↔
+    // `Sample.acct`) and stays INTERNAL — no label reaches the rendered output. Group order is
+    // irrelevant: the peak below is an order-independent filter + `reduce(f64::max)` over the window.
+    let mut by_acct: BTreeMap<&str, Vec<&Sample>> = BTreeMap::new();
+    for s in samples {
+        by_acct.entry(s.acct.as_str()).or_default().push(s);
+    }
+
+    let session = fold_landings(&by_acct, &inputs.reactivations, &inputs.session_swaps);
+    let (p50, p90, p100) = landing_percentiles(&session);
+    // The breach split is a property of the (decision, landing) PAIR: a swap already at/over the
+    // ceiling when it fired is a gap-crossing (SLI 1 already shows it); one that fired below and
+    // landed at/over is the post-swap committed tail this SLI exists to expose.
+    let gap_crossing = session
+        .measured
+        .iter()
+        .filter(|(_, decision)| decision.is_some_and(|d| d >= SLO_SWAP_P100_MAX))
+        .count();
+    let post_swap_tail = session
+        .measured
+        .iter()
+        .filter(|(landing, decision)| {
+            // `Some(d) if d < ceiling`, NOT `!(d >= ceiling)`: an anchor with NO decision reading
+            // (`SwapOut::decision_pct`) is not a swap that "fired below" — it is one whose firing
+            // point is unanswerable, and the negated form would silently classify it as a post-swap
+            // tail. Unreachable from the session partition today, which only ever carries
+            // `Some`; stated positively so it stays right if a future caller folds a mixed set.
+            decision.is_some_and(|d| d < SLO_SWAP_P100_MAX) && *landing >= SLO_SWAP_P100_MAX
+        })
+        .count();
+    let landing = Landing {
         // Clean reaction-latency anchors only (issue #719): the capacity-held anchors are excluded
         // from the coverage denominator so `n_measured + n_unmeasured == swaps_total` still holds.
-        swaps_total: inputs.session_swaps.len() - capacity_held,
-        n_measured: n,
-        n_unmeasured,
-        p50: pct(0.50),
-        p90: pct(0.90),
-        p100: pct(1.0),
+        swaps_total: inputs.session_swaps.len() - session.capacity_held,
+        n_measured: session.measured.len(),
+        n_unmeasured: session.n_unmeasured,
+        p50,
+        p90,
+        p100,
         gap_crossing,
         post_swap_tail,
-        capacity_held,
-    }
+        capacity_held: session.capacity_held,
+    };
+
+    let operator = fold_landings(&by_acct, &inputs.reactivations, &inputs.operator_swaps);
+    let (op_p50, op_p90, op_p100) = landing_percentiles(&operator);
+    // NOT a breach split. An operator swap carries no decision reading (`SwapOut::decision_pct`), so
+    // "fired below and landed at/over" is unanswerable for it — a plain count of the landings that
+    // reached the ceiling is the whole of what the evidence supports, and naming it that way keeps
+    // it from being read as the `post_swap_tail` class it is not.
+    let n_at_or_over_ceiling = operator
+        .measured
+        .iter()
+        .filter(|(landing, _)| *landing >= SLO_SWAP_P100_MAX)
+        .count();
+    let operator_landing = OperatorLanding {
+        swaps_total: inputs.operator_swaps.len() - operator.capacity_held,
+        n_measured: operator.measured.len(),
+        n_unmeasured: operator.n_unmeasured,
+        p50: op_p50,
+        p90: op_p90,
+        p100: op_p100,
+        n_at_or_over_ceiling,
+        capacity_held: operator.capacity_held,
+    };
+
+    (landing, operator_landing)
 }
 
 /// The false-preempt SLI: the real (still-pending) rate plus the interim blind-window proxy.
@@ -1845,6 +2043,9 @@ struct Report {
     /// The #595 landing-point overshoot — where `reason=session` swaps actually landed (post-swap
     /// peak of the parked account), reconstructed from the usage-sample store.
     landing: Landing,
+    /// The #1453 operator-initiated landing partition — where an operator's own `use` swap left the
+    /// account it parked. Same reconstruction, the population `landing` filters out.
+    operator_landing: OperatorLanding,
     /// The #608 observed session-velocity distribution — the live peak climb rate vs the assumed
     /// `v_peak` constant the coupling bound is calibrated on.
     observed_peak: ObservedPeak,
@@ -2000,12 +2201,16 @@ fn aggregate(inputs: &Inputs, samples: &[Sample], window: Option<Window>) -> Rep
         p100: error_pct(1.0),
     };
 
+    // Both landing partitions come out of one pass over one sample index (issue #1453).
+    let (landing, operator_landing) = compute_landing(inputs, samples);
+
     Report {
         window,
         swap_overshoot,
         capacity_held,
         projective_swap_out_pct,
-        landing: compute_landing(inputs, samples),
+        landing,
+        operator_landing,
         observed_peak,
         time_blind_near_limit_secs: inputs.time_blind_near_limit_secs,
         false_preempt: FalsePreempt {
@@ -2165,6 +2370,66 @@ fn render_human(r: &Report) -> String {
         _ => out.push_str(&format!(
             "landing-point session_pct (post-swap peak of the outgoing account): no post-swap samples in window ({} of {} reason=session swaps unmeasured)\n",
             r.landing.n_unmeasured, r.landing.swaps_total
+        )),
+    }
+    out.push('\n');
+
+    // SLI 1c-op — the OPERATOR-INITIATED landing partition (issue #1453). Rendered immediately
+    // beneath SLI 1c and never merged into it: the two are the same measurement over two
+    // populations, and the whole point is that a reader can see the manual rescues WITHOUT the
+    // daemon's own reaction figures moving. No `[ok]`/`[OVER]` flag on the P100 line — an operator
+    // swap carries no decision reading, so there is no SLO here to pass or fail; the at-ceiling
+    // count below is the finding, stated as a count.
+    match (
+        r.operator_landing.p50,
+        r.operator_landing.p90,
+        r.operator_landing.p100,
+    ) {
+        (Some(p50), Some(p90), Some(p100)) => {
+            out.push_str(&format!(
+                "landing-point session_pct, OPERATOR-initiated swaps (reason=manual/forced, window <= {LANDING_WINDOW_SECS}s)\n"
+            ));
+            out.push_str(&format!(
+                "  measured n={} of {} operator swaps ({} with no post-swap sample)\n",
+                r.operator_landing.n_measured,
+                r.operator_landing.swaps_total,
+                r.operator_landing.n_unmeasured
+            ));
+            out.push_str(&format!("  P50  = {p50}\n"));
+            out.push_str(&format!("  P90  = {p90}\n"));
+            out.push_str(&format!("  P100 = {p100}  (no SLO: a manual swap records no decision reading)\n"));
+            out.push_str(&format!(
+                "  landed >= {SLO_SWAP_P100_MAX}: {}  (not a breach class — where the fleet ended up when a human intervened)\n",
+                r.operator_landing.n_at_or_over_ceiling
+            ));
+            if r.operator_landing.capacity_held > 0 {
+                // Issue #719's terms, NOT "#363 scope" as the session block above says it: #363 is
+                // the session-trigger reaction-latency umbrella, and this partition is the
+                // `reason=manual`/`forced` population that umbrella never covered — so explaining
+                // the exclusion by a scope this block is not in would be a non-sequitur.
+                out.push_str(&format!(
+                    "  capacity-held (all_exhausted, excluded — issue #719): {}\n",
+                    r.operator_landing.capacity_held
+                ));
+            }
+        }
+        _ if r.operator_landing.swaps_total == 0 => {
+            out.push_str(
+                "landing-point session_pct, OPERATOR-initiated swaps: no gradeable reason=manual/forced swaps observed\n",
+            );
+            // A partition that is ENTIRELY capacity-held reaches here with `swaps_total == 0`, and
+            // saying only "none observed" over a log that carried several would be false. The
+            // excluded count is the whole of what there is to report, so report it.
+            if r.operator_landing.capacity_held > 0 {
+                out.push_str(&format!(
+                    "  capacity-held (all_exhausted, excluded — issue #719): {}\n",
+                    r.operator_landing.capacity_held
+                ));
+            }
+        }
+        _ => out.push_str(&format!(
+            "landing-point session_pct, OPERATOR-initiated swaps: no post-swap samples in window ({} of {} operator swaps unmeasured)\n",
+            r.operator_landing.n_unmeasured, r.operator_landing.swaps_total
         )),
     }
     out.push('\n');
@@ -2375,7 +2640,7 @@ fn render_human(r: &Report) -> String {
     out
 }
 
-// --- rendering: JSON wire (schema:11) ---------------------------------------
+// --- rendering: JSON wire (schema:12) ---------------------------------------
 
 /// The stable `--json` document. Field names are OWNED by this wire contract (decoupled from
 /// the internal aggregate types), so an internal refactor cannot silently break the schema.
@@ -2394,6 +2659,10 @@ struct ReliabilityWire {
     projective_swap_out_pct: ProjectiveSwapOutPctWire,
     /// The #595 landing-point overshoot — where reason=session swaps actually landed (schema:4, additive).
     landing: LandingWire,
+    /// The #1453 operator-initiated landing partition (schema:12, additive) — where a
+    /// `reason=manual` / `reason=forced` swap left the account it parked. Its own block, so no
+    /// schema:11 figure changes meaning.
+    operator_landing: OperatorLandingWire,
     /// The #608 observed session-velocity distribution vs the assumed `v_peak` (schema:5, additive).
     observed_peak: ObservedPeakWire,
     time_blind_near_limit_secs: u64,
@@ -2565,6 +2834,37 @@ struct LandingClassesWire {
     post_swap_tail: usize,
     /// Decision reading already at/over the ceiling — visible in SLI 1 (gap-crossing, class 2).
     gap_crossing: usize,
+}
+
+/// Operator-initiated landing block (issue #1453): where `reason=manual` / `reason=forced` swaps
+/// left the accounts they parked — the population every other block here excludes. `p50`/`p90`/
+/// `p100` are `null` when no operator swap had a post-swap sample (an empty subject is not a passing
+/// `0`).
+///
+/// No `classes` and no `p100_met`, unlike [`LandingWire`]: an operator swap records no decision
+/// reading, so neither a breach split nor an SLO verdict has an input. `n_at_or_over_ceiling` is
+/// what the evidence does support, and `ceiling` is stamped beside it so a consumer reads the count
+/// against the value it was computed with rather than against today's constant.
+#[derive(serde::Serialize)]
+struct OperatorLandingWire {
+    /// Operator-initiated swap anchors in view, capacity-holds excluded (the coverage denominator).
+    swaps_total: usize,
+    /// Anchors with >= 1 post-swap sample — the measured subject the percentiles summarize.
+    n_measured: usize,
+    /// Anchors with no post-swap sample in the window — a coverage gap, not a `0` landing.
+    n_unmeasured: usize,
+    p50: Option<u8>,
+    p90: Option<u8>,
+    p100: Option<u8>,
+    /// The bounded post-swap window these landings were measured over (seconds).
+    window_secs: i64,
+    /// The ceiling `n_at_or_over_ceiling` was counted against — the SAME #455 ceiling SLI 1 uses.
+    ceiling: u8,
+    /// Measured episodes that landed at/over `ceiling`. A COUNT, not a breach class.
+    n_at_or_over_ceiling: usize,
+    /// Anchors excluded as `all_exhausted` capacity holds (issue #719), on the same terms
+    /// `landing.capacity_held` excludes them.
+    capacity_held: usize,
 }
 
 /// Observed session-velocity block (issue #608): the live session-velocity percentiles vs the
@@ -2787,6 +3087,18 @@ fn reliability_wire(r: &Report) -> ReliabilityWire {
                 gap_crossing: r.landing.gap_crossing,
             },
             capacity_held: r.landing.capacity_held,
+        },
+        operator_landing: OperatorLandingWire {
+            swaps_total: r.operator_landing.swaps_total,
+            n_measured: r.operator_landing.n_measured,
+            n_unmeasured: r.operator_landing.n_unmeasured,
+            p50: r.operator_landing.p50,
+            p90: r.operator_landing.p90,
+            p100: r.operator_landing.p100,
+            window_secs: LANDING_WINDOW_SECS,
+            ceiling: SLO_SWAP_P100_MAX,
+            n_at_or_over_ceiling: r.operator_landing.n_at_or_over_ceiling,
+            capacity_held: r.operator_landing.capacity_held,
         },
         observed_peak: ObservedPeakWire {
             n: r.observed_peak.n,
@@ -3445,7 +3757,7 @@ ts=2026-07-11T00:14:00Z event=refresh account=spare outcome=dead rotated=false
     /// the bump to a payload-shape change, so the two must be pinned together or a later edit can
     /// add a key and leave the version behind.
     #[test]
-    fn the_json_wire_carries_the_loss_block_under_schema_11() {
+    fn the_json_wire_carries_the_loss_block_under_schema_12() {
         let r = aggregate(
             &parse_events(LIVE_REPLAY_REFRESH_TOKEN_LOSS_LOG, None),
             &[],
@@ -3453,7 +3765,7 @@ ts=2026-07-11T00:14:00Z event=refresh account=spare outcome=dead rotated=false
         );
         let json: serde_json::Value =
             serde_json::from_str(&render_json(&r).expect("serializes")).expect("valid JSON");
-        assert_eq!(json["schema"], 11);
+        assert_eq!(json["schema"], 12);
         let loss = &json["refresh_token_loss"];
         assert_eq!(loss["accounts"], 3);
         assert_eq!(loss["observations"], 6);
@@ -4319,6 +4631,8 @@ ts=2026-07-11T00:04:00Z event=swap from=c to=d reason=session session_pct=100
                 "\n",
                 "landing-point session_pct (post-swap peak of the outgoing account): no post-swap samples in window (2 of 2 reason=session swaps unmeasured)\n",
                 "\n",
+                "landing-point session_pct, OPERATOR-initiated swaps: no post-swap samples in window (1 of 1 operator swaps unmeasured)\n",
+                "\n",
                 "observed session velocity (session_pct_per_min, positive climbs only; the v_peak reserve-coupling calibration input)\n",
                 "  measured n=1 usage_velocity samples\n",
                 "  P50  = 0.2000 %/min\n",
@@ -4370,7 +4684,7 @@ ts=2026-07-11T00:04:00Z event=swap from=c to=d reason=session session_pct=100
     }
 
     #[test]
-    fn json_render_is_stable_schema_11() {
+    fn json_render_is_stable_schema_12() {
         // The whole-log default: `window` is null and every field except the #635-renamed
         // velocity-projection key (`projective_swap_out_pct`, schema:6) is byte-identical to
         // schema:1–5 — the additive contract (#494/#539/#595/#608/#636/#591) plus the one #635
@@ -4406,12 +4720,21 @@ ts=2026-07-11T00:04:00Z event=swap from=c to=d reason=session session_pct=100
         // has no dead-refresh line at all, so both read 0 and only the key and the version differ.
         // The correction itself is pinned where it can actually fire, by
         // `a_recovery_triggered_poll_refresh_death_is_not_counted_as_a_poll_driven_retry`.
+        //
+        // schema:12 (issue #1453) appends the top-level `operator_landing` object after `landing` —
+        // ADDITIVE, and, like 10→11's key addition, with no value-domain correction: it folds
+        // `reason=manual` / `reason=forced` anchors, which every block above EXCLUDES by its
+        // `reason=session` filter. This document is the direct evidence: read it against the
+        // schema:11 expectation in git history and exactly two things differ — the version integer
+        // and the inserted block. And the block is NOT inert here, which is the point of the bump:
+        // FIXTURE_LOG has always carried a manual swap, `swaps_total` reads 1 for it, and until this
+        // block existed that swap was graded by nothing at all.
         let out = render_json(&fixture_report()).expect("integer wire serializes");
         assert_eq!(
             out,
             concat!(
                 "{\n",
-                "  \"schema\": 11,\n",
+                "  \"schema\": 12,\n",
                 "  \"window\": null,\n",
                 "  \"swap_overshoot\": {\n",
                 "    \"n\": 2,\n",
@@ -4461,6 +4784,18 @@ ts=2026-07-11T00:04:00Z event=swap from=c to=d reason=session session_pct=100
                 "      \"post_swap_tail\": 0,\n",
                 "      \"gap_crossing\": 0\n",
                 "    },\n",
+                "    \"capacity_held\": 0\n",
+                "  },\n",
+                "  \"operator_landing\": {\n",
+                "    \"swaps_total\": 1,\n",
+                "    \"n_measured\": 0,\n",
+                "    \"n_unmeasured\": 1,\n",
+                "    \"p50\": null,\n",
+                "    \"p90\": null,\n",
+                "    \"p100\": null,\n",
+                "    \"window_secs\": 900,\n",
+                "    \"ceiling\": 99,\n",
+                "    \"n_at_or_over_ceiling\": 0,\n",
                 "    \"capacity_held\": 0\n",
                 "  },\n",
                 "  \"observed_peak\": {\n",
@@ -5176,8 +5511,8 @@ ts=2026-07-10T00:00:00Z event=swap from=a to=b reason=session session_pct=97
         ))
         .expect("serializes");
         assert!(
-            out.contains("\"schema\": 11,"),
-            "schema bumped to 11: {out}"
+            out.contains("\"schema\": 12,"),
+            "schema bumped to 12: {out}"
         );
         assert!(
             out.contains(concat!(
@@ -5534,13 +5869,13 @@ ts=2026-07-12T00:10:00Z event=usage_backoff acct=u-B class=transient consecutive
                 SwapOut {
                     ts: epoch("2026-07-11T00:00:00Z"),
                     acct: "oleksii@pelykh.com".to_owned(),
-                    decision_pct: 96,
+                    decision_pct: Some(96),
                     held: false,
                 },
                 SwapOut {
                     ts: epoch("2026-07-11T00:06:00Z"),
                     acct: "oleksii@pelykh.com".to_owned(),
-                    decision_pct: 100,
+                    decision_pct: Some(100),
                     held: false,
                 },
             ]
@@ -6163,6 +6498,341 @@ ts=2026-07-10T00:00:00Z event=swap from=work to=spare reason=session session_pct
             assert!(fire + crate::swap::WEEKLY_TAIL_MARGIN <= ceiling + 1e-9);
             assert!(ceiling < 1.0);
         }
+    }
+
+    // --- issue #1453: operator-initiated swaps reach the post-swap readout ----
+
+    /// AC-4. An operator's own `sessiometer use` swap is GRADED — it appears in the post-swap
+    /// readout instead of being filtered away by `reason=session`.
+    ///
+    /// This is the whole of what #1453's readout half buys, and the reason it is not cosmetic: the
+    /// defining action of a post-swap observation incident is an operator seeing an at-limit active
+    /// and rescuing it by hand. Every SLI in this file dropped that swap at the `reason` filter, so
+    /// nothing moved when it happened and nothing would move when the observation gap that caused it
+    /// was fixed.
+    #[test]
+    fn an_operator_initiated_swap_is_graded_by_the_post_swap_readout() {
+        let at = epoch("2026-07-11T00:00:00Z");
+        let log = "\
+ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=manual session_pct=0\n";
+        // The parked account keeps burning after the operator moved off it: 0.94 → 0.99 inside the
+        // window. Reconstructed from the SAMPLES, exactly as a reason=session landing is — the swap
+        // line's `session_pct` is never read.
+        let samples = vec![
+            sample(at + 60, "work", 0.94),
+            sample(at + 120, "work", 0.99),
+        ];
+        let r = aggregate(&parse_events(log, None), &samples, None);
+
+        assert_eq!(r.operator_landing.swaps_total, 1, "the anchor is kept");
+        assert_eq!(r.operator_landing.n_measured, 1);
+        assert_eq!(r.operator_landing.n_unmeasured, 0);
+        assert_eq!(r.operator_landing.p100, Some(99), "the peak of the window");
+        assert_eq!(
+            r.operator_landing.n_at_or_over_ceiling, 1,
+            "the rescue still ended up at/over the ceiling — the finding this partition exists to \
+             make visible"
+        );
+    }
+
+    /// AC-4's `BUT NOT` half, and the reason the partition is separate rather than a widened filter:
+    /// grading the operator swap must not change what a manual swap RECORDS, and must not let its
+    /// deliberate `session_pct=0` reach a distribution that means something else.
+    ///
+    /// `0` on a manual swap is a correct record of "not session-triggered"
+    /// (`crate::observability::SwapReason`). Folding these swaps into `swap_overshoot` would drag the
+    /// #363 gate's percentiles toward a reading no daemon decision ever produced; folding them into
+    /// `landing` would silently redefine an already-published figure. So both stay empty here while
+    /// the operator partition is populated — the two directions of the same requirement.
+    #[test]
+    fn grading_an_operator_swap_moves_no_session_scoped_figure() {
+        let at = epoch("2026-07-11T00:00:00Z");
+        let log = "\
+ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=manual session_pct=0\n\
+ts=2026-07-11T00:10:00Z event=swap from=spare to=backup reason=forced session_pct=0\n";
+        let samples = vec![
+            sample(at + 60, "work", 0.99),
+            sample(at + 660, "spare", 0.40),
+        ];
+        let r = aggregate(&parse_events(log, None), &samples, None);
+
+        // BOTH operator reasons are anchored — `forced` is a `use --force`, equally operator-driven.
+        assert_eq!(r.operator_landing.swaps_total, 2);
+        assert_eq!(r.operator_landing.n_measured, 2);
+        assert_eq!(r.operator_landing.p100, Some(99));
+
+        // And nothing session-scoped moved: no decision-point sample, no landing anchor, no
+        // capacity-held reclassification. A `0` reaching `swap_overshoot` would show as `n=1` here.
+        assert_eq!(
+            r.swap_overshoot.n, 0,
+            "no session_pct=0 entered the #363 gate"
+        );
+        assert_eq!(r.swap_overshoot.p50, None);
+        assert_eq!(r.landing.swaps_total, 0, "no operator anchor entered SLI 5");
+        assert_eq!(r.landing.n_measured, 0);
+        assert_eq!(r.capacity_held.n, 0);
+    }
+
+    /// The operator partition carries NO breach classes and NO SLO verdict, deliberately: with no
+    /// decision reading there is nothing to say the swap fired below the ceiling, so a
+    /// `post_swap_tail` count would be a class invented out of a field that means "not applicable".
+    ///
+    /// Pinned on the WIRE, because that is where a consumer would read a verdict that is not there.
+    #[test]
+    fn the_operator_landing_block_publishes_no_verdict_it_cannot_support() {
+        let at = epoch("2026-07-11T00:00:00Z");
+        let log = "\
+ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=manual session_pct=0\n";
+        let samples = vec![sample(at + 60, "work", 0.99)];
+        let r = aggregate(&parse_events(log, None), &samples, None);
+        let json: serde_json::Value =
+            serde_json::from_str(&render_json(&r).expect("serializes")).expect("valid JSON");
+        let block = &json["operator_landing"];
+
+        assert_eq!(block["n_measured"], 1);
+        assert_eq!(block["n_at_or_over_ceiling"], 1);
+        // The ceiling the count was taken against travels WITH it, so a stored readout is read
+        // against its own constant rather than today's.
+        assert_eq!(block["ceiling"], u64::from(SLO_SWAP_P100_MAX));
+        assert!(
+            block.get("classes").is_none(),
+            "no breach split: an operator swap has no decision reading to classify against"
+        );
+        assert!(
+            block.get("p100_met").is_none(),
+            "no SLO verdict: gating a manual swap would score a number the daemon never chose"
+        );
+    }
+
+    /// A capacity-held operator swap is excluded on the SAME terms issue #719 excludes a session
+    /// one: the outgoing account was pinned at the ceiling because no viable target existed, which
+    /// is a fleet-capacity limit whoever pressed the button.
+    ///
+    /// Without this the partition would read an operator's rescue-of-last-resort as a landing
+    /// overshoot — the exact conflation #719 removed from the session gate.
+    #[test]
+    fn a_capacity_held_operator_swap_is_segregated_not_counted_as_a_landing() {
+        let at = epoch("2026-07-11T00:00:00Z");
+        let log = "\
+ts=2026-07-11T00:00:00Z event=all_exhausted hold=spare cause=session\n\
+ts=2026-07-11T00:01:00Z event=swap from=work to=spare reason=manual session_pct=0\n";
+        let samples = vec![sample(at + 120, "work", 1.00)];
+        let r = aggregate(&parse_events(log, None), &samples, None);
+
+        assert_eq!(r.operator_landing.capacity_held, 1);
+        assert_eq!(
+            r.operator_landing.swaps_total, 0,
+            "held anchors leave the coverage denominator, so measured + unmeasured still totals it"
+        );
+        assert_eq!(r.operator_landing.n_measured, 0);
+        assert_eq!(r.operator_landing.p100, None);
+        assert_eq!(
+            r.operator_landing.n_at_or_over_ceiling, 0,
+            "an at-ceiling capacity hold is not a landing overshoot"
+        );
+    }
+
+    /// An operator swap the sample store cannot reconstruct is UNMEASURED, never a passing `0`
+    /// landing — the cardinality discipline every percentile block here follows.
+    #[test]
+    fn an_operator_swap_without_post_swap_samples_is_unmeasured_not_zero() {
+        let log = "\
+ts=2026-07-11T00:00:00Z event=swap from=work to=spare reason=manual session_pct=0\n";
+        let r = aggregate(&parse_events(log, None), &[], None);
+
+        assert_eq!(r.operator_landing.swaps_total, 1);
+        assert_eq!(r.operator_landing.n_measured, 0);
+        assert_eq!(r.operator_landing.n_unmeasured, 1);
+        assert_eq!(r.operator_landing.p50, None);
+        assert_eq!(r.operator_landing.p90, None);
+        assert_eq!(r.operator_landing.p100, None);
+        assert_eq!(r.operator_landing.n_at_or_over_ceiling, 0);
+    }
+
+    /// The RENDERED operator block, populated — the arm an operator actually reads once the
+    /// partition has something in it.
+    ///
+    /// Every other test here asserts the computed `OperatorLanding`, and all three committed CLI
+    /// render goldens exercise the EMPTY arm ("no reason=manual/forced swaps observed"), so the
+    /// populated one shipped with no assertion over it at all: transposing its P50 and P90 left the
+    /// whole suite and the golden gate green.
+    ///
+    /// Ten landings, because the percentile is NEAREST-RANK — `ceil(p · n)` — so P90 and P100 are the
+    /// same element for every n below 10, and a fixture smaller than this cannot tell those two
+    /// lines apart no matter how distinct its values are.
+    #[test]
+    fn the_populated_operator_landing_block_renders_each_figure_in_its_own_place() {
+        let at = epoch("2026-07-11T00:00:00Z");
+        let log = "\
+ts=2026-07-11T00:00:00Z event=swap from=a0 to=b0 reason=manual session_pct=0\n\
+ts=2026-07-11T01:00:00Z event=swap from=a1 to=b1 reason=forced session_pct=0\n\
+ts=2026-07-11T02:00:00Z event=swap from=a2 to=b2 reason=manual session_pct=0\n\
+ts=2026-07-11T03:00:00Z event=swap from=a3 to=b3 reason=forced session_pct=0\n\
+ts=2026-07-11T04:00:00Z event=swap from=a4 to=b4 reason=manual session_pct=0\n\
+ts=2026-07-11T05:00:00Z event=swap from=a5 to=b5 reason=forced session_pct=0\n\
+ts=2026-07-11T06:00:00Z event=swap from=a6 to=b6 reason=manual session_pct=0\n\
+ts=2026-07-11T07:00:00Z event=swap from=a7 to=b7 reason=forced session_pct=0\n\
+ts=2026-07-11T08:00:00Z event=swap from=a8 to=b8 reason=manual session_pct=0\n\
+ts=2026-07-11T09:00:00Z event=swap from=a9 to=b9 reason=forced session_pct=0\n\
+ts=2026-07-11T10:00:00Z event=all_exhausted hold=held-to\n\
+ts=2026-07-11T10:10:00Z event=swap from=held-from to=held-to reason=manual session_pct=0\n";
+        // One post-swap sample per rescue, inside each swap's own window, so all ten are measured.
+        let samples = vec![
+            sample(at + 60, "a0", 0.80),
+            sample(at + 3_660, "a1", 0.82),
+            sample(at + 7_260, "a2", 0.84),
+            sample(at + 10_860, "a3", 0.86),
+            sample(at + 14_460, "a4", 0.88),
+            sample(at + 18_060, "a5", 0.90),
+            sample(at + 21_660, "a6", 0.92),
+            sample(at + 25_260, "a7", 0.94),
+            sample(at + 28_860, "a8", 0.96),
+            sample(at + 32_460, "a9", 0.99),
+        ];
+
+        let out = render_human(&aggregate(&parse_events(log, None), &samples, None));
+        let block: String = out
+            .lines()
+            .skip_while(|l| !l.starts_with("landing-point session_pct, OPERATOR-initiated"))
+            .take_while(|l| !l.is_empty())
+            .map(|l| format!("{l}\n"))
+            .collect();
+
+        assert_eq!(
+            block,
+            concat!(
+                "landing-point session_pct, OPERATOR-initiated swaps (reason=manual/forced, window <= 900s)\n",
+                "  measured n=10 of 10 operator swaps (0 with no post-swap sample)\n",
+                "  P50  = 88\n",
+                "  P90  = 96\n",
+                "  P100 = 99  (no SLO: a manual swap records no decision reading)\n",
+                "  landed >= 99: 1  (not a breach class — where the fleet ended up when a human intervened)\n",
+                "  capacity-held (all_exhausted, excluded — issue #719): 1\n",
+            ),
+            "full render was:\n{out}"
+        );
+    }
+
+    /// The same ten landings on the JSON wire, where a script reads them.
+    ///
+    /// `json_render_is_stable_schema_12` pins the whole document, but its fixture leaves every
+    /// operator percentile `null`, `capacity_held` at `0`, and `swaps_total` equal to
+    /// `n_unmeasured` — so a projection that transposed P50 with P90, or `swaps_total` with
+    /// `n_unmeasured`, passes it. `the_populated_operator_landing_block_renders_each_figure_in_its_own_place`
+    /// separates those values but only through `render_human`, which leaves everything between
+    /// `Report` and the wire ungraded. Five figures, all distinct, on the surface a consumer parses.
+    #[test]
+    fn the_operator_landing_wire_carries_each_figure_in_its_own_field() {
+        let at = epoch("2026-07-11T00:00:00Z");
+        let log = "\
+ts=2026-07-11T00:00:00Z event=swap from=a0 to=b0 reason=manual session_pct=0\n\
+ts=2026-07-11T01:00:00Z event=swap from=a1 to=b1 reason=forced session_pct=0\n\
+ts=2026-07-11T02:00:00Z event=swap from=a2 to=b2 reason=manual session_pct=0\n\
+ts=2026-07-11T03:00:00Z event=swap from=a3 to=b3 reason=forced session_pct=0\n\
+ts=2026-07-11T04:00:00Z event=swap from=a4 to=b4 reason=manual session_pct=0\n\
+ts=2026-07-11T05:00:00Z event=swap from=a5 to=b5 reason=forced session_pct=0\n\
+ts=2026-07-11T06:00:00Z event=swap from=a6 to=b6 reason=manual session_pct=0\n\
+ts=2026-07-11T07:00:00Z event=swap from=a7 to=b7 reason=forced session_pct=0\n\
+ts=2026-07-11T08:00:00Z event=swap from=a8 to=b8 reason=manual session_pct=0\n\
+ts=2026-07-11T09:00:00Z event=swap from=a9 to=b9 reason=forced session_pct=0\n\
+\
+ts=2026-07-11T10:00:00Z event=all_exhausted hold=held-to\n\
+ts=2026-07-11T10:10:00Z event=swap from=held-from to=held-to reason=manual session_pct=0\n";
+        let samples = vec![
+            sample(at + 60, "a0", 0.80),
+            sample(at + 3_660, "a1", 0.82),
+            sample(at + 7_260, "a2", 0.84),
+            sample(at + 10_860, "a3", 0.86),
+            sample(at + 14_460, "a4", 0.88),
+            sample(at + 18_060, "a5", 0.90),
+            sample(at + 21_660, "a6", 0.92),
+            sample(at + 25_260, "a7", 0.94),
+            sample(at + 28_860, "a8", 0.96),
+            sample(at + 32_460, "a9", 0.99),
+        ];
+
+        let json = render_json(&aggregate(&parse_events(log, None), &samples, None)).unwrap();
+        let block = json
+            .split("\"operator_landing\": ")
+            .nth(1)
+            .expect("the wire carries the partition")
+            .split("\n  }")
+            .next()
+            .expect("… as an object");
+
+        for field in [
+            "\"swaps_total\": 10",
+            "\"n_measured\": 10",
+            "\"n_unmeasured\": 0",
+            "\"p50\": 88",
+            "\"p90\": 96",
+            "\"p100\": 99",
+            "\"n_at_or_over_ceiling\": 1",
+            "\"capacity_held\": 1",
+        ] {
+            assert!(block.contains(field), "missing {field} in {block}");
+        }
+    }
+
+    /// A partition that is ENTIRELY capacity-held still says so on the human surface.
+    ///
+    /// Holds leave the denominator (issue #719), so `swaps_total` reads `0` and the render falls to
+    /// the nothing-observed arm — over a log that carried an operator swap. Saying only "none
+    /// observed" there would be false, and the excluded count is the whole of what there is to
+    /// report. The `--json` surface was never affected: `capacity_held` rides the wire either way.
+    #[test]
+    fn an_all_held_operator_partition_reports_the_exclusion_rather_than_nothing() {
+        let at = epoch("2026-07-11T00:00:00Z");
+        let log = "\
+ts=2026-07-11T00:00:00Z event=all_exhausted hold=spare cause=session\n\
+ts=2026-07-11T00:01:00Z event=swap from=work to=spare reason=manual session_pct=0\n";
+        let samples = vec![sample(at + 120, "work", 0.99)];
+
+        let r = aggregate(&parse_events(log, None), &samples, None);
+        assert_eq!(
+            r.operator_landing.swaps_total, 0,
+            "the hold left the denominator"
+        );
+        assert_eq!(r.operator_landing.capacity_held, 1);
+
+        let out = render_human(&r);
+        assert!(
+            out.contains(
+                "landing-point session_pct, OPERATOR-initiated swaps: no gradeable reason=manual/forced swaps observed\n  capacity-held (all_exhausted, excluded — issue #719): 1\n"
+            ),
+            "the exclusion is reported, not silently dropped:\n{out}"
+        );
+    }
+
+    /// The adopt-recovery sentinel is not an anchor.
+    ///
+    /// `sessiometer use --force` onto a scrubbed canonical emits a real `reason=forced` swap whose
+    /// `from=` is `(unknown)` — a redaction-safe placeholder for an outgoing account that could not
+    /// be named, not a roster label. It shares no namespace with a usage sample's `acct`, so an
+    /// anchor keyed on it can never join one: it would inflate `swaps_total` and sit in
+    /// `n_unmeasured` on every run forever, reported as a sample-coverage gap an operator could go
+    /// looking for and never find. Every OTHER operator swap in the same log must still be graded,
+    /// which is what makes this a filter rather than a reason to drop the family.
+    #[test]
+    fn the_adopt_recovery_sentinel_is_not_counted_as_an_unmeasurable_operator_swap() {
+        let at = epoch("2026-07-11T00:00:00Z");
+        let log = "\
+ts=2026-07-11T00:00:00Z event=swap from=(unknown) to=spare reason=forced session_pct=0\n\
+ts=2026-07-11T01:00:00Z event=swap from=work to=backup reason=manual session_pct=0\n";
+        let samples = vec![sample(at + 3_660, "work", 0.99)];
+
+        let r = aggregate(&parse_events(log, None), &samples, None);
+
+        assert_eq!(
+            r.operator_landing.swaps_total, 1,
+            "the sentinel is not an anchor; the real swap still is"
+        );
+        assert_eq!(r.operator_landing.n_measured, 1);
+        assert_eq!(
+            r.operator_landing.n_unmeasured, 0,
+            "an unmeasurable-by-construction anchor must not read as a coverage gap"
+        );
+        assert_eq!(r.operator_landing.p100, Some(99));
     }
 
     // --- issue #767: FULL-OUTPUT goldens for the `reliability` human render -----------

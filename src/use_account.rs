@@ -532,7 +532,7 @@ fn warn_quarantined(label: &str) -> String {
 /// the outgoing account is genuinely unknown — the canonical was scrubbed / rotated AND
 /// `~/.claude.json` was cleared, so no roster account resolves. A non-secret sentinel
 /// (issue #15 — never a token, email, or account-uuid).
-const ADOPT_UNKNOWN_FROM: &str = "(unknown)";
+pub(crate) const ADOPT_UNKNOWN_FROM: &str = "(unknown)";
 
 /// The adopt-target recovery note (issue #212): the canonical credential was gone or
 /// rotated, so the target was installed DIRECTLY — the previous account was NOT
@@ -3085,6 +3085,7 @@ mod tests {
         ("maintain_stats_store", NotHandleResolution, "keys the per-account stats store by label"),
         ("next_swap", NotHandleResolution, "the next-swap projection's target handle"),
         ("note_account_backoff", NotHandleResolution, "the backoff event's account uuid"),
+        ("note_active_designation", NotHandleResolution, "the newly-designated active's account uuid, stamped as the designation key"),
         ("note_blind_episode", NotHandleResolution, "the blind-episode events' account uuid"),
         ("note_blind_gate_eligibility", NotHandleResolution, "the blind-gate eligibility event's account uuid"),
         ("note_canonical_liveness", NotHandleResolution, "the canonical-liveness event's active handle"),
@@ -3092,6 +3093,7 @@ mod tests {
         ("note_expiry_horizon_edge", NotHandleResolution, "the expiry-horizon event's account uuid"),
         ("note_health_transitions", NotHandleResolution, "the health-transition events' account handles"),
         ("note_landing_overshoot", NotHandleResolution, "the landing-overshoot event's from handle"),
+        ("note_observation_gap", NotHandleResolution, "the observation-gap events' account uuid"),
         ("note_poll_outcome", NotHandleResolution, "the four poll-outcome events' account handles"),
         ("note_refresh_outcome", NotHandleResolution, "the refresh-outcome event's account handle"),
         ("poke_all", NotHandleResolution, "`poke` with no target — sweeps the WHOLE roster, so it resolves nothing"),
@@ -3263,6 +3265,8 @@ mod tests {
         //
         // Unique by construction: `config::validate` rejects a duplicated uuid, so there is no
         // ambiguity here to refuse on. Only LABELS are un-unique, which is what R-6a is about.
+        ("note_active_designation", "compares the account-uuid on record as the active DESIGNATION against the resolved active's, so a re-stamp happens only when the designation actually changed — a uuid-keyed edge check, never a handle lookup"),
+        ("note_observation_gap", "matches the designation record's account-uuid back to its roster index, so a roster reindex cannot move a designation instant onto a different account"),
         ("apply_import", "matches an INCOMING artifact account's uuid to a local roster index, and compares that same uuid against the ACTIVE one for the adoption check"),
         ("apply_refresh_observation", "matches a poll observation's own account-uuid back to its roster index"),
         ("apply_refresh_restore", "matches a restore outcome's account-uuid back to its roster index"),
@@ -3480,7 +3484,7 @@ mod tests {
         for (arm, expected) in [
             (SharedResolver, 1),
             (ViaSharedResolver, 4),
-            (NotHandleResolution, 90),
+            (NotHandleResolution, 92),
         ] {
             let actual = HANDLE_READ_REGISTER
                 .iter()
@@ -5584,8 +5588,17 @@ mod tests {
                 .expose(),
             b"A-token"
         );
+        // The `session_pct=0` is asserted, not elided (issue #1453). It is a deliberate record of
+        // "this swap was not session-triggered", and the offline readout's whole operator partition
+        // is built on it: `SwapOut::decision_pct` is `None` for these anchors, the partition
+        // publishes no breach split and no SLO verdict, and the `reason=session` filter is left
+        // narrow rather than widened — all three because the `0` is not a decision reading. Every
+        // one of those consumer tests asserts the premise into existence from a hand-written
+        // fixture; this is the one place the PRODUCER is pinned, so a change here that started
+        // emitting a real reading would otherwise leave the whole suite green while the readout
+        // silently discarded genuine decision data.
         assert!(
-            log.contains("event=swap from=work to=spare reason=manual"),
+            log.contains("event=swap from=work to=spare reason=manual session_pct=0"),
             "log: {log}"
         );
         assert_eq!(calls, 1, "a one-shot command polls the target exactly once");

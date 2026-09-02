@@ -21,6 +21,8 @@ landing-point session_pct (post-swap peak of the outgoing account, window <= 900
   breach classes: 1 post-swap tail (fired < 99, landed >= 99); 0 gap-crossing (decision >= 99); blind-burn: see time-blind SLI (issue #583)
   capacity-held (all_exhausted, excluded — out of #363 scope): 1
 
+landing-point session_pct, OPERATOR-initiated swaps: no gradeable reason=manual/forced swaps observed
+
 observed session velocity (session_pct_per_min, positive climbs only; the v_peak reserve-coupling calibration input)
   measured n=1 usage_velocity samples
   P50  = 0.2000 %/min

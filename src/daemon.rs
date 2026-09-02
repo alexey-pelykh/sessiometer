@@ -259,8 +259,9 @@ pub(crate) use records::{TickAction, TickOutcome};
 // takes the daemon-private `AnchorArmInputs`, which would be a more-private type in a public
 // interface.
 use records::{
-    blind_active_view, BlindAnchor, BlindPreemptSwapRecord, CredentialReadSource, LastGood,
-    LastSwap, ParkedLanding, SwapVerdict, TickBackoff, VelocityEma,
+    blind_active_view, ActiveDesignation, BlindAnchor, BlindPreemptSwapRecord,
+    CredentialReadSource, LastGood, LastSwap, ObservationGapAnchor, ParkedLanding, SwapVerdict,
+    TickBackoff, VelocityEma,
 };
 
 // The five responsibility clusters carved out of the single `impl Daemon<P, C, S, K>` block by the
@@ -1020,7 +1021,10 @@ struct LandingOvershootRecord {
 // `pub(crate)` (fields stay private) so the snapshot submodule's re-exported
 // `refresh_health_view(&AccountHealth)` does not expose a more-private type (issue #203);
 // the health state itself remains daemon-owned and its fields daemon-private.
-#[derive(Default, Clone)]
+// `PartialEq` so a caller can compare a whole `AccountHealth` rather than field-by-field — issue
+// #1453's AC-5 assertion needs "nothing here moved" to stay true as fields are added, and a
+// hand-maintained list of comparisons silently narrows the moment one is.
+#[derive(Default, Clone, PartialEq)]
 pub(crate) struct AccountHealth {
     /// Consecutive non-scope 401s on this account's stored token. Incremented on a
     /// 401, reset to 0 on ANY non-401 outcome (success, 403, transient, locked). The
@@ -1329,6 +1333,23 @@ struct AccountRuntime {
     /// episode is claimed. See [`BlindAnchor`]; contrast the ACTIVE-scoped
     /// [`last_good`](DecisionState::last_good).
     blind_anchor: Option<BlindAnchor>,
+    /// The open OBSERVATION-GAP anchor (issue #1453) — `Some` exactly while this account is inside a
+    /// gap the daemon witnessed open: it was the ACTIVE account and its last completed reading had
+    /// aged past [`observation_gap_threshold`](Daemon::observation_gap_threshold). Set on the
+    /// crossing edge (which emits [`Event::ObservationGapEnter`]), read and cleared on the
+    /// re-observation edge (which emits [`Event::ObservationGapExit`]), and touched by nothing else
+    /// — no swap path, no active resolution, which is load-bearing here rather than incidental: a
+    /// change of active is precisely what OPENS the gap this records, so an anchor a swap reset
+    /// would be erased by the event it measures.
+    ///
+    /// `None` for an account observed within the bound, and — the only genuinely unmeasurable case
+    /// — for one with NEITHER a completed reading nor a designation on record, reachable at daemon
+    /// start before the first active resolves. An account with no reading but a designation IS
+    /// tracked, measured from the designation: `blind_anchor` above cannot speak for it (its entry
+    /// edge needs a poll that failed while an earlier reading was retained), so leaving it out would
+    /// make an active the daemon has never once seen the one thing nothing reports.
+    /// See [`ObservationGapAnchor`].
+    observation_gap: Option<ObservationGapAnchor>,
     /// Whether this account has been polled at least once this run (issue #80). Drives the warm-up
     /// latch [`warmed_up`](DecisionState::warmed_up).
     polled_once: bool,
@@ -1384,6 +1405,17 @@ struct DecisionState {
     /// `status` candidate is #88's `next_swap`,
     /// computed fresh from readings — not this record.)
     last_swap: Option<LastSwap>,
+    /// When the ACTIVE designation last CHANGED, and to whom (issue #1453) — see
+    /// [`ActiveDesignation`]. Written by
+    /// [`note_active_designation`](Daemon::note_active_designation) at the top of every tick once
+    /// the active is resolved; read by
+    /// [`note_observation_gap`](Daemon::note_observation_gap) as the origin a freshly-designated
+    /// active's observation gap is measured from. `None` until the first active resolves.
+    ///
+    /// SEPARATE from the cooldown-bearing `last_swap` above, which is a near-miss on both sides:
+    /// `adopt_manual_swap` arms that slot without a designation change, and
+    /// `reconcile_canonical_change` changes the designation without arming it.
+    active_designation: Option<ActiveDesignation>,
     /// The most recent #452 preemptive swap-away, retained so `status` can narrate it (issue #479):
     /// `Some` from a successful [`Daemon::blind_swap`] until superseded / aged out. See
     /// [`BlindPreemptSwapRecord`]. `None` by default (no preemptive swap yet). DEDICATED, kept off the
@@ -1420,10 +1452,11 @@ struct DecisionState {
     /// Per-account carried runtime state (issue #668), one slot per roster account, in roster order —
     /// health (#42), the last-known reading (#80) and its timestamp (#449), the session-velocity EMA
     /// (#539), the armed landing watch (#613), the session high-water mark (#614), the pre-blind
-    /// anchor (#583), and the warm-up flag (#80). Sized to the roster in [`Daemon::new`] and re-keyed
-    /// BY UUID (never by position) in [`reconcile_roster`](Daemon::reconcile_roster).
+    /// anchor (#583), the observation-gap anchor (#1453), and the warm-up flag (#80). Sized to the
+    /// roster in [`Daemon::new`] and re-keyed BY UUID (never by position) in
+    /// [`reconcile_roster`](Daemon::reconcile_roster).
     ///
-    /// ONE vec, not eight parallel ones: index `i` denotes roster account `i` for EVERY signal at
+    /// ONE vec, not one per signal: index `i` denotes roster account `i` for EVERY signal at
     /// once, so the roster/state length-and-index invariant is structural rather than hand-maintained
     /// across a growing set of sizing and re-key sites. See [`AccountRuntime`].
     accounts: Vec<AccountRuntime>,
@@ -2492,6 +2525,11 @@ where
             };
         }
         let active = self.state.active;
+        // Issue #1453: stamp the instant this designation began, BEFORE anything reads it. Placed
+        // here rather than in the swap paths because the question is "when did THIS account become
+        // the one the daemon is responsible for", and the set of ways that changes is wider than the
+        // set of swaps — see [`ActiveDesignation`].
+        self.note_active_designation(active);
 
         // Issue #464: record the canonical item's OWN per-poll liveness (present / scrubbed /
         // unknown + a redaction-safe token fingerprint, handle, and expiry) and edge-trigger the
@@ -2801,6 +2839,24 @@ where
             );
             self.note_polled(i);
         }
+
+        // Issue #1453: the never-looked-at instrument. The property that matters is not that this
+        // is the only call outside the poll block above — several later ones are too
+        // (`note_blind_gate_eligibility`, the two cleared-edge pushes, `check_fleet_runway_warn`,
+        // the near-limit coverage line) — it is that this is the only BLINDNESS detector keyed on
+        // elapsed time rather than on a poll outcome. Every detector inside the block —
+        // `record_usage_sample`, `maintain_stats_store`, `note_blind_episode`, `note_exhausted_poll`
+        // — needs a poll of THAT account to have run, and `note_blind_episode` additionally needs it
+        // to have FAILED, so an active account the schedule stops selecting goes dark with nothing
+        // recording it.
+        //
+        // Placed HERE, after the block, so a tick that DID poll the active closes any open episode
+        // on the same tick rather than a tick late — the poll's slot write is already visible. Reads
+        // the local `active` (the top-of-tick resolution, which `decide_action` below has not yet
+        // moved) and its own monotonic instant; issues no request, so the schedule, the cadence and
+        // the aggregate poll rate are untouched.
+        let observation_now = self.clock.now();
+        self.note_observation_gap(active, observation_now, &mut events);
 
         // Issue #282 PROACTIVE keep-warm: BEFORE deciding, if the active token is within its
         // (staggered) near-expiry horizon, mint a fresh token in place and promote it to the
@@ -3194,6 +3250,259 @@ where
             }
             // Held blind (episode already open) or an ordinary live poll — no edge, stay silent.
             (Some(_), Err(_)) | (None, Ok(_)) => {}
+        }
+    }
+
+    /// Stamp when the ACTIVE designation last changed (issue #1453), keyed by account UUID so a
+    /// roster reindex cannot move it onto a different account.
+    ///
+    /// Idempotent per designation: re-stamping on every tick would reset the very clock the
+    /// observation-gap instrument measures, so a tick whose active is the one already on record
+    /// writes nothing. An UNRESOLVED active (`None`) leaves the previous record standing rather than
+    /// clearing it — the resolve failed, the designation did not change, and the instrument is
+    /// entry-gated on a resolved active anyway.
+    ///
+    /// The instant is when the daemon NOTICED the change, not when it happened, and the two differ
+    /// by up to one sub-interval for a swap `decide_action` performs at the END of a tick — the run
+    /// loop re-ticks immediately for the socket and manual paths, so those are negligible. The bias
+    /// runs LOW (a shorter measured gap than the true one) and is bounded by the sub-interval, which
+    /// is half the bound the instrument compares against. Recorded rather than corrected: stamping
+    /// inside each swap path is exactly the enumerate-the-swaps coupling [`ActiveDesignation`]
+    /// exists to avoid, and it would buy a correction smaller than the jitter on the interval.
+    fn note_active_designation(&mut self, active: Option<usize>) {
+        let Some(i) = active else { return };
+        let uuid = self.roster[i].account_uuid.as_str();
+        if self
+            .state
+            .active_designation
+            .as_ref()
+            .is_some_and(|d| d.account_uuid == uuid)
+        {
+            return;
+        }
+        self.state.active_designation = Some(ActiveDesignation {
+            account_uuid: uuid.to_owned(),
+            at: self.clock.now(),
+        });
+    }
+
+    /// The re-observation bound the observation-gap instrument measures against (issue #1453):
+    /// `2 · poll_secs / N`, the interval `ADR-0012` decision 4 states for the ACTIVE account and the
+    /// shape [`build_poll_schedule`](Self::build_poll_schedule)'s interleave delivers — the active
+    /// sits at every other slot, so a consumed schedule re-polls it every two SUB-INTERVALS.
+    ///
+    /// Two sub-intervals of SCHEDULE, which is not the same as `2 · poll_secs / N` of wall clock,
+    /// and the ADR is careful to say "roughly": [`next_subinterval`](Self::next_subinterval) draws a
+    /// fresh jittered interval each time, so two consecutive ones sum to more than twice the base
+    /// about half the time at the shipped `Jitter::Normal` default. That does not make the threshold
+    /// trip on a healthy schedule, because this runs AFTER the poll block: on the tick that polls
+    /// the active the stamp has already moved, so the largest gap a healthy rotation ever presents
+    /// here is ONE sub-interval against a TWO-sub-interval bound. A false entry would need a single
+    /// draw at twice the base — about five standard deviations at the default.
+    ///
+    /// `ADR-0012` decision 4 also reasons entirely about a STATIC active: nothing in it considers a
+    /// mid-cycle change of active, which is the case this instrument's primary population is made
+    /// of, so the interval was never DERIVED for it. The ADR now says so itself (§ Status → Amended
+    /// 2026-09-02); the citation above is to the interval, not to a derivation that covers this.
+    ///
+    /// `poll_secs` is read from [`poll_strategy`](Self::poll_strategy)`.base` — the UN-jittered base,
+    /// the same idiom [`note_exhausted_poll`](Self::note_exhausted_poll) uses for its own floor.
+    /// Deliberately NOT [`next_poll_interval`](Self::next_poll_interval): that DRAWS from the seeded
+    /// `rng`, and every swap arm's draw order is fixture-pinned, so an instrument that drew would
+    /// silently re-order them. The guard is the `&self` receiver, not a test — drawing needs
+    /// `&mut self`, so a call that drew would not compile. Integer arithmetic throughout, so no
+    /// float→`Duration` conversion can panic on a degenerate config.
+    ///
+    /// `N` is [`rotation_len`](Self::rotation_len) — the count of DISTINCT rotation accounts, the
+    /// same divisor [`next_subinterval`](Self::next_subinterval) uses, floored at 1 so a
+    /// single-account roster reads the whole interval rather than dividing by zero.
+    ///
+    /// The #540 near-limit cap is deliberately NOT folded in: it only ever SHORTENS the sub-interval
+    /// while the active is in-band, so the bound above still holds and the instrument keeps ONE
+    /// threshold across the band edge rather than moving its own goalposts mid-episode.
+    fn observation_gap_threshold(&self) -> Duration {
+        // `base as u64` saturates rather than wrapping, matching `note_exhausted_poll`'s read of the
+        // same field; the doubling saturates too, so no arithmetic here can overflow or panic.
+        let poll_secs = self.poll_strategy.base as u64;
+        let rotation = self.rotation_len().max(1) as u64;
+        Duration::from_secs(poll_secs.saturating_mul(2) / rotation)
+    }
+
+    /// Record the OBSERVATION-GAP edges (issue #1453): [`Event::ObservationGapEnter`] when the ACTIVE
+    /// account's last completed reading ages past [`observation_gap_threshold`](Self::observation_gap_threshold),
+    /// and [`Event::ObservationGapExit`] when an account carrying an open anchor is observed again.
+    ///
+    /// This is the ONE BLINDNESS detector in the tick that does not need a poll to have happened.
+    /// (Not the only call outside the poll block — `note_blind_gate_eligibility` and the fleet /
+    /// cleared-edge signals are outside it too; they are simply not about whether an account can be
+    /// SEEN.) Every other detector of that kind — [`record_usage_sample`],
+    /// [`maintain_stats_store`](Self::maintain_stats_store),
+    /// [`note_blind_episode`](Self::note_blind_episode),
+    /// [`note_exhausted_poll`](Self::note_exhausted_poll) — is called from INSIDE
+    /// `if let Some(i) = poll_idx { … }`, so a tick that polls something else emits nothing about the
+    /// active account at all, and `note_blind_episode`'s entry arm additionally requires an `Err`
+    /// that a never-attempted poll cannot produce. So this is called from OUTSIDE that block, and
+    /// keyed on elapsed time rather than on an outcome. It therefore also covers the narrower case
+    /// where the block IS entered but its `filter` drops the index (an account scheduled, then
+    /// skipped by its back-off or slow-poll window) — a schedule-position instrument would not.
+    ///
+    /// **Edge-triggered, both ways.** The anchor is what makes it so: an open episode suppresses
+    /// re-entry, so a gap that lasts a hundred ticks still writes two lines. Which edge each account
+    /// is eligible for is decided by whether it holds an anchor, never by both tests running.
+    ///
+    /// **The two edges are scoped differently, deliberately.** ENTRY fires only for the resolved
+    /// ACTIVE account — the population the `2 · poll_secs / N` bound is stated for; a peer's own
+    /// bound is a full sweep, roughly `N/2` times longer, so opening peer episodes at this threshold
+    /// would emit for every peer on nearly every cycle. EXIT fires for ANY account holding an anchor,
+    /// because an account can be swapped away mid-episode: scoping the close to the active too would
+    /// strand that anchor forever, and a stranded anchor is not merely an unclosed episode — it
+    /// suppresses every future ENTRY on that account, so the instrument would go permanently deaf on
+    /// exactly the accounts a swap-churning fleet cycles through.
+    ///
+    /// **A FAILED poll neither closes an episode nor stops its clock.** The caller clears
+    /// `last_reading_at` on a failed poll, so the anchor simply stays open and the eventual exit
+    /// spans the failure. That is the honest reading of "first COMPLETED observation", and it keeps
+    /// this record and the blind-episode pair disjoint in cause while free to overlap in time: one
+    /// says nothing looked, the other says looking failed.
+    ///
+    /// **Fail-open by construction** (not by a swallowed error): it reads carried state, pushes onto
+    /// the caller's `events` vec, and writes one `Option` per roster slot. It issues no request,
+    /// touches no store or credential, draws no `rng`, and returns no `Result` — there is no failure
+    /// for it to swallow and no path by which it can delay, block, or alter the poll it instruments.
+    /// The same discipline `record_usage_sample` states ("off the swap-decision path, so a sampling
+    /// failure never perturbs the loop"), reached by having nothing that can fail rather than by
+    /// catching it.
+    ///
+    /// `active` is the top-of-tick resolution (the caller's local, which `decide_action` has not yet
+    /// moved) and `now` the tick's monotonic [`Clock`] instant.
+    fn note_observation_gap(
+        &mut self,
+        active: Option<usize>,
+        now: Instant,
+        events: &mut Vec<Event>,
+    ) {
+        let threshold = self.observation_gap_threshold();
+        // A zero bound would open an episode on every active account on its very first tick and
+        // every tick after — the flood the edge-trigger exists to prevent. Only a degenerate
+        // `poll_secs` (below `N/2`) reaches it, and treating that as "instrument off" fails toward
+        // silence rather than toward a log the operator has to filter.
+        //
+        // It suppresses ENTRY only, never the loop: an episode already open must still be able to
+        // close. Returning here instead would strand every open anchor the moment the config went
+        // degenerate, and a stranded anchor also suppresses every future entry on its account — the
+        // instrument would not merely go quiet, it would stay quiet after the config was fixed.
+        let entry_armed = !threshold.is_zero();
+        // Read once, before the loop, because the loop needs `&mut self.state.accounts`.
+        //
+        // `designated_at` is when the CURRENT active was designated, and only when the record names
+        // that same account — the origin its gap is measured from. `last_designation_at` is the
+        // latest designation of anyone, which is what tells an EXIT whether the designation moved
+        // while its episode was open.
+        let last_designation_at = self.state.active_designation.as_ref().map(|d| d.at);
+        let designated_at = active.and_then(|i| {
+            self.state
+                .active_designation
+                .as_ref()
+                .filter(|d| d.account_uuid == self.roster[i].account_uuid)
+                .map(|d| d.at)
+        });
+        for i in 0..self.roster.len() {
+            // The last instant this account was actually SEEN — which `last_reading_at` alone does
+            // NOT give: a failed poll CLEARS that stamp (its own doc says so). Reading it naively
+            // would treat a single 401 on a long-healthy active as an account never observed at
+            // all, fall through to the designation below, and report the account's whole active
+            // tenure as an observation gap — on a fleet with nothing wrong with it, and tagged as a
+            // usable first-sight sample. `blind_anchor.at` is exactly the reading instant that
+            // failure discarded, retained by `note_blind_episode` for the same reason, so the two
+            // together are failure-proof. `None` beats nothing (`Option`'s own ordering), so this
+            // is the later of whichever is present.
+            let observed_at = self.state.accounts[i]
+                .last_reading_at
+                .max(self.state.accounts[i].blind_anchor.map(|a| a.at));
+            match self.state.accounts[i].observation_gap {
+                // EXIT edge — an episode is open and this account has a reading NEWER than the
+                // anchor, i.e. some poll since the anchor completed. `elapsed` is measured to the
+                // OBSERVATION, not to `now`: the observation instant is what the latency is about,
+                // and reading it out of the slot keeps this line agreeing with the reading it
+                // describes even if the two clocks are read a hair apart.
+                Some(anchor) => {
+                    let Some(observed_at) = observed_at else {
+                        continue; // still unobserved (a failed poll cleared the stamp) — hold it open
+                    };
+                    if observed_at <= anchor.at {
+                        continue; // the same reading the anchor was taken from — no new observation
+                    }
+                    events.push(Event::ObservationGapExit {
+                        account: self.roster[i].account_uuid.clone(),
+                        elapsed_secs: observed_at.saturating_duration_since(anchor.at).as_secs(),
+                        was_active: anchor.was_active,
+                        // The tail a naive first-sight reading would over-count: the episode opened
+                        // on the active account, and by the time anything looked the designation had
+                        // moved, so this is not a first sight of the designation the anchor belongs
+                        // to. Two ways that happens, and only the first is obvious: the account is
+                        // no longer active, OR it left and came BACK — where `active == Some(i)`
+                        // again while the episode still spans a designation this line is not about.
+                        // A designation stamped AFTER the anchor is what distinguishes them; the
+                        // anchor of a freshly-designated active IS its designation instant, so an
+                        // ordinary post-swap first sight compares equal and stays `false`.
+                        swapped_away: anchor.was_active
+                            && (active != Some(i)
+                                || last_designation_at.is_some_and(|at| at > anchor.at)),
+                    });
+                    self.state.accounts[i].observation_gap = None;
+                }
+                // ENTRY edge — the ACTIVE account, no episode open, and its last completed reading
+                // has aged past the bound. Anchored on that reading's own instant, so the exit
+                // measures the WHOLE gap rather than the part of it after the crossing.
+                None => {
+                    if !entry_armed || active != Some(i) {
+                        continue;
+                    }
+                    // Whichever came LAST: the account's own reading, or the moment it became
+                    // active. Anchoring on the reading alone folds a PEER's pre-swap staleness into
+                    // a post-swap figure — a peer is re-observed once per sweep, so an account just
+                    // promoted can carry a reading a whole sweep old, and the SLI this event exists
+                    // to serve ("from a change of active designation to the first completed
+                    // observation") would read a sweep high on exactly the population it is about.
+                    // Taking the later instant makes the one number mean the same thing in both
+                    // regimes: how long the daemon has been unable to see the account it is
+                    // RESPONSIBLE for.
+                    //
+                    // The designation ALONE suffices when there is no reading at all — an account
+                    // promoted before it was ever polled, or whose only poll failed. That account is
+                    // unobserved in the strongest sense the instrument exists for, and it reaches
+                    // neither `blind_enter` (whose entry edge needs a poll that ran and failed while
+                    // an earlier reading was on record) nor an anchor keyed on a reading it does not
+                    // have. What is genuinely unmeasurable is the remaining case: no reading AND no
+                    // designation on record, at daemon start before the first active resolves —
+                    // there is no instant to measure from, and the instrument claims nothing.
+                    let anchored_at = match (observed_at, designated_at) {
+                        (Some(observed), Some(designated)) => observed.max(designated),
+                        (Some(observed), None) => observed,
+                        (None, Some(designated)) => designated,
+                        (None, None) => continue,
+                    };
+                    let elapsed = now.saturating_duration_since(anchored_at);
+                    // Strictly greater, because the guarantee is stated as an inclusive bound —
+                    // `R-1` says the newly-designated active is observed WITHIN `2 · poll_secs / N`
+                    // and the SLI's own target is `p95 <= 2 · poll_secs / N`. At exactly the bound
+                    // the guarantee is met, so an episode opened there would report a breach that
+                    // the requirement does not consider one.
+                    if elapsed <= threshold {
+                        continue;
+                    }
+                    self.state.accounts[i].observation_gap = Some(ObservationGapAnchor {
+                        at: anchored_at,
+                        was_active: true,
+                    });
+                    events.push(Event::ObservationGapEnter {
+                        account: self.roster[i].account_uuid.clone(),
+                        elapsed_secs: elapsed.as_secs(),
+                        threshold_secs: threshold.as_secs(),
+                        was_active: true,
+                    });
+                }
+            }
         }
     }
 
@@ -14617,6 +14926,916 @@ mod tests {
                 "two session-saturated accounts must HOLD (no swap) at tick {step}"
             );
         }
+    }
+
+    // --- #1453 the never-looked-at instrument: an UNOBSERVED active account ---
+    //
+    // Every detector above lives inside `if let Some(i) = poll_idx { … }`, so all of them are
+    // silent about an account the schedule stops selecting. These drive exactly that state — the
+    // schedule holding accounts the active is no longer among, which is the shape of the incident —
+    // and assert the gap becomes durable anyway.
+
+    /// A three-account daemon warmed up, then driven into the incident's state: the active moved to
+    /// `spare` mid-cycle while the poll schedule still holds only `work` and `backup`, so nothing
+    /// ever polls the active account.
+    ///
+    /// The stale schedule is seeded rather than produced by a swap on purpose: the swap-path fix
+    /// (issue #1452) is a SEPARATE change, and an instrument that only fired through it could not be
+    /// shown to work BEFORE it — which is the entire reason this lands first. Seeding the state the
+    /// defect produces keeps this suite RED-able against a tree with no fix in it at all.
+    async fn daemon_with_an_unobserved_active() -> FakeDaemon {
+        let mut daemon = three_account_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.11, 0.10)
+                .ok("u-B", 0.22, 0.10)
+                .ok("u-C", 0.33, 0.10),
+        )
+        .await;
+        let _ = warmed_tick(&mut daemon).await;
+        // Warm-up polled every account, so each has a completed reading to measure a gap from.
+        for i in 0..3 {
+            assert!(
+                daemon.state.accounts[i].last_reading_at.is_some(),
+                "slot {i} must carry a completed observation before the gap opens"
+            );
+        }
+        daemon.state.active = Some(1); // `spare` is now active …
+                                       // … designated at THIS instant, which is what the incident's clock runs from. Seeded rather
+                                       // than left to `note_active_designation` for the same reason the schedule is: the first tick
+                                       // would otherwise stamp the designation at its own `now`, i.e. AFTER the test's advance, and
+                                       // every gap would measure zero. Warm-up left every reading at this instant too, so the two
+                                       // origins coincide here and each test's advance is the whole gap.
+        daemon.state.active_designation = Some(ActiveDesignation {
+            account_uuid: "u-B".to_owned(),
+            at: daemon.clock.now(),
+        });
+        daemon.state.poll_schedule = vec![0, 2, 0, 2]; // … and the schedule never names it
+        daemon.state.poll_pos = 0;
+        daemon
+    }
+
+    /// AC-1: an unobserved active emits WITHOUT any poll of it having run.
+    ///
+    /// The three negatives are the requirement's `BUT NOT` clauses, and each one is a detector that
+    /// stays silent here: nothing polled `spare`, so there is no `Err` for `blind_enter` to key on
+    /// and no in-block call that could have fired at all.
+    #[tokio::test]
+    async fn an_unobserved_active_emits_with_no_poll_of_it_having_run() {
+        let mut daemon = daemon_with_an_unobserved_active().await;
+        // 2 · poll_secs / N = 2 · 60 / 3 = 40 s. Cross it.
+        daemon.clock.advance(Duration::from_secs(45));
+
+        let outcome = daemon.tick().await;
+
+        // This tick polled the SCHEDULED account, never the active one.
+        let polled: Vec<&str> = outcome
+            .diagnostics
+            .iter()
+            .filter_map(|d| match d {
+                Diagnostic::Poll { account, .. } => Some(account.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(polled, vec!["work"], "the stale schedule polls `work`");
+        // So every poll-keyed detector is silent about `spare` — including the blind pair, whose
+        // entry arm needs a poll that RAN AND FAILED.
+        assert!(
+            !outcome
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::BlindEnter { .. } | Event::BlindExit { .. })),
+            "no poll of `spare` ran, so no blind edge can exist: {:?}",
+            outcome.events
+        );
+
+        // And yet the gap is recorded.
+        let enter = outcome
+            .events
+            .iter()
+            .find(|e| matches!(e, Event::ObservationGapEnter { .. }))
+            .expect("the unobserved active must emit an observation-gap entry");
+        assert_eq!(
+            enter,
+            &Event::ObservationGapEnter {
+                account: "u-B".to_owned(),
+                elapsed_secs: 45,
+                threshold_secs: 40,
+                was_active: true,
+            }
+        );
+    }
+
+    /// AC-1's complement: the instrument does not fire while the active is observed inside the
+    /// bound. Without this the test above would pass on an instrument that emits unconditionally,
+    /// which is the failure mode an edge-triggered detector is most likely to have.
+    #[tokio::test]
+    async fn an_active_observed_inside_the_bound_emits_nothing() {
+        let mut daemon = daemon_with_an_unobserved_active().await;
+        daemon.clock.advance(Duration::from_secs(39)); // one second short of 2 · 60 / 3
+
+        let outcome = daemon.tick().await;
+
+        assert!(
+            !outcome
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::ObservationGapEnter { .. })),
+            "39 s < 40 s is not a crossing: {:?}",
+            outcome.events
+        );
+        assert!(daemon.state.accounts[1].observation_gap.is_none());
+    }
+
+    /// AC-2: one event on the crossing edge and one on re-observation — never one per tick for the
+    /// duration of the gap.
+    ///
+    /// The middle leg is the one that matters: at the live configuration a 638 s hole spans ~17
+    /// ticks, so a level-triggered instrument would write 17 lines for one episode and the signal
+    /// would drown in its own reporting.
+    #[tokio::test]
+    async fn the_observation_gap_emits_one_edge_each_way_not_one_per_tick() {
+        let mut daemon = daemon_with_an_unobserved_active().await;
+
+        // Leg 1 — the crossing. Exactly one entry.
+        daemon.clock.advance(Duration::from_secs(45));
+        let crossing = daemon.tick().await;
+        assert_eq!(
+            crossing
+                .events
+                .iter()
+                .filter(|e| matches!(e, Event::ObservationGapEnter { .. }))
+                .count(),
+            1,
+        );
+
+        // Leg 2 — the gap PERSISTS across the rest of the stale sweep, and stays silent through
+        // all of it. Three ticks: the seeded schedule holds four slots and the crossing consumed one.
+        for tick in 1..=3u64 {
+            daemon.clock.advance(Duration::from_secs(45));
+            let held = daemon.tick().await;
+            assert!(
+                !held.events.iter().any(|e| matches!(
+                    e,
+                    Event::ObservationGapEnter { .. } | Event::ObservationGapExit { .. }
+                )),
+                "a held gap emits no edge (tick {tick}): {:?}",
+                held.events
+            );
+        }
+
+        // Leg 3 — re-observation, reached the way the incident reached it: the stale schedule is
+        // exhausted, `next_poll_index` rebuilds it from the CURRENT active, and the active is at
+        // index 0 of the new one. The episode closes exactly once.
+        daemon.clock.advance(Duration::from_secs(45));
+        let reobserved = daemon.tick().await;
+        let exits: Vec<&Event> = reobserved
+            .events
+            .iter()
+            .filter(|e| matches!(e, Event::ObservationGapExit { .. }))
+            .collect();
+        assert_eq!(exits.len(), 1, "one close per episode: {exits:?}");
+        assert!(
+            daemon.state.accounts[1].observation_gap.is_none(),
+            "the anchor is released, so a later gap can open afresh"
+        );
+
+        // Leg 4 — and the closed episode does not re-open on the next quiet tick.
+        daemon.clock.advance(Duration::from_secs(10));
+        let after = daemon.tick().await;
+        assert!(
+            !after.events.iter().any(|e| matches!(
+                e,
+                Event::ObservationGapEnter { .. } | Event::ObservationGapExit { .. }
+            )),
+            "a freshly-observed active is not a new gap: {:?}",
+            after.events
+        );
+    }
+
+    /// AC-3: the exit line is sufficient ON ITS OWN to compute post-swap first-sight latency — the
+    /// elapsed gap and the population it belongs to, with no second source.
+    ///
+    /// Two properties are being pinned, and the first is the easy one to get wrong: `elapsed_secs`
+    /// is the WHOLE anchor-to-observation gap (6 × 45 s here), not the increment since the entry
+    /// line. An exit carrying only the post-crossing remainder would force a reader to join two
+    /// lines to recover one latency, which is precisely the second source the requirement forbids.
+    #[tokio::test]
+    async fn the_observation_gap_exit_carries_the_whole_latency_on_one_line() {
+        let mut daemon = daemon_with_an_unobserved_active().await;
+        // Four ticks consume the stale schedule (the crossing plus three held ticks) …
+        for _ in 0..4 {
+            daemon.clock.advance(Duration::from_secs(45));
+            let _ = daemon.tick().await;
+        }
+        // … and the fifth rebuilds it from the current active, so the active is finally polled.
+        daemon.clock.advance(Duration::from_secs(45));
+
+        let outcome = daemon.tick().await;
+
+        let exit = outcome
+            .events
+            .iter()
+            .find(|e| matches!(e, Event::ObservationGapExit { .. }))
+            .expect("re-observation closes the episode");
+        assert_eq!(
+            exit,
+            &Event::ObservationGapExit {
+                account: "u-B".to_owned(),
+                elapsed_secs: 225, // 5 × 45 s, measured from the anchor — not from the crossing
+                was_active: true,
+                swapped_away: false,
+            }
+        );
+        // The DURABLE surface is the rendered line, which is what an offline reader actually has.
+        assert_eq!(
+            exit.to_log_line(std::time::UNIX_EPOCH),
+            "ts=1970-01-01T00:00:00Z event=observation_gap_exit acct=u-B elapsed_secs=225 \
+             was_active=true swapped_away=false"
+        );
+    }
+
+    /// The tail that forces the exit edge to be per-account rather than active-scoped: an episode
+    /// can outlive the active designation it opened under.
+    ///
+    /// Closing only for the CURRENT active would strand this anchor — and a stranded anchor is worse
+    /// than an unclosed episode, because it also suppresses every future entry on that account. The
+    /// instrument would go permanently deaf on exactly the accounts a swap-churning fleet cycles
+    /// through, which is the population it exists for.
+    #[tokio::test]
+    async fn an_episode_that_outlives_its_active_still_closes_and_is_tagged() {
+        let mut daemon = daemon_with_an_unobserved_active().await;
+        daemon.clock.advance(Duration::from_secs(45));
+        let _ = daemon.tick().await;
+        assert!(daemon.state.accounts[1].observation_gap.is_some());
+
+        // The daemon moves on: `work` is active again, and `spare` is now an ordinary peer.
+        daemon.state.active = Some(0);
+        daemon.state.poll_schedule = vec![1];
+        daemon.state.poll_pos = 0;
+        daemon.clock.advance(Duration::from_secs(45));
+
+        let outcome = daemon.tick().await;
+
+        // Asserted as the WHOLE observation-gap event set for this tick, not by `find`, because the
+        // absence of a SECOND line is itself load-bearing. `work` has just been re-designated and
+        // its last reading is 90 s old against a 40 s bound, so an instrument anchored on the
+        // reading alone would open an episode on it in the same breath as closing this one — a
+        // freshly designated active reported as already in breach, on every swap. Anchoring on the
+        // designation is what makes that set empty.
+        let gap_events: Vec<&Event> = outcome
+            .events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    Event::ObservationGapEnter { .. } | Event::ObservationGapExit { .. }
+                )
+            })
+            .collect();
+        assert_eq!(
+            gap_events,
+            vec![&Event::ObservationGapExit {
+                account: "u-B".to_owned(),
+                elapsed_secs: 90,
+                was_active: true,
+                // Not a first sight of the CURRENT active: a reader folding this into the latency
+                // SLI would overstate it, so the line says so rather than leaving it to be inferred.
+                swapped_away: true,
+            }],
+        );
+        assert!(
+            daemon.state.accounts[1].observation_gap.is_none(),
+            "the anchor is released, so the instrument is not deafened on this account"
+        );
+    }
+
+    /// An active account with NO completed observation at all is still reported — measured from
+    /// the moment it was designated.
+    ///
+    /// This is the sharpest form of the population the instrument exists for, and the one no other
+    /// detector reaches: an account promoted before it was ever polled, or whose only polls failed.
+    /// `blind_enter`'s entry edge is `(None, Err(_))` against a RETAINED reading, so an account with
+    /// no reading to anchor on produces no blind episode either — the two guards would otherwise
+    /// both decline, and an active the daemon has never once seen would be the one thing the
+    /// observability surface says nothing about.
+    #[tokio::test]
+    async fn an_active_never_observed_at_all_is_measured_from_its_designation() {
+        let mut daemon = daemon_with_an_unobserved_active().await;
+        daemon.state.accounts[1].last_reading = None;
+        daemon.state.accounts[1].last_reading_at = None;
+        daemon.clock.advance(Duration::from_secs(45));
+
+        let outcome = daemon.tick().await;
+
+        let enter = outcome
+            .events
+            .iter()
+            .find(|e| matches!(e, Event::ObservationGapEnter { .. }))
+            .expect("a never-observed active is unobserved in the strongest sense");
+        assert_eq!(
+            enter,
+            &Event::ObservationGapEnter {
+                account: "u-B".to_owned(),
+                elapsed_secs: 45, // from the designation — the only origin there is
+                threshold_secs: 40,
+                was_active: true,
+            }
+        );
+    }
+
+    /// A single failed poll on a long-standing active does NOT open a gap.
+    ///
+    /// The trap this closes is that `last_reading_at` is CLEARED by a failed poll, so an instrument
+    /// reading it naively sees an account with no observation at all and measures from the
+    /// designation instead — which on a stable fleet is hours or days old. The consequence is not a
+    /// missing line but a fabricated one: an `ObservationGapEnter` reporting the account's whole
+    /// active tenure, followed by an exit carrying that span as a `swapped_away=false` first-sight
+    /// sample, which is exactly the population the latency SLI folds. One transient 401 would
+    /// manufacture a breach on a daemon that had observed the account seconds earlier.
+    ///
+    /// `blind_anchor.at` is the reading instant the failure discarded — `note_blind_episode`
+    /// retains it for its own reasons, and it runs earlier in the same tick — so the pair recovers
+    /// what the slot lost.
+    #[tokio::test]
+    async fn one_failed_poll_on_a_long_observed_active_opens_no_gap() {
+        let mut daemon = daemon_with_an_unobserved_active().await;
+        // Designated long ago and observed continuously since — nothing is wrong with this account.
+        let now = daemon.clock.now();
+        daemon.state.active_designation = Some(ActiveDesignation {
+            account_uuid: "u-B".to_owned(),
+            at: now - Duration::from_secs(3_600),
+        });
+
+        // Its next poll 401s, five seconds after a good reading.
+        daemon.poller = FakeRosterPoller::new()
+            .ok("u-A", 0.11, 0.10)
+            .unauthorized("u-B")
+            .ok("u-C", 0.33, 0.10);
+        daemon.state.poll_schedule = vec![1];
+        daemon.state.poll_pos = 0;
+        daemon.clock.advance(Duration::from_secs(5));
+
+        let outcome = daemon.tick().await;
+
+        assert!(
+            daemon.state.accounts[1].last_reading_at.is_none(),
+            "the failure cleared the stamp — otherwise this test proves nothing"
+        );
+        assert!(
+            daemon.state.accounts[1].blind_anchor.is_some(),
+            "and the blind episode retained the instant it discarded"
+        );
+        assert!(
+            !outcome
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::ObservationGapEnter { .. })),
+            "5 s since the last sight is not a gap, whatever the poll returned: {:?}",
+            outcome.events
+        );
+        assert!(daemon.state.accounts[1].observation_gap.is_none());
+    }
+
+    /// … but with no reading AND no designation on record, there is no instant to measure from, so
+    /// the instrument claims nothing rather than fabricating an origin.
+    ///
+    /// The never-fabricate-an-anchor discipline `note_blind_episode` follows, applied here for the
+    /// same reason: a gap asserted from an instant that does not exist is worse than silence,
+    /// because a reader cannot tell it apart from a measured one. Reachable only before the first
+    /// active ever resolves.
+    #[tokio::test]
+    async fn an_active_with_no_reading_and_no_designation_claims_no_gap() {
+        let mut daemon = daemon_with_an_unobserved_active().await;
+        daemon.state.accounts[1].last_reading = None;
+        daemon.state.accounts[1].last_reading_at = None;
+        daemon.state.active_designation = None;
+        daemon.clock.advance(Duration::from_secs(600)); // far past any bound
+
+        let outcome = daemon.tick().await;
+
+        assert!(
+            !outcome
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::ObservationGapEnter { .. })),
+            "no origin ⇒ no claim: {:?}",
+            outcome.events
+        );
+        assert!(daemon.state.accounts[1].observation_gap.is_none());
+    }
+
+    /// The other direction of the anchor choice: in STEADY STATE — an active that has been polled
+    /// since it was designated — the origin is the READING, not the designation.
+    ///
+    /// Without this the anchor rule is only ever exercised where the designation is the later of the
+    /// two, and taking the designation unconditionally would pass. It would also be catastrophic: an
+    /// account designated hours ago would present hours of elapsed time on every healthy tick, so
+    /// the instrument would open and close an episode continuously on a fleet with nothing wrong
+    /// with it — the exact flood the edge trigger exists to prevent, arriving through the anchor
+    /// instead of through the trigger.
+    #[tokio::test]
+    async fn a_long_standing_active_is_measured_from_its_reading_not_its_designation() {
+        let mut daemon = daemon_with_an_unobserved_active().await;
+        let now = daemon.clock.now();
+        // Designated long ago, and observed since — the ordinary case for an account that has been
+        // active for a while.
+        daemon.state.active_designation = Some(ActiveDesignation {
+            account_uuid: "u-B".to_owned(),
+            at: now - Duration::from_secs(3_600),
+        });
+        daemon.state.accounts[1].last_reading_at = Some(now);
+
+        daemon.clock.advance(Duration::from_secs(45));
+        let outcome = daemon.tick().await;
+
+        let enter = outcome
+            .events
+            .iter()
+            .find(|e| matches!(e, Event::ObservationGapEnter { .. }))
+            .expect("45 s past a 40 s bound is still a crossing");
+        assert_eq!(
+            enter,
+            &Event::ObservationGapEnter {
+                account: "u-B".to_owned(),
+                elapsed_secs: 45, // from the reading — not 3645 from the designation
+                threshold_secs: 40,
+                was_active: true,
+            }
+        );
+    }
+
+    /// The shared swap path leaves an open anchor exactly as it found it.
+    ///
+    /// `record_swap` is that path — the reactive, emergency, preemptive and socket swaps all route
+    /// through it — and it already clears four other carried records (`parked_landing`, `last_good`,
+    /// `last_blind_preempt_swap`, `last_landing_overshoot`'s siblings), so adding the
+    /// observation-gap anchor to that list is the natural-looking edit and the one that would
+    /// silently disarm this instrument: a change of active is precisely what OPENS the gap this
+    /// records, so an anchor a swap reset would be erased by the event it measures.
+    ///
+    /// Called directly rather than driven through `tick`, and the reason is a property of the
+    /// fixture rather than a shortcut: opening an episode at all requires an active the schedule
+    /// stops selecting, which this helper produces by FORCING `state.active` without moving the
+    /// credential store — so the outgoing stash no longer matches what the store holds and a real
+    /// `locked_swap` aborts (`TickAction::SwapFailed`) before `record_swap` is ever reached. The
+    /// tagging half of the property is driven end-to-end in the test below.
+    #[tokio::test]
+    async fn the_shared_swap_path_leaves_an_open_anchor_exactly_as_it_found_it() {
+        let mut daemon = daemon_with_an_unobserved_active().await;
+        daemon.clock.advance(Duration::from_secs(45));
+        let _ = daemon.tick().await;
+        let anchor = daemon.state.accounts[1]
+            .observation_gap
+            .expect("the episode opened");
+
+        daemon.clock.advance(Duration::from_secs(45));
+        let at = daemon.clock.now();
+        let incoming = daemon.roster[2].stash();
+        daemon.record_swap(2, &incoming, at).await;
+
+        assert_eq!(
+            daemon.state.active,
+            Some(2),
+            "the swap path ran, or the assertion below is vacuous"
+        );
+        assert_eq!(
+            daemon.state.accounts[1].observation_gap,
+            Some(anchor),
+            "the swap left the anchor byte-for-byte as it found it"
+        );
+    }
+
+    /// The tail a "is it active RIGHT NOW?" test cannot see: an account that left the designation
+    /// and came BACK before anything observed it.
+    ///
+    /// `active == Some(i)` reads `true` again at the close, so a `swapped_away` derived from that
+    /// alone would present the whole span as a first sight of the CURRENT designation — the longest
+    /// possible over-count, on the line whose entire purpose is that latency. A designation stamped
+    /// AFTER the anchor is what separates the two cases; an ordinary post-swap first sight anchors
+    /// ON its designation, so it compares equal and stays `false` (pinned by
+    /// `a_freshly_promoted_active_is_measured_from_the_promotion_not_its_peer_reading`).
+    #[tokio::test]
+    async fn an_account_that_left_the_designation_and_returned_is_not_a_first_sight() {
+        let mut daemon = daemon_with_an_unobserved_active().await;
+        daemon.clock.advance(Duration::from_secs(45));
+        let _ = daemon.tick().await;
+        let anchor = daemon.state.accounts[1]
+            .observation_gap
+            .expect("the episode opened");
+
+        // The designation moved away and back while the episode stayed open; `u-B` is active again.
+        daemon.clock.advance(Duration::from_secs(45));
+        daemon.state.active_designation = Some(ActiveDesignation {
+            account_uuid: "u-B".to_owned(),
+            at: daemon.clock.now(),
+        });
+        assert_eq!(daemon.state.active, Some(1), "still the active account");
+        assert!(
+            daemon.state.active_designation.as_ref().unwrap().at > anchor.at,
+            "the designation is later than the anchor — the whole discriminator"
+        );
+
+        daemon.state.poll_schedule = vec![1];
+        daemon.state.poll_pos = 0;
+        daemon.clock.advance(Duration::from_secs(45));
+
+        let outcome = daemon.tick().await;
+
+        let exit = outcome
+            .events
+            .iter()
+            .find(|e| matches!(e, Event::ObservationGapExit { .. }))
+            .expect("the observation closes the episode");
+        assert_eq!(
+            exit,
+            &Event::ObservationGapExit {
+                account: "u-B".to_owned(),
+                elapsed_secs: 135,
+                was_active: true,
+                swapped_away: true,
+            }
+        );
+    }
+
+    /// A FAILED poll neither closes an episode nor stops its clock.
+    ///
+    /// This is the branch that carries the instrument through the incident it is named for: a poll
+    /// that errors clears `last_reading_at`, so an exit arm reading it naively would either close
+    /// the episode on a failure (reporting a first sight that never happened) or, worse, close it
+    /// silently and lose the whole span. Those are the LONG episodes — the ones the latency SLI most
+    /// needs — so losing them would make the readout look better the worse the fleet behaved.
+    #[tokio::test]
+    async fn a_failed_poll_inside_an_episode_neither_closes_it_nor_stops_its_clock() {
+        let mut daemon = daemon_with_an_unobserved_active().await;
+        daemon.clock.advance(Duration::from_secs(45));
+        let _ = daemon.tick().await;
+        assert!(daemon.state.accounts[1].observation_gap.is_some());
+
+        // The active IS polled now — and 401s, so its reading stamp is cleared rather than moved.
+        daemon.poller = FakeRosterPoller::new()
+            .ok("u-A", 0.11, 0.10)
+            .unauthorized("u-B")
+            .ok("u-C", 0.33, 0.10);
+        daemon.state.poll_schedule = vec![1];
+        daemon.state.poll_pos = 0;
+        daemon.clock.advance(Duration::from_secs(45));
+
+        let failed = daemon.tick().await;
+
+        assert!(
+            daemon.state.accounts[1].last_reading_at.is_none(),
+            "the failure cleared the stamp — otherwise this test proves nothing"
+        );
+        assert!(
+            !failed
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::ObservationGapExit { .. })),
+            "a failure is not an observation: {:?}",
+            failed.events
+        );
+        assert!(
+            daemon.state.accounts[1].observation_gap.is_some(),
+            "the episode is still open"
+        );
+
+        // A successful poll finally observes it, and the reported gap spans the failure.
+        daemon.poller = FakeRosterPoller::new()
+            .ok("u-A", 0.11, 0.10)
+            .ok("u-B", 0.22, 0.10)
+            .ok("u-C", 0.33, 0.10);
+        daemon.state.poll_schedule = vec![1];
+        daemon.state.poll_pos = 0;
+        daemon.clock.advance(Duration::from_secs(45));
+
+        let recovered = daemon.tick().await;
+
+        let exit = recovered
+            .events
+            .iter()
+            .find(|e| matches!(e, Event::ObservationGapExit { .. }))
+            .expect("the successful poll closes the episode");
+        assert_eq!(
+            exit,
+            &Event::ObservationGapExit {
+                account: "u-B".to_owned(),
+                elapsed_secs: 135, // 3 × 45 s — the failed tick is inside the span, not the end of it
+                was_active: true,
+                swapped_away: false,
+            }
+        );
+    }
+
+    /// A degenerate bound disarms the ENTRY edge, and only that — an episode already open still
+    /// closes.
+    ///
+    /// `2 · poll_secs / N` truncates to zero once the rotation outnumbers twice the poll interval,
+    /// and a zero bound would open an episode on the active account's every tick. Returning early
+    /// would be the obvious way to suppress that, and it would strand every open anchor — which is
+    /// worse than the flood, because a stranded anchor also suppresses every future entry on its
+    /// account, so the instrument would stay deaf after the configuration was corrected.
+    #[tokio::test]
+    async fn a_degenerate_bound_disarms_entry_without_stranding_an_open_episode() {
+        let mut daemon = daemon_with_an_unobserved_active().await;
+        daemon.clock.advance(Duration::from_secs(45));
+        let _ = daemon.tick().await;
+        assert!(daemon.state.accounts[1].observation_gap.is_some());
+
+        // 2 · 1 / 3 truncates to 0.
+        daemon.poll_strategy.base = 1.0;
+        assert!(daemon.observation_gap_threshold().is_zero());
+
+        daemon.state.poll_schedule = vec![1];
+        daemon.state.poll_pos = 0;
+        daemon.clock.advance(Duration::from_secs(45));
+
+        let outcome = daemon.tick().await;
+
+        assert!(
+            outcome
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::ObservationGapExit { .. })),
+            "the open episode still closes: {:?}",
+            outcome.events
+        );
+        assert!(daemon.state.accounts[1].observation_gap.is_none());
+        // … and no new one opens, however long the account then goes unobserved.
+        daemon.state.poll_schedule = vec![0, 2];
+        daemon.state.poll_pos = 0;
+        daemon.clock.advance(Duration::from_secs(600));
+        let quiet = daemon.tick().await;
+        assert!(
+            !quiet
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::ObservationGapEnter { .. })),
+            "a zero bound is 'instrument off', not 'fire every tick': {:?}",
+            quiet.events
+        );
+    }
+
+    /// AC-5 (fail-open) and AC-6 (rate-neutral), on the tick where the instrument actually fires.
+    ///
+    /// Both requirements are about what the instrument must NOT do, so both are pinned as a
+    /// before/after comparison over the state it could have perturbed. AC-6 is the poll count and
+    /// the schedule: an instrument that "helpfully" re-polled the unobserved account, or re-pointed
+    /// the schedule at it, would issue a request this change is not allowed to add — and would also
+    /// quietly implement issue #1452, whose fix this is supposed to remain able to falsify.
+    /// AC-5 is everything else on the account it observed: the episode is recorded and NOTHING about
+    /// the account's readings, health, or carried state moves with it.
+    #[tokio::test]
+    async fn the_instrument_issues_no_poll_and_perturbs_no_carried_state() {
+        let mut daemon = daemon_with_an_unobserved_active().await;
+        daemon.clock.advance(Duration::from_secs(45));
+
+        let schedule_before = daemon.state.poll_schedule.clone();
+        let pos_before = daemon.state.poll_pos;
+        let before = daemon.state.accounts[1].clone();
+
+        let outcome = daemon.tick().await;
+
+        // AC-6 — exactly ONE poll this tick (the scheduled peer), no extra request for the account
+        // the instrument reported on.
+        assert_eq!(
+            outcome
+                .diagnostics
+                .iter()
+                .filter(|d| matches!(d, Diagnostic::Poll { .. }))
+                .count(),
+            1,
+            "the instrument adds no poll: {:?}",
+            outcome.diagnostics
+        );
+        // … and the schedule it read is left exactly as it found it, advanced only by the one slot
+        // `next_poll_index` consumed.
+        assert_eq!(daemon.state.poll_schedule, schedule_before);
+        assert_eq!(daemon.state.poll_pos, pos_before + 1);
+
+        // The instrument DID fire — otherwise everything below passes vacuously.
+        assert!(outcome
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::ObservationGapEnter { .. })));
+
+        // AC-5 — and the only thing it wrote on that account is its own anchor.
+        //
+        // Destructured rather than spot-checked, so the coverage cannot silently narrow: a TENTH
+        // per-account signal fails to compile here until someone decides whether the instrument is
+        // allowed to move it. The same discipline `fingerprint` uses for the issue #668 re-key
+        // property, applied to the field AC-5 is actually about.
+        let AccountRuntime {
+            health,
+            last_reading,
+            last_reading_at,
+            session_velocity,
+            parked_landing,
+            session_high_water,
+            blind_anchor,
+            observation_gap,
+            polled_once,
+        } = &daemon.state.accounts[1];
+        assert!(observation_gap.is_some(), "its own anchor moved");
+        assert_eq!(last_reading, &before.last_reading);
+        assert_eq!(last_reading_at, &before.last_reading_at);
+        assert_eq!(session_velocity, &before.session_velocity);
+        assert_eq!(blind_anchor, &before.blind_anchor);
+        assert_eq!(session_high_water, &before.session_high_water);
+        assert_eq!(parked_landing, &before.parked_landing);
+        assert_eq!(polled_once, &before.polled_once);
+        // `assert!` rather than `assert_eq!`: `AccountHealth` deliberately derives no `Debug`, and
+        // this test is not a reason to give a credential-adjacent record a formatter.
+        assert!(
+            health == &before.health,
+            "the instrument moved account health"
+        );
+        // And the loop still reached its decision — the instrument neither blocked nor short-circuited it.
+        assert!(outcome
+            .diagnostics
+            .iter()
+            .any(|d| matches!(d, Diagnostic::Tick { .. })));
+    }
+
+    /// AC-1's STRUCTURAL prohibition, driven rather than read: a tick on which NO account is polled
+    /// at all still emits.
+    ///
+    /// `an_unobserved_active_emits_with_no_poll_of_it_having_run` above proves no poll of the ACTIVE
+    /// ran, but a poll of some peer did — so it passes just as well against an instrument called
+    /// from INSIDE `if let Some(i) = poll_idx { … }`, which is the one placement the criterion
+    /// forbids. Backing every scheduled account off empties the block entirely, so the emission can
+    /// only have come from outside it. Without this the prohibition has no regression guard at all.
+    #[tokio::test]
+    async fn the_instrument_emits_on_a_tick_that_polls_nothing_at_all() {
+        let mut daemon = daemon_with_an_unobserved_active().await;
+        // Every account the stale schedule can select is inside a poll back-off window, so
+        // `poll_idx.filter(…)` yields `None` and the poll block is never entered.
+        let until = daemon.clock.now() + Duration::from_secs(3_600);
+        for i in [0, 2] {
+            daemon.state.accounts[i].health.poll_backoff_until = Some(until);
+        }
+        daemon.clock.advance(Duration::from_secs(45));
+
+        let outcome = daemon.tick().await;
+
+        assert_eq!(
+            outcome
+                .diagnostics
+                .iter()
+                .filter(|d| matches!(d, Diagnostic::Poll { .. }))
+                .count(),
+            0,
+            "the poll block must not have been entered at all: {:?}",
+            outcome.diagnostics
+        );
+        assert!(
+            outcome
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::ObservationGapEnter { .. })),
+            "a zero-poll tick still reports the gap: {:?}",
+            outcome.events
+        );
+    }
+
+    /// AC-3's quantity, on the population it exists for: an account PROMOTED from peer reports the
+    /// time since its promotion, not the time since the stale peer reading it arrived with.
+    ///
+    /// Peers are re-observed once per sweep, so a freshly-promoted account routinely carries a
+    /// reading a whole sweep old. Anchoring on that reading would fold pre-swap staleness into a
+    /// post-swap figure and the SLI would read high by roughly a sweep — on exactly the swaps it is
+    /// meant to grade, and in the direction that hides a fix. The anchor is therefore the LATER of
+    /// the reading and the change of active designation.
+    #[tokio::test]
+    async fn a_freshly_promoted_active_is_measured_from_the_promotion_not_its_peer_reading() {
+        let mut daemon = daemon_with_an_unobserved_active().await;
+        let promoted_at = daemon.clock.now();
+        // `spare` arrives carrying a reading from long before it was promoted — the shape a sweep
+        // leaves behind. The promotion itself is the designation the helper seeded at this same
+        // instant; `last_swap` is deliberately NOT set, because the anchor does not read it, and a
+        // line here that looked like the promotion would misdirect the next reader of the one test
+        // whose whole subject is which record the anchor uses.
+        daemon.state.accounts[1].last_reading_at = Some(promoted_at - Duration::from_secs(525));
+
+        daemon.clock.advance(Duration::from_secs(45));
+        let outcome = daemon.tick().await;
+
+        let enter = outcome
+            .events
+            .iter()
+            .find(|e| matches!(e, Event::ObservationGapEnter { .. }))
+            .expect("45 s past a 40 s bound is a crossing");
+        assert_eq!(
+            enter,
+            &Event::ObservationGapEnter {
+                account: "u-B".to_owned(),
+                // 45, not 570: the pre-promotion staleness belongs to the peer cadence, not to this
+                // SLI. A reader of this one line has the post-swap latency and nothing else folded in.
+                elapsed_secs: 45,
+                threshold_secs: 40,
+                was_active: true,
+            }
+        );
+
+        // And the same holds through to the close, which is the line the SLI is actually computed
+        // from: three more ticks consume the stale schedule, the fourth rebuilds it from the current
+        // active and finally polls it.
+        for _ in 0..3 {
+            daemon.clock.advance(Duration::from_secs(45));
+            let _ = daemon.tick().await;
+        }
+        daemon.clock.advance(Duration::from_secs(45));
+        let closed = daemon.tick().await;
+        let exit = closed
+            .events
+            .iter()
+            .find(|e| matches!(e, Event::ObservationGapExit { .. }))
+            .expect("re-observation closes the episode");
+        assert_eq!(
+            exit,
+            &Event::ObservationGapExit {
+                account: "u-B".to_owned(),
+                elapsed_secs: 225, // 5 × 45 s since the PROMOTION — not 750 since the peer reading
+                was_active: true,
+                swapped_away: false,
+            }
+        );
+    }
+
+    /// The crossing boundary is EXCLUSIVE — `elapsed == threshold` is not yet a breach.
+    ///
+    /// Either reading satisfies AC-1's "when that threshold is crossed" on its own, which is exactly
+    /// why it is worth pinning: an unpinned boundary is a decision nobody recorded, and the next
+    /// reader has to re-derive it from an `if`. The guarantee is what settles it — `R-1` says the
+    /// newly-designated active is observed WITHIN `2 · poll_secs / N`, and the SLI's target is
+    /// `p95 <= 2 · poll_secs / N`. At exactly the bound the guarantee is MET, so an episode opened
+    /// there would report a breach the requirement does not consider one.
+    #[tokio::test]
+    async fn the_crossing_boundary_is_exclusive_of_the_bound_itself() {
+        let mut daemon = daemon_with_an_unobserved_active().await;
+        daemon.clock.advance(Duration::from_secs(40)); // exactly 2 · 60 / 3
+
+        let at_the_bound = daemon.tick().await;
+
+        assert!(
+            !at_the_bound
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::ObservationGapEnter { .. })),
+            "elapsed == threshold is within the guarantee: {:?}",
+            at_the_bound.events
+        );
+        assert!(daemon.state.accounts[1].observation_gap.is_none());
+
+        // One second past it, and the same daemon reports.
+        daemon.clock.advance(Duration::from_secs(1));
+        let past_the_bound = daemon.tick().await;
+        let enter = past_the_bound
+            .events
+            .iter()
+            .find(|e| matches!(e, Event::ObservationGapEnter { .. }))
+            .expect("elapsed > threshold is a crossing");
+        assert_eq!(
+            enter,
+            &Event::ObservationGapEnter {
+                account: "u-B".to_owned(),
+                elapsed_secs: 41,
+                threshold_secs: 40,
+                was_active: true,
+            }
+        );
+    }
+
+    /// The bound is `2 · poll_secs / N` — derived, not a constant — so it tracks the configuration
+    /// the re-observation guarantee is actually stated against.
+    ///
+    /// It is read from `poll_strategy.base` DELIBERATELY, never from `next_poll_interval`: that draws
+    /// from the seeded `rng`, whose draw order every swap arm's fixtures pin, so an instrument that
+    /// drew would silently re-order them.
+    ///
+    /// This test asserts the ARITHMETIC only. The no-draw property is not pinned here and is not
+    /// pinned by the jitter fixtures either — `Jitter::None` consumes no sample, and no test ticks
+    /// under a jittered POLL strategy, so forcing a draw through leaves the suite green. What
+    /// actually guards it is the `&self` receiver on `observation_gap_threshold`: drawing needs
+    /// `&mut self`, so the call does not compile. That is a stronger guard than a fixture, and
+    /// stating it here is the point — the claim this comment used to make was false.
+    #[tokio::test]
+    async fn the_observation_bound_is_two_sub_intervals_of_the_current_rotation() {
+        let mut daemon = daemon_with_an_unobserved_active().await;
+        // Three rotation accounts at poll_secs = 60 → 2 · 60 / 3 = 40 s.
+        assert_eq!(
+            daemon.observation_gap_threshold(),
+            Duration::from_secs(40),
+            "N = 3"
+        );
+
+        // Quarantining a peer takes it out of the rotation, so N drops to 2 and the bound widens to
+        // 2 · 60 / 2 = 60 s — the active is now interleaved against one peer instead of two.
+        daemon.state.accounts[2].health.quarantined = true;
+        assert_eq!(
+            daemon.observation_gap_threshold(),
+            Duration::from_secs(60),
+            "N = 2"
+        );
     }
 
     // --- timing jitter strategies (issue #38) ------------------------------

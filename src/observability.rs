@@ -2048,6 +2048,76 @@ pub(crate) enum Event {
         after: i64,
         grant_replaced: Option<bool>,
     },
+    /// The ACTIVE account's last COMPLETED observation aged past the re-observation bound
+    /// (issue #1453) — the OPENING half of the observation-gap pair ([`Event::ObservationGapExit`]
+    /// closes it), and the one blindness signal in this file that does not need a poll to have
+    /// happened.
+    ///
+    /// Every other detector in the family keys on a poll that RAN AND FAILED:
+    /// [`Event::BlindEnter`]'s entry edge needs an `Err`, and [`Event::UsageBackoff`] needs a `429`
+    /// or a `5xx`/transient — either way, a poll.
+    /// A poll that was never ATTEMPTED produces neither, so an active account the poll schedule
+    /// stops selecting goes dark with nothing recording it. This event keys on ELAPSED TIME instead,
+    /// so the never-attempted case — and the narrower scheduled-but-skipped one (a back-off /
+    /// slow-poll filter dropping the scheduled index) — are both visible.
+    ///
+    /// Edge-triggered, mirroring the [`Event::BlindEnter`] / [`Event::BlindExit`] episode shape: one
+    /// line on the crossing, one on re-observation, never one per tick for the duration of the gap.
+    ///
+    /// `elapsed_secs` is the gap at the crossing, measured from the LATER of the account's last
+    /// completed reading and the swap that made it active — so on a freshly-promoted account it is
+    /// time-since-promotion, not time-since-a-stale-peer-reading, and the two regimes report the
+    /// same quantity. `threshold_secs` is the bound it crossed — the daemon's `2 · poll_secs / N`
+    /// re-observation interval, carried because it is derived from config the event log does not
+    /// otherwise contain, so a reader can tell a breach from a re-tuned bound without a second
+    /// source. (`ADR-0012` decision 4 states that interval for a STATIC active; it was never derived
+    /// for the mid-cycle change of active this event's primary population is made of, which that ADR
+    /// now records itself — § Status → Amended 2026-09-02.) `was_active` names the population: the emitter opens
+    /// an episode only on the ACTIVE account, so it reads `true` on every line the daemon writes
+    /// today — it states which population the line belongs to rather than leaving a reader to infer
+    /// it from the emitter's scoping, exactly as [`Event::BlindEnter`] carries the same-named field.
+    /// `account` is the account UUID (#15) — matching the usage-family `acct=` (never the free-form
+    /// label); every other field a bare number / bool, never a token or email.
+    ObservationGapEnter {
+        account: String,
+        elapsed_secs: u64,
+        threshold_secs: u64,
+        was_active: bool,
+    },
+    /// The account inside an observation gap was OBSERVED again (issue #1453): a poll completed and
+    /// refreshed its reading, closing the episode [`Event::ObservationGapEnter`] opened. The CLOSING
+    /// half of the pair, and the line the post-swap first-sight latency SLI is computed from.
+    ///
+    /// `elapsed_secs` is the WHOLE gap — anchor to this observation — not the increment since the
+    /// entry line, so the latency reads straight off one line without differencing two. The anchor
+    /// is the later of the account's last completed reading and the change of active designation
+    /// (see [`Event::ObservationGapEnter`]), which is what makes the number ON THIS LINE the SLI's
+    /// own quantity rather than a figure a reader would first have to net a preceding `event=swap`
+    /// out of. It spans any failed polls in between: a poll that errored is not an observation, so it neither closes the
+    /// episode nor stops the clock (that population is [`Event::BlindEnter`]'s, and the two records
+    /// are deliberately allowed to overlap rather than either suppressing the other).
+    ///
+    /// What the emitted set IS, because a percentile over it is easy to misread: the pair is
+    /// edge-triggered PAST the bound, so the exits form the tail
+    /// `{ latency > 2 · poll_secs / N }`, never the whole first-sight distribution. A p50 over these
+    /// lines is therefore the median of BREACHES, and the healthier the fleet the smaller and worse
+    /// that population reads — a within-bound first sight emits nothing at all. The `FAIL`-side
+    /// criterion (any single occurrence beyond the bound) and the breach tail are what this line
+    /// supports honestly; a p50 of first-sight latency needs a source that also records the
+    /// non-breaches, which no event here is.
+    ///
+    /// `was_active` carries the entry's population tag through, and `swapped_away` is the tail that
+    /// makes it usable: an episode that opened on the active account and closed after the daemon
+    /// had already swapped away is NOT a first-sight-of-the-new-active sample, so a reader that
+    /// folded it would overstate the latency. The same distinction, for the same reason, as
+    /// [`Event::BlindExit`]'s field of that name. `account` is the account UUID (#15) — matching the
+    /// usage-family `acct=`; every other field a bare number / bool, never a token or email.
+    ObservationGapExit {
+        account: String,
+        elapsed_secs: u64,
+        was_active: bool,
+        swapped_away: bool,
+    },
 }
 
 impl Event {
@@ -2754,6 +2824,39 @@ impl Event {
                 };
                 format!(
                     "ts={ts} event=credential_expiry_observed acct={account} provenance={provenance}{before_field}{after_field}{delta}{rt_field}"
+                )
+            }
+            Event::ObservationGapEnter {
+                account,
+                elapsed_secs,
+                threshold_secs,
+                was_active,
+            } => {
+                // The observation-gap OPEN (issue #1453) — emitted the moment the active account's
+                // last completed reading ages past the `2 · poll_secs / N` re-observation bound,
+                // WITHOUT any poll of it having run. `threshold_secs` is the bound crossed: it is
+                // derived from config, which no other line on this channel carries, so an offline
+                // reader can separate a genuine breach from a re-tuned bound without a second
+                // source. All bare numbers + bools (#15); `acct=` is the UUID, matching the
+                // usage-family lines.
+                format!(
+                    "ts={ts} event=observation_gap_enter acct={account} elapsed_secs={elapsed_secs} threshold_secs={threshold_secs} was_active={was_active}"
+                )
+            }
+            Event::ObservationGapExit {
+                account,
+                elapsed_secs,
+                was_active,
+                swapped_away,
+            } => {
+                // The observation-gap CLOSE (issue #1453) — the post-swap first-sight latency
+                // sample. `elapsed_secs` is the WHOLE anchor-to-observation gap, so the latency
+                // reads off this one line rather than by differencing it against the entry;
+                // `swapped_away` is what lets a reader drop the episodes that closed after the
+                // daemon had already moved on, which are not first sights of a still-active
+                // account. All bare numbers + bools (#15); `acct=` is the UUID.
+                format!(
+                    "ts={ts} event=observation_gap_exit acct={account} elapsed_secs={elapsed_secs} was_active={was_active} swapped_away={swapped_away}"
                 )
             }
         };
@@ -5990,6 +6093,8 @@ pub(crate) mod tests {
             Event::RetryAfterWalk { .. } => "RetryAfterWalk",
             Event::CredentialExpiryHorizon { .. } => "CredentialExpiryHorizon",
             Event::CredentialExpiryObserved { .. } => "CredentialExpiryObserved",
+            Event::ObservationGapEnter { .. } => "ObservationGapEnter",
+            Event::ObservationGapExit { .. } => "ObservationGapExit",
         }
     }
 
@@ -6253,6 +6358,21 @@ pub(crate) mod tests {
                 before: Some(1_785_499_802),
                 after: 1_785_586_202,
                 grant_replaced: Some(true),
+            },
+            // Issue #1453: the observation-gap pair. Both carry the account UUID and bare
+            // numbers/bools only, so they add no email/token surface; the exit is sampled with
+            // `swapped_away: true` so the scan covers the tail field as well.
+            Event::ObservationGapEnter {
+                account: "u-A".to_owned(),
+                elapsed_secs: 90,
+                threshold_secs: 75,
+                was_active: true,
+            },
+            Event::ObservationGapExit {
+                account: "u-A".to_owned(),
+                elapsed_secs: 638,
+                was_active: true,
+                swapped_away: true,
             },
         ];
         assert_samples_every_variant("Event", &samples, event_variant_name);
@@ -7378,6 +7498,69 @@ outcome=failed\n",
             line,
             format!(
                 "{TS0} event=blind_exit acct=u-A duration_secs=7512 session_burn_pct=-29 weekly_burn_pct=12 session_pct=29 session_at_recovery=0 weekly_pct=5 weekly_at_recovery=17 was_active=true swapped_away=true near_limit=false"
+            )
+        );
+    }
+
+    #[test]
+    fn the_observation_gap_pair_renders_the_gap_and_the_bound_it_crossed() {
+        // Issue #1453. The pair's whole job is that ONE line answers "how long was the active
+        // account unobserved?" — the post-swap first-sight latency, with no second source to join
+        // against. So the ENTRY carries the gap at the crossing AND `threshold_secs`, the bound it
+        // crossed: that bound is derived from config (`2 · poll_secs / N`), which appears nowhere
+        // else on this channel, so without it a reader cannot tell a real breach from a re-tuned
+        // bound. The figures here are the live configuration's — 75 s at `poll_secs=300`, `N=8`.
+        let enter = Event::ObservationGapEnter {
+            account: "u-B".to_owned(),
+            elapsed_secs: 76,
+            threshold_secs: 75,
+            was_active: true,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            enter,
+            format!(
+                "{TS0} event=observation_gap_enter acct=u-B elapsed_secs=76 threshold_secs=75 was_active=true"
+            )
+        );
+
+        // The CLOSE carries the WHOLE gap — 638 s, the worst episode actually measured — not the
+        // increment since the entry, so the latency is read off this line alone. `swapped_away=false`
+        // is what makes it a first sight of a still-active account, and so a usable SLI sample.
+        let exit = Event::ObservationGapExit {
+            account: "u-B".to_owned(),
+            elapsed_secs: 638,
+            was_active: true,
+            swapped_away: false,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            exit,
+            format!(
+                "{TS0} event=observation_gap_exit acct=u-B elapsed_secs=638 was_active=true swapped_away=false"
+            )
+        );
+    }
+
+    #[test]
+    fn an_observation_gap_that_outlived_its_active_says_so() {
+        // The tail a naive reading of the pair would over-count: the gap opened on the active
+        // account and closed only after the daemon had already swapped away, so the account was
+        // observed as a PEER. It is a real episode — the account genuinely went unseen — but it is
+        // not a first sight of the current active, and folding it into the latency SLI would
+        // overstate that figure. The line says which it is rather than leaving it to be inferred
+        // from a join against the swap stream.
+        let line = Event::ObservationGapExit {
+            account: "u-C".to_owned(),
+            elapsed_secs: 420,
+            was_active: true,
+            swapped_away: true,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            line,
+            format!(
+                "{TS0} event=observation_gap_exit acct=u-C elapsed_secs=420 was_active=true swapped_away=true"
             )
         );
     }
