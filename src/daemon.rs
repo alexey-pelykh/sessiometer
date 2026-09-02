@@ -2467,6 +2467,10 @@ where
     pub(crate) async fn tick(&mut self) -> TickOutcome {
         self.state.ticks += 1;
         let at = self.clock.now();
+        // Issue #1452: the active designation this tick STARTED on, captured before anything can
+        // move it, so the re-resolve below can tell whether it changed. See the comparison there
+        // for why the third change-of-active seam can only be closed here.
+        let active_before_tick = self.state.active;
         let mut events: Vec<Event> = Vec::new();
         // The operator-facing diagnostics this cycle (issue #77), produced
         // unconditionally — `run_loop`'s `DiagnosticLog` applies the verbosity gate.
@@ -2523,6 +2527,39 @@ where
                 Some(canonical) => self.resolve_account_for(canonical).await,
                 None => self.resolve_active().await,
             };
+        }
+        // Issue #1452, the THIRD change-of-active seam — and the one that reaches neither swap
+        // path. `reconcile_canonical_change` above drops `active` to `None` when an out-of-band
+        // `claude /login` repoints the canonical at a different roster account, and the resolve
+        // just above re-designates it to that account WITHIN THIS TICK. No swap was recorded, so
+        // neither `record_swap` nor `adopt_manual_swap` runs — yet the schedule is every bit as
+        // stale, and `ADR-0012` § Status → Amended 2026-09-02 (#1454) binds the guarantee to the
+        // moment of designation "by any path". An enumeration of `poll_schedule` writes does not
+        // find this one, because it is an `active` write.
+        //
+        // Compared against the designation this tick STARTED on rather than handled inside
+        // `reconcile_canonical_change`, because that function deliberately does not resolve the
+        // incoming account — it clears `active` precisely so the resolve above does — and this is
+        // where the new designation is first known. That comparison also supplies the guard for
+        // free: a re-login of the account that was ALREADY active resolves back to the same index,
+        // changes no designation, and must not restart the peer sweep.
+        //
+        // It cannot double-fire with the swap paths either, and the reason is ORDERING WITHIN THE
+        // TICK rather than location relative to it — most of them run INSIDE this function, below.
+        // `recover_scrubbed_canonical` and `decide_action` (which reaches `emergency_swap`,
+        // `blind_swap` and `velocity_swap`) are all called from `tick` further down, so their
+        // `record_swap` commits strictly AFTER this comparison and cannot influence it; the next
+        // tick then captures their write in `active_before_tick`, finds `active` already `Some`,
+        // skips the re-resolve, and compares equal. Only `perform_socket_swap` and
+        // `adopt_manual_swap` run outside a tick at all. **This block must therefore stay ABOVE
+        // `decide_action`** — relocating it below would put a same-tick swap between the capture
+        // and the comparison and produce a genuine double-invalidation.
+        //
+        // On the first tick of a run it sees `None -> Some(_)` and clears a schedule that is still
+        // empty (`DecisionState` derives `Default`): a no-op, and the rebuild below was happening
+        // regardless.
+        if self.state.active != active_before_tick {
+            self.invalidate_poll_schedule();
         }
         let active = self.state.active;
         // Issue #1453: stamp the instant this designation began, BEFORE anything reads it. Placed
@@ -3069,6 +3106,47 @@ where
             }
         }
         schedule
+    }
+
+    /// Drop the standing poll schedule so [`next_poll_index`](Self::next_poll_index) rebuilds it
+    /// from current state on the VERY NEXT tick: after the clear its rebuild condition
+    /// `poll_pos >= poll_schedule.len()` reads `0 >= 0`, and
+    /// [`build_poll_schedule`](Self::build_poll_schedule) emits `[active, p₁, active, p₂, …]`, so
+    /// the account this rebuild is for sits at index 0 and is polled first.
+    ///
+    /// **Call this on every CHANGE OF ACTIVE (issue #1452), by any path.** The schedule is derived
+    /// from `state.active`, so a change of active makes it stale exactly as a roster change does —
+    /// but `next_poll_index` rebuilds only at a CYCLE BOUNDARY, so a change landing mid-cycle
+    /// leaves the departed active in every interleave slot and the incoming one unscheduled until
+    /// the wrap. `ADR-0012` § Status → Amended 2026-09-02 (#1454) binds the newly-designated
+    /// active's first observation at `2·poll_secs / N` **from the moment of designation**, and R-1
+    /// of `docs/requirements/active-account-observation-continuity.md` is the ratified requirement;
+    /// one rebuilt cycle costs one tick = `poll_secs / N`, half that bound.
+    ///
+    /// Rate-neutral, and structurally so (`ADR-0012` Decision 3): the tick divisor is
+    /// [`rotation_len`](Self::rotation_len) — DISTINCT rotation accounts taken from the roster —
+    /// which never reads `poll_schedule`, so re-deriving that vector cannot move a tick's timing,
+    /// add a tick, or add a request. It changes only WHICH index a tick polls.
+    ///
+    /// **Also called on a ROSTER change** — [`reconcile_roster`](Self::reconcile_roster) — whose
+    /// reason is the older and narrower one: INDEX VALIDITY, the vector held old roster indices. A
+    /// change of active moves no index, so that reason never reached it, which is precisely why the
+    /// active case went uncovered until #1452. Two reasons, one operation.
+    ///
+    /// Callers should invalidate only on an ACTUAL change: re-deriving the vector for an active
+    /// that did not change restarts the peer sweep for nothing, and nothing bounds peer coverage
+    /// under repeated changes of active (`ADR-0012` § Status, tracked at #1455). Two callers are
+    /// deliberately unconditional, and neither is an oversight:
+    ///
+    /// - [`record_swap`](Self::record_swap) — the shape the ratified solution design § 5 **B-1**
+    ///   specifies (unlike **B-2**, which is guarded). It is reachable with no change of
+    ///   designation only via `use --force <active>`, the display-repair self-swap that
+    ///   `swap_command_verdict` admits as `Swap` rather than `AlreadyActive` under `force`.
+    /// - `reconcile_roster` — pre-existing index-validity behaviour; a reload that changed nothing
+    ///   still invalidates.
+    fn invalidate_poll_schedule(&mut self) {
+        self.state.poll_schedule.clear();
+        self.state.poll_pos = 0;
     }
 
     /// Record that account `i` was polled this run and latch the warm-up flag (issue
@@ -4054,6 +4132,13 @@ where
     /// the normal swap and the emergency swap (#42).
     async fn record_swap(&mut self, target_idx: usize, incoming: &str, at: Instant) {
         self.state.active = Some(target_idx);
+        // Issue #1452: the schedule is DERIVED from `active` and `next_poll_index` rebuilds it only
+        // at a cycle boundary, so a swap landing mid-cycle would leave the just-parked account in
+        // every interleave slot and `target_idx` unscheduled until the wrap — the 8.5× observation
+        // overrun this closes. Invalidate here, in the SHARED swap-commit path, so the autonomous
+        // swap, the operator's daemon-routed `swap` (`perform_socket_swap`) and the scrubbed-canonical
+        // recovery (`recover_scrubbed_canonical`) are all covered by one write.
+        self.invalidate_poll_schedule();
         // Issue #613: the account going ACTIVE cannot be a parked-landing subject — disarm any landing
         // watch on it here (the shared swap path), so a prior park's stale window can't fire against an
         // account that is now active again. The complementary arm of the OUTGOING account (reason=session
@@ -12663,41 +12748,40 @@ mod tests {
     // --- issue #1451: the mid-cycle change-of-active regression oracle ------
     //
     // Pre-authored from the solution design AHEAD of its fix (issue #1452), so that whoever
-    // implements the fix does not get to bind the assertions grading it. The two positive
-    // oracles below are `#[ignore]`d for exactly as long as that separation lasts, and the
-    // reason is mechanical rather than a matter of taste: `main` is protected by a ruleset
+    // implements the fix did not get to bind the assertions grading it. The two positive
+    // oracles below landed `#[ignore]`d for exactly as long as that separation lasted, and the
+    // reason was mechanical rather than a matter of taste: `main` is protected by a ruleset
     // whose only required check is `ci-ok`, `ci-ok` needs the `test` job, and that job runs a
     // bare `cargo test` — so a test that is RED on purpose cannot be merged while it runs.
-    // Landing them ignored is what puts the assertions into `main`'s history BEFORE the fix,
-    // which is the whole point of filing them separately; removing the two attributes — and
-    // nothing else about them — belongs to the fix rather than to this change (issue #1452).
+    // Landing them ignored is what put the assertions into `main`'s history BEFORE the fix,
+    // which is the whole point of having filed them separately.
     //
-    // What that costs, and what pays it back. An ignored test is compiled (and linted) but not
-    // RUN, so it is CI-inert until un-ignored. Two things bound that. The negative case below
-    // is NOT ignored, so the fixture and the tick helper both stay exercised by every CI run
-    // and cannot rot unnoticed. And the RED demonstration is not deferred to a promise — it was
-    // measured before the attributes were applied, and it is reproducible from this tree on
-    // demand:
+    // **#1452 has since landed and both attributes are removed** — the two oracles now RUN on
+    // every CI run, and going green is the fix's AC-4. Nothing here is `#[ignore]`d any more, so
+    // `cargo test -- --ignored a_mid_cycle` — the on-demand recipe this comment used to offer —
+    // now selects ZERO tests and reports a green `ok` over an empty subject. Do not read that as
+    // a pass. The RED demonstration is reproducible only against a tree WITHOUT the fix: check
+    // out this file's parent commit, or neutralise the three `invalidate_poll_schedule` call
+    // sites (`record_swap`, `adopt_manual_swap`, and the change-of-active guard in `tick`) and
+    // run `cargo test -- a_mid_cycle`. Both then fail at their AC-3 LATENCY assertion with a
+    // first sight of 75 s against a 30 s bound. A pass there would have falsified the diagnosis
+    // rather than confirmed it, and would have sent #1451 back to analysis instead of on to the
+    // fix — as would a failure at any of the earlier assertions, which grade the setup and the
+    // request budget, not the latency.
     //
-    //     cargo test -- --ignored a_mid_cycle
-    //
-    // Both fail at their AC-3 LATENCY assertion with a first sight of 75 s against a 30 s
-    // bound. A pass there would falsify the diagnosis rather than confirm it, and would send
-    // #1451 back to analysis instead of on to the fix — as would a failure at any of the
-    // earlier assertions, which grade the setup and the request budget, not the latency.
-    //
-    // WHAT THIS LOCK DOES NOT COVER, stated here so the boundary travels with it. #1451's AC-2
-    // enumerates two active-changing paths and both are covered below. `ADR-0012` § Status →
-    // Amended 2026-09-02 (#1454) — which landed after this oracle was authored — enumerates a
-    // THIRD, and warns that "a mechanism that covers only the two swap seams leaves that one
-    // carrying the whole defect": `reconcile_canonical_change` (`src/daemon/canonical.rs`) drops
-    // `state.active` to `None` when an out-of-band login repoints the canonical at a different
-    // roster account, and `tick`'s top-of-tick resolve re-designates it within the same tick.
-    // That is an `active` write and not a `poll_schedule` write, so an enumeration of schedule
-    // writes does not find it — and neither does this lock. Going GREEN here is therefore
-    // evidence about the two swap seams and about nothing else; widening the enumeration is
-    // #1452's to carry, and it is recorded there rather than silently absorbed into this
-    // issue's ratified scope.
+    // WHAT THIS LOCK DID NOT COVER, kept because the boundary is still worth knowing. #1451's
+    // AC-2 enumerates two active-changing paths and both are covered by the two oracles below.
+    // `ADR-0012` § Status → Amended 2026-09-02 (#1454) — which landed after this oracle was
+    // authored — enumerates a THIRD, and warns that "a mechanism that covers only the two swap
+    // seams leaves that one carrying the whole defect": `reconcile_canonical_change`
+    // (`src/daemon/canonical.rs`) drops `state.active` to `None` when an out-of-band login
+    // repoints the canonical at a different roster account, and `tick`'s top-of-tick resolve
+    // re-designates it within the same tick. That is an `active` write and not a
+    // `poll_schedule` write, so an enumeration of schedule writes does not find it — and neither
+    // did this lock. Widening the enumeration was #1452's to carry, and it did:
+    // `a_mid_cycle_out_of_band_login_observes_the_new_active_within_the_bound` and
+    // `an_out_of_band_relogin_of_the_active_account_does_not_disturb_the_schedule` cover that
+    // third path and sit directly below the negative case.
 
     /// How many ticks the oracles below observe after a change of active. Five is what the
     /// pre-fix gap costs on this fixture and two is the bound, so eight leaves the measurement
@@ -12844,7 +12928,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "RED oracle: pre-authored ahead of its fix (issue #1452), which un-ignores it"]
     async fn a_mid_cycle_autonomous_swap_observes_the_new_active_within_the_bound() {
         // Issue #1451: pins the observation-continuity guarantee across an AUTONOMOUS change of
         // active — after a swap the newly-active account is re-observed within `2·poll_secs/N`.
@@ -12989,7 +13072,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "RED oracle: pre-authored ahead of its fix (issue #1452), which un-ignores it"]
     async fn a_mid_cycle_adopted_manual_swap_observes_the_new_active_within_the_bound() {
         // Issue #1451, the OPERATOR-ADOPTED half of the same guarantee: a manual `use` swap
         // rewrote the canonical out of band and the daemon adopts it (issue #64), re-resolving
@@ -13164,6 +13246,212 @@ mod tests {
             "the tick after a same-account adoption must poll roster index \
              {next_by_the_undisturbed_schedule}, the entry the undisturbed schedule \
              {schedule_before:?} owed at cursor {cursor}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mid_cycle_out_of_band_login_observes_the_new_active_within_the_bound() {
+        // Issue #1452, the THIRD change-of-active path — the one #1451's two oracles cannot reach
+        // and the one `ADR-0012` § Status → Amended 2026-09-02 (#1454) singles out: an out-of-band
+        // `claude /login` repoints the canonical at a DIFFERENT roster account, so
+        // `reconcile_canonical_change` drops `state.active` to `None` and the top-of-tick resolve
+        // re-designates it within the same tick. No swap is recorded, so neither `record_swap` nor
+        // `adopt_manual_swap` runs — a fix wired only into those two leaves this path carrying the
+        // whole defect, and an enumeration of `poll_schedule` writes never finds it because it is
+        // an `active` write.
+        let mut daemon = four_account_daemon().await;
+        warmed_tick(&mut daemon).await;
+        tick_and_report_the_polled_account(&mut daemon).await;
+
+        // The same strictly-inside-a-cycle precondition the two oracles assert on their setup: at a
+        // boundary the next `next_poll_index` rebuilds anyway and the defect cannot show.
+        let cycle_len = daemon.state.poll_schedule.len();
+        let cursor = daemon.state.poll_pos;
+        assert!(
+            cursor > 0 && cursor < cycle_len,
+            "the change of active must land mid-cycle, but the cursor sits at {cursor} of a \
+             {cycle_len}-entry schedule — a boundary, which is the case that already works"
+        );
+
+        // The contract, derived from the daemon's own state exactly as the two oracles derive it:
+        // `ADR-0012` Decision 3's `poll_secs / N` per-source floor, divisor `rotation_len` (the
+        // DISTINCT rotation-account count, never the ~2N schedule length), and two of them for the
+        // bound. Exact here because the `tunables` fixture pins the #540 near-limit cap — the one
+        // thing that may legitimately return LESS than the floor — to its `0` kill-switch.
+        let interval = daemon.next_poll_interval();
+        let rotation_len = daemon.rotation_len();
+        let expected_spacing = interval / rotation_len.max(1) as u32;
+        let bound = expected_spacing * 2;
+
+        // The out-of-band login itself: `reserve`'s token lands in the canonical and the watch is
+        // deliberately NOT committed, which is what makes the next tick classify it `Changed`.
+        // Nothing forces `state.active` by hand — the daemon must reach `reserve` through its own
+        // re-stash and re-resolve, or this would prove nothing about the path under test.
+        daemon.store.write(&cred(b"D-token")).await.unwrap();
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "`work` must still be the designated active until the daemon observes the login"
+        );
+
+        let mut spacings = Vec::with_capacity(POST_CHANGE_TICKS);
+        let mut requests = 0u32;
+        let mut elapsed = Duration::ZERO;
+        let mut first_sight: Option<Duration> = None;
+        for _ in 0..POST_CHANGE_TICKS {
+            let (spacing, polled, tick_requests) =
+                tick_and_report_the_polled_account(&mut daemon).await;
+            spacings.push(spacing);
+            elapsed += spacing;
+            requests += tick_requests;
+            if first_sight.is_none() && polled == Some(3) {
+                first_sight = Some(elapsed);
+            }
+        }
+        assert_eq!(
+            daemon.state.active,
+            Some(3),
+            "the daemon must have re-resolved active to `reserve` from the repointed canonical"
+        );
+
+        // AC-4's rate halves first, so a "fix" that merely polled more is caught before its
+        // latency number is believed. Unlike the two swap oracles there is no separate
+        // across-the-change window to measure: the detection, the re-stash and the re-designation
+        // all happen INSIDE the first tick below, so the per-tick counts are the only place an
+        // extra request could hide — and they are counted from before the store write.
+        assert_eq!(
+            spacings,
+            vec![expected_spacing; POST_CHANGE_TICKS],
+            "the interleave is rate-neutral (ADR-0012 Decision 3), so a change of active must \
+             leave every tick at the `poll_secs / N` floor: the post-login window ticked \
+             {spacings:?} against {expected_spacing:?} per tick (N = {rotation_len} distinct \
+             rotation accounts)"
+        );
+        // The absolute count is what carries AC-2 / `ADR-0012` Decision 3 here. A per-tick-versus-
+        // total cross-check was deliberately NOT added alongside it: `tick_and_report_the_polled_account`
+        // derives each tick's count from consecutive non-overlapping reads of the same monotonic
+        // counter, so summing the deltas telescopes to `final - initial` by construction and the
+        // comparison could never fail — it would read as a third rate assertion while measuring
+        // nothing. Nothing outside the ticks can reach the poller anyway: the whole window holds
+        // one credential-store write, one `assert_eq!`, and a clock advance per iteration.
+        assert_eq!(
+            requests, POST_CHANGE_TICKS as u32,
+            "an out-of-band login must not add requests: the {POST_CHANGE_TICKS} ticks after it \
+             put {requests} usage requests on the wire, against the exactly one per tick the #80 \
+             stagger issues"
+        );
+
+        // The latency claim last, so the recorded failure is the diagnosis itself.
+        let first_sight = first_sight.unwrap_or_else(|| {
+            panic!(
+                "`reserve` became the canonical's account but was never polled at all in the \
+                 {POST_CHANGE_TICKS}-tick ({elapsed:?}) window after the login"
+            )
+        });
+        assert!(
+            first_sight <= bound,
+            "ADR-0012 § Status → Amended 2026-09-02 (#1454) binds the newly-active account's \
+             first observation at 2·poll_secs/N FROM THE MOMENT OF DESIGNATION, BY ANY PATH — \
+             and it names this path specifically, because it reaches neither swap seam. R-1 of \
+             docs/requirements/active-account-observation-continuity.md is the ratified \
+             requirement. After a mid-cycle out-of-band login repointed the canonical at \
+             `reserve` it was first polled {first_sight:?}, against a bound of {bound:?} \
+             (N = {rotation_len} distinct rotation accounts)"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_out_of_band_relogin_of_the_active_account_does_not_disturb_the_schedule() {
+        // Issue #1452, the NEGATIVE case for the third path — the counterpart of
+        // `an_adopted_manual_swap_to_the_same_account_does_not_disturb_the_schedule`. A `claude
+        // /login` that re-authenticates the account that is ALREADY active still classifies as
+        // `Changed` and still drops `state.active` to `None`, but the top-of-tick resolve puts the
+        // SAME index back. No designation changed, so nothing may be invalidated: restarting the
+        // peer sweep on every in-place token refresh would starve the peers of their turn, and
+        // `ADR-0012` § Status leaves peer coverage under repeated changes of active unbounded
+        // (#1455). Passes both before and after the fix by design — it guards against
+        // OVER-invalidating, it does not detect the defect.
+        let mut daemon = four_account_daemon().await;
+        warmed_tick(&mut daemon).await;
+        tick_and_report_the_polled_account(&mut daemon).await;
+
+        let cycle_len = daemon.state.poll_schedule.len();
+        let cursor = daemon.state.poll_pos;
+        assert!(
+            cursor > 0 && cursor < cycle_len,
+            "the re-login must land mid-cycle, but the cursor sits at {cursor} of a \
+             {cycle_len}-entry schedule"
+        );
+        let schedule_before = daemon.state.poll_schedule.clone();
+        // What the UNDISTURBED schedule owes the very next tick, captured BEFORE the re-login so
+        // the assertion at the end cannot be satisfied by whatever the re-login left behind.
+        let next_by_the_undisturbed_schedule = schedule_before[cursor];
+
+        // A fresh token for `work`, the account already active — exactly the shape of an in-place
+        // refresh. TWO resolutions follow, and they run on different signals: DETECTION, inside
+        // `reconcile_canonical_change`, finds no stash matching these bytes and falls through to
+        // the `~/.claude.json` display step, which names `u-A`; that is what identifies the account
+        // to re-stash, and only the re-stash succeeding clears `state.active` at all.
+        // RE-DESIGNATION, in `tick`'s own resolve — the one the guard under test compares — then
+        // walks the stashes first and matches the freshly re-stashed `A-token-v2` on `u-A`, never
+        // reaching the display fallback.
+        daemon.store.write(&cred(b"A-token-v2")).await.unwrap();
+
+        // Drive the tick that detects it. The structural assertions below are read AFTER this
+        // tick rather than before, because unlike the adoption case there is no seam that runs
+        // outside a tick — the detect, the re-stash and the re-resolve are all inside it, and the
+        // cursor legitimately advances by the one entry this tick consumed.
+        let (_, polled, _) = tick_and_report_the_polled_account(&mut daemon).await;
+
+        // The re-login WAS detected — otherwise everything below passes vacuously. Every other
+        // assertion here is equally satisfied by nothing having happened: `active` is `Some(0)`
+        // because it already was, and an untouched schedule is what an undetected change leaves
+        // too. Only `restash_account` writes this token into `u-A`'s stash, and the `state.active`
+        // clear that the guard under test then re-resolves sits inside the same success arm — so
+        // this is the one observable proving the path ran. Its sibling
+        // `an_adopted_manual_swap_to_the_same_account_does_not_disturb_the_schedule` needs no such
+        // assertion: its stimulus is a direct call, which cannot silently not-run.
+        // Compared with `Credential::matches` rather than `assert_eq!`: `Credential` deliberately
+        // implements no `Debug`, so a secret can never reach a panic message.
+        assert!(
+            daemon
+                .stash
+                .read("Sessiometer/u-A")
+                .await
+                .expect("`work`'s stash must be readable")
+                .credential
+                .matches(&cred(b"A-token-v2")),
+            "the re-login must have been DETECTED and re-stashed onto `work` — without that, \
+             `state.active` was never cleared and every assertion below holds vacuously"
+        );
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "a re-login of the active account must leave `work` active"
+        );
+        assert_eq!(
+            polled,
+            Some(next_by_the_undisturbed_schedule),
+            "the tick that observes a re-login of the ACTIVE account must poll roster index \
+             {next_by_the_undisturbed_schedule}, the entry the undisturbed schedule \
+             {schedule_before:?} owed at cursor {cursor}"
+        );
+        // The standing cycle must still be the one that was standing — an eager invalidation
+        // replaces the vector, and the cursor must have advanced by exactly the entry consumed
+        // above rather than restarted.
+        assert_eq!(
+            daemon.state.poll_schedule, schedule_before,
+            "a re-login of the active account must leave the schedule standing, but it became \
+             {:?} from {schedule_before:?}",
+            daemon.state.poll_schedule
+        );
+        assert_eq!(
+            daemon.state.poll_pos,
+            cursor + 1,
+            "the cursor must have advanced by the single entry this tick consumed, from {cursor} \
+             to {}, but it sits at {}",
+            cursor + 1,
+            daemon.state.poll_pos
         );
     }
 

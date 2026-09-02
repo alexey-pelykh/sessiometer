@@ -25,11 +25,20 @@ derived for a mid-cycle change of active.** *Mid-cycle* here means: while a sche
 **The guarantee, restated so it holds across a change of active.** `2·poll_secs / N` binds **from the
 moment an account is designated active, by any path — not from the start of the cycle in which that
 designation happens.** This *extends* Decision 4's domain and revises nothing in it: for a static
-active the interval and the 1:1-interleave cap are unchanged and still correct. **No mechanism in
-the tree delivers this yet** — read it as the standard the code owes, not as a description of
-current behaviour. Conformance is tracked at **#1452**, gated on the **#1451** oracle being
-demonstrated RED against the pre-fix tree first, and on the **#1453** instrument, without which a
-never-attempted poll emits nothing and a landed fix moves no readout.
+active the interval and the 1:1-interleave cap are unchanged and still correct. Conformance was
+tracked at **#1452**, gated on the **#1451** oracle being demonstrated RED against the pre-fix tree
+first, and on the **#1453** instrument, without which a never-attempted poll emits nothing and a
+landed fix moves no readout.
+
+**Delivered 2026-09-02 (#1452).** When this amendment was written no mechanism in the tree delivered
+the restated guarantee, and it read as the standard the code owed rather than as a description of
+current behaviour. That is no longer so: `Daemon::invalidate_poll_schedule` (`src/daemon.rs`) drops
+the standing schedule so `next_poll_index` rebuilds it on the very next tick, and it is called from
+every path enumerated below — `record_swap`, `adopt_manual_swap`, and the change-of-active guard in
+`tick` that covers the third path. First sight is one tick, `poll_secs / N`, half the bound. Read
+the paragraphs that follow as the derivation of a guarantee the code now meets. Two things they say
+are unaffected and still open: the `account_backing_off` limit immediately below, and the peer-bound
+question at **#1455**.
 
 *By any path* is meant literally, and the enumeration is wider than it looks. `record_swap`
 (`src/daemon.rs`) is the **shared swap-commit path** — the autonomous swap-away reaches it, and so
@@ -205,9 +214,10 @@ retained only as a small-roster fallback, gated on a source-window check.
    > is consumed. When the active changes **mid-cycle** the two come apart, and this item
    > does not reach that case. The amendment widens the domain — the interval binds from
    > the moment an account is **designated** active, by any path — and leaves the number
-   > and the 1:1-interleave cap exactly as stated. **No mechanism in the tree delivers the
-   > widened form yet** (#1452); and the peer bound stated above is derived over an
-   > uninterrupted traversal, which a conforming mechanism does not preserve for free.
+   > and the 1:1-interleave cap exactly as stated. The widened form is **delivered as of
+   > 2026-09-02** (#1452) — see § Status → Delivered; and the peer bound stated above is
+   > derived over an uninterrupted traversal, which the delivered mechanism does not preserve
+   > for free (**#1455**).
 
 5. **Lowering `poll_secs` is a small-roster fallback only, behind a source-window
    check.** For a small roster the interleave yields little (few ticks per cycle; a
