@@ -53,6 +53,16 @@ where
             // the reset in `record_swap`.
             if next_active != prev_active {
                 self.state.last_good = None;
+                // Issue #1452: the poll schedule is derived from `active` and `next_poll_index`
+                // rebuilds it only at a cycle boundary, so an adoption landing mid-cycle would
+                // leave the departed active in every interleave slot and `next_active`
+                // unscheduled until the wrap. Under the SAME guard as the reset above, and for
+                // the same reason: a duplicate / same-account #64 notification changes no
+                // designation, and re-deriving the vector for it would restart the peer sweep for
+                // nothing. Inside the `if let Ok(canonical)` block, so a locked keychain — which
+                // leaves `active` unresolved and defers to the next tick's own resolve — does not
+                // invalidate a schedule that is still correct.
+                self.invalidate_poll_schedule();
             }
             self.state.canonical_watch.commit(&canonical);
         }
@@ -559,9 +569,11 @@ where
         }
         // The schedule held OLD roster indices; clear it so `next_poll_index` rebuilds a
         // fresh one (the active interleaved before each enabled non-quarantined peer,
-        // #366) at the next cycle start.
-        self.state.poll_schedule.clear();
-        self.state.poll_pos = 0;
+        // #366) at the next cycle start. This site's reason is INDEX VALIDITY and reaches
+        // only a roster change; a change of ACTIVE moves no index, which is why it went
+        // uncovered until #1452 — see `invalidate_poll_schedule`, whose contract now names
+        // both.
+        self.invalidate_poll_schedule();
     }
 }
 
