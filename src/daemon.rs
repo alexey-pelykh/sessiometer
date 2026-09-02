@@ -5589,13 +5589,28 @@ mod tests {
     /// unscripted account returns a transient error (unavailable).
     pub(super) struct FakeRosterPoller {
         readings: HashMap<String, Scripted>,
+        /// How many polls the daemon actually put ON THE WIRE — every [`RosterPoller::poll`]
+        /// call, whatever it returns. `ADR-0012` Decision 3 bounds REQUESTS, so this is what a
+        /// rate-neutrality assertion has to count; "ticks that polled something" is a strictly
+        /// weaker proxy, saturating at one per tick and blind to any request issued outside the
+        /// tick path. Read via [`requests`](Self::requests); a `Cell` for the same reason
+        /// [`FakeClock`] uses one — `poll` takes `&self`, and the daemon run loop is
+        /// single-threaded (`ADR-0001`).
+        requests: Cell<u32>,
     }
 
     impl FakeRosterPoller {
         pub(super) fn new() -> Self {
             Self {
                 readings: HashMap::new(),
+                requests: Cell::new(0),
             }
+        }
+
+        /// Requests issued so far. Tests take DELTAS across a window rather than reading it
+        /// absolutely, so a shared warm-up costs them nothing.
+        pub(super) fn requests(&self) -> u32 {
+            self.requests.get()
         }
         pub(super) fn ok(mut self, uuid: &str, session: f64, weekly: f64) -> Self {
             self.readings.insert(
@@ -5680,6 +5695,10 @@ mod tests {
 
     impl RosterPoller for FakeRosterPoller {
         async fn poll(&self, account: &Account, _active: bool) -> Result<PolledReading> {
+            // Counted BEFORE the outcome match, so every arm counts: a request that comes back
+            // `401` / `429` / transient still went out, and it is requests — not successful
+            // readings — that `ADR-0012` Decision 3 bounds.
+            self.requests.set(self.requests.get() + 1);
             match self.readings.get(&account.account_uuid) {
                 // The scripted decision reading, wrapped as a PolledReading with no
                 // severity (the collector's severity path is unit-tested directly).
@@ -12330,6 +12349,513 @@ mod tests {
             &tun,
         );
         assert_eq!(solo.next_subinterval(), Duration::from_secs(60));
+    }
+
+    // --- issue #1451: the mid-cycle change-of-active regression oracle ------
+    //
+    // Pre-authored from the solution design AHEAD of its fix (issue #1452), so that whoever
+    // implements the fix does not get to bind the assertions grading it. The two positive
+    // oracles below are `#[ignore]`d for exactly as long as that separation lasts, and the
+    // reason is mechanical rather than a matter of taste: `main` is protected by a ruleset
+    // whose only required check is `ci-ok`, `ci-ok` needs the `test` job, and that job runs a
+    // bare `cargo test` — so a test that is RED on purpose cannot be merged while it runs.
+    // Landing them ignored is what puts the assertions into `main`'s history BEFORE the fix,
+    // which is the whole point of filing them separately; removing the two attributes — and
+    // nothing else about them — belongs to the fix rather than to this change (issue #1452).
+    //
+    // What that costs, and what pays it back. An ignored test is compiled (and linted) but not
+    // RUN, so it is CI-inert until un-ignored. Two things bound that. The negative case below
+    // is NOT ignored, so the fixture and the tick helper both stay exercised by every CI run
+    // and cannot rot unnoticed. And the RED demonstration is not deferred to a promise — it was
+    // measured before the attributes were applied, and it is reproducible from this tree on
+    // demand:
+    //
+    //     cargo test -- --ignored a_mid_cycle
+    //
+    // Both fail at their AC-3 LATENCY assertion with a first sight of 75 s against a 30 s
+    // bound. A pass there would falsify the diagnosis rather than confirm it, and would send
+    // #1451 back to analysis instead of on to the fix — as would a failure at any of the
+    // earlier assertions, which grade the setup and the request budget, not the latency.
+    //
+    // WHAT THIS LOCK DOES NOT COVER, stated here so the boundary travels with it. #1451's AC-2
+    // enumerates two active-changing paths and both are covered below. `ADR-0012` § Status →
+    // Amended 2026-09-02 (#1454) — which landed after this oracle was authored — enumerates a
+    // THIRD, and warns that "a mechanism that covers only the two swap seams leaves that one
+    // carrying the whole defect": `reconcile_canonical_change` (`src/daemon/canonical.rs`) drops
+    // `state.active` to `None` when an out-of-band login repoints the canonical at a different
+    // roster account, and `tick`'s top-of-tick resolve re-designates it within the same tick.
+    // That is an `active` write and not a `poll_schedule` write, so an enumeration of schedule
+    // writes does not find it — and neither does this lock. Going GREEN here is therefore
+    // evidence about the two swap seams and about nothing else; widening the enumeration is
+    // #1452's to carry, and it is recorded there rather than silently absorbed into this
+    // issue's ratified scope.
+
+    /// How many ticks the oracles below observe after a change of active. Five is what the
+    /// pre-fix gap costs on this fixture and two is the bound, so eight leaves the measurement
+    /// margin on both sides AND carries the window past the cycle wrap that ends the gap — so a
+    /// run that measures nothing (an oracle silently observing an empty window) cannot be
+    /// mistaken for a run that measured a pass.
+    const POST_CHANGE_TICKS: usize = 8;
+
+    /// A FOUR-account daemon (`work` active, then `spare`, `backup`, `reserve`) with the
+    /// canonical holding `work`'s token — the fixture for the issue #1451 oracles below.
+    ///
+    /// Four rather than the three of `three_account_daemon` is load-bearing, not incidental.
+    /// With `work` active the schedule is `[0, 1, 0, 2, 0, 3]`, so a change of active to
+    /// `reserve` (roster index 3) targets the LAST interleave slot: the pre-fix gap then spans
+    /// five sub-intervals against a two-sub-interval bound. A three-account roster puts the new
+    /// active one slot earlier and leaves a single tick of margin, where one mis-counted tick
+    /// would flip the verdict in either direction.
+    ///
+    /// Every account is scripted far below every trigger (0.10 session / 0.10 weekly against a
+    /// 95 ceiling and an 80 floor), so no tick takes a swap decision of its own and the only
+    /// change of active in these tests is the one the test drives. That every account is
+    /// scripted `Ok` is load-bearing a SECOND time, for a reason that is easy to lose: it is
+    /// what makes a request and a moved `last_reading_at` stamp the same event, which
+    /// `tick_and_report_the_polled_account` asserts rather than assumes — script one account
+    /// `Scripted::Transient` and that assertion fails loudly instead of silently under-counting.
+    async fn four_account_daemon() -> FakeDaemon {
+        let roster = vec![
+            account("u-A", "work"),
+            account("u-B", "spare"),
+            account("u-C", "backup"),
+            account("u-D", "reserve"),
+        ];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+            ("Sessiometer/u-C", b"C-token", "u-C"),
+            ("Sessiometer/u-D", b"D-token", "u-D"),
+        ])
+        .await;
+        let (dir, json) = claude_json("u-A");
+        // Keep the temp `~/.claude.json` alive for the daemon's lifetime by leaking the guard —
+        // these are short-lived unit-test daemons (as `three_account_daemon`).
+        std::mem::forget(dir);
+        let tun = tunables(95, 80, 0);
+        Daemon::new(
+            roster,
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .ok("u-B", 0.10, 0.10)
+                .ok("u-C", 0.10, 0.10)
+                .ok("u-D", 0.10, 0.10),
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        )
+    }
+
+    /// Drive ONE tick at the daemon's own declared cadence and report what it observed: the
+    /// sub-interval waited beforehand, the roster index the tick actually POLLED (`None` when it
+    /// polled nothing), and how many usage requests the tick put ON THE WIRE.
+    ///
+    /// The polled account is read off the `last_reading_at` stamp the poll writes (issue #449),
+    /// never off the schedule, so what is named is the poll that HAPPENED. Reading the schedule
+    /// instead would claim a request that never went out: a slot the tick consumed and then
+    /// filtered — a per-account back-off (#293) or the out-of-rotation slow-poll (#537) — issues
+    /// nothing, and `None` is the honest answer for it.
+    ///
+    /// The stamp alone UNDER-reports, though, and the request count is what closes that. `tick`
+    /// writes `last_reading_at = last_reading.as_ref().map(|_| now)`, so a FAILED poll CLEARS
+    /// the stamp: a tick polling an account whose stamp is already `None` leaves it `None`, and
+    /// the diff then reports "polled nothing" for a request that did go out — a THIRD honest-
+    /// `None` case, and the only dishonest one of the three. What rules it out here is the
+    /// FIXTURE rather than this helper — every account in `four_account_daemon` is scripted
+    /// `Ok` — so the two views are asserted to AGREE below instead of that property being left
+    /// unstated.
+    ///
+    /// Counting requests rather than ticks-that-polled is what makes this the real `ADR-0012`
+    /// Decision 3 guard: the poller counts every call it receives, wherever in the daemon it
+    /// came from, so a request issued OUTSIDE the tick path is visible here too.
+    ///
+    /// Ordering: this waits and THEN ticks, where the run loop ticks and then waits
+    /// (`wait_after_tick` -> `wait_for_next_poll` -> `next_subinterval`). That is the same
+    /// steady-state cadence offset by one, and it is the right order here, because the interval
+    /// being measured starts at a change of active landing BETWEEN two ticks. The one piece of
+    /// state the order could perturb is `near_limit_fast_poll` — `next_subinterval` READS it and
+    /// the tick WRITES it (issue #540) — and the `tunables` fixture ships `near_limit_poll_secs`
+    /// at its `0` kill-switch, the sole gate on that flag ever being set, so it is `false` under
+    /// either ordering here.
+    ///
+    /// The clock is advanced EXPLICITLY rather than through `wait_for_next_poll`, because
+    /// `FakeClock::tick` advances by its OWN `step` and ignores the interval it is handed — and
+    /// on the `frozen()` clock this fixture uses, that step is zero.
+    async fn tick_and_report_the_polled_account(
+        daemon: &mut FakeDaemon,
+    ) -> (Duration, Option<usize>, u32) {
+        let spacing = daemon.next_subinterval();
+        daemon.clock.advance(spacing);
+        let before: Vec<Option<Instant>> = daemon
+            .state
+            .accounts
+            .iter()
+            .map(|runtime| runtime.last_reading_at)
+            .collect();
+        let requests_before = daemon.poller.requests();
+        daemon.tick().await;
+        let requests = daemon.poller.requests() - requests_before;
+        let polled: Vec<usize> = (0..daemon.state.accounts.len())
+            .filter(|&i| daemon.state.accounts[i].last_reading_at != before[i])
+            .collect();
+        let restamped = polled.len();
+        // One tick puts at most ONE request on the wire — the whole point of the #80 stagger,
+        // and the per-tick half of ADR-0012 Decision 3. Asserted on the REQUEST count and not on
+        // the stamps, because a "fix" that closed the latency gap by polling the new active
+        // alongside the scheduled one is a rate violation whether or not both stamps move.
+        assert!(
+            requests <= 1,
+            "one tick must put at most one usage request on the wire (issue #80), but this tick \
+             issued {requests}"
+        );
+        // The stamp view of the same tick, kept because it is the one that names WHICH account —
+        // the request counter cannot.
+        assert!(
+            restamped <= 1,
+            "one tick must poll at most one account (issue #80), but this tick moved the \
+             readings of roster indices {polled:?}"
+        );
+        // …and the two views must AGREE. Under this fixture's all-`Ok` scripting a request
+        // always stamps exactly one account, so a disagreement is either the stamp diff
+        // under-reporting a failed poll (see the doc above) or a request that no scheduled poll
+        // accounts for — and both would silently weaken every count the callers build on the
+        // stamps.
+        assert_eq!(
+            restamped, requests as usize,
+            "the stamp diff and the request count disagree: {restamped} account(s) restamped \
+             ({polled:?}) against {requests} request(s) on the wire — under \
+             `four_account_daemon`'s all-`Ok` scripting every request stamps exactly one \
+             account, so either this fixture is no longer all-`Ok` or a request went out that \
+             the scheduled poll does not account for"
+        );
+        (spacing, polled.first().copied(), requests)
+    }
+
+    #[tokio::test]
+    #[ignore = "RED oracle: pre-authored ahead of its fix (issue #1452), which un-ignores it"]
+    async fn a_mid_cycle_autonomous_swap_observes_the_new_active_within_the_bound() {
+        // Issue #1451: pins the observation-continuity guarantee across an AUTONOMOUS change of
+        // active — after a swap the newly-active account is re-observed within `2·poll_secs/N`.
+        // `next_poll_index` rebuilds the schedule ONLY at a cycle wrap, and `record_swap`
+        // touches neither `poll_schedule` nor `poll_pos` when it sets `state.active`, so a swap
+        // landing mid-cycle leaves the PREVIOUS active in every interleave slot and the new one
+        // unobserved until the wrap. The nearest existing lock (#367) drives a reading crossing
+        // to its ceiling inside a single interval and stops at the first swap, so it cannot fail
+        // on a gap that spans several intervals — this measures the interval the guarantee
+        // actually bounds.
+        let mut daemon = four_account_daemon().await;
+        warmed_tick(&mut daemon).await;
+
+        // One tick past the warm-up wrap leaves the cursor at position 1 of the freshly rebuilt
+        // `[0, 1, 0, 2, 0, 3]`.
+        tick_and_report_the_polled_account(&mut daemon).await;
+
+        // AC-5, asserted on the SETUP rather than the outcome: the change of active below has to
+        // land strictly INSIDE a cycle. At a cycle boundary the very next `next_poll_index`
+        // rebuilds from the fresh active and the defect cannot show — that case already works and
+        // would pass pre-fix. (AC-3 forbids asserting the schedule was RESET as the outcome; this
+        // asserts only where in the cycle the change lands, before anything touches it.)
+        let cycle_len = daemon.state.poll_schedule.len();
+        let cursor = daemon.state.poll_pos;
+        assert!(
+            cursor > 0 && cursor < cycle_len,
+            "the change of active must land mid-cycle, but the cursor sits at {cursor} of a \
+             {cycle_len}-entry schedule — a boundary, which is the case that already works"
+        );
+
+        // THE CONTRACT, derived once here and used by both halves below. It is computed from
+        // `ADR-0012` Decision 3 — the per-source floor is `poll_secs / N`, whose divisor is
+        // `rotation_len`, the count of DISTINCT rotation accounts and NOT the ~2N schedule
+        // length — while the window below measures what `next_subinterval` actually RETURNS.
+        // Those are two different things, which is what keeps this a test rather than a
+        // tautology: a `next_subinterval` whose divisor drifted to the schedule length halves
+        // the measured spacing and leaves this expectation where it is, so they disagree and the
+        // spacing assertion reddens. (An earlier draft compared the window against a second
+        // control daemon instead. That comparison held BY CONSTRUCTION — both sides ran the same
+        // `next_subinterval` on the same rosters — and detected nothing.)
+        //
+        // The equality is exact HERE, not in general: `next_subinterval` legitimately returns
+        // LESS than the floor while the #540 near-limit cap is armed, and the `tunables` fixture
+        // pins `near_limit_poll_secs` to its `0` kill-switch — the sole gate on that cap — so
+        // nothing here can arm it. A fixture that armed it would need this expectation revisited,
+        // not the assertion relaxed.
+        let interval = daemon.next_poll_interval();
+        let rotation_len = daemon.rotation_len();
+        let expected_spacing = interval / rotation_len.max(1) as u32;
+        let bound = expected_spacing * 2;
+
+        // The change of active, in the engine's own order: the canonical is written FIRST, then
+        // the swap is recorded. The store write is load-bearing rather than ceremony —
+        // `record_swap` commits the INCOMING stash's credential to the canonical watch, so a
+        // canonical left holding `A-token` would classify as `Changed` on the next tick and
+        // `reconcile_canonical_change` would re-stash and re-resolve active out from under the
+        // measurement.
+        let requests_before_the_change = daemon.poller.requests();
+        daemon.store.write(&cred(b"D-token")).await.unwrap();
+        let at = daemon.clock.now();
+        daemon.record_swap(3, "Sessiometer/u-D", at).await;
+        assert_eq!(
+            daemon.state.active,
+            Some(3),
+            "the swap must have taken effect before the window is measured"
+        );
+
+        // AC-4, first half, and the one the per-tick counting below CANNOT reach: `ADR-0012`
+        // Decision 3 lets a change of active reorder the schedule and never lets it add a
+        // request. Measured across the change itself, because a fix that closed the latency gap
+        // by polling the new active from inside the swap path would leave every tick in the
+        // window still issuing exactly one request, and nothing else here would notice.
+        let requests_across_the_change = daemon.poller.requests() - requests_before_the_change;
+        assert_eq!(
+            requests_across_the_change, 0,
+            "a change of active may reorder the schedule but must never itself issue a usage \
+             request (ADR-0012 Decision 3), yet the store write plus `record_swap` put \
+             {requests_across_the_change} on the wire"
+        );
+
+        // Observe the window: per-tick spacing, requests on the wire, and when `reserve` — the
+        // account that just went active — is first seen.
+        let mut spacings = Vec::with_capacity(POST_CHANGE_TICKS);
+        let mut requests = 0u32;
+        let mut elapsed = Duration::ZERO;
+        let mut first_sight: Option<Duration> = None;
+        for _ in 0..POST_CHANGE_TICKS {
+            let (spacing, polled, tick_requests) =
+                tick_and_report_the_polled_account(&mut daemon).await;
+            spacings.push(spacing);
+            elapsed += spacing;
+            requests += tick_requests;
+            if first_sight.is_none() && polled == Some(3) {
+                first_sight = Some(elapsed);
+            }
+        }
+
+        // AC-4's remaining halves, read BEFORE the latency claim, so a "fix" that merely polled
+        // more is caught before its latency number is believed.
+        assert_eq!(
+            spacings,
+            vec![expected_spacing; POST_CHANGE_TICKS],
+            "the interleave is rate-neutral (ADR-0012 Decision 3), so a change of active must \
+             leave every tick at the `poll_secs / N` floor: the post-swap window ticked \
+             {spacings:?} against {expected_spacing:?} per tick (N = {rotation_len} distinct \
+             rotation accounts)"
+        );
+        assert_eq!(
+            requests, POST_CHANGE_TICKS as u32,
+            "a change of active must not add requests: the {POST_CHANGE_TICKS} ticks after the \
+             swap put {requests} usage requests on the wire, against the exactly one per tick \
+             the #80 stagger issues"
+        );
+
+        // AC-3 LAST, so the recorded failure is the latency assertion — the diagnosis itself.
+        //
+        // Two anchors, and the distinction is not pedantry. `ADR-0012` Decision 4 as ORIGINALLY
+        // written is not one of them: its arithmetic was derived for a STATIC active, and that
+        // absence is the finding this whole oracle rests on. `ADR-0012` § Status →
+        // Amended 2026-09-02 (#1454) is what closed it, restating the guarantee so that
+        // `2·poll_secs / N` binds from the moment an account is DESIGNATED active, by any path,
+        // rather than from the start of the cycle in which that designation happens — widening
+        // Decision 4's domain rather than revising it. That amendment is the authority for the
+        // mid-cycle case; R-1 of `docs/requirements/active-account-observation-continuity.md`
+        // (`[operator-ratified 2026-09-01]`) is the ratified requirement it serves.
+        let first_sight = first_sight.unwrap_or_else(|| {
+            panic!(
+                "`reserve` went active but was never polled at all in the \
+                 {POST_CHANGE_TICKS}-tick ({elapsed:?}) window after the swap"
+            )
+        });
+        assert!(
+            first_sight <= bound,
+            "ADR-0012 § Status → Amended 2026-09-02 (#1454) binds the newly-active account's \
+             first observation at 2·poll_secs/N FROM THE MOMENT OF DESIGNATION, by any path — \
+             the amendment that widened Decision 4, whose own arithmetic was derived for a \
+             STATIC active. R-1 of docs/requirements/active-account-observation-continuity.md \
+             is the ratified requirement. After a mid-cycle `record_swap` to `reserve` it was \
+             first polled {first_sight:?} after the swap, against a bound of {bound:?} \
+             (N = {rotation_len} distinct rotation accounts)"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "RED oracle: pre-authored ahead of its fix (issue #1452), which un-ignores it"]
+    async fn a_mid_cycle_adopted_manual_swap_observes_the_new_active_within_the_bound() {
+        // Issue #1451, the OPERATOR-ADOPTED half of the same guarantee: a manual `use` swap
+        // rewrote the canonical out of band and the daemon adopts it (issue #64), re-resolving
+        // active from that canonical. `adopt_manual_swap` sets `state.active` without touching
+        // `poll_schedule` or `poll_pos`, exactly as `record_swap` does — so the two paths share
+        // one defect and each needs its own case; covering only the autonomous one would leave a
+        // fix free to repair that path alone.
+        let mut daemon = four_account_daemon().await;
+        warmed_tick(&mut daemon).await;
+        tick_and_report_the_polled_account(&mut daemon).await;
+
+        // AC-5: the same strictly-inside-a-cycle precondition on the setup.
+        let cycle_len = daemon.state.poll_schedule.len();
+        let cursor = daemon.state.poll_pos;
+        assert!(
+            cursor > 0 && cursor < cycle_len,
+            "the change of active must land mid-cycle, but the cursor sits at {cursor} of a \
+             {cycle_len}-entry schedule — a boundary, which is the case that already works"
+        );
+
+        // The contract, derived from the daemon's own state exactly as above: `expected_spacing`
+        // is `ADR-0012` Decision 3's `poll_secs / N` per-source floor (divisor `rotation_len`,
+        // the DISTINCT rotation-account count, never the ~2N schedule length), and the bound is
+        // two of them. The window below measures what `next_subinterval` returns, so the two
+        // disagree the moment that divisor drifts. Exact here because the `tunables` fixture
+        // pins the #540 near-limit cap — the one thing that may legitimately return LESS than
+        // the floor — to its `0` kill-switch.
+        let interval = daemon.next_poll_interval();
+        let rotation_len = daemon.rotation_len();
+        let expected_spacing = interval / rotation_len.max(1) as u32;
+        let bound = expected_spacing * 2;
+
+        // The operator's `use` already rewrote the canonical to `reserve`'s token; adoption
+        // re-resolves active FROM that canonical (issue #207's shared token-first resolver), which
+        // is the real path — `state.active` is never forced by hand here, or the test would prove
+        // nothing about how the daemon reaches it.
+        let requests_before_the_change = daemon.poller.requests();
+        daemon.store.write(&cred(b"D-token")).await.unwrap();
+        daemon.adopt_manual_swap().await;
+        assert_eq!(
+            daemon.state.active,
+            Some(3),
+            "adoption must have re-resolved active to `reserve` before the window is measured"
+        );
+
+        // AC-4's swap-path half, as above: adoption may reorder and may never add a request, and
+        // this is the only assertion here that can see one issued from inside the adoption.
+        let requests_across_the_change = daemon.poller.requests() - requests_before_the_change;
+        assert_eq!(
+            requests_across_the_change, 0,
+            "an adopted manual swap may reorder the schedule but must never itself issue a usage \
+             request (ADR-0012 Decision 3), yet the store write plus `adopt_manual_swap` put \
+             {requests_across_the_change} on the wire"
+        );
+
+        let mut spacings = Vec::with_capacity(POST_CHANGE_TICKS);
+        let mut requests = 0u32;
+        let mut elapsed = Duration::ZERO;
+        let mut first_sight: Option<Duration> = None;
+        for _ in 0..POST_CHANGE_TICKS {
+            let (spacing, polled, tick_requests) =
+                tick_and_report_the_polled_account(&mut daemon).await;
+            spacings.push(spacing);
+            elapsed += spacing;
+            requests += tick_requests;
+            if first_sight.is_none() && polled == Some(3) {
+                first_sight = Some(elapsed);
+            }
+        }
+
+        // AC-4's window halves first, against the derived contract.
+        assert_eq!(
+            spacings,
+            vec![expected_spacing; POST_CHANGE_TICKS],
+            "the interleave is rate-neutral (ADR-0012 Decision 3), so an adopted manual swap must \
+             leave every tick at the `poll_secs / N` floor: the post-adoption window ticked \
+             {spacings:?} against {expected_spacing:?} per tick (N = {rotation_len} distinct \
+             rotation accounts)"
+        );
+        assert_eq!(
+            requests, POST_CHANGE_TICKS as u32,
+            "an adopted manual swap must not add requests: the {POST_CHANGE_TICKS} ticks after \
+             the adoption put {requests} usage requests on the wire, against the exactly one per \
+             tick the #80 stagger issues"
+        );
+
+        // AC-3 last, against R-1 — see the autonomous case above for why the ratified anchor is
+        // the requirement and not `ADR-0012` Decision 4, which supplies the value but never
+        // derived it for a mid-cycle change of active (R-12, issue #1454).
+        let first_sight = first_sight.unwrap_or_else(|| {
+            panic!(
+                "`reserve` went active but was never polled at all in the \
+                 {POST_CHANGE_TICKS}-tick ({elapsed:?}) window after the adopted manual swap"
+            )
+        });
+        assert!(
+            first_sight <= bound,
+            "ADR-0012 § Status → Amended 2026-09-02 (#1454) binds the newly-active account's \
+             first observation at 2·poll_secs/N FROM THE MOMENT OF DESIGNATION, by any path — \
+             the amendment that widened Decision 4, whose own arithmetic was derived for a \
+             STATIC active. R-1 of docs/requirements/active-account-observation-continuity.md \
+             is the ratified requirement. After a mid-cycle `adopt_manual_swap` to `reserve` it \
+             was first polled {first_sight:?} after the adoption, against a bound of {bound:?} \
+             (N = {rotation_len} distinct rotation accounts)"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_adopted_manual_swap_to_the_same_account_does_not_disturb_the_schedule() {
+        // Issue #1451, the NEGATIVE case: a same-account adoption — the canonical still holds the
+        // CURRENT active's token, so `next_active == prev_active` — must invalidate nothing. This
+        // passes both BEFORE and AFTER the fix BY DESIGN: it is a guard against the fix
+        // OVER-invalidating, not a detector of the defect. `adopt_manual_swap` already gates its
+        // #450 `last_good` reset on `next_active != prev_active`; any schedule invalidation must
+        // sit under that same guard, or every duplicate / out-of-order #64 notification would
+        // restart the cycle and starve the peers of their turn.
+        let mut daemon = four_account_daemon().await;
+        warmed_tick(&mut daemon).await;
+        tick_and_report_the_polled_account(&mut daemon).await;
+
+        // The same mid-cycle position the two oracles above adopt from, so this case guards
+        // exactly the state they mutate.
+        let cycle_len = daemon.state.poll_schedule.len();
+        let cursor = daemon.state.poll_pos;
+        assert!(
+            cursor > 0 && cursor < cycle_len,
+            "the adoption must land mid-cycle, but the cursor sits at {cursor} of a \
+             {cycle_len}-entry schedule"
+        );
+        let schedule_before = daemon.state.poll_schedule.clone();
+        // What the UNDISTURBED schedule dictates for the very next tick, captured BEFORE the
+        // adoption so the assertion at the end cannot be satisfied by whatever the adoption left.
+        let next_by_the_undisturbed_schedule = schedule_before[cursor];
+
+        // The canonical still holds `A-token`, so adoption re-resolves to the account that is
+        // ALREADY active.
+        daemon.adopt_manual_swap().await;
+
+        assert_eq!(
+            daemon.state.active,
+            Some(0),
+            "a same-account adoption must leave `work` active"
+        );
+        // Here the STRUCTURAL assertions are the correct ones — "nothing was invalidated" is the
+        // whole content of this case, and there is no interval to measure. Between them they
+        // catch every EAGER invalidation: an unguarded `poll_schedule.clear()` fails the first,
+        // and an unguarded `poll_pos = poll_schedule.len()` — which invalidates by parking the
+        // cursor past the end, leaving the vector intact — fails the second.
+        assert_eq!(
+            daemon.state.poll_schedule, schedule_before,
+            "a same-account adoption must leave the schedule standing, but it became {:?} from \
+             {schedule_before:?}",
+            daemon.state.poll_schedule
+        );
+        assert_eq!(
+            daemon.state.poll_pos, cursor,
+            "a same-account adoption must leave the cursor where it was ({cursor}), but it moved \
+             to {}",
+            daemon.state.poll_pos
+        );
+
+        // The load-bearing half, and the reason the two structural assertions are not enough:
+        // they see only the state an EAGER invalidation writes. A LAZY one writes none of it — a
+        // `schedule_stale` flag set here and consumed by `next_poll_index` leaves both the vector
+        // and the cursor byte-identical, passes both assertions above, and still rebuilds the
+        // cycle on the very next tick. Only driving that tick and comparing what it polled
+        // against the entry the STANDING cycle owed can catch it.
+        let (_, polled, _) = tick_and_report_the_polled_account(&mut daemon).await;
+        assert_eq!(
+            polled,
+            Some(next_by_the_undisturbed_schedule),
+            "the tick after a same-account adoption must poll roster index \
+             {next_by_the_undisturbed_schedule}, the entry the undisturbed schedule \
+             {schedule_before:?} owed at cursor {cursor}"
+        );
     }
 
     #[tokio::test]

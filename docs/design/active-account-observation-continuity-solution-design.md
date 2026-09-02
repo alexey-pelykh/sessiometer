@@ -294,10 +294,10 @@ gestural. All must pass **without modification**:
 
 | Test | File | What it pins |
 |---|---|---|
-| `the_sub_interval_spreads_a_cycle_across_the_rotation` | `src/daemon.rs:12304` | Tick spacing = `poll_secs / N`. The rate-neutrality lock proper |
-| `the_poll_schedule_interleaves_the_active_before_each_peer_and_wraps` | `src/daemon.rs:12244` | The `[active, p₁, active, p₂, …]` shape and its wrap |
-| `the_poll_schedule_interleaves_before_each_peer_and_handles_degenerate_rosters` | `src/daemon.rs:12273` | Degenerate rosters — no active, or an active with no peers |
-| `near_limit_fast_poll_caps_the_active_sub_interval_in_band_only` | `src/daemon.rs:12497` | The `#540` cap applies in-band only; steady-state cadence stays flat |
+| `the_sub_interval_spreads_a_cycle_across_the_rotation` | `src/daemon.rs` | Tick spacing = `poll_secs / N`. The rate-neutrality lock proper |
+| `the_poll_schedule_interleaves_the_active_before_each_peer_and_wraps` | `src/daemon.rs` | The `[active, p₁, active, p₂, …]` shape and its wrap |
+| `the_poll_schedule_interleaves_before_each_peer_and_handles_degenerate_rosters` | `src/daemon.rs` | Degenerate rosters — no active, or an active with no peers |
+| `near_limit_fast_poll_caps_the_active_sub_interval_in_band_only` | `src/daemon.rs` | The `#540` cap applies in-band only; steady-state cadence stays flat |
 
 
 | Attribute | Target | Gate |
