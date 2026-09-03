@@ -4253,6 +4253,270 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_refused_shrink_records_both_counts_on_the_reload_line() {
+        // Issue #1442 AC-1, end to end through the handler: the incident's own shape reaching the
+        // daemon over the wire — a live SIX-account daemon, a `config.toml` presenting ONE, and
+        // append-only intent. The roster survives and the refusal is LEGIBLE afterwards.
+        //
+        // Both counts, or the line says nothing. "refused 1" cannot be told from a daemon that
+        // refused a widening; `refused 1, was 6` is the whole event, and a shrink is not
+        // expressible in either number alone. Asserted on the RENDERED line — that is what an
+        // operator holding only the log actually reads — and token by token rather than over the
+        // tail, because this grammar is additively extensible by design.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        write_roster_config(&config_path, &[("u-A", "work")]);
+
+        let mut daemon: FakeDaemon = reconcile_daemon(vec![
+            account("u-A", "work"),
+            account("u-B", "spare"),
+            account("u-C", "third"),
+            account("u-D", "fourth"),
+            account("u-E", "fifth"),
+            account("u-F", "sixth"),
+        ])
+        .with_config_path(config_path);
+
+        let line = daemon
+            .adopt_roster_reload(ReloadIntent::AppendOnly)
+            .await
+            .to_log_line(std::time::UNIX_EPOCH);
+
+        assert_eq!(
+            roster_uuids(&daemon),
+            vec!["u-A", "u-B", "u-C", "u-D", "u-E", "u-F"],
+            "the live rotation is unchanged — five accounts did NOT leave it"
+        );
+        assert_eq!(field_of(&line, "event"), Some("roster_reload"), "{line}");
+        assert_eq!(
+            field_of(&line, "outcome"),
+            Some("refused"),
+            "the daemon DECLINED — it read the file and decided against it: {line}"
+        );
+        assert_eq!(
+            field_of(&line, "reason"),
+            Some("shrink"),
+            "and the reason separates this from the reload-disabled refusal: {line}"
+        );
+        assert_eq!(
+            field_of(&line, "previous"),
+            Some("6"),
+            "the `was` half of the pair: {line}"
+        );
+        assert_eq!(
+            field_of(&line, "incoming"),
+            Some("1"),
+            "and the half a post-read refusal can report, unlike reload_disabled: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mutating_reload_shrinks_the_live_roster_through_the_handler() {
+        // The other side of the same handler, so the test above is evidence of a PARTITION rather
+        // than of a daemon that refuses every shrink. Identical file, identical daemon, identical
+        // call — only the intent differs, and the roster legitimately collapses to one.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        write_roster_config(&config_path, &[("u-A", "work")]);
+
+        let mut daemon: FakeDaemon = reconcile_daemon(vec![
+            account("u-A", "work"),
+            account("u-B", "spare"),
+            account("u-C", "third"),
+        ])
+        .with_config_path(config_path);
+
+        let line = daemon
+            .adopt_roster_reload(ReloadIntent::Mutating)
+            .await
+            .to_log_line(std::time::UNIX_EPOCH);
+
+        assert_eq!(roster_uuids(&daemon), vec!["u-A"]);
+        assert_eq!(field_of(&line, "outcome"), Some("adopted"), "{line}");
+        assert_eq!(
+            field_of(&line, "reason"),
+            None,
+            "an adoption has no reason: {line}"
+        );
+    }
+
+    #[test]
+    fn an_omitted_or_unrecognized_intent_is_read_as_append_only() {
+        // PRD R-3a, the fail-closed default, asserted at the boundary that decides it.
+        //
+        // THREE inputs, because the requirement's own reasoning covers a rollout in both
+        // directions. An omitted token is the legacy shape — `notify_daemon_roster_reload` took no
+        // arguments before this issue, so an older CLI against a newer daemon sends exactly that.
+        // An unrecognized token is the mirror: a newer CLI against an older daemon, or a third
+        // intent added later. Neither can be read as permission to shrink, so both resolve to the
+        // refusing treatment, and only the exact `mutating` token opts in.
+        assert_eq!(ReloadIntent::from_wire(None), ReloadIntent::AppendOnly);
+        assert_eq!(
+            ReloadIntent::from_wire(Some("banana")),
+            ReloadIntent::AppendOnly,
+            "a token this daemon cannot interpret is not permission to lose accounts"
+        );
+        assert_eq!(
+            ReloadIntent::from_wire(Some("")),
+            ReloadIntent::AppendOnly,
+            "and neither is an empty one"
+        );
+        // The one opt-in, and the round trip that keeps the two halves of the protocol spelling
+        // the same tokens: whatever `as_wire` emits, `from_wire` must read back unchanged.
+        for intent in [ReloadIntent::AppendOnly, ReloadIntent::Mutating] {
+            assert_eq!(
+                ReloadIntent::from_wire(Some(intent.as_wire())),
+                intent,
+                "`{}` does not round-trip",
+                intent.as_wire()
+            );
+        }
+    }
+
+    #[test]
+    fn control_reply_reads_the_roster_reload_intent_off_the_request() {
+        // The wire half of R-3a: the resolution above has to actually run on the served line.
+        // A `roster-reload` request carrying `mutating` yields the permissive signal; one carrying
+        // an unknown token, or none at all, yields the refusing one.
+        let snap = StatusSnapshot::default();
+        for (line, expected) in [
+            (
+                r#"{"cmd":"roster-reload","intent":"mutating"}"#,
+                ReloadIntent::Mutating,
+            ),
+            (
+                r#"{"cmd":"roster-reload","intent":"append-only"}"#,
+                ReloadIntent::AppendOnly,
+            ),
+            (
+                r#"{"cmd":"roster-reload","intent":"whatever"}"#,
+                ReloadIntent::AppendOnly,
+            ),
+            (r#"{"cmd":"roster-reload"}"#, ReloadIntent::AppendOnly),
+        ] {
+            let (reply, signal) = control_reply(line, &snap, true);
+            assert_eq!(reply, r#"{"ok":true}"#, "{line}");
+            assert_eq!(
+                signal,
+                Some(ControlSignal::RosterReloadRequested(expected)),
+                "{line}"
+            );
+        }
+        // An UNauthenticated peer still produces no signal, whatever intent it declares — a
+        // stranger can neither trigger a reload nor choose how it is treated.
+        let (reply, signal) = control_reply(
+            r#"{"cmd":"roster-reload","intent":"mutating"}"#,
+            &snap,
+            false,
+        );
+        assert_eq!(reply, r#"{"error":"unauthorized"}"#);
+        assert_eq!(signal, None);
+    }
+
+    #[tokio::test]
+    async fn the_client_notify_puts_its_intent_on_the_wire() {
+        // The seam nothing else covers, and the one that decides whether "intent travels" is TRUE
+        // rather than merely typed. `control_reply` is tested above against hand-written JSON, and
+        // `notify_daemon_roster_reload` is tested through its callers — so a `notify_roster_reload`
+        // that took the parameter and sent the old payload-less line would leave every other test
+        // in this file green while the daemon refused, or adopted, on a default nobody chose.
+        //
+        // Asserted by round-tripping the REAL client against a real socket and feeding what it
+        // sent to the REAL server-side parser: no hand-written request line in the middle, so the
+        // two halves of this protocol are checked against each other rather than against a
+        // literal that could drift with them.
+        use tokio::io::AsyncBufReadExt;
+        use tokio::net::UnixListener;
+
+        for intent in [ReloadIntent::Mutating, ReloadIntent::AppendOnly] {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("daemon.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+
+            let server = async {
+                let (stream, _addr) = listener.accept().await.unwrap();
+                let mut buffered = tokio::io::BufReader::new(stream);
+                let mut request = String::new();
+                buffered.read_line(&mut request).await.unwrap();
+                // The client waits for an ack before returning; drop the connection instead, which
+                // the notify treats as a best-effort failure. What it SENT is already captured.
+                request
+            };
+            let (sent, _) =
+                tokio::join!(server, crate::daemon::notify_roster_reload(&socket, intent));
+
+            let (reply, signal) = control_reply(sent.trim_end(), &StatusSnapshot::default(), true);
+            assert_eq!(reply, r#"{"ok":true}"#, "the daemon parsed it: {sent}");
+            assert_eq!(
+                signal,
+                Some(ControlSignal::RosterReloadRequested(intent)),
+                "the intent the client sent is the intent the daemon read: {sent}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_reconcile_roster_call_site_reaches_the_one_shared_floor() {
+        // Issue #1442 AC + design D-4, and the distinction is the point: this asserts every call
+        // site is covered BY the invariant, NOT that every caller checks. Those are different
+        // properties and only one of them survives a fourth caller.
+        //
+        // The investigation that found this defect enumerated TWO of the three call sites. A
+        // per-caller guard written from that enumeration would have left `perform_config_set`
+        // reconciling with no floor at all, which is the original defect with extra steps — so the
+        // structural claim is what needs asserting, and nothing behavioural can see it.
+        let source = commands_source_above_the_tests();
+
+        // (1) The floor is written ONCE. A caller growing its own copy fails here even if that
+        // copy is correct, because two copies drift and the second one is invisible.
+        const PREDICATE: &str = "new_roster.len() < self.roster.len()";
+        assert_eq!(
+            source.matches(PREDICATE).count(),
+            1,
+            "the shrink comparison must exist exactly once, in `reconcile_roster` itself"
+        );
+        assert!(
+            method_body(&source, "pub(super) fn reconcile_roster").contains(PREDICATE),
+            "the one comparison is not inside `reconcile_roster`"
+        );
+
+        // (2) Every call site, enumerated with the intent it must declare. Extracted from each
+        // caller's own body, so a site that moved to a different function fails rather than being
+        // matched by a coincidental substring elsewhere in the file.
+        const CALL: &str = "self.reconcile_roster(";
+        let sites = [
+            ("pub(super) async fn perform_socket_capture", "AppendOnly"),
+            ("pub(super) async fn perform_config_set", "Mutating"),
+            ("pub(super) async fn adopt_roster_reload", "intent"),
+        ];
+        for (signature, intent) in sites {
+            let body = method_body(&source, signature);
+            let at = body.find(CALL).unwrap_or_else(|| {
+                panic!(
+                    "`{signature}` no longer reconciles — this enumeration has gone stale:\n{body}"
+                )
+            });
+            let call: String = body[at..].chars().take_while(|c| *c != ';').collect();
+            assert!(
+                call.contains(intent),
+                "`{signature}` must reconcile with `{intent}` intent, and does not: {call}"
+            );
+        }
+
+        // (3) Cardinality, so (2) is evidence rather than a sample. A FOURTH caller cannot reach
+        // the roster without an intent — the parameter is required, so that much the compiler
+        // holds — but it can reach it with the WRONG one, silently, and nothing above would look.
+        // Failing here forces the new site into the enumeration, where its intent is a decision
+        // somebody made rather than one that defaulted.
+        assert_eq!(
+            source.matches(CALL).count(),
+            sites.len(),
+            "a `reconcile_roster` call site was added or removed; add it to `sites` above with \
+             the intent its verb implies"
+        );
+    }
+
     /// This file's source above its test block — the subject of
     /// [`the_reload_handler_prints_nothing_it_only_returns_the_event`].
     ///

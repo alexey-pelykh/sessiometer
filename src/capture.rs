@@ -2317,6 +2317,122 @@ mod tests {
         }
     }
 
+    #[test]
+    fn every_roster_verb_declares_the_intent_its_verb_implies() {
+        // Issue #1442 AC: every `notify_daemon_roster_reload` call site passes an intent, and each
+        // one's choice is CORRECT FOR ITS VERB. The compiler holds the first half — the parameter
+        // is required, so a seventh call site cannot be added bare. It cannot hold the second, and
+        // the second is where the damage is: flipping `reconcile_login` to `Mutating` reinstates
+        // the 2026-08-27 collapse on the exact verb that caused it, and flipping `remove_account`
+        // to `AppendOnly` makes every legitimate removal refuse. Both edits are one token, both
+        // are invisible in review, and before this test both left the whole suite green.
+        //
+        // The classification is a property of the VERB, not of what a given run happens to do:
+        // `set_enabled` changes no roster count at all and is still `Mutating`, because a wire
+        // token derived from the data rather than from the caller would mean something different
+        // on every invocation.
+        //
+        // SIX call sites, not the five the issue enumerates: `config_restore` arrived with issue
+        // #1439 after #1442 was written. That is the argument for asserting the cardinality below
+        // rather than trusting a count copied from prose.
+        const SITES: &[(&str, &str, &str, &str)] = &[
+            (
+                "src/capture.rs",
+                "pub(crate) async fn capture",
+                "AppendOnly",
+                "capture only updates-in-place or pushes",
+            ),
+            (
+                "src/capture.rs",
+                "pub(crate) async fn reconcile_login",
+                "AppendOnly",
+                "login onboards or re-authenticates one account and drops none",
+            ),
+            (
+                "src/cli.rs",
+                "async fn config_restore",
+                "Mutating",
+                "a restore installs a whole retained file, which may hold fewer accounts",
+            ),
+            (
+                "src/cli.rs",
+                "async fn import",
+                "Mutating",
+                "import merges under an overwrite policy rather than appending",
+            ),
+            (
+                "src/cli.rs",
+                "async fn set_enabled",
+                "Mutating",
+                "enable/disable is a roster-mutating verb even though the count holds",
+            ),
+            (
+                "src/cli.rs",
+                "async fn remove_account",
+                "Mutating",
+                "remove is the canonical shrink, including a legitimate 1 -> 0",
+            ),
+        ];
+        const NOTIFY: &str = "notify_daemon_roster_reload(";
+
+        for (file, signature, intent, why) in SITES {
+            let source = source_above_the_tests(file);
+            let body = fn_body(&source, signature);
+            let at = body.find(NOTIFY).unwrap_or_else(|| {
+                panic!(
+                    "`{signature}` ({file}) no longer notifies the daemon — this enumeration has \
+                     gone stale and is measuring nothing:\n{body}"
+                )
+            });
+            // The whole call up to its `;`, so the assertion reads the ARGUMENT and not merely the
+            // name — a bare-name search admits every wrong intent there is.
+            let call: String = body[at..].chars().take_while(|c| *c != ';').collect();
+            assert!(
+                call.contains(&format!("ReloadIntent::{intent}")),
+                "`{signature}` ({file}) must declare `{intent}` intent — {why} — and does \
+                 not: {call}"
+            );
+        }
+
+        // Cardinality, so the loop above is evidence rather than a sample: a SEVENTH verb reaching
+        // the daemon must land in the enumeration, where its intent is a decision somebody made
+        // rather than whichever token was nearest to copy.
+        let calls: usize = ["src/capture.rs", "src/cli.rs"]
+            .iter()
+            .map(|file| source_above_the_tests(file).matches(NOTIFY).count())
+            .sum();
+        assert_eq!(
+            calls,
+            SITES.len() + 1,
+            "a `notify_daemon_roster_reload` call site was added or removed; add it to `SITES` \
+             with the intent its verb implies (the +1 is this function's own definition)"
+        );
+    }
+
+    /// `file`'s source above its test block — the subject of
+    /// [`every_roster_verb_declares_the_intent_its_verb_implies`], which spans two files.
+    ///
+    /// The generalization of [`capture_source_above_the_tests`], kept beside it rather than
+    /// replacing it: that one names its single file in its own panic messages, which is what makes
+    /// the two structural assertions above readable when they fail.
+    fn source_above_the_tests(file: &str) -> String {
+        let text =
+            std::fs::read_to_string(file).unwrap_or_else(|err| panic!("cannot read {file}: {err}"));
+        let above = text
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("split always yields a first element")
+            .to_owned();
+        // Canary: a boundary that moved shows as a failure here rather than as a green run over a
+        // truncated — or an un-truncated — subject.
+        assert!(
+            above.len() < text.len(),
+            "{file} has no column-0 `#[cfg(test)] mod tests`, so nothing was cut and the \
+             extraction is measuring the tests too"
+        );
+        above
+    }
+
     /// This file's source above its test block — the subject of the two structural
     /// assertions above.
     ///
