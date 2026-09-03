@@ -57,8 +57,25 @@ mod settings;
 #[cfg(test)]
 mod test_support;
 mod validate;
+mod write_lock;
 
 pub(crate) use validate::account_uuid_violation;
+
+/// Take the config-write lock for `config_path`, for tests OUTSIDE this module that need to
+/// stand in for a second config writer (issue #1445).
+///
+/// `write_lock` is private because [`Config::save_to`] is the only production path that may take
+/// this lock — a caller taking it itself would nest it, or hold it across work it should not.
+/// `crate::capture`'s stash-before-roster test needs to make a save FAIL the way another writer
+/// makes it fail, which is the one thing no public seam offers; this is that seam, and it is
+/// compiled only under `cfg(test)`.
+#[cfg(test)]
+pub(crate) async fn acquire_config_write_lock_for_test(
+    config_path: &std::path::Path,
+    max_wait: std::time::Duration,
+) -> crate::error::Result<write_lock::ConfigWriteLock> {
+    write_lock::ConfigWriteLock::acquire(&write_lock::lock_path(config_path), max_wait).await
+}
 
 /// Default seconds between re-polling a given account — the per-account cadence.
 /// Issue #38 lengthened this from the original fixed 60 s to a longer base that the

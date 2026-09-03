@@ -360,7 +360,7 @@ where
                 // Persist the new roster OUTSIDE the lock (a swap never contends on `config.toml`),
                 // stash-before-roster. A save failure leaves an inert ORPHAN stash, never a partial
                 // roster — report it `Failed` (the stash landed, but the roster row did not).
-                if let Err(err) = report.config.save_to(&config_path) {
+                if let Err(err) = report.config.save_to(&config_path).await {
                     return self.capture_failure(command, classify_capture_failure(&err));
                 }
                 let crate::capture::CaptureReport {
@@ -427,8 +427,9 @@ where
     /// (temp + rename). Every refusal is a TRUE no-op — ZERO writes — leaving the old file intact:
     /// no wired `config_path` → `Unavailable`; absent file → `NoConfig`; unreadable / malformed
     /// baseline → `ConfigUnreadable`; a stale label uuid → `UnknownAccount`; a range / cross-field
-    /// violation → `Invalid` (with the non-secret field-named `detail`); an atomic-write failure →
-    /// `SaveFailed`. On success the `effect` tells the UI what the change requires: a LABEL change
+    /// violation → `Invalid` (with the non-secret field-named `detail`); an atomic-write failure,
+    /// or a config-write lock still held by another writer after its budget (issue #1445 — this
+    /// verb is one of the two writers that pair is about) → `SaveFailed`. On success the `effect` tells the UI what the change requires: a LABEL change
     /// is adopted LIVE — the in-memory roster is reconciled to the freshly-written file (the SAME
     /// [`reconcile_roster`](Self::reconcile_roster) core the #139 roster-reload drives) — while a
     /// TUNABLE change is reload-by-restart (the daemon derives its strategy fields once at
@@ -486,7 +487,7 @@ where
         }
         // Persist the validated config atomically (temp + rename, 0600). A write failure leaves the
         // OLD file intact — report `SaveFailed`, adopt nothing.
-        if config.save_to(&config_path).is_err() {
+        if config.save_to(&config_path).await.is_err() {
             return ConfigSetAck::Rejected {
                 reason: ConfigSetRejection::SaveFailed,
                 detail: None,

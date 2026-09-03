@@ -89,9 +89,10 @@ pub(crate) struct CaptureReport {
 /// The canonical read (identity + token) and the stash write run under the single-writer
 /// swap lock via [`capture_locked`], so a concurrent daemon swap cannot land between the two
 /// reads and pair one account's identity with another's token — the mis-keyed-roster race the
-/// module docs name (#357). The roster (`config.toml`) save stays OUTSIDE the lock — a swap
+/// module docs name (#357). The roster (`config.toml`) save stays OUTSIDE the swap lock — a swap
 /// never contends on `config.toml` — preserving stash-before-roster, exactly like
-/// [`reconcile_login`].
+/// [`reconcile_login`]; it takes the dedicated config-write lock instead (issue #1445), which
+/// serializes it against the OTHER config writers the swap lock was never about.
 pub(crate) async fn capture(label: Option<String>) -> Result<()> {
     let existing = load_existing()?;
 
@@ -131,7 +132,7 @@ pub(crate) async fn capture(label: Option<String>) -> Result<()> {
     )
     .await?;
 
-    report.config.save()?;
+    report.config.save().await?;
     // Tell a running daemon to pick up the new roster now (#139) — best-effort, so no
     // daemon (or a wedged one) never blocks capture; the disk write is authoritative.
     notify_daemon_roster_reload().await;
@@ -222,6 +223,8 @@ fn prompt_label_default(
 /// with the lock released: a swap contends only on the keychain + `~/.claude.json`, never on
 /// `config.toml`, and stash-before-roster means a crash after the locked stash but before the
 /// save leaves an inert orphan stash, never a roster row referencing an unstashed account.
+/// That save carries its own config-write lock (issue #1445) — see [`reconcile_login`] for why
+/// outside the SWAP lock does not mean unlocked, and why the two are never nested.
 /// Generic over both keychain seams and taking the identity path as an argument, so the
 /// daemon-routed `cmd:capture` command (#359) can reuse this exact primitive with its own seams.
 pub(crate) async fn capture_locked<C, S>(
@@ -919,11 +922,29 @@ fn should_signal_restored(activate: bool, outcome: LoginOutcome) -> bool {
 /// the swap lock around the short write (serializing against a concurrent daemon swap),
 /// then persists the roster. Wired into production by the [`login`] verb (#135).
 ///
-/// The roster (`config.toml`) write is deliberately OUTSIDE the lock: a swap contends
-/// only on the keychain + `~/.claude.json`, never on `config.toml`, so no concurrent
-/// swap can race it. Stash-before-roster (like [`capture`]): a crash after the locked
-/// write but before the save leaves a fresh, restorable stash + canonical, never a
+/// The roster (`config.toml`) write is deliberately OUTSIDE the swap lock, and still is: a
+/// swap contends only on the keychain + `~/.claude.json`, never on `config.toml`, so no
+/// concurrent swap can race it. Stash-before-roster (like [`capture`]): a crash after the
+/// locked write but before the save leaves a fresh, restorable stash + canonical, never a
 /// roster referencing an unstashed account.
+///
+/// OUTSIDE the swap lock is not the same as unlocked, and since issue #1445 it no longer
+/// implies it. The sentence above answers only "can a concurrent SWAP race this save", and the
+/// answer is still no; the pair it never addressed is two CONFIG writers racing each other —
+/// this save against another CLI invocation or the daemon's `config set`. Their PUBLISHES are
+/// serialized by a dedicated lock of its own, taken inside [`Config::save`] across the
+/// read-modify-write `save_to` itself performs — retain into the ring, write, prune
+/// ([`crate::config`]'s `write_lock`, design D-8). It does NOT make this verb's own
+/// read-modify-write atomic: `existing` was parsed before an interactive login that can run for
+/// minutes, and a concurrent `config set` landing in that window is overwritten here. That
+/// residual is issue #1482, and widening this lock to cover the login is exactly what AC-8
+/// forbids.
+///
+/// The two locks are never nested: `run_login_locked` has returned and released the swap lock
+/// before the save below is reached — pinned by
+/// `the_roster_save_is_reached_only_after_the_swap_lock_has_been_released`. That is a latency
+/// property, not the anti-deadlock guarantee; see `write_lock`'s module docs for why the bounded
+/// wait is what rules a deadlock out.
 ///
 /// `existing` is the config the CALLER parsed, passed in rather than re-read here (issue
 /// #1440, R-5). It used to call [`load_existing`] itself, which meant the roster this
@@ -973,7 +994,7 @@ pub(crate) async fn reconcile_login(
     )
     .await?;
 
-    report.config.save()?;
+    report.config.save().await?;
     // Tell a running daemon to pick up the onboarded / relogged-in account now (#139) —
     // best-effort, the login already committed to disk.
     notify_daemon_roster_reload().await;
@@ -2044,6 +2065,149 @@ mod tests {
         }
     }
 
+    /// AC-4 (issue #1445): a crash between the locked keychain write and the roster save leaves a
+    /// fresh, RESTORABLE stash — the stash-before-roster ordering the config-write lock must not
+    /// have disturbed.
+    ///
+    /// The failure is injected through the new lock rather than through a contrived I/O fault,
+    /// because that is the failure mode this change ADDS. Be exact about what this observes: a
+    /// held lock makes the save NOT PROCEED, and the assertion below is on the stash the
+    /// non-proceeding save left behind. It is cancelled at the 200 ms timeout rather than run to
+    /// the 5 s budget, so it never reaches the `ConfigWriteLockBusy` return — that return is
+    /// observed through `save_to` by
+    /// `config::render::tests::a_held_lock_makes_save_to_return_config_write_lock_busy`, and at
+    /// the primitive by `config::write_lock::tests::a_contended_acquire_fails_closed_and_recovers_on_release`.
+    ///
+    /// What "restorable" means concretely: the account's credential is in the stash under its own
+    /// key, so a re-run reaches the same roster row rather than a row pointing at nothing. The
+    /// inverse — a roster written before the stash — would leave a row referencing an unstashed
+    /// account, which is the state the ordering exists to make unreachable.
+    #[tokio::test]
+    async fn a_failed_roster_save_still_leaves_the_stash_restorable() {
+        let store = FakeCredentialStore::empty();
+        store
+            .write(&Credential::new(b"fresh-token".to_vec()))
+            .await
+            .unwrap();
+        let stash = FakeAccountStash::empty();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let claude_json = dir.path().join("claude.json");
+        std::fs::write(
+            &claude_json,
+            br#"{"numStartups":1,"oauthAccount":{"accountUuid":"u-new","emailAddress":"n@example.com"}}"#,
+        )
+        .unwrap();
+
+        // The keychain half runs first and completes — exactly as it does in production, where
+        // `capture_locked` returns with the swap lock released and the save is still ahead.
+        let report = capture_locked(None, &store, &stash, &claude_json, None, Some("newcomer"))
+            .await
+            .expect("the locked keychain half completes");
+
+        // Now the crash-equivalent: the save cannot land. Another config writer holds the lock
+        // for longer than the save is willing to wait.
+        let held = crate::config::acquire_config_write_lock_for_test(
+            &config_path,
+            std::time::Duration::from_millis(50),
+        )
+        .await
+        .expect("the stand-in config writer takes the lock");
+        let saved = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            report.config.save_to(&config_path),
+        )
+        .await;
+        assert!(
+            saved.is_err(),
+            "the roster save must not have landed — this test's whole premise is that it did not"
+        );
+        drop(held);
+
+        // The roster never landed…
+        assert!(
+            !config_path.exists(),
+            "no roster was written, so nothing references the account yet"
+        );
+        // …and the stash did, which is the ordering: an inert ORPHAN stash, never a roster row
+        // pointing at an account that was never stashed.
+        assert_eq!(
+            stash
+                .read("Sessiometer/u-new")
+                .await
+                .expect("the stash landed before the roster and survives the failed save")
+                .credential
+                .expose(),
+            b"fresh-token",
+            "the stashed credential is intact, so the capture is restorable by re-running"
+        );
+    }
+
+    /// AC-5's structural half: the roster save is REACHED only after the swap-locked section has
+    /// returned and released, over ALL FOUR verbs that hold a swap lock and then save.
+    ///
+    /// Not the anti-deadlock guarantee — the BOUNDED wait is, and it would be even if the locks
+    /// nested, since `save_to`'s critical section acquires nothing else and only one hold-and-wait
+    /// direction is constructible. What non-nesting buys is that a contended config write cannot
+    /// extend a swap-lock hold by `CONFIG_WRITE_LOCK_MAX_WAIT`, and that the invariant survives
+    /// issue #257 replacing the bounded `flock` poll with a possibly-unbounded `File::try_lock`.
+    ///
+    /// All four are covered because the claim in `write_lock`'s module docs is universal. The two
+    /// outside this file are the ones a reordering would NOT make locally obvious: each holds its
+    /// swap lock inside a CALLED function (`capture_locked`, `apply_import`), so the guard is not
+    /// visible at the save. This reads the shipped source because the property is about the ORDER
+    /// of two calls in a function body, which no runtime assertion can observe.
+    #[test]
+    fn the_roster_save_is_reached_only_after_the_swap_lock_has_been_released() {
+        for (file, verb, locked_call, save_call) in [
+            (
+                "src/capture.rs",
+                "pub(crate) async fn capture",
+                "capture_locked(",
+                "config.save()",
+            ),
+            (
+                "src/capture.rs",
+                "pub(crate) async fn reconcile_login",
+                "run_login_locked(",
+                "config.save()",
+            ),
+            (
+                "src/daemon/commands.rs",
+                "pub(super) async fn perform_socket_capture",
+                "capture_locked(",
+                "config.save_to(",
+            ),
+            (
+                "src/cli.rs",
+                "async fn import",
+                "apply_import(",
+                "config.save()",
+            ),
+        ] {
+            let source = source_above_the_tests(file);
+            let body = fn_body_in(&source, verb, file);
+            let locked = body.find(locked_call).unwrap_or_else(|| {
+                panic!(
+                    "`{verb}` in {file} no longer calls `{locked_call}` — this gate's anchor has \
+                     gone stale"
+                )
+            });
+            let save = body.find(save_call).unwrap_or_else(|| {
+                panic!(
+                    "`{verb}` in {file} no longer calls `{save_call}` — this gate's anchor has \
+                     gone stale"
+                )
+            });
+            assert!(
+                locked < save,
+                "`{verb}` in {file} saves the roster BEFORE `{locked_call}` returns, so the \
+                 config-write lock would be taken inside the swap lock — extending a swap-lock \
+                 hold by the config-write budget, and a reordering of stash-before-roster besides"
+            );
+        }
+    }
+
     #[test]
     fn the_login_reconcile_never_re_reads_the_config_it_was_handed() {
         // Issue #1440 AC: the roster parsed by the verb reaches persistence with NO
@@ -2139,11 +2303,23 @@ mod tests {
     /// else. Both callers canary what they extracted, so a boundary that moved up shows as a
     /// failure rather than as a green run over an empty subject.
     fn capture_source_above_the_tests() -> String {
-        let text = std::fs::read_to_string("src/capture.rs").expect("cannot read src/capture.rs");
-        text.split("\n#[cfg(test)]\nmod tests")
+        source_above_the_tests("src/capture.rs")
+    }
+
+    /// The production half of `file` — everything above its `#[cfg(test)] mod tests`.
+    fn source_above_the_tests(file: &str) -> String {
+        let text = std::fs::read_to_string(file).unwrap_or_else(|_| panic!("cannot read {file}"));
+        let above = text
+            .split("\n#[cfg(test)]\nmod tests")
             .next()
             .expect("split always yields a first element")
-            .to_owned()
+            .to_owned();
+        assert!(
+            above.len() < text.len(),
+            "{file} has no `#[cfg(test)] mod tests` at column 0 — this gate would grade the \
+             test module as production source"
+        );
+        above
     }
 
     /// The CODE of `source` from the line opening `signature` to the next column-0 `}` —
@@ -2169,13 +2345,25 @@ mod tests {
     /// literal is left alone (detected by an odd quote count to its left), so the strip
     /// cannot eat code.
     fn fn_body(source: &str, signature: &str) -> String {
+        fn_body_in(source, signature, "src/capture.rs")
+    }
+
+    /// As [`fn_body`], but for any `origin` file and for a signature at ANY indentation.
+    ///
+    /// Delimits on a closing brace at the signature's OWN column rather than at column 0, which
+    /// `cargo fmt` guarantees and which a method inside an `impl` block needs — a column-0
+    /// delimiter would run such a body to the end of the whole `impl`, and an ordering assertion
+    /// over that span could be satisfied by two calls in unrelated methods.
+    fn fn_body_in(source: &str, signature: &str, origin: &str) -> String {
         let from = source
             .find(signature)
-            .unwrap_or_else(|| panic!("`{signature}` is not in src/capture.rs"));
+            .unwrap_or_else(|| panic!("`{signature}` is not in {origin}"));
+        let line_start = source[..from].rfind('\n').map_or(0, |at| at + 1);
+        let closer = format!("\n{}}}\n", &source[line_start..from]);
         let rest = &source[from..];
-        let end = rest
-            .find("\n}\n")
-            .unwrap_or_else(|| panic!("`{signature}` has no column-0 closing brace"));
+        let end = rest.find(&closer).unwrap_or_else(|| {
+            panic!("`{signature}` in {origin} has no closing brace at its own indentation")
+        });
         rest[..end]
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))

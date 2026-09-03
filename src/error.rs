@@ -1143,6 +1143,30 @@ pub(crate) enum Error {
     #[error("the usage store is busy — could not acquire the store lock; retry shortly")]
     UsageStoreBusy,
 
+    // --- Single-writer config-write lock (issue #1445) ------------------------
+    /// The dedicated config-write lock (issue #1445, design D-8) could not be
+    /// acquired within the bounded wait — another config writer (a concurrent CLI
+    /// verb, or the daemon's `config set` / `capture` handler) held it the whole
+    /// time. FAIL-CLOSED: rather than write without it and let two writers interleave
+    /// against `config.toml`, publishing a partial or blended file, the save ABORTS with
+    /// ZERO writes: nothing retained into the backup ring, nothing written, nothing
+    /// evicted. What the lock prevents is an interleaved PUBLISH; it does not make a
+    /// caller's own read-mutate-save atomic — see
+    /// [`crate::config`]'s `write_lock` module docs for the span and issue #1482 for the
+    /// window it leaves.
+    ///
+    /// DISTINCT from [`Error::SwapLockBusy`]: that lock guards the keychain +
+    /// `~/.claude.json` pair, whose contention set deliberately excludes
+    /// `config.toml`. A separate variant so an operator can tell WHICH writer to
+    /// wait for, and so the two never get conflated in a bug report. Maps to exit
+    /// `4`, the same "could not write safely, retry shortly" class as
+    /// [`Error::SwapLockBusy`] and [`Error::UsageStoreBusy`]. Secret-free.
+    #[error(
+        "another config write is in progress — could not acquire the config-write lock; \
+         retry shortly"
+    )]
+    ConfigWriteLockBusy,
+
     /// `config restore <N>` named an index the roster backup ring does not hold (issue #1439).
     ///
     /// Carries the ring's own size so the message is self-correcting: the operator sees what the
@@ -1184,7 +1208,10 @@ impl Error {
             // usage-store lock (issue #188) share exit `4`: all are the "could not
             // write safely right now, retry shortly" class — each aborted with ZERO
             // writes rather than tear state.
-            Error::KeychainLocked { .. } | Error::SwapLockBusy | Error::UsageStoreBusy => 4,
+            Error::KeychainLocked { .. }
+            | Error::SwapLockBusy
+            | Error::UsageStoreBusy
+            | Error::ConfigWriteLockBusy => 4,
             Error::UseTargetNotFound { .. } => 5,
             Error::UseTargetAmbiguous { .. } => 6,
             // The gate refused — weekly-exhausted, cooldown, or quarantined all share
@@ -2302,7 +2329,7 @@ pub(crate) mod tests {
         // message below can say which one this is rather than leaving the reader to guess.
         assert_eq!(
             prose.len(),
-            90,
+            91,
             "the `#[error(...)]` count moved, and a variant having been ADDED OR REMOVED is the \
              EXPECTED cause: `error_prose_of`'s self-consistency check ran first and found that \
              every `#[error(` in the source started an attribute it parsed, which rules out the \

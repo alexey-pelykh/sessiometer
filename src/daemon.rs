@@ -18481,6 +18481,9 @@ mod tests {
                 column: 12,
             },
             Error::UsageStoreBusy,
+            // Issue #1445: a fixed sentence and no fields at all — the busiest possible variant
+            // to redact, and the same shape as `SwapLockBusy` / `UsageStoreBusy` above it.
+            Error::ConfigWriteLockBusy,
             // Issue #1439: two counts and nothing else — the ring's own size and the index the
             // operator named, both structural.
             Error::BackupNotRetained {

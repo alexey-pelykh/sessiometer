@@ -1182,6 +1182,25 @@ pub(crate) fn create_private_file(path: &Path) -> Result<File> {
 /// [`create_private_file`], whose mode applies only on creation. The parent
 /// directory must already exist and be private (caller runs
 /// [`ensure_private_dir`] first).
+///
+/// # The staging name is FIXED, and that is a contract on the CALLER
+///
+/// `<path>.tmp` is derived from `path` alone, so every writer of one `path` stages at one name,
+/// and this function opens that name by unlinking it first. That is deliberate — it is what lets
+/// a write self-clean after a crashed predecessor, which every fixed-path caller in this crate
+/// relies on (see [`crate::roster_backup`]'s `prune`, which exists precisely because the ring's
+/// per-write unique names get no such sweep).
+///
+/// The price is that this is atomic for ONE writer of a given `path`, not for two. Concurrently,
+/// writer B's unlink can land between writer A's `fsync` and its `rename`, at which point A
+/// renames B's half-written file into place: a complete-looking, truncated publish. So a `path`
+/// with more than one possible writer needs to be serialized by its caller, and every such `path`
+/// in this crate is — `config.toml` by the config-write lock inside
+/// [`Config::save_to`](crate::config::Config::save_to) (issue #1445), the usage store by its own
+/// `usage.lock`. The remaining callers write per-session or per-process paths with one writer by
+/// construction. Adding an unserialized second writer to any `path` written here reopens that
+/// race; unique staging names are not the answer to it, since they would trade this race for
+/// unbounded staging debris in directories nothing sweeps.
 pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");

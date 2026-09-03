@@ -156,6 +156,14 @@ pub(crate) fn classify_swap_failure(err: &Error) -> SwapRejection {
 /// invites (retry). Folding it into `Failed` would tell a panel operator to retry a capture that is
 /// guaranteed to refuse again — and would leave the durable audit line unable to distinguish the
 /// guard firing from an I/O fault.
+///
+/// [`Error::ConfigWriteLockBusy`] (issue #1445) deliberately does NOT get its own code, and it is
+/// the same test that admits the one above: the action that resolves a busy config lock IS retry,
+/// which is exactly what `Failed` invites, so a distinct tag would buy an operator nothing while
+/// widening the closed wire vocabulary the Swift side fails closed on. It is a roster save
+/// failure, which this function's contract already routes to `Failed`. Distinct from
+/// [`Error::SwapLockBusy`] at the error level regardless — the two locks guard different
+/// resources, and a bug report must never conflate them.
 pub(crate) fn classify_capture_failure(err: &Error) -> CaptureRejection {
     match err {
         Error::KeychainLocked { .. } => CaptureRejection::KeychainLocked,
@@ -397,6 +405,15 @@ mod tests {
         );
         assert_eq!(
             classify_capture_failure(&Error::SwapWrongIdentityRestash),
+            CaptureRejection::Failed
+        );
+        // Issue #1445. Pinned because the deliberate choice is the one a reader would most
+        // plausibly "improve": `ConfigWriteLockBusy` is a busy LOCK, so mapping it onto
+        // `SwapLockBusy` compiles, reads as tidy, and passes every other test in this file —
+        // while telling an operator the SWAP lock is busy when it is not. The docs above say a
+        // bug report must never conflate them; this is what enforces it.
+        assert_eq!(
+            classify_capture_failure(&Error::ConfigWriteLockBusy),
             CaptureRejection::Failed
         );
     }
