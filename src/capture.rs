@@ -54,6 +54,7 @@ use crate::config::{
     account_uuid_violation, Account, Config, CredentialConfig, LoginConfig, MigrationConfig,
     RefreshConfig, StatsConfig, Tunables,
 };
+use crate::daemon::ReloadIntent;
 use crate::error::{Error, Result};
 use crate::keychain::{Credential, CredentialStore, RealCredentialStore};
 use crate::login::login_account;
@@ -135,7 +136,9 @@ pub(crate) async fn capture(label: Option<String>) -> Result<()> {
     report.config.save().await?;
     // Tell a running daemon to pick up the new roster now (#139) — best-effort, so no
     // daemon (or a wedged one) never blocks capture; the disk write is authoritative.
-    notify_daemon_roster_reload().await;
+    // APPEND-ONLY (#1442, R-3): `plan_capture` only updates-in-place or pushes, so the roster
+    // this just saved can never be smaller than the one it read.
+    notify_daemon_roster_reload(ReloadIntent::AppendOnly).await;
     println!(
         "{}",
         confirmation(report.outcome, &report.label, report.count)
@@ -375,7 +378,15 @@ fn emit_login_event(account: Option<String>, outcome: LoginEventOutcome) {
 /// ([`emit_roster_reload_not_notified`], issue #1438): a roster write that the daemon was never
 /// told about is the CLI-side twin of the same blind spot the daemon handler had — the file moved
 /// and the running rotation did not, with nothing recording the divergence.
-pub(crate) async fn notify_daemon_roster_reload() {
+///
+/// `intent` (issue #1442) declares whether the calling verb can only ADD to the roster
+/// ([`ReloadIntent::AppendOnly`] — `capture`, `login`) or may legitimately change its membership
+/// ([`ReloadIntent::Mutating`] — `remove`, `enable` / `disable`, `import`, `config restore`). The
+/// daemon's never-shrink floor partitions on it, and cannot recover it from the file: a smaller
+/// roster on disk is either the operator's `remove` or the 2026-08-27 collapse, and the two are
+/// identical from the reading end. Every caller must state it — the wire field is optional only so
+/// a pre-#1442 CLI still parses, and an absent one is read as the REFUSING treatment (R-3a).
+pub(crate) async fn notify_daemon_roster_reload(intent: ReloadIntent) {
     let socket = match paths::control_socket() {
         Ok(socket) => socket,
         Err(err) => {
@@ -386,7 +397,7 @@ pub(crate) async fn notify_daemon_roster_reload() {
             return;
         }
     };
-    if let Err(err) = crate::daemon::notify_roster_reload(&socket).await {
+    if let Err(err) = crate::daemon::notify_roster_reload(&socket, intent).await {
         // A TIMEOUT is not a failure to deliver, and the two must not share one code (#1438). The
         // daemon's jittered start-up delay draws a uniform `[0, STARTUP_DELAY_CAP)` wait — up to
         // 30s (#76) — and its control socket is BOUND before anything accepts on it, so a roster
@@ -997,7 +1008,10 @@ pub(crate) async fn reconcile_login(
     report.config.save().await?;
     // Tell a running daemon to pick up the onboarded / relogged-in account now (#139) —
     // best-effort, the login already committed to disk.
-    notify_daemon_roster_reload().await;
+    // APPEND-ONLY (#1442, R-3): a login onboards or re-authenticates one account and drops none.
+    // This is the verb whose reload collapsed the roster on 2026-08-27, and the intent it now
+    // declares is what lets the daemon refuse that reload instead of adopting it.
+    notify_daemon_roster_reload(ReloadIntent::AppendOnly).await;
     // #276: a non-activating REVIVE did NOT re-point the canonical item, so the daemon's
     // #107 path won't clear this account's `needs re-login` quarantine — signal it to
     // un-quarantine the revived account NOW (the reliable on-demand path, since the #106
@@ -2252,12 +2266,19 @@ mod tests {
                 // a refusal leaves the tree untouched), the label prompt (an
                 // operator-visible step), the locked identity + token read and stash, the
                 // roster save, and the daemon notify.
+                //
+                // The notify anchor carries its ARGUMENT, on the same reasoning the gate anchor
+                // below gives for matching the whole call: `capture` is an append-only verb, and
+                // the intent it declares is what lets the daemon refuse a reload that would shrink
+                // the live roster (issue #1442). A bare-name anchor would stay green through a
+                // silent flip to `Mutating`, which is the one edit here that reinstates the
+                // 2026-08-27 collapse on this path.
                 &[
                     "ensure_private_dir",
                     "prefill_label_from_identity",
                     "capture_locked(",
                     "report.config.save()",
-                    "notify_daemon_roster_reload()",
+                    "notify_daemon_roster_reload(ReloadIntent::AppendOnly)",
                 ][..],
             ),
             (
@@ -2294,6 +2315,173 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn every_roster_verb_declares_the_intent_its_verb_implies() {
+        // Issue #1442 AC: every `notify_daemon_roster_reload` call site passes an intent, and each
+        // one's choice is CORRECT FOR ITS VERB. The compiler holds the first half — the parameter
+        // is required, so a seventh call site cannot be added bare. It cannot hold the second, and
+        // the second is where the damage is: flipping `reconcile_login` to `Mutating` reinstates
+        // the 2026-08-27 collapse on the exact verb that caused it, and flipping `remove_account`
+        // to `AppendOnly` makes every legitimate removal refuse. Both edits are one token, both
+        // are invisible in review, and before this test both left the whole suite green.
+        //
+        // The classification is a property of the VERB, not of what a given run happens to do:
+        // `set_enabled` changes no roster count at all and is still `Mutating`, because a wire
+        // token derived from the data rather than from the caller would mean something different
+        // on every invocation.
+        //
+        // SIX call sites, not the five the issue enumerates: `config_restore` arrived with issue
+        // #1439 after #1442 was written. That is the argument for asserting the cardinality below
+        // rather than trusting a count copied from prose.
+        const SITES: &[(&str, &str, &str, &str)] = &[
+            (
+                "src/capture.rs",
+                "pub(crate) async fn capture",
+                "AppendOnly",
+                "capture only updates-in-place or pushes",
+            ),
+            (
+                "src/capture.rs",
+                "pub(crate) async fn reconcile_login",
+                "AppendOnly",
+                "login onboards or re-authenticates one account and drops none",
+            ),
+            (
+                "src/cli.rs",
+                "async fn config_restore",
+                "Mutating",
+                "a restore installs a whole retained file, which may hold fewer accounts",
+            ),
+            (
+                "src/cli.rs",
+                "async fn import",
+                "Mutating",
+                "import merges under an overwrite policy rather than appending",
+            ),
+            (
+                "src/cli.rs",
+                "async fn set_enabled",
+                "Mutating",
+                "enable/disable is a roster-mutating verb even though the count holds",
+            ),
+            (
+                "src/cli.rs",
+                "async fn remove_account",
+                "Mutating",
+                "remove is the canonical shrink, including a legitimate 1 -> 0",
+            ),
+        ];
+        const NOTIFY: &str = "notify_daemon_roster_reload(";
+
+        for (file, signature, intent, why) in SITES {
+            let source = source_above_the_tests(file);
+            let body = fn_body_in(&source, signature, file);
+            let at = body.find(NOTIFY).unwrap_or_else(|| {
+                panic!(
+                    "`{signature}` ({file}) no longer notifies the daemon — this enumeration has \
+                     gone stale and is measuring nothing:\n{body}"
+                )
+            });
+            // The whole call up to its `;`, so the assertion reads the ARGUMENT and not merely the
+            // name — a bare-name search admits every wrong intent there is.
+            let call: String = body[at..].chars().take_while(|c| *c != ';').collect();
+            assert!(
+                call.contains(&format!("ReloadIntent::{intent}")),
+                "`{signature}` ({file}) must declare `{intent}` intent — {why} — and does \
+                 not: {call}"
+            );
+        }
+
+        // Cardinality, so the loop above is evidence rather than a sample: a SEVENTH verb reaching
+        // the daemon must land in the enumeration, where its intent is a decision somebody made
+        // rather than whichever token was nearest to copy.
+        //
+        // Counted over the WHOLE crate, not over the two files that happen to hold today's six.
+        // `notify_daemon_roster_reload` is `pub(crate)`, so every module can reach it, and a
+        // seventh verb landing in `src/config.rs` or `src/swap.rs` is exactly the case a
+        // two-file count cannot see — it would pass, unchanged, having measured a corpus the new
+        // caller is not in.
+        let (calls, prose) = crate_notify_mentions(NOTIFY);
+        assert_eq!(
+            calls,
+            SITES.len() + 1,
+            "a `notify_daemon_roster_reload` call site was added or removed somewhere under \
+             `src/`; add it to `SITES` with the intent its verb implies (the +1 is this \
+             function's own definition)"
+        );
+        // Canary on the comment strip that makes the count above a count of CALLS: a strip that
+        // stopped working would INFLATE the count rather than deflate it, and the assertion above
+        // would then fail for a reason nobody could read. Requiring a non-zero prose count proves
+        // the strip is separating the two classes rather than passing everything through as code.
+        //
+        // The prose it finds is NOT in this file — this file's own mentions all sit inside the test
+        // block, which is cut before counting. At the time of writing the corpus holds exactly one,
+        // in `src/daemon/socket.rs`'s `ReloadIntent` doc. That makes the canary one doc-comment edit
+        // in an unrelated file away from failing, which is a real cost and a deliberate one: the
+        // alternative is a count with no evidence that the classification behind it works at all.
+        // If it ever fails on a corpus that genuinely has no commented mention, restate it against
+        // a token this crate does comment about — do not delete it.
+        assert!(
+            prose > 0,
+            "no commented mention of `notify_daemon_roster_reload` was found under `src/`, so \
+             the comment strip that makes the count above a count of CALLS is not being exercised"
+        );
+    }
+
+    /// How many times `needle` occurs under `src/` as CODE, and how many times as prose.
+    ///
+    /// The scope `notify_daemon_roster_reload`'s `pub(crate)` visibility actually grants. Walked
+    /// from the directory rather than listed, so a module added tomorrow is searched the day it
+    /// lands instead of the day someone remembers to widen a literal; each file is cut above its
+    /// own test block, because a test naming the function is not a caller of it.
+    ///
+    /// Returns both halves so the caller can canary the split: the prose count is what proves the
+    /// comment strip is doing work, and a strip that silently stopped would otherwise show up
+    /// only as an unreadable failure in the code count.
+    fn crate_notify_mentions(needle: &str) -> (usize, usize) {
+        let mut pending = vec![std::path::PathBuf::from("src")];
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir)
+                .unwrap_or_else(|err| panic!("cannot read {}: {err}", dir.display()))
+            {
+                let path = entry.expect("cannot stat a src entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        // Canary: the walk found the module tree, not an empty or one-level read.
+        assert!(
+            files.len() > 10,
+            "only {} `.rs` files found under `src/` — the walk is not seeing the crate",
+            files.len()
+        );
+
+        let mut code = 0usize;
+        let mut prose = 0usize;
+        for path in files {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()));
+            let above = text
+                .split("\n#[cfg(test)]\nmod tests")
+                .next()
+                .expect("split always yields a first element");
+            for line in above.lines() {
+                if line.trim_start().starts_with("//") {
+                    prose += line.matches(needle).count();
+                } else {
+                    let (kept, dropped) = line.split_at(strip_trailing_comment(line).len());
+                    code += kept.matches(needle).count();
+                    prose += dropped.matches(needle).count();
+                }
+            }
+        }
+        (code, prose)
     }
 
     /// This file's source above its test block — the subject of the two structural
@@ -2355,8 +2543,14 @@ mod tests {
     /// delimiter would run such a body to the end of the whole `impl`, and an ordering assertion
     /// over that span could be satisfied by two calls in unrelated methods.
     fn fn_body_in(source: &str, signature: &str, origin: &str) -> String {
+        // The opening paren is part of the needle. Without it `signature` matches by PREFIX, and
+        // this file has the collision live: `pub(crate) async fn capture` is a prefix of
+        // `pub(crate) async fn capture_locked`, so a reordering that put the longer one first
+        // would silently redirect every assertion onto the wrong body — and pass, since the two
+        // do overlapping work.
+        let needle = format!("{signature}(");
         let from = source
-            .find(signature)
+            .find(&needle)
             .unwrap_or_else(|| panic!("`{signature}` is not in {origin}"));
         let line_start = source[..from].rfind('\n').map_or(0, |at| at + 1);
         let closer = format!("\n{}}}\n", &source[line_start..from]);
