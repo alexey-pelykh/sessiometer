@@ -1075,18 +1075,18 @@ pub(crate) enum RosterReloadOutcome {
     ///
     /// Deliberately NOT "declined before reading anything". WHY it declined is the
     /// [`RosterReloadReason`], and so is whether the line carries an `incoming` count — this
-    /// outcome decides neither. Today's only refusal is [`RosterReloadReason::ReloadDisabled`],
-    /// which declines because no `config_path` is wired and therefore never reads, leaving
-    /// `incoming` absent.
+    /// outcome decides neither. TWO reasons ride it, and they differ on exactly that:
+    /// [`RosterReloadReason::ReloadDisabled`] declines because no `config_path` is wired and
+    /// therefore never reads, leaving `incoming` absent; [`RosterReloadReason::Shrink`] (issue
+    /// #1442) can only detect a shrink by COMPARING the two counts, so it necessarily reads first
+    /// and renders BOTH.
     ///
-    /// A refusal taken AFTER a read is the expected shape of the next one, and is invited rather
-    /// than forbidden here: the roster-never-shrinks guard
-    /// (`docs/specs/roster-never-shrinks.feature.md`, issue #1442) can only detect a shrink by
-    /// COMPARING the two counts, so it necessarily reads first, and its own "a refusal is legible
-    /// after the fact" scenario requires the event to record `refused` with BOTH counts. Nothing
-    /// forecloses that — not this variant, not the render arm (each count is rendered off its own
+    /// That the second one FITS here without altering this variant is the design working as
+    /// written, and is worth keeping said for the third: nothing about a post-read refusal is
+    /// foreclosed — not this variant, not the render arm (each count is rendered off its own
     /// `Option`), and not the absence matrix, which is keyed on the (outcome, reason) PAIR
-    /// precisely so a post-read refusal adds a row instead of contradicting one.
+    /// precisely so a post-read refusal adds a row instead of contradicting one. A third refusal
+    /// adds a reason and a matrix row, not an outcome.
     Refused,
     /// The read was attempted and yielded no config (an absent, unreadable or invalid file). The
     /// current in-memory roster was KEPT — best-effort by contract (issue #139).
@@ -6945,6 +6945,20 @@ pub(crate) mod tests {
                 },
                 ("refused", Some("reload_disabled")),
                 [true, false, true],
+            ),
+            // The row the comment above was written to make room for (issue #1442), and the ONLY
+            // combination that renders both counts alongside a reason. It is what makes the pair
+            // keying evidence rather than an argument: `refused` appears TWICE in this list with
+            // OPPOSITE `incoming` presence, so a renderer keying absence on the outcome fails here.
+            (
+                Event::RosterReload {
+                    outcome: RosterReloadOutcome::Refused,
+                    previous: Some(6),
+                    incoming: Some(1),
+                    reason: Some(RosterReloadReason::Shrink),
+                },
+                ("refused", Some("shrink")),
+                [true, true, true],
             ),
             (
                 Event::RosterReload {
