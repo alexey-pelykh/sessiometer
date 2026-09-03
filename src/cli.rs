@@ -2384,7 +2384,10 @@ fn render_config_backups(dir: &Path, retained: &[crate::roster_backup::Retained]
 /// restart. Best-effort, like theirs.
 async fn config_restore(index: usize) -> Result<()> {
     config_restore_at(&paths::config_file()?, index).await?;
-    crate::capture::notify_daemon_roster_reload().await;
+    // MUTATING (#1442, R-4): a restore installs a whole retained file, which may legitimately
+    // hold FEWER accounts than the live roster — that is the point of restoring one. It is the
+    // sixth notify call site, added by issue #1439 after #1442 was written.
+    crate::capture::notify_daemon_roster_reload(crate::daemon::ReloadIntent::Mutating).await;
     Ok(())
 }
 
@@ -5040,7 +5043,10 @@ async fn import(path: PathBuf, overwrite: bool, passphrase: PassphraseSource) ->
     // publish; it does not make this verb's read-above/write-here pair atomic (issue #1482).
     config.save().await?;
     // Tell a running daemon to pick up the imported accounts now (#139) — best-effort.
-    crate::capture::notify_daemon_roster_reload().await;
+    // MUTATING (#1442, R-4): named in R-4's own enumeration. `apply_import` merges a payload
+    // under an `overwrite` policy rather than appending unconditionally, so it is not an
+    // append-only verb even where a given run happens only to add.
+    crate::capture::notify_daemon_roster_reload(crate::daemon::ReloadIntent::Mutating).await;
 
     println!("{}", import_report(&outcomes));
 
@@ -5837,7 +5843,11 @@ async fn set_enabled(query: Option<String>, enabled: bool) -> Result<()> {
         // Tell a running daemon to pick up the enable/disable now (#139) — best-effort;
         // the account joins / leaves the live rotation without a restart. Skipped on a
         // no-op flip (nothing changed on disk, so nothing to reload).
-        crate::capture::notify_daemon_roster_reload().await;
+        // MUTATING (#1442, R-4): a flip changes no roster COUNT — the entry stays, only its
+        // `enabled` flag moves — but R-4 names the verb, and classifying it by what a given run
+        // happens to do rather than by what the verb is would make the wire token a function of
+        // the data instead of the caller.
+        crate::capture::notify_daemon_roster_reload(crate::daemon::ReloadIntent::Mutating).await;
     }
     // Name the RESOLVED account, not `query` — which since #1005 may be an account-uuid, and
     // echoing 36 hex characters back would name nothing the operator typed or recognizes. WHICH
@@ -5939,7 +5949,10 @@ async fn remove_account(query: Option<String>) -> Result<()> {
     RealAccountStash::new().delete(&removed.stash()).await?;
     // Tell a running daemon to drop the removed account from its live rotation now
     // (#139) — best-effort, so it never swaps to an account whose stash is gone.
-    crate::capture::notify_daemon_roster_reload().await;
+    // MUTATING (#1442, R-4): the canonical shrink. Removing the LAST account is a legitimate
+    // 1 → 0, which is exactly the case an empty-roster floor would have broken and this intent
+    // partition preserves.
+    crate::capture::notify_daemon_roster_reload(crate::daemon::ReloadIntent::Mutating).await;
     // Name the REMOVED account's label, not `query` — which since #1005 may be an
     // account-uuid, and echoing that back would not tell the operator which handle went. Pinned
     // by `the_confirmations_name_the_resolved_handle` (issue #1088), for the same reason as the

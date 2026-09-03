@@ -373,7 +373,19 @@ where
                 // #139 roster-reload drives): an already-rostered active account keeps its per-account
                 // state (the idempotent refresh, no duplicate row), a new one joins with default state
                 // and becomes a swap target once it has a reading.
-                self.reconcile_roster(config.roster);
+                //
+                // `capture` is an APPEND-ONLY verb (issue #1442, R-3), so it declares that intent and
+                // the shared never-shrink floor applies. It cannot refuse on this capture's OWN
+                // account: `plan_capture` has only update-in-place and push arms, so the roster just
+                // saved is never smaller than the one read. It CAN refuse when the file that was read
+                // had already lost accounts the live daemon still holds — the 2026-08-27 shape
+                // reached through this second entry point — and refusing is then exactly right: the
+                // stash and the roster row stand on disk, and the live rotation is NOT narrowed onto
+                // a file that lost five accounts. The ack reports the CAPTURE, which succeeded, and
+                // the single `Event` slot below is already the capture's own line; reporting the
+                // disk/memory divergence itself is issue #1443's, on the poll tick. Bound rather
+                // than discarded so the `#[must_use]` is answered deliberately.
+                let _reconcile = self.reconcile_roster(config.roster, ReloadIntent::AppendOnly);
                 // The durable audit line (best-effort logged by the run loop): the resolved roster
                 // LABEL handle + the outcome token — non-secret by construction (#15).
                 let event = Event::Capture {
@@ -496,8 +508,15 @@ where
         // A LABEL change is adopted LIVE: reconcile the in-memory roster to the freshly-written
         // file (the SAME core the #139 roster-reload drives), so `status` reflects the new label
         // within the poll cadence. A TUNABLE change is reload-by-restart (no hot-reload primitive).
+        //
+        // `config set` is a MUTATING verb by R-4's own enumeration, so it declares that intent and
+        // the issue-#1442 floor does not apply here. Nothing is given away by that: `apply_settings`
+        // overlays label edits onto the roster it parsed out of this very file and can neither add
+        // nor drop a row, so the count it hands over always equals the count on disk — this call
+        // site cannot shrink through its own action at all. It reaches the shared enforcement point
+        // by passing an intent, which is what D-4 asks of a caller; it is not exempt from it.
         if change.labels_changed {
-            self.reconcile_roster(config.roster);
+            let _reconcile = self.reconcile_roster(config.roster, ReloadIntent::Mutating);
         }
         // A tunable change is the operative action even if a label also changed (both persisted).
         let effect = if change.tunables_changed {
@@ -541,12 +560,20 @@ where
     /// Three outcomes, not two. A `None` `config_path` — the hermetic-test default, and any daemon
     /// with no reload wired — is `Refused`: the daemon DECLINED, which is not the same fact as a
     /// read that FAILED, while an absent or unreadable file is the latter. What separates them is
-    /// the DECISION, not where it falls relative to the read. This particular refusal happens to
-    /// decline without reading, which is a property of its reason (`ReloadDisabled`) and is why
-    /// its line carries no `incoming` count; a refusal taken AFTER a read is the expected next one
-    /// — issue #1442's shrink guard can only detect a shrink by COMPARING the two counts, so it
-    /// must read before it can decline — and it lands here as another `Refused` arm carrying BOTH
-    /// counts, not as a new outcome.
+    /// the DECISION, not where it falls relative to the read. That split now carries TWO refusals,
+    /// which is what it was shaped for. `ReloadDisabled` declines WITHOUT reading, so its line
+    /// carries no `incoming` count; `Shrink` (issue #1442) can only detect a shrink by COMPARING
+    /// the two counts, so it must read before it can decline, and it renders BOTH — a second
+    /// `Refused` arm distinguished by its REASON, exactly as predicted, and not a fourth outcome.
+    ///
+    /// `intent` is the originating verb's own declaration, carried on the wire since issue #1442
+    /// because the file cannot supply it: a smaller roster is either a legitimate `remove` or the
+    /// 2026-08-27 collapse, and only the VERB knows which. It is resolved fail-closed at the socket
+    /// boundary ([`ReloadIntent::from_wire`]), so an omitted or unrecognized token reaches this
+    /// function as `AppendOnly` and a shrink is refused — an older CLI, and a verb added later
+    /// without declaring intent, are both safe by construction (R-3a). This function does not
+    /// re-decide any of that; the floor lives in `reconcile_roster` (design D-4) and this arm
+    /// reports its verdict.
     ///
     /// It is no longer a SILENT no-op, and the `eprintln!` this replaced is gone rather than
     /// supplemented: the daemon runs in the background, so its stderr had no reader, and the
@@ -577,7 +604,7 @@ where
     /// which touches the keychain + `~/.claude.json`), so the re-read races nothing the
     /// daemon itself writes.
     #[must_use = "the roster reload's event is the only durable trace it ran — emit it (#1438)"]
-    pub(super) async fn adopt_roster_reload(&mut self) -> Event {
+    pub(super) async fn adopt_roster_reload(&mut self, intent: ReloadIntent) -> Event {
         // The live roster size BEFORE anything is reconciled — the `was` half of the pair, and the
         // only thing that makes a shrink readable off the emitted line (issue #1438).
         let previous = Some(self.roster.len());
@@ -596,12 +623,27 @@ where
             Ok(config) => {
                 // Read before `reconcile_roster` takes the roster by value.
                 let incoming = Some(config.roster.len());
-                self.reconcile_roster(config.roster);
-                Event::RosterReload {
-                    outcome: RosterReloadOutcome::Adopted,
-                    previous,
-                    incoming,
-                    reason: None,
+                // The never-shrink floor (issue #1442) lives INSIDE the reconcile, so this arm
+                // reports its verdict rather than re-deciding it — the same core, and the same
+                // decision, that the other two call sites reach. `intent` came off the wire and was
+                // already resolved fail-closed by `ReloadIntent::from_wire`, so an omitted or
+                // unrecognized token arrives here as `AppendOnly` and a shrink is refused.
+                match self.reconcile_roster(config.roster, intent) {
+                    ReconcileOutcome::Adopted => Event::RosterReload {
+                        outcome: RosterReloadOutcome::Adopted,
+                        previous,
+                        incoming,
+                        reason: None,
+                    },
+                    // The post-read refusal the doc above anticipated: it carries BOTH counts,
+                    // because a shrink is not legible from either one alone. The in-memory roster
+                    // is untouched — the reconcile mutated nothing before returning this.
+                    ReconcileOutcome::RefusedShrink => Event::RosterReload {
+                        outcome: RosterReloadOutcome::Refused,
+                        previous,
+                        incoming,
+                        reason: Some(RosterReloadReason::Shrink),
+                    },
                 }
             }
             // Best-effort: keep the current in-memory roster on any read/parse failure
@@ -648,7 +690,47 @@ where
     /// not re-gate the whole rotation. State NOT indexed by roster position — the
     /// cooldown (#10), the canonical watch (#13), the tick counter — is deliberately
     /// untouched: a roster change is not a swap and must not re-arm or clear them.
-    pub(super) fn reconcile_roster(&mut self, new_roster: Vec<Account>) {
+    ///
+    /// # The never-shrink floor (issue #1442, design D-4)
+    ///
+    /// All of the above describes what an ADOPTED reconcile does. Whether to adopt at all is
+    /// decided first, here, and NOT at the three call sites — that placement is the decision, not
+    /// an implementation detail. The investigation that found this defect enumerated two of the
+    /// three callers; a per-caller guard is therefore one missed caller away from reinstating the
+    /// original defect, and covers no caller added later. One enforcement point covers all three
+    /// and any fourth.
+    ///
+    /// The rule is **shrink-scoped and intent-partitioned**: an [`ReloadIntent::AppendOnly`]
+    /// reconcile presenting FEWER accounts than the live roster is refused whole — nothing is
+    /// mutated, and the caller reports it. `<`, never `<=`: an equal-count roster is a relabel or a
+    /// re-order, not a shrink, and widening is untouched (a floor that narrowed it would break
+    /// issue #139, the reason the roster-reload exists at all — R-18).
+    ///
+    /// **An empty-roster floor in this position would be inert on the incident and wrong
+    /// everywhere else**, which is why the shape is what it is. The 2026-08-27 transition was
+    /// 6 → 1, so a "refuse an empty roster" guard never fires on it; and it can never fire on ANY
+    /// append-only path, because `plan_capture` has only update-in-place and push arms and so
+    /// always leaves at least one account in the file it saves. The one reload that CAN present
+    /// zero is a removal of the last account — the single case that should be allowed. That guard
+    /// fires only where it is wrong.
+    ///
+    /// Under [`ReloadIntent::Mutating`] no floor applies at all: `remove`, `disable`, `import` and
+    /// `config restore` may legitimately shrink the roster, INCLUDING to zero (R-4).
+    ///
+    /// Returns the [`ReconcileOutcome`], `#[must_use]` because a caller that drops it reports an
+    /// adoption that did not happen — the refusal's only durable trace is the line the caller
+    /// writes from this value.
+    #[must_use = "a refused reconcile mutated nothing — the caller must report it, not assume it landed (#1442)"]
+    pub(super) fn reconcile_roster(
+        &mut self,
+        new_roster: Vec<Account>,
+        intent: ReloadIntent,
+    ) -> ReconcileOutcome {
+        // The floor, BEFORE any mutation: a refusal is a true no-op, not a partial reshape.
+        if matches!(intent, ReloadIntent::AppendOnly) && new_roster.len() < self.roster.len() {
+            return ReconcileOutcome::RefusedShrink;
+        }
+
         // Capture the active account's identity from the CURRENT roster before it is
         // replaced, so active can be re-resolved by uuid against the new roster.
         let active_uuid = self
@@ -710,12 +792,45 @@ where
         // uncovered until #1452 — see `invalidate_poll_schedule`, whose contract now names
         // both.
         self.invalidate_poll_schedule();
+        ReconcileOutcome::Adopted
     }
+}
+
+/// Whether a [`Daemon::reconcile_roster`] call actually replaced the live roster (issue #1442).
+///
+/// Two variants, and the refusing one names its REASON rather than being a bare `false`: the
+/// caller renders it onto the durable `roster-reload` line, where "refused" alone is not an
+/// operator-actionable fact. There is exactly one refusal today; a second would be a variant here,
+/// so the render arms fail to compile until they account for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReconcileOutcome {
+    /// The new roster replaced the live one, and every per-account signal was re-keyed onto it.
+    Adopted,
+    /// Refused: an [`ReloadIntent::AppendOnly`] reconcile presented FEWER accounts than the live
+    /// roster (R-3 / R-3a). A TRUE no-op — the roster, the per-account state, the active index and
+    /// the poll schedule are all exactly as they were.
+    RefusedShrink,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reconcile and assert the never-shrink floor (issue #1442) ADOPTED it.
+    ///
+    /// Every reconcile test that predates the floor wants this shape: the reshape it describes is
+    /// one the floor must let through, and saying so is the point rather than boilerplate. A
+    /// widening, an equal-count relabel, and every mutating shrink all assert it here — so a floor
+    /// that over-fires (narrowing issue #139's path, or refusing a legitimate `remove`) fails
+    /// across this whole module rather than in one place.
+    #[track_caller]
+    fn assert_adopted(outcome: ReconcileOutcome) {
+        assert_eq!(
+            outcome,
+            ReconcileOutcome::Adopted,
+            "the floor must not refuse this reshape"
+        );
+    }
 
     use crate::config::SetTunables;
     use crate::contract::SweepOutcome;
@@ -2938,11 +3053,14 @@ mod tests {
             account.polled_once = true;
         }
 
-        daemon.reconcile_roster(vec![
-            account("u-A", "work"),
-            account("u-B", "spare"),
-            account("u-C", "third"),
-        ]);
+        assert_adopted(daemon.reconcile_roster(
+            vec![
+                account("u-A", "work"),
+                account("u-B", "spare"),
+                account("u-C", "third"),
+            ],
+            ReloadIntent::AppendOnly,
+        ));
 
         // The new account is now in the live roster…
         assert_eq!(roster_uuids(&daemon), vec!["u-A", "u-B", "u-C"]);
@@ -2978,10 +3096,10 @@ mod tests {
         daemon.state.accounts[1].last_reading = Some(reading(0.11, 0.22));
         daemon.state.accounts[1].health.recovery_successes = 2;
 
-        daemon.reconcile_roster(vec![
-            account("u-A", "work"),
-            account("u-B", "spare-renamed"),
-        ]);
+        assert_adopted(daemon.reconcile_roster(
+            vec![account("u-A", "work"), account("u-B", "spare-renamed")],
+            ReloadIntent::AppendOnly,
+        ));
 
         assert_eq!(roster_uuids(&daemon), vec!["u-A", "u-B"], "no duplicate");
         assert_eq!(daemon.roster[1].label, "spare-renamed", "label updated");
@@ -3006,10 +3124,10 @@ mod tests {
         daemon.state.accounts[1].last_reading = Some(reading(0.10, 0.20));
 
         // `disable spare` on disk → the reloaded roster carries B parked.
-        daemon.reconcile_roster(vec![
-            account("u-A", "work"),
-            disabled_account("u-B", "spare"),
-        ]);
+        assert_adopted(daemon.reconcile_roster(
+            vec![account("u-A", "work"), disabled_account("u-B", "spare")],
+            ReloadIntent::Mutating,
+        ));
 
         assert!(
             !daemon.roster[1].enabled,
@@ -3035,7 +3153,10 @@ mod tests {
         daemon.state.accounts[0].last_reading = Some(reading(0.10, 0.10)); // A reading
         daemon.state.accounts[2].health.recovery_successes = 3; // C health mark
 
-        daemon.reconcile_roster(vec![account("u-A", "work"), account("u-C", "third")]);
+        assert_adopted(daemon.reconcile_roster(
+            vec![account("u-A", "work"), account("u-C", "third")],
+            ReloadIntent::Mutating,
+        ));
 
         assert_eq!(roster_uuids(&daemon), vec!["u-A", "u-C"], "B dropped");
         assert_eq!(daemon.state.accounts.len(), 2);
@@ -3062,7 +3183,10 @@ mod tests {
         ]);
         daemon.state.active = Some(2); // C is active at index 2
 
-        daemon.reconcile_roster(vec![account("u-B", "spare"), account("u-C", "third")]); // A removed
+        assert_adopted(daemon.reconcile_roster(
+            vec![account("u-B", "spare"), account("u-C", "third")],
+            ReloadIntent::Mutating,
+        )); // A removed
 
         // C is now at index 1 — active tracks the uuid, not the old slot.
         assert_eq!(roster_uuids(&daemon), vec!["u-B", "u-C"]);
@@ -3076,7 +3200,9 @@ mod tests {
         let mut daemon = reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")]);
         daemon.state.active = Some(0); // A active
 
-        daemon.reconcile_roster(vec![account("u-B", "spare")]); // A removed
+        assert_adopted(
+            daemon.reconcile_roster(vec![account("u-B", "spare")], ReloadIntent::Mutating),
+        ); // A removed
 
         assert_eq!(roster_uuids(&daemon), vec!["u-B"]);
         assert_eq!(daemon.state.active, None);
@@ -3092,7 +3218,7 @@ mod tests {
         daemon.state.active = Some(0);
         daemon.state.accounts[0].last_reading = Some(reading(0.10, 0.10));
 
-        daemon.reconcile_roster(vec![]);
+        assert_adopted(daemon.reconcile_roster(vec![], ReloadIntent::Mutating));
 
         assert!(daemon.roster.is_empty());
         assert!(daemon.state.accounts.is_empty());
@@ -3258,7 +3384,7 @@ mod tests {
                 for (i, account) in daemon.state.accounts.iter_mut().enumerate() {
                     seed(account, i);
                 }
-                daemon.reconcile_roster(new_roster.clone());
+                assert_adopted(daemon.reconcile_roster(new_roster.clone(), ReloadIntent::Mutating));
 
                 let shape: Vec<String> = new_roster.iter().map(uuid_of).collect();
 
@@ -3310,11 +3436,14 @@ mod tests {
         daemon.state.poll_schedule = vec![0, 1];
         daemon.state.poll_pos = 1;
 
-        daemon.reconcile_roster(vec![
-            account("u-A", "work"),
-            account("u-B", "spare"),
-            account("u-C", "third"),
-        ]);
+        assert_adopted(daemon.reconcile_roster(
+            vec![
+                account("u-A", "work"),
+                account("u-B", "spare"),
+                account("u-C", "third"),
+            ],
+            ReloadIntent::AppendOnly,
+        ));
 
         assert!(daemon.state.poll_schedule.is_empty(), "schedule reset");
         assert_eq!(daemon.state.poll_pos, 0, "cursor reset");
@@ -3327,7 +3456,16 @@ mod tests {
         let snap = StatusSnapshot::default();
         let (reply, signal) = control_reply(r#"{"cmd":"roster-reload"}"#, &snap, true);
         assert_eq!(reply, r#"{"ok":true}"#);
-        assert_eq!(signal, Some(ControlSignal::RosterReloadRequested));
+        // Issue #1442: a request carrying NO `intent` is the legacy shape a pre-#1442 CLI sends,
+        // and it resolves to the REFUSING treatment — asserted on the signal itself, so a
+        // `from_wire` default flipped to `Mutating` fails here rather than silently permitting
+        // every shrink an old client triggers.
+        assert_eq!(
+            signal,
+            Some(ControlSignal::RosterReloadRequested(
+                ReloadIntent::AppendOnly
+            ))
+        );
     }
 
     #[test]
@@ -3464,7 +3602,7 @@ mod tests {
         daemon.state.active = Some(0);
         daemon.state.accounts[0].health.quarantined = true; // A's state must survive the reload
 
-        let event = daemon.adopt_roster_reload().await;
+        let event = daemon.adopt_roster_reload(ReloadIntent::AppendOnly).await;
 
         assert_eq!(roster_uuids(&daemon), vec!["u-A", "u-B", "u-C"]);
         assert!(
@@ -3498,7 +3636,7 @@ mod tests {
             reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")])
                 .with_config_path(config_path);
 
-        let event = daemon.adopt_roster_reload().await;
+        let event = daemon.adopt_roster_reload(ReloadIntent::AppendOnly).await;
 
         assert_eq!(
             roster_uuids(&daemon),
@@ -3529,7 +3667,7 @@ mod tests {
         // an empty roster.
         let mut daemon = reconcile_daemon(vec![account("u-A", "work")]);
 
-        let event = daemon.adopt_roster_reload().await;
+        let event = daemon.adopt_roster_reload(ReloadIntent::AppendOnly).await;
 
         assert_eq!(roster_uuids(&daemon), vec!["u-A"]);
         assert_eq!(
@@ -3557,7 +3695,7 @@ mod tests {
             reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")])
                 .with_config_path(config_path);
 
-        let event = daemon.adopt_roster_reload().await;
+        let event = daemon.adopt_roster_reload(ReloadIntent::AppendOnly).await;
 
         assert_eq!(
             roster_uuids(&daemon),
@@ -3597,7 +3735,7 @@ mod tests {
         .with_config_path(config_path);
 
         let line = daemon
-            .adopt_roster_reload()
+            .adopt_roster_reload(ReloadIntent::Mutating)
             .await
             .to_log_line(std::time::UNIX_EPOCH);
 
@@ -3663,7 +3801,7 @@ mod tests {
         let render = |event: Event| event.to_log_line(std::time::UNIX_EPOCH);
 
         // (a) absent — the dropped error carries the whole config path.
-        let absent = render(daemon.adopt_roster_reload().await);
+        let absent = render(daemon.adopt_roster_reload(ReloadIntent::AppendOnly).await);
         // The sweep below asserts the secrets are NOT on the line, which is evidence only if they
         // were AVAILABLE to leak — so assert positively, here, that the error the handler
         // classifies and discards really does carry them. Without this, a `toml` bump that stopped
@@ -3679,7 +3817,7 @@ mod tests {
 
         // (b) unreadable — the dropped TOML error quotes the file's own content.
         std::fs::write(&config_path, format!("]not valid toml[ {SECRET_LABEL}")).unwrap();
-        let unreadable = render(daemon.adopt_roster_reload().await);
+        let unreadable = render(daemon.adopt_roster_reload(ReloadIntent::AppendOnly).await);
         let unreadable_err = Config::load_path(&config_path).unwrap_err().to_string();
         assert!(
             unreadable_err.contains(SECRET_LABEL),
@@ -3689,12 +3827,12 @@ mod tests {
 
         // (c) adopted — the roster that WAS read is full of distinctive handles.
         write_roster_config(&config_path, &[(SECRET_UUID, SECRET_LABEL)]);
-        let adopted = render(daemon.adopt_roster_reload().await);
+        let adopted = render(daemon.adopt_roster_reload(ReloadIntent::AppendOnly).await);
 
         // (d) refused — no `config_path` at all, so the file is never opened and the only thing
         // in reach is the live roster, which carries both handles.
         let mut unarmed: FakeDaemon = reconcile_daemon(vec![account(SECRET_UUID, SECRET_LABEL)]);
-        let refused = render(unarmed.adopt_roster_reload().await);
+        let refused = render(unarmed.adopt_roster_reload(ReloadIntent::AppendOnly).await);
         assert!(
             roster_uuids(&unarmed)
                 .iter()
@@ -3745,7 +3883,7 @@ mod tests {
                 .with_config_path(config_path);
 
         let line = daemon
-            .adopt_roster_reload()
+            .adopt_roster_reload(ReloadIntent::Mutating)
             .await
             .to_log_line(std::time::UNIX_EPOCH);
 
@@ -3772,7 +3910,7 @@ mod tests {
         // `previous = 0` is reachable, and only from here: the daemon now HOLDS an empty roster,
         // so the next reload reports zero as the `was` half too.
         let again = daemon
-            .adopt_roster_reload()
+            .adopt_roster_reload(ReloadIntent::Mutating)
             .await
             .to_log_line(std::time::UNIX_EPOCH);
         assert_eq!(
@@ -3790,7 +3928,7 @@ mod tests {
         // renderer that collapses zero into absence: the refusal path reads nothing, and OMITS.
         let mut unarmed: FakeDaemon = reconcile_daemon(vec![account("u-A", "work")]);
         let refused = unarmed
-            .adopt_roster_reload()
+            .adopt_roster_reload(ReloadIntent::AppendOnly)
             .await
             .to_log_line(std::time::UNIX_EPOCH);
         assert_eq!(
@@ -3830,17 +3968,17 @@ mod tests {
 
         // (a) refused — no config path wired.
         let mut unarmed: FakeDaemon = reconcile_daemon(vec![account("u-A", "work")]);
-        let refused = unarmed.adopt_roster_reload().await;
+        let refused = unarmed.adopt_roster_reload(ReloadIntent::AppendOnly).await;
 
         let mut daemon: FakeDaemon =
             reconcile_daemon(vec![account("u-A", "work")]).with_config_path(config_path.clone());
         // (b) failed / absent, (c) failed / unreadable, (d) adopted — in that order, so one
         // daemon walks the file from missing through malformed to valid.
-        let absent = daemon.adopt_roster_reload().await;
+        let absent = daemon.adopt_roster_reload(ReloadIntent::AppendOnly).await;
         std::fs::write(&config_path, "]not valid toml[").unwrap();
-        let unreadable = daemon.adopt_roster_reload().await;
+        let unreadable = daemon.adopt_roster_reload(ReloadIntent::AppendOnly).await;
         write_roster_config(&config_path, &[("u-A", "work")]);
-        let adopted = daemon.adopt_roster_reload().await;
+        let adopted = daemon.adopt_roster_reload(ReloadIntent::AppendOnly).await;
 
         let paths = [&refused, &absent, &unreadable, &adopted];
         for event in paths {
@@ -4024,7 +4162,7 @@ mod tests {
         // Tick 1 → idle delivers `RosterReloadRequested` (reload) → tick 2 → shutdown.
         // after(3): 1 start-up check (pends) + 2 idle shutdown-checks.
         let mut shutdown = FakeShutdown::after(3);
-        let control = OnceRosterReload::new();
+        let control = OnceRosterReload::new(ReloadIntent::AppendOnly);
 
         let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
         run_loop(

@@ -63,6 +63,65 @@ use super::*;
 
 use crate::config::SetTunables;
 
+/// Which KIND of roster write triggered a `roster-reload` notification (issue #1442, design D-2).
+///
+/// The daemon cannot tell an append from a removal by looking at the file. Both present a roster,
+/// and a SMALLER one is either a legitimate `remove` or the 2026-08-27 collapse — structurally
+/// indistinguishable from the reading end, which is why diffing uuid sets was rejected as the
+/// alternative. Only the ORIGINATING VERB knows, so the verb declares it and
+/// `Daemon::reconcile_roster` partitions the never-shrink floor on it (design D-4).
+///
+/// Two variants and not three: "unknown" is NOT a third state the daemon reasons about. It is
+/// [`ReloadIntent::AppendOnly`] by [`ReloadIntent::from_wire`], which is what makes R-3a
+/// ("no declared intent ⇒ the refusing treatment") a property of the type rather than a rule every
+/// call site has to remember. A third `Unknown` variant would push that decision back out to every
+/// match arm, where forgetting it is silent and permissive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReloadIntent {
+    /// `login` / `capture` — verbs that can only ADD to the roster. `plan_capture`
+    /// ([`crate::capture`]) has only update-in-place and push arms, so a roster these verbs save
+    /// always holds at least every account it started with. A reload from one of them presenting
+    /// FEWER accounts than the live roster therefore did not come from the verb: something else
+    /// removed them, and the daemon refuses (R-3).
+    AppendOnly,
+    /// `remove` / `enable` / `disable` / `import` / `config restore` / `config set` — verbs whose
+    /// whole job may be to change roster membership. A shrink here is the operator's intent,
+    /// INCLUDING a legitimate reduction to zero (removing the last account), so the floor does not
+    /// apply (R-4).
+    Mutating,
+}
+
+impl ReloadIntent {
+    /// The wire token for the `roster-reload` request's optional `intent` field.
+    pub(crate) fn as_wire(self) -> &'static str {
+        match self {
+            ReloadIntent::AppendOnly => "append-only",
+            ReloadIntent::Mutating => "mutating",
+        }
+    }
+
+    /// Resolve a received `intent` token, FAIL-CLOSED (R-3a).
+    ///
+    /// Three inputs collapse to [`ReloadIntent::AppendOnly`] — the refusing treatment — and the
+    /// collapse is the point:
+    ///   - `None`: the legacy shape. `notify_daemon_roster_reload()` took no arguments before this
+    ///     issue, so an older CLI against a newer daemon sends exactly this;
+    ///   - an UNRECOGNIZED token: a newer CLI against an older daemon, or a verb that grows a third
+    ///     intent later. Nothing here can know what it meant, and guessing `Mutating` would adopt a
+    ///     shrink on a token the daemon does not understand;
+    ///   - the literal `append-only`.
+    ///
+    /// So a partial rollout in EITHER direction refuses rather than permits, and a verb added
+    /// without declaring intent is safe by construction rather than by review (PRD premortem P-4).
+    /// Only the exact `mutating` token opts into a shrink.
+    pub(crate) fn from_wire(token: Option<&str>) -> Self {
+        match token {
+            Some(token) if token == ReloadIntent::Mutating.as_wire() => ReloadIntent::Mutating,
+            _ => ReloadIntent::AppendOnly,
+        }
+    }
+}
+
 /// A side effect a served control connection asks the run loop to apply after the
 /// reply is sent. `status` produces none (a pure read); each state-affecting command
 /// maps to a variant. Returned by [`Control::serve`] so the mutation lands on the
@@ -70,7 +129,7 @@ use crate::config::SetTunables;
 /// itself only borrows the read-only snapshot.
 ///
 /// Deliberately NOT `Copy`: [`Restored`](ControlSignal::Restored) carries an owned
-/// `uuid` payload (issue #275), unlike the two payload-less signals. The run loop
+/// `uuid` payload (issue #275). The run loop
 /// consumes the signal by value out of the idle `select!`, so a move (not a copy) is
 /// all the handling needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -86,11 +145,15 @@ pub(crate) enum ControlSignal {
     /// the daemon (issue #139). The run loop reloads it
     /// ([`Daemon::adopt_roster_reload`]): re-read `config.toml` and reconcile the
     /// in-memory roster (add onboarded/relogged-in accounts, drop removed ones),
-    /// preserving per-account health/decision state for accounts that persist. Like
-    /// [`ManualSwapped`](ControlSignal::ManualSwapped) it carries no payload — the
-    /// authoritative new roster is the on-disk `config.toml`, re-read from scratch — so
-    /// a duplicate or out-of-order notification at worst re-reads an unchanged file.
-    RosterReloadRequested,
+    /// preserving per-account health/decision state for accounts that persist.
+    ///
+    /// It carries no ROSTER — the authoritative new one is the on-disk `config.toml`, re-read from
+    /// scratch, so a duplicate or out-of-order notification at worst re-reads an unchanged file.
+    /// What it does carry is the originating verb's [`ReloadIntent`] (issue #1442), which the file
+    /// cannot supply: whether a smaller roster is a legitimate `remove` or a collapse is a fact
+    /// about the VERB, not about the bytes. An unauthenticated peer produces no signal at all, so
+    /// a stranger can neither trigger a reload nor choose its intent.
+    RosterReloadRequested(ReloadIntent),
     /// An authenticated peer (the `login` verb re-logging in a parked account; in
     /// principle a manual operator) asked to un-quarantine the account with this
     /// `uuid` WITHOUT making it active (issue #275). The run loop hands it to
@@ -326,6 +389,18 @@ struct ControlRequest {
     /// the value is validated (and mapped to the series) in the spawned task, never here.
     #[serde(default)]
     period: Option<String>,
+    /// The `roster-reload` command's OPTIONAL originating intent (issue #1442, design D-2):
+    /// `append-only` (`login` / `capture`) or `mutating` (`remove` / `enable` / `disable` /
+    /// `import` / `config restore`). A machine token naming a VERB CLASS — never a credential,
+    /// never an account handle, never a count.
+    ///
+    /// `#[serde(default)]` so every other command omits it AND so a `roster-reload` from a
+    /// pre-#1442 CLI still parses. That missing value is not a gap to be filled later: it is the
+    /// fail-closed default R-3a requires, resolved by [`ReloadIntent::from_wire`] — which is why
+    /// this stays `Option<String>` here and is narrowed to a two-variant enum exactly once, at the
+    /// dispatch below, rather than being threaded onward as a raw string.
+    #[serde(default)]
+    intent: Option<String>,
 }
 
 /// A parsed `swap` control request (issue #167): an operator-supplied target handle plus the
@@ -617,11 +692,20 @@ pub(crate) fn control_reply(
         // new on-disk roster — so, like `manual-swapped`, it is honored ONLY for an
         // authenticated same-user peer; an unauthenticated one gets an error and
         // produces NO signal (a stranger can never make the daemon re-read its config).
+        //
+        // The optional `intent` (issue #1442) is resolved HERE, once, by
+        // `ReloadIntent::from_wire` — so an absent or unrecognized token becomes the refusing
+        // `AppendOnly` at the boundary rather than travelling inward as an `Option<String>` that
+        // some later arm has to remember to default correctly. A malformed request never reaches
+        // this arm at all (serde's `Err` branch below answers it), and an unauthenticated peer
+        // produces no signal, so an intent is only ever read off a well-formed authenticated line.
         Ok(request) if request.cmd == "roster-reload" => {
             if peer_authenticated {
                 (
                     r#"{"ok":true}"#.to_owned(),
-                    Some(ControlSignal::RosterReloadRequested),
+                    Some(ControlSignal::RosterReloadRequested(
+                        ReloadIntent::from_wire(request.intent.as_deref()),
+                    )),
                 )
             } else {
                 (r#"{"error":"unauthorized"}"#.to_owned(), None)
@@ -1436,14 +1520,28 @@ const CLIENT_NOTIFY_TIMEOUT: Duration = Duration::from_secs(2);
 /// error — is for the CALLER to log and ignore, never fatal. Bounded by
 /// [`CLIENT_NOTIFY_TIMEOUT`] so a missing / wedged daemon can never hang the
 /// verb. Carries NO credential and NO write target — a pure reload signal (the daemon
-/// re-reads the authoritative file itself).
-pub(crate) async fn notify_roster_reload(socket: &Path) -> Result<()> {
+/// re-reads the authoritative file itself) plus the calling verb's [`ReloadIntent`].
+///
+/// `intent` (issue #1442) is what lets the daemon's never-shrink floor tell a legitimate `remove`
+/// from the 2026-08-27 collapse; the file itself cannot, since both present a smaller roster. It is
+/// REQUIRED of every caller here even though the wire field is optional — the optionality exists
+/// for an OLDER CLI whose binary predates the field, not as a way for a current one to abstain.
+/// Making it a parameter is what turns "declare your intent" from a convention into a compile
+/// error, so a seventh call site cannot be added silently.
+pub(crate) async fn notify_roster_reload(socket: &Path, intent: ReloadIntent) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
+    // Built from `as_wire`, never a literal: the token the CLI sends and the token the daemon
+    // matches in `from_wire` are then the same one expression, so a re-spelling cannot leave the
+    // two halves of this protocol disagreeing while both still compile.
+    let request = format!(
+        "{{\"cmd\":\"roster-reload\",\"intent\":\"{}\"}}\n",
+        intent.as_wire()
+    );
     let exchange = async {
         let stream = tokio::net::UnixStream::connect(socket).await?;
         let mut buffered = tokio::io::BufReader::new(stream);
-        buffered.write_all(b"{\"cmd\":\"roster-reload\"}\n").await?;
+        buffered.write_all(request.as_bytes()).await?;
         buffered.flush().await?;
         // Read the one-line ack so the daemon has processed the request before we
         // return; the content is irrelevant (any failure is non-fatal for the caller).

@@ -169,8 +169,8 @@ mod socket;
 pub(crate) use socket::{
     notify_restored, notify_roster_reload, request_swap, write_capture_ack, write_config_set_ack,
     write_swap_ack, CaptureAck, CaptureCommand, CaptureRejection, ConfigSetAck, ConfigSetCommand,
-    ConfigSetEffect, ConfigSetRejection, Control, ControlSignal, ControlYield, SwapAck,
-    SwapCommand, SwapRejection, UnixControl, SWAP_ACK_WRITE_TIMEOUT,
+    ConfigSetEffect, ConfigSetRejection, Control, ControlSignal, ControlYield, ReloadIntent,
+    SwapAck, SwapCommand, SwapRejection, UnixControl, SWAP_ACK_WRITE_TIMEOUT,
 };
 // `serve_control` / `control_reply` / `MAX_CONTROL_LINE_BYTES` are exercised only by the
 // in-module socket tests (production reaches them through `UnixControl::serve`); `serve_watch` /
@@ -6664,14 +6664,20 @@ mod tests {
     /// then idles normally on every later poll. The roster-reload analog of
     /// [`OnceManualSwap`]: drives the live `Idle::RosterReloadRequested =>
     /// adopt_roster_reload` wiring that `NoControl` never does.
+    /// Holds the [`ReloadIntent`] the signal carries (issue #1442) rather than fixing one, so a
+    /// run-loop test can drive an ADOPTION and a shrink REFUSAL through the same live wiring —
+    /// the intent is the only thing that separates them, and hard-coding it here would put the
+    /// refusal arm permanently out of the run loop's reach.
     pub(super) struct OnceRosterReload {
         fired: Cell<bool>,
+        intent: ReloadIntent,
     }
 
     impl OnceRosterReload {
-        pub(super) fn new() -> Self {
+        pub(super) fn new(intent: ReloadIntent) -> Self {
             Self {
                 fired: Cell::new(false),
+                intent,
             }
         }
     }
@@ -6681,7 +6687,7 @@ mod tests {
             if self.fired.replace(true) {
                 std::future::pending().await
             } else {
-                ControlYield::Signal(Some(ControlSignal::RosterReloadRequested))
+                ControlYield::Signal(Some(ControlSignal::RosterReloadRequested(self.intent)))
             }
         }
     }
@@ -11924,7 +11930,16 @@ mod tests {
         daemon.state.accounts[1].session_high_water =
             swap::SessionHighWater::fold(None, &stamped(0.42));
 
-        daemon.reconcile_roster(vec![account("u-B", "spare"), account("u-C", "third")]);
+        // `Mutating` (issue #1442): u-A is REMOVED here. The count happens to stay at two, so the
+        // never-shrink floor would not fire either way, but the intent names the verb rather than
+        // the arithmetic.
+        assert_eq!(
+            daemon.reconcile_roster(
+                vec![account("u-B", "spare"), account("u-C", "third")],
+                ReloadIntent::Mutating,
+            ),
+            commands::ReconcileOutcome::Adopted,
+        );
 
         // The vec stays length- and index-aligned with the new roster.
         assert_eq!(roster_uuids(&daemon), vec!["u-B", "u-C"]);
@@ -11960,7 +11975,16 @@ mod tests {
             samples: 2,
         });
 
-        daemon.reconcile_roster(vec![account("u-B", "spare"), account("u-C", "third")]);
+        // `Mutating` (issue #1442): u-A is REMOVED here. The count happens to stay at two, so the
+        // never-shrink floor would not fire either way, but the intent names the verb rather than
+        // the arithmetic.
+        assert_eq!(
+            daemon.reconcile_roster(
+                vec![account("u-B", "spare"), account("u-C", "third")],
+                ReloadIntent::Mutating,
+            ),
+            commands::ReconcileOutcome::Adopted,
+        );
 
         // The vec stays length- and index-aligned with the new roster.
         assert_eq!(roster_uuids(&daemon), vec!["u-B", "u-C"]);
@@ -12004,7 +12028,16 @@ mod tests {
             near_limit: false,
         });
 
-        daemon.reconcile_roster(vec![account("u-B", "spare"), account("u-C", "third")]);
+        // `Mutating` (issue #1442): u-A is REMOVED here. The count happens to stay at two, so the
+        // never-shrink floor would not fire either way, but the intent names the verb rather than
+        // the arithmetic.
+        assert_eq!(
+            daemon.reconcile_roster(
+                vec![account("u-B", "spare"), account("u-C", "third")],
+                ReloadIntent::Mutating,
+            ),
+            commands::ReconcileOutcome::Adopted,
+        );
 
         // The vec stays length- and index-aligned with the new roster.
         assert_eq!(roster_uuids(&daemon), vec!["u-B", "u-C"]);

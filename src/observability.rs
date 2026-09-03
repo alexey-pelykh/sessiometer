@@ -1200,6 +1200,26 @@ pub(crate) enum RosterReloadReason {
     /// reading, which is why its line carries no `incoming` count. That absence belongs to this
     /// reason, not to [`RosterReloadOutcome::Refused`].
     ReloadDisabled,
+    /// The reload declared APPEND-ONLY intent (`login` / `capture`, or an omitted intent, which
+    /// R-3a resolves to the same treatment) and presented FEWER accounts than the live roster, so
+    /// the daemon kept what it had (issue #1442). The 2026-08-27 incident's own code.
+    ///
+    /// The counterpart of [`RosterReloadReason::ReloadDisabled`] across the split that outcome
+    /// documents: this refusal is taken AFTER the read, because a shrink is only visible by
+    /// comparing the two counts — so its line renders BOTH `previous` and `incoming`, where
+    /// `ReloadDisabled` renders no `incoming` at all. A reader seeing this code is looking at a
+    /// roster the daemon declined to lose, and at the two numbers that say how much.
+    ///
+    /// NOT a failure: nothing was unreadable and nothing went wrong with the file. The daemon read
+    /// it, understood it, and decided against it — which is why this rides on
+    /// [`RosterReloadOutcome::Refused`] and not on [`RosterReloadOutcome::Failed`].
+    ///
+    /// Distinct from [`RosterReloadReason::CountMismatch`], which the poll-tick CHECK (issue
+    /// #1443) reports and which also carries both counts. That one OBSERVES a disagreement and
+    /// writes nothing; this one is a decision taken on a reload the daemon was asked to adopt.
+    /// The pair is why the absence matrix is keyed on the (outcome, reason) PAIR rather than on
+    /// either alone.
+    Shrink,
     /// The config file was not there when the reload — or the issue-#1443 poll-tick check — went
     /// to read it.
     ///
@@ -1209,8 +1229,10 @@ pub(crate) enum RosterReloadReason {
     /// the line carries only `previous` because there is no incoming roster to count.
     Absent,
     /// CHECK side (issue #1443): the file parsed, and the roster it presents is a DIFFERENT SIZE
-    /// from the live in-memory rotation. The only reason whose line carries both counts, because
-    /// the disagreement is not legible in either one alone.
+    /// from the live in-memory rotation. Its line carries both counts, because the disagreement is
+    /// not legible in either one alone — as does [`RosterReloadReason::Shrink`] (issue #1442),
+    /// which landed after this doc was written and which said "the ONLY reason" is no longer true
+    /// of. The two are the observe-side and the decide-side of the same disagreement.
     ///
     /// SIZE, deliberately, and this is the bound to know when reading a line: a same-size
     /// substitution — one account swapped for another with the roster length unchanged — is NOT
@@ -1261,6 +1283,7 @@ impl RosterReloadReason {
     fn as_str(self) -> &'static str {
         match self {
             RosterReloadReason::ReloadDisabled => "reload_disabled",
+            RosterReloadReason::Shrink => "shrink",
             RosterReloadReason::Absent => "absent",
             RosterReloadReason::CountMismatch => "count_mismatch",
             RosterReloadReason::Unreadable => "unreadable",
@@ -7125,6 +7148,7 @@ pub(crate) mod tests {
     fn roster_reload_reason_variant_name(reason: &RosterReloadReason) -> &'static str {
         match reason {
             RosterReloadReason::ReloadDisabled => "ReloadDisabled",
+            RosterReloadReason::Shrink => "Shrink",
             RosterReloadReason::Absent => "Absent",
             RosterReloadReason::CountMismatch => "CountMismatch",
             RosterReloadReason::Unreadable => "Unreadable",
@@ -7142,6 +7166,7 @@ pub(crate) mod tests {
     fn expected_reason_render(reason: RosterReloadReason) -> (&'static str, RosterReloadOutcome) {
         match reason {
             RosterReloadReason::ReloadDisabled => ("reload_disabled", RosterReloadOutcome::Refused),
+            RosterReloadReason::Shrink => ("shrink", RosterReloadOutcome::Refused),
             RosterReloadReason::Absent => ("absent", RosterReloadOutcome::Failed),
             // The one reason the CHECK owns outright — no reload path can produce it, so its
             // representative outcome is `Diverged` (issue #1443).
@@ -7214,6 +7239,7 @@ pub(crate) mod tests {
         // it just silently stops matching, or starts matching the wrong incidents.
         const EVERY_REASON: &[RosterReloadReason] = &[
             RosterReloadReason::ReloadDisabled,
+            RosterReloadReason::Shrink,
             RosterReloadReason::Absent,
             RosterReloadReason::CountMismatch,
             RosterReloadReason::Unreadable,

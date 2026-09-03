@@ -54,6 +54,7 @@ use crate::config::{
     account_uuid_violation, Account, Config, CredentialConfig, LoginConfig, MigrationConfig,
     RefreshConfig, StatsConfig, Tunables,
 };
+use crate::daemon::ReloadIntent;
 use crate::error::{Error, Result};
 use crate::keychain::{Credential, CredentialStore, RealCredentialStore};
 use crate::login::login_account;
@@ -135,7 +136,9 @@ pub(crate) async fn capture(label: Option<String>) -> Result<()> {
     report.config.save().await?;
     // Tell a running daemon to pick up the new roster now (#139) — best-effort, so no
     // daemon (or a wedged one) never blocks capture; the disk write is authoritative.
-    notify_daemon_roster_reload().await;
+    // APPEND-ONLY (#1442, R-3): `plan_capture` only updates-in-place or pushes, so the roster
+    // this just saved can never be smaller than the one it read.
+    notify_daemon_roster_reload(ReloadIntent::AppendOnly).await;
     println!(
         "{}",
         confirmation(report.outcome, &report.label, report.count)
@@ -375,7 +378,15 @@ fn emit_login_event(account: Option<String>, outcome: LoginEventOutcome) {
 /// ([`emit_roster_reload_not_notified`], issue #1438): a roster write that the daemon was never
 /// told about is the CLI-side twin of the same blind spot the daemon handler had — the file moved
 /// and the running rotation did not, with nothing recording the divergence.
-pub(crate) async fn notify_daemon_roster_reload() {
+///
+/// `intent` (issue #1442) declares whether the calling verb can only ADD to the roster
+/// ([`ReloadIntent::AppendOnly`] — `capture`, `login`) or may legitimately change its membership
+/// ([`ReloadIntent::Mutating`] — `remove`, `enable` / `disable`, `import`, `config restore`). The
+/// daemon's never-shrink floor partitions on it, and cannot recover it from the file: a smaller
+/// roster on disk is either the operator's `remove` or the 2026-08-27 collapse, and the two are
+/// identical from the reading end. Every caller must state it — the wire field is optional only so
+/// a pre-#1442 CLI still parses, and an absent one is read as the REFUSING treatment (R-3a).
+pub(crate) async fn notify_daemon_roster_reload(intent: ReloadIntent) {
     let socket = match paths::control_socket() {
         Ok(socket) => socket,
         Err(err) => {
@@ -386,7 +397,7 @@ pub(crate) async fn notify_daemon_roster_reload() {
             return;
         }
     };
-    if let Err(err) = crate::daemon::notify_roster_reload(&socket).await {
+    if let Err(err) = crate::daemon::notify_roster_reload(&socket, intent).await {
         // A TIMEOUT is not a failure to deliver, and the two must not share one code (#1438). The
         // daemon's jittered start-up delay draws a uniform `[0, STARTUP_DELAY_CAP)` wait — up to
         // 30s (#76) — and its control socket is BOUND before anything accepts on it, so a roster
@@ -997,7 +1008,10 @@ pub(crate) async fn reconcile_login(
     report.config.save().await?;
     // Tell a running daemon to pick up the onboarded / relogged-in account now (#139) —
     // best-effort, the login already committed to disk.
-    notify_daemon_roster_reload().await;
+    // APPEND-ONLY (#1442, R-3): a login onboards or re-authenticates one account and drops none.
+    // This is the verb whose reload collapsed the roster on 2026-08-27, and the intent it now
+    // declares is what lets the daemon refuse that reload instead of adopting it.
+    notify_daemon_roster_reload(ReloadIntent::AppendOnly).await;
     // #276: a non-activating REVIVE did NOT re-point the canonical item, so the daemon's
     // #107 path won't clear this account's `needs re-login` quarantine — signal it to
     // un-quarantine the revived account NOW (the reliable on-demand path, since the #106

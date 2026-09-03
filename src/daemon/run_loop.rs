@@ -96,8 +96,11 @@ enum Idle {
     /// A manual `use` swap notified the daemon (#64) — adopt it, then re-tick.
     ManualSwapped,
     /// A roster write (`capture` / `login` / `remove`) notified the daemon (#139)
-    /// — reload + reconcile the in-memory roster, then re-tick.
-    RosterReloadRequested,
+    /// — reload + reconcile the in-memory roster, then re-tick. Carries the originating verb's
+    /// [`ReloadIntent`] moved out of the [`ControlSignal::RosterReloadRequested`] payload
+    /// (issue #1442): the never-shrink floor cannot tell a legitimate `remove` from a collapse
+    /// without it, and the on-disk file it re-reads cannot supply it.
+    RosterReloadRequested(ReloadIntent),
     /// An authenticated `restored` control command (#275) asked to reconcile a revived
     /// account with this `uuid` WITHOUT activating it — apply
     /// [`Daemon::reconcile_restored`] (best-effort log its edge-triggered events), then
@@ -300,8 +303,8 @@ where
                     // A `roster-reload` (#139) breaks the idle to reconcile the
                     // in-memory roster to the freshly-written config; a `status`
                     // read (None) just continues serving until the wait elapses.
-                    ControlYield::Signal(Some(ControlSignal::RosterReloadRequested)) => {
-                        break Idle::RosterReloadRequested
+                    ControlYield::Signal(Some(ControlSignal::RosterReloadRequested(intent))) => {
+                        break Idle::RosterReloadRequested(intent)
                     }
                     // A `restored` (#275) breaks the idle to un-quarantine the named
                     // account (moving the uuid payload out of the signal), then re-tick;
@@ -674,8 +677,8 @@ where
             // and was: with the attribute removed, collapsing this arm to a bare
             // `daemon.adopt_roster_reload().await;` left
             // `cargo clippy --all-targets --all-features -- -D warnings` at exit 0.
-            Idle::RosterReloadRequested => {
-                let event = daemon.adopt_roster_reload().await;
+            Idle::RosterReloadRequested(intent) => {
+                let event = daemon.adopt_roster_reload(intent).await;
                 emit_best_effort(log, &event);
             }
             // Reconcile the revived account the `restored` control command named (#275 +
