@@ -1593,24 +1593,87 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
-    /// The Swift mirror of [`CaptureRejection`], resolved from `CARGO_MANIFEST_DIR` so the scan is
-    /// tied to the repo under test whatever the working directory.
-    fn swift_capture_ack() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("apps/menubar/Sources/CaptureAck.swift")
+    /// Every [`CaptureRejection`] the daemon can emit, paired with the wire tag it serializes as.
+    ///
+    /// The `match` is the completeness gate, and it is a COMPILER one: it carries no wildcard arm,
+    /// so a variant added to `CaptureRejection` fails to BUILD until it is given a tag here. That
+    /// replaced a scan of this file's own source text, which had the hole the whole assertion below
+    /// exists to close — a declaration line that deviated at all (a trailing `// comment`, a
+    /// payload, a discriminant) parsed to nothing, the surviving variants still cleared a
+    /// cardinality floor, and the test then compared a subject missing exactly the variant that had
+    /// just been added, and passed.
+    ///
+    /// The tags here are still only a CLAIM about the wire; [`rust_wire_tags`] round-trips each one
+    /// through the real `Serialize` / `Deserialize` before anything is compared, so a
+    /// `#[serde(rename)]` or a changed `rename_all` reddens rather than silently re-defining what
+    /// the assertion is about.
+    fn tagged_rejections() -> Vec<(CaptureRejection, &'static str)> {
+        [
+            CaptureRejection::NoActiveAccount,
+            CaptureRejection::KeychainLocked,
+            CaptureRejection::SwapLockBusy,
+            CaptureRejection::Failed,
+            CaptureRejection::PriorConfiguration,
+        ]
+        .into_iter()
+        .map(|reason| {
+            let tag = match reason {
+                CaptureRejection::NoActiveAccount => "no-active-account",
+                CaptureRejection::KeychainLocked => "keychain-locked",
+                CaptureRejection::SwapLockBusy => "swap-lock-busy",
+                CaptureRejection::Failed => "failed",
+                CaptureRejection::PriorConfiguration => "prior-configuration",
+            };
+            (reason, tag)
+        })
+        .collect()
     }
 
-    /// Every `CaptureRejection` variant the daemon can emit, read off THIS file's own `enum`
-    /// declaration rather than hand-listed.
+    /// The wire tags of every rejection, each proven against serde rather than asserted.
     ///
-    /// Hand-listing is what the assertion below exists to prevent, one level up: a list that a new
-    /// variant does not have to join is a list that silently falls behind the enum, and the test
-    /// would then compare four tags against four cases and pass while the fifth drifted. Reading the
-    /// declaration means adding a variant automatically widens the subject.
+    /// The array in [`tagged_rejections`] and the `match` beside it are two hand-written lists, and
+    /// the compiler only forces the second. This is what stops the first from falling behind it:
+    /// the round-trip is per-variant, so a variant present in the `match` but missing from the array
+    /// simply never reaches serde — which the count check in
+    /// [`the_rejection_vocabulary_is_completely_enumerated`] catches by reading the declaration.
+    fn rust_wire_tags() -> BTreeSet<String> {
+        tagged_rejections()
+            .into_iter()
+            .map(|(reason, claimed)| {
+                // The claimed tag must DESERIALIZE — proving it is a real wire value and not this
+                // test's guess at one…
+                let decoded: CaptureRejection = serde_json::from_str(&format!("\"{claimed}\""))
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "`{reason:?}` is listed as wire tag `{claimed}`, which serde does not \
+                             accept — the derived form and this list disagree: {err}"
+                        )
+                    });
+                // …and must round-trip back to the SAME variant, which is what a rename creating a
+                // collision with another variant's tag would break.
+                assert_eq!(
+                    decoded, reason,
+                    "wire tag `{claimed}` decodes to `{decoded:?}`, not `{reason:?}`"
+                );
+                // Compared below as the bytes serde EMITS, never as the ones this test wrote down.
+                serde_json::to_string(&reason)
+                    .expect("a fieldless enum serializes")
+                    .trim_matches('"')
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// The variant identifiers declared in this file's `enum CaptureRejection`, parsed STRICTLY.
     ///
-    /// The identifiers are converted to their wire form by [`wire_tag`] and each one is then
-    /// round-tripped through `serde` by the caller, so this parse never has to be TRUSTED — a
-    /// mis-parsed or invented identifier fails to deserialize and is reported as such.
-    fn rust_rejection_variants(source: &str) -> Vec<String> {
+    /// Every line inside the declaration is either recognised or PANICS. That is the whole
+    /// difference from the filter-and-drop shape this replaced: a payload, a trailing comment or a
+    /// discriminant now fails loudly instead of shrinking the subject by one and passing.
+    fn declared_variant_names() -> Vec<String> {
+        let source = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/daemon/socket.rs"),
+        )
+        .expect("this file is readable from the crate root");
         let body = source
             .split_once("pub(crate) enum CaptureRejection {")
             .expect("this file declares `pub(crate) enum CaptureRejection`")
@@ -1620,30 +1683,34 @@ mod tests {
             .0;
         body.lines()
             .map(str::trim)
-            // Doc comments, attributes and blank lines are not variants; a variant is a bare
-            // PascalCase identifier followed by a comma (none of them carry a payload — a redacted
-            // machine code is the whole point).
-            .filter_map(|line| line.strip_suffix(','))
             .filter(|line| {
-                line.starts_with(|c: char| c.is_ascii_uppercase())
-                    && line.chars().all(|c| c.is_ascii_alphanumeric())
+                !line.is_empty() && !line.starts_with("//") && !line.starts_with("#[")
             })
-            .map(str::to_owned)
+            .map(|line| {
+                let name = line.strip_suffix(',').unwrap_or_else(|| {
+                    panic!(
+                        "unrecognised line in `enum CaptureRejection`: `{line}`. Every variant is a \
+                         bare identifier followed by a comma — a redacted machine code carries no \
+                         payload. If that changed, teach this parser the new shape rather than \
+                         letting it drop the variant: a dropped variant is a wire tag with no Swift \
+                         case and a broken menu-bar capture button, reported as a pass."
+                    )
+                });
+                assert!(
+                    name.starts_with(|c: char| c.is_ascii_uppercase())
+                        && name.chars().all(|c| c.is_ascii_alphanumeric()),
+                    "unrecognised variant `{name}` in `enum CaptureRejection` — see the panic above \
+                     for why this refuses to guess"
+                );
+                name.to_owned()
+            })
             .collect()
     }
 
-    /// A PascalCase variant identifier in the kebab-case form `#[serde(rename_all = "kebab-case")]`
-    /// gives it. Never trusted on its own — the caller deserializes the result back into a
-    /// [`CaptureRejection`], which is what ties this conversion to what actually goes on the wire.
-    fn wire_tag(variant: &str) -> String {
-        let mut out = String::new();
-        for (i, ch) in variant.char_indices() {
-            if ch.is_ascii_uppercase() && i > 0 {
-                out.push('-');
-            }
-            out.push(ch.to_ascii_lowercase());
-        }
-        out
+    /// The Swift mirror of [`CaptureRejection`], resolved from `CARGO_MANIFEST_DIR` so the scan is
+    /// tied to the repo under test whatever the working directory.
+    fn swift_capture_ack() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("apps/menubar/Sources/CaptureAck.swift")
     }
 
     /// Every `CaptureRejection` raw value the Swift decoder models, read off its `enum` declaration.
@@ -1652,10 +1719,25 @@ mod tests {
     /// `case foo = "foo-bar"` and an implicit `case failed`, whose raw value is the case name. The
     /// implicit form is live today (`failed`), so dropping it would make this scan silently miss a
     /// real case.
+    ///
+    /// The declaration is located by NAME and then by its opening brace, never by its full
+    /// conformance list. Pinning the list is what an earlier shape of this did, and adding
+    /// `CaseIterable` to the Swift enum — a change with no bearing on the vocabulary — broke it.
+    /// It failed LOUDLY, which is the property that matters and the reason this parser panics
+    /// rather than filters, but a conformance is not the subject and should not be able to red it.
     fn swift_rejection_tags(source: &str) -> Vec<String> {
-        let body = source
-            .split_once("enum CaptureRejection: String, Equatable {")
-            .expect("CaptureAck.swift declares `enum CaptureRejection: String, Equatable`")
+        // The name is matched on an identifier BOUNDARY, not as a bare substring. A plain
+        // `split_once` accepts `enum CaptureRejectionV2`, whose cases are a different vocabulary
+        // entirely, and the parse then succeeds over the WRONG declaration — the one failure this
+        // assertion cannot afford, because it reports green.
+        let declaration = source
+            .match_indices("enum CaptureRejection")
+            .map(|(at, matched)| &source[at + matched.len()..])
+            .find(|rest| !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+            .expect("CaptureAck.swift declares `enum CaptureRejection`");
+        let body = declaration
+            .split_once('{')
+            .expect("the Swift enum declaration opens a brace")
             .1
             .split_once("\n}")
             .expect("the Swift enum declaration is closed by a column-0 brace")
@@ -1673,6 +1755,24 @@ mod tests {
     }
 
     #[test]
+    fn the_rejection_vocabulary_is_completely_enumerated() {
+        // The compiler already forces a new variant to take an arm in `tagged_rejections`, but not
+        // to join the array beside that `match`. This closes that gap from the outside, by counting
+        // the DECLARATION: a variant with an arm and no array entry leaves the two cardinalities
+        // apart, and the parse is strict, so it cannot under-count its way back into agreement.
+        let declared = declared_variant_names();
+        let enumerated: Vec<String> = tagged_rejections()
+            .into_iter()
+            .map(|(reason, _)| format!("{reason:?}"))
+            .collect();
+        assert_eq!(
+            declared, enumerated,
+            "`enum CaptureRejection` declares {declared:?} but `tagged_rejections` enumerates \
+             {enumerated:?} — the parity assertion below would run over the smaller of the two"
+        );
+    }
+
+    #[test]
     fn every_rust_rejection_tag_has_a_swift_case() {
         // Issue #1441 AC, and the reason it is a `test`-job assertion rather than a golden or a
         // lint: `apps/menubar/Sources/CaptureAck.swift` decodes an unmodelled `reason` by THROWING
@@ -1680,59 +1780,30 @@ mod tests {
         // in the app — it breaks the menu-bar capture button. The natural home for a cross-surface
         // check is `panel-goldens`, and that job is deliberately soft: every step is
         // `continue-on-error`, so it always reports pass and would certify a parity it never
-        // checked. `ci-ok` requires `test`, which can actually fail.
+        // checked. `ci-ok` requires `test`, which can actually fail — and `CaptureAck.swift` is in
+        // the `rust` path filter (`.github/workflows/ci.yml`) precisely so that a SWIFT-only edit
+        // cannot skip this job and be counted as a pass.
         //
         // Set EQUALITY, not one-way coverage. A Swift case with no Rust tag is a state the panel
         // can render and the daemon can never send — dead copy that reads as live, and the same
         // drift measured from the other end.
-        let rust_source = std::fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/daemon/socket.rs"),
-        )
-        .expect("this file is readable from the crate root");
+        //
+        // SCOPE, stated because a green here is narrower than it looks: this compares the
+        // `reason` vocabulary only. The sibling `result` vocabulary (`captured` / `refreshed` /
+        // `rejected`) has the identical closed-enum-throws property on the Swift side and is NOT
+        // covered — it is diverged today and tracked separately.
         let swift_source = std::fs::read_to_string(swift_capture_ack())
             .expect("apps/menubar/Sources/CaptureAck.swift is readable from the crate root");
 
-        let variants = rust_rejection_variants(&rust_source);
-        // Canary the extraction BEFORE comparing. Both sides are parsed out of source text, and a
-        // boundary that moved would yield two empty sets — which compare EQUAL. A green over an
-        // empty subject is not evidence, so the subject is measured first.
-        assert!(
-            variants.len() >= 5,
-            "extracted only {} `CaptureRejection` variants from src/daemon/socket.rs — the parse \
-             boundary has moved and this test is comparing an empty or truncated subject: {variants:?}",
-            variants.len()
-        );
-
-        let rust: BTreeSet<String> = variants
-            .iter()
-            .map(|variant| {
-                let tag = wire_tag(variant);
-                // The conversion above is a HAND-ROLLED kebab-case, and what actually reaches the
-                // wire is serde's. Round-tripping each tag through the real `Deserialize` is what
-                // makes the comparison below about the WIRE contract rather than about my spelling:
-                // if `rename_all` ever changes, or a variant grows a `#[serde(rename)]`, this is
-                // where it reddens.
-                let decoded: CaptureRejection =
-                    serde_json::from_str(&format!("\"{tag}\"")).unwrap_or_else(|err| {
-                        panic!(
-                            "`CaptureRejection::{variant}` does not serialize as `{tag}` — the \
-                             derived wire form and this test's kebab-case conversion disagree: {err}"
-                        )
-                    });
-                // …and back out again, so the tag compared below is the one serde EMITS rather than
-                // the one this test guessed and serde merely tolerated.
-                serde_json::to_string(&decoded)
-                    .expect("a fieldless enum serializes")
-                    .trim_matches('"')
-                    .to_owned()
-            })
-            .collect();
+        let rust = rust_wire_tags();
         let swift: BTreeSet<String> = swift_rejection_tags(&swift_source).into_iter().collect();
+        // Canary the Swift extraction before comparing. Its subject is parsed out of source text,
+        // and a moved delimiter would yield an empty set — which compares EQUAL to nothing, and to
+        // an empty Rust set. The Rust side needs no such floor: it is compiler-enumerated.
         assert!(
-            swift.len() >= 5,
-            "extracted only {} `CaptureRejection` cases from CaptureAck.swift — the parse boundary \
-             has moved and this test is comparing an empty or truncated subject: {swift:?}",
-            swift.len()
+            !swift.is_empty(),
+            "extracted no `CaptureRejection` cases from CaptureAck.swift — the parse boundary has \
+             moved and this test is comparing an empty subject"
         );
 
         let unmodelled: Vec<&String> = rust.difference(&swift).collect();
@@ -1760,7 +1831,10 @@ mod tests {
         // CLI's stderr refusal says — no path, no account label, no count.
         //
         // Asserted on the SERIALIZED bytes rather than on the variant name, because the wire form is
-        // what a client (and anyone reading over a shoulder) actually sees.
+        // what a client (and anyone reading over a shoulder) actually sees. Pinned WHOLE rather than
+        // by forbidden substring: a substring list reads as generalizable and is not — `account` is
+        // a substring of the legitimate sibling tag `no-active-account`, so the obvious next edit
+        // (run it over the whole vocabulary) reds on a tag that indexes nothing.
         let wire = serde_json::to_string(&CaptureAck::Rejected {
             reason: CaptureRejection::PriorConfiguration,
         })
@@ -1774,11 +1848,5 @@ mod tests {
             crate::redaction::meter::unauthored_emails(&wire, &[]).is_empty(),
             "the refusal ack leaks no email: {wire}"
         );
-        for forbidden in ["/", "config.toml", "roster", "account"] {
-            assert!(
-                !wire.contains(forbidden),
-                "the refusal ack carries `{forbidden}`, which indexes what it is refusing about: {wire}"
-            );
-        }
     }
 }

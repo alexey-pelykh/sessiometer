@@ -40,10 +40,16 @@ final class AccountCaptureTests: XCTestCase {
             ("swap-lock-busy", .swapLockBusy),
             ("failed", .failed),
             // #1441. The tag the daemon gained when the socket capture took the CLI's
-            // prior-configuration witness rule; `every_rust_rejection_tag_has_a_swift_case`
-            // in `src/daemon/socket.rs` is what keeps this list and the Rust enum one set.
+            // prior-configuration witness rule.
             ("prior-configuration", .priorConfiguration),
         ]
+        // This list is hand-written, and NOTHING outside this file guards it: the Rust-side
+        // `every_rust_rejection_tag_has_a_swift_case` reads `Sources/CaptureAck.swift` and never
+        // `Tests/`, so it cannot see a tag missing from here. Assert the cardinality against the
+        // enum itself, so a case added to `CaptureRejection` reddens here rather than going
+        // undecoded — the same job `testEveryCaptureFailureIsEnumerated` does for `captureFailures`.
+        XCTAssertEqual(cases.count, CaptureRejection.allCases.count,
+                       "a CaptureRejection case is missing from this decode table")
         for (code, expected) in cases {
             let line = #"{"result":"rejected","reason":"\#(code)"}"#
             XCTAssertEqual(try CaptureAck.decode(line), .rejected(expected), "reason \(code)")

@@ -49,7 +49,10 @@ enum CaptureAck: Equatable {
 /// reads THIS declaration and fails the `test` job when the two sets differ. That assertion is
 /// deliberately not in `panel-goldens`: every step of that job is `continue-on-error`, so it always
 /// reports pass and could never tell you the vocabulary drifted.
-enum CaptureRejection: String, Equatable {
+/// `CaseIterable` so the tests that enumerate this vocabulary can COUNT it rather than restate it —
+/// `AccountCaptureTests`' decode table is hand-written and the Rust-side parity assertion reads only
+/// `Sources/`, so without `allCases` nothing here notices a case that never gets decoded.
+enum CaptureRejection: String, Equatable, CaseIterable {
     /// No active account to capture — nothing is logged into Claude Code. The operator runs `claude /login`
     /// first, then captures (the honest scope boundary: capture snapshots the ACTIVE account, it is not a
     /// picker).
