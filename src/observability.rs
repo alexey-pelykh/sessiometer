@@ -1037,19 +1037,29 @@ pub(crate) struct BlindVelocity {
     pub(crate) ceiling_pct: f64,
 }
 
-/// The outcome of one runtime roster reload (issue #1438) — the `outcome=` token of the redacted
-/// [`Event::RosterReload`], and the axis an operator sorts a reload incident on.
+/// The outcome of one runtime roster reload — or of one periodic disk-versus-memory roster CHECK
+/// (issues #1438 / #1443) — the `outcome=` token of the redacted [`Event::RosterReload`], and the
+/// axis an operator sorts a roster incident on.
 ///
-/// THREE daemon-side states, not a boolean. The reload was ADOPTED (the on-disk roster is now the
-/// live rotation), REFUSED (the daemon DECLINED what the reload presented, and the live rotation
-/// was kept), or it FAILED at the read (the file was absent or unreadable, so there was never
-/// anything to decide about). A boolean would fold the last two together and they are not the same
-/// fact: a refusal is a decision the daemon took, a failure is a file that did not answer.
+/// THREE reload states, not a boolean. The reload was ADOPTED (the on-disk roster is now the live
+/// rotation), REFUSED (the daemon DECLINED what the reload presented, and the live rotation was
+/// kept), or it FAILED at the read (the file was absent or unreadable, so there was never anything
+/// to decide about). A boolean would fold the last two together and they are not the same fact: a
+/// refusal is a decision the daemon took, a failure is a file that did not answer.
 ///
-/// The fourth is the CLI half of the same operation ([`RosterReloadOutcome::NotNotified`]): the
+/// THREE more are the issue-#1443 poll-tick check, which reads the file and COMPARES without
+/// adopting anything: [`RosterReloadOutcome::Diverged`] (the two copies disagree),
+/// [`RosterReloadOutcome::Undetermined`] (the file did not parse, so no comparison was possible)
+/// and [`RosterReloadOutcome::Converged`] (a previously-reported disagreement is gone). They are
+/// SEPARATE from the reload trio rather than reusing `Failed`, because the reload outcomes all
+/// carry the implication that a reload was REQUESTED and did or did not happen — which is false of
+/// every check line, and would have an operator hunting for a `capture` that never ran.
+///
+/// The last is the CLI half of the reload operation ([`RosterReloadOutcome::NotNotified`]): the
 /// roster write landed on disk but the CLI saw no acknowledgement come back, so there may be no
-/// daemon-side line to go looking for. It rides this enum rather than an event of its own so that
-/// one `grep event=roster_reload` returns the whole operation, both halves.
+/// daemon-side line to go looking for. Like the check trio it rides this enum rather than an event
+/// of its own, so that one `grep event=roster_reload` returns the whole picture — the reload, its
+/// CLI half, and the background check that watches the same two copies between reloads.
 ///
 /// WHICH optional tokens a line carries is a property of the [`RosterReloadReason`] and never of
 /// the outcome — see [`RosterReloadOutcome::Refused`], where the difference is load-bearing.
@@ -1081,6 +1091,45 @@ pub(crate) enum RosterReloadOutcome {
     /// The read was attempted and yielded no config (an absent, unreadable or invalid file). The
     /// current in-memory roster was KEPT — best-effort by contract (issue #139).
     Failed,
+    /// CHECK side (issue #1443): the poll-tick comparison found the on-disk roster and the live
+    /// in-memory rotation DISAGREEING. Nothing was adopted and nothing was written — which copy is
+    /// right is not knowable from the disagreement alone, so the daemon reports and stops.
+    ///
+    /// Two shapes, told apart by the [`RosterReloadReason`]:
+    /// [`RosterReloadReason::CountMismatch`] carries BOTH counts, and
+    /// [`RosterReloadReason::Absent`] carries only `previous` — the file was not there at all
+    /// while the daemon still held a rotation, which is the 2026-08-27 incident's own shape.
+    ///
+    /// Edge-triggered: emitted when the check's verdict CHANGES, never once per tick while the two
+    /// copies stay apart. [`RosterReloadOutcome::Converged`] is its EXIT partner.
+    Diverged,
+    /// CHECK side (issue #1443): the poll-tick comparison could not read or parse the file, so it
+    /// makes NO claim about divergence — the daemon cannot assert that a file it could not parse
+    /// disagrees with anything.
+    ///
+    /// Deliberately not [`RosterReloadOutcome::Failed`]: that outcome says a REQUESTED reload
+    /// failed at its read, and no reload was requested here. Carries `previous` (the live roster
+    /// is always knowable) and never `incoming`, under
+    /// [`RosterReloadReason::Unreadable`] — whose own doc records that its wording spans read
+    /// I/O failures, TOML syntax errors and validation failures alike.
+    ///
+    /// Edge-triggered alongside [`RosterReloadOutcome::Diverged`], and its EXIT partner is the
+    /// same [`RosterReloadOutcome::Converged`]: a file that becomes readable AND agrees has left
+    /// the un-checkable state, which is the fact an operator is waiting on.
+    Undetermined,
+    /// CHECK side (issue #1443): the poll-tick comparison found the two copies in AGREEMENT after
+    /// a [`RosterReloadOutcome::Diverged`] or [`RosterReloadOutcome::Undetermined`] line was
+    /// emitted for the episode now ending. Carries both counts, which are equal — the value they
+    /// agreed ON is what closes the incident.
+    ///
+    /// The EXIT partner of the two above, and the reason the whole check trio is edge-triggered
+    /// rather than level-triggered. It is emitted ONLY across that falling edge, so a steady-state
+    /// daemon whose copies have always agreed emits NOTHING, ever — the issue-#1443 criterion that
+    /// agreement is not spammed. Follows the established ENTER/EXIT idiom of
+    /// [`Event::CanonicalScrubbed`] / [`Event::CanonicalRestored`] and
+    /// [`Event::FleetRunwayLow`] / [`Event::FleetRunwayRecovered`]: without it a healed divergence
+    /// is indistinguishable, in the log, from one still open.
+    Converged,
     /// CLI side: a roster write committed to disk, and the CLI did not observe an acknowledgement
     /// from a running daemon.
     ///
@@ -1100,6 +1149,9 @@ impl RosterReloadOutcome {
             RosterReloadOutcome::Adopted => "adopted",
             RosterReloadOutcome::Refused => "refused",
             RosterReloadOutcome::Failed => "failed",
+            RosterReloadOutcome::Diverged => "diverged",
+            RosterReloadOutcome::Undetermined => "undetermined",
+            RosterReloadOutcome::Converged => "converged",
             RosterReloadOutcome::NotNotified => "not_notified",
         }
     }
@@ -1132,8 +1184,25 @@ pub(crate) enum RosterReloadReason {
     /// reading, which is why its line carries no `incoming` count. That absence belongs to this
     /// reason, not to [`RosterReloadOutcome::Refused`].
     ReloadDisabled,
-    /// The config file was not there when the reload went to read it.
+    /// The config file was not there when the reload — or the issue-#1443 poll-tick check — went
+    /// to read it.
+    ///
+    /// Under [`RosterReloadOutcome::Failed`] this is the benign mid-write race the reload's
+    /// best-effort contract exists for. Under [`RosterReloadOutcome::Diverged`] it is the
+    /// 2026-08-27 incident itself: the file was GONE while the daemon still held a rotation, and
+    /// the line carries only `previous` because there is no incoming roster to count.
     Absent,
+    /// CHECK side (issue #1443): the file parsed, and the roster it presents is a DIFFERENT SIZE
+    /// from the live in-memory rotation. The only reason whose line carries both counts, because
+    /// the disagreement is not legible in either one alone.
+    ///
+    /// SIZE, deliberately, and this is the bound to know when reading a line: a same-size
+    /// substitution — one account swapped for another with the roster length unchanged — is NOT
+    /// detected. The issue scopes the comparison to counts ("Report counts, not contents"), and a
+    /// membership comparison would need a divergence vocabulary richer than the two numbers this
+    /// event carries. An absence of this code is therefore evidence that the two rosters are the
+    /// same SIZE, never that they are the same roster.
+    CountMismatch,
     /// The config file was there and did not yield a usable config — it could not be read,
     /// parsed, or VALIDATED.
     ///
@@ -1177,6 +1246,7 @@ impl RosterReloadReason {
         match self {
             RosterReloadReason::ReloadDisabled => "reload_disabled",
             RosterReloadReason::Absent => "absent",
+            RosterReloadReason::CountMismatch => "count_mismatch",
             RosterReloadReason::Unreadable => "unreadable",
             RosterReloadReason::SocketUnresolved => "socket_unresolved",
             RosterReloadReason::NotifyFailed => "notify_failed",
@@ -6658,6 +6728,37 @@ pub(crate) mod tests {
                 incoming: None,
                 reason: Some(RosterReloadReason::NotifyTimedOut),
             },
+            // Issue #1443: the poll-tick disk-versus-memory check, sampled once per outcome and
+            // once per divergence SHAPE. These are the lines most worth sweeping in this family:
+            // the check is the only path that reads `config.toml` on a schedule nobody triggered,
+            // so it is the one whose error classification an operator never sees coming — and
+            // `Error::ConfigNotFound` carries the config PATH while a parse failure quotes file
+            // CONTENT. Both are dropped at the classifier, leaving bare counts and machine codes,
+            // which is exactly what this sweep exists to confirm rather than assume.
+            Event::RosterReload {
+                outcome: RosterReloadOutcome::Diverged,
+                previous: Some(6),
+                incoming: Some(4),
+                reason: Some(RosterReloadReason::CountMismatch),
+            },
+            Event::RosterReload {
+                outcome: RosterReloadOutcome::Diverged,
+                previous: Some(6),
+                incoming: None,
+                reason: Some(RosterReloadReason::Absent),
+            },
+            Event::RosterReload {
+                outcome: RosterReloadOutcome::Undetermined,
+                previous: Some(6),
+                incoming: None,
+                reason: Some(RosterReloadReason::Unreadable),
+            },
+            Event::RosterReload {
+                outcome: RosterReloadOutcome::Converged,
+                previous: Some(6),
+                incoming: Some(6),
+                reason: None,
+            },
         ];
         assert_samples_every_variant("Event", &samples, event_variant_name);
         samples
@@ -6846,6 +6947,53 @@ pub(crate) mod tests {
                 ("not_notified", Some("notify_timed_out")),
                 [false, false, true],
             ),
+            // Issue #1443's four check rows. `diverged` appears TWICE under different reasons and
+            // with different absence shapes, which is the clearest case yet for keying this matrix
+            // on the (outcome, reason) PAIR: a count mismatch renders both counts, while an absent
+            // file renders only `previous` — there was no file to present an incoming roster, and
+            // `incoming=0` would claim it presented an EMPTY one.
+            (
+                Event::RosterReload {
+                    outcome: RosterReloadOutcome::Diverged,
+                    previous: Some(6),
+                    incoming: Some(4),
+                    reason: Some(RosterReloadReason::CountMismatch),
+                },
+                ("diverged", Some("count_mismatch")),
+                [true, true, true],
+            ),
+            (
+                Event::RosterReload {
+                    outcome: RosterReloadOutcome::Diverged,
+                    previous: Some(6),
+                    incoming: None,
+                    reason: Some(RosterReloadReason::Absent),
+                },
+                ("diverged", Some("absent")),
+                [true, false, true],
+            ),
+            (
+                Event::RosterReload {
+                    outcome: RosterReloadOutcome::Undetermined,
+                    previous: Some(6),
+                    incoming: None,
+                    reason: Some(RosterReloadReason::Unreadable),
+                },
+                ("undetermined", Some("unreadable")),
+                [true, false, true],
+            ),
+            // The EXIT partner carries both counts and NO reason: there is nothing to explain
+            // about an agreement, and the pair of equal numbers is the whole content of the line.
+            (
+                Event::RosterReload {
+                    outcome: RosterReloadOutcome::Converged,
+                    previous: Some(6),
+                    incoming: Some(6),
+                    reason: None,
+                },
+                ("converged", None),
+                [true, true, false],
+            ),
         ];
 
         for (event, (outcome, reason), [has_previous, has_incoming, has_reason]) in cases {
@@ -6892,6 +7040,9 @@ pub(crate) mod tests {
             RosterReloadOutcome::Adopted => "Adopted",
             RosterReloadOutcome::Refused => "Refused",
             RosterReloadOutcome::Failed => "Failed",
+            RosterReloadOutcome::Diverged => "Diverged",
+            RosterReloadOutcome::Undetermined => "Undetermined",
+            RosterReloadOutcome::Converged => "Converged",
             RosterReloadOutcome::NotNotified => "NotNotified",
         }
     }
@@ -6916,6 +7067,11 @@ pub(crate) mod tests {
             RosterReloadOutcome::Adopted => ("adopted", None),
             RosterReloadOutcome::Refused => ("refused", Some(RosterReloadReason::ReloadDisabled)),
             RosterReloadOutcome::Failed => ("failed", Some(RosterReloadReason::Unreadable)),
+            RosterReloadOutcome::Diverged => ("diverged", Some(RosterReloadReason::CountMismatch)),
+            RosterReloadOutcome::Undetermined => {
+                ("undetermined", Some(RosterReloadReason::Unreadable))
+            }
+            RosterReloadOutcome::Converged => ("converged", None),
             RosterReloadOutcome::NotNotified => {
                 ("not_notified", Some(RosterReloadReason::NotifyFailed))
             }
@@ -6928,6 +7084,7 @@ pub(crate) mod tests {
         match reason {
             RosterReloadReason::ReloadDisabled => "ReloadDisabled",
             RosterReloadReason::Absent => "Absent",
+            RosterReloadReason::CountMismatch => "CountMismatch",
             RosterReloadReason::Unreadable => "Unreadable",
             RosterReloadReason::SocketUnresolved => "SocketUnresolved",
             RosterReloadReason::NotifyFailed => "NotifyFailed",
@@ -6944,6 +7101,9 @@ pub(crate) mod tests {
         match reason {
             RosterReloadReason::ReloadDisabled => ("reload_disabled", RosterReloadOutcome::Refused),
             RosterReloadReason::Absent => ("absent", RosterReloadOutcome::Failed),
+            // The one reason the CHECK owns outright — no reload path can produce it, so its
+            // representative outcome is `Diverged` (issue #1443).
+            RosterReloadReason::CountMismatch => ("count_mismatch", RosterReloadOutcome::Diverged),
             RosterReloadReason::Unreadable => ("unreadable", RosterReloadOutcome::Failed),
             RosterReloadReason::SocketUnresolved => {
                 ("socket_unresolved", RosterReloadOutcome::NotNotified)
@@ -6966,6 +7126,9 @@ pub(crate) mod tests {
             RosterReloadOutcome::Adopted,
             RosterReloadOutcome::Refused,
             RosterReloadOutcome::Failed,
+            RosterReloadOutcome::Diverged,
+            RosterReloadOutcome::Undetermined,
+            RosterReloadOutcome::Converged,
             RosterReloadOutcome::NotNotified,
         ];
         // Layer 2: writing a list down does not make it complete. Held against the variants the
@@ -7010,6 +7173,7 @@ pub(crate) mod tests {
         const EVERY_REASON: &[RosterReloadReason] = &[
             RosterReloadReason::ReloadDisabled,
             RosterReloadReason::Absent,
+            RosterReloadReason::CountMismatch,
             RosterReloadReason::Unreadable,
             RosterReloadReason::SocketUnresolved,
             RosterReloadReason::NotifyFailed,

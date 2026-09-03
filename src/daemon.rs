@@ -1389,6 +1389,41 @@ impl AccountRuntime {
     }
 }
 
+/// What the issue-#1443 disk-versus-memory roster check saw on the tick that last ran it — the
+/// edge-trigger latch behind [`Daemon::check_roster_divergence`], and the reason a persistent
+/// divergence is reported ONCE per episode rather than once per poll.
+///
+/// Compared for equality against the CURRENT tick's verdict, so a divergence that CHANGES SHAPE
+/// (the counts move, or an absent file becomes an unparseable one) re-reports as the new fact it
+/// is, while an unchanged one stays silent. That is why this carries the counts rather than being
+/// the `bool` the `signaled_all_exhausted` idiom uses: with a bool, `previous=6 incoming=4`
+/// followed by `previous=6 incoming=1` would be one episode and the second, worse, state would
+/// never reach the log.
+///
+/// [`RosterCheckVerdict::Agrees`] is the `Default`, and it is an ASSUMPTION rather than an
+/// observation — no check has run when a daemon is built. That is the correct starting value in
+/// both directions: a daemon whose copies agree from boot matches on its first tick and emits
+/// nothing (so a healthy fleet's log gains no line at all, ever), while one that boots ALREADY
+/// diverged mismatches on its first tick and reports immediately. The alternative — a `None`
+/// "never checked" state — would only differ by emitting a `converged` line on the first healthy
+/// tick of every daemon start, which is the agreement spam the issue forbids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum RosterCheckVerdict {
+    /// The on-disk roster and the live rotation are the same size — or the check is not armed at
+    /// all (no `config_path` wired), which is held here rather than in a separate state because
+    /// an unarmed check must be as silent as a clean one.
+    #[default]
+    Agrees,
+    /// The file parsed and presented a DIFFERENT number of accounts than the live rotation holds.
+    Diverged { previous: usize, incoming: usize },
+    /// The file was not there at all while the daemon held `previous` accounts — the 2026-08-27
+    /// incident's own shape.
+    Absent { previous: usize },
+    /// The file could not be read, parsed or validated, so no comparison was possible. Carries the
+    /// live count only, which is the half the check can always know.
+    Undetermined { previous: usize },
+}
+
 /// Per-loop decision state carried across polls.
 #[derive(Default)]
 struct DecisionState {
@@ -1509,6 +1544,11 @@ struct DecisionState {
     /// backed-off retry while the keychain stays locked — mirroring
     /// `signaled_all_exhausted`.
     signaled_keychain_locked: bool,
+    /// The issue-#1443 disk-versus-memory roster check's verdict as of the tick that last ran it
+    /// — the edge-trigger latch that makes the check report a CHANGE rather than a level. See
+    /// [`RosterCheckVerdict`] for why it carries counts instead of being the `bool` the
+    /// `signaled_all_exhausted` idiom uses, and why its `Default` is `Agrees`.
+    roster_check: RosterCheckVerdict,
     /// Edge-trigger guard for the canonical-scrub signal (issue #464): set when a
     /// `canonical_scrubbed` event is emitted (the shared `Claude Code-credentials` item was
     /// observed empty/scrubbed), cleared when the item is next observed LIVE (which emits the
@@ -2510,6 +2550,13 @@ where
         // unconditionally — `run_loop`'s `DiagnosticLog` applies the verbosity gate.
         let mut diagnostics: Vec<Diagnostic> = Vec::new();
 
+        // Issue #1443: compare the on-disk roster against the live one and report a disagreement.
+        // Read-only and self-heal-free — see `check_roster_divergence`. FIRST, above the canonical
+        // read, so the locked-keychain short-circuit below cannot suppress it: `config.toml` has
+        // nothing to do with the keychain, and a lock is precisely when nobody is watching.
+        // `locked_tick` carries `events` onward for that reason.
+        self.check_roster_divergence(&mut events);
+
         // Read the canonical credential ONCE at the top of the cycle. It drives
         // three things, all from this single read: lock detection (defer the whole
         // cycle and back off, #13), re-auth re-stash detection (the canonical
@@ -2521,7 +2568,7 @@ where
         // read must never fabricate a scrub or a recovery).
         let mut canonical_absent = false;
         let canonical = match self.store.read().await {
-            Err(Error::KeychainLocked { .. }) => return self.locked_tick(),
+            Err(Error::KeychainLocked { .. }) => return self.locked_tick(events),
             Ok(canonical) => {
                 // Readable: clear any lock back-off and re-arm the edge-triggered
                 // lock signal, then heal an out-of-band canonical change (#13).
@@ -3740,6 +3787,122 @@ where
             .count()
     }
 
+    /// Compare the on-disk roster against the live in-memory one and report a DISAGREEMENT
+    /// (issue #1443), pushing at most one edge-triggered [`Event::RosterReload`] into `events`.
+    ///
+    /// The roster lives in two copies — `config.toml` and this daemon's `Vec<Account>` — and they
+    /// are synchronized in ONE direction only, on a write-verb notify
+    /// ([`adopt_roster_reload`](Self::adopt_roster_reload)). Nothing reconciled them and nothing
+    /// checked them, so on 2026-08-27 the file was GONE while the daemon still held six accounts
+    /// and `status` kept rendering six from memory, looking correct, for an unknown period. This
+    /// is the check that would have said so.
+    ///
+    /// DETECT AND REPORT, NEVER SELF-HEAL. This function takes `&mut self` for one purpose — to
+    /// advance the edge-trigger latch — and touches NOTHING else: not the roster, not `active`,
+    /// not the poll schedule, and never the file, which it opens read-only through
+    /// [`Config::load_path`]. Auto-reconciling would make this a SECOND unguarded write path into
+    /// the roster, which is the exact defect class the check exists to close; and which copy is
+    /// right is not knowable from a disagreement anyway — a file the operator just edited and a
+    /// file something truncated look identical from here.
+    ///
+    /// NO NEW TIMER, NO NEW THREAD. It is called from [`tick`](Self::tick), on the poll cadence
+    /// that already runs (`poll_secs`, ratified by `ADR-0012`), so the reporting latency is up to
+    /// one poll interval by construction. Called at the TOP of the tick, BEFORE the canonical
+    /// credential read, deliberately: a locked keychain short-circuits the entire rest of the tick
+    /// through [`locked_tick`](Self::locked_tick), and a keychain lock has nothing whatever to do
+    /// with `config.toml`. Running the check after that short-circuit would let an unattended
+    /// locked Mac suppress divergence detection for as long as the lock lasts — reinstating, in
+    /// the one state most likely to go unwatched, exactly the silence this issue closes.
+    /// `locked_tick` therefore takes the events collected so far rather than starting a fresh vec.
+    ///
+    /// EDGE-TRIGGERED, on the verdict rather than on a level: a persistent divergence reports ONCE
+    /// and a steady-state daemon emits nothing at all, which is the issue's "agreement is not
+    /// spammed" criterion. A verdict that CHANGES SHAPE re-reports, because it is a new fact —
+    /// see [`RosterCheckVerdict`]. The falling edge emits
+    /// [`RosterReloadOutcome::Converged`], following the ENTER/EXIT idiom of `canonical_scrubbed`
+    /// / `canonical_restored` (#464) and `fleet_runway_low` / `fleet_runway_recovered` (#827),
+    /// without which a healed divergence is indistinguishable in the log from one still open.
+    ///
+    /// UNARMED IS SILENT. With no `config_path` wired — the hermetic-test default, and any daemon
+    /// whose runtime reload was never armed — there is no file to compare against, so the check
+    /// holds [`RosterCheckVerdict::Agrees`] and emits nothing. It reports no `reload_disabled`
+    /// line: that code belongs to a reload someone REQUESTED and the daemon declined, and a
+    /// background check nobody asked for has no refusal to announce.
+    ///
+    /// An absent file is a DIVERGENCE and not an absence to ignore — but only while the daemon
+    /// actually holds accounts. A daemon with an empty rotation and no file on disk is two empty
+    /// rosters that agree, and saying otherwise would put a divergence line on every tick of a
+    /// freshly-installed daemon that has not been `capture`d into yet.
+    fn check_roster_divergence(&mut self, events: &mut Vec<Event>) {
+        let previous = self.roster.len();
+        let verdict = match self.config_path.as_deref() {
+            // Not armed: nothing to compare against. Silent, and NOT `reload_disabled` — see the
+            // doc above.
+            None => RosterCheckVerdict::Agrees,
+            Some(path) => match Config::load_path(path) {
+                Ok(config) => {
+                    let incoming = config.roster.len();
+                    if incoming == previous {
+                        RosterCheckVerdict::Agrees
+                    } else {
+                        RosterCheckVerdict::Diverged { previous, incoming }
+                    }
+                }
+                // An absent file while the daemon holds a rotation is THE incident. An absent file
+                // while it holds nothing is two empty rosters agreeing.
+                Err(Error::ConfigNotFound { .. }) if previous > 0 => {
+                    RosterCheckVerdict::Absent { previous }
+                }
+                Err(Error::ConfigNotFound { .. }) => RosterCheckVerdict::Agrees,
+                // Every other class `load_path` returns — a read I/O failure, a TOML syntax error,
+                // and the two validation failures — is a file the check could not parse, so it
+                // makes NO divergence claim. The error is bound only to be classified and is then
+                // dropped: it carries the config path, and a parse failure quotes file CONTENT,
+                // neither of which may reach the event channel (#15). Mirrors the classifier in
+                // `adopt_roster_reload` exactly, including its documented `_` catch-all.
+                Err(_) => RosterCheckVerdict::Undetermined { previous },
+            },
+        };
+        let was = self.state.roster_check;
+        self.state.roster_check = verdict;
+        if verdict == was {
+            // Unchanged: the episode is already on the log (or there is no episode).
+            return;
+        }
+        let event = match verdict {
+            // The falling edge. `was == Agrees` was filtered out by the equality check above, so
+            // reaching here means a real episode just ended: report the size the two copies
+            // agreed ON, which is what closes the incident.
+            RosterCheckVerdict::Agrees => Event::RosterReload {
+                outcome: RosterReloadOutcome::Converged,
+                previous: Some(previous),
+                incoming: Some(previous),
+                reason: None,
+            },
+            RosterCheckVerdict::Diverged { previous, incoming } => Event::RosterReload {
+                outcome: RosterReloadOutcome::Diverged,
+                previous: Some(previous),
+                incoming: Some(incoming),
+                reason: Some(RosterReloadReason::CountMismatch),
+            },
+            // No `incoming` count: there was no file to present one, and `incoming=0` would claim
+            // the file presented an EMPTY roster — a different and far less alarming fact.
+            RosterCheckVerdict::Absent { previous } => Event::RosterReload {
+                outcome: RosterReloadOutcome::Diverged,
+                previous: Some(previous),
+                incoming: None,
+                reason: Some(RosterReloadReason::Absent),
+            },
+            RosterCheckVerdict::Undetermined { previous } => Event::RosterReload {
+                outcome: RosterReloadOutcome::Undetermined,
+                previous: Some(previous),
+                incoming: None,
+                reason: Some(RosterReloadReason::Unreadable),
+            },
+        };
+        events.push(event);
+    }
+
     /// The keychain was LOCKED when this cycle went to read the canonical
     /// credential (issue #13). Defer ALL work — no resolve, no poll, no swap — and
     /// back off so the daemon does not hammer a locked keychain. The back-off grows
@@ -3749,8 +3912,14 @@ where
     /// `signaled_keychain_locked`), not every backed-off retry. The daemon NEVER
     /// auto-unlocks or prompts — a locked keychain is the operator's to open; a
     /// non-interactive read just fails (exit 36), and the daemon waits it out.
-    fn locked_tick(&mut self) -> TickOutcome {
-        let mut events = Vec::new();
+    ///
+    /// Takes the events the tick had ALREADY collected before it reached the canonical read rather
+    /// than starting a fresh vec (issue #1443): the disk-versus-memory roster check runs at the
+    /// top of every tick, above this short-circuit, and its line must survive a locked cycle — a
+    /// lock has nothing to do with `config.toml`, and suppressing the check while the keychain is
+    /// locked would silence it on exactly the unattended machine where a divergence goes unseen
+    /// longest.
+    fn locked_tick(&mut self, mut events: Vec<Event>) -> TickOutcome {
         if !self.state.signaled_keychain_locked {
             events.push(Event::KeychainLockedWait);
             self.state.signaled_keychain_locked = true;

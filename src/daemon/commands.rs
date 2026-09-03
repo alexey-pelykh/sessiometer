@@ -4052,9 +4052,18 @@ mod tests {
         // a regression dropping the `emit_best_effort` fails here rather than leaving the reload
         // traceless again. Asserted on the appended line, which is what an operator would read.
         let logged = std::fs::read_to_string(&log_path).unwrap();
+        // Filtered by the RELOAD outcomes, not by `event=roster_reload` alone. Issue #1443's
+        // poll-tick divergence check rides this same event name — deliberately, so one
+        // `grep event=roster_reload` returns the whole picture — and it fires legitimately in this
+        // fixture: tick 1 sees 2 accounts in memory against 3 on disk and reports `diverged`, the
+        // reload then adopts, and tick 2 reports `converged`. Those are the check working, not a
+        // double-adopt, so the "exactly one" guarantee this test exists for is narrowed to the
+        // path it is about rather than relaxed — a genuine second reload line still fails here.
+        const RELOAD_OUTCOMES: [&str; 3] = ["adopted", "refused", "failed"];
         let reload_lines: Vec<&str> = logged
             .lines()
             .filter(|line| line.contains(" event=roster_reload "))
+            .filter(|line| field_of(line, "outcome").is_some_and(|o| RELOAD_OUTCOMES.contains(&o)))
             .collect();
         assert_eq!(
             reload_lines.len(),
