@@ -18108,6 +18108,7 @@ mod tests {
             Error::ConfigNotFound {
                 path: PathBuf::from("/home/op/.config/sessiometer/config.toml"),
             },
+            Error::PriorConfigurationWithoutConfig,
             Error::RosterEmpty,
             Error::ConfigParse("expected `=` at line 3".to_owned()),
             Error::ConfigInvalid("session_ceiling must be in 50..=99, got 120".to_owned()),

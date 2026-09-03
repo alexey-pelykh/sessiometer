@@ -91,12 +91,24 @@ pub(crate) struct CaptureReport {
 /// never contends on `config.toml` — preserving stash-before-roster, exactly like
 /// [`reconcile_login`].
 pub(crate) async fn capture(label: Option<String>) -> Result<()> {
+    let existing = load_existing()?;
+
+    // #1440 (design D-1): an ABSENT `config.toml` means either "never configured" or
+    // "configuration disappeared", and this verb can only append — so resolving the
+    // ambiguity to "first run" is what wrote a one-account roster over a live six-account
+    // one. Refuse when durable local state says the machine was configured before.
+    //
+    // FIRST, ahead of `ensure_private_dir` as well as the prompt and the credential read,
+    // so a refusal leaves the filesystem exactly as it found it. Only the config read
+    // precedes it, because its result is this gate's own input.
+    crate::witness::admit_append_only(&crate::witness::WitnessSources::real()?, existing.is_some())
+        .await?;
+
     // Ensure the native-local support dir (0700) that houses `swap.lock` exists before
     // acquiring the lock (mirrors `reconcile_login` / `use`, #64).
     paths::ensure_private_dir(&paths::support_dir()?)?;
     let swap_lock = paths::swap_lock()?;
     let claude_json = paths::claude_json()?;
-    let existing = load_existing()?;
 
     // #447: when the operator gave no label on the command line, offer the harvested
     // email as the editable, pre-filled default at an interactive prompt. A confirmed
@@ -255,13 +267,34 @@ where
 ///
 /// The `[login]` config block supplies the capture timeout and an optional `claude` binary
 /// override (both defaulted when no `config.toml` exists yet — the first login precedes it).
+///
+/// The config is read exactly ONCE, here, and the parsed value is carried the whole way to
+/// [`reconcile_login`] (issue #1440, R-5). It used to be read twice — this function kept
+/// `c.login` and dropped the roster three lines apart, and the reconcile then rebuilt one
+/// from `Vec::new()` in a different function, far below. A second read cannot see what
+/// the first one saw, and a re-derivation from nothing is what made the fall-through
+/// invisible: the run reported `(now 1 in rotation)` and looked correct.
 pub(crate) async fn login(label: Option<String>) -> Result<()> {
-    // The `[login]` settings: capture timeout + optional binary override. A MALFORMED config is a
-    // hard error surfaced BEFORE the interactive login (never run a multi-minute login only to
-    // fail on save); an ABSENT config yields the defaults (the first login precedes any
-    // `config.toml`). The override threads through the SAME resolver the refresh path uses (#135
-    // AC: no new binary-override mechanism).
-    let login_cfg = load_existing()?.map(|c| c.login).unwrap_or_default();
+    // The ONE config read for the whole verb. A MALFORMED config is a hard error surfaced
+    // BEFORE the interactive login (never run a multi-minute login only to fail on save);
+    // an ABSENT config is `None` (the first login precedes any `config.toml`).
+    let existing = load_existing()?;
+
+    // #1440 (design D-1): resolve the absent-config ambiguity BEFORE the interactive login,
+    // for the same reason a malformed config is surfaced here — refusing after a
+    // multi-minute login spends the operator's time to reach a verdict already fixed. A
+    // refusal is a true no-op: no engine spawned, nothing harvested, nothing written.
+    crate::witness::admit_append_only(&crate::witness::WitnessSources::real()?, existing.is_some())
+        .await?;
+
+    // The `[login]` settings: capture timeout + optional binary override. Read off the
+    // config parsed above — cloned rather than moved, so the roster stays whole for the
+    // reconcile. The override threads through the SAME resolver the refresh path uses
+    // (#135 AC: no new binary-override mechanism).
+    let login_cfg = existing
+        .as_ref()
+        .map(|c| c.login.clone())
+        .unwrap_or_default();
 
     match login_account(login_cfg.claude_bin.as_deref(), login_cfg.timeout()).await {
         Ok(capture) => {
@@ -272,7 +305,7 @@ pub(crate) async fn login(label: Option<String>) -> Result<()> {
             let uuid_handle = capture.account_uuid().map(str::to_owned);
             match capture.into_captured() {
                 // A completed login: the fresh credential + identity were harvested.
-                Some(captured) => match reconcile_login(captured, label).await {
+                Some(captured) => match reconcile_login(captured, label, existing).await {
                     Ok((outcome, label, count)) => {
                         let event_outcome = match outcome {
                             LoginOutcome::Onboarded => LoginEventOutcome::Onboarded,
@@ -678,6 +711,17 @@ where
     // `[credential]` settings across the reconcile, exactly like `run_capture`
     // (#58/#105/#135/#161/#150/#878): landing a login must never reset any of them to defaults.
     // Destructured exactly as `run_capture` does, and for the same compile-time reason.
+    //
+    // The `None` arm builds a first-run config with an EMPTY roster, and it is the arm that
+    // destroyed five accounts (#1440): `reconcile_login` used to re-read `config.toml` itself,
+    // so a roster that had been read perfectly well by the verb arrived here as `None` and was
+    // rebuilt from `Vec::new()`. Two changes make the arm honest rather than merely rarer —
+    // `existing` is now the CALLER's parsed value, so there is no second read to disagree with
+    // the first, and the caller has already refused an absent config that a prior-configuration
+    // witness contradicts (`crate::witness`). What reaches `None` now is a machine on which
+    // no prior configuration could be OBSERVED — which is a genuine first run except for the
+    // false negative `PriorConfiguration::Absent` documents (a loss that also took both
+    // witnesses), whose second line is the backup ring, not this arm.
     let Config {
         mut roster,
         tunables,
@@ -814,16 +858,24 @@ fn should_signal_restored(activate: bool, outcome: LoginOutcome) -> bool {
 /// swap can race it. Stash-before-roster (like [`capture`]): a crash after the locked
 /// write but before the save leaves a fresh, restorable stash + canonical, never a
 /// roster referencing an unstashed account.
+///
+/// `existing` is the config the CALLER parsed, passed in rather than re-read here (issue
+/// #1440, R-5). It used to call [`load_existing`] itself, which meant the roster this
+/// function persisted was never the roster the verb's own gate had seen: two reads of one
+/// file, a long way apart and separated by one interactive login, with `run_login`'s
+/// `unwrap_or_else(Vec::new)` silently supplying a fresh roster if the second read came
+/// back `None`. One read, carried, is what removes that gap — there is no second read left
+/// to disagree with the first.
 pub(crate) async fn reconcile_login(
     captured: StashedAccount,
     label: Option<String>,
+    existing: Option<Config>,
 ) -> Result<(LoginOutcome, String, usize)> {
     // Ensure the native-local support dir (0700) that houses `swap.lock` exists before
     // acquiring the lock (mirrors `use`, #64).
     paths::ensure_private_dir(&paths::support_dir()?)?;
     let swap_lock = paths::swap_lock()?;
     let claude_json = paths::claude_json()?;
-    let existing = load_existing()?;
 
     // #274: preserve the currently-active account. Read the current canonical identity — the
     // uuid displayed in `~/.claude.json`, the honest-display pair of the canonical token (the
@@ -831,8 +883,10 @@ pub(crate) async fn reconcile_login(
     // login ONLY when it IS that account (re-auth in place) or there is no readable active
     // identity (bootstrap). An unreadable/absent `~/.claude.json` (not-found / no
     // `oauthAccount` / malformed) reads as "no active account" via `.ok()` → bootstrap-
-    // activate, the safe default for an operator who just ran `login`. Read here (before the
-    // swap lock, like `load_existing`), keeping [`run_login`] pure — the verdict is passed in.
+    // activate, the safe default for an operator who just ran `login`. Read here, before the
+    // swap lock, keeping [`run_login`] pure — the verdict is passed in. (This was "like
+    // `load_existing`" until issue #1440 moved the config read to the caller; the ordering
+    // it describes is unchanged, the comparison simply no longer has a sibling here.)
     let active_uuid = read_oauth_account_from(&claude_json)
         .ok()
         .map(|o| o.account_uuid().to_owned());
@@ -1870,5 +1924,218 @@ mod tests {
     #[test]
     fn the_login_reconcile_entry_stays_reachable() {
         let _entry = reconcile_login;
+    }
+
+    // --- the prior-configuration witness at the append-only verbs (#1440) --------------
+
+    #[tokio::test]
+    async fn a_login_lands_on_the_roster_the_caller_parsed_rather_than_a_re_derived_one() {
+        // Issue #1440 R-5 / AC: the roster `login` reads is the roster the reconcile
+        // persists. Six accounts in, seven out — the incident's own transition run the right
+        // way round. The unguarded shape produced ONE here, because the second read's `None`
+        // fell through to `Vec::new()` and `plan_capture`'s only reachable arm on an empty
+        // roster is a push.
+        let store = FakeCredentialStore::empty();
+        let stash = FakeAccountStash::empty();
+        let dir = tempfile::tempdir().unwrap();
+        let existing = Config {
+            roster: (1..=6)
+                .map(|n| account(&format!("u-{n}"), "held"))
+                .collect(),
+            tunables: Tunables::default(),
+            refresh: RefreshConfig::default(),
+            login: LoginConfig::default(),
+            stats: StatsConfig::default(),
+            migration: MigrationConfig::default(),
+            credential: CredentialConfig::default(),
+        };
+
+        let report = run_login(
+            HarvestedLogin {
+                captured: stashed("u-7", b"seventh"),
+                activate: true,
+            },
+            &store,
+            &stash,
+            Some(existing),
+            None,
+            &absent_claude_json(dir.path()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.outcome, LoginOutcome::Onboarded);
+        assert_eq!(report.config.roster.len(), 7);
+        assert_eq!(report.count, 7);
+        // Every prior account is still there, by uuid — a count alone would pass a roster
+        // that replaced six entries with seven different ones.
+        for n in 1..=6 {
+            let uuid = format!("u-{n}");
+            assert!(
+                report.config.roster.iter().any(|a| a.account_uuid == uuid),
+                "the reconcile dropped {uuid} from the roster it was handed"
+            );
+        }
+    }
+
+    #[test]
+    fn the_login_reconcile_never_re_reads_the_config_it_was_handed() {
+        // Issue #1440 AC: the roster parsed by the verb reaches persistence with NO
+        // re-derivation. `reconcile_login` used to call `load_existing` itself, which is the
+        // re-read this forbids — far below, and one multi-minute interactive login after the
+        // verb's own read, with nothing reconciling the two.
+        //
+        // The parameter makes the RIGHT roster available; only this keeps a second read from
+        // being added back beside it, which would restore the divergence while the signature
+        // still looked correct.
+        let source = capture_source_above_the_tests();
+        let body = fn_body(&source, "pub(crate) async fn reconcile_login");
+        assert!(
+            !body.contains("load_existing"),
+            "`reconcile_login` re-reads the config instead of using the one it was handed:\n{body}"
+        );
+        // Canary: the body was actually extracted, so the absence above is evidence.
+        assert!(body.contains("run_login_locked"));
+    }
+
+    #[test]
+    fn both_append_only_verbs_consult_the_witness_before_they_can_write() {
+        /// The gate call, verbatim. Reformatting is free (whitespace is collapsed out of
+        /// the tail check and `cargo fmt` owns the line breaks); changing the ARGUMENT or
+        /// the propagation is not, which is the point.
+        const GATE_CALL: &str = "crate::witness::admit_append_only(&crate::witness::WitnessSources::real()?, existing.is_some())";
+        /// What must follow it: awaited, and the verdict propagated.
+        const GATE_TAIL: &str = ".await?;";
+
+        // Issue #1440 AC: a refusal writes NOTHING. That is a property of WHERE the gate
+        // sits, not of what it returns — a correct verdict reached after the stash has landed
+        // (or after a multi-minute interactive login has run) refuses far too late.
+        //
+        // Each verb's first irreversible or operator-visible step is named below, and the
+        // gate has to precede all of them. Moving the gate down is the regression; so is
+        // deleting it, which the `expect` on the gate's own position catches.
+        let source = capture_source_above_the_tests();
+        for (verb, first_effects) in [
+            (
+                "pub(crate) async fn capture",
+                // The support-dir creation (the first filesystem MUTATION, and the reason
+                // a refusal leaves the tree untouched), the label prompt (an
+                // operator-visible step), the locked identity + token read and stash, the
+                // roster save, and the daemon notify.
+                &[
+                    "ensure_private_dir",
+                    "prefill_label_from_identity",
+                    "capture_locked(",
+                    "report.config.save()",
+                    "notify_daemon_roster_reload()",
+                ][..],
+            ),
+            (
+                "pub(crate) async fn login",
+                // The interactive login engine, and the reconcile that stashes and saves.
+                &["login_account(", "reconcile_login("][..],
+            ),
+        ] {
+            let body = fn_body(&source, verb);
+            // The whole call, not the bare name. Three regressions ride on this being the
+            // anchor: passing a constant instead of `existing.is_some()` (a gate that can
+            // never refuse), dropping the `?` so the refusal is computed and discarded, and
+            // deleting the call while leaving prose that names it. A bare-token search
+            // admits all three.
+            let gate = body.find(GATE_CALL).unwrap_or_else(|| {
+                panic!("`{verb}` does not consult the prior-configuration witness as `{GATE_CALL}`:\n{body}")
+            });
+            let tail: String = body[gate + GATE_CALL.len()..]
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .take(GATE_TAIL.len())
+                .collect();
+            assert_eq!(
+                tail, GATE_TAIL,
+                "`{verb}` does not propagate the witness verdict — the refusal is computed and dropped"
+            );
+            for effect in first_effects {
+                let at = body.find(effect).unwrap_or_else(|| {
+                    panic!("`{verb}` no longer contains `{effect}` — this gate's anchor set has gone stale and is no longer measuring the order it claims to")
+                });
+                assert!(
+                    gate < at,
+                    "`{verb}` reaches `{effect}` before consulting the witness, so a refusal is not a no-op"
+                );
+            }
+        }
+    }
+
+    /// This file's source above its test block — the subject of the two structural
+    /// assertions above.
+    ///
+    /// Cut at a column-0 `#[cfg(test)]`, which in this file is the test module and nothing
+    /// else. Both callers canary what they extracted, so a boundary that moved up shows as a
+    /// failure rather than as a green run over an empty subject.
+    fn capture_source_above_the_tests() -> String {
+        let text = std::fs::read_to_string("src/capture.rs").expect("cannot read src/capture.rs");
+        text.split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("split always yields a first element")
+            .to_owned()
+    }
+
+    /// The CODE of `source` from the line opening `signature` to the next column-0 `}` —
+    /// one function body, brace-delimited by the file's own `cargo fmt`-guaranteed layout,
+    /// with whole-line comments removed.
+    ///
+    /// Deliberately not a brace counter: `rustfmt` puts a top-level item's closing brace at
+    /// column 0 and nothing else in this file's non-test region has one, so the simple rule
+    /// is exact here and fails loudly (an empty or run-on body) rather than subtly if that
+    /// ever stops holding — which is what the callers' canaries check.
+    ///
+    /// The comment strip is what makes both callers measure the thing they claim to. Both
+    /// ask about CALLS — does this function re-read the config, does that one reach a write
+    /// before the gate — and this file's comments name those very functions, at length and
+    /// on purpose. Without the strip, a body's prose about `load_existing` reads as a call
+    /// to it, and a paragraph mentioning `capture_locked` shifts a position the ordering
+    /// assertion compares.
+    ///
+    /// Trailing comments are stripped as well as whole-line ones. A trailing comment cannot
+    /// precede code on its own line, but it can still sit on an EARLIER line than the code
+    /// it names — which is exactly a false first occurrence — so stripping only whole lines
+    /// would leave the ordering assertion satisfiable by a comment. A `//` inside a string
+    /// literal is left alone (detected by an odd quote count to its left), so the strip
+    /// cannot eat code.
+    fn fn_body(source: &str, signature: &str) -> String {
+        let from = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("`{signature}` is not in src/capture.rs"));
+        let rest = &source[from..];
+        let end = rest
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("`{signature}` has no column-0 closing brace"));
+        rest[..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .map(strip_trailing_comment)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// `line` up to a `//` that is not inside a string literal.
+    ///
+    /// "Not inside a string literal" is decided by an even count of unescaped `"` to the
+    /// left, which is exact for a single line of Rust that this file's `cargo fmt` layout
+    /// produces (no raw strings spanning a `//`, no char literal holding a lone quote).
+    fn strip_trailing_comment(line: &str) -> &str {
+        let bytes = line.as_bytes();
+        let mut in_string = false;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' => i += 1,
+                b'"' => in_string = !in_string,
+                b'/' if !in_string && bytes.get(i + 1) == Some(&b'/') => return &line[..i],
+                _ => {}
+            }
+            i += 1;
+        }
+        line
     }
 }

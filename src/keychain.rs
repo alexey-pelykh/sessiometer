@@ -552,12 +552,12 @@ impl RealCredentialStore {
     /// locked keychain and never decrypts secret data) rather than the issue's
     /// literal `find-generic-password -s`: the latter returns only the first
     /// match, so it cannot detect the >1 (ambiguous) case the uniqueness rule
-    /// requires.
+    /// requires. The argv comes from [`dump_keychain_args`] (issue #1440), which
+    /// is where the no-`-d` invariant is single-homed.
     async fn resolve(&self) -> Result<OsString> {
         let keychain = self.keychain_path()?;
         let output = Command::new(SECURITY)
-            .arg("dump-keychain")
-            .arg(&keychain)
+            .args(dump_keychain_args(&keychain))
             .stdin(Stdio::null())
             .output()
             .await?;
@@ -756,6 +756,75 @@ fn service_matches(service: &str, dump: &str) -> Vec<Option<Vec<u8>>> {
         }
     }
     matches
+}
+
+/// Whether ANY generic-password item in `dump` carries a service beginning with
+/// `prefix` — the prior-configuration witness's keychain half (issue #1440, design D-1).
+///
+/// Deliberately a PREFIX test rather than the exact-service [`service_matches`] above:
+/// the question is *"has this machine ever held a per-account stash?"*, and every stash
+/// service is `Sessiometer/<account_uuid>` ([`crate::config::Account::stash`]) — a family,
+/// not one name. The uuids are exactly what an absent `config.toml` has taken away, so a
+/// probe that had to name them could not run at all.
+///
+/// Returns a BOOLEAN and nothing else. No `acct`, no service, no count leaves this
+/// function: the refusal it feeds names an ambient prior configuration and no specific
+/// item (issue #1440 AC), and a value that is never returned cannot be printed by a later
+/// edit.
+fn any_service_with_prefix(prefix: &str, dump: &str) -> bool {
+    // Same block split + `genp` filter as `service_matches`, so the two passes can never
+    // disagree about what "an item in this dump" is.
+    dump.split("\nkeychain: ").any(|block| {
+        block.contains("class: \"genp\"")
+            && block_attr(block, "svce").is_some_and(|svce| svce.starts_with(prefix.as_bytes()))
+    })
+}
+
+/// The `security dump-keychain` argv, pinned to one keychain file.
+///
+/// **No `-d`**, which is the whole point and why this is a shared function rather than two
+/// inline argv constructions: `-d` would decrypt, and decryption is what raises a prompt
+/// and what fails on a LOCKED keychain. Both callers — the isolated-orphan reap
+/// ([`IsolatedService::enumerate`], issue #769) and the prior-configuration witness
+/// ([`any_stash_item_present`], issue #1440) — run at moments the operator may well not be
+/// able to unlock, so metadata-only is a correctness property for each, not a preference.
+/// Single-homed here for the reason [`service_matches`] is single-homed: two copies of an
+/// invariant are two chances to drift apart, and this one drifts silently — a decrypting
+/// dump still returns the metadata the parsers read, so nothing downstream would notice.
+fn dump_keychain_args(keychain: &Path) -> [&OsStr; 2] {
+    [OsStr::new("dump-keychain"), keychain.as_os_str()]
+}
+
+/// Whether `keychain` holds any per-account stash item — the keychain half of the
+/// prior-configuration witness (issue #1440, design D-1).
+///
+/// Metadata only (see [`dump_keychain_args`]): no prompt, no decryption, correct against a
+/// LOCKED keychain. That last property is load-bearing rather than incidental — the witness
+/// is consulted at the exact moment an operator has lost their `config.toml`, and making a
+/// refusal contingent on an unlocked keychain would withhold it precisely then.
+///
+/// The dump covers the whole keychain but never leaves this function, exactly as in
+/// [`IsolatedService::enumerate`]: [`any_service_with_prefix`] reduces it to one bool and
+/// nothing renders the text.
+pub(crate) async fn any_stash_item_present(keychain: &Path) -> Result<bool> {
+    let output = Command::new(SECURITY)
+        .args(dump_keychain_args(keychain))
+        // Non-interactive: this child can never block on our stdin.
+        .stdin(Stdio::null())
+        .output()
+        .await?;
+    if !output.status.success() {
+        return Err(keychain_error(
+            "prior-configuration witness",
+            output.status.code().unwrap_or(-1),
+        ));
+    }
+    // Metadata text (attribute names + quoted/hex values), not secret data; a lossy decode
+    // is safe and never touches a token.
+    Ok(any_service_with_prefix(
+        crate::config::STASH_PREFIX,
+        &String::from_utf8_lossy(&output.stdout),
+    ))
 }
 
 /// Parse `security dump-keychain` output: find every generic-password item whose
@@ -1287,13 +1356,14 @@ impl IsolatedService {
     /// `dump-keychain` (no `-d`) like the canonical [`RealCredentialStore::resolve`]:
     /// metadata only, so it raises no prompt, decrypts no secret, and works on a
     /// locked keychain — which matters here, since a reap runs at daemon start where
-    /// the keychain may well still be locked. The dump covers the whole keychain but
+    /// the keychain may well still be locked. The argv comes from the shared
+    /// [`dump_keychain_args`] (issue #1440), which is where the no-`-d` invariant now
+    /// lives for both metadata passes. The dump covers the whole keychain but
     /// never leaves this function: [`parse_reap_targets`] keeps only this service's
     /// items, and nothing renders the text.
     async fn enumerate(&self, keychain: &Path) -> Result<ReapTargets> {
         let output = Command::new(SECURITY)
-            .arg("dump-keychain")
-            .arg(keychain)
+            .args(dump_keychain_args(keychain))
             .stdin(Stdio::null())
             .output()
             .await?;
@@ -1996,6 +2066,94 @@ class: "genp"
         );
     }
 
+    // --- prior-configuration witness (#1440): a PREFIX pass over the same dump ---------
+    //
+    // A dump holding two per-account stashes, the canonical Claude Code item, and a
+    // non-`genp` item — the shape a configured machine actually presents.
+    const A_CONFIGURED_MACHINE: &str = r#"keychain: "/tmp/x.keychain-db"
+class: "genp"
+    "acct"<blob>="credential"
+    "svce"<blob>="Sessiometer/11111111-1111-1111-1111-111111111111"
+keychain: "/tmp/x.keychain-db"
+class: "genp"
+    "acct"<blob>="oauthAccount"
+    "svce"<blob>="Sessiometer/22222222-2222-2222-2222-222222222222"
+keychain: "/tmp/x.keychain-db"
+class: "genp"
+    "acct"<blob>="user-a"
+    "svce"<blob>="Claude Code-credentials"
+keychain: "/tmp/x.keychain-db"
+class: "inet"
+    "srvr"<blob>="Sessiometer/not-a-generic-password"
+"#;
+
+    #[test]
+    fn the_witness_sees_a_stash_under_the_prefix_and_ignores_everything_else() {
+        // The witness fires on the stash FAMILY, which is the whole point: an absent
+        // `config.toml` has taken away the uuids, so no exact service name is available to
+        // ask about.
+        assert!(any_service_with_prefix(
+            crate::config::STASH_PREFIX,
+            A_CONFIGURED_MACHINE
+        ));
+        // The canonical Claude Code item is NOT a witness. Claude Code writes it on its own
+        // `/login`, with no sessiometer involvement — so counting it would refuse a genuine
+        // first run on every machine that has ever run `claude`, which is all of them.
+        assert!(!any_service_with_prefix(
+            crate::config::STASH_PREFIX,
+            r#"keychain: "/tmp/x.keychain-db"
+class: "genp"
+    "acct"<blob>="user-a"
+    "svce"<blob>="Claude Code-credentials"
+"#
+        ));
+        // A non-`genp` item whose attribute merely CONTAINS the prefix is not a stash. The
+        // `genp` filter is what keeps an internet-password's `srvr` out of the answer.
+        assert!(!any_service_with_prefix(
+            crate::config::STASH_PREFIX,
+            r#"keychain: "/tmp/x.keychain-db"
+class: "inet"
+    "srvr"<blob>="Sessiometer/11111111-1111-1111-1111-111111111111"
+"#
+        ));
+        // An empty dump — a fresh machine.
+        assert!(!any_service_with_prefix(crate::config::STASH_PREFIX, ""));
+    }
+
+    #[test]
+    fn the_witness_decodes_a_hex_rendered_service() {
+        // `dump-keychain` renders an attribute as hex at its own discretion, and a witness
+        // that read only the quoted form would answer `Absent` on a machine whose stash is
+        // right there — the false negative that costs the operator their roster.
+        // 0x53657373696F6D657465722F75 is `Sessiometer/u`.
+        assert!(any_service_with_prefix(
+            crate::config::STASH_PREFIX,
+            r#"keychain: "/tmp/x.keychain-db"
+class: "genp"
+    "acct"<blob>="credential"
+    "svce"<blob>=0x53657373696F6D657465722F75
+"#
+        ));
+    }
+
+    #[test]
+    fn the_metadata_dump_never_asks_security_to_decrypt() {
+        // `-d` is what raises a prompt and what fails on a locked keychain, and BOTH
+        // metadata passes depend on its absence — the reap runs at daemon start, the
+        // witness runs when an operator has just lost their config. Asserted on the argv
+        // rather than trusted to a doc comment: this is a two-element array, so a `-d`
+        // reaching it changes the length and cannot be added without failing here.
+        let args = dump_keychain_args(Path::new("/tmp/x.keychain-db"));
+        assert_eq!(
+            args,
+            [
+                OsStr::new("dump-keychain"),
+                OsStr::new("/tmp/x.keychain-db")
+            ]
+        );
+        assert!(!args.contains(&OsStr::new("-d")));
+    }
+
     #[test]
     fn the_reap_and_the_resolve_enumerate_the_same_items() {
         // Both passes run off `service_matches`, so what the canonical resolve treats as
@@ -2258,6 +2416,141 @@ class: "genp"
             let (_dir, kc) = fresh_keychain();
             let store = RealCredentialStore::for_keychain(kc.clone());
             assert!(matches!(store.read().await, Err(Error::CredentialNotFound)));
+            delete(&kc);
+        }
+
+        /// Seed a per-account stash item, as `capture` / the login reconcile do
+        /// (`Sessiometer/<account_uuid>`, `acct=credential`) — the witness's subject.
+        fn seed_stash(kc: &Path, account_uuid: &str, secret: &str) {
+            assert!(StdCommand::new(SECURITY)
+                .args([
+                    "add-generic-password",
+                    "-U",
+                    "-s",
+                    &format!("{}{account_uuid}", crate::config::STASH_PREFIX),
+                    "-a",
+                    "credential",
+                    "-w",
+                    secret,
+                ])
+                .arg(kc)
+                .status()
+                .expect("spawn add-generic-password")
+                .success());
+        }
+
+        /// A throwaway keychain protected by a REAL password, seeded with one per-account
+        /// stash and then LOCKED.
+        ///
+        /// The password is what makes the lock mean anything, and getting this wrong is the
+        /// whole trap: [`fresh_keychain`] above creates with `-p ""`, and an empty-password
+        /// keychain **auto-unlocks on first use** — `lock-keychain` still exits 0, so the
+        /// setup looks identical while every subsequent read silently succeeds. A witness
+        /// test built on that keychain would pass against a probe that decrypts, which is
+        /// the one thing it exists to rule out. Measured on macOS 26.5 / `security` on
+        /// 2026-09-03, against a keychain built exactly like this one:
+        /// `find-generic-password -w` with stdin `/dev/null` **does not return** (it raises
+        /// the GUI unlock dialog), and neither does `show-keychain-info`.
+        fn locked_keychain_holding_a_stash(account_uuid: &str) -> (tempfile::TempDir, PathBuf) {
+            const PASSWORD: &str = "sessiometer-witness-test";
+            let dir = tempfile::tempdir().unwrap();
+            let kc = dir.path().join("locked.keychain-db");
+            for args in [
+                ["create-keychain", "-p", PASSWORD],
+                ["unlock-keychain", "-p", PASSWORD],
+            ] {
+                assert!(StdCommand::new(SECURITY)
+                    .args(args)
+                    .arg(&kc)
+                    .status()
+                    .expect("spawn security")
+                    .success());
+            }
+            seed_stash(&kc, account_uuid, "stashed-token");
+            assert!(StdCommand::new(SECURITY)
+                .arg("lock-keychain")
+                .arg(&kc)
+                .status()
+                .expect("spawn lock-keychain")
+                .success());
+            (dir, kc)
+        }
+
+        #[tokio::test]
+        async fn the_witness_reads_a_locked_keychain_without_prompting() {
+            // Issue #1440 AC: the probe does not prompt, does not decrypt, and returns
+            // CORRECTLY against a locked keychain — asserted against the real `security`,
+            // not assumed from the absence of `-d`.
+            //
+            // This is the moment the witness exists for. An operator who has just lost their
+            // `config.toml` is the least able to supply a keychain password, so a probe that
+            // needed one would withhold the refusal exactly when it is load-bearing — and
+            // would do so by falling back to "no witness", i.e. permissively.
+            //
+            // The no-decrypt half is additionally asserted mechanically on the argv by
+            // [`the_metadata_dump_never_asks_security_to_decrypt`].
+            let (_dir, kc) =
+                locked_keychain_holding_a_stash("11111111-1111-1111-1111-111111111111");
+
+            // OBSERVE the precondition rather than trusting the construction. Without this,
+            // swapping `lock-keychain` for `unlock-keychain` leaves the test green — it
+            // would still pass, having proved only that the probe reads an UNLOCKED
+            // keychain, which is not the claim.
+            //
+            // The observation is the lock's own signature: a DECRYPTING read of the same
+            // item cannot answer while locked, so a bounded attempt that comes back
+            // successful is proof the keychain is open. Measured on macOS 26.5.2 / 25F84
+            // against this exact fixture: unlocked exits 0 immediately, locked blocks on
+            // the GUI dialog until killed.
+            //
+            // `-a credential` is the ACCOUNT [`seed_stash`] writes, and it is what makes
+            // this an instrument rather than a decoration: with any other selector the read
+            // fails as item-not-found whatever the lock state, and the assertion below
+            // passes over a keychain that is wide open. `kill_on_drop` is load-bearing too
+            // — the timeout drops the future, and without it the blocked `security`
+            // outlives the test run.
+            let decrypting = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                Command::new(SECURITY)
+                    .args(["find-generic-password", "-a", "credential", "-w"])
+                    .arg(&kc)
+                    .stdin(Stdio::null())
+                    .kill_on_drop(true)
+                    .output(),
+            )
+            .await;
+            assert!(
+                !matches!(&decrypting, Ok(Ok(out)) if out.status.success()),
+                "a decrypting read succeeded, so this keychain is NOT locked and the test is \
+                 not measuring what it claims"
+            );
+
+            // The timeout IS the no-prompt assertion: a probe that raised the dialog would
+            // sit on it forever, so this fails the test in seconds instead of wedging the
+            // suite. Generous against a cold `security` and a large dump — the measured call
+            // is milliseconds, so nothing borderline can reach this bound.
+            let present = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                any_stash_item_present(&kc),
+            )
+            .await
+            .expect("the metadata probe returned without waiting on a prompt")
+            .expect("the metadata probe survives a locked keychain");
+            assert!(present);
+
+            delete(&kc);
+        }
+
+        #[tokio::test]
+        async fn the_witness_is_absent_on_a_keychain_that_holds_only_claude_codes_own_item() {
+            // A genuine first run on a machine that HAS run `claude`: the canonical item is
+            // there, no stash is. Refusing here would tax every first run — the tax the
+            // absent-config-alone route was rejected for.
+            let (_dir, kc) = fresh_keychain();
+            seed(&kc, "sessiometer-first-run-acct", "claude-code-token");
+            assert!(!any_stash_item_present(&kc)
+                .await
+                .expect("an empty-of-stashes keychain probes cleanly"));
             delete(&kc);
         }
 
