@@ -367,7 +367,7 @@ where
                     config,
                     outcome,
                     label,
-                    count,
+                    count: _saved_count,
                 } = report;
                 // Reconcile the in-memory rotation to the freshly-written roster (the SAME core the
                 // #139 roster-reload drives): an already-rostered active account keeps its per-account
@@ -392,7 +392,9 @@ where
                 // divergence detection on the poll tick, which reports that disk and memory
                 // DISAGREE — a different signal from the one that says this reconcile REFUSED, and
                 // it would arrive a poll cadence later off a state comparison rather than off this
-                // event. The ack is unaffected either way: it reports the CAPTURE, which succeeded.
+                // event. The ack's OUTCOME is unaffected either way — the capture itself succeeded,
+                // stash and roster row both on disk — but its COUNT is not, which is why it is read
+                // back below rather than taken from the report.
                 //
                 // Bound rather than discarded so the `#[must_use]` is answered deliberately.
                 let _reconcile = self.reconcile_roster(config.roster, ReloadIntent::AppendOnly);
@@ -402,6 +404,14 @@ where
                     account: Some(label.clone()),
                     outcome: capture_event_outcome(outcome),
                 };
+                // The LIVE rotation, read after the reconcile — not `report.count`, which counts the
+                // file just saved. They agree on every adopting path and part company on a refusal,
+                // and `CaptureAck::Captured`'s contract is explicit that this field is "the running
+                // account COUNT" (issue #35). Reporting the file's count through a refusal tells the
+                // operator their new account is one of N in the rotation when the rotation never
+                // took it — on the recovery path for the 2026-08-27 divergence, which is the one
+                // place this refusal actually fires.
+                let count = self.roster.len();
                 let ack = match outcome {
                     crate::capture::CaptureOutcome::Captured => {
                         CaptureAck::Captured { label, count }
@@ -542,11 +552,28 @@ where
         //
         // Nothing legitimate is given up. A label edit cannot change the count, so the floor is
         // unreachable on every path where the file and the live roster agree.
-        if change.labels_changed {
-            let _reconcile = self.reconcile_roster(config.roster, ReloadIntent::AppendOnly);
-        }
+        // A REFUSED reconcile means the label is on disk and the live daemon did not take it, so
+        // the ack cannot say `Live` — that variant's contract is literally "adopted LIVE (the daemon
+        // reconciled its roster in-process)". The label rendered by `status` and the panel comes off
+        // `self.roster`, so it stays the OLD one until something reloads; `RestartRequired` —
+        // "persisted, effective on the NEXT daemon start" — is exactly that state, and is the only
+        // truthful variant available. A fourth `applied-not-live` effect would be more precise, and
+        // is deliberately NOT added here: `ConfigSetEffect` is mirrored in Swift
+        // (`apps/menubar/Sources/ConfigWire.swift`) where an unknown value is a HARD decode error,
+        // so a new variant breaks every shipped app until all four surfaces land together (design
+        // D-5, R-12). Routed to the issue owner rather than taken here.
+        //
+        // The restart that hint invites would load the diverged file and drop the memory-only
+        // accounts — but that hazard belongs to the divergence, not to this ack, and detecting it is
+        // #1443 (D-6, R-10). `Live` does not protect against it; it only hides the label problem too.
+        let reconciled = if change.labels_changed {
+            self.reconcile_roster(config.roster, ReloadIntent::AppendOnly)
+        } else {
+            // No label changed, so no reconcile was owed and none was refused.
+            ReconcileOutcome::Adopted
+        };
         // A tunable change is the operative action even if a label also changed (both persisted).
-        let effect = if change.tunables_changed {
+        let effect = if change.tunables_changed || reconciled == ReconcileOutcome::RefusedShrink {
             ConfigSetEffect::RestartRequired
         } else {
             ConfigSetEffect::Live
@@ -2231,6 +2258,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_capture_onto_a_diverged_file_reports_the_live_count_not_the_saved_one() {
+        // Issue #1442. The socket-capture path's refusal case, which no behavioural test reached:
+        // the floor is asserted here structurally (every call site is covered BY it), but what the
+        // OPERATOR is told when it fires at this site is a separate claim, and it was wrong.
+        //
+        // The scenario is this issue's own recovery path. The daemon holds three accounts; the file
+        // has diverged to one — the state a refused `login` reload LEAVES behind, since the daemon
+        // never writes `config.toml` and reconciling the two is #1443. The operator opens the panel
+        // and captures an account to recover. `capture_locked` appends to the file it read, so two
+        // accounts are saved, and `reconcile_roster` refuses (2 < 3).
+        //
+        // `CaptureAck::Captured`'s `count` is contractually "the running account COUNT" (issue #35).
+        // Taken from the capture report it is the count of the FILE just written, so the ack would
+        // say two — telling the operator their new account is one of two in the rotation, when the
+        // rotation holds three and does not include it at all. Read off the live roster it says
+        // three, which is true, and the disagreement is the whole signal.
+        let roster = vec![
+            account("u-A", "work"),
+            account("u-B", "spare"),
+            account("u-C", "third"),
+        ];
+        let store = store_holding(b"N-token").await;
+        let stash = stash_with(&[("Sessiometer/u-A", b"A-token", "u-A")]).await;
+        let (_json_dir, json) = claude_json("u-NEW");
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let config_path = cfg_dir.path().join("config.toml");
+        // The file the divergence left: ONE account, where the daemon holds three.
+        write_roster_config(&config_path, &[("u-A", "work")]);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            FakeRosterPoller::new(),
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        )
+        .with_config_path(config_path.clone());
+
+        let (ack, event) = daemon
+            .perform_socket_capture(&CaptureCommand {
+                label: Some("recovered".to_owned()),
+            })
+            .await;
+
+        // The capture itself succeeded: the stash landed and the roster row is on disk.
+        assert_eq!(
+            event,
+            Some(Event::Capture {
+                account: Some("recovered".to_owned()),
+                outcome: CaptureEventOutcome::Captured,
+            })
+        );
+        let on_disk = Config::load_path(&config_path).unwrap();
+        assert_eq!(on_disk.roster.len(), 2, "the capture appended to the file");
+
+        // But the rotation refused it, so the ack must say three and not two.
+        assert_eq!(
+            ack,
+            CaptureAck::Captured {
+                label: "recovered".to_owned(),
+                count: 3,
+            },
+            "the ack's count is the LIVE rotation, not the file that was just saved"
+        );
+        assert_eq!(
+            roster_uuids(&daemon),
+            vec!["u-A", "u-B", "u-C"],
+            "and the rotation itself is unchanged — the reconcile refused"
+        );
+    }
+
+    #[tokio::test]
     async fn perform_socket_capture_refuses_an_absent_config_when_the_live_roster_survives() {
         // PRD § 7 row 2, and the incident run at the second entry point with the durable witness
         // GONE: `config.toml` is absent, the daemon is still holding the six accounts the file used
@@ -2715,14 +2816,30 @@ mod tests {
 
         // The edit itself still succeeds and still lands on disk — the floor governs what the
         // daemon ADOPTS, and refusing the operator's label change would be a different bug.
+        //
+        // But NOT `Live`. That variant's contract is "adopted LIVE (the daemon reconciled its
+        // roster in-process)", and the reconcile was refused, so the rename is on disk and the live
+        // daemon does not have it. `RestartRequired` — "persisted, effective on the NEXT daemon
+        // start" — is the state the operator is actually in. An ack saying `Live` here is a false
+        // statement in a wire contract, and it is one this issue's own floor introduced: before the
+        // floor, the reconcile never refused and `Live` was always true.
         assert_eq!(
             ack,
             ConfigSetAck::Applied {
-                effect: ConfigSetEffect::Live,
-            }
+                effect: ConfigSetEffect::RestartRequired,
+            },
+            "a refused reconcile means the label is persisted but NOT live"
         );
         let on_disk = Config::load_path(&config_path).unwrap();
         assert_eq!(on_disk.roster[0].label, "day-job", "the rename persisted");
+        // The other half of the same claim, and the one a shape-check would miss: the LIVE label is
+        // still the old one. `status` and the panel render labels straight off `self.roster`, so
+        // this is what the operator sees until something reloads — which is exactly what the ack
+        // above now tells them.
+        assert_eq!(
+            daemon.roster[0].label, "work",
+            "the live label did not move, because the reconcile that would have moved it refused"
+        );
 
         // And the live rotation kept all three accounts, with their carried state.
         assert_eq!(
