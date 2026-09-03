@@ -2411,11 +2411,18 @@ mod tests {
              `src/`; add it to `SITES` with the intent its verb implies (the +1 is this \
              function's own definition)"
         );
-        // Canary on the comment strip that makes the count above a count of CALLS. This file's
-        // own prose names the function repeatedly and on purpose, so a strip that stopped working
-        // would inflate the count rather than deflate it — and the assertion would then fail for
-        // a reason nobody could read. Requiring the prose mentions to be non-zero proves the
-        // strip is separating the two classes rather than passing everything through as code.
+        // Canary on the comment strip that makes the count above a count of CALLS: a strip that
+        // stopped working would INFLATE the count rather than deflate it, and the assertion above
+        // would then fail for a reason nobody could read. Requiring a non-zero prose count proves
+        // the strip is separating the two classes rather than passing everything through as code.
+        //
+        // The prose it finds is NOT in this file — this file's own mentions all sit inside the test
+        // block, which is cut before counting. At the time of writing the corpus holds exactly one,
+        // in `src/daemon/socket.rs`'s `ReloadIntent` doc. That makes the canary one doc-comment edit
+        // in an unrelated file away from failing, which is a real cost and a deliberate one: the
+        // alternative is a count with no evidence that the classification behind it works at all.
+        // If it ever fails on a corpus that genuinely has no commented mention, restate it against
+        // a token this crate does comment about — do not delete it.
         assert!(
             prose > 0,
             "no commented mention of `notify_daemon_roster_reload` was found under `src/`, so \

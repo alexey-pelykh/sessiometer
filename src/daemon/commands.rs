@@ -4576,12 +4576,15 @@ mod tests {
     fn an_omitted_or_unrecognized_intent_is_read_as_append_only() {
         // PRD R-3a, the fail-closed default, asserted at the boundary that decides it.
         //
-        // THREE inputs, because the requirement's own reasoning covers a rollout in both
-        // directions. An omitted token is the legacy shape — `notify_daemon_roster_reload` took no
-        // arguments before this issue, so an older CLI against a newer daemon sends exactly that.
-        // An unrecognized token is the mirror: a newer CLI against an older daemon, or a third
+        // THREE inputs. An omitted token is the legacy shape — `notify_daemon_roster_reload` took
+        // no arguments before this issue, so an older CLI against a newer daemon sends exactly
+        // that. An unrecognized token is any value this daemon does not know, including a third
         // intent added later. Neither can be read as permission to shrink, so both resolve to the
         // refusing treatment, and only the exact `mutating` token opts in.
+        //
+        // The mirror direction — a newer CLI against an OLDER daemon — is NOT covered and cannot
+        // be tested here: that binary never runs this function. See `ReloadIntent::from_wire`'s
+        // doc for why (no `deny_unknown_fields` on `ControlRequest`, so the field is dropped).
         assert_eq!(ReloadIntent::from_wire(None), ReloadIntent::AppendOnly);
         assert_eq!(
             ReloadIntent::from_wire(Some("banana")),
@@ -4765,16 +4768,45 @@ mod tests {
         // `self.roster = config.roster.clone();` written beside its reconcile call reinstates the
         // 2026-08-27 collapse while every assertion above still passes. So the module holds
         // exactly ONE assignment to the field, and it is the one inside `reconcile_roster`.
-        const WRITE: &str = ".roster = ";
+        // ASSIGNMENT is not the only way to write a `Vec`. `self.roster.retain(..)`,
+        // `.truncate(..)`, `.clear()`, `.pop()`, `.drain(..)` and `mem::take(&mut self.roster)` all
+        // shrink it in place, reach the field without an `=`, and would leave an assignment-only
+        // count at one. None exists today; the point is that adding one must fail here rather than
+        // pass, since the heading above claims the FIELD is governed and not merely one syntax.
+        const ASSIGN: &str = ".roster = ";
+        const IN_PLACE: &[&str] = &[
+            ".roster.retain(",
+            ".roster.truncate(",
+            ".roster.clear(",
+            ".roster.pop(",
+            ".roster.drain(",
+            ".roster.remove(",
+            ".roster.push(",
+            ".roster.insert(",
+            ".roster.extend(",
+            ".roster.swap_remove(",
+            ".roster.dedup",
+            ".roster.sort",
+            "&mut self.roster",
+            "&mut daemon.roster",
+        ];
         let writers: Vec<String> = daemon_module_sources()
             .iter()
-            .flat_map(|(file, text)| std::iter::repeat_n(file.clone(), text.matches(WRITE).count()))
+            .flat_map(|(file, text)| {
+                let n = text.matches(ASSIGN).count()
+                    + IN_PLACE
+                        .iter()
+                        .map(|needle| text.matches(needle).count())
+                        .sum::<usize>();
+                std::iter::repeat_n(file.clone(), n)
+            })
             .collect();
         assert_eq!(
             writers.len(),
             1,
             "the daemon's roster field must have exactly ONE writer, so the floor cannot be \
-             bypassed by assigning it directly; found {writers:?}"
+             bypassed by assigning it — or mutating it in place — behind the guard's back; \
+             found {writers:?}"
         );
 
         // And that one writer is behind the guard, not in front of it. Position, not membership:
@@ -4784,8 +4816,8 @@ mod tests {
         let compared = floor
             .find(PREDICATE)
             .expect("the comparison is in this body — asserted in (1)");
-        let wrote = floor.find(WRITE).unwrap_or_else(|| {
-            panic!("the one `{WRITE}` writer is not inside `reconcile_roster`:\n{floor}")
+        let wrote = floor.find(ASSIGN).unwrap_or_else(|| {
+            panic!("the one `{ASSIGN}` writer is not inside `reconcile_roster`:\n{floor}")
         });
         assert!(
             compared < wrote,
@@ -4809,9 +4841,30 @@ mod tests {
     /// `reconcile_roster(...)` would otherwise be counted as a fourth call site and fail a guard
     /// for a reason nobody could read.
     fn code_above_the_tests(text: &str) -> String {
-        text.split("\n#[cfg(test)]\nmod tests")
+        let above = text
+            .split("\n#[cfg(test)]\nmod tests")
             .next()
-            .expect("split always yields a first element")
+            .expect("split always yields a first element");
+        // Canary on the cut, because the split is on a LITERAL and the literal already fails to
+        // match a shape live in this crate: `src/error.rs` opens its block `#[cfg(test)]` /
+        // `pub(crate) mod tests {`. A daemon file written that way comes back UNCUT and its whole
+        // test module is then counted as production code — silently, since an inflated count reads
+        // as a new call site rather than as a broken corpus.
+        //
+        // Keyed on the DECLARATION and not on "every file has tests", which is false here: three
+        // files in this module (`peer_auth.rs`, `run_loop.rs`, `snapshot.rs`) legitimately have no
+        // test block, and asserting they were cut fails on a shape that is fine. The claim that
+        // actually holds is the conditional one — a file that declares `mod tests` must have been
+        // cut — and that is exactly the shape drift this guards.
+        let declares_tests = text
+            .lines()
+            .any(|line| line.trim_end().ends_with("mod tests {"));
+        assert!(
+            !declares_tests || above.len() < text.len(),
+            "a daemon module file declares `mod tests` but was not cut, so its test module is \
+             being counted as production code — the split literal no longer matches its shape"
+        );
+        above
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
             .map(strip_trailing_comment)

@@ -106,14 +106,23 @@ impl ReloadIntent {
     /// collapse is the point:
     ///   - `None`: the legacy shape. `notify_daemon_roster_reload()` took no arguments before this
     ///     issue, so an older CLI against a newer daemon sends exactly this;
-    ///   - an UNRECOGNIZED token: a newer CLI against an older daemon, or a verb that grows a third
-    ///     intent later. Nothing here can know what it meant, and guessing `Mutating` would adopt a
-    ///     shrink on a token the daemon does not understand;
+    ///   - an UNRECOGNIZED token: a verb that grows a third intent later, or any value this daemon
+    ///     does not know. Nothing here can know what it meant, and guessing `Mutating` would adopt
+    ///     a shrink on a token the daemon does not understand;
     ///   - the literal `append-only`.
     ///
-    /// So a partial rollout in EITHER direction refuses rather than permits, and a verb added
-    /// without declaring intent is safe by construction rather than by review (PRD premortem P-4).
-    /// Only the exact `mutating` token opts into a shrink.
+    /// So a verb added without declaring intent is safe by construction rather than by review (PRD
+    /// premortem P-4), and only the exact `mutating` token opts into a shrink.
+    ///
+    /// The rollout guarantee is ONE-DIRECTIONAL, and deliberately stated as such. This function is
+    /// the NEW daemon, so it covers an older CLI reaching it and a token it does not recognise. It
+    /// cannot cover the mirror — a newer CLI against an OLDER daemon never reaches this code at
+    /// all; that binary has no `intent` field, [`ControlRequest`] carries no `deny_unknown_fields`
+    /// (unlike [`ConfigSetRequest`]), so the field is silently dropped and the old daemon adopts
+    /// unconditionally exactly as it did before. That is the PRE-EXISTING behaviour rather than a
+    /// regression, and the only control over it is upgrading the daemon. PRD assumption A-6 is
+    /// about not BREAKING an existing client, which holds; it is not a claim that an un-upgraded
+    /// one gains the floor.
     pub(crate) fn from_wire(token: Option<&str>) -> Self {
         match token {
             Some(token) if token == ReloadIntent::Mutating.as_wire() => ReloadIntent::Mutating,
