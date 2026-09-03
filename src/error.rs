@@ -1147,10 +1147,13 @@ pub(crate) enum Error {
     /// The dedicated config-write lock (issue #1445, design D-8) could not be
     /// acquired within the bounded wait — another config writer (a concurrent CLI
     /// verb, or the daemon's `config set` / `capture` handler) held it the whole
-    /// time. FAIL-CLOSED: rather than write without it and let two writers
-    /// interleave against `config.toml` — publishing a partial file, or losing one
-    /// writer's update — the save ABORTS with ZERO writes: nothing retained into the
-    /// backup ring, nothing written, nothing evicted.
+    /// time. FAIL-CLOSED: rather than write without it and let two writers interleave
+    /// against `config.toml`, publishing a partial or blended file, the save ABORTS with
+    /// ZERO writes: nothing retained into the backup ring, nothing written, nothing
+    /// evicted. What the lock prevents is an interleaved PUBLISH; it does not make a
+    /// caller's own read-mutate-save atomic — see
+    /// [`crate::config`]'s `write_lock` module docs for the span and issue #1482 for the
+    /// window it leaves.
     ///
     /// DISTINCT from [`Error::SwapLockBusy`]: that lock guards the keychain +
     /// `~/.claude.json` pair, whose contention set deliberately excludes

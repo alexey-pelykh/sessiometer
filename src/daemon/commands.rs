@@ -427,8 +427,9 @@ where
     /// (temp + rename). Every refusal is a TRUE no-op — ZERO writes — leaving the old file intact:
     /// no wired `config_path` → `Unavailable`; absent file → `NoConfig`; unreadable / malformed
     /// baseline → `ConfigUnreadable`; a stale label uuid → `UnknownAccount`; a range / cross-field
-    /// violation → `Invalid` (with the non-secret field-named `detail`); an atomic-write failure →
-    /// `SaveFailed`. On success the `effect` tells the UI what the change requires: a LABEL change
+    /// violation → `Invalid` (with the non-secret field-named `detail`); an atomic-write failure,
+    /// or a config-write lock still held by another writer after its budget (issue #1445 — this
+    /// verb is one of the two writers that pair is about) → `SaveFailed`. On success the `effect` tells the UI what the change requires: a LABEL change
     /// is adopted LIVE — the in-memory roster is reconciled to the freshly-written file (the SAME
     /// [`reconcile_roster`](Self::reconcile_roster) core the #139 roster-reload drives) — while a
     /// TUNABLE change is reload-by-restart (the daemon derives its strategy fields once at

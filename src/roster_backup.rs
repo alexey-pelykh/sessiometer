@@ -53,6 +53,12 @@
 //! the replacing write, eviction and [`prune`] all run inside one critical section per config
 //! file. Every path into this module runs under it, because `save_to` is the only caller.
 //!
+//! Per config FILE, and the ring is per config DIRECTORY ([`ring_dir`]), so the guarantees below
+//! are exact only while one directory holds one config file — which production enforces
+//! ([`paths::config_file`] always names `config.toml`, and `--config` names the directory). Two
+//! config files sharing a directory would share this ring while taking two different locks.
+//! Reachable only through `save_to`'s injectable-path seam, i.e. from tests.
+//!
 //! That is what closes the three degradations this module could previously only describe, and
 //! they are recorded because each is what an unserialized writer would reintroduce:
 //!
@@ -369,8 +375,9 @@ fn next_after((secs, nanos): (u64, u32)) -> (u64, u32) {
 /// entry it sees WHEN IT RUNS, not when this runs: a writer that computed its stamp, then had a
 /// later writer land an entry and reach here, would have an in-flight temp below the new newest
 /// and could have it swept out from under it. Since issue #1445 that interleaving is unreachable
-/// — the config-write lock this module is always entered under means no other writer has an
-/// in-flight temp while this runs — but the rule stays as it is rather than widening: it is
+/// — the config-write lock this module is always entered under means no other writer of THIS
+/// config file has an in-flight temp while this runs — but the rule stays as it is rather than
+/// widening: it is
 /// correct on its own terms, and a sweep that trusted the lock would be a second place the lock's
 /// scope had to hold.
 fn prune(dir: &Path) {

@@ -5035,7 +5035,9 @@ async fn import(path: PathBuf, overwrite: bool, passphrase: PassphraseSource) ->
 
     // Persist the merged roster atomically (temp + rename, 0600) — OUTSIDE the swap lock
     // (config.toml is never swap-contended), mirroring `reconcile_login` (#135). One
-    // write → a partial failure above leaves no half-written roster.
+    // write → a partial failure above leaves no half-written roster. Atomic here is
+    // per-PUBLISH, and since issue #1445 also serialized against another config writer's
+    // publish; it does not make this verb's read-above/write-here pair atomic (issue #1482).
     config.save().await?;
     // Tell a running daemon to pick up the imported accounts now (#139) — best-effort.
     crate::capture::notify_daemon_roster_reload().await;
@@ -5199,7 +5201,9 @@ fn label_bearers(roster: &[Account]) -> std::collections::HashMap<String, usize>
 /// [`Config`] is the merged result the caller persists; the [`AccountImport`] vec is the
 /// per-account outcome report. The swap lock (`lock`, `Some` in production) is acquired
 /// BEFORE any keychain write and held across all of them, then dropped before return so
-/// the caller's `config.save()` runs unlocked; it is skipped entirely for a config-only
+/// the caller's `config.save()` runs outside it — outside the SWAP lock, which since issue
+/// #1445 is not the same as unlocked: that save takes the config-write lock of its own, and
+/// the two are deliberately never nested. It is skipped entirely for a config-only
 /// artifact (no keychain write to serialize). A `lock` of `None` is the hermetic test
 /// path.
 ///
