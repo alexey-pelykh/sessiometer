@@ -1092,7 +1092,7 @@ pub(crate) enum Error {
     ///
     /// Carries the ring's own size so the message is self-correcting: the operator sees what the
     /// valid range actually is without re-running `config backups`. `retained` is a COUNT, never a
-    /// label — the same discipline the listing itself keeps (design D-3, AC-5). Secret-free.
+    /// label — the same discipline the listing itself keeps (`docs/specs/roster-backup-qualifying-write.feature.md`, Rule 3). Secret-free.
     ///
     /// A generic failure exit `1` via the `exit_code` catch-all: a mistyped index is a usage
     /// mistake, not a distinct machine-actionable condition.

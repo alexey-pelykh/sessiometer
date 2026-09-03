@@ -611,8 +611,9 @@ const RESTORE_UNDELIVERED: &str = "token refreshed and stashed, but the daemon c
 /// from `status`'s `degraded — run 'sessiometer poke'` cue and would otherwise read `refreshed`
 /// as the cue being answered.
 ///
-/// The remedy names the property, not a command: labels live in `config.toml` (the CLI's
-/// `config` verb is read-only diagnostics), and this line is reached from BOTH poke modes, so
+/// The remedy names the property, not a command: labels live in `config.toml` (no `config`
+/// sub-action edits one — `restore` writes the file, but only wholesale from a retained backup),
+/// and this line is reached from BOTH poke modes, so
 /// pointing at one invocation would be wrong for the other. Non-secret (issue #15): a
 /// classification plus the label-uniqueness fact the operator can already see in `status`, no
 /// token, and not even the label itself — [`poke_line`] has already printed that.

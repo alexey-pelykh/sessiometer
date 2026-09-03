@@ -345,13 +345,38 @@ impl Config {
     /// never displace a good backup. A qualifying file that cannot be retained aborts the write
     /// rather than overwriting the last good roster; a non-qualifying one touches nothing and
     /// so cannot fail here.
+    ///
+    /// The retention is TWO-PHASE, and the second phase is what keeps this function's failure a
+    /// true no-op. Retaining has to precede the write — afterwards the file it copies is gone —
+    /// but eviction lives in
+    /// [`Retention::commit`](crate::roster_backup::Retention::commit), which runs only once the
+    /// replacement has landed. A failed write rolls the entry back instead, so the ring is
+    /// byte-identical to what it was. Without that split, a config write failing repeatedly
+    /// (a full volume, a `config.toml.tmp` that is not a file) would evict a good entry per
+    /// attempt while every attempt reported writing nothing — the "fixed-size countdown to
+    /// losing everything" D-3 forbids, reached through QUALIFYING writes, which is exactly the
+    /// path the ring's own non-qualifying-write guard cannot see. `perform_config_set` in
+    /// `src/daemon/commands.rs` states the contract this preserves: a refusal is a true no-op.
     pub(crate) fn save_to(&self, path: &Path) -> Result<()> {
         paths::ensure_private_dir(
             path.parent()
                 .expect("a config path always has a parent directory"),
         )?;
-        crate::roster_backup::retain_if_qualifying(path)?;
-        paths::write_private_file(path, self.render().as_bytes())
+        let retention = crate::roster_backup::retain_if_qualifying(path)?;
+        match paths::write_private_file(path, self.render().as_bytes()) {
+            Ok(()) => {
+                if let Some(retention) = retention {
+                    retention.commit();
+                }
+                Ok(())
+            }
+            Err(err) => {
+                if let Some(retention) = retention {
+                    retention.roll_back();
+                }
+                Err(err)
+            }
+        }
     }
 
     /// Render the config back to TOML with the inline tunable-documenting

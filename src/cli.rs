@@ -96,9 +96,12 @@ enum Command {
     /// and management mode (`status`, read-only), plus stopping / restarting it (`stop` /
     /// `restart`). The process-lifecycle counterpart to the persistence-oriented `service` noun.
     Daemon { action: DaemonAction },
-    /// `config path|validate|show [--origin]` — READ-ONLY config diagnostics (issue #401):
-    /// resolve the `config.toml` path, parse+validate it without running, or print the effective
-    /// config with each value tagged `default` vs `from-file`. Never mutates the file or the daemon.
+    /// `config path|validate|show|backups|restore [--origin]` — config diagnostics (issue #401)
+    /// and the roster backup ring (issue #1439): resolve the `config.toml` path, parse+validate
+    /// it without running, print the effective config with each value tagged `default` vs
+    /// `from-file`, list retained backups, or restore one. `restore` is the only one that
+    /// mutates — it writes `config.toml` and notifies a running daemon; the other four are
+    /// read-only. See [`ConfigAction`] for why the noun is no longer read-only wholesale.
     Config { action: ConfigAction },
     /// `status [--json] [--no-color] [-v|--verbose]` — the live status client.
     Status {
@@ -963,7 +966,7 @@ COMMANDS:
     run [-v|--verbose]   Run the foreground daemon (poll + swap; -v adds run diagnostics)
     service <install|uninstall|status>  Persistence: install/uninstall the background launchd LaunchAgent, and report whether one is installed (auto-start at login)
     daemon <status|stop|restart>  Process lifecycle: report the running daemon (status), stop it, or restart it
-    config <path|validate|show>  Read-only config diagnostics: resolve the config.toml path, validate it, or show the effective config (show --origin tags default vs from-file)
+    config <path|validate|show|backups|restore>  Config diagnostics and the backup ring: resolve the config.toml path, validate it, show the effective config (show --origin tags default vs from-file), list retained backups, or restore one
     status [--json] [--no-color] [-v|--verbose]  Show each account's usage + resets-in, and the next swap (-v adds each access token's expiry)
     list       List captured accounts
     use <account> [--force]  Switch the active account now (--force overrides the pre-swap gate)
@@ -2279,7 +2282,7 @@ fn render_peak_runway_advisory(a: &crate::config::PeakRunwayAdvisory) -> String 
 ///
 /// Read-only. Reports a COUNT and a timestamp per entry and never an account label: the listing
 /// is a more public surface than the file it describes (it is what an operator pastes into a bug
-/// report), so it carries enough to choose between entries and nothing more (design D-3, AC-5).
+/// report), so it carries enough to choose between entries and nothing more (`docs/specs/roster-backup-qualifying-write.feature.md`, Rule 3).
 fn config_backups() -> Result<()> {
     let path = paths::config_file()?;
     let retained = crate::roster_backup::list(&path)?;
@@ -2300,11 +2303,15 @@ fn render_config_backups(dir: &Path, retained: &[crate::roster_backup::Retained]
     if retained.is_empty() {
         return format!("no backups retained under {}\n", dir.display());
     }
+    // The count is the ring's ACTUAL contents, with the depth named separately rather than as a
+    // denominator: pruning is best-effort, so a transient failure can leave one entry over depth
+    // and `4 of 3 retained` would read as a contradiction rather than as the recoverable state
+    // it is (the next qualifying write prunes to depth again).
     let mut out = format!(
-        "{} of {} retained under {}\n",
+        "{} retained under {} (ring depth {})\n",
         retained.len(),
-        crate::roster_backup::RING_DEPTH,
-        dir.display()
+        dir.display(),
+        crate::roster_backup::RING_DEPTH
     );
     for (ordinal, entry) in retained.iter().enumerate() {
         let when = crate::observability::rfc3339(entry.taken_at);
@@ -2339,8 +2346,10 @@ async fn config_restore(index: usize) -> Result<()> {
         index,
         retained: retained.len(),
     })?;
-    // Validate BEFORE naming what will happen, so a refusal never trails a line that reads as
-    // an announcement of a write that did not occur.
+    // Validate BEFORE naming what will happen, so a REFUSED ENTRY never trails a line that reads
+    // as an announcement of a write that did not occur. The write itself can still fail after the
+    // notice — a qualifying config that cannot be retained aborts it by design — and that error
+    // follows immediately on stderr rather than being silent.
     let restored = Config::from_toml_str(&std::fs::read_to_string(&entry.path)?)?;
     // The config being replaced, described from the same seam the ring's own rule uses: a file
     // that will not load is reported as such rather than as zero accounts.
@@ -2354,12 +2363,20 @@ async fn config_restore(index: usize) -> Result<()> {
     Ok(())
 }
 
-/// Render `config restore`'s before-and-after notice (issue #1439). Pure — no I/O — so the
-/// exact operator-facing text is unit-tested without a real ring.
+/// Render `config restore`'s notice (issue #1439). Pure — no I/O — so the exact operator-facing
+/// text is unit-tested without a real ring.
 ///
-/// Names both sides, which is the AC-5 property: an operator who miscounted the index sees what
-/// they installed and what it displaced in the same two lines, and the displaced file is itself
-/// in the ring whenever it qualified.
+/// Four things, in the order they matter to someone who has just lost a roster. What is being
+/// installed and what it displaces — the AC-5 property, so an operator who miscounted the index
+/// sees both in the same breath. Then two disclosures that would otherwise be discoverable only
+/// by reading the source:
+///
+/// - the installed file is RE-RENDERED from the retained entry, not copied from it, so anything
+///   the current emitter does not write (a hand-added comment) does not come back. The retained
+///   file is named so it can be copied verbatim instead;
+/// - when the displaced config qualified it entered the ring, which makes the restore reversible
+///   AND shifts every index the operator just read, since the listing is newest-first. Saying so
+///   is what stops a second `restore` from silently targeting a different entry.
 fn render_restore_notice(
     entry: &crate::roster_backup::Retained,
     accounts: usize,
@@ -2371,12 +2388,25 @@ fn render_restore_notice(
         Some(count) => format!("{count} accounts"),
         None => "no loadable config".to_string(),
     };
-    format!(
+    let mut out = format!(
         "restoring the backup taken {} ({accounts} in its roster)\n\
          over {} ({held})\n",
         crate::observability::rfc3339(entry.taken_at),
         path.display()
-    )
+    );
+    out.push_str(&format!(
+        "values are re-rendered; the retained file stays at {}\n",
+        entry.path.display()
+    ));
+    // Exactly the ring's own predicate: a displaced config enters the ring iff it parses with a
+    // non-empty roster, and only then does the numbering move.
+    if replaced.is_some_and(|count| count > 0) {
+        out.push_str(
+            "the displaced config is retained, so backup numbering shifts — re-run \
+             `config backups` before restoring again\n",
+        );
+    }
+    out
 }
 
 /// `config show [--origin]` (issue #401): print the effective config the daemon WOULD load
@@ -13923,18 +13953,18 @@ spare  22222222-2222\n\
         assert_eq!(
             spelled.len(),
             79,
-            "expected 76 functions spelling an inline word-bearing literal; the count moved — \
+            "expected 79 functions spelling an inline word-bearing literal; the count moved — \
              disposition the new one, then update this"
         );
         assert_eq!(
             literals.len(),
-            286,
-            "expected 272 inline word-bearing literals; the count moved — check whether the \
+            288,
+            "expected 288 inline word-bearing literals; the count moved — check whether the \
              function that gained one is still dispositioned correctly, then update this"
         );
 
         // Per-arm cardinality, so the DEBT is pinned rather than merely listed: a surface moved
-        // into `Unscanned` without anyone deciding to would otherwise land silently among 42
+        // into `Unscanned` without anyone deciding to would otherwise land silently among 44
         // entries that already say so. Shrinking this number is the progress issue #1167 tracks.
         for (arm, expected) in [(Scanned, 11), (NotRendered, 24), (Unscanned, 44)] {
             let actual = INLINE_PROSE_REGISTER
@@ -14354,7 +14384,7 @@ impl Nested {
             .count();
         assert_eq!(
             sites, 9,
-            "expected 8 `CliUsage` construction sites in src/cli.rs's non-test code; the count \
+            "expected 9 `CliUsage` construction sites in src/cli.rs's non-test code; the count \
              moved — add an argv case to `usage_error_surfaces` covering the new site, then \
              update this"
         );
@@ -14686,7 +14716,8 @@ impl Nested {
 
     #[test]
     fn config_verbs_parse_to_their_actions() {
-        // #401: the three READ-ONLY config diagnostics verbs route to their actions.
+        // #401: the three read-only config diagnostics verbs route to their actions. The two
+        // backup-ring verbs (#1439) are covered by `backup_verbs_parse_to_their_actions`.
         assert_eq!(
             parse_argv(&["config", "path"]).unwrap(),
             Command::Config {
@@ -14745,8 +14776,9 @@ impl Nested {
     #[test]
     fn config_help_and_bare_config_print_help_never_an_action() {
         // `config --help` and a bare `config` both resolve to HELP — pure `Help`, so neither
-        // can read a config or touch state as a side effect (all three verbs are read-only
-        // anyway, but bare-noun-is-help stays consistent with `service` / `daemon`).
+        // can read a config or touch state as a side effect. That matters more since #1439 gave
+        // the noun a mutating verb: a bare `config` still cannot restore anything, and
+        // bare-noun-is-help stays consistent with `service` / `daemon`.
         assert_eq!(
             parse_argv(&["config", "--help"]).unwrap(),
             Command::Help(HelpTopic::Config)
@@ -14865,18 +14897,20 @@ impl Nested {
         let rendered = render_config_backups(dir, &entries);
         assert_eq!(
             rendered,
-            "3 of 3 retained under /tmp/cfg/backups\n\
+            "3 retained under /tmp/cfg/backups (ring depth 3)\n\
              \x20 1  2025-09-03T11:46:40Z  6 accounts\n\
              \x20 2  2025-09-02T08:00:00Z  1 account\n\
              \x20 3  2025-09-01T04:13:20Z  unreadable\n",
         );
-        // AC-5: the listing is a more public surface than the file it describes. It carries a
-        // count per entry and never a label, so pasting one into a bug report discloses nothing
-        // the roster was keeping.
-        assert!(
-            !rendered.contains("label") && !rendered.contains("account_uuid"),
-            "the listing names no roster field: {rendered}"
-        );
+        // The listing is a more public surface than the file it describes — it is what an
+        // operator pastes into a bug report — so it carries a count per entry and never a label
+        // (`docs/specs/roster-backup-qualifying-write.feature.md`, Rule 3). That guarantee is
+        // STRUCTURAL and belongs to the type: `Retained` has no field able to carry a label or a
+        // uuid, so the byte-exact assertion above is the whole of what a test here can add. An
+        // assertion searching the output for "label" would be vacuous for the same reason — it
+        // would pass over a rendering that printed the label's VALUE — so it is deliberately not
+        // written. What would actually break the guarantee is widening `Retained`; the compiler
+        // is what surfaces that, and this comment is the note the author of such a change reads.
     }
 
     #[test]
@@ -14906,9 +14940,30 @@ impl Nested {
         );
         // The incident's own state: nothing loadable to displace. Reported as such rather than
         // as zero accounts, which would read as a roster that exists and is empty.
+        let over_nothing = render_restore_notice(&entry, 6, path, None);
+        assert!(over_nothing.contains("(no loadable config)"), "absent");
+
+        // The re-render is disclosed, and the retained file is named so it can be copied
+        // verbatim by an operator who wants the bytes rather than the values.
+        for rendered in [&over_one, &over_nothing] {
+            assert!(
+                rendered.contains("values are re-rendered")
+                    && rendered.contains("/tmp/cfg/backups/config.00001756900000.000000000.toml"),
+                "the notice discloses the re-render and names the retained file: {rendered}"
+            );
+        }
+
+        // The renumbering warning fires on exactly the ring's own predicate: the displaced
+        // config enters the ring iff it parses with a NON-EMPTY roster, and only then do the
+        // indexes the operator just read move.
+        assert!(over_one.contains("numbering shifts"), "{over_one}");
         assert!(
-            render_restore_notice(&entry, 6, path, None).contains("(no loadable config)"),
-            "absent"
+            !over_nothing.contains("numbering shifts"),
+            "nothing was displaced into the ring, so nothing renumbers: {over_nothing}"
+        );
+        assert!(
+            !render_restore_notice(&entry, 6, path, Some(0)).contains("numbering shifts"),
+            "a zero-account config does not qualify, so it does not enter the ring"
         );
     }
 
