@@ -4612,14 +4612,68 @@ mod tests {
             "a `reconcile_roster` call site was added or removed somewhere in `crate::daemon`; add \
              it to `sites` above with the intent its verb implies (the +1 is the definition)"
         );
+
+        // (4) The floor governs the FIELD, not merely this method — which (1) through (3) do not
+        // establish. A guard placed perfectly inside `reconcile_roster` is INERT if anything else
+        // can assign `self.roster`, and the capture path is one line away from doing exactly that:
+        // `perform_socket_capture` already holds the freshly-read config, so
+        // `self.roster = config.roster.clone();` written beside its reconcile call reinstates the
+        // 2026-08-27 collapse while every assertion above still passes. So the module holds
+        // exactly ONE assignment to the field, and it is the one inside `reconcile_roster`.
+        const WRITE: &str = ".roster = ";
+        let writers: Vec<String> = daemon_module_sources()
+            .iter()
+            .flat_map(|(file, text)| std::iter::repeat_n(file.clone(), text.matches(WRITE).count()))
+            .collect();
+        assert_eq!(
+            writers.len(),
+            1,
+            "the daemon's roster field must have exactly ONE writer, so the floor cannot be \
+             bypassed by assigning it directly; found {writers:?}"
+        );
+
+        // And that one writer is behind the guard, not in front of it. Position, not membership:
+        // moving the assignment ABOVE the comparison leaves the count at one and every earlier
+        // assertion green, while making a refusal a partial reshape instead of a true no-op.
+        let floor = method_body(&source, "pub(super) fn reconcile_roster");
+        let compared = floor
+            .find(PREDICATE)
+            .expect("the comparison is in this body — asserted in (1)");
+        let wrote = floor.find(WRITE).unwrap_or_else(|| {
+            panic!("the one `{WRITE}` writer is not inside `reconcile_roster`:\n{floor}")
+        });
+        assert!(
+            compared < wrote,
+            "`reconcile_roster` must compare the counts BEFORE it assigns the roster — a refusal \
+             that has already written is not the no-op the floor promises"
+        );
     }
 
-    /// Every file of the `crate::daemon` module, each cut above its own test block.
+    /// Every file of the `crate::daemon` module, each cut above its own test block and
+    /// stripped of comments.
     ///
     /// The scope `reconcile_roster`'s `pub(super)` visibility actually grants — which is what the
     /// cardinality guard has to search, since a caller added in a sibling file is exactly the case
     /// a this-file count cannot see. Enumerated from the directory rather than listed, so a NEW
     /// file in the module is searched the day it lands instead of the day someone remembers it.
+    /// `text` above its column-0 test block, with comments removed.
+    ///
+    /// Both halves matter to what the corpus is evidence OF. The cut drops the tests, because a
+    /// test naming a method is not a caller of it. The strip drops the prose, because this module
+    /// documents its own methods by name and at length — so a doc comment reading
+    /// `reconcile_roster(...)` would otherwise be counted as a fourth call site and fail a guard
+    /// for a reason nobody could read.
+    fn code_above_the_tests(text: &str) -> String {
+        text.split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("split always yields a first element")
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .map(strip_trailing_comment)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn daemon_module_sources() -> Vec<(String, String)> {
         let mut sources: Vec<(String, String)> = std::fs::read_dir("src/daemon")
             .expect("cannot read src/daemon")
@@ -4628,22 +4682,12 @@ mod tests {
             .map(|path| {
                 let text = std::fs::read_to_string(&path)
                     .unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()));
-                let above = text
-                    .split("\n#[cfg(test)]\nmod tests")
-                    .next()
-                    .expect("split always yields a first element")
-                    .to_owned();
-                (path.display().to_string(), above)
+                (path.display().to_string(), code_above_the_tests(&text))
             })
             .collect();
         // `src/daemon.rs` is the module root and sits beside the directory, not inside it.
         let root = std::fs::read_to_string("src/daemon.rs").expect("cannot read src/daemon.rs");
-        let root_above = root
-            .split("\n#[cfg(test)]\nmod tests")
-            .next()
-            .expect("split always yields a first element")
-            .to_owned();
-        sources.push(("src/daemon.rs".to_owned(), root_above));
+        sources.push(("src/daemon.rs".to_owned(), code_above_the_tests(&root)));
         // Canary: the module is not empty and every file was actually cut, so a count over this
         // corpus is evidence rather than the shape of an empty read.
         assert!(
