@@ -5004,6 +5004,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_loop_adopts_a_shrinking_reload_when_the_wire_says_mutating() {
+        // The third direction through the same wiring, and the one that proves the intent's VALUE
+        // travels rather than merely its presence. The two runs above both drive `AppendOnly`, so
+        // an idle arm or a post-idle arm that DISCARDED the signal's payload and passed a constant
+        // `ReloadIntent::AppendOnly` would leave both of them green — and would then refuse every
+        // legitimate `remove`, `import` and `config restore`, which is the never-shrink floor
+        // failing in the opposite direction from the incident it was written for.
+        //
+        // Byte-identical setup to the refusal above, one token apart, because that is the claim:
+        // same two live accounts, same one-account file, same seam — and the opposite outcome.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        write_roster_config(&config_path, &[("u-A", "work")]);
+
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_json_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10);
+        let tun = tunables(95, 80, 100);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::new(Duration::from_secs(60)),
+            json,
+            &tun,
+        )
+        .with_config_path(config_path);
+
+        let logdir = tempfile::tempdir().unwrap();
+        let log_path = logdir.path().join("sessiometer.log");
+        let mut log = EventLog::at(&log_path).unwrap();
+        let mut shutdown = FakeShutdown::after(3);
+        // The one token that separates this run from the refusal above.
+        let control = OnceRosterReload::new(ReloadIntent::Mutating);
+
+        let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
+        run_loop(
+            &mut daemon,
+            &mut log,
+            &mut diag,
+            &mut shutdown,
+            &control,
+            &mut NoopRefreshTicker,
+            &mut NoopExternalLoginWatch,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            roster_uuids(&daemon),
+            vec!["u-A"],
+            "a declared-mutating reload must be adopted even though it narrows the roster — this \
+             is `remove`, `import` and `config restore`'s path"
+        );
+
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        let reload_lines: Vec<&str> = logged
+            .lines()
+            .filter(|line| line.contains(" event=roster_reload "))
+            .collect();
+        assert_eq!(reload_lines.len(), 1, "exactly one reload line: {logged}");
+        let logged_line = reload_lines[0];
+        assert_eq!(
+            field_of(logged_line, "outcome"),
+            Some("adopted"),
+            "{logged_line}"
+        );
+        assert_eq!(
+            field_of(logged_line, "reason"),
+            None,
+            "an adoption carries no reason — `shrink` names why a refusal happened, and nothing \
+             was refused here: {logged_line}"
+        );
+        assert_eq!(
+            field_of(logged_line, "previous"),
+            Some("2"),
+            "{logged_line}"
+        );
+        assert_eq!(
+            field_of(logged_line, "incoming"),
+            Some("1"),
+            "{logged_line}"
+        );
+    }
+
+    #[tokio::test]
     async fn run_loop_restored_control_command_un_quarantines_without_activating() {
         // Issue #275: the run loop's idle select must route a `Restored(uuid)` control signal
         // into `reconcile_restored` — un-quarantining the named PARKED account and logging its
