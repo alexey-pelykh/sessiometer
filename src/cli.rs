@@ -508,7 +508,7 @@ fn parse_config(parser: &mut lexopt::Parser) -> Result<Command> {
 ///
 /// Both rejections are shaped at ONE construction site, so the two messages cannot drift into
 /// different registers and the `CliUsage` construction-site count in
-/// [`every_cli_usage_construction_site_is_scanned`] moves by one rather than by two. `0` is
+/// `every_cli_usage_construction_site_is_scanned` moves by one rather than by two. `0` is
 /// rejected with the non-numeric input: the listing this index comes from is 1-based, so a `0`
 /// is a miscount rather than a boundary, and answering it with the ring's oldest entry would
 /// silently restore something the operator did not name.
@@ -13806,6 +13806,7 @@ spare  22222222-2222\n\
         ("unexpected", Scanned, "three CliUsage messages the `status --zzz` / `-z` / `log zzz` cases render"),
         ("required_value", Scanned, "the CliUsage message the `stats --period` case renders"),
         ("parse_config", Scanned, "argv tokens, plus the two CliUsage messages `config zzz` / `config path --origin` render"),
+        ("backup_index", Scanned, "the two CliUsage messages `config restore` / `config restore 0` render"),
         ("parse_daemon", Scanned, "argv tokens, plus the CliUsage message `daemon zzz` renders"),
         ("parse_service", Scanned, "argv tokens, plus the CliUsage message `service zzz` renders"),
         ("parse_use", Scanned, "argv tokens, plus the CliUsage message `use zzz --next` renders"),
@@ -13876,6 +13877,8 @@ spare  22222222-2222\n\
         ("render_peak_runway_advisory", Unscanned, "the peak-runway tuning advisory"),
         ("render_config_validate", Unscanned, "`config validate`'s verdict"),
         ("render_config_origin", Unscanned, "`config show`'s heading, provenance tags and section lines"),
+        ("render_config_backups", Unscanned, "`config backups`' ring heading and per-entry account-count noun"),
+        ("render_restore_notice", Unscanned, "`config restore`'s before-and-after notice"),
         ("version_line", Unscanned, "the version banner's program name and `env!` key"),
     ];
 
@@ -13919,13 +13922,13 @@ spare  22222222-2222\n\
         // catches a second same-named function, since the register keys on the name alone.
         assert_eq!(
             spelled.len(),
-            76,
+            79,
             "expected 76 functions spelling an inline word-bearing literal; the count moved — \
              disposition the new one, then update this"
         );
         assert_eq!(
             literals.len(),
-            272,
+            286,
             "expected 272 inline word-bearing literals; the count moved — check whether the \
              function that gained one is still dispositioned correctly, then update this"
         );
@@ -13933,7 +13936,7 @@ spare  22222222-2222\n\
         // Per-arm cardinality, so the DEBT is pinned rather than merely listed: a surface moved
         // into `Unscanned` without anyone deciding to would otherwise land silently among 42
         // entries that already say so. Shrinking this number is the progress issue #1167 tracks.
-        for (arm, expected) in [(Scanned, 10), (NotRendered, 24), (Unscanned, 42)] {
+        for (arm, expected) in [(Scanned, 11), (NotRendered, 24), (Unscanned, 44)] {
             let actual = INLINE_PROSE_REGISTER
                 .iter()
                 .filter(|(_, disposition, _)| *disposition == arm)
@@ -14299,6 +14302,10 @@ impl Nested {
             // The two fully-static messages.
             ("config path --origin", vec!["config", "path", "--origin"]),
             ("use zzz --next", vec!["use", "zzz", "--next"]),
+            // Both messages `backup_index` shapes at its one construction site (issue #1439):
+            // the index left off entirely, and one that is not a 1-based ordinal.
+            ("config restore", vec!["config", "restore"]),
+            ("config restore 0", vec!["config", "restore", "0"]),
             // lexopt's own message, folded in by `From<lexopt::Error>` — third-party prose we
             // nonetheless ship, so it is scanned like the rest.
             ("status --json=1", vec!["status", "--json=1"]),
@@ -14346,7 +14353,7 @@ impl Nested {
             .filter(|line| line.contains("CliUsage {"))
             .count();
         assert_eq!(
-            sites, 8,
+            sites, 9,
             "expected 8 `CliUsage` construction sites in src/cli.rs's non-test code; the count \
              moved — add an argv case to `usage_error_surfaces` covering the new site, then \
              update this"
@@ -14358,7 +14365,7 @@ impl Nested {
         // What this pins is that the scanned subject has not silently shrunk.
         assert_eq!(
             usage_error_surfaces().len(),
-            13,
+            15,
             "the scanned argv cases changed count — a scan over a shrunken subject passes \
              identically, so this is pinned rather than trusted"
         );
@@ -14771,6 +14778,138 @@ impl Nested {
         let err = parse_argv(&["config", "show", "--verbose"]).unwrap_err();
         assert!(matches!(err, Error::CliUsage { .. }));
         assert!(err.to_string().contains("--verbose"), "got: {err}");
+    }
+
+    // --- the backup ring's operator surface (issue #1439) ------------------
+
+    #[test]
+    fn backup_verbs_parse_to_their_actions() {
+        assert_eq!(
+            parse_argv(&["config", "backups"]).unwrap(),
+            Command::Config {
+                action: ConfigAction::Backups
+            }
+        );
+        assert_eq!(
+            parse_argv(&["config", "restore", "2"]).unwrap(),
+            Command::Config {
+                action: ConfigAction::Restore { index: 2 }
+            }
+        );
+    }
+
+    #[test]
+    fn restore_rejects_a_missing_or_non_ordinal_index() {
+        // The listing is 1-based, so `0` is a miscount rather than a boundary: answering it
+        // with the ring's oldest entry would restore something the operator did not name.
+        for argv in [
+            vec!["config", "restore"],
+            vec!["config", "restore", "0"],
+            vec!["config", "restore", "x"],
+            vec!["config", "restore", "-1"],
+        ] {
+            match parse_argv(&argv).unwrap_err() {
+                Error::CliUsage { usage_hint, .. } => {
+                    assert_eq!(usage_hint, "sessiometer config --help");
+                }
+                other => panic!("`{argv:?}` must be a CliUsage error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_origin_flag_is_rejected_on_the_backup_verbs_too() {
+        // The flag means something for `show` alone; the strict-usage stance is the same
+        // wherever else it lands, so the two new verbs inherit it rather than accepting it.
+        for argv in [
+            vec!["config", "backups", "--origin"],
+            vec!["config", "restore", "1", "--origin"],
+        ] {
+            match parse_argv(&argv).unwrap_err() {
+                Error::CliUsage { message, .. } => {
+                    assert!(message.contains("--origin"), "names the flag: {message}");
+                }
+                other => panic!("`{argv:?}` must be a CliUsage error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn render_config_backups_reports_counts_and_timestamps_and_never_a_label() {
+        use crate::roster_backup::Retained;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let dir = Path::new("/tmp/cfg/backups");
+        assert_eq!(
+            render_config_backups(dir, &[]),
+            "no backups retained under /tmp/cfg/backups\n"
+        );
+
+        let entries = vec![
+            Retained {
+                path: dir.join("config.00001756900000.000000000.toml"),
+                taken_at: UNIX_EPOCH + Duration::from_secs(1_756_900_000),
+                accounts: Some(6),
+            },
+            Retained {
+                path: dir.join("config.00001756800000.000000000.toml"),
+                taken_at: UNIX_EPOCH + Duration::from_secs(1_756_800_000),
+                accounts: Some(1),
+            },
+            Retained {
+                path: dir.join("config.00001756700000.000000000.toml"),
+                taken_at: UNIX_EPOCH + Duration::from_secs(1_756_700_000),
+                accounts: None,
+            },
+        ];
+        let rendered = render_config_backups(dir, &entries);
+        assert_eq!(
+            rendered,
+            "3 of 3 retained under /tmp/cfg/backups\n\
+             \x20 1  2025-09-03T11:46:40Z  6 accounts\n\
+             \x20 2  2025-09-02T08:00:00Z  1 account\n\
+             \x20 3  2025-09-01T04:13:20Z  unreadable\n",
+        );
+        // AC-5: the listing is a more public surface than the file it describes. It carries a
+        // count per entry and never a label, so pasting one into a bug report discloses nothing
+        // the roster was keeping.
+        assert!(
+            !rendered.contains("label") && !rendered.contains("account_uuid"),
+            "the listing names no roster field: {rendered}"
+        );
+    }
+
+    #[test]
+    fn render_restore_notice_names_both_sides_before_the_write() {
+        use crate::roster_backup::Retained;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let entry = Retained {
+            path: PathBuf::from("/tmp/cfg/backups/config.00001756900000.000000000.toml"),
+            taken_at: UNIX_EPOCH + Duration::from_secs(1_756_900_000),
+            accounts: Some(6),
+        };
+        let path = Path::new("/tmp/cfg/config.toml");
+
+        // What is installed, and what it displaces — the AC-5 property, so an operator who
+        // miscounted sees both in the same two lines.
+        let over_one = render_restore_notice(&entry, 6, path, Some(1));
+        assert!(over_one.contains("6 in its roster"), "{over_one}");
+        assert!(
+            over_one.contains("/tmp/cfg/config.toml (1 account)"),
+            "{over_one}"
+        );
+
+        assert!(
+            render_restore_notice(&entry, 6, path, Some(3)).contains("(3 accounts)"),
+            "plural"
+        );
+        // The incident's own state: nothing loadable to displace. Reported as such rather than
+        // as zero accounts, which would read as a roster that exists and is empty.
+        assert!(
+            render_restore_notice(&entry, 6, path, None).contains("(no loadable config)"),
+            "absent"
+        );
     }
 
     #[test]

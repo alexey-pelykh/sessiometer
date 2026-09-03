@@ -46,6 +46,7 @@
 //! serialized today, which is issue #1445's subject, not this module's. The ring degrades by
 //! retaining one entry instead of two; it cannot corrupt one.
 
+use std::cmp::Reverse;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -159,7 +160,7 @@ pub(crate) fn list(config_path: &Path) -> Result<Vec<Retained>> {
     let dir = ring_dir(config_path);
     let mut stamps = scan(&dir)?;
     // Newest first: the stamp is `(secs, nanos)`, so a plain reverse ordering is chronological.
-    stamps.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    stamps.sort_unstable_by_key(|(_, stamp)| Reverse(*stamp));
     Ok(stamps
         .into_iter()
         .map(|(path, (secs, nanos))| Retained {
@@ -238,8 +239,322 @@ fn next_after((secs, nanos): (u64, u32)) -> (u64, u32) {
 /// [`retain_if_qualifying`] contract; not incremental, so it recovers from a prior failure.
 fn prune(dir: &Path) {
     let mut found = scan(dir).unwrap_or_default();
-    found.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    found.sort_unstable_by_key(|(_, stamp)| Reverse(*stamp));
     for (stale, _) in found.into_iter().skip(RING_DEPTH) {
         let _ = fs::remove_file(stale);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::os::unix::fs::PermissionsExt;
+
+    use tempfile::TempDir;
+
+    /// A valid config carrying `accounts` accounts, as TOML text. Tunables are omitted
+    /// throughout — every one has a compiled-in default, so the roster is the only thing these
+    /// fixtures vary, which is the only thing the qualifying rule reads.
+    fn roster_of(accounts: usize) -> String {
+        let mut out = String::new();
+        for n in 0..accounts {
+            out.push_str(&format!(
+                "[[account]]\naccount_uuid = \"{n}\"\nlabel = \"a{n}\"\n\n"
+            ));
+        }
+        out
+    }
+
+    /// The parsed form of [`roster_of`], for driving a real [`Config::save_to`].
+    fn config_of(accounts: usize) -> Config {
+        Config::from_toml_str(&roster_of(accounts)).expect("the fixture roster parses")
+    }
+
+    /// A temp dir plus the config path inside it. Every test drives the REAL write seam
+    /// ([`Config::save_to`]) against this path, so what is asserted is the shipped behaviour of
+    /// the hook rather than a re-implementation of it.
+    fn scratch() -> (TempDir, PathBuf) {
+        let dir = TempDir::new().expect("temp dir");
+        let path = dir.path().join("config.toml");
+        (dir, path)
+    }
+
+    /// How many accounts each retained entry holds, newest first.
+    fn retained_counts(config_path: &Path) -> Vec<Option<usize>> {
+        list(config_path)
+            .expect("the ring lists")
+            .into_iter()
+            .map(|e| e.accounts)
+            .collect()
+    }
+
+    /// **The point of issue #1439.** The incident's own sequence — a good six-account file that
+    /// has been retained, then a deletion from outside this tool, then `login`'s one-account
+    /// write — leaves the six-account entry present and unevicted.
+    ///
+    /// A back-up-what-was-there rule passes every other test in this module and fails this one:
+    /// the previous contents at the moment of the one-account write were NOTHING, so such a rule
+    /// would retain the empty state and, at depth, evict a good entry to do it. This is the only
+    /// sequence that actually happened, which is why it is asserted first and by itself.
+    #[test]
+    fn the_incident_sequence_leaves_the_six_account_backup_unevicted() {
+        let (_dir, path) = scratch();
+
+        // A six-account roster on disk, then an ordinary legitimate save over it — which is how
+        // the six-account file enters the ring in the first place.
+        fs::write(&path, roster_of(6)).unwrap();
+        config_of(6).save_to(&path).unwrap();
+        assert_eq!(retained_counts(&path), vec![Some(6)]);
+
+        // Something outside sessiometer removes the file. Unattributed, then and here.
+        fs::remove_file(&path).unwrap();
+
+        // `login` finds nothing, concludes first run, and writes one account.
+        config_of(1).save_to(&path).unwrap();
+
+        assert_eq!(
+            retained_counts(&path),
+            vec![Some(6)],
+            "the six-account backup is still present and unevicted"
+        );
+        assert_eq!(
+            Config::load_path(&path).unwrap().roster.len(),
+            1,
+            "the live config is what login wrote — the ring changes nothing about the write"
+        );
+    }
+
+    /// The ordinary path: a file that parses and holds accounts is retained before it is
+    /// replaced, and what is retained is the REPLACED contents, not the replacing ones.
+    #[test]
+    fn a_valid_populated_file_is_retained_before_it_is_replaced() {
+        let (_dir, path) = scratch();
+        fs::write(&path, roster_of(3)).unwrap();
+
+        config_of(2).save_to(&path).unwrap();
+
+        assert_eq!(retained_counts(&path), vec![Some(3)]);
+        assert_eq!(Config::load_path(&path).unwrap().roster.len(), 2);
+    }
+
+    /// Three shapes, one rule: a file that cannot be vouched for is not evidence of anything, so
+    /// it neither enters the ring nor displaces what is already there.
+    #[test]
+    fn absent_malformed_and_empty_files_neither_retain_nor_evict() {
+        for (label, seed) in [
+            ("absent", None),
+            ("malformed", Some("][".to_string())),
+            ("zero-account", Some(String::new())),
+        ] {
+            let (_dir, path) = scratch();
+            // One good entry in the ring to have something to lose.
+            fs::write(&path, roster_of(4)).unwrap();
+            config_of(4).save_to(&path).unwrap();
+            assert_eq!(retained_counts(&path), vec![Some(4)], "{label}: seeded");
+
+            match seed {
+                Some(text) => fs::write(&path, text).unwrap(),
+                None => fs::remove_file(&path).unwrap(),
+            }
+            config_of(1).save_to(&path).unwrap();
+
+            assert_eq!(
+                retained_counts(&path),
+                vec![Some(4)],
+                "{label}: nothing retained, and nothing evicted"
+            );
+        }
+    }
+
+    /// The eviction predicate is the QUALIFYING write, not the write. A ring that evicted
+    /// per-write would be a fixed-size countdown to losing everything.
+    ///
+    /// Driven against a FULL ring rather than a single entry, which is what makes it bite on
+    /// the whole family: a ring that drops its oldest per write empties in three, and one that
+    /// merely prunes to depth-minus-one per write loses its oldest immediately — neither is
+    /// observable when only one entry is seeded, because `skip(n)` over one entry removes
+    /// nothing. Both mutants were run against this test; both are caught here and neither was
+    /// caught by the single-entry form.
+    #[test]
+    fn repeated_non_qualifying_writes_cannot_drain_the_ring() {
+        let (_dir, path) = scratch();
+        // Fill the ring: three qualifying writes over files holding 6, 5 then 4 accounts.
+        fs::write(&path, roster_of(6)).unwrap();
+        for accounts in [5, 4, 3] {
+            config_of(accounts).save_to(&path).unwrap();
+        }
+        assert_eq!(retained_counts(&path), vec![Some(4), Some(5), Some(6)]);
+
+        // Five in succession — more than the ring is deep, so a per-write ring would have
+        // cycled every good entry out with two writes to spare.
+        for _ in 0..5 {
+            fs::remove_file(&path).unwrap();
+            config_of(1).save_to(&path).unwrap();
+        }
+
+        assert_eq!(retained_counts(&path), vec![Some(4), Some(5), Some(6)]);
+    }
+
+    /// Depth, and the eviction order — asserted on CONTENT rather than on a count, so a ring
+    /// that evicted newest-first would fail rather than pass at three.
+    #[test]
+    fn the_ring_holds_at_most_three_and_evicts_oldest_first() {
+        let (_dir, path) = scratch();
+        // Four qualifying writes: each replaces a file holding 4, 5, 6 then 7 accounts.
+        fs::write(&path, roster_of(4)).unwrap();
+        for accounts in 5..=8 {
+            config_of(accounts).save_to(&path).unwrap();
+        }
+
+        assert_eq!(
+            retained_counts(&path),
+            vec![Some(7), Some(6), Some(5)],
+            "newest three retained; the four-account entry is the one evicted"
+        );
+        assert_eq!(list(&path).unwrap().len(), RING_DEPTH);
+    }
+
+    /// The mode is read off the filesystem, never inferred from the writer used. A `0644`
+    /// backup of a `0600` file is a disclosure the original deliberately prevented.
+    #[test]
+    fn every_retained_file_carries_the_config_file_mode() {
+        let (_dir, path) = scratch();
+        fs::write(&path, roster_of(2)).unwrap();
+        for accounts in 3..=5 {
+            config_of(accounts).save_to(&path).unwrap();
+        }
+
+        let retained = list(&path).unwrap();
+        assert_eq!(retained.len(), 3);
+        for entry in retained {
+            let mode = fs::metadata(&entry.path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode,
+                0o600,
+                "{} is {mode:o}, not 0600",
+                entry.path.display()
+            );
+        }
+    }
+
+    /// A stale backup is never loadable as the live config by accident: the ring is a
+    /// SUBDIRECTORY, so no entry shares the config file's name or its directory, and the loader
+    /// — which opens one exact path and never scans — reads the live file with the ring in place.
+    #[test]
+    fn a_retained_backup_is_never_a_candidate_for_the_live_config() {
+        let (_dir, path) = scratch();
+        fs::write(&path, roster_of(6)).unwrap();
+        config_of(1).save_to(&path).unwrap();
+
+        let retained = list(&path).unwrap();
+        assert_eq!(retained.len(), 1);
+        let dir = ring_dir(&path);
+        assert_ne!(
+            dir,
+            path.parent().unwrap(),
+            "the ring is not the config dir"
+        );
+        for entry in &retained {
+            assert_eq!(entry.path.parent(), Some(dir.as_path()));
+            assert_ne!(entry.path, path);
+            assert_ne!(entry.path.file_name(), path.file_name());
+        }
+        assert_eq!(
+            Config::load_path(&path).unwrap().roster.len(),
+            1,
+            "loading normally reads the live file, not the six-account entry beside it"
+        );
+    }
+
+    /// What is retained is the replaced file's OWN bytes, not a re-render of them: a backup that
+    /// round-tripped through this build's emitter would silently drop anything the emitter no
+    /// longer writes, which is the opposite of what a backup is for.
+    #[test]
+    fn the_retained_text_is_the_replaced_files_own_bytes() {
+        let (_dir, path) = scratch();
+        // Valid, and deliberately unlike anything `Config::render` emits: a comment, an inline
+        // spelling of a defaulted tunable, and no trailing structure.
+        let authored = "# hand-authored\n[[account]]\naccount_uuid = \"x\"\nlabel = \"l\"\n";
+        fs::write(&path, authored).unwrap();
+
+        config_of(2).save_to(&path).unwrap();
+
+        let retained = list(&path).unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(fs::read_to_string(&retained[0].path).unwrap(), authored);
+    }
+
+    /// A retention filename round-trips its stamp, and nothing else is mistaken for one — the
+    /// ring directory is the operator's too, so a stray file is skipped rather than decoded.
+    #[test]
+    fn a_retention_name_round_trips_and_nothing_else_decodes_as_one() {
+        for stamp in [
+            (0, 0),
+            (1_756_900_000, 123_456_789),
+            (99_999_999_999, 999_999_999),
+        ] {
+            let name = file_name(stamp);
+            assert_eq!(stamp_of(&name), Some(stamp), "{name} did not round-trip");
+        }
+        for stray in [
+            "config.toml",
+            "config.toml.tmp",
+            "notes.txt",
+            // Right affixes, wrong field widths — an unpadded stamp would sort wrongly, so it
+            // is refused rather than accepted and mis-ordered.
+            "config.1756900000.123456789.toml",
+            "config.01756900000.12345678.toml",
+            // Right widths, not digits.
+            "config.0175690000x.123456789.toml",
+        ] {
+            assert_eq!(stamp_of(stray), None, "{stray} decoded as a retention name");
+        }
+    }
+
+    /// The stamp is clamped strictly above the newest entry, so "oldest-first" stays
+    /// well-defined when the wall clock steps backwards (NTP, a VM resume, a manual set).
+    /// Without the clamp such a write sorts as the oldest and is pruned on the very next one,
+    /// quietly costing the ring a slot.
+    #[test]
+    fn the_stamp_is_clamped_above_the_newest_retained_entry() {
+        let (dir, _path) = scratch();
+        let ring = dir.path().join(RING_DIR);
+        fs::create_dir_all(&ring).unwrap();
+        // A stamp far in the future — the state a backwards clock step leaves behind.
+        let future = (99_999_999_999, 0);
+        fs::write(ring.join(file_name(future)), roster_of(1)).unwrap();
+
+        let next = stamp_for(&ring);
+
+        assert_eq!(next, next_after(future));
+        assert!(next > future);
+    }
+
+    /// The nanosecond field carries into the seconds field rather than overflowing.
+    #[test]
+    fn the_stamp_successor_carries_across_the_second_boundary() {
+        assert_eq!(next_after((7, 999_999_998)), (7, 999_999_999));
+        assert_eq!(next_after((7, 999_999_999)), (8, 0));
+    }
+
+    /// An absent ring is an empty ring, not an error — the common case on a machine that has
+    /// never had a qualifying write.
+    #[test]
+    fn an_absent_ring_lists_as_empty() {
+        let (_dir, path) = scratch();
+        assert_eq!(list(&path).unwrap(), Vec::new());
+    }
+
+    /// An entry that no longer parses reports `None` rather than being hidden or panicking:
+    /// hiding it would make the numbering `config restore` accepts disagree with the listing.
+    #[test]
+    fn an_unparseable_entry_reports_no_account_count() {
+        let (dir, path) = scratch();
+        let ring = dir.path().join(RING_DIR);
+        fs::create_dir_all(&ring).unwrap();
+        fs::write(ring.join(file_name((100, 0))), "][").unwrap();
+
+        assert_eq!(retained_counts(&path), vec![None]);
     }
 }

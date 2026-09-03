@@ -54,9 +54,6 @@ mod reliability;
 /// shipping binary reads a golden, so it is not compiled into one.
 #[cfg(test)]
 mod render_golden;
-/// The roster backup ring (issue #1439) — the qualifying-write rule that decides which
-/// replaced `config.toml` enters a fixed three-deep private ring, plus the enumeration and
-/// restore path behind `config backups` / `config restore`.
 mod roster_backup;
 mod service;
 mod sha256;
