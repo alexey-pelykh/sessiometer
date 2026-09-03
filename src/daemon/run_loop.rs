@@ -660,8 +660,14 @@ where
             }
             // Reload + reconcile the in-memory roster to the freshly-written
             // `config.toml` (#139) — the onboarded / relogged-in / removed account is
-            // adopted into the live rotation — BEFORE looping back to re-tick.
-            Idle::RosterReloadRequested => daemon.adopt_roster_reload().await,
+            // adopted into the live rotation — BEFORE looping back to re-tick. This is the
+            // daemon's one unattended path to REPLACING the whole rotation, so its outcome and
+            // both roster counts are logged on every path, adopted or not (#1438); the handler
+            // returns the event by value, so no path here can skip the emit.
+            Idle::RosterReloadRequested => {
+                let event = daemon.adopt_roster_reload().await;
+                emit_best_effort(log, &event);
+            }
             // Reconcile the revived account the `restored` control command named (#275 +
             // issue #643): a bare `Degraded` quarantine takes the plain on-demand
             // un-quarantine (`apply_refresh_restore`); a `Dead` PARKED account additionally

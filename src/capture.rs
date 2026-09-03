@@ -57,7 +57,9 @@ use crate::config::{
 use crate::error::{Error, Result};
 use crate::keychain::{Credential, CredentialStore, RealCredentialStore};
 use crate::login::login_account;
-use crate::observability::{Event, EventLog, LoginEventOutcome};
+use crate::observability::{
+    Event, EventLog, LoginEventOutcome, RosterReloadOutcome, RosterReloadReason,
+};
 use crate::paths;
 use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
 use crate::swap::{SwapLock, SWAP_LOCK_MAX_WAIT};
@@ -365,6 +367,11 @@ fn emit_login_event(account: Option<String>, outcome: LoginEventOutcome) {
 /// running (connect refused / socket absent), a timeout, an unresolvable socket path —
 /// is logged and ignored, never failing the verb. With no daemon running there is
 /// nothing to keep stale: the next `run` loads the fresh roster at startup.
+///
+/// Both failure paths now ALSO leave a durable trace
+/// ([`emit_roster_reload_not_notified`], issue #1438): a roster write that the daemon was never
+/// told about is the CLI-side twin of the same blind spot the daemon handler had — the file moved
+/// and the running rotation did not, with nothing recording the divergence.
 pub(crate) async fn notify_daemon_roster_reload() {
     let socket = match paths::control_socket() {
         Ok(socket) => socket,
@@ -372,11 +379,39 @@ pub(crate) async fn notify_daemon_roster_reload() {
             eprintln!(
                 "sessiometer: roster-reload notify skipped (cannot resolve control socket): {err}"
             );
+            emit_roster_reload_not_notified(RosterReloadReason::SocketUnresolved);
             return;
         }
     };
     if let Err(err) = crate::daemon::notify_roster_reload(&socket).await {
         eprintln!("sessiometer: roster-reload notify skipped (is the daemon running?): {err}");
+        emit_roster_reload_not_notified(RosterReloadReason::NotifyFailed);
+    }
+}
+
+/// Emit the CLI-side [`Event::RosterReload`] for a roster write the running daemon was never told
+/// about (issue #1438) — BEST-EFFORT, exactly like [`emit_login_event`]: the write already landed
+/// on disk and stands regardless of whether this line can be appended.
+///
+/// The `eprintln!` beside each call site is KEPT, not replaced. The issue's "gone, not
+/// supplemented" is scoped to the DAEMON handler, whose stderr has no reader because it runs in
+/// the background; here the operator is standing in front of the verb they just ran, so the
+/// message reaches them synchronously and the event is the DURABLE half of the same report rather
+/// than a substitute for it.
+///
+/// Both counts are absent. The CLI cannot see the daemon's in-memory roster, and a count of what
+/// it merely WROTE — with no `previous` to pair it against — cannot express the shrink this event
+/// exists to make legible, so it is omitted rather than half-reported. `reason` separates the two
+/// failures: an unresolvable socket path is a broken environment, while a failed send is
+/// overwhelmingly just "no daemon is running", which is benign.
+fn emit_roster_reload_not_notified(reason: RosterReloadReason) {
+    if let Ok(mut log) = EventLog::open() {
+        let _ = log.emit(&Event::RosterReload {
+            outcome: RosterReloadOutcome::NotNotified,
+            previous: None,
+            incoming: None,
+            reason: Some(reason),
+        });
     }
 }
 

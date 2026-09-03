@@ -454,34 +454,82 @@ where
         ConfigSetAck::Applied { effect }
     }
 
-    /// Adopt a runtime roster-reload signalled over the control socket (issue #139).
+    /// Adopt a runtime roster-reload signalled over the control socket (issue #139), returning the
+    /// one durable [`Event::RosterReload`] record of it (issue #1438).
     ///
     /// A roster write (`capture` / `login` / `remove`) committed a NEW `config.toml`
     /// on disk and notified us; re-read that authoritative file and reconcile the
     /// in-memory roster to it via [`reconcile_roster`](Self::reconcile_roster).
     /// BEST-EFFORT by contract, mirroring [`adopt_manual_swap`](Self::adopt_manual_swap):
     /// the on-disk file is authoritative, so a read failure — a malformed or briefly
-    /// absent file — leaves the current in-memory roster INTACT and is logged, never
-    /// fatal. A torn/partial read cannot occur: `Config::save` writes a temp file and
+    /// absent file — leaves the current in-memory roster INTACT and is never fatal.
+    /// A torn/partial read cannot occur: `Config::save` writes a temp file and
     /// `rename`s it over `config.toml` atomically, so this read observes either the
-    /// whole old or the whole new file (issue #139 acceptance). A `None` `config_path`
-    /// (the hermetic-test default) is a silent no-op.
+    /// whole old or the whole new file (issue #139 acceptance).
+    ///
+    /// EVERY return path yields an event, and the SIGNATURE is what guarantees it: returning a
+    /// bare `Event` rather than an `Option` makes issue #1438's "no path returns without emitting"
+    /// structural — the compiler refuses a path that produces none — instead of a convention a
+    /// later edit can quietly drop. Three outcomes, not two: a `None` `config_path` (the
+    /// hermetic-test default, and any daemon with no reload wired) is `Refused`, since it reads
+    /// nothing and so is not the same fact as a read that FAILED, while an absent or unreadable
+    /// file is `Failed`. It is no longer a SILENT no-op, and the `eprintln!` this replaced is gone
+    /// rather than supplemented: the daemon runs in the background, so its stderr had no reader,
+    /// and the reload is the one unattended operation that can replace the whole live rotation.
+    ///
+    /// `previous` is read BEFORE the reconcile and `incoming` before the new roster is handed over
+    /// by value, because the pair is the only form in which a shrink is legible at all.
+    ///
+    /// The error is bound only to CLASSIFY it and is then dropped, never rendered: it carries the
+    /// config path, and a TOML parse failure quotes file CONTENT, which the issue's redaction
+    /// criterion forbids on a channel with a wider audience than the mode-`0o600` file itself.
     ///
     /// No lock is taken: the run loop drives `tick`, the control serve, and this
     /// adoption on a SINGLE task, so no daemon swap can interleave with the reconcile;
     /// and `config.toml` is written only by the CLI verbs (never by a daemon swap,
     /// which touches the keychain + `~/.claude.json`), so the re-read races nothing the
     /// daemon itself writes.
-    pub(super) async fn adopt_roster_reload(&mut self) {
+    pub(super) async fn adopt_roster_reload(&mut self) -> Event {
+        // The live roster size BEFORE anything is reconciled — the `was` half of the pair, and the
+        // only thing that makes a shrink readable off the emitted line (issue #1438).
+        let previous = Some(self.roster.len());
         let Some(path) = self.config_path.clone() else {
-            return; // reload disabled (no config path wired) — nothing to do.
+            // Reload disabled (no config path wired): nothing is read, so there is no incoming
+            // count to report — and NOT `incoming=0`, which would claim the file presented an
+            // empty roster.
+            return Event::RosterReload {
+                outcome: RosterReloadOutcome::Refused,
+                previous,
+                incoming: None,
+                reason: Some(RosterReloadReason::ReloadDisabled),
+            };
         };
         match Config::load_path(&path) {
-            Ok(config) => self.reconcile_roster(config.roster),
+            Ok(config) => {
+                // Read before `reconcile_roster` takes the roster by value.
+                let incoming = Some(config.roster.len());
+                self.reconcile_roster(config.roster);
+                Event::RosterReload {
+                    outcome: RosterReloadOutcome::Adopted,
+                    previous,
+                    incoming,
+                    reason: None,
+                }
+            }
             // Best-effort: keep the current in-memory roster on any read/parse failure
             // (a transient absent file, or a malformed edit) rather than dropping the
-            // rotation. The next reload notification re-attempts.
-            Err(err) => eprintln!("sessiometer: roster-reload skipped: {err}"),
+            // rotation. The next reload notification re-attempts. The error is CLASSIFIED
+            // into a bare machine code and dropped — formatting it onto the event would put
+            // the config path, or a quoted fragment of the file, on the event channel.
+            Err(err) => Event::RosterReload {
+                outcome: RosterReloadOutcome::Failed,
+                previous,
+                incoming: None,
+                reason: Some(match err {
+                    Error::ConfigNotFound { .. } => RosterReloadReason::Absent,
+                    _ => RosterReloadReason::Unreadable,
+                }),
+            },
         }
     }
 
@@ -2968,7 +3016,7 @@ mod tests {
         daemon.state.active = Some(0);
         daemon.state.accounts[0].health.quarantined = true; // A's state must survive the reload
 
-        daemon.adopt_roster_reload().await;
+        let event = daemon.adopt_roster_reload().await;
 
         assert_eq!(roster_uuids(&daemon), vec!["u-A", "u-B", "u-C"]);
         assert!(
@@ -2976,6 +3024,18 @@ mod tests {
             "A's state preserved"
         );
         assert_eq!(daemon.state.active, Some(0));
+        // Issue #1438 AC-1: the ADOPT path returns its own durable record, carrying the count
+        // PAIR (2 -> 3) that makes a widening — or, reversed, a collapse — readable with no
+        // access to the daemon. No `reason`: nothing was refused and nothing failed.
+        assert_eq!(
+            event,
+            Event::RosterReload {
+                outcome: RosterReloadOutcome::Adopted,
+                previous: Some(2),
+                incoming: Some(3),
+                reason: None,
+            }
+        );
     }
 
     #[tokio::test]
@@ -2990,24 +3050,172 @@ mod tests {
             reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")])
                 .with_config_path(config_path);
 
-        daemon.adopt_roster_reload().await;
+        let event = daemon.adopt_roster_reload().await;
 
         assert_eq!(
             roster_uuids(&daemon),
             vec!["u-A", "u-B"],
             "roster unchanged on a bad read"
         );
+        // Issue #1438 AC-1/AC-3: the failure is RECORDED now, not printed to a background
+        // process's stderr. The file was THERE and would not parse, so the code is `unreadable`
+        // — distinct from the `absent` mid-write race below — and there is no incoming count,
+        // because no roster was ever read.
+        assert_eq!(
+            event,
+            Event::RosterReload {
+                outcome: RosterReloadOutcome::Failed,
+                previous: Some(2),
+                incoming: None,
+                reason: Some(RosterReloadReason::Unreadable),
+            }
+        );
     }
 
     #[tokio::test]
-    async fn adopt_roster_reload_is_a_noop_without_a_config_path() {
-        // With no config path wired (the hermetic default), a reload signal is a silent
-        // no-op — there is nothing to read, and the roster is left as-is.
+    async fn adopt_roster_reload_refuses_and_records_it_without_a_config_path() {
+        // With no config path wired (the hermetic default), a reload signal reads nothing and
+        // leaves the roster as-is — but since issue #1438 it is no longer a SILENT no-op: it
+        // returns a `refused` record naming why reload is not armed. `previous` is the live
+        // roster size; `incoming` is ABSENT rather than `0`, which would claim the file presented
+        // an empty roster.
         let mut daemon = reconcile_daemon(vec![account("u-A", "work")]);
 
-        daemon.adopt_roster_reload().await;
+        let event = daemon.adopt_roster_reload().await;
 
         assert_eq!(roster_uuids(&daemon), vec!["u-A"]);
+        assert_eq!(
+            event,
+            Event::RosterReload {
+                outcome: RosterReloadOutcome::Refused,
+                previous: Some(1),
+                incoming: None,
+                reason: Some(RosterReloadReason::ReloadDisabled),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn adopt_roster_reload_reports_an_absent_config_apart_from_an_unreadable_one() {
+        // Issue #1438 AC-1, the fourth return path: a config path IS wired but the file is not
+        // there — the benign mid-write race the #139 best-effort contract exists for. It reports
+        // `absent`, never `unreadable`: a file briefly missing and a file that is there and wrong
+        // are different operator situations, and `Error::ConfigNotFound` already separates them
+        // for free.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml"); // never written
+
+        let mut daemon: FakeDaemon =
+            reconcile_daemon(vec![account("u-A", "work"), account("u-B", "spare")])
+                .with_config_path(config_path);
+
+        let event = daemon.adopt_roster_reload().await;
+
+        assert_eq!(
+            roster_uuids(&daemon),
+            vec!["u-A", "u-B"],
+            "roster unchanged when the file is absent"
+        );
+        assert_eq!(
+            event,
+            Event::RosterReload {
+                outcome: RosterReloadOutcome::Failed,
+                previous: Some(2),
+                incoming: None,
+                reason: Some(RosterReloadReason::Absent),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_roster_reload_that_shrinks_the_fleet_renders_the_whole_pair() {
+        // Issue #1438 AC-2, driven end to end through the daemon: the 2026-08-27 shape — a
+        // daemon holding SIX accounts reloads a `config.toml` presenting ONE. The assertion is
+        // on the RENDERED line, not on the returned value, because the criterion is that an
+        // operator holding only the log can tell a collapse from a widening. `adopted 1` says
+        // nothing; `adopted 1, was 6` is the whole event.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        write_roster_config(&config_path, &[("u-A", "work")]);
+
+        let mut daemon: FakeDaemon = reconcile_daemon(vec![
+            account("u-A", "work"),
+            account("u-B", "spare"),
+            account("u-C", "third"),
+            account("u-D", "fourth"),
+            account("u-E", "fifth"),
+            account("u-F", "sixth"),
+        ])
+        .with_config_path(config_path);
+
+        let line = daemon
+            .adopt_roster_reload()
+            .await
+            .to_log_line(std::time::UNIX_EPOCH);
+
+        assert_eq!(
+            roster_uuids(&daemon),
+            vec!["u-A"],
+            "five accounts left the live rotation"
+        );
+        assert!(
+            line.ends_with("event=roster_reload outcome=adopted previous=6 incoming=1"),
+            "the collapse must be legible from this line alone: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_roster_reload_line_carries_a_path_account_or_error_text() {
+        // Issue #1438 AC-5, asserted rather than claimed in a comment. Every position that could
+        // leak is filled with material nothing else in the tree would produce, and all three
+        // daemon-side paths are driven: `Error::ConfigNotFound` carries the config `PathBuf` and
+        // a TOML parse error quotes file CONTENT, so this is exactly what the classify-and-drop
+        // discipline in `adopt_roster_reload` exists for — the event log has a WIDER AUDIENCE
+        // than the mode-`0o600` file the roster lives in.
+        const SECRET_SEGMENT: &str = "zz-secret-roster-dir";
+        const SECRET_LABEL: &str = "zz-secret-label";
+        const SECRET_UUID: &str = "zz-secret-uuid";
+
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join(SECRET_SEGMENT);
+        std::fs::create_dir(&nested).unwrap();
+        let config_path = nested.join("config.toml");
+
+        let mut daemon: FakeDaemon = reconcile_daemon(vec![account(SECRET_UUID, SECRET_LABEL)])
+            .with_config_path(config_path.clone());
+        let render = |event: Event| event.to_log_line(std::time::UNIX_EPOCH);
+
+        // (a) absent — the dropped error carries the whole config path.
+        let absent = render(daemon.adopt_roster_reload().await);
+        // (b) unreadable — the dropped TOML error quotes the file's own content.
+        std::fs::write(&config_path, format!("]not valid toml[ {SECRET_LABEL}")).unwrap();
+        let unreadable = render(daemon.adopt_roster_reload().await);
+        // (c) adopted — the roster that WAS read is full of distinctive handles.
+        write_roster_config(&config_path, &[(SECRET_UUID, SECRET_LABEL)]);
+        let adopted = render(daemon.adopt_roster_reload().await);
+
+        let lines = [absent, unreadable, adopted];
+        for line in &lines {
+            assert!(!line.contains(SECRET_SEGMENT), "no path segment: {line}");
+            assert!(!line.contains(SECRET_LABEL), "no account label: {line}");
+            assert!(!line.contains(SECRET_UUID), "no account uuid: {line}");
+            // No path AT ALL, not merely not this one: the line carries counts and bare machine
+            // codes, and none of those can contain a separator.
+            assert!(!line.contains('/'), "no filesystem path: {line}");
+            assert!(!line.contains('@'), "no email sigil: {line}");
+            assert!(!line.to_lowercase().contains("token"), "no token: {line}");
+            assert_eq!(line.lines().count(), 1, "exactly one record: {line}");
+        }
+        // The sweep above is evidence only if it ran on the three distinct paths it names — a
+        // loop over an empty or collapsed set would pass having checked nothing.
+        assert_eq!(
+            lines
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3,
+            "three DISTINCT paths driven: {lines:?}"
+        );
     }
 
     #[tokio::test]
@@ -3055,7 +3263,8 @@ mod tests {
         );
 
         let logdir = tempfile::tempdir().unwrap();
-        let mut log = EventLog::at(&logdir.path().join("sessiometer.log")).unwrap();
+        let log_path = logdir.path().join("sessiometer.log");
+        let mut log = EventLog::at(&log_path).unwrap();
         // Tick 1 → idle delivers `RosterReloadRequested` (reload) → tick 2 → shutdown.
         // after(3): 1 start-up check (pends) + 2 idle shutdown-checks.
         let mut shutdown = FakeShutdown::after(3);
@@ -3081,6 +3290,26 @@ mod tests {
             roster_uuids(&daemon),
             vec!["u-A", "u-B", "u-C"],
             "the onboarded account joined the live rotation without a restart"
+        );
+
+        // Issue #1438: and the run loop LOGGED it. The handler returning the event by value only
+        // guarantees one exists — this is the other half, that the idle arm actually emits it, so
+        // a regression dropping the `emit_best_effort` fails here rather than leaving the reload
+        // traceless again. Asserted on the appended line, which is what an operator would read.
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        let reload_lines: Vec<&str> = logged
+            .lines()
+            .filter(|line| line.contains(" event=roster_reload "))
+            .collect();
+        assert_eq!(
+            reload_lines.len(),
+            1,
+            "exactly one reload line for the one reload signal: {logged}"
+        );
+        assert!(
+            reload_lines[0].ends_with("outcome=adopted previous=2 incoming=3"),
+            "the widening is legible from the logged line: {}",
+            reload_lines[0]
         );
     }
 
