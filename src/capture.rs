@@ -2377,7 +2377,7 @@ mod tests {
 
         for (file, signature, intent, why) in SITES {
             let source = source_above_the_tests(file);
-            let body = fn_body(&source, signature);
+            let body = fn_body_in(&source, signature, file);
             let at = body.find(NOTIFY).unwrap_or_else(|| {
                 panic!(
                     "`{signature}` ({file}) no longer notifies the daemon — this enumeration has \
@@ -2397,40 +2397,84 @@ mod tests {
         // Cardinality, so the loop above is evidence rather than a sample: a SEVENTH verb reaching
         // the daemon must land in the enumeration, where its intent is a decision somebody made
         // rather than whichever token was nearest to copy.
-        let calls: usize = ["src/capture.rs", "src/cli.rs"]
-            .iter()
-            .map(|file| source_above_the_tests(file).matches(NOTIFY).count())
-            .sum();
+        //
+        // Counted over the WHOLE crate, not over the two files that happen to hold today's six.
+        // `notify_daemon_roster_reload` is `pub(crate)`, so every module can reach it, and a
+        // seventh verb landing in `src/config.rs` or `src/swap.rs` is exactly the case a
+        // two-file count cannot see — it would pass, unchanged, having measured a corpus the new
+        // caller is not in.
+        let (calls, prose) = crate_notify_mentions(NOTIFY);
         assert_eq!(
             calls,
             SITES.len() + 1,
-            "a `notify_daemon_roster_reload` call site was added or removed; add it to `SITES` \
-             with the intent its verb implies (the +1 is this function's own definition)"
+            "a `notify_daemon_roster_reload` call site was added or removed somewhere under \
+             `src/`; add it to `SITES` with the intent its verb implies (the +1 is this \
+             function's own definition)"
+        );
+        // Canary on the comment strip that makes the count above a count of CALLS. This file's
+        // own prose names the function repeatedly and on purpose, so a strip that stopped working
+        // would inflate the count rather than deflate it — and the assertion would then fail for
+        // a reason nobody could read. Requiring the prose mentions to be non-zero proves the
+        // strip is separating the two classes rather than passing everything through as code.
+        assert!(
+            prose > 0,
+            "no commented mention of `notify_daemon_roster_reload` was found under `src/`, so \
+             the comment strip that makes the count above a count of CALLS is not being exercised"
         );
     }
 
-    /// `file`'s source above its test block — the subject of
-    /// [`every_roster_verb_declares_the_intent_its_verb_implies`], which spans two files.
+    /// How many times `needle` occurs under `src/` as CODE, and how many times as prose.
     ///
-    /// The generalization of [`capture_source_above_the_tests`], kept beside it rather than
-    /// replacing it: that one names its single file in its own panic messages, which is what makes
-    /// the two structural assertions above readable when they fail.
-    fn source_above_the_tests(file: &str) -> String {
-        let text =
-            std::fs::read_to_string(file).unwrap_or_else(|err| panic!("cannot read {file}: {err}"));
-        let above = text
-            .split("\n#[cfg(test)]\nmod tests")
-            .next()
-            .expect("split always yields a first element")
-            .to_owned();
-        // Canary: a boundary that moved shows as a failure here rather than as a green run over a
-        // truncated — or an un-truncated — subject.
+    /// The scope `notify_daemon_roster_reload`'s `pub(crate)` visibility actually grants. Walked
+    /// from the directory rather than listed, so a module added tomorrow is searched the day it
+    /// lands instead of the day someone remembers to widen a literal; each file is cut above its
+    /// own test block, because a test naming the function is not a caller of it.
+    ///
+    /// Returns both halves so the caller can canary the split: the prose count is what proves the
+    /// comment strip is doing work, and a strip that silently stopped would otherwise show up
+    /// only as an unreadable failure in the code count.
+    fn crate_notify_mentions(needle: &str) -> (usize, usize) {
+        let mut pending = vec![std::path::PathBuf::from("src")];
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir)
+                .unwrap_or_else(|err| panic!("cannot read {}: {err}", dir.display()))
+            {
+                let path = entry.expect("cannot stat a src entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    files.push(path);
+                }
+            }
+        }
+        // Canary: the walk found the module tree, not an empty or one-level read.
         assert!(
-            above.len() < text.len(),
-            "{file} has no column-0 `#[cfg(test)] mod tests`, so nothing was cut and the \
-             extraction is measuring the tests too"
+            files.len() > 10,
+            "only {} `.rs` files found under `src/` — the walk is not seeing the crate",
+            files.len()
         );
-        above
+
+        let mut code = 0usize;
+        let mut prose = 0usize;
+        for path in files {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()));
+            let above = text
+                .split("\n#[cfg(test)]\nmod tests")
+                .next()
+                .expect("split always yields a first element");
+            for line in above.lines() {
+                if line.trim_start().starts_with("//") {
+                    prose += line.matches(needle).count();
+                } else {
+                    let (kept, dropped) = line.split_at(strip_trailing_comment(line).len());
+                    code += kept.matches(needle).count();
+                    prose += dropped.matches(needle).count();
+                }
+            }
+        }
+        (code, prose)
     }
 
     /// This file's source above its test block — the subject of the two structural
@@ -2492,8 +2536,14 @@ mod tests {
     /// delimiter would run such a body to the end of the whole `impl`, and an ordering assertion
     /// over that span could be satisfied by two calls in unrelated methods.
     fn fn_body_in(source: &str, signature: &str, origin: &str) -> String {
+        // The opening paren is part of the needle. Without it `signature` matches by PREFIX, and
+        // this file has the collision live: `pub(crate) async fn capture` is a prefix of
+        // `pub(crate) async fn capture_locked`, so a reordering that put the longer one first
+        // would silently redirect every assertion onto the wrong body — and pass, since the two
+        // do overlapping work.
+        let needle = format!("{signature}(");
         let from = source
-            .find(signature)
+            .find(&needle)
             .unwrap_or_else(|| panic!("`{signature}` is not in {origin}"));
         let line_start = source[..from].rfind('\n').map_or(0, |at| at + 1);
         let closer = format!("\n{}}}\n", &source[line_start..from]);

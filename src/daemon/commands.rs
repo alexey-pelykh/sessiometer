@@ -4595,12 +4595,67 @@ mod tests {
         // holds — but it can reach it with the WRONG one, silently, and nothing above would look.
         // Failing here forces the new site into the enumeration, where its intent is a decision
         // somebody made rather than one that defaulted.
+        //
+        // Counted over the WHOLE `daemon` module and by BARE method name, not over this file and
+        // not by `self.`. `reconcile_roster` is `pub(super)`, so every file in `crate::daemon` can
+        // reach it, and a caller in one of them writes `daemon.reconcile_roster(` — which a
+        // this-file, `self.`-anchored count misses on both axes at once. `run_loop.rs` already
+        // holds a `&mut Daemon` and calls sibling methods on it, so that fourth site is a plausible
+        // edit and not a hypothetical.
+        let module_calls: usize = daemon_module_sources()
+            .iter()
+            .map(|(_, text)| text.matches("reconcile_roster(").count())
+            .sum();
         assert_eq!(
-            source.matches(CALL).count(),
-            sites.len(),
-            "a `reconcile_roster` call site was added or removed; add it to `sites` above with \
-             the intent its verb implies"
+            module_calls,
+            sites.len() + 1,
+            "a `reconcile_roster` call site was added or removed somewhere in `crate::daemon`; add \
+             it to `sites` above with the intent its verb implies (the +1 is the definition)"
         );
+    }
+
+    /// Every file of the `crate::daemon` module, each cut above its own test block.
+    ///
+    /// The scope `reconcile_roster`'s `pub(super)` visibility actually grants — which is what the
+    /// cardinality guard has to search, since a caller added in a sibling file is exactly the case
+    /// a this-file count cannot see. Enumerated from the directory rather than listed, so a NEW
+    /// file in the module is searched the day it lands instead of the day someone remembers it.
+    fn daemon_module_sources() -> Vec<(String, String)> {
+        let mut sources: Vec<(String, String)> = std::fs::read_dir("src/daemon")
+            .expect("cannot read src/daemon")
+            .map(|entry| entry.expect("cannot stat a src/daemon entry").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+            .map(|path| {
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()));
+                let above = text
+                    .split("\n#[cfg(test)]\nmod tests")
+                    .next()
+                    .expect("split always yields a first element")
+                    .to_owned();
+                (path.display().to_string(), above)
+            })
+            .collect();
+        // `src/daemon.rs` is the module root and sits beside the directory, not inside it.
+        let root = std::fs::read_to_string("src/daemon.rs").expect("cannot read src/daemon.rs");
+        let root_above = root
+            .split("\n#[cfg(test)]\nmod tests")
+            .next()
+            .expect("split always yields a first element")
+            .to_owned();
+        sources.push(("src/daemon.rs".to_owned(), root_above));
+        // Canary: the module is not empty and every file was actually cut, so a count over this
+        // corpus is evidence rather than the shape of an empty read.
+        assert!(
+            sources.len() > 5,
+            "only {} daemon module files found — the enumeration is not seeing the module",
+            sources.len()
+        );
+        assert!(
+            sources.iter().all(|(_, text)| !text.is_empty()),
+            "a daemon module file cut to nothing"
+        );
+        sources
     }
 
     /// This file's source above its test block — the subject of
@@ -4855,32 +4910,37 @@ mod tests {
             .lines()
             .filter(|line| line.contains(" event=roster_reload "))
             .collect();
+        // TWO lines, and the pair is the point. The refusal is one — silence is what #1438
+        // removed. The poll tick that follows it then observes the state the refusal deliberately
+        // LEFT — memory holding more accounts than the file — and reports it as a divergence
+        // (issue #1443, merged after this test was written). Neither subsumes the other: the
+        // refusal says the daemon declined a reload, the divergence says disk and memory disagree,
+        // and an operator reading the log needs both to understand why the rotation is what it is.
         assert_eq!(
             reload_lines.len(),
-            1,
-            "a refusal is still exactly one reload line — silence is what #1438 removed: {logged}"
+            2,
+            "expected the refusal and the divergence the refusal leaves behind: {logged}"
         );
-        let logged_line = reload_lines[0];
+
+        let refusal = reload_lines
+            .iter()
+            .find(|line| field_of(line, "outcome") == Some("refused"))
+            .unwrap_or_else(|| panic!("no refusal line: {logged}"));
+        assert_eq!(field_of(refusal, "reason"), Some("shrink"), "{refusal}");
+        assert_eq!(field_of(refusal, "previous"), Some("2"), "{refusal}");
+        assert_eq!(field_of(refusal, "incoming"), Some("1"), "{refusal}");
+
+        let divergence = reload_lines
+            .iter()
+            .find(|line| field_of(line, "outcome") == Some("diverged"))
+            .unwrap_or_else(|| panic!("no divergence line: {logged}"));
         assert_eq!(
-            field_of(logged_line, "outcome"),
-            Some("refused"),
-            "{logged_line}"
+            field_of(divergence, "reason"),
+            Some("count_mismatch"),
+            "{divergence}"
         );
-        assert_eq!(
-            field_of(logged_line, "reason"),
-            Some("shrink"),
-            "{logged_line}"
-        );
-        assert_eq!(
-            field_of(logged_line, "previous"),
-            Some("2"),
-            "{logged_line}"
-        );
-        assert_eq!(
-            field_of(logged_line, "incoming"),
-            Some("1"),
-            "{logged_line}"
-        );
+        assert_eq!(field_of(divergence, "previous"), Some("2"), "{divergence}");
+        assert_eq!(field_of(divergence, "incoming"), Some("1"), "{divergence}");
     }
 
     #[tokio::test]
