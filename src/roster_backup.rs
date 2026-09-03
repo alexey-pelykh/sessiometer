@@ -46,30 +46,34 @@
 //! precisely because the cause is unattributed and the write paths cannot be enumerated.
 //! Whether a write happens at all is [`crate::witness`]' question (issue #1440).
 //!
-//! Two processes replacing the config at the same instant can compute the same retention stamp —
-//! [`stamp_for`] reads the ring and clamps above what it sees, so a collision is DETERMINISTIC
-//! for two processes that read it before either has landed, not a nanosecond coincidence. The
-//! config-write path is not serialized today; that is issue #1445's subject, not this module's.
-//!
 //! State only what the code guarantees here, because a comment is where a later reader will look
-//! for it. Every guarantee in the table above holds for a SERIALIZED writer. Under a concurrent
-//! one they degrade, and the degradation is bounded but not benign:
+//! for it. Every guarantee in the table above holds for a SERIALIZED writer — and since issue
+//! #1445 the writer IS serialized: [`Config::save_to`](crate::config::Config::save_to) holds a
+//! dedicated config-write lock across the whole read-modify-write it performs here, so retention,
+//! the replacing write, eviction and [`prune`] all run inside one critical section per config
+//! file. Every path into this module runs under it, because `save_to` is the only caller.
 //!
-//! - Two writers share a staging name, and [`paths::write_private_file`] opens by unlinking that
-//!   name. Whichever renames first wins the entry; the other's rename usually fails `ENOENT`, so
-//!   its retention returns `Err` and its replacing write aborts — no loss. But if the unlink
-//!   lands between the winner's `fsync` and its rename, the winner renames the LOSER's
-//!   half-written file into place, and the ring holds a TORN entry. `config restore` re-validates
-//!   before installing, so a torn entry is refused rather than restored; it is still an entry the
-//!   ring believed it had.
-//! - [`prune`]'s sweep can unlink a concurrent writer's in-flight staging file, aborting that
-//!   write. See [`prune`] for why the ordering that would prevent it does not hold.
-//! - [`Retention::roll_back`] removes an entry by path, which another process may by then have
-//!   replaced at that same name.
+//! That is what closes the three degradations this module could previously only describe, and
+//! they are recorded because each is what an unserialized writer would reintroduce:
 //!
-//! None of that loses the LIVE roster, which is what this module exists to protect: a replacing
-//! write that cannot retain is refused, never completed. Serializing the path is what closes the
-//! rest, and that is not this module's to do.
+//! - Two writers sharing a staging name. [`paths::write_private_file`] opens by unlinking that
+//!   name, so an unlink landing between the winner's `fsync` and its `rename` publishes the
+//!   LOSER's half-written file — a TORN entry the ring believed it had. (`config restore`
+//!   re-validates before installing, so a torn entry was refused rather than restored even then.)
+//! - [`prune`]'s sweep unlinking a concurrent writer's in-flight staging file, aborting that
+//!   write. See [`prune`] for why the ordering that would prevent it does not hold on its own.
+//! - [`Retention::roll_back`] removing an entry by path that another process had replaced at that
+//!   same name.
+//!
+//! Two processes could also compute the same retention stamp — [`stamp_for`] reads the ring and
+//! clamps above what it sees, so a collision was DETERMINISTIC for two processes that read it
+//! before either had landed, not a nanosecond coincidence. Serialization removes the window
+//! rather than making the collision less likely.
+//!
+//! None of that ever lost the LIVE roster, which is what this module exists to protect: a
+//! replacing write that cannot retain is refused, never completed. The lock is what closes the
+//! rest, and it is deliberately NOT this module's — it belongs to the write seam every caller
+//! reaches this module through.
 
 use std::cmp::Reverse;
 use std::fs;
@@ -363,10 +367,12 @@ fn next_after((secs, nanos): (u64, u32)) -> (u64, u32) {
 /// safe against the case it is for (a temp stranded by a crash, older than everything that has
 /// landed since) and does NOT make it safe in general. [`stamp_for`] clamps above the newest
 /// entry it sees WHEN IT RUNS, not when this runs: a writer that computed its stamp, then had a
-/// later writer land an entry and reach here, has an in-flight temp below the new newest and can
-/// have it swept out from under it. That aborts the swept writer's replacing write — a refused
-/// write, not a lost roster — and closing it needs the serialization issue #1445 owns, not a
-/// wider or narrower rule here.
+/// later writer land an entry and reach here, would have an in-flight temp below the new newest
+/// and could have it swept out from under it. Since issue #1445 that interleaving is unreachable
+/// — the config-write lock this module is always entered under means no other writer has an
+/// in-flight temp while this runs — but the rule stays as it is rather than widening: it is
+/// correct on its own terms, and a sweep that trusted the lock would be a second place the lock's
+/// scope had to hold.
 fn prune(dir: &Path) {
     let mut found = scan(dir).unwrap_or_default();
     found.sort_unstable_by_key(|(_, stamp)| Reverse(*stamp));
