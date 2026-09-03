@@ -269,6 +269,14 @@ where
     /// preserved, NO duplicate row), and a newly-captured one joins the live rotation without a
     /// restart. The daemon-`None` `config_path` (the hermetic-test default with no reload wired)
     /// fails closed — the capture cannot be persisted, so nothing is stashed-then-lost.
+    ///
+    /// An ABSENT `config.toml` is gated by the prior-configuration witness (issue #1441, design
+    /// D-1) before anything is read or written: this is the second entry point to the append-only
+    /// write that collapsed a six-account roster on 2026-08-27, and it carries the SAME rule as the
+    /// CLI verbs ([`crate::witness::admit`]) rather than a parallel one. Unlike them it observes
+    /// the rule's input TWICE — the durable witness, plus its own in-memory roster, which PRD § 7
+    /// row 2 requires and which the CLI has no access to. A refusal is
+    /// [`CaptureRejection::PriorConfiguration`] and a true no-op.
     pub(super) async fn perform_socket_capture(
         &mut self,
         command: &CaptureCommand,
@@ -286,6 +294,51 @@ where
             Err(Error::ConfigNotFound { .. }) => None,
             Err(err) => return self.capture_failure(command, classify_capture_failure(&err)),
         };
+        // #1441 (design D-1 / D-5, R-2): the arm directly above turns an absent `config.toml` into
+        // `None`, and `capture_locked` can then only APPEND — so resolving that ambiguity to "first
+        // run" writes a one-account roster over a live six-account one. That is the incident, and
+        // this is its SECOND reachable entry point: the menu-bar capture button reaches it over the
+        // control socket, so fixing the CLI verbs alone left the collapse reproducible from the GUI.
+        //
+        // `crate::witness::admit` owns the RULE and is the SAME one the CLI's `capture` / `login`
+        // apply — one rule, two entry points, not two rules. What is composed here is its INPUT,
+        // because this entry point can observe the one question ("has this machine been configured
+        // before?") TWICE, and the CLI can only observe it once.
+        //
+        // The daemon's OWN in-memory roster is that second observation, and PRD § 7 row 2 turns on
+        // it: `config.toml` absent while a RUNNING daemon holds accounts IS the incident, and it
+        // must refuse whether or not a durable witness also survived (§ 7a amended row 1 only and
+        // says so — "Rows 2–9 are unchanged"). That distinction is reachable rather than academic:
+        // the witness's accepted false negative is a loss that took every witness with it, and both
+        // usage-store files are SIBLINGS of `config.toml` in one directory, so a single
+        // directory-scoped deletion takes all three. On that machine the durable witness answers
+        // `Absent` and only the live roster still knows better.
+        //
+        // Corroboration, never establishment — the direction ADR-0036 permits. The daemon's roster
+        // can only ADD refusals: an EMPTY one (§ 7 row 3, a genuine first run with the daemon up)
+        // says nothing and leaves the verdict entirely to the durable witness. Reading it costs
+        // nothing and consults no socket; the rule's independence from a reachable daemon is what
+        // `crate::witness` must preserve, and it still does — this is the caller's observation,
+        // made where the fallback is visible rather than hidden inside the rule.
+        //
+        // Placed HERE, immediately after the config read whose result is this gate's own input and
+        // BEFORE `capture_locked` below, so a refusal is a true no-op: no lock acquired, no identity
+        // or token read, nothing stashed, no roster saved, `self` unmutated. A verdict reached after
+        // the stash has landed would be correct and far too late.
+        //
+        // `admit`'s `(true, _)` arm is why this whole block is skipped for a PRESENT config: the
+        // verdict is fixed there whatever the witness says, so probing would spawn `security` on
+        // every capture to learn nothing — the same short-circuit `admit_append_only` makes.
+        if existing.is_none() {
+            let witness = if self.roster.is_empty() {
+                self.witness_sources.observe().await
+            } else {
+                crate::witness::PriorConfiguration::Present
+            };
+            if let Err(err) = crate::witness::admit(false, witness) {
+                return self.capture_failure(command, classify_capture_failure(&err));
+            }
+        }
         // Reuse the #357 primitive with the daemon's OWN seams + swap lock. `None` lock is the
         // hermetic-test default (no second in-process writer to serialize against); production threads
         // the real `swap.lock` path, so a concurrent auto-swap cannot interleave with the two reads.
@@ -1937,6 +1990,365 @@ mod tests {
         assert_eq!(Config::load_path(&config_path).unwrap().roster.len(), 1);
         assert_eq!(daemon.stash.len(), 1);
         assert!(!daemon.stash.contains("Sessiometer/u-A"));
+    }
+
+    // --- the prior-configuration witness at the SOCKET entry point (#1441) ---------
+
+    /// Witness sources pinned for a daemon test — never the operator's login keychain.
+    ///
+    /// `configured` picks which verdict the sources produce, and each arm is arranged the cheap
+    /// way `WitnessSources::observe` already documents. A CONFIGURED machine is a non-empty
+    /// usage-store file, which `observe` checks FIRST and which therefore never spawns
+    /// `security` at all. An unconfigured one is an empty store plus a keychain path that does
+    /// not exist — measured (see `crate::witness::resolve_probe`) to exit 0 with empty output,
+    /// so the probe answers `Ok(false)` rather than erroring into the fail-closed arm.
+    fn pinned_witness(dir: &Path, configured: bool) -> crate::witness::WitnessSources {
+        let samples = dir.join("usage-samples.jsonl");
+        let usage_store = if configured {
+            std::fs::write(&samples, b"{\"ts\":0}\n").unwrap();
+            vec![samples]
+        } else {
+            Vec::new()
+        };
+        crate::witness::WitnessSources::pinned(dir.join("no-such.keychain-db"), usage_store)
+    }
+
+    #[tokio::test]
+    async fn perform_socket_capture_refuses_an_absent_config_on_the_durable_witness_alone() {
+        // Issue #1441 AC: `config.toml` is gone while durable local state says this machine was
+        // configured before. The CLI's rule, applied at the second entry point.
+        //
+        // The daemon's roster is deliberately EMPTY here, which is what makes this test about the
+        // WITNESS. The gate has two observations and refuses on either; giving this one a populated
+        // roster would let the corroboration below satisfy it, and a regression that broke the
+        // durable half — the only half a CLI-shaped machine has — would stay green.
+        let roster: Vec<Account> = Vec::new();
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[("Sessiometer/u-1", b"one", "u-1")]).await;
+        let (_json_dir, json) = claude_json("u-A");
+        let cfg_dir = tempfile::tempdir().unwrap();
+        // The config path is WIRED but the file is ABSENT — exactly what the operator was left
+        // with on 2026-08-27, and what `Config::load_path` turns into `None` above.
+        let config_path = cfg_dir.path().join("config.toml");
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            FakeRosterPoller::new(),
+            store,
+            stash,
+            FakeClock::frozen(),
+            json.clone(),
+            &tun,
+        )
+        .with_config_path(config_path.clone())
+        .with_witness_sources(pinned_witness(cfg_dir.path(), true));
+
+        let (ack, event) = daemon
+            .perform_socket_capture(&CaptureCommand {
+                label: Some("work".to_owned()),
+            })
+            .await;
+
+        assert_eq!(
+            ack,
+            CaptureAck::Rejected {
+                reason: CaptureRejection::PriorConfiguration,
+            }
+        );
+        // The durable audit line carries the same machine reason. The socket path has no stderr,
+        // so this is the only DURABLE trace the refusal leaves — the ack itself is read once by the
+        // caller and gone.
+        assert_eq!(
+            event,
+            Some(Event::Capture {
+                account: Some("work".to_owned()),
+                outcome: CaptureEventOutcome::PriorConfiguration,
+            })
+        );
+        // ZERO writes, which is the acceptance criterion and not a nicety — a correct verdict
+        // reached after the stash had landed would refuse far too late.
+        assert!(
+            roster_uuids(&daemon).is_empty(),
+            "the refusal grew the roster"
+        );
+        assert!(
+            !config_path.exists(),
+            "the refusal created `config.toml`, so it was not a no-op"
+        );
+        assert_eq!(daemon.stash.len(), 1, "the refusal stashed a credential");
+        assert!(!daemon.stash.contains("Sessiometer/u-A"));
+        // Canonical-READ-ONLY holds through the refusal too.
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"A-token")));
+        assert_eq!(displayed_uuid(&json).as_deref(), Some("u-A"));
+    }
+
+    #[tokio::test]
+    async fn perform_socket_capture_refuses_an_absent_config_when_the_live_roster_survives() {
+        // PRD § 7 row 2, and the incident run at the second entry point with the durable witness
+        // GONE: `config.toml` is absent, the daemon is still holding the six accounts the file used
+        // to name, and nothing durable survives to say the machine was ever configured.
+        //
+        // That combination is reachable rather than academic. Both usage-store files are siblings of
+        // `config.toml` in one directory, so a single directory-scoped deletion takes all three, and
+        // a keychain that cannot be read degrades SILENTLY to "no witness" (measured — see
+        // `crate::witness::resolve_probe`). On that machine the durable witness answers `Absent` and
+        // only the live roster still knows better. Without the corroboration the gate admits here,
+        // `capture_locked` appends to a roster it read as empty, `save_to` writes ONE account over
+        // the six, and `reconcile_roster` collapses the live rotation to match — which is the
+        // 2026-08-27 incident, reproduced from the menu-bar button.
+        //
+        // Six accounts in, six accounts out, and a redacted refusal instead of a capture.
+        let roster: Vec<Account> = (1..=6)
+            .map(|n| account(&format!("u-{n}"), &format!("acct-{n}")))
+            .collect();
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[("Sessiometer/u-1", b"one", "u-1")]).await;
+        let (_json_dir, json) = claude_json("u-A");
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let config_path = cfg_dir.path().join("config.toml");
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            FakeRosterPoller::new(),
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        )
+        .with_config_path(config_path.clone())
+        // NO witness of any kind — the loss took every durable trace with it.
+        .with_witness_sources(pinned_witness(cfg_dir.path(), false));
+
+        let (ack, event) = daemon
+            .perform_socket_capture(&CaptureCommand { label: None })
+            .await;
+
+        assert_eq!(
+            ack,
+            CaptureAck::Rejected {
+                reason: CaptureRejection::PriorConfiguration,
+            }
+        );
+        assert_eq!(
+            event,
+            Some(Event::Capture {
+                account: None,
+                outcome: CaptureEventOutcome::PriorConfiguration,
+            })
+        );
+        // The AC in its own words: the daemon's roster is unchanged, and nothing was written.
+        assert_eq!(roster_uuids(&daemon).len(), 6, "the daemon's roster shrank");
+        assert!(
+            !config_path.exists(),
+            "the refusal wrote a collapsed roster"
+        );
+        assert_eq!(daemon.stash.len(), 1, "the refusal stashed a credential");
+        assert!(!daemon.stash.contains("Sessiometer/u-A"));
+    }
+
+    #[tokio::test]
+    async fn perform_socket_capture_still_onboards_a_genuine_first_run() {
+        // Issue #1441 AC and PRD § 7 row 3: the GUI first run is a real path and must not be the
+        // price of the fix. Same absent `config.toml` as above — the arm the guard sits on — but
+        // with NEITHER observation firing: no durable witness, and an EMPTY daemon roster, which is
+        // what a machine that has genuinely never been configured looks like. It lands a one-account
+        // roster exactly as the unguarded path did.
+        //
+        // Without this, both refusals above are satisfied by a gate that refuses unconditionally,
+        // and the menu-bar capture button would be dead on every fresh install. It is also what
+        // keeps the roster corroboration a CORROBORATION: an empty daemon says nothing, so the
+        // durable witness alone decides, and row 3 stays distinct from row 2.
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[]).await;
+        let (_json_dir, json) = claude_json("u-A");
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let config_path = cfg_dir.path().join("config.toml");
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            Vec::new(),
+            FakeRosterPoller::new(),
+            store,
+            stash,
+            FakeClock::frozen(),
+            json.clone(),
+            &tun,
+        )
+        .with_config_path(config_path.clone())
+        .with_witness_sources(pinned_witness(cfg_dir.path(), false));
+
+        let (ack, event) = daemon
+            .perform_socket_capture(&CaptureCommand {
+                label: Some("work".to_owned()),
+            })
+            .await;
+
+        assert_eq!(
+            ack,
+            CaptureAck::Captured {
+                label: "work".to_owned(),
+                count: 1,
+            }
+        );
+        assert_eq!(
+            event,
+            Some(Event::Capture {
+                account: Some("work".to_owned()),
+                outcome: CaptureEventOutcome::Captured,
+            })
+        );
+        // The roster was created and the live rotation reconciled to it.
+        assert_eq!(roster_uuids(&daemon), vec!["u-A"]);
+        let on_disk = Config::load_path(&config_path).unwrap();
+        assert_eq!(on_disk.roster.len(), 1);
+        assert_eq!(on_disk.roster[0].account_uuid, "u-A");
+        assert!(daemon.stash.contains("Sessiometer/u-A"));
+    }
+
+    #[tokio::test]
+    async fn perform_socket_capture_admits_a_present_config_whatever_the_witness_says() {
+        // The rule's `(true, _)` arm at this entry point: a PRESENT `config.toml` is the ordinary
+        // append and the witness has nothing to decide, so a configured machine — the arm that
+        // refuses above — must still capture normally. Without this the guard could be a blanket
+        // "refuse when a witness exists", which would break every capture on every machine that
+        // has ever been configured, i.e. all of them.
+        let roster = vec![account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[("Sessiometer/u-B", b"B-token", "u-B")]).await;
+        let (_json_dir, json) = claude_json("u-A");
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let config_path = cfg_dir.path().join("config.toml");
+        write_roster_config(&config_path, &[("u-B", "spare")]);
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            FakeRosterPoller::new(),
+            store,
+            stash,
+            FakeClock::frozen(),
+            json.clone(),
+            &tun,
+        )
+        .with_config_path(config_path.clone())
+        // A CONFIGURED machine — the same sources the refusal above uses.
+        .with_witness_sources(pinned_witness(cfg_dir.path(), true));
+
+        let (ack, _event) = daemon
+            .perform_socket_capture(&CaptureCommand {
+                label: Some("work".to_owned()),
+            })
+            .await;
+
+        assert_eq!(
+            ack,
+            CaptureAck::Captured {
+                label: "work".to_owned(),
+                count: 2,
+            }
+        );
+        assert_eq!(roster_uuids(&daemon), vec!["u-B", "u-A"]);
+    }
+
+    #[test]
+    fn the_daemon_run_path_wires_the_real_witness_sources() {
+        // The gate above is only as good as its seam, and the seam is an OPT-IN: `Daemon::new`
+        // leaves it `Unwired` and exactly one line in `run` overrides it. Nothing else notices if
+        // that line is dropped — every hermetic test pins its own sources, so the whole suite stays
+        // green while the shipped daemon refuses EVERY socket capture into an absent config.
+        //
+        // Note the direction of that regression: it fails CLOSED, so it costs a false refusal on a
+        // genuine GUI first run rather than the collapse. That is the safe way round, and still a
+        // real defect — the affordance is dead on a fresh install with no test able to say why.
+        // This is the daemon-side counterpart of `admit_append_only`'s own doc comment, which
+        // records the same one-call-short gap for the CLI verbs.
+        /// The wiring call, verbatim. Reformatting is free (`cargo fmt` owns the line breaks and
+        /// the search is over trimmed lines); changing the ARGUMENT is not, which is the point —
+        /// `WitnessSources::real()` is what makes the shipped daemon able to observe at all.
+        const WIRING_CALL: &str = ".with_witness_sources(crate::witness::WitnessSources::real()?)";
+
+        // A bare `source.contains(...)` is NOT enough here, and the reason is specific: commenting
+        // the call out leaves the substring intact, so the one regression this test names would
+        // ship under a green suite. The line must therefore be LIVE CODE on the builder chain —
+        // a chain link starts at `.` once trimmed, which a `//`-prefixed line never does.
+        //
+        // The sibling `both_append_only_verbs_consult_the_witness_before_they_can_write`
+        // (`src/capture.rs`) is the CLI-side shape of the same idea and goes further, pinning the
+        // gate's POSITION against five named first-effects. Position is not the property here:
+        // the daemon's builder links are order-independent, so presence on the live chain is the
+        // whole claim.
+        let cli = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli.rs"),
+        )
+        .expect("src/cli.rs is readable from the crate root");
+        let live_chain_links: Vec<&str> = cli
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with('.'))
+            .collect();
+        // Canary the extraction BEFORE the assertion it carries: a truncated read, or a refactor
+        // that stops writing the daemon as a builder chain, yields an EMPTY link set — which
+        // satisfies no `contains` and would report the regression as absent by having looked at
+        // nothing. `with_config_path` is a sibling link on the same chain.
+        assert!(
+            live_chain_links
+                .iter()
+                .any(|link| link.starts_with(".with_config_path(")),
+            "no live builder chain found in src/cli.rs; this scan has no subject"
+        );
+        assert!(
+            live_chain_links.contains(&WIRING_CALL),
+            "`run` no longer wires the real prior-configuration witness as LIVE code, so the \
+             shipped daemon carries the `Unwired` default and refuses every socket capture into \
+             an absent config — a dead capture button on every fresh install"
+        );
+    }
+
+    #[tokio::test]
+    async fn perform_socket_capture_fails_closed_with_no_witness_sources_wired() {
+        // The hermetic-test DEFAULT, asserted rather than left implicit. `Daemon::new` leaves the
+        // seam `Unwired`, which cannot observe — and "cannot tell" must never be spelled `Absent`,
+        // because only `Absent` permits the write.
+        //
+        // This is the same fail-closed shape as a `None` `config_path`, and it is what keeps a
+        // future daemon test from accidentally re-opening the fall-through: a test that wants a
+        // capture into an absent config to SUCCEED has to pin sources that say so, in writing.
+        //
+        // The daemon roster is EMPTY, so the corroboration cannot be what refuses — this is about
+        // the unwired seam and nothing else.
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[]).await;
+        let (_json_dir, json) = claude_json("u-A");
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let config_path = cfg_dir.path().join("config.toml");
+        let tun = tunables(95, 80, 0);
+        let mut daemon: FakeDaemon = Daemon::new(
+            Vec::new(),
+            FakeRosterPoller::new(),
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tun,
+        )
+        .with_config_path(config_path.clone());
+
+        let (ack, _event) = daemon
+            .perform_socket_capture(&CaptureCommand { label: None })
+            .await;
+
+        assert_eq!(
+            ack,
+            CaptureAck::Rejected {
+                reason: CaptureRejection::PriorConfiguration,
+            }
+        );
+        assert!(!config_path.exists());
+        assert_eq!(daemon.stash.len(), 0);
     }
 
     #[tokio::test]

@@ -840,6 +840,11 @@ pub(crate) enum CaptureEventOutcome {
     SwapLockBusy,
     /// The capture aborted for another reason (an I/O error, or the post-stash roster save failed).
     Failed,
+    /// `config.toml` was absent while durable local state said the machine HAS been configured, so
+    /// the append-only write was refused before it could collapse the roster (issue #1441, design
+    /// D-1). ZERO writes. The durable counterpart of the CLI verbs' stderr refusal — the socket
+    /// path has no terminal to print to, so the audit line is the only place this leaves a trace.
+    PriorConfiguration,
 }
 
 impl CaptureEventOutcome {
@@ -852,6 +857,7 @@ impl CaptureEventOutcome {
             CaptureEventOutcome::KeychainLocked => "keychain_locked",
             CaptureEventOutcome::SwapLockBusy => "swap_lock_busy",
             CaptureEventOutcome::Failed => "failed",
+            CaptureEventOutcome::PriorConfiguration => "prior_configuration",
         }
     }
 }

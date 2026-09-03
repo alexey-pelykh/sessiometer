@@ -58,6 +58,13 @@ enum StatusPanelFormat {
             case .keychainLocked:  return "Keychain is locked — unlock it, then try again."
             case .swapLockBusy:    return "The daemon is busy — try again in a moment."
             case .failed:          return "Capture failed — try again."
+            // #1441. Deliberately NOT "try again": this refusal is stable, so inviting a retry
+            // would send the operator around a loop that refuses identically every time. The one
+            // action that resolves it is restoring the file, so that is what it names. `config.toml`
+            // is a fixed filename, not a path or an account handle — the same class of token as
+            // `claude /login` above, and nothing that indexes the operator's roster.
+            case .priorConfiguration:
+                return "config.toml is missing but this Mac was set up before — restore it, then capture."
             }
         case .daemonError(let reason):
             // The same-user local peer should never be unauthorized; surface it plainly if it ever happens.

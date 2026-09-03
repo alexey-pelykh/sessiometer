@@ -32,13 +32,26 @@
 //!
 //! Scope: this module decides the rule and observes the usage-store half; the keychain half
 //! is [`crate::keychain::any_stash_item_present`], where the rest of this crate's `security`
-//! handling lives. WHERE the rule is applied is the caller's — today [`crate::capture`]'s
-//! `login` and `capture` verbs (issue #1440); the socket-borne `capture` entry point takes
-//! the same rule under issue #1441.
+//! handling lives. WHERE the rule is applied is the caller's — [`crate::capture`]'s `login`
+//! and `capture` verbs (issue #1440), and `perform_socket_capture`, the entry point the
+//! menu-bar capture button drives (issue #1441). All three reach [`admit`] — ONE rule with
+//! three entry points, not three rules — but by two ROUTES, and the difference is the
+//! INPUT, not the rule. The two verbs take [`admit_append_only`], the wrapper that observes
+//! and then admits, because `observe` is the only answer a CLI process has. The socket path
+//! calls [`admit`] directly with a witness it composes itself: it can observe the question
+//! twice, holding a live roster the verbs cannot see. Callers are named here in prose and
+//! never by path — the structural test below forbids the handful of tokens by which this
+//! module could actually REACH the daemon (its module path, the socket path helper, the
+//! stream type, the reload notifier; the test enumerates them). Naming a caller in prose
+//! stays legal, so the ban costs nothing here and still makes the regression impossible.
+//! Do not restate that list in this file: each entry is its own tripwire, and quoting one
+//! to explain it trips it — measured, three times.
 //!
-//! A reachable, populated daemon would corroborate a refusal but is never what establishes
-//! one, which is what keeps the rule correct with the daemon down. Corroboration is not
-//! implemented: nothing here reads the socket, by design.
+//! A reachable, populated daemon corroborates a refusal and never establishes one, which is
+//! what keeps the rule correct with the daemon down. Corroboration is implemented, and
+//! deliberately NOT here: it is composed at the socket call site, where the fallback to the
+//! durable witness is visible, rather than hidden inside the rule. Nothing in this module
+//! reads the socket, by design.
 
 use crate::error::{Error, Result};
 use crate::paths;
@@ -65,19 +78,39 @@ pub(crate) enum PriorConfiguration {
 /// Production wires the real machine ([`WitnessSources::real`]); a test pins a throwaway
 /// keychain and a temp-dir usage store, so the rule is asserted against real `security`
 /// behaviour without touching the operator's login keychain.
-pub(crate) struct WitnessSources {
-    /// The keychain file to enumerate for `Sessiometer/…` items.
-    keychain: PathBuf,
-    /// Files whose NON-EMPTINESS is the second witness. A list rather than two fields
-    /// because the rule is "any of these", and a list cannot grow a third source without
-    /// the loop already handling it.
-    usage_store: Vec<PathBuf>,
+///
+/// An enum rather than a struct because a caller whose seam is UNWIRED
+/// ([`Unwired`](WitnessSources::Unwired), issue #1441) is a real state of this type and not
+/// a degenerate pair of fields: there is no half-observable machine, and modelling one
+/// would let a future edit wire a keychain while leaving the usage store empty and call
+/// the result an observation.
+pub(crate) enum WitnessSources {
+    /// The two durable sources on a machine this process can read.
+    Observable {
+        /// The keychain file to enumerate for `Sessiometer/…` items.
+        keychain: PathBuf,
+        /// Files whose NON-EMPTINESS is the second witness. A list rather than two fields
+        /// because the rule is "any of these", and a list cannot grow a third source
+        /// without the loop already handling it.
+        usage_store: Vec<PathBuf>,
+    },
+    /// This caller has no wired sources and therefore cannot observe at all (issue #1441).
+    ///
+    /// The socket path's hermetic-test default, and the reason this variant is not
+    /// `#[cfg(test)]`: it is the initial value of a field in a non-test constructor, exactly
+    /// like that type's `None` `config_path` or `swap_lock_path`, and production overrides it
+    /// with [`real`](WitnessSources::real) via `with_witness_sources`.
+    ///
+    /// [`observe`](WitnessSources::observe) resolves it to
+    /// [`Present`](PriorConfiguration::Present) — see there for why *"cannot tell"* must
+    /// never be spelled [`Absent`](PriorConfiguration::Absent).
+    Unwired,
 }
 
 impl WitnessSources {
     /// The real machine: the login keychain plus both usage-store files.
     pub(crate) fn real() -> Result<Self> {
-        Ok(Self {
+        Ok(Self::Observable {
             keychain: paths::login_keychain()?,
             usage_store: vec![paths::usage_samples()?, paths::usage_rollup()?],
         })
@@ -86,7 +119,7 @@ impl WitnessSources {
     /// Sources pinned for a test — never the login keychain.
     #[cfg(test)]
     pub(crate) fn pinned(keychain: PathBuf, usage_store: Vec<PathBuf>) -> Self {
-        Self {
+        Self::Observable {
             keychain,
             usage_store,
         }
@@ -119,11 +152,24 @@ impl WitnessSources {
     /// A genuine first run does not meet this arm at all: on a fresh machine the probe
     /// SUCCEEDS and simply finds nothing. The diagnostic is what keeps a machine that
     /// *does* meet it from being told only that it was refused.
+    ///
+    /// [`Unwired`](WitnessSources::Unwired) resolves the same way and for the same reason:
+    /// a caller with no sources cannot tell either, and only `Absent` permits the write.
+    /// It differs from the probe error above in being silent — an unwired seam is a
+    /// construction fact the operator did not cause and cannot act on, so there is nothing
+    /// to tell them on stderr.
     pub(crate) async fn observe(&self) -> PriorConfiguration {
-        if self.usage_store.iter().any(|path| is_non_empty(path)) {
+        let Self::Observable {
+            keychain,
+            usage_store,
+        } = self
+        else {
+            return PriorConfiguration::Present;
+        };
+        if usage_store.iter().any(|path| is_non_empty(path)) {
             return PriorConfiguration::Present;
         }
-        resolve_probe(crate::keychain::any_stash_item_present(&self.keychain).await)
+        resolve_probe(crate::keychain::any_stash_item_present(keychain).await)
     }
 }
 
@@ -178,6 +224,16 @@ fn is_non_empty(path: &Path) -> bool {
 ///
 /// A malformed or unreadable file never reaches here — it is already a hard error at the
 /// load, and stays one.
+///
+/// STANDARD DEFECT, do not "fix" the code to match the table. Reading PRD § 7 row-by-row,
+/// row 3 (config absent, daemon running with an EMPTY roster) says *"allow — a genuine
+/// first run"* with no condition, and § 7a closes with *"Rows 2–9 are unchanged"*. The
+/// `(false, Present)` arm below refuses inside that row, which reads as a violation. It is
+/// not: design D-1's own heading scopes it to *"PRD § 7 rows 1–3"*, and § 7a's amendment
+/// table is precisely this row's discriminator — a machine that lost its config and then
+/// restarted its daemon lands in its refuse column. The table row and the rule that row
+/// cites (R-6) disagree, and only the standard's author can settle which wording was meant.
+/// Routed as issue #1475; the behaviour here is what the incident requires either way.
 pub(crate) fn admit(config_present: bool, witness: PriorConfiguration) -> Result<()> {
     match (config_present, witness) {
         // No file, yet the machine carries state only a configured machine produces.
@@ -205,6 +261,15 @@ pub(crate) fn admit(config_present: bool, witness: PriorConfiguration) -> Result
 /// replacing it with `Ok(())` would keep the whole suite green, so the guard would have no
 /// gate at all. Callers pass `&WitnessSources::real()?`; construction is pure path
 /// resolution and spawns nothing, so the present-config path stays free.
+///
+/// The daemon (issue #1441) reaches the same RULE — [`admit`] — but NOT through this
+/// function: it calls `admit` directly with a witness it composes itself, because it can
+/// observe the question twice (the durable witness, plus its own in-memory roster, which
+/// PRD § 7 row 2 requires and a CLI process cannot see). This wrapper is the CLI shape,
+/// where `observe` is the only available answer. One rule, two routes, two inputs.
+/// Both hold a [`WitnessSources`]; the daemon's hermetic-test default is
+/// [`WitnessSources::Unwired`], which needs no special case in either route because
+/// [`WitnessSources::observe`] already resolves it to [`PriorConfiguration::Present`].
 pub(crate) async fn admit_append_only(
     sources: &WitnessSources,
     config_present: bool,
@@ -368,14 +433,24 @@ mod tests {
         // has to fail when the witness and the writer drift apart, which a hard-coded path
         // could not detect.
         let sources = WitnessSources::real().expect("the real sources resolve on this machine");
+        // The variant is part of what is being asserted: `real` returning `Unwired` would
+        // resolve `Present` and refuse every capture on every machine, and a destructure
+        // that merely skipped the check would report that as an unrelated panic.
+        let WitnessSources::Observable {
+            keychain,
+            usage_store,
+        } = &sources
+        else {
+            panic!("`real` must yield observable sources — an unwired production seam can never see a witness");
+        };
         assert_eq!(
-            sources.keychain,
-            paths::login_keychain().unwrap(),
+            keychain,
+            &paths::login_keychain().unwrap(),
             "the witness reads a different keychain than `stash` writes to, so it cannot see a stash"
         );
         assert_eq!(
-            sources.usage_store,
-            vec![paths::usage_samples().unwrap(), paths::usage_rollup().unwrap()],
+            usage_store,
+            &vec![paths::usage_samples().unwrap(), paths::usage_rollup().unwrap()],
             "the witness watches different files than the usage store writes, so it cannot see a sample"
         );
     }
@@ -481,6 +556,36 @@ mod tests {
         std::fs::write(&samples, b"{\"ts\":0}\n").unwrap();
         let backstopped = WitnessSources::pinned(unreadable, vec![samples]);
         assert_eq!(backstopped.observe().await, PriorConfiguration::Present);
+    }
+
+    #[tokio::test]
+    async fn an_unwired_seam_cannot_observe_and_so_resolves_present() {
+        // Issue #1441: the daemon holds its sources as a field, and its hermetic-test
+        // default is unwired. That is a third way of not being able to tell, alongside the
+        // probe error above, and it takes the SAME fail-closed direction for the same
+        // reason — only `Absent` permits the write.
+        //
+        // Asserted at `observe` rather than only through the gate below, because `observe`
+        // is where the resolution lives: a future edit returning `Absent` here would hand
+        // the daemon a permissive default and reproduce the incident at the second entry
+        // point, while every gate-level test that wires real sources stayed green.
+        assert_eq!(
+            WitnessSources::Unwired.observe().await,
+            PriorConfiguration::Present
+        );
+        // …and the rule then refuses an absent config, which is the property that matters.
+        assert!(matches!(
+            admit_append_only(&WitnessSources::Unwired, false)
+                .await
+                .unwrap_err(),
+            Error::PriorConfigurationWithoutConfig
+        ));
+        // A PRESENT config is still admitted: `admit`'s `(true, _)` arm does not consult
+        // the witness at all, so an unwired seam never turns the ordinary path into a
+        // refusal. Without this the arm above would read as "unwired ⇒ always refuse".
+        assert!(admit_append_only(&WitnessSources::Unwired, true)
+            .await
+            .is_ok());
     }
 
     // --- the production entry point --------------------------------------------------

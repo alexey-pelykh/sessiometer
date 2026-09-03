@@ -475,7 +475,10 @@
   .cap-onb .cap-btn{ align-self:flex-start }
   .cap-note{ font-size:10.5px; color:var(--text-3); line-height:1.4; margin-top:2px; text-align:left }
   .cap-note code{ font-family:ui-monospace,"SF Mono",Menlo,Monaco,monospace; font-size:10px }
-  /* capture interaction-states reference card (pending / done / error — not a connection state) */
+  /* capture interaction-states reference card (pending / done / error / refused — not connection states).
+     `Refused` is its own row because a refusal is a deliberate verdict the operator can act on, not a
+     fault: #1441's prior-configuration guard, which the panel states in copy that names the fix and
+     never says "try again". */
   .cap-demo{ padding:13px 14px 16px; display:flex; flex-direction:column; gap:12px }
   .cap-demo-row{ display:flex; align-items:flex-start; gap:10px }
   .cap-demo-row .cds-k{ flex:0 0 56px; font-size:9.5px; font-weight:600; letter-spacing:.05em; text-transform:uppercase; color:var(--text-3); padding-top:1px }
@@ -2423,6 +2426,7 @@
               <div class="cap-demo-row"><span class="cds-k">Pending</span><span class="cap-status pending"><span class="spin"></span>Capturing&hellip;</span></div>
               <div class="cap-demo-row"><span class="cds-k">Done</span><span class="cap-status done">&#10003;&ensp;Captured &lsquo;Work&rsquo;</span></div>
               <div class="cap-demo-row"><span class="cds-k">Error</span><span class="cap-status error">&#9888;&ensp;No active account &mdash; run <code>claude /login</code>, then capture.</span></div>
+              <div class="cap-demo-row"><span class="cds-k">Refused</span><span class="cap-status error">&#9888;&ensp;<code>config.toml</code> is missing but this Mac was set up before &mdash; restore it, then capture.</span></div>
             </div>
           </div>
         </div>
@@ -2445,6 +2449,7 @@
               <div class="cap-demo-row"><span class="cds-k">Pending</span><span class="cap-status pending"><span class="spin"></span>Capturing&hellip;</span></div>
               <div class="cap-demo-row"><span class="cds-k">Done</span><span class="cap-status done">&#10003;&ensp;Captured &lsquo;Work&rsquo;</span></div>
               <div class="cap-demo-row"><span class="cds-k">Error</span><span class="cap-status error">&#9888;&ensp;No active account &mdash; run <code>claude /login</code>, then capture.</span></div>
+              <div class="cap-demo-row"><span class="cds-k">Refused</span><span class="cap-status error">&#9888;&ensp;<code>config.toml</code> is missing but this Mac was set up before &mdash; restore it, then capture.</span></div>
             </div>
           </div>
         </div>

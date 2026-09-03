@@ -47,6 +47,22 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'deny.toml'
+              # The Swift half of the capture rejection vocabulary (issue #1441). The `test` job
+              # asserts set EQUALITY between `CaptureRejection` in src/daemon/socket.rs and this
+              # enum, because the Swift decoder THROWS on a tag it does not model — so a divergence
+              # is a broken menu-bar capture button, not a degraded one. The assertion's subject is
+              # therefore two files under two different filters, and without this entry its trigger
+              # was one-directional: a SWIFT-only edit (rename a raw value, delete a case) skipped
+              # `test` entirely, `ci-ok` counted the skip as a pass, and the one check whose whole
+              # job was to notice never ran. Exactly the `swift`-filter defect of issue #1266 below,
+              # mirrored — recorded there as "reported green having never executed".
+              #
+              # The file, not `apps/menubar/**`: only this declaration is a subject of a Rust test,
+              # and widening it to the app would put every panel edit through test + msrv + deny.
+              # It is also read at test RUNTIME (`std::fs::read_to_string`), not `include_str!`, so
+              # the re-derivation command below cannot see it — which is why it is listed here by
+              # hand and why this comment says so.
+              - 'apps/menubar/Sources/CaptureAck.swift'
               # `include_str!` compile-time inputs; a fixture-only edit is still a Rust-affecting
               # change and must run the Rust jobs — for the render goldens especially, since a
               # golden-only PR is exactly the shape a silent re-baseline takes. Consumers, complete

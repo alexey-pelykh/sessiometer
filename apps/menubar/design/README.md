@@ -192,6 +192,30 @@ Light shown here:
   render two of three rows in one colour). The committed oracle now demonstrates the per-account cue
   across three visibly-distinct colours — violet / ochre / teal — not two; the hues are hash-derived
   and, like every colour here, needn't match the mock's illustrative ones
+- the mock **code-styles** the fixed tokens inside capture-error copy (`<code>claude /login</code>`,
+  and since #1441 `<code>config.toml</code>`) where the panel renders **one plain string**. Not new
+  with #1441 — the `claude /login` instance has been there since #360 and was simply never written
+  down; the refusal row inherits it rather than introducing it, and recording it now covers both.
+  *Why the panel does this*: `StatusPanelFormat.captureErrorText` is a pure `String` function and
+  every arm of it is pinned as a VALUE by `AccountCaptureTests`, measured against the card's width
+  budget at every Dynamic Type class by `PanelCaptureCardTests`, and re-read out of source by
+  `testEveryCaptureFailureIsEnumerated`. An inline code span would mean either markup inside the copy
+  (which every one of those three gates then measures, and the first one pins character-for-character)
+  or a view-side parser deciding which spans are code — trading a tested pure function for an
+  untested one. The mock's styling is doing a **design-reference** job the panel does not need to
+  copy: marking which words are literal so a reader does not read `config.toml` as prose. State
+  parity holds — same state, same treatment (`⚠` + the error token), same words
+- the mock's capture-states frames label the #1441 row **Refused** where the other error row is
+  labelled **Error**. That column is the mock's own scaffolding — it names the states for a reader
+  of the reference and has no counterpart in the panel, which renders the copy alone. The distinct
+  label is deliberate: a refusal is a verdict the daemon reached on purpose and the operator can act
+  on, not a fault, and the panel says the same thing in the copy itself: it names the one action that
+  resolves the refusal instead of inviting a retry, which is what
+  `testPriorConfigurationCopyNamesTheActionAndNotARetry` pins. That is a property of THIS arm and no
+  claim about the others — `.noActiveAccount` names a remedy too, `.keychainLocked` names one *and*
+  invites a retry, and the non-rejection arms simply state a condition. An earlier draft of this
+  entry asserted uniqueness twice, each time falsely; the property the test measures needs no
+  comparison to hold
 
 (Capture placement is now reconciled with the mock, not a difference: the **populated** panel carries
 no capture bar — capture is **empty-roster / first-run only**, and Add account lives off-panel in the
