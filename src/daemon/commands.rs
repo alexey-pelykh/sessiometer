@@ -3210,19 +3210,232 @@ mod tests {
 
     #[test]
     fn reconcile_roster_to_an_empty_roster_clears_active_and_state() {
-        // Reachable edge: removing the LAST account (a `remove` of the final entry)
-        // reconciles to an empty roster — the per-account runtime state empties and active drops
-        // to `None`. A degenerate-but-valid runtime state (the daemon then polls
-        // nothing); it must not panic on the length-zero reshape.
+        // Rewritten for issue #1442 (R-7). This test previously blessed the empty reconcile as a
+        // valid runtime state whatever asked for it — the codified form of the assumption that
+        // destroyed five accounts on 2026-08-27, and a gate that certifies the defect. An empty
+        // reconcile is valid, and it is valid ONLY under mutating intent.
+        //
+        // Both halves in ONE test on purpose. The legitimate case is `remove` of the LAST account:
+        // a real 1 -> 0 the daemon must accept, must not panic on, and must clear active and the
+        // per-account state for. The illegitimate case is the SAME reshape arriving from an
+        // append-only verb, where zero accounts cannot have come from the verb — `plan_capture`
+        // only updates-in-place or pushes — so it is a file that lost its roster, and the daemon
+        // keeps what it holds. Either assertion alone is satisfied by a floor that fires on
+        // neither, or on both.
+        let seed = || {
+            let mut daemon = reconcile_daemon(vec![account("u-A", "work")]);
+            daemon.state.active = Some(0);
+            daemon.state.accounts[0].last_reading = Some(reading(0.10, 0.10));
+            daemon
+        };
+
+        // Mutating: the `remove` of the final entry. Adopted, and the reshape is clean.
+        let mut removing = seed();
+        assert_adopted(removing.reconcile_roster(vec![], ReloadIntent::Mutating));
+        assert!(removing.roster.is_empty());
+        assert!(removing.state.accounts.is_empty());
+        assert_eq!(removing.state.active, None);
+
+        // Append-only: the same empty roster, refused. Nothing moves.
+        let mut appending = seed();
+        assert_eq!(
+            appending.reconcile_roster(vec![], ReloadIntent::AppendOnly),
+            ReconcileOutcome::RefusedShrink,
+            "an empty roster from an append-only verb is a file that lost its accounts"
+        );
+        assert_eq!(roster_uuids(&appending), vec!["u-A"]);
+        assert_eq!(appending.state.active, Some(0));
+        assert_eq!(
+            appending.state.accounts[0].last_reading,
+            Some(reading(0.10, 0.10)),
+            "a refusal is a TRUE no-op — the carried reading is untouched"
+        );
+    }
+
+    #[test]
+    fn the_incident_an_append_only_reload_narrowing_six_to_one_is_refused() {
+        // Issue #1442, the 2026-08-27 transition itself: a live SIX-account daemon, a `login`
+        // (append-only) reload presenting ONE account. Before the floor the daemon adopted it and
+        // five accounts left the live rotation. It is 6 -> 1 and not 6 -> 0 on purpose — that is
+        // what the incident was, and it is why the invariant is shrink-scoped rather than
+        // empty-scoped (see the sibling test directly below).
+        let mut daemon = reconcile_daemon(vec![
+            account("u-A", "work"),
+            account("u-B", "spare"),
+            account("u-C", "third"),
+            account("u-D", "fourth"),
+            account("u-E", "fifth"),
+            account("u-F", "sixth"),
+        ]);
+
+        assert_eq!(
+            daemon.reconcile_roster(vec![account("u-A", "work")], ReloadIntent::AppendOnly),
+            ReconcileOutcome::RefusedShrink,
+        );
+
+        assert_eq!(
+            roster_uuids(&daemon),
+            vec!["u-A", "u-B", "u-C", "u-D", "u-E", "u-F"],
+            "the daemon still holds all six — the reload was refused whole, not partially applied"
+        );
+    }
+
+    #[test]
+    fn an_empty_roster_floor_would_never_have_fired_on_the_incident() {
+        // The control, kept as an argument rather than as the mechanism. A floor that refused only
+        // an EMPTY roster passes the incident above by doing nothing — 1 is not 0 — and the daemon
+        // still loses five accounts. This test pins the zero case as ALSO refused under append-only
+        // intent, which the shrink-scoped rule gives for free, while the test above pins the case
+        // an empty-scoped rule would have missed. Reachable only if the file is emptied by
+        // something other than an append-only verb: `plan_capture` has update-in-place and push
+        // arms only, so an append-only verb cannot itself produce a zero-account file.
+        let mut daemon = reconcile_daemon(vec![
+            account("u-A", "work"),
+            account("u-B", "spare"),
+            account("u-C", "third"),
+            account("u-D", "fourth"),
+            account("u-E", "fifth"),
+            account("u-F", "sixth"),
+        ]);
+
+        assert_eq!(
+            daemon.reconcile_roster(vec![], ReloadIntent::AppendOnly),
+            ReconcileOutcome::RefusedShrink,
+        );
+        assert_eq!(roster_uuids(&daemon).len(), 6, "nothing left the rotation");
+    }
+
+    #[test]
+    fn a_widening_reload_is_untouched_so_issue_139_still_works() {
+        // Issue #139 is the reason `notify_daemon_roster_reload` exists at all: a running daemon
+        // picks up an on-disk roster ADDITION without a restart. A never-shrink floor that also
+        // narrowed this direction would break the fix it is built on (PRD R-18), and the failure
+        // would be silent — a captured account simply never joining the rotation.
+        //
+        // Asserted under APPEND-ONLY intent specifically: that is the intent `capture` and `login`
+        // send, so this is issue #139's own live path and not a variant of it.
         let mut daemon = reconcile_daemon(vec![account("u-A", "work")]);
-        daemon.state.active = Some(0);
-        daemon.state.accounts[0].last_reading = Some(reading(0.10, 0.10));
 
-        assert_adopted(daemon.reconcile_roster(vec![], ReloadIntent::Mutating));
+        assert_adopted(daemon.reconcile_roster(
+            vec![account("u-A", "work"), account("u-B", "onboarded")],
+            ReloadIntent::AppendOnly,
+        ));
 
-        assert!(daemon.roster.is_empty());
-        assert!(daemon.state.accounts.is_empty());
-        assert_eq!(daemon.state.active, None);
+        assert_eq!(
+            roster_uuids(&daemon),
+            vec!["u-A", "u-B"],
+            "the onboarded account joined the live rotation"
+        );
+    }
+
+    #[test]
+    fn an_equal_count_reload_is_adopted_because_a_relabel_is_not_a_shrink() {
+        // `<`, never `<=`. A relabelled or re-ordered roster of the same size carries no loss, and
+        // refusing it would strand a `config set` label edit outside the live rotation while
+        // reporting nothing. The distinction is one character and is the whole difference between
+        // a floor and a freeze.
+        let mut daemon = reconcile_daemon(vec![
+            account("u-A", "work"),
+            account("u-B", "spare"),
+            account("u-C", "third"),
+        ]);
+
+        assert_adopted(daemon.reconcile_roster(
+            vec![
+                account("u-C", "third"),
+                account("u-A", "work-renamed"),
+                account("u-B", "spare"),
+            ],
+            ReloadIntent::AppendOnly,
+        ));
+
+        assert_eq!(
+            roster_uuids(&daemon),
+            vec!["u-C", "u-A", "u-B"],
+            "the re-ordered, re-labelled roster of the same size was adopted"
+        );
+        assert_eq!(daemon.roster[1].label, "work-renamed");
+    }
+
+    #[test]
+    fn a_mutating_reload_may_shrink() {
+        // PRD R-4. `remove` is not a defect, and without intent the daemon could only refuse EVERY
+        // shrink — blocking this — or none, which is the pre-#1442 behaviour that lost the roster.
+        // The partition is what makes both directions correct at once.
+        let mut daemon = reconcile_daemon(vec![
+            account("u-A", "work"),
+            account("u-B", "spare"),
+            account("u-C", "third"),
+            account("u-D", "fourth"),
+            account("u-E", "fifth"),
+            account("u-F", "sixth"),
+        ]);
+
+        assert_adopted(daemon.reconcile_roster(
+            vec![
+                account("u-A", "work"),
+                account("u-B", "spare"),
+                account("u-C", "third"),
+                account("u-D", "fourth"),
+                account("u-E", "fifth"),
+            ],
+            ReloadIntent::Mutating,
+        ));
+
+        assert_eq!(roster_uuids(&daemon).len(), 5, "the removal was adopted");
+    }
+
+    #[test]
+    fn a_refused_shrink_leaves_every_carried_signal_exactly_as_it_was() {
+        // A refusal must be a TRUE no-op, not an early return part-way through the reshape. The
+        // reconcile writes five things — the roster, the per-account runtime vec, the active
+        // index, `last_good`, and the poll schedule — and a floor placed after any of them would
+        // leave the daemon in a state no reload produced, which is worse than the bug: the roster
+        // would survive while the state indexing it did not.
+        //
+        // Asserted on the WHOLE observable set rather than on the roster alone, because the roster
+        // is the one field an incorrectly-placed floor is most likely to get right.
+        let mut daemon = reconcile_daemon(vec![
+            account("u-A", "work"),
+            account("u-B", "spare"),
+            account("u-C", "third"),
+        ]);
+        daemon.state.active = Some(1);
+        daemon.state.accounts[0].last_reading = Some(reading(0.11, 0.22));
+        daemon.state.accounts[0].health.quarantined = true;
+        daemon.state.accounts[2].health.recovery_successes = 2;
+        daemon.state.poll_schedule = vec![2, 0, 1];
+        daemon.state.poll_pos = 2;
+
+        // Compared through `fingerprint`, the module's EXHAUSTIVE per-signal projection: it
+        // destructures `AccountRuntime` field by field, so a tenth signal added later is covered
+        // here for free rather than silently escaping this assertion.
+        let before: Vec<_> = daemon.state.accounts.iter().map(fingerprint).collect();
+
+        assert_eq!(
+            daemon.reconcile_roster(vec![account("u-A", "work")], ReloadIntent::AppendOnly),
+            ReconcileOutcome::RefusedShrink,
+        );
+
+        assert_eq!(roster_uuids(&daemon), vec!["u-A", "u-B", "u-C"]);
+        assert_eq!(
+            daemon
+                .state
+                .accounts
+                .iter()
+                .map(fingerprint)
+                .collect::<Vec<_>>(),
+            before,
+            "no per-account signal moved"
+        );
+        assert_eq!(daemon.state.active, Some(1), "active was not re-resolved");
+        assert_eq!(
+            daemon.state.poll_schedule,
+            vec![2, 0, 1],
+            "the schedule was not invalidated — its indices are still valid, because the roster \
+             they index did not change"
+        );
+        assert_eq!(daemon.state.poll_pos, 2, "and neither was its cursor");
     }
 
     /// Every per-account signal on [`AccountRuntime`], projected into one comparable tuple.
