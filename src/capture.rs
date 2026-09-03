@@ -89,9 +89,10 @@ pub(crate) struct CaptureReport {
 /// The canonical read (identity + token) and the stash write run under the single-writer
 /// swap lock via [`capture_locked`], so a concurrent daemon swap cannot land between the two
 /// reads and pair one account's identity with another's token — the mis-keyed-roster race the
-/// module docs name (#357). The roster (`config.toml`) save stays OUTSIDE the lock — a swap
+/// module docs name (#357). The roster (`config.toml`) save stays OUTSIDE the swap lock — a swap
 /// never contends on `config.toml` — preserving stash-before-roster, exactly like
-/// [`reconcile_login`].
+/// [`reconcile_login`]; it takes the dedicated config-write lock instead (issue #1445), which
+/// serializes it against the OTHER config writers the swap lock was never about.
 pub(crate) async fn capture(label: Option<String>) -> Result<()> {
     let existing = load_existing()?;
 
@@ -222,6 +223,8 @@ fn prompt_label_default(
 /// with the lock released: a swap contends only on the keychain + `~/.claude.json`, never on
 /// `config.toml`, and stash-before-roster means a crash after the locked stash but before the
 /// save leaves an inert orphan stash, never a roster row referencing an unstashed account.
+/// That save carries its own config-write lock (issue #1445) — see [`reconcile_login`] for why
+/// outside the SWAP lock does not mean unlocked, and why the two are never nested.
 /// Generic over both keychain seams and taking the identity path as an argument, so the
 /// daemon-routed `cmd:capture` command (#359) can reuse this exact primitive with its own seams.
 pub(crate) async fn capture_locked<C, S>(
@@ -919,11 +922,21 @@ fn should_signal_restored(activate: bool, outcome: LoginOutcome) -> bool {
 /// the swap lock around the short write (serializing against a concurrent daemon swap),
 /// then persists the roster. Wired into production by the [`login`] verb (#135).
 ///
-/// The roster (`config.toml`) write is deliberately OUTSIDE the lock: a swap contends
-/// only on the keychain + `~/.claude.json`, never on `config.toml`, so no concurrent
-/// swap can race it. Stash-before-roster (like [`capture`]): a crash after the locked
-/// write but before the save leaves a fresh, restorable stash + canonical, never a
+/// The roster (`config.toml`) write is deliberately OUTSIDE the swap lock, and still is: a
+/// swap contends only on the keychain + `~/.claude.json`, never on `config.toml`, so no
+/// concurrent swap can race it. Stash-before-roster (like [`capture`]): a crash after the
+/// locked write but before the save leaves a fresh, restorable stash + canonical, never a
 /// roster referencing an unstashed account.
+///
+/// OUTSIDE the swap lock is not the same as unlocked, and since issue #1445 it no longer
+/// implies it. The sentence above answers only "can a concurrent SWAP race this save", and the
+/// answer is still no; the pair it never addressed is two CONFIG writers racing each other —
+/// this save against another CLI invocation or the daemon's `config set`. That pair is served
+/// by a dedicated lock of its own, taken inside [`Config::save`] over the whole
+/// read-modify-write ([`crate::config`]'s `write_lock`, design D-8). The two locks are never
+/// nested: `run_login_locked` has returned and released the swap lock before the save below is
+/// reached, which is what keeps a CLI writer and a daemon holding `swap.lock` from deadlocking,
+/// and is pinned by `the_roster_save_is_reached_only_after_the_swap_lock_has_been_released`.
 ///
 /// `existing` is the config the CALLER parsed, passed in rather than re-read here (issue
 /// #1440, R-5). It used to call [`load_existing`] itself, which meant the roster this
@@ -2040,6 +2053,114 @@ mod tests {
             assert!(
                 report.config.roster.iter().any(|a| a.account_uuid == uuid),
                 "the reconcile dropped {uuid} from the roster it was handed"
+            );
+        }
+    }
+
+    /// AC-4 (issue #1445): a crash between the locked keychain write and the roster save leaves a
+    /// fresh, RESTORABLE stash — the stash-before-roster ordering the config-write lock must not
+    /// have disturbed.
+    ///
+    /// The failure is injected through the new lock rather than through a contrived I/O fault,
+    /// because that is the failure mode this change ADDS: another config writer holding the lock
+    /// makes the save return `ConfigWriteLockBusy`. So this asserts both halves at once — the new
+    /// refusal path behaves like every other save failure, and the ordering invariant survives it.
+    ///
+    /// What "restorable" means concretely: the account's credential is in the stash under its own
+    /// key, so a re-run reaches the same roster row rather than a row pointing at nothing. The
+    /// inverse — a roster written before the stash — would leave a row referencing an unstashed
+    /// account, which is the state the ordering exists to make unreachable.
+    #[tokio::test]
+    async fn a_failed_roster_save_still_leaves_the_stash_restorable() {
+        let store = FakeCredentialStore::empty();
+        store
+            .write(&Credential::new(b"fresh-token".to_vec()))
+            .await
+            .unwrap();
+        let stash = FakeAccountStash::empty();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        let claude_json = dir.path().join("claude.json");
+        std::fs::write(
+            &claude_json,
+            br#"{"numStartups":1,"oauthAccount":{"accountUuid":"u-new","emailAddress":"n@example.com"}}"#,
+        )
+        .unwrap();
+
+        // The keychain half runs first and completes — exactly as it does in production, where
+        // `capture_locked` returns with the swap lock released and the save is still ahead.
+        let report = capture_locked(None, &store, &stash, &claude_json, None, Some("newcomer"))
+            .await
+            .expect("the locked keychain half completes");
+
+        // Now the crash-equivalent: the save cannot land. Another config writer holds the lock
+        // for longer than the save is willing to wait.
+        let held = crate::config::acquire_config_write_lock_for_test(
+            &config_path,
+            std::time::Duration::from_millis(50),
+        )
+        .await
+        .expect("the stand-in config writer takes the lock");
+        let saved = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            report.config.save_to(&config_path),
+        )
+        .await;
+        assert!(
+            saved.is_err(),
+            "the roster save must not have landed — this test's whole premise is that it did not"
+        );
+        drop(held);
+
+        // The roster never landed…
+        assert!(
+            !config_path.exists(),
+            "no roster was written, so nothing references the account yet"
+        );
+        // …and the stash did, which is the ordering: an inert ORPHAN stash, never a roster row
+        // pointing at an account that was never stashed.
+        assert_eq!(
+            stash
+                .read("Sessiometer/u-new")
+                .await
+                .expect("the stash landed before the roster and survives the failed save")
+                .credential
+                .expose(),
+            b"fresh-token",
+            "the stashed credential is intact, so the capture is restorable by re-running"
+        );
+    }
+
+    /// AC-5's structural half, and the reason the two locks cannot deadlock against each other:
+    /// the roster save is REACHED only after the swap-locked section has returned and released.
+    ///
+    /// A bounded wait alone would degrade a lock-order inversion into two mutual timeouts rather
+    /// than a hang — survivable, but a spurious failure on every contended write. Not nesting them
+    /// is what makes the guarantee structural. This reads the shipped source because the property
+    /// is about the ORDER of two calls in a function body, which no runtime assertion in a
+    /// single-threaded test can observe.
+    #[test]
+    fn the_roster_save_is_reached_only_after_the_swap_lock_has_been_released() {
+        let source = capture_source_above_the_tests();
+        for (verb, locked_call) in [
+            ("pub(crate) async fn capture", "capture_locked("),
+            ("pub(crate) async fn reconcile_login", "run_login_locked("),
+        ] {
+            let body = fn_body(&source, verb);
+            let locked = body.find(locked_call).unwrap_or_else(|| {
+                panic!(
+                    "`{verb}` no longer calls `{locked_call}` — this gate's anchor has gone stale"
+                )
+            });
+            let save = body.find("config.save()").unwrap_or_else(|| {
+                panic!("`{verb}` no longer saves the roster — this gate's anchor has gone stale")
+            });
+            assert!(
+                locked < save,
+                "`{verb}` saves the roster BEFORE `{locked_call}` returns, so the config-write \
+                 lock would be taken inside the swap lock — a lock-order inversion against a \
+                 daemon that takes them the other way round, and a reordering of \
+                 stash-before-roster besides"
             );
         }
     }
