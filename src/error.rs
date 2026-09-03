@@ -284,17 +284,72 @@ pub(crate) enum Error {
     PriorConfigurationWithoutConfig,
 
     /// No accounts in the roster to act on. The friendly, user-facing empty state
-    /// for two consumers: the offline `list` view (an absent config, OR a
-    /// well-formed tunables-only file whose roster is empty) and the daemon's
-    /// [`crate::config::Config::require_roster`] precondition (`run` refuses to
-    /// start with nothing to rotate across). Both read as "nothing captured yet"
-    /// instead of leaking a lower-level "file missing" or "invalid config". An
-    /// empty roster is a legitimate state — `capture` loads it to add the first
-    /// account (#58) — so it is NOT a validation error. A *malformed* config is
-    /// deliberately not remapped: it keeps surfacing as its real
-    /// [`Error::ConfigParse`] / [`Error::ConfigInvalid`]. Secret-free.
-    #[error("no accounts captured yet — run `sessiometer capture`")]
+    /// for FOUR verbs, by two routes: the offline `list` view remaps it (an absent
+    /// config, OR a well-formed tunables-only file whose roster is empty), and
+    /// [`crate::config::Config::require_roster`] raises it as a precondition for
+    /// `run` (`src/cli.rs`, refusing to start with nothing to rotate across),
+    /// `poke` (`src/poke.rs`) and `use` (`src/use_account.rs`). Enumerated rather
+    /// than summarised because this list is the record of which surfaces the
+    /// wording below was judged against, and it undercounted at two for as long as
+    /// `poke` and `use` had been raising it. All four read as an observation of
+    /// what the roster holds NOW, instead of leaking a lower-level "file missing" or
+    /// "invalid config". An empty roster is a legitimate state — `capture` loads
+    /// it to add the first account (#58) — so it is NOT a validation error. A
+    /// *malformed* config is deliberately not remapped: it keeps surfacing as its
+    /// real [`Error::ConfigParse`] / [`Error::ConfigInvalid`]. Secret-free.
+    ///
+    /// # Why it claims nothing about the past, and names no write verb (issue #1444)
+    ///
+    /// This read *"no accounts captured yet — run `sessiometer capture`"* until issue #1444,
+    /// and both halves are the absent-config-means-first-run assumption in copy — wrong
+    /// exactly when the message matters most.
+    ///
+    /// The first half asserts a HISTORY this variant cannot observe. It is constructed from a
+    /// count and nothing else, so "yet" is an inference, and after a loss it is the wrong one:
+    /// an operator whose roster disappeared was told they had never captured anything.
+    ///
+    /// The second half names a WRITE verb. On an absent or emptied config `capture` publishes
+    /// a one-account roster — the transition that displaced five accounts on 2026-08-27 — so
+    /// the message directed a bereaved operator at the one command that would finish the job.
+    /// `config path` is read-only, and it is the same useful next step for a genuine first run
+    /// as for a loss: it names the file to look at either way.
+    ///
+    /// The clause is imperative, like every sibling remedy in this file, and conditional
+    /// (`would be read`) rather than existential. `list` reaches this variant from an ABSENT
+    /// config too — `resolve_roster` remaps `ConfigNotFound` onto it — so a clause asserting a
+    /// file the roster "is read from" would be false on the one path a genuine first-run
+    /// operator actually sees. Naming the file that WOULD be read is true whether or not one
+    /// is there, and it drops a pronoun whose nearest antecedent was the command, not the
+    /// roster.
+    #[error(
+        "the roster holds no accounts — run `sessiometer config path` to see which config file \
+         would be read"
+    )]
     RosterEmpty,
+
+    /// `config validate` loaded and validated `config.toml` with no complaint, and the roster
+    /// it carries is EMPTY. Carries the path (a filesystem location, never a secret) so the
+    /// verdict names the file it judged.
+    ///
+    /// # Why this is its own variant and its own exit code (issue #1444)
+    ///
+    /// `validate`'s one word was doing two jobs — *parses* and *is in a usable state* — and
+    /// only the first was ever checked, so a roster that had just lost five accounts rendered
+    /// as `is valid (1 account)` at exit `0`, with the count right there in the string and the
+    /// verdict ignoring it.
+    ///
+    /// Collapsing the empty case into [`Error::ConfigParse`] / [`Error::ConfigInvalid`] would
+    /// trade one conflation for another. A pre-flight check needs "the file is broken" told
+    /// apart from "the file is fine and there is nothing in it": only the second can be true
+    /// of a file the daemon would load without complaint, and the two call for opposite next
+    /// moves. So this exits `8` ([`Error::exit_code`]) where a parse or validation failure
+    /// exits `1`.
+    ///
+    /// Deliberately NOT [`Error::RosterEmpty`], which is `list`'s and `run`'s empty state:
+    /// that variant carries no path, and sharing it would have moved those two verbs' exit
+    /// code as well — a behaviour change neither verb asked for.
+    #[error("{path} parses, but its roster holds no accounts")]
+    ConfigRosterEmpty { path: PathBuf },
 
     /// `config.toml` is not valid TOML, or a field has the wrong type. The
     /// wrapped message comes from the TOML parser; it is secret-free because the
@@ -1114,9 +1169,14 @@ impl Error {
     /// a locked keychain (`4`, the always-enforced abort), an unresolvable (`5`)
     /// or ambiguous (`6`) target, and a gate refusal (`7` — the pre-swap gate
     /// refusing a NAMED target without `--force`, or, since issue #960, `use
-    /// --next` finding the whole fleet gated). Every other error is a generic
-    /// failure (`1`). The mapping lives here so the `main` exit-code branch stays a
-    /// thin lookup.
+    /// --next` finding the whole fleet gated). Issue #1444 extends it once more, at
+    /// the other end: `config validate` finding a file that parses and carries no
+    /// accounts exits `8`, which is the whole point of that variant — a pre-flight
+    /// check cannot act on "broken" and "empty" through one code. Every error with
+    /// no arm below is a generic failure (`1`). The mapping lives here so the `main`
+    /// exit-code branch stays a thin lookup, and this list is the only place the set
+    /// is written down — `main` deliberately stopped restating it after saying
+    /// "every other error exits `1`" through four codes that were not `1`.
     pub(crate) fn exit_code(&self) -> u8 {
         match self {
             Error::AlreadyRunning => 3,
@@ -1141,6 +1201,14 @@ impl Error {
             | Error::UseCooldownActive
             | Error::UseTargetQuarantined { .. }
             | Error::UseNextNoViableTarget { .. } => 7,
+            // `config validate` parsed and validated the file, and its roster is empty
+            // (issue #1444). Its own code because the alternative is the conflation the
+            // issue was opened about: a pre-flight check that cannot tell "the file is
+            // broken" (`1`) from "the file is fine and holds nothing" has to re-read the
+            // text to know which happened, and the two call for opposite next moves.
+            // `8` extends the block above rather than taking `2`, which carries a strong
+            // enough convention as "usage error" elsewhere to mislead a script author.
+            Error::ConfigRosterEmpty { .. } => 8,
             _ => 1,
         }
     }
@@ -1270,6 +1338,104 @@ pub(crate) mod tests {
         assert_eq!(
             Error::UsageStoreBusy.exit_code(),
             Error::SwapLockBusy.exit_code(),
+        );
+    }
+
+    #[test]
+    fn a_parses_but_empty_roster_does_not_share_a_parse_failure_s_exit_code() {
+        // Issue #1444: `config validate` used to answer one question (`does it parse?`) with a
+        // word that reads as two (`is it usable?`), so an emptied roster rendered as
+        // `is valid (1 account)` at exit `0`. The remedy has to keep THREE outcomes apart, and
+        // the exit code is the half a script reads:
+        //
+        //   0  parses, and carries accounts
+        //   8  parses, and carries none
+        //   1  does not parse / does not validate
+        //
+        // Collapsing the middle into either neighbour is what this asserts against. Folding it
+        // into `0` restores the original defect; folding it into `1` tells a pre-flight check
+        // the file is broken when the daemon would load it without complaint.
+        let empty = Error::ConfigRosterEmpty {
+            path: PathBuf::from("/home/op/.config/sessiometer/config.toml"),
+        };
+        // ONE literal pin, on the arm this issue added. Pinning the failures' `1` as well
+        // would make the comparisons below theorems — both operands fixed by a literal on
+        // the line above, so no reachable state could report — and a comparison that cannot
+        // fail is indistinguishable from one nobody wrote. Left unpinned, each `assert_ne!`
+        // carries the property the acceptance criterion actually names: it fires if a future
+        // arm maps a parse or validation failure onto `8`, which is the collapse in the
+        // direction no other assertion here can see.
+        assert_eq!(empty.exit_code(), 8, "the parses-but-empty verdict");
+        for failure in [
+            Error::ConfigParse("expected `=` at line 3".to_owned()),
+            Error::ConfigInvalid("session_ceiling must be in 50..=99, got 120".to_owned()),
+        ] {
+            assert_ne!(
+                empty.exit_code(),
+                failure.exit_code(),
+                "parses-but-empty and {failure:?} must stay distinguishable by exit code alone"
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_empty_roster_messages_observe_the_present_and_name_no_write_verb() {
+        // Issue #1444, both halves of R-13's shape. Each message may state WHAT IS — a count —
+        // and may not state WHY, because neither variant is constructed from anything that
+        // could know. `yet` and `captured` are the retired copy's claim about a past this
+        // process never saw; `capture` is the write verb that, on an absent or emptied config,
+        // publishes a one-account roster over whatever survived.
+        //
+        // The path-bearing variant is checked through a rendered value rather than the
+        // template, so an interpolation that silently dropped the path would be visible here.
+        let list_and_run = Error::RosterEmpty.to_string();
+        let validate = Error::ConfigRosterEmpty {
+            path: PathBuf::from("/home/op/.config/sessiometer/config.toml"),
+        }
+        .to_string();
+
+        for message in [&list_and_run, &validate] {
+            assert!(
+                message.contains("no accounts"),
+                "states the observed count: {message}"
+            );
+            for claim in ["yet", "captured", "capture", "first run"] {
+                assert!(
+                    !message.contains(claim),
+                    "{message:?} must not spend {claim:?} — it asserts a past this variant \
+                     cannot observe, or names a verb that would overwrite surviving state"
+                );
+            }
+            // An operator cannot resolve an issue, ADR or design-doc reference from a terminal.
+            for internal in ['#', '§'] {
+                assert!(
+                    !message.contains(internal),
+                    "{message:?} carries an internal cross-reference ({internal})"
+                );
+            }
+        }
+
+        // `list` / `run` point at a READ-ONLY verb; the validate verdict names the file itself,
+        // so it needs no pointer.
+        assert!(
+            list_and_run.contains("run `sessiometer config path`"),
+            "names the read-only next step, imperatively: {list_and_run}"
+        );
+        // `list` reaches this variant from an ABSENT config too, so the clause must stay
+        // conditional: a message asserting a file the roster IS read from would be false on
+        // the one path a genuine first-run operator sees.
+        assert!(
+            list_and_run.contains("would be read") && !list_and_run.contains("is read from"),
+            "the clause names the file that WOULD be read, asserting no file exists: \
+             {list_and_run}"
+        );
+        assert!(
+            validate.starts_with("/home/op/.config/sessiometer/config.toml "),
+            "the verdict names the file it judged: {validate}"
+        );
+        assert!(
+            validate.contains("parses"),
+            "the verdict says outright that the file parsed: {validate}"
         );
     }
 
@@ -2136,7 +2302,7 @@ pub(crate) mod tests {
         // message below can say which one this is rather than leaving the reader to guess.
         assert_eq!(
             prose.len(),
-            89,
+            90,
             "the `#[error(...)]` count moved, and a variant having been ADDED OR REMOVED is the \
              EXPECTED cause: `error_prose_of`'s self-consistency check ran first and found that \
              every `#[error(` in the source started an attribute it parsed, which rules out the \

@@ -1137,6 +1137,33 @@ daemon applies at load. It reports the documented error classes and exits non-ze
 of them, so it drops into a pre-flight check: a typo'd/unknown key (e.g. `poll_secss`), an
 out-of-range value (`poll_secs must be in 5..=3600`), or `target_max_session_usage > session_ceiling`.
 
+A file that parses cleanly but carries **no accounts** is none of those, and it is **not**
+reported as a pass. `validate` answers two questions — *does it parse?* and *is there
+anything in it?* — and keeps them apart in the **exit code**, so a script never has to
+re-read the text to know which happened:
+
+| Exit | What it means |
+|---|---|
+| `0` | parses, and carries accounts |
+| `8` | parses, and carries none |
+| `1` | could not be read as a valid config at all — absent, malformed, or out of range |
+
+```console
+$ sessiometer config validate; echo "exit $?"
+sessiometer: /Users/you/Library/Application Support/sessiometer/config.toml parses, but its roster holds no accounts
+exit 8
+```
+
+Only `8` is new. `1` keeps everything it already covered, and that is wider than a syntax
+error: an **absent** `config.toml` lands there too, since a file that is not there cannot be
+read as a valid one either. What `8` buys is that a script no longer has to re-read the text
+to tell a file it cannot use from a file it can use but that holds nothing.
+
+An empty roster is a legitimate state on a fresh install, so this is not a claim that
+anything went wrong — only that `validate` will not call it usable. The verbs that need a
+roster — `list`, `run`, `use` and `poke` — report the same emptiness in their own words, and
+their exit codes are unchanged.
+
 A **valid** file may still print a non-fatal **advisory** (it does not change the exit code):
 if `target_max_session_usage` sits above the *peak-velocity runway bound* — the highest reserve
 that still leaves a swapped-to account runway when it is climbing at the assumed peak session

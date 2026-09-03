@@ -1803,8 +1803,8 @@ mod tests {
     #[test]
     fn require_roster_rejects_an_empty_roster_with_the_friendly_empty_state() {
         // The daemon's precondition (#58): an empty roster is the friendly
-        // `RosterEmpty` ("nothing captured yet"), the same state the offline `list`
-        // reports — not a raw parse/validation error.
+        // `RosterEmpty` — an observation of what the roster holds now (#1444) — the
+        // same state the offline `list` reports, not a raw parse/validation error.
         let config = Config::parse("[tunables]\npoll_secs = 60\n").unwrap();
         assert!(matches!(config.require_roster(), Err(Error::RosterEmpty)));
     }
