@@ -82,8 +82,11 @@ async fn main() -> ExitCode {
         Err(err) => {
             // `Error` never carries secret material, so this is safe to print.
             eprintln!("sessiometer: {err}");
-            // A held single-instance lock exits `3`; every other error exits `1`
-            // (issue #7, via `Error::exit_code`).
+            // `Error::exit_code` owns the mapping and is the only authority on it: a
+            // held single-instance lock exits `3` (issue #7), and the codes above it
+            // have accrued one per verdict a script has to tell apart. Restating the
+            // set here would be a second copy that drifts — this comment said "every
+            // other error exits `1`" through four codes that were not `1`.
             ExitCode::from(err.exit_code())
         }
     }
