@@ -509,14 +509,29 @@ where
         // file (the SAME core the #139 roster-reload drives), so `status` reflects the new label
         // within the poll cadence. A TUNABLE change is reload-by-restart (no hot-reload primitive).
         //
-        // `config set` is a MUTATING verb by R-4's own enumeration, so it declares that intent and
-        // the issue-#1442 floor does not apply here. Nothing is given away by that: `apply_settings`
-        // overlays label edits onto the roster it parsed out of this very file and can neither add
-        // nor drop a row, so the count it hands over always equals the count on disk — this call
-        // site cannot shrink through its own action at all. It reaches the shared enforcement point
-        // by passing an intent, which is what D-4 asks of a caller; it is not exempt from it.
+        // APPEND-ONLY (issue #1442), and this is the one call site where the classification is a
+        // judgement rather than a transcription, so the reasoning is here rather than cited.
+        //
+        // R-4 enumerates `config set` among the MUTATING verbs. That enumeration governs a
+        // ROSTER-RELOAD's declared intent — which verb wrote the file the daemon is being told to
+        // re-read — and this call site is not a reload: no notification is involved, and the CLI
+        // `config set` verb sends none. What R-4's mutating class licenses is a shrink the OPERATOR
+        // ASKED FOR, and a label edit never asks for one: `apply_settings` overlays the edits onto
+        // the roster it parsed out of this very file and can neither add nor drop a row.
+        //
+        // So the count handed over always equals the count ON DISK — which is exactly the number
+        // that can be lower than the LIVE roster, and the two claims are not the same. Declaring
+        // `Mutating` here would adopt a diverged file's shrunken roster on an unrelated label edit,
+        // reproducing the 2026-08-27 collapse through a verb that changed no membership at all —
+        // and this issue's own floor is what makes that state persist, since refusing the reload
+        // leaves memory holding more accounts than disk until something reconciles them (#1443).
+        // Under `AppendOnly` the same edit is refused instead: the label change still lands on
+        // disk, and the live rotation keeps its accounts.
+        //
+        // Nothing legitimate is given up. A label edit cannot change the count, so the floor is
+        // unreachable on every path where the file and the live roster agree.
         if change.labels_changed {
-            let _reconcile = self.reconcile_roster(config.roster, ReloadIntent::Mutating);
+            let _reconcile = self.reconcile_roster(config.roster, ReloadIntent::AppendOnly);
         }
         // A tunable change is the operative action even if a label also changed (both persisted).
         let effect = if change.tunables_changed {
@@ -2652,6 +2667,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_label_edit_cannot_narrow_the_live_roster_onto_a_diverged_file() {
+        // Issue #1442. `perform_config_set` is the one `reconcile_roster` call site whose intent is
+        // a judgement rather than a transcription of R-4's verb list, and this is the scenario that
+        // decides it — reachable only BECAUSE this issue's floor exists, which is why it needs its
+        // own test rather than riding on the reload cases.
+        //
+        // The sequence: the file diverges to one account while the daemon holds three. A `login`
+        // reload is now refused, so the daemon KEEPS its three and the divergence PERSISTS (the
+        // daemon never writes `config.toml`; reconciling the two is issue #1443). The operator then
+        // does something entirely unrelated — renames a label in the Settings panel. The panel
+        // reads the FILE, so the rename targets a surviving account and succeeds.
+        //
+        // Under `Mutating` that edit would adopt the file's one-account roster and collapse the
+        // live rotation 3 -> 1: the 2026-08-27 loss, through a verb that changed no membership,
+        // with no roster-reload line and no event of any kind (a config edit emits none in v1). The
+        // floor is what prevents it.
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let config_path = cfg_dir.path().join("config.toml");
+        write_roster_config(&config_path, &[("u-A", "work")]);
+        let mut daemon: FakeDaemon = reconcile_daemon(vec![
+            account("u-A", "work"),
+            account("u-B", "spare"),
+            account("u-C", "third"),
+        ])
+        .with_config_path(config_path.clone());
+        daemon.state.accounts[2].health.quarantined = true;
+
+        let ack = daemon
+            .perform_config_set(&ConfigSetCommand {
+                tunables: SetTunables::default(),
+                labels: BTreeMap::from([("u-A".to_owned(), "day-job".to_owned())]),
+            })
+            .await;
+
+        // The edit itself still succeeds and still lands on disk — the floor governs what the
+        // daemon ADOPTS, and refusing the operator's label change would be a different bug.
+        assert_eq!(
+            ack,
+            ConfigSetAck::Applied {
+                effect: ConfigSetEffect::Live,
+            }
+        );
+        let on_disk = Config::load_path(&config_path).unwrap();
+        assert_eq!(on_disk.roster[0].label, "day-job", "the rename persisted");
+
+        // And the live rotation kept all three accounts, with their carried state.
+        assert_eq!(
+            roster_uuids(&daemon),
+            vec!["u-A", "u-B", "u-C"],
+            "a label edit must not narrow the live roster onto a file that lost accounts"
+        );
+        assert!(
+            daemon.state.accounts[2].health.quarantined,
+            "and no per-account signal was re-keyed by the refused reconcile"
+        );
+    }
+
+    #[tokio::test]
     async fn perform_config_set_reports_unchanged_for_a_noop() {
         // Submitting the CURRENT values (poll_secs 300 = the default the file carries, and no label
         // edit) changes nothing → `Unchanged`, and nothing is rewritten.
@@ -4500,7 +4573,7 @@ mod tests {
         const CALL: &str = "self.reconcile_roster(";
         let sites = [
             ("pub(super) async fn perform_socket_capture", "AppendOnly"),
-            ("pub(super) async fn perform_config_set", "Mutating"),
+            ("pub(super) async fn perform_config_set", "AppendOnly"),
             ("pub(super) async fn adopt_roster_reload", "intent"),
         ];
         for (signature, intent) in sites {
