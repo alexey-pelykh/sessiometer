@@ -2225,25 +2225,55 @@ fn config_path() -> Result<()> {
 /// key (`deny_unknown_fields` → [`Error::ConfigParse`]), an out-of-range value
 /// ([`Error::ConfigInvalid`]), or `target_max_session_usage > session_ceiling`
 /// ([`Error::ConfigTargetMaxSessionAboveTrigger`]) surfaces here with the identical message the daemon
-/// would fail on, and a clean file reports valid. Read-only: it loads and validates, nothing
-/// more. A validation failure propagates as the loader's error, so it exits non-zero (usable
-/// in a pre-flight check) — `main` prints it and maps the exit code.
+/// would fail on, and a clean file carrying accounts reports valid. Read-only: it loads and
+/// validates, nothing more. A validation failure propagates as the loader's error, so it exits
+/// non-zero (usable in a pre-flight check) — `main` prints it and maps the exit code.
 ///
 /// A VALID file may still trail a non-fatal advisory (issue #608): this is the one surface that
 /// renders [`Config::peak_runway_advisory`], the swap-target reserve's peak-velocity runway
 /// coupling. It does not affect the exit code — the file IS valid — so the pre-flight use stays
 /// intact.
+///
+/// A file that parses cleanly and carries NO accounts is the one case where "valid" is not the
+/// whole answer (issue #1444): [`config_validate_verdict`] owns that split, and it exits on its
+/// own code rather than printing a pass.
 fn config_validate() -> Result<()> {
     let path = paths::config_file()?;
     let config = Config::load_path(&path)?;
-    print!("{}", render_config_validate(&path, &config));
+    print!("{}", config_validate_verdict(&path, &config)?);
     Ok(())
+}
+
+/// Split `config validate`'s outcome into the pass it PRINTS and the empty-roster verdict it
+/// EXITS on (issue #1444). Pure — no I/O — so both arms are unit-testable without touching a
+/// real config path, which is the same reason [`render_config_validate`] exists.
+///
+/// The word `valid` was doing two jobs on this surface — *parses* and *is in a usable state* —
+/// and only the first was ever checked. A roster that had just lost five accounts rendered as
+/// `is valid (1 account)` and exited `0`, with the count in the string and the verdict ignoring
+/// it. A zero-account roster now takes the [`Error::ConfigRosterEmpty`] arm, which carries its
+/// own exit code, so a pre-flight check tells it apart from a parse or validation failure
+/// without re-reading the text.
+///
+/// The healthy path is deliberately untouched: same bytes, same exit `0`, advisory and all. The
+/// split lives here rather than inside [`render_config_validate`] because that function returns
+/// a `String` and an exit code is precisely what a `String` cannot carry.
+fn config_validate_verdict(path: &Path, config: &Config) -> Result<String> {
+    if config.roster.is_empty() {
+        return Err(Error::ConfigRosterEmpty {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(render_config_validate(path, config))
 }
 
 /// Render `config validate`'s output: the valid-file line, plus the non-fatal peak-velocity runway
 /// advisory when the reserve exceeds its bound (issue #608). Pure — no I/O — so the
 /// state→text mapping is unit-tested without touching a real config path, matching
 /// [`render_config_origin`].
+///
+/// Reached only with a NON-empty roster since issue #1444 — [`config_validate_verdict`] diverts
+/// the zero-account case ahead of it — so the plural branch below spans 1 and many, never none.
 fn render_config_validate(path: &Path, config: &Config) -> String {
     let count = config.roster.len();
     let plural = if count == 1 { "" } else { "s" };
@@ -5594,8 +5624,9 @@ fn resolve_roster(loaded: Result<Config>) -> Result<Vec<Account>> {
     match loaded {
         // Both empty states read the same: an absent config, OR a well-formed
         // tunables-only file whose roster is empty (now that `capture` can load
-        // such a file, #58). Either way `list` shows the friendly "nothing captured
-        // yet" rather than a bare "0 accounts".
+        // such a file, #58). Either way `list` shows the friendly empty state
+        // rather than a bare "0 accounts" — an observation of what the roster
+        // holds now, claiming nothing about whether it ever held more (#1444).
         Ok(config) if config.roster.is_empty() => Err(Error::RosterEmpty),
         Ok(config) => Ok(config.roster),
         Err(Error::ConfigNotFound { .. }) => Err(Error::RosterEmpty),
@@ -6055,10 +6086,11 @@ personal  22222222-2222-2222-2222-222222222222\n\
             matches!(resolve_roster(loaded), Err(Error::RosterEmpty)),
             "an absent config must become the friendly empty state"
         );
-        // The friendly message points at the next step and never leaks the path.
+        // The friendly message points at a READ-ONLY next step and never leaks the path.
         assert_eq!(
             Error::RosterEmpty.to_string(),
-            "no accounts captured yet — run `sessiometer capture`"
+            "the roster holds no accounts — `sessiometer config path` names the file it is \
+             read from"
         );
     }
 
@@ -15169,6 +15201,56 @@ impl Nested {
         let out = render_config_origin(Path::new("/x/config.toml"), &report, true);
         assert!(out.contains("1 account,"), "singular roster: {out}");
         assert!(!out.contains("1 accounts"), "no plural for one: {out}");
+    }
+
+    #[test]
+    fn config_validate_verdict_refuses_a_parses_but_empty_roster() {
+        // Issue #1444. The file PARSED — `Config::load_path` returned `Ok` before this seam is
+        // reached — so what this reports is about CONTENTS, not syntax. Two things follow, and
+        // the acceptance names both: it must not print a pass, and its exit code must not be a
+        // parse failure's, because a pre-flight check reads the code and not the sentence.
+        let path = Path::new("/x/config.toml");
+        let err = config_validate_verdict(path, &config_with(vec![]))
+            .expect_err("a zero-account roster is not an unqualified pass");
+        assert!(
+            matches!(&err, Error::ConfigRosterEmpty { path: p } if p.as_path() == path),
+            "got {err:?}"
+        );
+        assert_eq!(
+            err.exit_code(),
+            8,
+            "the parses-but-empty verdict carries its own code"
+        );
+        assert_ne!(
+            err.exit_code(),
+            Error::ConfigParse("expected `=` at line 3".to_owned()).exit_code(),
+            "a parse failure and a parses-but-empty result must not collapse into one code"
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.starts_with("/x/config.toml "),
+            "names the file it judged: {rendered}"
+        );
+        assert!(
+            !rendered.contains("is valid"),
+            "no pass verdict: {rendered}"
+        );
+    }
+
+    #[test]
+    fn config_validate_verdict_leaves_a_healthy_roster_untouched() {
+        // The other half of the issue #1444 acceptance: no new friction on the normal path.
+        // Asserted against `render_config_validate` itself rather than against a transcription
+        // of its output, so whatever it trails — the issue #608 advisory the shipped defaults
+        // do reach — travels with it, and a later change to one cannot drift from the other.
+        let config = config_with(vec![acct("work", "11111111-1111-1111-1111-111111111111")]);
+        let path = Path::new("/x/config.toml");
+        let out = config_validate_verdict(path, &config).expect("a healthy roster still passes");
+        assert_eq!(out, render_config_validate(path, &config));
+        assert!(
+            out.starts_with("/x/config.toml is valid (1 account)\n"),
+            "the pass line is unchanged: {out}"
+        );
     }
 
     #[test]

@@ -18145,6 +18145,9 @@ mod tests {
             },
             Error::PriorConfigurationWithoutConfig,
             Error::RosterEmpty,
+            Error::ConfigRosterEmpty {
+                path: PathBuf::from("/home/op/.config/sessiometer/config.toml"),
+            },
             Error::ConfigParse("expected `=` at line 3".to_owned()),
             Error::ConfigInvalid("session_ceiling must be in 50..=99, got 120".to_owned()),
             Error::ConfigTargetMaxSessionAboveTrigger {
