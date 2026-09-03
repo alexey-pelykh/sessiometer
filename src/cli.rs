@@ -193,13 +193,19 @@ enum DaemonAction {
     Restart,
 }
 
-/// The `config` sub-action (issue #401): READ-ONLY config diagnostics. `path` prints the
-/// resolved `config.toml` location, `validate` parses + validates it WITHOUT running (the same
-/// seam the daemon loads through), and `show` prints the effective config — with `--origin`,
-/// each value tagged `default` vs `from-file` so a silently-defaulted absent section is visible.
-/// None of the three mutates the file or the daemon. A plain data enum, like [`ServiceAction`] /
-/// [`DaemonAction`] — the parser resolves the sub-verb (and the `--origin` flag) so `execute`
+/// The `config` sub-action (issues #401, #1439): config diagnostics, plus the backup ring's
+/// operator surface. `path` prints the resolved `config.toml` location, `validate` parses +
+/// validates it WITHOUT running (the same seam the daemon loads through), `show` prints the
+/// effective config — with `--origin`, each value tagged `default` vs `from-file` so a
+/// silently-defaulted absent section is visible — and `backups` enumerates what the roster
+/// backup ring retains. A plain data enum, like [`ServiceAction`] / [`DaemonAction`] — the
+/// parser resolves the sub-verb (and the `--origin` flag, and `restore`'s index) so `execute`
 /// just dispatches.
+///
+/// Four of the five are READ-ONLY. `restore` is the exception and the reason this noun is no
+/// longer described as read-only wholesale: issue #1439 R-9 requires an operator-invocable path
+/// back from a lost roster that does not involve hand-editing TOML, and it lands here because
+/// it is a `config.toml` operation and belongs beside the listing that names its argument.
 #[derive(Debug, PartialEq)]
 enum ConfigAction {
     /// `config path` — print the resolved `config.toml` path (honours `$XDG_CONFIG_HOME`).
@@ -208,6 +214,11 @@ enum ConfigAction {
     Validate,
     /// `config show [--origin]` — print the effective config; `--origin` tags each value's provenance.
     Show { origin: bool },
+    /// `config backups` — list what the roster backup ring retains (issue #1439).
+    Backups,
+    /// `config restore <N>` — replace `config.toml` with retained backup `N` (issue #1439).
+    /// The index is 1-based and newest-first, as `config backups` prints it.
+    Restore { index: usize },
 }
 
 /// Which help text a [`Command::Help`] prints (issue #175): the root overview, or one
@@ -437,15 +448,18 @@ fn parse_daemon(parser: &mut lexopt::Parser) -> Result<Command> {
     }
 }
 
-/// Parse `config <path|validate|show> [--origin]` (issue #401): the READ-ONLY config
-/// diagnostics noun. The first positional is the sub-action; the order-independent `--origin`
-/// flag applies to `show` (tag each value default-vs-file). `-h`/`--help` short-circuits, an
-/// unknown flag or action is a strict-usage error, and bare `config` prints the config help.
-/// Mirrors [`parse_service`] / [`parse_daemon`]; the `--origin` flag is the only shape
-/// difference, and it is REJECTED on `path`/`validate` (where it is meaningless) rather than
-/// silently accepted — the same strict-usage stance as an unknown flag (issue #175).
+/// Parse `config <path|validate|show|backups|restore> [<index>] [--origin]` (issues #401,
+/// #1439): the config-diagnostics noun, plus the backup ring's two operator verbs. The first
+/// positional is the sub-action and the second is `restore`'s index; the order-independent
+/// `--origin` flag applies to `show` (tag each value default-vs-file). `-h`/`--help`
+/// short-circuits, an unknown flag or action is a strict-usage error, and bare `config` prints
+/// the config help. Mirrors [`parse_service`] / [`parse_daemon`]; the `--origin` flag is the
+/// only shape difference, and it is REJECTED on every action but `show` (where alone it means
+/// something) rather than silently accepted — the same strict-usage stance as an unknown flag
+/// (issue #175).
 fn parse_config(parser: &mut lexopt::Parser) -> Result<Command> {
     let mut action_name = None;
+    let mut argument = None;
     let mut origin = false;
     while let Some(arg) = parser.next()? {
         match arg {
@@ -453,6 +467,9 @@ fn parse_config(parser: &mut lexopt::Parser) -> Result<Command> {
             Long("origin") => origin = true,
             Value(value) if action_name.is_none() => {
                 action_name = Some(value.to_string_lossy().into_owned());
+            }
+            Value(value) if argument.is_none() => {
+                argument = Some(value.to_string_lossy().into_owned());
             }
             Value(_) => {} // extra positional ignored, matching the other parsers
             other => return Err(unexpected(other, HelpTopic::Config)),
@@ -466,6 +483,10 @@ fn parse_config(parser: &mut lexopt::Parser) -> Result<Command> {
         "path" => ConfigAction::Path,
         "validate" => ConfigAction::Validate,
         "show" => ConfigAction::Show { origin },
+        "backups" => ConfigAction::Backups,
+        "restore" => ConfigAction::Restore {
+            index: backup_index(argument.as_deref())?,
+        },
         other => {
             return Err(Error::CliUsage {
                 message: format!("unknown config action `{other}`"),
@@ -473,7 +494,7 @@ fn parse_config(parser: &mut lexopt::Parser) -> Result<Command> {
             })
         }
     };
-    // `--origin` only means something for `show`; on `path`/`validate` it is a usage error.
+    // `--origin` only means something for `show`; everywhere else it is a usage error.
     if origin && !matches!(action, ConfigAction::Show { .. }) {
         return Err(Error::CliUsage {
             message: "`--origin` applies only to `config show`".to_string(),
@@ -481,6 +502,30 @@ fn parse_config(parser: &mut lexopt::Parser) -> Result<Command> {
         });
     }
     Ok(Command::Config { action })
+}
+
+/// Resolve `config restore`'s positional into a 1-based ring index (issue #1439).
+///
+/// Both rejections are shaped at ONE construction site, so the two messages cannot drift into
+/// different registers and the `CliUsage` construction-site count in
+/// [`every_cli_usage_construction_site_is_scanned`] moves by one rather than by two. `0` is
+/// rejected with the non-numeric input: the listing this index comes from is 1-based, so a `0`
+/// is a miscount rather than a boundary, and answering it with the ring's oldest entry would
+/// silently restore something the operator did not name.
+fn backup_index(argument: Option<&str>) -> Result<usize> {
+    let message = match argument {
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(index) if index > 0 => return Ok(index),
+            _ => format!("invalid backup index `{raw}`: expected a whole number from 1 upward"),
+        },
+        None => "`config restore` takes the index of a retained backup, as numbered by `config \
+                 backups`"
+            .to_string(),
+    };
+    Err(Error::CliUsage {
+        message,
+        usage_hint: HelpTopic::Config.hint(),
+    })
 }
 
 /// Parse `status [--json] [--no-color] [-v|--verbose]` (issues #72/#73/#143) — all flags
@@ -845,6 +890,8 @@ async fn execute(command: Command) -> Result<()> {
             ConfigAction::Path => config_path(),
             ConfigAction::Validate => config_validate(),
             ConfigAction::Show { origin } => config_show(origin),
+            ConfigAction::Backups => config_backups(),
+            ConfigAction::Restore { index } => config_restore(index).await,
         },
         Command::Status {
             json,
@@ -1050,21 +1097,28 @@ You do not start a daemon with `daemon`: one is started by `service install` (ma
 login) or `sessiometer run` (unmanaged, foreground) — which is why there is no `daemon start`.
 ";
 
-const CONFIG_USAGE: &str = "sessiometer config — read-only config diagnostics: resolve, validate, and inspect config.toml
+const CONFIG_USAGE: &str = "sessiometer config — config diagnostics, and the config.toml backup ring
 
 USAGE:
-    sessiometer config <path|validate|show> [--origin]
+    sessiometer config <path|validate|show|backups|restore> [<index>] [--origin]
 
     path        print the resolved config.toml path (honours $XDG_CONFIG_HOME, else ~/Library/Application Support/sessiometer)
     validate    parse + validate config.toml WITHOUT running; report typo'd/unknown keys, out-of-range values, and target_max_session_usage > session_ceiling
     show        print the effective config (defaults filled in); with --origin, tag each value default (absent → compiled-in) vs from-file
+    backups     list the retained config.toml backups, newest first, by timestamp and account count
+    restore <N> replace config.toml with retained backup <N>, as numbered by `config backups`
     --origin    (with show) tag each value's provenance, so a silently-defaulted absent section is visible
     -h, --help  print this help
 
-All three are READ-ONLY: they never write config.toml, start/stop a daemon, or change any state. `config
-show --origin` surfaces effective-vs-on-disk drift — e.g. a hand-deleted [tunables] block shows every
-tunable as `default`, the very drift that once went unnoticed because the effective config is only ever
-emitted once to stderr at start-up.
+path, validate, show and backups are READ-ONLY: they never write config.toml, start/stop a daemon, or
+change any state. `config show --origin` surfaces effective-vs-on-disk drift — e.g. a hand-deleted
+[tunables] block shows every tunable as `default`, the very drift that once went unnoticed because the
+effective config is only ever emitted once to stderr at start-up.
+
+`config restore` is the one that writes. A config.toml holding accounts is copied into the ring before
+any replacement of it, including this one, so a restore is itself reversible; a file that is absent,
+unreadable, malformed or empty is neither copied nor allowed to displace what the ring already holds.
+The ring keeps three, newest first.
 ";
 
 const STATUS_USAGE: &str = "sessiometer status — show each account's usage + resets-in and the next swap (needs a running daemon)
@@ -2217,6 +2271,111 @@ fn render_peak_runway_advisory(a: &crate::config::PeakRunwayAdvisory) -> String 
          \x20 to at {reserve}% is already past its own swap fire point over that lookahead, so it \
          can swap\n\
          \x20 straight back out. A tuning note, not an error — the shipped defaults sit here too.\n",
+    )
+}
+
+/// `config backups` (issue #1439): list what the roster backup ring retains — the enumeration
+/// half of R-9's operator-invocable path back from a lost roster.
+///
+/// Read-only. Reports a COUNT and a timestamp per entry and never an account label: the listing
+/// is a more public surface than the file it describes (it is what an operator pastes into a bug
+/// report), so it carries enough to choose between entries and nothing more (design D-3, AC-5).
+fn config_backups() -> Result<()> {
+    let path = paths::config_file()?;
+    let retained = crate::roster_backup::list(&path)?;
+    print!(
+        "{}",
+        render_config_backups(&crate::roster_backup::ring_dir(&path), &retained)
+    );
+    Ok(())
+}
+
+/// Render `config backups`' listing (issue #1439). Pure — no I/O — so the state→text mapping is
+/// unit-tested without a real ring, matching [`render_config_validate`] / [`render_config_origin`].
+///
+/// An entry that no longer parses renders its count as `unreadable` rather than being hidden:
+/// it is still restorable material an operator may want to look at, and hiding it would make
+/// the numbering disagree with what `restore` accepts.
+fn render_config_backups(dir: &Path, retained: &[crate::roster_backup::Retained]) -> String {
+    if retained.is_empty() {
+        return format!("no backups retained under {}\n", dir.display());
+    }
+    let mut out = format!(
+        "{} of {} retained under {}\n",
+        retained.len(),
+        crate::roster_backup::RING_DEPTH,
+        dir.display()
+    );
+    for (ordinal, entry) in retained.iter().enumerate() {
+        let when = crate::observability::rfc3339(entry.taken_at);
+        let held = match entry.accounts {
+            Some(1) => "1 account".to_string(),
+            Some(count) => format!("{count} accounts"),
+            None => "unreadable".to_string(),
+        };
+        out.push_str(&format!("  {}  {when}  {held}\n", ordinal + 1));
+    }
+    out
+}
+
+/// `config restore <N>` (issue #1439): replace `config.toml` with retained backup `N` — the
+/// restore half of R-9, so a lost roster comes back without hand-editing TOML.
+///
+/// Three properties make this a roster write like any other rather than a privileged one.
+/// It re-validates the chosen entry through [`Config::from_toml_str`] before writing anything,
+/// so a backup that no longer parses is refused rather than installed. It writes through
+/// [`Config::save_to`], which means the config it replaces goes into the ring first if it
+/// qualifies — so a restore is itself undoable, which is what AC-5's "not silently over a
+/// roster the operator has since changed" asks for. And it NAMES both sides before acting:
+/// what is being installed, and what is being replaced.
+///
+/// It then notifies a running daemon exactly as the other roster-mutating verbs do
+/// (`remove`, `enable` / `disable`), so a restored roster is live rather than pending a
+/// restart. Best-effort, like theirs.
+async fn config_restore(index: usize) -> Result<()> {
+    let path = paths::config_file()?;
+    let retained = crate::roster_backup::list(&path)?;
+    let entry = retained.get(index - 1).ok_or(Error::BackupNotRetained {
+        index,
+        retained: retained.len(),
+    })?;
+    // Validate BEFORE naming what will happen, so a refusal never trails a line that reads as
+    // an announcement of a write that did not occur.
+    let restored = Config::from_toml_str(&std::fs::read_to_string(&entry.path)?)?;
+    // The config being replaced, described from the same seam the ring's own rule uses: a file
+    // that will not load is reported as such rather than as zero accounts.
+    let replaced = Config::load_path(&path).ok().map(|c| c.roster.len());
+    print!(
+        "{}",
+        render_restore_notice(entry, restored.roster.len(), &path, replaced)
+    );
+    restored.save_to(&path)?;
+    crate::capture::notify_daemon_roster_reload().await;
+    Ok(())
+}
+
+/// Render `config restore`'s before-and-after notice (issue #1439). Pure — no I/O — so the
+/// exact operator-facing text is unit-tested without a real ring.
+///
+/// Names both sides, which is the AC-5 property: an operator who miscounted the index sees what
+/// they installed and what it displaced in the same two lines, and the displaced file is itself
+/// in the ring whenever it qualified.
+fn render_restore_notice(
+    entry: &crate::roster_backup::Retained,
+    accounts: usize,
+    path: &Path,
+    replaced: Option<usize>,
+) -> String {
+    let held = match replaced {
+        Some(1) => "1 account".to_string(),
+        Some(count) => format!("{count} accounts"),
+        None => "no loadable config".to_string(),
+    };
+    format!(
+        "restoring the backup taken {} ({accounts} in its roster)\n\
+         over {} ({held})\n",
+        crate::observability::rfc3339(entry.taken_at),
+        path.display()
     )
 }
 

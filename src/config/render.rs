@@ -334,11 +334,23 @@ impl Config {
     /// `cmd:capture` (#359) writes back through its wired `config_path` (so a hermetic test lands
     /// the new roster in a temp file, not the real support dir), exactly as [`save`](Config::save)
     /// writes the canonical location for the standalone `capture` (#4).
+    ///
+    /// Every replacement of a config file passes through here, which is why the roster backup
+    /// ring hangs off THIS function rather than off its callers (issue #1439, design D-3): the
+    /// 2026-08-27 deletion is unattributed, so the write paths that could destroy a roster
+    /// cannot be enumerated, and a per-caller guard would structurally miss the next one. The
+    /// ring keys on the REPLACED file's own quality instead —
+    /// [`retain_if_qualifying`](crate::roster_backup::retain_if_qualifying) retains it only if
+    /// it parses with a non-empty roster, and only such a write may evict, so a bad write can
+    /// never displace a good backup. A qualifying file that cannot be retained aborts the write
+    /// rather than overwriting the last good roster; a non-qualifying one touches nothing and
+    /// so cannot fail here.
     pub(crate) fn save_to(&self, path: &Path) -> Result<()> {
         paths::ensure_private_dir(
             path.parent()
                 .expect("a config path always has a parent directory"),
         )?;
+        crate::roster_backup::retain_if_qualifying(path)?;
         paths::write_private_file(path, self.render().as_bytes())
     }
 
