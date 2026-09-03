@@ -46,13 +46,30 @@
 //! precisely because the cause is unattributed and the write paths cannot be enumerated.
 //! Whether a write happens at all is [`crate::witness`]' question (issue #1440).
 //!
-//! Two processes replacing the config at the same instant can compute the same retention stamp.
-//! The config-write path is not serialized today — issue #1445's subject, not this module's —
-//! and the honest statement of what then happens is stronger than "one entry instead of two":
-//! [`paths::write_private_file`] begins by unlinking its own temp name, so the loser's rename
-//! fails and its retention returns `Err`, which aborts that process's replacing write. No ring
-//! entry is corrupted and no good entry is evicted; a write is refused. Serializing the path is
-//! what fixes it, and that is not this module's to do.
+//! Two processes replacing the config at the same instant can compute the same retention stamp —
+//! [`stamp_for`] reads the ring and clamps above what it sees, so a collision is DETERMINISTIC
+//! for two processes that read it before either has landed, not a nanosecond coincidence. The
+//! config-write path is not serialized today; that is issue #1445's subject, not this module's.
+//!
+//! State only what the code guarantees here, because a comment is where a later reader will look
+//! for it. Every guarantee in the table above holds for a SERIALIZED writer. Under a concurrent
+//! one they degrade, and the degradation is bounded but not benign:
+//!
+//! - Two writers share a staging name, and [`paths::write_private_file`] opens by unlinking that
+//!   name. Whichever renames first wins the entry; the other's rename usually fails `ENOENT`, so
+//!   its retention returns `Err` and its replacing write aborts — no loss. But if the unlink
+//!   lands between the winner's `fsync` and its rename, the winner renames the LOSER's
+//!   half-written file into place, and the ring holds a TORN entry. `config restore` re-validates
+//!   before installing, so a torn entry is refused rather than restored; it is still an entry the
+//!   ring believed it had.
+//! - [`prune`]'s sweep can unlink a concurrent writer's in-flight staging file, aborting that
+//!   write. See [`prune`] for why the ordering that would prevent it does not hold.
+//! - [`Retention::roll_back`] removes an entry by path, which another process may by then have
+//!   replaced at that same name.
+//!
+//! None of that loses the LIVE roster, which is what this module exists to protect: a replacing
+//! write that cannot retain is refused, never completed. Serializing the path is what closes the
+//! rest, and that is not this module's to do.
 
 use std::cmp::Reverse;
 use std::fs;
@@ -188,6 +205,10 @@ impl Retention {
 /// forbids, and AC-5's "BUT NOT by retaining a backup readable by another user" is a property of
 /// what is on disk, not of the writer that was used. A wider entry is removed and the write
 /// aborts.
+///
+/// The comparison is against [`paths::FILE_MODE`] itself — the constant AC-5 names — and not a
+/// second copy of `0600` spelled here, so the two cannot drift apart. That is why this module
+/// widened it to `pub(crate)`.
 pub(crate) fn retain_if_qualifying(config_path: &Path) -> Result<Option<Retention>> {
     let Some(contents) = qualifying_contents(config_path) else {
         return Ok(None);
@@ -201,7 +222,9 @@ pub(crate) fn retain_if_qualifying(config_path: &Path) -> Result<Option<Retentio
         // Not a retention at all: it is a disclosure wearing a retention's name.
         let _ = fs::remove_file(&target);
         return Err(Error::Io(std::io::Error::other(format!(
-            "refusing a roster backup at mode {mode:o}: {} does not preserve {FILE_MODE:o}",
+            "refusing this roster write: its backup landed at mode {mode:o} because {} does \
+             not preserve {FILE_MODE:o}; move the config directory to a filesystem that honours \
+             POSIX modes, or the roster cannot be replaced without widening a copy of it",
             dir.display()
         ))));
     }
@@ -336,9 +359,14 @@ fn next_after((secs, nanos): (u64, u32)) -> (u64, u32) {
 /// suffix) so pruning never reaches it either. One full roster copy per crashed write,
 /// accumulating for the life of the machine.
 ///
-/// Only temps STRICTLY OLDER than the newest retained entry are swept. A concurrent writer's
-/// in-flight temp carries a stamp clamped ABOVE that entry, so this cannot unlink a write that
-/// is still happening.
+/// Only temps STRICTLY OLDER than the newest retained entry are swept — which makes the sweep
+/// safe against the case it is for (a temp stranded by a crash, older than everything that has
+/// landed since) and does NOT make it safe in general. [`stamp_for`] clamps above the newest
+/// entry it sees WHEN IT RUNS, not when this runs: a writer that computed its stamp, then had a
+/// later writer land an entry and reach here, has an in-flight temp below the new newest and can
+/// have it swept out from under it. That aborts the swept writer's replacing write — a refused
+/// write, not a lost roster — and closing it needs the serialization issue #1445 owns, not a
+/// wider or narrower rule here.
 fn prune(dir: &Path) {
     let mut found = scan(dir).unwrap_or_default();
     found.sort_unstable_by_key(|(_, stamp)| Reverse(*stamp));
@@ -861,7 +889,8 @@ mod tests {
         fs::create_dir_all(&ring).unwrap();
         let stranded = ring.join(format!("{}{TMP_SUFFIX}", file_name((100, 0))));
         let retained = ring.join(file_name((200, 0)));
-        // A concurrent writer's in-flight temp always clamps ABOVE the newest entry.
+        // Newer than the newest entry: the shape a crash cannot produce, so the sweep leaves it
+        // alone. NOT a claim that a live writer's temp is always up here — see `prune`.
         let in_flight = ring.join(format!("{}{TMP_SUFFIX}", file_name((300, 0))));
         let bystander = ring.join("operator-notes.txt");
         for f in [&stranded, &retained, &in_flight, &bystander] {
