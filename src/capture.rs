@@ -384,8 +384,32 @@ pub(crate) async fn notify_daemon_roster_reload() {
         }
     };
     if let Err(err) = crate::daemon::notify_roster_reload(&socket).await {
-        eprintln!("sessiometer: roster-reload notify skipped (is the daemon running?): {err}");
-        emit_roster_reload_not_notified(RosterReloadReason::NotifyFailed);
+        // A TIMEOUT is not a failure to deliver, and the two must not share one code (#1438). The
+        // daemon's jittered start-up delay draws a uniform `[0, STARTUP_DELAY_CAP)` wait — up to
+        // 30s (#76) — and its control socket is BOUND before anything accepts on it, so a roster
+        // verb landing in that window connects into the listen BACKLOG, waits, and gives up at the
+        // 2s `CLIENT_NOTIFY_TIMEOUT`, after which the daemon accepts the queued request and adopts
+        // it. The server already anticipates this exact client: its control serve swallows the
+        // `EPIPE` from acking a peer that has gone. Reporting that as `notify_failed` would write
+        // a durable, FALSE "the daemon was never told" for a reload the daemon actually performs —
+        // on every roster verb issued in a daemon's first half-minute.
+        //
+        // The durable code and the printed message are derived from ONE classification, so they
+        // cannot drift apart and tell an operator two different stories: "is the daemon running?"
+        // is the right question for a refused connect and the wrong one for a timeout, where the
+        // answer is very likely yes and the reload very likely lands anyway.
+        let (reason, note) = match &err {
+            Error::Io(io) if io.kind() == std::io::ErrorKind::TimedOut => (
+                RosterReloadReason::NotifyTimedOut,
+                "notify timed out; a starting daemon may still adopt it",
+            ),
+            _ => (
+                RosterReloadReason::NotifyFailed,
+                "notify skipped (is the daemon running?)",
+            ),
+        };
+        eprintln!("sessiometer: roster-reload {note}: {err}");
+        emit_roster_reload_not_notified(reason);
     }
 }
 
@@ -401,9 +425,16 @@ pub(crate) async fn notify_daemon_roster_reload() {
 ///
 /// Both counts are absent. The CLI cannot see the daemon's in-memory roster, and a count of what
 /// it merely WROTE — with no `previous` to pair it against — cannot express the shrink this event
-/// exists to make legible, so it is omitted rather than half-reported. `reason` separates the two
-/// failures: an unresolvable socket path is a broken environment, while a failed send is
-/// overwhelmingly just "no daemon is running", which is benign.
+/// exists to make legible, so it is omitted rather than half-reported.
+///
+/// `reason` carries the whole difference between the three ways this can happen, and the split is
+/// load-bearing rather than cosmetic. An unresolvable socket path
+/// ([`RosterReloadReason::SocketUnresolved`]) is a broken environment; a failed send
+/// ([`RosterReloadReason::NotifyFailed`]) is overwhelmingly just "no daemon is running", which is
+/// benign; and a TIMEOUT ([`RosterReloadReason::NotifyTimedOut`]) is not evidence of either — the
+/// request may already be queued on a starting daemon and may still be adopted. The outcome is
+/// therefore only ever "no ack was seen": a reader chasing divergence between the file and the
+/// live rotation has to consult the reason before treating any of these as a divergence at all.
 fn emit_roster_reload_not_notified(reason: RosterReloadReason) {
     if let Ok(mut log) = EventLog::open() {
         let _ = log.emit(&Event::RosterReload {
