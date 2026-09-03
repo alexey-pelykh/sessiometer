@@ -38,9 +38,17 @@ enum CaptureAck: Equatable {
 }
 
 /// Why the daemon refused a `capture` (issue #359 spec: "failure = a bare machine error tag") — a redacted,
-/// stable machine code, serialized kebab-case. These are the four tags #359 enumerates; each already
-/// exists in the sibling `SwapRejection`, so the daemon can share the reason vocabulary. Keep in lockstep
-/// with the Rust enum once #359 lands.
+/// stable machine code, serialized kebab-case. The first four are the tags #359 enumerates; each already
+/// exists in the sibling `SwapRejection`, so the daemon can share the reason vocabulary. `#1441` added the
+/// fifth, which is capture-only (no swap appends to the roster, so no swap can collapse it).
+///
+/// THE VOCABULARY IS CLOSED AND MOVES AS ONE. `decode` below fails closed on a tag it does not model
+/// (`DecodeError.unrecognized`), which is correct behaviour and is exactly why a Rust-side tag added
+/// without its case here does not degrade — it BREAKS the capture button. The Rust enum is
+/// `CaptureRejection` in `src/daemon/socket.rs`, and `every_rust_rejection_tag_has_a_swift_case` there
+/// reads THIS declaration and fails the `test` job when the two sets differ. That assertion is
+/// deliberately not in `panel-goldens`: every step of that job is `continue-on-error`, so it always
+/// reports pass and could never tell you the vocabulary drifted.
 enum CaptureRejection: String, Equatable {
     /// No active account to capture — nothing is logged into Claude Code. The operator runs `claude /login`
     /// first, then captures (the honest scope boundary: capture snapshots the ACTIVE account, it is not a
@@ -52,6 +60,14 @@ enum CaptureRejection: String, Equatable {
     case swapLockBusy = "swap-lock-busy"
     /// The capture engine aborted for another reason (an I/O error, a read-back mismatch). ZERO writes.
     case failed
+    /// `config.toml` is absent while durable local state says this Mac HAS been configured (#1441,
+    /// design D-1). The daemon refused rather than treat that as a first run and append a one-account
+    /// roster over a live one — the 2026-08-27 roster collapse. ZERO writes.
+    ///
+    /// Redacted like its siblings: the tag names an ambient prior configuration and nothing that
+    /// indexes it — no path, no account label, no count. The panel is a more public surface than a
+    /// terminal, so it learns strictly less here than the CLI's stderr refusal says.
+    case priorConfiguration = "prior-configuration"
 }
 
 extension CaptureAck {

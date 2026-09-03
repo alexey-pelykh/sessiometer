@@ -561,6 +561,22 @@ pub(crate) enum CaptureRejection {
     /// Stash-before-roster ordering (#6) means a save failure leaves an inert ORPHAN stash, never a
     /// partial or duplicate roster row.
     Failed,
+    /// `config.toml` is absent while durable local state says this machine HAS been configured
+    /// (issue #1441, design D-1 / D-5 — [`crate::witness`]). The append-only write would have
+    /// resolved that ambiguity to "first run" and collapsed the roster, which is what destroyed
+    /// five accounts on 2026-08-27. ZERO writes: the gate precedes `capture_locked`.
+    ///
+    /// Redacted like its siblings, and deliberately more so than the CLI's
+    /// [`crate::error::Error::PriorConfigurationWithoutConfig`]
+    /// needs to be: the tag names an ambient prior configuration and nothing that indexes it — no
+    /// path, no account label, no count — because the panel is a more public surface than a
+    /// terminal. Adding it here is HALF a change: `CaptureRejection` in
+    /// `apps/menubar/Sources/CaptureAck.swift` is a closed enum whose decoder throws on a tag it
+    /// does not model, so the two move together or the menu-bar capture button breaks. That is
+    /// asserted by `every_rust_rejection_tag_has_a_swift_case` in this file's test module — which
+    /// runs in the `test` job, never in `panel-goldens`: every step of that job is
+    /// `continue-on-error`, so it always reports pass and could never tell you the two drifted.
+    PriorConfiguration,
 }
 
 /// Build the one-line reply to a control request line, plus any [`ControlSignal`]
@@ -1569,4 +1585,200 @@ pub(crate) async fn request_swap(
                 "swap command timed out",
             ))
         })?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    /// The Swift mirror of [`CaptureRejection`], resolved from `CARGO_MANIFEST_DIR` so the scan is
+    /// tied to the repo under test whatever the working directory.
+    fn swift_capture_ack() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("apps/menubar/Sources/CaptureAck.swift")
+    }
+
+    /// Every `CaptureRejection` variant the daemon can emit, read off THIS file's own `enum`
+    /// declaration rather than hand-listed.
+    ///
+    /// Hand-listing is what the assertion below exists to prevent, one level up: a list that a new
+    /// variant does not have to join is a list that silently falls behind the enum, and the test
+    /// would then compare four tags against four cases and pass while the fifth drifted. Reading the
+    /// declaration means adding a variant automatically widens the subject.
+    ///
+    /// The identifiers are converted to their wire form by [`wire_tag`] and each one is then
+    /// round-tripped through `serde` by the caller, so this parse never has to be TRUSTED — a
+    /// mis-parsed or invented identifier fails to deserialize and is reported as such.
+    fn rust_rejection_variants(source: &str) -> Vec<String> {
+        let body = source
+            .split_once("pub(crate) enum CaptureRejection {")
+            .expect("this file declares `pub(crate) enum CaptureRejection`")
+            .1
+            .split_once("\n}")
+            .expect("the enum declaration is closed by a column-0 brace")
+            .0;
+        body.lines()
+            .map(str::trim)
+            // Doc comments, attributes and blank lines are not variants; a variant is a bare
+            // PascalCase identifier followed by a comma (none of them carry a payload — a redacted
+            // machine code is the whole point).
+            .filter_map(|line| line.strip_suffix(','))
+            .filter(|line| {
+                line.starts_with(|c: char| c.is_ascii_uppercase())
+                    && line.chars().all(|c| c.is_ascii_alphanumeric())
+            })
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// A PascalCase variant identifier in the kebab-case form `#[serde(rename_all = "kebab-case")]`
+    /// gives it. Never trusted on its own — the caller deserializes the result back into a
+    /// [`CaptureRejection`], which is what ties this conversion to what actually goes on the wire.
+    fn wire_tag(variant: &str) -> String {
+        let mut out = String::new();
+        for (i, ch) in variant.char_indices() {
+            if ch.is_ascii_uppercase() && i > 0 {
+                out.push('-');
+            }
+            out.push(ch.to_ascii_lowercase());
+        }
+        out
+    }
+
+    /// Every `CaptureRejection` raw value the Swift decoder models, read off its `enum` declaration.
+    ///
+    /// Handles both spellings Swift allows for a `String`-backed enum: an explicit
+    /// `case foo = "foo-bar"` and an implicit `case failed`, whose raw value is the case name. The
+    /// implicit form is live today (`failed`), so dropping it would make this scan silently miss a
+    /// real case.
+    fn swift_rejection_tags(source: &str) -> Vec<String> {
+        let body = source
+            .split_once("enum CaptureRejection: String, Equatable {")
+            .expect("CaptureAck.swift declares `enum CaptureRejection: String, Equatable`")
+            .1
+            .split_once("\n}")
+            .expect("the Swift enum declaration is closed by a column-0 brace")
+            .0;
+        body.lines()
+            .map(str::trim)
+            .filter_map(|line| line.strip_prefix("case "))
+            .map(|rest| match rest.split_once('=') {
+                // `case priorConfiguration = "prior-configuration"`
+                Some((_, raw)) => raw.trim().trim_matches('"').to_owned(),
+                // `case failed` — the raw value IS the case name.
+                None => rest.trim().to_owned(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_rust_rejection_tag_has_a_swift_case() {
+        // Issue #1441 AC, and the reason it is a `test`-job assertion rather than a golden or a
+        // lint: `apps/menubar/Sources/CaptureAck.swift` decodes an unmodelled `reason` by THROWING
+        // (`DecodeError.unrecognized`), so a rejection tag added on this side alone does not degrade
+        // in the app — it breaks the menu-bar capture button. The natural home for a cross-surface
+        // check is `panel-goldens`, and that job is deliberately soft: every step is
+        // `continue-on-error`, so it always reports pass and would certify a parity it never
+        // checked. `ci-ok` requires `test`, which can actually fail.
+        //
+        // Set EQUALITY, not one-way coverage. A Swift case with no Rust tag is a state the panel
+        // can render and the daemon can never send — dead copy that reads as live, and the same
+        // drift measured from the other end.
+        let rust_source = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/daemon/socket.rs"),
+        )
+        .expect("this file is readable from the crate root");
+        let swift_source = std::fs::read_to_string(swift_capture_ack())
+            .expect("apps/menubar/Sources/CaptureAck.swift is readable from the crate root");
+
+        let variants = rust_rejection_variants(&rust_source);
+        // Canary the extraction BEFORE comparing. Both sides are parsed out of source text, and a
+        // boundary that moved would yield two empty sets — which compare EQUAL. A green over an
+        // empty subject is not evidence, so the subject is measured first.
+        assert!(
+            variants.len() >= 5,
+            "extracted only {} `CaptureRejection` variants from src/daemon/socket.rs — the parse \
+             boundary has moved and this test is comparing an empty or truncated subject: {variants:?}",
+            variants.len()
+        );
+
+        let rust: BTreeSet<String> = variants
+            .iter()
+            .map(|variant| {
+                let tag = wire_tag(variant);
+                // The conversion above is a HAND-ROLLED kebab-case, and what actually reaches the
+                // wire is serde's. Round-tripping each tag through the real `Deserialize` is what
+                // makes the comparison below about the WIRE contract rather than about my spelling:
+                // if `rename_all` ever changes, or a variant grows a `#[serde(rename)]`, this is
+                // where it reddens.
+                let decoded: CaptureRejection =
+                    serde_json::from_str(&format!("\"{tag}\"")).unwrap_or_else(|err| {
+                        panic!(
+                            "`CaptureRejection::{variant}` does not serialize as `{tag}` — the \
+                             derived wire form and this test's kebab-case conversion disagree: {err}"
+                        )
+                    });
+                // …and back out again, so the tag compared below is the one serde EMITS rather than
+                // the one this test guessed and serde merely tolerated.
+                serde_json::to_string(&decoded)
+                    .expect("a fieldless enum serializes")
+                    .trim_matches('"')
+                    .to_owned()
+            })
+            .collect();
+        let swift: BTreeSet<String> = swift_rejection_tags(&swift_source).into_iter().collect();
+        assert!(
+            swift.len() >= 5,
+            "extracted only {} `CaptureRejection` cases from CaptureAck.swift — the parse boundary \
+             has moved and this test is comparing an empty or truncated subject: {swift:?}",
+            swift.len()
+        );
+
+        let unmodelled: Vec<&String> = rust.difference(&swift).collect();
+        assert!(
+            unmodelled.is_empty(),
+            "the daemon can emit capture rejection {unmodelled:?} that \
+             apps/menubar/Sources/CaptureAck.swift does not model. Its decoder throws \
+             `DecodeError.unrecognized` on an unknown tag, so this does not degrade in the app — it \
+             breaks the menu-bar capture button. Add the case (and its \
+             `StatusPanelFormat.captureErrorText` copy) in the SAME change."
+        );
+        let unreachable: Vec<&String> = swift.difference(&rust).collect();
+        assert!(
+            unreachable.is_empty(),
+            "apps/menubar/Sources/CaptureAck.swift models capture rejection {unreachable:?} that \
+             the daemon can never send — the panel carries copy for a state that cannot occur. \
+             Remove the case, or add the Rust variant it is waiting for."
+        );
+    }
+
+    #[test]
+    fn the_prior_configuration_tag_is_redacted() {
+        // Issue #1441: the tag names an ambient prior configuration and NOTHING that indexes it.
+        // The panel is a more public surface than a terminal, so it learns strictly less than the
+        // CLI's stderr refusal says — no path, no account label, no count.
+        //
+        // Asserted on the SERIALIZED bytes rather than on the variant name, because the wire form is
+        // what a client (and anyone reading over a shoulder) actually sees.
+        let wire = serde_json::to_string(&CaptureAck::Rejected {
+            reason: CaptureRejection::PriorConfiguration,
+        })
+        .expect("the ack serializes");
+        assert_eq!(
+            wire,
+            r#"{"result":"rejected","reason":"prior-configuration"}"#
+        );
+        // The redaction meter's own view of the same bytes: no non-authored email (#15 / #444).
+        assert!(
+            crate::redaction::meter::unauthored_emails(&wire, &[]).is_empty(),
+            "the refusal ack leaks no email: {wire}"
+        );
+        for forbidden in ["/", "config.toml", "roster", "account"] {
+            assert!(
+                !wire.contains(forbidden),
+                "the refusal ack carries `{forbidden}`, which indexes what it is refusing about: {wire}"
+            );
+        }
+    }
 }

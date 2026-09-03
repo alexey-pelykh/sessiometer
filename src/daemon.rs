@@ -1845,6 +1845,18 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// [`with_config_path`](Self::with_config_path); when `None`, an inbound
     /// `roster-reload` signal is a logged best-effort no-op (there is nothing to read).
     config_path: Option<PathBuf>,
+    /// Where [`perform_socket_capture`](Self::perform_socket_capture) reads the
+    /// prior-configuration witness (issue #1441, design D-1) — the daemon's half of the same
+    /// seam the CLI verbs pass inline. Consulted ONLY when `config.toml` is absent, so the
+    /// ordinary capture spawns nothing extra.
+    ///
+    /// The hermetic-test default is [`crate::witness::WitnessSources::Unwired`], which
+    /// [`observe`](crate::witness::WitnessSources::observe) resolves to `Present` — so an unwired daemon
+    /// REFUSES a capture into an absent config rather than resolving that ambiguity
+    /// permissively. That is the same fail-closed default as a `None` `config_path` above,
+    /// and it is deliberate: a permissive default is the incident. Production wires the real
+    /// machine via [`with_witness_sources`](Self::with_witness_sources).
+    witness_sources: crate::witness::WitnessSources,
     /// The poll-path refresh-then-retry seam (issue #162), or `None` to disable it — the
     /// hermetic-test default, and ONLY that: a 401 then flows straight to the #42 streak
     /// exactly as before. Production wires the #102 engine ([`RealRefreshEngine`]) via
@@ -2047,6 +2059,12 @@ where
             // No runtime roster-reload by default (issue #139); production opts in via
             // `with_config_path`. A hermetic test drives `reconcile_roster` directly.
             config_path: None,
+            // No witness sources by default (issue #1441); production opts in via
+            // `with_witness_sources`. Unwired means "cannot observe", which resolves
+            // `Present` and REFUSES a capture into an absent config — fail-closed, never a
+            // permissive default. A test that needs the capture to succeed there pins its
+            // own throwaway sources.
+            witness_sources: crate::witness::WitnessSources::Unwired,
             // No poll-path refresh-then-retry by default (issue #162); production opts in
             // via `with_refresh_engine`. Left unset, a 401 flows straight to the streak.
             poll_refresh: None,
@@ -2133,6 +2151,22 @@ where
     /// / `with_seed` and keep `new`'s args stable.
     pub(crate) fn with_config_path(mut self, path: PathBuf) -> Self {
         self.config_path = Some(path);
+        self
+    }
+
+    /// Wire where the prior-configuration witness is read from (issue #1441, design D-1):
+    /// [`perform_socket_capture`](Self::perform_socket_capture) then consults it before an
+    /// append-only roster write into an ABSENT `config.toml`, refusing when durable local state
+    /// says this machine has been configured before.
+    ///
+    /// Production passes [`crate::witness::WitnessSources::real`]; a test pins a throwaway keychain and temp-dir
+    /// usage store so the rule is exercised without touching the operator's login keychain. The
+    /// sources are INJECTED here rather than resolved inside the command for the same #315 reason
+    /// as `with_usage_samples`: the hermetic test harness never wires them, so a `FakeDaemon`
+    /// capture spawns no `security` against the developer's real keychain. Builder-style to
+    /// mirror `with_swap_lock` / `with_config_path` and keep `new`'s args stable.
+    pub(crate) fn with_witness_sources(mut self, sources: crate::witness::WitnessSources) -> Self {
+        self.witness_sources = sources;
         self
     }
 
@@ -5904,6 +5938,7 @@ fn capture_event_outcome_rejected(reason: CaptureRejection) -> CaptureEventOutco
         CaptureRejection::KeychainLocked => CaptureEventOutcome::KeychainLocked,
         CaptureRejection::SwapLockBusy => CaptureEventOutcome::SwapLockBusy,
         CaptureRejection::Failed => CaptureEventOutcome::Failed,
+        CaptureRejection::PriorConfiguration => CaptureEventOutcome::PriorConfiguration,
     }
 }
 

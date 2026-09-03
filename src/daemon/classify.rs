@@ -149,10 +149,18 @@ pub(crate) fn classify_swap_failure(err: &Error) -> SwapRejection {
 /// `~/.claude.json`) or the canonical credential gone — routes to
 /// [`CaptureRejection::NoActiveAccount`]; everything else (an I/O error, a roster save failure) is
 /// the opaque `Failed`. Secret-free by construction: it inspects only the error's discriminant.
+///
+/// The prior-configuration refusal (issue #1441) gets its own code rather than the opaque `Failed`
+/// for the same reason the two SAFETY aborts do: it is not a fault, it is a REFUSAL the operator can
+/// act on, and the one action that resolves it (restore `config.toml`) is not the one `Failed`
+/// invites (retry). Folding it into `Failed` would tell a panel operator to retry a capture that is
+/// guaranteed to refuse again — and would leave the durable audit line unable to distinguish the
+/// guard firing from an I/O fault.
 pub(crate) fn classify_capture_failure(err: &Error) -> CaptureRejection {
     match err {
         Error::KeychainLocked { .. } => CaptureRejection::KeychainLocked,
         Error::SwapLockBusy => CaptureRejection::SwapLockBusy,
+        Error::PriorConfigurationWithoutConfig => CaptureRejection::PriorConfiguration,
         // Not logged in (absent `~/.claude.json` or no `oauthAccount` block) or the canonical token
         // is gone — there is no active account to capture.
         Error::ClaudeStateNotFound { .. }

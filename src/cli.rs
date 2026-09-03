@@ -1417,6 +1417,15 @@ async fn run(verbosity: Verbosity, managed: bool) -> Result<()> {
     // notifies the daemon over the control socket, which then reconciles the in-memory
     // rotation to the freshly-written `config.toml` without a restart.
     .with_config_path(paths::config_file()?)
+    // Wire the prior-configuration witness (#1441, design D-1) at the real machine, so a socket
+    // `capture` into an ABSENT `config.toml` is refused when durable local state says this machine
+    // was configured before — the same rule the CLI's `capture` / `login` apply, at the entry point
+    // the menu-bar capture button uses. INJECTED here for the same #315 reason as
+    // `.with_usage_samples` below: the hermetic test harness never wires it, so a `FakeDaemon`
+    // capture never spawns `security` against the developer's own login keychain. Construction is
+    // pure path resolution and spawns nothing; `support_dir()` already gated startup via
+    // `.with_swap_lock(paths::swap_lock()?)` above, so this `?` adds no new failure mode.
+    .with_witness_sources(crate::witness::WitnessSources::real()?)
     // Maintain the usage-stats store (#161): compact + roll aged samples under the operator's
     // `[stats]` retention horizons, emitting redacted `usage_rollup` / `usage_gap` events. The
     // poll cadence is the daily-coverage denominator, so it is threaded in from `[tunables]`.
