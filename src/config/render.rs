@@ -358,6 +358,18 @@ impl Config {
     /// path the ring's own non-qualifying-write guard cannot see. `perform_config_set` in
     /// `src/daemon/commands.rs` states the contract this preserves: a refusal is a true no-op.
     pub(crate) async fn save_to(&self, path: &Path) -> Result<()> {
+        self.save_to_within(path, super::write_lock::CONFIG_WRITE_LOCK_MAX_WAIT)
+            .await
+    }
+
+    /// [`save_to`](Config::save_to) with an explicit config-write-lock budget.
+    ///
+    /// Split out so the FAIL-CLOSED return can be observed THROUGH this function in
+    /// milliseconds. Waiting out the production budget would put a 5 s sleep in the suite, and
+    /// cancelling the future with an outer `timeout` instead observes a cancellation — it never
+    /// reaches the [`Error::ConfigWriteLockBusy`] return, so it cannot tell that variant apart
+    /// from any other way of not finishing.
+    async fn save_to_within(&self, path: &Path, lock_budget: std::time::Duration) -> Result<()> {
         paths::ensure_private_dir(
             path.parent()
                 .expect("a config path always has a parent directory"),
@@ -370,7 +382,7 @@ impl Config {
         // retained, nothing written, nothing evicted. Dropped on return, releasing the lock.
         let _write_lock = super::write_lock::ConfigWriteLock::acquire(
             &super::write_lock::lock_path(path),
-            super::write_lock::CONFIG_WRITE_LOCK_MAX_WAIT,
+            lock_budget,
         )
         .await?;
         let retention = crate::roster_backup::retain_if_qualifying(path)?;
@@ -1440,9 +1452,11 @@ label = \"work\"
     /// This is the test that fails against the pre-change code, and it fails for the right
     /// reason: without the lock `save_to` completes immediately whatever anyone else is holding,
     /// so the `timeout` below returns `Ok` and the assertion that it was BLOCKED is what breaks.
-    /// The concurrency test beneath it exercises the same lock under real threads, but a race
-    /// that has to be *observed* can only ever be evidence, never a proof — this one is the
-    /// proof.
+    /// Scope, because "the proof" would overclaim: this proves the lock is TAKEN and that a
+    /// contended writer neither proceeds nor writes. It does NOT prove the guard is HELD across
+    /// the critical section — releasing it immediately after acquiring would pass every
+    /// assertion here, since the acquire still blocks. That span is pinned structurally by
+    /// `the_config_write_lock_guard_is_held_across_the_critical_section` below.
     ///
     /// It also demonstrates the no-deadlock property AC-5 asks for from the other side: the wait
     /// is BOUNDED, so a writer facing a daemon that holds the lock gets an error, never a hang.
@@ -1450,8 +1464,24 @@ label = \"work\"
     async fn save_to_blocks_on_a_held_config_write_lock_and_writes_nothing_meanwhile() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        roster_of(2).save_to(&path).await.unwrap();
+        // Fill the ring first. One entry against a depth of three leaves the eviction half of
+        // the assertion below unfalsifiable — `prune`'s `skip(RING_DEPTH)` removes nothing from
+        // a short ring whatever the implementation does.
+        for accounts in 1..=(crate::roster_backup::RING_DEPTH + 1) {
+            roster_of(accounts).save_to(&path).await.unwrap();
+        }
         let before = std::fs::read_to_string(&path).unwrap();
+        let ring_before: Vec<_> = crate::roster_backup::list(&path)
+            .unwrap()
+            .iter()
+            .map(|e| e.accounts)
+            .collect();
+        assert_eq!(
+            ring_before.len(),
+            crate::roster_backup::RING_DEPTH,
+            "the ring must be FULL before the blocked write, or `prune` cannot evict and the \
+             no-eviction half of this test asserts nothing"
+        );
 
         // Stand in for the other writer — a second CLI invocation, or the daemon's `config set`
         // handler — holding the lock across its own read-modify-write.
@@ -1479,16 +1509,121 @@ label = \"work\"
             before,
             "a writer waiting on the lock has written nothing — the refusal is a true no-op"
         );
-        assert!(
-            crate::roster_backup::list(&path).unwrap().is_empty(),
+        let ring_after: Vec<_> = crate::roster_backup::list(&path)
+            .unwrap()
+            .iter()
+            .map(|e| e.accounts)
+            .collect();
+        assert_eq!(
+            ring_after, ring_before,
             "nor has it retained or evicted anything: the lock is acquired BEFORE the ring is \
-             touched, which is what makes the whole read-modify-write the critical section"
+             touched, which is what makes the ring's read-modify-write part of the critical \
+             section"
         );
 
         // And it recovers: the lock is per-write, not per-process.
         drop(held);
         roster_of(9).save_to(&path).await.unwrap();
         assert_eq!(Config::load_path(&path).unwrap().roster.len(), 9);
+    }
+
+    /// AC-5's REPORTED half, observed as a returned value rather than as a cancellation: a
+    /// writer that cannot take the lock within its budget gets [`Error::ConfigWriteLockBusy`]
+    /// back OUT OF `save_to`, and the exit code an operator sees is the shared "busy, retry
+    /// shortly" one.
+    ///
+    /// The two `timeout`-based tests either side of this one cannot establish this — a cancelled
+    /// future returns nothing at all, so "did not finish" is all they can observe, and it is
+    /// satisfied by any hang whatsoever.
+    #[tokio::test]
+    async fn a_held_lock_makes_save_to_return_config_write_lock_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        roster_of(2).save_to(&path).await.unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let held = super::write_lock::ConfigWriteLock::acquire(
+            &super::write_lock::lock_path(&path),
+            std::time::Duration::from_millis(50),
+        )
+        .await
+        .expect("the stand-in writer takes the lock");
+
+        let err = roster_of(9)
+            .save_to_within(&path, std::time::Duration::from_millis(100))
+            .await
+            .expect_err("a save whose whole budget elapses under a held lock must fail closed");
+        assert!(
+            matches!(err, crate::error::Error::ConfigWriteLockBusy),
+            "a busy config-write lock must surface as its OWN variant, not as an I/O error or a \
+             swap-lock one — an operator reading the message has to be told which lock is busy; \
+             got {err:?}"
+        );
+        assert_eq!(
+            err.exit_code(),
+            4,
+            "a busy lock is the transient retry-shortly class, sharing an exit code with \
+             `SwapLockBusy` and `UsageStoreBusy` so a script can branch on it"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "the refusal wrote nothing"
+        );
+        drop(held);
+    }
+
+    /// The SPAN of the config-write lock: the guard binds to a live name and every effect of the
+    /// critical section happens after it.
+    ///
+    /// Structural on purpose. The mutation this exists to catch is `let _write_lock = …` becoming
+    /// `let _ = …`, which drops the guard at the end of the statement while leaving the acquire —
+    /// and therefore every runtime assertion about a contended writer BLOCKING — intact. No test
+    /// that observes `save_to` from outside can separate those two programs.
+    #[test]
+    fn the_config_write_lock_guard_is_held_across_the_critical_section() {
+        let source = std::fs::read_to_string("src/config/render.rs")
+            .expect("cannot read src/config/render.rs");
+        let from = source
+            .find("async fn save_to_within(")
+            .expect("`save_to_within` has been renamed — this gate's anchor has gone stale");
+        let body = &source[from..][..source[from..]
+            .find("\n    }\n")
+            .expect("`save_to_within` has no closing brace at its own indentation")];
+
+        let acquire = body
+            .find("ConfigWriteLock::acquire(")
+            .expect("`save_to_within` no longer acquires the config-write lock");
+        let binding = body[..acquire]
+            .rfind("let ")
+            .expect("the acquire is not bound by a `let` at all");
+        // The binding's NAME: everything between `let ` and the `=` opening the initializer.
+        let bound_to = body[binding + 4..acquire]
+            .split_once('=')
+            .expect("a `let` binding the acquire always has an `=`")
+            .0
+            .trim();
+        assert!(
+            bound_to != "_",
+            "the config-write lock is bound to `_`, which drops the guard at the end of its own \
+             statement — the acquire still blocks a contended writer, so every runtime assertion \
+             in this module still passes while the critical section runs UNLOCKED"
+        );
+
+        for effect in [
+            "retain_if_qualifying(",
+            "write_private_file(",
+            "retention.commit()",
+        ] {
+            let at = body
+                .find(effect)
+                .unwrap_or_else(|| panic!("`{effect}` is no longer in `save_to_within`"));
+            assert!(
+                acquire < at,
+                "`{effect}` runs BEFORE the config-write lock is acquired, so a refusal is no \
+                 longer a true no-op"
+            );
+        }
     }
 
     /// AC-2 under REAL concurrency: several writers race one `config.toml` from separate OS
@@ -1503,18 +1638,23 @@ label = \"work\"
     ///   parses. Pre-change this is reachable because the writers share one staging name and
     ///   `write_private_file` opens it by unlinking: an unlink landing between the winner's
     ///   `fsync` and its `rename` publishes the LOSER's half-written file.
-    /// - **No update is lost.** Every writer's roster is accounted for — one live, the rest
-    ///   retained by whoever replaced them. `WRITERS` is held at [`RING_DEPTH`] so the ring can
-    ///   hold every displaced entry and eviction never confounds the accounting.
+    /// - **No writer's output vanishes.** Every writer's roster is accounted for in live ∪ ring
+    ///   — one live, the rest retained by whoever replaced them. Say it that way rather than "no
+    ///   update is lost": this is RING accounting, and it is not the write-write sense, in which
+    ///   a caller whose read-modify-write straddles another's publish does still lose its change
+    ///   (issue #1482). What it does catch is a writer whose output never reached disk at all,
+    ///   and two writers retaining the SAME displaced roster — the duplicate-plus-missing pair a
+    ///   broken lock produces. `WRITERS` is held at [`RING_DEPTH`] so the ring can hold every
+    ///   displaced entry and eviction never confounds the accounting.
     /// - **Exactly one writer's output is live**, complete and valid (AC-8 verbatim).
     ///
     /// Being a race, a green run is EVIDENCE and not proof — the deterministic proof that the
     /// lock is wired at all is the test above. This one is what would catch a lock that is taken
     /// but does not actually cover the ring's read-modify-write.
     #[test]
-    fn concurrent_writers_publish_one_complete_config_and_lose_no_update() {
+    fn concurrent_writers_publish_one_complete_config_and_none_of_their_output_vanishes() {
         use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
+        use std::sync::{Arc, Barrier};
 
         const WRITERS: usize = crate::roster_backup::RING_DEPTH;
         // Distinct, non-zero roster sizes: each writer's own signature in the accounting below.
@@ -1545,29 +1685,69 @@ label = \"work\"
                         Err(crate::error::Error::ConfigNotFound { .. }) => {}
                         Err(err) => panic!("the live config did not parse: {err}"),
                     }
+                    // Bounded, not a busy spin: an unthrottled read+parse loop burns a core
+                    // against the writers, and on a low-core runner that is what could push one
+                    // of them past its lock budget into a spurious failure.
+                    std::thread::sleep(std::time::Duration::from_micros(200));
                 }
             })
         };
 
+        // Force the race rather than hope for it. Without this the writers are only *likely* to
+        // overlap — thread 1 can finish before thread 3's runtime is even built, and that
+        // degenerate sequential run satisfies every assertion below having tested nothing about
+        // concurrency. So: the main thread takes the lock first, every writer parks at the
+        // barrier with its runtime already built, and the lock is released only once they are
+        // all parked. Each writer therefore STARTS blocked, and its own elapsed time proves it.
+        const HOLD: std::time::Duration = std::time::Duration::from_millis(150);
+        let gate = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                super::write_lock::ConfigWriteLock::acquire(
+                    &super::write_lock::lock_path(&path),
+                    std::time::Duration::from_millis(50),
+                )
+                .await
+            })
+            .expect("the gate takes the lock on an uncontended file");
+
+        let barrier = Arc::new(Barrier::new(WRITERS + 1));
         let writers: Vec<_> = sizes
             .iter()
             .copied()
             .map(|accounts| {
                 let path = path.clone();
+                let barrier = Arc::clone(&barrier);
                 // One runtime per thread: genuinely parallel acquires, not a single-threaded
                 // interleave that would serialize by accident and pass without a lock.
                 std::thread::spawn(move || {
-                    tokio::runtime::Builder::new_current_thread()
+                    let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
-                        .unwrap()
+                        .unwrap();
+                    barrier.wait();
+                    let began = std::time::Instant::now();
+                    runtime
                         .block_on(async { roster_of(accounts).save_to(&path).await })
                         .unwrap_or_else(|err| panic!("writer {accounts} failed: {err}"));
+                    (accounts, began.elapsed())
                 })
             })
             .collect();
+        barrier.wait();
+        std::thread::sleep(HOLD);
+        drop(gate);
+
         for w in writers {
-            w.join().unwrap();
+            let (accounts, took) = w.join().unwrap();
+            assert!(
+                took >= HOLD,
+                "writer {accounts} finished in {took:?}, faster than the {HOLD:?} the gate held \
+                 the lock for — it did not wait on the lock, so this run never exercised \
+                 contention and every assertion below passed vacuously"
+            );
         }
         stop.store(true, Ordering::Relaxed);
         reader.join().unwrap();

@@ -407,5 +407,14 @@ mod tests {
             classify_capture_failure(&Error::SwapWrongIdentityRestash),
             CaptureRejection::Failed
         );
+        // Issue #1445. Pinned because the deliberate choice is the one a reader would most
+        // plausibly "improve": `ConfigWriteLockBusy` is a busy LOCK, so mapping it onto
+        // `SwapLockBusy` compiles, reads as tidy, and passes every other test in this file —
+        // while telling an operator the SWAP lock is busy when it is not. The docs above say a
+        // bug report must never conflate them; this is what enforces it.
+        assert_eq!(
+            classify_capture_failure(&Error::ConfigWriteLockBusy),
+            CaptureRejection::Failed
+        );
     }
 }

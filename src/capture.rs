@@ -931,12 +931,20 @@ fn should_signal_restored(activate: bool, outcome: LoginOutcome) -> bool {
 /// OUTSIDE the swap lock is not the same as unlocked, and since issue #1445 it no longer
 /// implies it. The sentence above answers only "can a concurrent SWAP race this save", and the
 /// answer is still no; the pair it never addressed is two CONFIG writers racing each other —
-/// this save against another CLI invocation or the daemon's `config set`. That pair is served
-/// by a dedicated lock of its own, taken inside [`Config::save`] over the whole
-/// read-modify-write ([`crate::config`]'s `write_lock`, design D-8). The two locks are never
-/// nested: `run_login_locked` has returned and released the swap lock before the save below is
-/// reached, which is what keeps a CLI writer and a daemon holding `swap.lock` from deadlocking,
-/// and is pinned by `the_roster_save_is_reached_only_after_the_swap_lock_has_been_released`.
+/// this save against another CLI invocation or the daemon's `config set`. Their PUBLISHES are
+/// serialized by a dedicated lock of its own, taken inside [`Config::save`] across the
+/// read-modify-write `save_to` itself performs — retain into the ring, write, prune
+/// ([`crate::config`]'s `write_lock`, design D-8). It does NOT make this verb's own
+/// read-modify-write atomic: `existing` was parsed before an interactive login that can run for
+/// minutes, and a concurrent `config set` landing in that window is overwritten here. That
+/// residual is issue #1482, and widening this lock to cover the login is exactly what AC-8
+/// forbids.
+///
+/// The two locks are never nested: `run_login_locked` has returned and released the swap lock
+/// before the save below is reached — pinned by
+/// `the_roster_save_is_reached_only_after_the_swap_lock_has_been_released`. That is a latency
+/// property, not the anti-deadlock guarantee; see `write_lock`'s module docs for why the bounded
+/// wait is what rules a deadlock out.
 ///
 /// `existing` is the config the CALLER parsed, passed in rather than re-read here (issue
 /// #1440, R-5). It used to call [`load_existing`] itself, which meant the roster this
@@ -2062,9 +2070,13 @@ mod tests {
     /// have disturbed.
     ///
     /// The failure is injected through the new lock rather than through a contrived I/O fault,
-    /// because that is the failure mode this change ADDS: another config writer holding the lock
-    /// makes the save return `ConfigWriteLockBusy`. So this asserts both halves at once — the new
-    /// refusal path behaves like every other save failure, and the ordering invariant survives it.
+    /// because that is the failure mode this change ADDS. Be exact about what this observes: a
+    /// held lock makes the save NOT PROCEED, and the assertion below is on the stash the
+    /// non-proceeding save left behind. It is cancelled at the 200 ms timeout rather than run to
+    /// the 5 s budget, so it never reaches the `ConfigWriteLockBusy` return — that return is
+    /// observed through `save_to` by
+    /// `config::render::tests::a_held_lock_makes_save_to_return_config_write_lock_busy`, and at
+    /// the primitive by `config::write_lock::tests::a_contended_acquire_fails_closed_and_recovers_on_release`.
     ///
     /// What "restorable" means concretely: the account's credential is in the stash under its own
     /// key, so a re-run reaches the same roster row rather than a row pointing at nothing. The
@@ -2131,36 +2143,67 @@ mod tests {
         );
     }
 
-    /// AC-5's structural half, and the reason the two locks cannot deadlock against each other:
-    /// the roster save is REACHED only after the swap-locked section has returned and released.
+    /// AC-5's structural half: the roster save is REACHED only after the swap-locked section has
+    /// returned and released, over ALL FOUR verbs that hold a swap lock and then save.
     ///
-    /// A bounded wait alone would degrade a lock-order inversion into two mutual timeouts rather
-    /// than a hang — survivable, but a spurious failure on every contended write. Not nesting them
-    /// is what makes the guarantee structural. This reads the shipped source because the property
-    /// is about the ORDER of two calls in a function body, which no runtime assertion in a
-    /// single-threaded test can observe.
+    /// Not the anti-deadlock guarantee — the BOUNDED wait is, and it would be even if the locks
+    /// nested, since `save_to`'s critical section acquires nothing else and only one hold-and-wait
+    /// direction is constructible. What non-nesting buys is that a contended config write cannot
+    /// extend a swap-lock hold by `CONFIG_WRITE_LOCK_MAX_WAIT`, and that the invariant survives
+    /// issue #257 replacing the bounded `flock` poll with a possibly-unbounded `File::try_lock`.
+    ///
+    /// All four are covered because the claim in `write_lock`'s module docs is universal. The two
+    /// outside this file are the ones a reordering would NOT make locally obvious: each holds its
+    /// swap lock inside a CALLED function (`capture_locked`, `apply_import`), so the guard is not
+    /// visible at the save. This reads the shipped source because the property is about the ORDER
+    /// of two calls in a function body, which no runtime assertion can observe.
     #[test]
     fn the_roster_save_is_reached_only_after_the_swap_lock_has_been_released() {
-        let source = capture_source_above_the_tests();
-        for (verb, locked_call) in [
-            ("pub(crate) async fn capture", "capture_locked("),
-            ("pub(crate) async fn reconcile_login", "run_login_locked("),
+        for (file, verb, locked_call, save_call) in [
+            (
+                "src/capture.rs",
+                "pub(crate) async fn capture",
+                "capture_locked(",
+                "config.save()",
+            ),
+            (
+                "src/capture.rs",
+                "pub(crate) async fn reconcile_login",
+                "run_login_locked(",
+                "config.save()",
+            ),
+            (
+                "src/daemon/commands.rs",
+                "pub(super) async fn perform_socket_capture",
+                "capture_locked(",
+                "config.save_to(",
+            ),
+            (
+                "src/cli.rs",
+                "async fn import",
+                "apply_import(",
+                "config.save()",
+            ),
         ] {
-            let body = fn_body(&source, verb);
+            let source = source_above_the_tests(file);
+            let body = fn_body_in(&source, verb, file);
             let locked = body.find(locked_call).unwrap_or_else(|| {
                 panic!(
-                    "`{verb}` no longer calls `{locked_call}` — this gate's anchor has gone stale"
+                    "`{verb}` in {file} no longer calls `{locked_call}` — this gate's anchor has \
+                     gone stale"
                 )
             });
-            let save = body.find("config.save()").unwrap_or_else(|| {
-                panic!("`{verb}` no longer saves the roster — this gate's anchor has gone stale")
+            let save = body.find(save_call).unwrap_or_else(|| {
+                panic!(
+                    "`{verb}` in {file} no longer calls `{save_call}` — this gate's anchor has \
+                     gone stale"
+                )
             });
             assert!(
                 locked < save,
-                "`{verb}` saves the roster BEFORE `{locked_call}` returns, so the config-write \
-                 lock would be taken inside the swap lock — a lock-order inversion against a \
-                 daemon that takes them the other way round, and a reordering of \
-                 stash-before-roster besides"
+                "`{verb}` in {file} saves the roster BEFORE `{locked_call}` returns, so the \
+                 config-write lock would be taken inside the swap lock — extending a swap-lock \
+                 hold by the config-write budget, and a reordering of stash-before-roster besides"
             );
         }
     }
@@ -2260,11 +2303,23 @@ mod tests {
     /// else. Both callers canary what they extracted, so a boundary that moved up shows as a
     /// failure rather than as a green run over an empty subject.
     fn capture_source_above_the_tests() -> String {
-        let text = std::fs::read_to_string("src/capture.rs").expect("cannot read src/capture.rs");
-        text.split("\n#[cfg(test)]\nmod tests")
+        source_above_the_tests("src/capture.rs")
+    }
+
+    /// The production half of `file` — everything above its `#[cfg(test)] mod tests`.
+    fn source_above_the_tests(file: &str) -> String {
+        let text = std::fs::read_to_string(file).unwrap_or_else(|_| panic!("cannot read {file}"));
+        let above = text
+            .split("\n#[cfg(test)]\nmod tests")
             .next()
             .expect("split always yields a first element")
-            .to_owned()
+            .to_owned();
+        assert!(
+            above.len() < text.len(),
+            "{file} has no `#[cfg(test)] mod tests` at column 0 — this gate would grade the \
+             test module as production source"
+        );
+        above
     }
 
     /// The CODE of `source` from the line opening `signature` to the next column-0 `}` —
@@ -2290,13 +2345,25 @@ mod tests {
     /// literal is left alone (detected by an odd quote count to its left), so the strip
     /// cannot eat code.
     fn fn_body(source: &str, signature: &str) -> String {
+        fn_body_in(source, signature, "src/capture.rs")
+    }
+
+    /// As [`fn_body`], but for any `origin` file and for a signature at ANY indentation.
+    ///
+    /// Delimits on a closing brace at the signature's OWN column rather than at column 0, which
+    /// `cargo fmt` guarantees and which a method inside an `impl` block needs — a column-0
+    /// delimiter would run such a body to the end of the whole `impl`, and an ordering assertion
+    /// over that span could be satisfied by two calls in unrelated methods.
+    fn fn_body_in(source: &str, signature: &str, origin: &str) -> String {
         let from = source
             .find(signature)
-            .unwrap_or_else(|| panic!("`{signature}` is not in src/capture.rs"));
+            .unwrap_or_else(|| panic!("`{signature}` is not in {origin}"));
+        let line_start = source[..from].rfind('\n').map_or(0, |at| at + 1);
+        let closer = format!("\n{}}}\n", &source[line_start..from]);
         let rest = &source[from..];
-        let end = rest
-            .find("\n}\n")
-            .unwrap_or_else(|| panic!("`{signature}` has no column-0 closing brace"));
+        let end = rest.find(&closer).unwrap_or_else(|| {
+            panic!("`{signature}` in {origin} has no closing brace at its own indentation")
+        });
         rest[..end]
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
