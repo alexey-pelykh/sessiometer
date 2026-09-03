@@ -96,9 +96,12 @@ enum Command {
     /// and management mode (`status`, read-only), plus stopping / restarting it (`stop` /
     /// `restart`). The process-lifecycle counterpart to the persistence-oriented `service` noun.
     Daemon { action: DaemonAction },
-    /// `config path|validate|show [--origin]` — READ-ONLY config diagnostics (issue #401):
-    /// resolve the `config.toml` path, parse+validate it without running, or print the effective
-    /// config with each value tagged `default` vs `from-file`. Never mutates the file or the daemon.
+    /// `config path|validate|show|backups|restore [--origin]` — config diagnostics (issue #401)
+    /// and the roster backup ring (issue #1439): resolve the `config.toml` path, parse+validate
+    /// it without running, print the effective config with each value tagged `default` vs
+    /// `from-file`, list retained backups, or restore one. `restore` is the only one that
+    /// mutates — it writes `config.toml` and notifies a running daemon; the other four are
+    /// read-only. See [`ConfigAction`] for why the noun is no longer read-only wholesale.
     Config { action: ConfigAction },
     /// `status [--json] [--no-color] [-v|--verbose]` — the live status client.
     Status {
@@ -193,13 +196,19 @@ enum DaemonAction {
     Restart,
 }
 
-/// The `config` sub-action (issue #401): READ-ONLY config diagnostics. `path` prints the
-/// resolved `config.toml` location, `validate` parses + validates it WITHOUT running (the same
-/// seam the daemon loads through), and `show` prints the effective config — with `--origin`,
-/// each value tagged `default` vs `from-file` so a silently-defaulted absent section is visible.
-/// None of the three mutates the file or the daemon. A plain data enum, like [`ServiceAction`] /
-/// [`DaemonAction`] — the parser resolves the sub-verb (and the `--origin` flag) so `execute`
+/// The `config` sub-action (issues #401, #1439): config diagnostics, plus the backup ring's
+/// operator surface. `path` prints the resolved `config.toml` location, `validate` parses +
+/// validates it WITHOUT running (the same seam the daemon loads through), `show` prints the
+/// effective config — with `--origin`, each value tagged `default` vs `from-file` so a
+/// silently-defaulted absent section is visible — and `backups` enumerates what the roster
+/// backup ring retains. A plain data enum, like [`ServiceAction`] / [`DaemonAction`] — the
+/// parser resolves the sub-verb (and the `--origin` flag, and `restore`'s index) so `execute`
 /// just dispatches.
+///
+/// Four of the five are READ-ONLY. `restore` is the exception and the reason this noun is no
+/// longer described as read-only wholesale: issue #1439 R-9 requires an operator-invocable path
+/// back from a lost roster that does not involve hand-editing TOML, and it lands here because
+/// it is a `config.toml` operation and belongs beside the listing that names its argument.
 #[derive(Debug, PartialEq)]
 enum ConfigAction {
     /// `config path` — print the resolved `config.toml` path (honours `$XDG_CONFIG_HOME`).
@@ -208,6 +217,11 @@ enum ConfigAction {
     Validate,
     /// `config show [--origin]` — print the effective config; `--origin` tags each value's provenance.
     Show { origin: bool },
+    /// `config backups` — list what the roster backup ring retains (issue #1439).
+    Backups,
+    /// `config restore <N>` — replace `config.toml` with retained backup `N` (issue #1439).
+    /// The index is 1-based and newest-first, as `config backups` prints it.
+    Restore { index: usize },
 }
 
 /// Which help text a [`Command::Help`] prints (issue #175): the root overview, or one
@@ -437,15 +451,18 @@ fn parse_daemon(parser: &mut lexopt::Parser) -> Result<Command> {
     }
 }
 
-/// Parse `config <path|validate|show> [--origin]` (issue #401): the READ-ONLY config
-/// diagnostics noun. The first positional is the sub-action; the order-independent `--origin`
-/// flag applies to `show` (tag each value default-vs-file). `-h`/`--help` short-circuits, an
-/// unknown flag or action is a strict-usage error, and bare `config` prints the config help.
-/// Mirrors [`parse_service`] / [`parse_daemon`]; the `--origin` flag is the only shape
-/// difference, and it is REJECTED on `path`/`validate` (where it is meaningless) rather than
-/// silently accepted — the same strict-usage stance as an unknown flag (issue #175).
+/// Parse `config <path|validate|show|backups|restore> [<index>] [--origin]` (issues #401,
+/// #1439): the config-diagnostics noun, plus the backup ring's two operator verbs. The first
+/// positional is the sub-action and the second is `restore`'s index; the order-independent
+/// `--origin` flag applies to `show` (tag each value default-vs-file). `-h`/`--help`
+/// short-circuits, an unknown flag or action is a strict-usage error, and bare `config` prints
+/// the config help. Mirrors [`parse_service`] / [`parse_daemon`]; the `--origin` flag is the
+/// only shape difference, and it is REJECTED on every action but `show` (where alone it means
+/// something) rather than silently accepted — the same strict-usage stance as an unknown flag
+/// (issue #175).
 fn parse_config(parser: &mut lexopt::Parser) -> Result<Command> {
     let mut action_name = None;
+    let mut argument = None;
     let mut origin = false;
     while let Some(arg) = parser.next()? {
         match arg {
@@ -453,6 +470,9 @@ fn parse_config(parser: &mut lexopt::Parser) -> Result<Command> {
             Long("origin") => origin = true,
             Value(value) if action_name.is_none() => {
                 action_name = Some(value.to_string_lossy().into_owned());
+            }
+            Value(value) if argument.is_none() => {
+                argument = Some(value.to_string_lossy().into_owned());
             }
             Value(_) => {} // extra positional ignored, matching the other parsers
             other => return Err(unexpected(other, HelpTopic::Config)),
@@ -466,6 +486,10 @@ fn parse_config(parser: &mut lexopt::Parser) -> Result<Command> {
         "path" => ConfigAction::Path,
         "validate" => ConfigAction::Validate,
         "show" => ConfigAction::Show { origin },
+        "backups" => ConfigAction::Backups,
+        "restore" => ConfigAction::Restore {
+            index: backup_index(argument.as_deref())?,
+        },
         other => {
             return Err(Error::CliUsage {
                 message: format!("unknown config action `{other}`"),
@@ -473,7 +497,7 @@ fn parse_config(parser: &mut lexopt::Parser) -> Result<Command> {
             })
         }
     };
-    // `--origin` only means something for `show`; on `path`/`validate` it is a usage error.
+    // `--origin` only means something for `show`; everywhere else it is a usage error.
     if origin && !matches!(action, ConfigAction::Show { .. }) {
         return Err(Error::CliUsage {
             message: "`--origin` applies only to `config show`".to_string(),
@@ -481,6 +505,30 @@ fn parse_config(parser: &mut lexopt::Parser) -> Result<Command> {
         });
     }
     Ok(Command::Config { action })
+}
+
+/// Resolve `config restore`'s positional into a 1-based ring index (issue #1439).
+///
+/// Both rejections are shaped at ONE construction site, so the two messages cannot drift into
+/// different registers and the `CliUsage` construction-site count in
+/// `every_cli_usage_construction_site_is_scanned` moves by one rather than by two. `0` is
+/// rejected with the non-numeric input: the listing this index comes from is 1-based, so a `0`
+/// is a miscount rather than a boundary, and answering it with the ring's oldest entry would
+/// silently restore something the operator did not name.
+fn backup_index(argument: Option<&str>) -> Result<usize> {
+    let message = match argument {
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(index) if index > 0 => return Ok(index),
+            _ => format!("invalid backup index `{raw}`: expected a whole number from 1 upward"),
+        },
+        None => "`config restore` takes the index of a retained backup, as numbered by `config \
+                 backups`"
+            .to_string(),
+    };
+    Err(Error::CliUsage {
+        message,
+        usage_hint: HelpTopic::Config.hint(),
+    })
 }
 
 /// Parse `status [--json] [--no-color] [-v|--verbose]` (issues #72/#73/#143) — all flags
@@ -845,6 +893,8 @@ async fn execute(command: Command) -> Result<()> {
             ConfigAction::Path => config_path(),
             ConfigAction::Validate => config_validate(),
             ConfigAction::Show { origin } => config_show(origin),
+            ConfigAction::Backups => config_backups(),
+            ConfigAction::Restore { index } => config_restore(index).await,
         },
         Command::Status {
             json,
@@ -916,7 +966,7 @@ COMMANDS:
     run [-v|--verbose]   Run the foreground daemon (poll + swap; -v adds run diagnostics)
     service <install|uninstall|status>  Persistence: install/uninstall the background launchd LaunchAgent, and report whether one is installed (auto-start at login)
     daemon <status|stop|restart>  Process lifecycle: report the running daemon (status), stop it, or restart it
-    config <path|validate|show>  Read-only config diagnostics: resolve the config.toml path, validate it, or show the effective config (show --origin tags default vs from-file)
+    config <path|validate|show|backups|restore>  Config diagnostics and the backup ring: resolve the config.toml path, validate it, show the effective config (show --origin tags default vs from-file), list retained backups, or restore one
     status [--json] [--no-color] [-v|--verbose]  Show each account's usage + resets-in, and the next swap (-v adds each access token's expiry)
     list       List captured accounts
     use <account> [--force]  Switch the active account now (--force overrides the pre-swap gate)
@@ -1050,21 +1100,28 @@ You do not start a daemon with `daemon`: one is started by `service install` (ma
 login) or `sessiometer run` (unmanaged, foreground) — which is why there is no `daemon start`.
 ";
 
-const CONFIG_USAGE: &str = "sessiometer config — read-only config diagnostics: resolve, validate, and inspect config.toml
+const CONFIG_USAGE: &str = "sessiometer config — config diagnostics, and the config.toml backup ring
 
 USAGE:
-    sessiometer config <path|validate|show> [--origin]
+    sessiometer config <path|validate|show|backups|restore> [<index>] [--origin]
 
     path        print the resolved config.toml path (honours $XDG_CONFIG_HOME, else ~/Library/Application Support/sessiometer)
     validate    parse + validate config.toml WITHOUT running; report typo'd/unknown keys, out-of-range values, and target_max_session_usage > session_ceiling
     show        print the effective config (defaults filled in); with --origin, tag each value default (absent → compiled-in) vs from-file
+    backups     list the retained config.toml backups, newest first, by timestamp and account count
+    restore <N> replace config.toml with retained backup <N>, as numbered by `config backups`
     --origin    (with show) tag each value's provenance, so a silently-defaulted absent section is visible
     -h, --help  print this help
 
-All three are READ-ONLY: they never write config.toml, start/stop a daemon, or change any state. `config
-show --origin` surfaces effective-vs-on-disk drift — e.g. a hand-deleted [tunables] block shows every
-tunable as `default`, the very drift that once went unnoticed because the effective config is only ever
-emitted once to stderr at start-up.
+path, validate, show and backups are READ-ONLY: they never write config.toml, start/stop a daemon, or
+change any state. `config show --origin` surfaces effective-vs-on-disk drift — e.g. a hand-deleted
+[tunables] block shows every tunable as `default`, the very drift that once went unnoticed because the
+effective config is only ever emitted once to stderr at start-up.
+
+`config restore` is the one that writes. A config.toml holding accounts is copied into the ring before
+any replacement of it, including this one, so a restore is itself reversible; a file that is absent,
+unreadable, malformed or empty is neither copied nor allowed to displace what the ring already holds.
+The ring keeps three, newest first.
 ";
 
 const STATUS_USAGE: &str = "sessiometer status — show each account's usage + resets-in and the next swap (needs a running daemon)
@@ -2218,6 +2275,160 @@ fn render_peak_runway_advisory(a: &crate::config::PeakRunwayAdvisory) -> String 
          can swap\n\
          \x20 straight back out. A tuning note, not an error — the shipped defaults sit here too.\n",
     )
+}
+
+/// `config backups` (issue #1439): list what the roster backup ring retains — the enumeration
+/// half of R-9's operator-invocable path back from a lost roster.
+///
+/// Read-only. Reports a COUNT and a timestamp per entry and never an account label: the listing
+/// is a more public surface than the file it describes (it is what an operator pastes into a bug
+/// report), so it carries enough to choose between entries and nothing more (`docs/specs/roster-backup-qualifying-write.feature.md`, Rule 3).
+fn config_backups() -> Result<()> {
+    let path = paths::config_file()?;
+    let retained = crate::roster_backup::list(&path)?;
+    print!(
+        "{}",
+        render_config_backups(&crate::roster_backup::ring_dir(&path), &retained)
+    );
+    Ok(())
+}
+
+/// Render `config backups`' listing (issue #1439). Pure — no I/O — so the state→text mapping is
+/// unit-tested without a real ring, matching [`render_config_validate`] / [`render_config_origin`].
+///
+/// An entry that no longer parses renders its count as `unreadable` rather than being hidden:
+/// it is still restorable material an operator may want to look at, and hiding it would make
+/// the numbering disagree with what `restore` accepts.
+fn render_config_backups(dir: &Path, retained: &[crate::roster_backup::Retained]) -> String {
+    if retained.is_empty() {
+        return format!("no backups retained under {}\n", dir.display());
+    }
+    // The count is the ring's ACTUAL contents, with the depth named separately rather than as a
+    // denominator: pruning is best-effort, so a transient failure can leave one entry over depth
+    // and `4 of 3 retained` would read as a contradiction rather than as the recoverable state
+    // it is (the next qualifying write prunes to depth again).
+    let mut out = format!(
+        "{} retained under {} (ring depth {})\n",
+        retained.len(),
+        dir.display(),
+        crate::roster_backup::RING_DEPTH
+    );
+    for (ordinal, entry) in retained.iter().enumerate() {
+        let when = crate::observability::rfc3339(entry.taken_at);
+        let held = match entry.accounts {
+            Some(1) => "1 account".to_string(),
+            Some(count) => format!("{count} accounts"),
+            None => "unreadable".to_string(),
+        };
+        out.push_str(&format!("  {}  {when}  {held}\n", ordinal + 1));
+    }
+    out
+}
+
+/// `config restore <N>` (issue #1439): replace `config.toml` with retained backup `N` — the
+/// restore half of R-9, so a lost roster comes back without hand-editing TOML.
+///
+/// Three properties make this a roster write like any other rather than a privileged one.
+/// It re-validates the chosen entry through [`Config::from_toml_str`] before writing anything,
+/// so a backup that no longer parses is refused rather than installed. It writes through
+/// [`Config::save_to`], which means the config it replaces goes into the ring first if it
+/// qualifies — so a restore is itself undoable, which is what AC-5's "not silently over a
+/// roster the operator has since changed" asks for. And it NAMES both sides before acting:
+/// what is being installed, and what is being replaced.
+///
+/// It then notifies a running daemon exactly as the other roster-mutating verbs do
+/// (`remove`, `enable` / `disable`), so a restored roster is live rather than pending a
+/// restart. Best-effort, like theirs.
+async fn config_restore(index: usize) -> Result<()> {
+    config_restore_at(&paths::config_file()?, index)?;
+    crate::capture::notify_daemon_roster_reload().await;
+    Ok(())
+}
+
+/// Everything `config restore` does to the filesystem, against a CALLER-SUPPLIED config path
+/// (issue #1439).
+///
+/// Split out from [`config_restore`] for one reason: the enclosing verb resolves
+/// [`paths::config_file`] off the live machine, so nothing could drive the write half hermetically
+/// and its only coverage was a test in `crate::roster_backup` that RE-IMPLEMENTED this sequence.
+/// A re-implementation cannot catch this function drifting away from it — replacing the
+/// [`Config::save_to`] call below with a plain copy would bypass the ring entirely, un-doing the
+/// reversibility AC-5 asks for and the `0600` write with it, while every test stayed green.
+///
+/// The daemon notify stays with the caller: it is best-effort, needs a running daemon, and is the
+/// one step with nothing on disk to assert against.
+fn config_restore_at(path: &Path, index: usize) -> Result<()> {
+    let retained = crate::roster_backup::list(path)?;
+    // `checked_sub`, not `index - 1`: `backup_index` is the only production constructor and it
+    // rejects `0`, but that makes the PARSER the whole guard for an arithmetic underflow, and
+    // this function is now reachable from a test that does not go through it.
+    let entry =
+        index
+            .checked_sub(1)
+            .and_then(|i| retained.get(i))
+            .ok_or(Error::BackupNotRetained {
+                index,
+                retained: retained.len(),
+            })?;
+    // Validate BEFORE naming what will happen, so a REFUSED ENTRY never trails a line that reads
+    // as an announcement of a write that did not occur. The write itself can still fail after the
+    // notice — a qualifying config that cannot be retained aborts it by design — and that error
+    // follows immediately on stderr rather than being silent.
+    let restored = Config::from_toml_str(&std::fs::read_to_string(&entry.path)?)?;
+    // The config being replaced, described from the same seam the ring's own rule uses: a file
+    // that will not load is reported as such rather than as zero accounts.
+    let replaced = Config::load_path(path).ok().map(|c| c.roster.len());
+    print!(
+        "{}",
+        render_restore_notice(entry, restored.roster.len(), path, replaced)
+    );
+    restored.save_to(path)
+}
+
+/// Render `config restore`'s notice (issue #1439). Pure — no I/O — so the exact operator-facing
+/// text is unit-tested without a real ring.
+///
+/// Four things, in the order they matter to someone who has just lost a roster. What is being
+/// installed and what it displaces — the AC-5 property, so an operator who miscounted the index
+/// sees both in the same breath. Then two disclosures that would otherwise be discoverable only
+/// by reading the source:
+///
+/// - the installed file is RE-RENDERED from the retained entry, not copied from it, so anything
+///   the current emitter does not write (a hand-added comment) does not come back. The retained
+///   file is named so it can be copied verbatim instead;
+/// - when the displaced config qualified it entered the ring, which makes the restore reversible
+///   AND shifts every index the operator just read, since the listing is newest-first. Saying so
+///   is what stops a second `restore` from silently targeting a different entry.
+fn render_restore_notice(
+    entry: &crate::roster_backup::Retained,
+    accounts: usize,
+    path: &Path,
+    replaced: Option<usize>,
+) -> String {
+    let held = match replaced {
+        Some(1) => "1 account".to_string(),
+        Some(count) => format!("{count} accounts"),
+        None => "no loadable config".to_string(),
+    };
+    let mut out = format!(
+        "restoring the backup taken {} ({accounts} in its roster)\n\
+         over {} ({held})\n",
+        crate::observability::rfc3339(entry.taken_at),
+        path.display()
+    );
+    out.push_str(&format!(
+        "values are re-rendered; the retained file stays at {}\n",
+        entry.path.display()
+    ));
+    // Exactly the ring's own predicate: a displaced config enters the ring iff it parses with a
+    // non-empty roster, and only then does the numbering move.
+    if replaced.is_some_and(|count| count > 0) {
+        out.push_str(
+            "the displaced config is retained, so backup numbering shifts — re-run \
+             `config backups` before restoring again\n",
+        );
+    }
+    out
 }
 
 /// `config show [--origin]` (issue #401): print the effective config the daemon WOULD load
@@ -13647,6 +13858,7 @@ spare  22222222-2222\n\
         ("unexpected", Scanned, "three CliUsage messages the `status --zzz` / `-z` / `log zzz` cases render"),
         ("required_value", Scanned, "the CliUsage message the `stats --period` case renders"),
         ("parse_config", Scanned, "argv tokens, plus the two CliUsage messages `config zzz` / `config path --origin` render"),
+        ("backup_index", Scanned, "the two CliUsage messages `config restore` / `config restore 0` render"),
         ("parse_daemon", Scanned, "argv tokens, plus the CliUsage message `daemon zzz` renders"),
         ("parse_service", Scanned, "argv tokens, plus the CliUsage message `service zzz` renders"),
         ("parse_use", Scanned, "argv tokens, plus the CliUsage message `use zzz --next` renders"),
@@ -13717,6 +13929,8 @@ spare  22222222-2222\n\
         ("render_peak_runway_advisory", Unscanned, "the peak-runway tuning advisory"),
         ("render_config_validate", Unscanned, "`config validate`'s verdict"),
         ("render_config_origin", Unscanned, "`config show`'s heading, provenance tags and section lines"),
+        ("render_config_backups", Unscanned, "`config backups`' ring heading and per-entry account-count noun"),
+        ("render_restore_notice", Unscanned, "`config restore`'s before-and-after notice"),
         ("version_line", Unscanned, "the version banner's program name and `env!` key"),
     ];
 
@@ -13760,21 +13974,21 @@ spare  22222222-2222\n\
         // catches a second same-named function, since the register keys on the name alone.
         assert_eq!(
             spelled.len(),
-            76,
-            "expected 76 functions spelling an inline word-bearing literal; the count moved — \
+            79,
+            "expected 79 functions spelling an inline word-bearing literal; the count moved — \
              disposition the new one, then update this"
         );
         assert_eq!(
             literals.len(),
-            272,
-            "expected 272 inline word-bearing literals; the count moved — check whether the \
+            288,
+            "expected 288 inline word-bearing literals; the count moved — check whether the \
              function that gained one is still dispositioned correctly, then update this"
         );
 
         // Per-arm cardinality, so the DEBT is pinned rather than merely listed: a surface moved
-        // into `Unscanned` without anyone deciding to would otherwise land silently among 42
+        // into `Unscanned` without anyone deciding to would otherwise land silently among 44
         // entries that already say so. Shrinking this number is the progress issue #1167 tracks.
-        for (arm, expected) in [(Scanned, 10), (NotRendered, 24), (Unscanned, 42)] {
+        for (arm, expected) in [(Scanned, 11), (NotRendered, 24), (Unscanned, 44)] {
             let actual = INLINE_PROSE_REGISTER
                 .iter()
                 .filter(|(_, disposition, _)| *disposition == arm)
@@ -14140,6 +14354,10 @@ impl Nested {
             // The two fully-static messages.
             ("config path --origin", vec!["config", "path", "--origin"]),
             ("use zzz --next", vec!["use", "zzz", "--next"]),
+            // Both messages `backup_index` shapes at its one construction site (issue #1439):
+            // the index left off entirely, and one that is not a 1-based ordinal.
+            ("config restore", vec!["config", "restore"]),
+            ("config restore 0", vec!["config", "restore", "0"]),
             // lexopt's own message, folded in by `From<lexopt::Error>` — third-party prose we
             // nonetheless ship, so it is scanned like the rest.
             ("status --json=1", vec!["status", "--json=1"]),
@@ -14187,8 +14405,8 @@ impl Nested {
             .filter(|line| line.contains("CliUsage {"))
             .count();
         assert_eq!(
-            sites, 8,
-            "expected 8 `CliUsage` construction sites in src/cli.rs's non-test code; the count \
+            sites, 9,
+            "expected 9 `CliUsage` construction sites in src/cli.rs's non-test code; the count \
              moved — add an argv case to `usage_error_surfaces` covering the new site, then \
              update this"
         );
@@ -14199,7 +14417,7 @@ impl Nested {
         // What this pins is that the scanned subject has not silently shrunk.
         assert_eq!(
             usage_error_surfaces().len(),
-            13,
+            15,
             "the scanned argv cases changed count — a scan over a shrunken subject passes \
              identically, so this is pinned rather than trusted"
         );
@@ -14520,7 +14738,8 @@ impl Nested {
 
     #[test]
     fn config_verbs_parse_to_their_actions() {
-        // #401: the three READ-ONLY config diagnostics verbs route to their actions.
+        // #401: the three read-only config diagnostics verbs route to their actions. The two
+        // backup-ring verbs (#1439) are covered by `backup_verbs_parse_to_their_actions`.
         assert_eq!(
             parse_argv(&["config", "path"]).unwrap(),
             Command::Config {
@@ -14579,8 +14798,9 @@ impl Nested {
     #[test]
     fn config_help_and_bare_config_print_help_never_an_action() {
         // `config --help` and a bare `config` both resolve to HELP — pure `Help`, so neither
-        // can read a config or touch state as a side effect (all three verbs are read-only
-        // anyway, but bare-noun-is-help stays consistent with `service` / `daemon`).
+        // can read a config or touch state as a side effect. That matters more since #1439 gave
+        // the noun a mutating verb: a bare `config` still cannot restore anything, and
+        // bare-noun-is-help stays consistent with `service` / `daemon`.
         assert_eq!(
             parse_argv(&["config", "--help"]).unwrap(),
             Command::Help(HelpTopic::Config)
@@ -14612,6 +14832,265 @@ impl Nested {
         let err = parse_argv(&["config", "show", "--verbose"]).unwrap_err();
         assert!(matches!(err, Error::CliUsage { .. }));
         assert!(err.to_string().contains("--verbose"), "got: {err}");
+    }
+
+    // --- the backup ring's operator surface (issue #1439) ------------------
+
+    #[test]
+    fn backup_verbs_parse_to_their_actions() {
+        assert_eq!(
+            parse_argv(&["config", "backups"]).unwrap(),
+            Command::Config {
+                action: ConfigAction::Backups
+            }
+        );
+        assert_eq!(
+            parse_argv(&["config", "restore", "2"]).unwrap(),
+            Command::Config {
+                action: ConfigAction::Restore { index: 2 }
+            }
+        );
+    }
+
+    #[test]
+    fn restore_rejects_a_missing_or_non_ordinal_index() {
+        // The listing is 1-based, so `0` is a miscount rather than a boundary: answering it
+        // with the ring's oldest entry would restore something the operator did not name.
+        for argv in [
+            vec!["config", "restore"],
+            vec!["config", "restore", "0"],
+            vec!["config", "restore", "x"],
+            vec!["config", "restore", "-1"],
+        ] {
+            match parse_argv(&argv).unwrap_err() {
+                Error::CliUsage { usage_hint, .. } => {
+                    assert_eq!(usage_hint, "sessiometer config --help");
+                }
+                other => panic!("`{argv:?}` must be a CliUsage error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_origin_flag_is_rejected_on_the_backup_verbs_too() {
+        // The flag means something for `show` alone; the strict-usage stance is the same
+        // wherever else it lands, so the two new verbs inherit it rather than accepting it.
+        for argv in [
+            vec!["config", "backups", "--origin"],
+            vec!["config", "restore", "1", "--origin"],
+        ] {
+            match parse_argv(&argv).unwrap_err() {
+                Error::CliUsage { message, .. } => {
+                    assert!(message.contains("--origin"), "names the flag: {message}");
+                }
+                other => panic!("`{argv:?}` must be a CliUsage error, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn render_config_backups_reports_counts_and_timestamps_and_never_a_label() {
+        use crate::roster_backup::Retained;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let dir = Path::new("/tmp/cfg/backups");
+        assert_eq!(
+            render_config_backups(dir, &[]),
+            "no backups retained under /tmp/cfg/backups\n"
+        );
+
+        let entries = vec![
+            Retained {
+                path: dir.join("config.00001756900000.000000000.toml"),
+                taken_at: UNIX_EPOCH + Duration::from_secs(1_756_900_000),
+                accounts: Some(6),
+            },
+            Retained {
+                path: dir.join("config.00001756800000.000000000.toml"),
+                taken_at: UNIX_EPOCH + Duration::from_secs(1_756_800_000),
+                accounts: Some(1),
+            },
+            Retained {
+                path: dir.join("config.00001756700000.000000000.toml"),
+                taken_at: UNIX_EPOCH + Duration::from_secs(1_756_700_000),
+                accounts: None,
+            },
+        ];
+        let rendered = render_config_backups(dir, &entries);
+        assert_eq!(
+            rendered,
+            "3 retained under /tmp/cfg/backups (ring depth 3)\n\
+             \x20 1  2025-09-03T11:46:40Z  6 accounts\n\
+             \x20 2  2025-09-02T08:00:00Z  1 account\n\
+             \x20 3  2025-09-01T04:13:20Z  unreadable\n",
+        );
+        // The listing is a more public surface than the file it describes — it is what an
+        // operator pastes into a bug report — so it carries a count per entry and never a label
+        // (`docs/specs/roster-backup-qualifying-write.feature.md`, Rule 3). That guarantee is
+        // STRUCTURAL and belongs to the type: `Retained` has no field able to carry a label or a
+        // uuid, so the byte-exact assertion above is the whole of what a test here can add. An
+        // assertion searching the output for "label" would be vacuous for the same reason — it
+        // would pass over a rendering that printed the label's VALUE — so it is deliberately not
+        // written. What would actually break the guarantee is widening `Retained`; the compiler
+        // is what surfaces that, and this comment is the note the author of such a change reads.
+    }
+
+    #[test]
+    fn render_restore_notice_names_both_sides_before_the_write() {
+        use crate::roster_backup::Retained;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let entry = Retained {
+            path: PathBuf::from("/tmp/cfg/backups/config.00001756900000.000000000.toml"),
+            taken_at: UNIX_EPOCH + Duration::from_secs(1_756_900_000),
+            accounts: Some(6),
+        };
+        let path = Path::new("/tmp/cfg/config.toml");
+
+        // What is installed, and what it displaces — the AC-5 property, so an operator who
+        // miscounted sees both in the same two lines.
+        let over_one = render_restore_notice(&entry, 6, path, Some(1));
+        assert!(over_one.contains("6 in its roster"), "{over_one}");
+        assert!(
+            over_one.contains("/tmp/cfg/config.toml (1 account)"),
+            "{over_one}"
+        );
+
+        assert!(
+            render_restore_notice(&entry, 6, path, Some(3)).contains("(3 accounts)"),
+            "plural"
+        );
+        // The incident's own state: nothing loadable to displace. Reported as such rather than
+        // as zero accounts, which would read as a roster that exists and is empty.
+        let over_nothing = render_restore_notice(&entry, 6, path, None);
+        assert!(over_nothing.contains("(no loadable config)"), "absent");
+
+        // The re-render is disclosed, and the retained file is named so it can be copied
+        // verbatim by an operator who wants the bytes rather than the values.
+        for rendered in [&over_one, &over_nothing] {
+            assert!(
+                rendered.contains("values are re-rendered")
+                    && rendered.contains("/tmp/cfg/backups/config.00001756900000.000000000.toml"),
+                "the notice discloses the re-render and names the retained file: {rendered}"
+            );
+        }
+
+        // The renumbering warning fires on exactly the ring's own predicate: the displaced
+        // config enters the ring iff it parses with a NON-EMPTY roster, and only then do the
+        // indexes the operator just read move.
+        assert!(over_one.contains("numbering shifts"), "{over_one}");
+        assert!(
+            !over_nothing.contains("numbering shifts"),
+            "nothing was displaced into the ring, so nothing renumbers: {over_nothing}"
+        );
+        assert!(
+            !render_restore_notice(&entry, 6, path, Some(0)).contains("numbering shifts"),
+            "a zero-account config does not qualify, so it does not enter the ring"
+        );
+    }
+    /// `config restore`'s WRITE half, driven through the shipped function rather than a
+    /// re-implementation of it (issue #1439, R-9 + AC-5).
+    ///
+    /// The mutation this exists to catch: replace [`config_restore_at`]'s `restored.save_to(path)`
+    /// with `std::fs::copy(&entry.path, path)`. The restored roster still arrives, so a test that
+    /// only checked "the live config now holds 6" passes — but the config it displaced never
+    /// enters the ring, so the restore stops being undoable, which is the AC-5 property the
+    /// notice printed one line earlier claims. The ring assertion below is what fails.
+    #[test]
+    fn restoring_installs_the_entry_and_rings_the_config_it_displaced() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let roster = |accounts: usize| {
+            let mut out = String::new();
+            for n in 0..accounts {
+                out.push_str(&format!(
+                    "[[account]]\naccount_uuid = \"{n}\"\nlabel = \"a{n}\"\n\n"
+                ));
+            }
+            Config::from_toml_str(&out).expect("the fixture roster parses")
+        };
+
+        // The incident's shape: a good roster, then a write that replaces it with a thin one.
+        roster(6).save_to(&path).unwrap();
+        roster(1).save_to(&path).unwrap();
+        assert_eq!(
+            crate::roster_backup::list(&path).unwrap().len(),
+            1,
+            "the six-account config was retained when the one-account write replaced it"
+        );
+
+        config_restore_at(&path, 1).expect("entry 1 restores");
+
+        assert_eq!(
+            Config::load_path(&path).unwrap().roster.len(),
+            6,
+            "the retained roster is what is now live"
+        );
+        // The AC-5 half, and the one a copy-based restore silently drops.
+        assert_eq!(
+            crate::roster_backup::list(&path)
+                .unwrap()
+                .iter()
+                .map(|e| e.accounts)
+                .collect::<Vec<_>>(),
+            vec![Some(1), Some(6)],
+            "newest first: the config the restore displaced entered the ring — so the restore is \
+             itself undoable — above the entry it restored FROM, which the ring still holds \
+             because a restore evicts nothing at depth two"
+        );
+        // Read the ACTUAL mode rather than trusting the writer: a copy-based restore would carry
+        // the source's mode, and `write_private_file` is what guarantees this one.
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the restored config is written at the config file mode"
+        );
+    }
+
+    /// A restore that cannot proceed leaves the live roster exactly as it was — the refusal is a
+    /// true no-op, not a partial write (issue #1439).
+    #[test]
+    fn a_refused_restore_leaves_the_live_roster_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let two = "[[account]]\naccount_uuid = \"x\"\nlabel = \"x\"\n\n\
+                   [[account]]\naccount_uuid = \"y\"\nlabel = \"y\"\n";
+        Config::from_toml_str(two).unwrap().save_to(&path).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // An empty ring: every index is out of range, including the one the parser cannot emit.
+        // `0` is the arithmetic case — `index - 1` would underflow here, and in a release build
+        // wrap to `usize::MAX` and reach the same answer by accident.
+        for index in [0, 1, 9] {
+            assert!(
+                matches!(
+                    config_restore_at(&path, index),
+                    Err(Error::BackupNotRetained { retained: 0, .. })
+                ),
+                "index {index} names nothing in an empty ring"
+            );
+        }
+
+        // A retained entry that no longer parses is REFUSED, not installed: `list` reports it so
+        // an operator can still see it, and `restore` is where the re-validation happens.
+        Config::from_toml_str("[[account]]\naccount_uuid = \"z\"\nlabel = \"z\"\n")
+            .unwrap()
+            .save_to(&path)
+            .unwrap();
+        let entry = crate::roster_backup::list(&path).unwrap().remove(0);
+        std::fs::write(&entry.path, "this is not toml = = =").unwrap();
+        assert!(
+            config_restore_at(&path, 1).is_err(),
+            "an entry that no longer parses is refused rather than installed"
+        );
+        assert_eq!(
+            Config::load_path(&path).unwrap().roster.len(),
+            1,
+            "the refusals above wrote nothing over the live roster"
+        );
+        assert_ne!(before, std::fs::read_to_string(&path).unwrap());
     }
 
     #[test]

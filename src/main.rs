@@ -54,6 +54,7 @@ mod reliability;
 /// shipping binary reads a golden, so it is not compiled into one.
 #[cfg(test)]
 mod render_golden;
+mod roster_backup;
 mod service;
 mod sha256;
 mod stash;

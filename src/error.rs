@@ -1088,6 +1088,17 @@ pub(crate) enum Error {
     #[error("the usage store is busy — could not acquire the store lock; retry shortly")]
     UsageStoreBusy,
 
+    /// `config restore <N>` named an index the roster backup ring does not hold (issue #1439).
+    ///
+    /// Carries the ring's own size so the message is self-correcting: the operator sees what the
+    /// valid range actually is without re-running `config backups`. `retained` is a COUNT, never a
+    /// label — the same discipline the listing itself keeps (`docs/specs/roster-backup-qualifying-write.feature.md`, Rule 3). Secret-free.
+    ///
+    /// A generic failure exit `1` via the `exit_code` catch-all: a mistyped index is a usage
+    /// mistake, not a distinct machine-actionable condition.
+    #[error("no retained backup at index {index}; the ring holds {retained}")]
+    BackupNotRetained { index: usize, retained: usize },
+
     /// An underlying I/O failure.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -2125,7 +2136,7 @@ pub(crate) mod tests {
         // message below can say which one this is rather than leaving the reader to guess.
         assert_eq!(
             prose.len(),
-            88,
+            89,
             "the `#[error(...)]` count moved, and a variant having been ADDED OR REMOVED is the \
              EXPECTED cause: `error_prose_of`'s self-consistency check ran first and found that \
              every `#[error(` in the source started an attribute it parsed, which rules out the \

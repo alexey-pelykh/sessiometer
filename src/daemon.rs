@@ -18268,6 +18268,12 @@ mod tests {
                 column: 12,
             },
             Error::UsageStoreBusy,
+            // Issue #1439: two counts and nothing else — the ring's own size and the index the
+            // operator named, both structural.
+            Error::BackupNotRetained {
+                index: 9,
+                retained: 3,
+            },
             Error::Io(std::io::Error::other("boom")),
         ]
     }

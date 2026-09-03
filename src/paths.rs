@@ -53,7 +53,7 @@ use crate::isolated_spawn::SPAWN_ENV_REMOVE;
 /// `0700` — owner `rwx`, nothing for group/other.
 const DIR_MODE: u32 = 0o700;
 /// `0600` — owner `rw`, nothing for group/other.
-const FILE_MODE: u32 = 0o600;
+pub(crate) const FILE_MODE: u32 = 0o600;
 /// Application name segment used in every derived path.
 const APP: &str = "sessiometer";
 

@@ -512,11 +512,11 @@ where
     ///
     /// A roster write committed a NEW `config.toml` on disk and notified us; re-read that
     /// authoritative file and reconcile the in-memory roster to it via
-    /// [`reconcile_roster`](Self::reconcile_roster). FIVE verbs send that notify, all of them
-    /// through the single `crate::capture::notify_daemon_roster_reload` and all indistinguishable
-    /// from here: `capture` and `login` (in `crate::capture`), and `import`, `enable` / `disable`
-    /// and `remove` (in `crate::cli`). The handler does not learn which one ran and does not need
-    /// to — the file is the authority, not the verb that wrote it.
+    /// [`reconcile_roster`](Self::reconcile_roster). Every verb sending it goes through the one
+    /// `crate::capture::notify_daemon_roster_reload` and is indistinguishable from here: `capture`
+    /// and `login` (in `crate::capture`), and `import`, `enable` / `disable`, `remove` and
+    /// `config restore` (in `crate::cli`). Deliberately uncounted — a cardinal here goes stale the
+    /// next time a verb is added, which is what issue #1439 did to its predecessor.
     ///
     /// BEST-EFFORT by contract, mirroring [`adopt_manual_swap`](Self::adopt_manual_swap):
     /// the on-disk file is authoritative, so a read failure — a malformed or briefly
