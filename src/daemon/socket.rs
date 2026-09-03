@@ -1742,6 +1742,22 @@ mod tests {
             .split_once("\n}")
             .expect("the Swift enum declaration is closed by a column-0 brace")
             .0;
+        // A `case` the compiler does not see must not be extracted as live. Two constructs can
+        // hide one, and both fail in the direction that reports GREEN over a real divergence:
+        // delete a Swift case by wrapping it in `/* ... */`, or gate it behind `#if DEBUG`, and a
+        // line-oriented scan still counts it — so the Rust tag it is missing looks covered. The
+        // `//` form needs no handling: `strip_prefix("case ")` already rejects it.
+        //
+        // Block comments are STRIPPED (a commented-out case is genuinely gone). A conditional
+        // compilation directive PANICS instead, because there is no single right answer — which
+        // branch is live depends on the build configuration this test cannot see, so the honest
+        // move is to refuse rather than guess a vocabulary.
+        let body = strip_block_comments(body);
+        assert!(
+            !body.contains("#if"),
+            "`enum CaptureRejection` is conditionally compiled; this scan cannot know which cases \
+             a given build has, so it would compare against a vocabulary that may not ship"
+        );
         body.lines()
             .map(str::trim)
             .filter_map(|line| line.strip_prefix("case "))
@@ -1752,6 +1768,39 @@ mod tests {
                 None => rest.trim().to_owned(),
             })
             .collect()
+    }
+
+    /// Remove `/* ... */` spans, preserving newlines so the caller stays line-oriented.
+    ///
+    /// Swift block comments NEST, so a depth counter is the correct shape and a
+    /// `split("*/")` is not. Unterminated is treated as "comment to end of body" — the
+    /// conservative direction, since the alternative extracts commented-out cases as live.
+    fn strip_block_comments(body: &str) -> String {
+        let bytes: Vec<char> = body.chars().collect();
+        let mut out = String::with_capacity(body.len());
+        let mut depth = 0usize;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let pair = (bytes[i], bytes.get(i + 1).copied());
+            match pair {
+                ('/', Some('*')) => {
+                    depth += 1;
+                    i += 2;
+                }
+                ('*', Some('/')) if depth > 0 => {
+                    depth -= 1;
+                    i += 2;
+                }
+                (c, _) => {
+                    // Keep newlines through a comment so line numbers and line splitting survive.
+                    if depth == 0 || c == '\n' {
+                        out.push(c);
+                    }
+                    i += 1;
+                }
+            }
+        }
+        out
     }
 
     #[test]
@@ -1788,10 +1837,14 @@ mod tests {
         // can render and the daemon can never send — dead copy that reads as live, and the same
         // drift measured from the other end.
         //
+        // Placement is `docs/specs/capture-rejection-parity.feature.md` Rule 3, which is where
+        // the reasoning above is ratified rather than merely argued.
+        //
         // SCOPE, stated because a green here is narrower than it looks: this compares the
         // `reason` vocabulary only. The sibling `result` vocabulary (`captured` / `refreshed` /
         // `rejected`) has the identical closed-enum-throws property on the Swift side and is NOT
-        // covered — it is diverged today and tracked separately.
+        // covered — it is diverged today, and `refreshed` in particular decodes as an ERROR in
+        // the panel while naming a successful write. Tracked as issue #1474.
         let swift_source = std::fs::read_to_string(swift_capture_ack())
             .expect("apps/menubar/Sources/CaptureAck.swift is readable from the crate root");
 

@@ -2056,7 +2056,8 @@ mod tests {
             }
         );
         // The durable audit line carries the same machine reason. The socket path has no stderr,
-        // so this is the ONLY place the refusal leaves a trace.
+        // so this is the only DURABLE trace the refusal leaves — the ack itself is read once by the
+        // caller and gone.
         assert_eq!(
             event,
             Some(Event::Capture {
@@ -2265,18 +2266,46 @@ mod tests {
         // real defect — the affordance is dead on a fresh install with no test able to say why.
         // This is the daemon-side counterpart of `admit_append_only`'s own doc comment, which
         // records the same one-call-short gap for the CLI verbs.
+        /// The wiring call, verbatim. Reformatting is free (`cargo fmt` owns the line breaks and
+        /// the search is over trimmed lines); changing the ARGUMENT is not, which is the point —
+        /// `WitnessSources::real()` is what makes the shipped daemon able to observe at all.
+        const WIRING_CALL: &str = ".with_witness_sources(crate::witness::WitnessSources::real()?)";
+
+        // A bare `source.contains(...)` is NOT enough here, and the reason is specific: commenting
+        // the call out leaves the substring intact, so the one regression this test names would
+        // ship under a green suite. The line must therefore be LIVE CODE on the builder chain —
+        // a chain link starts at `.` once trimmed, which a `//`-prefixed line never does.
+        //
+        // The sibling `both_append_only_verbs_consult_the_witness_before_they_can_write`
+        // (`src/capture.rs`) is the CLI-side shape of the same idea and goes further, pinning the
+        // gate's POSITION against five named first-effects. Position is not the property here:
+        // the daemon's builder links are order-independent, so presence on the live chain is the
+        // whole claim.
         let cli = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli.rs"),
         )
         .expect("src/cli.rs is readable from the crate root");
+        let live_chain_links: Vec<&str> = cli
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.starts_with('.'))
+            .collect();
+        // Canary the extraction BEFORE the assertion it carries: a truncated read, or a refactor
+        // that stops writing the daemon as a builder chain, yields an EMPTY link set — which
+        // satisfies no `contains` and would report the regression as absent by having looked at
+        // nothing. `with_config_path` is a sibling link on the same chain.
         assert!(
-            cli.contains(".with_witness_sources(crate::witness::WitnessSources::real()?)"),
-            "`run` no longer wires the real prior-configuration witness, so the shipped daemon \
-             carries the `Unwired` default and refuses every socket capture into an absent config"
+            live_chain_links
+                .iter()
+                .any(|link| link.starts_with(".with_config_path(")),
+            "no live builder chain found in src/cli.rs; this scan has no subject"
         );
-        // Canary the corpus: a truncated read would satisfy the assertion above by having read
-        // nothing to contradict it. `with_config_path` is wired on the same builder chain.
-        assert!(cli.contains(".with_config_path("));
+        assert!(
+            live_chain_links.contains(&WIRING_CALL),
+            "`run` no longer wires the real prior-configuration witness as LIVE code, so the \
+             shipped daemon carries the `Unwired` default and refuses every socket capture into \
+             an absent config — a dead capture button on every fresh install"
+        );
     }
 
     #[tokio::test]

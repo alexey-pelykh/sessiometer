@@ -34,16 +34,24 @@
 //! is [`crate::keychain::any_stash_item_present`], where the rest of this crate's `security`
 //! handling lives. WHERE the rule is applied is the caller's — [`crate::capture`]'s `login`
 //! and `capture` verbs (issue #1440), and `perform_socket_capture`, the entry point the
-//! menu-bar capture button drives (issue #1441). All three reach [`admit_append_only`], so
-//! there is ONE rule with three entry points rather than three rules; the socket path
-//! differs only in holding its [`WitnessSources`] as a field rather than constructing them
-//! inline. Callers are named here in prose and never by path: the structural test below
-//! forbids this module from mentioning the daemon or the socket at all, so that it cannot
-//! regress into asking either.
+//! menu-bar capture button drives (issue #1441). All three reach [`admit`] — ONE rule with
+//! three entry points, not three rules — but by two ROUTES, and the difference is the
+//! INPUT, not the rule. The two verbs take [`admit_append_only`], the wrapper that observes
+//! and then admits, because `observe` is the only answer a CLI process has. The socket path
+//! calls [`admit`] directly with a witness it composes itself: it can observe the question
+//! twice, holding a live roster the verbs cannot see. Callers are named here in prose and
+//! never by path — the structural test below forbids the handful of tokens by which this
+//! module could actually REACH the daemon (its module path, the socket path helper, the
+//! stream type, the reload notifier; the test enumerates them). Naming a caller in prose
+//! stays legal, so the ban costs nothing here and still makes the regression impossible.
+//! Do not restate that list in this file: each entry is its own tripwire, and quoting one
+//! to explain it trips it — measured, three times.
 //!
-//! A reachable, populated daemon would corroborate a refusal but is never what establishes
-//! one, which is what keeps the rule correct with the daemon down. Corroboration is not
-//! implemented: nothing here reads the socket, by design.
+//! A reachable, populated daemon corroborates a refusal and never establishes one, which is
+//! what keeps the rule correct with the daemon down. Corroboration is implemented, and
+//! deliberately NOT here: it is composed at the socket call site, where the fallback to the
+//! durable witness is visible, rather than hidden inside the rule. Nothing in this module
+//! reads the socket, by design.
 
 use crate::error::{Error, Result};
 use crate::paths;
@@ -216,6 +224,16 @@ fn is_non_empty(path: &Path) -> bool {
 ///
 /// A malformed or unreadable file never reaches here — it is already a hard error at the
 /// load, and stays one.
+///
+/// STANDARD DEFECT, do not "fix" the code to match the table. Reading PRD § 7 row-by-row,
+/// row 3 (config absent, daemon running with an EMPTY roster) says *"allow — a genuine
+/// first run"* with no condition, and § 7a closes with *"Rows 2–9 are unchanged"*. The
+/// `(false, Present)` arm below refuses inside that row, which reads as a violation. It is
+/// not: design D-1's own heading scopes it to *"PRD § 7 rows 1–3"*, and § 7a's amendment
+/// table is precisely this row's discriminator — a machine that lost its config and then
+/// restarted its daemon lands in its refuse column. The table row and the rule that row
+/// cites (R-6) disagree, and only the standard's author can settle which wording was meant.
+/// Routed as issue #1475; the behaviour here is what the incident requires either way.
 pub(crate) fn admit(config_present: bool, witness: PriorConfiguration) -> Result<()> {
     match (config_present, witness) {
         // No file, yet the machine carries state only a configured machine produces.
@@ -244,10 +262,14 @@ pub(crate) fn admit(config_present: bool, witness: PriorConfiguration) -> Result
 /// gate at all. Callers pass `&WitnessSources::real()?`; construction is pure path
 /// resolution and spawns nothing, so the present-config path stays free.
 ///
-/// The daemon (issue #1441) reaches this SAME function with sources it holds as a field
-/// rather than constructs — one rule and two entry points, not two rules. Its
-/// hermetic-test default is [`WitnessSources::Unwired`], which needs no special case here
-/// because [`WitnessSources::observe`] already resolves it.
+/// The daemon (issue #1441) reaches the same RULE — [`admit`] — but NOT through this
+/// function: it calls `admit` directly with a witness it composes itself, because it can
+/// observe the question twice (the durable witness, plus its own in-memory roster, which
+/// PRD § 7 row 2 requires and a CLI process cannot see). This wrapper is the CLI shape,
+/// where `observe` is the only available answer. One rule, two routes, two inputs.
+/// Both hold a [`WitnessSources`]; the daemon's hermetic-test default is
+/// [`WitnessSources::Unwired`], which needs no special case in either route because
+/// [`WitnessSources::observe`] already resolves it to [`PriorConfiguration::Present`].
 pub(crate) async fn admit_append_only(
     sources: &WitnessSources,
     config_present: bool,

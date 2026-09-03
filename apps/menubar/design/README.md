@@ -209,12 +209,13 @@ Light shown here:
   labelled **Error**. That column is the mock's own scaffolding — it names the states for a reader
   of the reference and has no counterpart in the panel, which renders the copy alone. The distinct
   label is deliberate: a refusal is a verdict the daemon reached on purpose and the operator can act
-  on, not a fault, and the panel says the same thing in the copy itself — it is the only *rejection*
-  arm that names a remedy in place of a retry. (Not the only capture-error string without *try
-  again*: `.noActiveAccount` names a remedy too, and four non-rejection arms — unauthorized, daemon
-  not running, undecodable, unavailable — simply state a condition. What is pinned, by
-  `testPriorConfigurationCopyNamesTheActionAndNotARetry`, is the absence of *try again* from this
-  arm, never a uniqueness claim across the other twelve)
+  on, not a fault, and the panel says the same thing in the copy itself: it names the one action that
+  resolves the refusal instead of inviting a retry, which is what
+  `testPriorConfigurationCopyNamesTheActionAndNotARetry` pins. That is a property of THIS arm and no
+  claim about the others — `.noActiveAccount` names a remedy too, `.keychainLocked` names one *and*
+  invites a retry, and the non-rejection arms simply state a condition. An earlier draft of this
+  entry asserted uniqueness twice, each time falsely; the property the test measures needs no
+  comparison to hold
 
 (Capture placement is now reconciled with the mock, not a difference: the **populated** panel carries
 no capture bar — capture is **empty-roster / first-run only**, and Add account lives off-panel in the
