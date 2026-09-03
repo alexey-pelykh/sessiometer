@@ -2266,12 +2266,19 @@ mod tests {
                 // a refusal leaves the tree untouched), the label prompt (an
                 // operator-visible step), the locked identity + token read and stash, the
                 // roster save, and the daemon notify.
+                //
+                // The notify anchor carries its ARGUMENT, on the same reasoning the gate anchor
+                // below gives for matching the whole call: `capture` is an append-only verb, and
+                // the intent it declares is what lets the daemon refuse a reload that would shrink
+                // the live roster (issue #1442). A bare-name anchor would stay green through a
+                // silent flip to `Mutating`, which is the one edit here that reinstates the
+                // 2026-08-27 collapse on this path.
                 &[
                     "ensure_private_dir",
                     "prefill_label_from_identity",
                     "capture_locked(",
                     "report.config.save()",
-                    "notify_daemon_roster_reload()",
+                    "notify_daemon_roster_reload(ReloadIntent::AppendOnly)",
                 ][..],
             ),
             (
