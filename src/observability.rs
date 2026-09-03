@@ -1129,6 +1129,22 @@ pub(crate) enum RosterReloadOutcome {
     /// [`Event::CanonicalScrubbed`] / [`Event::CanonicalRestored`] and
     /// [`Event::FleetRunwayLow`] / [`Event::FleetRunwayRecovered`]: without it a healed divergence
     /// is indistinguishable, in the log, from one still open.
+    ///
+    /// KNOWN BOUND, and it is the one an operator is most likely to meet: the latch behind this
+    /// line lives in the daemon's in-memory decision state, so a RESTART does not emit it. The
+    /// daemon is rebuilt from `config.toml`, which makes the two copies equal by construction, so
+    /// the episode really has ended — silently. A restart is also the obvious remedy for a
+    /// reported divergence, which makes an unterminated `diverged` line the EXPECTED shape of a
+    /// resolved incident rather than a rare one. So an open `diverged` with no `converged` after
+    /// it means "unresolved, OR resolved by a restart"; only a `converged` line is positive
+    /// evidence of a heal WITHIN one daemon lifetime. Making the bracket durable would mean
+    /// persisting check state across restarts, which no other edge-triggered signal in this
+    /// vocabulary does either.
+    ///
+    /// `incoming` is the count the FILE presented and is absent where the agreement was reached
+    /// without reading one — an absent file against an already-empty rotation. It is never
+    /// back-filled from `previous`: `incoming=0` is a real roster size meaning the file presented
+    /// an EMPTY roster, and must never be spelled the same way as "this path read nothing".
     Converged,
     /// CLI side: a roster write committed to disk, and the CLI did not observe an acknowledgement
     /// from a running daemon.
@@ -6759,6 +6775,16 @@ pub(crate) mod tests {
                 incoming: Some(6),
                 reason: None,
             },
+            // The falling edge reached WITHOUT reading a file — an absent `config.toml` against an
+            // already-empty rotation. Sampled separately from the row above because it is the one
+            // `converged` shape that renders no `incoming` at all, and the zero it must not render
+            // is the value most likely to be back-filled by a careless render arm.
+            Event::RosterReload {
+                outcome: RosterReloadOutcome::Converged,
+                previous: Some(0),
+                incoming: None,
+                reason: None,
+            },
         ];
         assert_samples_every_variant("Event", &samples, event_variant_name);
         samples
@@ -6993,6 +7019,22 @@ pub(crate) mod tests {
                 },
                 ("converged", None),
                 [true, true, false],
+            ),
+            // The same outcome with a DIFFERENT absence shape, which is why this matrix is keyed
+            // on the pair and not on the outcome: a convergence reached without reading a file
+            // renders no `incoming` at all. Back-filling it from `previous` would spell `0`, and a
+            // zero here is a real roster size meaning the file presented an EMPTY roster — the
+            // very confusion `an_empty_roster_renders_a_zero_count_where_an_unread_one_renders_none`
+            // exists to forbid, arriving through the newest arm.
+            (
+                Event::RosterReload {
+                    outcome: RosterReloadOutcome::Converged,
+                    previous: Some(0),
+                    incoming: None,
+                    reason: None,
+                },
+                ("converged", None),
+                [true, false, false],
             ),
         ];
 

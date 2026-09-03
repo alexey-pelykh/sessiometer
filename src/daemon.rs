@@ -3807,7 +3807,8 @@ where
     ///
     /// NO NEW TIMER, NO NEW THREAD. It is called from [`tick`](Self::tick), on the poll cadence
     /// that already runs (`poll_secs`, ratified by `ADR-0012`), so the reporting latency is up to
-    /// one poll interval by construction. Called at the TOP of the tick, BEFORE the canonical
+    /// one poll interval by construction — two on the first, since the opening tick deliberately
+    /// does not compare (see the start-up window in the body). Called at the TOP of the tick, BEFORE the canonical
     /// credential read, deliberately: a locked keychain short-circuits the entire rest of the tick
     /// through [`locked_tick`](Self::locked_tick), and a keychain lock has nothing whatever to do
     /// with `config.toml`. Running the check after that short-circuit would let an unattended
@@ -3834,7 +3835,36 @@ where
     /// rosters that agree, and saying otherwise would put a divergence line on every tick of a
     /// freshly-installed daemon that has not been `capture`d into yet.
     fn check_roster_divergence(&mut self, events: &mut Vec<Event>) {
+        // The FIRST tick never compares, and this costs nothing in detection power. Production
+        // builds the daemon FROM the file it is about to watch — `Daemon::new(config.roster
+        // .clone(), …)` in `crate::cli`, whose `reconcile_on_start` reconciles only the DISPLAY
+        // (`~/.claude.json`), never the roster — so the two copies are equal by construction at
+        // boot and a genuine boot-time divergence does not exist.
+        //
+        // What the first tick CAN see is a roster verb that landed during the jittered start-up
+        // delay. The control socket is bound before anything accepts on it and the delay draws
+        // `[0, STARTUP_DELAY_CAP)`, so a `capture` in that window sits in the listen BACKLOG,
+        // times out client-side at `CLIENT_NOTIFY_TIMEOUT`, and is adopted when the run loop
+        // reaches its first idle select — which is strictly AFTER the first tick. Checking there
+        // would read the freshly-written file against the not-yet-reloaded roster and write a
+        // durable `diverged` line, spelled identically to the 2026-08-27 incident, for a healthy
+        // capture the daemon adopts milliseconds later. `crate::capture` already refuses to write
+        // a false durable line in exactly this window — it is why `NotifyTimedOut` is split from
+        // `NotifyFailed` — and the same restraint belongs here.
+        //
+        // Skipping leaves the latch at its `Agrees` default, so a divergence that is still real on
+        // the second tick reports there, one poll interval later at worst. Against an incident
+        // that went unnoticed for an unknown period, that is not a cost worth a false positive.
+        if self.state.ticks <= 1 {
+            return;
+        }
         let previous = self.roster.len();
+        // The count the FILE presented, or `None` where no file was read. Tracked beside the
+        // verdict rather than inside it because the falling-edge line needs it and
+        // `RosterCheckVerdict::Agrees` must stay a unit variant: were the count part of `Agrees`,
+        // the equality test below would treat one agreement as differing from another and emit a
+        // `converged` line across two states that both mean "the copies agree".
+        let mut observed: Option<usize> = None;
         let verdict = match self.config_path.as_deref() {
             // Not armed: nothing to compare against. Silent, and NOT `reload_disabled` — see the
             // doc above.
@@ -3842,6 +3872,7 @@ where
             Some(path) => match Config::load_path(path) {
                 Ok(config) => {
                     let incoming = config.roster.len();
+                    observed = Some(incoming);
                     if incoming == previous {
                         RosterCheckVerdict::Agrees
                     } else {
@@ -3849,7 +3880,12 @@ where
                     }
                 }
                 // An absent file while the daemon holds a rotation is THE incident. An absent file
-                // while it holds nothing is two empty rosters agreeing.
+                // while it holds NOTHING is two empty rosters that genuinely agree — the state a
+                // freshly-installed daemon is in before its first `capture`, where there is no
+                // disagreement to report. (The guard is faithfulness to the criterion, which scopes
+                // the report to an absent file "while the daemon holds accounts" — NOT an
+                // anti-spam measure: the edge trigger below would already hold an unguarded
+                // `Absent { previous: 0 }` to a single line per install, not one per tick.)
                 Err(Error::ConfigNotFound { .. }) if previous > 0 => {
                     RosterCheckVerdict::Absent { previous }
                 }
@@ -3873,10 +3909,15 @@ where
             // The falling edge. `was == Agrees` was filtered out by the equality check above, so
             // reaching here means a real episode just ended: report the size the two copies
             // agreed ON, which is what closes the incident.
+            //
+            // `incoming` comes from `observed`, NEVER from `previous`. An `Agrees` verdict reached
+            // through the absent-file-with-an-empty-rotation arm read no file, and rendering
+            // `incoming=0` there would claim the file presented an EMPTY roster — the one thing
+            // this vocabulary is emphatic that a zero must always mean, and never "unknown".
             RosterCheckVerdict::Agrees => Event::RosterReload {
                 outcome: RosterReloadOutcome::Converged,
                 previous: Some(previous),
-                incoming: Some(previous),
+                incoming: observed,
                 reason: None,
             },
             RosterCheckVerdict::Diverged { previous, incoming } => Event::RosterReload {
@@ -19922,12 +19963,22 @@ mod tests {
         /// against `self.roster` and nothing else.
         fn daemon_holding(held: &[&str], config_path: PathBuf) -> FakeDaemon {
             let roster = held.iter().map(|uuid| account(uuid, "label")).collect();
-            reconcile_daemon(roster).with_config_path(config_path)
+            let mut daemon = reconcile_daemon(roster).with_config_path(config_path);
+            // Past the opening tick, which deliberately does not compare (the start-up window in
+            // `check_roster_divergence`). Every test using `checked` below is about the steady
+            // regime, so it starts where that regime does; the opening tick's own silence is
+            // pinned separately by `the_opening_tick_does_not_compare`, and the two tick-driven
+            // tests at the end of this module drive `Daemon::tick` for real rather than seeding.
+            daemon.state.ticks = 1;
+            daemon
         }
 
-        /// The one event the check pushed this run, or `None` — and a hard failure on more than
+        /// The one event the check pushed this tick, or `None` — and a hard failure on more than
         /// one, since "at most one line per tick" is the whole shape of an edge-triggered signal.
+        /// Advances the tick counter first, so successive calls model successive ticks rather than
+        /// repeatedly re-running the same one.
         fn checked(daemon: &mut FakeDaemon) -> Option<Event> {
+            daemon.state.ticks += 1;
             let mut events = Vec::new();
             daemon.check_roster_divergence(&mut events);
             assert!(
@@ -20057,8 +20108,14 @@ mod tests {
             let config_path = dir.path().join("config.toml");
             write_roster_config(&config_path, &[("u-A", "work"), ("u-A", "duplicate")]);
             assert!(
-                Config::load_path(&config_path).is_err(),
-                "fixture precondition: this file must fail validation, not parse cleanly"
+                matches!(
+                    Config::load_path(&config_path),
+                    Err(Error::ConfigInvalid(_))
+                ),
+                "fixture precondition: this file must fail VALIDATION, not parsing — `is_err()` \
+                 alone cannot tell this branch from the one `an_unparseable_config_...` covers, \
+                 so a change to `write_roster_config`'s emitted shape would silently leave the \
+                 validation arm covered by nothing"
             );
 
             let mut daemon = daemon_holding(&["u-A", "u-B"], config_path);
@@ -20309,6 +20366,144 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn the_opening_tick_does_not_compare() {
+            // The start-up window. A roster verb issued while the daemon sits in its jittered
+            // start-up delay lands in the control socket's listen backlog and is adopted at the
+            // first idle select — strictly AFTER the first tick. A check on that tick would read
+            // the freshly-written file against the not-yet-reloaded roster and write a durable
+            // `diverged` line, spelled identically to the 2026-08-27 incident, for a healthy
+            // `capture` the daemon adopts moments later.
+            //
+            // Costs nothing: production builds the daemon FROM this file, so the two copies are
+            // equal at boot by construction and the opening tick has no genuine divergence to
+            // find. Driven through `Daemon::tick` because it is the tick counter, not the helper,
+            // that the guard reads.
+            let dir = tempfile::tempdir().unwrap();
+            let config_path = dir.path().join("config.toml");
+            write_roster_config(&config_path, &[("u-A", "work")]);
+
+            let mut daemon = daemon_holding(&["u-A", "u-B", "u-C"], config_path);
+            daemon.state.ticks = 0; // drive the real counter, do not inherit the helper's seed
+
+            let opening = daemon.tick().await;
+
+            assert!(
+                !opening
+                    .events
+                    .iter()
+                    .any(|e| matches!(e, Event::RosterReload { .. })),
+                "a divergence visible on the opening tick is withheld: {:?}",
+                opening.events
+            );
+            // Withheld, not swallowed: the same divergence still reports on the next tick, so the
+            // guard costs one poll interval and never a missed incident.
+            let second = daemon.tick().await;
+            assert!(
+                second.events.contains(&Event::RosterReload {
+                    outcome: RosterReloadOutcome::Diverged,
+                    previous: Some(3),
+                    incoming: Some(1),
+                    reason: Some(RosterReloadReason::CountMismatch),
+                }),
+                "the second tick reports it: {:?}",
+                second.events
+            );
+        }
+
+        #[test]
+        fn a_single_account_daemon_whose_config_vanished_is_the_incident_too() {
+            // The `previous > 0` guard's boundary, which is 1 and not 6. Without a case here,
+            // widening the guard to `previous > 1` by one character passes the whole module while
+            // silencing the incident at the roster size a first `capture` produces — the most
+            // common roster there is.
+            let dir = tempfile::tempdir().unwrap();
+            let config_path = dir.path().join("config.toml");
+
+            let mut daemon = daemon_holding(&["u-A"], config_path);
+
+            assert_eq!(
+                checked(&mut daemon),
+                Some(Event::RosterReload {
+                    outcome: RosterReloadOutcome::Diverged,
+                    previous: Some(1),
+                    incoming: None,
+                    reason: Some(RosterReloadReason::Absent),
+                })
+            );
+        }
+
+        #[test]
+        fn a_same_size_roster_with_different_accounts_is_not_detected() {
+            // The comparison is by SIZE, and this test exists to state that in the one place a
+            // reader will look for it. `{u-A, u-B}` in memory against `{u-C, u-D}` on disk is a
+            // real disagreement the check does not report — the issue scopes the comparison to
+            // counts, and `count_mismatch` would be a lie about a pair of equal numbers.
+            //
+            // It is a CONTRACT, not an accident: pinning it means a later change to membership
+            // comparison must come here and say so, rather than silently altering what an
+            // operator's log means.
+            let dir = tempfile::tempdir().unwrap();
+            let config_path = dir.path().join("config.toml");
+            write_roster_config(&config_path, &[("u-C", "third"), ("u-D", "fourth")]);
+
+            let mut daemon = daemon_holding(&["u-A", "u-B"], config_path);
+
+            assert_eq!(
+                checked(&mut daemon),
+                None,
+                "same size, different accounts: reported by count comparison, which this is not"
+            );
+        }
+
+        #[test]
+        fn a_convergence_reached_without_reading_a_file_renders_no_incoming_count() {
+            // `incoming=0` is a REAL roster size in this vocabulary — it means the file presented
+            // an EMPTY roster — so it must never double as "this path read nothing". An episode
+            // that ends because the daemon's own rotation emptied, against a file that is still
+            // absent, is an agreement reached without reading anything, and its falling-edge line
+            // must omit `incoming` rather than back-fill it from `previous`.
+            let dir = tempfile::tempdir().unwrap();
+            let config_path = dir.path().join("config.toml");
+            std::fs::write(&config_path, b"]not valid toml[").unwrap();
+
+            let mut daemon = daemon_holding(&["u-A"], config_path.clone());
+            assert_eq!(
+                checked(&mut daemon),
+                Some(Event::RosterReload {
+                    outcome: RosterReloadOutcome::Undetermined,
+                    previous: Some(1),
+                    incoming: None,
+                    reason: Some(RosterReloadReason::Unreadable),
+                }),
+                "precondition: an open episode"
+            );
+
+            // The rotation empties and the unreadable file is removed. Two empty rosters agree —
+            // but nothing was ever counted off a file.
+            daemon.roster.clear();
+            daemon.state.accounts.clear();
+            std::fs::remove_file(&config_path).unwrap();
+
+            let event = checked(&mut daemon);
+            assert_eq!(
+                event,
+                Some(Event::RosterReload {
+                    outcome: RosterReloadOutcome::Converged,
+                    previous: Some(0),
+                    incoming: None,
+                    reason: None,
+                })
+            );
+            // Asserted on the rendered line too: the defect this guards is a token appearing at
+            // all, and `incoming=0` would satisfy a struct comparison against `Some(0)`.
+            let line = event.unwrap().to_log_line(std::time::UNIX_EPOCH);
+            assert!(
+                !line.contains("incoming="),
+                "a convergence that read no file must render no incoming count: {line}"
+            );
+        }
+
+        #[tokio::test]
         async fn the_check_runs_on_the_existing_poll_tick() {
             // The wiring, end to end: no new timer and no new thread, so the only thing that can
             // make the check run is a tick. Driven through `Daemon::tick` rather than by calling
@@ -20319,6 +20514,17 @@ mod tests {
             write_roster_config(&config_path, &[("u-A", "work")]);
 
             let mut daemon = daemon_holding(&["u-A", "u-B", "u-C"], config_path);
+            daemon.state.ticks = 0; // drive the real counter, do not inherit the helper's seed
+
+            let opening = daemon.tick().await;
+            assert!(
+                !opening
+                    .events
+                    .iter()
+                    .any(|e| matches!(e, Event::RosterReload { .. })),
+                "the opening tick does not compare: {:?}",
+                opening.events
+            );
 
             let outcome = daemon.tick().await;
 
@@ -20345,8 +20551,10 @@ mod tests {
             let config_path = dir.path().join("config.toml");
 
             let mut daemon = daemon_holding(&["u-A", "u-B"], config_path);
+            daemon.state.ticks = 0; // drive the real counter, do not inherit the helper's seed
             daemon.store.set_locked(true);
 
+            let _opening = daemon.tick().await; // the opening tick never compares
             let outcome = daemon.tick().await;
 
             assert_eq!(
