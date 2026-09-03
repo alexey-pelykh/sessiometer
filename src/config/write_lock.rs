@@ -14,8 +14,9 @@
 //! other** — two CLI invocations, or a CLI and the daemon's `perform_config_set`. The swap lock
 //! was never the instrument for that pair; widening it would break a documented invariant to fix
 //! an unrelated one, and would put the roster write back inside a lock the stash-before-roster
-//! ordering deliberately keeps it outside of. This lock is the instrument for that pair, and it
-//! leaves `swap.lock`'s contention set exactly as it was.
+//! ordering deliberately keeps it outside of. This lock serializes those writers' PUBLISHES — see
+//! § The span, exactly for what that does and does not buy — and it leaves `swap.lock`'s
+//! contention set exactly as it was.
 //!
 //! # Why the lock is a SIBLING of the config file, not a fixed support-dir path
 //!
@@ -31,8 +32,14 @@
 //! and [`Config::save_to`](crate::config::Config::save_to) is an injectable-path seam, so a fixed
 //! native-local lock would make two shells writing two DIFFERENT config files contend for no
 //! reason, and — worse — would make every hermetic test in this crate contend on the real
-//! machine's lock. Deriving it makes the rule exact: same config file ⇒ same lock, different
-//! config files ⇒ no contention. `swap.lock` and `daemon.lock` are native-local for the opposite
+//! machine's lock. Deriving it makes the rule: same config PATH ⇒ same lock, different config
+//! paths ⇒ no contention. Path, not file — the derivation is lexical, so two spellings of one
+//! file (a symlinked home, `/tmp` vs `/private/tmp`) key two different locks and do not contend,
+//! and a lock file deleted between two acquires gives each writer a fresh inode of its own. Both
+//! are silent. Neither is reachable through the production path — `paths::config_file` returns
+//! one spelling and nothing removes the file — and both are shared with `swap.lock` and
+//! `usage.lock`, which derive theirs the same way; hardening all three is issue #1483.
+//! `swap.lock` and `daemon.lock` are native-local for the opposite
 //! reason: the resource THEY guard (the keychain, the daemon instance) is machine-global and has
 //! no per-config identity to key on.
 //!
@@ -43,13 +50,38 @@
 //! `save_to` acquires BEFORE it reads the file it is about to replace, so a refusal is a true
 //! no-op: nothing retained, nothing written, nothing evicted.
 //!
-//! The wait is bounded AND the two locks are never nested, which is what keeps a CLI writer and
-//! a daemon holding `swap.lock` from deadlocking. Every `save_to` call in this crate sits
-//! strictly AFTER its verb's swap-locked section has returned and released
-//! (`capture` / `reconcile_login` / `apply_import` all save outside the lock, by the same
-//! documented intent this module opens with), so the two critical sections are disjoint rather
-//! than ordered. `config_write_lock_is_never_taken_inside_the_swap_lock` in
-//! [`crate::config`] pins that.
+//! What rules out a config-vs-swap deadlock is the BOUNDED wait, and it would rule one out even
+//! if the locks were nested: a cycle needs both hold-and-wait directions, and this critical
+//! section acquires nothing else, so only one direction is even constructible — the worst a
+//! nesting could cost is a swap-lock hold extended by `CONFIG_WRITE_LOCK_MAX_WAIT`.
+//!
+//! Non-nesting is kept anyway, for that latency and because it survives the wait becoming
+//! unbounded (issue #257 plans to replace this raw `flock` with `File::try_lock`). Every
+//! `save_to` call in this crate sits strictly AFTER its verb's swap-locked section has returned
+//! and released — `capture` / `reconcile_login` / `perform_socket_capture` / `apply_import` all
+//! save outside the lock, by the same documented intent this module opens with — so the two
+//! critical sections are disjoint rather than ordered.
+//! `capture::tests::the_roster_save_is_reached_only_after_the_swap_lock_has_been_released`
+//! pins that over all four.
+//!
+//! # The span, exactly — and what it does NOT cover
+//!
+//! State the span rather than the aspiration, because "a config-write lock exists" invites a
+//! reader to assume more than this one gives. It is held across what
+//! [`Config::save_to`](crate::config::Config::save_to) itself does: retain the file being
+//! replaced into the backup ring, publish the replacement, then prune. That is a genuine
+//! read-modify-write OF `config.toml` — the ring reads the very file it is about to displace —
+//! and serializing it is what makes a concurrent publish impossible (R-16), leaves the file on
+//! disk as exactly one writer's complete valid output (AC-8), and closes the three degradations
+//! [`crate::roster_backup`] previously had to describe rather than prevent.
+//!
+//! It does NOT cover a CALLER that reads `config.toml`, mutates the parsed value, and only then
+//! saves. Two such callers can each publish a complete, valid file with one of them losing its
+//! change, because only the last step of each is serialized. That wider span is deliberately out
+//! of scope here — D-8's runtime view annotates the lock on the SAVE step alone, and AC-8 forbids
+//! two of the obvious widenings outright — and it is tracked as its own issue (#1482), which also
+//! records why `capture` and `login` cannot simply be widened: their reads straddle a
+//! multi-minute interactive spawn.
 
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
@@ -113,10 +145,16 @@ impl ConfigWriteLock {
     /// prevent. A busy lock is REPORTED, never silently skipped.
     ///
     /// Polls `flock(LOCK_EX|LOCK_NB)` and yields the runtime between tries (an async sleep, never
-    /// a busy-spin or a blocked OS thread), so the daemon keeps serving its control socket while
-    /// it waits and a CLI verb stays interruptible — the same discipline
+    /// a busy-spin or a blocked OS thread), so the runtime keeps turning while it WAITS and a CLI
+    /// verb stays interruptible — the same discipline
     /// [`SwapLock::acquire`](crate::swap::SwapLock::acquire) keeps, and the reason this is async
     /// where [`crate::usage_store`]'s blocking store lock is not.
+    ///
+    /// Scoped to the wait deliberately. The daemon awaits both its `save_to` calls inline in the
+    /// run loop's post-idle, so the TICK and every command routed through it are delayed by up to
+    /// `max_wait` regardless; and the critical section the wait leads to is synchronous
+    /// `std::fs` on a `current_thread` runtime. Yielding here buys an interruptible, non-spinning
+    /// wait — not a daemon that keeps working through it.
     pub(crate) async fn acquire(path: &Path, max_wait: Duration) -> Result<Self> {
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -140,8 +178,16 @@ impl ConfigWriteLock {
             match err.raw_os_error() {
                 // EWOULDBLOCK (== EAGAIN): another config writer holds it — wait, retry.
                 Some(libc::EWOULDBLOCK) => {}
-                // Interrupted by a signal — not contention; retry immediately.
-                Some(libc::EINTR) => continue,
+                // Interrupted by a signal — not contention; retry immediately, but only
+                // after the deadline check below. A bare `continue` here would skip it, so a
+                // signal arriving faster than the loop could turn the one function whose whole
+                // contract is "bounded" into an unbounded spin.
+                Some(libc::EINTR) => {
+                    if Instant::now() >= deadline {
+                        return Err(Error::ConfigWriteLockBusy);
+                    }
+                    continue;
+                }
                 // A genuine I/O failure (a broken fd / filesystem), surfaced as itself rather
                 // than masqueraded as contention.
                 _ => return Err(Error::Io(err)),
