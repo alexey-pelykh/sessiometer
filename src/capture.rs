@@ -131,7 +131,7 @@ pub(crate) async fn capture(label: Option<String>) -> Result<()> {
     )
     .await?;
 
-    report.config.save()?;
+    report.config.save().await?;
     // Tell a running daemon to pick up the new roster now (#139) — best-effort, so no
     // daemon (or a wedged one) never blocks capture; the disk write is authoritative.
     notify_daemon_roster_reload().await;
@@ -973,7 +973,7 @@ pub(crate) async fn reconcile_login(
     )
     .await?;
 
-    report.config.save()?;
+    report.config.save().await?;
     // Tell a running daemon to pick up the onboarded / relogged-in account now (#139) —
     // best-effort, the login already committed to disk.
     notify_daemon_roster_reload().await;

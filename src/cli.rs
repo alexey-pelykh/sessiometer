@@ -2383,7 +2383,7 @@ fn render_config_backups(dir: &Path, retained: &[crate::roster_backup::Retained]
 /// (`remove`, `enable` / `disable`), so a restored roster is live rather than pending a
 /// restart. Best-effort, like theirs.
 async fn config_restore(index: usize) -> Result<()> {
-    config_restore_at(&paths::config_file()?, index)?;
+    config_restore_at(&paths::config_file()?, index).await?;
     crate::capture::notify_daemon_roster_reload().await;
     Ok(())
 }
@@ -2400,7 +2400,7 @@ async fn config_restore(index: usize) -> Result<()> {
 ///
 /// The daemon notify stays with the caller: it is best-effort, needs a running daemon, and is the
 /// one step with nothing on disk to assert against.
-fn config_restore_at(path: &Path, index: usize) -> Result<()> {
+async fn config_restore_at(path: &Path, index: usize) -> Result<()> {
     let retained = crate::roster_backup::list(path)?;
     // `checked_sub`, not `index - 1`: `backup_index` is the only production constructor and it
     // rejects `0`, but that makes the PARSER the whole guard for an arithmetic underflow, and
@@ -2425,7 +2425,7 @@ fn config_restore_at(path: &Path, index: usize) -> Result<()> {
         "{}",
         render_restore_notice(entry, restored.roster.len(), path, replaced)
     );
-    restored.save_to(path)
+    restored.save_to(path).await
 }
 
 /// Render `config restore`'s notice (issue #1439). Pure — no I/O — so the exact operator-facing
@@ -5036,7 +5036,7 @@ async fn import(path: PathBuf, overwrite: bool, passphrase: PassphraseSource) ->
     // Persist the merged roster atomically (temp + rename, 0600) — OUTSIDE the swap lock
     // (config.toml is never swap-contended), mirroring `reconcile_login` (#135). One
     // write → a partial failure above leaves no half-written roster.
-    config.save()?;
+    config.save().await?;
     // Tell a running daemon to pick up the imported accounts now (#139) — best-effort.
     crate::capture::notify_daemon_roster_reload().await;
 
@@ -5829,7 +5829,7 @@ async fn set_enabled(query: Option<String>, enabled: bool) -> Result<()> {
     // Only rewrite config.toml when the flag actually changed — re-disabling an
     // already-parked account is a friendly no-op, not a needless disk write.
     if matches!(outcome, FlipOutcome::Changed) {
-        config.save()?;
+        config.save().await?;
         // Tell a running daemon to pick up the enable/disable now (#139) — best-effort;
         // the account joins / leaves the live rotation without a restart. Skipped on a
         // no-op flip (nothing changed on disk, so nothing to reload).
@@ -5929,7 +5929,7 @@ async fn remove_account(query: Option<String>) -> Result<()> {
     // Config FIRST (see the doc): persist the roster without the entry before the
     // destructive stash delete, so any failure past here orphans a harmless stash
     // rather than dangling a roster entry at a deleted one.
-    config.save()?;
+    config.save().await?;
     // Then delete the now-unreferenced stash — both halves, idempotent. The
     // service name is derived from the removed account's uuid (issue #70).
     RealAccountStash::new().delete(&removed.stash()).await?;
@@ -15041,8 +15041,8 @@ impl Nested {
     /// only checked "the live config now holds 6" passes — but the config it displaced never
     /// enters the ring, so the restore stops being undoable, which is the AC-5 property the
     /// notice printed one line earlier claims. The ring assertion below is what fails.
-    #[test]
-    fn restoring_installs_the_entry_and_rings_the_config_it_displaced() {
+    #[tokio::test]
+    async fn restoring_installs_the_entry_and_rings_the_config_it_displaced() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -15058,15 +15058,15 @@ impl Nested {
         };
 
         // The incident's shape: a good roster, then a write that replaces it with a thin one.
-        roster(6).save_to(&path).unwrap();
-        roster(1).save_to(&path).unwrap();
+        roster(6).save_to(&path).await.unwrap();
+        roster(1).save_to(&path).await.unwrap();
         assert_eq!(
             crate::roster_backup::list(&path).unwrap().len(),
             1,
             "the six-account config was retained when the one-account write replaced it"
         );
 
-        config_restore_at(&path, 1).expect("entry 1 restores");
+        config_restore_at(&path, 1).await.expect("entry 1 restores");
 
         assert_eq!(
             Config::load_path(&path).unwrap().roster.len(),
@@ -15096,13 +15096,17 @@ impl Nested {
 
     /// A restore that cannot proceed leaves the live roster exactly as it was — the refusal is a
     /// true no-op, not a partial write (issue #1439).
-    #[test]
-    fn a_refused_restore_leaves_the_live_roster_untouched() {
+    #[tokio::test]
+    async fn a_refused_restore_leaves_the_live_roster_untouched() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let two = "[[account]]\naccount_uuid = \"x\"\nlabel = \"x\"\n\n\
                    [[account]]\naccount_uuid = \"y\"\nlabel = \"y\"\n";
-        Config::from_toml_str(two).unwrap().save_to(&path).unwrap();
+        Config::from_toml_str(two)
+            .unwrap()
+            .save_to(&path)
+            .await
+            .unwrap();
         let before = std::fs::read_to_string(&path).unwrap();
 
         // An empty ring: every index is out of range, including the one the parser cannot emit.
@@ -15111,7 +15115,7 @@ impl Nested {
         for index in [0, 1, 9] {
             assert!(
                 matches!(
-                    config_restore_at(&path, index),
+                    config_restore_at(&path, index).await,
                     Err(Error::BackupNotRetained { retained: 0, .. })
                 ),
                 "index {index} names nothing in an empty ring"
@@ -15123,11 +15127,12 @@ impl Nested {
         Config::from_toml_str("[[account]]\naccount_uuid = \"z\"\nlabel = \"z\"\n")
             .unwrap()
             .save_to(&path)
+            .await
             .unwrap();
         let entry = crate::roster_backup::list(&path).unwrap().remove(0);
         std::fs::write(&entry.path, "this is not toml = = =").unwrap();
         assert!(
-            config_restore_at(&path, 1).is_err(),
+            config_restore_at(&path, 1).await.is_err(),
             "an entry that no longer parses is refused rather than installed"
         );
         assert_eq!(

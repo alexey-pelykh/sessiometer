@@ -360,7 +360,7 @@ where
                 // Persist the new roster OUTSIDE the lock (a swap never contends on `config.toml`),
                 // stash-before-roster. A save failure leaves an inert ORPHAN stash, never a partial
                 // roster — report it `Failed` (the stash landed, but the roster row did not).
-                if let Err(err) = report.config.save_to(&config_path) {
+                if let Err(err) = report.config.save_to(&config_path).await {
                     return self.capture_failure(command, classify_capture_failure(&err));
                 }
                 let crate::capture::CaptureReport {
@@ -486,7 +486,7 @@ where
         }
         // Persist the validated config atomically (temp + rename, 0600). A write failure leaves the
         // OLD file intact — report `SaveFailed`, adopt nothing.
-        if config.save_to(&config_path).is_err() {
+        if config.save_to(&config_path).await.is_err() {
             return ConfigSetAck::Rejected {
                 reason: ConfigSetRejection::SaveFailed,
                 detail: None,

@@ -325,8 +325,8 @@ impl Config {
     /// Persist this config to the canonical `config.toml` (`0600`, parent `0700`), with the
     /// inline tunable-documenting comments. The write path for the standalone `capture` (#4).
     #[allow(dead_code)]
-    pub(crate) fn save(&self) -> Result<()> {
-        self.save_to(&paths::config_file()?)
+    pub(crate) async fn save(&self) -> Result<()> {
+        self.save_to(&paths::config_file()?).await
     }
 
     /// Persist this config to an EXPLICIT `path` (`0600`, parent `0700`) — the injectable-path
@@ -357,11 +357,22 @@ impl Config {
     /// losing everything" D-3 forbids, reached through QUALIFYING writes, which is exactly the
     /// path the ring's own non-qualifying-write guard cannot see. `perform_config_set` in
     /// `src/daemon/commands.rs` states the contract this preserves: a refusal is a true no-op.
-    pub(crate) fn save_to(&self, path: &Path) -> Result<()> {
+    pub(crate) async fn save_to(&self, path: &Path) -> Result<()> {
         paths::ensure_private_dir(
             path.parent()
                 .expect("a config path always has a parent directory"),
         )?;
+        // The config-write lock (#1445, D-8), acquired BEFORE the file about to be replaced is
+        // read and held until this function returns — so what it serializes is the whole
+        // read-modify-write (retain the replaced file → publish the replacement → prune the
+        // ring), not merely the write in the middle. A contended acquire fails closed HERE,
+        // ahead of every effect below, which is what makes a refusal a true no-op: nothing
+        // retained, nothing written, nothing evicted. Dropped on return, releasing the lock.
+        let _write_lock = super::write_lock::ConfigWriteLock::acquire(
+            &super::write_lock::lock_path(path),
+            super::write_lock::CONFIG_WRITE_LOCK_MAX_WAIT,
+        )
+        .await?;
         let retention = crate::roster_backup::retain_if_qualifying(path)?;
         match paths::write_private_file(path, self.render().as_bytes()) {
             Ok(()) => {

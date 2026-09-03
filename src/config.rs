@@ -57,6 +57,7 @@ mod settings;
 #[cfg(test)]
 mod test_support;
 mod validate;
+mod write_lock;
 
 pub(crate) use validate::account_uuid_violation;
 

@@ -452,21 +452,21 @@ mod tests {
     /// the previous contents at the moment of the one-account write were NOTHING, so such a rule
     /// would retain the empty state and, at depth, evict a good entry to do it. This is the only
     /// sequence that actually happened, which is why it is asserted first and by itself.
-    #[test]
-    fn the_incident_sequence_leaves_the_six_account_backup_unevicted() {
+    #[tokio::test]
+    async fn the_incident_sequence_leaves_the_six_account_backup_unevicted() {
         let (_dir, path) = scratch();
 
         // A six-account roster on disk, then an ordinary legitimate save over it — which is how
         // the six-account file enters the ring in the first place.
         fs::write(&path, roster_of(6)).unwrap();
-        config_of(6).save_to(&path).unwrap();
+        config_of(6).save_to(&path).await.unwrap();
         assert_eq!(retained_counts(&path), vec![Some(6)]);
 
         // Something outside sessiometer removes the file. Unattributed, then and here.
         fs::remove_file(&path).unwrap();
 
         // `login` finds nothing, concludes first run, and writes one account.
-        config_of(1).save_to(&path).unwrap();
+        config_of(1).save_to(&path).await.unwrap();
 
         assert_eq!(
             retained_counts(&path),
@@ -487,12 +487,12 @@ mod tests {
 
     /// The ordinary path: a file that parses and holds accounts is retained before it is
     /// replaced, and what is retained is the REPLACED contents, not the replacing ones.
-    #[test]
-    fn a_valid_populated_file_is_retained_before_it_is_replaced() {
+    #[tokio::test]
+    async fn a_valid_populated_file_is_retained_before_it_is_replaced() {
         let (_dir, path) = scratch();
         fs::write(&path, roster_of(3)).unwrap();
 
-        config_of(2).save_to(&path).unwrap();
+        config_of(2).save_to(&path).await.unwrap();
 
         assert_eq!(retained_counts(&path), vec![Some(3)]);
         assert_eq!(Config::load_path(&path).unwrap().roster.len(), 2);
@@ -500,8 +500,8 @@ mod tests {
 
     /// Three shapes, one rule: a file that cannot be vouched for is not evidence of anything, so
     /// it neither enters the ring nor displaces what is already there.
-    #[test]
-    fn absent_malformed_and_empty_files_neither_retain_nor_evict() {
+    #[tokio::test]
+    async fn absent_malformed_and_empty_files_neither_retain_nor_evict() {
         for (label, seed) in [
             ("absent", None),
             ("malformed", Some("][".to_string())),
@@ -510,14 +510,14 @@ mod tests {
             let (_dir, path) = scratch();
             // One good entry in the ring to have something to lose.
             fs::write(&path, roster_of(4)).unwrap();
-            config_of(4).save_to(&path).unwrap();
+            config_of(4).save_to(&path).await.unwrap();
             assert_eq!(retained_counts(&path), vec![Some(4)], "{label}: seeded");
 
             match seed {
                 Some(text) => fs::write(&path, text).unwrap(),
                 None => fs::remove_file(&path).unwrap(),
             }
-            config_of(1).save_to(&path).unwrap();
+            config_of(1).save_to(&path).await.unwrap();
 
             // As in the incident replay above, the "nothing evicted" half is carried by
             // `repeated_non_qualifying_writes_cannot_drain_the_ring`, not by this one-entry ring.
@@ -538,13 +538,13 @@ mod tests {
     /// observable when only one entry is seeded, because `skip(n)` over one entry removes
     /// nothing. Both mutants were run against this test; both are caught here and neither was
     /// caught by the single-entry form.
-    #[test]
-    fn repeated_non_qualifying_writes_cannot_drain_the_ring() {
+    #[tokio::test]
+    async fn repeated_non_qualifying_writes_cannot_drain_the_ring() {
         let (_dir, path) = scratch();
         // Fill the ring: three qualifying writes over files holding 6, 5 then 4 accounts.
         fs::write(&path, roster_of(6)).unwrap();
         for accounts in [5, 4, 3] {
-            config_of(accounts).save_to(&path).unwrap();
+            config_of(accounts).save_to(&path).await.unwrap();
         }
         assert_eq!(retained_counts(&path), vec![Some(4), Some(5), Some(6)]);
 
@@ -552,7 +552,7 @@ mod tests {
         // cycled every good entry out with two writes to spare.
         for _ in 0..5 {
             fs::remove_file(&path).unwrap();
-            config_of(1).save_to(&path).unwrap();
+            config_of(1).save_to(&path).await.unwrap();
         }
 
         assert_eq!(retained_counts(&path), vec![Some(4), Some(5), Some(6)]);
@@ -560,13 +560,13 @@ mod tests {
 
     /// Depth, and the eviction order — asserted on CONTENT rather than on a count, so a ring
     /// that evicted newest-first would fail rather than pass at three.
-    #[test]
-    fn the_ring_holds_at_most_three_and_evicts_oldest_first() {
+    #[tokio::test]
+    async fn the_ring_holds_at_most_three_and_evicts_oldest_first() {
         let (_dir, path) = scratch();
         // Four qualifying writes: each replaces a file holding 4, 5, 6 then 7 accounts.
         fs::write(&path, roster_of(4)).unwrap();
         for accounts in 5..=8 {
-            config_of(accounts).save_to(&path).unwrap();
+            config_of(accounts).save_to(&path).await.unwrap();
         }
 
         assert_eq!(
@@ -579,12 +579,12 @@ mod tests {
 
     /// The mode is read off the filesystem, never inferred from the writer used. A `0644`
     /// backup of a `0600` file is a disclosure the original deliberately prevented.
-    #[test]
-    fn every_retained_file_carries_the_config_file_mode() {
+    #[tokio::test]
+    async fn every_retained_file_carries_the_config_file_mode() {
         let (_dir, path) = scratch();
         fs::write(&path, roster_of(2)).unwrap();
         for accounts in 3..=5 {
-            config_of(accounts).save_to(&path).unwrap();
+            config_of(accounts).save_to(&path).await.unwrap();
         }
 
         let retained = list(&path).unwrap();
@@ -603,11 +603,11 @@ mod tests {
     /// A stale backup is never loadable as the live config by accident: the ring is a
     /// SUBDIRECTORY, so no entry shares the config file's name or its directory, and the loader
     /// — which opens one exact path and never scans — reads the live file with the ring in place.
-    #[test]
-    fn a_retained_backup_is_never_a_candidate_for_the_live_config() {
+    #[tokio::test]
+    async fn a_retained_backup_is_never_a_candidate_for_the_live_config() {
         let (_dir, path) = scratch();
         fs::write(&path, roster_of(6)).unwrap();
-        config_of(1).save_to(&path).unwrap();
+        config_of(1).save_to(&path).await.unwrap();
 
         let retained = list(&path).unwrap();
         assert_eq!(retained.len(), 1);
@@ -632,15 +632,15 @@ mod tests {
     /// What is retained is the replaced file's OWN bytes, not a re-render of them: a backup that
     /// round-tripped through this build's emitter would silently drop anything the emitter no
     /// longer writes, which is the opposite of what a backup is for.
-    #[test]
-    fn the_retained_text_is_the_replaced_files_own_bytes() {
+    #[tokio::test]
+    async fn the_retained_text_is_the_replaced_files_own_bytes() {
         let (_dir, path) = scratch();
         // Valid, and deliberately unlike anything `Config::render` emits: a comment, an inline
         // spelling of a defaulted tunable, and no trailing structure.
         let authored = "# hand-authored\n[[account]]\naccount_uuid = \"x\"\nlabel = \"l\"\n";
         fs::write(&path, authored).unwrap();
 
-        config_of(2).save_to(&path).unwrap();
+        config_of(2).save_to(&path).await.unwrap();
 
         let retained = list(&path).unwrap();
         assert_eq!(retained.len(), 1);
@@ -716,12 +716,12 @@ mod tests {
     /// LANDED instead. The failure is provoked the way it actually arises — a `config.toml.tmp`
     /// that is a directory, so `write_private_file`'s `remove_file` and `create_new` both fail
     /// exactly as they would on a full volume.
-    #[test]
-    fn a_failed_replacing_write_neither_adds_to_nor_evicts_from_the_ring() {
+    #[tokio::test]
+    async fn a_failed_replacing_write_neither_adds_to_nor_evicts_from_the_ring() {
         let (_dir, path) = scratch();
         fs::write(&path, roster_of(6)).unwrap();
         for accounts in [5, 4, 3] {
-            config_of(accounts).save_to(&path).unwrap();
+            config_of(accounts).save_to(&path).await.unwrap();
         }
         let before = retained_counts(&path);
         assert_eq!(before, vec![Some(4), Some(5), Some(6)]);
@@ -734,7 +734,7 @@ mod tests {
         // Three attempts: at depth, a per-attempt eviction would take the ring apart.
         for _ in 0..3 {
             assert!(
-                config_of(2).save_to(&path).is_err(),
+                config_of(2).save_to(&path).await.is_err(),
                 "the wedged staging path must fail the write"
             );
         }
@@ -752,17 +752,17 @@ mod tests {
     ///
     /// Drives the mechanics `config restore` performs — validate the retained text, then write
     /// it through the same seam — at the layer where they can be driven hermetically.
-    #[test]
-    fn restoring_through_the_write_seam_retains_the_config_it_replaces() {
+    #[tokio::test]
+    async fn restoring_through_the_write_seam_retains_the_config_it_replaces() {
         let (_dir, path) = scratch();
         fs::write(&path, roster_of(6)).unwrap();
-        config_of(1).save_to(&path).unwrap();
+        config_of(1).save_to(&path).await.unwrap();
         assert_eq!(retained_counts(&path), vec![Some(6)]);
 
         // What `config restore 1` does: re-validate the chosen entry, then write it back.
         let chosen = list(&path).unwrap().remove(0);
         let restored = Config::from_toml_str(&fs::read_to_string(&chosen.path).unwrap()).unwrap();
-        restored.save_to(&path).unwrap();
+        restored.save_to(&path).await.unwrap();
 
         assert_eq!(Config::load_path(&path).unwrap().roster.len(), 6);
         assert_eq!(
