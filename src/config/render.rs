@@ -1419,6 +1419,187 @@ label = \"work\"
         }
     }
 
+    // --- the dedicated config-write lock (issue #1445, design D-8) -------------------
+
+    /// A roster of `accounts` accounts, as a parsed [`Config`] — the size doubles as the
+    /// writer's identity, so a lost update is visible as a missing number rather than as a
+    /// byte diff.
+    fn roster_of(accounts: usize) -> Config {
+        let mut out = String::new();
+        for n in 0..accounts {
+            out.push_str(&format!(
+                "[[account]]\naccount_uuid = \"u-{n}\"\nlabel = \"a{n}\"\n\n"
+            ));
+        }
+        Config::from_toml_str(&out).expect("the fixture roster parses")
+    }
+
+    /// AC-5, and the DETERMINISTIC half of AC-2: `save_to` actually takes the config-write lock,
+    /// a busy lock is REPORTED rather than silently skipped, and the refusal is a true no-op.
+    ///
+    /// This is the test that fails against the pre-change code, and it fails for the right
+    /// reason: without the lock `save_to` completes immediately whatever anyone else is holding,
+    /// so the `timeout` below returns `Ok` and the assertion that it was BLOCKED is what breaks.
+    /// The concurrency test beneath it exercises the same lock under real threads, but a race
+    /// that has to be *observed* can only ever be evidence, never a proof — this one is the
+    /// proof.
+    ///
+    /// It also demonstrates the no-deadlock property AC-5 asks for from the other side: the wait
+    /// is BOUNDED, so a writer facing a daemon that holds the lock gets an error, never a hang.
+    #[tokio::test]
+    async fn save_to_blocks_on_a_held_config_write_lock_and_writes_nothing_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        roster_of(2).save_to(&path).await.unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        // Stand in for the other writer — a second CLI invocation, or the daemon's `config set`
+        // handler — holding the lock across its own read-modify-write.
+        let held = super::write_lock::ConfigWriteLock::acquire(
+            &super::write_lock::lock_path(&path),
+            std::time::Duration::from_millis(50),
+        )
+        .await
+        .expect("the stand-in writer takes the lock");
+
+        // Far shorter than `CONFIG_WRITE_LOCK_MAX_WAIT`, so this observes the BLOCK without
+        // waiting out the production budget.
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            roster_of(9).save_to(&path),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "`save_to` completed while another writer held the config-write lock — it is not \
+             taking the lock at all, so two writers can still interleave"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "a writer waiting on the lock has written nothing — the refusal is a true no-op"
+        );
+        assert!(
+            crate::roster_backup::list(&path).unwrap().is_empty(),
+            "nor has it retained or evicted anything: the lock is acquired BEFORE the ring is \
+             touched, which is what makes the whole read-modify-write the critical section"
+        );
+
+        // And it recovers: the lock is per-write, not per-process.
+        drop(held);
+        roster_of(9).save_to(&path).await.unwrap();
+        assert_eq!(Config::load_path(&path).unwrap().roster.len(), 9);
+    }
+
+    /// AC-2 under REAL concurrency: several writers race one `config.toml` from separate OS
+    /// threads (the closest in-process model of the separate PROCESSES the defect is about —
+    /// `flock` contends across open file descriptions either way), while a reader parses the live
+    /// file continuously.
+    ///
+    /// Three properties, which are AC-2's two clauses plus the ring accounting that makes "no
+    /// lost update" mean something at this seam:
+    ///
+    /// - **No partial file is ever rendered live.** The reader only ever observes a config that
+    ///   parses. Pre-change this is reachable because the writers share one staging name and
+    ///   `write_private_file` opens it by unlinking: an unlink landing between the winner's
+    ///   `fsync` and its `rename` publishes the LOSER's half-written file.
+    /// - **No update is lost.** Every writer's roster is accounted for — one live, the rest
+    ///   retained by whoever replaced them. `WRITERS` is held at [`RING_DEPTH`] so the ring can
+    ///   hold every displaced entry and eviction never confounds the accounting.
+    /// - **Exactly one writer's output is live**, complete and valid (AC-8 verbatim).
+    ///
+    /// Being a race, a green run is EVIDENCE and not proof — the deterministic proof that the
+    /// lock is wired at all is the test above. This one is what would catch a lock that is taken
+    /// but does not actually cover the ring's read-modify-write.
+    #[test]
+    fn concurrent_writers_publish_one_complete_config_and_lose_no_update() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        const WRITERS: usize = crate::roster_backup::RING_DEPTH;
+        // Distinct, non-zero roster sizes: each writer's own signature in the accounting below.
+        let sizes: Vec<usize> = (1..=WRITERS).collect();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reader = {
+            let path = path.clone();
+            let stop = Arc::clone(&stop);
+            let reads = Arc::clone(&reads);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    // An absent file is legitimate only before the first write lands; a file that
+                    // EXISTS must always parse. A torn publish fails here.
+                    match Config::load_path(&path) {
+                        Ok(config) => {
+                            assert!(
+                                !config.roster.is_empty(),
+                                "a live config with an empty roster is a torn or truncated \
+                                 publish — every writer here writes a non-empty one"
+                            );
+                            reads.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(crate::error::Error::ConfigNotFound { .. }) => {}
+                        Err(err) => panic!("the live config did not parse: {err}"),
+                    }
+                }
+            })
+        };
+
+        let writers: Vec<_> = sizes
+            .iter()
+            .copied()
+            .map(|accounts| {
+                let path = path.clone();
+                // One runtime per thread: genuinely parallel acquires, not a single-threaded
+                // interleave that would serialize by accident and pass without a lock.
+                std::thread::spawn(move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(async { roster_of(accounts).save_to(&path).await })
+                        .unwrap_or_else(|err| panic!("writer {accounts} failed: {err}"));
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+        assert!(
+            reads.load(Ordering::Relaxed) > 0,
+            "the reader never observed the file at all — the no-torn-read assertion above ran \
+             against nothing"
+        );
+
+        // Exactly one writer's complete, valid output is live (AC-8).
+        let live = Config::load_path(&path).unwrap().roster.len();
+        assert!(
+            sizes.contains(&live),
+            "the live roster holds {live} accounts, which no writer wrote — the file is a blend \
+             of two writers' output"
+        );
+
+        // And no update was lost: the live roster plus the ring account for every writer.
+        let mut seen: Vec<usize> = crate::roster_backup::list(&path)
+            .unwrap()
+            .iter()
+            .map(|e| e.accounts.expect("every retained entry still parses"))
+            .collect();
+        seen.push(live);
+        seen.sort_unstable();
+        assert_eq!(
+            seen, sizes,
+            "every writer's roster should be accounted for — one live, the rest retained by \
+             whoever replaced them; a missing size is an update that vanished"
+        );
+    }
+
     /// AC #3 + #4 end-to-end: a config written the way `capture` will write it
     /// (rendered → `write_private_file`) is read back identically by the daemon's
     /// `load`, and the on-disk file is `0600`.

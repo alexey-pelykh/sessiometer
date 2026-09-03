@@ -154,3 +154,105 @@ impl ConfigWriteLock {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::time::Duration;
+
+    /// The lock is the config file's OWN sibling, so two shells pointed at two different config
+    /// files (an `XDG_CONFIG_HOME` override, or two hermetic tests) never contend for no reason —
+    /// and one config file always resolves to one lock however it was reached.
+    #[test]
+    fn the_lock_is_the_config_files_own_sibling_and_is_per_config_file() {
+        let a = Path::new("/cfg/a/config.toml");
+        let b = Path::new("/cfg/b/config.toml");
+
+        assert_eq!(lock_path(a), PathBuf::from("/cfg/a/config.toml.lock"));
+        assert_eq!(lock_path(a), lock_path(Path::new("/cfg/a/config.toml")));
+        assert_ne!(lock_path(a), lock_path(b));
+
+        // Never the config file itself: `write_private_file` publishes by `rename`, so a lock on
+        // that inode would not carry across the swap and a later writer opening the new file by
+        // path would not contend with the holder.
+        assert_ne!(lock_path(a), a.to_path_buf());
+    }
+
+    /// The lock is DISTINCT from `swap.lock` — AC-3's structural half. Sharing a file with the
+    /// swap lock is the one implementation that would satisfy "a lock exists" while silently
+    /// widening `swap.lock`'s contention set, which the issue forbids outright.
+    #[test]
+    fn the_lock_file_is_never_the_swap_or_daemon_lock() {
+        let support = Path::new("/support");
+        let config_lock = lock_path(Path::new("/cfg/config.toml"));
+
+        assert_ne!(config_lock, support.join("swap.lock"));
+        assert_ne!(config_lock, support.join("daemon.lock"));
+        assert_ne!(config_lock, support.join("usage.lock"));
+    }
+
+    /// FAIL-CLOSED while held, and available again the moment the holder releases — the property
+    /// AC-5 rests on. A busy lock is REPORTED as [`Error::ConfigWriteLockBusy`] within the bounded
+    /// wait; it neither blocks forever (which is the deadlock AC-5 forbids) nor silently proceeds
+    /// without the lock (which would make the lock decorative).
+    ///
+    /// Mirrors `swap::tests::the_swap_lock_fails_closed_while_held_then_recovers_on_release`.
+    #[tokio::test]
+    async fn a_contended_acquire_fails_closed_and_recovers_on_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml.lock");
+
+        let held = ConfigWriteLock::acquire(&path, Duration::from_millis(50))
+            .await
+            .expect("the first acquire takes an uncontended lock");
+
+        // A short budget so the refusal is observed without waiting out the production one; the
+        // BEHAVIOUR under test is the fail-closed verdict, not the length of the wait.
+        let refused = ConfigWriteLock::acquire(&path, Duration::from_millis(50)).await;
+        assert!(
+            matches!(refused, Err(Error::ConfigWriteLockBusy)),
+            "a contended acquire must report `ConfigWriteLockBusy`, got {refused:?}"
+        );
+
+        drop(held);
+        ConfigWriteLock::acquire(&path, Duration::from_millis(50))
+            .await
+            .expect("the lock is available again once the holder releases");
+    }
+
+    /// Two DIFFERENT config files do not serialize against each other. The per-config-file keying
+    /// is not cosmetic: a fixed native-local lock would make every hermetic test in this crate,
+    /// and any two shells under different `XDG_CONFIG_HOME` values, queue behind one another.
+    #[tokio::test]
+    async fn two_different_config_files_do_not_contend() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = lock_path(&dir.path().join("a/config.toml"));
+        let b = lock_path(&dir.path().join("b/config.toml"));
+        std::fs::create_dir_all(a.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(b.parent().unwrap()).unwrap();
+
+        let _held_a = ConfigWriteLock::acquire(&a, Duration::from_millis(50))
+            .await
+            .unwrap();
+        ConfigWriteLock::acquire(&b, Duration::from_millis(50))
+            .await
+            .expect("a different config file's lock is a different lock");
+    }
+
+    /// The lock file is created `0600`: it sits beside a `0600` config in a `0700` directory, and
+    /// a world-writable lock would let any local user wedge every config write on the machine.
+    #[tokio::test]
+    async fn the_lock_file_is_created_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml.lock");
+        let _held = ConfigWriteLock::acquire(&path, Duration::from_millis(50))
+            .await
+            .unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the lock file is created private");
+    }
+}
