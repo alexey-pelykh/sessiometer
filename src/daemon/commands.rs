@@ -3479,6 +3479,16 @@ mod tests {
         daemon.state.accounts[2].health.recovery_successes = 2;
         daemon.state.poll_schedule = vec![2, 0, 1];
         daemon.state.poll_pos = 2;
+        // Seeded, not left at its `None` default, because the reconcile's `last_good` write only
+        // fires when the active account leaves the roster — which is precisely what this shrink
+        // would do to `u-B`. Unseeded, that write clears `None` to `None` and the fifth of the
+        // five writes named above is asserted by a comparison that cannot fail.
+        let anchor = LastGood {
+            session: 0.42,
+            weekly: 0.17,
+            at: Instant::now(),
+        };
+        daemon.state.last_good = Some(anchor);
 
         // Compared through `fingerprint`, the module's EXHAUSTIVE per-signal projection: it
         // destructures `AccountRuntime` field by field, so a tenth signal added later is covered
@@ -3509,6 +3519,12 @@ mod tests {
              they index did not change"
         );
         assert_eq!(daemon.state.poll_pos, 2, "and neither was its cursor");
+        assert_eq!(
+            daemon.state.last_good,
+            Some(anchor),
+            "the active account's pre-blind anchor was dropped — the reconcile clears it when the \
+             active account leaves the roster, and a refusal means it never left"
+        );
     }
 
     /// Every per-account signal on [`AccountRuntime`], projected into one comparable tuple.
