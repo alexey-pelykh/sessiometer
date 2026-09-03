@@ -111,8 +111,8 @@ use crate::landing;
 use crate::observability::{
     BackoffClass, BlindVelocity, CanonicalLiveness, CaptureEventOutcome, CredentialHealth,
     DecisionClass, Diagnostic, DiagnosticLog, Event, EventLog, ExpiryHorizon, ExpiryProvenance,
-    KeepWarmTrigger, PollClass, PollRefreshTrigger, RefreshEventOutcome, SwapProjection,
-    SwapReason,
+    KeepWarmTrigger, PollClass, PollRefreshTrigger, RefreshEventOutcome, RosterReloadOutcome,
+    RosterReloadReason, SwapProjection, SwapReason,
 };
 use crate::refresh::{CredentialClocks, RefreshOutcome, RefreshReport};
 use crate::refresh_tick::{refresh_event_outcome, RealRefreshEngine, RefreshEngine};

@@ -660,8 +660,24 @@ where
             }
             // Reload + reconcile the in-memory roster to the freshly-written
             // `config.toml` (#139) — the onboarded / relogged-in / removed account is
-            // adopted into the live rotation — BEFORE looping back to re-tick.
-            Idle::RosterReloadRequested => daemon.adopt_roster_reload().await,
+            // adopted into the live rotation — BEFORE looping back to re-tick. This is the
+            // daemon's one unattended path to REPLACING the whole rotation, so its outcome and
+            // both roster counts are logged on every path, adopted or not (#1438).
+            //
+            // Two things keep the emit here, and the handler's by-value return is NEITHER of them
+            // — that guarantees an event is PRODUCED, not that this arm uses one.
+            // `adopt_roster_reload` is `#[must_use]`, so an arm that awaits it and drops the value
+            // fails to build under `-D warnings`; and
+            // `run_loop_adopts_a_roster_reload_signal_through_the_idle_select` reads the appended
+            // line back off the log, so an arm that still compiles but emits the wrong thing fails
+            // too. Measured, because the compiler half is the kind of claim that is easy to assume
+            // and was: with the attribute removed, collapsing this arm to a bare
+            // `daemon.adopt_roster_reload().await;` left
+            // `cargo clippy --all-targets --all-features -- -D warnings` at exit 0.
+            Idle::RosterReloadRequested => {
+                let event = daemon.adopt_roster_reload().await;
+                emit_best_effort(log, &event);
+            }
             // Reconcile the revived account the `restored` control command named (#275 +
             // issue #643): a bare `Degraded` quarantine takes the plain on-demand
             // un-quarantine (`apply_refresh_restore`); a `Dead` PARKED account additionally

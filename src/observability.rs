@@ -1031,6 +1031,154 @@ pub(crate) struct BlindVelocity {
     pub(crate) ceiling_pct: f64,
 }
 
+/// The outcome of one runtime roster reload (issue #1438) — the `outcome=` token of the redacted
+/// [`Event::RosterReload`], and the axis an operator sorts a reload incident on.
+///
+/// THREE daemon-side states, not a boolean. The reload was ADOPTED (the on-disk roster is now the
+/// live rotation), REFUSED (the daemon DECLINED what the reload presented, and the live rotation
+/// was kept), or it FAILED at the read (the file was absent or unreadable, so there was never
+/// anything to decide about). A boolean would fold the last two together and they are not the same
+/// fact: a refusal is a decision the daemon took, a failure is a file that did not answer.
+///
+/// The fourth is the CLI half of the same operation ([`RosterReloadOutcome::NotNotified`]): the
+/// roster write landed on disk but the CLI saw no acknowledgement come back, so there may be no
+/// daemon-side line to go looking for. It rides this enum rather than an event of its own so that
+/// one `grep event=roster_reload` returns the whole operation, both halves.
+///
+/// WHICH optional tokens a line carries is a property of the [`RosterReloadReason`] and never of
+/// the outcome — see [`RosterReloadOutcome::Refused`], where the difference is load-bearing.
+///
+/// A bare classification, never a handle, path, or error string (#15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RosterReloadOutcome {
+    /// The on-disk `config.toml` was read and the in-memory roster reconciled to it — the live
+    /// rotation now matches the file.
+    Adopted,
+    /// The daemon DECLINED to adopt what the reload presented; the live in-memory rotation was
+    /// kept.
+    ///
+    /// Deliberately NOT "declined before reading anything". WHY it declined is the
+    /// [`RosterReloadReason`], and so is whether the line carries an `incoming` count — this
+    /// outcome decides neither. Today's only refusal is [`RosterReloadReason::ReloadDisabled`],
+    /// which declines because no `config_path` is wired and therefore never reads, leaving
+    /// `incoming` absent.
+    ///
+    /// A refusal taken AFTER a read is the expected shape of the next one, and is invited rather
+    /// than forbidden here: the roster-never-shrinks guard
+    /// (`docs/specs/roster-never-shrinks.feature.md`, issue #1442) can only detect a shrink by
+    /// COMPARING the two counts, so it necessarily reads first, and its own "a refusal is legible
+    /// after the fact" scenario requires the event to record `refused` with BOTH counts. Nothing
+    /// forecloses that — not this variant, not the render arm (each count is rendered off its own
+    /// `Option`), and not the absence matrix, which is keyed on the (outcome, reason) PAIR
+    /// precisely so a post-read refusal adds a row instead of contradicting one.
+    Refused,
+    /// The read was attempted and yielded no config (an absent, unreadable or invalid file). The
+    /// current in-memory roster was KEPT — best-effort by contract (issue #139).
+    Failed,
+    /// CLI side: a roster write committed to disk, and the CLI did not observe an acknowledgement
+    /// from a running daemon.
+    ///
+    /// "No ack was seen" is the whole claim, and it is deliberately weaker than "the daemon was
+    /// never told" — only the [`RosterReloadReason`] says which.
+    /// [`RosterReloadReason::SocketUnresolved`] and [`RosterReloadReason::NotifyFailed`] delivered
+    /// nothing, so the daemon really is still serving the pre-write rotation until something else
+    /// makes it reload; [`RosterReloadReason::NotifyTimedOut`] claims no such thing, because the
+    /// request may already be queued and may still be adopted.
+    NotNotified,
+}
+
+impl RosterReloadOutcome {
+    /// The `outcome=` token for the [`Event::RosterReload`] log line.
+    fn as_str(self) -> &'static str {
+        match self {
+            RosterReloadOutcome::Adopted => "adopted",
+            RosterReloadOutcome::Refused => "refused",
+            RosterReloadOutcome::Failed => "failed",
+            RosterReloadOutcome::NotNotified => "not_notified",
+        }
+    }
+}
+
+/// WHY a roster reload did not adopt (issue #1438) — the `reason=` token of the redacted
+/// [`Event::RosterReload`], carried on the non-adopted outcomes only.
+///
+/// A bare machine code, deliberately NOT a rendering of the underlying error.
+/// [`crate::error::Error::ConfigNotFound`] carries the config `PathBuf` and a TOML parse failure
+/// quotes file CONTENT, so formatting either onto this channel would put a filesystem location —
+/// or a fragment of a mode-`0o600` file that indexes credentials — into a log with a WIDER
+/// AUDIENCE than the file it describes (#15). The error is bound to be classified and then
+/// dropped; nothing derived from its text reaches a line.
+///
+/// The absent-versus-unreadable split is carried because it is free — `Error::ConfigNotFound`
+/// already distinguishes them — and because the two mean different things: a briefly-absent file
+/// is the benign mid-write race the best-effort contract exists for, while an unreadable one is a
+/// file that is there and wrong.
+///
+/// THIS enum, not [`RosterReloadOutcome`], decides which optional tokens a line carries:
+/// [`RosterReloadReason::ReloadDisabled`] declines without reading and so renders no `incoming`,
+/// where a post-read refusal would render both counts. Every code's rendered spelling is pinned on
+/// a real line by `every_roster_reload_reason_renders_its_own_token` in this file's test module —
+/// these codes are the operator's grep handles, so a silent re-spelling would re-label every
+/// historical line rather than break anything visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RosterReloadReason {
+    /// No `config_path` is wired, so runtime reload is not armed — this refusal declines WITHOUT
+    /// reading, which is why its line carries no `incoming` count. That absence belongs to this
+    /// reason, not to [`RosterReloadOutcome::Refused`].
+    ReloadDisabled,
+    /// The config file was not there when the reload went to read it.
+    Absent,
+    /// The config file was there and did not yield a usable config — it could not be read,
+    /// parsed, or VALIDATED.
+    ///
+    /// The wording is wide on purpose. The classifier in `adopt_roster_reload` names
+    /// [`crate::error::Error::ConfigNotFound`] and routes EVERY other `Config::load_path` error
+    /// class here through a `_` arm, so a read I/O failure, a TOML syntax error, an out-of-range
+    /// tunable ([`crate::error::Error::ConfigInvalid`]) and
+    /// [`crate::error::Error::ConfigTargetMaxSessionAboveTrigger`] all render this one code — as
+    /// will any class `load_path` grows later. Deliberate: a `_` arm DOCUMENTED as absorbing the
+    /// remainder is honest, where splitting one validation code off today would look exhaustive
+    /// while silently re-absorbing the next class into whichever half it happened to land in.
+    Unreadable,
+    /// CLI side: the control socket path could not be resolved, so no notify was ever sent.
+    SocketUnresolved,
+    /// CLI side: the socket path resolved and the send FAILED outright — overwhelmingly, no daemon
+    /// is running (connect refused / socket absent), which is the benign case. A failure and never
+    /// a timeout: [`RosterReloadReason::NotifyTimedOut`] is split out because the two carry
+    /// opposite implications for whether the daemon was told.
+    NotifyFailed,
+    /// CLI side: the request was sent and no acknowledgement arrived inside the 2s
+    /// `CLIENT_NOTIFY_TIMEOUT` every client notify is bounded by.
+    ///
+    /// NOT evidence that the daemon was never told, which is the whole reason it is split from
+    /// [`RosterReloadReason::NotifyFailed`]. A daemon inside its jittered start-up delay (a
+    /// uniform `[0, STARTUP_DELAY_CAP)` draw, so up to 30s — issue #76) has ALREADY bound its
+    /// control socket while nothing is accepting yet, and the run loop is single-threaded, so a
+    /// roster verb landing in that window connects into the listen backlog, waits, and gives up
+    /// at 2s — after which the daemon accepts the backlogged request and adopts it, writing its
+    /// own `outcome=adopted` line. The server anticipates exactly this client already: its control
+    /// serve swallows the `EPIPE` from acking a peer that has already gone.
+    ///
+    /// So a reader must not treat this code as divergence between the file and the live rotation.
+    /// It says the CLI stopped waiting, not that the reload did not happen; the daemon-side line,
+    /// if one follows, is the authority.
+    NotifyTimedOut,
+}
+
+impl RosterReloadReason {
+    /// The `reason=` token for the [`Event::RosterReload`] log line.
+    fn as_str(self) -> &'static str {
+        match self {
+            RosterReloadReason::ReloadDisabled => "reload_disabled",
+            RosterReloadReason::Absent => "absent",
+            RosterReloadReason::Unreadable => "unreadable",
+            RosterReloadReason::SocketUnresolved => "socket_unresolved",
+            RosterReloadReason::NotifyFailed => "notify_failed",
+            RosterReloadReason::NotifyTimedOut => "notify_timed_out",
+        }
+    }
+}
+
 /// One observable daemon state change, rendered as a single `key=val` log line by
 /// [`Event::to_log_line`].
 ///
@@ -2118,6 +2266,59 @@ pub(crate) enum Event {
         was_active: bool,
         swapped_away: bool,
     },
+    /// A runtime roster reload ran (issue #1438) — the one durable trace that the operation which
+    /// can replace the whole live rotation happened at all.
+    ///
+    /// The reload is the daemon's only unattended path to REPLACING its roster, and until this
+    /// event it wrote nothing durable: the handler's failure arm was an `eprintln!` on a
+    /// background process whose stderr nobody reads, and its success arm said nothing whatsoever.
+    /// A reload that silently shrank the roster from six accounts to one left an operator with a
+    /// changed fleet and no line to find — the shape of the 2026-08-27 incident this event exists
+    /// for.
+    ///
+    /// Emitted on EVERY return path of the daemon handler ([`crate::daemon`]'s
+    /// `adopt_roster_reload`, which returns this event BY VALUE so the compiler refuses a path
+    /// that produces none) and, with [`RosterReloadOutcome::NotNotified`], on both failure paths
+    /// of the CLI-side notify that ASKS for the reload. One line per reload ATTEMPTED — not an
+    /// episode pair like [`Event::ObservationGapEnter`] / [`Event::ObservationGapExit`], and not
+    /// edge-triggered on the roster changing: "the reload ran and adopted the same six accounts"
+    /// and "no reload ran at all" are the two readings an incident has to separate, so the
+    /// no-change case is recorded too.
+    ///
+    /// `previous` and `incoming` are carried as a PAIR because that is the only form in which the
+    /// incident is legible: `adopted 1` says nothing, `adopted 1, was 6` is the whole event. A
+    /// single count cannot express a shrink, and a reader with one number cannot tell a widening
+    /// from a collapse. Both are optional because not every path knows both — and WHICH path is a
+    /// property of the [`RosterReloadReason`], never of the outcome:
+    /// [`RosterReloadReason::ReloadDisabled`] declines without reading and so has no incoming
+    /// count, a post-read refusal (issue #1442's shrink guard) carries both, and the CLI side can
+    /// see neither the daemon's in-memory roster nor, meaningfully, its own. An unknown count is
+    /// OMITTED rather than rendered `0`: `incoming=0` is a real and alarming fact (the file
+    /// presented an EMPTY roster) and must never be spelled the same way as "this path never read
+    /// the file" — the one distinction this whole shape exists to keep, so it is pinned on
+    /// rendered lines by `an_empty_roster_renders_a_zero_count_where_an_unread_one_renders_none`
+    /// rather than only argued here.
+    ///
+    /// `reason` rides the non-adopted outcomes only. That is a CONVENTION of the emitters and not
+    /// a property of this shape: `reason` is a flat `Option` beside `outcome`, so
+    /// `Adopted { reason: Some(..) }` is representable and would render. Keeping it flat is
+    /// deliberate — folding the reason into the outcome would restructure the variant every
+    /// consumer matches on — so the convention is CHECKED instead, by
+    /// `every_daemon_reload_path_pairs_its_outcome_with_the_right_reason`, which drives all four
+    /// of the daemon handler's return paths (the CLI emitter constructs
+    /// [`RosterReloadOutcome::NotNotified`] literally and so cannot reach `Adopted` at all).
+    ///
+    /// The reason itself is a bare machine code ([`RosterReloadReason`]) — never the path, never
+    /// an account, never the error text. Nothing here is a token, an email, a label or a
+    /// filesystem location (#15): the roster indexes credentials and `config.toml` is mode
+    /// `0o600`, while this log has a wider audience than the file it describes, so the event
+    /// carries COUNTS and CODES and nothing that names an account.
+    RosterReload {
+        outcome: RosterReloadOutcome,
+        previous: Option<usize>,
+        incoming: Option<usize>,
+        reason: Option<RosterReloadReason>,
+    },
 }
 
 impl Event {
@@ -2857,6 +3058,37 @@ impl Event {
                 // account. All bare numbers + bools (#15); `acct=` is the UUID.
                 format!(
                     "ts={ts} event=observation_gap_exit acct={account} elapsed_secs={elapsed_secs} was_active={was_active} swapped_away={swapped_away}"
+                )
+            }
+            Event::RosterReload {
+                outcome,
+                previous,
+                incoming,
+                reason,
+            } => {
+                // The runtime roster reload (issue #1438). `previous` / `incoming` are the PAIR
+                // a shrink is only readable from — a single count cannot express one — and each
+                // is OMITTED when the path could not know it rather than rendered `0`, which is a
+                // real roster size (a file presenting an empty roster) and has to stay
+                // distinguishable from "never read". The same absent-not-empty rule as
+                // `event=credential_expiry_observed`'s optional deadlines above. `reason` is a
+                // bare machine code and rides only the non-adopted outcomes. Counts and codes
+                // only — no path, no label, no error text (#15).
+                let outcome = outcome.as_str();
+                let previous_field = match previous {
+                    Some(count) => format!(" previous={count}"),
+                    None => String::new(),
+                };
+                let incoming_field = match incoming {
+                    Some(count) => format!(" incoming={count}"),
+                    None => String::new(),
+                };
+                let reason_field = match reason {
+                    Some(reason) => format!(" reason={}", reason.as_str()),
+                    None => String::new(),
+                };
+                format!(
+                    "ts={ts} event=roster_reload outcome={outcome}{previous_field}{incoming_field}{reason_field}"
                 )
             }
         };
@@ -4655,7 +4887,14 @@ pub(crate) mod tests {
     /// The value of `key` on a rendered line, tokenized exactly as the shipped readers do
     /// (`crate::log`'s `field`, `crate::reliability`'s fold): split on whitespace, then at the
     /// token's FIRST `=`.
-    fn field_of<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    ///
+    /// `pub(crate)` so a test that renders an event OUTSIDE this module asserts through the same
+    /// tokenizer rather than a re-implementation of it — the precedent
+    /// [`declared_variant_names`] set for `crate::reliability`. Issue #1438's daemon-side reload
+    /// tests are the current out-of-module caller: a per-token read is what keeps them from
+    /// over-pinning the whole rendered tail, which this event's own charter (two follow-up items
+    /// extending it) makes a live concern.
+    pub(crate) fn field_of<'a>(line: &'a str, key: &str) -> Option<&'a str> {
         line.split_whitespace()
             .filter_map(|token| token.split_once('='))
             .find(|(k, _)| *k == key)
@@ -6095,6 +6334,7 @@ pub(crate) mod tests {
             Event::CredentialExpiryObserved { .. } => "CredentialExpiryObserved",
             Event::ObservationGapEnter { .. } => "ObservationGapEnter",
             Event::ObservationGapExit { .. } => "ObservationGapExit",
+            Event::RosterReload { .. } => "RosterReload",
         }
     }
 
@@ -6374,9 +6614,486 @@ pub(crate) mod tests {
                 was_active: true,
                 swapped_away: true,
             },
+            // Issue #1438: the runtime roster reload, sampled once per outcome — plus the second
+            // CLI reason, whose whole point is that it does NOT mean what its sibling means. They
+            // differ in WHICH of the three optional tokens they render, and the absence matrix is
+            // a stated criterion of that issue, so the sweep sees every combination rather than
+            // one. Bare counts and machine codes throughout — no handle at all, so no email/token
+            // surface. Reason-token SPELLINGS are pinned separately and exhaustively by
+            // `every_roster_reload_reason_renders_its_own_token`; this list is the redaction
+            // sweep's corpus, not the vocabulary's.
+            Event::RosterReload {
+                outcome: RosterReloadOutcome::Adopted,
+                previous: Some(6),
+                incoming: Some(1),
+                reason: None,
+            },
+            Event::RosterReload {
+                outcome: RosterReloadOutcome::Refused,
+                previous: Some(6),
+                incoming: None,
+                reason: Some(RosterReloadReason::ReloadDisabled),
+            },
+            Event::RosterReload {
+                outcome: RosterReloadOutcome::Failed,
+                previous: Some(6),
+                incoming: None,
+                reason: Some(RosterReloadReason::Unreadable),
+            },
+            Event::RosterReload {
+                outcome: RosterReloadOutcome::NotNotified,
+                previous: None,
+                incoming: None,
+                reason: Some(RosterReloadReason::NotifyFailed),
+            },
+            Event::RosterReload {
+                outcome: RosterReloadOutcome::NotNotified,
+                previous: None,
+                incoming: None,
+                reason: Some(RosterReloadReason::NotifyTimedOut),
+            },
         ];
         assert_samples_every_variant("Event", &samples, event_variant_name);
         samples
+    }
+
+    #[test]
+    fn the_variant_scan_sees_the_roster_reload_variant() {
+        // Issue #1438. The scan (`declared_variant_names`) re-parses this file's source, and its
+        // known failure direction is SILENT: a variant it drops is missing from `declared`, and if
+        // it is also missing from the samples the equality sweep passes over an empty difference,
+        // green, having never seen it. So canary the corpus first, and only then assert the new
+        // variant is visible.
+        //
+        // BOTH ENDS are canaried, because one end cannot see the other's failure. `Swap` is the
+        // FIRST variant `enum Event` declares and has been there since the vocabulary's first
+        // commit, so it proves the scan found the enum at all — but the scan's documented failure
+        // modes (a brace carrier inside a variant, a doc comment the line filter mis-reads) drop
+        // everything BEHIND the point where they trip, which is the TAIL. A head-anchored canary
+        // is maximally insensitive to exactly that, and would sit green over a scan that stopped
+        // reading two thirds of the way down. `ObservationGapExit` was the last variant declared
+        // before this one, so a scan that reaches it reaches the end of the pre-#1438 enum.
+        let declared = declared_variant_names("Event");
+        assert!(
+            declared.contains("Swap"),
+            "canary (head): the source scan is not reading `enum Event` at all — every assertion \
+             below is vacuous. declared={declared:?}"
+        );
+        assert!(
+            declared.contains("ObservationGapExit"),
+            "canary (tail): the source scan stops before the END of `enum Event`, so it cannot \
+             see anything declared last — which is where every new variant lands. \
+             declared={declared:?}"
+        );
+        assert!(
+            declared.contains("RosterReload"),
+            "the source scan does not see `RosterReload`; the issue #891 sweep would pass over it \
+             without ever rendering it. declared={declared:?}"
+        );
+    }
+
+    #[test]
+    fn a_roster_shrink_is_distinguishable_from_a_widening_by_the_line_alone() {
+        // Issue #1438 AC-2. The incident is legible only as a PAIR — `adopted 1` says nothing,
+        // `adopted 1, was 6` is the whole event — so the criterion is that a reader holding
+        // NOTHING BUT THE RENDERED LINE, with no access to the daemon and none to the `Event`
+        // value, can tell a collapse from a widening. Everything below therefore goes through
+        // `to_log_line` and parses the tokens back out with `field_of` — the shipped readers'
+        // own tokenization; comparing the struct's own fields would prove they agree with
+        // themselves and would pass over a render arm that dropped one of them.
+        let rendered = |previous, incoming| {
+            Event::RosterReload {
+                outcome: RosterReloadOutcome::Adopted,
+                previous: Some(previous),
+                incoming: Some(incoming),
+                reason: None,
+            }
+            .to_log_line(at_epoch(0))
+        };
+        let shrink = rendered(6, 1);
+        let widening = rendered(1, 6);
+
+        let verdict = |line: &str| -> &'static str {
+            let count = |key: &str| -> usize {
+                let raw = field_of(line, key)
+                    .unwrap_or_else(|| panic!("no `{key}=` token on the line: {line}"));
+                raw.parse()
+                    .unwrap_or_else(|err| panic!("`{key}={raw}` is not a count: {err}"))
+            };
+            match count("incoming").cmp(&count("previous")) {
+                std::cmp::Ordering::Less => "shrink",
+                std::cmp::Ordering::Greater => "widening",
+                std::cmp::Ordering::Equal => "unchanged",
+            }
+        };
+
+        assert_eq!(
+            verdict(&shrink),
+            "shrink",
+            "6 -> 1 must read as a shrink: {shrink}"
+        );
+        assert_eq!(
+            verdict(&widening),
+            "widening",
+            "1 -> 6 must read as a widening: {widening}"
+        );
+        // And the two are not merely orderable once parsed: the lines themselves differ, so the
+        // pair cannot render to one string that a reader would have to disambiguate.
+        assert_ne!(shrink, widening);
+    }
+
+    #[test]
+    fn the_roster_reload_line_omits_a_count_its_path_could_not_know() {
+        // Issue #1438 design D-7 (`docs/design/roster-loss-prevention-solution-design.md` § 12 —
+        // "one roster-reload event carrying outcome + both counts"; D-3 in that same table is
+        // issue #1439's backup rule, and the repo spells every label hyphenated), the absence
+        // matrix, asserted on the RENDERED line. `incoming=0` is a REAL roster size — a config
+        // file that presented an EMPTY roster, a different and far more alarming fact — so a
+        // count the path could not know is OMITTED, never defaulted to zero. That the ZERO is
+        // rendered where it IS known is the other half, and lives in
+        // `an_empty_roster_renders_a_zero_count_where_an_unread_one_renders_none`; a matrix of
+        // absences alone is satisfied by a render arm that omits every zero.
+        //
+        // Keyed on the (outcome, reason) PAIR, never on the outcome alone. WHICH counts a line
+        // carries is decided by the REASON: `reload_disabled` declines without reading and so has
+        // no incoming count, whereas issue #1442's shrink guard can only detect a shrink by
+        // COMPARING the two, so it refuses AFTER a read and its spec requires that `refused` line
+        // to carry BOTH. Keying a row on `refused` alone would pin "a refusal has no incoming
+        // count" as a property of the outcome, turning this test into a prohibition on the exact
+        // row #1442 must add. Paired, a post-read refusal is a NEW row here rather than a
+        // contradiction of this one.
+        //
+        // The pair also pins each row's `reason=` spelling beside its `outcome=`, so a renamed
+        // code fails here rather than silently re-labelling every historical line's meaning.
+        // TOTALITY over the two vocabularies — that no variant escapes having a pinned spelling
+        // at all — is `every_roster_reload_outcome_renders_its_own_token` and
+        // `every_roster_reload_reason_renders_its_own_token`; this list is the emitted
+        // combinations, not the vocabulary.
+        let cases = [
+            (
+                Event::RosterReload {
+                    outcome: RosterReloadOutcome::Adopted,
+                    previous: Some(6),
+                    incoming: Some(1),
+                    reason: None,
+                },
+                ("adopted", None),
+                [true, true, false],
+            ),
+            (
+                Event::RosterReload {
+                    outcome: RosterReloadOutcome::Refused,
+                    previous: Some(6),
+                    incoming: None,
+                    reason: Some(RosterReloadReason::ReloadDisabled),
+                },
+                ("refused", Some("reload_disabled")),
+                [true, false, true],
+            ),
+            (
+                Event::RosterReload {
+                    outcome: RosterReloadOutcome::Failed,
+                    previous: Some(6),
+                    incoming: None,
+                    reason: Some(RosterReloadReason::Absent),
+                },
+                ("failed", Some("absent")),
+                [true, false, true],
+            ),
+            (
+                Event::RosterReload {
+                    outcome: RosterReloadOutcome::Failed,
+                    previous: Some(6),
+                    incoming: None,
+                    reason: Some(RosterReloadReason::Unreadable),
+                },
+                ("failed", Some("unreadable")),
+                [true, false, true],
+            ),
+            (
+                Event::RosterReload {
+                    outcome: RosterReloadOutcome::NotNotified,
+                    previous: None,
+                    incoming: None,
+                    reason: Some(RosterReloadReason::SocketUnresolved),
+                },
+                ("not_notified", Some("socket_unresolved")),
+                [false, false, true],
+            ),
+            (
+                Event::RosterReload {
+                    outcome: RosterReloadOutcome::NotNotified,
+                    previous: None,
+                    incoming: None,
+                    reason: Some(RosterReloadReason::NotifyFailed),
+                },
+                ("not_notified", Some("notify_failed")),
+                [false, false, true],
+            ),
+            (
+                Event::RosterReload {
+                    outcome: RosterReloadOutcome::NotNotified,
+                    previous: None,
+                    incoming: None,
+                    reason: Some(RosterReloadReason::NotifyTimedOut),
+                },
+                ("not_notified", Some("notify_timed_out")),
+                [false, false, true],
+            ),
+        ];
+
+        for (event, (outcome, reason), [has_previous, has_incoming, has_reason]) in cases {
+            let line = event.to_log_line(at_epoch(0));
+            let row = format!("{outcome}/{reason:?}");
+            assert_eq!(
+                field_of(&line, "outcome"),
+                Some(outcome),
+                "the outcome token on the {row} row: {line}"
+            );
+            assert_eq!(
+                field_of(&line, "reason"),
+                reason,
+                "the reason token on the {row} row: {line}"
+            );
+            for (key, expected) in [
+                ("previous", has_previous),
+                ("incoming", has_incoming),
+                ("reason", has_reason),
+            ] {
+                assert_eq!(
+                    field_of(&line, key).is_some(),
+                    expected,
+                    "`{key}=` presence on the {row} row: {line}"
+                );
+                // Absent means the token is ABSENT — not rendered empty (which would split the
+                // `key=val` grammar) and not defaulted to `0` (which is a real count).
+                assert_eq!(
+                    line.contains(&format!("{key}=")),
+                    expected,
+                    "`{key}=` must not appear at all when the path could not know it: {line}"
+                );
+            }
+        }
+    }
+
+    /// This [`RosterReloadOutcome`]'s variant name, spelled as the enum declares it — layer 1 of
+    /// the same two-layer idiom `event_variant_name` uses for `Event` (issue #891). The match is
+    /// EXHAUSTIVE, so a new outcome fails to compile until it is named here, after which the sweep
+    /// inside `every_roster_reload_outcome_renders_its_own_token` fails until it is also listed
+    /// there.
+    fn roster_reload_outcome_variant_name(outcome: &RosterReloadOutcome) -> &'static str {
+        match outcome {
+            RosterReloadOutcome::Adopted => "Adopted",
+            RosterReloadOutcome::Refused => "Refused",
+            RosterReloadOutcome::Failed => "Failed",
+            RosterReloadOutcome::NotNotified => "NotNotified",
+        }
+    }
+
+    /// The `outcome=` token this [`RosterReloadOutcome`] must render, paired with the `reason` it
+    /// actually rides with.
+    ///
+    /// Spelled INDEPENDENTLY of `RosterReloadOutcome::as_str` on purpose. A test that called
+    /// `as_str` would compare the renderer with itself and pass over a pair of SWAPPED arms — the
+    /// exact failure this exists to catch, and one that silently re-labels every historical line
+    /// rather than breaking anything visible.
+    ///
+    /// The COUNTS its caller renders alongside are fixed and carry no claim: which counts each
+    /// outcome legitimately has is the absence matrix's subject
+    /// (`the_roster_reload_line_omits_a_count_its_path_could_not_know`), and asserting it twice
+    /// in two shapes is how the two drift apart. This pair is the token and its companion reason,
+    /// nothing more.
+    fn expected_outcome_render(
+        outcome: RosterReloadOutcome,
+    ) -> (&'static str, Option<RosterReloadReason>) {
+        match outcome {
+            RosterReloadOutcome::Adopted => ("adopted", None),
+            RosterReloadOutcome::Refused => ("refused", Some(RosterReloadReason::ReloadDisabled)),
+            RosterReloadOutcome::Failed => ("failed", Some(RosterReloadReason::Unreadable)),
+            RosterReloadOutcome::NotNotified => {
+                ("not_notified", Some(RosterReloadReason::NotifyFailed))
+            }
+        }
+    }
+
+    /// This [`RosterReloadReason`]'s variant name, spelled as the enum declares it — layer 1, as
+    /// [`roster_reload_outcome_variant_name`] is for the outcome.
+    fn roster_reload_reason_variant_name(reason: &RosterReloadReason) -> &'static str {
+        match reason {
+            RosterReloadReason::ReloadDisabled => "ReloadDisabled",
+            RosterReloadReason::Absent => "Absent",
+            RosterReloadReason::Unreadable => "Unreadable",
+            RosterReloadReason::SocketUnresolved => "SocketUnresolved",
+            RosterReloadReason::NotifyFailed => "NotifyFailed",
+            RosterReloadReason::NotifyTimedOut => "NotifyTimedOut",
+        }
+    }
+
+    /// The `reason=` token this [`RosterReloadReason`] must render, paired with the outcome it
+    /// rides on — the daemon codes on their own outcomes, the three CLI codes on `NotNotified`.
+    ///
+    /// Independently spelled, and carrying no claim about the counts, for the two reasons
+    /// [`expected_outcome_render`] gives.
+    fn expected_reason_render(reason: RosterReloadReason) -> (&'static str, RosterReloadOutcome) {
+        match reason {
+            RosterReloadReason::ReloadDisabled => ("reload_disabled", RosterReloadOutcome::Refused),
+            RosterReloadReason::Absent => ("absent", RosterReloadOutcome::Failed),
+            RosterReloadReason::Unreadable => ("unreadable", RosterReloadOutcome::Failed),
+            RosterReloadReason::SocketUnresolved => {
+                ("socket_unresolved", RosterReloadOutcome::NotNotified)
+            }
+            RosterReloadReason::NotifyFailed => ("notify_failed", RosterReloadOutcome::NotNotified),
+            RosterReloadReason::NotifyTimedOut => {
+                ("notify_timed_out", RosterReloadOutcome::NotNotified)
+            }
+        }
+    }
+
+    #[test]
+    fn every_roster_reload_outcome_renders_its_own_token() {
+        // Issue #1438. The `outcome=` codes are what an operator greps a reload incident by, so
+        // each one's SPELLING is pinned on a rendered line rather than left to whatever `as_str`
+        // currently says. Swapping two arms there is a silent re-labelling of history — every
+        // past line keeps its bytes and changes its meaning — and no test comparing the `Event`
+        // struct with itself can see it.
+        const EVERY_OUTCOME: &[RosterReloadOutcome] = &[
+            RosterReloadOutcome::Adopted,
+            RosterReloadOutcome::Refused,
+            RosterReloadOutcome::Failed,
+            RosterReloadOutcome::NotNotified,
+        ];
+        // Layer 2: writing a list down does not make it complete. Held against the variants the
+        // enum's own SOURCE declares, the same issue #891 scan `assert_samples_every_variant`
+        // runs for `Event` — so an outcome added and never listed here fails rather than passing
+        // over an absence.
+        assert_samples_every_variant(
+            "RosterReloadOutcome",
+            EVERY_OUTCOME,
+            roster_reload_outcome_variant_name,
+        );
+
+        for &outcome in EVERY_OUTCOME {
+            let (expected, reason) = expected_outcome_render(outcome);
+            let line = Event::RosterReload {
+                outcome,
+                previous: Some(6),
+                incoming: None,
+                reason,
+            }
+            .to_log_line(at_epoch(0));
+            assert_eq!(
+                field_of(&line, "outcome"),
+                Some(expected),
+                "`{}` must render `outcome={expected}`: {line}",
+                roster_reload_outcome_variant_name(&outcome)
+            );
+        }
+    }
+
+    #[test]
+    fn every_roster_reload_reason_renders_its_own_token() {
+        // Issue #1438. The counterpart of the sweep above, and the gap it closes is wider: the
+        // four `outcome=` tokens were pinned from the start, while NO test asserted a `reason=`
+        // spelling at all — they only asserted the token was PRESENT, and compared the enum at
+        // struct level everywhere else. So swapping the `Absent` and `Unreadable` arms of
+        // `RosterReloadReason::as_str` inverted every operator-facing code with the suite green,
+        // and `SocketUnresolved` was rendered by nothing whatsoever.
+        //
+        // These codes are grep handles in a durable log. A re-spelling breaks no reader loudly;
+        // it just silently stops matching, or starts matching the wrong incidents.
+        const EVERY_REASON: &[RosterReloadReason] = &[
+            RosterReloadReason::ReloadDisabled,
+            RosterReloadReason::Absent,
+            RosterReloadReason::Unreadable,
+            RosterReloadReason::SocketUnresolved,
+            RosterReloadReason::NotifyFailed,
+            RosterReloadReason::NotifyTimedOut,
+        ];
+        assert_samples_every_variant(
+            "RosterReloadReason",
+            EVERY_REASON,
+            roster_reload_reason_variant_name,
+        );
+
+        for &reason in EVERY_REASON {
+            let (expected, outcome) = expected_reason_render(reason);
+            let line = Event::RosterReload {
+                outcome,
+                previous: Some(6),
+                incoming: None,
+                reason: Some(reason),
+            }
+            .to_log_line(at_epoch(0));
+            assert_eq!(
+                field_of(&line, "reason"),
+                Some(expected),
+                "`{}` must render `reason={expected}`: {line}",
+                roster_reload_reason_variant_name(&reason)
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_roster_renders_a_zero_count_where_an_unread_one_renders_none() {
+        // Issue #1438's most-argued invariant, and the one nothing rendered until now: every
+        // count in every other test here is drawn from {None, 1, 2, 3, 6}, so a render arm
+        // reading `Some(count) if count > 0 => …, _ => String::new()` would erase the
+        // absent-versus-zero distinction and leave the whole suite green. `incoming=0` is a REAL
+        // and alarming fact — the file presented an EMPTY roster, the 2026-08-27 incident taken
+        // to its limit — and must never be spelled the same way as "this path never read the
+        // file".
+        //
+        // Both halves in ONE test on purpose. The zero must be present and read exactly `0`, the
+        // unknown must be absent, and either assertion alone is satisfied by a renderer that
+        // collapses the two into each other.
+        //
+        // The daemon reaches both counts for real: `Config::load_path` accepts a tunables-only
+        // file (its own doc: the "at least one account" rule is `Config::require_roster`, which
+        // the reload handler never calls), so
+        // `a_tunables_only_config_reloads_as_incoming_zero_not_as_an_unread_roster` in
+        // `crate::daemon`'s command tests drives `incoming=0` and then `previous=0` end to end.
+        let empty = Event::RosterReload {
+            outcome: RosterReloadOutcome::Adopted,
+            previous: Some(0),
+            incoming: Some(0),
+            reason: None,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            field_of(&empty, "incoming"),
+            Some("0"),
+            "an empty roster READ is `incoming=0`, rendered, not omitted: {empty}"
+        );
+        assert_eq!(
+            field_of(&empty, "previous"),
+            Some("0"),
+            "and the same on the `was` half of the pair: {empty}"
+        );
+
+        let unread = Event::RosterReload {
+            outcome: RosterReloadOutcome::Refused,
+            previous: Some(6),
+            incoming: None,
+            reason: Some(RosterReloadReason::ReloadDisabled),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            field_of(&unread, "incoming"),
+            None,
+            "a count the path never read has NO token: {unread}"
+        );
+        assert!(
+            !unread.contains("incoming="),
+            "not the key with an empty value either, which would split the `key=val` grammar: \
+             {unread}"
+        );
+        // And the two renderings are not the same string, which is the invariant stated end to
+        // end: an operator cannot be handed one line that could mean either.
+        assert_ne!(
+            field_of(&empty, "incoming"),
+            field_of(&unread, "incoming"),
+            "`incoming=0` and an unread roster must not render alike: {empty} / {unread}"
+        );
     }
 
     #[test]
