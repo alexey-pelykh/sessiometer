@@ -284,11 +284,15 @@ pub(crate) enum Error {
     PriorConfigurationWithoutConfig,
 
     /// No accounts in the roster to act on. The friendly, user-facing empty state
-    /// for two consumers: the offline `list` view (an absent config, OR a
-    /// well-formed tunables-only file whose roster is empty) and the daemon's
-    /// [`crate::config::Config::require_roster`] precondition (`run` refuses to
-    /// start with nothing to rotate across). Both read as an observation of what
-    /// the roster holds NOW, instead of leaking a lower-level "file missing" or
+    /// for FOUR verbs, by two routes: the offline `list` view remaps it (an absent
+    /// config, OR a well-formed tunables-only file whose roster is empty), and
+    /// [`crate::config::Config::require_roster`] raises it as a precondition for
+    /// `run` (`src/cli.rs`, refusing to start with nothing to rotate across),
+    /// `poke` (`src/poke.rs`) and `use` (`src/use_account.rs`). Enumerated rather
+    /// than summarised because this list is the record of which surfaces the
+    /// wording below was judged against, and it undercounted at two for as long as
+    /// `poke` and `use` had been raising it. All four read as an observation of
+    /// what the roster holds NOW, instead of leaking a lower-level "file missing" or
     /// "invalid config". An empty roster is a legitimate state — `capture` loads
     /// it to add the first account (#58) — so it is NOT a validation error. A
     /// *malformed* config is deliberately not remapped: it keeps surfacing as its
@@ -309,8 +313,17 @@ pub(crate) enum Error {
     /// the message directed a bereaved operator at the one command that would finish the job.
     /// `config path` is read-only, and it is the same useful next step for a genuine first run
     /// as for a loss: it names the file to look at either way.
+    ///
+    /// The clause is imperative, like every sibling remedy in this file, and conditional
+    /// (`would be read`) rather than existential. `list` reaches this variant from an ABSENT
+    /// config too — `resolve_roster` remaps `ConfigNotFound` onto it — so a clause asserting a
+    /// file the roster "is read from" would be false on the one path a genuine first-run
+    /// operator actually sees. Naming the file that WOULD be read is true whether or not one
+    /// is there, and it drops a pronoun whose nearest antecedent was the command, not the
+    /// roster.
     #[error(
-        "the roster holds no accounts — `sessiometer config path` names the file it is read from"
+        "the roster holds no accounts — run `sessiometer config path` to see which config file \
+         would be read"
     )]
     RosterEmpty,
 
@@ -1156,9 +1169,14 @@ impl Error {
     /// a locked keychain (`4`, the always-enforced abort), an unresolvable (`5`)
     /// or ambiguous (`6`) target, and a gate refusal (`7` — the pre-swap gate
     /// refusing a NAMED target without `--force`, or, since issue #960, `use
-    /// --next` finding the whole fleet gated). Every other error is a generic
-    /// failure (`1`). The mapping lives here so the `main` exit-code branch stays a
-    /// thin lookup.
+    /// --next` finding the whole fleet gated). Issue #1444 extends it once more, at
+    /// the other end: `config validate` finding a file that parses and carries no
+    /// accounts exits `8`, which is the whole point of that variant — a pre-flight
+    /// check cannot act on "broken" and "empty" through one code. Every error with
+    /// no arm below is a generic failure (`1`). The mapping lives here so the `main`
+    /// exit-code branch stays a thin lookup, and this list is the only place the set
+    /// is written down — `main` deliberately stopped restating it after saying
+    /// "every other error exits `1`" through four codes that were not `1`.
     pub(crate) fn exit_code(&self) -> u8 {
         match self {
             Error::AlreadyRunning => 3,
@@ -1340,17 +1358,18 @@ pub(crate) mod tests {
         let empty = Error::ConfigRosterEmpty {
             path: PathBuf::from("/home/op/.config/sessiometer/config.toml"),
         };
+        // ONE literal pin, on the arm this issue added. Pinning the failures' `1` as well
+        // would make the comparisons below theorems — both operands fixed by a literal on
+        // the line above, so no reachable state could report — and a comparison that cannot
+        // fail is indistinguishable from one nobody wrote. Left unpinned, each `assert_ne!`
+        // carries the property the acceptance criterion actually names: it fires if a future
+        // arm maps a parse or validation failure onto `8`, which is the collapse in the
+        // direction no other assertion here can see.
         assert_eq!(empty.exit_code(), 8, "the parses-but-empty verdict");
-        assert_ne!(
-            empty.exit_code(),
-            0,
-            "an emptied roster is not an unqualified pass"
-        );
         for failure in [
             Error::ConfigParse("expected `=` at line 3".to_owned()),
             Error::ConfigInvalid("session_ceiling must be in 50..=99, got 120".to_owned()),
         ] {
-            assert_eq!(failure.exit_code(), 1, "a parse/validation failure");
             assert_ne!(
                 empty.exit_code(),
                 failure.exit_code(),
@@ -1399,8 +1418,16 @@ pub(crate) mod tests {
         // `list` / `run` point at a READ-ONLY verb; the validate verdict names the file itself,
         // so it needs no pointer.
         assert!(
-            list_and_run.contains("`sessiometer config path`"),
-            "names the read-only next step: {list_and_run}"
+            list_and_run.contains("run `sessiometer config path`"),
+            "names the read-only next step, imperatively: {list_and_run}"
+        );
+        // `list` reaches this variant from an ABSENT config too, so the clause must stay
+        // conditional: a message asserting a file the roster IS read from would be false on
+        // the one path a genuine first-run operator sees.
+        assert!(
+            list_and_run.contains("would be read") && !list_and_run.contains("is read from"),
+            "the clause names the file that WOULD be read, asserting no file exists: \
+             {list_and_run}"
         );
         assert!(
             validate.starts_with("/home/op/.config/sessiometer/config.toml "),

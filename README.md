@@ -1146,7 +1146,7 @@ re-read the text to know which happened:
 |---|---|
 | `0` | parses, and carries accounts |
 | `8` | parses, and carries none |
-| `1` | does not parse, or does not validate |
+| `1` | could not be read as a valid config at all — absent, malformed, or out of range |
 
 ```console
 $ sessiometer config validate; echo "exit $?"
@@ -1154,9 +1154,15 @@ sessiometer: /Users/you/Library/Application Support/sessiometer/config.toml pars
 exit 8
 ```
 
+Only `8` is new. `1` keeps everything it already covered, and that is wider than a syntax
+error: an **absent** `config.toml` lands there too, since a file that is not there cannot be
+read as a valid one either. What `8` buys is that a script no longer has to re-read the text
+to tell a file it cannot use from a file it can use but that holds nothing.
+
 An empty roster is a legitimate state on a fresh install, so this is not a claim that
-anything went wrong — only that `validate` will not call it usable. `list` and `run` report
-the same emptiness in their own words, and their exit codes are unchanged.
+anything went wrong — only that `validate` will not call it usable. The verbs that need a
+roster — `list`, `run`, `use` and `poke` — report the same emptiness in their own words, and
+their exit codes are unchanged.
 
 A **valid** file may still print a non-fatal **advisory** (it does not change the exit code):
 if `target_max_session_usage` sits above the *peak-velocity runway bound* — the highest reserve

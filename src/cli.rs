@@ -1106,7 +1106,7 @@ USAGE:
     sessiometer config <path|validate|show|backups|restore> [<index>] [--origin]
 
     path        print the resolved config.toml path (honours $XDG_CONFIG_HOME, else ~/Library/Application Support/sessiometer)
-    validate    parse + validate config.toml WITHOUT running; report typo'd/unknown keys, out-of-range values, and target_max_session_usage > session_ceiling
+    validate    parse + validate config.toml WITHOUT running: exit 0 valid, 8 parses but roster empty, 1 typo'd/unknown key, out-of-range value, or target_max_session_usage > session_ceiling
     show        print the effective config (defaults filled in); with --origin, tag each value default (absent → compiled-in) vs from-file
     backups     list the retained config.toml backups, newest first, by timestamp and account count
     restore <N> replace config.toml with retained backup <N>, as numbered by `config backups`
@@ -2238,9 +2238,22 @@ fn config_path() -> Result<()> {
 /// whole answer (issue #1444): [`config_validate_verdict`] owns that split, and it exits on its
 /// own code rather than printing a pass.
 fn config_validate() -> Result<()> {
-    let path = paths::config_file()?;
-    let config = Config::load_path(&path)?;
-    print!("{}", config_validate_verdict(&path, &config)?);
+    config_validate_at(&paths::config_file()?)
+}
+
+/// `config validate` against an EXPLICIT path — everything the verb does except resolve
+/// which file to read.
+///
+/// Split out so the verb's own wiring is reachable from a test (issue #1444). The pure
+/// [`config_validate_verdict`] seam below proves the state→outcome mapping, but a test that
+/// only drives it cannot see the composition: an arm here that swallowed the empty-roster
+/// error and printed a pass anyway would keep that seam alive, compile, and redden nothing.
+/// Driving this function against a real file on disk is what closes that, and it costs only
+/// the `paths::config_file()` lookup in coverage — a pure join over an environment lookup,
+/// with its own tests in [`crate::paths`].
+fn config_validate_at(path: &Path) -> Result<()> {
+    let config = Config::load_path(path)?;
+    print!("{}", config_validate_verdict(path, &config)?);
     Ok(())
 }
 
@@ -6089,8 +6102,8 @@ personal  22222222-2222-2222-2222-222222222222\n\
         // The friendly message points at a READ-ONLY next step and never leaks the path.
         assert_eq!(
             Error::RosterEmpty.to_string(),
-            "the roster holds no accounts — `sessiometer config path` names the file it is \
-             read from"
+            "the roster holds no accounts — run `sessiometer config path` to see which config \
+             file would be read"
         );
     }
 
@@ -15240,17 +15253,66 @@ impl Nested {
     #[test]
     fn config_validate_verdict_leaves_a_healthy_roster_untouched() {
         // The other half of the issue #1444 acceptance: no new friction on the normal path.
-        // Asserted against `render_config_validate` itself rather than against a transcription
-        // of its output, so whatever it trails — the issue #608 advisory the shipped defaults
-        // do reach — travels with it, and a later change to one cannot drift from the other.
         let config = config_with(vec![acct("work", "11111111-1111-1111-1111-111111111111")]);
         let path = Path::new("/x/config.toml");
         let out = config_validate_verdict(path, &config).expect("a healthy roster still passes");
+
+        // The equality pins the DELEGATION and nothing more: both sides run the same renderer,
+        // so a mutation inside it moves them together and this assertion cannot see it. What it
+        // does catch is this seam composing its own pass line, or stripping the tail before
+        // returning.
         assert_eq!(out, render_config_validate(path, &config));
+
+        // So the OUTPUT is pinned against literal text instead — the pass line, and the issue
+        // #608 advisory tail that the shipped defaults do reach. Without this, deleting the
+        // advisory-append branch outright would leave the equality above green (both sides lose
+        // the tail) and the prefix check green (the prefix is intact), and no other test calls
+        // `render_config_validate` at all.
         assert!(
             out.starts_with("/x/config.toml is valid (1 account)\n"),
             "the pass line is unchanged: {out}"
         );
+        assert!(
+            out.contains("advisory: target_max_session_usage (80)"),
+            "the non-fatal advisory still trails the pass line: {out}"
+        );
+    }
+
+    #[test]
+    fn config_validate_at_composes_the_verdict_it_prints_across_all_three_outcomes() {
+        // Issue #1444. `config_validate_verdict` proves the state→outcome mapping, but the
+        // acceptance is about the VERB, and the composition between the two is where the
+        // original defect lived. This drives the verb's own wiring against real files: an arm
+        // that swallowed the empty-roster error and printed a pass anyway would keep every
+        // other test in this file green.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        // Parses, carries nothing — its own error, its own code, and no pass printed.
+        std::fs::write(&path, "[tunables]\npoll_secs = 300\n").unwrap();
+        let err = config_validate_at(&path).expect_err("an empty roster is not a pass");
+        assert!(
+            matches!(&err, Error::ConfigRosterEmpty { path: p } if p == &path),
+            "got {err:?}"
+        );
+        assert_eq!(err.exit_code(), 8);
+
+        // Parses, carries an account — passes, and prints.
+        std::fs::write(
+            &path,
+            "[tunables]\npoll_secs = 300\n\n[[account]]\n\
+             account_uuid = \"11111111-1111-1111-1111-111111111111\"\n\
+             label = \"work\"\nenabled = true\n",
+        )
+        .unwrap();
+        config_validate_at(&path).expect("a healthy roster passes");
+
+        // Does not parse — still its own class, on the code it always had. This is the arm the
+        // acceptance forbids collapsing the empty case into.
+        std::fs::write(&path, "[tunables]\npoll_secss = 300\n").unwrap();
+        let err = config_validate_at(&path).expect_err("an unknown key is still a parse failure");
+        assert!(matches!(err, Error::ConfigParse(_)), "got {err:?}");
+        assert_eq!(err.exit_code(), 1);
     }
 
     #[test]
