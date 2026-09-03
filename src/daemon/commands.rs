@@ -4192,8 +4192,19 @@ mod tests {
         let unreadable = daemon.adopt_roster_reload(ReloadIntent::AppendOnly).await;
         write_roster_config(&config_path, &[("u-A", "work")]);
         let adopted = daemon.adopt_roster_reload(ReloadIntent::AppendOnly).await;
+        // (e) refused / shrink — issue #1442's post-read refusal, and the reason this test had to
+        // grow: its subject is "every path that can produce a pairing", so a NEW emitting path
+        // silently outside the sweep would leave the convention unchecked exactly where it is
+        // newest. The daemon holds one account and the file below presents none, under the
+        // append-only intent that makes that a refusal rather than a legitimate removal.
+        let mut shrinking: FakeDaemon =
+            reconcile_daemon(vec![account("u-A", "work")]).with_config_path(config_path.clone());
+        write_roster_config(&config_path, &[]);
+        let shrunk = shrinking
+            .adopt_roster_reload(ReloadIntent::AppendOnly)
+            .await;
 
-        let paths = [&refused, &absent, &unreadable, &adopted];
+        let paths = [&refused, &absent, &unreadable, &adopted, &shrunk];
         for event in paths {
             let (outcome, reason) = pairing(event);
             assert_eq!(
@@ -4202,16 +4213,18 @@ mod tests {
                 "`reason` rides the NON-adopted outcomes only: {outcome:?} paired with {reason:?}"
             );
         }
-        // Cardinality, so the loop is evidence: four outcomes, and all four distinct — a loop over
-        // a collapsed set would satisfy the assertion above having checked one path twice.
+        // Cardinality, so the loop is evidence: five paths, and all five distinct — a loop over a
+        // collapsed set would satisfy the assertion above having checked one path twice. The two
+        // REFUSALS are distinct pairings, which is the property issue #1442 added: `reload_disabled`
+        // and `shrink` ride the same outcome and are told apart only by their reason.
         assert_eq!(
             paths
                 .iter()
                 .map(|event| format!("{:?}", pairing(event)))
                 .collect::<std::collections::BTreeSet<_>>()
                 .len(),
-            4,
-            "four DISTINCT (outcome, reason) pairs driven"
+            paths.len(),
+            "every driven path must be a DISTINCT (outcome, reason) pair"
         );
         assert!(
             matches!(pairing(&adopted).0, RosterReloadOutcome::Adopted),
@@ -4695,6 +4708,105 @@ mod tests {
             field_of(logged_line, "incoming"),
             Some("3"),
             "the widening is legible from the logged line: {logged_line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_loop_refuses_a_shrinking_reload_through_the_idle_select() {
+        // The refusal's own end-to-end path, and the counterpart of the adoption above. Everything
+        // between the control signal and the log line is live: the idle select carries the intent
+        // out of `ControlSignal::RosterReloadRequested`, the post-idle arm hands it to
+        // `adopt_roster_reload`, the floor declines, and `emit_best_effort` writes the line.
+        //
+        // Worth its own run because the intent now travels through wiring that previously carried
+        // no payload at all. An idle arm that dropped it — or a post-idle arm that passed a
+        // constant instead of the signal's own value — would leave the handler tests above green
+        // while the daemon adopted every shrink a `login` triggered, which is precisely the
+        // 2026-08-27 failure with the guard nominally present.
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        // Two live accounts, a file presenting one: the incident's shape, minimised.
+        write_roster_config(&config_path, &[("u-A", "work")]);
+
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_json_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10);
+        let tun = tunables(95, 80, 100);
+        let mut daemon: FakeDaemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::new(Duration::from_secs(60)),
+            json,
+            &tun,
+        )
+        .with_config_path(config_path);
+
+        let logdir = tempfile::tempdir().unwrap();
+        let log_path = logdir.path().join("sessiometer.log");
+        let mut log = EventLog::at(&log_path).unwrap();
+        let mut shutdown = FakeShutdown::after(3);
+        // The intent is what makes this a refusal rather than the adoption above.
+        let control = OnceRosterReload::new(ReloadIntent::AppendOnly);
+
+        let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
+        run_loop(
+            &mut daemon,
+            &mut log,
+            &mut diag,
+            &mut shutdown,
+            &control,
+            &mut NoopRefreshTicker,
+            &mut NoopExternalLoginWatch,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            roster_uuids(&daemon),
+            vec!["u-A", "u-B"],
+            "the live rotation kept both accounts — the shrinking reload was refused"
+        );
+
+        let logged = std::fs::read_to_string(&log_path).unwrap();
+        let reload_lines: Vec<&str> = logged
+            .lines()
+            .filter(|line| line.contains(" event=roster_reload "))
+            .collect();
+        assert_eq!(
+            reload_lines.len(),
+            1,
+            "a refusal is still exactly one reload line — silence is what #1438 removed: {logged}"
+        );
+        let logged_line = reload_lines[0];
+        assert_eq!(
+            field_of(logged_line, "outcome"),
+            Some("refused"),
+            "{logged_line}"
+        );
+        assert_eq!(
+            field_of(logged_line, "reason"),
+            Some("shrink"),
+            "{logged_line}"
+        );
+        assert_eq!(
+            field_of(logged_line, "previous"),
+            Some("2"),
+            "{logged_line}"
+        );
+        assert_eq!(
+            field_of(logged_line, "incoming"),
+            Some("1"),
+            "{logged_line}"
         );
     }
 
