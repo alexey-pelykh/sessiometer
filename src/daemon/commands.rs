@@ -389,10 +389,12 @@ where
                 // `adopt_roster_reload`, and this function has ONE `Event` slot, already spoken for
                 // by the capture's own line. Widening that to a `Vec<Event>` is the fix and is not
                 // this issue's. Do NOT read issue #1443 as covering it: that is D-6 (R-10),
-                // divergence detection on the poll tick, which reports that disk and memory
-                // DISAGREE — a different signal from the one that says this reconcile REFUSED, and
-                // it would arrive a poll cadence later off a state comparison rather than off this
-                // event. The ack's OUTCOME is unaffected either way — the capture itself succeeded,
+                // divergence detection on the poll tick, and it MERGED while this branch was open —
+                // which is what makes the distinction concrete rather than theoretical. Its line
+                // says disk and memory DISAGREE, a state comparison arriving a poll cadence later;
+                // the missing line here would say this reconcile REFUSED, a decision this daemon
+                // took at this instant. `run_loop_refuses_a_shrinking_reload_through_the_idle_select`
+                // asserts both lines and neither subsuming the other. The ack's OUTCOME is unaffected either way — the capture itself succeeded,
                 // stash and roster row both on disk — but its COUNT is not, which is why it is read
                 // back below rather than taken from the report.
                 //
@@ -545,8 +547,9 @@ where
         // reproducing the 2026-08-27 collapse through a verb that changed no membership at all —
         // and this issue's own floor is what makes that state persist, since refusing the reload
         // leaves memory holding more accounts than disk until something reconciles them — which
-        // is what #1443's poll-tick divergence detection (design D-6, R-10) is for, and is
-        // separate from this refusal going unrecorded (see `perform_socket_capture` above).
+        // is what #1443's poll-tick divergence detection (design D-6, R-10, merged while this
+        // branch was open) reports, and is separate from this refusal going unrecorded (see
+        // `perform_socket_capture` above).
         // Under `AppendOnly` the same edit is refused instead: the label change still lands on
         // disk, and the live rotation keeps its accounts.
         //
