@@ -120,6 +120,7 @@ final class PanelCaptureCardTests: XCTestCase {
         ("rejected/keychainLocked", .rejected(.keychainLocked)),
         ("rejected/swapLockBusy", .rejected(.swapLockBusy)),
         ("rejected/failed", .rejected(.failed)),
+        ("rejected/priorConfiguration", .rejected(.priorConfiguration)),
         ("daemonError/unauthorized", .daemonError("unauthorized")),
         ("daemonError/other", .daemonError("something-else")),
         ("transport/connectionRefused", .transport(.connectionRefused(reason: "ECONNREFUSED"))),

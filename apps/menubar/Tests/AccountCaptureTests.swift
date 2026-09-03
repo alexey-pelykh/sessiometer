@@ -39,6 +39,10 @@ final class AccountCaptureTests: XCTestCase {
             ("keychain-locked", .keychainLocked),
             ("swap-lock-busy", .swapLockBusy),
             ("failed", .failed),
+            // #1441. The tag the daemon gained when the socket capture took the CLI's
+            // prior-configuration witness rule; `every_rust_rejection_tag_has_a_swift_case`
+            // in `src/daemon/socket.rs` is what keeps this list and the Rust enum one set.
+            ("prior-configuration", .priorConfiguration),
         ]
         for (code, expected) in cases {
             let line = #"{"result":"rejected","reason":"\#(code)"}"#
@@ -78,6 +82,34 @@ final class AccountCaptureTests: XCTestCase {
                 return XCTFail("expected .unrecognized, got \(error)")
             }
         }
+    }
+
+    // #1441 AC, and the one that has to be read against its NEIGHBOUR above to mean anything. That test
+    // pins the fail-closed decode: an unmodelled `reason` throws. This pins the other half — the tag the
+    // daemon actually gained now lands on a case and does NOT throw.
+    //
+    // Both are the same line of `CaptureAck.decode` (the `CaptureRejection(rawValue:)` guard), and the
+    // throw is correct behaviour rather than a defect: it is exactly why the Rust enum and this one have
+    // to move in ONE change. Before that change `prior-configuration` was `future-reason` — the capture
+    // button would have thrown on a refusal the daemon can send, which is a broken button, not a
+    // degraded one. `every_rust_rejection_tag_has_a_swift_case` (`src/daemon/socket.rs`, the `test` job)
+    // is what keeps the next tag from arriving the same way.
+    func testDecodePriorConfigurationRejectionDoesNotThrow() throws {
+        XCTAssertEqual(
+            try CaptureAck.decode(#"{"result":"rejected","reason":"prior-configuration"}"#),
+            .rejected(.priorConfiguration))
+    }
+
+    // The refusal reaches the operator as ONE actionable sentence, and deliberately not as a retry
+    // prompt: this refusal is stable, so "try again" would send them around a loop that refuses
+    // identically every time. Redacted like the tag — it names a fixed filename, never a path, an
+    // account label, or a count (#1441; the panel is a more public surface than a terminal).
+    func testPriorConfigurationCopyNamesTheActionAndNotARetry() {
+        let copy = StatusPanelFormat.captureErrorText(.rejected(.priorConfiguration))
+        XCTAssertEqual(copy, "config.toml is missing but this Mac was set up before — restore it, then capture.")
+        XCTAssertFalse(copy.lowercased().contains("try again"),
+                       "this refusal is stable — inviting a retry sends the operator around a loop")
+        XCTAssertFalse(copy.contains("/"), "the copy carries a path: \(copy)")
     }
 
     // A `captured` ack that omits the load-bearing `label` is malformed → the decoder's OWN `.unrecognized`,
@@ -148,6 +180,8 @@ final class AccountCaptureTests: XCTestCase {
                        "The daemon is busy — try again in a moment.")
         XCTAssertEqual(StatusPanelFormat.captureErrorText(.rejected(.failed)),
                        "Capture failed — try again.")
+        XCTAssertEqual(StatusPanelFormat.captureErrorText(.rejected(.priorConfiguration)),
+                       "config.toml is missing but this Mac was set up before — restore it, then capture.")
         XCTAssertEqual(StatusPanelFormat.captureErrorText(.daemonError("unauthorized")),
                        "Not authorized to capture.")
         XCTAssertEqual(StatusPanelFormat.captureErrorText(.daemonError("weird")),
