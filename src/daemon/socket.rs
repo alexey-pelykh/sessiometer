@@ -359,9 +359,15 @@ impl Control for UnixControl {
 
 /// The `{"cmd": "..."}` control request. `uuid` is present only for the `restored`
 /// command (issue #275); `target` / `force` only for the `swap` command (issue #167);
-/// `label` only for the `capture` command (issue #359) — the payload-less commands
-/// (`status` / `manual-swapped` / `roster-reload`) omit them all, and serde defaults a
-/// missing field (`Option` → `None`, `bool` → `false`).
+/// `label` only for the `capture` command (issue #359); `intent` only for the
+/// `roster-reload` command (issue #1442) — the payload-less commands (`status` /
+/// `manual-swapped`) omit them all, and serde defaults a missing field (`Option` →
+/// `None`, `bool` → `false`).
+///
+/// `roster-reload` was payload-less until #1442 and is the one command here whose own field is
+/// optional ON THE WIRE while being required of every current caller: the optionality carries an
+/// OLDER CLI whose binary predates the field, and `ReloadIntent::from_wire` resolves that absence
+/// fail-closed (R-3a) rather than treating it as permission.
 #[derive(Deserialize)]
 struct ControlRequest {
     cmd: String,
@@ -1511,8 +1517,11 @@ const CLIENT_NOTIFY_TIMEOUT: Duration = Duration::from_secs(2);
 /// Notify a running daemon that the on-disk roster changed (issue #139), so it
 /// re-reads `config.toml` and reconciles its in-memory rotation WITHOUT a restart.
 /// The CLI-verb counterpart of the daemon's `roster-reload` control handler
-/// ([`control_reply`]); sends one newline-delimited `{"cmd":"roster-reload"}` request
-/// and reads the one-line ack so the daemon has RECEIVED it before returning.
+/// ([`control_reply`]); sends one newline-delimited
+/// `{"cmd":"roster-reload","intent":"..."}` request and reads the one-line ack so the
+/// daemon has RECEIVED it before returning. The `intent` token is rendered by
+/// [`ReloadIntent::as_wire`] and never written as a literal here, so the two ends of the
+/// wire cannot drift apart by a typo.
 ///
 /// BEST-EFFORT by contract, exactly like the `use` manual-hold notify (#64): the
 /// on-disk `config.toml` is authoritative (the write already succeeded), so a notify

@@ -381,10 +381,20 @@ where
                 // had already lost accounts the live daemon still holds — the 2026-08-27 shape
                 // reached through this second entry point — and refusing is then exactly right: the
                 // stash and the roster row stand on disk, and the live rotation is NOT narrowed onto
-                // a file that lost five accounts. The ack reports the CAPTURE, which succeeded, and
-                // the single `Event` slot below is already the capture's own line; reporting the
-                // disk/memory divergence itself is issue #1443's, on the poll tick. Bound rather
-                // than discarded so the `#[must_use]` is answered deliberately.
+                // a file that lost five accounts.
+                //
+                // A refusal here is SILENT, and that is a known gap rather than a decision. Design
+                // D-7 (R-14) says a reload's outcome gets a durable record, and #1438 built the
+                // vocabulary and the emitter for it — but `Event::RosterReload` is written only by
+                // `adopt_roster_reload`, and this function has ONE `Event` slot, already spoken for
+                // by the capture's own line. Widening that to a `Vec<Event>` is the fix and is not
+                // this issue's. Do NOT read issue #1443 as covering it: that is D-6 (R-10),
+                // divergence detection on the poll tick, which reports that disk and memory
+                // DISAGREE — a different signal from the one that says this reconcile REFUSED, and
+                // it would arrive a poll cadence later off a state comparison rather than off this
+                // event. The ack is unaffected either way: it reports the CAPTURE, which succeeded.
+                //
+                // Bound rather than discarded so the `#[must_use]` is answered deliberately.
                 let _reconcile = self.reconcile_roster(config.roster, ReloadIntent::AppendOnly);
                 // The durable audit line (best-effort logged by the run loop): the resolved roster
                 // LABEL handle + the outcome token — non-secret by construction (#15).
@@ -524,7 +534,9 @@ where
         // `Mutating` here would adopt a diverged file's shrunken roster on an unrelated label edit,
         // reproducing the 2026-08-27 collapse through a verb that changed no membership at all —
         // and this issue's own floor is what makes that state persist, since refusing the reload
-        // leaves memory holding more accounts than disk until something reconciles them (#1443).
+        // leaves memory holding more accounts than disk until something reconciles them — which
+        // is what #1443's poll-tick divergence detection (design D-6, R-10) is for, and is
+        // separate from this refusal going unrecorded (see `perform_socket_capture` above).
         // Under `AppendOnly` the same edit is refused instead: the label change still lands on
         // disk, and the live rotation keeps its accounts.
         //
