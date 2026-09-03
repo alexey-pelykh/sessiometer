@@ -266,6 +266,23 @@ pub(crate) enum Error {
     #[error("no config file at {path} — run `sessiometer capture` to create one")]
     ConfigNotFound { path: PathBuf },
 
+    /// An append-only roster write found no `config.toml`, while durable local state says
+    /// this machine has been configured before (issue #1440, design D-1 — see
+    /// [`crate::witness`]). Treating that as a first run is what destroyed five accounts on
+    /// 2026-08-27: `login` wrote a one-account roster and a daemon still holding six
+    /// adopted it.
+    ///
+    /// Deliberately carries NO payload. The witness is durable state, not a place: naming
+    /// which source fired would print a keychain item name (a per-account uuid) or a
+    /// filesystem path, and naming how much survived would print a count. A refusal is
+    /// printed on stderr and has a wider audience than the `0600` file it is about, so it
+    /// names an ambient prior configuration and nothing that indexes it.
+    #[error(
+        "refusing to write the roster: this machine carries a prior configuration \
+         but config.toml is absent — restore it before capturing an account"
+    )]
+    PriorConfigurationWithoutConfig,
+
     /// No accounts in the roster to act on. The friendly, user-facing empty state
     /// for two consumers: the offline `list` view (an absent config, OR a
     /// well-formed tunables-only file whose roster is empty) and the daemon's
@@ -2108,7 +2125,7 @@ pub(crate) mod tests {
         // message below can say which one this is rather than leaving the reader to guess.
         assert_eq!(
             prose.len(),
-            87,
+            88,
             "the `#[error(...)]` count moved, and a variant having been ADDED OR REMOVED is the \
              EXPECTED cause: `error_prose_of`'s self-consistency check ran first and found that \
              every `#[error(` in the source started an attribute it parsed, which rules out the \

@@ -65,6 +65,7 @@ mod usage;
 mod usage_stats;
 mod usage_store;
 mod use_account;
+mod witness;
 
 use std::process::ExitCode;
 
