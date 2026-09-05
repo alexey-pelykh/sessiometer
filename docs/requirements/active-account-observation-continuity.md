@@ -97,6 +97,13 @@ surfacing half is sized **separately**, after § Stage 2 design has costed the `
 bump. Rationale: the core is rate-neutral by construction and therefore shippable without waiting on
 wire work.
 
+**Costing outcome, 2026-09-04 — the precondition above is discharged, and it returned a different
+wire.** The ratified sentence stands as written and is not amended here; what follows records what the
+costing found. Stage 2 design (`docs/design/daemon-diagnostic-integrity-solution-design.md` § 7, D-4)
+concluded the surfacing half belongs on `ReliabilityWire` under `reliability`'s own
+`JSON_SCHEMA_VERSION`, so no `STATUS_SCHEMA_VERSION` bump is costed *because none is owed*. § 6b
+carries the decision; § 9.6's superseded lockstep instruction is corrected there.
+
 ### Out of Scope — with the reason each is excluded
 
 | Excluded | Why |
@@ -329,7 +336,7 @@ FAIL:   any increase
 | Feature | Verdict | Gap |
 |---|---|---|
 | Schedule invalidation on change of active (R-1..R-3) | **COMPLETE** | Mechanism, sites, oracle and rate-neutrality proof all identified |
-| Never-looked-at observability (R-4, R-5) | **NEAR-COMPLETE** | The event is specifiable; which readout carries it is a Stage 2 decision |
+| Never-looked-at observability (R-4, R-5) | **NEAR-COMPLETE** | The *readout home* is now decided; the METER is **half-satisfiable**, so the row does not move to COMPLETE. **Decided 2026-09-04**: a `first_sight` block on `ReliabilityWire`, `reliability`'s own `JSON_SCHEMA_VERSION` 12 → 13, additive, mirroring `BlindEpisodesWire`'s enter/exit-pair census — see `docs/design/daemon-diagnostic-integrity-solution-design.md` § 7. No `STATUS_SCHEMA_VERSION` bump, no Swift surface, no status/watch golden — but `reliability`'s human render shares its `Report`, so the three `build/fixtures/cli-renders/reliability-*.txt` renders do move and owe `emit_cli_render_goldens` plus a `CLI-Goldens-Rebaselined:` trailer. Scope bound: the **event-log** readout only — `record_usage_sample` stays inside the `poll_idx` guard, so the usage-sample store still cannot see a never-attempted poll. **Why this stays NEAR-COMPLETE:** `observation_gap_enter` fires only when `elapsed > 2*poll_secs / N` (strictly, and deliberately so), so the emitted set is the breach tail — left-censored at the bound. With `T = 2*poll_secs / N`, the entry edge is `T` while § 6's `FAIL` is *any single occurrence > 2T* — twice that edge — so filtering the emitted set on `elapsed_secs > 2T` **cannot produce a false negative**: an empty result conclusively means no `FAIL`. It is an **upper bound** rather than an exact count, because the entry anchor is `observed.max(designated)`, so a mid-tenure observation gap on a long-active account also passes the filter while lying outside § 6's post-swap `SCALE`. It makes the breach tail durable for the first time, which is the value here. What it cannot carry is `GOAL p95 <= T`, a percentile over the **whole** distribution: this set omits everything at or below `T` by construction, so no filtering recovers it and GOAL-met is not a representable state. The daemon's own emitter doc comment in `src/observability.rs` says as much — *"a p50 of first-sight latency needs a source that also records the non-breaches, which no event here is"*. Which source could grade the GOAL half is **OQ-3** in that design's § 11, and it is open |
 | Regression oracle (R-6) | **COMPLETE** | Template and RED-state proof are exact |
 | Target-selection staleness (R-7, R-8) | **INCOMPLETE** | `{T}` UNSET — operator-owned. Bounding form (`fresh-enough-or-repoll-first`) is specified; the value is not |
 | ~~Landing-watch preservation (R-9)~~ | **WITHDRAWN** | Stage 2 grounding showed the behaviour is deliberate and correct; the requirement collapses into R-1. Removes work rather than adding it |
@@ -404,10 +411,19 @@ fix. **One operational hazard is recorded rather than exercised**: `DecisionStat
 and **clears the swap cooldown entirely**. That makes "restart it and see" actively destructive to
 the state under test, and it is adjacent to **#1356**.
 
-**9.6 Lifecycle** — `ADR-0012` owes an amendment or a superseding record (R-12). If the surfacing
-half proceeds, `STATUS_SCHEMA_VERSION` takes a **minor** bump, which obligates regenerating the five
-status/watch goldens and updating the **current-minor** Swift fixtures and assertions while leaving
-version-pinned compat fixtures alone.
+**9.6 Lifecycle** — `ADR-0012` owes an amendment or a superseding record (R-12).
+
+**Superseded 2026-09-04 — do not follow the `STATUS_SCHEMA_VERSION` lockstep from this section.** This
+section previously instructed that the surfacing half takes a `STATUS_SCHEMA_VERSION` **minor** bump
+and therefore owes the five status/watch goldens plus a current-minor Swift fixture sweep. § 6b's
+decision record now settles the readout home elsewhere: the surfacing half lands on `ReliabilityWire`
+and carries `reliability`'s **own** `JSON_SCHEMA_VERSION`, so `STATUS_SCHEMA_VERSION` does not move,
+there is no Swift surface and no status/watch golden. What it *does* owe is the three
+`build/fixtures/cli-renders/reliability-*.txt` renders (`cargo test -- --ignored
+emit_cli_render_goldens`) and a `CLI-Goldens-Rebaselined:` trailer. Following the superseded
+instruction would regenerate five goldens and sweep `apps/menubar/Tests/Fixtures.swift` for a change
+that touches neither wire — the cross-wire confusion `CLAUDE.md` § Schema versions calls the single
+most common cross-cutting mistake here. Read § 6b, not this paragraph.
 
 ## 10. Source Traceability
 
