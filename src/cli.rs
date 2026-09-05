@@ -32,8 +32,8 @@ use crate::error::{Error, Result};
 use crate::keychain::{Credential, CredentialStore, RealCredentialStore};
 use crate::migration::{ManagedAccount, MigrationArtifact, Passphrase, Payload, PLAINTEXT_WARNING};
 use crate::observability::{
-    CredentialHealth, Diagnostic, DiagnosticLog, Event, EventLog, ExpiryHorizon, ExportMode,
-    RefreshEventOutcomeKind, Verbosity,
+    daemon_build_event, CredentialHealth, Diagnostic, DiagnosticLog, Event, EventLog,
+    ExpiryHorizon, ExportMode, RefreshEventOutcomeKind, Verbosity,
 };
 use crate::paths;
 use crate::refresh;
@@ -1448,6 +1448,46 @@ async fn run(verbosity: Verbosity, managed: bool) -> Result<()> {
     paths::ensure_private_dir(&paths::config_dir()?)?;
     paths::ensure_private_dir(&paths::logs_dir()?)?;
     let mut log = EventLog::open()?;
+
+    // Stamp this process's own build identity into the durable log (issue #1486, design D-1),
+    // at the FIRST point in startup where an event can be written at all — the line above. It
+    // sits BEFORE the socket bind deliberately: "which build failed to bind the socket?" is one
+    // of the questions this exists to answer, and a stamp emitted after the bind cannot answer it.
+    //
+    // UNCONDITIONAL, and that is the requirement rather than a side effect: every genuine start
+    // passes through here, a restart after a crash included — which is precisely when the build
+    // is asked about — so this must never sit behind a clean-shutdown, first-run or
+    // once-per-install condition. The `--managed` agent that LOSES the single-instance lock above
+    // returns before reaching this point, correctly: it started nothing, reached no socket and no
+    // state write, so stamping there would assert a start that did not happen. AC-4's "every
+    // start" is therefore every start THAT ACQUIRES THE LOCK — narrower than every invocation,
+    // and `Event::DaemonBuild`'s own doc says so where someone counting restart boundaries out of
+    // the log will read it.
+    //
+    // Fail-open on both halves, which are not the same KIND of fail-open. `daemon_build_event`
+    // returns an `Event` and never a `Result`, so an unresolvable `current_exe()` degrades the
+    // LINE rather than the startup — structural, and unforgettable by construction. The write
+    // failure is swallowed by `emit_best_effort` (issue #9), whose stderr report is a discarded
+    // `writeln!` rather than `eprintln!` precisely so it cannot panic a daemon whose stderr
+    // shares the volume that just filled: the launchd plist routes `StandardErrorPath` into the
+    // same directory as the event log. That is `emit_best_effort`'s convention and not the
+    // crate's — `use_account.rs` PROPAGATES with `?` under this same issue number, and other
+    // sites discard silently without reporting at all — so read the citation rather than any
+    // claim of uniformity. Deliberately uncounted: the count depends on where you cut the
+    // production half of a file, and cutting at the first column-0 `#[cfg(test)]` truncates
+    // `use_account.rs` at line 74 of 7784. The argument needs only that the convention varies. A daemon that will not start because it cannot describe itself is
+    // strictly worse than an unattributable log line (design § 8).
+    //
+    // ACCEPTED RESIDUAL, pre-bind latency. `current_exe()` is `_NSGetExecutablePath` on the only
+    // supported target and touches no filesystem, but the `std::fs::metadata` inside
+    // `daemon_build_event` does, and it is un-timeboxed. Run from a stalled network or removable
+    // mount — which the shipped launchd agent is not — it blocks here, leaving the process ALIVE
+    // with nothing bound, which `KeepAlive` cannot see: a supervisor-invisible wedge rather than
+    // the crash-loop the supervisor handles. The pre-bind path already blocks on `$HOME` two
+    // lines up; the marginal delta is that a SECOND volume can now stall it. AC-5 enumerates
+    // these calls FAILING and never hanging, so bounding it is a design question, not a local
+    // one.
+    emit_best_effort(&mut log, &daemon_build_event(std::env::current_exe()));
 
     // Bind the 0600 control socket (status queries; issue #15: handles +
     // percentages only). The lock above guarantees no live daemon owns a stale
@@ -6002,6 +6042,198 @@ mod tests {
         scan_with, ADVISORY_EXEMPT_TOKENS, BANNED_PHRASES, USAGE_EXEMPT_TOKENS,
     };
     use std::path::PathBuf;
+
+    #[test]
+    fn the_daemon_start_path_stamps_its_build_identity_unconditionally() {
+        // Issue #1486 AC-4: the stamp is emitted on EVERY start, a restart after a crash included
+        // — which is precisely when the build gets asked about. That is a property of the CALL
+        // SITE, not of the event, so no test over `Event` can see it: `run` acquires a lock, loads
+        // the real config and binds a socket, and every hermetic test in this crate drives the
+        // pieces below it. Nothing else notices if this line is dropped, moved behind a condition,
+        // or commented out — the whole suite stays green while the shipped daemon logs no build at
+        // all. The same gap, and the same remedy, as
+        // `the_daemon_run_path_wires_the_real_witness_sources` in `src/daemon/commands.rs`.
+        //
+        // Matched VERBATIM, the same tradeoff the precedent above takes: a rename long enough to
+        // make `cargo fmt` WRAP this call would break the constant, which is correct — the call's
+        // spelling is the contract this test pins, so a change to it belongs in this constant too
+        // rather than passing silently. What is free is the CONSTANT'S SPELLING, and nothing
+        // else. Indentation in particular is NOT free here, unlike in the precedent, which
+        // asserts none: the indent check below is the entire mechanical form of AC-4 in a repo
+        // with no integration tests, so relaxing it as boilerplate inherited from that precedent
+        // would leave the criterion with no guard at all.
+        //
+        // What this scan CANNOT see, said here so a green is not read as more than it is: a guard
+        // introduced INSIDE `daemon_build_event` or `emit_best_effort` suppresses the line while
+        // every assertion below passes, and so does an early return above the log open. The call
+        // site is the subject; its callees and its prologue are not.
+        const STAMP_CALL: &str =
+            "emit_best_effort(&mut log, &daemon_build_event(std::env::current_exe()));";
+        const LOG_OPEN: &str = "let mut log = EventLog::open()?;";
+
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/cli.rs"),
+        )
+        .expect("src/cli.rs is readable from the crate root");
+        // `run`'s body: from its signature to the next column-0 `}`, which `cargo fmt` guarantees
+        // is this function's own closing brace.
+        let from = source
+            .find("async fn run(verbosity: Verbosity, managed: bool) -> Result<()> {")
+            .expect("`run` is in src/cli.rs");
+        let body = &source[from..];
+        let end = body
+            .find("\n}\n")
+            .expect("`run` has a column-0 closing brace");
+        let body = &body[..end];
+
+        // Canary the extraction BEFORE the assertions it carries. A signature rename or a
+        // refactor that splits `run` yields a body that satisfies no `contains`, which would
+        // report the regression as absent by having looked at nothing.
+        assert!(
+            body.contains(LOG_OPEN),
+            "`run` no longer opens the event log as `{LOG_OPEN}`; this scan has no subject"
+        );
+
+        // LIVE CODE, not a substring: commenting the call out leaves the text intact, so the one
+        // regression this test names would ship under a green suite. A statement line starts with
+        // its own token once trimmed, which a `//`-prefixed line never does.
+        //
+        // The OFFSET comes out of that same walk rather than from a second search over the whole
+        // body. An independent `find` can land on a DIFFERENT occurrence — a comment quoting the
+        // call verbatim — and then the ordering assertions below would be about a line other than
+        // the one just proved live.
+        let (stamp_at, stamp_line) = body
+            .split_inclusive('\n')
+            .scan(0usize, |offset, raw| {
+                let at = *offset;
+                *offset += raw.len();
+                Some((at, raw))
+            })
+            .find(|(_, raw)| raw.trim() == STAMP_CALL)
+            .map(|(at, raw)| (at, raw.trim_end()))
+            .unwrap_or_else(|| {
+                panic!(
+                    "`run` no longer stamps the build identity as LIVE code (`{STAMP_CALL}`), so \
+                     no daemon start records which build it is — issue #1486 in full"
+                )
+            });
+
+        // EXACTLY ONE, not merely at least one: AC-1 says a start emits ONE line, and a
+        // duplicated call site emits two with every other assertion here still green.
+        let live_sites = body
+            .lines()
+            .filter(|line| line.trim() == STAMP_CALL)
+            .count();
+        assert_eq!(
+            live_sites, 1,
+            "`run` stamps the build identity {live_sites} times; AC-1 says a start emits exactly \
+             one `event=daemon_build` line"
+        );
+        // And `run` must be the only production site that BUILDS one, so a second call elsewhere
+        // in this file cannot add a line to a start `run` already stamped. Test-module calls are
+        // excluded at this file's own column-0 `#[cfg(test)]`, the boundary the source lints in
+        // this module already draw.
+        let production: String = source
+            .lines()
+            .take_while(|line| !line.starts_with("#[cfg(test)]"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            production.contains(STAMP_CALL),
+            "the non-test slice of src/cli.rs stops before `run`; this count has no subject"
+        );
+        assert_eq!(
+            production.matches("daemon_build_event(").count(),
+            1,
+            "exactly one production site may build a startup stamp, or one start renders more \
+             than one `event=daemon_build` line"
+        );
+
+        // UNCONDITIONAL, and REACHED. Two different failures, and a nesting check cannot see the
+        // second.
+        //
+        // NESTED: `cargo fmt` indents a statement one level per enclosing block, so a stamp moved
+        // inside an `if`, a `match` arm or a loop — behind a clean-shutdown, first-run or
+        // once-per-install condition, which is the failure AC-4 names — indents deeper than
+        // `run`'s own four spaces. The same formatter that makes this exact is the one CI already
+        // enforces.
+        let indent = stamp_line.len() - stamp_line.trim_start().len();
+        assert_eq!(
+            indent, 4,
+            "the build stamp is nested inside a block, so some starts do not emit it; AC-4 \
+             requires every start — a restart after a crash included: {stamp_line:?}"
+        );
+
+        let open_at = body.find(LOG_OPEN).expect("the canary found the log open");
+
+        // REACHED: measured, two mutations pass a nesting-only check while silencing the stamp —
+        // a `#[cfg(not(debug_assertions))]` directly above it (no line on every debug build) and
+        // an early return between the log open and it. Both leave the statement at four spaces.
+        // So the stamp must be the FIRST STATEMENT after the log open: everything between them is
+        // blank or a `//` comment, and an attribute is neither.
+        let between: Vec<&str> = body[open_at + LOG_OPEN.len()..stamp_at]
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("//"))
+            .collect();
+        assert!(
+            between.is_empty(),
+            "nothing may sit between opening the event log and stamping the build identity but \
+             blank lines and comments — an attribute or an early return there leaves the call at \
+             `run`'s own indentation and never reached, which the nesting check above cannot \
+             see. Found: {between:?}"
+        );
+
+        // And BEFORE the socket bind, so a start that dies binding is still attributable.
+        let bind_at = body
+            .find("bind_control_socket(")
+            .expect("`run` binds the control socket");
+        assert!(
+            open_at < stamp_at && stamp_at < bind_at,
+            "the stamp must sit between opening the log and binding the socket, so that a start \
+             which fails to bind is still attributable to a build"
+        );
+    }
+
+    #[test]
+    fn the_startup_stamp_cannot_panic_the_daemon_while_reporting_a_write_failure() {
+        // Issue #1486 AC-5 and design § 8: the daemon must still start when it cannot describe
+        // itself. Two halves back that, and only one is structural — `daemon_build_event`
+        // returning an `Event` rather than a `Result` needs no guard. This one does:
+        // `eprintln!` PANICS when the stderr write itself fails, and the launchd plist routes
+        // `StandardErrorPath` into the same directory as the event log (`crate::service`), so the
+        // one condition that makes the log write fail is the condition that would make the report
+        // panic — before the socket is ever bound, and on the very line AC-5 governs.
+        //
+        // A SOURCE scan because the failure is unreachable from a test: stderr cannot be made
+        // unwritable inside a running test process without taking the harness down with it.
+        const SIGNATURE: &str =
+            "pub(crate) fn emit_best_effort(log: &mut EventLog, event: &Event) {";
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/daemon/run_loop.rs"),
+        )
+        .expect("src/daemon/run_loop.rs is readable from the crate root");
+        let from = source
+            .find(SIGNATURE)
+            .expect("`emit_best_effort` is in src/daemon/run_loop.rs");
+        let body = &source[from..];
+        let end = body
+            .find("\n}\n")
+            .expect("`emit_best_effort` has a column-0 closing brace");
+        let body = &body[..end];
+
+        // Canary the extraction before the assertion it carries.
+        assert!(
+            body.contains("log.emit(event)"),
+            "the extracted body is not `emit_best_effort`'s; this scan has no subject: {body}"
+        );
+        assert!(
+            !body.contains("eprintln!"),
+            "`emit_best_effort` reports a swallowed write failure through a macro that PANICS on \
+             a failed stderr write, so a full volume kills the daemon at the very startup stamp \
+             AC-5 says it must survive: {body}"
+        );
+    }
 
     fn acct(label: &str, uuid: &str) -> Account {
         Account {

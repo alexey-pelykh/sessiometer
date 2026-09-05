@@ -72,11 +72,24 @@ fn label_at(snapshot: &StatusSnapshot, index: usize) -> &str {
 /// Emit one event to the event log, best-effort: a write failure is logged to stderr and
 /// swallowed (issue #9). The daemon must never die on a logging failure, and one failed event
 /// must not drop the rest — so this never returns an error. The single home for the tick / idle /
-/// post-idle emit sites AND `cli`'s pre-loop startup-preflight site (issue #787), so the fail-open
-/// path and its message live in one place.
+/// post-idle emit sites AND `cli`'s pre-loop startup-preflight and build-stamp sites (issue #787,
+/// issue #1486), so the fail-open path and its message live in one place.
+///
+/// The report is a DISCARDED `writeln!` and not `eprintln!`, which is the difference between
+/// fail-open and fail-open-except-once: `eprintln!` panics when the stderr write ITSELF fails,
+/// and the launchd plist routes `StandardErrorPath` into the same directory as the event log
+/// ([`crate::service`]). So the one condition that makes `log.emit` fail — a full or unwritable
+/// volume — is the condition that would make the report kill the daemon, and issue #1486's build
+/// stamp put this call ahead of the socket bind, where that death is a start that never happens.
+/// A daemon dying to report that it could not log is the outcome issue #9 exists to prevent,
+/// arrived at one level down.
 pub(crate) fn emit_best_effort(log: &mut EventLog, event: &Event) {
     if let Err(err) = log.emit(event) {
-        eprintln!("sessiometer: event log write failed: {err}");
+        use std::io::Write as _;
+        let _ = writeln!(
+            std::io::stderr(),
+            "sessiometer: event log write failed: {err}"
+        );
     }
 }
 
