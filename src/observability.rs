@@ -39,12 +39,19 @@
 //! earlier revision said "two" and omitted the third, which this file already named
 //! beside `parse_events` further down.
 //!
-//! The one FREE-FORM value on this channel is the resolved `claude` path
-//! ([`Event::RefreshBinaryResolved`], issue #786) — a filesystem location, still
-//! never a token or an email. Because a path can legally contain a space, it is the
-//! one value this module DOES police at FIELD level: it renders percent-encoded
-//! ([`path_value`]), so the whitespace-free grammar every parser assumes holds by
-//! construction rather than by the operator's good luck in naming their directories.
+//! The FREE-FORM values on this channel are TWO, and both are filesystem locations,
+//! still never a token or an email: the resolved `claude` path
+//! ([`Event::RefreshBinaryResolved`], issue #786) and the daemon's own executable path
+//! ([`Event::DaemonBuild`], issue #1486). This list carries its count for the same
+//! reason the one above carries one, and with the same failure already on record
+//! there — so it is CHECKED rather than asserted:
+//! `the_free_form_values_are_the_ones_this_module_claims` pins [`path_value`]'s
+//! production call sites to exactly these two, and a third that arrives without
+//! amending this paragraph fails there instead of quietly falsifying it. Because a
+//! path can legally contain a space, these are the values this module DOES police at
+//! FIELD level: each renders percent-encoded ([`path_value`]), so the whitespace-free
+//! grammar every parser assumes holds by construction rather than by the operator's
+//! good luck in naming their directories.
 //!
 //! ## Record integrity (issue #1092)
 //!
@@ -2434,6 +2441,65 @@ pub(crate) enum Event {
         incoming: Option<usize>,
         reason: Option<RosterReloadReason>,
     },
+    /// The running daemon's own build identity, stamped once per process start (issue #1486,
+    /// design D-1).
+    ///
+    /// The question this answers is asked AFTER the fact — "which build was that?" — usually of a
+    /// process that has already exited, so the answer has to be durable. Before this event it was
+    /// answered only by indirect proof, and the proofs that identified the ARTIFACT — an `lsof`
+    /// probe plus a `strings` canary against the running binary, and a schema-constant
+    /// cross-reference over the live socket — all needed the process to still be alive, so a
+    /// crash-restart defeated them precisely when the question gets asked. What survived a
+    /// restart was a sweep of the event log itself, and the PRD records both that it was the only
+    /// reason the question was answerable at all and that it worked BY ACCIDENT: a newly added
+    /// event happened to be diagnostic, so its absence dated the build. This event makes that
+    /// surviving route deliberate instead of lucky, and makes it name the artifact directly
+    /// rather than bound it by which events a given build knew how to emit.
+    ///
+    /// One line per START THAT STARTS SOMETHING, which is narrower than one per invocation and
+    /// matters to anyone counting restart boundaries out of the log: the `--managed` agent that
+    /// loses the single-instance lock returns before the stamp, having bound no socket and
+    /// written no state, so it leaves no line. Counting `event=daemon_build` counts daemon
+    /// STARTS, not daemon launches.
+    ///
+    /// Runtime-observable facts only: the resolved `current_exe()` path and that file's size and
+    /// mtime, beside `CARGO_PKG_VERSION`. The version is rendered from the constant rather than
+    /// carried here: there is exactly one correct value for a given binary, and a field would let
+    /// a caller write a different one into the record an operator trusts. Deliberately NOT a
+    /// build-time git SHA — a SHA is stamped from the last commit regardless of uncommitted
+    /// changes, so on the working checkout an operator actually builds from, it answers "was this
+    /// the build with my fix in it?" wrongly and confidently, which is worse than not answering.
+    /// Path + size + mtime is the same artifact identity a live `lsof` probe established, read
+    /// back from the log after the process is gone. A SHA stays additive to this event later, and
+    /// must carry a dirty-tree marker beside it (design § 11).
+    ///
+    /// Every field is optional because every one of them can fail to resolve, and a daemon that
+    /// refuses to start because it cannot describe itself is strictly worse than an unattributable
+    /// log line (design § 8) — so [`daemon_build_event`] returns an `Event` and never a `Result`,
+    /// and the startup path has nothing to propagate. An unresolved field renders
+    /// [`BUILD_FIELD_UNAVAILABLE`] rather than being OMITTED, which is where this parts company
+    /// with [`Event::RosterReload`]'s absent-not-empty convention above: there, omission
+    /// distinguishes "could not know" from a real zero. Here an omitted field would be
+    /// indistinguishable from an older daemon that never emitted one, and "we looked and could
+    /// not tell" is the entire content of the degraded case.
+    ///
+    /// That fail-open sentence is RESTATED at this change's four entry points rather than cited —
+    /// here, on [`daemon_build_event`], on its degradation test, and at the call site in
+    /// [`crate::cli`] — deliberately, and this is the one place that records the choice: each of
+    /// the four is a different reader's first contact with the rule, and a reader who lands on
+    /// the constructor should not have to follow a pointer to learn it cannot fail. Design D-3
+    /// decides the opposite for the runbook, where a paraphrase rots silently and a citation
+    /// degrades visibly; the trade differs here because these four sit in one crate and move
+    /// together, while that runbook tracks a script that moves on its own.
+    ///
+    /// A filesystem path, a version, a size and a timestamp — no credential, no token, no account
+    /// UUID, no roster content (#15). Version and build disclosure in a log the operator may share
+    /// is accepted deliberately.
+    DaemonBuild {
+        exe: Option<PathBuf>,
+        exe_size: Option<u64>,
+        exe_mtime: Option<SystemTime>,
+    },
 }
 
 impl Event {
@@ -3206,8 +3272,124 @@ impl Event {
                     "ts={ts} event=roster_reload outcome={outcome}{previous_field}{incoming_field}{reason_field}"
                 )
             }
+            Event::DaemonBuild {
+                exe,
+                exe_size,
+                exe_mtime,
+            } => {
+                // The startup build stamp (issue #1486, design D-1). `version` comes from the
+                // crate constant directly and NOT from `crate::cli`'s `version_line()`, which
+                // returns TWO lines (the version plus the Claude Code provenance line): reusing it
+                // would embed a newline mid-event and break the one-grep-one-line contract R-7
+                // binds. `single_line` below would encode that newline rather than let it split
+                // the record, so the damage would be a mangled field rather than a forged line —
+                // still the wrong answer to the one question this event exists to answer.
+                //
+                // `exe` is percent-encoded through `path_value` (#786) so a path containing a
+                // space cannot split into a second token and forge an `event=` that overwrites
+                // the real one in `reliability::parse_events`' field map. It is NOT kept last here
+                // — `Event::RefreshBinaryResolved` above prefers that placement — because the
+                // design pins this line's field order and the encoding, not the position, is what
+                // makes a path safe in the middle of a line.
+                //
+                // `exe` renders EXACTLY what `current_exe()` returned, UN-canonicalized, and that
+                // is an accepted residual rather than an oversight. On the only supported target
+                // that call preserves a symlink rather than resolving it, while the `metadata()`
+                // beside it FOLLOWS one — so a daemon launched through a symlink stamps the
+                // link's path next to the target's size and mtime. Bounded: the shipped launchd
+                // agent is unaffected, because the plist's program path comes from
+                // `crate::service`'s `current_binary()`, which canonicalizes; what is left is a
+                // manual run through e.g. a Homebrew symlink. Canonicalizing here would add a
+                // THIRD blocking filesystem call ahead of the socket bind, whose cost the call
+                // site in `crate::cli` already records as a residual of its own.
+                //
+                // Each field falls back to `BUILD_FIELD_UNAVAILABLE` rather than vanishing; the
+                // variant doc says why an omission would be the wrong degraded shape.
+                let exe_field = match exe {
+                    Some(path) => path_value(path),
+                    None => BUILD_FIELD_UNAVAILABLE.to_owned(),
+                };
+                let size_field = match exe_size {
+                    Some(bytes) => bytes.to_string(),
+                    None => BUILD_FIELD_UNAVAILABLE.to_owned(),
+                };
+                let mtime_field = match exe_mtime {
+                    // A PRE-EPOCH mtime is not representable on this channel: [`rfc3339`] renders
+                    // it as the epoch sentinel, deliberately, so a skewed clock can never panic a
+                    // best-effort log write. On THIS line that sentinel would be an unmarked
+                    // wrong answer in the one field an operator compares against a build
+                    // artifact, and indistinguishable from a genuine epoch mtime. This event
+                    // alone on the channel owns a vocabulary for "we looked and could not tell",
+                    // so it says that instead of naming an instant that is not the file's. An
+                    // mtime of exactly the epoch IS representable and renders normally.
+                    Some(at) if at.duration_since(UNIX_EPOCH).is_ok() => rfc3339(*at),
+                    _ => BUILD_FIELD_UNAVAILABLE.to_owned(),
+                };
+                format!(
+                    "ts={ts} event=daemon_build version={} exe={exe_field} exe_size={size_field} exe_mtime={mtime_field}",
+                    env!("CARGO_PKG_VERSION")
+                )
+            }
         };
         single_line(line)
+    }
+}
+
+/// The value an `event=daemon_build` field renders when the daemon could not resolve it
+/// (issue #1486, design D-1; the marker convention itself is design § 8).
+///
+/// One shared token across all three resolvable fields, so an operator learns it once. Against
+/// `exe_size` (a decimal count) and `exe_mtime` (an RFC 3339 stamp) it is unambiguous outright —
+/// neither can ever spell a word. Against `exe` a collision is CONCEIVABLE but never AMBIGUOUS,
+/// and it takes two conjuncts to be even conceivable: a daemon exec'd as the bare relative path
+/// `unavailable` with no directory component (anything containing a `/` renders with it), AND its
+/// `metadata()` resolving. [`daemon_build_event`] derives the metadata FROM `exe`, so a genuine
+/// degradation renders the marker in all three fields, while that collision renders a real size
+/// and mtime beside it: `exe=unavailable exe_size=unavailable` and `exe=unavailable
+/// exe_size=4812336` are the two readings, and the line itself tells them apart.
+///
+/// So the residue is accepted on cheaper grounds than "a sigil would read as noise", which is
+/// what an earlier revision of this comment claimed and is not the tradeoff on offer:
+/// [`path_value`] percent-encodes `%`, so ANY `%`-prefixed marker is collision-proof BY
+/// CONSTRUCTION for the cost of one character rather than by an argument about which paths occur.
+/// Adopting one changes the rendered line the design pins, so it belongs in that document rather
+/// than in a local call taken here.
+const BUILD_FIELD_UNAVAILABLE: &str = "unavailable";
+
+/// Build the startup build-identity event (issue #1486, design D-1) from `exe` — what
+/// `std::env::current_exe()` returned — resolving the executable's size and mtime from it.
+///
+/// Takes the resolution as its ARGUMENT rather than calling `current_exe()` itself, which is the
+/// whole testability seam: a real process cannot be made to fail `current_exe()`, so the
+/// degradation this function exists to perform would otherwise be unreachable by any test and
+/// would ship on the strength of its author's reading. Passed an `Err`, it renders the fully
+/// degraded line; passed an `Ok` naming a path that is not there, the `metadata()` failure is a
+/// REAL one from `std::fs` rather than a mocked one, so the partial-degradation arm is driven by
+/// the same call the daemon makes.
+///
+/// Returns an `Event` and never a `Result`: this is where design § 8's fail-open requirement is
+/// enforced structurally rather than by discipline at the call site. A daemon that will not start
+/// because it cannot describe itself is a strictly worse outcome than an unattributable log line,
+/// and with no error to propagate the startup path has no way to express that failure even by
+/// accident.
+pub(crate) fn daemon_build_event(exe: std::io::Result<std::path::PathBuf>) -> Event {
+    let exe = exe.ok();
+    // One `metadata()` call for both fields, so size and mtime can never describe two different
+    // states of a binary rewritten mid-startup. `modified()` is fallible in its own right (a
+    // platform without mtime support), so it degrades independently of `len()` rather than
+    // discarding both — a claim about the SHAPE of this expression, not one any macOS test can
+    // reach; see the note below the call.
+    let metadata = exe.as_deref().and_then(|path| std::fs::metadata(path).ok());
+    // Independence is UNOBSERVABLE at runtime on the only supported target — `Metadata::modified`
+    // reads a field macOS always fills, so no fixture can fail it while `metadata()` itself
+    // succeeds — and a collapse into one fallible chain was measured to leave the whole suite
+    // green. It is pinned in two halves instead: the RENDER half by the `(Some, Some, None)`
+    // sample in `every_event_variant`, and the CONSTRUCTION half below at the source, by
+    // `the_build_stamp_degrades_its_size_and_mtime_independently`.
+    Event::DaemonBuild {
+        exe_size: metadata.as_ref().map(std::fs::Metadata::len),
+        exe_mtime: metadata.as_ref().and_then(|meta| meta.modified().ok()),
+        exe,
     }
 }
 
@@ -6450,6 +6632,7 @@ pub(crate) mod tests {
             Event::ObservationGapEnter { .. } => "ObservationGapEnter",
             Event::ObservationGapExit { .. } => "ObservationGapExit",
             Event::RosterReload { .. } => "RosterReload",
+            Event::DaemonBuild { .. } => "DaemonBuild",
         }
     }
 
@@ -6808,6 +6991,53 @@ pub(crate) mod tests {
                 incoming: None,
                 reason: None,
             },
+            // Issue #1486: the startup build stamp, sampled once per DEGRADATION SHAPE rather
+            // than once per variant. The fully-resolved line is the one an operator normally
+            // reads; the rest are the fail-open arms design § 8 requires.
+            //
+            // What the degraded samples earn, measured rather than assumed: the two sweeps over
+            // this list assert non-authored emails, the literal `token`, single-line-ness, and
+            // the POSITION of the `event=` field. None of them inspects anything past field 1, so
+            // the class they catch is a leak into a field that only an UNRESOLVED arm renders —
+            // and they do catch it: injecting a `token` substring into the `exe: None` arm is
+            // caught WITH these samples and MISSED with only the resolved one. A placeholder path
+            // or a folded-in `metadata()` error string is a different class that no sweep here
+            // would see; the closed-field-set assertion in
+            // `a_daemon_build_line_carries_no_credential_account_or_roster_content` is what
+            // covers that one.
+            Event::DaemonBuild {
+                exe: Some(PathBuf::from(
+                    "/Applications/Sessiometer.app/Contents/MacOS/sessiometer",
+                )),
+                exe_size: Some(4_812_336),
+                exe_mtime: Some(system_time_from_epoch(1_767_225_600)),
+            },
+            // `current_exe()` resolved but its `metadata()` did not — a binary replaced or
+            // unlinked between exec and this emit.
+            Event::DaemonBuild {
+                exe: Some(PathBuf::from(
+                    "/Applications/Sessiometer.app/Contents/MacOS/sessiometer",
+                )),
+                exe_size: None,
+                exe_mtime: None,
+            },
+            // `current_exe()` itself failed: nothing resolved, and the daemon started anyway.
+            Event::DaemonBuild {
+                exe: None,
+                exe_size: None,
+                exe_mtime: None,
+            },
+            // The FOURTH reachable shape: `metadata()` resolved but `modified()` did not. No
+            // fixture can construct it through `daemon_build_event` on macOS, where
+            // `Metadata::modified` does not fail, so it is sampled directly — this is the render
+            // half of the independence `daemon_build_event`'s own comment claims.
+            Event::DaemonBuild {
+                exe: Some(PathBuf::from(
+                    "/Applications/Sessiometer.app/Contents/MacOS/sessiometer",
+                )),
+                exe_size: Some(4_812_336),
+                exe_mtime: None,
+            },
         ];
         assert_samples_every_variant("Event", &samples, event_variant_name);
         samples
@@ -6845,6 +7075,567 @@ pub(crate) mod tests {
             declared.contains("RosterReload"),
             "the source scan does not see `RosterReload`; the issue #891 sweep would pass over it \
              without ever rendering it. declared={declared:?}"
+        );
+    }
+
+    #[test]
+    fn the_variant_scan_sees_the_daemon_build_variant() {
+        // Issue #1486, the same shape as the #1438 canary above and for the same reason: the scan
+        // (`declared_variant_names`) re-parses this file's source, and its known failure direction
+        // is SILENT — a variant it drops is missing from `declared`, and if it is also missing
+        // from the samples the equality sweep passes over an empty difference, green, having never
+        // seen it.
+        //
+        // BOTH ENDS are canaried, because one end cannot see the other's failure. `Swap` is the
+        // FIRST variant `enum Event` declares, so a set that comes back without it proves the
+        // scan found the enum and lost its first variant — `declared_variant_names` panics
+        // outright when it cannot find the enum, and refuses an empty parse.
+        //
+        // The TAIL canary names `RosterReload` and not `ObservationGapExit`, which is what the
+        // #1438 canary above names — but NOT for the reason an earlier revision of this comment
+        // gave. That reason was that a truncated scan would keep `RosterReload` and drop
+        // `DaemonBuild`, and it is inverted: this walk truncates by SUFFIX (the depth counter
+        // breaks at 0 and never resumes), so any scan still reaching `RosterReload` has already
+        // reached `DaemonBuild` too, and any scan that loses `DaemonBuild` fails the assertion
+        // below FIRST. For truncation the tail canary is verdict-neutral — measured.
+        //
+        // What the token choice does buy is DIAGNOSIS, plus one case the assertion below misses.
+        // Diagnosis: a scan that stopped early reds HERE saying the scan stopped, rather than
+        // below saying the variant is missing — two different repairs, and the older canary's
+        // token would send a maintainer to the second. The case: a variant dropped from the
+        // MIDDLE of the enum body — a brace-shadowing comment or literal above it, whose carriers
+        // `variant_names_in`'s own doc catalogues (issue #1433) — takes `RosterReload` while
+        // `DaemonBuild` survives, and nothing else here would notice.
+        let declared = declared_variant_names("Event");
+        assert!(
+            declared.contains("Swap"),
+            "canary (head): the source scan dropped `Swap`, the FIRST variant `enum Event` \
+             declares. `declared_variant_names` panics when it cannot find the enum and refuses \
+             an empty parse, so the scan DID find the enum and lost its first variant — every \
+             assertion below is over a set already known to be lossy. declared={declared:?}"
+        );
+        assert!(
+            declared.contains("RosterReload"),
+            "canary (tail): the source scan lost `RosterReload` — either it stops before the \
+             END of `enum Event`, where every new variant lands, or a variant was dropped from \
+             the MIDDLE of the body. Either way the assertion below is over a lossy set. \
+             declared={declared:?}"
+        );
+        assert!(
+            declared.contains("DaemonBuild"),
+            "the source scan does not see `DaemonBuild`; the issue #891 sweep would pass over it \
+             without ever rendering it. declared={declared:?}"
+        );
+    }
+
+    #[test]
+    fn the_event_vocabulary_renders_a_daemon_build_line() {
+        // Issue #1486 AC-1/AC-2, deliberately phrased over the EXISTING vocabulary rather than
+        // over the new variant, so that it compiles against the pre-change tree and reddens there
+        // as a failed ASSERTION rather than as a missing type. That is what lets the AC-6 RED
+        // demonstration say something about behaviour: a compile error proves the name is absent,
+        // this proves no line in the whole event vocabulary answers the question the event exists
+        // to answer.
+        //
+        // The token is matched by FIELD POSITION, not by substring, on the same #1185 reasoning
+        // `every_event_line_carries_its_event_key_as_the_second_field` states: a free-form handle
+        // can spell any substring but cannot occupy a field ahead of itself.
+        let carries_the_token = every_event_variant().iter().any(|event| {
+            event
+                .to_log_line(at_epoch(0))
+                .split(' ')
+                .nth(1)
+                .is_some_and(|field| field == "event=daemon_build")
+        });
+        assert!(
+            carries_the_token,
+            "no `Event` variant renders `event=daemon_build`: the build identity of a running \
+             daemon is unattributable from its own log, which is the whole of issue #1486"
+        );
+    }
+
+    #[test]
+    fn a_daemon_build_line_is_readable_from_the_log_file_alone() {
+        // Issue #1486 AC-1 + AC-2. The criterion is about READING THE ANSWER BACK, so this goes
+        // through the real durable path — `EventLog::emit` to a file, the handle dropped, the file
+        // re-read as text — rather than asserting on a rendered `String` in memory. Asserting the
+        // latter would prove the formatter agrees with itself while saying nothing about the one
+        // thing AC-1 asks: that no live process, no `lsof`, no `strings` and no schema constant is
+        // needed. Everything below the emit sees only bytes on disk.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessiometer.log");
+        let exe = dir.path().join("sessiometer");
+        std::fs::write(&exe, b"not really a binary").unwrap();
+        // Pin the fixture's mtime to a known instant, and a FUTURE one deliberately. The
+        // assertion below is what tells `modified()` apart from any other timestamp on the same
+        // inode, and on macOS a freshly written file has birthtime EQUAL to mtime at the second
+        // granularity this channel renders — so against a just-created fixture, `created()`
+        // renders identically and the assertion proves nothing. Measured on this host: setting
+        // the mtime into the PAST drags birthtime back with it, while setting it into the FUTURE
+        // leaves birthtime where it was. Hence the future.
+        let pinned = UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&exe)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(pinned))
+            .expect("the fixture's mtime is settable");
+        // Read back through `std::fs`, so the expected value is an INDEPENDENT observation of the
+        // same file the daemon would stat rather than a restatement of what was just written.
+        let observed_mtime = std::fs::metadata(&exe).unwrap().modified().unwrap();
+        {
+            let mut log = EventLog::at(&path).unwrap();
+            // A start emits the stamp among other events, so "exactly one" below is a real
+            // selection rather than a count over a single-line file.
+            log.emit(&daemon_build_event(Ok(exe.clone()))).unwrap();
+            log.emit(&Event::AllExhaustedCleared).unwrap();
+            log.emit(&Event::KeychainLockedWait).unwrap();
+        }
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        // ONE grep for ONE stable token — AC-2, and the condition design § 10 puts on
+        // `BuildAttributionCost` GOAL 0. (The tag itself is PRD § 6; PRD § 10 is Source
+        // Traceability and carries no Planguage condition.)
+        let hits: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("event=daemon_build"))
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "one start must leave exactly one greppable build stamp; log was:\n{text}"
+        );
+
+        let line = hits[0];
+        assert_eq!(
+            field_of(line, "version"),
+            Some(env!("CARGO_PKG_VERSION")),
+            "the version is the crate's own, read off the line: {line}"
+        );
+        assert_eq!(
+            field_of(line, "exe"),
+            Some(exe.display().to_string().as_str()),
+            "the resolved executable path is readable from the line: {line}"
+        );
+        // Size and mtime resolved from a real file, so the happy path is not merely "not
+        // degraded" but actually correct.
+        assert_eq!(
+            field_of(line, "exe_size"),
+            Some("19"),
+            "the executable's size is readable from the line: {line}"
+        );
+        // The VALUE, not merely its shape. A shape assertion — 20 characters ending in `Z` — is
+        // satisfied by any timestamp on this inode, so it cannot tell `modified()` from
+        // `created()`; measured, that substitution left the whole suite green. `exe_mtime` naming
+        // a different instant is the harm this event exists to prevent: an operator comparing it
+        // against a build artifact gets a confident wrong answer.
+        assert_eq!(
+            field_of(line, "exe_mtime"),
+            Some(rfc3339(observed_mtime).as_str()),
+            "`exe_mtime` must be the executable's own modification time, read back from the same \
+             file: {line}"
+        );
+        // The marker must be ABSENT on a fully-resolved line, or every degradation assertion in
+        // the sibling tests is unfalsifiable — a render arm that emitted it unconditionally would
+        // satisfy all of them.
+        assert!(
+            !line.contains(BUILD_FIELD_UNAVAILABLE),
+            "a fully-resolved stamp carries no unavailability marker: {line}"
+        );
+    }
+
+    #[test]
+    fn a_daemon_build_stamp_survives_an_unresolvable_executable() {
+        // Issue #1486 AC-5, the fail-open requirement design § 8 states: a daemon that will not
+        // start because it cannot describe itself is strictly worse than an unattributable log
+        // line. `current_exe()` cannot be made to fail on a real process, which is exactly why
+        // `daemon_build_event` takes its result as an ARGUMENT — the degradation is reachable here
+        // and nowhere else.
+        //
+        // RESIDUAL, recorded rather than papered over: this drives the DEGRADATION — that an
+        // `Err` renders the fully degraded shape — and nothing beyond it. That the STARTUP PATH
+        // reaches this arm on a real `current_exe()` failure is not proven here, and cannot be
+        // proven black-box on the only supported target: macOS resolves `current_exe()` through
+        // `_NSGetExecutablePath`, which copies a path out of the process image without
+        // canonicalizing it, so it returns `Ok` even when the binary has been renamed, deleted,
+        // or its parent made unreadable — only `metadata()` ever fails there. An independent
+        // verification pass drove the real daemon into the `metadata()` failure (it started, and
+        // emitted `exe_size=unavailable exe_mtime=unavailable`) and confirmed this arm's
+        // rendering, but not the conjunction of the two. A future edit making the `Err` arm
+        // return early instead of emitting would keep this test green and would surface only on a
+        // platform where `current_exe()` can fail.
+        let event = daemon_build_event(Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no executable path",
+        )));
+        let line = event.to_log_line(at_epoch(0));
+
+        // The event is still EMITTED, still greppable, and still names the version — the half of
+        // the identity that never depended on the filesystem.
+        assert_eq!(
+            line.split(' ').nth(1),
+            Some("event=daemon_build"),
+            "a degraded stamp is still found by the same one grep: {line}"
+        );
+        assert_eq!(field_of(&line, "version"), Some(env!("CARGO_PKG_VERSION")));
+        // Each unresolved field carries an EXPLICIT marker rather than vanishing. An omitted
+        // field would be indistinguishable from an older daemon that never emitted one; the
+        // marker says "we looked and could not tell", which is the whole content of this case.
+        for key in ["exe", "exe_size", "exe_mtime"] {
+            assert_eq!(
+                field_of(&line, key),
+                Some(BUILD_FIELD_UNAVAILABLE),
+                "`{key}` must carry the explicit unavailability marker, not vanish: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_daemon_build_stamp_keeps_the_exe_when_its_metadata_cannot_be_read() {
+        // Issue #1486 AC-5, the PARTIAL degradation — the field set is resolved independently, so
+        // a `metadata()` failure must not discard the path that DID resolve. The `metadata()`
+        // failure here is a REAL one from `std::fs` (the path does not exist), not a mock, so this
+        // drives the same call the daemon makes.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("sessiometer-was-replaced");
+        assert!(
+            std::fs::metadata(&missing).is_err(),
+            "the fixture must actually be unreadable, or this test proves nothing"
+        );
+
+        let line = daemon_build_event(Ok(missing.clone())).to_log_line(at_epoch(0));
+        assert_eq!(
+            field_of(&line, "exe"),
+            Some(missing.display().to_string().as_str()),
+            "the resolved path survives a metadata failure: {line}"
+        );
+        for key in ["exe_size", "exe_mtime"] {
+            assert_eq!(
+                field_of(&line, key),
+                Some(BUILD_FIELD_UNAVAILABLE),
+                "`{key}` degrades on its own without taking `exe` with it: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_daemon_build_line_carries_no_credential_account_or_roster_content() {
+        // Issue #1486 AC-3, and design § 8's security clause. A GUARD, not an oracle: it is
+        // VACUOUS against the pre-change tree, where no such line exists to carry anything, so it
+        // is no evidence that the fix works and takes no part in the AC-6 RED demonstration. What
+        // it does is fail a future edit that folds an account label, a `metadata()` error string,
+        // or roster content into the one startup line an operator is most likely to paste into a
+        // bug report.
+        //
+        // The generic #15 sweep (`no_event_line_carries_an_email_or_token_sigil`) already covers
+        // this variant for emails and the literal `token`; the account-UUID and roster-content
+        // halves of AC-3 have no generic sweep, which is why they are asserted here.
+        //
+        // `is_uuid_shaped` is the whole of the account-UUID half, and its failure direction is
+        // SILENT: an under-matching predicate returns false for everything and the sweep below
+        // passes having recognised nothing, permanently and greenly. Measured: widening its
+        // group-count check from 5 to 6 left the entire suite green. So it is canaried
+        // POSITIVELY first, in both shapes it must recognise — a bare UUID, and the value half of
+        // a `key=value` token, which is the only shape one can actually reach a log line in —
+        // and negatively once, so a predicate that matched everything could not pass either.
+        assert!(
+            is_uuid_shaped("bfa7357b-9f4e-4c2a-8d1b-6e5f0a3c9d72"),
+            "canary: `is_uuid_shaped` does not recognise a roster account UUID, so the sweep \
+             below cannot see one leak either"
+        );
+        assert!(
+            is_uuid_shaped("acct=bfa7357b-9f4e-4c2a-8d1b-6e5f0a3c9d72"),
+            "canary: `is_uuid_shaped` does not recognise a UUID as the VALUE half of a \
+             `key=value` token, which is how one would arrive on a line"
+        );
+        assert!(
+            !is_uuid_shaped("exe=/Applications/Sessiometer.app/Contents/MacOS/sessiometer"),
+            "canary: `is_uuid_shaped` matches an ordinary path, so the sweep below would red on \
+             every resolved build stamp rather than on a leak"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("sessiometer");
+        std::fs::write(&exe, b"not really a binary").unwrap();
+        let lines = [
+            daemon_build_event(Ok(exe)).to_log_line(at_epoch(0)),
+            daemon_build_event(Ok(dir.path().join("gone"))).to_log_line(at_epoch(0)),
+            daemon_build_event(Err(std::io::Error::other("no executable path")))
+                .to_log_line(at_epoch(0)),
+        ];
+        for line in &lines {
+            let keys: Vec<&str> = line
+                .split(' ')
+                .filter_map(|token| token.split_once('='))
+                .map(|(key, _)| key)
+                .collect();
+            // The field set is CLOSED, asserted by equality rather than by scanning for known-bad
+            // values: a denylist can only reject the leaks someone thought of, while this rejects
+            // any field that was not designed in — which is how an account or a roster count would
+            // actually arrive.
+            assert_eq!(
+                keys,
+                vec!["ts", "event", "version", "exe", "exe_size", "exe_mtime"],
+                "the build stamp's field set is closed — nothing about an account, a roster or a \
+                 credential has a place in it: {line}"
+            );
+            assert!(!line.contains('@'), "no email-shaped label (#15): {line}");
+            assert!(
+                !line.to_lowercase().contains("token"),
+                "no token (#15): {line}"
+            );
+            // An account UUID is the roster's own identifier shape — 8-4-4-4-12 hex. Checked
+            // structurally rather than against a literal, because the leak this guards would
+            // carry a REAL uuid, never the one a test could name.
+            assert!(
+                !line.split(' ').any(is_uuid_shaped),
+                "no account UUID (#15): {line}"
+            );
+        }
+    }
+
+    /// Whether `token` — or the value half of a `key=value` token — has the 8-4-4-4-12 hex shape
+    /// of a roster account UUID.
+    fn is_uuid_shaped(token: &str) -> bool {
+        let value = token.split_once('=').map_or(token, |(_, value)| value);
+        let groups: Vec<&str> = value.split('-').collect();
+        groups.len() == 5
+            && groups.iter().map(|group| group.len()).eq([8, 4, 4, 4, 12])
+            && groups
+                .iter()
+                .all(|group| group.chars().all(|ch| ch.is_ascii_hexdigit()))
+    }
+
+    #[test]
+    fn a_daemon_build_line_keeps_its_grammar_over_a_hostile_executable_path() {
+        // Issue #1486 AC-1, and issue #786's encoding. `exe` is one of only two FREE-FORM values
+        // on this channel and a path may legally contain a space, so the ONE thing keeping this
+        // line a six-field record rather than an eight-field one is `path_value`. Nothing else
+        // pins it: every other `DaemonBuild` fixture here is space-free, so dropping the encoder
+        // renders all of them identically — measured, that substitution left the whole suite
+        // green. This is the fixture that tells the two apart.
+        //
+        // The `%` is there for the encoder's other half: it must be encoded FIRST (as `%25`), or
+        // a reader decoding `%20` back to a space cannot tell an encoded space from a literal
+        // `%20` an operator typed into a directory name.
+        let line = Event::DaemonBuild {
+            exe: Some(PathBuf::from("/Volumes/My Disk/Sessiometer 1%/sessiometer")),
+            exe_size: Some(4_812_336),
+            exe_mtime: Some(system_time_from_epoch(1_767_225_600)),
+        }
+        .to_log_line(at_epoch(0));
+
+        // SIX fields, counted over EVERY whitespace-separated token rather than over the ones
+        // that parse as `key=value`: a split leaves fragments (`Disk/Sessiometer`) carrying no
+        // `=` at all, so a filtered count would drop exactly the evidence of the split and pass.
+        let tokens: Vec<&str> = line.split(' ').collect();
+        assert_eq!(
+            tokens.len(),
+            6,
+            "a path containing a space split the record into extra FIELDS; \
+             `reliability::parse_events` tokenizes on whitespace and would read a truncated \
+             `exe`: {line}"
+        );
+        assert!(
+            tokens.iter().all(|token| token.contains('=')),
+            "every field of a build stamp is a `key=value`: {line}"
+        );
+        assert_eq!(
+            field_of(&line, "exe"),
+            Some("/Volumes/My%20Disk/Sessiometer%201%25/sessiometer"),
+            "the executable path renders percent-encoded (#786) — the space as `%20`, and the \
+             `%` itself as `%25`: {line}"
+        );
+        // The fields AFTER `exe` still carry their own values: the harm a split does is not only
+        // a truncated `exe` but a record whose remaining fields have shifted.
+        assert_eq!(field_of(&line, "exe_size"), Some("4812336"), "{line}");
+        assert_eq!(
+            field_of(&line, "exe_mtime"),
+            Some("2026-01-01T00:00:00Z"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn a_pre_epoch_executable_mtime_renders_the_marker_rather_than_the_epoch() {
+        // Issue #1486 AC-5's marker convention, applied to a value `rfc3339` cannot represent. A
+        // pre-1970 mtime is reachable (`touch -t 196001010000` succeeds on macOS) and `rfc3339`
+        // renders it `1970-01-01T00:00:00Z` — a deliberate channel-wide sentinel that keeps a
+        // skewed clock from panicking a best-effort log write. Unmarked, on THIS line, it is one
+        // third of the artifact-identity triple silently false and indistinguishable from a
+        // genuine epoch mtime.
+        let line = Event::DaemonBuild {
+            exe: Some(PathBuf::from(
+                "/Applications/Sessiometer.app/Contents/MacOS/sessiometer",
+            )),
+            exe_size: Some(4_812_336),
+            exe_mtime: Some(UNIX_EPOCH - Duration::from_secs(1)),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            field_of(&line, "exe_mtime"),
+            Some(BUILD_FIELD_UNAVAILABLE),
+            "an mtime this channel cannot render must say so, not render the epoch sentinel: \
+             {line}"
+        );
+        // Per-field: the values that DID resolve are untouched.
+        assert_eq!(field_of(&line, "exe_size"), Some("4812336"), "{line}");
+
+        // And the epoch ITSELF is a real instant, not an unrenderable one.
+        let at_the_epoch = Event::DaemonBuild {
+            exe: None,
+            exe_size: None,
+            exe_mtime: Some(UNIX_EPOCH),
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            field_of(&at_the_epoch, "exe_mtime"),
+            Some("1970-01-01T00:00:00Z"),
+            "{at_the_epoch}"
+        );
+    }
+
+    #[test]
+    fn the_build_stamp_renders_the_version_from_the_crate_constant() {
+        // Issue #1486 AC-1. `a_daemon_build_line_is_readable_from_the_log_file_alone` asserts the
+        // rendered `version` equals `env!("CARGO_PKG_VERSION")` — reading that constant on BOTH
+        // sides, so it cannot tell a render arm that READS the constant from one that hardcoded
+        // today's value. Measured: substituting the CURRENT literal leaves the whole suite green,
+        // while substituting a DIFFERENT one is caught, which is exactly what makes the weaker
+        // assertion feel sufficient. The regression that matters looks like the first — after the
+        // next version bump the daemon stamps a stale version forever, in the one field an
+        // operator reads to answer which build this is.
+        //
+        // So the SOURCE is pinned, in the idiom
+        // `the_daemon_start_path_stamps_its_build_identity_unconditionally` establishes in
+        // `src/cli.rs`. The arm head is spelled with `\n` escapes rather than as a raw block, so
+        // this constant's own text cannot satisfy the search it performs.
+        const ARM_HEAD: &str = "Event::DaemonBuild {\n                exe,\n                exe_size,\n                exe_mtime,\n            } => {";
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/observability.rs");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let from = source
+            .find(ARM_HEAD)
+            .expect("`to_log_line` has an `Event::DaemonBuild` render arm");
+        let arm = &source[from..];
+        let end = arm
+            .find("\n            }\n")
+            .expect("the render arm closes at its own indentation");
+        let arm = &arm[..end];
+
+        // Canary the extraction BEFORE the assertion it carries: a `contains` over the wrong
+        // window reports a regression it never looked for.
+        assert!(
+            arm.contains("event=daemon_build version="),
+            "the extracted window is not the `DaemonBuild` render arm: {arm}"
+        );
+        assert!(
+            arm.contains("env!(\"CARGO_PKG_VERSION\")"),
+            "the build stamp's `version` must be READ from `env!(\"CARGO_PKG_VERSION\")`, never \
+             spelled as a literal: a hardcoded value is correct on the day it is written and \
+             silently wrong from the next bump onward. The canary above already proved this is \
+             the right render arm, so the arm is not dumped here — open it."
+        );
+    }
+
+    #[test]
+    fn the_build_stamp_degrades_its_size_and_mtime_independently() {
+        // Issue #1486 AC-5. `daemon_build_event`'s comment says `exe_size` and `exe_mtime`
+        // degrade INDEPENDENTLY — an mtime failure must not discard a size that resolved. On the
+        // only supported target that is unobservable at runtime: `Metadata::modified` reads a
+        // field macOS always fills, so no fixture can fail it while `metadata()` itself succeeds.
+        // Measured: collapsing the two into one fallible chain leaves the whole suite green.
+        //
+        // Two halves, because neither reaches the other. The RENDER half is observable and is
+        // driven by the `(Some, Some, None)` sample in `every_event_variant`, asserted here. The
+        // CONSTRUCTION half is pinned at the source, in the same idiom as
+        // `the_build_stamp_renders_the_version_from_the_crate_constant` above.
+        let rendered = Event::DaemonBuild {
+            exe: Some(PathBuf::from("/opt/sessiometer")),
+            exe_size: Some(4_812_336),
+            exe_mtime: None,
+        }
+        .to_log_line(at_epoch(0));
+        assert_eq!(
+            field_of(&rendered, "exe_size"),
+            Some("4812336"),
+            "{rendered}"
+        );
+        assert_eq!(
+            field_of(&rendered, "exe_mtime"),
+            Some(BUILD_FIELD_UNAVAILABLE),
+            "an unresolved mtime marks its own field and leaves the size alone: {rendered}"
+        );
+
+        const SIZE_EXPR: &str = "exe_size: metadata.as_ref().map(std::fs::Metadata::len),";
+        const MTIME_EXPR: &str =
+            "exe_mtime: metadata.as_ref().and_then(|meta| meta.modified().ok()),";
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/observability.rs");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let from = source
+            .find("pub(crate) fn daemon_build_event(")
+            .expect("`daemon_build_event` is in src/observability.rs");
+        let body = &source[from..];
+        let end = body
+            .find("\n}\n")
+            .expect("`daemon_build_event` has a column-0 closing brace");
+        let body = &body[..end];
+
+        // Canary the extraction before the assertions it carries.
+        assert!(
+            body.contains("std::fs::metadata(path).ok()"),
+            "the extracted body is not `daemon_build_event`'s; this scan has no subject: {body}"
+        );
+        assert!(
+            body.contains(SIZE_EXPR),
+            "`exe_size` no longer derives from the metadata ALONE — a chain that folds \
+             `modified()` into it discards a size that resolved, which the comment there says \
+             does not happen and which no macOS test can witness: {body}"
+        );
+        assert!(
+            body.contains(MTIME_EXPR),
+            "`exe_mtime` no longer degrades on its own: {body}"
+        );
+    }
+
+    #[test]
+    fn the_free_form_values_are_the_ones_this_module_claims() {
+        // The module header names the free-form values this channel carries and carries their
+        // COUNT. A count in prose rots silently, and this file already records being bitten by
+        // exactly that — "an earlier revision said two and omitted the third". Issue #1486 added
+        // the second one, and the header said "the one" for the length of that change.
+        //
+        // The subject is `path_value`'s PRODUCTION call sites: the encoder every free-form value
+        // must pass through, so a third value either arrives encoded here or is not free-form.
+        // Cut at this file's own column-0 `#[cfg(test)]`, the boundary the source lints in
+        // `src/cli.rs` already draw — the encoder's unit tests call it many times and are not
+        // values on the channel.
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/observability.rs");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let production: String = source
+            .lines()
+            .take_while(|line| !line.starts_with("#[cfg(test)]"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Canary the CUT before counting over it. A boundary drawn too early yields a slice with
+        // no call in it at all, and a count of zero would read as "no free-form value on this
+        // channel" rather than as a broken scan.
+        assert!(
+            production.contains("fn path_value(path: &Path) -> String {"),
+            "the non-test slice stops before `path_value`'s own definition; this count has no \
+             subject"
+        );
+        // The definition's own `fn ` line is not a call; every other occurrence is.
+        let calls = production.matches("path_value(").count() - 1;
+        assert_eq!(
+            calls, 2,
+            "the module header names the free-form values on this channel and states their \
+             count. `path_value` now has {calls} production call sites rather than 2 — name the \
+             new one there, or say why its value is not free-form, instead of leaving that \
+             paragraph asserting something no longer true"
         );
     }
 
@@ -7350,9 +8141,10 @@ pub(crate) mod tests {
 
     #[test]
     fn no_event_line_carries_an_email_or_token_sigil() {
-        // #15/#444: every field is a handle / enum / number / timestamp — or, in the single
-        // case of the resolved `claude` path (#786), a percent-encoded filesystem location —
-        // so a token or a NON-authored email can never reach a rendered line. Total over
+        // #15/#444: every field is a handle / enum / number / timestamp — or, in the two cases
+        // of the resolved `claude` path (#786) and the daemon's own executable path (#1486), a
+        // percent-encoded filesystem location — so a token or a NON-authored email can never
+        // reach a rendered line. Total over
         // `Event` by construction: see the two-layer note above `declared_variant_names`.
         for event in &every_event_variant() {
             let line = event.to_log_line(at_epoch(0));
