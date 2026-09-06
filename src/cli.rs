@@ -6235,6 +6235,162 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_run_loop_reports_to_the_console_without_a_call_that_can_panic_the_daemon() {
+        // Issue #1494, the sibling of the guard directly above and the same argument one scope
+        // out: `eprintln!` PANICS when the stderr write ITSELF fails, and the launchd plist
+        // routes `StandardErrorPath` into the same directory as the event log
+        // (`crate::service`) — so on the volume-full condition every console report in the run
+        // loop is a panic site. The four converted by #1494 are `report_tick_outcome`'s swap
+        // echo, `notify_unrecoverable`'s operator line, and `run_loop`'s own reconcile-on-start
+        // and boot-canary reports.
+        //
+        // WHAT THIS GUARD COVERS, STATED SO THE BOUND IS NOT MISREAD: exactly one file,
+        // `src/daemon/run_loop.rs`. It is NOT a guard over "the daemon's live path", which is a
+        // strictly larger set — AT LEAST NINE reports outside this file are reached after the
+        // socket binds and still panic on a failed write: `cli::run`'s own "daemon started"
+        // line, four in `refresh`'s orphan reapers, `daemon::append_sample_for_poll` (every
+        // poll), `witness::resolve_probe` and `stats::stats_socket_json_with` (both
+        // socket-served), and `stats::fleet_runway`, whose own comment already NAMES this
+        // defect. A FLOOR and not a count: the live subset of the crate's console reports is a
+        // call-chain question per site, this enumeration has been revised upward twice, and
+        // issue #1498 owns the sweep rather than this comment. That is why the scan stays one
+        // file wide — widening it without converting those in the same change would fail on
+        // sites issue #1494 deliberately did not touch.
+        //
+        // A SOURCE scan for the same reason the guard above is one: stderr cannot be made
+        // unwritable inside a running test process without taking the harness down with it.
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/daemon/run_loop.rs"),
+        )
+        .expect("src/daemon/run_loop.rs is readable from the crate root");
+
+        // Prose in that file NAMES these macros deliberately — `emit_best_effort`'s doc comment
+        // explains the convention and each converted site cites it — so scanning the raw text
+        // would fail on the very comments that document the rule. Scan CODE only: keep every
+        // line whose trimmed form does not open a `//` or `///` comment, carrying each line's
+        // 1-based number so a finding can name WHERE rather than dumping the file. Two honest
+        // limits, neither present in that file today and both failing SAFE (toward a false
+        // alarm, never a false pass): a trailing `// …` on a code line, and a `/* … */` block.
+        let is_comment = |line: &str| line.trim_start().starts_with("//");
+        let code: Vec<(usize, &str)> = source
+            .lines()
+            .enumerate()
+            .map(|(i, line)| (i + 1, line))
+            .filter(|(_, line)| !is_comment(line))
+            .collect();
+
+        // Canary the extraction before the assertions it carry. An un-canaried source scan
+        // passes over an empty or truncated selection, and a guard that cannot fail is not a
+        // guard. Three canaries, because presence alone proves the corpus is NON-EMPTY and this
+        // needs it COMPLETE: a truncated scan that still contains one converted site would
+        // otherwise certify the sites it never read.
+        let has = |needle: &str| code.iter().any(|(_, line)| line.contains(needle));
+
+        // (a) HEAD — a declaration, so an extraction that ate the code fails here.
+        assert!(
+            has("fn notify_unrecoverable(labels: &[String]) {"),
+            "the comment-strip left no run-loop code, so this scan has no subject: it kept {} \
+             of {} lines",
+            code.len(),
+            source.lines().count()
+        );
+        // (b) TAIL — the LAST converted site, so a corpus truncated anywhere above it fails
+        //     here even though earlier converted sites are still in view.
+        assert!(
+            has(r#""sessiometer: boot canary skipped: {err}""#),
+            "the last converted site is not in the scanned code, so this scan does not reach \
+             the end of the file: it kept {} of {} lines",
+            code.len(),
+            source.lines().count()
+        );
+        // (c) PARTITION — every line is either kept or a comment. Recomputed independently of
+        //     the filter above, so ANY extra narrowing (a `take_while`, a widened strip) breaks
+        //     the sum instead of silently shrinking the subject.
+        let comments = source.lines().filter(|line| is_comment(line)).count();
+        assert_eq!(
+            code.len() + comments,
+            source.lines().count(),
+            "the extraction dropped lines that are neither code nor comment, so its subject is \
+             narrower than the file and the assertions below cover less than they claim"
+        );
+
+        // The property is "cannot panic while reporting", NOT "does not spell `eprintln!`".
+        // Naming one macro passed `println!` (same `print_to`, same panic; `StandardOutPath` is
+        // a file too) and `dbg!` (expands to `eprintln!`). Naming the macros AND requiring a
+        // discarded `writeln!` still passed `write!(…).expect(…)` — two characters from the
+        // prescribed form — plus `stderr().write_all(…).expect(…)`, `.write_fmt(…).expect(…)`,
+        // and a bound `let mut e = stderr(); …; e.flush().expect(…)`. Each was measured green
+        // against this test, `cargo fmt --check` and `cargo clippy -D warnings`.
+        //
+        // Enumerating the write surface is what kept failing, so the third invariant below does
+        // not enumerate it. It forbids the PANIC SHAPES themselves anywhere in this file, which
+        // is a superset of "while reporting" and is deliberately so: `label_at`'s own comment
+        // already states the principle for this module — "the long-running daemon must never
+        // panic on a display path". The file satisfies it today with zero occurrences, so it
+        // costs nothing to hold. A future `.expect()` here that is genuinely justified must
+        // amend this list and say why, which is the point.
+
+        const PANICKING_MACROS: [&str; 5] =
+            ["eprintln!(", "eprint!(", "println!(", "print!(", "dbg!("];
+        let regressed: Vec<String> = code
+            .iter()
+            .filter(|(_, line)| PANICKING_MACROS.iter().any(|name| line.contains(name)))
+            .map(|(n, line)| format!("  src/daemon/run_loop.rs:{n}: {}", line.trim()))
+            .collect();
+        assert!(
+            regressed.is_empty(),
+            "a console report in the run loop went back to a macro that PANICS on a failed \
+             write, so the volume-full condition that makes the event log unwritable kills the \
+             running daemon instead of being swallowed (issue #1494). Use the discarded \
+             `writeln!` form `emit_best_effort` documents:\n{}",
+            regressed.join("\n")
+        );
+
+        const PANIC_SHAPES: [&str; 5] =
+            [".expect(", ".unwrap(", "panic!(", "unreachable!(", "todo!("];
+        let panics: Vec<String> = code
+            .iter()
+            .filter(|(_, line)| PANIC_SHAPES.iter().any(|name| line.contains(name)))
+            .map(|(n, line)| format!("  src/daemon/run_loop.rs:{n}: {}", line.trim()))
+            .collect();
+        assert!(
+            panics.is_empty(),
+            "the run loop gained a call that can panic. On the daemon's live path that aborts \
+             the process, and when it sits on a console report it reintroduces exactly what \
+             issue #1494 removed — `.expect()` on a write is the reflex repair for a `let _ =` \
+             that reads like a lint smell. Report through the discarded `writeln!` form, or \
+             amend PANIC_SHAPES with the reason this one cannot fire:\n{}",
+            panics.join("\n")
+        );
+
+        // Writes ADDRESSED TO THE CONSOLE must additionally discard: `?` would compile inside
+        // `run_loop` (it returns `Result`) and would end the loop on a failed console write —
+        // a panic shape's quieter cousin that the list above cannot see. Scoped to stderr and
+        // stdout deliberately, so a legitimate propagating write to a caller-owned `W: Write`
+        // — which `report_tick_outcome<W: Write>`'s own signature invites — is not caught here.
+        let joined = code
+            .iter()
+            .map(|(_, line)| *line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let undiscarded = joined
+            .match_indices("write")
+            .filter(|(at, _)| {
+                let tail = &joined[*at..];
+                (tail.starts_with("writeln!") || tail.starts_with("write!"))
+                    && tail[..tail.len().min(90)].contains("std::io::std")
+                    && !joined[..*at].ends_with("let _ = ")
+            })
+            .count();
+        assert_eq!(
+            undiscarded, 0,
+            "{undiscarded} console write in the run loop does not discard its result, so a \
+             failed write can still propagate out of the loop (issue #1494) — the outcome the \
+             `let _ = writeln!(std::io::stderr(), …)` form exists to rule out"
+        );
+    }
+
     fn acct(label: &str, uuid: &str) -> Account {
         Account {
             account_uuid: uuid.to_owned(),
