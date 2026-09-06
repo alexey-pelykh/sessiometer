@@ -216,9 +216,11 @@ fn report_tick_outcome<W: Write>(
         diag.emit(diagnostic);
     }
     // The console gets just swaps, sourced solely from labels (issue #15); the file event log
-    // (above) records every cycle.
+    // (above) records every cycle. A DISCARDED `writeln!` and not `eprintln!`, for the reason
+    // [`emit_best_effort`] states: `eprintln!` panics when the stderr write ITSELF fails, and
+    // under launchd this echo's stderr is a FILE on the event log's volume (issue #1494).
     if let Some(report) = swap_report(outcome) {
-        eprintln!("sessiometer: {report}");
+        let _ = writeln!(std::io::stderr(), "sessiometer: {report}");
     }
 }
 
@@ -517,12 +519,17 @@ pub(crate) fn unrecoverable_report(label: &str) -> String {
 /// the file log cannot reach: the foreground `run`'s stderr (matching the `sessiometer: …` swap
 /// reports) and a macOS user notification for the background-agent case (#168/#169 menubar
 /// direction). Both carry [`unrecoverable_report`] (handle + `claude /login`, label only), so no
-/// token or email can travel (#15). Best-effort and non-fatal: the daemon must outlive a failed
-/// notification, so a macOS spawn error is swallowed and the console line is the reliable channel.
+/// token or email can travel (#15). Best-effort and non-fatal on BOTH channels: the daemon must
+/// outlive a failed notification, so a macOS spawn error is swallowed — and, since issue #1494,
+/// so is a failed console write. The console is the more RELIABLE of the two (it needs no
+/// `osascript`, no GUI session and no notification permission), which is why the notification may
+/// be dropped without a fallback; it was never the INFALLIBLE one, and until #1494 `eprintln!`
+/// made it the single call here that could kill the daemon — the one outcome "non-fatal" rules
+/// out. Discarded `writeln!` for the reason [`emit_best_effort`] states.
 fn notify_unrecoverable(labels: &[String]) {
     for label in labels {
         let report = unrecoverable_report(label);
-        eprintln!("sessiometer: {report}");
+        let _ = writeln!(std::io::stderr(), "sessiometer: {report}");
         notify_macos("Sessiometer: account needs re-login", &report);
     }
 }
@@ -584,9 +591,13 @@ where
     W: Write,
 {
     // Reconcile-on-start is best-effort: a failure is logged and the loop still
-    // starts — the next swap re-establishes consistency anyway.
+    // starts — the next swap re-establishes consistency anyway. Discarded `writeln!` and not
+    // `eprintln!`, for the reason [`emit_best_effort`] states (issue #1494).
     if let Err(err) = daemon.reconcile_on_start().await {
-        eprintln!("sessiometer: reconcile-on-start skipped: {err}");
+        let _ = writeln!(
+            std::io::stderr(),
+            "sessiometer: reconcile-on-start skipped: {err}"
+        );
     }
 
     // Boot-time behavioral canary (issue #714), AFTER the reconcile above (its display
@@ -599,7 +610,7 @@ where
     {
         let mut events = Vec::new();
         if let Err(err) = daemon.refresh_canary(&mut events).await {
-            eprintln!("sessiometer: boot canary skipped: {err}");
+            let _ = writeln!(std::io::stderr(), "sessiometer: boot canary skipped: {err}");
         }
         for event in &events {
             emit_best_effort(log, event);
