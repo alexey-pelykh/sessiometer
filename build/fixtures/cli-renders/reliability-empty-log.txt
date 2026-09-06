@@ -13,6 +13,10 @@ observed session velocity (session_pct_per_min): no usage_velocity samples obser
 time blind & near-limit: 0s (sum of blind_window duration_secs where near_limit=true)
   uncensored episodes: none in view
 
+first sight after a change of active (observation_gap pair; the BREACH TAIL — the daemon emits only gaps already past its bound)
+  GOAL (p95 over the WHOLE first-sight distribution) is not computable from this source — a within-bound first sight emits no event at all (design OQ-3, open)
+  none in view (n=0)
+
 false-preempt (preemptive swap whose target turned out unnecessary)
   preemptive swaps observed: 0
   proxy (blind-window reconciliation, interim margin 20pp): 0 of 0 near-limit windows would-be-wasted

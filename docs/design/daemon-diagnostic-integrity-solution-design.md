@@ -309,6 +309,14 @@ that it works:** the two anchor branches are distinguishable at the emit site �
 separates them — so `observation_gap_enter` could carry which one fired, and a consumer could then
 separate post-swap first sights from mid-tenure gaps. Whether that is worth an event field belongs
 to #1488's implementation, and nothing here should be read as having decided it.
+>
+> **Disposition, recorded 2026-09-06 by #1488: DEFERRED, not taken.** Two reasons, and the second is
+> the binding one. It changes the daemon's event-emission surface, which sits outside what #1488
+> owns. And the SLI reads the **exit** line while the branch is knowable only at **entry**, so
+> consuming the field would require the enter↔exit pairing the exit's own doc comment exists to make
+> unnecessary — the latency is read off one line by design. Recorded rather than left silent because
+> this design asked for a decision and silence would have read as one. Worth a sibling issue; it is
+> the second thing standing between § 6b's R-4/R-5 row and COMPLETE, after OQ-3.
 
 What is **not** computable is the `GOAL` statistic itself. `GOAL` is a `p95` over the *whole*
 first-sight distribution; `E` omits every observation at or below `T` by construction, so `p95(E)` is
@@ -316,8 +324,10 @@ not `p95(whole)` and no filtering recovers it. That needs a source recording wit
 sights, and none exists today: **OQ-3** in § 11. Not closed by this design, and not to be recorded as
 closed.
 
-This is what #1488 delivers, and it is real: today neither the `FAIL` criterion nor the breach tail
-reaches any JSON wire, so nothing moves when a fix lands.
+This is what #1488 delivered, and it was real: **before** that item neither the `FAIL` criterion nor
+the breach tail reached any JSON wire, so nothing moved when a fix landed. As of `reliability`
+schema:13 (2026-09-06) both do — the `first_sight` block. The paragraphs above describe the
+pre-#1488 state and are kept as the reasoning that justified the work, not as a current reading.
 
 **Scope bound.** `record_usage_sample` stays inside the `poll_idx` guard, so the usage-sample store
 still cannot see a never-attempted poll. D-4 repairs the **event-log** readout only. Stating this is

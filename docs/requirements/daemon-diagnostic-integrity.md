@@ -45,8 +45,9 @@ restart. A self-report is load-bearing evidence, and three distinct properties o
 | **Deployable** — the operator can put the build they intend into service | `cargo build` replaces nothing that runs; the real procedure is undocumented | R-4, R-5 |
 
 **Not owned here — the observation-gap readout.** The investigation also found that
-`observation_gap_enter` / `observation_gap_exit` reach no JSON wire, so the post-swap first-sight SLI
-has no durable readout. That is **already a requirement elsewhere** — `must`, but **pipeline-authored
+`observation_gap_enter` / `observation_gap_exit` reached no JSON wire, so the post-swap first-sight
+SLI had no durable readout (delivered 2026-09-06 by issue #1488 as `reliability` schema:13's
+`first_sight` block; the finding is kept here as the reason the requirement was filed). That is **already a requirement elsewhere** — `must`, but **pipeline-authored
 and ratification-pending**, exactly like this PRD's own (that document's § 11 files R-4/R-5 under
 *Derived from measured evidence*, outstanding operator action; its § 1b ratifies only that the
 surfacing half is sized separately, and R-5 is the surfacing half):
