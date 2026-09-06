@@ -76,7 +76,7 @@ app.
 
 The procedure, the hazard in it, and that check:
 [`docs/runbooks/replacing-the-running-daemon.md`](docs/runbooks/replacing-the-running-daemon.md),
-which is authoritative wherever this summary and it disagree.
+which this paragraph only summarises — read it before acting on the summary.
 
 ## Hand-rolled primitives (and why)
 

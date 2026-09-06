@@ -13,7 +13,9 @@ procedure that does replace it, and the check that tells you it worked.
 
 **Run every command below from the repository root.** No block changes your working directory —
 `release-macos.sh` resolves its own location from `$0`, so it does not need you to `cd` into
-`apps/menubar` first, and every path here is repo-root-relative.
+`apps/menubar` first. Every path you are asked to *run* is repo-root-relative; the one quoted from
+inside the script (§ The hazard) is relative to `apps/menubar`, as that script's own working
+directory is.
 
 Written for a **contributor deploying to their own machine by hand**. It is not a release process —
 see § What this does not cover.
@@ -72,19 +74,34 @@ the app can each register it, and the app yields when the CLI already owns it (t
 invariant, `apps/menubar/Sources/LoginItemModel.swift`).
 
 ```sh
-launchctl print "gui/$(id -u)/org.sessiometer.agent" | grep -E '^	(managed_by|path|state|pid) '
+launchctl print "gui/$(id -u)/org.sessiometer.agent" | head -20
 ```
 
-`launchctl print` names the registrant — read `managed_by` and `path`:
+Deliberately unfiltered: the fields are in the first dozen lines, and the job's own properties are
+one tab in while nested dictionaries are deeper — a filter that loses that distinction reports a
+nested `state = active` as the job's. Read `managed_by` and `path`, which name the registrant:
 
 | What you see | Owner | What to do |
 |---|---|---|
 | `managed_by = com.apple.xpc.ServiceManagement`, `path = (submitted by smd.…)` | The app | Continue below — whether `state` is `running` or `not running`. |
 | `path = …/Library/LaunchAgents/org.sessiometer.agent.plist` | CLI (`sessiometer service install`) | **This runbook does not apply.** `service install` renders the plist for *the binary that runs it*, so re-pointing it is a `cargo build` plus a re-`install`. See `README.md` § Running in the background. |
-| The command fails — *"Could not find service"* | Nobody has registered it | There is nothing to replace yet. Build the bundle (§ The procedure, skipping step 1), launch the app, and press **Start daemon** in the panel. Launching does **not** register a daemon: the repair below only repairs a registration the app already holds, and first registration is deliberately the operator's act, not the app's. |
+| `Could not find service …` | No job in the domain | Ambiguous — see below. |
 
-`ls ~/Library/LaunchAgents/org.sessiometer.agent.plist` answers the same question from the other
-side and is worth running if `path` is ambiguous.
+**Run this before you start, and read the last row carefully.** *No job in the domain* is also what
+step 1 of this procedure produces, so once you are mid-run it stops being diagnostic. From a cold
+start it splits three ways, and the `ls` is what separates them:
+
+```sh
+ls ~/Library/LaunchAgents/org.sessiometer.agent.plist
+```
+
+- **The plist exists** — a CLI-installed agent that someone stopped. Row 2 above.
+- **No plist, and the app has never started a daemon** — nothing to replace yet. Build the bundle
+  (§ The procedure, skipping step 1), launch the app, and press **Start daemon** in the panel.
+  Launching does **not** register a daemon by itself: the repair below only repairs a registration
+  the app already holds, and first registration is deliberately the operator's act.
+- **`launchctl print` failed for some other reason** — a bad domain or a denied request exits
+  non-zero too, and carries no information about the job either way.
 
 ## The hazard: the script removes the directory you are probably running from
 
@@ -104,6 +121,13 @@ with `RunAtLoad` and a conditional `KeepAlive`, and it keeps running perfectly w
 executable is unlinked. Which is why the first step of the procedure stops it explicitly.
 
 ## The procedure
+
+**0. Take the baseline reading.** § Confirm compares against it, and after step 1 you cannot go
+back and get it:
+
+```sh
+sessiometer log | grep daemon_build | tail -1
+```
 
 **1. Quit the app, and stop the daemon.** Both — they are two separate launchd jobs, and each is
 needed for a different reason:
@@ -145,13 +169,15 @@ that is the repair (`apps/menubar/Sources/LoginItemModel.swift`).
 - **Quitting the app.** The repair runs from `applicationDidFinishLaunching` and nowhere else
   (`apps/menubar/Sources/main.swift`). `open` on an app that is *already running* activates it
   rather than launching it, so the repair never fires at all.
-- **Stopping the daemon.** The repair is gated: it *postpones* whenever our own agent's launchd job
-  is still running, because unregistering would terminate a live daemon. Skipped, it defers —
-  logged at `info` and nowhere else. With the daemon stopped the job is gone and the lock is free,
-  so it proceeds.
+- **Stopping the daemon.** The repair is gated: it *postpones* whenever a daemon is still live,
+  because unregistering would terminate it. With the job booted out and the single-instance lock
+  free, it proceeds. The lock is any-provenance by design, so a hand-run `sessiometer run` in
+  another terminal holds it too, and holds the repair off with it — stop that as well.
 
 Get either wrong and the old daemon keeps serving while § Confirm shows nothing changed and no error
-explains it.
+explains it. Only the live-daemon gate says anything at all, and only at `info` in the unified log;
+the repair's earlier gates return silently. **If the daemon does not come back, press Start daemon
+in the panel** — that registers unconditionally and does not depend on any of this.
 
 ### If you did not stop the daemon first
 
@@ -165,15 +191,18 @@ or § Confirm still shows the old build, fall back to stop-then-relaunch.
 
 Note the asymmetry: `daemon restart` **refuses** after a `daemon stop` on an app-owned agent —
 there is no CLI plist for it to bootstrap from, so it reports no managed service. Relaunching the
-app is what brings that one back.
+app is what brings that one back, and only when the executable actually changed: the repair
+short-circuits on an unchanged identity, and it also records a new identity *before* waiting for
+the daemon to appear, so a registration that succeeded while the spawn failed is not retried on the
+next launch either. **Start daemon** in the panel is the recovery for both.
 
 ## Confirm the build you just deployed is the one serving
 
 The daemon stamps its own identity into the event log at startup, so this is a read rather than an
-inference. **Take the reading before you start**, or you have one line and nothing to compare it to:
+inference. Run the same command as step 0 and compare the two:
 
 ```sh
-sessiometer log | grep daemon_build | tail -1     # run this BEFORE step 1, and again after step 3
+sessiometer log | grep daemon_build | tail -1     # the same command as step 0
 ```
 
 The line's shape (`Event::DaemonBuild`, `src/observability.rs`):
@@ -211,16 +240,16 @@ Three things that make a match look like a mismatch:
   not evidence that the deploy failed, but it does mean this check cannot answer the question.
 
 **An unchanged line is the informative failure**, and it looks exactly like a good one, which is why
-the before-reading matters. It means no new daemon reached the stamp. Three ways that happens, in
-rough order of likelihood here:
+step 0 matters. It means no new daemon reached the stamp, in rough order of likelihood here:
 
 1. **The old daemon never went away** — either half of step 1 skipped. Take the `pid` from
    `launchctl print` and age it with `ps -o lstart= -p <pid>`; `launchctl print` itself carries no
    start time, so the pid alone cannot tell you.
-2. **The replacement never started** — registration refused, or the daemon exited before the stamp.
-   The stamp is written early but not first: several fallible steps precede it (`src/cli.rs`) —
-   loading the config, requiring a non-empty roster, creating the private directories, opening the
-   event log — and any of them failing produces no line.
+2. **The replacement never started** — registration refused or postponed, or the daemon exited
+   before the stamp. The stamp is written early but not first (`src/cli.rs`): creating the support
+   directory precedes even the lock, and loading the config, requiring a non-empty roster, creating
+   the remaining private directories and opening the event log all precede the stamp. Any of them
+   failing produces no line.
 3. **Nothing was ever registered** — the third row of § First. Press **Start daemon** in the panel;
    nothing in this procedure registers an agent for the first time.
 4. **Something else already held the single-instance lock**, so the new daemon stood down before
