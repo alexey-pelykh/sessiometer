@@ -33,6 +33,15 @@ time blind & near-limit: 900s (sum of blind_window duration_secs where near_limi
   uncensored episodes: entered=1 exited=1 swapped_away=0 never_recovered=0 anchor_lost=0
   near-limit blind time: >= 480s (480s measured + 0s right-censored floor, n=1)
 
+first sight after a change of active (observation_gap pair; the BREACH TAIL — the daemon emits only gaps already past its bound)
+  GOAL (p95 over the WHOLE first-sight distribution) is not computable from this source — a within-bound first sight emits no event at all (design OQ-3, open)
+  qualifying exits: n=1 of 2 in view (1 swapped away before anything looked; 0 not active at entry)
+  breach P50  = 638s
+  breach P95  = 638s
+  breach P100 = 638s
+  FAIL (> 150s, TWICE the 75s entry edge): at most 1 — an upper bound; 0 is conclusive, non-zero is not (a mid-tenure gap passes the same filter)
+  gaps: entered=2 exited=2 never_recovered=0 anchor_lost=0
+
 false-preempt (preemptive swap whose target turned out unnecessary)
   preemptive swaps observed: 0
   proxy (blind-window reconciliation, interim margin 20pp): 1 of 2 near-limit windows would-be-wasted

@@ -3724,6 +3724,8 @@ ts=2026-07-11T00:20:00Z event=blind_window acct=u-B duration_secs=600 session_pc
 ts=2026-07-11T00:30:00Z event=blind_window acct=u-C duration_secs=120 session_pct=50 session_at_recovery=51 near_limit=false
 ts=2026-07-11T00:31:00Z event=blind_enter acct=u-D session_pct=97 weekly_pct=40 was_active=true near_limit=true
 ts=2026-07-11T00:32:00Z event=blind_exit acct=u-D duration_secs=999 session_burn_pct=-97 weekly_burn_pct=12 session_pct=97 session_at_recovery=0 weekly_pct=40 weekly_at_recovery=52 was_active=true swapped_away=true near_limit=true
+ts=2026-07-11T00:33:00Z event=observation_gap_enter acct=u-E elapsed_secs=76 threshold_secs=75 was_active=true
+ts=2026-07-11T00:34:00Z event=observation_gap_exit acct=u-E elapsed_secs=638 was_active=true swapped_away=false
 ts=2026-07-11T00:40:00Z event=usage_backoff acct=u-A class=rate_limited consecutive=1 backoff_secs=60
 ts=2026-07-11T00:41:00Z event=usage_backoff acct=u-A class=rate_limited consecutive=2 backoff_secs=120 retry_after_secs=120
 ts=2026-07-11T00:42:00Z event=usage_backoff acct=u-B class=transient consecutive=1 backoff_secs=30
@@ -3763,6 +3765,15 @@ ts=2026-07-11T00:50:00Z event=usage_velocity acct=u-A session_pct_per_min=0.20 w
         assert_eq!(inputs.blind_entries.len(), 1);
         assert_eq!(inputs.blind_exits.len(), 1);
         assert_eq!(inputs.blind_pair_malformed, 0);
+        // The observation-gap pair (issue #1488) reaches its OWN raw ingredients and nothing else —
+        // the same two-directional guard the blind pair above carries, and it matters MORE here
+        // because the two families are adjacent in subject (both are about the fleet going unseen)
+        // while disjoint in cause. The `time_blind_near_limit_secs == 900` and two-reconciliation
+        // assertions above are the other direction: this pair must not leak into a `blind_window`
+        // figure, and the `blind_entries`/`blind_exits` counts pin that it did not land there either.
+        assert_eq!(inputs.first_sight_entries.len(), 1);
+        assert_eq!(inputs.first_sight_exits.len(), 1);
+        assert_eq!(inputs.first_sight_malformed, 0);
         assert_eq!(inputs.rate_limited, 2);
         assert_eq!(inputs.transient, 1);
         assert_eq!(inputs.cleared, 1);
@@ -4261,7 +4272,7 @@ ts=2026-07-11T00:14:00Z event=refresh account=spare outcome=dead rotated=false
     /// the bump to a payload-shape change, so the two must be pinned together or a later edit can
     /// add a key and leave the version behind.
     #[test]
-    fn the_json_wire_carries_the_loss_block_under_schema_12() {
+    fn the_json_wire_carries_the_loss_block_under_schema_13() {
         let r = aggregate(
             &parse_events(LIVE_REPLAY_REFRESH_TOKEN_LOSS_LOG, None),
             &[],
@@ -4269,7 +4280,7 @@ ts=2026-07-11T00:14:00Z event=refresh account=spare outcome=dead rotated=false
         );
         let json: serde_json::Value =
             serde_json::from_str(&render_json(&r).expect("serializes")).expect("valid JSON");
-        assert_eq!(json["schema"], 12);
+        assert_eq!(json["schema"], 13);
         let loss = &json["refresh_token_loss"];
         assert_eq!(loss["accounts"], 3);
         assert_eq!(loss["observations"], 6);
@@ -5150,6 +5161,21 @@ ts=2026-07-11T00:04:00Z event=swap from=c to=d reason=session session_pct=100
                 "  uncensored episodes: entered=1 exited=1 swapped_away=1 never_recovered=0 anchor_lost=0\n",
                 "  near-limit blind time: >= 999s (999s measured + 0s right-censored floor, n=1)\n",
                 "\n",
+                // Issue #1488: the first-sight block, rendered directly beneath the blind census —
+                // the two blindness instruments adjacent, never merged. Note what did NOT move
+                // above it: `time_blind_near_limit_secs` is still 900 and the uncensored episode
+                // counts are unchanged, so the observation-gap pair reached this block and no
+                // other. The pair is FIXTURE_LOG's u-E, one enter (threshold 75) and one exit at
+                // 638s — past the 150s FAIL bound, and past `u8::MAX`, which is the type trap.
+                "first sight after a change of active (observation_gap pair; the BREACH TAIL — the daemon emits only gaps already past its bound)\n",
+                "  GOAL (p95 over the WHOLE first-sight distribution) is not computable from this source — a within-bound first sight emits no event at all (design OQ-3, open)\n",
+                "  qualifying exits: n=1 of 1 in view (0 swapped away before anything looked; 0 not active at entry)\n",
+                "  breach P50  = 638s\n",
+                "  breach P95  = 638s\n",
+                "  breach P100 = 638s\n",
+                "  FAIL (> 150s, TWICE the 75s entry edge): at most 1 — an upper bound; 0 is conclusive, non-zero is not (a mid-tenure gap passes the same filter)\n",
+                "  gaps: entered=1 exited=1 never_recovered=0 anchor_lost=0\n",
+                "\n",
                 "false-preempt (preemptive swap whose target turned out unnecessary)\n",
                 "  preemptive swaps observed: 0\n",
                 "  proxy (blind-window reconciliation, interim margin 20pp): 1 of 2 near-limit windows would-be-wasted\n",
@@ -5188,7 +5214,7 @@ ts=2026-07-11T00:04:00Z event=swap from=c to=d reason=session session_pct=100
     }
 
     #[test]
-    fn json_render_is_stable_schema_12() {
+    fn json_render_is_stable_schema_13() {
         // The whole-log default: `window` is null and every field except the #635-renamed
         // velocity-projection key (`projective_swap_out_pct`, schema:6) is byte-identical to
         // schema:1–5 — the additive contract (#494/#539/#595/#608/#636/#591) plus the one #635
@@ -5238,7 +5264,7 @@ ts=2026-07-11T00:04:00Z event=swap from=c to=d reason=session session_pct=100
             out,
             concat!(
                 "{\n",
-                "  \"schema\": 12,\n",
+                "  \"schema\": 13,\n",
                 "  \"window\": null,\n",
                 "  \"swap_overshoot\": {\n",
                 "    \"n\": 2,\n",
@@ -5353,6 +5379,34 @@ ts=2026-07-11T00:04:00Z event=swap from=c to=d reason=session session_pct=100
                 "      \"censored_floor_secs\": 0,\n",
                 "      \"total_secs_lower_bound\": 999\n",
                 "    }\n",
+                "  },\n",
+                // schema:13 (issue #1488): the first-sight block, INSERTED here beside the
+                // `blind_episodes` census it mirrors rather than appended last — so
+                // `refresh_token_loss` below is still last and its own "placed LAST" note stays
+                // true. FIXTURE_LOG's u-E pair populates it: one enter stamping the 75s bound, one
+                // exit at 638s. Read against the schema:12 expectation in git history and exactly
+                // two things differ, the version integer and this block; every figure above is
+                // byte-identical, which is the ADDITIVE claim pinned as bytes rather than argued.
+                //
+                // The percentile KEYS are the acceptance, not just the values: `breach_*` and no
+                // bare `p50`/`p95`, no `targets`/`met`. A GOAL verdict is not representable from a
+                // left-censored population, so this block publishes none.
+                "  \"first_sight\": {\n",
+                "    \"n\": 1,\n",
+                "    \"breach_p50\": 638,\n",
+                "    \"breach_p95\": 638,\n",
+                "    \"breach_p100\": 638,\n",
+                "    \"entry_threshold_secs\": 75,\n",
+                "    \"fail_bound_secs\": 150,\n",
+                "    \"n_over_fail_bound_upper\": 1,\n",
+                "    \"n_entered\": 1,\n",
+                "    \"n_exited\": 1,\n",
+                "    \"n_swapped_away\": 0,\n",
+                "    \"n_not_active\": 0,\n",
+                "    \"n_never_recovered\": 0,\n",
+                "    \"n_anchor_lost\": 0,\n",
+                "    \"n_exit_without_enter\": 0,\n",
+                "    \"n_malformed\": 0\n",
                 "  },\n",
                 "  \"rate_limit_neutrality\": {\n",
                 "    \"rate_limited\": 2,\n",
@@ -6015,8 +6069,8 @@ ts=2026-07-10T00:00:00Z event=swap from=a to=b reason=session session_pct=97
         ))
         .expect("serializes");
         assert!(
-            out.contains("\"schema\": 12,"),
-            "schema bumped to 12: {out}"
+            out.contains("\"schema\": 13,"),
+            "schema bumped to 13: {out}"
         );
         assert!(
             out.contains(concat!(
@@ -6206,6 +6260,365 @@ ts=2026-07-12T00:10:00Z event=usage_backoff acct=u-B class=transient consecutive
         assert_eq!(ep.n_anchor_lost, 0);
         assert_eq!(ep.n_never_recovered, 1);
         assert_eq!(ep.near_limit_censored_floor_secs, 600);
+    }
+
+    // --- issue #1488: the observation-gap first-sight readout -----------------
+
+    /// One log carrying every pathology the issue #1488 acceptance names at once: a severed pair
+    /// (`u-SEV`, an exit whose entry a `--since` cutoff or a rotation removed), a restart orphan
+    /// (`u-ORPH`, an entry superseded by a later entry for the same account), a gap still open at
+    /// the horizon (`u-OPEN`), a gap that ended by PARKING rather than by observation (`u-PARK`),
+    /// and two unplaceable lines — one exit with no `elapsed_secs`, one entry with no
+    /// `threshold_secs`.
+    ///
+    /// The qualifying latencies are 300 s and **638 s**. That second value is not decoration: it is
+    /// the requirement's own `PAST` "worst observed", and it is the one that FAILS the type trap
+    /// this block was most exposed to — the swap-SLI siblings carry `Option<u8>` percentiles because
+    /// they measure PERCENTAGES, and copying that type here would silently truncate every realistic
+    /// reading. A fixture built on small numbers would have passed a `u8` implementation.
+    const FIRST_SIGHT_LOG: &str = "\
+ts=2026-07-11T00:00:00Z event=observation_gap_exit acct=u-SEV elapsed_secs=300 was_active=true swapped_away=false
+ts=2026-07-11T00:01:00Z event=observation_gap_enter acct=u-ORPH elapsed_secs=80 threshold_secs=75 was_active=true
+ts=2026-07-11T00:02:00Z event=observation_gap_enter acct=u-ORPH elapsed_secs=90 threshold_secs=75 was_active=true
+ts=2026-07-11T00:03:00Z event=observation_gap_exit acct=u-ORPH elapsed_secs=638 was_active=true swapped_away=false
+ts=2026-07-11T00:04:00Z event=observation_gap_enter acct=u-OPEN elapsed_secs=80 threshold_secs=75 was_active=true
+ts=2026-07-11T00:05:00Z event=observation_gap_enter acct=u-PARK elapsed_secs=80 threshold_secs=75 was_active=true
+ts=2026-07-11T00:06:00Z event=observation_gap_exit acct=u-PARK elapsed_secs=420 was_active=true swapped_away=true
+ts=2026-07-11T00:07:00Z event=observation_gap_exit acct=u-BAD was_active=true swapped_away=false
+ts=2026-07-11T00:08:00Z event=observation_gap_enter acct=u-BAD2 elapsed_secs=80 was_active=true
+";
+
+    fn first_sight_of(log: &str, cutoff: Option<i64>) -> FirstSight {
+        aggregate(&parse_events(log, cutoff), &[], None).first_sight
+    }
+
+    /// AC-3 + AC-5: the four census pathologies are COUNTED, never silently dropped — and the
+    /// partition of `n_exited` is exact, so no exit goes undisclosed.
+    #[test]
+    fn the_first_sight_census_counts_all_four_pair_pathologies() {
+        let fs = first_sight_of(FIRST_SIGHT_LOG, None);
+
+        // Malformed lines never become entries or exits, so the two counts below are of PLACED
+        // lines only and the drop is disclosed separately (`n_malformed`), not folded away.
+        assert_eq!(fs.n_entered, 4, "u-ORPH x2, u-OPEN, u-PARK");
+        assert_eq!(fs.n_exited, 3, "u-SEV, u-ORPH, u-PARK");
+        assert_eq!(
+            fs.n_malformed, 2,
+            "the exit with no elapsed_secs, the entry with no threshold_secs"
+        );
+
+        // Severed pair: u-SEV's exit has no entry in view.
+        assert_eq!(fs.n_exit_without_enter, 1);
+        // Restart orphan: u-ORPH's second entry supersedes the first with no exit between, which
+        // the daemon's strictly-alternating state machine makes impossible unless the in-memory
+        // anchor was lost. Counted APART from never-recovered so a restart cannot inflate the tail.
+        assert_eq!(fs.n_anchor_lost, 1);
+        // Still open at the horizon: u-OPEN. Exactly one — u-ORPH's supersession must NOT also
+        // land here, which is the whole reason the two counts are separate.
+        assert_eq!(fs.n_never_recovered, 1);
+
+        // The exit partition is EXACT: every exit lands in exactly one bucket.
+        assert_eq!(fs.n + fs.n_swapped_away + fs.n_not_active, fs.n_exited);
+    }
+
+    /// AC-1 + AC-4: the percentiles are over the QUALIFYING exits only, and a gap that ended by
+    /// parking is excluded and counted apart.
+    #[test]
+    fn the_first_sight_percentiles_cover_only_the_qualifying_exits() {
+        let fs = first_sight_of(FIRST_SIGHT_LOG, None);
+
+        // u-SEV (300) and u-ORPH (638). u-PARK's 420 is EXCLUDED — folding it in would move p50
+        // from 300 to 420 and flatter the metric with an observation that never happened.
+        assert_eq!(fs.n, 2);
+        assert_eq!(fs.n_swapped_away, 1);
+        assert_eq!(fs.breach_p50, Some(300));
+        assert_eq!(fs.breach_p95, Some(638));
+        assert_eq!(fs.breach_p100, Some(638));
+
+        // A severed entry costs no sample: one line carries the whole latency, so u-SEV's 300 is
+        // in the distribution despite its entry being out of view.
+        assert!(
+            fs.n_exit_without_enter > 0,
+            "the fixture must exercise the severed pair here"
+        );
+
+        // THE TYPE TRAP, asserted rather than commented. `Option<u8>` — the shape every swap-SLI
+        // sibling uses — silently truncates 638 to 126. This is what catches a copy of that type.
+        assert!(
+            fs.breach_p100.is_some_and(|v| v > u64::from(u8::MAX)),
+            "the fixture no longer exercises a latency past u8::MAX, so it cannot catch a \
+             percentile typed as the swap SLIs' Option<u8>"
+        );
+    }
+
+    /// AC-4's exclusion, isolated: a log whose ONLY exit was swapped away has an empty percentile
+    /// subject even though it is not an empty log.
+    #[test]
+    fn a_gap_that_ended_by_parking_leaves_the_percentile_subject_empty() {
+        let log = "\
+ts=2026-07-11T00:00:00Z event=observation_gap_enter acct=u-A elapsed_secs=80 threshold_secs=75 was_active=true
+ts=2026-07-11T00:01:00Z event=observation_gap_exit acct=u-A elapsed_secs=420 was_active=true swapped_away=true
+";
+        let fs = first_sight_of(log, None);
+        assert_eq!(fs.n_exited, 1);
+        assert_eq!(fs.n_swapped_away, 1);
+        assert_eq!(fs.n, 0);
+        assert_eq!(
+            fs.breach_p50, None,
+            "a parked gap is not a first sight, so there is nothing to summarize"
+        );
+        assert_eq!(fs.breach_p95, None);
+        assert_eq!(fs.breach_p100, None);
+    }
+
+    /// AC-2: an empty window WITHHOLDS the percentiles rather than reporting `0`, and publishes the
+    /// sample count beside them so the denominator is visible.
+    #[test]
+    fn an_empty_window_withholds_the_first_sight_percentiles() {
+        // A cutoff past every line: the window is real, and it contains nothing.
+        let fs = first_sight_of(FIRST_SIGHT_LOG, Some(epoch("2026-07-11T01:00:00Z")));
+
+        assert_eq!(fs.n, 0, "the denominator must be published, not implied");
+        assert_eq!(fs.n_entered, 0);
+        assert_eq!(fs.n_exited, 0);
+        // `p95 = 0` over zero samples asserts PERFECT latency where nothing was measured — the
+        // discriminator against `RefreshTokenLossWire`'s plain-count shape, whose own doc comment
+        // says a zero THERE is a real reading.
+        assert_eq!(fs.breach_p50, None);
+        assert_eq!(fs.breach_p95, None);
+        assert_eq!(fs.breach_p100, None);
+        // And the bound itself is unobservable with no entry in view — ungraded, not a passing 0.
+        assert_eq!(fs.entry_threshold_secs, None);
+        assert_eq!(fs.fail_bound_secs(), None);
+        assert_eq!(fs.n_over_fail_bound_upper, None);
+
+        // The withhold must reach the surfaces, not just the struct.
+        let rendered = render_human(&aggregate(&parse_events("", None), &[], None));
+        assert!(
+            rendered.contains("first sight after a change of active"),
+            "the block is absent from the readout entirely:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("none in view"),
+            "an empty subject must say so rather than print a figure:\n{rendered}"
+        );
+        let json = render_json(&aggregate(&parse_events("", None), &[], None)).expect("serializes");
+        assert!(json.contains("\"breach_p50\": null"), "{json}");
+        assert!(json.contains("\"breach_p95\": null"), "{json}");
+        assert!(json.contains("\"n_over_fail_bound_upper\": null"), "{json}");
+    }
+
+    /// The `FAIL` detector is built at `2T` and never at `T`. The two differ by a factor of two, and
+    /// a detector at the entry edge would fire at HALF the threshold the requirement states — the
+    /// exact error `docs/design/daemon-diagnostic-integrity-solution-design.md` § 7 quotes the
+    /// daemon's own emitter comment unelided to warn against.
+    #[test]
+    fn the_fail_detector_is_built_at_twice_the_entry_edge() {
+        // Three qualifying exits straddling both thresholds: 80 s is past the 75 s ENTRY edge (it
+        // had to be, to be emitted at all) but under the 150 s FAIL bound; 151 s and 638 s are past
+        // both. A detector built at `T` would report 3 where the requirement's FAIL is 2.
+        let log = "\
+ts=2026-07-11T00:00:00Z event=observation_gap_enter acct=u-A elapsed_secs=80 threshold_secs=75 was_active=true
+ts=2026-07-11T00:01:00Z event=observation_gap_exit acct=u-A elapsed_secs=80 was_active=true swapped_away=false
+ts=2026-07-11T00:02:00Z event=observation_gap_enter acct=u-B elapsed_secs=80 threshold_secs=75 was_active=true
+ts=2026-07-11T00:03:00Z event=observation_gap_exit acct=u-B elapsed_secs=151 was_active=true swapped_away=false
+ts=2026-07-11T00:04:00Z event=observation_gap_enter acct=u-C elapsed_secs=80 threshold_secs=75 was_active=true
+ts=2026-07-11T00:05:00Z event=observation_gap_exit acct=u-C elapsed_secs=638 was_active=true swapped_away=false
+";
+        let fs = first_sight_of(log, None);
+        assert_eq!(fs.entry_threshold_secs, Some(75));
+        assert_eq!(
+            fs.fail_bound_secs(),
+            Some(150),
+            "the FAIL bound is 2T, not T"
+        );
+        assert_eq!(
+            fs.n_over_fail_bound_upper,
+            Some(2),
+            "a detector at the 75s entry edge would count all 3 — it must be built at 150s"
+        );
+    }
+
+    /// A `swapped_away` exit is outside § 6's `SCALE` (it ended by parking, not by observation), so
+    /// it cannot trip the `FAIL` detector either — the exclusion is one decision applied in both
+    /// places, not two that could drift.
+    #[test]
+    fn a_parked_gap_cannot_trip_the_fail_detector() {
+        let log = "\
+ts=2026-07-11T00:00:00Z event=observation_gap_enter acct=u-A elapsed_secs=80 threshold_secs=75 was_active=true
+ts=2026-07-11T00:01:00Z event=observation_gap_exit acct=u-A elapsed_secs=9000 was_active=true swapped_away=true
+";
+        let fs = first_sight_of(log, None);
+        assert_eq!(
+            fs.n_over_fail_bound_upper,
+            Some(0),
+            "a 9000s PARKED gap is not a FAIL occurrence"
+        );
+        assert_eq!(fs.n_swapped_away, 1, "but it must still be visible");
+    }
+
+    /// The bound is read off the log, never assumed — and its absence is reported as UNGRADED
+    /// rather than as a passing zero. `reliability` is an offline reader: it cannot see the
+    /// daemon's live `poll_secs` or rotation length, so a log carrying exits but no entry (a
+    /// `--since` cutoff, a rotation) leaves `T` genuinely unobservable.
+    #[test]
+    fn an_unobservable_bound_leaves_the_fail_criterion_ungraded_not_passing() {
+        let log = "\
+ts=2026-07-11T00:00:00Z event=observation_gap_exit acct=u-A elapsed_secs=638 was_active=true swapped_away=false
+";
+        let fs = first_sight_of(log, None);
+        assert_eq!(fs.entry_threshold_secs, None);
+        assert_eq!(
+            fs.n_over_fail_bound_upper, None,
+            "with no bound in view the criterion is ungraded; `Some(0)` would assert a PASS the \
+             log cannot support"
+        );
+        // The percentiles are unaffected — one line carries the whole latency.
+        assert_eq!(fs.breach_p100, Some(638));
+
+        let rendered = render_human(&aggregate(&parse_events(log, None), &[], None));
+        assert!(
+            rendered.contains("FAIL: ungraded"),
+            "the human surface must say the criterion was not graded:\n{rendered}"
+        );
+    }
+
+    /// A config change mid-window makes several bounds legitimate; the LATEST is the regime a
+    /// reader grades today's fleet against, and it is taken by log order rather than by magnitude.
+    #[test]
+    fn the_bound_is_the_latest_one_in_view_not_the_largest() {
+        let log = "\
+ts=2026-07-11T00:00:00Z event=observation_gap_enter acct=u-A elapsed_secs=400 threshold_secs=300 was_active=true
+ts=2026-07-11T00:01:00Z event=observation_gap_exit acct=u-A elapsed_secs=400 was_active=true swapped_away=false
+ts=2026-07-11T00:02:00Z event=observation_gap_enter acct=u-B elapsed_secs=80 threshold_secs=75 was_active=true
+ts=2026-07-11T00:03:00Z event=observation_gap_exit acct=u-B elapsed_secs=80 was_active=true swapped_away=false
+";
+        let fs = first_sight_of(log, None);
+        assert_eq!(
+            fs.entry_threshold_secs,
+            Some(75),
+            "the 300s bound is larger but older — the current regime is what a reader grades against"
+        );
+        assert_eq!(fs.fail_bound_secs(), Some(150));
+        assert_eq!(
+            fs.n_over_fail_bound_upper,
+            Some(1),
+            "only the 400s gap is past 150s"
+        );
+    }
+
+    /// The `--since` window bounds this readout like every sibling SLI, and the severed pair it
+    /// creates is DISCLOSED rather than absorbed: an exit whose entry the cutoff removed still
+    /// contributes its latency, and says so.
+    #[test]
+    fn the_window_bounds_the_first_sight_readout_and_discloses_the_pair_it_severs() {
+        let fs = first_sight_of(FIRST_SIGHT_LOG, Some(epoch("2026-07-11T00:03:00Z")));
+        // u-SEV's exit and u-ORPH's two entries are all before the cutoff.
+        assert_eq!(
+            fs.n_entered, 2,
+            "u-OPEN and u-PARK only: u-ORPH's two entries are before the cutoff, and u-BAD2's is \
+             malformed so it never became an entry at all"
+        );
+        assert_eq!(
+            fs.n_exited, 2,
+            "u-ORPH's 638 exit is AT the cutoff, plus u-PARK's"
+        );
+        assert_eq!(
+            fs.n_exit_without_enter, 1,
+            "u-ORPH's exit survived the cutoff while both its entries did not — the severed pair"
+        );
+        assert_eq!(
+            fs.n_anchor_lost, 0,
+            "the supersession was entirely out of window"
+        );
+        assert_eq!(
+            fs.breach_p100,
+            Some(638),
+            "a severed entry costs no percentile sample"
+        );
+    }
+
+    /// The two blindness families are DISJOINT: `blind_*` says a poll ran and failed, the
+    /// observation-gap pair says nothing looked. Neither may leak into the other's figures — the
+    /// same two-directional guard `parse_folds_only_the_four_relevant_families` pins on the shared
+    /// fixture, restated here on a log carrying ONLY the two pairs so a leak cannot hide behind
+    /// another family's counts.
+    #[test]
+    fn the_observation_gap_pair_and_the_blind_pair_do_not_leak_into_each_other() {
+        let log = "\
+ts=2026-07-11T00:00:00Z event=blind_enter acct=u-A session_pct=97 weekly_pct=40 was_active=true near_limit=true
+ts=2026-07-11T00:01:00Z event=blind_exit acct=u-A duration_secs=480 session_pct=97 session_at_recovery=98 weekly_pct=40 weekly_at_recovery=42 was_active=true swapped_away=false near_limit=true
+ts=2026-07-11T00:02:00Z event=observation_gap_enter acct=u-B elapsed_secs=80 threshold_secs=75 was_active=true
+ts=2026-07-11T00:03:00Z event=observation_gap_exit acct=u-B elapsed_secs=638 was_active=true swapped_away=false
+";
+        let r = aggregate(&parse_events(log, None), &[], None);
+        // The blind census sees its own pair and NOT the observation gap.
+        assert_eq!(r.blind_episodes.n_entered, 1);
+        assert_eq!(r.blind_episodes.n_exited, 1);
+        assert_eq!(r.blind_episodes.n_malformed, 0);
+        // The first-sight readout sees its own pair and NOT the blind one.
+        assert_eq!(r.first_sight.n_entered, 1);
+        assert_eq!(r.first_sight.n_exited, 1);
+        assert_eq!(r.first_sight.n_malformed, 0);
+        assert_eq!(r.first_sight.breach_p100, Some(638));
+        // And the `blind_window`-derived figure is untouched by either pair.
+        assert_eq!(r.time_blind_near_limit_secs, 0);
+    }
+
+    /// The human render names the censoring at the point of use and never grades the `GOAL` — the
+    /// design register's highest-rated risk (K-6) is a reader taking a bare percentile here for the
+    /// requirement's `GOAL` figure. Pinned as properties so it survives a re-baseline.
+    #[test]
+    fn the_first_sight_render_carries_its_censoring_and_grades_no_goal() {
+        let rendered = render_human(&aggregate(&parse_events(FIRST_SIGHT_LOG, None), &[], None));
+        assert!(
+            rendered.contains("BREACH TAIL"),
+            "the heading does not name the censored population:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("breach P50") && rendered.contains("breach P95"),
+            "the percentiles are rendered without the breach qualifier, which is the K-6 defect \
+             the wire field names exist to prevent:\n{rendered}"
+        );
+        assert!(
+            rendered
+                .contains("GOAL (p95 over the WHOLE first-sight distribution) is not computable"),
+            "a reader looking for the GOAL verdict must find out HERE that it is absent by \
+             construction, not conclude the readout forgot it:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("an upper bound"),
+            "the FAIL count is presented as exact, which over-reports: a mid-tenure gap passes \
+             the same filter:\n{rendered}"
+        );
+    }
+
+    /// The wire names the percentiles for the censored population — AC-1's naming constraint, and
+    /// design § 11's K-6 mitigation, asserted as BYTES rather than argued in a doc comment. A bare
+    /// `p50` / `p95` inside this block is the defect.
+    #[test]
+    fn the_first_sight_wire_never_publishes_a_bare_percentile_name() {
+        let json = render_json(&aggregate(&parse_events(FIRST_SIGHT_LOG, None), &[], None))
+            .expect("serializes");
+        let block = json
+            .split("\"first_sight\": {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n  }").next())
+            .expect("the first_sight block is on the wire");
+
+        assert!(block.contains("\"breach_p50\""), "{block}");
+        assert!(block.contains("\"breach_p95\""), "{block}");
+        assert!(
+            !block.contains("\"p50\"") && !block.contains("\"p95\"") && !block.contains("\"p100\""),
+            "a bare percentile key invites comparison against the GOAL this source cannot \
+             support:\n{block}"
+        );
+        // And no target/met pair: a GOAL verdict is not a representable state here, so publishing
+        // one would assert what the data cannot say.
+        assert!(
+            !block.contains("\"met\"") && !block.contains("\"targets\""),
+            "the block asserts a GOAL verdict its own population cannot support:\n{block}"
+        );
     }
 
     /// The #15 durable-line guarantee, extended to the readout: neither the human nor the JSON
@@ -7219,7 +7632,7 @@ ts=2026-07-11T10:10:00Z event=swap from=held-from to=held-to reason=manual sessi
 
     /// The same ten landings on the JSON wire, where a script reads them.
     ///
-    /// `json_render_is_stable_schema_12` pins the whole document, but its fixture leaves every
+    /// `json_render_is_stable_schema_13` pins the whole document, but its fixture leaves every
     /// operator percentile `null`, `capacity_held` at `0`, and `swaps_total` equal to
     /// `n_unmeasured` — so a projection that transposed P50 with P90, or `swaps_total` with
     /// `n_unmeasured`, passes it. `the_populated_operator_landing_block_renders_each_figure_in_its_own_place`
@@ -7385,9 +7798,13 @@ ts=2026-07-11T00:08:00Z event=all_exhausted hold=third cause=all_accounts_exhaus
 ts=2026-07-11T00:09:00Z event=swap from=work to=third reason=session session_pct=100
 ts=2026-07-11T00:10:00Z event=blind_window acct=u-A duration_secs=300 session_pct=97 session_at_recovery=99 near_limit=true
 ts=2026-07-11T00:20:00Z event=blind_window acct=u-B duration_secs=600 session_pct=96 session_at_recovery=40 near_limit=true
+ts=2026-07-11T00:24:00Z event=observation_gap_enter acct=u-E elapsed_secs=76 threshold_secs=75 was_active=true
 ts=2026-07-11T00:30:00Z event=blind_window acct=u-C duration_secs=120 session_pct=50 session_at_recovery=51 near_limit=false
 ts=2026-07-11T00:31:00Z event=blind_enter acct=u-D session_pct=95 weekly_pct=40 was_active=true near_limit=true
 ts=2026-07-11T00:32:00Z event=blind_exit acct=u-D duration_secs=480 session_burn_pct=3 weekly_burn_pct=2 session_pct=95 session_at_recovery=98 weekly_pct=40 weekly_at_recovery=42 was_active=true swapped_away=false near_limit=true
+ts=2026-07-11T00:33:00Z event=observation_gap_exit acct=u-E elapsed_secs=638 was_active=true swapped_away=false
+ts=2026-07-11T00:34:00Z event=observation_gap_enter acct=u-F elapsed_secs=90 threshold_secs=75 was_active=true
+ts=2026-07-11T00:35:00Z event=observation_gap_exit acct=u-F elapsed_secs=420 was_active=true swapped_away=true
 ts=2026-07-11T00:40:00Z event=usage_backoff acct=u-A class=rate_limited consecutive=1 backoff_secs=60
 ts=2026-07-11T00:41:00Z event=usage_backoff acct=u-B class=transient consecutive=1 backoff_secs=30
 ts=2026-07-11T00:45:00Z event=usage_backoff_cleared acct=u-A
@@ -7553,6 +7970,26 @@ ts=2026-07-11T00:50:00Z event=usage_velocity acct=u-A session_pct_per_min=0.20 w
                 full.contains("[ok]") || full.contains("[OVER]"),
                 "the populated case asserts no target verdict at all, so the flag rendering is \
                  unexercised"
+            );
+
+            // The issue #1488 FIRST-SIGHT axis. Without these three the block's goldens would be
+            // three renderings of "none in view", which asserts nothing about the populated path —
+            // the degenerate-subject trap this readout guards against everywhere else.
+            assert!(
+                full.contains("breach P100 = 638s"),
+                "the populated case does not render a first-sight percentile, so the goldens have \
+                 no opinion on the block at all:\n{full}"
+            );
+            assert!(
+                windowed.contains("exits with no entry in view: 1"),
+                "the windowed case does not sever the observation-gap pair, so it duplicates the \
+                 full case for this block instead of exercising the `--since` pathology:\n{windowed}"
+            );
+            assert!(
+                empty.contains("first sight after a change of active")
+                    && empty.contains("none in view"),
+                "the empty-log case must still render the block, and must withhold rather than \
+                 print a figure:\n{empty}"
             );
         }
 
