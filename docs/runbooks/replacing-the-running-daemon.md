@@ -11,8 +11,9 @@ source: docs/requirements/daemon-diagnostic-integrity.md
 machine where the menu-bar app owns the daemon, nothing loads that path. This runbook is the
 procedure that does replace it, and the check that tells you it worked.
 
-**Run every command below from the repository root**, except where a block says otherwise. The one
-`cd` in the procedure is inside its own command and does not carry over.
+**Run every command below from the repository root.** No block changes your working directory —
+`release-macos.sh` resolves its own location from `$0`, so it does not need you to `cd` into
+`apps/menubar` first, and every path here is repo-root-relative.
 
 Written for a **contributor deploying to their own machine by hand**. It is not a release process —
 see § What this does not cover.
@@ -57,10 +58,12 @@ So a `cargo build`, however green, changes nothing that serves.
   ```
 
   There is no alternative deployment path in this repo for a contributor without that identity.
-- **A `sessiometer` CLI you can invoke** for the read-only verbs below (`daemon stop`, `log`). Any
-  build reads the same event log and the same launchd domain, so `cargo build --release` and
-  `./target/release/sessiometer` is fine here — that build cannot *serve*, which is this runbook's
-  whole point, but it can *ask*. Adjust the command names below to however you invoke it.
+- **A `sessiometer` CLI you can invoke** for `log` and `daemon stop` below. Any build will do,
+  including `cargo build --release` and `./target/release/sessiometer`: `log` reads a file, and
+  `daemon stop` acts on the launchd job by *label*, never on the binary that issued it. That build
+  cannot *serve* — this runbook's whole point — but it can drive both. Note that `daemon stop` is
+  not a probe: it terminates the running daemon. Adjust the command names below to however you
+  invoke it.
 
 ## First: which of the two owners are you replacing?
 
@@ -69,18 +72,19 @@ the app can each register it, and the app yields when the CLI already owns it (t
 invariant, `apps/menubar/Sources/LoginItemModel.swift`).
 
 ```sh
-ls ~/Library/LaunchAgents/org.sessiometer.agent.plist    # CLI-owned iff this exists
-launchctl print "gui/$(id -u)/org.sessiometer.agent" | grep -E '^	(state|pid) '
+launchctl print "gui/$(id -u)/org.sessiometer.agent" | grep -E '^	(managed_by|path|state|pid) '
 ```
+
+`launchctl print` names the registrant — read `managed_by` and `path`:
 
 | What you see | Owner | What to do |
 |---|---|---|
-| The plist exists | CLI (`sessiometer service install`) | **This runbook does not apply.** `service install` renders the plist for *the binary that runs it*, so re-pointing it is a `cargo build` plus a re-`install`. See `README.md` § Running in the background. |
-| No plist; `launchctl print` shows `state = running` | The app | Continue below. |
-| No plist; `launchctl print` fails or shows no running state | Nobody, yet | There is nothing to replace. Build the bundle (§ The procedure, skipping the stop) and launch the app once; registering is what the first launch does. |
+| `managed_by = com.apple.xpc.ServiceManagement`, `path = (submitted by smd.…)` | The app | Continue below — whether `state` is `running` or `not running`. |
+| `path = …/Library/LaunchAgents/org.sessiometer.agent.plist` | CLI (`sessiometer service install`) | **This runbook does not apply.** `service install` renders the plist for *the binary that runs it*, so re-pointing it is a `cargo build` plus a re-`install`. See `README.md` § Running in the background. |
+| The command fails — *"Could not find service"* | Nobody has registered it | There is nothing to replace yet. Build the bundle (§ The procedure, skipping step 1), launch the app, and press **Start daemon** in the panel. Launching does **not** register a daemon: the repair below only repairs a registration the app already holds, and first registration is deliberately the operator's act, not the app's. |
 
-`launchctl print` is keyed on the label alone and cannot tell you *who* registered the job — the
-plist check is what distinguishes them, so run both.
+`ls ~/Library/LaunchAgents/org.sessiometer.agent.plist` answers the same question from the other
+side and is worth running if `path` is ambiguous.
 
 ## The hazard: the script removes the directory you are probably running from
 
@@ -101,16 +105,18 @@ executable is unlinked. Which is why the first step of the procedure stops it ex
 
 ## The procedure
 
-**1. Stop the app and the daemon.** Both, and the daemon is the one that is easy to miss:
+**1. Quit the app, and stop the daemon.** Both — they are two separate launchd jobs, and each is
+needed for a different reason:
 
 ```sh
-sessiometer daemon stop      # boots the agent out of your login session
+osascript -e 'quit app "Sessiometer"'   # the app; its bundle is about to be deleted
+sessiometer daemon stop                 # the daemon; boots the agent out of your login session
 ```
 
 **2. Rebuild and sign the bundle.**
 
 ```sh
-cd apps/menubar && ./scripts/release-macos.sh --sign-only
+./apps/menubar/scripts/release-macos.sh --sign-only
 ```
 
 `--sign-only` stops after signing, because CI notarizes separately with an ASC API key
@@ -134,16 +140,23 @@ open apps/menubar/.build/Build/Products/Release/Sessiometer.app
 Launching fires `reconcileDaemonAgentRegistration()`, which unregisters before re-registering —
 that is the repair (`apps/menubar/Sources/LoginItemModel.swift`).
 
-**Step 1 is what makes step 3 work.** That repair is gated: it *postpones* whenever our own agent's
-launchd job is still running, because unregistering would terminate a live daemon. Skip the stop and
-the repair silently defers — logged at `info` and nowhere else — the old daemon keeps serving, and
-you land on § Confirm with nothing changed and no error to explain it. With the daemon stopped the
-job is gone and the lock is free, so the repair proceeds.
+**Both halves of step 1 are what make step 3 work**, and each failure is silent:
+
+- **Quitting the app.** The repair runs from `applicationDidFinishLaunching` and nowhere else
+  (`apps/menubar/Sources/main.swift`). `open` on an app that is *already running* activates it
+  rather than launching it, so the repair never fires at all.
+- **Stopping the daemon.** The repair is gated: it *postpones* whenever our own agent's launchd job
+  is still running, because unregistering would terminate a live daemon. Skipped, it defers —
+  logged at `info` and nowhere else. With the daemon stopped the job is gone and the lock is free,
+  so it proceeds.
+
+Get either wrong and the old daemon keeps serving while § Confirm shows nothing changed and no error
+explains it.
 
 ### If you did not stop the daemon first
 
-`sessiometer daemon restart` (which is `launchctl kickstart -k gui/<uid>/org.sessiometer.agent`,
-`src/service.rs:166`) restarts the job, and because the registration points at a *path* whose
+`sessiometer daemon restart` (`kickstart_managed`, `src/service.rs:166`, which runs
+`launchctl kickstart -k` against the agent) restarts the job, and because the registration points at a *path* whose
 contents you just replaced, it comes back on the new binary. It is the faster route.
 
 Be clear about what it does not do: it does **not** re-register, which is the thing `SMAppService`
@@ -201,13 +214,16 @@ Three things that make a match look like a mismatch:
 the before-reading matters. It means no new daemon reached the stamp. Three ways that happens, in
 rough order of likelihood here:
 
-1. **The old daemon never went away** — the deferred-repair case above. Check
-   `launchctl print "gui/$(id -u)/org.sessiometer.agent"` for a `pid` older than your rebuild.
+1. **The old daemon never went away** — either half of step 1 skipped. Take the `pid` from
+   `launchctl print` and age it with `ps -o lstart= -p <pid>`; `launchctl print` itself carries no
+   start time, so the pid alone cannot tell you.
 2. **The replacement never started** — registration refused, or the daemon exited before the stamp.
-   The stamp is written early but not first: it sits after the config load, the roster check and
-   opening the event log (`src/cli.rs`), so a missing config or an empty roster also produces no
-   line.
-3. **Something else already held the single-instance lock**, so the new daemon stood down before
+   The stamp is written early but not first: several fallible steps precede it (`src/cli.rs`) —
+   loading the config, requiring a non-empty roster, creating the private directories, opening the
+   event log — and any of them failing produces no line.
+3. **Nothing was ever registered** — the third row of § First. Press **Start daemon** in the panel;
+   nothing in this procedure registers an agent for the first time.
+4. **Something else already held the single-instance lock**, so the new daemon stood down before
    stamping.
 
 ## What this does not cover
@@ -219,9 +235,10 @@ path and CI's job, not steps an operator runs from this document.
 ## Known limitation
 
 This runbook documents a script's behaviour, and **nothing in this repo reconciles the two**. No CI
-job reads this file against `release-macos.sh`, and the citation-rot gate does not reach it either —
-`scripts/check-doc-citation-rot.sh` only inspects `src/*.rs:NNN` citations, so the
-`release-macos.sh:NN` line numbers above are checked by nobody.
+job reads this file against `release-macos.sh`. The citation-rot gate reaches this file, but only
+partly: `scripts/check-doc-citation-rot.sh` matches `src/*.rs:NNN` and nothing else, so the two
+Rust citations above are held to a symbol while every `release-macos.sh:NN` line number is checked
+by nobody.
 
 Citing rather than restating bounds the rot unevenly, and it is worth being exact about which half:
 a **renamed flag or a moved file** shows up the moment a reader follows the citation, but a **moved
