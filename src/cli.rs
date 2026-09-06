@@ -6247,13 +6247,16 @@ mod tests {
         //
         // WHAT THIS GUARD COVERS, STATED SO THE BOUND IS NOT MISREAD: exactly one file,
         // `src/daemon/run_loop.rs`. It is NOT a guard over "the daemon's live path", which is a
-        // strictly larger set. SIX reports outside this file are reached after the socket binds
-        // and still panic on a failed write — `cli::run`'s own "daemon started" line, four in
-        // `refresh`'s orphan reapers (both called from `cli::run` after the bind), and
-        // `daemon::append_sample_for_poll`, the most frequent of all since it fires every poll.
-        // All six are enumerated in issue #1498, none is converted here, and that is why this
-        // scan is one file wide: widening it without converting them in the same change would
-        // fail on sites issue #1494 deliberately did not touch.
+        // strictly larger set — AT LEAST NINE reports outside this file are reached after the
+        // socket binds and still panic on a failed write: `cli::run`'s own "daemon started"
+        // line, four in `refresh`'s orphan reapers, `daemon::append_sample_for_poll` (every
+        // poll), `witness::resolve_probe` and `stats::stats_socket_json_with` (both
+        // socket-served), and `stats::fleet_runway`, whose own comment already NAMES this
+        // defect. A FLOOR and not a count: the live subset of the crate's console reports is a
+        // call-chain question per site, this enumeration has been revised upward twice, and
+        // issue #1498 owns the sweep rather than this comment. That is why the scan stays one
+        // file wide — widening it without converting those in the same change would fail on
+        // sites issue #1494 deliberately did not touch.
         //
         // A SOURCE scan for the same reason the guard above is one: stderr cannot be made
         // unwritable inside a running test process without taking the harness down with it.
@@ -6312,16 +6315,27 @@ mod tests {
              narrower than the file and the assertions below cover less than they claim"
         );
 
-        // The property is "cannot panic while reporting", NOT "does not spell `eprintln!`" —
-        // naming only the one macro would pass `println!` (same `print_to`, same panic, and
-        // `StandardOutPath` is a file too), `dbg!` (expands to `eprintln!`), and above all
-        // `writeln!(…).expect(…)`, which is the likeliest regression of the lot: `let _ =`
-        // reads like a lint smell and `.expect()` is the reflex "fix". So check BOTH halves —
-        // no panicking console macro, and every `writeln!` in the discarded form.
-        const PANICKING: [&str; 5] = ["eprintln!(", "eprint!(", "println!(", "print!(", "dbg!("];
+        // The property is "cannot panic while reporting", NOT "does not spell `eprintln!`".
+        // Naming one macro passed `println!` (same `print_to`, same panic; `StandardOutPath` is
+        // a file too) and `dbg!` (expands to `eprintln!`). Naming the macros AND requiring a
+        // discarded `writeln!` still passed `write!(…).expect(…)` — two characters from the
+        // prescribed form — plus `stderr().write_all(…).expect(…)`, `.write_fmt(…).expect(…)`,
+        // and a bound `let mut e = stderr(); …; e.flush().expect(…)`. Each was measured green
+        // against this test, `cargo fmt --check` and `cargo clippy -D warnings`.
+        //
+        // Enumerating the write surface is what kept failing, so the third invariant below does
+        // not enumerate it. It forbids the PANIC SHAPES themselves anywhere in this file, which
+        // is a superset of "while reporting" and is deliberately so: `label_at`'s own comment
+        // already states the principle for this module — "the long-running daemon must never
+        // panic on a display path". The file satisfies it today with zero occurrences, so it
+        // costs nothing to hold. A future `.expect()` here that is genuinely justified must
+        // amend this list and say why, which is the point.
+
+        const PANICKING_MACROS: [&str; 5] =
+            ["eprintln!(", "eprint!(", "println!(", "print!(", "dbg!("];
         let regressed: Vec<String> = code
             .iter()
-            .filter(|(_, line)| PANICKING.iter().any(|macro_| line.contains(macro_)))
+            .filter(|(_, line)| PANICKING_MACROS.iter().any(|name| line.contains(name)))
             .map(|(n, line)| format!("  src/daemon/run_loop.rs:{n}: {}", line.trim()))
             .collect();
         assert!(
@@ -6333,22 +6347,46 @@ mod tests {
             regressed.join("\n")
         );
 
-        // `let _ = ` is contiguous with `writeln!` in both the one-line and the rustfmt-wrapped
-        // form, so scanning the joined code catches either. Anything else — `.expect(…)`,
-        // `.unwrap()`, `?` — keeps the `io::Error` live and can still abort the daemon.
+        const PANIC_SHAPES: [&str; 5] =
+            [".expect(", ".unwrap(", "panic!(", "unreachable!(", "todo!("];
+        let panics: Vec<String> = code
+            .iter()
+            .filter(|(_, line)| PANIC_SHAPES.iter().any(|name| line.contains(name)))
+            .map(|(n, line)| format!("  src/daemon/run_loop.rs:{n}: {}", line.trim()))
+            .collect();
+        assert!(
+            panics.is_empty(),
+            "the run loop gained a call that can panic. On the daemon's live path that aborts \
+             the process, and when it sits on a console report it reintroduces exactly what \
+             issue #1494 removed — `.expect()` on a write is the reflex repair for a `let _ =` \
+             that reads like a lint smell. Report through the discarded `writeln!` form, or \
+             amend PANIC_SHAPES with the reason this one cannot fire:\n{}",
+            panics.join("\n")
+        );
+
+        // Writes ADDRESSED TO THE CONSOLE must additionally discard: `?` would compile inside
+        // `run_loop` (it returns `Result`) and would end the loop on a failed console write —
+        // a panic shape's quieter cousin that the list above cannot see. Scoped to stderr and
+        // stdout deliberately, so a legitimate propagating write to a caller-owned `W: Write`
+        // — which `report_tick_outcome<W: Write>`'s own signature invites — is not caught here.
         let joined = code
             .iter()
             .map(|(_, line)| *line)
             .collect::<Vec<_>>()
             .join("\n");
         let undiscarded = joined
-            .match_indices("writeln!")
-            .filter(|(at, _)| !joined[..*at].ends_with("let _ = "))
+            .match_indices("write")
+            .filter(|(at, _)| {
+                let tail = &joined[*at..];
+                (tail.starts_with("writeln!") || tail.starts_with("write!"))
+                    && tail[..tail.len().min(90)].contains("std::io::std")
+                    && !joined[..*at].ends_with("let _ = ")
+            })
             .count();
         assert_eq!(
             undiscarded, 0,
-            "{undiscarded} `writeln!` in the run loop does not discard its result, so a failed \
-             console write can still propagate or panic (issue #1494) — the exact outcome the \
+            "{undiscarded} console write in the run loop does not discard its result, so a \
+             failed write can still propagate out of the loop (issue #1494) — the outcome the \
              `let _ = writeln!(std::io::stderr(), …)` form exists to rule out"
         );
     }
