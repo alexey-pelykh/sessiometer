@@ -1254,17 +1254,20 @@ const RELIABILITY_USAGE: &str = "sessiometer reliability — swap-out overshoot 
 USAGE:
     sessiometer reliability [--since <duration>] [--json]
 
-    --since <d> bound all four indicators to events at/after now - <duration>. <duration> is a
+    --since <d> bound every indicator to events at/after now - <duration>. <duration> is a
                 non-negative integer with a unit: s, m, h, d, w (e.g. 30m, 24h, 7d, 2w). Omit for
                 the whole-log aggregate (the default).
     --json      print the readout as JSON (schema:13, for scripts) instead of the text view
     -h, --help  print this help
 
 READ-ONLY: it reads ~/Library/Logs/sessiometer/sessiometer.log and makes no live call, so it
-works when the daemon is down. It reports four indicators, each with its target: swap-out
-session_pct P50/P95/P100 (targets P50 <= 97, P100 < 99); time spent blind while near the limit; a
+works when the daemon is down. It reports a roster-wide indicator set — SOME carry a target and
+some cannot: swap-out session_pct P50/P95/P100 (targets P50 <= 97, P100 < 99); time spent blind
+while near the limit; post-swap first-sight BREACH latency (no target, deliberately — the daemon
+emits only gaps already past its bound, so the goal figure is not computable from that source); a
 false-preempt proxy from the blind-window recovery reconciliation; and the usage-poll 429 vs
-transient counts. By default the indicators fold the whole log; --since <duration> bounds them to a
+transient counts, among others. The count is deliberately not stated here: it has grown with every
+schema bump, and a number in help text goes stale silently. By default the indicators fold the whole log; --since <duration> bounds them to a
 recent window (the cutoff is documented in both output forms). The readout is roster-wide numbers
 only — no per-account breakdown, no identifiers.
 ";

@@ -5,23 +5,28 @@ XCTest bundle. These scenarios pin each acceptance criterion in scenario form; d
 written scenario as a passing test.
 
 Built by issue #1488 (2026-09-06). Each scenario now carries a `# Binds:` line naming the test that
-holds it; an unbound scenario is a statement of intent, never evidence. Two are deliberately left
-unbound and say so in place — both are statements about what the DIFF does not contain, which no
-assertion can carry.
+holds it; an unbound scenario is a statement of intent, never evidence. Exactly ONE scenario is
+unbound — "the usage-sample store is NOT repaired by this", a scope bound rather than a behaviour
+this item adds — plus the three NEGATIVE clauses inside "the reliability wire bumps, and nothing
+else does", which are statements about what the DIFF does not contain and which no assertion can
+carry. Those are two different reasons, and an earlier form of this note gave the second one for
+both while counting them as two scenarios.
 -->
 
 # Feature: the first-sight SLI has a durable readout, and withholds what it could not measure
 
 Issue #1488 · `active-account-observation-continuity` R-4 / R-5 · design § 7 (D-4 / D-4b)
 
-Example Mapping: 🟦 4 rules · 🟩 10 examples · 🟥 0 open
+Example Mapping: 🟦 4 rules · 🟩 13 examples · 🟥 0 open
 
 > `PostSwapFirstSightLatency` is pinned as Planguage — p50/p95 over a 7-day window, GOAL
 > `p95 <= 2*poll_secs/N`, PAST p50 182 s / p95 436 s, worst observed 638 s. The instrument exists:
 > the `ObservationGapEnter` / `ObservationGapExit` render arms in `src/observability.rs` — but it
 > is edge-triggered PAST the bound, so it instruments the **breach tail**, not the whole
-> distribution, and the `GOAL` half of that Planguage tag has no source (design § 11 OQ-3). But the
-> pair reaches **no JSON wire**, so the SLI has no durable readout and nothing moves when a fix lands.
+> distribution, and the `GOAL` half of that Planguage tag has no source (design § 11 OQ-3). Before
+> this item the pair reached **no JSON wire**, so the SLI had no durable readout and nothing moved
+> when a fix landed. As of schema:13 it does; `docs/design/daemon-diagnostic-integrity-solution-design.md`
+> § 7 and `docs/requirements/daemon-diagnostic-integrity.md` still describe the pre-#1488 state.
 >
 > The readout is a `first_sight` block on `ReliabilityWire`, mirroring `BlindEpisodesWire` — the same
 > enter/exit-pair census, because it faces the same four pathologies.
@@ -51,12 +56,18 @@ Scenario: the SLI is computed from the qualifying exits only
     # p50 is therefore the median of BREACHES, and p95 <= GOAL is unreachable while n > 0 -- while
     # at n = 0 the next rule withholds the figure. The GOAL-met state is not representable.
     # Mind the factor of two. With T = 2*poll_secs/N: the ENTRY edge is T, GOAL is p95 <= T, and
-    # FAIL is any occurrence > 2T -- TWICE the entry edge. So filtering the emitted set on
-    # elapsed_secs > 2T CANNOT produce a false negative: empty means no FAIL, conclusively. It is an
+    # FAIL is any occurrence > 2T -- TWICE the entry edge. Since 2T > T, no occurrence that would
+    # trip FAIL is missing from the EMITTED set, so the censoring alone cannot lose one. It is an
     # UPPER BOUND and not an exact count -- the entry anchor is observed.max(designated), so a
     # mid-tenure gap on a long-active account passes this same filter while sitting outside section
     # 6's post-swap SCALE. Do not build a FAIL verdict that treats a non-empty result as certain. A
-    # detector built at T instead would fire at half the threshold section 6 states. (Section 6's
+    # detector built at T instead would fire at half the threshold section 6 states.
+    # An earlier form of this note went further and said "empty means no FAIL, conclusively". That
+    # is FALSE as an unconditional claim, and the two ways it fails are pinned as scenarios under
+    # Rule 3: one 2T is applied to every exit while a window can hold several T (the rotation length
+    # is the divisor), and three populations sit outside the filter entirely. Take the SMALLEST T in
+    # view, and publish whether the zero carries its strong reading rather than asserting it always
+    # does. (Section 6's
     # Planguage is itself pipeline-authored and ratification-pending per that PRD's section 11 --
     # it is the stated requirement, not an operator-ratified one.)
     # What is NOT computable is GOAL's p95, which is stated over the WHOLE distribution -- and this
@@ -70,7 +81,7 @@ Scenario: the SLI is computed from the qualifying exits only
     # render consistent with the wire. This is design section 11 K-6's mitigation -- the highest-
     # rated risk in that register -- and it lives here because this is what an implementer reads.
 
-Scenario: a gap that ended by being parked is not a first sight
+Scenario: a gap whose designation moved is not a first sight of the current one
   Given an observation_gap_exit line with swapped_away=true
    When the block is computed
    Then it is excluded from the percentiles
@@ -79,8 +90,13 @@ Scenario: a gap that ended by being parked is not a first sight
     # the exclusion and the separate count, and reliability::tests::a_parked_gap_cannot_trip_the_fail
     # _detector for the second consumer — the FAIL detector applies the SAME exclusion, so a 9000s
     # parked gap is not a FAIL occurrence. One decision in two places, pinned so they cannot drift.
-    # Such a gap ended by the account being parked, not by being observed. Folding it in would
-    # flatter the metric — it would look like an observation that never happened.
+    # Read the emitter before reading this exclusion. The daemon pushes NO exit until an
+    # observation lands newer than the anchor, so a swapped_away episode DID end in a real
+    # observation — this is not "nothing ever looked". What moved is which designation the sample
+    # belongs to: the episode opened on the active account and closed after the daemon had swapped
+    # away, or after the account left and came back. Nor does folding it in flatter the metric; in
+    # the committed fixture it moves p50 from 300 to 420, i.e. the wrong way. The exclusion is about
+    # WHICH designation the sample measures, and about nothing else.
 ```
 
 ## Rule 2 — an empty subject withholds the figure rather than reporting zero
@@ -109,7 +125,8 @@ Scenario: a thin window is legible as thin
     # Binds: reliability::tests::json_render_is_stable_schema_13, whose pinned document carries "n"
     # as the FIRST key of the first_sight block, immediately above breach_p50 — so a consumer cannot
     # read a percentile without having read its denominator. The human render's "qualifying exits:
-    # n=1 of 2 in view" line is pinned by the three committed cli-render goldens.
+    # n=1 of 2 in view" line is pinned by TWO of the three committed cli-render goldens (full and
+    # windowed); the third, empty-log, takes the withholding branch and pins "none in view (n=0)".
     # The denominator is published, not implied — a reader must be able to see the figure is thin
     # rather than discovering it later.
 ```
@@ -142,6 +159,50 @@ Scenario: an episode still open at the horizon
    Then it is counted as never-recovered
     # Binds: reliability::tests::the_first_sight_census_counts_all_four_pair_pathologies.
     # A gap that never closed is the WORST case, not a missing sample. It must not vanish.
+
+Scenario: the window holds more than one entry edge
+  Given observation_gap_enter lines carrying different threshold_secs
+   When the FAIL bound is derived
+   Then it is twice the SMALLEST edge in view
+    And the count of distinct edges is published
+    # Binds: reliability::tests::the_fail_bound_is_the_smallest_edge_in_view_so_a_mixed_window
+    # _cannot_hide_a_fail, whose fixture returns 1 under the smallest edge and 0 under the latest —
+    # so it discriminates rather than merely agreeing. Its sibling ..._tracks_a_tightened_edge_too
+    # covers the case where smallest and latest coincide, which passes either way.
+    # This is not a hand-built input. observation_gap_threshold() divides by the rotation length,
+    # which counts enabled, un-quarantined accounts, so quarantining one account of four raises T
+    # from 150s to 200s mid-window with no restart and no config edit — and raises it in the
+    # under-counting direction, precisely when the fleet is already degraded. One 2T is applied to
+    # every subject exit, so grading a tighter episode against a looser bound reports a real FAIL as
+    # absent. The minimum can only over-count, which is what an upper bound is for.
+
+Scenario: a zero FAIL count is qualified by what the filter could not see
+  Given the block is computed
+   When n_over_fail_bound_upper is 0
+   Then whether that zero is conclusive is published beside it
+    # Binds: reliability::tests::a_zero_fail_count_is_conclusive_only_when_nothing_went_unseen,
+    # which asserts each disqualifier ALONE strips the strong reading, on both surfaces.
+    # Three populations sit outside the 2T filter and each can hide an occurrence: an unplaceable
+    # line never becomes an exit, a still-open gap has no elapsed_secs yet, and a severed exit has
+    # no T of its own so the window's bound may exceed the one its episode ran under. Derived once
+    # (fail_zero_is_conclusive) rather than restated per surface, so the human render and the wire
+    # cannot disagree about a verdict's strength. The committed windowed golden takes the
+    # NOT-conclusive branch off its own severed pair.
+
+Scenario: an unreadable boolean flag
+  Given an observation_gap_exit line whose was_active or swapped_away is not exactly true or false
+   When the line is parsed
+   Then it is counted as malformed
+    And it contributes no percentile and no FAIL sample
+    # Binds: reliability::tests::an_unreadable_flag_is_malformed_and_never_a_population_fact, which
+    # truncates a genuinely swapped-away exit by exactly ONE trailing byte and requires the verdict
+    # not to flip.
+    # swapped_away is the LAST field the emitter writes, so a torn append reaches it first. Under a
+    # lenient `== "true"` parse the truncated line read as swapped_away=false — a QUALIFYING first
+    # sight — contributing a percentile and a FAIL sample while n_malformed, the field whose whole
+    # job is making unreadable lines visible, stayed 0. Silent exclusion is "the safe direction" for
+    # the percentiles only; for a detector whose value is that its zero can be conclusive, it is the
+    # unsafe one.
 
 Scenario: an unparseable line
   Given a line with an unreadable ts, acct, or elapsed_secs

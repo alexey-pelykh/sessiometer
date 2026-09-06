@@ -74,7 +74,7 @@
 //! #451/#484). This verb is a pure READER — it changes no state, adds no event, and does not
 //! build the #452 fix it measures.
 //!
-//! By default the four indicators fold the WHOLE log. `--since <duration>` (issue #494) bounds
+//! By default the indicators fold the WHOLE log. `--since <duration>` (issue #494) bounds
 //! them to a recent window — every event whose `ts=` is at/after `now - duration` — so a recent
 //! regression (or recovery) is not diluted by ancient data as the durable log grows. The window
 //! is duration-only (`<int><unit>`, units `s`/`m`/`h`/`d`/`w`), hand-rolled per the
@@ -6441,8 +6441,11 @@ ts=2026-07-11T00:08:00Z event=observation_gap_enter acct=u-BAD2 elapsed_secs=80 
     fn the_first_sight_percentiles_cover_only_the_qualifying_exits() {
         let fs = first_sight_of(FIRST_SIGHT_LOG, None);
 
-        // u-SEV (300) and u-ORPH (638). u-PARK's 420 is EXCLUDED — folding it in would move p50
-        // from 300 to 420 and flatter the metric with an observation that never happened.
+        // u-SEV (300) and u-ORPH (638). u-PARK's 420 is EXCLUDED — and mind the DIRECTION, which
+        // is the opposite of flattering: folding it in would move p50 from 300 to 420, i.e. make the
+        // readout look WORSE. The exclusion is not about the number. That observation really
+        // happened (the daemon emits no exit until one lands); it just belongs to a designation this
+        // readout is not measuring.
         assert_eq!(fs.n, 2);
         assert_eq!(fs.n_swapped_away, 1);
         assert_eq!(fs.breach_p50, Some(300));
