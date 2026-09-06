@@ -1606,8 +1606,12 @@ struct DecisionState {
     blind_gate_signaled: bool,
     /// Whether the ACTIVE account's near-limit poll-coverage fast-poll is engaged (issue #540):
     /// the active's last reading — or the #539 velocity projection — is in the near-limit band, so
-    /// [`next_subinterval`](Daemon::next_subinterval) tightens the poll sub-interval to
-    /// [`near_limit_poll_secs`](Daemon::near_limit_poll_secs). Recomputed every tick from the
+    /// [`next_subinterval`](Daemon::next_subinterval) caps the poll sub-interval at
+    /// [`near_limit_poll_secs`](Daemon::near_limit_poll_secs) — applying
+    /// `min(poll_secs / N, near_limit_poll_secs)`, so it tightens only where the rotation's own
+    /// `poll_secs / N` is above the cap, and at the shipped configuration it is not (issue #1487;
+    /// the same over-claim that issue removed from [`Event::NearLimitPollCoverage`]'s payload).
+    /// Recomputed every tick from the
     /// post-decision state ([`near_limit_fast_poll_engaged`](Daemon::near_limit_fast_poll_engaged))
     /// so it always reflects the CURRENT active account and its freshest reading; the wait path
     /// reads this cached verdict rather than re-deriving it, and its `false → true` transition is
@@ -3063,7 +3067,12 @@ where
             if let Some(active_idx) = self.state.active {
                 events.push(Event::NearLimitPollCoverage {
                     account: self.roster[active_idx].account_uuid.clone(),
-                    sub_interval_secs: self.near_limit_poll_secs,
+                    // Issue #1487: the sub-interval the scheduler APPLIES, not the bare cap this
+                    // carried through 2026-09-06. Computed side-effect-free from the configured
+                    // base — see `near_limit_applied_sub_interval_secs` for why it must not call
+                    // `next_subinterval` here (it would draw, and move the schedule).
+                    sub_interval_secs: self.near_limit_applied_sub_interval_secs(),
+                    cap_secs: self.near_limit_poll_secs,
                 });
             }
         }
@@ -3443,6 +3452,59 @@ where
             account_uuid: uuid.to_owned(),
             at: self.clock.now(),
         });
+    }
+
+    /// The near-limit poll sub-interval the scheduler ACTUALLY applies, in seconds (issue #1487):
+    /// `min(poll_secs / N, near_limit_poll_secs)` — the form
+    /// [`next_subinterval`](Self::next_subinterval) computes, and the form
+    /// [`near_limit_poll_secs`](Self::near_limit_poll_secs) and `config`'s two doc comments have
+    /// always stated. The value the durable [`Event::NearLimitPollCoverage`] carries.
+    ///
+    /// It exists because that event carried the bare CAP instead. At the shipped configuration
+    /// (`poll_secs = 300`, `N = 8`, cap `60`) the applied interval is `min(37.5, 60) = 37.5` and the
+    /// line said `60`: the cap has never bound there, so a band-entry line — the exact record an
+    /// operator reads during an incident — reported a tightening that did not happen.
+    ///
+    /// `poll_secs` is read from [`poll_strategy`](Self::poll_strategy)`.base` — the UN-jittered
+    /// base — exactly as [`observation_gap_threshold`](Self::observation_gap_threshold) reads it,
+    /// and deliberately NOT from [`next_poll_interval`](Self::next_poll_interval): that DRAWS from
+    /// the seeded `rng`, and [`next_subinterval`](Self::next_subinterval)'s own contract is that
+    /// "each sub-interval draws a fresh full interval (inheriting the #38 jitter decorrelation)
+    /// before dividing" — so a diagnostic that drew would consume a sample and shift every
+    /// subsequent jittered interval, moving the poll schedule, the per-tick spacing and the
+    /// aggregate request rate. Issue #1487 forbids exactly that: the event had to become truthful
+    /// WITHOUT the schedule moving. **Do not "simplify" this into a `next_subinterval()` call.**
+    ///
+    /// The guard on THIS FUNCTION is its `&self` receiver, not a test: drawing needs `&mut self`,
+    /// so a draw inside this body would not compile. That is by CONSTRUCTION rather than by
+    /// convention — but it is scoped to the body, and the scope is worth stating because the
+    /// obvious reading over-claims. The CALL SITE is inside [`tick`](Self::tick), which is
+    /// `&mut self`, so a future edit that draws THERE — next to this call, or instead of it —
+    /// compiles fine. Measured: substituting `self.next_subinterval()` at the emit site, or adding
+    /// a bare `self.rng` sample beside it, both compile, and the second leaves the whole suite
+    /// green, because every fixture on this path uses `Strategy::fixed`, whose `Jitter::None` arm
+    /// never touches `rng`. So no test is sensitive to the daemon's RNG stream position here and
+    /// none of them can catch that edit. What stands between the schedule and such an edit is this
+    /// paragraph and review — not the type system, and not the suite.
+    ///
+    /// Reusing the value the scheduler will apply is not available either — this is computed inside
+    /// [`tick`](Self::tick), and the one live `next_subinterval` call is in
+    /// [`wait_for_next_poll`](Self::wait_for_next_poll), which the run loop reaches only AFTER
+    /// `tick` returns. At emit time the applied draw does not exist yet. So this is the NOMINAL
+    /// applied interval — the configured base, un-jittered — which is what the arithmetic in the
+    /// three doc comments above describes and what an operator reading the line means by it.
+    ///
+    /// The base is clamped to `[POLL_SECS_LO, POLL_SECS_HI]` BEFORE dividing, mirroring
+    /// [`next_poll_interval`](Self::next_poll_interval)'s own order (it clamps the draw, and
+    /// `next_subinterval` divides afterwards), so a degenerate configured base cannot report an
+    /// interval the scheduler would never apply. `N` is [`rotation_len`](Self::rotation_len) floored
+    /// at 1, the same divisor `next_subinterval` uses. Fractional throughout: the quotient generally
+    /// is (`300 / 8 = 37.5`), and truncating it would understate the tightening while still passing
+    /// a naive "not the cap" read.
+    fn near_limit_applied_sub_interval_secs(&self) -> f64 {
+        let poll_secs = self.poll_strategy.base.clamp(POLL_SECS_LO, POLL_SECS_HI);
+        let rotation = self.rotation_len().max(1) as f64;
+        (poll_secs / rotation).min(self.near_limit_poll_secs as f64)
     }
 
     /// The re-observation bound the observation-gap instrument measures against (issue #1453):
@@ -14643,21 +14705,187 @@ mod tests {
             inband.state.near_limit_fast_poll,
             "0.90 ≥ 0.85 floor → the fast-poll engages",
         );
-        assert!(
-            out.events.iter().any(|e| matches!(
-                e,
+        // `f64` is not allowed in a `matches!` pattern, so destructure and compare. Both fields are
+        // asserted: this fixture is the arm where the cap DOES bind — `min(600 / 3, 60) == 60`, so
+        // the applied interval and the cap COINCIDE here, which is exactly why no assertion of this
+        // shape could ever have distinguished them (issue #1487). The RED oracle
+        // `near_limit_poll_coverage_reports_the_applied_sub_interval_not_the_cap` covers the arm
+        // where they differ.
+        let coverage = out
+            .events
+            .iter()
+            .find_map(|e| match e {
                 Event::NearLimitPollCoverage {
-                    sub_interval_secs: 60,
+                    sub_interval_secs,
+                    cap_secs,
                     ..
-                }
-            )),
-            "band entry emits the durable near_limit_poll_coverage event carrying the cap: {:?}",
+                } => Some((*sub_interval_secs, *cap_secs)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("band entry emits the event: {:?}", out.events));
+        assert_eq!(
+            coverage,
+            (60.0, 60),
+            "band entry emits the durable near_limit_poll_coverage event carrying the APPLIED \
+             sub-interval and the cap; on THIS fixture the cap binds (min(600 / 3, 60) = 60), so \
+             the two coincide: {:?}",
             out.events,
         );
         assert_eq!(
             inband.next_subinterval(),
             Duration::from_secs(60),
             "in the band the sub-interval is capped to near_limit_poll_secs — no poll gap ≥ the cap",
+        );
+    }
+
+    /// Issue #1487's RED oracle: it asserts 37.5 where the pre-change code yields 60.
+    ///
+    /// The demonstration is by reverting the emit site to `self.near_limit_poll_secs as f64`, NOT
+    /// by checking out the pre-change tree: there the variant is `{ account, sub_interval_secs: u64 }`,
+    /// so this test's `cap_secs` binding and its `f64` literal do not COMPILE and there is no RED to
+    /// observe. Under the reversion it fails `left: 60.0, right: 37.5` — the issue's exact numbers.
+    ///
+    /// `Event::NearLimitPollCoverage` reported the configured CAP (`near_limit_poll_secs`) rather
+    /// than the sub-interval the scheduler applies, `min(poll_secs / N, near_limit_poll_secs)`. At
+    /// the shipped configuration (`poll_secs = 300`, `N = 8`, cap `60`) the applied interval is
+    /// `min(37.5, 60) = 37.5` and the line said `60` — the cap has never bound there. The line is
+    /// emitted at band ENTRY, the exact regime an operator inspects during an incident, so a reader
+    /// concluded the daemon had tightened its polling when it had not.
+    ///
+    /// Every pre-existing test was blind to this BY CONSTRUCTION: the only in-band fixture is
+    /// `Strategy::fixed(600.0)` over the 3-account rotation with cap 60, where `min(200, 60) == 60`
+    /// — the cap and the applied value COINCIDE, degenerate on the one axis under test. This test
+    /// picks `Strategy::fixed(112.5)` over the SAME 3-account fixture so that `112.5 / 3 = 37.5`
+    /// and `min(37.5, 60) = 37.5`: the issue's exact number, on the arm where the cap does NOT bind.
+    ///
+    /// The arithmetic is exact in binary floating point (112.5, 3 and the quotient 37.5 are each
+    /// representable), so the comparisons below are tolerance-free rather than approximate.
+    #[tokio::test]
+    async fn near_limit_poll_coverage_reports_the_applied_sub_interval_not_the_cap() {
+        let mut daemon = warmed_velocity_daemon(0.90).await; // active reading at/over the 0.85 floor
+        daemon.poll_strategy = Strategy::fixed(112.5);
+        daemon.near_limit_poll_secs = 60;
+
+        let out = daemon.tick().await;
+        assert!(
+            daemon.state.near_limit_fast_poll,
+            "0.90 ≥ 0.85 floor → the fast-poll engages, so the band-entry edge fires",
+        );
+        let (applied, cap) = out
+            .events
+            .iter()
+            .find_map(|e| match e {
+                Event::NearLimitPollCoverage {
+                    sub_interval_secs,
+                    cap_secs,
+                    ..
+                } => Some((*sub_interval_secs, *cap_secs)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("band entry emits the event: {:?}", out.events));
+
+        assert_eq!(
+            applied, 37.5,
+            "the emitted sub_interval_secs must be the APPLIED min(112.5 / 3, 60) = 37.5",
+        );
+        assert_eq!(
+            cap, 60,
+            "the cap rides beside it so a reader sees whether it bound",
+        );
+        assert_ne!(
+            applied, 60.0,
+            "issue #1487: emitting the configured cap (60) instead of the applied sub-interval \
+             (37.5) tells an operator the daemon tightened further than it did",
+        );
+        assert!(
+            applied < cap as f64,
+            "this fixture is the NON-degenerate arm — the cap must not bind, or the assertions \
+             above could not tell the two fields apart",
+        );
+
+        // The render arm carries both fields too, so the oracle covers the rendered line and not
+        // only the payload. Two decimals: the applied value is a quotient and generally fractional,
+        // and the `u64` seconds field this replaced could not represent 37.5 at all.
+        let line = out
+            .events
+            .iter()
+            .find(|e| matches!(e, Event::NearLimitPollCoverage { .. }))
+            .expect("the event is present")
+            .to_log_line(std::time::UNIX_EPOCH);
+        assert_eq!(
+            line,
+            "ts=1970-01-01T00:00:00Z event=near_limit_poll_coverage \
+             acct=u-A sub_interval_secs=37.50 cap_secs=60",
+        );
+
+        // AC-3, in the same test because it is the same configuration: making this diagnostic
+        // truthful must not move the schedule. The cap is untouched, and the interval the scheduler
+        // actually applies is still `min(112.5 / 3, 60) = 37.5` — so the helper reports what
+        // `next_subinterval` returns rather than something merely adjacent to it. Exact arithmetic,
+        // so no tolerance.
+        assert_eq!(
+            daemon.near_limit_poll_secs, 60,
+            "#1487 makes the diagnostic truthful; lowering the cap is #1458's scope, not this one",
+        );
+        assert_eq!(
+            daemon.next_subinterval(),
+            Duration::from_secs_f64(37.5),
+            "the applied sub-interval is unchanged — the emitted value now MATCHES it",
+        );
+
+        // The divisor's IDENTITY, not merely its value. Everything above holds a rotation of 3
+        // fixed, so a helper that had hard-coded `3.0` instead of reading `rotation_len()` would
+        // satisfy every assertion in this test and every assertion in its sibling — measured:
+        // substituting the literal leaves the whole suite green. Quarantining a peer takes it out
+        // of the rotation, so N drops to 2 and the applied sub-interval WIDENS to
+        // `min(112.5 / 2, 60) = 56.25` — still below the cap, so the arm stays non-degenerate and
+        // the `min` is not what is being read. `56.25` is exactly representable in binary floating
+        // point, so this comparison is tolerance-free like the others.
+        //
+        // This mirrors `the_observation_bound_is_two_sub_intervals_of_the_current_rotation`, which
+        // pins the same divisor for the sibling instrument `observation_gap_threshold` in the same
+        // way and for the same reason — the two helpers read the same two inputs.
+        daemon.state.accounts[2].health.quarantined = true;
+        assert_eq!(
+            daemon.near_limit_applied_sub_interval_secs(),
+            56.25,
+            "N is read from rotation_len(), not fixed: quarantining a peer widens the applied \
+             sub-interval to min(112.5 / 2, 60) = 56.25",
+        );
+
+        // The helper does not DRAW, under a strategy where drawing would be visible. Every other
+        // fixture on this path is `Strategy::fixed`, whose `Jitter::None` arm returns the base
+        // without touching `rng` — so under those, an implementation that drew would be
+        // indistinguishable from one that did not, and the whole suite stays green. Under
+        // `Jitter::Normal` a draw perturbs the value, so repeated calls returning the SAME nominal
+        // is evidence the RNG was never consulted. This covers the helper's BODY; a draw added at
+        // the emit site is a different hazard that no test here can see, and
+        // `near_limit_applied_sub_interval_secs`' own doc comment says so rather than implying the
+        // `&self` receiver covers it.
+        daemon.poll_strategy = Strategy {
+            base: 112.5,
+            jitter: Jitter::Normal { stddev: 20.0 },
+        };
+        for call in 0..8 {
+            assert_eq!(
+                daemon.near_limit_applied_sub_interval_secs(),
+                56.25,
+                "call {call}: the helper reads the un-jittered base, so it is pure and constant \
+                 under a jittered strategy — a drawing implementation would vary here",
+            );
+        }
+
+        // The base is clamped BEFORE the division, mirroring `next_poll_interval` (which clamps its
+        // draw) ahead of `next_subinterval` (which divides after). Order matters below the floor:
+        // clamp-then-divide gives `clamp(1) / 2 = 5 / 2 = 2.5`, divide-then-clamp would give
+        // `clamp(1 / 2) = 5`. `validate::range("poll_secs", …, 5, 3600)` keeps a config-loaded base
+        // in range, so this branch is defensive — but it carries a doc-comment claim, and an
+        // unchecked claim is how this event acquired its defect in the first place.
+        daemon.poll_strategy = Strategy::fixed(1.0);
+        assert_eq!(
+            daemon.near_limit_applied_sub_interval_secs(),
+            2.5,
+            "clamp precedes the divide: min(clamp(1.0, 5, 3600) / 2, 60) = 2.5, not 5.0",
         );
     }
 
