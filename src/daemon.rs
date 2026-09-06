@@ -14814,6 +14814,26 @@ mod tests {
             Duration::from_secs_f64(37.5),
             "the applied sub-interval is unchanged — the emitted value now MATCHES it",
         );
+
+        // The divisor's IDENTITY, not merely its value. Everything above holds a rotation of 3
+        // fixed, so a helper that had hard-coded `3.0` instead of reading `rotation_len()` would
+        // satisfy every assertion in this test and every assertion in its sibling — measured:
+        // substituting the literal leaves the whole suite green. Quarantining a peer takes it out
+        // of the rotation, so N drops to 2 and the applied sub-interval WIDENS to
+        // `min(112.5 / 2, 60) = 56.25` — still below the cap, so the arm stays non-degenerate and
+        // the `min` is not what is being read. `56.25` is exactly representable in binary floating
+        // point, so this comparison is tolerance-free like the others.
+        //
+        // This mirrors `the_observation_bound_is_two_sub_intervals_of_the_current_rotation`, which
+        // pins the same divisor for the sibling instrument `observation_gap_threshold` in the same
+        // way and for the same reason — the two helpers read the same two inputs.
+        daemon.state.accounts[2].health.quarantined = true;
+        assert_eq!(
+            daemon.near_limit_applied_sub_interval_secs(),
+            56.25,
+            "N is read from rotation_len(), not fixed: quarantining a peer widens the applied \
+             sub-interval to min(112.5 / 2, 60) = 56.25",
+        );
     }
 
     #[tokio::test]
