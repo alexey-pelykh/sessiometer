@@ -1930,19 +1930,34 @@ pub(crate) enum Event {
     ExhaustedSlowPollCleared { account: String },
     /// The ACTIVE account entered the near-limit poll-coverage fast-poll (issue #540): its reading —
     /// or the #539 velocity projection — reached the near-limit band, so the daemon TIGHTENED its
-    /// poll sub-interval to `sub_interval_secs` (the `near_limit_poll_secs` cap) so no long poll gap
-    /// opens on the final climb to the limit. The near-limit-scoped MIRROR of
-    /// [`Event::ExhaustedSlowPoll`] (#537), which WIDENS an idle peer — same edge-triggered idiom,
+    /// poll sub-interval to `sub_interval_secs` so no long poll gap opens on the final climb to the
+    /// limit. The near-limit-scoped MIRROR of [`Event::ExhaustedSlowPoll`] (#537), which WIDENS an
+    /// idle peer — same edge-triggered idiom,
     /// opposite direction. Emitted ONCE on the below-band → near-limit transition (NOT re-emitted on
     /// each held near-limit tick while the active stays in the band), and UNPAIRED: the band ends at
     /// a swap (its own [`Event::Swap`], `session_pct` at swap-out) or a below-band / blind reading,
     /// so no CLEARED partner is needed to bracket the span. A quota-poll-cadence policy, distinct
     /// from the 429/5xx `usage_backoff` rate-limit (ADR-0009), like its `ExhaustedSlowPoll` sibling.
     /// `account` is the account UUID — a non-PII identifier secret-free BY CONSTRUCTION, never the
-    /// operator `label` (issue #15); `sub_interval_secs` is a bare duration, never a token.
+    /// operator `label` (issue #15); `sub_interval_secs` and `cap_secs` are bare durations, never
+    /// tokens.
     NearLimitPollCoverage {
         account: String,
-        sub_interval_secs: u64,
+        /// The sub-interval the scheduler APPLIES while the band is held, in seconds (issue #1487):
+        /// `min(poll_secs / N, near_limit_poll_secs)` — the form [`crate::daemon`]'s
+        /// `next_subinterval` applies, NOT the bare cap. Through 2026-09-06 this carried the
+        /// configured `near_limit_poll_secs` instead, so at the shipped configuration
+        /// (`poll_secs = 300`, `N = 8`, cap `60`) it read `60` where the applied interval was
+        /// `37.5` — a line emitted at band entry, the exact regime an operator inspects during an
+        /// incident, saying the daemon had tightened further than it had. Fractional (`f64`) because
+        /// the quotient generally is: `u64` seconds cannot represent `37.5`, and truncating to `37`
+        /// would understate it while still passing a naive "not the cap" read.
+        sub_interval_secs: f64,
+        /// The configured `near_limit_poll_secs` CAP, in seconds (issue #1487) — the same unit as
+        /// `sub_interval_secs` above, so a reader compares the two directly and sees whether the cap
+        /// BOUND (`sub_interval_secs == cap_secs`) or the rotation's own `poll_secs / N` was already
+        /// tighter (`sub_interval_secs < cap_secs`, which is the shipped configuration).
+        cap_secs: u64,
     },
     /// The per-account usage VELOCITY between the last two readings (issue #399, normalized to
     /// %/min by issue #449): the SIGNED change in each rounded-percent dimension since the account's
@@ -2979,13 +2994,19 @@ impl Event {
             Event::NearLimitPollCoverage {
                 account,
                 sub_interval_secs,
+                cap_secs,
             } => {
                 // `acct=` carries the account UUID (never the free-form `label`, #15), matching the
-                // sibling `exhausted_slow_poll` line; `sub_interval_secs` is the tightened near-limit
-                // poll cadence (a bare duration, never a token). Redacted to uuid + cadence ONLY
-                // (issue #540 / #15).
+                // sibling `exhausted_slow_poll` line; `sub_interval_secs` is the APPLIED near-limit
+                // poll cadence and `cap_secs` the configured cap it was capped against (issue #1487)
+                // — both bare durations, never tokens. Redacted to uuid + cadence + cap ONLY (issue
+                // #540 / #15). Rendered to two decimals because the applied value is a quotient
+                // (`poll_secs / N`) and generally fractional — the explicit-precision idiom the
+                // `usage_velocity` / `blind_window` rate fields already use, so the field width stays
+                // stable across configurations. The cap rides beside it in the SAME unit, so a reader
+                // sees whether it bound without converting anything.
                 format!(
-                    "ts={ts} event=near_limit_poll_coverage acct={account} sub_interval_secs={sub_interval_secs}"
+                    "ts={ts} event=near_limit_poll_coverage acct={account} sub_interval_secs={sub_interval_secs:.2} cap_secs={cap_secs}"
                 )
             }
             Event::UsageVelocity {
@@ -6817,7 +6838,11 @@ pub(crate) mod tests {
             },
             Event::NearLimitPollCoverage {
                 account: "work".to_owned(),
-                sub_interval_secs: 60,
+                // The NON-degenerate payload (issue #1487): the applied 37.5 s sub-interval under a
+                // 60 s cap that did NOT bind — the shipped configuration's shape, so the sweep
+                // renders the interesting case rather than the coincidence where the two are equal.
+                sub_interval_secs: 37.5,
+                cap_secs: 60,
             },
             Event::UsageVelocity {
                 account: "work".to_owned(),
@@ -8980,18 +9005,27 @@ outcome=failed\n",
 
     #[test]
     fn near_limit_poll_coverage_line_carries_the_uuid_and_cadence() {
-        // The durable band-ENTER line (issue #540): the active account UUID (not a label, #15) and
-        // the tightened near-limit poll cadence — redacted to uuid + cadence ONLY, the same
-        // single-surface discipline as its `exhausted_slow_poll` sibling. No token/email surface
-        // exists (the mirror-image sibling of `exhausted_slow_poll_line_carries_the_uuid_and_window`).
+        // The durable band-ENTER line (issue #540): the active account UUID (not a label, #15), the
+        // APPLIED near-limit poll cadence and the cap it was capped against (issue #1487) — redacted
+        // to uuid + cadence + cap ONLY, the same single-surface discipline as its
+        // `exhausted_slow_poll` sibling. No token/email surface exists (the mirror-image sibling of
+        // `exhausted_slow_poll_line_carries_the_uuid_and_window`).
+        //
+        // The payload is deliberately NON-degenerate — an applied 37.5 s under a 60 s cap that did
+        // not bind, the shipped configuration's shape. Where the two coincide (the small-N /
+        // high-`poll_secs` regime) a rendered assertion cannot tell the fields apart, so a swap or a
+        // collapse of the two would read green; here it would not.
         let line = Event::NearLimitPollCoverage {
             account: "u-A".to_owned(),
-            sub_interval_secs: 60,
+            sub_interval_secs: 37.5,
+            cap_secs: 60,
         }
         .to_log_line(at_epoch(0));
         assert_eq!(
             line,
-            format!("{TS0} event=near_limit_poll_coverage acct=u-A sub_interval_secs=60")
+            format!(
+                "{TS0} event=near_limit_poll_coverage acct=u-A sub_interval_secs=37.50 cap_secs=60"
+            )
         );
         // #15: no non-authored email, no token/bearer/api-key, and the identity is the UUID.
         assert!(
