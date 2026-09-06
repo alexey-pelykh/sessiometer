@@ -38,6 +38,17 @@ mechanisms (#26 Linux, #27 Windows, #28 at-rest hygiene), then productionization
 a per-OS CI matrix (#29). The full rationale — and the alternative that was weighed and
 deferred — is in [ADR-0029](docs/adr/0029-macos-is-the-only-supported-build-target.md).
 
+## Deploying a build to your own machine
+
+`cargo build` replaces nothing that runs. Where the menu-bar app is installed, the daemon is an
+`SMAppService` agent **inside the app bundle** — there is no `~/Library/LaunchAgents` plist to
+re-point, and a Debug `xcodebuild` embeds no daemon at all. Replacing the one that is already
+registered and serving is a bundle rebuild, and confirming which build is serving is a read of the
+event log rather than an inference.
+
+The procedure, the hazard in it, and that check:
+[`docs/runbooks/replacing-the-running-daemon.md`](docs/runbooks/replacing-the-running-daemon.md).
+
 ## The minimal-dependency line
 
 `sessiometer` reads and rewrites the credential Claude Code stores in your macOS
