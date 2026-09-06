@@ -4,8 +4,10 @@ This repo has no Gherkin runner; the executable gates are the Rust test suite an
 XCTest bundle. These scenarios pin each acceptance criterion in scenario form; do not read a
 written scenario as a passing test.
 
-No scenario below names a binding test yet — the item is scoped, not built. Add a *Binds* line to
-each as its test lands; an unbound scenario is a statement of intent, never evidence.
+Built and bound 2026-09-06 (#1487). Every scenario below now names the test that binds it, per this
+header's own instruction; an unbound scenario is a statement of intent, never evidence. Rule 3's
+last two scenarios bind to prohibitions rather than to assertions — see their own notes, which say
+what is and is not evidence for them.
 -->
 
 # Feature: near_limit_poll_coverage reports the interval the scheduler applied
@@ -42,6 +44,10 @@ Scenario: the cap does not bind, so the effective interval is reported
     # MEAN is 37.5. Without the pin this Then is not decidable and the test is flaky.
     # It also requires a sub-second field: integral sub_interval_secs cannot express 37.5 and
     # would truncate a truthful report to 37, passing "not 60" while still lying.
+    # Binds: daemon::tests::near_limit_poll_coverage_reports_the_applied_sub_interval_not_the_cap
+    # (fixed(112.5) over N=3 gives that same 37.5 on the existing 3-account fixture; the RED is
+    # demonstrated by reverting the emit site, not by checkout, since the test cannot compile
+    # pre-change against the u64 field.)
 
 Scenario: the cap does bind, and is reported as the applied value
   Given a configuration in which near_limit_poll_secs is below poll_secs / N
@@ -53,6 +59,9 @@ Scenario: the cap does bind, and is reported as the applied value
     # reason: base is a draw. Without the pin, "near_limit_poll_secs below poll_secs / N" only makes
     # the cap binding LIKELY, so the Then is probabilistic -- and the flake would land on the arm
     # that is supposed to prove the cap is not dead code.
+    # Binds: daemon::tests::near_limit_fast_poll_caps_the_active_sub_interval_in_band_only
+    # (fixed(600.0) over N=3: min(200, 60) = 60, so the cap binds and IS the applied value. It is
+    # the only test that kills a dropped `.min(...)`, so it is not redundant with the oracle above.)
 ```
 
 ## Rule 2 — the cap travels beside the applied value, so "did it bind?" is answerable
@@ -65,6 +74,9 @@ Scenario: both values are carried
     And the line carries the configured cap
     # Strictly more informative than either alone. A reader can see the cap did not bind rather
     # than having to infer it from poll_secs and roster size.
+    # Binds: observability::tests::near_limit_poll_coverage_line_carries_the_uuid_cadence_and_cap
+    # (asserts the whole rendered line on a NON-degenerate 37.5/60 payload, so swapping or
+    # collapsing the two fields fails), plus the oracle above, which asserts both payload fields.
 ```
 
 ## Rule 3 — nothing about when the daemon polls changes
@@ -79,6 +91,16 @@ Scenario: the schedule is untouched
     And the value of near_limit_poll_secs is unchanged
     # A regression guard, NOT a RED oracle — it passes pre-change too. Do not present it as
     # evidence the fix works.
+    # Binds: the #80/#366 stagger locks, unchanged and passing:
+    # the_sub_interval_spreads_a_cycle_across_the_rotation,
+    # the_poll_schedule_interleaves_the_active_before_each_peer_and_wraps,
+    # the_observation_bound_is_two_sub_intervals_of_the_current_rotation. The stronger evidence is
+    # structural rather than a test: no scheduling symbol changed at all (next_subinterval,
+    # next_poll_interval, wait_for_next_poll, wait_after_tick, rotation_len, build_poll_schedule
+    # are byte-identical, doc comments included), and the emitter helper takes `&self`, so its body
+    # cannot draw. LIMIT, stated because no test covers it: a draw added at the EMIT SITE would
+    # compile (`tick` is `&mut self`) and no assertion here would see it, because every fixture on
+    # this path is `Strategy::fixed`, whose `Jitter::None` arm never touches the RNG.
 
 Scenario: the event is not gated away
   Given a configuration in which the cap never binds
@@ -86,10 +108,16 @@ Scenario: the event is not gated away
    Then the event is still emitted
     # Considered and rejected: gating on the cap binding would delete the only durable record
     # that the band was entered — which, at the live configuration, means always.
+    # Binds: the oracle above, whose fixture is exactly this case: min(112.5/3, 60) = 37.5 < 60, so
+    # the cap does NOT bind and the event is asserted present anyway.
 
 Scenario: lowering the cap is out of scope
   Given the temptation to make the schedule tighter rather than the report truthful
    Then near_limit_poll_secs is NOT lowered
     # That is #1458's scope, conditional on operator-owned {T}/{D}. The cap is SHARED, so lowering
     # it tightens the whole tick — a rate change ADR-0012 Decision 3 forbids buying silently.
+    # Binds: a prohibition, so the evidence is the diff rather than an assertion.
+    # DEFAULT_NEAR_LIMIT_POLL_SECS is untouched and near_limit_poll_secs is only ever READ in
+    # production. The oracle asserts `daemon.near_limit_poll_secs == 60` after the tick, which
+    # guards the value at runtime but is not evidence about the default; only the diff is.
 ```

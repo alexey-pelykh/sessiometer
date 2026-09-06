@@ -1606,8 +1606,12 @@ struct DecisionState {
     blind_gate_signaled: bool,
     /// Whether the ACTIVE account's near-limit poll-coverage fast-poll is engaged (issue #540):
     /// the active's last reading — or the #539 velocity projection — is in the near-limit band, so
-    /// [`next_subinterval`](Daemon::next_subinterval) tightens the poll sub-interval to
-    /// [`near_limit_poll_secs`](Daemon::near_limit_poll_secs). Recomputed every tick from the
+    /// [`next_subinterval`](Daemon::next_subinterval) caps the poll sub-interval at
+    /// [`near_limit_poll_secs`](Daemon::near_limit_poll_secs) — applying
+    /// `min(poll_secs / N, near_limit_poll_secs)`, so it tightens only where the rotation's own
+    /// `poll_secs / N` is above the cap, and at the shipped configuration it is not (issue #1487;
+    /// the same over-claim that issue removed from [`Event::NearLimitPollCoverage`]'s payload).
+    /// Recomputed every tick from the
     /// post-decision state ([`near_limit_fast_poll_engaged`](Daemon::near_limit_fast_poll_engaged))
     /// so it always reflects the CURRENT active account and its freshest reading; the wait path
     /// reads this cached verdict rather than re-deriving it, and its `false → true` transition is
@@ -3471,8 +3475,17 @@ where
     /// aggregate request rate. Issue #1487 forbids exactly that: the event had to become truthful
     /// WITHOUT the schedule moving. **Do not "simplify" this into a `next_subinterval()` call.**
     ///
-    /// The guard is the `&self` receiver, not a test: drawing needs `&mut self`, so a call that drew
-    /// would not compile. That is why this is by CONSTRUCTION rather than by convention.
+    /// The guard on THIS FUNCTION is its `&self` receiver, not a test: drawing needs `&mut self`,
+    /// so a draw inside this body would not compile. That is by CONSTRUCTION rather than by
+    /// convention — but it is scoped to the body, and the scope is worth stating because the
+    /// obvious reading over-claims. The CALL SITE is inside [`tick`](Self::tick), which is
+    /// `&mut self`, so a future edit that draws THERE — next to this call, or instead of it —
+    /// compiles fine. Measured: substituting `self.next_subinterval()` at the emit site, or adding
+    /// a bare `self.rng` sample beside it, both compile, and the second leaves the whole suite
+    /// green, because every fixture on this path uses `Strategy::fixed`, whose `Jitter::None` arm
+    /// never touches `rng`. So no test is sensitive to the daemon's RNG stream position here and
+    /// none of them can catch that edit. What stands between the schedule and such an edit is this
+    /// paragraph and review — not the type system, and not the suite.
     ///
     /// Reusing the value the scheduler will apply is not available either — this is computed inside
     /// [`tick`](Self::tick), and the one live `next_subinterval` call is in
@@ -14725,7 +14738,12 @@ mod tests {
         );
     }
 
-    /// Issue #1487's RED oracle. Pre-change it asserts 37.5 and observes 60.
+    /// Issue #1487's RED oracle: it asserts 37.5 where the pre-change code yields 60.
+    ///
+    /// The demonstration is by reverting the emit site to `self.near_limit_poll_secs as f64`, NOT
+    /// by checking out the pre-change tree: there the variant is `{ account, sub_interval_secs: u64 }`,
+    /// so this test's `cap_secs` binding and its `f64` literal do not COMPILE and there is no RED to
+    /// observe. Under the reversion it fails `left: 60.0, right: 37.5` — the issue's exact numbers.
     ///
     /// `Event::NearLimitPollCoverage` reported the configured CAP (`near_limit_poll_secs`) rather
     /// than the sub-interval the scheduler applies, `min(poll_secs / N, near_limit_poll_secs)`. At
@@ -14833,6 +14851,41 @@ mod tests {
             56.25,
             "N is read from rotation_len(), not fixed: quarantining a peer widens the applied \
              sub-interval to min(112.5 / 2, 60) = 56.25",
+        );
+
+        // The helper does not DRAW, under a strategy where drawing would be visible. Every other
+        // fixture on this path is `Strategy::fixed`, whose `Jitter::None` arm returns the base
+        // without touching `rng` — so under those, an implementation that drew would be
+        // indistinguishable from one that did not, and the whole suite stays green. Under
+        // `Jitter::Normal` a draw perturbs the value, so repeated calls returning the SAME nominal
+        // is evidence the RNG was never consulted. This covers the helper's BODY; a draw added at
+        // the emit site is a different hazard that no test here can see, and
+        // `near_limit_applied_sub_interval_secs`' own doc comment says so rather than implying the
+        // `&self` receiver covers it.
+        daemon.poll_strategy = Strategy {
+            base: 112.5,
+            jitter: Jitter::Normal { stddev: 20.0 },
+        };
+        for call in 0..8 {
+            assert_eq!(
+                daemon.near_limit_applied_sub_interval_secs(),
+                56.25,
+                "call {call}: the helper reads the un-jittered base, so it is pure and constant \
+                 under a jittered strategy — a drawing implementation would vary here",
+            );
+        }
+
+        // The base is clamped BEFORE the division, mirroring `next_poll_interval` (which clamps its
+        // draw) ahead of `next_subinterval` (which divides after). Order matters below the floor:
+        // clamp-then-divide gives `clamp(1) / 2 = 5 / 2 = 2.5`, divide-then-clamp would give
+        // `clamp(1 / 2) = 5`. `validate::range("poll_secs", …, 5, 3600)` keeps a config-loaded base
+        // in range, so this branch is defensive — but it carries a doc-comment claim, and an
+        // unchecked claim is how this event acquired its defect in the first place.
+        daemon.poll_strategy = Strategy::fixed(1.0);
+        assert_eq!(
+            daemon.near_limit_applied_sub_interval_secs(),
+            2.5,
+            "clamp precedes the divide: min(clamp(1.0, 5, 3600) / 2, 60) = 2.5, not 5.0",
         );
     }
 

@@ -82,8 +82,8 @@ Two sites, both in `src/daemon.rs`:
 
 | Site | Today | After |
 |---|---|---|
-| `Event::NearLimitPollCoverage` (emit) | `sub_interval_secs: self.near_limit_poll_secs` — the cap | the interval `next_subinterval` applied, **carried** to this site |
-| `next_subinterval` (compute) | `base.min(Duration::from_secs(self.near_limit_poll_secs))` | unchanged in value; must now **publish** what it applied |
+| `Event::NearLimitPollCoverage` (emit) | `sub_interval_secs: self.near_limit_poll_secs` — the cap | the interval `next_subinterval` applied, **carried** to this site. *Amended 2026-09-06 (#1487): read "the NOMINAL applied interval, re-derived side-effect-free from `poll_strategy.base`" — see the amendment below* |
+| `next_subinterval` (compute) | `base.min(Duration::from_secs(self.near_limit_poll_secs))` | unchanged in value; must now **publish** what it applied. *Amended 2026-09-06 (#1487): NOT changed at all — it is byte-identical in the shipped fix* |
 
 **The fix is to CARRY the applied value from the compute site, never to re-derive it at the emit
 site** — and that is a constraint, not a style preference. `next_subinterval` obtains `base` from
@@ -93,6 +93,35 @@ comment states that *each sub-interval draws a fresh full interval before dividi
 again at the emit site would advance the RNG and perturb the schedule — a rate change R-3 forbids —
 and would in any case yield a *different* draw than the one actually applied. The applied value must
 be captured where it is computed and passed through.
+
+> *Amended 2026-09-06 (#1487): the **rationale** above holds and governed the implementation; the
+> **action** it prescribes turned out not to be available in the tree, so the shipped fix re-derives
+> the value side-effect-free at the emit site instead. Three findings, each verified at
+> implementation time rather than argued:*
+>
+> 1. *There is no computed value to carry at emit time. The event is emitted inside `tick()`; the
+>    one live `next_subinterval()` call is in `wait_for_next_poll()`, which the run loop reaches
+>    only AFTER `tick()` returns (`src/daemon/run_loop.rs`, `tick` → `report_tick_outcome` →
+>    `idle_until_next_tick` → `wait_after_tick`). At band entry the applied draw does not exist yet.*
+> 2. *Publishing from the wait path and reading it at the next emit does not rescue the shape:
+>    band **entry** is precisely the tick with no prior in-band draw, so it would report an
+>    out-of-band interval — worse than the nominal. And `wait_after_tick` branches, so the
+>    locked-keychain arm never reaches `wait_for_next_poll` at all, which would make the band-entry
+>    record **conditional on the wait path being taken** — eroding the "only durable record that the
+>    band was entered" property this very decision exists to protect.*
+> 3. *Drawing earlier inside `tick()` to stash a value reorders the seeded RNG stream that every
+>    swap arm's fixtures pin (`observation_gap_threshold`'s doc states this outright), which is the
+>    same R-3 violation the paragraph above forbids, reached by a different route.*
+>
+> *So the shipped value is `min(poll_secs / N, near_limit_poll_secs)` computed from the CONFIGURED,
+> un-jittered `poll_strategy.base` — exactly the form `near_limit_poll_secs`' own doc comment and
+> `config.rs`' two doc comments have always stated, and exactly AC-1's arithmetic (`300 / 8 = 37.5`
+> is the configured base over N, not a draw). The helper takes `&self`, so its body cannot draw.*
+>
+> *The cost is real and is documented on the event's own field rather than buried here: the reported
+> value is the nominal, while the per-tick applied interval is a draw distributed around it. The
+> paragraph below already says `37.5` is the mean. Reporting the draw is not reachable without one
+> of the three violations above.*
 
 **A second consequence of the same draw: `base` is a random variable, so the report needs
 sub-second resolution.** `37.5 s` is the *mean* of `base` at the live configuration, not a fixed
