@@ -6236,7 +6236,7 @@ mod tests {
     }
 
     #[test]
-    fn the_run_loop_reports_to_the_console_without_a_macro_that_can_panic_the_daemon() {
+    fn the_run_loop_reports_to_the_console_without_a_call_that_can_panic_the_daemon() {
         // Issue #1494, the sibling of the guard directly above and the same argument one scope
         // out: `eprintln!` PANICS when the stderr write ITSELF fails, and the launchd plist
         // routes `StandardErrorPath` into the same directory as the event log
@@ -6247,11 +6247,13 @@ mod tests {
         //
         // WHAT THIS GUARD COVERS, STATED SO THE BOUND IS NOT MISREAD: exactly one file,
         // `src/daemon/run_loop.rs`. It is NOT a guard over "the daemon's live path", which is a
-        // strictly larger set — `daemon::append_sample_for_poll` reports a skipped usage-sample
-        // write on the poll path, after the bind, and is outside issue #1494's enumerated scope
-        // (filed as issue #1498 rather than folded in). Widening this scan to the live path means
-        // converting that site in the same change; do not widen the scan alone, which would
-        // fail on a site this issue deliberately did not touch.
+        // strictly larger set. SIX reports outside this file are reached after the socket binds
+        // and still panic on a failed write — `cli::run`'s own "daemon started" line, four in
+        // `refresh`'s orphan reapers (both called from `cli::run` after the bind), and
+        // `daemon::append_sample_for_poll`, the most frequent of all since it fires every poll.
+        // All six are enumerated in issue #1498, none is converted here, and that is why this
+        // scan is one file wide: widening it without converting them in the same change would
+        // fail on sites issue #1494 deliberately did not touch.
         //
         // A SOURCE scan for the same reason the guard above is one: stderr cannot be made
         // unwritable inside a running test process without taking the harness down with it.
@@ -6260,28 +6262,29 @@ mod tests {
         )
         .expect("src/daemon/run_loop.rs is readable from the crate root");
 
-        // Prose in that file NAMES the macro deliberately — `emit_best_effort`'s doc comment
+        // Prose in that file NAMES these macros deliberately — `emit_best_effort`'s doc comment
         // explains the convention and each converted site cites it — so scanning the raw text
         // would fail on the very comments that document the rule. Scan CODE only: keep every
         // line whose trimmed form does not open a `//` or `///` comment, carrying each line's
         // 1-based number so a finding can name WHERE rather than dumping the file. Two honest
         // limits, neither present in that file today and both failing SAFE (toward a false
-        // alarm, never a false pass): a trailing `// …eprintln!(…` on a code line, and a
-        // `/* … */` block.
+        // alarm, never a false pass): a trailing `// …` on a code line, and a `/* … */` block.
+        let is_comment = |line: &str| line.trim_start().starts_with("//");
         let code: Vec<(usize, &str)> = source
             .lines()
             .enumerate()
             .map(|(i, line)| (i + 1, line))
-            .filter(|(_, line)| !line.trim_start().starts_with("//"))
+            .filter(|(_, line)| !is_comment(line))
             .collect();
 
-        // Canary the extraction before the assertions it carries — an un-canaried scan passes
-        // over an empty or mis-selected corpus, and a guard that cannot fail is not a guard.
-        // Both halves are known-present IN THE DIMENSION UNDER TEST (code lines, post-strip):
-        // a declaration proves the strip did not eat the file, and a converted call proves the
-        // sites themselves are still here, so DELETING them cannot make the assertion below
-        // pass vacuously.
+        // Canary the extraction before the assertions it carry. An un-canaried source scan
+        // passes over an empty or truncated selection, and a guard that cannot fail is not a
+        // guard. Three canaries, because presence alone proves the corpus is NON-EMPTY and this
+        // needs it COMPLETE: a truncated scan that still contains one converted site would
+        // otherwise certify the sites it never read.
         let has = |needle: &str| code.iter().any(|(_, line)| line.contains(needle));
+
+        // (a) HEAD — a declaration, so an extraction that ate the code fails here.
         assert!(
             has("fn notify_unrecoverable(labels: &[String]) {"),
             "the comment-strip left no run-loop code, so this scan has no subject: it kept {} \
@@ -6289,26 +6292,64 @@ mod tests {
             code.len(),
             source.lines().count()
         );
+        // (b) TAIL — the LAST converted site, so a corpus truncated anywhere above it fails
+        //     here even though earlier converted sites are still in view.
         assert!(
-            has(r#"let _ = writeln!(std::io::stderr(), "sessiometer: {report}");"#),
-            "the converted console reports are gone from the scanned code, so the assertion \
-             below would hold vacuously; this scan has no subject: it kept {} of {} lines",
+            has(r#""sessiometer: boot canary skipped: {err}""#),
+            "the last converted site is not in the scanned code, so this scan does not reach \
+             the end of the file: it kept {} of {} lines",
             code.len(),
             source.lines().count()
         );
+        // (c) PARTITION — every line is either kept or a comment. Recomputed independently of
+        //     the filter above, so ANY extra narrowing (a `take_while`, a widened strip) breaks
+        //     the sum instead of silently shrinking the subject.
+        let comments = source.lines().filter(|line| is_comment(line)).count();
+        assert_eq!(
+            code.len() + comments,
+            source.lines().count(),
+            "the extraction dropped lines that are neither code nor comment, so its subject is \
+             narrower than the file and the assertions below cover less than they claim"
+        );
 
+        // The property is "cannot panic while reporting", NOT "does not spell `eprintln!`" —
+        // naming only the one macro would pass `println!` (same `print_to`, same panic, and
+        // `StandardOutPath` is a file too), `dbg!` (expands to `eprintln!`), and above all
+        // `writeln!(…).expect(…)`, which is the likeliest regression of the lot: `let _ =`
+        // reads like a lint smell and `.expect()` is the reflex "fix". So check BOTH halves —
+        // no panicking console macro, and every `writeln!` in the discarded form.
+        const PANICKING: [&str; 5] = ["eprintln!(", "eprint!(", "println!(", "print!(", "dbg!("];
         let regressed: Vec<String> = code
             .iter()
-            .filter(|(_, line)| line.contains("eprintln!("))
+            .filter(|(_, line)| PANICKING.iter().any(|macro_| line.contains(macro_)))
             .map(|(n, line)| format!("  src/daemon/run_loop.rs:{n}: {}", line.trim()))
             .collect();
         assert!(
             regressed.is_empty(),
             "a console report in the run loop went back to a macro that PANICS on a failed \
-             stderr write, so the volume-full condition that makes the event log unwritable \
-             kills the running daemon instead of being swallowed (issue #1494). Use the \
-             discarded `writeln!` form `emit_best_effort` documents:\n{}",
+             write, so the volume-full condition that makes the event log unwritable kills the \
+             running daemon instead of being swallowed (issue #1494). Use the discarded \
+             `writeln!` form `emit_best_effort` documents:\n{}",
             regressed.join("\n")
+        );
+
+        // `let _ = ` is contiguous with `writeln!` in both the one-line and the rustfmt-wrapped
+        // form, so scanning the joined code catches either. Anything else — `.expect(…)`,
+        // `.unwrap()`, `?` — keeps the `io::Error` live and can still abort the daemon.
+        let joined = code
+            .iter()
+            .map(|(_, line)| *line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let undiscarded = joined
+            .match_indices("writeln!")
+            .filter(|(at, _)| !joined[..*at].ends_with("let _ = "))
+            .count();
+        assert_eq!(
+            undiscarded, 0,
+            "{undiscarded} `writeln!` in the run loop does not discard its result, so a failed \
+             console write can still propagate or panic (issue #1494) — the exact outcome the \
+             `let _ = writeln!(std::io::stderr(), …)` form exists to rule out"
         );
     }
 

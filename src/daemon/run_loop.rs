@@ -530,8 +530,10 @@ pub(crate) fn unrecoverable_report(label: &str) -> String {
 /// so is a failed console write. The console is the more RELIABLE of the two (it needs no
 /// `osascript`, no GUI session and no notification permission), which is why the notification may
 /// be dropped without a fallback; it was never the INFALLIBLE one, and until #1494 `eprintln!`
-/// made it the single call here that could kill the daemon — the one outcome "non-fatal" rules
-/// out. Discarded `writeln!` for the reason [`emit_best_effort`] states.
+/// made it the one call here whose own FAILURE could kill the daemon — the outcome "non-fatal"
+/// rules out. Discarded `writeln!` for the reason [`emit_best_effort`] states. (`notify_macos`
+/// swallows a spawn error but inherits `tokio::process`'s need for a reactor, so calling this
+/// from OUTSIDE the runtime would panic there; the sole caller is inside the run loop.)
 fn notify_unrecoverable(labels: &[String]) {
     for label in labels {
         let report = unrecoverable_report(label);
@@ -546,8 +548,10 @@ fn notify_unrecoverable(labels: &[String]) {
 /// accrues. The message and title are passed as `argv` to an `on run argv` script, NEVER
 /// interpolated into the `-e` source: an account label is charset-unrestricted, so interpolation
 /// would let a `"`-bearing label break — or inject — the AppleScript. A spawn failure (no
-/// `osascript`, not a macOS GUI session) is swallowed: the console line above is the reliable
-/// channel, the notification a best-effort upgrade.
+/// `osascript`, not a macOS GUI session) is swallowed: the console line above is the MORE
+/// reliable channel — it needs none of those — and the notification a best-effort upgrade.
+/// Neither is infallible, and since issue #1494 a failure of neither is fatal; see
+/// [`notify_unrecoverable`].
 fn notify_macos(title: &str, body: &str) {
     let _ = tokio::process::Command::new("osascript")
         .args([
@@ -616,6 +620,8 @@ where
     {
         let mut events = Vec::new();
         if let Err(err) = daemon.refresh_canary(&mut events).await {
+            // Discarded `writeln!` and not `eprintln!`, for the reason [`emit_best_effort`]
+            // states (issue #1494).
             let _ = writeln!(std::io::stderr(), "sessiometer: boot canary skipped: {err}");
         }
         for event in &events {
