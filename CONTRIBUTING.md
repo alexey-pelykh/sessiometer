@@ -65,6 +65,19 @@ The authoritative, always-current picture is the code, not this document:
   that dependencies come from crates.io and carry an allow-listed license.
 - `cargo tree` — the actual graph at any moment.
 
+## Deploying a build to your own machine
+
+`cargo build` replaces nothing that runs, and a Debug `xcodebuild` embeds no daemon at all. Where
+the menu-bar app owns the daemon — rather than a `sessiometer service install` — it runs as an
+`SMAppService` agent **inside the app bundle**, so replacing the one already registered and serving
+is a bundle rebuild, and confirming which build is serving is a read of the event log rather than an
+inference. Which of those two owners you have is the runbook's first step, and it is not always the
+app.
+
+The procedure, the hazard in it, and that check:
+[`docs/runbooks/replacing-the-running-daemon.md`](docs/runbooks/replacing-the-running-daemon.md),
+which this paragraph only summarises — read it before acting on the summary.
+
 ## Hand-rolled primitives (and why)
 
 These live in the crate instead of as dependencies. Each is small, stable, and
