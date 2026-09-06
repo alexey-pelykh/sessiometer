@@ -247,12 +247,21 @@ pub(crate) const LANDING_WINDOW_SECS: i64 = 15 * 60;
 /// differs. The exclusion itself is left in place deliberately rather than widened: `session_pct=0`
 /// on a manual swap is a correct record of "not session-triggered", so folding those swaps into
 /// `swap_overshoot` would corrupt the #363 gate with readings no daemon decision produced.
+/// Bumped `12 → 13` (issue #1488) when the observation-gap first-sight readout added the top-level
+/// `first_sight` object — ADDITIVE (a new always-present field; every schema:12 key is
+/// byte-identical). Like `11 → 12` it carries NO value-domain correction: it folds the
+/// `observation_gap_enter` / `observation_gap_exit` pair (issue #1453), a family every prior block
+/// ignored entirely, so not one prior figure moves — diff a schema:12 and a schema:13 readout of
+/// one log and only the added key differs. Its percentiles are named `breach_*` rather than
+/// `p50`/`p95`: the population is LEFT-CENSORED at the daemon's entry edge, so they summarize
+/// breaches and not first-sight latency. See [`FirstSight`] before comparing either against the
+/// requirement's `GOAL`.
 ///
 /// `pub(crate)` so the number [`crate::cli`]'s `RELIABILITY_USAGE` advertises to script authors is
 /// held against this one by a test instead of by hand (issue #913) — tied so the two cannot drift,
 /// the way [`LANDING_WINDOW_SECS`] ties the offline window to the runtime detector's. Nothing else
 /// outside this module reads it.
-pub(crate) const JSON_SCHEMA_VERSION: u32 = 12;
+pub(crate) const JSON_SCHEMA_VERSION: u32 = 13;
 
 /// Parsed `reliability` options (issues #455/#494). A plain comparable value so the CLI parser
 /// is unit-testable by value, like `StatsArgs`.
@@ -537,6 +546,17 @@ struct Inputs {
     /// an undisclosed drop is a missing denominator, the survivorship failure this module guards
     /// against everywhere else.
     blind_pair_malformed: usize,
+    /// Every `observation_gap_enter` line in view (issues #1453/#1488) — the OPENING halves of the
+    /// first-sight record, kept RAW here and paired in [`fold_first_sight`] at aggregation (the
+    /// ingredients-here / verdict-there split every sibling SLI in this module uses).
+    first_sight_entries: Vec<FirstSightEntry>,
+    /// Every `observation_gap_exit` line in view (issues #1453/#1488) — the CLOSING halves, each
+    /// carrying the whole anchor-to-observation latency on its own line.
+    first_sight_exits: Vec<FirstSightExit>,
+    /// Lines of the first-sight pair this reader could not place: a missing or unparseable `ts=` /
+    /// `acct=` (either half), `threshold_secs=` (an entry), or `elapsed_secs=` (an exit). DISCLOSED
+    /// rather than silently dropped, for the reason [`Inputs::blind_pair_malformed`] gives.
+    first_sight_malformed: usize,
     /// The DISTINCT accounts a refresh cycle reported `outcome=dead` for (issue #881) — the
     /// refresh-token-loss population. A [`BTreeSet`] because the same loss is observed repeatedly:
     /// on the live log one account's single lapse produced four `outcome=dead` lines across two
@@ -865,6 +885,256 @@ fn fold_blind_episodes(
             }
         }
     }
+
+    out
+}
+
+/// One `observation_gap_enter` line in view (issue #1488) — the OPENING half of an observation gap.
+///
+/// Carries `threshold_secs` because the ENTRY arm is the only place the daemon stamps the bound it
+/// applied; the exit line does not repeat it. That is what lets an OFFLINE reader grade the
+/// requirement's `FAIL` criterion at all — `reliability` cannot see the daemon's live `poll_secs` /
+/// rotation, so the bound has to come off the log or not at all.
+#[derive(Debug, Clone, PartialEq)]
+struct FirstSightEntry {
+    /// The entry instant — the pairing walk's ordering key, with [`Self::seq`].
+    ts: i64,
+    /// The line's ordinal in the folded text, for the same reason [`BlindEntry::seq`] carries one:
+    /// `ts=` has whole-second resolution, so one account's exit and its next entry can share a
+    /// timestamp, and ordering those two wrong turns a real never-recovered gap into a phantom
+    /// restart.
+    seq: usize,
+    /// The account UUID (`acct=`) — the pairing key. INTERNAL only, never rendered (the #15
+    /// roster-wide-bare-numbers invariant this whole readout keeps).
+    acct: String,
+    /// `T`, the entry edge the daemon applied — `2 · poll_secs / N`.
+    threshold_secs: u64,
+}
+
+/// One `observation_gap_exit` line in view (issue #1488) — the CLOSING half.
+///
+/// SELF-CONTAINED, exactly as [`BlindExit`] is, and for a documented reason: the daemon measures
+/// `elapsed_secs` against its own in-memory anchor and tags `was_active` / `swapped_away` at the exit
+/// edge, so ONE line carries the whole anchor-to-observation latency. The emitter's own doc comment
+/// says so outright. The latency is therefore read OFF this line and never reconstructed by
+/// differencing it against an entry — pairing answers only what one line cannot (which ENTRIES never
+/// closed), which is also why a `--since` cutoff that severed the entry costs no percentile sample.
+#[derive(Debug, Clone, PartialEq)]
+struct FirstSightExit {
+    ts: i64,
+    /// Log-order tie-break, as [`FirstSightEntry::seq`].
+    seq: usize,
+    acct: String,
+    /// The WHOLE anchor-to-observation gap in seconds. `u64` because these are SECONDS, not the
+    /// percentages the swap-SLI siblings carry in `u8`: the requirement's own PAST records p50 182 s,
+    /// p95 436 s and a worst observed 638 s, every one of which overflows a `u8`.
+    elapsed_secs: u64,
+    /// Whether the account was the ACTIVE one when the gap opened. `true` on every episode today
+    /// (the daemon's entry edge is active-scoped), and filtered on anyway rather than assumed — a
+    /// reader that assumed it would silently admit a future peer-scoped episode into a
+    /// post-swap SLI.
+    was_active: bool,
+    /// The designation moved before anything looked: the gap ended by the account being PARKED, not
+    /// by being observed. Excluded from the percentiles and counted apart — folding it in would
+    /// flatter the metric with an observation that never happened.
+    swapped_away: bool,
+}
+
+/// The observation-gap first-sight readout (issue #1488) — the durable form of
+/// `active-account-observation-continuity` § 6's `PostSwapFirstSightLatency`, folded from the
+/// `observation_gap_enter` / `observation_gap_exit` pair (issue #1453).
+///
+/// **Read the percentile names before reading the percentiles.** They are `breach_*`, not `p50` /
+/// `p95`, and the prefix is load-bearing rather than decorative. The daemon's entry arm fires only
+/// when `elapsed > T` (strictly — at the bound the guarantee is MET), so the emitted population is
+/// **left-censored at `T`**: every sample here is already a breach, a within-bound first sight emits
+/// nothing at all, and the healthier the fleet the smaller and worse this population reads. So:
+///
+/// - `breach_p50` is the median of BREACHES, never of first-sight latency.
+/// - § 6's `GOAL` (`p95 <= T`, over the WHOLE distribution) is **not computable from this source**,
+///   and no filtering recovers it — this set omits everything at or below `T` by construction. The
+///   GOAL-met state is not representable, which is why this block carries no `targets` / `met` pair
+///   where its swap-SLI siblings do. Which source could grade it is `OQ-3` in
+///   `docs/design/daemon-diagnostic-integrity-solution-design.md` § 11, and it is OPEN.
+///
+/// **The one verdict this source does support, and its direction.** § 6's `FAIL` is *any single
+/// occurrence > 2T* — **twice** the entry edge, not the entry edge. Since `2T > T`, no occurrence
+/// that would trip `FAIL` is missing from the emitted set, so filtering it at `2T` cannot produce a
+/// FALSE NEGATIVE: [`Self::n_over_fail_bound_upper`] at `0` is conclusive. A non-empty result is
+/// NOT conclusive, and the field is named for that asymmetry: the entry anchor is
+/// `observed.max(designated)`, so a MID-TENURE gap on a long-active account passes this filter
+/// verbatim while sitting outside § 6's post-swap `SCALE`. It is an upper bound, never a count.
+///
+/// **Scope bound.** This is the EVENT-LOG readout only. `record_usage_sample` stays inside the
+/// daemon's `poll_idx` guard, so the usage-sample store still cannot see a never-attempted poll — a
+/// reader who assumes both surfaces were repaired will trust the wrong one.
+#[derive(Debug, Default, PartialEq)]
+struct FirstSight {
+    /// Every `observation_gap_enter` line in view.
+    n_entered: usize,
+    /// Every `observation_gap_exit` line in view. Partitioned EXACTLY by `n + n_swapped_away +
+    /// n_not_active`, so no exit goes undisclosed.
+    n_exited: usize,
+    /// The percentile subject: exits with `was_active=true` AND `swapped_away=false`.
+    n: usize,
+    /// Exits tagged `swapped_away=true` — a gap that ended by parking, not by observation.
+    n_swapped_away: usize,
+    /// Exits tagged `was_active=false`. Unreachable from today's daemon (its entry edge is
+    /// active-scoped, so every anchor it opens carries `was_active: true`) and counted anyway: the
+    /// field is on the wire, so a hand-written or future log can carry it, and a filter that
+    /// dropped those lines silently would make the partition above stop adding up.
+    n_not_active: usize,
+    /// Entries still OPEN at the horizon, restart orphans EXCLUDED (see [`Self::n_anchor_lost`]) —
+    /// a gap that never closed is the WORST case, not a missing sample.
+    n_never_recovered: usize,
+    /// Entries superseded by a LATER entry for the same account with no exit between: the anchor was
+    /// lost out-of-band. `observation_gap` is in-memory (`src/daemon.rs`) and its edges strictly
+    /// alternate, so a second entry with no exit between PROVES a restart or a roster-reconcile
+    /// drop. Counted apart so ordinary restarts cannot inflate the worst tail.
+    n_anchor_lost: usize,
+    /// Exits whose entry is not in view (a `--since` cutoff or a rotated log severed it). Their
+    /// `elapsed_secs` is still valid evidence (see [`FirstSightExit`]), so these DO contribute
+    /// percentiles; disclosed so the entry and exit counts visibly need not balance.
+    n_exit_without_enter: usize,
+    /// Pair lines that could not be placed (unreadable `ts=` / `acct=`, or `elapsed_secs=` on an
+    /// exit). DISCLOSED rather than silently dropped — an undisclosed drop is a missing denominator.
+    n_malformed: usize,
+    /// p50 of `elapsed_secs` over the breach population. `None` on an empty subject — a window with
+    /// no qualifying exit measured NOTHING, and `0` there would assert perfect latency.
+    breach_p50: Option<u64>,
+    /// p95 of the same. Named for the censored population it measures; NOT comparable to § 6's
+    /// `GOAL` p95 (see the type doc).
+    breach_p95: Option<u64>,
+    /// The worst gap in view — the figure § 6's `PAST` records as "worst observed 638 s", and the
+    /// one a `FAIL` criterion ("any single occurrence") is actually about. Published beside the
+    /// bound count so a reader sees how bad as well as how many.
+    breach_p100: Option<u64>,
+    /// `T` as the daemon stamped it, taken from the LATEST `observation_gap_enter` in view. `None`
+    /// when no entry is in view — the bound is then UNOBSERVABLE, never assumed. Read off the log
+    /// rather than recomputed because this reader is offline: it cannot see `poll_secs` or the
+    /// rotation length, so the only honest source is the line the daemon wrote.
+    entry_threshold_secs: Option<u64>,
+    /// An UPPER BOUND on § 6 `FAIL` occurrences: exits in the percentile subject whose
+    /// `elapsed_secs` exceeds `2T`. `None` when `T` is unobservable — an ungraded criterion, never a
+    /// fabricated `0`. Zero is conclusive; non-zero is not (see the type doc).
+    n_over_fail_bound_upper: Option<usize>,
+}
+
+impl FirstSight {
+    /// `2T` — § 6's `FAIL` bound. DERIVED from [`Self::entry_threshold_secs`] rather than stored, so
+    /// the edge the daemon applied and the bound this readout grades against cannot disagree, and
+    /// derived in ONE place so the human and JSON surfaces cannot disagree either (the
+    /// [`BlindEpisodes::near_limit_total_secs_lower_bound`] discipline).
+    fn fail_bound_secs(&self) -> Option<u64> {
+        self.entry_threshold_secs.map(|t| t.saturating_mul(2))
+    }
+}
+
+/// Pair the raw `observation_gap_enter` / `observation_gap_exit` halves into the first-sight readout
+/// (issue #1488), mirroring [`fold_blind_episodes`] — the same enter/exit pair shape, so the same
+/// four pathologies (severed pair, restart orphan, still-open-at-horizon, malformed).
+///
+/// Exit-derived facts (`elapsed_secs`, `was_active`, `swapped_away`) are read off the LINES; the
+/// pairing walk answers only what one line cannot — which entries never closed, and whether an
+/// unclosed one is a genuine never-recovered gap or a restart orphan.
+fn fold_first_sight(
+    entries: &[FirstSightEntry],
+    exits: &[FirstSightExit],
+    malformed: usize,
+) -> FirstSight {
+    let mut out = FirstSight {
+        n_entered: entries.len(),
+        n_exited: exits.len(),
+        n_malformed: malformed,
+        // The bound the daemon most recently applied in view. `max_by_key` over `(ts, seq)` is the
+        // LATEST line, not the largest threshold: a config change mid-window makes several values
+        // legitimate, and the current regime is the one a reader grades today's fleet against.
+        entry_threshold_secs: entries
+            .iter()
+            .max_by_key(|e| (e.ts, e.seq))
+            .map(|e| e.threshold_secs),
+        ..FirstSight::default()
+    };
+
+    // The exit partition. Ordered so it is EXACT and TOTAL: `was_active=false` is tested first, so
+    // a line carrying both flags lands in exactly one bucket and `n + n_swapped_away + n_not_active
+    // == n_exited` holds by construction rather than by an invariant of today's emitter.
+    let mut breaches: Vec<f64> = Vec::new();
+    for x in exits {
+        if !x.was_active {
+            out.n_not_active += 1;
+        } else if x.swapped_away {
+            out.n_swapped_away += 1;
+        } else {
+            out.n += 1;
+            // Widening `u64` → `f64` so the shared nearest-rank percentile (issue #455's single
+            // copy) can summarize it. Exact for every value below 2^53 — a gap of that many seconds
+            // is ~285 million years, so no reachable reading loses a bit here.
+            breaches.push(x.elapsed_secs as f64);
+        }
+    }
+
+    if out.n > 0 {
+        // `percentile` returns one of the inputs, each an integer-valued `f64` widened from `u64`
+        // above, so `as u64` is exact — it is the sample, not an interpolation.
+        let pct = |p: f64| crate::percentile::percentile(&breaches, p) as u64;
+        out.breach_p50 = Some(pct(0.50));
+        out.breach_p95 = Some(pct(0.95));
+        out.breach_p100 = Some(pct(1.0));
+    }
+
+    // The `FAIL` detector, at `2T` and never at `T`. The two differ by a factor of two, and a
+    // detector built at the entry edge would fire at HALF the threshold § 6 states. Over the
+    // percentile subject only: a `swapped_away` gap ended by parking, so it is not an occurrence of
+    // the interval § 6's SCALE names.
+    out.n_over_fail_bound_upper = out.fail_bound_secs().map(|bound| {
+        exits
+            .iter()
+            .filter(|x| x.was_active && !x.swapped_away && x.elapsed_secs > bound)
+            .count()
+    });
+
+    enum Edge<'a> {
+        Enter(&'a FirstSightEntry),
+        Exit(&'a FirstSightExit),
+    }
+
+    // One timeline over BOTH halves, keyed `(ts, seq)` — see [`fold_blind_episodes`] for why `ts`
+    // alone is not enough (whole-second resolution, and this Vec is built as all entries then all
+    // exits, which destroys log order before the sort).
+    let mut timeline: Vec<Edge> = entries
+        .iter()
+        .map(Edge::Enter)
+        .chain(exits.iter().map(Edge::Exit))
+        .collect();
+    timeline.sort_by_key(|edge| match edge {
+        Edge::Enter(e) => (e.ts, e.seq),
+        Edge::Exit(x) => (x.ts, x.seq),
+    });
+
+    let mut pending: BTreeMap<&str, &FirstSightEntry> = BTreeMap::new();
+    for edge in &timeline {
+        match edge {
+            // Replacing a pending entry is the anchor-loss proof documented on `n_anchor_lost`.
+            Edge::Enter(e) => {
+                if pending.insert(e.acct.as_str(), e).is_some() {
+                    out.n_anchor_lost += 1;
+                }
+            }
+            Edge::Exit(x) => {
+                if pending.remove(x.acct.as_str()).is_none() {
+                    out.n_exit_without_enter += 1;
+                }
+            }
+        }
+    }
+
+    // Whatever is still open at the horizon never closed IN VIEW. No censored-floor sum here, unlike
+    // the blind census: that one accumulates BLIND TIME, a quantity a still-open episode contributes
+    // a real lower bound to. This readout's quantity is a LATENCY PERCENTILE, and an unclosed gap
+    // has no latency to contribute — a floor folded into a percentile would be a fabricated sample.
+    // It is counted, and counted only.
+    out.n_never_recovered += pending.len();
 
     out
 }
@@ -1258,6 +1528,56 @@ fn parse_events(text: &str, cutoff: Option<i64>) -> Inputs {
                     });
                 } else {
                     inputs.blind_pair_malformed += 1;
+                }
+            }
+            // The observation-gap pair (issues #1453/#1488) — the first-sight readout's raw halves.
+            // Kept RAW here and paired in [`fold_first_sight`] at aggregation, for the same reason
+            // the blind pair above is: which entry never closed is a WHOLE-VIEW property.
+            //
+            // DISJOINT from the blind pair in cause, though free to overlap in time: `blind_enter`
+            // needs a poll that RAN and FAILED, while this fires on elapsed time with no poll at
+            // all. One says looking failed, the other says nothing looked. So these feed ONLY the
+            // `first_sight` block — never `time_blind_near_limit_secs` or the episode census.
+            Some("observation_gap_enter") => {
+                if let (Some(ts), Some(acct), Some(threshold_secs)) = (
+                    fields.get("ts").copied().and_then(epoch_from_rfc3339),
+                    fields.get("acct").copied(),
+                    fields
+                        .get("threshold_secs")
+                        .and_then(|v| v.parse::<u64>().ok()),
+                ) {
+                    inputs.first_sight_entries.push(FirstSightEntry {
+                        ts,
+                        seq,
+                        acct: acct.to_owned(),
+                        threshold_secs,
+                    });
+                } else {
+                    inputs.first_sight_malformed += 1;
+                }
+            }
+            Some("observation_gap_exit") => {
+                if let (Some(ts), Some(acct), Some(elapsed_secs)) = (
+                    fields.get("ts").copied().and_then(epoch_from_rfc3339),
+                    fields.get("acct").copied(),
+                    fields
+                        .get("elapsed_secs")
+                        .and_then(|v| v.parse::<u64>().ok()),
+                ) {
+                    inputs.first_sight_exits.push(FirstSightExit {
+                        ts,
+                        seq,
+                        acct: acct.to_owned(),
+                        elapsed_secs,
+                        // Absent reads as `false` for BOTH flags, matching the blind pair's arm.
+                        // Fails toward EXCLUSION from the percentiles (`was_active` absent → the
+                        // line lands in `n_not_active`), which is the safe direction: a line whose
+                        // population cannot be established must not enter a post-swap SLI.
+                        was_active: fields.get("was_active").copied() == Some("true"),
+                        swapped_away: fields.get("swapped_away").copied() == Some("true"),
+                    });
+                } else {
+                    inputs.first_sight_malformed += 1;
                 }
             }
             Some("usage_backoff") => match fields.get("class").copied() {
@@ -2060,6 +2380,9 @@ struct Report {
     /// published BESIDE the `blind_window`-derived figures above so the censoring gap is visible
     /// rather than silently folded away.
     blind_episodes: BlindEpisodes,
+    /// The issue #1488 observation-gap first-sight readout — the `observation_gap_enter` /
+    /// `observation_gap_exit` population, on a pair DISJOINT in cause from the blind one above.
+    first_sight: FirstSight,
     rate_limit: RateLimit,
     /// The issue #881 refresh-token-loss attribution — the credential-lifecycle class, reported
     /// distinctly from every swap SLI above (which it cannot reach: disjoint event families).
@@ -2224,6 +2547,15 @@ fn aggregate(inputs: &Inputs, samples: &[Sample], window: Option<Window>) -> Rep
         },
         blind_projection_error,
         blind_episodes,
+        // The issue #1488 first-sight readout, folded from the observation-gap pair. No `horizon_ts`
+        // argument, unlike `fold_blind_episodes`: that fold needs the horizon to measure a censored
+        // FLOOR in seconds, and this one measures no such quantity (see `fold_first_sight`'s closing
+        // comment) — it only COUNTS what never closed, which the pairing walk already knows.
+        first_sight: fold_first_sight(
+            &inputs.first_sight_entries,
+            &inputs.first_sight_exits,
+            inputs.first_sight_malformed,
+        ),
         rate_limit: RateLimit {
             rate_limited: inputs.rate_limited,
             transient: inputs.transient,
@@ -2535,6 +2867,75 @@ fn render_human(r: &Report) -> String {
     }
     out.push('\n');
 
+    // SLI 8 — first sight after a change of active (issue #1488): the durable form of
+    // `active-account-observation-continuity` § 6's `PostSwapFirstSightLatency`. Rendered
+    // immediately beneath the blind census because those are the fleet's two blindness instruments
+    // and a reader should meet them together — but kept a SEPARATE block, never merged, because the
+    // two are disjoint in CAUSE: `blind_*` says a poll ran and FAILED, this says nothing LOOKED.
+    //
+    // The heading carries the censoring in words, at the point of use, and the GOAL caveat sits
+    // directly under it in EVERY case including the empty one. That placement is the point: a reader
+    // looking for the § 6 `GOAL` verdict must find out here that it is absent BY CONSTRUCTION, not
+    // conclude the readout forgot it. Design § 11 K-6 — the highest-rated risk in that register — is
+    // exactly a reader taking a bare percentile here for the `GOAL` figure.
+    let fs = &r.first_sight;
+    out.push_str(
+        "first sight after a change of active (observation_gap pair; the BREACH TAIL — the daemon emits only gaps already past its bound)\n",
+    );
+    out.push_str(
+        "  GOAL (p95 over the WHOLE first-sight distribution) is not computable from this source — a within-bound first sight emits no event at all (design OQ-3, open)\n",
+    );
+    if fs.n_entered == 0 && fs.n_exited == 0 && fs.n_malformed == 0 {
+        // Deliberately does NOT name a cause: absence has three (no gap crossed the bound, a
+        // `--since` window excluding them, or a log predating the record) and the reader cannot tell
+        // them apart from here — the [`BlindEpisodes`] render's own reasoning, for the same reason.
+        out.push_str("  none in view\n");
+    } else {
+        out.push_str(&format!(
+            "  qualifying exits: n={} of {} in view ({} swapped away before anything looked; {} not active at entry)\n",
+            fs.n, fs.n_exited, fs.n_swapped_away, fs.n_not_active
+        ));
+        match (fs.breach_p50, fs.breach_p95, fs.breach_p100) {
+            (Some(p50), Some(p95), Some(p100)) => {
+                out.push_str(&format!("  breach P50  = {p50}s\n"));
+                out.push_str(&format!("  breach P95  = {p95}s\n"));
+                out.push_str(&format!("  breach P100 = {p100}s\n"));
+            }
+            // A `0` here would assert PERFECT latency over a window that measured nothing. The
+            // discriminator against the plain-count shape `RefreshTokenLossWire` uses, whose own
+            // doc comment says a zero THERE is a real reading; here it is not.
+            _ => out.push_str(
+                "  no qualifying exits — percentiles withheld (an empty subject is not a 0s first sight)\n",
+            ),
+        }
+        match (
+            fs.entry_threshold_secs,
+            fs.fail_bound_secs(),
+            fs.n_over_fail_bound_upper,
+        ) {
+            (Some(t), Some(bound), Some(over)) => out.push_str(&format!(
+                "  FAIL (> {bound}s, TWICE the {t}s entry edge): at most {over} — an upper bound; 0 is conclusive, non-zero is not (a mid-tenure gap passes the same filter)\n"
+            )),
+            // Unobservable, never a fabricated `0`: without an entry line the daemon's own bound is
+            // not on the log, and this reader is offline — it cannot see `poll_secs` or the rotation.
+            _ => out.push_str(
+                "  FAIL: ungraded — no observation_gap_enter in view, so the daemon's bound is unobservable from here\n",
+            ),
+        }
+        out.push_str(&format!(
+            "  gaps: entered={} exited={} never_recovered={} anchor_lost={}\n",
+            fs.n_entered, fs.n_exited, fs.n_never_recovered, fs.n_anchor_lost
+        ));
+        // Never hide a drop: an undisclosed one is a missing denominator.
+        if fs.n_exit_without_enter > 0 || fs.n_malformed > 0 {
+            out.push_str(&format!(
+                "  (exits with no entry in view: {}; unplaceable pair lines: {})\n",
+                fs.n_exit_without_enter, fs.n_malformed
+            ));
+        }
+    }
+    out.push('\n');
+
     // SLI 3 — false-preempt: the real preemptive-swap count (issue #452, ADR-0017) plus the
     // interim blind-window proxy.
     out.push_str("false-preempt (preemptive swap whose target turned out unnecessary)\n");
@@ -2674,6 +3075,16 @@ struct ReliabilityWire {
     /// The issue #591 uncensored blind-episode census (schema:8, additive) — the `blind_enter` /
     /// `blind_exit` population beside the `blind_window`-derived figures above.
     blind_episodes: BlindEpisodesWire,
+    /// The issue #1488 observation-gap first-sight readout (schema:13, additive) — the durable form
+    /// of `active-account-observation-continuity` § 6's `PostSwapFirstSightLatency`.
+    ///
+    /// Placed HERE, beside `blind_episodes`, rather than last. Two conventions are live in this
+    /// struct and this follows `operator_landing`'s: adjacency, justified because this block is
+    /// `BlindEpisodesWire`'s enter/exit-pair census one instrument over, and a reader who cannot see
+    /// them together cannot see that. The `refresh_token_loss` convention below — appended last so
+    /// every prior key keeps its POSITION — is respected too, and by construction: inserting above
+    /// `rate_limit_neutrality` leaves that block still last, so its own doc comment stays true.
+    first_sight: FirstSightWire,
     rate_limit_neutrality: RateLimitWire,
     /// The issue #881 refresh-token-loss attribution (schema:10, additive) — the credential-
     /// lifecycle class, kept out of every swap SLI above. Placed LAST so every schema:9 key keeps
@@ -3021,6 +3432,81 @@ struct BlindProjectionErrorWire {
     p100: Option<f64>,
 }
 
+/// The observation-gap first-sight readout (schema:13, issue #1488) — the `observation_gap_enter` /
+/// `observation_gap_exit` population (issue #1453), reaching a JSON wire for the first time.
+///
+/// **The percentile names carry the censoring, and that is the contract, not a style choice.** They
+/// are `breach_*` because the daemon's entry arm fires only when `elapsed > T`: the population is
+/// LEFT-CENSORED at that bound, so every sample is already a breach and a within-bound first sight
+/// emits nothing. A bare `p50` / `p95` here would invite comparison against
+/// `active-account-observation-continuity` § 6's `GOAL` — the one comparison this source cannot
+/// support (`p95 <= T` is stated over the WHOLE distribution, which this set omits by construction).
+///
+/// **No `targets` / `met` pair, deliberately**, where every swap-SLI sibling above carries one: a
+/// `GOAL` verdict is not a representable state here, so publishing one would assert what the data
+/// cannot say. The one criterion this source DOES bound is § 6's `FAIL` — see
+/// [`Self::n_over_fail_bound_upper`], and read its direction before quoting it.
+///
+/// Full derivation, the `OQ-3` gap, and the `K-6` naming constraint this shape satisfies:
+/// [`FirstSight`], and `docs/design/daemon-diagnostic-integrity-solution-design.md` § 7 / § 11.
+#[derive(serde::Serialize)]
+struct FirstSightWire {
+    /// The percentile subject: `observation_gap_exit` lines with `was_active=true` AND
+    /// `swapped_away=false`. Published BESIDE the percentiles so the denominator is always visible —
+    /// a thin window must be legible as thin, not discovered later.
+    n: usize,
+    /// p50 of `elapsed_secs` over that subject, in SECONDS. `null` on `n = 0` — never `0`, which
+    /// would assert perfect latency where nothing was measured.
+    breach_p50: Option<u64>,
+    /// p95 of the same. NOT comparable to § 6's `GOAL` p95; see the type doc.
+    breach_p95: Option<u64>,
+    /// The worst gap in view — § 6's `PAST` records "worst observed 638 s", and a `FAIL` criterion
+    /// ("any single occurrence") is about exactly this figure.
+    breach_p100: Option<u64>,
+    /// `T`, the entry edge, read off the LATEST `observation_gap_enter` in view — the only place the
+    /// daemon stamps it, and the only source an OFFLINE reader has (it cannot see `poll_secs` or the
+    /// rotation length). `null` when no entry is in view: unobservable, not assumed.
+    entry_threshold_secs: Option<u64>,
+    /// `2 · entry_threshold_secs` — § 6's `FAIL` bound, TWICE the entry edge. Derived from the field
+    /// above so the two cannot disagree, and published so a consumer can see which bound the count
+    /// below was computed against. `null` whenever `T` is.
+    fail_bound_secs: Option<u64>,
+    /// An UPPER BOUND on § 6 `FAIL` occurrences: subject exits with `elapsed_secs > fail_bound_secs`.
+    /// `null` when the bound is unobservable — an ungraded criterion, never a fabricated `0`.
+    ///
+    /// **Read the direction.** `0` is CONCLUSIVE (no occurrence that would trip `FAIL` can be
+    /// missing from the emitted set, since `2T > T`). Non-zero is NOT a count of `FAIL` occurrences:
+    /// the entry anchor is `observed.max(designated)`, so a MID-TENURE gap on a long-active account
+    /// passes this filter verbatim while sitting outside § 6's post-swap `SCALE`.
+    n_over_fail_bound_upper: Option<usize>,
+    /// Every `observation_gap_enter` line in view.
+    n_entered: usize,
+    /// Every `observation_gap_exit` line in view. Partitioned EXACTLY by `n + n_swapped_away +
+    /// n_not_active`, so no exit goes undisclosed.
+    n_exited: usize,
+    /// Exits tagged `swapped_away=true`: the gap ended by the account being PARKED, not by being
+    /// observed. Counted here and excluded from the percentiles — folding it in would flatter the
+    /// metric with an observation that never happened.
+    n_swapped_away: usize,
+    /// Exits tagged `was_active=false` — excluded too. Unreachable from today's daemon and counted
+    /// anyway, so the partition above holds by construction rather than by an emitter invariant.
+    n_not_active: usize,
+    /// Entries still open at the horizon, restart orphans EXCLUDED (see `n_anchor_lost`). A gap that
+    /// never closed is the worst case, not a missing sample.
+    n_never_recovered: usize,
+    /// Entries superseded by a later entry for the same account: the in-memory anchor was lost
+    /// out-of-band (a daemon restart, or a roster-reconcile drop). Counted APART from
+    /// `n_never_recovered` so restarts cannot inflate the worst tail.
+    n_anchor_lost: usize,
+    /// Exits whose entry is not in view (a `--since` cutoff or a rotated log severed it). They still
+    /// contribute percentiles — one line carries the whole latency — so this is disclosed only so
+    /// the entry and exit counts visibly need not balance.
+    n_exit_without_enter: usize,
+    /// Pair lines that could not be placed (unreadable `ts=` / `acct=` / `threshold_secs=` /
+    /// `elapsed_secs=`).
+    n_malformed: usize,
+}
+
 /// 429-rate neutrality counts.
 #[derive(serde::Serialize)]
 struct RateLimitWire {
@@ -3163,6 +3649,24 @@ fn reliability_wire(r: &Report) -> ReliabilityWire {
                 // The SAME derivation the human surface renders, so the two cannot disagree.
                 total_secs_lower_bound: r.blind_episodes.near_limit_total_secs_lower_bound(),
             },
+        },
+        first_sight: FirstSightWire {
+            n: r.first_sight.n,
+            breach_p50: r.first_sight.breach_p50,
+            breach_p95: r.first_sight.breach_p95,
+            breach_p100: r.first_sight.breach_p100,
+            entry_threshold_secs: r.first_sight.entry_threshold_secs,
+            // The SAME derivation the human surface renders, so the two cannot disagree.
+            fail_bound_secs: r.first_sight.fail_bound_secs(),
+            n_over_fail_bound_upper: r.first_sight.n_over_fail_bound_upper,
+            n_entered: r.first_sight.n_entered,
+            n_exited: r.first_sight.n_exited,
+            n_swapped_away: r.first_sight.n_swapped_away,
+            n_not_active: r.first_sight.n_not_active,
+            n_never_recovered: r.first_sight.n_never_recovered,
+            n_anchor_lost: r.first_sight.n_anchor_lost,
+            n_exit_without_enter: r.first_sight.n_exit_without_enter,
+            n_malformed: r.first_sight.n_malformed,
         },
         rate_limit_neutrality: RateLimitWire {
             rate_limited: r.rate_limit.rate_limited,
