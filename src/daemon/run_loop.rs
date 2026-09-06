@@ -219,6 +219,12 @@ fn report_tick_outcome<W: Write>(
     // (above) records every cycle. A DISCARDED `writeln!` and not `eprintln!`, for the reason
     // [`emit_best_effort`] states: `eprintln!` panics when the stderr write ITSELF fails, and
     // under launchd this echo's stderr is a FILE on the event log's volume (issue #1494).
+    //
+    // Addressed to `stderr` DIRECTLY and not through `diag`, even though a writer is already
+    // threaded here: `DiagnosticLog::emit` is verbosity-gated and drops everything at
+    // `Verbosity::Quiet`, the default. The swap echo is the operator's swap notification
+    // (issue #8), not a debugging aid, so it must survive that gate. Production wires the
+    // same `std::io::stderr()` into both (`cli`), so this costs no divergence.
     if let Some(report) = swap_report(outcome) {
         let _ = writeln!(std::io::stderr(), "sessiometer: {report}");
     }

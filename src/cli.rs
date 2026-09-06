@@ -6235,6 +6235,83 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_run_loop_reports_to_the_console_without_a_macro_that_can_panic_the_daemon() {
+        // Issue #1494, the sibling of the guard directly above and the same argument one scope
+        // out: `eprintln!` PANICS when the stderr write ITSELF fails, and the launchd plist
+        // routes `StandardErrorPath` into the same directory as the event log
+        // (`crate::service`) — so on the volume-full condition every console report in the run
+        // loop is a panic site. The four converted by #1494 are `report_tick_outcome`'s swap
+        // echo, `notify_unrecoverable`'s operator line, and `run_loop`'s own reconcile-on-start
+        // and boot-canary reports.
+        //
+        // WHAT THIS GUARD COVERS, STATED SO THE BOUND IS NOT MISREAD: exactly one file,
+        // `src/daemon/run_loop.rs`. It is NOT a guard over "the daemon's live path", which is a
+        // strictly larger set — `daemon::append_sample_for_poll` reports a skipped usage-sample
+        // write on the poll path, after the bind, and is outside issue #1494's enumerated scope
+        // (filed separately rather than folded in). Widening this scan to the live path means
+        // converting that site in the same change; do not widen the scan alone, which would
+        // fail on a site this issue deliberately did not touch.
+        //
+        // A SOURCE scan for the same reason the guard above is one: stderr cannot be made
+        // unwritable inside a running test process without taking the harness down with it.
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/daemon/run_loop.rs"),
+        )
+        .expect("src/daemon/run_loop.rs is readable from the crate root");
+
+        // Prose in that file NAMES the macro deliberately — `emit_best_effort`'s doc comment
+        // explains the convention and each converted site cites it — so scanning the raw text
+        // would fail on the very comments that document the rule. Scan CODE only: keep every
+        // line whose trimmed form does not open a `//` or `///` comment, carrying each line's
+        // 1-based number so a finding can name WHERE rather than dumping the file. Two honest
+        // limits, neither present in that file today and both failing SAFE (toward a false
+        // alarm, never a false pass): a trailing `// …eprintln!(…` on a code line, and a
+        // `/* … */` block.
+        let code: Vec<(usize, &str)> = source
+            .lines()
+            .enumerate()
+            .map(|(i, line)| (i + 1, line))
+            .filter(|(_, line)| !line.trim_start().starts_with("//"))
+            .collect();
+
+        // Canary the extraction before the assertions it carries — an un-canaried scan passes
+        // over an empty or mis-selected corpus, and a guard that cannot fail is not a guard.
+        // Both halves are known-present IN THE DIMENSION UNDER TEST (code lines, post-strip):
+        // a declaration proves the strip did not eat the file, and a converted call proves the
+        // sites themselves are still here, so DELETING them cannot make the assertion below
+        // pass vacuously.
+        let has = |needle: &str| code.iter().any(|(_, line)| line.contains(needle));
+        assert!(
+            has("fn notify_unrecoverable(labels: &[String]) {"),
+            "the comment-strip left no run-loop code, so this scan has no subject: it kept {} \
+             of {} lines",
+            code.len(),
+            source.lines().count()
+        );
+        assert!(
+            has(r#"let _ = writeln!(std::io::stderr(), "sessiometer: {report}");"#),
+            "the converted console reports are gone from the scanned code, so the assertion \
+             below would hold vacuously; this scan has no subject: it kept {} of {} lines",
+            code.len(),
+            source.lines().count()
+        );
+
+        let regressed: Vec<String> = code
+            .iter()
+            .filter(|(_, line)| line.contains("eprintln!("))
+            .map(|(n, line)| format!("  src/daemon/run_loop.rs:{n}: {}", line.trim()))
+            .collect();
+        assert!(
+            regressed.is_empty(),
+            "a console report in the run loop went back to a macro that PANICS on a failed \
+             stderr write, so the volume-full condition that makes the event log unwritable \
+             kills the running daemon instead of being swallowed (issue #1494). Use the \
+             discarded `writeln!` form `emit_best_effort` documents:\n{}",
+            regressed.join("\n")
+        );
+    }
+
     fn acct(label: &str, uuid: &str) -> Account {
         Account {
             account_uuid: uuid.to_owned(),
