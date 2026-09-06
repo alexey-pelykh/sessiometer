@@ -1558,28 +1558,115 @@ mod tests {
         let base = now - DAY_SECS; // inside the 14d raw window → always retained
 
         const N: i64 = 50;
+        // Two handshakes replace the wall-clock pacing this test used to rely on
+        // (issue #1492), which was load-dependent in both directions at once: a
+        // yield short enough to keep the compactor colliding with the appender also
+        // let it hold the unfairly-granted `flock` for ~the whole run, so on a loaded
+        // machine the backing-off appender could miss for the entire
+        // `STORE_LOCK_MAX_WAIT` and fail closed with `UsageStoreBusy`.
+        //
+        // 1. A capacity-0 rendezvous fixes the run's SHAPE: one compaction pass per
+        //    append, so neither writer runs ahead and each queues behind at most ONE
+        //    of the other's critical sections rather than a whole run of them. That
+        //    is a structural bound on WHAT is waited for; the MARGIN it leaves is
+        //    finite and load-dependent, so do not read it as unbounded headroom.
+        //    Instrumenting `StoreLock::acquire` with a per-acquire retry counter, the
+        //    worst single contended acquire consumed 1 of the 100-retry budget
+        //    unloaded, 7 alongside three concurrent suites and 31 alongside seven —
+        //    growing with load, never exhausted. The comments on `:113`/`:121` call
+        //    these sections sub-millisecond, which holds for the daemon and not for a
+        //    loaded test host; that gap is the margin, and a future change that
+        //    lengthens a critical section spends it.
+        // 2. The appender then holds each append until the pass it just released is
+        //    demonstrably UNDERWAY, so the append is issued INSIDE the rewrite's
+        //    read-modify-write rather than merely near it — the interleaving the lock
+        //    exists to forbid. A rendezvous alone releases both threads together and
+        //    an append wins by microseconds every time, which silently stops covering
+        //    the guard in `append_sample`.
+        //
+        // Both arms of that wait are EVENTS, never an interval: an unavailable store
+        // lock (probed with a zero budget, so it never blocks) means the pass is in
+        // flight, and a completion on `done_rx` means it has finished. The compactor
+        // must produce one or the other, so the wait cannot hang and there is no
+        // duration to tune — which matters, because an interval short enough to
+        // catch a compactor that locks is long enough to miss one that does not.
+        // Completions are COUNTED rather than drained, so none is ever discarded.
+        // Both `unwrap`s stay: a fail-closed refusal from either writer must still
+        // fail this test loudly.
+        //
+        // The appends ALTERNATE between the two timings because neither covers both
+        // halves of the lock. Measured 40 runs per cell against builds with one
+        // guard removed in turn — the pre-#188 race, from each side:
+        //
+        //     guard removed from    early only   late only   alternating
+        //     `compact_and_roll`      40/40        0/40         40/40
+        //     `append_sample`         27/40       40/40         40/40
+        //
+        // An early-only append wins by microseconds and never enters the rewrite
+        // window; a late-only one waits out a compactor that does not lock, so it
+        // never overlaps either. The wall-clock pacing this replaced also scored
+        // 40/40 on both, and failed 16 of 120 full-suite runs under concurrent load;
+        // alternating holds 40/40 on both at 0 of 120.
+        //
+        // It costs time, and that is the price rather than an oversight: this test
+        // runs ~1.6 s isolated against the predecessor's ~0.24 s, because an appender
+        // that waits for a pass to be underway then queues behind it. Suite wall time
+        // is unchanged (both ~5 s at default parallelism), so it is not a CI cost. Do
+        // not trade the waiting away for a faster run — the waiting IS the exercise.
+        let (tick_tx, tick_rx) = std::sync::mpsc::sync_channel::<()>(0);
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let appender = {
             let samples_path = samples_path.clone();
             std::thread::spawn(move || {
+                let lock = lock_path(&samples_path);
+                let mut passes_done: i64 = 0;
                 for k in 0..N {
+                    // Keep the completion count current so the guard below reflects
+                    // the compactor's real progress rather than a stale reading.
+                    while done_rx.try_recv().is_ok() {
+                        passes_done += 1;
+                    }
+                    if k % 2 == 1 {
+                        // `is_ok()` drops the probe's guard at the end of the
+                        // condition, so a probe that wins the lock never holds it
+                        // against the compaction it is waiting on. Note this arm
+                        // READS the very guard the test checks: were the store lock
+                        // ever a no-op, it would degenerate to the late timing, which
+                        // scores 0/40 against the `compact_and_roll` mutant. The
+                        // even-`k` appends are what cover that, so the alternation is
+                        // load-bearing — do not simplify it to this branch alone.
+                        while passes_done < k && StoreLock::acquire(&lock, Duration::ZERO).is_ok() {
+                            if done_rx.try_recv().is_ok() {
+                                passes_done += 1;
+                            } else {
+                                std::thread::yield_now();
+                            }
+                        }
+                    }
                     append_sample(&samples_path, &sample(base + k, 0.1, 0.2)).unwrap();
+                    // A dropped receiver means the compactor has already panicked and
+                    // the main thread is unwinding, so the assertion below is
+                    // unreachable and there is nothing left to append FOR. Stop:
+                    // carrying on races `dir`'s removal and buries the real failure
+                    // under a spurious `NotFound` from this thread (measured in 27 of
+                    // 30 fault-injected runs before this `break`, 0 of 30 after).
+                    if tick_tx.send(()).is_err() {
+                        break;
+                    }
                 }
             })
         };
-        // Compact concurrently while the appender runs. A brief yield between passes
-        // models reality (the daemon compacts at most hourly, never in a tight loop)
-        // AND keeps the advisory lock — which `flock` grants unfairly — free often
-        // enough that neither writer starves the other; a tight no-yield loop would
-        // let the compactor hold the lock ~continuously and starve the backing-off
-        // appender, a test artifact rather than a serialization failure.
-        while !appender.is_finished() {
+        // One pass per append; the loop ends when the appender drops its sender.
+        for _ in tick_rx {
             compact_and_roll(&samples_path, &rollup_path, now, &policy).unwrap();
-            std::thread::sleep(Duration::from_millis(1));
+            let _ = done_tx.send(());
         }
         appender.join().unwrap();
-        // Settle any samples appended after the last concurrent compaction.
+        // A final pass, which settles NOTHING: the rendezvous orders the last append
+        // before the last in-loop pass, so that pass already saw all N. It is kept as
+        // a free idempotence check — a pass over the full retained window must not
+        // change the count the assertion reads.
         compact_and_roll(&samples_path, &rollup_path, now, &policy).unwrap();
-
         let remaining = read_samples(&samples_path).unwrap();
         assert_eq!(
             remaining.len(),
