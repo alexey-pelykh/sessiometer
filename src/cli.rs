@@ -6249,7 +6249,7 @@ mod tests {
         // `src/daemon/run_loop.rs`. It is NOT a guard over "the daemon's live path", which is a
         // strictly larger set — `daemon::append_sample_for_poll` reports a skipped usage-sample
         // write on the poll path, after the bind, and is outside issue #1494's enumerated scope
-        // (filed separately rather than folded in). Widening this scan to the live path means
+        // (filed as issue #1498 rather than folded in). Widening this scan to the live path means
         // converting that site in the same change; do not widen the scan alone, which would
         // fail on a site this issue deliberately did not touch.
         //
