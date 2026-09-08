@@ -356,7 +356,13 @@ mod tests {
         let source = witness_source_above_the_tests();
         for forbidden in [
             "control_socket",
+            // Both spellings on purpose. `UnixStream` was the client type's name until #1511
+            // moved it behind a per-target alias; keeping it costs nothing and it is still what
+            // a Unix-only reach would be written as, while `control_transport` is the name any
+            // reach would have to go through now. Dropping the old token as "dead" is how a
+            // guard quietly stops guarding.
             "UnixStream",
+            "control_transport",
             "notify_roster_reload",
             "crate::daemon",
         ] {

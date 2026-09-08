@@ -4,9 +4,9 @@
 //! The control channel's BYTE TRANSPORT, one arm per target (issue #1511, ADR-0037).
 //!
 //! Everything above this module — the newline-delimited `{"cmd":"…"}` framing, the
-//! `serde` decode, [`crate::daemon`]'s `serve_control` and every client verb — is pure Rust
-//! with no OS surface. This module is the whole of the per-target seam under it: how a listening
-//! endpoint is created, how one connection is accepted, and how a client opens one.
+//! `serde` decode, [`crate::daemon`]'s `socket::serve_control` and every client verb — is pure
+//! Rust with no OS surface. This module is the whole of the per-target seam under it: how a
+//! listening endpoint is created, how one connection is accepted, and how a client opens one.
 //!
 //! Unix (macOS, Linux) keeps the `0600` Unix-domain socket verbatim: the aliases below
 //! ARE `tokio::net::UnixStream` / `UnixListener`, and `ControlListener::bind` is the
@@ -34,16 +34,23 @@
 //! - **The name is derived from the control-socket path**, so the two ends cannot drift
 //!   (`windows_pipe_name`, in the Windows arm below).
 //!
-//! The item names above are code spans rather than intra-doc links on purpose: each one lives
-//! in a private per-target `imp` module, so a link would either not resolve at all or resolve
-//! on one target only — and `RUSTDOCFLAGS="-D warnings"` turns that into a failed build. This
-//! is the idiom `crate::canary` already uses for the same reason.
+//! The item names above are code spans rather than intra-doc links on purpose. Each lives in a
+//! private per-target `imp` module, which is not in this module's link scope, and
+//! `windows_pipe_name` does not exist at all on Unix — so a link would either never resolve or
+//! resolve on one target only, and `RUSTDOCFLAGS="-D warnings"` turns that into a failed build.
+//! The shape used instead — link the module that IS reachable, name the item beside it in a code
+//! span — is the one `crate::canary`'s `reconcile_on_start` reference already takes.
 //!
-//! NOT here, deliberately: the peer's identity and the pipe's owner-only security descriptor.
-//! ADR-0037 assigns both to **#976** and this item's Boundaries exclude them
-//! (`crate::daemon::peer_auth` is the Unix half). The one identity-protecting piece that IS
-//! here is the client's SQOS flag pair, because it rides on the client's own open call and so
+//! NOT here: the peer's identity, which ADR-0037 assigns to **#976** and this item's Boundaries
+//! exclude (`crate::daemon::peer_auth` is the Unix half). The one identity-protecting piece that
+//! IS here is the client's SQOS flag pair, because it rides on the client's own open call and so
 //! is transport code — ADR-0037 § Consequences → Negative splits them the same way.
+//!
+//! ALSO not here, and on a different footing: the pipe's owner-only security descriptor. That one
+//! is not a residual anybody was assigned — ADR-0037 § Decision 2 mandates it in the same sentence
+//! as `first_pipe_instance` and `reject_remote_clients`, and this port implements those two and
+//! not it. It is tracked at **#1513**; until that lands an instance carries the pipe namespace's
+//! DEFAULT descriptor, and the `0600` socket's guarantee has no Windows counterpart.
 
 // The control transport is per-target and neither arm below is portable beyond the targets
 // ADR-0029 and ADR-0037 declare. Fail at compile time naming the missing port, rather than
@@ -133,6 +140,16 @@ mod imp {
         tokio::net::UnixStream::connect(path).await
     }
 
+    /// Whether `err` from [`connect`] means the daemon is UP but had no capacity to spare.
+    ///
+    /// Always `false` here, and not as a stub: a Unix listener has no per-client endpoint to run
+    /// out of, so `connect` either reaches the daemon or does not. It exists so the callers that
+    /// distinguish "no daemon" from "daemon busy" can be written once, target-neutrally — on this
+    /// target the arm is dead code the compiler folds away, and the behaviour is unchanged.
+    pub(crate) fn is_saturated(_err: &io::Error) -> bool {
+        false
+    }
+
     /// Best-effort removal of the endpoint on the way out.
     ///
     /// On Unix the socket is a real file that outlives the process, so a clean shutdown unlinks
@@ -181,8 +198,10 @@ mod imp {
     /// documented signal to retry, not an error (ADR-0037 § Consequences → Negative). In the
     /// accept loop below the window is a single `create` call wide, so this budget exists for
     /// the pathological saturated case rather than the normal one. BOUNDED here rather than left
-    /// to the caller because two clients (`ControlSocketCache::query_status`, `poke`'s
-    /// best-effort read) wrap no timeout of their own around the exchange.
+    /// to the caller because not every client bounds itself: `cli::query_status` and `poke`'s
+    /// best-effort read wrap no timeout of their own around the exchange.
+    /// `ControlSocketCache::query_status` reads as a third and is not one — `use_account` wraps
+    /// it in `CONTROL_SOCKET_TIMEOUT` at the call site.
     const CLIENT_BUSY_BUDGET: Duration = Duration::from_secs(1);
 
     /// How long a CLIENT sleeps between `ERROR_PIPE_BUSY` retries.
@@ -196,6 +215,16 @@ mod imp {
     /// nothing in this repo pins.
     fn is_pipe_busy(err: &io::Error) -> bool {
         err.raw_os_error() == Some(ERROR_PIPE_BUSY as i32)
+    }
+
+    /// Whether `err` from [`connect`] means the daemon is UP but had no capacity to spare.
+    ///
+    /// The public half of [`is_pipe_busy`], for callers that cannot key on `io::ErrorKind`. A
+    /// busy error only reaches a caller after [`CLIENT_BUSY_BUDGET`] has already been spent
+    /// retrying, so seeing one means the saturation outlasted that budget — still "the daemon is
+    /// running", which is the distinction the caller needs.
+    pub(crate) fn is_saturated(err: &io::Error) -> bool {
+        is_pipe_busy(err)
     }
 
     /// The pipe name for the control endpoint whose Unix-side path is `path`.
@@ -250,10 +279,12 @@ mod imp {
     ///
     /// NOT set here: the owner-only security descriptor
     /// (`create_with_security_attributes_raw` with `D:P(A;;GA;;;<our user SID>)`, the analogue of
-    /// the Unix `0600` chmod). That is identity-shaped work and ADR-0037 assigns it to **#976**,
-    /// whose Boundaries this port must not cross. Until it lands the instance carries the pipe
-    /// namespace's DEFAULT descriptor — which is why the whole Windows tier lands together behind
-    /// the #978 CI job and nothing ships from this item alone.
+    /// the Unix `0600` chmod). ADR-0037 § Decision 2 mandates it in the same sentence as the two
+    /// flags above, so it is a gap in that decision rather than a boundary this port respects —
+    /// it belongs to no residual the ADR assigns and is tracked at **#1513**. Until it lands the
+    /// instance carries the pipe namespace's DEFAULT descriptor, which is one reason the whole
+    /// Windows tier lands together behind the #978 CI job and nothing ships from this item
+    /// alone.
     fn create_instance(name: &OsString, first: bool) -> io::Result<NamedPipeServer> {
         ServerOptions::new()
             .first_pipe_instance(first)
@@ -267,7 +298,7 @@ mod imp {
     ///
     /// This is the cancel-safety mechanism, and it is a guard rather than the more obvious
     /// borrow-across-the-await because that pattern is `clippy::await_holding_refcell_ref`, which
-    /// this crate denies. Same RAII shape the #972 spike uses to close its impersonation window: the
+    /// is warn-by-default and so an error under CI's `-D warnings`. Same RAII shape the #972 spike uses to close its impersonation window: the
     /// property must not depend on every arm remembering to restore, since an early return or an
     /// unwinding panic would then leave the endpoint with nothing listening.
     struct PendingAccept<'a> {
@@ -300,8 +331,8 @@ mod imp {
     pub(crate) struct ControlListener {
         name: OsString,
         /// The created-but-not-yet-connected instance. `None` only in the window after an
-        /// instance was handed out and its replacement could not yet be created (the pipe was at
-        /// its ceiling); the next [`accept`] waits for one.
+        /// instance was handed out and its replacement could not yet be created (no instance was
+        /// available); the next [`ControlListener::accept`] waits for one.
         idle: RefCell<Option<NamedPipeServer>>,
     }
 
@@ -326,9 +357,22 @@ mod imp {
 
         /// Wait until a listening instance can be created, then create it.
         ///
-        /// `ERROR_PIPE_BUSY` from `create` means the pipe is at its instance ceiling — 255, the
-        /// OS maximum, which tokio requests as `PIPE_UNLIMITED_INSTANCES` and this code does not
-        /// lower. Every other error is surfaced.
+        /// `ERROR_PIPE_BUSY` from `create` means no instance is available right now. It does NOT
+        /// mean a ceiling of 255 was reached, and an earlier revision of this comment said it
+        /// did: this code never calls `ServerOptions::max_instances`, so it takes tokio's default
+        /// of `PIPE_UNLIMITED_INSTANCES`, which is a SENTINEL rather than a count — Windows
+        /// documents the number of instances under it as limited only by the availability of
+        /// system resources. 255 is the value of that sentinel and is the one number
+        /// `max_instances` refuses outright (`assert!(instances < 255)`, so 254 is the largest
+        /// ceiling that can be set at all).
+        ///
+        /// The retry predicate is correspondingly narrower than "at capacity": it keys on
+        /// `ERROR_PIPE_BUSY` and surfaces everything else. Whether exhausting system resources
+        /// reports busy or reports something else is UNMEASURED — the #972 spike pinned a small
+        /// `max_instances` so that a ceiling was reachable inside a CI run, which is not this
+        /// configuration. A non-busy error surfaces, and `UnixControl::serve` turns a failed
+        /// accept into an event the run loop re-arms immediately, so that path spins where this
+        /// one waits. #978 is where it first becomes observable.
         ///
         /// It WAITS rather than erroring because the run loop treats a resolved `serve` as an
         /// event: returning `Err` at the ceiling would resolve the select arm immediately and
@@ -359,17 +403,24 @@ mod imp {
         ///   holds its instance for the length of the exchange. A `watch` subscription (#165)
         ///   holds one for its whole lifetime, which is where one-client-per-instance bites
         ///   hardest.
-        /// - **The ceiling is 255**, the OS maximum. At the ceiling, creating the replacement
+        /// - **There is no fixed ceiling.** `max_instances` is never set, so instances are
+        ///   bounded by system resources rather than by a number — see
+        ///   [`ControlListener::wait_for_instance`], which also records what that costs the retry
+        ///   predicate. When none can be created the replacement
         ///   fails `ERROR_PIPE_BUSY`; this leaves no listening instance, so an arriving client
         ///   also gets `ERROR_PIPE_BUSY` — which [`connect`] retries — and the next `accept`
-        ///   waits (see [`wait_for_instance`]) until a subscriber disconnects. Nothing is
+        ///   waits (see [`ControlListener::wait_for_instance`]) until a subscriber disconnects.
+        ///   Nothing is
         ///   dropped and no client is refused outright; service resumes on its own.
         /// - **At least one instance exists at all times**, so the NAME is never released while
-        ///   the daemon is up. That is why the replacement is created BEFORE the connected
-        ///   instance is handed out, and why the failure above leaves the connected one in the
-        ///   caller's hands rather than closing it. A released name is worse than a busy one: a
-        ///   client would see `ERROR_FILE_NOT_FOUND` and report "no daemon", and any local
-        ///   process could then take the name.
+        ///   the daemon is up. A released name is worse than a busy one: a client would see
+        ///   `ERROR_FILE_NOT_FOUND` and report "no daemon", any local process could then take
+        ///   the name, and the recovery path creates with `first_pipe_instance(false)`, so the
+        ///   kernel-enforced reservation would not come back. Two places have to honour it, and
+        ///   the second is the one that is easy to miss: the replacement is created BEFORE the
+        ///   connected instance is handed out, AND a `connect` that FAILS must not drop its
+        ///   instance until a replacement exists — at that point `idle` has already been emptied,
+        ///   so with no live connection that instance is the only one the process holds.
         ///
         /// CANCEL-SAFE, and the structure below is what buys it. The run loop's idle `select!`
         /// drops this future whenever another arm wins, which on a busy daemon is most ticks. The
@@ -400,11 +451,25 @@ mod imp {
                 .connect()
                 .await
             {
-                // NOT restored: an instance whose `connect` failed is discarded, so the next
-                // accept creates a fresh one. Putting it back would re-await the same failing
-                // instance, and since the run loop re-arms `serve` as soon as it resolves, that
-                // is an error that spins rather than one that recovers.
-                pending.server = None;
+                // Discarding this instance is the right move — re-awaiting a `connect` that just
+                // failed is an error that spins rather than recovers, because the run loop
+                // re-arms `serve` as soon as it resolves. But `idle` was emptied above, so with
+                // no live connection this instance is the ONLY one the process holds, and
+                // dropping it first would release the NAME (see the accounting on this method).
+                // So replace before releasing, and let the failure decide how:
+                match create_instance(&self.name, false) {
+                    // A fresh instance is listening. Assigning it here drops the failed one, and
+                    // the guard parks the replacement in `idle` — the name is held throughout.
+                    Ok(next) => pending.server = Some(next),
+                    // Busy means some OTHER instance is alive, so the name does not depend on
+                    // this one: discard it, exactly as before.
+                    Err(create_err) if is_pipe_busy(&create_err) => pending.server = None,
+                    // Anything else says nothing about whether another instance exists. Keep the
+                    // failed one listening rather than gamble the name on it. This is the one
+                    // branch that can spin, and it is the trade taken deliberately: a spin is
+                    // observable and recoverable, a released name is neither.
+                    Err(_) => {}
+                }
                 return Err(err);
             }
             let connected = pending
@@ -446,7 +511,9 @@ mod imp {
     /// different in kind — the daemon IS up and holds the name, it just has no free instance
     /// this instant — so it is retried here rather than surfaced as a failure, bounded by
     /// [`CLIENT_BUSY_BUDGET`]. If the budget runs out the busy error is returned as-is: it is
-    /// NOT `NotFound`, so no caller mistakes a saturated daemon for an absent one.
+    /// NOT `NotFound`, so a caller keying on `NotFound` cannot mistake a saturated daemon for an
+    /// absent one — and [`is_saturated`] is how the one caller that discards the kind entirely
+    /// tells them apart.
     pub(crate) async fn connect(path: &Path) -> io::Result<ControlClient> {
         let name = windows_pipe_name(path);
         let deadline = tokio::time::Instant::now() + CLIENT_BUSY_BUDGET;
@@ -480,7 +547,7 @@ mod imp {
 // `ControlClient` is deliberately NOT re-exported: it is `connect`'s return type and every
 // caller infers it, so naming it here would be an unused import under `-D warnings`. Its
 // definition inside each arm is what documents the client/server type split.
-pub(crate) use imp::{cleanup, connect, ControlListener, ControlStream};
+pub(crate) use imp::{cleanup, connect, is_saturated, ControlListener, ControlStream};
 
 #[cfg(all(test, windows))]
 mod windows_tests {

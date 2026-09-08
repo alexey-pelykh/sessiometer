@@ -5,7 +5,8 @@
 //! client-side reload / restore notifies (issues #15, #64, #139, #276, #359; the #195
 //! per-concern decomposition). The BYTE TRANSPORT under it is per-target
 //! ([`crate::control_transport`]) — the `0600` Unix-domain socket on macOS / Linux, a named pipe
-//! on Windows (issue #1511, ADR-0037) — and everything in this module sits above that seam. The protocol is a newline-delimited `{"cmd":"…"}` request → one
+//! on Windows (issue #1511, ADR-0037) — and everything in this module sits above that seam.
+//! The protocol is a newline-delimited `{"cmd":"…"}` request → one
 //! newline-delimited JSON reply. The commands:
 //!   - `status` (#9/#164) — a non-secret READ, answered for ANY peer (the frozen versioned snapshot).
 //!   - `watch` (#165) — a non-secret snapshot STREAM, also un-auth-gated (ADR-0011).
@@ -1704,6 +1705,11 @@ pub(crate) async fn request_swap(
         // double-writing when the daemon is up.
         let stream = match control_transport::connect(socket).await {
             Ok(stream) => stream,
+            // A SATURATED daemon is a running daemon. It is the one failure here that must not
+            // read as "no daemon": falling back to standalone against a live daemon is the
+            // double-write this split exists to prevent. Inert on Unix — `is_saturated` is
+            // `false` there by construction — so the macOS/Linux behaviour is what it was.
+            Err(err) if control_transport::is_saturated(&err) => return Err(Error::Io(err)),
             Err(_) => return Ok::<Option<SwapAck>, Error>(None),
         };
         let mut buffered = tokio::io::BufReader::new(stream);
