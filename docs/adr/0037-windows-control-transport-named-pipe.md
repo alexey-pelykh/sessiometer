@@ -377,8 +377,11 @@ technical impossibility.
   property CHECK 2 measured in our favour — cuts the other way too: a foreign local process that
   creates `\\.\pipe\sessiometer-...` first either denies the daemon its own name or stands a server
   in front of the CLI. **#976** therefore owes a **client-side check of the server's
-  owner SID** and **must open** with `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` so a rogue
-  server cannot impersonate the CLI even if it wins the race. Neither is optional, and neither is
+  owner SID**, and **#1511** **must open** with
+  `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` so a rogue
+  server cannot impersonate the CLI even if it wins the race — the flag pair rides on the client's
+  own open call, so it is transport code even though identity is what it protects. Neither is
+  optional, and neither is
   work the Unix side ever had to do. § What this spike did NOT establish restates this pair in the
   same words on purpose — that is the section an implementer skims for what is owed, so the two
   must not drift apart in strength.
@@ -410,7 +413,7 @@ onto their owners is tracker work this record does not perform, and merging this
 - **No cross-user test.** The proof's client is a child of its server and so runs as the same user
   by construction. The negative control proves the instrument distinguishes *impersonating* from
   *not impersonating*; it does not prove that a **different** user's SID would be reported as
-  different. Nothing in the API suggests otherwise, but nothing here measured it.
+  different. Nothing in the API suggests otherwise, but nothing here measured it. **#976** owes it.
 - **No foreign-account open against the DACL.** Every connection in the run was opened by the same
   account that created the pipe, so the descriptor's *denying* half was never exercised — only its
   granting half, implicitly, by the client's own successful open. **#976** owes one cross-account open attempt against a live
@@ -428,10 +431,10 @@ onto their owners is tracker work this record does not perform, and merging this
   measured, and cannot be on a runner where everything is one account. It is the direction the
   `0700` directory closes for free on Unix, so it is the one place the port is structurally exposed
   where the socket was not. **#976** owes a client-side check of the server's owner
-  SID, and **must open** with `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` so a rogue
-  server cannot impersonate the CLI even if it wins the race — the same strength
-  § Consequences → Negative states it at, and § Decision 2 with them. The flag pair is a binary
-  the port either sets
+  SID, and **#1511** **must open** with `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` so a
+  rogue server cannot impersonate the CLI even if it wins the race — the same split and the same
+  strength § Consequences → Negative states them at, and § Decision 2 with them. The flag pair is
+  a binary the port either sets
   or does not (`SECURITY_IDENTIFICATION` without `SECURITY_SQOS_PRESENT` is not requested at all),
   and nothing here measured it, so this prose is the only carrier it has.
 - **Nothing about performance, reconnection, or the `watch` stream.** The proof round-trips exactly
