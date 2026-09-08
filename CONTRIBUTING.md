@@ -18,33 +18,37 @@ omission is intentional, not an oversight.
 **macOS-only** — a SwiftUI/AppKit application with no Linux counterpart. **Windows is not
 supported**; it stays tracked behind its own recon (#27).
 
-**Linux support is decided, not yet landed, and not yet gated.** Two files on `main` hold
-macOS-only syscall sites, so the crate does not build for a Linux target today. The port is
-#963; the CI job that enforces it is #964. Until #964 is green, **every job that runs `cargo
-build` / `test` / `clippy` / `doc` still uses a `macos-latest` runner** — the
+**Linux support is decided and landed, and still not gated.** The two macOS-only syscall
+sites are ported (#963), so the crate builds, links, tests and lints for a Linux target. The
+CI job that would enforce that is #964, and it does not exist yet. Until it is green, **every
+job that runs `cargo build` / `test` / `clippy` / `doc` still uses a `macos-latest` runner** — the
 `ubuntu-latest` jobs (`changes`, `deny`, `ci-ok-needs-complete`, `doc-gates`,
 `gate-change-ack`, `ci-ok`) are gates and routers, and none of them compiles the crate.
 
 Three things follow, and all three matter when you write or review a change:
 
 - **A green CI run still says nothing about portability.** Introduce a macOS-only call and
-  every gate passes. Two instances are on `main` right now:
-  [`src/daemon/peer_auth.rs`](src/daemon/peer_auth.rs) calls `libc::getpeereid` with no
+  every gate passes — the port landing changed nothing about that, because no job compiles
+  for Linux. The two sites #963 ported are the worked example:
+  [`src/daemon/peer_auth.rs`](src/daemon/peer_auth.rs) called `libc::getpeereid` with no
   `cfg(target_os)` gate (`getpeereid(3)` is not in glibc), and
-  [`src/contract.rs`](src/contract.rs) declares three Mach clock symbols in an `extern "C"`
-  block. Both are ports that are owed (#963), not consequences to be accepted.
+  [`src/contract.rs`](src/contract.rs) declared three Mach clock symbols in an `extern "C"`
+  block. Both now carry per-target arms; a third such site would ship just as invisibly.
 - **`cargo check` cannot verify a Linux build.** An `extern` block resolves at **link**, not
-  at type-check, so `check` compiles the Mach block clean for a Linux target and it fails
-  only when something links. A Linux `cargo check --all-targets` reports exactly **1** error
-  on unpatched `main` — the `getpeereid` site — and stays blind to the other. Back any claim
-  about the Linux build with `cargo build` or `cargo test`, never `check`. This has already
-  cost two verifications: issue #797 and ADR-0029's superseded text were both checked this
-  way, and both named only one of the two sites.
+  at type-check, so `check` compiled the Mach block clean for a Linux target and it failed
+  only when something linked. Pre-port, a Linux `cargo check --all-targets` reported exactly
+  **1** error — the `getpeereid` site — and stayed blind to the other. Back any claim about
+  the Linux build with `cargo build` or `cargo test`, never `check`. This has already cost
+  two verifications: issue #797 and ADR-0029's superseded text were both checked this way,
+  and both named only one of the two sites.
 - **Do not write an acceptance criterion asserting that the Linux build works — not until
-  #964 lands.** Nothing verifies it yet, so the claim cannot fail, which is worse than not
-  making it. Where a test carries a platform assumption (a live `/bin/sh -l` spawn, an
-  absolute passwd entry), say so in a comment beside it, as the login-shell harvest tests in
-  [`src/paths.rs`](src/paths.rs) do.
+  #964 lands.** Nothing in CI verifies it, so the claim cannot fail, which is worse than not
+  making it. That the port is green today was measured by hand, in a container, and recorded
+  on #963 — evidence for one commit, not a standing gate. Where a test carries a platform
+  assumption (a live `/bin/sh -l` spawn, an absolute passwd entry, a spawn of
+  `/usr/bin/security` or `/usr/bin/plutil`), say so in a comment beside it and gate it on
+  `target_os`, as the login-shell harvest tests in [`src/paths.rs`](src/paths.rs) and the
+  real-`security` tests in [`src/witness.rs`](src/witness.rs) do.
 
 The credential mechanism follows its own sequence: recon (#40, Linux half answered), then
 the backend-neutral credential-store seam (#25) and the per-OS mechanisms (#26 Linux, #27

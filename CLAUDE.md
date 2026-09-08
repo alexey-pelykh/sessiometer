@@ -10,10 +10,11 @@ those differently.
 
 A Rust daemon + CLI at `src/`, and a SwiftUI macOS menu-bar app at `apps/menubar/` that talks to the
 daemon over a local AF_UNIX socket. **The CLI and daemon target macOS and Linux; the menu-bar app is
-macOS-only and Windows is unsupported** (`CONTRIBUTING.md`, ADR-0029). Linux is **decided but not yet
-landed**: two macOS-only syscall sites keep the crate from building there (#963), and until the
-enforcing job (#964) exists **no CI job compiles for Linux or Windows, so a green run still says
-nothing about portability**.
+macOS-only and Windows is unsupported** (`CONTRIBUTING.md`, ADR-0029). Linux is **landed but not
+gated**: the two macOS-only syscall sites are ported (#963), so the crate builds, links, tests and
+lints there — but until the enforcing job (#964) exists **no CI job compiles for Linux or Windows,
+so a green run still says nothing about portability**, and nothing stops the next macOS-only call
+from silently regressing it.
 
 The two halves version their wire contracts independently and are gated by different CI jobs. Most
 mistakes below come from applying one half's rule to the other.
@@ -356,11 +357,13 @@ python3 design/build-comparison.py ../../.tmp/panelcaps ../../.tmp/design-vs-cap
 
 ## Deliberate — do not "fix" these
 
-- ~~`src/daemon/peer_auth.rs`'s un-gated `libc::getpeereid`~~ — **withdrawn 2026-09-08 (#962).** It
-  was listed here as an accepted consequence of macOS-only support; ADR-0029 reversed that, so the
-  site is now a port that is **owed** (#963), matching the comment at the call site. It is still not
-  a defect to fix *in passing* — it belongs to #963, with `src/contract.rs`'s `extern "C"` Mach block,
-  which a Linux `cargo check` cannot even see.
+- The per-target `cfg` split in `src/daemon/peer_auth.rs` and `src/contract.rs`, and the
+  `compile_error!` guarding each — **do not collapse either.** #963 ported both syscall sites
+  (`getpeereid` / `SO_PEERCRED`, and the Mach clock pair / `CLOCK_BOOTTIME` minus
+  `CLOCK_MONOTONIC`), retiring the withdrawn entry that stood here. The `compile_error!` arms are
+  not boilerplate: without them a third target fails at a *call site* with "cannot find function
+  `peer_euid`" rather than naming the unported syscall — and for peer auth, a third target
+  silently taking the wrong arm would be a security defect, not a build one.
 - Eight Swift files are permanently excluded from the `MenubarTests` target because they touch
   surfaces a headless bundle cannot host (`main.swift`, `StatusItemController`, the Settings pair,
   the login-item and notification presenters, and the two render tools). The exclusions carry

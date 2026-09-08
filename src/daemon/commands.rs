@@ -1125,7 +1125,7 @@ mod tests {
         // AC (peer-credential authN): a `swap` is STATE-AFFECTING, so a non-owner peer is rejected
         // BEFORE any handoff — the swap never reaches the run loop (`one_shot()` proves there is NO
         // `Swap` handoff), and the peer gets `unauthorized` and learns nothing past the rejection.
-        // This is the socket-layer half of the guard; the real `getpeereid` euid comparison that
+        // This is the socket-layer half of the guard; the real peer-credential euid comparison that
         // computes the bool is proven by `serve_control_rejects_a_foreign_uid_peer` / `is_same_user`.
         let (mut client, server) = tokio::net::UnixStream::pair().expect("socketpair");
         client
