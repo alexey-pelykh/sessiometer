@@ -122,7 +122,16 @@ byte-identical quote as stale, which is the failure direction that discredits a 
 Quoting the output in full is what carries it instead — nothing below depends on the commit, the
 run, or the spike directory outliving this ADR. It is the whole of what the program printed; the
 workflow step around it also emits cargo's own `Compiling` / `Finished` / `Running` lines, which
-are not reproduced:
+are not reproduced.
+
+**The pids are per-run**, so a later run is not byte-identical to this one and that is not
+staleness: the host pid, the client child pid, the pipe name that embeds the host pid, and CHECK 4's
+restatement of both all move every run. Everything else — every `CHECK` verdict, every
+`MEASUREMENT`, and the equality CHECK 5 asserts — is invariant, and that invariant part is the
+evidence. Measured, not assumed: re-running the proof at this branch's head reproduced the block
+with exactly those substitutions and no other difference. The user SID is the runner account's, a
+property of the image rather than of the code; it happened to reproduce across those two runs, which
+is a fact about the image and not one to rely on.
 
 ```text
 [spike-972] host pid           : 7992
