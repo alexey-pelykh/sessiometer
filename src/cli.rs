@@ -15,12 +15,11 @@ use std::time::Duration;
 
 use lexopt::Arg::{Long, Short, Value};
 
-use tokio::net::{UnixListener, UnixStream};
-
 use unicode_width::UnicodeWidthStr;
 
 use crate::claude_state::OauthAccount;
 use crate::config::{Account, Config, ConflictPolicy, Origin, OriginReport};
+use crate::control_transport::{self, ControlListener};
 use crate::daemon::{
     emit_best_effort, run_loop, AccountExpiry, AccountStatusLine, BlindActive, CanaryStatus,
     CanonicalScrub, Daemon, ExpiryCohort, ExternalLoginWatcher, InstanceLock, NextSwap,
@@ -1756,29 +1755,21 @@ async fn run(verbosity: Verbosity, managed: bool) -> Result<()> {
     }
 
     // Best-effort cleanup: remove our socket on the way out (the lock releases
-    // when `_lock` drops at the end of this scope).
-    let _ = std::fs::remove_file(&socket_path);
+    // when `_lock` drops at the end of this scope). Per-target, because there is nothing to
+    // unlink on Windows — a pipe name is not a filesystem entry and goes with the process
+    // (issue #1511, ADR-0037 § Consequences → Positive).
+    control_transport::cleanup(&socket_path);
     result
 }
 
-/// Bind the `0600` Unix-domain control socket at `path`, removing any stale
-/// socket left by a previous run first (the single-instance lock guarantees no
-/// live daemon owns it). The enclosing support dir is `0700`, so the socket is
-/// owner-only-reachable even during the bind→chmod window.
+/// Bind the control endpoint at `path`.
+///
+/// The steps are per-target and live in [`crate::control_transport`] (issue #1511, ADR-0037):
+/// on macOS / Linux the unchanged remove→bind→chmod that leaves a `0600` Unix-domain socket in
+/// the `0700` support dir; on Windows the creation of the named pipe's first instance, which
+/// carries `first_pipe_instance` and so fails outright if the name is already held.
 fn bind_control_socket(path: &Path) -> Result<UnixControl> {
-    use std::os::unix::fs::PermissionsExt;
-
-    // A leftover socket file makes `bind` fail with EADDRINUSE; the lock we hold
-    // means it cannot belong to a running daemon, so remove it. A genuinely
-    // absent file is not an error.
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(Error::Io(err)),
-    }
-    let listener = UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(UnixControl::new(listener))
+    Ok(UnixControl::new(ControlListener::bind(path)?))
 }
 
 /// Show the active account, every account's usage, and the next swap candidate (#88).
@@ -1868,7 +1859,7 @@ async fn status(json: bool, no_color: bool, verbose: bool) -> Result<()> {
 async fn query_status(path: &Path) -> Result<String> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-    let stream = match UnixStream::connect(path).await {
+    let stream = match control_transport::connect(path).await {
         Ok(stream) => stream,
         // No socket file, or a stale one with no listener → no live daemon.
         Err(err)
@@ -2194,7 +2185,7 @@ async fn daemon_restart() -> Result<()> {
 async fn request_shutdown(path: &Path) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-    let stream = match UnixStream::connect(path).await {
+    let stream = match control_transport::connect(path).await {
         Ok(stream) => stream,
         // No socket file, or a stale one with no listener → no live daemon.
         Err(err)
@@ -6045,6 +6036,10 @@ mod tests {
         scan_with, ADVISORY_EXEMPT_TOKENS, BANNED_PHRASES, USAGE_EXEMPT_TOKENS,
     };
     use std::path::PathBuf;
+    // The tests below stand a real listener up to exercise the CLI's own client verbs. They are
+    // Unix-only by construction (the whole suite is — no CI job builds this crate for Windows
+    // until #978), so they name the concrete type rather than the per-target alias.
+    use tokio::net::UnixListener;
 
     #[test]
     fn the_daemon_start_path_stamps_its_build_identity_unconditionally() {

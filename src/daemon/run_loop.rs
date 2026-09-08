@@ -18,7 +18,7 @@
 //! methods; `run_loop` is re-exported under `crate::daemon::*` for `crate::cli` and the
 //! in-module test suite.
 
-use tokio::net::UnixStream;
+use crate::control_transport::ControlStream;
 
 use super::*;
 
@@ -130,7 +130,7 @@ enum Idle {
     /// ack from the real outcome, then re-ticks so `status` reflects the swap within the poll
     /// cadence. Unlike the payload-less signals, this must be answered INLINE here (not spawned)
     /// because the swap needs the `!Send` daemon seams (ADR-0001).
-    SwapRequested(UnixStream, SwapCommand),
+    SwapRequested(ControlStream, SwapCommand),
     /// An authenticated `capture` control command (#359) asked the daemon to capture the active
     /// account into the roster. Carries the still-OPEN connection + the parsed request (moved out
     /// of the [`ControlYield::Capture`] handoff), so the post-idle applies it where `&mut Daemon`
@@ -139,7 +139,7 @@ enum Idle {
     /// redacted ack from the real outcome, then re-ticks so `status` reflects the new roster within
     /// the poll cadence. Answered INLINE here (not spawned), exactly like `swap`, because the
     /// capture needs the `!Send` daemon seams (ADR-0001).
-    CaptureRequested(UnixStream, CaptureCommand),
+    CaptureRequested(ControlStream, CaptureCommand),
     /// A `config-set` control command (#268) asked the daemon to apply tunable + label edits to
     /// `config.toml`. Carries the still-OPEN connection + the parsed request (moved out of the
     /// [`ControlYield::ConfigSet`] handoff), so the post-idle applies it where `&mut Daemon` is
@@ -149,7 +149,7 @@ enum Idle {
     /// outcome, then re-ticks so `status` reflects a live label change within the poll cadence.
     /// Answered INLINE here (not spawned), exactly like `swap` / `capture`, because the reconcile
     /// touches the `!Send` daemon seams (ADR-0001).
-    ConfigSetRequested(UnixStream, Box<ConfigSetCommand>),
+    ConfigSetRequested(ControlStream, Box<ConfigSetCommand>),
     /// The external-login watch (#140) saw the canonical credential change out-of-band
     /// during the idle (a manual `claude /login`) — re-tick NOW, off the usage-poll cadence,
     /// so the next `tick`'s `reconcile_canonical_change` re-stashes / re-resolves / surfaces

@@ -122,7 +122,7 @@ impl ManualSwapNotifier for ControlSocketNotifier {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
         let exchange = async {
-            let stream = tokio::net::UnixStream::connect(&self.socket).await?;
+            let stream = crate::control_transport::connect(&self.socket).await?;
             let mut buffered = tokio::io::BufReader::new(stream);
             buffered
                 .write_all(b"{\"cmd\":\"manual-swapped\"}\n")
@@ -198,7 +198,7 @@ impl ControlSocketCache {
     async fn query_status(&self) -> Result<StatusResponse> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
-        let stream = tokio::net::UnixStream::connect(&self.socket).await?;
+        let stream = crate::control_transport::connect(&self.socket).await?;
         let mut buffered = tokio::io::BufReader::new(stream);
         buffered.write_all(b"{\"cmd\":\"status\"}\n").await?;
         buffered.flush().await?;
@@ -1127,7 +1127,7 @@ async fn query_next_swap(socket: &Path) -> Result<StatusResponse> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
     let exchange = async {
-        let stream = tokio::net::UnixStream::connect(socket)
+        let stream = crate::control_transport::connect(socket)
             .await
             .map_err(|err| {
                 match err.kind() {

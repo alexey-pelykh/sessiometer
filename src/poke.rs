@@ -851,7 +851,7 @@ async fn daemon_status_best_effort() -> Option<StatusResponse> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
     let path = paths::control_socket().ok()?;
-    let stream = tokio::net::UnixStream::connect(&path).await.ok()?;
+    let stream = crate::control_transport::connect(&path).await.ok()?;
     let mut buffered = tokio::io::BufReader::new(stream);
     // The same newline-delimited JSON `serve_control` speaks: one request line, one reply.
     buffered.write_all(b"{\"cmd\":\"status\"}\n").await.ok()?;

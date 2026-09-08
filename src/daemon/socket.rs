@@ -1,9 +1,11 @@
 // Copyright (c) 2026 Oleksii PELYKH
 // SPDX-License-Identifier: MIT
 
-//! The control socket: the `0600` Unix-domain server the daemon answers the local control protocol
-//! on, plus the client-side reload / restore notifies (issues #15, #64, #139, #276, #359; the #195
-//! per-concern decomposition). The protocol is a newline-delimited `{"cmd":"…"}` request → one
+//! The control socket: the local control-protocol server the daemon answers on, plus the
+//! client-side reload / restore notifies (issues #15, #64, #139, #276, #359; the #195
+//! per-concern decomposition). The BYTE TRANSPORT under it is per-target
+//! ([`crate::control_transport`]) — the `0600` Unix-domain socket on macOS / Linux, a named pipe
+//! on Windows (issue #1511, ADR-0037) — and everything in this module sits above that seam. The protocol is a newline-delimited `{"cmd":"…"}` request → one
 //! newline-delimited JSON reply. The commands:
 //!   - `status` (#9/#164) — a non-secret READ, answered for ANY peer (the frozen versioned snapshot).
 //!   - `watch` (#165) — a non-secret snapshot STREAM, also un-auth-gated (ADR-0011).
@@ -56,8 +58,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::watch;
+
+use crate::control_transport::{self, ControlListener, ControlStream};
 
 use super::*;
 
@@ -201,29 +204,31 @@ pub(crate) enum ControlSignal {
 /// where `&mut Daemon` is available and writes the REDACTED ack from the real outcome — an outcome
 /// the read-only serve seam cannot know (accepted / rejected-with-reason).
 ///
-/// The stream is the concrete production [`UnixStream`] (the sole real [`Control`] impl,
+/// The stream is the concrete production [`ControlStream`] (the sole real [`Control`] impl,
 /// [`UnixControl`], accepts one); the hermetic test seams never yield a [`Swap`](ControlYield::Swap)
-/// (they only fire signals), so the concrete type costs the trait no generality it uses.
+/// (they only fire signals), so the concrete type costs the trait no generality it uses. That
+/// alias is `tokio::net::UnixStream` on macOS / Linux and a connected named-pipe instance on
+/// Windows (issue #1511, ADR-0037) — the framing above it is identical either way.
 pub(crate) enum ControlYield {
     /// A fire-and-forget signal (or none) for the run loop to apply — the existing
     /// `manual-swapped` / `roster-reload` / `restored` commands and every non-signal read.
     Signal(Option<ControlSignal>),
     /// A `swap` command (issue #167): the open connection + the parsed request, handed to the run
     /// loop to perform the swap (needs `&mut Daemon`) and write the redacted ack.
-    Swap(UnixStream, SwapCommand),
+    Swap(ControlStream, SwapCommand),
     /// A `capture` command (issue #359): the open connection + the parsed request, handed to the
     /// run loop to perform the capture (needs `&mut Daemon`) and write the redacted ack — the
     /// daemon-routed sibling of `swap`, mirroring it 1:1.
-    Capture(UnixStream, CaptureCommand),
+    Capture(ControlStream, CaptureCommand),
     /// A `config-set` command (issue #268): the open connection + the parsed edits, handed to the
     /// run loop to apply them (needs `&mut Daemon` to reconcile a live label change) and write the
     /// redacted ack — the config-editing sibling of `swap` / `capture`. (`config-get` is a spawned
     /// read, like `stats`, so it never yields here — it produces a bare [`Signal(None)`](ControlYield::Signal).)
-    ConfigSet(UnixStream, Box<ConfigSetCommand>),
+    ConfigSet(ControlStream, Box<ConfigSetCommand>),
 }
 
 /// Control seam: serve control-socket connections. The production impl
-/// ([`UnixControl`]) accepts on a `UnixListener`; the run loop's idle select
+/// ([`UnixControl`]) accepts on a [`ControlListener`]; the run loop's idle select
 /// drives it between polls. The test no-op never resolves, so it never wins the
 /// select. A served connection yields a [`ControlYield`] for the run loop — a
 /// [`Signal`](ControlYield::Signal) to apply (`None` for a pure `status` read) or a
@@ -241,10 +246,15 @@ pub(crate) trait Control {
     fn publish(&self, _snapshot: &StatusSnapshot) {}
 }
 
-/// Production control: accept one client at a time on the bound socket and answer
+/// Production control: accept one client at a time on the bound endpoint and answer
 /// from the latest snapshot.
+///
+/// The name is historical and the endpoint is not: on macOS / Linux the listener is the `0600`
+/// Unix-domain socket it has always been, and on Windows it is a named pipe (issue #1511,
+/// ADR-0037). Everything this type does ABOVE the accept — the framing, the verbs, the
+/// snapshot channel — is identical on both, which is the whole point of the split.
 pub(crate) struct UnixControl {
-    listener: UnixListener,
+    listener: ControlListener,
     /// The latest-snapshot channel (issue #165): the run loop feeds it each cycle through
     /// [`publish`](UnixControl::publish), and every `watch` subscription
     /// ([`serve`](UnixControl::serve)) streams from a [`subscribe`](watch::Sender::subscribe)d
@@ -255,7 +265,7 @@ pub(crate) struct UnixControl {
 }
 
 impl UnixControl {
-    pub(crate) fn new(listener: UnixListener) -> Self {
+    pub(crate) fn new(listener: ControlListener) -> Self {
         // Seed the channel with an all-defaults snapshot so a subscriber that connects before the
         // first tick still gets a well-formed frame (empty accounts, `generated_at: 0`) it reads
         // as "starting / stale" rather than nothing; the first tick's `publish` replaces it.
@@ -271,7 +281,7 @@ impl UnixControl {
 impl Control for UnixControl {
     async fn serve(&self, snapshot: &StatusSnapshot) -> ControlYield {
         match self.listener.accept().await {
-            Ok((stream, _addr)) => {
+            Ok(stream) => {
                 // Authenticate the peer as the SAME local user (issue #64): a
                 // state-affecting command (`manual-swapped`, `swap` #167) is honored
                 // only from our own uid. The socket is already `0600` in a `0700`
@@ -279,7 +289,21 @@ impl Control for UnixControl {
                 // path must be authenticated, never trust-by-reachability. Peer creds
                 // are read from the real fd here; `serve_control` takes the verdict as
                 // a plain bool so it stays testable over an in-memory duplex.
+                #[cfg(unix)]
                 let peer_authenticated = peer_is_same_user(&stream);
+                // The Windows peer identity — `ImpersonateNamedPipeClient` → `OpenThreadToken`
+                // → `GetTokenInformation(TokenUser)` → `ConvertSidToStringSidW` → `RevertToSelf`,
+                // compared against our own process token's user SID — is ADR-0037 § Decision 3,
+                // and it belongs to **#976**, not to the transport port (#1511) whose Boundaries
+                // exclude it. Until #976 lands this is the FAIL-CLOSED constant, which is the
+                // same direction `peer_euid`'s `None` already fails in: no Windows peer is ever
+                // authenticated, so every state-affecting command (`manual-swapped`,
+                // `roster-reload`, `restored`, `shutdown`, `swap`, `capture`, `config-set`) is
+                // refused with `{"error":"unauthorized"}` and only the non-secret reads answer.
+                // Explicit and safe rather than silent and wrong — and unreachable in a shipped
+                // binary either way, since no CI job builds this target until #978 exists.
+                #[cfg(windows)]
+                let peer_authenticated = false;
                 // Best-effort: a malformed or disconnected client must never crash
                 // the daemon — drop the exchange (the reply carries nothing secret).
                 match serve_control(stream, snapshot, peer_authenticated).await {
@@ -1557,7 +1581,7 @@ pub(crate) async fn notify_roster_reload(socket: &Path, intent: ReloadIntent) ->
         intent.as_wire()
     );
     let exchange = async {
-        let stream = tokio::net::UnixStream::connect(socket).await?;
+        let stream = control_transport::connect(socket).await?;
         let mut buffered = tokio::io::BufReader::new(stream);
         buffered.write_all(request.as_bytes()).await?;
         buffered.flush().await?;
@@ -1603,7 +1627,7 @@ pub(crate) async fn notify_restored(socket: &Path, uuid: &str) -> Result<()> {
         .expect("serializing the restored control request");
 
     let exchange = async {
-        let stream = tokio::net::UnixStream::connect(socket).await?;
+        let stream = control_transport::connect(socket).await?;
         let mut buffered = tokio::io::BufReader::new(stream);
         buffered.write_all(&request).await?;
         buffered.write_all(b"\n").await?;
@@ -1678,7 +1702,7 @@ pub(crate) async fn request_swap(
         // fall back to standalone), distinct from a mid-exchange failure (→ `Err`, do NOT fall
         // back — the daemon may already have written). This split is what keeps `use` from ever
         // double-writing when the daemon is up.
-        let stream = match tokio::net::UnixStream::connect(socket).await {
+        let stream = match control_transport::connect(socket).await {
             Ok(stream) => stream,
             Err(_) => return Ok::<Option<SwapAck>, Error>(None),
         };
