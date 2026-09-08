@@ -9,9 +9,10 @@
 //! *"exactly one message on one connection"*, and that the long-lived `watch` subscription (#165)
 //! *"is untested here — and it is where one-client-per-instance (§ Negative) bites hardest, since
 //! a subscriber occupies an instance for its whole lifetime"*. It assigns the gap to **#1511**,
-//! *"answering how many instances the accept loop keeps outstanding and what happens when they
-//! are exhausted"*. This module is that answer, MEASURED on a real `windows-latest` host rather
-//! than reasoned from the API docs — the same standard the #972 proof was held to.
+//! *"answering how many instances the accept loop keeps outstanding"*; the second half of the
+//! question — what happens when they are exhausted — is #1511's own AC3, not the ADR's wording.
+//! This module answers both, MEASURED on a real `windows-latest` host rather than reasoned from
+//! the API docs — the same standard the #972 proof was held to.
 //!
 //! **It is a separate mode, not an extension of the #972 proof.** ADR-0037 quotes that proof's
 //! output and says it is *"the whole of what the program printed"*; adding checks to `cargo run`
@@ -26,10 +27,14 @@
 //! provenance rather than approximated, exactly as `MAX_CONTROL_LINE_BYTES` is in `proof.rs`. If
 //! the two ever disagree this proof is measuring a loop the daemon does not run.
 //!
-//! **`max_instances` is lowered to make the ceiling reachable.** Production sets no limit, which
-//! means the OS maximum of 255 — unreachable in a bounded CI run. This proof pins
-//! [`MAX_INSTANCES`] so exhaustion happens after a handful of clients. What generalizes is the
-//! BEHAVIOUR at the ceiling, which is a property of `CreateNamedPipe` and not of the number.
+//! **`max_instances` is lowered to make a ceiling exist at all.** Production never calls
+//! `max_instances`, so it takes tokio's default of `PIPE_UNLIMITED_INSTANCES` — a SENTINEL, not
+//! a count: under it Windows bounds instances by the availability of system resources, and 255 is
+//! the sentinel's value rather than a limit (`max_instances` asserts `< 255`, so 254 is the
+//! largest settable one). This proof pins [`MAX_INSTANCES`] so exhaustion happens after a handful
+//! of clients. What generalizes is the BEHAVIOUR when a create is refused, a property of
+//! `CreateNamedPipe`; the number does not, and neither does the assumption that production's
+//! configuration refuses with the SAME error — nothing here measures that.
 
 use std::cell::RefCell;
 use std::ffi::OsString;
@@ -61,9 +66,9 @@ const PROOF_TIMEOUT: Duration = Duration::from_secs(20);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The cadence a busy create is retried at — a MIRROR of `INSTANCE_RETRY_INTERVAL` in
-/// `src/control_transport.rs`, where `wait_for_instance` carries it INSIDE the accept. This proof's
-/// [`AcceptLoop::accept`] deliberately does not retry, because surfacing that busy is what gates
-/// CHECK 6a, so the same cadence has to be supplied by whoever drives it.
+/// `src/control_transport.rs`, used by [`AcceptLoop::wait_for_instance`] for the same purpose and
+/// also by the proof's own driven-retry passes, which have to pace themselves once an accept can
+/// be cut short.
 const INSTANCE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 /// How long one driven accept pass waits for a client before the proof takes the loop back. Its
@@ -148,9 +153,10 @@ impl Drop for PendingAccept<'_> {
 struct AcceptLoop {
     name: OsString,
     idle: RefCell<Option<NamedPipeServer>>,
-    /// Whether the last refill attempt was denied for want of an instance. Not part of the
-    /// production type — this proof reads it to gate CHECK 6a, where production simply defers the
-    /// create to the next accept.
+    /// Whether the last refill attempt was denied for want of an instance. The one field NOT in
+    /// the production type: this proof reads it to gate CHECK 6a. It is written only by the
+    /// post-`connect` refill, which is the single-attempt one production also does not retry —
+    /// so recording it costs the mirror nothing.
     refill_was_busy: RefCell<bool>,
 }
 
@@ -162,6 +168,22 @@ impl AcceptLoop {
             idle: RefCell::new(Some(first)),
             refill_was_busy: RefCell::new(false),
         })
+    }
+
+    /// Wait until a listening instance can be created, then create it — the transcription of
+    /// `wait_for_instance` in `src/control_transport.rs`, retry cadence included. Untranscribed,
+    /// this proof would be measuring a loop the daemon does not run, which is the one thing the
+    /// module doc says would invalidate it.
+    async fn wait_for_instance(&self) -> io::Result<NamedPipeServer> {
+        loop {
+            match create_instance(&self.name, false) {
+                Ok(server) => return Ok(server),
+                Err(err) if is_code(&err, ERROR_PIPE_BUSY) => {
+                    tokio::time::sleep(INSTANCE_RETRY_INTERVAL).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     /// Accept one connection.
@@ -176,7 +198,7 @@ impl AcceptLoop {
     ///   instance always exists and the name is never released.
     async fn accept(&self) -> io::Result<NamedPipeServer> {
         if self.idle.borrow().is_none() {
-            let created = create_instance(&self.name, false)?;
+            let created = self.wait_for_instance().await?;
             *self.idle.borrow_mut() = Some(created);
         }
         let mut pending = PendingAccept {
@@ -296,10 +318,18 @@ async fn proof() -> Checked<()> {
         .accept()
         .await
         .map_err(|err| fail(format!("CHECK 3: the accept loop failed: {err}")))?;
+    // ASSERTED, not merely printed. Interpolating `listening()` into a PASS line makes the check
+    // unfalsifiable: a refill that was denied prints "PASS — … the loop refilled (0 listening…)"
+    // and the run goes green having measured the opposite of what the line claims.
+    if loop_.listening() != 1 {
+        return Err(fail(format!(
+            "CHECK 3: the loop did not refill after handing out a connection; listening={}",
+            loop_.listening()
+        )));
+    }
     println!(
         "{TAG} CHECK 3  subscribe  : PASS — client 1 connected and is HELD OPEN (the `watch` \
-         shape); the loop refilled ({} listening, 1 connected)",
-        loop_.listening()
+         shape); the loop refilled (1 listening, 1 connected)"
     );
 
     // Push several frames down the held connection and read them back in order: the `watch`
@@ -471,8 +501,11 @@ async fn proof() -> Checked<()> {
             ))
         })?;
     println!(
-        "{TAG} CHECK 7  recovery   : PASS — one subscriber left, the loop created a replacement \
-         instance on its next accept, and a new client connected; no intervention, no restart"
+        "{TAG} CHECK 7  recovery   : PASS — one subscriber left and a new client connected \
+         {:.3}s later; no intervention, no restart. Reported on the PASS and not only on the \
+         failure, because the number is the finding: reclaim is not synchronous with the \
+         client's disconnect, so a single refill attempt can still be refused",
+        started.elapsed().as_secs_f64()
     );
     subscribers.push(recovered);
     served.push(served_recovered);
@@ -548,7 +581,10 @@ async fn proof() -> Checked<()> {
          outstanding, plus one per live connection — so a `watch` subscriber occupies one for its \
          whole lifetime. At the ceiling the refill is denied ERROR_PIPE_BUSY, nothing listens, and \
          an arriving client is told BUSY rather than NOT-FOUND; when any connection ends the loop \
-         refills on its next accept and service resumes unattended."
+         refills and service resumes unattended — but NOT necessarily on the very next accept, \
+         since the instance is not reclaimed synchronously with the client's disconnect. That is \
+         what production's `wait_for_instance` retry cadence is for, and CHECK 7 prints how long \
+         it actually took on this run."
     );
     Ok(())
 }
