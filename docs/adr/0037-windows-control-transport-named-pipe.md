@@ -101,9 +101,13 @@ and not sufficient for the issue's AC2. The proof therefore runs on a GitHub-hos
 that label over time, so treat it as a fact about that run rather than as a requirement — nothing
 here depends on the image.
 
-The proof binary's complete stdout, at commit `da006bc` — this branch's tip, so the record quotes
-the code it ships with. It is the whole of what the program printed; the workflow step around it
-also emits cargo's own `Compiling` / `Finished` / `Running` lines, which are not reproduced:
+The proof binary's complete stdout, from the run at commit `da006bc` — **the last commit to touch
+the proof's sources**, which is the pin that stays true as this branch takes further commits (an
+earlier revision said "this branch's tip" and stopped being true one commit later). Re-derive it
+with `git log -1 --format=%h -- spikes/windows-control-transport/src/`; if that prints something
+else, the quote is stale and the run to re-read is that commit's. It is the whole of what the
+program printed; the workflow step around it also emits cargo's own `Compiling` / `Finished` /
+`Running` lines, which are not reproduced:
 
 ```text
 [spike-972] host pid           : 7992
