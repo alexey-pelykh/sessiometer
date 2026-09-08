@@ -20,7 +20,8 @@ exists, and this ADR fixes the approach one will implement.
 
 **It is a decision in force, not a landed port** — the same distinction **ADR-0029** draws for
 Linux. Nothing in the crate builds for Windows today, and no CI job compiles for it — **#978** is
-the enforcing job, exactly as **#964** is on the Linux side. What is landed
+the enforcing job, exactly as **#964** is on the Linux side. The port this decision governs is
+**#1511**; the dependent identity and single-instance-lock work is **#976**. What is landed
 is a *proof*, in `spikes/windows-control-transport/`, which is deliberately outside the root build
 graph and is run by the non-required `spike-972-windows-transport` workflow.
 
@@ -342,7 +343,12 @@ technical impossibility.
   repeatedly: the server must create a *new* instance for each accept, and only the first may carry
   `first_pipe_instance`. That is a real structural change to `UnixControl`, and it interacts with
   the reservation above — the first instance must stay alive for the name to remain held. This is
-  the largest single piece of work the decision implies.
+  the largest single piece of work the decision implies, and it is **#1511**'s — the transport
+  port itself. Deliberately **not** #976's: that issue's Boundaries say *"Do not implement the
+  transport here — that is the spike plus its follow-on"*, and until this record was written that
+  follow-on did not exist. #970 had left the cluster undecomposed on purpose, because *"the
+  transport choice determines the shape"* — this ADR is that choice, so the item is now filable,
+  and filed.
 - **Impersonation mutates the calling thread's token.** The resolution must therefore be fully
   synchronous: **no `.await` between `ImpersonateNamedPipeClient` and `RevertToSelf`**. What an
   `.await` there costs is **not** primarily a multi-thread hazard, and reading it that way is the
@@ -371,9 +377,11 @@ technical impossibility.
   property CHECK 2 measured in our favour — cuts the other way too: a foreign local process that
   creates `\\.\pipe\sessiometer-...` first either denies the daemon its own name or stands a server
   in front of the CLI. **#976** therefore owes a **client-side check of the server's
-  owner SID** and should open with `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` so a rogue
+  owner SID** and **must open** with `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` so a rogue
   server cannot impersonate the CLI even if it wins the race. Neither is optional, and neither is
-  work the Unix side ever had to do.
+  work the Unix side ever had to do. § What this spike did NOT establish restates this pair in the
+  same words on purpose — that is the section an implementer skims for what is owed, so the two
+  must not drift apart in strength.
 - **`paths::control_socket()` gains a per-target shape**, and with it every caller that reasons
   about the socket as a *file*. The CLI's friendly `Error::DaemonNotRunning` currently keys on a
   failed connect to a filesystem path; on Windows the not-running case is `ERROR_FILE_NOT_FOUND`
@@ -386,15 +394,18 @@ technical impossibility.
 
 ### What this spike did NOT establish
 
-Recorded as residuals rather than left to be rediscovered. All but the last belong to **#976** —
-*build: peer identity and the single-instance lock on Windows*, open and declared `Blocked by
-#972`. The last one cannot: adding a Windows CI job is **#978**'s work, and #976's own AC2
-*presupposes* that job by requiring its verification *"on the Windows CI job"*. Four of the six
-below are
+Recorded as residuals rather than left to be rediscovered, and **each names its own owner** — they
+do not all belong to one item, which an earlier revision of this section assumed. Identity-shaped
+residuals are **#976**'s (*build: peer identity and the single-instance lock on Windows*, open and
+declared `Blocked by #972`). Transport-shaped ones — the accept loop, and `watch` — are
+**#1511**'s, because #976's Boundaries exclude implementing the transport. Enforcement is
+**#978**'s, since
+#976's own AC2 *presupposes* the Windows CI job by requiring verification *"on the Windows CI
+job"*, so it cannot also be the item that builds it. Several residuals below sit
 outside #976's acceptance criteria as that issue is currently written: it was authored before this
 spike and says outright that it *"deliberately does not prescribe the mechanism"*. Carrying them
-onto it is tracker work this record does not perform, and merging this PR auto-closes #972, so the
-carry is owed at that moment and not later:
+onto their owners is tracker work this record does not perform, and merging this PR auto-closes
+#972, so the carry is owed at that moment and not later:
 
 - **No cross-user test.** The proof's client is a child of its server and so runs as the same user
   by construction. The negative control proves the instrument distinguishes *impersonating* from
@@ -417,14 +428,19 @@ carry is owed at that moment and not later:
   measured, and cannot be on a runner where everything is one account. It is the direction the
   `0700` directory closes for free on Unix, so it is the one place the port is structurally exposed
   where the socket was not. **#976** owes a client-side check of the server's owner
-  SID, and should consider opening with `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` so a rogue
-  server cannot impersonate the CLI even if it wins the race.
+  SID, and **must open** with `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` so a rogue
+  server cannot impersonate the CLI even if it wins the race — the same strength
+  § Consequences → Negative states it at, and § Decision 2 with them. The flag pair is a binary
+  the port either sets
+  or does not (`SECURITY_IDENTIFICATION` without `SECURITY_SQOS_PRESENT` is not requested at all),
+  and nothing here measured it, so this prose is the only carrier it has.
 - **Nothing about performance, reconnection, or the `watch` stream.** The proof round-trips exactly
   one message on one connection. The long-lived `watch` subscription (#165), which hands the
   connection to a spawned task and streams frames indefinitely, is untested here — and it is where
   one-client-per-instance (§ Negative) bites hardest, since a subscriber occupies an instance for
-  its whole lifetime. **#976 owes a `watch`-shaped proof before that subscription is
-  ported**, answering how many instances the accept loop keeps outstanding; this
+  its whole lifetime. **#1511 owes a `watch`-shaped proof before that subscription is
+  ported**, answering how many instances the accept loop keeps outstanding — the accept loop is
+  the transport port's work, not #976's, for the same Boundaries reason as § Negative above. This
   record does not settle it and no measurement here bears on it.
 - **Nothing is enforced, and this one is #978's, not #976's.** No CI job compiles the crate for
   Windows; **#978** — *ci: add a Windows job that builds and tests (not just checks)* — is the
