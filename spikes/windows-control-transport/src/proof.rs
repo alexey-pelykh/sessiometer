@@ -13,11 +13,13 @@
 //! is independently known (the `Child::id()` the spawn returned). Without that, "the peer's pid
 //! resolved" would be indistinguishable from "we read our own pid back".
 //!
-//! **Every check is fail-loud.** `run` returns a non-zero [`ExitCode`] if any of the five gated
-//! checks fails, so the CI job's own pass/fail IS the proof's verdict rather than a log a human has
-//! to read. The one deliberately UN-gated line is the pre-read impersonation attempt: its outcome is
-//! the question, so asserting an answer would be assuming the finding. It is printed as a
-//! `MEASUREMENT`, and ADR-0037 quotes it.
+//! **Every check is fail-loud.** `run` returns a non-zero [`ExitCode`] if any gated check fails, so
+//! the CI job's own pass/fail IS the proof's verdict rather than a log a human has to read. The two
+//! `MEASUREMENT` lines print the resolved SIDs because ADR-0037 quotes them; they are reports, not
+//! gates, and the properties they report are gated beside them (CHECK 6, CHECK 5). On the spike's
+//! FIRST run the pre-read one was deliberately un-gated — its outcome was the open question, so
+//! asserting an answer would have assumed the finding. ADR-0037 § Decision 4 records the answer, and
+//! a recorded decision no check enforces is one a later run can regress in silence.
 
 use std::ffi::c_void;
 use std::os::windows::io::AsRawHandle;
@@ -231,6 +233,16 @@ async fn proof() -> Result<(), String> {
     let mut child = tokio::process::Command::new(&exe)
         .arg("client")
         .arg(&pipe_name)
+        // Piped stdio is the HANDSHAKE CHANNEL, and it is what makes CHECK 6 a controlled
+        // measurement instead of a race. Without it, the child opens the pipe and writes its
+        // request immediately, so by the time the server impersonates, request bytes may or may not
+        // already be sitting in the pipe — unsynchronised, and different on every run. Since the
+        // documented wording is "the security context of the last message READ from the pipe", a
+        // run that cannot say whether bytes were available answers only one branch of the question
+        // it claims to settle. Out-of-band on stdio, never on the pipe, or the synchronisation
+        // would be the very traffic it exists to exclude.
+        .stdout(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::piped())
         // Every check below can return early, and a client left running would sit in its own
         // 30-second timeout after this process is gone.
         .kill_on_drop(true)
@@ -240,12 +252,44 @@ async fn proof() -> Result<(), String> {
         .id()
         .ok_or_else(|| "the client child exited before its pid could be read".to_string())?;
     println!("[spike-972] client child pid   : {child_pid}");
+    let mut child_says = tokio::io::BufReader::new(
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| "the client child has no piped stdout".to_string())?,
+    );
+    let mut tell_child = child
+        .stdin
+        .take()
+        .ok_or_else(|| "the client child has no piped stdin".to_string())?;
 
     server
         .connect()
         .await
         .map_err(|err| format!("CHECK 1 accept: NamedPipeServer::connect failed: {err}"))?;
     println!("[spike-972] CHECK 1b accept    : PASS — connect() returned; a client is attached");
+
+    // -- CHECK 1c: the client is attached AND has written nothing yet. -------------------------
+    //
+    // The child announces on stdout the moment its `open()` returns, then blocks until we release
+    // it. Reading that line here establishes the state CHECK 6 needs: a connected peer with ZERO
+    // bytes in the pipe. Every impersonation below happens in that state, so "no read had occurred"
+    // is joined by the stronger "nothing was there to read".
+    let mut announced = String::new();
+    (&mut child_says)
+        .take(64)
+        .read_line(&mut announced)
+        .await
+        .map_err(|err| {
+            format!("CHECK 1c handshake: could not read the child's announcement: {err}")
+        })?;
+    if announced.trim_end() != "opened" {
+        return Err(format!(
+            "CHECK 1c handshake: the child announced {announced:?}, not \"opened\" — the pipe's \
+             state at impersonation time is not established, so CHECK 6 would be measuring a race"
+        ));
+    }
+    println!("[spike-972] CHECK 1c handshake : PASS — the client has opened the pipe and written NOTHING (it is blocked awaiting our release)");
 
     // -- CHECK 0a: the impersonation instrument can tell its two states apart. -----------------
     //
@@ -323,6 +367,16 @@ async fn proof() -> Result<(), String> {
          (DIAGNOSTIC: a pid is reusable and TOCTOU-prone, never the authentication primitive)"
     );
 
+    // -- Release the child: every pre-read measurement is now taken. ---------------------------
+    tell_child
+        .write_all(b"go\n")
+        .await
+        .map_err(|err| format!("could not release the client child: {err}"))?;
+    tell_child
+        .flush()
+        .await
+        .map_err(|err| format!("could not flush the release to the client child: {err}"))?;
+
     // -- CHECK 3: one framed message round-trips. ----------------------------------------------
     //
     // The daemon's exact framing, transcribed from `serve_control` in `src/daemon/socket.rs`:
@@ -379,10 +433,22 @@ async fn proof() -> Result<(), String> {
     println!("[spike-972] CHECK 0c canary   : PASS — the impersonation token is gone again after the post-read window");
 
     // -- Reply, and let the client read it. ----------------------------------------------------
-    write_line(&mut buffered, r#"{"ok":true,"proof":"spike-972"}"#)
-        .await
-        .map_err(|err| format!("CHECK 3 framing: writing the reply line failed: {err}"))?;
-    println!("[spike-972] CHECK 3b reply     : PASS — one reply line written, newline-terminated and flushed");
+    // Transcribed from `serve_control`'s one-shot arm, INCLUDING its error handling, which is the
+    // part that is easy to get wrong: the daemon writes the ack inline and BEST-EFFORT and discards
+    // the result (`let _ = ack;`). It is deliberate — a peer that hung up first would make this
+    // write fail, and propagating that would discard the `ControlSignal` at `UnixControl::serve`'s
+    // error arm, silently cancelling an action the operator had already authenticated. A `?` here
+    // would be a lookalike, not a transcription, and on a named pipe it is exactly where the two
+    // diverge: a client that gave up yields `ERROR_BROKEN_PIPE` rather than `EPIPE`.
+    let reply = r#"{"ok":true,"proof":"spike-972"}"#;
+    let ack = async {
+        buffered.write_all(reply.as_bytes()).await?;
+        buffered.write_all(b"\n").await?;
+        buffered.flush().await
+    }
+    .await;
+    let _ = ack;
+    println!("[spike-972] CHECK 3b reply     : PASS — one reply line attempted inline and best-effort, exactly as the daemon writes its ack (delivery is proven by CHECK 3c, not by this write)");
 
     let status = child
         .wait()
@@ -432,6 +498,28 @@ async fn client_exchange(pipe_name: &str) -> Result<(), String> {
         }
     };
 
+    // Announce that the pipe is OPEN and that nothing has been written to it, then block until the
+    // server releases us. This is what lets the server's pre-read impersonation happen in a known
+    // state rather than in a race with this write. Blocking `std` stdio on purpose: this process
+    // has nothing else to do, and it keeps the spike off tokio's `io-std` feature.
+    {
+        use std::io::{BufRead, Write};
+        println!("opened");
+        std::io::stdout()
+            .flush()
+            .map_err(|err| format!("could not flush the announcement: {err}"))?;
+        let mut release = String::new();
+        std::io::stdin()
+            .lock()
+            .read_line(&mut release)
+            .map_err(|err| format!("could not wait for the server's release: {err}"))?;
+        if release.trim_end() != "go" {
+            return Err(format!(
+                "the server released us with {release:?}, not \"go\""
+            ));
+        }
+    }
+
     let mut buffered = tokio::io::BufReader::new(client);
     write_line(&mut buffered, r#"{"cmd":"status"}"#)
         .await
@@ -454,6 +542,12 @@ async fn client_exchange(pipe_name: &str) -> Result<(), String> {
 /// The daemon's `write_line` (`src/daemon/socket.rs`), transcribed: the payload, then `b"\n"`, then
 /// a flush. Kept a separate function for the same reason it is one there — the frame terminator is
 /// the contract, and inlining it is how a `\r\n` creeps in on a Windows port.
+///
+/// NOT the daemon's one-shot ack writer, and the distinction is deliberate on both sides. There,
+/// `write_line` serves the `watch` stream and the inline REJECTION replies, while the one-shot ack
+/// is written inline and best-effort so an `EPIPE` cannot discard an authenticated
+/// `ControlSignal`. Here it carries the client's request and nothing else; the server's reply is
+/// written inline, the same way, for the same reason.
 async fn write_line<W>(writer: &mut W, line: &str) -> std::io::Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
