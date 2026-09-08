@@ -302,7 +302,12 @@ mod cc_acct {
         /// Wrap an explicit name, bypassing the derivation — tests only, so the
         /// real-CLI round-trip can pin a throwaway `acct` without weakening the
         /// production guarantee above.
-        #[cfg(test)]
+        ///
+        /// Gated to match its ONE caller, `RealCredentialStore::for_keychain`, which is
+        /// `#[cfg(all(test, target_os = "macos"))]` because it drives the real
+        /// `/usr/bin/security`. A bare `#[cfg(test)]` here makes this dead code on Linux,
+        /// which `-D warnings` rejects (issue #963).
+        #[cfg(all(test, target_os = "macos"))]
         pub(super) fn for_test(name: OsString) -> Self {
             Self(name)
         }

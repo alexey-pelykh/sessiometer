@@ -2668,16 +2668,18 @@ mod tests {
     /// actual spawn, and its subject is verified non-degenerate (the child really did
     /// emit a populated environment) before the absence claim is made.
     ///
-    /// **macOS-only assumption — documented, not `cfg`-gated (issue #797, ADR-0029).**
+    /// **Platform assumption — documented, not `cfg`-gated (issue #797, ADR-0029, #963).**
     /// This spawns the real `/bin/sh -l -c /usr/bin/env` and asserts it succeeded, which
     /// assumes `/bin/sh` accepts `-l` and still emits an environment. macOS's `/bin/sh`
-    /// (bash in `sh` mode) does; `dash` — the Debian/Ubuntu `/bin/sh` — does not treat
-    /// `-l` the same, so the success assertion could fail there for a reason unrelated to
-    /// the scrub under test. It stays a comment rather than a `#[cfg(target_os = "macos")]`
-    /// because the crate does not compile for Linux at all today (issue #963 is the port),
-    /// so the gate would be inert AND would falsely imply the rest of this suite is
-    /// portable. A future porter (#26 / #29) re-verifies it against the
-    /// target's real `/bin/sh`.
+    /// (bash in `sh` mode) does. ADR-0029 expected `dash` — the Debian/Ubuntu `/bin/sh` —
+    /// not to, which would fail the success assertion for a reason unrelated to the scrub
+    /// under test, and so assigned the re-decision to issue #963. That measurement came
+    /// back the other way: the test PASSES on `rust:1.96-bookworm` in a full, unfiltered
+    /// `cargo test`. It therefore stays a comment rather than a
+    /// `#[cfg(target_os = "macos")]` — a gate would now cost real coverage on a target
+    /// where the test works, and would still falsely imply the rest of this suite is
+    /// portable. One image on one date is not a standing guarantee, so a porter meeting a
+    /// `/bin/sh` that rejects `-l` gates it then (#26 / #29), rather than pre-emptively.
     #[tokio::test]
     async fn a_live_harvest_child_emits_no_scrubbed_variable() {
         // The real shape — `/bin/sh -l -c /usr/bin/env` — so the child's own `env`
@@ -2773,8 +2775,10 @@ mod tests {
     /// libc-owned static buffer, so a borrow left dangling by one would be clobbered by
     /// the next `getpwuid` — this is the test that would catch it.
     ///
-    /// **macOS-only assumption — documented, not `cfg`-gated (issue #797, ADR-0029; same
-    /// reasoning as `a_live_harvest_child_emits_no_scrubbed_variable`).** The absoluteness
+    /// **macOS-only assumption — documented, not `cfg`-gated (issue #797, ADR-0029).**
+    /// Ungated for a DIFFERENT reason than the live-harvest test above, which #963
+    /// measured passing on Linux: this one carries no such measurement and is deferred,
+    /// so do not read that result across to it. The absoluteness
     /// assertions below read the HOST's live passwd entry and require it to be populated:
     /// an absolute `pw_dir`, an absolute `pw_shell`, a non-empty name. Every macOS account
     /// satisfies that; a minimal Linux container image need not — a uid with no passwd

@@ -385,6 +385,7 @@ mod tests {
             .to_owned()
     }
 
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn the_witness_sees_an_item_named_the_way_the_roster_actually_names_them() {
         // The probe asks about `Sessiometer/…` items; `Account::stash` is what names the
@@ -481,6 +482,7 @@ mod tests {
         assert!(!is_non_empty(&as_dir));
     }
 
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn either_usage_store_file_alone_carries_the_witness() {
         // "Two independent witnesses, either sufficient" applies WITHIN the usage store
@@ -540,6 +542,13 @@ mod tests {
         ));
     }
 
+    // macOS-only since issue #963: the first assertion pins a MEASURED `/usr/bin/security`
+    // behaviour (see `resolve_probe`) — a bad keychain path exits 0 with empty output, hence
+    // `Ok(false)`. On Linux there is no `security` to measure: the spawn fails, the probe
+    // returns `Err`, and the fail-closed arm answers `Present`. The premise is absent, not the
+    // assertion wrong. The store-as-backstop half is covered target-neutrally by
+    // `a_populated_usage_store_is_a_witness_and_an_empty_one_is_not`.
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn an_unreadable_keychain_degrades_to_no_witness_and_the_store_is_the_backstop() {
         // The measured reality, pinned so nobody re-derives it wrongly: `dump-keychain` on
@@ -590,6 +599,7 @@ mod tests {
 
     // --- the production entry point --------------------------------------------------
 
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn the_gate_refuses_allows_and_skips_against_observed_sources() {
         // `admit_append_only` is what the verbs actually call, and until it took its
@@ -620,6 +630,7 @@ mod tests {
         delete_keychain(&keychain).await;
     }
 
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn a_surviving_six_account_stash_set_is_refused() {
         // Issue #1440 AC-3, the incident's own shape: six accounts stashed and `config.toml`
@@ -671,12 +682,21 @@ mod tests {
     }
 
     // --- real-`security` helpers -----------------------------------------------------
+    //
+    // These four, and the four tests above that call them, are `#[cfg(target_os = "macos")]`
+    // since issue #963: each shells out to `/usr/bin/security`, which is the system under
+    // test rather than an incidental tool, so there is nothing for a Linux runner to
+    // exercise. Gated per item rather than folded into a `mod real_cli` (the shape
+    // `keychain` / `stash` / `swap` use) because the four callers are interleaved with
+    // target-neutral tests that must keep running everywhere — moving them would either
+    // split the module's reading order or drag those along.
 
     /// A throwaway keychain holding nothing — the keychain half's honest `Ok(false)`.
     ///
     /// Created with a password and never added to the search list, so it is invisible to
     /// everything but the explicit path handed to `dump-keychain`; the operator's login
     /// keychain is never touched.
+    #[cfg(target_os = "macos")]
     async fn empty_keychain(dir: &Path) -> PathBuf {
         let keychain = dir.join("witness-test.keychain-db");
         let status = tokio::process::Command::new("/usr/bin/security")
@@ -690,11 +710,13 @@ mod tests {
     }
 
     /// Add one `Sessiometer/<uuid>` item, exactly as `Account::stash` names them.
+    #[cfg(target_os = "macos")]
     async fn seed_stash(keychain: &Path, uuid: &str) {
         add_item(keychain, &format!("{}{uuid}", crate::config::STASH_PREFIX)).await;
     }
 
     /// Add one generic-password item under `service`.
+    #[cfg(target_os = "macos")]
     async fn add_item(keychain: &Path, service: &str) {
         let status = tokio::process::Command::new("/usr/bin/security")
             .args(["add-generic-password", "-a", "sessiometer", "-s"])
@@ -707,6 +729,7 @@ mod tests {
         assert!(status.success(), "add-generic-password failed: {status}");
     }
 
+    #[cfg(target_os = "macos")]
     async fn delete_keychain(keychain: &Path) {
         let _ = tokio::process::Command::new("/usr/bin/security")
             .arg("delete-keychain")

@@ -14,6 +14,16 @@ use std::time::{Duration, Instant};
 
 use crate::observability::{Event, RefreshEventOutcome};
 
+// [`slept_since_boot`] is the one per-target piece of this module, and neither arm's clock pair
+// exists on the other's target. A third target has no arm at all, so say so here — naming the port
+// that is missing — rather than leaving a bare "cannot find function `slept_since_boot`" at the
+// single call site in [`RealClock::now`]. ADR-0029 declares macOS and Linux the supported set.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+compile_error!(
+    "the sleep-inclusive clock needs a per-target accumulated-suspend read; only macOS \
+     (`mach_continuous_time`) and Linux (`CLOCK_BOOTTIME`) are ported — see ADR-0029"
+);
+
 /// Time seam: the daemon reads "now" and sleeps until the next poll through
 /// this, so a fake can drive time and make the loop run instantly in tests.
 pub(crate) trait Clock {
@@ -35,7 +45,14 @@ pub(crate) trait Clock {
     /// `effective_ceiling - velocity × poll_gap`
     /// ([`crate::swap::reactive_session_threshold`]) is dragged down toward the observed reading.
     ///
-    /// ## `std`'s `Instant` does NOT satisfy this on macOS — settled by issue #624
+    /// ## `std`'s `Instant` does NOT satisfy this on EITHER supported target
+    ///
+    /// On Linux `Instant::now()` reads `CLOCK_MONOTONIC`, which `man 2 clock_gettime` defines as
+    /// NOT including "any time that the system is suspended" — that is `CLOCK_BOOTTIME`'s job. The
+    /// macOS case below is the same defect under different names, and issue #624 settled it there
+    /// first; [`slept_since_boot`] carries a per-target arm for each.
+    ///
+    /// ### The macOS half — settled by issue #624
     ///
     /// `Instant::now()` on Apple targets reads `CLOCK_UPTIME_RAW`, which `man 3 clock_gettime`
     /// defines as the clock that "does not increment while the system is asleep" and whose value
@@ -80,6 +97,7 @@ impl RealClock {
 
 /// The mach timebase ratio: mach tick counts are in these units, NOT nanoseconds — 1/1 on x86_64,
 /// 125/3 on Apple silicon — so the ratio must be read at runtime, never assumed.
+#[cfg(target_os = "macos")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct MachTimebaseInfo {
@@ -87,7 +105,11 @@ struct MachTimebaseInfo {
     denom: u32,
 }
 
-// The three libSystem entry points the sleep-inclusive clock needs (issue #624).
+// The three libSystem entry points the sleep-inclusive clock needs on macOS (issue #624).
+// This block is why a Linux `cargo check` could not see the port that was owed (issue
+// #963): an `extern` block resolves at LINK, so an un-gated one compiles cleanly on a
+// target whose libc has none of these symbols and fails only when `build` or `test` links
+// a binary. Linux takes the `clock_gettime` arm below instead.
 //
 // Hand-declared rather than taken from `libc`. Two independent reasons, either sufficient:
 // `libc` 0.2.186 exposes only TWO of these three — `mach_absolute_time` and `mach_timebase_info`
@@ -99,6 +121,7 @@ struct MachTimebaseInfo {
 // hand-rolled FFI shim over a time crate). This is the same call the raw `libc::flock` FFI makes
 // (ADR-0004). All three ship in libSystem, which the crate already links; `mach_continuous_time`
 // is macOS 10.12+.
+#[cfg(target_os = "macos")]
 extern "C" {
     /// Mach ticks since boot, EXCLUDING time spent asleep — what `Instant::now()` already reads.
     fn mach_absolute_time() -> u64;
@@ -114,6 +137,7 @@ extern "C" {
 /// Split out from [`slept_since_boot`] because it is the part that can be wrong silently: an
 /// inverted ratio still produces a plausible-looking `Duration`, just off by ~1700x on Apple
 /// silicon. Pure and total, so the unit tests below pin it against both real-world timebases.
+#[cfg(target_os = "macos")]
 fn ticks_to_duration(ticks: u64, timebase: MachTimebaseInfo) -> Duration {
     if timebase.denom == 0 {
         // Unreachable via `mach_timebase_info`; guards the division rather than trusting that.
@@ -123,7 +147,7 @@ fn ticks_to_duration(ticks: u64, timebase: MachTimebaseInfo) -> Duration {
     Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
 }
 
-/// How long the host has been ASLEEP since boot (issue #624).
+/// How long the host has been ASLEEP since boot, on macOS (issue #624).
 ///
 /// `mach_continuous_time - mach_absolute_time`: both count mach ticks from the SAME boot epoch, the
 /// former through sleep and the latter not, so the difference is exactly the accumulated sleep. It
@@ -134,6 +158,8 @@ fn ticks_to_duration(ticks: u64, timebase: MachTimebaseInfo) -> Duration {
 /// the tidier source, but it is NOT epoch-aligned with `CLOCK_UPTIME_RAW` — measured on macOS 26.5,
 /// the two sit a constant ~4.87 s apart with ZERO drift between samples. Differencing THAT pair
 /// would fold a fixed constant into every reading; the mach pair is the one with a shared origin.
+/// Linux's own pair does not have that defect — see the `linux` arm below.
+#[cfg(target_os = "macos")]
 fn slept_since_boot() -> Duration {
     // Read continuous FIRST: should the host suspend between these two reads, `absolute` lands after
     // the wake and the difference UNDER-counts the sleep rather than over-counting it. That is the
@@ -154,9 +180,85 @@ fn slept_since_boot() -> Duration {
     ticks_to_duration(continuous.saturating_sub(absolute), timebase)
 }
 
+/// The accumulated-suspend duration implied by ONE paired reading of the two boot-epoch clocks
+/// (issue #963).
+///
+/// Split out from [`slept_since_boot`] for exactly the reason `ticks_to_duration` is split out on
+/// the mach arm (an intra-doc link, not a plain-text reference, would be a broken one here — that
+/// item does not exist on this target): it is the part that can be wrong SILENTLY. Swapping the
+/// two operands still
+/// yields a perfectly plausible `Duration::ZERO` on every host that has never suspended — which
+/// is every CI runner — so only a pure test driving a synthetic suspended reading can tell a real
+/// subtraction from an inverted one. Pure and total, so the unit tests below do exactly that.
+///
+/// `saturating_sub` rather than a panic or a wrap: [`slept_since_boot`] reads `boottime` FIRST, so
+/// on a never-suspended host `monotonic` lands a few nanoseconds LATER and the difference is
+/// negative by that much. Flooring it to zero under-counts by nanoseconds, which is the safe
+/// direction (see [`slept_since_boot`]); wrapping would turn it into ~584 years.
+#[cfg(target_os = "linux")]
+fn sleep_between_boot_clocks(boottime: Duration, monotonic: Duration) -> Duration {
+    boottime.saturating_sub(monotonic)
+}
+
+/// One `clock_gettime` reading as a [`Duration`] since the clock's epoch, or `None` when the
+/// syscall fails. `None` is what makes [`slept_since_boot`] degrade to "no sleep to add back" —
+/// the unadjusted clock — rather than fabricating an offset from a reading it never got.
+#[cfg(target_os = "linux")]
+fn read_clock(clock: libc::clockid_t) -> Option<Duration> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `clock_gettime` writes the two fields of the `timespec` handed to it by pointer;
+    // `ts` is a live local of exactly that type, and the kernel writes it ONLY on success
+    // (return 0). A `clockid_t` it does not know returns `EINVAL` rather than UB.
+    if unsafe { libc::clock_gettime(clock, &mut ts) } != 0 {
+        return None;
+    }
+    // Both fields are non-negative for these two clocks (each counts UP from boot); a negative
+    // value would be a kernel contract violation, and refusing it here is the same fail-soft
+    // branch as the syscall error above rather than a panic in a long-lived daemon.
+    Some(Duration::new(
+        u64::try_from(ts.tv_sec).ok()?,
+        u32::try_from(ts.tv_nsec).ok()?,
+    ))
+}
+
+/// How long the host has been SUSPENDED since boot, on Linux (issue #963).
+///
+/// `CLOCK_BOOTTIME - CLOCK_MONOTONIC`, the direct analogue of the mach arm above: `man 2
+/// clock_gettime` defines `CLOCK_BOOTTIME` as "identical to `CLOCK_MONOTONIC`, except that it also
+/// includes any time that the system is suspended", so the two share a boot epoch and their
+/// difference is exactly the accumulated suspend. It is ZERO on a host that has never suspended,
+/// which is what makes adding it back a strict no-op until the first suspend.
+///
+/// This pair does NOT carry the constant epoch offset that rules Darwin's `CLOCK_MONOTONIC` /
+/// `CLOCK_UPTIME_RAW` pair out on macOS — Linux's `CLOCK_MONOTONIC` IS the uptime clock the
+/// correction is applied to. `std`'s `Instant::now()` reads `CLOCK_MONOTONIC` on Linux, so
+/// [`RealClock::now`] adding this offset back yields precisely `CLOCK_BOOTTIME`, which is the
+/// sleep-inclusive reading [`Clock::now`]'s contract requires.
+#[cfg(target_os = "linux")]
+fn slept_since_boot() -> Duration {
+    // Read boottime FIRST, for the same reason the mach arm reads `continuous` first: should the
+    // host suspend between these two reads, `monotonic` lands after the wake and the difference
+    // UNDER-counts the suspend rather than over-counting it. Under-counting merely leaves this
+    // reading as accurate as the un-adjusted clock was; over-counting would dilute a rate toward a
+    // MISSED swap.
+    let (Some(boottime), Some(monotonic)) = (
+        read_clock(libc::CLOCK_BOOTTIME),
+        read_clock(libc::CLOCK_MONOTONIC),
+    ) else {
+        // Unreachable in practice — both ids are unconditionally supported on every kernel this
+        // crate builds for; degrade to "no sleep to add back", i.e. a bare `Instant::now()`.
+        return Duration::ZERO;
+    };
+    sleep_between_boot_clocks(boottime, monotonic)
+}
+
 impl Clock for RealClock {
     fn now(&self) -> Instant {
-        // `Instant::now()` is macOS's sleep-EXCLUSIVE uptime clock (see [`Clock::now`]); adding back
+        // `Instant::now()` is the host's sleep-EXCLUSIVE uptime clock on BOTH supported targets —
+        // `CLOCK_UPTIME_RAW` on macOS, `CLOCK_MONOTONIC` on Linux (see [`Clock::now`]); adding back
         // the sleep it skipped yields the boottime reading this trait's contract requires.
         //
         // The offset is re-read EVERY call — it must be, to pick up sleep that happens during the
@@ -288,15 +390,22 @@ mod tests {
     use super::*;
 
     /// The two mach timebases that occur in the wild.
+    #[cfg(target_os = "macos")]
     const APPLE_SILICON: MachTimebaseInfo = MachTimebaseInfo {
         numer: 125,
         denom: 3,
     };
+    #[cfg(target_os = "macos")]
     const X86_64: MachTimebaseInfo = MachTimebaseInfo { numer: 1, denom: 1 };
 
     /// The tick-to-nanosecond conversion, pinned against both real timebases. An inverted ratio is
     /// the silent failure mode this exists to catch: it still yields a plausible `Duration`, just
     /// ~1736x wrong on Apple silicon.
+    ///
+    /// macOS-only, and it does NOT transfer: mach ticks and their timebase have no Linux
+    /// counterpart at all. The Linux arm's own silent-failure guard is
+    /// `the_suspend_offset_is_the_boottime_excess_over_monotonic` below.
+    #[cfg(target_os = "macos")]
     #[test]
     fn ticks_convert_through_the_real_world_timebases() {
         // Apple silicon: a 24 MHz counter, so 24e6 ticks is exactly one second.
@@ -316,6 +425,7 @@ mod tests {
     /// A zero denominator degrades to "no sleep to add back" instead of dividing by zero, and a tick
     /// count large enough to overflow the nanosecond `u64` saturates instead of wrapping to a small
     /// value — a wrap would silently reverse the correction's effect.
+    #[cfg(target_os = "macos")]
     #[test]
     fn tick_conversion_is_total() {
         let degenerate = MachTimebaseInfo {
@@ -329,10 +439,72 @@ mod tests {
         );
     }
 
+    /// The Linux arm's silent-failure guard, and the counterpart to the mach arm's
+    /// [`ticks_convert_through_the_real_world_timebases`] (issue #963): the suspend offset is
+    /// `CLOCK_BOOTTIME`'s EXCESS over `CLOCK_MONOTONIC`, in that order.
+    ///
+    /// The middle case is the whole point. Every CI runner — and every developer machine that has
+    /// not suspended — reads the two clocks equal, so a swapped subtraction, a hard-coded
+    /// `Duration::ZERO`, or a `saturating_sub` pointing the wrong way are ALL indistinguishable
+    /// from the real thing on a live host: each one returns zero and each one passes
+    /// [`accumulated_sleep_does_not_drift_while_awake`] and
+    /// [`real_clock_now_is_the_uptime_instant_plus_accumulated_sleep`] below. Only a synthetic
+    /// suspended reading separates them, and only a PURE function can be handed one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_suspend_offset_is_the_boottime_excess_over_monotonic() {
+        // Never suspended: the two clocks agree, so the correction is a strict no-op.
+        assert_eq!(
+            sleep_between_boot_clocks(Duration::from_secs(100), Duration::from_secs(100)),
+            Duration::ZERO,
+        );
+        // Suspended for 50 s: boottime kept counting, monotonic did not. An inverted subtraction
+        // saturates to ZERO here and fails; the live-host cases above cannot tell the two apart.
+        assert_eq!(
+            sleep_between_boot_clocks(Duration::from_secs(150), Duration::from_secs(100)),
+            Duration::from_secs(50),
+        );
+        // The ordering the kernel's contract forbids, which the nanoseconds between the two reads
+        // can nonetheless produce on a never-suspended host: floor to zero rather than wrap to
+        // ~584 years, which would swamp every rate the daemon derives.
+        assert_eq!(
+            sleep_between_boot_clocks(Duration::from_secs(100), Duration::from_secs(150)),
+            Duration::ZERO,
+        );
+    }
+
+    /// The two clock ids [`slept_since_boot`] differences are BOTH readable on this host, and the
+    /// offset they yield is bounded by the host's own time since boot (issue #963).
+    ///
+    /// What this catches that the pure test above cannot: a wrong clock id. `CLOCK_REALTIME`
+    /// differenced against `CLOCK_MONOTONIC` is just as stable while awake and just as
+    /// self-consistent, so it passes every other test in this module — and reports the host as
+    /// having been asleep since 1970. Accumulated suspend cannot exceed time since boot.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_suspend_offset_cannot_exceed_the_time_since_boot() {
+        let boottime = read_clock(libc::CLOCK_BOOTTIME)
+            .expect("CLOCK_BOOTTIME is readable on every kernel this crate builds for");
+        assert!(
+            read_clock(libc::CLOCK_MONOTONIC).is_some(),
+            "CLOCK_MONOTONIC must be readable — it is what `Instant::now()` itself reads",
+        );
+        let offset = slept_since_boot();
+        assert!(
+            offset <= boottime,
+            "the host cannot have been suspended for {offset:?} of its {boottime:?} since boot — \
+             that is a differenced pair with no shared boot epoch",
+        );
+    }
+
     /// The accumulated-sleep offset is a property of the HOST, not of the moment it is read, so two
     /// reads taken while awake must agree. This is the guard against picking a source whose two
     /// halves drift apart while running — and the reason Darwin's `CLOCK_MONOTONIC` /
     /// `CLOCK_UPTIME_RAW` pair is not the source here (a constant, but nonzero, epoch offset).
+    ///
+    /// Target-neutral by construction: it calls [`slept_since_boot`], so it exercises whichever arm
+    /// this target compiled. What it does NOT do is tell a real arm from a stub, since both hold
+    /// steady while awake — that is the pure per-arm test's job.
     #[test]
     fn accumulated_sleep_does_not_drift_while_awake() {
         let first = slept_since_boot();

@@ -1549,16 +1549,23 @@ raise [`poll_secs`](#configuration) or keep the roster smaller by choice.
 no Linux counterpart. **Windows is not a supported target**; it stays tracked behind its
 own recon (#27).
 
-**Linux is decided but not yet landed.** The crate does not build for a Linux target on
-`main` today: two files hold macOS-only syscall sites. Porting them is #963, and the CI
-job that will enforce the result is #964. Until #964 is green, every job that builds,
-tests, or lints the crate runs on a macOS runner — so a green run still says nothing about
-the Linux build.
+**Linux builds, but nothing in CI proves it.** The two macOS-only syscall sites are ported
+(#963): peer authentication reads `SO_PEERCRED` on Linux and `getpeereid` on macOS, and the
+suspend-inclusive clock differences `CLOCK_BOOTTIME` against `CLOCK_MONOTONIC` where macOS
+uses the Mach pair. The job that would *enforce* that is still #964. Until it is green,
+every job that builds, tests, or lints the crate runs on a macOS runner — so **a green run
+still says nothing about the Linux build**, and the port's own evidence is a manual
+container run, recorded on #963.
+
+Scope, so the sentence above is not read as more than it is: the crate **compiles, links,
+tests and lints** on Linux. The credential store, service management and notifications are
+still macOS-shaped and are tracked separately under umbrella #961.
 
 One trap is worth carrying out of that work: **`cargo check` cannot verify a Linux build.**
-One of the two sites is an `extern "C"` block, which resolves at *link* rather than at
-type-check, so `check` compiles it clean and only `cargo build` or `cargo test` catches it.
-The full record — what was measured, and what reversed the earlier macOS-only decision — is
+One of the two sites was an `extern "C"` block, which resolves at *link* rather than at
+type-check, so `check` compiled it clean and only `cargo build` or `cargo test` caught it.
+Back any claim about the Linux build with `build` or `test`, never `check`. The full record
+— what was measured, and what reversed the earlier macOS-only decision — is
 [ADR-0029](docs/adr/0029-linux-is-a-supported-build-target.md), under umbrella #961.
 
 ```sh

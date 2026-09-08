@@ -1125,7 +1125,7 @@ mod tests {
         // AC (peer-credential authN): a `swap` is STATE-AFFECTING, so a non-owner peer is rejected
         // BEFORE any handoff — the swap never reaches the run loop (`one_shot()` proves there is NO
         // `Swap` handoff), and the peer gets `unauthorized` and learns nothing past the rejection.
-        // This is the socket-layer half of the guard; the real `getpeereid` euid comparison that
+        // This is the socket-layer half of the guard; the real peer-credential euid comparison that
         // computes the bool is proven by `serve_control_rejects_a_foreign_uid_peer` / `is_same_user`.
         let (mut client, server) = tokio::net::UnixStream::pair().expect("socketpair");
         client
@@ -2334,6 +2334,12 @@ mod tests {
         );
     }
 
+    // macOS-only since issue #963: this test's `pinned_witness(_, false)` leaves the usage-store
+    // half empty, so `WitnessSources::observe` falls through to the keychain probe — and that
+    // probe spawns `/usr/bin/security`. On Linux the spawn fails, `resolve_probe` fail-closes
+    // the error to `Present`, and the half this test is actually about never gets to decide.
+    // The two sibling tests here stay portable because `observe` answers before the probe.
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn perform_socket_capture_refuses_an_absent_config_when_the_live_roster_survives() {
         // PRD § 7 row 2, and the incident run at the second entry point with the durable witness
@@ -2399,6 +2405,12 @@ mod tests {
         assert!(!daemon.stash.contains("Sessiometer/u-A"));
     }
 
+    // macOS-only since issue #963: this test's `pinned_witness(_, false)` leaves the usage-store
+    // half empty, so `WitnessSources::observe` falls through to the keychain probe — and that
+    // probe spawns `/usr/bin/security`. On Linux the spawn fails, `resolve_probe` fail-closes
+    // the error to `Present`, and the half this test is actually about never gets to decide.
+    // The two sibling tests here stay portable because `observe` answers before the probe.
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn perform_socket_capture_still_onboards_a_genuine_first_run() {
         // Issue #1441 AC and PRD § 7 row 3: the GUI first run is a real path and must not be the

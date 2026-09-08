@@ -3252,7 +3252,7 @@ mod tests {
         // peer is fail-closed with `{"error":"unauthorized"}` and produces NO signal — a stranger
         // can never stop the daemon (the same same-user gate `manual-swapped` #64 / `roster-reload`
         // #139 / `restored` #275 sit behind). Auth is the ONLY gate on this verb, so this is the
-        // whole guard: the socket-layer half here, the real `getpeereid` euid comparison that
+        // whole guard: the socket-layer half here, the real peer-credential euid comparison that
         // computes the bool in `serve_control_rejects_a_foreign_uid_peer` / `is_same_user`.
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -4268,11 +4268,14 @@ mod tests {
 
     #[tokio::test]
     async fn peer_is_same_user_authenticates_a_same_process_peer() {
-        // Issue #64: the manual-hold receive path authenticates the peer's uid via
-        // `getpeereid(2)` before honoring a state-affecting command. A socket pair
-        // made in THIS process has its peer on our own uid, so the real (unsafe) FFI
-        // path must report it authenticated — exercising the `getpeereid`/`getuid`
-        // computation that the boolean-gated `control_reply` tests take as a given.
+        // Issue #64: the manual-hold receive path authenticates the peer's uid via the
+        // platform's peer-credential read before honoring a state-affecting command. A
+        // socket pair made in THIS process has its peer on our own uid, so the real
+        // (unsafe) FFI path must report it authenticated — exercising the real
+        // credential-read/`getuid` computation that the boolean-gated `control_reply`
+        // tests take as a given. Since issue #963 that read is per-target — `getpeereid`
+        // on macOS, `SO_PEERCRED` on Linux — so this is also what proves each arm is
+        // reached on the target that compiles it.
         let (ours, _peer) = tokio::net::UnixStream::pair().expect("socketpair");
         assert!(
             peer_is_same_user(&ours),
@@ -4284,7 +4287,7 @@ mod tests {
     fn is_same_user_denies_foreign_and_unreadable_credentials() {
         // Issue #196: the pure peer-auth decision, exercised on all three branches so a
         // silent auth-inverting refactor cannot ship green. Fixed uids (no syscall) —
-        // the real `getpeereid` path is covered by the socket tests around this one.
+        // the real credential-read path is covered by the socket tests around this one.
         let owner: libc::uid_t = 1_000;
         // Same user → authenticated.
         assert!(
@@ -4296,7 +4299,7 @@ mod tests {
             !is_same_user(Some(owner + 1), owner),
             "a foreign uid is not the same local user"
         );
-        // Unreadable credential (a `getpeereid` error) → fail closed. Both a fail-OPEN
+        // Unreadable credential (a credential-read error) → fail closed. Both a fail-OPEN
         // regression (treating `None` as allow) and inverting the comparison ALLOW this.
         assert!(
             !is_same_user(None, owner),
@@ -4305,24 +4308,26 @@ mod tests {
     }
 
     #[test]
-    fn peer_euid_fails_closed_when_getpeereid_errors() {
+    fn peer_euid_fails_closed_when_the_credential_read_errors() {
         use std::os::unix::io::AsRawFd;
-        // Issue #196: the fail-closed ERROR branch, driven for real. `getpeereid` on a
-        // non-socket fd returns `ENOTSOCK` — the syscall itself errors — so `peer_euid`
-        // must yield `None` and the decision must then DENY. A fail-open regression that
-        // surfaced a default uid on error (e.g. the pre-`Option` `euid` left at 0) would
-        // return `Some(_)` here. A regular file's fd is a real, valid fd that is simply
-        // not a socket, so this exercises the `rc != 0` branch portably.
+        // Issue #196: the fail-closed ERROR branch, driven for real. Both arms reject a
+        // non-socket fd with `ENOTSOCK` — `getpeereid` on macOS, `getsockopt(SO_PEERCRED)`
+        // on Linux (issue #963) — so the syscall itself errors and `peer_euid` must yield
+        // `None`, after which the decision must DENY. A fail-open regression that surfaced
+        // a default uid on error (e.g. the pre-`Option` `euid` left at 0) would return
+        // `Some(_)` here. A regular file's fd is a real, valid fd that is simply not a
+        // socket, so this exercises the `rc != 0` branch portably — which is why the test
+        // needed no gate when the second arm landed.
         let file = tempfile::tempfile().expect("tempfile");
         let euid = peer_euid(file.as_raw_fd());
         assert_eq!(
             euid, None,
-            "getpeereid on a non-socket fd must fail (no credential)"
+            "a peer-credential read on a non-socket fd must fail (no credential)"
         );
         // SAFETY: `getuid` cannot fail and has no preconditions.
         assert!(
             !is_same_user(euid, unsafe { libc::getuid() }),
-            "a getpeereid error must deny — fail closed"
+            "a credential-read error must deny — fail closed"
         );
     }
 
@@ -4333,12 +4338,12 @@ mod tests {
         // Issue #196: drive a REAL socket peer through the serve path and assert the
         // state-affecting `manual-swapped` is REJECTED when the peer is not the socket
         // owner. A genuinely foreign-uid peer cannot be spawned without root, so "foreign"
-        // is realized faithfully: the peer's uid is read for real via `getpeereid`, then
+        // is realized faithfully: the peer's uid is read for real via `peer_euid`, then
         // compared against an owner uid deliberately NOT it. The real credential read and
         // the real serve exchange are exercised; only the owner identity is synthesized.
         let (mut client, server) = tokio::net::UnixStream::pair().expect("socketpair");
 
-        // Real getpeereid read of the connected peer — its true euid (our own).
+        // Real per-target credential read of the connected peer — its true euid (our own).
         let peer_uid =
             peer_euid(server.as_raw_fd()).expect("a connected peer has a readable credential");
         // A socket owner that is NOT the peer → the peer is foreign to this socket.

@@ -885,13 +885,19 @@ org.sessiometer.agent = {
         assert!(plist.contains("<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\""));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_rendered_plist_passes_macos_plutil_lint() {
         // The strongest correctness check for the artifact this module exists to
         // produce: macOS's OWN property-list parser accepts what we render — both the
         // plain form and the one carrying an `EnvironmentVariables` dict. `/usr/bin/
         // plutil` is always present on macOS, like the `security` the keychain tests
-        // shell out to (the suite is already macOS-bound).
+        // shell out to.
+        //
+        // macOS-only since issue #963: `plutil` IS the system under test, so there is
+        // nothing for a Linux runner to exercise and the test would simply fail there.
+        // `render_plist` itself is a pure string builder and stays covered on every
+        // target by the shape assertions above.
         for environment in [
             Vec::new(),
             vec![("XDG_CONFIG_HOME".to_owned(), "/home/u/.config".to_owned())],
