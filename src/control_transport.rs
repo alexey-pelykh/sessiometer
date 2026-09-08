@@ -4,12 +4,12 @@
 //! The control channel's BYTE TRANSPORT, one arm per target (issue #1511, ADR-0037).
 //!
 //! Everything above this module — the newline-delimited `{"cmd":"…"}` framing, the
-//! `serde` decode, [`crate::daemon::serve_control`] and every client verb — is pure Rust with no OS
-//! surface. This module is the whole of the per-target seam under it: how a listening
+//! `serde` decode, [`crate::daemon`]'s `serve_control` and every client verb — is pure Rust
+//! with no OS surface. This module is the whole of the per-target seam under it: how a listening
 //! endpoint is created, how one connection is accepted, and how a client opens one.
 //!
 //! Unix (macOS, Linux) keeps the `0600` Unix-domain socket verbatim: the aliases below
-//! ARE `tokio::net::UnixStream` / `UnixListener`, and [`ControlListener::bind`] is the
+//! ARE `tokio::net::UnixStream` / `UnixListener`, and `ControlListener::bind` is the
 //! remove→bind→chmod dance moved here unchanged from `cli::bind_control_socket`. Nothing
 //! about the Unix behaviour changes — it is relocated, not rewritten.
 //!
@@ -19,7 +19,7 @@
 //!
 //! - **One client per INSTANCE.** There is no listening socket that accepts repeatedly. The
 //!   server creates a new instance per accept and only the FIRST carries `first_pipe_instance`
-//!   (ADR-0037 § Consequences → Negative). [`ControlListener::accept`] is where that structural
+//!   (ADR-0037 § Consequences → Negative). `ControlListener::accept` is where that structural
 //!   difference lives; its own docs carry the instance accounting.
 //! - **The framing survives unchanged.** The pipe stays in BYTE mode
 //!   (`PipeMode::Byte`) — set explicitly rather than inherited from tokio's default, the same
@@ -27,12 +27,17 @@
 //!   must not silently lose it. Message mode would impose datagram boundaries the newline
 //!   framing does not need.
 //! - **Every CLIENT open sets `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`**
-//!   ([`connect`]), so a server that wins the pipe-name race cannot impersonate the CLI. The
+//!   (`connect`), so a server that wins the pipe-name race cannot impersonate the CLI. The
 //!   pipe namespace has no `0700` directory to protect the name, so first-creator-wins cuts
 //!   both ways; ADR-0037 records this flag pair as NOT optional, and warns that
 //!   `SECURITY_IDENTIFICATION` without `SECURITY_SQOS_PRESENT` is not requested at all.
 //! - **The name is derived from the control-socket path**, so the two ends cannot drift
-//!   ([`windows_pipe_name`]).
+//!   (`windows_pipe_name`, in the Windows arm below).
+//!
+//! The item names above are code spans rather than intra-doc links on purpose: each one lives
+//! in a private per-target `imp` module, so a link would either not resolve at all or resolve
+//! on one target only — and `RUSTDOCFLAGS="-D warnings"` turns that into a failed build. This
+//! is the idiom `crate::canary` already uses for the same reason.
 //!
 //! NOT here, deliberately: the peer's identity and the pipe's owner-only security descriptor.
 //! ADR-0037 assigns both to **#976** and this item's Boundaries exclude them
