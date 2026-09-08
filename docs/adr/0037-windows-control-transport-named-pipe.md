@@ -40,8 +40,14 @@ Four pieces, all cited by symbol rather than by line, since line numbers rot sil
   (macOS) or `SO_PEERCRED` (Linux) to an `Option<uid_t>` and compares it to our own `getuid()`.
   FAIL CLOSED: an unreadable credential is `None`, which is never a uid, so it can never match ours.
 - **Framing** — `serve_control` in `src/daemon/socket.rs`: `BufReader` +
-  `.take(MAX_CONTROL_LINE_BYTES)` + `read_line`, one `serde_json` parse of the trimmed line, and a
-  reply written by `write_line` as the payload, then `b"\n"`, then a flush.
+  `.take(MAX_CONTROL_LINE_BYTES)` + `read_line`, then a `serde_json` parse of the trimmed line. The
+  one-shot ack is written **inline and best-effort** — payload, `b"\n"`, flush, result discarded
+  with `let _ = ack;` — and the discard is deliberate rather than sloppy: propagating a write error
+  would drop the `ControlSignal` at `UnixControl::serve`'s error arm and silently cancel an action
+  the operator had already authenticated. `write_line` is a *different* writer in the same file,
+  carrying the `watch` stream and the inline rejection replies. The distinction matters to a port,
+  because the two arms want opposite error handling on a transport whose hang-up error has a
+  different name.
 
 ### Why this cluster is a spike and not a substitution
 
@@ -50,9 +56,10 @@ exposes no AF_UNIX surface on Windows at all**, even though Win10 1803+ supports
 level. There is no in-place swap, and the candidates differ in their async story, their
 peer-identity story, and their filesystem semantics.
 
-Measured on this branch, `cargo check --target x86_64-pc-windows-msvc --all-targets` reports **105
-errors compiling the binary and 194 compiling its test target** — cargo's own counts, not a
-re-derivation. Two things in that output are worth more than the totals:
+Measured on this branch, `cargo check --target x86_64-pc-windows-msvc --all-targets` fails on both
+the binary and its test target. The error counts are deliberately **not** quoted: they move with
+every `src/**` change, so a number written here is stale on landing and carries nothing the
+enumeration below does not. Two things in that output are worth more than any total:
 
 - **Both `compile_error!` arms fire first, and by name** — the peer-credential one from
   `src/daemon/peer_auth.rs` and the accumulated-suspend one from `src/contract.rs`, each naming the
@@ -71,36 +78,42 @@ re-derivation. Two things in that output are worth more than the totals:
 The spike is a standalone package under `spikes/windows-control-transport/` — the root manifest
 declares no `[workspace]` table, so `cargo metadata --no-deps` at the root lists `sessiometer`
 alone and the root build / test / clippy / doc / deny / `check-no-security-framework.sh` gates never
-see it. Same posture as `apps/menubar/spikes/**` under ADR-0011. Its committed `Cargo.lock` pins
-every one of its 22 transitive crates to the version the root lockfile already holds, and the only
-package it adds is the spike itself — so it exercises the dependency set a real port inherits.
+see it. Same posture as `apps/menubar/spikes/**` under ADR-0011. Its committed `Cargo.lock` pins every
+transitive crate to the version the root lockfile already holds, and the only package it adds is
+the spike itself — so it exercises the dependency set a real port inherits.
 
 It had to run on a **real Windows host**. The repo has none (ARM macOS, Linux-only Docker), and the
 installed `x86_64-pc-windows-msvc` target gives `cargo check` only, which **type-checks without
 linking or running** — precisely the blindness class ADR-0029 records for the Mach `extern` block,
 and not sufficient for the issue's AC2. The proof therefore runs on a GitHub-hosted
-`windows-latest` runner: **Windows Server 2025, image `windows-2025-vs2026`**, Rust 1.96.0.
+`windows-latest` runner, on the toolchain `RUST_STABLE` pins in the spike's own workflow. The
+`windows-latest` label resolved to Windows Server 2025 on the run quoted below; GitHub re-points
+that label over time, so treat it as a fact about that run rather than as a requirement — nothing
+here depends on the image.
 
-The proof binary's complete stdout, at commit `3f79f8d`. It is the whole of what the program
+The proof binary's complete stdout, at commit `e824034`. It is the whole of what the program
 printed; the workflow step around it also emits cargo's own `Compiling` / `Finished` /
 `Running` lines, which are not reproduced:
 
 ```text
-[spike-972] host pid           : 6140
+[spike-972] host pid           : 4480
 [spike-972] host user SID      : S-1-5-21-1456194669-2875347699-3862154473-500
-[spike-972] pipe name          : \\.\pipe\sessiometer-spike-972-6140
+[spike-972] pipe name          : \\.\pipe\sessiometer-spike-972-4480
 [spike-972] CHECK 1a create    : PASS — owner-only server instance created (D:P(A;;GA;;;S-1-5-21-1456194669-2875347699-3862154473-500))
 [spike-972] CHECK 2  squat     : PASS — second first_pipe_instance create denied (ERROR_ACCESS_DENIED = 5)
-[spike-972] client child pid   : 7388
+[spike-972] client child pid   : 9208
 [spike-972] CHECK 1b accept    : PASS — connect() returned; a client is attached
+[spike-972] CHECK 1c handshake : PASS — the client has opened the pipe and written NOTHING (it is blocked awaiting our release)
 [spike-972] CHECK 0a canary   : PASS — this thread carries NO impersonation token yet (OpenThreadToken -> ERROR_NO_TOKEN = 1008)
 [spike-972] MEASUREMENT pre-read impersonation : S-1-5-21-1456194669-2875347699-3862154473-500
-[spike-972] CHECK 4  peer pid  : PASS — 7388 == the spawned child, != our own 6140 (DIAGNOSTIC: a pid is reusable and TOCTOU-prone, never the authentication primitive)
+[spike-972] CHECK 6  pre-read   : PASS — the peer's SID resolved with NO read having occurred, so the documented wording imposes no read-first ordering constraint
+[spike-972] CHECK 0b canary   : PASS — the impersonation token is gone again after the pre-read window
+[spike-972] CHECK 4  peer pid  : PASS — 9208 == the spawned child, != our own 4480 (DIAGNOSTIC: a pid is reusable and TOCTOU-prone, never the authentication primitive)
 [spike-972] CHECK 3a request   : PASS — read one framed line, one serde_json parse, cmd="status" (17 bytes on the wire)
 [spike-972] MEASUREMENT post-read impersonation: S-1-5-21-1456194669-2875347699-3862154473-500
 [spike-972] CHECK 5  peer SID  : PASS — S-1-5-21-1456194669-2875347699-3862154473-500 == our own SID (the `getpeereid` analogue: a per-USER identity, not a per-process one)
-[spike-972] CHECK 0b canary   : PASS — the impersonation token is gone again after RevertToSelf
-[spike-972] CHECK 3b reply     : PASS — one reply line written, newline-terminated and flushed
+[spike-972] CHECK 0c canary   : PASS — the impersonation token is gone again after the post-read window
+[spike-972] CHECK 3b reply     : PASS — one reply line attempted inline and best-effort, exactly as the daemon writes its ack (delivery is proven by CHECK 3c, not by this write)
 [spike-972] CHECK 3c client    : PASS — the child parsed the reply frame and exited 0
 [spike-972] VERDICT: PASS — every gated check succeeded.
 ```
@@ -110,16 +123,26 @@ Two properties of that run carry more weight than the passes themselves.
 **The client is a child process of the server**, so the pid CHECK 4 resolves is provably not our
 own — which is what makes the pid-vs-SID distinction observable rather than asserted.
 
-**CHECK 0a and 0b are a negative control, and without them CHECK 5 is not evidence.** The child runs
-as the same user as its parent — that is exactly what lets the run assert "the peer is us" — and it
-is also what would make "we impersonated the peer and read its SID" and "the impersonation did
-nothing and we read our own primary token" produce a byte-identical string. `OpenThreadToken` fails
-`ERROR_NO_TOKEN` on a thread carrying no impersonation token, so the run proves that failure before
-impersonating and again after `RevertToSelf`, with the successful `OpenThreadToken` inside
-`peer_user_sid` between them. **One run therefore exercises both states of the instrument**, which
-is why no mutation pass is needed to show it discriminates. CHECK 0b additionally proves what
-`RevertToSelf`'s return value cannot: that the token is *gone* afterwards, not merely that the call
-reported success.
+**The CHECK 0 canaries are a negative control, and without them CHECK 5 is not evidence.** The
+child runs as the same user as its parent — that is exactly what lets the run assert "the peer is
+us" — and it is also what would make "we impersonated the peer and read its SID" and "the
+impersonation did nothing and we read our own primary token" produce a byte-identical string.
+`OpenThreadToken` fails `ERROR_NO_TOKEN` on a thread carrying no impersonation token, so the run
+proves that failure before impersonating and again after each `RevertToSelf`, with the successful
+`OpenThreadToken` inside `peer_user_sid` between them. **One run therefore exercises both states of
+the instrument**, which is why no mutation pass is needed to show it discriminates. There is a
+canary on each side of *both* impersonation windows rather than only the last, so a window that
+failed to close would be caught wherever it sat. They additionally prove what `RevertToSelf`'s
+return value cannot: that the token is *gone* afterwards, not merely that the call reported success.
+
+**CHECK 1c is what makes CHECK 6 a measurement rather than a race.** The client announces on its
+stdout the moment `ClientOptions::open` returns and then blocks until the server releases it, so
+every impersonation above the release happens against a connected peer with **zero bytes in the
+pipe** — "no read had occurred" joined by the stronger "nothing was there to read". Without that
+handshake the client would write its request immediately and whether bytes were already available
+would differ per run and go unobserved, which for a question phrased around *the last message read
+from the pipe* answers only one branch. The synchronisation deliberately rides stdio and never the
+pipe, or it would be the very traffic it exists to exclude.
 
 ## Decision
 
@@ -136,9 +159,12 @@ those is already tokio's default and is set explicitly anyway, because on the ra
 opt-in and a future port that stops going through tokio must not silently lose it.
 
 This is the analogue of `bind_control_socket`'s `0600` chmod, and like it, it is the first line of
-defence: a foreign user cannot open an instance we created. **`first_pipe_instance` additionally
-buys a kernel-enforced name reservation** the Unix side has to get from its lockfile — CHECK 2
-measured a second create against a held name failing `ERROR_ACCESS_DENIED`.
+defence: a foreign user cannot open an instance we created. **Reasoned, not measured** — the runner
+is a single account, so no foreign-account open was ever attempted against that DACL; the claim
+rests on the descriptor being *protected* (`P`, nothing inherited) with exactly one ACE, and on the
+SDDL the run printed being the one it was built from. **`first_pipe_instance` additionally buys a
+kernel-enforced name reservation** the Unix side has to get from its lockfile — and that half *is*
+measured: CHECK 2 saw a second create against a held name fail `ERROR_ACCESS_DENIED`.
 
 **The `0700` DIRECTORY has no analogue, and that is a real asymmetry rather than a detail.** A DACL
 governs who may OPEN an instance we created; it says nothing about who may CREATE the name. On Unix
@@ -167,8 +193,9 @@ a property of the *connection*, not of a live process. It is worth reading for l
 This was the spike's open question: `ImpersonateNamedPipeClient` is documented to give "the security
 context of the last message read from the pipe", and whether that wording *implies* a read-first
 ordering constraint on a byte-mode pipe is not something an ADR should assert from a doc sentence.
-Measured: **the pre-read attempt resolved the peer's SID with no read having occurred.** That
-matters because `UnixControl::serve` computes `peer_authenticated` *before* calling `serve_control`,
+Measured: **the pre-read attempt resolved the peer's SID with a client attached, no read having
+occurred, and nothing in the pipe to read** — the last of those established by the out-of-band
+handshake (CHECK 1c) rather than by hoping the client had not written yet. That matters because `UnixControl::serve` computes `peer_authenticated` *before* calling `serve_control`,
 so a read-first constraint would have forced the authenticate-then-serve split apart. It does not.
 
 The proof's pre-read attempt was **un-gated on its first run** — asserting an answer would have
@@ -204,17 +231,29 @@ Rejected for two independent reasons, either sufficient:
   to *avoid* writing that.
 - **Peer identity is notably weaker, and that is the load-bearing property.** There is no
   `SO_PEERCRED` equivalent on Windows AF_UNIX. This option would have to fall back to something like
-  the pid, which decision 3 above rejects as an authentication primitive on its own terms. Trading
-  the strongest available identity for path-shape familiarity inverts the priority the issue sets.
+  the pid, which decision 3 above rejects as an authentication primitive on its own terms. Among the
+  local-IPC candidates on this platform the pipe's impersonated SID is the strongest identity on
+  offer, and trading it for path-shape familiarity inverts the priority the issue sets. No claim is
+  made about identity mechanisms outside that set.
 
 ### 3. TCP on loopback — REJECTED, and the rejection recorded deliberately
 
-It would put the daemon's control channel **on the host network**, which is exactly what this
-project's zero-egress posture exists to prevent. That posture is not a preference: it is enforced by
-two committed guards — `scripts/check-no-security-framework.sh` on the Rust side and
-`scripts/check-menubar-zero-egress.sh` on the Swift side, the latter failing the build if the app
-so much as *imports* a networking module — and ADR-0011 records the menu-bar app as a pure
-local-socket client for the same reason.
+It would put the daemon's control channel **on the host network**, which is what this project's
+zero-egress posture exists to prevent — and the guard that bites here is sharper than a posture.
+`no_raw_tcp_or_udp_socket_primitive_is_used` in `src/usage.rs` fails if `TcpStream` or
+`TcpListener` appears in the crate at all, which are the very types a loopback listener needs, so
+this option is **already red on the existing suite** rather than merely disfavoured. Two siblings
+hold the rest of the line — `no_in_process_http_tls_or_telemetry_client_is_linked` and
+`curl_is_the_only_network_capable_binary_referenced` — all three run in the `test` job, and `test`
+is in `ci-ok.needs`, the one required check on `main`. `CONTRIBUTING.md`
+§ *System CLIs, not client crates (the transport rule)* states the rule they enforce;
+`scripts/check-menubar-zero-egress.sh` holds the Swift side by failing the build if the app so much
+as *imports* a networking module; and ADR-0011 records the menu-bar app as a pure local-socket
+client for the same reason.
+
+`scripts/check-no-security-framework.sh` is **not** one of these guards, though its place in the
+`deny` job invites the assumption. Its own header scopes it to a Security.framework SDK binding and
+to keychain access going through `/usr/bin/security` (issue #2); it says nothing about networking.
 
 Three further reasons, each independent of the posture:
 
@@ -225,8 +264,8 @@ Three further reasons, each independent of the posture:
 - **Peer identity over loopback TCP is worse still than option 2's.** Recovering the peer requires
   a connection-table lookup (`GetExtendedTcpTable`) keyed on the 4-tuple — a pid, arrived at
   indirectly, with a wider TOCTOU window than the pipe's direct call.
-- **It is externally visible.** A listening port shows up in `netstat`, in host firewall prompts,
-  and in endpoint-security telemetry — user-visible surface a local control socket does not have.
+- **It is externally visible.** A listening port shows up in `netstat` and in any host-level
+  connection inventory — surface a local control socket simply does not have.
 
 This rejection is recorded rather than assumed precisely because loopback is the *easy* answer when
 a Unix socket is unavailable, and the reason not to take it is a project posture rather than a
@@ -269,6 +308,15 @@ technical impossibility.
   proof's client opens the pipe with tokio's defaults and never requests a different impersonation
   level, so this paragraph is an argument from the fail-closed comparison and from the API contract,
   not a reading taken off a run.
+- **The name is squattable in a way the socket path is not.** The `0700` support dir means a
+  foreign user cannot create our socket path at all, so `getpeereid` only ever had to answer the
+  forward direction. The pipe namespace has no directory to protect, so first-creator-wins — the
+  property CHECK 2 measured in our favour — cuts the other way too: a foreign local process that
+  creates `\\.\pipe\sessiometer-...` first either denies the daemon its own name or stands a server
+  in front of the CLI. The implementation item therefore owes a **client-side check of the server's
+  owner SID** and should open with `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` so a rogue
+  server cannot impersonate the CLI even if it wins the race. Neither is optional, and neither is
+  work the Unix side ever had to do.
 - **`paths::control_socket()` gains a per-target shape**, and with it every caller that reasons
   about the socket as a *file*. The CLI's friendly `Error::DaemonNotRunning` currently keys on a
   failed connect to a filesystem path; on Windows the not-running case is `ERROR_FILE_NOT_FOUND`
@@ -287,6 +335,11 @@ Recorded as residuals for the dependent implementation item rather than left to 
   by construction. The negative control proves the instrument distinguishes *impersonating* from
   *not impersonating*; it does not prove that a **different** user's SID would be reported as
   different. Nothing in the API suggests otherwise, but nothing here measured it.
+- **No foreign-account open against the DACL.** Every connection in the run was opened by the same
+  account that created the pipe, so the descriptor's *denying* half was never exercised — only its
+  granting half, implicitly, by the client's own successful open. The implementation item owes one
+  cross-account open attempt against a live instance; it is a two-account test, not a design
+  question.
 - **No standard-user run.** The runner's account SID ends in `-500`, the built-in Administrator RID,
   so every measurement was taken in a privileged context. Impersonating a client at Identification
   level is documented not to require `SeImpersonatePrivilege`, and a same-user token is a further
@@ -304,7 +357,11 @@ Recorded as residuals for the dependent implementation item rather than left to 
   server cannot impersonate the CLI even if it wins the race.
 - **Nothing about performance, reconnection, or the `watch` stream.** The proof round-trips exactly
   one message on one connection. The long-lived `watch` subscription (#165), which hands the
-  connection to a spawned task and streams frames indefinitely, is untested on this transport.
+  connection to a spawned task and streams frames indefinitely, is untested here — and it is where
+  one-client-per-instance (§ Negative) bites hardest, since a subscriber occupies an instance for
+  its whole lifetime. **The implementation item owes a `watch`-shaped proof before that
+  subscription is ported**, answering how many instances the accept loop keeps outstanding; this
+  record does not settle it and no measurement here bears on it.
 - **Nothing is enforced.** No CI job compiles the crate for Windows. The
   `spike-972-windows-transport` workflow builds and runs the *spike*, is not in `ci.yml`, and is not
   in `ci-ok.needs` — deliberately, so a throwaway proof never becomes a required check. Its
