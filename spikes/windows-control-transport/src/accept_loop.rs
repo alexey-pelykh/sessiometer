@@ -60,6 +60,21 @@ const PROOF_TIMEOUT: Duration = Duration::from_secs(20);
 /// it does not pace a success.
 const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The cadence a busy create is retried at — a MIRROR of `INSTANCE_RETRY_INTERVAL` in
+/// `src/control_transport.rs`, where `wait_for_instance` carries it INSIDE the accept. This proof's
+/// [`AcceptLoop::accept`] deliberately does not retry, because surfacing that busy is what gates
+/// CHECK 6a, so the same cadence has to be supplied by whoever drives it.
+const INSTANCE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+
+/// How long one driven accept pass waits for a client before the proof takes the loop back. Its
+/// expiry is also what puts a newly created instance back into `idle`, via [`PendingAccept`].
+const ACCEPT_POLL: Duration = Duration::from_millis(25);
+
+/// How many (poll, wait) passes CHECK 7 gives a freed instance — about three seconds, inside
+/// [`PROOF_TIMEOUT`]. A ceiling on a FAILURE, not a pace for a success: the recovery it measures
+/// normally lands on the first or second pass.
+const RECOVERY_ATTEMPTS: u32 = 40;
+
 /// The tag every line of this proof carries, so its output is never confused with #972's.
 const TAG: &str = "[spike-1511]";
 
@@ -407,18 +422,29 @@ async fn proof() -> Checked<()> {
     drop(departing);
     drop(served.remove(0));
 
+    let started = tokio::time::Instant::now();
     let mut recovered = None;
-    for _ in 0..40u32 {
+    for _ in 0..RECOVERY_ATTEMPTS {
         match open_client(&name) {
             Ok(client) => {
                 recovered = Some(client);
                 break;
             }
             Err(err) if is_code(&err, ERROR_PIPE_BUSY) => {
-                // The loop has not refilled yet: drive one accept attempt, which is exactly what
-                // the daemon's idle select does on its next pass. `accept` blocks until a client
-                // arrives, so it is polled with a timeout rather than awaited to completion.
-                let _ = tokio::time::timeout(Duration::from_millis(25), loop_.accept()).await;
+                // The loop has not refilled yet: drive one accept pass, which is exactly what the
+                // daemon's idle `select!` does on its next tick. `accept` blocks until a client
+                // arrives, so it is polled with a timeout rather than awaited to completion — and
+                // that expiry is also what returns a newly created instance to `idle`, where the
+                // next `open_client` can reach it.
+                let _ = tokio::time::timeout(ACCEPT_POLL, loop_.accept()).await;
+                // Then WAIT. This is load-bearing, not padding, and its absence is what the FIRST
+                // Windows run of this proof measured: every earlier check passed and CHECK 7
+                // reported that no client could connect. When the create is denied, `accept`
+                // returns its error on its first poll, `timeout` therefore never registers a
+                // sleep, and the whole loop ran to its limit inside one microsecond window — a
+                // budget that read as a second and was in fact zero. Production does not have
+                // this loop at all: `wait_for_instance` waits INSIDE the accept.
+                tokio::time::sleep(INSTANCE_RETRY_INTERVAL).await;
             }
             Err(err) => {
                 return Err(fail(format!(
@@ -428,7 +454,13 @@ async fn proof() -> Checked<()> {
         }
     }
     let recovered = recovered.ok_or_else(|| {
-        fail("CHECK 7: no client could connect after a subscriber freed its instance")
+        // The elapsed time is part of the finding, because the two ways this check can fail read
+        // identically without it: recovery that never happens, and a retry that never waited.
+        fail(format!(
+            "CHECK 7: no client could connect after a subscriber freed its instance \
+             ({RECOVERY_ATTEMPTS} passes over {:.3}s)",
+            started.elapsed().as_secs_f64()
+        ))
     })?;
     let served_recovered = tokio::time::timeout(FRAME_TIMEOUT, loop_.accept())
         .await
@@ -456,16 +488,25 @@ async fn proof() -> Checked<()> {
     // still connect.
     subscribers.clear();
     served.clear();
-    for _ in 0..40u32 {
+    let started = tokio::time::Instant::now();
+    for _ in 0..RECOVERY_ATTEMPTS {
         if loop_.listening() == 1 {
             break;
         }
-        let _ = tokio::time::timeout(Duration::from_millis(25), loop_.accept()).await;
+        // Same two-part pass as CHECK 7's retry, and for the same reason: drive one accept so a
+        // create is attempted and its instance parked in `idle`, then WAIT, because a denied
+        // create makes `accept` return on its first poll and the loop would otherwise spend its
+        // whole budget in no time at all.
+        let _ = tokio::time::timeout(ACCEPT_POLL, loop_.accept()).await;
+        tokio::time::sleep(INSTANCE_RETRY_INTERVAL).await;
     }
     if loop_.listening() != 1 {
-        return Err(fail(
-            "CHECK 8: could not get back to exactly one listening instance to cancel against",
-        ));
+        return Err(fail(format!(
+            "CHECK 8: could not get back to exactly one listening instance to cancel against \
+             ({RECOVERY_ATTEMPTS} passes over {:.3}s, listening={})",
+            started.elapsed().as_secs_f64(),
+            loop_.listening()
+        )));
     }
     // One listening instance, no client: `accept` cannot resolve, so the timeout DROPS the
     // future mid-`connect()` — the exact cancellation the idle select performs.
