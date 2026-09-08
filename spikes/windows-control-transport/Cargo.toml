@@ -1,0 +1,38 @@
+# Spike proof for issue #972 — the Windows daemon control transport.
+#
+# DELIBERATELY OUTSIDE the root crate's build graph. The repo root `Cargo.toml` declares no
+# `[workspace]` table, so this nested manifest is a standalone package: `cargo build` / `test` /
+# `clippy` / `doc` / `deny` / `scripts/check-no-security-framework.sh` at the repo root never see
+# it. Same posture as `apps/menubar/spikes/**` (ADR-0011), which `apps/menubar/project.yml` never
+# references. Throwaway knowledge-acquisition, not production code.
+#
+# Own `Cargo.lock` (committed) so the proof is reproducible: the root lockfile does not cover it.
+[package]
+name = "sessiometer-spike-windows-control-transport"
+version = "0.0.0"
+edition = "2021"
+# The root crate's MSRV. The spike is not gated on it, but drifting off it for no reason would
+# make the proof say less about the crate it is a proof for.
+rust-version = "1.87.0"
+license = "MIT"
+publish = false
+
+[dependencies]
+# The wire framing under test is newline-delimited JSON, so the proof parses a real request and
+# emits a real reply rather than echoing bytes (AC4 — the framing must survive UNCHANGED).
+serde_json = "1.0.150"
+
+[target.'cfg(windows)'.dependencies]
+# `net` is what carries `tokio::net::windows::named_pipe`; the rest mirror the daemon's own
+# feature set for the control path. `rt` only — the daemon is `current_thread` (ADR-0001).
+tokio = { version = "1.52.3", features = ["rt", "time", "io-util", "net", "process"] }
+# ALREADY in the root crate's Windows lockfile (tokio and `etcetera` both pull it), so the proof
+# introduces no crate the real port would not already have. Used for the peer-identity syscalls
+# and the pipe's security descriptor.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
