@@ -25,9 +25,12 @@
 //!      `ConvertSidToStringSidW` -> `RevertToSelf` — the peer's USER SID. This is the analogue of
 //!      `getpeereid`'s effective uid.
 //!
-//!    The impersonation is attempted TWICE on purpose: once BEFORE any read and once after, so the
-//!    run MEASURES whether the documented "security context of the last message read from the
-//!    pipe" wording implies a read-first ordering constraint, instead of the ADR asserting one.
+//!    The impersonation is attempted TWICE on purpose: once BEFORE any read and once after. On the
+//!    spike's FIRST run the pre-read attempt was un-gated, so the run MEASURED whether the
+//!    documented "security context of the last message read from the pipe" wording implies a
+//!    read-first ordering constraint, instead of the ADR asserting one. It does not, and ADR-0037
+//!    § Decision 4 records that — so the attempt is GATED from there on, because a recorded
+//!    decision no check enforces is one a later run can regress in silence.
 //!
 //!    Both attempts are bracketed by a NEGATIVE CONTROL, because without one point 4 is not
 //!    evidence: the client runs as the same user as the server, so "we impersonated the peer and

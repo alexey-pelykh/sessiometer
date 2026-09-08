@@ -81,7 +81,9 @@ linking or running** — precisely the blindness class ADR-0029 records for the 
 and not sufficient for the issue's AC2. The proof therefore runs on a GitHub-hosted
 `windows-latest` runner: **Windows Server 2025, image `windows-2025-vs2026`**, Rust 1.96.0.
 
-The run's full output, at commit `3f79f8d`:
+The proof binary's complete stdout, at commit `3f79f8d`. It is the whole of what the program
+printed; the workflow step around it also emits cargo's own `Compiling` / `Finished` /
+`Running` lines, which are not reproduced:
 
 ```text
 [spike-972] host pid           : 6140
@@ -133,11 +135,21 @@ to anyone else. Plus `first_pipe_instance(true)` and `reject_remote_clients(true
 those is already tokio's default and is set explicitly anyway, because on the raw Win32 API it is
 opt-in and a future port that stops going through tokio must not silently lose it.
 
-This is the analogue of `bind_control_socket`'s `0600`-in-a-`0700`-dir posture, and it is the first
-line of defence in both worlds: a foreign user cannot `CreateFile` the pipe any more than they can
-`connect(2)` the socket. **`first_pipe_instance` additionally buys a kernel-enforced name
-reservation** the Unix side has to get from its lockfile — CHECK 2 measured a second create against
-a held name failing `ERROR_ACCESS_DENIED`.
+This is the analogue of `bind_control_socket`'s `0600` chmod, and like it, it is the first line of
+defence: a foreign user cannot open an instance we created. **`first_pipe_instance` additionally
+buys a kernel-enforced name reservation** the Unix side has to get from its lockfile — CHECK 2
+measured a second create against a held name failing `ERROR_ACCESS_DENIED`.
+
+**The `0700` DIRECTORY has no analogue, and that is a real asymmetry rather than a detail.** A DACL
+governs who may OPEN an instance we created; it says nothing about who may CREATE the name. On Unix
+the support dir is `DIR_MODE` (`0700`, `src/paths.rs`), so a foreign user cannot create our socket
+path at all. The pipe namespace has no directory to protect, so `first_pipe_instance`'s
+first-creator-wins semantics — the very thing CHECK 2 measured — **cut both ways**: whoever creates
+`\\.\pipe\sessiometer-...` first holds it, and the loser is denied. The spike did not measure
+whether a foreign local user can win that race, so this ADR does not claim they cannot; see
+§ What this spike did NOT establish. What follows for the implementation item is that **the CLIENT
+must verify the SERVER's identity**, not only the reverse — the reverse is all `getpeereid` ever
+had to do, because the directory mode made the forward direction unnecessary.
 
 **3. Peer identity is the caller's USER SID, resolved by impersonation.**
 `ImpersonateNamedPipeClient` → `OpenThreadToken` → `GetTokenInformation(TokenUser)` →
@@ -158,6 +170,11 @@ ordering constraint on a byte-mode pipe is not something an ADR should assert fr
 Measured: **the pre-read attempt resolved the peer's SID with no read having occurred.** That
 matters because `UnixControl::serve` computes `peer_authenticated` *before* calling `serve_control`,
 so a read-first constraint would have forced the authenticate-then-serve split apart. It does not.
+
+The proof's pre-read attempt was **un-gated on its first run** — asserting an answer would have
+assumed the finding — and is **gated from this ADR onward** (CHECK 6). The reason is this section:
+once a measurement becomes a decision in force, and the proof stays re-runnable until the dependent
+items land, an un-gated measurement is a recorded decision a later run can regress in silence.
 
 **5. The message framing survives UNCHANGED.** Measured, not argued: the same `BufReader` +
 `.take(MAX_CONTROL_LINE_BYTES)` + `read_line`, one `serde_json` parse, one reply line terminated
@@ -248,7 +265,10 @@ technical impossibility.
   `SECURITY_ANONYMOUS`, in which case the server's impersonation yields an anonymous token. Under
   the fail-closed comparison this can only make the client **deny itself** — an anonymous token's
   user SID is not ours — so it is not an escalation path. It is still an asymmetry `getpeereid` does
-  not have, where the peer has no say in what the kernel reports.
+  not have, where the peer has no say in what the kernel reports. **Reasoned, not measured**: the
+  proof's client opens the pipe with tokio's defaults and never requests a different impersonation
+  level, so this paragraph is an argument from the fail-closed comparison and from the API contract,
+  not a reading taken off a run.
 - **`paths::control_socket()` gains a per-target shape**, and with it every caller that reasons
   about the socket as a *file*. The CLI's friendly `Error::DaemonNotRunning` currently keys on a
   failed connect to a filesystem path; on Windows the not-running case is `ERROR_FILE_NOT_FOUND`
@@ -274,6 +294,14 @@ Recorded as residuals for the dependent implementation item rather than left to 
   not, so the run cannot distinguish "no privilege was needed" from "the privilege was present". The
   daemon's gate only ever asks about a same-user peer, which is the exempt case; confirming that on
   a non-privileged account is implementation work, not spike work.
+- **Nothing about pipe-name pre-creation.** CHECK 2 measured only the case where *we* create the
+  name first. Whether a foreign local user can create `\\.\pipe\sessiometer-...` before the daemon
+  does — and so either deny the daemon its own name or stand a server in front of the CLI — was not
+  measured, and cannot be on a runner where everything is one account. It is the direction the
+  `0700` directory closes for free on Unix, so it is the one place the port is structurally exposed
+  where the socket was not. The implementation item owes a client-side check of the server's owner
+  SID, and should consider opening with `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` so a rogue
+  server cannot impersonate the CLI even if it wins the race.
 - **Nothing about performance, reconnection, or the `watch` stream.** The proof round-trips exactly
   one message on one connection. The long-lived `watch` subscription (#165), which hands the
   connection to a spawned task and streams frames indefinitely, is untested on this transport.
