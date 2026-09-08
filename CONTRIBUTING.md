@@ -46,9 +46,14 @@ Three things follow, and all three matter when you write or review a change:
   making it. That the port is green today was measured by hand, in a container, and recorded
   on #963 — evidence for one commit, not a standing gate. Where a test carries a platform
   assumption (a live `/bin/sh -l` spawn, an absolute passwd entry, a spawn of
-  `/usr/bin/security` or `/usr/bin/plutil`), say so in a comment beside it and gate it on
-  `target_os`, as the login-shell harvest tests in [`src/paths.rs`](src/paths.rs) and the
-  real-`security` tests in [`src/witness.rs`](src/witness.rs) do.
+  `/usr/bin/security` or `/usr/bin/plutil`), always say so in a comment beside it — then
+  gate it on `target_os` only if it actually fails on the other target. The two cases have
+  different exemplars, and citing the wrong one is how this gets misread: the
+  real-`security` tests in [`src/witness.rs`](src/witness.rs) and the `plutil` test in
+  [`src/service.rs`](src/service.rs) **are** gated, because the binary under test has no
+  Linux referent at all; the login-shell harvest tests in [`src/paths.rs`](src/paths.rs)
+  are deliberately **not**, because #963 measured them passing there — a gate would cost
+  real coverage on a target where they work.
 
 The credential mechanism follows its own sequence: recon (#40, Linux half answered), then
 the backend-neutral credential-store seam (#25) and the per-OS mechanisms (#26 Linux, #27
