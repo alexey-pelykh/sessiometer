@@ -101,24 +101,24 @@ and not sufficient for the issue's AC2. The proof therefore runs on a GitHub-hos
 that label over time, so treat it as a fact about that run rather than as a requirement — nothing
 here depends on the image.
 
-The proof binary's complete stdout, at commit `e824034`. It is the whole of what the program
-printed; the workflow step around it also emits cargo's own `Compiling` / `Finished` /
-`Running` lines, which are not reproduced:
+The proof binary's complete stdout, at commit `da006bc` — this branch's tip, so the record quotes
+the code it ships with. It is the whole of what the program printed; the workflow step around it
+also emits cargo's own `Compiling` / `Finished` / `Running` lines, which are not reproduced:
 
 ```text
-[spike-972] host pid           : 4480
+[spike-972] host pid           : 7992
 [spike-972] host user SID      : S-1-5-21-1456194669-2875347699-3862154473-500
-[spike-972] pipe name          : \\.\pipe\sessiometer-spike-972-4480
+[spike-972] pipe name          : \\.\pipe\sessiometer-spike-972-7992
 [spike-972] CHECK 1a create    : PASS — owner-only server instance created (D:P(A;;GA;;;S-1-5-21-1456194669-2875347699-3862154473-500))
 [spike-972] CHECK 2  squat     : PASS — second first_pipe_instance create denied (ERROR_ACCESS_DENIED = 5)
-[spike-972] client child pid   : 9208
+[spike-972] client child pid   : 4412
 [spike-972] CHECK 1b accept    : PASS — connect() returned; a client is attached
 [spike-972] CHECK 1c handshake : PASS — the client has opened the pipe and written NOTHING (it is blocked awaiting our release)
 [spike-972] CHECK 0a canary   : PASS — this thread carries NO impersonation token yet (OpenThreadToken -> ERROR_NO_TOKEN = 1008)
 [spike-972] MEASUREMENT pre-read impersonation : S-1-5-21-1456194669-2875347699-3862154473-500
 [spike-972] CHECK 6  pre-read   : PASS — the peer's SID resolved with NO read having occurred, so the documented wording imposes no read-first ordering constraint
 [spike-972] CHECK 0b canary   : PASS — the impersonation token is gone again after the pre-read window
-[spike-972] CHECK 4  peer pid  : PASS — 9208 == the spawned child, != our own 4480 (DIAGNOSTIC: a pid is reusable and TOCTOU-prone, never the authentication primitive)
+[spike-972] CHECK 4  peer pid  : PASS — 4412 == the spawned child, != our own 7992 (DIAGNOSTIC: a pid is reusable and TOCTOU-prone, never the authentication primitive)
 [spike-972] CHECK 3a request   : PASS — read one framed line, one serde_json parse, cmd="status" (17 bytes on the wire)
 [spike-972] MEASUREMENT post-read impersonation: S-1-5-21-1456194669-2875347699-3862154473-500
 [spike-972] CHECK 5  peer SID  : PASS — S-1-5-21-1456194669-2875347699-3862154473-500 == our own SID (the `getpeereid` analogue: a per-USER identity, not a per-process one)
