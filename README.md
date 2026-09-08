@@ -1544,14 +1544,22 @@ raise [`poll_secs`](#configuration) or keep the roster smaller by choice.
 
 ## Build from source
 
-**macOS is the only supported build target.** The crate does not compile for Linux or
-Windows today, and no CI job attempts it — every job that builds, tests, or lints the
-crate runs on a macOS runner. That is a stated position, not an oversight: the daemon is
-built on `launchd`, the login keychain, and the passwd database, and the menu-bar app on
-SwiftUI, TCC, and Developer ID notarization. Cross-platform support is tracked future
-work — recon (#40) first, then the credential-store seam (#25), the per-OS mechanisms
-(#26/#27/#28), and packaging plus CI (#29). See
-[ADR-0029](docs/adr/0029-macos-is-the-only-supported-build-target.md).
+**The CLI and daemon target macOS and Linux.** The menu-bar app
+([`apps/menubar/`](apps/menubar/)) is **macOS-only** — a SwiftUI/AppKit application with
+no Linux counterpart. **Windows is not a supported target**; it stays tracked behind its
+own recon (#27).
+
+**Linux is decided but not yet landed.** The crate does not build for a Linux target on
+`main` today: two files hold macOS-only syscall sites. Porting them is #963, and the CI
+job that will enforce the result is #964. Until #964 is green, every job that builds,
+tests, or lints the crate runs on a macOS runner — so a green run still says nothing about
+the Linux build.
+
+One trap is worth carrying out of that work: **`cargo check` cannot verify a Linux build.**
+One of the two sites is an `extern "C"` block, which resolves at *link* rather than at
+type-check, so `check` compiles it clean and only `cargo build` or `cargo test` catches it.
+The full record — what was measured, and what reversed the earlier macOS-only decision — is
+[ADR-0029](docs/adr/0029-linux-is-a-supported-build-target.md), under umbrella #961.
 
 ```sh
 cargo build --release

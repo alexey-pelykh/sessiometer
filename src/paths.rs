@@ -2674,9 +2674,9 @@ mod tests {
     /// (bash in `sh` mode) does; `dash` — the Debian/Ubuntu `/bin/sh` — does not treat
     /// `-l` the same, so the success assertion could fail there for a reason unrelated to
     /// the scrub under test. It stays a comment rather than a `#[cfg(target_os = "macos")]`
-    /// because macOS is the only supported build target: the crate does not compile for
-    /// Linux at all, so the gate would be inert today AND would falsely imply the rest of
-    /// this suite is portable. A future porter (#26 / #29) re-verifies it against the
+    /// because the crate does not compile for Linux at all today (issue #963 is the port),
+    /// so the gate would be inert AND would falsely imply the rest of this suite is
+    /// portable. A future porter (#26 / #29) re-verifies it against the
     /// target's real `/bin/sh`.
     #[tokio::test]
     async fn a_live_harvest_child_emits_no_scrubbed_variable() {

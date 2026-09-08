@@ -363,8 +363,8 @@ in test. #749 removed the technical basis for the broader reading.
 - **[ADR-0026](0026-daemon-fault-severity-rank-is-cross-surface.md)** — the cross-surface severity rank
   this scope's #768 turned into an enforced contract; its § Consequences records that enforcement.
 - **[ADR-0010](0010-macos-app-repo-topology.md)** (app topology),
-  **[ADR-0029](0029-macos-is-the-only-supported-build-target.md)** (macOS-only, so CI green says
-  nothing about portability).
+  **[ADR-0029](0029-linux-is-a-supported-build-target.md)** (the supported build targets, and
+  why a `cargo check`-only verification of one of them is a false green).
 - **Code / docs**: `apps/menubar/project.yml` (the `TEST_HOST: ""` bundle and its eight exclusions —
   the interaction boundary), `apps/menubar/design/README.md` (the six manual checklists, § Expected
   reconciliations), `apps/menubar/design/build-comparison.py` (the name-paired mock oracle),
