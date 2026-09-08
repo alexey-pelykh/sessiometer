@@ -27,7 +27,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
-use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+use tokio::net::windows::named_pipe::{ClientOptions, PipeMode, ServerOptions};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, LocalFree, ERROR_ACCESS_DENIED, ERROR_NO_TOKEN, ERROR_PIPE_BUSY,
@@ -173,7 +173,13 @@ async fn proof() -> Result<(), String> {
             .first_pipe_instance(true)
             // Already tokio's default (`ServerOptions::new`), stated anyway: on the raw Win32 API
             // it is opt-in, so a future port that stops going through tokio must set it by hand.
-            .reject_remote_clients(true);
+            .reject_remote_clients(true)
+            // Also already the default, and set for the same reason plus one more. ADR-0037
+            // § Decision 5 makes byte mode a CONSTRAINT the port must keep -- message mode would
+            // impose datagram boundaries the newline framing does not need -- and a constraint
+            // this proof takes from a default is one a dependency bump can retract without
+            // reddening anything. That is the argument CHECK 6 is gated on, applied here.
+            .pipe_mode(PipeMode::Byte);
         // SAFETY: `attributes` is a live, correctly-sized `SECURITY_ATTRIBUTES` on this stack frame
         // whose `lpSecurityDescriptor` came from `ConvertStringSecurityDescriptorToSecurityDescriptorW`
         // (a valid self-relative descriptor: that call returned TRUE, and the API documents its
@@ -502,6 +508,13 @@ async fn client_exchange(pipe_name: &str) -> Result<(), String> {
     // server releases us. This is what lets the server's pre-read impersonation happen in a known
     // state rather than in a race with this write. Blocking `std` stdio on purpose: this process
     // has nothing else to do, and it keeps the spike off tokio's `io-std` feature.
+    //
+    // One consequence worth stating, since it is invisible: `client_main` wraps this whole function
+    // in `tokio::time::timeout(PROOF_TIMEOUT, ..)`, and a blocking read on a `current_thread`
+    // runtime never yields -- so that timer CANNOT fire while we are parked here. The window is
+    // bounded from the other side instead: the server holds the only other end, its own
+    // PROOF_TIMEOUT bounds the whole proof, and `kill_on_drop(true)` on the spawned child means a
+    // server timeout drops the child and kills us.
     {
         use std::io::{BufRead, Write};
         println!("opened");

@@ -1,0 +1,5 @@
+# The workflow's `Run the proof` step tees the run's stdout here (see
+# .github/workflows/spike-972-windows-transport.yml). It only appears on the runner, but anyone
+# reproducing that step by hand on Windows gets it in their tree. Kept INSIDE the spike rather than
+# in the repo root so it is deleted with the spike, per ADR-0037 § Lifecycle.
+proof-output.txt
