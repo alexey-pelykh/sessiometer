@@ -16,9 +16,9 @@ decision_makers: [Oleksii PELYKH (maintainer)]
 
 > **Arriving from issue #797's closing comment, which describes this ADR as recording "macOS is the
 > only supported build target"?** That decision — accepted here on 2026-07-28, branch (b) of #797 —
-> is reversed, and this file was amended in place rather than superseded, so
-> `git log --follow docs/adr/0029-linux-is-a-supported-build-target.md` carries the superseded text
-> in full.
+> is reversed, and this file was amended in place rather than superseded:
+> `git log -- docs/adr/0029-macos-is-the-only-supported-build-target.md` carries the superseded text
+> in full, under the name this file had until then.
 
 The reversal is a **decision in force, not a landed port**. See § Decision part 4: the crate does not
 build for Linux today, and nothing enforces that it will until #964 lands. This ADR states what is
