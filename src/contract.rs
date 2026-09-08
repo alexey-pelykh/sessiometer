@@ -183,8 +183,10 @@ fn slept_since_boot() -> Duration {
 /// The accumulated-suspend duration implied by ONE paired reading of the two boot-epoch clocks
 /// (issue #963).
 ///
-/// Split out from [`slept_since_boot`] for exactly the reason [`ticks_to_duration`] is split out
-/// on the mach arm: it is the part that can be wrong SILENTLY. Swapping the two operands still
+/// Split out from [`slept_since_boot`] for exactly the reason `ticks_to_duration` is split out on
+/// the mach arm (an intra-doc link, not a plain-text reference, would be a broken one here — that
+/// item does not exist on this target): it is the part that can be wrong SILENTLY. Swapping the
+/// two operands still
 /// yields a perfectly plausible `Duration::ZERO` on every host that has never suspended — which
 /// is every CI runner — so only a pure test driving a synthetic suspended reading can tell a real
 /// subtraction from an inverted one. Pure and total, so the unit tests below do exactly that.
@@ -402,7 +404,7 @@ mod tests {
     ///
     /// macOS-only, and it does NOT transfer: mach ticks and their timebase have no Linux
     /// counterpart at all. The Linux arm's own silent-failure guard is
-    /// [`the_suspend_offset_is_the_boottime_excess_over_monotonic`] below.
+    /// `the_suspend_offset_is_the_boottime_excess_over_monotonic` below.
     #[cfg(target_os = "macos")]
     #[test]
     fn ticks_convert_through_the_real_world_timebases() {

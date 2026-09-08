@@ -542,6 +542,13 @@ mod tests {
         ));
     }
 
+    // macOS-only since issue #963: the first assertion pins a MEASURED `/usr/bin/security`
+    // behaviour (see `resolve_probe`) — a bad keychain path exits 0 with empty output, hence
+    // `Ok(false)`. On Linux there is no `security` to measure: the spawn fails, the probe
+    // returns `Err`, and the fail-closed arm answers `Present`. The premise is absent, not the
+    // assertion wrong. The store-as-backstop half is covered target-neutrally by
+    // `a_populated_usage_store_is_a_witness_and_an_empty_one_is_not`.
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn an_unreadable_keychain_degrades_to_no_witness_and_the_store_is_the_backstop() {
         // The measured reality, pinned so nobody re-derives it wrongly: `dump-keychain` on
