@@ -36,8 +36,13 @@
 //!    evidence: the client runs as the same user as the server, so "we impersonated the peer and
 //!    read its SID" and "the impersonation did nothing and we read our own" produce an identical
 //!    string. `OpenThreadToken` fails `ERROR_NO_TOKEN` on a thread carrying no impersonation token,
-//!    so the run proves that failure BEFORE impersonating and again AFTER `RevertToSelf` — which is
-//!    what makes the success in between mean something, and what proves the revert reverted.
+//!    so the run proves that failure on BOTH SIDES OF EACH WINDOW — before the first, between the
+//!    two, and after the second. Bracketing only the last one would leave a hole the exact shape of
+//!    the thing the control exists to exclude: a revert that silently failed would leave a residual
+//!    token for the next window to read back, and the SID would look right.
+//!
+//!    The window itself is closed by an RAII guard rather than by every arm remembering to revert,
+//!    so an early return or an unwinding panic cannot leave the thread running as the client.
 //!
 //! The client is a CHILD PROCESS of the server (this same binary, `client` mode), so the resolved
 //! PID is provably not our own — which is what makes the PID-vs-SID distinction in point 4

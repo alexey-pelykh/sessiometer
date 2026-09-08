@@ -69,6 +69,9 @@ impl std::fmt::Display for PeerSid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Resolved(sid) => write!(f, "{sid}"),
+            // `code: 0` is ERROR_SUCCESS, and printing it beside FAILED reads as a contradiction.
+            // The one arm that has no Win32 error to report says so instead.
+            Self::Failed { stage, code: 0 } => write!(f, "FAILED at {stage}"),
             Self::Failed { stage, code } => write!(f, "FAILED at {stage} (GetLastError={code})"),
         }
     }
@@ -171,7 +174,9 @@ async fn proof() -> Result<(), String> {
             .reject_remote_clients(true);
         // SAFETY: `attributes` is a live, correctly-sized `SECURITY_ATTRIBUTES` on this stack frame
         // whose `lpSecurityDescriptor` came from `ConvertStringSecurityDescriptorToSecurityDescriptorW`
-        // (a valid self-relative descriptor, non-null or we returned above). It outlives the call,
+        // (a valid self-relative descriptor: that call returned TRUE, and the API documents its
+        // out-parameter as non-null on success — this code tests the BOOL, not the pointer). It
+        // outlives the call,
         // which is all `CreateNamedPipeW` requires — the descriptor is COPIED into the kernel object,
         // which is why the free below is correct.
         let created = unsafe {
@@ -226,6 +231,9 @@ async fn proof() -> Result<(), String> {
     let mut child = tokio::process::Command::new(&exe)
         .arg("client")
         .arg(&pipe_name)
+        // Every check below can return early, and a client left running would sit in its own
+        // 30-second timeout after this process is gone.
+        .kill_on_drop(true)
         .spawn()
         .map_err(|err| format!("could not spawn the client child process: {err}"))?;
     let child_pid = child
@@ -283,6 +291,16 @@ async fn proof() -> Result<(), String> {
             ))
         }
     }
+
+    // -- CHECK 0b: the canary again, between the two impersonation windows. --------------------
+    //
+    // Bracketing only the LAST window leaves the control with a hole exactly the shape of the thing
+    // it exists to exclude: if window 1's revert silently failed to clear the token, window 2's
+    // impersonation could succeed-but-do-nothing and `OpenThreadToken` would read window 1's
+    // RESIDUAL token — whose SID is the client's, so CHECK 5 would print PASS off a stale reading.
+    // Every window is bracketed on both ends, so no window's exit is taken on trust.
+    no_impersonation_token("CHECK 0b canary (between the two impersonation windows)")?;
+    println!("[spike-972] CHECK 0b canary   : PASS — the impersonation token is gone again after the pre-read window");
 
     // -- CHECK 4: the peer's pid (DIAGNOSTIC only). --------------------------------------------
     let peer_pid = client_process_id(pipe).map_err(|code| {
@@ -352,13 +370,13 @@ async fn proof() -> Result<(), String> {
          a per-USER identity, not a per-process one)"
     );
 
-    // -- CHECK 0b: the canary's other end — `RevertToSelf` actually reverted. -------------------
+    // -- CHECK 0c: the canary's other end — the post-read window closed too. -------------------
     //
     // A thread left impersonating would do the rest of its work under the peer's identity, and the
     // failure would be silent. `peer_user_sid` aborts if `RevertToSelf` returns FALSE; this proves
     // the stronger thing the return value alone does not — that the token is GONE afterwards.
-    no_impersonation_token("CHECK 0b canary (after RevertToSelf)")?;
-    println!("[spike-972] CHECK 0b canary   : PASS — the impersonation token is gone again after RevertToSelf");
+    no_impersonation_token("CHECK 0c canary (after the post-read window)")?;
+    println!("[spike-972] CHECK 0c canary   : PASS — the impersonation token is gone again after the post-read window");
 
     // -- Reply, and let the client read it. ----------------------------------------------------
     write_line(&mut buffered, r#"{"ok":true,"proof":"spike-972"}"#)
@@ -465,6 +483,54 @@ fn client_process_id(pipe: HANDLE) -> Result<u32, u32> {
     Ok(pid)
 }
 
+/// RAII closure of the impersonation window.
+///
+/// `ImpersonateNamedPipeClient` replaces the CALLING THREAD's token, and the window has to end on
+/// EVERY path out — including an early `return` and an unwinding panic, which
+/// [`token_user_sid`] can raise because it allocates. A `Drop` impl closes it BY CONSTRUCTION,
+/// where a "every arm below remembers to revert" convention closes it by inspection; the
+/// difference is the whole point, and it is the rule the real port inherits rather than an
+/// accident of this file.
+///
+/// `!Send` on purpose (via the `PhantomData`): a thread token belongs to one thread, so a guard
+/// that could be moved to another would be a guard for the wrong thread. That makes any future
+/// holding one across an `.await` a COMPILE error on a multi-thread runtime instead of a silent
+/// hazard — the daemon is `current_thread` (ADR-0001), but the type system should not depend on
+/// that staying true.
+struct Impersonation {
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl Impersonation {
+    /// Take on the connected client's identity, or report the `GetLastError()` that prevented it.
+    fn begin(pipe: HANDLE) -> Result<Self, u32> {
+        // SAFETY: `pipe` is a live named-pipe HANDLE owned by a `NamedPipeServer` still in scope.
+        if unsafe { ImpersonateNamedPipeClient(pipe) } == 0 {
+            // SAFETY: no preconditions; reads the last-error slot set by the call above.
+            return Err(unsafe { GetLastError() });
+        }
+        Ok(Self {
+            _not_send: std::marker::PhantomData,
+        })
+    }
+}
+
+impl Drop for Impersonation {
+    fn drop(&mut self) {
+        // SAFETY: no preconditions; drops any impersonation token on the calling thread.
+        if unsafe { RevertToSelf() } == 0 {
+            // SAFETY: reads the last-error slot set by the call above.
+            let code = unsafe { GetLastError() };
+            // Not recoverable in any useful sense: the thread would keep running as the client, and
+            // a failure a caller can ignore is how that becomes silent. Never observed; the abort
+            // exists so that if it ever happens the proof says so rather than producing an answer
+            // under the wrong identity.
+            eprintln!("[spike-972] FATAL: RevertToSelf failed (GetLastError={code}) — this thread is still impersonating the client; aborting rather than continuing under its identity.");
+            std::process::abort();
+        }
+    }
+}
+
 /// The connected client's USER SID — the `getpeereid` analogue, and the load-bearing half of AC3.
 ///
 /// FULLY SYNCHRONOUS ON PURPOSE. `ImpersonateNamedPipeClient` replaces the CALLING THREAD's token;
@@ -476,16 +542,18 @@ fn client_process_id(pipe: HANDLE) -> Result<u32, u32> {
 /// Fail-closed by construction: every arm returns [`PeerSid::Failed`], which no caller can mistake
 /// for an identity. That mirrors `peer_euid`'s `None`-on-error contract in `src/daemon/peer_auth.rs`.
 fn peer_user_sid(pipe: HANDLE) -> PeerSid {
-    // SAFETY: `pipe` is a live named-pipe HANDLE owned by a `NamedPipeServer` still in scope.
-    if unsafe { ImpersonateNamedPipeClient(pipe) } == 0 {
-        // SAFETY: no preconditions; reads the last-error slot set by the call above.
-        return PeerSid::Failed {
-            stage: "ImpersonateNamedPipeClient",
-            code: unsafe { GetLastError() },
-        };
-    }
+    // From here to the end of this function the thread carries the CLIENT's token; `_window`'s
+    // `Drop` is what ends it, on every path including an unwind.
+    let _window = match Impersonation::begin(pipe) {
+        Ok(window) => window,
+        Err(code) => {
+            return PeerSid::Failed {
+                stage: "ImpersonateNamedPipeClient",
+                code,
+            }
+        }
+    };
 
-    // From here to `RevertToSelf` this thread carries the CLIENT's token. Every path below reverts.
     let mut token: HANDLE = std::ptr::null_mut();
     // SAFETY: `GetCurrentThread` returns a pseudo-handle needing no cleanup; `token` is a live local
     // the kernel writes only on success. `openasself = TRUE` performs the access check against the
@@ -493,9 +561,9 @@ fn peer_user_sid(pipe: HANDLE) -> PeerSid {
     // low-privilege client's token could deny us the open.
     let opened = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) };
     if opened == 0 {
-        // SAFETY: reads the last-error slot set by `OpenThreadToken`, before `RevertToSelf` clobbers it.
+        // SAFETY: reads the last-error slot set by `OpenThreadToken`. Read HERE, because the
+        // `RevertToSelf` in `_window`'s `Drop` runs after this expression and would clobber it.
         let code = unsafe { GetLastError() };
-        revert_to_self();
         return PeerSid::Failed {
             stage: "OpenThreadToken",
             code,
@@ -505,7 +573,6 @@ fn peer_user_sid(pipe: HANDLE) -> PeerSid {
     let result = token_user_sid(token);
     // SAFETY: `token` is the handle `OpenThreadToken` just wrote and has not been closed.
     unsafe { CloseHandle(token) };
-    revert_to_self();
     result
 }
 
@@ -586,8 +653,11 @@ fn token_user_sid(token: HANDLE) -> PeerSid {
         .div_ceil(std::mem::size_of::<u64>())
         .max(1);
     let mut buffer = vec![0u64; words];
-    // SAFETY: the buffer is `words * 8 >= needed` bytes of live, 8-byte-aligned, initialised memory,
-    // and `needed` is truthfully its usable size; the kernel writes it only on success.
+    // SAFETY: the buffer is `words * 8 >= needed` bytes of live, 8-byte-aligned, initialised memory.
+    // The length passed is `needed`, which UNDER-reports the allocation by up to seven bytes — the
+    // safe direction, since the kernel is told it has less room than it does. Rust evaluates call
+    // arguments left to right, so the by-value 4th argument copies `needed` BEFORE the `&mut needed`
+    // 5th exists; the out-write lands after and is never read again. Written only on success.
     let ok = unsafe {
         GetTokenInformation(
             token,
@@ -663,20 +733,6 @@ fn security_descriptor_from_sddl(sddl: &str) -> Result<*mut c_void, u32> {
         return Err(unsafe { GetLastError() });
     }
     Ok(descriptor)
-}
-
-/// Drop the impersonation token. A failure here is not recoverable in any useful sense — the thread
-/// would keep running as the client — so it aborts rather than returning a value a caller might
-/// ignore. It has never been observed to fail; the abort exists so that if it ever does, the proof
-/// says so instead of silently producing an answer under the wrong identity.
-fn revert_to_self() {
-    // SAFETY: no preconditions; drops any impersonation token on the calling thread.
-    if unsafe { RevertToSelf() } == 0 {
-        // SAFETY: reads the last-error slot set by the call above.
-        let code = unsafe { GetLastError() };
-        eprintln!("[spike-972] FATAL: RevertToSelf failed (GetLastError={code}) — this thread is still impersonating the client; aborting rather than continuing under its identity.");
-        std::process::abort();
-    }
 }
 
 /// A NUL-terminated UTF-16 Win32 string as a Rust `String`.
