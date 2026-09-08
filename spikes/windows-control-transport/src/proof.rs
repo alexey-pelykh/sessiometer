@@ -1,0 +1,620 @@
+// Copyright (c) 2026 Oleksii PELYKH
+// SPDX-License-Identifier: MIT
+
+//! The Windows half of the issue-#972 proof — everything that only exists on Windows.
+//!
+//! `main.rs` states WHAT is measured; this module is HOW, and it is deliberately one file so the
+//! whole proof is readable top to bottom. Nothing here is production code: it is throwaway
+//! knowledge-acquisition whose only consumers are ADR-0037 and the `windows-latest` CI job that
+//! runs it (`.github/workflows/spike-972-windows-transport.yml`).
+//!
+//! **The process is its own client.** The server half spawns this same binary in `client` mode as a
+//! CHILD PROCESS, so `GetNamedPipeClientProcessId` resolves a pid that is provably not our own and
+//! is independently known (the `Child::id()` the spawn returned). Without that, "the peer's pid
+//! resolved" would be indistinguishable from "we read our own pid back".
+//!
+//! **Every check is fail-loud.** `run` returns a non-zero [`ExitCode`] if any of the five gated
+//! checks fails, so the CI job's own pass/fail IS the proof's verdict rather than a log a human has
+//! to read. The one deliberately UN-gated line is the pre-read impersonation attempt: its outcome is
+//! the question, so asserting an answer would be assuming the finding. It is printed as a
+//! `MEASUREMENT`, and ADR-0037 quotes it.
+
+use std::ffi::c_void;
+use std::os::windows::io::AsRawHandle;
+use std::process::ExitCode;
+use std::time::Duration;
+
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, LocalFree, ERROR_ACCESS_DENIED, ERROR_PIPE_BUSY, HANDLE,
+};
+use windows_sys::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+use windows_sys::Win32::Security::{
+    GetTokenInformation, RevertToSelf, TokenUser, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+};
+use windows_sys::Win32::System::Pipes::{GetNamedPipeClientProcessId, ImpersonateNamedPipeClient};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, GetCurrentThread, OpenProcessToken, OpenThreadToken,
+};
+
+/// Mirror of `MAX_CONTROL_LINE_BYTES` in `src/daemon/socket.rs`. A COPY, not an import — the spike
+/// is a standalone package outside the root crate's build graph on purpose (see `Cargo.toml`), so
+/// it cannot `use` the daemon's constant. If the two ever disagree the spike is measuring a framing
+/// the daemon does not use, which is why the value is stated here with its provenance rather than
+/// picked.
+const MAX_CONTROL_LINE_BYTES: u64 = 8 * 1024;
+
+/// The whole exchange is time-boxed so a wedged runner fails the job instead of hanging it. Far
+/// looser than the daemon's own `CONTROL_EXCHANGE_TIMEOUT` (2s) because this window also covers
+/// spawning a child PROCESS, which the daemon's does not.
+const PROOF_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The peer's user SID, or the stage at which resolving it failed. Not a `Result<String, io::Error>`
+/// because WHICH of the four calls failed is the finding — "impersonation is not permitted here" and
+/// "the token has no user" are different answers to ADR-0037's question.
+#[derive(Debug, Clone)]
+enum PeerSid {
+    /// The peer's user SID in SDDL string form (`S-1-5-21-...`).
+    Resolved(String),
+    /// `stage` is the Win32 call that failed; `code` is its `GetLastError()`.
+    Failed { stage: &'static str, code: u32 },
+}
+
+impl std::fmt::Display for PeerSid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Resolved(sid) => write!(f, "{sid}"),
+            Self::Failed { stage, code } => write!(f, "FAILED at {stage} (GetLastError={code})"),
+        }
+    }
+}
+
+/// Entry point from `main.rs`. Server mode with no arguments; `client <pipe-name>` is the child half
+/// the server spawns and is not meant to be run by hand.
+pub(crate) fn run() -> ExitCode {
+    let mut args = std::env::args().skip(1);
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        // `current_thread`, matching the daemon (ADR-0001). Not incidental: the impersonation window
+        // below mutates the CALLING THREAD's token, so a single-threaded runtime is what makes
+        // "no `.await` between `ImpersonateNamedPipeClient` and `RevertToSelf`" a sufficient rule
+        // rather than a necessary-but-not-sufficient one.
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("[spike-972] FATAL: could not build the tokio runtime: {err}");
+            return ExitCode::from(1);
+        }
+    };
+
+    match args.next().as_deref() {
+        None => runtime.block_on(server_main()),
+        Some("client") => match args.next() {
+            Some(name) => runtime.block_on(client_main(&name)),
+            None => {
+                eprintln!("[spike-972] FATAL: `client` mode needs the pipe name as its argument.");
+                ExitCode::from(1)
+            }
+        },
+        Some(other) => {
+            eprintln!("[spike-972] FATAL: unknown mode {other:?}; expected no argument (server) or `client <pipe-name>`.");
+            ExitCode::from(1)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Server half — the proof itself.
+// ---------------------------------------------------------------------------------------------
+
+async fn server_main() -> ExitCode {
+    match tokio::time::timeout(PROOF_TIMEOUT, proof()).await {
+        Ok(Ok(())) => {
+            println!("[spike-972] VERDICT: PASS — every gated check succeeded.");
+            ExitCode::SUCCESS
+        }
+        Ok(Err(err)) => {
+            eprintln!("[spike-972] VERDICT: FAIL — {err}");
+            ExitCode::from(1)
+        }
+        Err(_) => {
+            eprintln!(
+                "[spike-972] VERDICT: FAIL — the proof did not finish within {PROOF_TIMEOUT:?}."
+            );
+            ExitCode::from(1)
+        }
+    }
+}
+
+async fn proof() -> Result<(), String> {
+    let our_pid = std::process::id();
+    let our_sid =
+        our_user_sid().map_err(|err| format!("could not read our own user SID: {err}"))?;
+    // Unique per run: two concurrent CI jobs (or a re-run overlapping a cancelled one) must not
+    // collide on the name, and a collision would surface as CHECK 2 passing for the wrong reason.
+    let pipe_name = format!(r"\\.\pipe\sessiometer-spike-972-{our_pid}");
+
+    println!("[spike-972] host pid           : {our_pid}");
+    println!("[spike-972] host user SID      : {our_sid}");
+    println!("[spike-972] pipe name          : {pipe_name}");
+
+    // -- CHECK 1: a server instance exists, owner-only, and accepts a connection. ---------------
+    //
+    // The security descriptor is the named-pipe analogue of `bind_control_socket`'s `0600` chmod
+    // (`src/cli.rs`, `fn bind_control_socket`): a DACL granting GENERIC_ALL to exactly one SID —
+    // ours — and nothing else. `P` makes it PROTECTED, so nothing is inherited from the pipe
+    // namespace's default ACL; without it the descriptor would be a floor, not a ceiling.
+    let sddl = format!("D:P(A;;GA;;;{our_sid})");
+    let descriptor = security_descriptor_from_sddl(&sddl)
+        .map_err(|code| format!("ConvertStringSecurityDescriptorToSecurityDescriptorW({sddl}) failed: GetLastError={code}"))?;
+    let mut attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor,
+        // The daemon's control socket is never inherited by a child; neither is this.
+        bInheritHandle: 0,
+    };
+
+    let server = {
+        let mut options = ServerOptions::new();
+        options
+            // The single-instance guarantee. The daemon gets this from its own lockfile plus an
+            // unlink-then-bind; a named pipe can enforce it in the kernel instead — see CHECK 2.
+            .first_pipe_instance(true)
+            // Already tokio's default (`ServerOptions::new`), stated anyway: on the raw Win32 API
+            // it is opt-in, so a future port that stops going through tokio must set it by hand.
+            .reject_remote_clients(true);
+        // SAFETY: `attributes` is a live, correctly-sized `SECURITY_ATTRIBUTES` on this stack frame
+        // whose `lpSecurityDescriptor` came from `ConvertStringSecurityDescriptorToSecurityDescriptorW`
+        // (a valid self-relative descriptor, non-null or we returned above). It outlives the call,
+        // which is all `CreateNamedPipeW` requires — the descriptor is COPIED into the kernel object,
+        // which is why the free below is correct.
+        let created = unsafe {
+            options.create_with_security_attributes_raw(
+                &pipe_name,
+                (&mut attributes as *mut SECURITY_ATTRIBUTES).cast::<c_void>(),
+            )
+        };
+        // SAFETY: `descriptor` is the pointer that call returned and has not been freed; the pipe
+        // holds its own copy from here on, so freeing ours cannot dangle the kernel object.
+        unsafe { LocalFree(descriptor) };
+        created.map_err(|err| format!("create_with_security_attributes_raw failed: {err}"))?
+    };
+    // Captured BEFORE the server is moved into the `BufReader`: the peer-identity calls take the raw
+    // pipe HANDLE, and the handle stays valid for as long as the `NamedPipeServer` does.
+    let pipe: HANDLE = server.as_raw_handle().cast::<c_void>();
+    println!("[spike-972] CHECK 1a create    : PASS — owner-only server instance created ({sddl})");
+
+    // -- CHECK 2: the name cannot be squatted while we hold it. --------------------------------
+    //
+    // A second `first_pipe_instance` create against the same name must fail ERROR_ACCESS_DENIED.
+    // This is the property the Unix side gets from the filesystem: a `0700` support dir means no
+    // other user can drop a socket at our path. The pipe namespace has no directory to protect, so
+    // the guarantee has to come from the create flag instead — which is exactly why it is measured
+    // rather than assumed.
+    match ServerOptions::new()
+        .first_pipe_instance(true)
+        .create(&pipe_name)
+    {
+        Ok(_) => {
+            let detail = "a SECOND first_pipe_instance create SUCCEEDED — the name is squattable \
+                          while we hold it";
+            return Err(format!("CHECK 2 squat against {pipe_name}: {detail}"));
+        }
+        Err(err) if err.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+            println!(
+                "[spike-972] CHECK 2  squat     : PASS — second first_pipe_instance create denied \
+                 (ERROR_ACCESS_DENIED = {ERROR_ACCESS_DENIED})"
+            );
+        }
+        Err(err) => {
+            let code = err.raw_os_error();
+            return Err(format!(
+                "CHECK 2 squat: the second create failed, but with {err:?} (raw_os_error={code:?}) \
+                 rather than ERROR_ACCESS_DENIED = {ERROR_ACCESS_DENIED}"
+            ));
+        }
+    }
+
+    // -- Spawn the child client. ---------------------------------------------------------------
+    let exe = std::env::current_exe().map_err(|err| format!("current_exe failed: {err}"))?;
+    let mut child = tokio::process::Command::new(&exe)
+        .arg("client")
+        .arg(&pipe_name)
+        .spawn()
+        .map_err(|err| format!("could not spawn the client child process: {err}"))?;
+    let child_pid = child
+        .id()
+        .ok_or_else(|| "the client child exited before its pid could be read".to_string())?;
+    println!("[spike-972] client child pid   : {child_pid}");
+
+    server
+        .connect()
+        .await
+        .map_err(|err| format!("CHECK 1 accept: NamedPipeServer::connect failed: {err}"))?;
+    println!("[spike-972] CHECK 1b accept    : PASS — connect() returned; a client is attached");
+
+    // -- MEASUREMENT: impersonation BEFORE any read. -------------------------------------------
+    //
+    // `ImpersonateNamedPipeClient` is documented to give "the security context of the last message
+    // read from the pipe". Whether that wording IMPLIES a read-first ordering constraint on a byte
+    // -mode pipe is precisely what ADR-0037 must not guess at, so this attempt is un-gated: its
+    // outcome is the finding, and asserting one here would assume it.
+    let sid_before_read = peer_user_sid(pipe);
+    println!("[spike-972] MEASUREMENT pre-read impersonation : {sid_before_read}");
+
+    // -- CHECK 4: the peer's pid (DIAGNOSTIC only). --------------------------------------------
+    let peer_pid = client_process_id(pipe).map_err(|code| {
+        format!("CHECK 4 pid: GetNamedPipeClientProcessId failed: GetLastError={code}")
+    })?;
+    if peer_pid == our_pid {
+        return Err(format!(
+            "CHECK 4 pid: the resolved peer pid {peer_pid} is our OWN pid — the call read back the \
+             server side, so it proves nothing about the caller"
+        ));
+    }
+    if peer_pid != child_pid {
+        return Err(format!(
+            "CHECK 4 pid: the resolved peer pid {peer_pid} is neither ours ({our_pid}) nor the child \
+             we spawned ({child_pid})"
+        ));
+    }
+    println!(
+        "[spike-972] CHECK 4  peer pid  : PASS — {peer_pid} == the spawned child, != our own {our_pid} \
+         (DIAGNOSTIC: a pid is reusable and TOCTOU-prone, never the authentication primitive)"
+    );
+
+    // -- CHECK 3: one framed message round-trips. ----------------------------------------------
+    //
+    // The daemon's exact framing, transcribed from `serve_control` in `src/daemon/socket.rs`:
+    // `BufReader` + `.take(MAX_CONTROL_LINE_BYTES)` + `read_line`, ONE `serde_json` parse of the
+    // trimmed line, then one reply line terminated by `b"\n"` and flushed.
+    let mut buffered = tokio::io::BufReader::new(server);
+    let mut line = String::new();
+    (&mut buffered)
+        .take(MAX_CONTROL_LINE_BYTES)
+        .read_line(&mut line)
+        .await
+        .map_err(|err| format!("CHECK 3 framing: read_line failed: {err}"))?;
+    let trimmed = line.trim_end();
+    let request: serde_json::Value = serde_json::from_str(trimmed).map_err(|err| {
+        format!("CHECK 3 framing: the request line {trimmed:?} is not JSON: {err}")
+    })?;
+    let cmd = request.get("cmd").and_then(serde_json::Value::as_str);
+    if cmd != Some("status") {
+        return Err(format!(
+            "CHECK 3 framing: parsed the request line but its `cmd` was {cmd:?}, not \"status\""
+        ));
+    }
+    println!("[spike-972] CHECK 3a request   : PASS — read one framed line, one serde_json parse, cmd=\"status\" ({} bytes on the wire)", line.len());
+
+    // -- MEASUREMENT + CHECK 5: impersonation AFTER the read. ----------------------------------
+    let sid_after_read = peer_user_sid(pipe);
+    println!("[spike-972] MEASUREMENT post-read impersonation: {sid_after_read}");
+    let peer_sid = match &sid_after_read {
+        PeerSid::Resolved(sid) => sid.clone(),
+        PeerSid::Failed { stage, code } => {
+            return Err(format!(
+                "CHECK 5 peer SID: impersonation after the read still failed at {stage} \
+                 (GetLastError={code}) — the transport cannot answer `getpeereid`'s question at all"
+            ))
+        }
+    };
+    if peer_sid != our_sid {
+        return Err(format!(
+            "CHECK 5 peer SID: the peer resolved to {peer_sid}, which is not our own {our_sid} — \
+             the child runs as us, so this is a defect in the resolution, not a foreign caller"
+        ));
+    }
+    println!(
+        "[spike-972] CHECK 5  peer SID  : PASS — {peer_sid} == our own SID (the `getpeereid` analogue: \
+         a per-USER identity, not a per-process one)"
+    );
+
+    // -- Reply, and let the client read it. ----------------------------------------------------
+    write_line(&mut buffered, r#"{"ok":true,"proof":"spike-972"}"#)
+        .await
+        .map_err(|err| format!("CHECK 3 framing: writing the reply line failed: {err}"))?;
+    println!("[spike-972] CHECK 3b reply     : PASS — one reply line written, newline-terminated and flushed");
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|err| format!("waiting on the client child failed: {err}"))?;
+    if !status.success() {
+        return Err(format!(
+            "CHECK 3 framing: the client child exited {status} — it did not accept the reply frame"
+        ));
+    }
+    println!(
+        "[spike-972] CHECK 3c client    : PASS — the child parsed the reply frame and exited 0"
+    );
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Client half — a child process, so the pid the server resolves is provably not its own.
+// ---------------------------------------------------------------------------------------------
+
+async fn client_main(pipe_name: &str) -> ExitCode {
+    match tokio::time::timeout(PROOF_TIMEOUT, client_exchange(pipe_name)).await {
+        Ok(Ok(())) => ExitCode::SUCCESS,
+        Ok(Err(err)) => {
+            eprintln!("[spike-972/client] FAIL — {err}");
+            ExitCode::from(1)
+        }
+        Err(_) => {
+            eprintln!("[spike-972/client] FAIL — no reply within {PROOF_TIMEOUT:?}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+async fn client_exchange(pipe_name: &str) -> Result<(), String> {
+    // A named pipe with no free instance answers ERROR_PIPE_BUSY rather than blocking, so the
+    // idiomatic client is a retry loop. Unix `connect(2)` on a bound socket has no equivalent — a
+    // difference the real port inherits, noted in ADR-0037.
+    let client = loop {
+        match ClientOptions::new().open(pipe_name) {
+            Ok(client) => break client,
+            Err(err) if err.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(err) => return Err(format!("ClientOptions::open({pipe_name}) failed: {err}")),
+        }
+    };
+
+    let mut buffered = tokio::io::BufReader::new(client);
+    write_line(&mut buffered, r#"{"cmd":"status"}"#)
+        .await
+        .map_err(|err| format!("writing the request line failed: {err}"))?;
+
+    let mut line = String::new();
+    (&mut buffered)
+        .take(MAX_CONTROL_LINE_BYTES)
+        .read_line(&mut line)
+        .await
+        .map_err(|err| format!("reading the reply line failed: {err}"))?;
+    let reply: serde_json::Value = serde_json::from_str(line.trim_end())
+        .map_err(|err| format!("the reply line {line:?} is not JSON: {err}"))?;
+    if reply.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(format!("the reply frame parsed but said {reply}"));
+    }
+    Ok(())
+}
+
+/// The daemon's `write_line` (`src/daemon/socket.rs`), transcribed: the payload, then `b"\n"`, then
+/// a flush. Kept a separate function for the same reason it is one there — the frame terminator is
+/// the contract, and inlining it is how a `\r\n` creeps in on a Windows port.
+async fn write_line<W>(writer: &mut W, line: &str) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    writer.write_all(line.as_bytes()).await?;
+    writer.write_all(b"\n").await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Peer identity.
+// ---------------------------------------------------------------------------------------------
+
+/// The connected client's process id — the `GetNamedPipeClientProcessId` answer. A DIAGNOSTIC, never
+/// the authentication primitive: a pid is reusable and the peer may exit and be replaced between the
+/// read and the decision, which is exactly the TOCTOU window `getpeereid` does not have (its uid is
+/// captured by the kernel at connect time and is a property of the connection, not of a live pid).
+fn client_process_id(pipe: HANDLE) -> Result<u32, u32> {
+    let mut pid: u32 = 0;
+    // SAFETY: `pipe` is a live named-pipe HANDLE owned by the `NamedPipeServer` still in scope, and
+    // `pid` is a live local the kernel writes only on success. A bad handle returns FALSE, not UB.
+    if unsafe { GetNamedPipeClientProcessId(pipe, &mut pid) } == 0 {
+        // SAFETY: no preconditions; reads this thread's last-error slot, set by the call above.
+        return Err(unsafe { GetLastError() });
+    }
+    Ok(pid)
+}
+
+/// The connected client's USER SID — the `getpeereid` analogue, and the load-bearing half of AC3.
+///
+/// FULLY SYNCHRONOUS ON PURPOSE. `ImpersonateNamedPipeClient` replaces the CALLING THREAD's token;
+/// an `.await` inside that window could (on a multi-thread runtime) resume elsewhere, leaving one
+/// thread impersonating forever and doing the work under the wrong identity. There is no async work
+/// to do between the two calls, so the rule costs nothing — but it is a rule the real port has to
+/// keep, not an accident of this file.
+///
+/// Fail-closed by construction: every arm returns [`PeerSid::Failed`], which no caller can mistake
+/// for an identity. That mirrors `peer_euid`'s `None`-on-error contract in `src/daemon/peer_auth.rs`.
+fn peer_user_sid(pipe: HANDLE) -> PeerSid {
+    // SAFETY: `pipe` is a live named-pipe HANDLE owned by a `NamedPipeServer` still in scope.
+    if unsafe { ImpersonateNamedPipeClient(pipe) } == 0 {
+        // SAFETY: no preconditions; reads the last-error slot set by the call above.
+        return PeerSid::Failed {
+            stage: "ImpersonateNamedPipeClient",
+            code: unsafe { GetLastError() },
+        };
+    }
+
+    // From here to `RevertToSelf` this thread carries the CLIENT's token. Every path below reverts.
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: `GetCurrentThread` returns a pseudo-handle needing no cleanup; `token` is a live local
+    // the kernel writes only on success. `openasself = TRUE` performs the access check against the
+    // PROCESS's context rather than the impersonation token we just took on — required, or a
+    // low-privilege client's token could deny us the open.
+    let opened = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) };
+    if opened == 0 {
+        // SAFETY: reads the last-error slot set by `OpenThreadToken`, before `RevertToSelf` clobbers it.
+        let code = unsafe { GetLastError() };
+        revert_to_self();
+        return PeerSid::Failed {
+            stage: "OpenThreadToken",
+            code,
+        };
+    }
+
+    let result = token_user_sid(token);
+    // SAFETY: `token` is the handle `OpenThreadToken` just wrote and has not been closed.
+    unsafe { CloseHandle(token) };
+    revert_to_self();
+    result
+}
+
+/// Our OWN user SID, read from the process token by the same two calls the peer path uses. Two jobs:
+/// it seeds the pipe's owner-only DACL, and it is what CHECK 5 compares the peer's SID against.
+fn our_user_sid() -> Result<String, String> {
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: `GetCurrentProcess` returns a pseudo-handle needing no cleanup; `token` is a live
+    // local the kernel writes only on success.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        // SAFETY: reads the last-error slot set by the call above.
+        return Err(format!(
+            "OpenProcessToken failed: GetLastError={}",
+            unsafe { GetLastError() }
+        ));
+    }
+    let result = token_user_sid(token);
+    // SAFETY: `token` is the handle `OpenProcessToken` just wrote and has not been closed.
+    unsafe { CloseHandle(token) };
+    match result {
+        PeerSid::Resolved(sid) => Ok(sid),
+        PeerSid::Failed { stage, code } => Err(format!("{stage} failed: GetLastError={code}")),
+    }
+}
+
+/// `GetTokenInformation(TokenUser)` on `token`, rendered as an SDDL SID string.
+///
+/// The buffer is a `Vec<u64>`, not a `Vec<u8>`, and that is load-bearing rather than fussy: the
+/// kernel writes a `TOKEN_USER` here, whose `Sid` member is a pointer, so reading it out of a
+/// 1-byte-aligned allocation is undefined behaviour on a technicality that happens to work. A `u64`
+/// element type makes the allocation 8-byte aligned, which is at least `align_of::<TOKEN_USER>()`.
+fn token_user_sid(token: HANDLE) -> PeerSid {
+    let mut needed: u32 = 0;
+    // First call sizes the buffer; it is EXPECTED to fail with ERROR_INSUFFICIENT_BUFFER, so its
+    // return value is deliberately ignored and only `needed` is read.
+    // SAFETY: a null buffer with length 0 is the documented sizing form; `needed` is a live local.
+    unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+    if needed == 0 {
+        // SAFETY: reads the last-error slot set by the sizing call above.
+        return PeerSid::Failed {
+            stage: "GetTokenInformation(TokenUser, sizing)",
+            code: unsafe { GetLastError() },
+        };
+    }
+
+    let words = (needed as usize)
+        .div_ceil(std::mem::size_of::<u64>())
+        .max(1);
+    let mut buffer = vec![0u64; words];
+    // SAFETY: the buffer is `words * 8 >= needed` bytes of live, 8-byte-aligned, initialised memory,
+    // and `needed` is truthfully its usable size; the kernel writes it only on success.
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr().cast::<c_void>(),
+            needed,
+            &mut needed,
+        )
+    };
+    if ok == 0 {
+        // SAFETY: reads the last-error slot set by the call above.
+        return PeerSid::Failed {
+            stage: "GetTokenInformation(TokenUser)",
+            code: unsafe { GetLastError() },
+        };
+    }
+
+    // SAFETY: on success the kernel wrote a `TOKEN_USER` at the start of `buffer`, which is
+    // correctly aligned for it (see the doc comment) and large enough (`needed` bytes). The `Sid` it
+    // carries points INTO that same buffer, so it stays valid while `buffer` is alive — which it is
+    // for the whole of `sid_to_string` below.
+    let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    if sid.is_null() {
+        return PeerSid::Failed {
+            stage: "TOKEN_USER.User.Sid (null)",
+            code: 0,
+        };
+    }
+    match sid_to_string(sid) {
+        Ok(string) => PeerSid::Resolved(string),
+        Err(code) => PeerSid::Failed {
+            stage: "ConvertSidToStringSidW",
+            code,
+        },
+    }
+}
+
+/// `ConvertSidToStringSidW`, with the `LocalFree` the API requires of its caller.
+fn sid_to_string(sid: *mut c_void) -> Result<String, u32> {
+    let mut wide: *mut u16 = std::ptr::null_mut();
+    // SAFETY: `sid` is a non-null pointer to a valid SID inside a live buffer (checked by the
+    // caller); `wide` is a live local the API writes only on success.
+    if unsafe { ConvertSidToStringSidW(sid, &mut wide) } == 0 {
+        // SAFETY: reads the last-error slot set by the call above.
+        return Err(unsafe { GetLastError() });
+    }
+    // SAFETY: on success `wide` is a valid NUL-terminated UTF-16 string allocated with `LocalAlloc`.
+    let string = unsafe { wide_to_string(wide) };
+    // SAFETY: `wide` is exactly the `LocalAlloc`-ed pointer the call returned, freed once.
+    unsafe { LocalFree(wide.cast::<c_void>()) };
+    Ok(string)
+}
+
+/// A self-relative security descriptor built from an SDDL string. The returned pointer is
+/// `LocalAlloc`-ed and the CALLER owns it — `CreateNamedPipeW` copies it, so freeing it right after
+/// the pipe exists is correct and is what the caller does.
+fn security_descriptor_from_sddl(sddl: &str) -> Result<*mut c_void, u32> {
+    let wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut descriptor: *mut c_void = std::ptr::null_mut();
+    // SAFETY: `wide` is a live, NUL-terminated UTF-16 buffer that outlives the call; `descriptor` is
+    // a live local the API writes only on success; a null size out-parameter is documented as "do
+    // not report the size".
+    let ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        // SAFETY: reads the last-error slot set by the call above.
+        return Err(unsafe { GetLastError() });
+    }
+    Ok(descriptor)
+}
+
+/// Drop the impersonation token. A failure here is not recoverable in any useful sense — the thread
+/// would keep running as the client — so it aborts rather than returning a value a caller might
+/// ignore. It has never been observed to fail; the abort exists so that if it ever does, the proof
+/// says so instead of silently producing an answer under the wrong identity.
+fn revert_to_self() {
+    // SAFETY: no preconditions; drops any impersonation token on the calling thread.
+    if unsafe { RevertToSelf() } == 0 {
+        // SAFETY: reads the last-error slot set by the call above.
+        let code = unsafe { GetLastError() };
+        eprintln!("[spike-972] FATAL: RevertToSelf failed (GetLastError={code}) — this thread is still impersonating the client; aborting rather than continuing under its identity.");
+        std::process::abort();
+    }
+}
+
+/// A NUL-terminated UTF-16 Win32 string as a Rust `String`.
+///
+/// # Safety
+///
+/// `ptr` must be non-null and point at a NUL-terminated UTF-16 sequence that stays valid for the
+/// duration of the call.
+unsafe fn wide_to_string(ptr: *const u16) -> String {
+    let mut len = 0usize;
+    // SAFETY: the caller guarantees a NUL terminator, so this walk stops inside the allocation.
+    while unsafe { *ptr.add(len) } != 0 {
+        len += 1;
+    }
+    // SAFETY: `ptr[..len]` is exactly the sequence walked above, all within the caller's allocation.
+    String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(ptr, len) })
+}
