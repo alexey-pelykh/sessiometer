@@ -102,6 +102,9 @@ pub(crate) fn run() -> ExitCode {
 
     match args.next().as_deref() {
         None => runtime.block_on(server_main()),
+        // The issue-#1511 accept-loop / `watch` proof — a separate measurement in the same
+        // package, printing its own block under its own tag (`crate::accept_loop`).
+        Some("watch") => runtime.block_on(crate::accept_loop::watch_main()),
         Some("client") => match args.next() {
             Some(name) => runtime.block_on(client_main(&name)),
             None => {
@@ -110,7 +113,7 @@ pub(crate) fn run() -> ExitCode {
             }
         },
         Some(other) => {
-            eprintln!("[spike-972] FATAL: unknown mode {other:?}; expected no argument (server) or `client <pipe-name>`.");
+            eprintln!("[spike-972] FATAL: unknown mode {other:?}; expected no argument (server), `watch`, or `client <pipe-name>`.");
             ExitCode::from(1)
         }
     }

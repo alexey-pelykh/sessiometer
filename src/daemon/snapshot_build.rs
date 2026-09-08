@@ -3590,8 +3590,8 @@ mod tests {
         // it — the wiring the duplex-level `serve_watch` tests above cannot reach.
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("daemon.sock");
-        let listener = tokio::net::UnixListener::bind(&sock).expect("bind");
-        let control = UnixControl::new(listener);
+        let control =
+            UnixControl::new(crate::control_transport::ControlListener::bind(&sock).expect("bind"));
 
         // A client opens the dedicated read-only connection and subscribes.
         let mut client = tokio::net::UnixStream::connect(&sock)

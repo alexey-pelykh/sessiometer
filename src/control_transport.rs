@@ -257,6 +257,32 @@ mod imp {
             .create(name)
     }
 
+    /// Holds the listening instance OUT of [`ControlListener::idle`] for the duration of one
+    /// `connect().await`, and puts it BACK if that await is cancelled.
+    ///
+    /// This is the cancel-safety mechanism, and it is a guard rather than the more obvious
+    /// borrow-across-the-await because that pattern is `clippy::await_holding_refcell_ref`, which
+    /// this crate denies. Same RAII shape the #972 spike uses to close its impersonation window: the
+    /// property must not depend on every arm remembering to restore, since an early return or an
+    /// unwinding panic would then leave the endpoint with nothing listening.
+    struct PendingAccept<'a> {
+        idle: &'a RefCell<Option<NamedPipeServer>>,
+        /// The instance being connected. `None` once the caller has claimed it (a completed accept)
+        /// or deliberately discarded it (a failed `connect`), which makes [`Drop`] a no-op.
+        server: Option<NamedPipeServer>,
+    }
+
+    impl Drop for PendingAccept<'_> {
+        fn drop(&mut self) {
+            if let Some(server) = self.server.take() {
+                // Cancelled mid-connect: the instance is untouched and still listening, so put it
+                // back rather than closing it. Closing the last instance would release the pipe NAME,
+                // and an arriving client would then read "no daemon" from `ERROR_FILE_NOT_FOUND`.
+                *self.idle.borrow_mut() = Some(server);
+            }
+        }
+    }
+
     /// The bound control endpoint the daemon accepts on.
     ///
     /// Holds the pipe NAME (so later instances can be created from it) and the one instance
@@ -264,8 +290,8 @@ mod imp {
     /// takes `&self` while a named-pipe accept genuinely mutates state — there is no listening
     /// socket to accept repeatedly from. Sound without a lock: the daemon is a `current_thread`
     /// runtime (ADR-0001) and the run loop is the only caller, so the borrows below never
-    /// overlap; none is held across an `.await` except the deliberate one in [`accept`], which
-    /// is the whole cancel-safety mechanism.
+    /// overlap, and none is held across an `.await` — [`PendingAccept`] is what carries the
+    /// instance through the one await that would otherwise need it.
     pub(crate) struct ControlListener {
         name: OsString,
         /// The created-but-not-yet-connected instance. `None` only in the window after an
@@ -342,33 +368,44 @@ mod imp {
         ///
         /// CANCEL-SAFE, and the structure below is what buys it. The run loop's idle `select!`
         /// drops this future whenever another arm wins, which on a busy daemon is most ticks. The
-        /// listening instance therefore STAYS inside the `RefCell` across the `connect().await` —
-        /// a cancelled accept drops only the borrow, leaving the instance listening. Taking it out
-        /// first and putting it back afterwards would close it on every cancellation, releasing
-        /// the name. Cancellation after `connect()` resolved is harmless too: the client stays
-        /// attached and the next `accept` re-awaits `connect()` on the same instance, which
-        /// returns immediately for an already-connected pipe.
+        /// listening instance is therefore carried through `connect().await` by [`PendingAccept`],
+        /// whose `Drop` puts it back — so a cancelled accept leaves the endpoint exactly as it
+        /// found it. Simply closing it would release the pipe NAME, and a client would then read
+        /// "no daemon" out of `ERROR_FILE_NOT_FOUND`. Cancellation AFTER `connect()` resolved is
+        /// harmless too: the client stays attached and the next `accept` re-awaits `connect()` on
+        /// the same instance, which returns immediately for an already-connected pipe.
         pub(crate) async fn accept(&self) -> io::Result<ControlStream> {
-            // Make sure something is listening. Borrow ends before the await below.
+            // Make sure something is listening. The `Ref` temporary in the condition is dropped
+            // before the block runs, so nothing is held across the await inside it.
             if self.idle.borrow().is_none() {
                 let created = self.wait_for_instance().await?;
                 *self.idle.borrow_mut() = Some(created);
             }
 
-            // Await the connection with the instance still IN the cell — see the cancel-safety
-            // note above. The scope drops the borrow before the `borrow_mut` that follows.
+            // Take the instance out under the restore guard, then await the connection. A
+            // cancelled accept drops the guard, which puts the instance back listening.
+            let mut pending = PendingAccept {
+                idle: &self.idle,
+                server: self.idle.borrow_mut().take(),
+            };
+            if let Err(err) = pending
+                .server
+                .as_ref()
+                .expect("a listening instance was just ensured")
+                .connect()
+                .await
             {
-                let listening = self.idle.borrow();
-                let server = listening
-                    .as_ref()
-                    .expect("a listening instance was just ensured");
-                server.connect().await?;
+                // NOT restored: an instance whose `connect` failed is discarded, so the next
+                // accept creates a fresh one. Putting it back would re-await the same failing
+                // instance, and since the run loop re-arms `serve` as soon as it resolves, that
+                // is an error that spins rather than one that recovers.
+                pending.server = None;
+                return Err(err);
             }
-
-            let connected =
-                self.idle.borrow_mut().take().expect(
-                    "the listening instance is only taken here, on the run loop's one thread",
-                );
+            let connected = pending
+                .server
+                .take()
+                .expect("the connected instance is claimed exactly once");
 
             // Replace it before handing the connected one out, so the name is never unheld. A
             // single attempt: at the ceiling this leaves `idle` empty and the NEXT accept waits,

@@ -132,6 +132,11 @@ use crate::usage_store::{append_sample, compact_and_roll, RetentionPolicy, Sampl
 // (the [`Daemon`] state machine) and its wiring.
 mod peer_auth;
 
+// Unix-only: the control server's call site is `#[cfg(unix)]` because the Windows peer identity
+// (ADR-0037 § Decision 3) is **#976**'s and not the transport port's (issue #1511). Re-exporting
+// it unconditionally would be an unused re-export on that target — a warning, and `-D warnings`
+// under the #978 job that will build it.
+#[cfg(unix)]
 pub(crate) use peer_auth::peer_is_same_user;
 // `is_same_user` / `peer_euid` are exercised only by the in-module peer-auth tests
 // (production reaches them through `peer_is_same_user`); re-export test-scoped so

@@ -48,8 +48,20 @@
 //! PID is provably not our own — which is what makes the PID-vs-SID distinction in point 4
 //! observable rather than asserted.
 //!
-//! Run: `cargo run` (server; spawns its own client). `cargo run -- client <pipe-name>` is the
-//! child half and is not meant to be invoked by hand.
+//! A SECOND, separate proof rides in this package under `cargo run -- watch`: the issue-#1511
+//! accept-loop / `watch` measurement (`accept_loop.rs`), which answers the residual ADR-0037
+//! § What this spike did NOT establish assigns to that item — how many instances the accept loop
+//! keeps outstanding and what happens when they are exhausted. It is a separate MODE rather than
+//! extra checks in the default one on purpose: ADR-0037 quotes this proof's output and says it is
+//! "the whole of what the program printed", and appending to that block would quietly falsify the
+//! sentence for every later run.
+//!
+//! Run: `cargo run` (server; spawns its own client). `cargo run -- watch` is the #1511
+//! accept-loop proof. `cargo run -- client <pipe-name>` is the #972 child half and is not meant
+//! to be invoked by hand.
+
+#[cfg(windows)]
+mod accept_loop;
 
 #[cfg(windows)]
 mod proof;
