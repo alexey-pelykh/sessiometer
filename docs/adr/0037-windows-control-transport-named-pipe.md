@@ -68,9 +68,10 @@ enumeration below does not. Two things in that output are worth more than any to
   #963 design working exactly as `CONTRIBUTING.md` and the project `CLAUDE.md` say it should.
 - **The transport cluster is distinct, and it is not the biggest thing in that output.** `UnixStream`
   and `UnixListener` raise a cluster of their own, joined by `std::os::fd` and `tokio::signal::unix`;
-  it sits alongside larger ones — `libc` symbols, Unix file modes and `PermissionsExt`, `OsStrExt`
+  it sits alongside others — `libc` symbols, Unix file modes and `PermissionsExt`, `OsStrExt`
   byte conversion — that belong to other items in umbrella #970 and are not this decision's to
-  answer. No share or per-symbol count is quoted, and the omission is the point rather than a
+  answer. No share or per-symbol count is quoted, and **no ranking among those other clusters is
+  asserted**; the omission is the point rather than a
   hedge: one source line can raise several diagnostics and one diagnostic can name several symbols,
   so any such number measures the compiler's grouping rather than the porting surface, and it is
   stale the moment `src/**` moves. What makes this cluster a spike is not its size — it is that
@@ -83,8 +84,9 @@ declares no `[workspace]` table, so `cargo metadata --no-deps` at the root lists
 alone and the root build / test / clippy / doc / deny / `check-no-security-framework.sh` gates never
 see it. Same posture as `apps/menubar/spikes/**` under ADR-0011. That posture has a flip side the upside
 hides: being out of the graph also puts the spike outside `cargo deny`,
-`check-no-security-framework.sh` and the three `src/usage.rs` egress lints (which walk
-`CARGO_MANIFEST_DIR/src` and so never reach it), while its own workflow runs only `fmt` / `clippy`
+`check-no-security-framework.sh` and the three `src/usage.rs` egress lints (two walk
+`CARGO_MANIFEST_DIR/src`; the third scans the root `Cargo.lock`, which the spike's own lockfile is
+no part of — so none of the three reaches it), while its own workflow runs only `fmt` / `clippy`
 / `build` / `run`. What substitutes for all of them is a subset property: its committed `Cargo.lock`
 pins every transitive crate to the version the root lockfile already holds, and the only package it
 adds is the spike itself — so it exercises a dependency set those gates have already cleared, and it
@@ -102,10 +104,12 @@ that label over time, so treat it as a fact about that run rather than as a requ
 here depends on the image.
 
 The proof binary's complete stdout, from the run at commit `da006bc` — **the last commit to touch
-the proof's sources**, which is the pin that stays true as this branch takes further commits (an
-earlier revision said "this branch's tip" and stopped being true one commit later). Re-derive it
-with `git log -1 --format=%h -- spikes/windows-control-transport/src/`; if that prints something
-else, the quote is stale and the run to re-read is that commit's. It is the whole of what the
+the proof or the workflow that runs it**, which is the pin that stays true as this branch takes
+further commits (an earlier revision said "this branch's tip" and stopped being true one commit
+later). The pathspec spans the whole spike directory, not just `src/`, because a `Cargo.toml` or
+`Cargo.lock` change alters the shipped binary without touching a source file. Re-derive it with
+`git log -1 --format=%h -- spikes/windows-control-transport/ .github/workflows/spike-972-windows-transport.yml`;
+if that prints something else, the quote is stale and the run to re-read is that commit's. It is the whole of what the
 program printed; the workflow step around it also emits cargo's own `Compiling` / `Finished` /
 `Running` lines, which are not reproduced:
 
@@ -338,7 +342,7 @@ technical impossibility.
   forward direction. The pipe namespace has no directory to protect, so first-creator-wins — the
   property CHECK 2 measured in our favour — cuts the other way too: a foreign local process that
   creates `\\.\pipe\sessiometer-...` first either denies the daemon its own name or stands a server
-  in front of the CLI. The implementation item therefore owes a **client-side check of the server's
+  in front of the CLI. **#976** therefore owes a **client-side check of the server's
   owner SID** and should open with `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` so a rogue
   server cannot impersonate the CLI even if it wins the race. Neither is optional, and neither is
   work the Unix side ever had to do.
