@@ -249,14 +249,40 @@ async fn proof() -> Result<(), String> {
     no_impersonation_token("CHECK 0a canary (before any impersonation)")?;
     println!("[spike-972] CHECK 0a canary   : PASS — this thread carries NO impersonation token yet (OpenThreadToken -> ERROR_NO_TOKEN = {ERROR_NO_TOKEN})");
 
-    // -- MEASUREMENT: impersonation BEFORE any read. -------------------------------------------
+    // -- CHECK 6 + MEASUREMENT: impersonation BEFORE any read. ---------------------------------
     //
     // `ImpersonateNamedPipeClient` is documented to give "the security context of the last message
-    // read from the pipe". Whether that wording IMPLIES a read-first ordering constraint on a byte
-    // -mode pipe is precisely what ADR-0037 must not guess at, so this attempt is un-gated: its
-    // outcome is the finding, and asserting one here would assume it.
+    // read from the pipe". Whether that wording IMPLIES a read-first ordering constraint on a
+    // byte-mode pipe was this spike's open question, and on its FIRST run this attempt was
+    // deliberately un-gated: asserting an answer would have assumed the finding.
+    //
+    // It resolved, and ADR-0037 § Decision 4 now records that as a decision in force — the daemon's
+    // `UnixControl::serve` computes `peer_authenticated` BEFORE `serve_control` reads, and a
+    // read-first constraint would force that split apart. So the property is GATED from here on:
+    // a re-run where pre-read impersonation regresses must redden the job, not print quietly. The
+    // MEASUREMENT line stays because the resolved value is the evidence the ADR quotes.
     let sid_before_read = peer_user_sid(pipe);
     println!("[spike-972] MEASUREMENT pre-read impersonation : {sid_before_read}");
+    match &sid_before_read {
+        PeerSid::Resolved(sid) if *sid == our_sid => println!(
+            "[spike-972] CHECK 6  pre-read   : PASS — the peer's SID resolved with NO read having \
+             occurred, so the documented wording imposes no read-first ordering constraint"
+        ),
+        PeerSid::Resolved(sid) => {
+            return Err(format!(
+                "CHECK 6 pre-read: impersonation before the read resolved {sid}, which is not our \
+                 own {our_sid} — the child runs as us, so this is a defect in the resolution"
+            ))
+        }
+        PeerSid::Failed { stage, code } => {
+            return Err(format!(
+                "CHECK 6 pre-read: impersonation before any read failed at {stage} \
+                 (GetLastError={code}). ADR-0037 Decision 4 records that it SUCCEEDS, and the \
+                 daemon authenticates before it serves — this is a regression against that decision, \
+                 not a new open question"
+            ))
+        }
+    }
 
     // -- CHECK 4: the peer's pid (DIAGNOSTIC only). --------------------------------------------
     let peer_pid = client_process_id(pipe).map_err(|code| {

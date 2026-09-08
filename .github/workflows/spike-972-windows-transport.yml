@@ -52,18 +52,20 @@ env:
   # no change to the spike. A red nobody can clear is worse than no job.
   RUST_STABLE: "1.96.0"
 
-defaults:
-  run:
-    # windows-latest defaults to pwsh; bash keeps this file readable next to its siblings and
-    # keeps `working-directory` + `$GITHUB_STEP_SUMMARY` behaving the way they do elsewhere.
-    shell: bash
-
 jobs:
   proof:
     name: proof (windows)
     runs-on: windows-latest
     defaults:
       run:
+        # BOTH keys must sit in the SAME defaults block. A job-level `defaults: run:` REPLACES the
+        # workflow-level one rather than merging key-by-key, so an earlier revision of this file
+        # that declared `shell: bash` at workflow level and `working-directory` here got neither
+        # honoured together: every step ran under pwsh while the file said bash. Measured from the
+        # run log (`shell: C:\Program Files\PowerShell\7\pwsh.EXE`), not inferred — and it was
+        # SILENT, because the summary step below is bash syntax that pwsh parses as a script-block
+        # literal and discards at exit 0.
+        shell: bash
         working-directory: spikes/windows-control-transport
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
