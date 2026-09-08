@@ -2,7 +2,7 @@
 type: architecture-decision-record
 number: 29
 title: "Linux is a supported build target for the CLI and daemon; the menu-bar app stays macOS-only"
-date: 2026-09-08
+date: 2026-07-28
 status: accepted
 decision_makers: [Oleksii PELYKH (maintainer)]
 ---
@@ -11,24 +11,32 @@ decision_makers: [Oleksii PELYKH (maintainer)]
 
 ## Status
 
-**Accepted** — 2026-09-08 (issue #962, under umbrella #961). Amended in place; the number and the
-`accepted` status are unchanged, the title and filename are not.
+**Accepted** — 2026-07-28. Recorded branch (b) of issue #797 — "macOS is the only supported build
+target" — as a decision in force plus documentation, not a code change.
+
+**Amended 2026-09-08 (#962, under umbrella #961) — the decision is REVERSED: Linux becomes a
+supported build target for the CLI and daemon.** Amended in place, not superseded; the number, the
+`accepted` status and the acceptance date above are unchanged, the title and filename are not. This
+is a full reversal, so the body below records the amended decision throughout rather than annotating
+the original — see § Alternatives 1 for why that is amendment and not supersession.
 
 > **Arriving from issue #797's closing comment, which describes this ADR as recording "macOS is the
-> only supported build target"?** That decision — accepted here on 2026-07-28, branch (b) of #797 —
-> is reversed, and this file was amended in place rather than superseded:
-> `git log -- docs/adr/0029-macos-is-the-only-supported-build-target.md` carries the superseded text
-> in full, under the name this file had until then.
+> only supported build target"?** You are in the right place — that is the decision amended above;
+> `git log -- docs/adr/0029-macos-is-the-only-supported-build-target.md` carries its text in full,
+> under the name this file had until then.
 
 The reversal is a **decision in force, not a landed port**. See § Decision part 4: the crate does not
 build for Linux today, and nothing enforces that it will until #964 lands. This ADR states what is
-decided; it does not claim a guarantee no gate checks — which was the one thing its superseded text
-got right, and is preserved here deliberately.
+decided; it does not claim a guarantee no gate checks — the superseded text's most load-bearing
+contribution, preserved here deliberately.
 
 ## Context
 
 Two facts reversed the 2026-07-28 decision. Both were measured under umbrella #961, in Docker
-(`rust:1.96-bookworm`, aarch64) with the repo mounted read-only.
+(`rust:1.96-bookworm`, aarch64) with the repo mounted read-only. **The figures below are quoted from
+that measurement and were not re-taken here**; they describe `main` as it stood then, so treat the
+test counts as a floor rather than a current reading — see § Consequences for what has since been
+found outside their scope.
 
 ### 1. The cost premise was wrong
 
@@ -40,7 +48,7 @@ barrier is **two files, roughly 45 lines**:
 |---|---|---|
 | `cargo check --all-targets` | **1** error | 0 errors |
 | `cargo test` (run **non-root**) | — | **1928 pass / 1 fail** (macOS baseline: 1945 pass) |
-| `clippy --all-targets --all-features -D warnings` | — | 1 error (`keychain.rs:291` — `for_test` is dead code on Linux) |
+| `clippy --all-targets --all-features -D warnings` | — | 1 error (`CcAcct::for_test` in `src/keychain.rs` is dead code on Linux) |
 | `RUSTDOCFLAGS="-D warnings" cargo doc` | — | clean |
 
 Two measurement traps produce false readings, and both were hit while taking the numbers above:
@@ -122,7 +130,10 @@ was the **crate** — the CLI and daemon do not depend on any of those to build,
    unchanged and out of scope** — #27 stays blocked on its own recon and #40's Windows half stays
    open. Linux first.
 
-2. **Both portability sites are named, and the second one is named as the trap it is.** `cargo check`
+2. **Both build/link-blocking portability sites are named, and the second one is named as the trap
+   it is.** The crate carries a much wider macOS-bound RUNTIME surface (`/usr/bin/security`,
+   `launchctl`, `plutil`, `~/Library/…`) that compiles and links on Linux perfectly well; those are
+   #26's and #963's business, not a build barrier. Of the barriers, `cargo check`
    resolves site 1 and is structurally blind to site 2, so a `check`-only verification of Linux
    support is a false green. Any claim about the Linux build must be backed by something that
    **links** — `cargo test` or `cargo build`.
@@ -151,17 +162,28 @@ whichever it did second.
    - **Pros**: matches the § Conventions text in `docs/adr/README.md` literally, and leaves the
      2026-07-28 reasoning readable in place rather than only in git.
    - **Cons**: that precedent does not fit. ADR-0023 states outright that it *"preserves that
-     decision and supersedes only its record of the meaning"* — 0022 still carries live content, so
-     both documents earn their place. This is a **full reversal**: nothing in the original survives.
+     decision and supersedes only its record of the "reach-the-trigger" meaning"* — 0022 still
+     carries live content, so both documents earn their place. This is a **full reversal**: nothing
+     in the original survives.
      A superseded 0029 would be a document titled "macOS is the only supported build target" whose
      entire content is "this is no longer true, see 0030". That is a redirect, not a record — and
      git already versions the file, so the supersession chain would duplicate history the repo keeps
      anyway.
-   - **Why rejected**: the repo does not supersede reflexively (ADR-0005 documents a deliberate
-     decision *not* to), and four index rows already record in-place amendment as house practice
-     (0006, 0012, 0020, and 0002 by a successor). The filename was changed with `git mv` for the
-     same reason the successor was rejected: a filename that contradicts its contents is worse than
-     the stub being avoided.
+   - **Why rejected**: `Superseded` has no referent here. `docs/adr/README.md` § Status vocabulary
+     defines it as *"replaced by a later ADR — link both ways"*, and ADR-0012 § Status states the
+     rule in prose: *"This directory reserves `Superseded` for a decision that a later ADR
+     replaces."* This issue forbids a successor, so there is no later ADR to link to and nothing to
+     replace it with — the status would point at a document that does not exist.
+     **Where this case differs from 0012's, stated plainly rather than glossed**: 0012 amends a
+     decision that STANDS, and rests on *"nothing here is replaced"*; here the decision does not
+     stand. So 0012's ground is not this one's, and its shape is invoked for the mechanism, not the
+     reasoning. What carries the weight instead is the rule above plus the redirect-not-a-record
+     argument, and the corpus's demonstrated willingness to amend in place (ADR-0006 by #1053,
+     ADR-0012 by #1454, ADR-0020 by #1123, ADR-0023 by ADR-0024 and ADR-0025; ADR-0005 documents a
+     deliberate
+     decision *not* to supersede). The filename was changed with `git mv` for the same reason the
+     successor was rejected: a filename that contradicts its contents is worse than the stub being
+     avoided.
 
 2. **Land the port (#963) and the CI job (#964) in this change, so the decision and its enforcement
    arrive together.**
@@ -211,17 +233,31 @@ whichever it did second.
   repeated in any Linux-facing doc, help text or README section.** Linux has no keychain here; the
   stash stays plaintext at `0600`, matching Claude Code's own posture on Linux. Self-encryption is
   explicitly not in scope (#28). Nothing enforces this — it is a review obligation.
-- **`src/paths.rs` carries three macOS-only test assumptions whose stated reasoning cites the
-  superseded decision, and this change leaves them exactly as they are.** Their premise — "the crate
-  does not compile for Linux at all, so a `#[cfg(target_os = "macos")]` gate would be inert today" —
-  is still true as this ADR lands, so the conclusion those comments reach survives on it. **#963 is
-  what falsifies that premise**, and re-deciding those three gates against a crate that does build on
-  Linux belongs to that item. Recorded here so it is inherited rather than rediscovered: a live
-  `/bin/sh -l -c /usr/bin/env` spawn (`dash` does not treat `-l` as macOS's `/bin/sh` does), and two
-  tests reading the host's live passwd entry (a minimal container image need not populate it).
-- **One test and one clippy finding are known-red on Linux before #963 opens.** The measurement
-  recorded 1 failing test out of 1929 and one `-D warnings` clippy error at `keychain.rs:291`
-  (`for_test` is dead code on Linux). Neither is a surprise to be discovered mid-port.
+- **`src/paths.rs` carries three macOS-only test assumptions, and this change edits only the clause
+  this decision falsified.** One of them justified staying a comment rather than a
+  `#[cfg(target_os = "macos")]` gate partly *because macOS was the only supported build target*;
+  that clause is struck, since leaving it would state the reversed decision while citing this ADR by
+  number. The surviving premise — the crate does not compile for Linux at all, so the gate would be
+  inert today and would falsely imply the rest of the suite is portable — still holds as this lands,
+  so the conclusion stands on it and the gates are not re-decided here. **#963 is what falsifies
+  that premise.** What it inherits: a live `/bin/sh -l -c /usr/bin/env` spawn (`dash` does not treat
+  `-l` as macOS's `/bin/sh` does), and two tests reading the host's live passwd entry (a minimal
+  container image need not populate it).
+- **The macOS-bound test surface is WIDER than the measured count implies, and `src/paths.rs` is not
+  the whole of it.** At least three further tests call a macOS-only binary under a plain
+  `#[cfg(test)]` with no `target_os` gate, so they cannot pass on Linux:
+  `the_rendered_plist_passes_macos_plutil_lint` in `src/service.rs` (`/usr/bin/plutil`), and the
+  `empty_keychain` helper in `src/witness.rs` (`/usr/bin/security`), which several `#[tokio::test]`
+  cases call. **This is more than the "1 fail" the #961 matrix records**, which is why that table is
+  marked a floor above: `src/witness.rs` backs ADR-0036 (2026-09-03), later than the measurement, and
+  the run may also have been filtered — the record carries no commit SHA, so the two cannot be told
+  apart from here. #963 should re-measure rather than budget for one known-red test, and should
+  expect the `CcAcct::for_test` dead-code clippy finding alongside it.
+- **Amending in place silently re-points every existing reference to this ADR.** ADR-0031's link was
+  updated because the rename broke it; ADR-0030 cites 0029 by number only, so nothing broke and its
+  point-in-time characterisation — written when this record said macOS-only — now describes a
+  document it has not read. That is the cost of the alternative chosen above, accepted rather than
+  hidden: a superseded stub would have preserved those references against a frozen text.
 
 ## Related
 

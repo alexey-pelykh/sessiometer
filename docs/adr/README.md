@@ -41,7 +41,7 @@ issue threads is consolidated here in a stable, discoverable place.
 | [0026](0026-daemon-fault-severity-rank-is-cross-surface.md) | Daemon-payload-fault severity is a cross-surface rank, not a per-surface colour register | Accepted |
 | [0027](0027-macos-app-bundle-identity.md) | macOS app bundle identity — freeze `org.sessiometer.menubar` on the `<surface>` axis | Accepted |
 | [0028](0028-version-range-provenance-canary-runtime-guard.md) | CC version range is provenance, not a runtime gate; the #714 behavioral canary is the runtime compatibility guard | Accepted (#730 hardening has since landed) |
-| [0029](0029-linux-is-a-supported-build-target.md) | Linux is a supported build target for the CLI and daemon; the menu-bar app stays macOS-only | Accepted (amended 2026-09-08 by #962 — reverses the macOS-only decision this number recorded) |
+| [0029](0029-linux-is-a-supported-build-target.md) | Linux is a supported build target for the CLI and daemon; the menu-bar app stays macOS-only | Accepted (amended 2026-09-08 by #962 — reverses the macOS-only decision this number recorded; decision in force, port is #963 and the enforcing CI job #964) |
 | [0030](0030-one-resolution-policy-cli-included.md) | One `claude`-resolution policy for every caller — `poke` / `login` resolve via the login-shell `PATH` too | Accepted |
 | [0031](0031-ui-verification-tiers-bounded-by-structural-blindness.md) | UI verification is a tier stack bounded by structural blindness; no gate ships without a proven falsifier | Accepted |
 | [0032](0032-login-is-daemon-routable-tty-gate-is-ours.md) | `login` is daemon-routable; the TTY gate is sessiometer's own conservatism, not a Claude Code requirement | Accepted |

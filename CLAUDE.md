@@ -9,8 +9,11 @@ those differently.
 ## What this repo is
 
 A Rust daemon + CLI at `src/`, and a SwiftUI macOS menu-bar app at `apps/menubar/` that talks to the
-daemon over a local AF_UNIX socket. **macOS is the only supported build target** — no CI job compiles
-for Linux or Windows, so a green run says nothing about portability (`CONTRIBUTING.md`).
+daemon over a local AF_UNIX socket. **The CLI and daemon target macOS and Linux; the menu-bar app is
+macOS-only and Windows is unsupported** (`CONTRIBUTING.md`, ADR-0029). Linux is **decided but not yet
+landed**: two macOS-only syscall sites keep the crate from building there (#963), and until the
+enforcing job (#964) exists **no CI job compiles for Linux or Windows, so a green run still says
+nothing about portability**.
 
 The two halves version their wire contracts independently and are gated by different CI jobs. Most
 mistakes below come from applying one half's rule to the other.
@@ -353,9 +356,11 @@ python3 design/build-comparison.py ../../.tmp/panelcaps ../../.tmp/design-vs-cap
 
 ## Deliberate — do not "fix" these
 
-- `src/daemon/peer_auth.rs` calls `libc::getpeereid` with no `cfg(target_os)` gate, so a Linux
-  `cargo check` fails. That is an accepted consequence of macOS-only support (`CONTRIBUTING.md`), not
-  a defect to clean up in passing.
+- ~~`src/daemon/peer_auth.rs`'s un-gated `libc::getpeereid`~~ — **withdrawn 2026-09-08 (#962).** It
+  was listed here as an accepted consequence of macOS-only support; ADR-0029 reversed that, so the
+  site is now a port that is **owed** (#963), matching the comment at the call site. It is still not
+  a defect to fix *in passing* — it belongs to #963, with `src/contract.rs`'s `extern "C"` Mach block,
+  which a Linux `cargo check` cannot even see.
 - Eight Swift files are permanently excluded from the `MenubarTests` target because they touch
   surfaces a headless bundle cannot host (`main.swift`, `StatusItemController`, the Settings pair,
   the login-item and notification presenters, and the two render tools). The exclusions carry
