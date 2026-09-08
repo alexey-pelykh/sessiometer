@@ -19,7 +19,8 @@ Like **ADR-0011**, this record **precedes the code it governs**: no Windows cont
 exists, and this ADR fixes the approach one will implement.
 
 **It is a decision in force, not a landed port** — the same distinction **ADR-0029** draws for
-Linux. Nothing in the crate builds for Windows today, and no CI job compiles for it. What is landed
+Linux. Nothing in the crate builds for Windows today, and no CI job compiles for it — **#978** is
+the enforcing job, exactly as **#964** is on the Linux side. What is landed
 is a *proof*, in `spikes/windows-control-transport/`, which is deliberately outside the root build
 graph and is run by the non-required `spike-972-windows-transport` workflow.
 
@@ -87,10 +88,16 @@ hides: being out of the graph also puts the spike outside `cargo deny`,
 `check-no-security-framework.sh` and the three `src/usage.rs` egress lints (two walk
 `CARGO_MANIFEST_DIR/src`; the third scans the root `Cargo.lock`, which the spike's own lockfile is
 no part of — so none of the three reaches it), while its own workflow runs only `fmt` / `clippy`
-/ `build` / `run`. What substitutes for all of them is a subset property: its committed `Cargo.lock`
-pins every transitive crate to the version the root lockfile already holds, and the only package it
-adds is the spike itself — so it exercises a dependency set those gates have already cleared, and it
-exercises the one a real port inherits. **Nothing enforces that property.** It was verified by hand
+/ `build` / `run`. What substitutes for **the graph-level ones** — `cargo deny`,
+`check-no-security-framework.sh`, and the lockfile-scanning lint — is a subset property: its
+committed `Cargo.lock` pins every transitive crate to the version the root lockfile already holds,
+and the only package it adds is the spike itself — so it exercises a dependency set those gates
+have already cleared, and it exercises the one a real port inherits. **The two source-walking
+lints have no substitute here**: they scan file text, and a lockfile says nothing about the
+spike's own sources, so nothing stops a raw socket or a network binary literal appearing under
+`spikes/**`. The same gap qualifies § Alternatives considered → 3, which calls TCP-on-loopback
+*already red on the existing suite* — true of `src/`, not of a prototype written here. **Nothing
+enforces either property.** The subset one was verified by hand
 against the root lockfile and it is one `cargo update` away from silently ceasing to hold; the
 mitigation is `--locked` throughout the workflow, plus the spike's own deletion under § Lifecycle.
 
@@ -103,15 +110,19 @@ and not sufficient for the issue's AC2. The proof therefore runs on a GitHub-hos
 that label over time, so treat it as a fact about that run rather than as a requirement — nothing
 here depends on the image.
 
-The proof binary's complete stdout, from the run at commit `da006bc` — **the last commit to touch
-the proof or the workflow that runs it**, which is the pin that stays true as this branch takes
-further commits (an earlier revision said "this branch's tip" and stopped being true one commit
-later). The pathspec spans the whole spike directory, not just `src/`, because a `Cargo.toml` or
-`Cargo.lock` change alters the shipped binary without touching a source file. Re-derive it with
-`git log -1 --format=%h -- spikes/windows-control-transport/ .github/workflows/spike-972-windows-transport.yml`;
-if that prints something else, the quote is stale and the run to re-read is that commit's. It is the whole of what the
-program printed; the workflow step around it also emits cargo's own `Compiling` / `Finished` /
-`Running` lines, which are not reproduced:
+The proof binary's complete stdout, from workflow run `34252922668` — the
+`spike-972-windows-transport.yml` run at commit `da006bc` on the spike's branch. Both referents are
+**provenance for how this output was obtained, not a currency check a later reader can run**, and
+saying so is the point: this repo squash-merges, so `da006bc` never reaches `main`; the workflow
+triggers on `pull_request` and `workflow_dispatch` only, so the squash commit has no run of its
+own; and § Lifecycle deletes the spike outright. Earlier revisions of this paragraph shipped a
+`git log` rule for re-deriving the pin — first against the branch tip, then against the files
+behind the binary. Both are **withdrawn**: each of the three facts above makes such a rule report a
+byte-identical quote as stale, which is the failure direction that discredits a correct record.
+Quoting the output in full is what carries it instead — nothing below depends on the commit, the
+run, or the spike directory outliving this ADR. It is the whole of what the program printed; the
+workflow step around it also emits cargo's own `Compiling` / `Finished` / `Running` lines, which
+are not reproduced:
 
 ```text
 [spike-972] host pid           : 7992
@@ -324,11 +335,19 @@ technical impossibility.
   the reservation above — the first instance must stay alive for the name to remain held. This is
   the largest single piece of work the decision implies.
 - **Impersonation mutates the calling thread's token.** The resolution must therefore be fully
-  synchronous: **no `.await` between `ImpersonateNamedPipeClient` and `RevertToSelf`**, or a
-  multi-thread runtime could resume elsewhere and leave a thread running as the client. The daemon
-  is `current_thread` (ADR-0001), which makes the rule sufficient rather than merely necessary — but
-  it is a rule the port must keep, not a property it inherits. `getpeereid` is a pure read and has
-  no equivalent hazard.
+  synchronous: **no `.await` between `ImpersonateNamedPipeClient` and `RevertToSelf`**. What an
+  `.await` there costs is **not** primarily a multi-thread hazard, and reading it that way is the
+  trap: on the daemon's own `current_thread` runtime (ADR-0001) an `.await` in that window lets
+  tokio poll **other tasks on the same thread while that thread carries the client's token** —
+  and `UnixControl::serve` (`src/daemon/socket.rs`) spawns exactly such tasks, its own comment
+  noting they run *"cooperatively on the one thread"*. On a multi-thread runtime it additionally
+  strands the impersonation on a thread that resumes elsewhere. So single-threadedness does not
+  make the rule sufficient — the **absence of a suspension point** does, on either flavour, and
+  single-threadedness is what turns a violation into a leak to co-scheduled tasks rather than one
+  stranded thread. Nor does the type system catch it here: the spike's `!Send` guard makes holding
+  the token across an `.await` a compile error only where a `Send` bound is demanded, and
+  `trait Control::serve` (`src/daemon/socket.rs`) declares none. It is a rule the port must keep,
+  not a property it inherits. `getpeereid` is a pure read and has no equivalent hazard.
 - **The client controls the impersonation level.** A client may open the pipe with
   `SECURITY_ANONYMOUS`, in which case the server's impersonation yields an anonymous token. Under
   the fail-closed comparison this can only make the client **deny itself** — an anonymous token's
@@ -358,8 +377,11 @@ technical impossibility.
 
 ### What this spike did NOT establish
 
-Recorded as residuals for **#976** — *build: peer identity and the single-instance lock on Windows*,
-open and declared `Blocked by #972` — rather than left to be rediscovered. Four of the six below are
+Recorded as residuals rather than left to be rediscovered. All but the last belong to **#976** —
+*build: peer identity and the single-instance lock on Windows*, open and declared `Blocked by
+#972`. The last one cannot: adding a Windows CI job is **#978**'s work, and #976's own AC2
+*presupposes* that job by requiring its verification *"on the Windows CI job"*. Four of the six
+below are
 outside #976's acceptance criteria as that issue is currently written: it was authored before this
 spike and says outright that it *"deliberately does not prescribe the mechanism"*. Carrying them
 onto it is tracker work this record does not perform, and merging this PR auto-closes #972, so the
@@ -395,7 +417,9 @@ carry is owed at that moment and not later:
   its whole lifetime. **#976 owes a `watch`-shaped proof before that subscription is
   ported**, answering how many instances the accept loop keeps outstanding; this
   record does not settle it and no measurement here bears on it.
-- **Nothing is enforced.** No CI job compiles the crate for Windows. The
+- **Nothing is enforced, and this one is #978's, not #976's.** No CI job compiles the crate for
+  Windows; **#978** — *ci: add a Windows job that builds and tests (not just checks)* — is the
+  enforcing job, the Windows half of the guard **#964** provides on Linux. The
   `spike-972-windows-transport` workflow builds and runs the *spike*, is not in `ci.yml`, and is not
   in `ci-ok.needs` — deliberately, so a throwaway proof never becomes a required check. Its
   existence is evidence about the transport, never about the crate.

@@ -85,9 +85,11 @@ pub(crate) fn run() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let runtime = match tokio::runtime::Builder::new_current_thread()
         // `current_thread`, matching the daemon (ADR-0001). Not incidental: the impersonation window
-        // below mutates the CALLING THREAD's token, so a single-threaded runtime is what makes
-        // "no `.await` between `ImpersonateNamedPipeClient` and `RevertToSelf`" a sufficient rule
-        // rather than a necessary-but-not-sufficient one.
+        // below mutates the CALLING THREAD's token. What makes "no `.await` between
+        // `ImpersonateNamedPipeClient` and `RevertToSelf`" sufficient is the ABSENCE OF A SUSPENSION
+        // POINT, not the runtime flavour — single-threadedness does not weaken the rule's necessity,
+        // it changes what a violation costs: co-scheduled tasks on this same thread would run under
+        // the client's token, where a multi-thread runtime would additionally strand it elsewhere.
         .enable_all()
         .build()
     {
@@ -600,10 +602,13 @@ fn client_process_id(pipe: HANDLE) -> Result<u32, u32> {
 /// accident of this file.
 ///
 /// `!Send` on purpose (via the `PhantomData`): a thread token belongs to one thread, so a guard
-/// that could be moved to another would be a guard for the wrong thread. That makes any future
-/// holding one across an `.await` a COMPILE error on a multi-thread runtime instead of a silent
-/// hazard — the daemon is `current_thread` (ADR-0001), but the type system should not depend on
-/// that staying true.
+/// that could be moved to another would be a guard for the wrong thread. That turns a future
+/// holding one across an `.await` into a COMPILE error WHEREVER A `Send` BOUND IS DEMANDED —
+/// `tokio::spawn` on a multi-thread runtime, say. Do NOT read it as a general guard for the port:
+/// `trait Control::serve` in `src/daemon/socket.rs` declares no `Send` bound and is driven under
+/// `block_on`, so a `!Send` future is perfectly legal on exactly the path the port will take. The
+/// no-`.await`-in-the-window rule is what holds there; this type only makes the mistake loud where
+/// the bound already exists.
 struct Impersonation {
     _not_send: std::marker::PhantomData<*const ()>,
 }
@@ -640,11 +645,12 @@ impl Drop for Impersonation {
 
 /// The connected client's USER SID — the `getpeereid` analogue, and the load-bearing half of AC3.
 ///
-/// FULLY SYNCHRONOUS ON PURPOSE. `ImpersonateNamedPipeClient` replaces the CALLING THREAD's token;
-/// an `.await` inside that window could (on a multi-thread runtime) resume elsewhere, leaving one
-/// thread impersonating forever and doing the work under the wrong identity. There is no async work
-/// to do between the two calls, so the rule costs nothing — but it is a rule the real port has to
-/// keep, not an accident of this file.
+/// FULLY SYNCHRONOUS ON PURPOSE. `ImpersonateNamedPipeClient` replaces the CALLING THREAD's token,
+/// so an `.await` inside that window is unsafe on EITHER runtime flavour: on `current_thread` it
+/// lets tokio poll other tasks on this same thread while the thread carries the client's token, and
+/// on a multi-thread runtime it can additionally resume elsewhere, leaving one thread impersonating
+/// forever. There is no async work to do between the two calls, so the rule costs nothing — but it
+/// is a rule the real port has to keep, not an accident of this file.
 ///
 /// Fail-closed by construction: every arm returns [`PeerSid::Failed`], which no caller can mistake
 /// for an identity. That mirrors `peer_euid`'s `None`-on-error contract in `src/daemon/peer_auth.rs`.
