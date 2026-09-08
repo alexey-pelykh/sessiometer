@@ -3,7 +3,8 @@
 Thanks for your interest in improving `sessiometer`. For building and running the
 tool see the [README](README.md); for the *why* behind load-bearing technical
 decisions see the [ADRs](docs/adr/). This guide covers the two things most likely
-to surprise a new contributor: **macOS is the only supported build target**, and the
+to surprise a new contributor: **which platforms are supported, and what CI actually
+enforces about them**, and the
 project holds a deliberate **minimal-dependency line** under which several primitives
 you might expect to be crates are hand-rolled on purpose.
 
@@ -11,32 +12,46 @@ If you are about to add a dependency, or "helpfully" swap a hand-rolled primitiv
 for a well-known crate (`clap`, `hex`, `reqwest`, …), please read this first — the
 omission is intentional, not an oversight.
 
-## Supported platform: macOS only
+## Supported platforms: macOS and Linux
 
-**`sessiometer` builds and runs on macOS only.** The crate does not compile for a Linux
-or Windows target today, and **no CI job attempts it** — every job that runs `cargo
-build` / `test` / `clippy` / `doc` uses a `macos-latest` runner. The `ubuntu-latest` jobs
-(`changes`, `deny`, `ci-ok-needs-complete`, `doc-gates`, `gate-change-ack`, `ci-ok`) are
-gates and routers; none of them compiles the crate.
+**The CLI and daemon target macOS and Linux.** The menu-bar app (`apps/menubar/`) is
+**macOS-only** — a SwiftUI/AppKit application with no Linux counterpart. **Windows is not
+supported**; it stays tracked behind its own recon (#27).
 
-Two things follow, and both matter when you write or review a change:
+**Linux support is decided, not yet landed, and not yet gated.** Two files on `main` hold
+macOS-only syscall sites, so the crate does not build for a Linux target today. The port is
+#963; the CI job that enforces it is #964. Until #964 is green, **every job that runs `cargo
+build` / `test` / `clippy` / `doc` still uses a `macos-latest` runner** — the
+`ubuntu-latest` jobs (`changes`, `deny`, `ci-ok-needs-complete`, `doc-gates`,
+`gate-change-ack`, `ci-ok`) are gates and routers, and none of them compiles the crate.
 
-- **A green CI run says nothing about portability.** Introduce a macOS-only call and every
-  gate still passes. The most concrete instance is already on `main`:
+Three things follow, and all three matter when you write or review a change:
+
+- **A green CI run still says nothing about portability.** Introduce a macOS-only call and
+  every gate passes. Two instances are on `main` right now:
   [`src/daemon/peer_auth.rs`](src/daemon/peer_auth.rs) calls `libc::getpeereid` with no
-  `cfg(target_os)` gate, and `getpeereid(3)` is not in glibc — so a Linux `cargo check`
-  exits 101. That is a known, accepted consequence, not a defect to fix in passing.
-- **Do not write an acceptance criterion asserting that the Linux build works.** Nothing
-  verifies it, so the claim cannot fail — which is worse than not making it. Where a test
-  carries a platform assumption (a live `/bin/sh -l` spawn, an absolute passwd entry), say
-  so in a comment beside it, as the login-shell harvest tests in
+  `cfg(target_os)` gate (`getpeereid(3)` is not in glibc), and
+  [`src/contract.rs`](src/contract.rs) declares three Mach clock symbols in an `extern "C"`
+  block. Both are ports that are owed (#963), not consequences to be accepted.
+- **`cargo check` cannot verify a Linux build.** An `extern` block resolves at **link**, not
+  at type-check, so `check` compiles the Mach block clean for a Linux target and it fails
+  only when something links. A Linux `cargo check --all-targets` reports exactly **1** error
+  on unpatched `main` — the `getpeereid` site — and stays blind to the other. Back any claim
+  about the Linux build with `cargo build` or `cargo test`, never `check`. This has already
+  cost two verifications: issue #797 and ADR-0029's superseded text were both checked this
+  way, and both named only one of the two sites.
+- **Do not write an acceptance criterion asserting that the Linux build works — not until
+  #964 lands.** Nothing verifies it yet, so the claim cannot fail, which is worse than not
+  making it. Where a test carries a platform assumption (a live `/bin/sh -l` spawn, an
+  absolute passwd entry), say so in a comment beside it, as the login-shell harvest tests in
   [`src/paths.rs`](src/paths.rs) do.
 
-None of this closes the door. Cross-platform support is tracked, sequenced future work:
-recon first (#40), then the backend-neutral credential-store seam (#25) and the per-OS
-mechanisms (#26 Linux, #27 Windows, #28 at-rest hygiene), then productionization including
-a per-OS CI matrix (#29). The full rationale — and the alternative that was weighed and
-deferred — is in [ADR-0029](docs/adr/0029-macos-is-the-only-supported-build-target.md).
+The credential mechanism follows its own sequence: recon (#40, Linux half answered), then
+the backend-neutral credential-store seam (#25) and the per-OS mechanisms (#26 Linux, #27
+Windows, #28 at-rest hygiene), with packaging and distribution beyond CI in #29. The full
+record — what was measured, what reversed the earlier macOS-only decision, and what stays
+out of scope — is in
+[ADR-0029](docs/adr/0029-linux-is-a-supported-build-target.md), under umbrella #961.
 
 ## The minimal-dependency line
 
@@ -212,7 +227,7 @@ A clean change then converts into a block by construction, and that block says n
 change.
 
 This guide already forbids one instance of the same defect: [do not write an acceptance criterion
-asserting that the Linux build works](#supported-platform-macos-only), because nothing verifies it.
+asserting that the Linux build works](#supported-platforms-macos-and-linux), because nothing verifies it.
 Hold the two together, because the root is identical — the criterion names something no artifact
 carries — and only the sign differs:
 

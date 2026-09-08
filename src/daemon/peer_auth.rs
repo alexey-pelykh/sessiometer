@@ -19,11 +19,13 @@
 pub(crate) fn peer_euid(fd: std::os::unix::io::RawFd) -> Option<libc::uid_t> {
     let mut euid: libc::uid_t = 0;
     let mut egid: libc::gid_t = 0;
-    // Left un-gated by ADR-0029: `getpeereid(3)` is a macOS/BSD call, not in glibc, so
-    // this is the site that keeps `main` from compiling for a Linux target. That is an
-    // acknowledged consequence of macOS being the only supported build target, not an
-    // oversight — making it portable (`SO_PEERCRED` via `getsockopt`) belongs to the
-    // cross-platform track (#25 / #26), not here.
+    // One of the TWO sites that keep `main` from building for Linux: `getpeereid(3)` is a
+    // macOS/BSD call, not in glibc, and this call is un-gated. ADR-0029 now makes Linux a
+    // supported build target for the CLI and daemon, so this is a port that is OWED (#963 —
+    // `SO_PEERCRED` via `getsockopt`), not a consequence that was accepted; the CI job that
+    // enforces the result is #964. The other site is the `extern "C"` Mach block in
+    // `src/contract.rs`, which a Linux `cargo check` cannot see at all — an extern block
+    // resolves at link, so only a `build` or `test` catches it.
     // SAFETY: `getpeereid` is a syscall the kernel validates `fd` for itself — a bad,
     // non-socket, or not-connected fd returns `rc != 0` (mapped to `None` below),
     // never UB — and it writes the two out-pointers (stack locals here) ONLY on
