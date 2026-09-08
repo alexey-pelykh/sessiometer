@@ -12,9 +12,10 @@ A Rust daemon + CLI at `src/`, and a SwiftUI macOS menu-bar app at `apps/menubar
 daemon over a local AF_UNIX socket. **The CLI and daemon target macOS and Linux; the menu-bar app is
 macOS-only and Windows is unsupported** (`CONTRIBUTING.md`, ADR-0029). Linux is **landed but not
 gated**: the two macOS-only syscall sites are ported (#963), so the crate builds, links, tests and
-lints there — but until the enforcing job (#964) exists **no CI job compiles for Linux or Windows,
-so a green run still says nothing about portability**, and nothing stops the next macOS-only call
-from silently regressing it.
+lints there — measured by hand in a container and recorded on #963, which is evidence for one
+commit and not a standing gate. Until the enforcing job (#964) exists **no CI job compiles for
+Linux or Windows, so a green run still says nothing about portability**, and nothing stops the
+next macOS-only call from silently regressing it.
 
 The two halves version their wire contracts independently and are gated by different CI jobs. Most
 mistakes below come from applying one half's rule to the other.

@@ -51,9 +51,13 @@ Three things follow, and all three matter when you write or review a change:
   different exemplars, and citing the wrong one is how this gets misread: the
   real-`security` tests in [`src/witness.rs`](src/witness.rs) and the `plutil` test in
   [`src/service.rs`](src/service.rs) **are** gated, because the binary under test has no
-  Linux referent at all; the login-shell harvest tests in [`src/paths.rs`](src/paths.rs)
-  are deliberately **not**, because #963 measured them passing there — a gate would cost
-  real coverage on a target where they work.
+  Linux referent at all; the live login-shell harvest test in
+  [`src/paths.rs`](src/paths.rs) is deliberately **not**, because #963 measured it passing
+  there — a gate would cost real coverage on a target where it works. Its two
+  passwd-reading neighbours in that same file are a third case again: also ungated, but on
+  a *deferral* rather than a measurement — they read the host's live passwd entry, which a
+  minimal container image need not populate, and a porter (#26 / #29) re-decides them. Do
+  not read the harvest test's result across to those two.
 
 The credential mechanism follows its own sequence: recon (#40, Linux half answered), then
 the backend-neutral credential-store seam (#25) and the per-OS mechanisms (#26 Linux, #27

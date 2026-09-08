@@ -2775,8 +2775,10 @@ mod tests {
     /// libc-owned static buffer, so a borrow left dangling by one would be clobbered by
     /// the next `getpwuid` — this is the test that would catch it.
     ///
-    /// **macOS-only assumption — documented, not `cfg`-gated (issue #797, ADR-0029; same
-    /// reasoning as `a_live_harvest_child_emits_no_scrubbed_variable`).** The absoluteness
+    /// **macOS-only assumption — documented, not `cfg`-gated (issue #797, ADR-0029).**
+    /// Ungated for a DIFFERENT reason than the live-harvest test above, which #963
+    /// measured passing on Linux: this one carries no such measurement and is deferred,
+    /// so do not read that result across to it. The absoluteness
     /// assertions below read the HOST's live passwd entry and require it to be populated:
     /// an absolute `pw_dir`, an absolute `pw_shell`, a non-empty name. Every macOS account
     /// satisfies that; a minimal Linux container image need not — a uid with no passwd
