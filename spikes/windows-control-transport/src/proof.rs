@@ -28,7 +28,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, LocalFree, ERROR_ACCESS_DENIED, ERROR_PIPE_BUSY, HANDLE,
+    CloseHandle, GetLastError, LocalFree, ERROR_ACCESS_DENIED, ERROR_NO_TOKEN, ERROR_PIPE_BUSY,
+    HANDLE,
 };
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -238,6 +239,16 @@ async fn proof() -> Result<(), String> {
         .map_err(|err| format!("CHECK 1 accept: NamedPipeServer::connect failed: {err}"))?;
     println!("[spike-972] CHECK 1b accept    : PASS — connect() returned; a client is attached");
 
+    // -- CHECK 0a: the impersonation instrument can tell its two states apart. -----------------
+    //
+    // Without this, CHECK 5 is not evidence. The client is a child of the server and therefore runs
+    // as the SAME user, so "we impersonated the peer and read its SID" and "the impersonation did
+    // nothing and we read our own" produce an IDENTICAL string — a check whose canary cannot come
+    // back empty is not a check. `OpenThreadToken` fails ERROR_NO_TOKEN on a thread carrying no
+    // impersonation token, so proving that failure HERE is what makes its success below meaningful.
+    no_impersonation_token("CHECK 0a canary (before any impersonation)")?;
+    println!("[spike-972] CHECK 0a canary   : PASS — this thread carries NO impersonation token yet (OpenThreadToken -> ERROR_NO_TOKEN = {ERROR_NO_TOKEN})");
+
     // -- MEASUREMENT: impersonation BEFORE any read. -------------------------------------------
     //
     // `ImpersonateNamedPipeClient` is documented to give "the security context of the last message
@@ -314,6 +325,14 @@ async fn proof() -> Result<(), String> {
         "[spike-972] CHECK 5  peer SID  : PASS — {peer_sid} == our own SID (the `getpeereid` analogue: \
          a per-USER identity, not a per-process one)"
     );
+
+    // -- CHECK 0b: the canary's other end — `RevertToSelf` actually reverted. -------------------
+    //
+    // A thread left impersonating would do the rest of its work under the peer's identity, and the
+    // failure would be silent. `peer_user_sid` aborts if `RevertToSelf` returns FALSE; this proves
+    // the stronger thing the return value alone does not — that the token is GONE afterwards.
+    no_impersonation_token("CHECK 0b canary (after RevertToSelf)")?;
+    println!("[spike-972] CHECK 0b canary   : PASS — the impersonation token is gone again after RevertToSelf");
 
     // -- Reply, and let the client read it. ----------------------------------------------------
     write_line(&mut buffered, r#"{"ok":true,"proof":"spike-972"}"#)
@@ -462,6 +481,37 @@ fn peer_user_sid(pipe: HANDLE) -> PeerSid {
     unsafe { CloseHandle(token) };
     revert_to_self();
     result
+}
+
+/// Assert that the calling thread carries NO impersonation token — `OpenThreadToken` must fail with
+/// `ERROR_NO_TOKEN`. The negative control for [`peer_user_sid`]: it is what distinguishes "the
+/// impersonation took effect" from "nothing happened and we read our own primary token", which the
+/// resolved SID alone cannot, because this proof's client runs as the same user as its server.
+///
+/// A SUCCESS here is the failure: it means a token was already present where none should be.
+fn no_impersonation_token(label: &str) -> Result<(), String> {
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: `GetCurrentThread` returns a pseudo-handle needing no cleanup; `token` is a live local
+    // the kernel writes only on success.
+    let opened = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) };
+    if opened != 0 {
+        // SAFETY: `token` is the handle the call just wrote and has not been closed.
+        unsafe { CloseHandle(token) };
+        return Err(format!(
+            "{label}: OpenThreadToken SUCCEEDED on a thread that should carry no impersonation \
+             token — the SID comparison below cannot distinguish the peer's identity from our own"
+        ));
+    }
+    // SAFETY: reads the last-error slot set by the call above.
+    let code = unsafe { GetLastError() };
+    if code != ERROR_NO_TOKEN {
+        return Err(format!(
+            "{label}: OpenThreadToken failed with GetLastError={code} rather than \
+             ERROR_NO_TOKEN = {ERROR_NO_TOKEN}, so the instrument's default state is not what the \
+             control assumes"
+        ));
+    }
+    Ok(())
 }
 
 /// Our OWN user SID, read from the process token by the same two calls the peer path uses. Two jobs:

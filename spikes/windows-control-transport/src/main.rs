@@ -29,6 +29,13 @@
 //!    run MEASURES whether the documented "security context of the last message read from the
 //!    pipe" wording implies a read-first ordering constraint, instead of the ADR asserting one.
 //!
+//!    Both attempts are bracketed by a NEGATIVE CONTROL, because without one point 4 is not
+//!    evidence: the client runs as the same user as the server, so "we impersonated the peer and
+//!    read its SID" and "the impersonation did nothing and we read our own" produce an identical
+//!    string. `OpenThreadToken` fails `ERROR_NO_TOKEN` on a thread carrying no impersonation token,
+//!    so the run proves that failure BEFORE impersonating and again AFTER `RevertToSelf` — which is
+//!    what makes the success in between mean something, and what proves the revert reverted.
+//!
 //! The client is a CHILD PROCESS of the server (this same binary, `client` mode), so the resolved
 //! PID is provably not our own — which is what makes the PID-vs-SID distinction in point 4
 //! observable rather than asserted.

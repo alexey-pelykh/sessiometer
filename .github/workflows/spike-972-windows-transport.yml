@@ -21,11 +21,11 @@
 #   sufficient for the issue's AC2 ("a minimal Windows proof accepts a connection, round-trips one
 #   framed message, and resolves the peer's identity"). Only an executed run answers that.
 #
-# READ THE VERDICT OFF THE EXIT CODE. The proof gates five checks itself and returns non-zero if
-# any fails (spikes/windows-control-transport/src/proof.rs), so this job's own pass/fail IS the
-# finding rather than a log someone has to interpret. The one deliberately UN-gated line is the
-# pre-read impersonation attempt — its outcome is the open question ADR-0037 records, so asserting
-# an answer here would assume the finding.
+# READ THE VERDICT OFF THE EXIT CODE. The proof gates its own checks and returns non-zero if any
+# fails (spikes/windows-control-transport/src/proof.rs), so this job's own pass/fail IS the finding
+# rather than a log someone has to interpret. The one deliberately UN-gated line is the pre-read
+# impersonation attempt — its outcome is the open question ADR-0037 records, so asserting an answer
+# here would assume the finding.
 #
 # LIFECYCLE: delete this file together with spikes/windows-control-transport/ once ADR-0037 is
 # accepted and the dependent Windows items no longer need the proof re-runnable.
