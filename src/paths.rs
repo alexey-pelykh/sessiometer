@@ -34,11 +34,19 @@
 //! Directories are created `0700` and files `0600`, and every directory we
 //! create is asserted to be owned by the current uid before use.
 
-use std::ffi::{CStr, OsStr, OsString};
+#[cfg(unix)]
+use std::ffi::CStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::future::Future;
 use std::io::{ErrorKind, Write};
+// Both `std::os::unix` imports are `cfg`-gated: an ungated one is a hard error on every
+// non-Unix target, and this module carried two of them while ALSO carrying the four
+// `#[cfg(windows)]` branches below — which is how the file with Windows support became the
+// largest Windows error site in the crate (issue #973 AC1).
+#[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -66,10 +74,12 @@ pub(crate) fn current_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
-/// Resolve the current user's home directory from the password database.
+/// Resolve the current user's home directory from the password database — the Unix arm.
 ///
 /// Uses `getpwuid(getuid())` and copies `pw_dir` out immediately; the `$HOME`
-/// environment variable is intentionally ignored.
+/// environment variable is intentionally ignored. See the `#[cfg(windows)]` sibling for
+/// the other target's ladder, and the module docs for why the two differ.
+#[cfg(unix)]
 fn home_dir() -> Result<PathBuf> {
     let uid = current_uid();
     // SAFETY: `getpwuid` returns a pointer into a libc-owned static buffer. Exactly
@@ -99,6 +109,35 @@ fn home_dir() -> Result<PathBuf> {
     }
 }
 
+/// Resolve the current user's home directory — the Windows arm (issue #973).
+///
+/// Windows has no password database, so the `getpwuid`-over-`$HOME` discipline the Unix
+/// sibling enforces has no counterpart here. This resolves through the same
+/// `etcetera::base_strategy::Windows` the rest of this module's Windows branches already
+/// use ([`windows_local_app_data`]), whose `home_dir` is the user-profile ladder
+/// [`Error::HomeUnresolved`] already documents: `%USERPROFILE%` when set, then the
+/// `SHGetKnownFolderPath(FOLDERID_Profile)` Known Folder.
+///
+/// **Env-first, and therefore NOT yet the spoof-resistant read the Unix arm is.** That is
+/// the same open residual `windows_local_app_data` records for the base directories, on
+/// the same resolver, and hardening both to the Known-Folder API alone stays pinned on
+/// the follow-up rather than being decided here — issue #973's Boundaries are explicit
+/// that the Windows path policy is validated here, not rewritten.
+///
+/// Two consumers derive macOS-SHAPED paths from this ([`launch_agents_dir`],
+/// [`login_keychain`]), so on Windows they name locations that do not exist. That is not
+/// new and not this arm's doing: both already compile on Linux, where they are equally
+/// meaningless, and both live behind modules (`crate::service`, `crate::keychain`) that
+/// no non-Apple target can build. Giving this function a Windows arm keeps the three
+/// currently-clean consumers of [`claude_json`] compiling; gating it away instead would
+/// break them for no gain.
+#[cfg(windows)]
+fn home_dir() -> Result<PathBuf> {
+    use etcetera::base_strategy::{BaseStrategy, Windows};
+    let strategy = Windows::new().map_err(|_| Error::HomeUnresolved)?;
+    Ok(strategy.home_dir().to_path_buf())
+}
+
 /// The current user's login name from the password database
 /// (`getpwuid(getuid())->pw_name`), resolved the same way as [`home_dir`] — never
 /// from `$USER`, which may be unset or spoofed.
@@ -111,6 +150,17 @@ fn home_dir() -> Result<PathBuf> {
 /// preference is deliberately confined to that mirror: everything else this module
 /// resolves — the home directory above all — must key off the real user regardless of
 /// a spoofed environment, which is exactly what this function guarantees.
+///
+/// **Unix-only, deliberately loud (issue #973).** There is no Windows arm: a passwd login
+/// name has no counterpart there, and this value feeds a keychain item's `acct` — the
+/// credential-adjacent class where `crate::daemon::peer_auth`'s `compile_error!` already
+/// records that a target silently taking a wrong arm is a security defect rather than a
+/// build one. Its one caller (`crate::keychain`'s `IsolatedKeychainItem::new`) therefore
+/// fails to resolve this name on Windows instead of quietly losing the `$USER`-spoof
+/// fallback the #711 tests exist to guarantee. That module is the macOS `/usr/bin/security`
+/// client and does not build on Windows for a dozen other reasons already; its port owns
+/// the decision, and this makes the missing piece visible at the call site.
+#[cfg(unix)]
 pub(crate) fn username() -> Result<OsString> {
     let uid = current_uid();
     // SAFETY: `getpwuid` returns a pointer into a libc-owned static buffer. Exactly
@@ -160,6 +210,7 @@ pub(crate) fn username() -> Result<OsString> {
 /// [`login_shell_from`] for why a *relative* entry is refused on the same footing. Not
 /// yet wired into production (the harvest's resolution-chain wiring is issue #784), so —
 /// like [`usage_samples`] — it is `allow(dead_code)` off the test path.
+#[cfg(unix)]
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn login_shell() -> Result<PathBuf> {
     let uid = current_uid();
@@ -186,6 +237,31 @@ pub(crate) fn login_shell() -> Result<PathBuf> {
     login_shell_from(&bytes)
 }
 
+/// The current user's login shell — the Windows arm (issue #973), which is that there is
+/// none to resolve.
+///
+/// The tier-3 harvest exists for ONE reason: under launchd the daemon inherits a bare
+/// `PATH=/usr/bin:/bin:/usr/sbin:/sbin` with no `~/.local/bin`, so the user-level `PATH`
+/// has to be reconstructed by running the login shell (issue #783). Windows has neither
+/// launchd nor a passwd `pw_shell`, and a service there receives its `PATH` from the
+/// environment normally — so the reconstruction has nothing to reconstruct.
+///
+/// [`Error::LoginShellUnresolved`] is not a stub standing in for unwritten work: it is the
+/// value this ladder's own contract already defines for "no shell to run", and
+/// [`tier3_path`]'s caller turns it into a fall-through to the INHERITED `PATH`. On this
+/// target that fall-through is not a degradation — the inherited `PATH` is the user's
+/// `PATH`, which is exactly what the harvest would have been trying to recover.
+///
+/// Returning it HERE rather than from [`harvest_login_shell_path`] is deliberate: the
+/// early `?` keeps [`harvest_path_from`] and its helpers referenced on this target, so
+/// they stay live code instead of becoming a dead-code island `-D warnings` would then
+/// have to be told to ignore.
+#[cfg(windows)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn login_shell() -> Result<PathBuf> {
+    Err(Error::LoginShellUnresolved)
+}
+
 /// The pure validation half of [`login_shell`], taking the raw `pw_shell` bytes so both
 /// rejections are testable without a passwd entry to forge — the same
 /// argument-threading the [`claude_binary_from`] and [`harvest_path_from`] seams in this
@@ -198,6 +274,7 @@ pub(crate) fn login_shell() -> Result<PathBuf> {
 /// more force to the binary actually exec'd than to the `/usr/bin/env` it runs — a
 /// relative `pw_shell` would otherwise be resolved against the very `PATH` whose absence
 /// is the reason this harvest exists.
+#[cfg(unix)]
 fn login_shell_from(pw_shell: &[u8]) -> Result<PathBuf> {
     let path = PathBuf::from(OsString::from_vec(pw_shell.to_vec()));
     if !path.is_absolute() {
@@ -931,6 +1008,40 @@ pub(crate) fn build_login_shell_env_command(shell: &Path) -> Command {
 /// An absent `PATH=` line and a present-but-EMPTY one are both errors. An empty `PATH`
 /// is not a usable answer, and returning it as success would present a failed harvest
 /// as a successful one.
+/// A harvested `PATH=` value's raw bytes as an `OsString` — per-target, because the two
+/// platforms disagree about what a path's bytes ARE and the wrong answer here is SILENT.
+///
+/// On Unix `OsStringExt::from_vec` is the byte-exact inverse of `OsStrExt::as_bytes`, so a
+/// `PATH` entry that is not valid UTF-8 survives verbatim — the property
+/// `a_non_utf8_path_entry_survives_verbatim` pins, and the reason this is not simply a
+/// `String` parse. Windows `OsStr` is UTF-16 and has no byte constructor at all; the
+/// substitution that LOOKS equivalent, `String::from_utf8_lossy`, would rewrite such an
+/// entry into replacement characters and then resolve `claude` against a directory that
+/// does not exist. So the Windows arm is lossless-or-refuse: `from_utf8` succeeds exactly
+/// when nothing is lost, and anything else is reported as an unharvested `PATH` rather
+/// than silently corrupted (issue #973).
+///
+/// Unreachable on Windows today — [`login_shell`]'s arm there yields no shell to harvest
+/// from — so this exists to make the family COMPILE, and is written to fail loudly if that
+/// ever changes.
+#[cfg(unix)]
+fn os_string_from_env_bytes(_shell: &Path, value: &[u8]) -> Result<OsString> {
+    Ok(OsString::from_vec(value.to_vec()))
+}
+
+/// See the `#[cfg(unix)]` sibling for the contract; this is the lossless-or-refuse arm.
+#[cfg(windows)]
+fn os_string_from_env_bytes(shell: &Path, value: &[u8]) -> Result<OsString> {
+    match std::str::from_utf8(value) {
+        Ok(text) => Ok(OsString::from(text)),
+        Err(_) => Err(Error::LoginShellPathUnharvested {
+            shell: shell.to_path_buf(),
+            reason: "it reported a PATH that is not valid UTF-8, which this target cannot \
+                     represent without loss",
+        }),
+    }
+}
+
 fn path_from_env_output(shell: &Path, output: &[u8]) -> Result<OsString> {
     for line in output.split(|byte| *byte == b'\n') {
         if let Some(value) = line.strip_prefix(b"PATH=") {
@@ -940,7 +1051,7 @@ fn path_from_env_output(shell: &Path, output: &[u8]) -> Result<OsString> {
                     reason: "it reported an empty PATH",
                 });
             }
-            return Ok(OsString::from_vec(value.to_vec()));
+            return os_string_from_env_bytes(shell, value);
         }
     }
     Err(Error::LoginShellPathUnharvested {
@@ -1510,6 +1621,9 @@ mod tests {
         assert_ne!(swap_lock().unwrap(), daemon_lock().unwrap());
     }
 
+    // Unix-only: it drives a passwd-database accessor or a POSIX-only filesystem /
+    // shell mechanism that has no Windows counterpart (issue #973).
+    #[cfg(unix)]
     #[test]
     fn username_resolves_a_non_empty_login_name() {
         // The login name is the FALLBACK source for the isolated item's `acct`
@@ -1581,6 +1695,9 @@ mod tests {
         );
     }
 
+    // Unix-only: it drives a passwd-database accessor or a POSIX-only filesystem /
+    // shell mechanism that has no Windows counterpart (issue #973).
+    #[cfg(unix)]
     #[test]
     fn create_isolated_dir_refuses_a_pre_existing_symlink() {
         // A symlink planted at the leaf path is REFUSED, not followed — it could
@@ -2128,6 +2245,9 @@ mod tests {
 
     // -- Regression guards (T15-T18) -----------------------------------------
 
+    // Unix-only: it drives a passwd-database accessor or a POSIX-only filesystem /
+    // shell mechanism that has no Windows counterpart (issue #973).
+    #[cfg(unix)]
     #[tokio::test]
     async fn t15_a_symlinked_claude_resolves_to_the_symlink_not_its_target() {
         // Issue #101: a `claude` wrapper on PATH must be spawned AS-IS. `absolutize` performs
@@ -2539,6 +2659,9 @@ mod tests {
     /// The harvested value is preserved BYTE-for-byte, including bytes that are not
     /// valid UTF-8. A `String`-based parse would lossily rewrite such a directory into
     /// replacement characters and resolve `claude` against a path that does not exist.
+    // Unix-only: it drives a passwd-database accessor or a POSIX-only filesystem /
+    // shell mechanism that has no Windows counterpart (issue #973).
+    #[cfg(unix)]
     #[test]
     fn a_non_utf8_path_entry_survives_verbatim() {
         let mut output = b"PATH=/usr/bin:/opt/".to_vec();
@@ -2792,6 +2915,9 @@ mod tests {
     /// empty `pw_shell` does the same, so the `unwrap()` panics before the absoluteness
     /// claim is even reached. A future porter (#26 / #29) re-verifies it against the
     /// target's passwd database.
+    // Unix-only: it drives a passwd-database accessor or a POSIX-only filesystem /
+    // shell mechanism that has no Windows counterpart (issue #973).
+    #[cfg(unix)]
     #[test]
     fn every_passwd_accessor_returns_its_own_field() {
         let home_first = home_dir().unwrap();
@@ -2895,6 +3021,9 @@ mod tests {
     /// rejects a `nologin`-class EMPTY `pw_shell` before `harvest_path_from` is ever
     /// called, so testing only the latter's gate would leave the reachable branch
     /// uncovered — the seam exists so the raw passwd bytes can be threaded in.
+    // Unix-only: it drives a passwd-database accessor or a POSIX-only filesystem /
+    // shell mechanism that has no Windows counterpart (issue #973).
+    #[cfg(unix)]
     #[test]
     fn an_empty_pw_shell_entry_is_unresolved() {
         assert!(matches!(
@@ -2908,6 +3037,9 @@ mod tests {
     /// harvest exists because the daemon does not have, and violating the transport rule's
     /// discipline #1 (absolute path, never `$PATH`-resolved) that this module's own
     /// `/usr/bin/env` comment invokes.
+    // Unix-only: it drives a passwd-database accessor or a POSIX-only filesystem /
+    // shell mechanism that has no Windows counterpart (issue #973).
+    #[cfg(unix)]
     #[test]
     fn a_relative_pw_shell_is_refused_not_path_resolved() {
         assert!(matches!(
@@ -3076,7 +3208,13 @@ mod tests {
         let mut dump = OsString::from("SHELL=/bin/zsh\nHOME=/harvest/must/ignore/this\nPATH=");
         dump.push(harvested.as_os_str());
         dump.push("\nTERM=xterm\n");
-        fs::write(tmp.path().join(FIXTURE_HARVESTED_ENV), dump.into_vec()).unwrap();
+        // `as_encoded_bytes` rather than the Unix-only `into_vec`: byte-identical on the
+        // only target that runs this fixture, and portable, so staging it costs no `cfg`.
+        fs::write(
+            tmp.path().join(FIXTURE_HARVESTED_ENV),
+            dump.as_encoded_bytes(),
+        )
+        .unwrap();
         fake_shell(
             tmp.path(),
             FIXTURE_LOGIN_SHELL,
@@ -3297,6 +3435,9 @@ mod tests {
     /// hand-run `cargo test -- --ignored` would otherwise execute several tests with no
     /// parent environment behind them, and the "not a child" branch would have to be
     /// repeated in each.
+    // Unix-only: it drives a passwd-database accessor or a POSIX-only filesystem /
+    // shell mechanism that has no Windows counterpart (issue #973).
+    #[cfg(unix)]
     #[tokio::test]
     #[ignore = "child half of the re-exec environment guards — driven by run_child_case"]
     async fn launchd_env_child_payload() {

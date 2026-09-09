@@ -35,7 +35,6 @@
 //! for the canonical item does not apply here.
 
 use std::ffi::OsString;
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -138,7 +137,7 @@ impl RealAccountStash {
     ) -> Result<()> {
         // `line` (the command, payload included) is the only heap copy of the
         // escaped secret and is `Zeroizing`; only `-i` ever reaches argv.
-        let line = write_item_command_line(service, acct, keychain, payload);
+        let line = write_item_command_line(service, acct, keychain, payload)?;
         let output = run_interactive_write(&line).await?;
         if output.status.success() {
             Ok(())
@@ -278,6 +277,39 @@ fn push_quoted(out: &mut Vec<u8>, token: &[u8]) {
     out.push(b'"');
 }
 
+/// The keychain file's path as the bytes to embed in a `security` command line — per-target,
+/// because the two platforms disagree about what a path's bytes ARE.
+///
+/// On Unix `OsStrExt::as_bytes` is the byte-exact view and the only correct source: the
+/// command line is a BYTE stream, and a `to_string_lossy` would rewrite a non-UTF-8 keychain
+/// path into replacement characters and pin a keychain that does not exist — a silent wrong
+/// answer where this one is loud. Windows `OsStr` is UTF-16 and has no byte view at all;
+/// `to_str` is its lossless-or-nothing counterpart, so a path it cannot represent is REFUSED
+/// rather than mangled (issue #973).
+///
+/// The Windows arm is unreachable and unmeasured: [`SECURITY`] is `/usr/bin/security`, which
+/// that target does not have, so no Windows build reaches a [`RealAccountStash`] write. It
+/// exists so this module COMPILES there, which is the whole of what #973 claims for it —
+/// Claude Code stores its Windows credentials in a plaintext file rather than a Keychain, so
+/// this module's real port is a separate item and owns that arm's fate.
+#[cfg(unix)]
+fn keychain_path_bytes(keychain: &Path) -> Result<&[u8]> {
+    use std::os::unix::ffi::OsStrExt;
+    Ok(keychain.as_os_str().as_bytes())
+}
+
+/// See the `#[cfg(unix)]` sibling for the contract; this is the lossless-or-refuse arm.
+#[cfg(windows)]
+fn keychain_path_bytes(keychain: &Path) -> Result<&[u8]> {
+    keychain.to_str().map(str::as_bytes).ok_or_else(|| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the keychain path is not valid UTF-8 and cannot be encoded for a `security` \
+             command line without loss",
+        ))
+    })
+}
+
 /// The `security -i` stdin line for one stash write: an in-place (`-U`)
 /// `add-generic-password` of `(service, acct)`, pinning the keychain, every field
 /// double-quoted (incl. the payload). Fed on stdin so the payload stays off argv
@@ -287,7 +319,7 @@ fn write_item_command_line(
     acct: &str,
     keychain: &Path,
     payload: &[u8],
-) -> Zeroizing<Vec<u8>> {
+) -> Result<Zeroizing<Vec<u8>>> {
     // Line-based reader: a newline in `payload` would truncate the command. The
     // stored halves never contain one (the credential is single-line OAuth JSON;
     // the oauthAccount half is pure-ASCII hex) — and if one ever did, `security`
@@ -304,9 +336,9 @@ fn write_item_command_line(
     line.extend_from_slice(b" -w ");
     push_quoted(&mut line, payload);
     line.push(b' ');
-    push_quoted(&mut line, keychain.as_os_str().as_bytes());
+    push_quoted(&mut line, keychain_path_bytes(keychain)?);
     line.push(b'\n');
-    Zeroizing::new(line)
+    Ok(Zeroizing::new(line))
 }
 
 /// Run one off-argv write: spawn `security -i` (argv is only `-i` — the payload
@@ -461,7 +493,8 @@ mod tests {
             ACCT_CREDENTIAL,
             kc,
             br#"blob "x" \y"#,
-        );
+        )
+        .unwrap();
         let expected = format!(
             "add-generic-password -U -s \"Sessiometer/11111111-1111-1111-1111-111111111111\" -a \"credential\" -w \"blob \\\"x\\\" \\\\y\" \"{}\"\n",
             kc.display()
