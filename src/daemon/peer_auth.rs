@@ -5,7 +5,7 @@
 //!
 //! Splits the same-user gate the control server ([`super::UnixControl`]) applies to a
 //! state-affecting command into three testable pieces: the raw peer-identity read
-//! ([`peer_euid`] on Unix, [`peer_user_sid`] on Windows), the pure same-user decision
+//! (`peer_euid` on Unix, `peer_user_sid` on Windows), the pure same-user decision
 //! ([`is_same_user`]), and the composed stream-level check ([`peer_is_same_user`]).
 //! FAIL CLOSED throughout — an unreadable identity is never an identity, so it can never
 //! match ours (issue #196). Extracted from `daemon` per the #195 per-concern decomposition;
@@ -48,7 +48,7 @@
 //!
 //! **New — the read mutates thread state.** `getpeereid` is a pure read. Impersonation replaces
 //! the calling thread's token for the duration of the window, which is a hazard the Unix arms do
-//! not have; [`peer_user_sid`] is where it is contained, and its own docs carry the rules.
+//! not have; `peer_user_sid` is where it is contained, and its own docs carry the rules.
 //!
 //! **Net.** The gate's question — "is this peer the same local user?" — is answered at least as
 //! precisely on Windows as on Unix, and every failure mode of the Windows read denies. What the
@@ -69,6 +69,15 @@ compile_error!(
      Linux (`SO_PEERCRED`) and Windows (`ImpersonateNamedPipeClient`) are ported — see \
      ADR-0029 and ADR-0037"
 );
+
+// A NOTE ON THE DOC LINKS BELOW. Every per-target item in this module is `cfg`'d individually
+// rather than tucked inside a per-target `mod`, so a doc comment that is NOT itself gated is
+// processed on every target — and an intra-doc link from one to `peer_euid` or `peer_user_sid`
+// resolves only on the target that has it. `RUSTDOCFLAGS="-D warnings"` turns the other target's
+// unresolved link into a failed build, which is invisible here because no CI job documents the
+// Windows arm (#978). So those two names are written as CODE SPANS wherever the surrounding doc
+// is ungated, and as links only inside a doc gated to the same target. Same shape, same reason,
+// as `crate::control_transport`'s module header takes for its per-target `imp` items.
 
 /// The peer's effective uid read from the connected Unix-domain socket `fd` via
 /// `getpeereid(2)`, or `None` when the credential cannot be read (the syscall errors —
@@ -124,11 +133,11 @@ pub(crate) fn peer_euid(fd: std::os::unix::io::RawFd) -> Option<libc::uid_t> {
 
 /// The connected named-pipe peer's USER SID in the SDDL string form
 /// `ConvertSidToStringSidW` renders (`S-1-5-21-…`), or `None` when it cannot be resolved —
-/// the Windows analogue of [`peer_euid`], and ADR-0037 § Decision 3 (issue #976 AC1).
+/// the Windows analogue of `peer_euid`, and ADR-0037 § Decision 3 (issue #976 AC1).
 ///
 /// `ImpersonateNamedPipeClient` → `OpenThreadToken` → `GetTokenInformation(TokenUser)` →
 /// `ConvertSidToStringSidW` → `RevertToSelf`. FAIL CLOSED at every stage, mirroring
-/// [`peer_euid`]'s `None`-on-error contract: a value no caller can mistake for an identity.
+/// `peer_euid`'s `None`-on-error contract: a value no caller can mistake for an identity.
 ///
 /// Three rules govern the impersonation window, and each is structural here rather than a
 /// convention a later edit could quietly drop.
@@ -192,7 +201,7 @@ pub(crate) fn peer_user_sid(stream: &crate::control_transport::ControlStream) ->
 }
 
 /// Reverts this thread to its own token when it leaves scope — the impersonation window's
-/// closing half, as RAII so that no arm of [`peer_user_sid`] has to remember it.
+/// closing half, as RAII so that no arm of `peer_user_sid` has to remember it.
 ///
 /// A `RevertToSelf` that FAILS is the one condition this type does not simply absorb. Microsoft's
 /// own guidance is explicit that an application which fails to revert continues running in the
@@ -250,7 +259,7 @@ impl Drop for Impersonation {
 
 /// The pure peer-auth decision (issue #64): whether a peer bearing identity `peer` — or
 /// `None` when its identity could not be read — is the SAME local user as `ours`. Split from
-/// the platform read ([`peer_euid`], [`peer_user_sid`]) so every branch is testable without a
+/// the platform read (`peer_euid`, `peer_user_sid`) so every branch is testable without a
 /// real foreign peer or root: same-user, a foreign identity, and the unreadable branch
 /// (issue #196). FAIL CLOSED — `None` is never the same user, so a failed read denies.
 /// Inverting this comparison flips BOTH the foreign-identity and the error branch from deny to
@@ -271,7 +280,7 @@ pub(crate) fn is_same_user<Id: PartialEq>(peer: Option<Id>, ours: Id) -> bool {
 
 /// Whether the peer connected on `stream` is the same local user as this process
 /// (issue #64). Reads the peer's identity via the platform arm ([`peer_euid`] over
-/// `getpeereid(2)` on macOS or `SO_PEERCRED` on Linux; [`peer_user_sid`] over
+/// `getpeereid(2)` on macOS or `SO_PEERCRED` on Linux; `peer_user_sid` over
 /// `ImpersonateNamedPipeClient` on Windows — see the module docs) and compares it to our own
 /// via [`is_same_user`]. Any failure to read the identity is treated as NOT authenticated —
 /// fail closed. Used to gate the state-affecting `manual-swapped` / `roster-reload` commands;
