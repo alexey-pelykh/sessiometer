@@ -292,12 +292,13 @@ impl Control for UnixControl {
                 // the Unix pair has an analogue: the mode does not exist (`paths.rs`,
                 // `control_socket`), and ADR-0037 § Consequences says outright that the
                 // `0700` DIRECTORY has none either — "the pipe namespace has no
-                // directory to protect". What would stand in for the mode is the pipe's
-                // own security descriptor, which is #1513's and has not landed, so who
-                // may open the name at all is a question nothing here answers. That is
-                // why the stub below fails CLOSED — and why the reads it does not gate
-                // (`status`, `watch`, `stats`, `config-get`) are, on Windows only,
-                // answered to whoever reaches the pipe, where on Unix reaching it was
+                // directory to protect". What stands in for the mode is the pipe's own
+                // owner-only security descriptor, which #1513 landed: every instance
+                // carries `D:P(A;;GA;;;<our user SID>)`, so who may OPEN the name is
+                // now bounded to this daemon's own user. That is why the stub below
+                // fails CLOSED — and why the reads it does not gate (`status`, `watch`,
+                // `stats`, `config-get`) are, on Windows only, answered to any
+                // same-user process that reaches the pipe, where on Unix reaching it was
                 // itself the gate. The state-affecting receive path must be
                 // authenticated, never trust-by-reachability. Peer creds are read from
                 // the real fd here; `serve_control` takes the verdict as a plain bool so
