@@ -21,8 +21,10 @@
 //! base resolves through `etcetera`'s Windows strategy, which is env-first —
 //! `%LOCALAPPDATA%` when set, the `SHGetKnownFolderPath` Known-Folder API as
 //! its fallback; pinning it to the API alone (the analog of this `getpwuid`
-//! discipline) is a requirement on the Windows-enablement work, which is also
-//! where that branch first compiles.
+//! discipline) remains a requirement on the Windows-enablement work and is NOT
+//! delivered. That branch does now COMPILE (issue #973) and carries committed
+//! `#[cfg(windows)]` tests, but no CI job runs them until #978 exists, so its
+//! behavior is asserted rather than observed.
 //!
 //! That same password-database discipline extends past *locations* to the user's
 //! login shell (issue #783): under launchd the daemon inherits a bare
@@ -475,8 +477,16 @@ fn windows_logs_dir_from(local_app_data: &Path) -> PathBuf {
 /// `data_dir()` map to the ROAMING profile and are deliberately not used here
 /// (Local, never Roaming). Being env-first, this does NOT yet mirror the Unix
 /// `getpwuid`-over-`$HOME` spoof-resistance of [`home_dir`] — hardening to the
-/// Known-Folder API alone is pinned on the Windows-enablement work (which is
-/// also where this branch first compiles; nothing builds it today).
+/// Known-Folder API alone stays pinned on the Windows-enablement work and is
+/// NOT delivered here; issue #973's Boundaries validate this policy rather than
+/// rewrite it.
+///
+/// **Compiles since #973; still unexecuted.** `windows_local_app_data_resolves_the_local_root_never_the_roaming_one`
+/// and `the_live_windows_accessors_route_through_the_local_app_data_root` are
+/// committed against this branch and run the moment #978's Windows job turns
+/// on. Until then its correctness is a type-checked hypothesis, not a measured
+/// result — which is the whole reason #973 refused to read the pre-existing
+/// shape of this code as evidence about it.
 #[cfg(windows)]
 fn windows_local_app_data() -> Result<PathBuf> {
     use etcetera::base_strategy::{BaseStrategy, Windows};
@@ -615,7 +625,8 @@ pub(crate) fn launch_agents_dir() -> Result<PathBuf> {
 /// - **Windows**: `%LOCALAPPDATA%\Sessiometer`. Caveat: `etcetera`'s resolver
 ///   is env-first (see `windows_local_app_data`), so the never-overridable
 ///   invariant is NOT yet delivered on that target — hardening to the
-///   Known-Folder API alone is pinned on the Windows-enablement work.
+///   Known-Folder API alone stays pinned on the Windows-enablement work, and
+///   #973 deliberately validated that policy rather than changing it.
 ///
 /// The daemon's runtime files (the single-instance lock and the control socket)
 /// live here rather than under an env-overridable dir so that a second `run`
@@ -1562,6 +1573,259 @@ mod tests {
         assert_eq!(config.file_name().unwrap(), APP_WINDOWS);
         assert_eq!(logs.parent().unwrap(), config.as_path());
         assert_eq!(logs.file_name().unwrap(), "logs");
+    }
+
+    // --- The `#[cfg(windows)]` branches (issue #973 AC2) --------------------------------
+    //
+    // The four Windows branches in this module predate any build that compiles them, and
+    // #973's premise is that un-evidenced code is a HYPOTHESIS rather than a head start.
+    // Compiling is the first half of the evidence; these are the second — AC2 is explicit
+    // that "a branch that compiles but is never executed does not satisfy this".
+    //
+    // They are committed and `#[cfg(windows)]`, so they run the moment the Windows CI job
+    // (#978) turns on, exactly as `crate::daemon::snapshot_build`'s #976 pair does. Until
+    // then NOTHING in this repo executes them, and that is stated rather than implied: the
+    // suite above covers the PURE derivations on every host, and these cover the live
+    // accessors that select them, which only the target itself can exercise.
+
+    /// AC2, the branch every other Windows branch depends on: `windows_local_app_data`
+    /// resolves, and resolves to the LOCAL app-data root rather than the Roaming profile.
+    ///
+    /// Local-never-Roaming is a policy claim, not a spelling detail — the module docs put it
+    /// as "credential-adjacent state must not roam across a domain profile" — so it is
+    /// asserted two independent ways. Against `etcetera`'s own accessors, which pins that we
+    /// read `cache_dir` (Local) and not the `config_dir`/`data_dir` pair (Roaming) and would
+    /// catch a future edit quietly switching them; and structurally, against the resolved
+    /// path, which holds even if `etcetera` re-maps its accessors underneath us.
+    #[cfg(windows)]
+    #[test]
+    fn windows_local_app_data_resolves_the_local_root_never_the_roaming_one() {
+        use etcetera::base_strategy::{BaseStrategy, Windows};
+
+        let root = windows_local_app_data().expect("the Windows base strategy must resolve");
+        assert!(
+            root.is_absolute(),
+            "the app-data root must be absolute, got {root:?}"
+        );
+
+        let strategy = Windows::new().expect("the Windows base strategy must construct");
+        assert_eq!(
+            root,
+            strategy.cache_dir(),
+            "the root must be etcetera's LOCAL app-data accessor (`cache_dir`), never the \
+             Roaming `config_dir`/`data_dir` pair"
+        );
+        assert!(
+            !root
+                .components()
+                .any(|c| c.as_os_str().eq_ignore_ascii_case("Roaming")),
+            "credential-adjacent state must not sit under a Roaming profile: {root:?}"
+        );
+    }
+
+    /// AC2 for the three live accessors: each one's `#[cfg(windows)]` arm EXECUTES, and each
+    /// selects its OWN derivation off the shared root.
+    ///
+    /// The pairing is the point rather than the equality. `windows_config_dir_from` and
+    /// `windows_state_dir_from` are byte-identical today and deliberately kept separate, so
+    /// an arm wired to the wrong one of those two is invisible here — but an arm wired to
+    /// `windows_logs_dir_from`, or one that fell through to a Unix derivation, is not. The
+    /// structural assertions below are what make that concrete rather than tautological.
+    #[cfg(windows)]
+    #[test]
+    fn the_live_windows_accessors_route_through_the_local_app_data_root() {
+        let root = windows_local_app_data().expect("the Windows base strategy must resolve");
+
+        let config = config_dir().expect("config_dir must resolve on Windows");
+        let logs = logs_dir().expect("logs_dir must resolve on Windows");
+        let support = support_dir().expect("support_dir must resolve on Windows");
+
+        assert_eq!(config, windows_config_dir_from(&root));
+        assert_eq!(logs, windows_logs_dir_from(&root));
+        assert_eq!(support, windows_state_dir_from(&root));
+
+        // The same structure the host-agnostic derivation test pins, asserted here against
+        // the values production actually hands out.
+        assert!(config.starts_with(&root));
+        assert_eq!(config.file_name().unwrap(), APP_WINDOWS);
+        assert_eq!(support, config, "config and state share one directory");
+        assert_eq!(logs.parent().unwrap(), config.as_path());
+        assert_eq!(logs.file_name().unwrap(), "logs");
+    }
+
+    /// AC2 for the arm #973 ADDED: `home_dir`'s Windows branch resolves the user-profile
+    /// ladder `Error::HomeUnresolved` documents, and the paths derived from it are anchored
+    /// on it rather than on something else.
+    ///
+    /// It is NOT asserted to equal the app-data root: the two come from different `etcetera`
+    /// accessors and an assertion that they agree would pass for the wrong reason on a host
+    /// where `%LOCALAPPDATA%` happens to sit under the profile.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_home_dir_arm_resolves_the_user_profile() {
+        use etcetera::base_strategy::{BaseStrategy, Windows};
+
+        let home = home_dir().expect("the Windows home ladder must resolve");
+        assert!(
+            home.is_absolute(),
+            "the home directory must be absolute, got {home:?}"
+        );
+        assert_eq!(
+            home,
+            Windows::new().expect("strategy").home_dir(),
+            "the arm must read etcetera's user-profile ladder, not invent its own"
+        );
+        assert_eq!(
+            claude_json().expect("claude_json must resolve on Windows"),
+            home.join(".claude.json"),
+            "Claude Code's per-user state file hangs off the resolved profile"
+        );
+    }
+
+    /// AC2 for the other arm #973 added: there is no login shell to harvest on Windows, and
+    /// the tier-3 ladder degrades through the path its own contract already defines.
+    ///
+    /// Both halves are asserted because only the second is the behaviour that matters: an
+    /// `Err` from `login_shell` is worth nothing if `harvest_login_shell_path` were to
+    /// translate it into something the resolver treats differently.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_has_no_login_shell_to_harvest() {
+        assert!(
+            matches!(login_shell(), Err(Error::LoginShellUnresolved)),
+            "Windows has no passwd `pw_shell`; the ladder's own 'no shell to run' value is \
+             the answer"
+        );
+        assert!(
+            matches!(
+                harvest_login_shell_path().await,
+                Err(Error::LoginShellUnresolved)
+            ),
+            "the harvest entry point must surface that unchanged, so tier 3 falls through to \
+             the inherited PATH rather than failing the resolve"
+        );
+    }
+
+    /// AC2 + AC4 for the byte seam: the Windows arm of `os_string_from_env_bytes` is
+    /// lossless-or-refuse, and REFUSING is the half that matters.
+    ///
+    /// This is the Windows twin of `a_non_utf8_path_entry_survives_verbatim`, and it exists
+    /// because the tempting substitution — `String::from_utf8_lossy` — passes a test that
+    /// only checks the UTF-8 case. The second half is what fails against it: a lossy arm
+    /// would return `Ok` carrying replacement characters, and a `claude` resolved against
+    /// that path does not exist.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_env_byte_seam_is_lossless_or_refuses() {
+        let shell = Path::new(r"C:\nonexistent\shell.exe");
+
+        assert_eq!(
+            os_string_from_env_bytes(shell, b"C:\\bin;C:\\Users\\x\\bin").unwrap(),
+            OsString::from(r"C:\bin;C:\Users\x\bin"),
+            "a representable value passes through exactly"
+        );
+
+        let mut lossy = b"C:\\bin;C:\\opt\\".to_vec();
+        lossy.push(0xff);
+        lossy.extend_from_slice(b"dir");
+        assert!(
+            matches!(
+                os_string_from_env_bytes(shell, &lossy),
+                Err(Error::LoginShellPathUnharvested { .. })
+            ),
+            "a value this target cannot represent must be REFUSED, never rewritten into \
+             replacement characters"
+        );
+    }
+
+    /// AC3: a non-ASCII path round-trips through the Windows derivations without loss.
+    ///
+    /// The probe is a lone high surrogate appended to non-ASCII text — the Windows analogue
+    /// of the `0xff` byte the Unix suite uses. It is representable in an `OsString` (whose
+    /// Windows encoding is potentially ill-formed UTF-16) and NOT in a `String`, which is
+    /// exactly the gap a `to_string_lossy` substitution falls through.
+    ///
+    /// The closing `assert_ne!` is the load-bearing one. Without it the round-trip above
+    /// would pass vacuously for any path that happens to be valid UTF-8; with it, the probe
+    /// is PROVEN to be a value lossy conversion destroys, so surviving it means something.
+    #[cfg(windows)]
+    #[test]
+    fn a_non_ascii_windows_path_round_trips_without_lossy_conversion() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+        let units: Vec<u16> = r"C:\Ωμέγα\日本語\Ко́т-🦀"
+            .encode_utf16()
+            .chain(std::iter::once(0xD800))
+            .collect();
+        let root = PathBuf::from(OsString::from_wide(&units));
+        assert_eq!(
+            root.as_os_str().encode_wide().collect::<Vec<u16>>(),
+            units,
+            "the probe itself must survive the OsString round trip, or it tests nothing"
+        );
+
+        for derived in [
+            windows_config_dir_from(&root),
+            windows_state_dir_from(&root),
+            windows_logs_dir_from(&root),
+        ] {
+            assert!(
+                derived.starts_with(&root),
+                "{derived:?} must nest under the base"
+            );
+            let wide: Vec<u16> = derived.as_os_str().encode_wide().collect();
+            assert_eq!(
+                &wide[..units.len()],
+                &units[..],
+                "every code unit of the base — the unpaired surrogate included — must appear \
+                 VERBATIM in the derived path"
+            );
+            assert_ne!(
+                derived,
+                PathBuf::from(derived.to_string_lossy().into_owned()),
+                "the probe must be a value lossy conversion actually destroys, or the \
+                 assertions above prove nothing"
+            );
+        }
+    }
+
+    /// AC3's host-agnostic half, which runs on EVERY target today rather than waiting on
+    /// #978: the platform derivations are pure, so a non-ASCII base can be pushed through
+    /// all three families here and checked for verbatim survival.
+    ///
+    /// It cannot reach the unpaired-surrogate case (that is representable only in a Windows
+    /// `OsString`), so it does not replace the `#[cfg(windows)]` test above — it is the
+    /// evidence that exists BEFORE the Windows job does.
+    #[test]
+    fn a_non_ascii_base_survives_every_platform_derivation() {
+        let base = PathBuf::from("/базовий/Ωμέγα/日本語/🦀");
+
+        for derived in [
+            apple_config_dir_from(&base, None),
+            apple_support_dir_from(&base),
+            apple_logs_dir_from(&base),
+            xdg_config_dir_from(&base, None),
+            xdg_state_dir_from(&base, None),
+            xdg_state_default_from(&base),
+            windows_config_dir_from(&base),
+            windows_state_dir_from(&base),
+            windows_logs_dir_from(&base),
+        ] {
+            assert!(
+                derived.starts_with(&base),
+                "{derived:?} must keep the non-ASCII base verbatim"
+            );
+            assert_eq!(
+                derived.components().count(),
+                base.components().count()
+                    + derived
+                        .strip_prefix(&base)
+                        .expect("prefix asserted above")
+                        .components()
+                        .count(),
+                "no base component may be dropped or merged"
+            );
+        }
     }
 
     #[test]
