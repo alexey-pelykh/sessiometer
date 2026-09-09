@@ -46,8 +46,10 @@ from the documented API contract and has never run; **#978** is the job that cha
 #976's own AC2 waits on it. The rest are NOT dischargeable by #978 either. The cross-user test and
 the foreign-account open each need a SECOND account on the host; the standard-user run needs a
 NON-privileged one; a single-account runner supplies neither, and compiling the target does not
-conjure an account. They stay #976's, so **#976 stays open** — and each bullet below now carries
-its own state rather than leaving a reader to infer it from the issue.
+conjure an account. **#1523** was filed for exactly that environment, because a sweep at the time
+found no open item promising it — so the three stay #976's while the thing they wait on is
+tracked, rather than owed to nobody. **#976 stays open**, and each bullet below now carries its
+own state rather than leaving a reader to infer it from the issue.
 
 ## Context
 
@@ -486,12 +488,13 @@ onto their owners is tracker work this record does not perform, and merging this
   SID fixtures and against a same-user pipe round trip, which is the same construction this bullet
   already rejects. A real cross-user measurement needs a SECOND account on the host, which neither
   the spike runner nor #978's job supplies — #978 makes the target compile, not the account exist.
+  **#1523** owns that environment.
 - **No foreign-account open against the DACL.** Every connection in the run was opened by the same
   account that created the pipe, so the descriptor's *denying* half was never exercised — only its
   granting half, implicitly, by the client's own successful open. **#976** owes one cross-account open attempt against a live
   instance; it is a two-account test, not a design question. Still owed after #976's port, and for
   the reason the bullet already gives: the descriptor is #1513's and unchanged, and what is missing
-  is the second account, not code. #978 does not supply one.
+  is the second account, not code. #978 does not supply one; **#1523** does.
 - **No standard-user run.** The runner's account SID ends in `-500`, the built-in Administrator RID,
   so every measurement was taken in a privileged context. Impersonating a client at Identification
   level is documented not to require `SeImpersonatePrivilege`, and a same-user token is a further
@@ -502,7 +505,7 @@ onto their owners is tracker work this record does not perform, and merging this
   impersonation window it landed is exactly the exempt case, and its failure arm is a DENY rather
   than a panic, so the untested direction is a false REFUSAL on a standard account, not a false
   accept. A runner whose account SID does not end in `-500` is what settles it, and #978's job as
-  specified does not promise one.
+  specified does not promise one — **#1523** is where that promise lives.
 - **Nothing about pipe-name pre-creation.** CHECK 2 measured only the case where *we* create the
   name first. Whether a foreign local user can create `\\.\pipe\sessiometer-...` before the daemon
   does — and so either deny the daemon its own name or stand a server in front of the CLI — was not

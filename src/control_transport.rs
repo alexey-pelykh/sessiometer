@@ -981,6 +981,24 @@ mod imp {
     /// pipe that IS answering under the wrong owner is the opposite of absent — reporting it as
     /// "no daemon" would tell the operator to start a daemon while a hostile one held the name.
     ///
+    /// That choice is HALF-EFFECTIVE and the shortfall is a residual rather than a fix. Other
+    /// callers of [`connect`] collapse every error kind before the kind can matter — a
+    /// `Err(_) => Ok(None)` arm in `crate::daemon::socket`, an `.ok()?` in `crate::poke`, and a
+    /// cache-miss mapping in `crate::use_account` that maps EVERY error identically. On those
+    /// paths the refusal above IS read as "no daemon", which is the outcome the kind was chosen to
+    /// prevent, and the operator gets no signal at all. It is benign today rather than dangerous:
+    /// a squatter holding the name means `first_pipe_instance(true)` already denied the real
+    /// daemon its bind, so there is no live daemon those paths could have reached. Widening them
+    /// is a change to callers this item does not own, so it is named here rather than made.
+    ///
+    /// One FALSE-REFUSAL case the two-value widening does NOT cover, for the same reason it covers
+    /// the first: both accepted values come from THIS process's token. Under MIXED elevation — an
+    /// elevated daemon on a machine whose default-owner policy names the Administrators group,
+    /// talked to by a non-elevated CLI whose filtered token reports the account for both values —
+    /// neither candidate matches the pipe's owner and a live daemon is refused. Availability, not
+    /// security: it fails closed, and it needs both the non-default policy and the elevation split
+    /// to arise. Unmeasurable here for the same reason as everything else in this arm.
+    ///
     /// UNMEASURED, like every other line of this arm: no CI job compiles this target (**#978**),
     /// so nothing here has been run against a real pipe, let alone against a second account. The
     /// committed `#[cfg(windows)]` tests are what run the moment that job exists.

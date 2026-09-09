@@ -319,9 +319,11 @@ impl KeepWarm for RealKeepWarmEngine {
 /// A held single-instance lock on the native-local `daemon.lock`: a kernel advisory
 /// `flock(LOCK_EX|LOCK_NB)` on Unix, a `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK |
 /// LOCKFILE_FAIL_IMMEDIATELY)` byte-range lock on Windows (issue #976). The file is held open
-/// for the process lifetime — the kernel releases the lock on death (or on drop) on BOTH
-/// targets, so there is no stale-PID reaping. A second `run` cannot acquire it and gets
-/// [`Error::AlreadyRunning`] (process exit `3`).
+/// for the process lifetime — the kernel releases the lock on death (or on drop) on BOTH targets,
+/// so there is no stale-PID reaping. A second `run` cannot acquire it and gets
+/// [`Error::AlreadyRunning`] (process exit `3`). The two targets are not equivalent on the TIMING
+/// of that release, and the § What the file lock does NOT carry over section below records the
+/// difference rather than leaving the word "death" to carry it.
 ///
 /// # Why a FILE lock on Windows and not a named mutex (issue #976 AC3)
 ///
@@ -349,11 +351,26 @@ impl KeepWarm for RealKeepWarmEngine {
 /// MSRV reaches it (#257) — is implemented over `LockFileEx` on Windows, so this choice puts both
 /// arms on one future convergence point instead of stranding the Windows arm off it.
 ///
-/// **What the file lock does NOT carry over.** `flock` is ADVISORY; a Windows byte-range lock is
-/// MANDATORY, so a third-party reader of `daemon.lock` is refused rather than ignored. Nothing in
-/// this crate reads the file's CONTENT — it is zero bytes and exists only to be locked — so the
-/// difference has no consumer here. It is recorded because it is a real semantic difference and
-/// the next reader should not have to rediscover it.
+/// **What the file lock does NOT carry over.** Two differences, and the second is the one with a
+/// consumer.
+///
+/// `flock` is ADVISORY; a Windows byte-range lock is MANDATORY, so a third-party reader of
+/// `daemon.lock` is refused rather than ignored. Nothing in this crate reads the file's CONTENT —
+/// it is zero bytes and exists only to be locked — so that one has no consumer here. It is
+/// recorded because it is a real semantic difference and the next reader should not have to
+/// rediscover it.
+///
+/// RELEASE ON ABRUPT DEATH IS NOT PROMPT ON WINDOWS, where `flock`'s is. `LockFileEx`'s own
+/// documented Remarks say the time the system takes to unlock a lock held by a terminated process
+/// "depends upon available system resources", and recommend a process unlock explicitly before it
+/// terminates. A graceful exit is fine — dropping the `File` closes the handle and releases the
+/// range — but after a kill or a crash there is an indeterminate window in which
+/// [`InstanceLock::is_held`] can still answer `true` and a restart can still take
+/// [`Error::AlreadyRunning`]. That is a startup-latency and operator-confusion hazard, not a
+/// correctness one: the lock cannot be held by two live daemons either way, and the conclusion
+/// above still holds, since a stale LOCK clears itself where a stale PID FILE would not. An
+/// explicit `UnlockFileEx` in `Drop` would not help the case that has the hazard — the process is
+/// already gone — so this is named rather than fixed.
 ///
 /// UNMEASURED on Windows, like every other line of that arm: no CI job compiles this target
 /// (**#978**). The reasoning above is from the documented API contract, not from a run.
