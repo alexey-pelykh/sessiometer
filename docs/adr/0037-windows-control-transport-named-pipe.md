@@ -27,7 +27,8 @@ graph and is run by the non-required `spike-972-windows-transport` workflow.
 
 **Amended** — 2026-09-09, on **#1511**. The decision is unchanged; the record gained the output of
 a SECOND proof. #1511 added an accept-loop / `watch` mode to the same spike package, and its
-measured block now sits beside the #972 one in § What was measured, and where. That is § Lifecycle's
+measured block is quoted in § The second proof: the accept loop and `watch` (#1511) — a NEW section,
+sibling to the #972 one under § Context, rather than an addition inside it. That is § Lifecycle's
 own requirement rather than a courtesy: it disposes of the spike directory and says this ADR is
 what survives it, *"which is why the measured output above is quoted here in full rather than
 linked to a CI run that expires"*. The second proof's output had been quoted only in an issue
@@ -205,11 +206,13 @@ printed"*. It answers that item's AC3: how many pipe instances the accept loop k
 and what happens when they are exhausted. Quoted here for the reason § Lifecycle gives — this
 record outlives the directory that produced it.
 
-The `host pid` and the pipe name it appears in vary per run, as do the three timing figures
-(CHECK 7's recovery interval, CHECK 9's busy window, and CHECK 4's implicit ordering). Everything
-else — every `CHECK` verdict, the `MEASUREMENT` line, and the ANSWER — is invariant. Read a timing
-figure's ORDER OF MAGNITUDE and never its digits: each resolves no finer than one poll pass of the
-proof's own cadence, which the CHECK 7 line states.
+What varies per run is the `host pid`, the pipe name it appears in, and the elapsed times CHECK 7
+and CHECK 9 print. Everything else — every `CHECK` verdict, the `MEASUREMENT` line, and the ANSWER
+— is invariant, and that was checked rather than assumed: a second green run of byte-identical
+spike source differs from this block on those lines and no others. Read an elapsed time as an
+ORDER OF MAGNITUDE and never as a value to reproduce. Each is paced by the retry cadence of the
+check that measured it as much as by the kernel, and the two checks do not share one — CHECK 7's
+own line states its cadence, and CHECK 9 retries on the instance interval alone.
 
 ```text
 [spike-1511] host pid           : 7512

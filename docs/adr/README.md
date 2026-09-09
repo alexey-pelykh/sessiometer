@@ -49,7 +49,7 @@ issue threads is consolidated here in a stable, discoverable place.
 | [0034](0034-log-handle-charset-is-a-reader-obligation.md) | The log handle charset is unconstrained; surviving one is each reader's obligation | Accepted |
 | [0035](0035-at-cap-time-stays-cadence-bounded.md) | `time_at_cap_secs` stays cadence-bounded; the asymmetry with the census is stated on the surface | Accepted |
 | [0036](0036-prior-configuration-witness.md) | An absent `config.toml` is a first run only when no prior-configuration witness survives | Accepted |
-| [0037](0037-windows-control-transport-named-pipe.md) | The Windows daemon control transport is a named pipe; peer identity is the caller's user SID | Accepted (decision in force; the port is #1511, the dependent identity/lock item #976 and the enforcing CI job #978) |
+| [0037](0037-windows-control-transport-named-pipe.md) | The Windows daemon control transport is a named pipe; peer identity is the caller's user SID | Accepted (amended 2026-09-09 by #1511 — the record gained a second proof's measured output; decision in force, the port is #1511, the dependent identity/lock item #976 and the enforcing CI job #978) |
 
 ## Conventions
 
