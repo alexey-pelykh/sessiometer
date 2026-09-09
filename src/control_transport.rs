@@ -205,8 +205,9 @@ mod imp {
     /// the pathological saturated case rather than the normal one. BOUNDED here rather than left
     /// to the caller because not every client bounds itself — and boundedness is a property of
     /// the CALL SITE, not of the function. `poke`'s best-effort read wraps no timeout of its own,
-    /// and `cli::query_status` wraps none at the `daemon status` path, though its other caller
-    /// `probe_socket_responsive` does wrap it in `DAEMON_STATUS_SOCKET_TIMEOUT`.
+    /// and neither does the plain `status` verb, which awaits `cli::query_status` directly. That
+    /// function's OTHER caller does bound it: `probe_socket_responsive` — the liveness probe
+    /// `daemon status` and `daemon restart` share — wraps it in `DAEMON_STATUS_SOCKET_TIMEOUT`.
     /// `ControlSocketCache::query_status` is bounded that same way, by `use_account`'s
     /// `CONTROL_SOCKET_TIMEOUT`. One unbounded site is enough to need this budget.
     const CLIENT_BUSY_BUDGET: Duration = Duration::from_secs(1);
@@ -311,9 +312,9 @@ mod imp {
     struct PendingAccept<'a> {
         idle: &'a RefCell<Option<NamedPipeServer>>,
         /// The instance being connected, and whatever [`ControlListener::accept`] leaves here is
-        /// what [`Drop`] parks back in `idle`. `None` once the caller has claimed it (a completed
-        /// accept), or where a failed `connect` deliberately discarded it — which is one of the
-        /// three ways that failure resolves, not the only one.
+        /// what [`Drop`] parks back in `idle`. `None` ONLY once the caller has claimed it (a
+        /// completed accept): the failed-`connect` path resolves two ways and neither discards,
+        /// so it always leaves an instance here for [`Drop`] to park.
         server: Option<NamedPipeServer>,
     }
 
@@ -339,9 +340,10 @@ mod imp {
     /// instance through the one await that would otherwise need it.
     pub(crate) struct ControlListener {
         name: OsString,
-        /// The created-but-not-yet-connected instance. `None` in two windows: after an instance
-        /// was handed out and its replacement was refused, and after a `connect` failed and its
-        /// replacement was refused as busy. The next [`ControlListener::accept`] waits for one —
+        /// The created-but-not-yet-connected instance. `None` in ONE window: after an instance
+        /// was handed out and its replacement was refused. A failed `connect` no longer leaves it
+        /// empty — that path keeps its own instance whenever no replacement can be made, so
+        /// [`Drop`] always parks one back. The next [`ControlListener::accept`] waits for one —
         /// for as long as the refusal keeps being `ERROR_PIPE_BUSY`; any other error surfaces.
         idle: RefCell<Option<NamedPipeServer>>,
     }
@@ -612,8 +614,10 @@ mod unix_tests {
     use super::ControlListener;
     use std::os::unix::fs::PermissionsExt;
 
-    /// The `0600` mode is the WHOLE of the Unix control channel's access control — nothing checks
-    /// the peer before the bytes are read — and until this test nothing anywhere asserted it. The
+    /// The `0600` mode is the Unix control channel's REACHABILITY control — who can open the
+    /// socket at all — which `src/daemon/socket.rs` calls defense-in-depth beside the peer check
+    /// it runs BEFORE any state-affecting command. Until this test nothing anywhere asserted the
+    /// mode, which is what makes it worth pinning even though it is not the only layer. The
     /// relocation in #1511 moved the `chmod` between files; had it dropped the call, every gate in
     /// the repo would still have gone green, and "relocated, not rewritten" would have rested on
     /// reading the two versions side by side.
