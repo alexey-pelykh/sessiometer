@@ -617,7 +617,11 @@ mod imp {
     /// Callers that KEY on the kind, mapping `NotFound | ConnectionRefused` to a friendly "no
     /// daemon" answer: `cli::query_status`, `cli::request_shutdown`, `use_account::query_next_swap`.
     /// Keying does not make them immune — it is what makes them WRONG in the zero-instance window,
-    /// where a live daemon is reported as absent (#1515 owns the `use` fallback that produces).
+    /// where a live daemon is reported as absent. What all three then do is REFUSE, with zero
+    /// writes: `DaemonNotRunning` twice and `UseNextRequiresDaemon` once, each telling the operator
+    /// to start a daemon that is running (#1517). The standalone FALLBACK the same window produces
+    /// is `socket::request_swap`'s alone, and #1515 owns that — the two are separate harms and an
+    /// earlier revision of this file attributed the second one to a caller that cannot take it.
     ///
     /// Callers that DISCARD it: `crate::poke` and `use_account`'s status cache, which degrade into
     /// an extra live poll; `socket::request_swap`, the one caller that takes [`is_saturated`],

@@ -286,13 +286,22 @@ impl Control for UnixControl {
                 // Authenticate the peer as the SAME local user (issue #64): a
                 // state-affecting command (`manual-swapped`, `swap` #167) is honored
                 // only from our own uid. On macOS / Linux the socket is already
-                // `0600` in a `0700` dir, so this is defense-in-depth; on Windows
-                // there is no mode and the equivalent descriptor is #1513's, so the
-                // Windows arm has this and the directory only — which is why the
-                // stub below fails CLOSED. The state-affecting receive
-                // path must be authenticated, never trust-by-reachability. Peer creds
-                // are read from the real fd here; `serve_control` takes the verdict as
-                // a plain bool so it stays testable over an in-memory duplex.
+                // `0600` in a `0700` dir, so this is defense-in-depth; on Windows it
+                // is the only layer there is, and an earlier revision of this comment
+                // credited the arm with a directory it does not have. NEITHER half of
+                // the Unix pair has an analogue: the mode does not exist (`paths.rs`,
+                // `control_socket`), and ADR-0037 § Consequences says outright that the
+                // `0700` DIRECTORY has none either — "the pipe namespace has no
+                // directory to protect". What would stand in for the mode is the pipe's
+                // own security descriptor, which is #1513's and has not landed, so who
+                // may open the name at all is a question nothing here answers. That is
+                // why the stub below fails CLOSED — and why the reads it does not gate
+                // (`status`, `watch`, `stats`, `config-get`) are, on Windows only,
+                // answered to whoever reaches the pipe, where on Unix reaching it was
+                // itself the gate. The state-affecting receive path must be
+                // authenticated, never trust-by-reachability. Peer creds are read from
+                // the real fd here; `serve_control` takes the verdict as a plain bool so
+                // it stays testable over an in-memory duplex.
                 #[cfg(unix)]
                 let peer_authenticated = peer_is_same_user(&stream);
                 // The Windows peer identity — `ImpersonateNamedPipeClient` → `OpenThreadToken`

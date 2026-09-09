@@ -1134,10 +1134,16 @@ async fn query_next_swap(socket: &Path) -> Result<StatusResponse> {
                     // No socket file, or a stale one with no listener → no live daemon.
                     // On Windows that inference is not sound: the accept loop's refill is
                     // a single attempt, so a live daemon can reach zero instances, stop
-                    // holding the pipe name, and answer `ERROR_FILE_NOT_FOUND` — this arm
-                    // then falls back to standalone against a daemon that is running.
-                    // Tracked at #1515; nothing here distinguishes the two yet, and the
-                    // path is unreachable until #978 compiles this target.
+                    // holding the pipe name, and answer `ERROR_FILE_NOT_FOUND`.
+                    //
+                    // What that costs HERE is a refusal, not a fallback, and an earlier
+                    // revision of this comment named the wrong one. The arm fails CLOSED —
+                    // `UseNextRequiresDaemon`, exit 1, zero writes — so nothing diverges;
+                    // the operator is told to start a daemon that is already running.
+                    // The standalone fallback belongs to `request_swap`, which is why it
+                    // is the one caller that takes `is_saturated`, and #1515 owns it.
+                    // This message is #1517's. Nothing here distinguishes the two cases
+                    // yet, and the path is unreachable until #978 compiles this target.
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
                         Error::UseNextRequiresDaemon
                     }
