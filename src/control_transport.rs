@@ -54,10 +54,14 @@
 //! The shape used instead — link the module that IS reachable, name the item beside it in a code
 //! span — is the one `crate::canary`'s `reconcile_on_start` reference already takes.
 //!
-//! NOT here: the peer's identity, which ADR-0037 assigns to **#976** and this item's Boundaries
-//! exclude (`crate::daemon::peer_auth` is the Unix half). The one identity-protecting piece that
-//! IS here is the client's SQOS flag pair, because it rides on the client's own open call and so
-//! is transport code — ADR-0037 § Consequences → Negative splits them the same way.
+//! NOT here: the peer's identity, which ADR-0037 assigns to **#976** and which landed there — in
+//! `crate::daemon::peer_auth`, now per-target rather than the Unix-only half this comment used to
+//! call it. Three identity-shaped pieces ARE here, each because it rides on a TRANSPORT call
+//! rather than on the peer: the client's SQOS flag pair, set on the client's own open; the
+//! client-side check of the SERVER's owner SID that #976 added beside it (`verify_server_owner`);
+//! and the process-token helpers that arm reads its own SID through, which live here so that
+//! exactly one site in the crate opens our own token. ADR-0037 § Consequences → Negative splits
+//! transport from peer the same way.
 //!
 //! The owner-only descriptor IS here as of **#1513**, and the module doc above records it with the
 //! other four decisions. It was the one part of ADR-0037 § Decision 2 that #1511 did not land — not
@@ -65,7 +69,10 @@
 //! `first_pipe_instance` and `reject_remote_clients`. What the DACL buys is bounded, and the bound
 //! is the ADR's own: it governs who may OPEN an instance we created, and says nothing about who may
 //! CREATE the name. There is no `0700` directory here to close that half, which is why the client
-//! open sets the SQOS pair above and why the client-side owner check remains **#976**'s.
+//! open sets the SQOS pair above and why **#976** landed the client-side owner check beside it.
+//! Neither is MEASURED, and saying so is the point: no CI job compiles this crate for Windows, so
+//! both are reasoned from the documented API contract rather than from a run — **#978** is the
+//! job that turns that around.
 
 // The control transport is per-target and neither arm below is portable beyond the targets
 // ADR-0029 and ADR-0037 declare. Fail at compile time naming the missing port, rather than
@@ -226,14 +233,16 @@ mod imp {
         ClientOptions, NamedPipeClient, NamedPipeServer, PipeMode, ServerOptions,
     };
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, LocalFree, ERROR_INVALID_SECURITY_DESCR, ERROR_PIPE_BUSY, HANDLE,
+        CloseHandle, GetLastError, LocalFree, ERROR_INVALID_SECURITY_DESCR, ERROR_PIPE_BUSY,
+        ERROR_SUCCESS, HANDLE,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        SDDL_REVISION_1,
+        GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
     };
     use windows_sys::Win32::Security::{
-        GetTokenInformation, TokenUser, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+        GetTokenInformation, TokenOwner, TokenUser, OWNER_SECURITY_INFORMATION, PSID,
+        SECURITY_ATTRIBUTES, TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::Storage::FileSystem::{SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT};
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -434,7 +443,10 @@ mod imp {
     }
 
     /// THIS PROCESS's own user SID, in the SDDL string form `ConvertSidToStringSidW` renders
-    /// (`S-1-5-21-…`) — the trustee of the owner-only DACL above (issue #1513 AC2).
+    /// (`S-1-5-21-…`) — the trustee of the owner-only DACL above (issue #1513 AC2), and since
+    /// #976 the identity the daemon compares an impersonated PEER against
+    /// (`crate::daemon::peer_auth`) and the one a client requires of a SERVER it opened
+    /// ([`verify_server_owner`]).
     ///
     /// Read from the process token, never hard-coded and never configurable: a SID that came from
     /// anywhere else would be a DACL naming somebody the daemon merely BELIEVES it is. FAIL CLOSED
@@ -442,11 +454,40 @@ mod imp {
     /// no instance — mirroring `peer_euid`'s `None`-on-error contract on the Unix side: a value no
     /// caller can mistake for an identity.
     ///
-    /// This is the daemon's OWN identity, which is a different question from the PEER's. Resolving
-    /// the caller's SID by impersonation (`ImpersonateNamedPipeClient` → `OpenThreadToken` → …) is
-    /// ADR-0037 § Decision 3 and belongs to **#976**; when it lands it will want this same read to
-    /// compare against, and lifting this function's visibility is that item's to do.
-    fn our_user_sid() -> io::Result<String> {
+    /// `pub(crate)` since #976 rather than private, which ADR-0037 § Decision 3 anticipated: the
+    /// peer check wants THIS read to compare against, so that the identity the daemon grants
+    /// access to and the identity it authenticates against cannot drift apart.
+    pub(crate) fn our_user_sid() -> io::Result<String> {
+        with_process_token(token_user_sid)
+    }
+
+    /// THIS PROCESS's own token OWNER SID — the SID Windows stamps as the owner of a kernel
+    /// object this token creates (issue #976, ADR-0037 § Consequences → Negative).
+    ///
+    /// A DIFFERENT question from [`our_user_sid`], and the difference is the whole reason this
+    /// exists. `TokenUser` is who we ARE and is invariant under elevation. `TokenOwner` is who
+    /// new objects are OWNED BY, and the two diverge in one configuration: a process holding a
+    /// full Administrators token on a machine whose "Default owner for objects created by members
+    /// of the Administrators group" policy is set to the Administrators group rather than to the
+    /// object creator. There, a pipe this daemon creates is owned by `BUILTIN\Administrators`
+    /// while `our_user_sid` still reports the account.
+    ///
+    /// [`verify_server_owner`] accepts EITHER, which is why both are read. Both are values of
+    /// THIS process's own token, so widening to two never admits an identity that is not ours;
+    /// what it removes is a false REFUSAL of a live daemon in that configuration, which nothing
+    /// in this repo can measure until **#978** compiles this arm.
+    fn our_owner_sid() -> io::Result<String> {
+        with_process_token(token_owner_sid)
+    }
+
+    /// Open this process's own token for query, hand it to `read`, and close it.
+    ///
+    /// The ONE `OpenProcessToken` site in this module, and deliberately so: the source guard at
+    /// the foot of this file pins the call's arity at one, which is what makes "the token read is
+    /// of THIS process" a property of the file rather than of whichever site a reader checked
+    /// (issue #1513 AC2). #976 added a second reader ([`our_owner_sid`]) and routed it through
+    /// here rather than opening a second token.
+    fn with_process_token<T>(read: impl FnOnce(HANDLE) -> io::Result<T>) -> io::Result<T> {
         let mut token: HANDLE = std::ptr::null_mut();
         // SAFETY: `GetCurrentProcess` returns a pseudo-handle needing no cleanup; `token` is a
         // live local the kernel writes only on success.
@@ -457,39 +498,47 @@ mod imp {
                 "OpenProcessToken failed: GetLastError={code}"
             )));
         }
-        let result = token_user_sid(token);
+        let result = read(token);
         // SAFETY: `token` is the handle `OpenProcessToken` just wrote and has not been closed.
         unsafe { CloseHandle(token) };
         result
     }
 
-    /// `GetTokenInformation(TokenUser)` on `token`, rendered as an SDDL SID string.
+    /// One `GetTokenInformation` class read off `token`, as a buffer the caller casts.
     ///
-    /// The buffer is a `Vec<u64>`, not a `Vec<u8>`, and that is load-bearing rather than fussy: the
-    /// kernel writes a `TOKEN_USER` here, whose `Sid` member is a pointer, so reading it out of a
-    /// 1-byte-aligned allocation is undefined behaviour on a technicality that happens to work. A
-    /// `u64` element type makes the allocation 8-byte aligned, which is at least
-    /// `align_of::<TOKEN_USER>()`.
-    fn token_user_sid(token: HANDLE) -> io::Result<String> {
+    /// The buffer is a `Vec<u64>`, not a `Vec<u8>`, and that is load-bearing rather than fussy:
+    /// every class read through here writes a struct whose members include a pointer, so reading
+    /// one out of a 1-byte-aligned allocation is undefined behaviour on a technicality that
+    /// happens to work. A `u64` element type makes the allocation 8-byte aligned, which is at
+    /// least the alignment of any of them.
+    ///
+    /// `minimum` is the size of the struct the CALLER will read back out, and `what` names the
+    /// class in the error text. Shared by [`token_user_sid`] and [`token_owner_sid`] since #976;
+    /// before that it was inlined in the first of those.
+    fn token_information(
+        token: HANDLE,
+        class: TOKEN_INFORMATION_CLASS,
+        minimum: usize,
+        what: &str,
+    ) -> io::Result<Vec<u64>> {
         let mut needed: u32 = 0;
         // First call sizes the buffer; it is EXPECTED to fail with `ERROR_INSUFFICIENT_BUFFER`, so
         // its return value is deliberately ignored and only `needed` is read.
         // SAFETY: a null buffer with length 0 is the documented sizing form; `needed` is a live
         // local.
-        unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+        unsafe { GetTokenInformation(token, class, std::ptr::null_mut(), 0, &mut needed) };
         // Checked against the size of what the kernel says it will WRITE, not merely against zero.
-        // The struct is read back out of this buffer below, so a `needed` under `size_of::<TOKEN_USER>()`
-        // would allocate less than the deref reads — out of bounds, which the zero check alone does
-        // not exclude. Only reachable if `GetTokenInformation` violates its documented contract, and
-        // this function already declines to trust it in the other direction; declining in the
-        // direction that is UB costs one comparison.
-        if (needed as usize) < std::mem::size_of::<TOKEN_USER>() {
+        // The struct is read back out of this buffer by the caller, so a `needed` under
+        // `minimum` would allocate less than the deref reads — out of bounds, which the zero check
+        // alone does not exclude. Only reachable if `GetTokenInformation` violates its documented
+        // contract, and this function already declines to trust it in the other direction;
+        // declining in the direction that is UB costs one comparison.
+        if (needed as usize) < minimum {
             // SAFETY: reads the last-error slot set by the sizing call above.
             let code = unsafe { GetLastError() };
             return Err(io::Error::other(format!(
-                "GetTokenInformation(TokenUser, sizing) reported {needed} bytes, below the {} a \
-                 TOKEN_USER occupies: GetLastError={code}",
-                std::mem::size_of::<TOKEN_USER>()
+                "GetTokenInformation({what}, sizing) reported {needed} bytes, below the {minimum} \
+                 that class occupies: GetLastError={code}"
             )));
         }
 
@@ -504,7 +553,7 @@ mod imp {
         let ok = unsafe {
             GetTokenInformation(
                 token,
-                TokenUser,
+                class,
                 buffer.as_mut_ptr().cast::<c_void>(),
                 needed,
                 &mut needed,
@@ -514,23 +563,61 @@ mod imp {
             // SAFETY: reads the last-error slot set by the call above.
             let code = unsafe { GetLastError() };
             return Err(io::Error::other(format!(
-                "GetTokenInformation(TokenUser) failed: GetLastError={code}"
+                "GetTokenInformation({what}) failed: GetLastError={code}"
             )));
         }
+        Ok(buffer)
+    }
 
+    /// `GetTokenInformation(TokenUser)` on `token`, rendered as an SDDL SID string.
+    ///
+    /// `pub(crate)` since #976: `crate::daemon::peer_auth` reads the PEER's SID off the token
+    /// `OpenThreadToken` yields inside its impersonation window, which is this same read against
+    /// a different token.
+    pub(crate) fn token_user_sid(token: HANDLE) -> io::Result<String> {
+        let buffer = token_information(
+            token,
+            TokenUser,
+            std::mem::size_of::<TOKEN_USER>(),
+            "TokenUser",
+        )?;
         // SAFETY: on success the kernel wrote a `TOKEN_USER` at the start of `buffer`, which is
-        // correctly aligned for it (see the doc comment) and large enough (`needed` bytes). The
-        // `Sid` it carries points INTO that same buffer, so it stays valid while `buffer` is alive
-        // — which it is for the whole of `sid_to_string` below.
+        // correctly aligned for it (see `token_information`) and large enough (`needed` bytes,
+        // checked to be at least `size_of::<TOKEN_USER>()`). The `Sid` it carries points INTO that
+        // same buffer, so it stays valid while `buffer` is alive — which it is for the whole of
+        // `sid_to_string` below.
         let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        sid_string_or_err(sid, "TOKEN_USER.User.Sid")
+    }
+
+    /// `GetTokenInformation(TokenOwner)` on `token`, rendered as an SDDL SID string — the
+    /// sibling of [`token_user_sid`] for the class [`our_owner_sid`] reads (issue #976).
+    fn token_owner_sid(token: HANDLE) -> io::Result<String> {
+        let buffer = token_information(
+            token,
+            TokenOwner,
+            std::mem::size_of::<TOKEN_OWNER>(),
+            "TokenOwner",
+        )?;
+        // SAFETY: exactly as in `token_user_sid`, for a `TOKEN_OWNER` — a struct of one `PSID`
+        // pointing into the same live buffer.
+        let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_OWNER>()).Owner };
+        sid_string_or_err(sid, "TOKEN_OWNER.Owner")
+    }
+
+    /// A SID pointer rendered as a string, refusing a null one rather than passing it on.
+    ///
+    /// `what` names the member it came from, so a failure says WHICH out-parameter the kernel
+    /// left null instead of printing a bare converter error.
+    fn sid_string_or_err(sid: *mut c_void, what: &str) -> io::Result<String> {
         if sid.is_null() {
-            return Err(io::Error::other(
-                "TOKEN_USER.User.Sid was null: the process token carries no user SID",
-            ));
+            return Err(io::Error::other(format!(
+                "{what} was null: the token carries no SID for that class"
+            )));
         }
         sid_to_string(sid).map_err(|code| {
             io::Error::other(format!(
-                "ConvertSidToStringSidW failed: GetLastError={code}"
+                "ConvertSidToStringSidW({what}) failed: GetLastError={code}"
             ))
         })
     }
@@ -856,6 +943,139 @@ mod imp {
         }
     }
 
+    /// Refuse a pipe whose OWNER is not this user — the client-side half of the squat defence
+    /// ADR-0037 assigns to **#976** (§ Consequences → Negative, restated in § What this spike did
+    /// NOT establish at the same strength).
+    ///
+    /// WHY a client-side check exists here at all, when `getpeereid` never needed one: on Unix
+    /// the support directory is `0700`, so a foreign user cannot create our socket PATH and the
+    /// only direction that ever had to be authenticated was server-checks-client. The pipe
+    /// namespace has no directory to protect, and `first_pipe_instance` is first-creator-wins —
+    /// so a foreign local process that creates the control pipe's name before the daemon does
+    /// either denies the daemon its own name or stands a SERVER in front of the CLI. The
+    /// `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` pair on the open below caps what such a
+    /// server may DO with the token it impersonates; this is what stops the CLI from talking to
+    /// it in the first place.
+    ///
+    /// `GetSecurityInfo(SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION)` on the connected client
+    /// handle reads the owner of the PIPE OBJECT — a property of the kernel object, set from the
+    /// creating token, not a live-process lookup. That is what makes it the right primitive and
+    /// `GetNamedPipeServerProcessId` the wrong one, for exactly the reason ADR-0037 § Decision 3
+    /// gives about the client-pid call in the other direction: a pid is reusable and TOCTOU-prone.
+    ///
+    /// TWO accepted values, both read from THIS process's own token: [`our_user_sid`] and
+    /// [`our_owner_sid`]. Under the default configuration they are the same string and the second
+    /// is redundant. They diverge only for a process holding a full Administrators token on a
+    /// machine whose default-owner policy names the Administrators group — where the pipe the
+    /// daemon created is owned by that group while `our_user_sid` still reports the account, and a
+    /// single-value check would REFUSE a live daemon. Accepting both cannot admit a foreign user:
+    /// every candidate is a SID of our own token. It does mean two administrators on such a
+    /// machine are not distinguished from each other — a boundary that is already not a boundary,
+    /// since either can debug the other's process outright.
+    ///
+    /// FAIL CLOSED: an owner that cannot be read is a refusal, not a pass. A rogue server whose
+    /// DACL withholds `READ_CONTROL` from us lands there, and so does any error.
+    ///
+    /// `PermissionDenied` rather than `NotFound`, deliberately. Three callers key on
+    /// `NotFound | ConnectionRefused` to mean "the daemon is not running" (see [`connect`]), and a
+    /// pipe that IS answering under the wrong owner is the opposite of absent — reporting it as
+    /// "no daemon" would tell the operator to start a daemon while a hostile one held the name.
+    ///
+    /// That choice is HALF-EFFECTIVE, and the shortfall is a residual rather than a fix. Only
+    /// three of [`connect`]'s callers key on the kind at all; the rest DISCARD it, so on those the
+    /// refusal above is read as "no daemon" — the outcome the kind was chosen to prevent. **Do not
+    /// re-list them here.** [`connect`]'s own doc below already partitions every caller by what it
+    /// does with the kind, derives that partition from a grep rather than maintaining it by hand,
+    /// and records that two earlier hand-written lists were each short. This is a third place that
+    /// would go stale the same way, so it points there instead — and an earlier revision of THIS
+    /// comment did ship such a list, and was short by half.
+    ///
+    /// What that partition means for a refusal HERE is worse than for the zero-instance window it
+    /// was written about, because the two harms it names both apply. `socket::request_swap`
+    /// discards the kind and takes [`is_saturated`], which is `is_pipe_busy` only — so a refusal
+    /// reaches its "no daemon reachable" arm and the caller falls through to the STANDALONE swap
+    /// path: a write, not a refusal. The swap lock still serialises it, so it is not a torn or
+    /// double write; what it bypasses is the daemon's own adjudication. **#1515** owns that
+    /// fallback. The three best-effort notifiers instead print "is the daemon running?" — a wrong
+    /// signal rather than no signal, and `crate::capture` writes one of them into a durable event.
+    ///
+    /// The squat case those harms would otherwise be about cannot arise: a squatter holding the
+    /// name means `first_pipe_instance(true)` already denied the real daemon its bind, so there is
+    /// no live daemon to have been misreported. The cases that DO reach a live daemon are the
+    /// mixed-elevation false refusal named below and any failure inside this function or the two
+    /// SID reads it calls — which fail closed BY DESIGN, and whose closure is what those callers
+    /// then misread. Widening them is a change to callers this item does not own.
+    ///
+    /// One FALSE-REFUSAL case the two-value widening does NOT cover, for the same reason it covers
+    /// the first: both accepted values come from THIS process's token. Under MIXED elevation — an
+    /// elevated daemon on a machine whose default-owner policy names the Administrators group,
+    /// talked to by a non-elevated CLI whose filtered token reports the account for both values —
+    /// neither candidate matches the pipe's owner and a live daemon is refused. Availability, not
+    /// security: it fails closed, and it needs both the non-default policy and the elevation split
+    /// to arise. Unmeasurable here for the same reason as everything else in this arm.
+    ///
+    /// UNMEASURED, like every other line of this arm: no CI job compiles this target (**#978**),
+    /// so nothing here has been run against a real pipe, let alone against a second account. The
+    /// committed `#[cfg(windows)]` tests are what run the moment that job exists.
+    fn verify_server_owner(client: &NamedPipeClient) -> io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+
+        let owner = pipe_owner_sid(client.as_raw_handle() as HANDLE)?;
+        let ours = our_user_sid()?;
+        if owner == ours {
+            return Ok(());
+        }
+        let owner_default = our_owner_sid()?;
+        if owner == owner_default {
+            return Ok(());
+        }
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "the control pipe is owned by {owner}, not by this user ({ours}, whose objects \
+                 default to {owner_default}); refusing to talk to it"
+            ),
+        ))
+    }
+
+    /// The OWNER SID of the kernel object behind `handle`, in the SDDL string form.
+    ///
+    /// `GetSecurityInfo` returns a `WIN32_ERROR` rather than a BOOL — `ERROR_SUCCESS` is the only
+    /// success — and it does NOT set the last-error slot, so the code it returns is the whole of
+    /// the diagnosis. The security descriptor it allocates is the caller's to `LocalFree`, and the
+    /// owner pointer points INTO that descriptor, so the render happens before the free.
+    fn pipe_owner_sid(handle: HANDLE) -> io::Result<String> {
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut descriptor: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `handle` is the raw handle of a live `NamedPipeClient` owned by the caller,
+        // which outlives this call. `owner` and `descriptor` are live locals the API writes only
+        // on success; the four out-parameters we do not want are documented as skippable by
+        // passing null, and `securityinfo` asks for the owner alone.
+        let rc = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if rc != ERROR_SUCCESS {
+            return Err(io::Error::other(format!(
+                "GetSecurityInfo(OWNER_SECURITY_INFORMATION) on the control pipe failed: {rc}"
+            )));
+        }
+        let rendered = sid_string_or_err(owner, "the control pipe's owner");
+        // SAFETY: `descriptor` is exactly the pointer that call returned and has not been freed.
+        // Freed unconditionally, on the error path too — `rendered` is already an owned `String`
+        // (or an error) by here, so nothing borrowed from the descriptor outlives this.
+        unsafe { LocalFree(descriptor) };
+        rendered
+    }
+
     /// Connect to the daemon's control endpoint at `path`.
     ///
     /// `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` is set on EVERY open (ADR-0037
@@ -880,7 +1100,9 @@ mod imp {
     /// against the opens for that reason, and cannot do better than counting.
     ///
     /// The CLIENT-side check of the SERVER's owner SID — the other half of that squat defence —
-    /// is **#976**'s and is not here.
+    /// landed with **#976** and IS here: every successful open goes through
+    /// [`verify_server_owner`] before the client is handed out, so a squatting server is refused
+    /// rather than merely held at identification level.
     ///
     /// The error KINDS callers key on line up with the Unix arm: a daemon that is not running
     /// leaves no pipe name, so `CreateFile` fails `ERROR_FILE_NOT_FOUND` → `NotFound`, which is
@@ -896,9 +1118,11 @@ mod imp {
     /// a moment and `NotFound` after — a running daemon reported as absent, with the whole busy
     /// budget potentially spent watching it change. Two earlier revisions of this comment shipped
     /// a hand-written list of the affected callers and each called itself the whole set; both were
-    /// short. So derive it instead — `git grep 'control_transport::connect'` outside this module
-    /// is every client, and the partition below is that grep's output at this commit, not a list
-    /// maintained beside it.
+    /// short. So derive it instead — `git grep 'control_transport::connect'` outside this module,
+    /// minus this crate's own tests, is every client, and the partition below is that grep's
+    /// output at this commit rather than a list maintained beside it. The test exclusion is not a
+    /// hedge: #976 added three such call sites to `crate::daemon::snapshot_build`, and a recipe
+    /// that no longer reproduces its own list is the exact weakness this paragraph replaced.
     ///
     /// Callers that KEY on the kind, mapping `NotFound | ConnectionRefused` to a friendly "no
     /// daemon" answer: `cli::query_status`, `cli::request_shutdown`, `use_account::query_next_swap`.
@@ -935,7 +1159,13 @@ mod imp {
                 .pipe_mode(PipeMode::Byte)
                 .open(&name);
             match attempt {
-                Ok(client) => return Ok(client),
+                // The owner check runs on the CONNECTED handle, so it sits in the loop's `Ok`
+                // arm rather than around the loop: a busy retry never reaches it, and no client
+                // is ever handed out unverified.
+                Ok(client) => {
+                    verify_server_owner(&client)?;
+                    return Ok(client);
+                }
                 Err(err) if is_pipe_busy(&err) => {
                     if tokio::time::Instant::now() >= deadline {
                         return Err(err);
@@ -960,6 +1190,13 @@ mod imp {
 // caller infers it, so naming it here would be an unused import under `-D warnings`. Its
 // definition inside each arm is what documents the client/server type split.
 pub(crate) use imp::{cleanup, connect, is_saturated, ControlListener, ControlStream};
+// The Windows identity reads `crate::daemon::peer_auth` needs (issue #976, ADR-0037 § Decision 3):
+// `our_user_sid` is the side of the comparison that says who WE are — the same read #1513 makes
+// the trustee of every instance's DACL, so access granted and access authenticated cannot drift —
+// and `token_user_sid` is the class read that module applies to the token `OpenThreadToken` yields
+// inside its impersonation window. Target-gated so the Unix build sees no unused re-export.
+#[cfg(windows)]
+pub(crate) use imp::{our_user_sid, token_user_sid};
 
 #[cfg(all(test, unix))]
 mod unix_tests {
@@ -1276,6 +1513,32 @@ mod windows_option_source_guard {
             code.matches(".security_qos_flags(").count(),
             clients,
             "a second security_qos_flags call would override the first — one per client open"
+        );
+    }
+
+    /// The CLIENT-side owner check, pinned to the same arity for the same reason as the flags above.
+    ///
+    /// `verify_server_owner` is the other half of the squat defence ADR-0037 § What this spike did
+    /// NOT establish assigns to **#976**, and deleting its call is a fail-OPEN edit that changes no
+    /// other spelling in this file: the open still succeeds, the client is still handed out, and
+    /// every compiler, test and CI job on every target stays green — the same argument the
+    /// null-descriptor pin above already makes in those words, applied to the one new call this
+    /// item added. Nothing else can catch it, because no job compiles this arm (**#978**).
+    ///
+    /// The whole call including the `?` is matched, not the bare name: a `let _ = ` binding would
+    /// discard the refusal while leaving the name in place, and the definition and its doc-link
+    /// mentions are other occurrences of that name. Counted against the client opens rather than
+    /// asserted `> 0`, so a SECOND open added without the check fails here rather than riding on
+    /// the first one's match.
+    #[test]
+    fn every_client_open_verifies_the_server_owner() {
+        let code = transport_code();
+        let (clients, _) = builders(&code);
+        assert_eq!(
+            code.matches("verify_server_owner(&client)?").count(),
+            clients,
+            "every client-side pipe open must verify the server's owner SID before handing the \
+             client out (ADR-0037 § What this spike did NOT establish, issue #976)"
         );
     }
 

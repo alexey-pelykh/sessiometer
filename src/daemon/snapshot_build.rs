@@ -3593,8 +3593,12 @@ mod tests {
         let control =
             UnixControl::new(crate::control_transport::ControlListener::bind(&sock).expect("bind"));
 
-        // A client opens the dedicated read-only connection and subscribes.
-        let mut client = tokio::net::UnixStream::connect(&sock)
+        // A client opens the dedicated read-only connection and subscribes — through the
+        // production client entry point rather than `UnixStream::connect`, so the test follows
+        // whatever transport the target has. On Unix that IS the same call it always made
+        // (`ControlClient` is `UnixStream` there); on Windows it is the named-pipe open, which is
+        // what lets this test compile at all once #978 builds that target (issue #976).
+        let mut client = crate::control_transport::connect(&sock)
             .await
             .expect("connect");
         client.write_all(b"{\"cmd\":\"watch\"}\n").await.unwrap();
@@ -4266,6 +4270,7 @@ mod tests {
         assert_eq!(signal, Some(ControlSignal::ManualSwapped));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn peer_is_same_user_authenticates_a_same_process_peer() {
         // Issue #64: the manual-hold receive path authenticates the peer's uid via the
@@ -4275,7 +4280,9 @@ mod tests {
         // credential-read/`getuid` computation that the boolean-gated `control_reply`
         // tests take as a given. Since issue #963 that read is per-target — `getpeereid`
         // on macOS, `SO_PEERCRED` on Linux — so this is also what proves each arm is
-        // reached on the target that compiles it.
+        // reached on the target that compiles it. The Windows arm's counterpart is
+        // `peer_is_same_user_authenticates_a_same_user_pipe_peer` below (issue #976); it needs a
+        // real pipe rather than a socket pair, so the two cannot be one test.
         let (ours, _peer) = tokio::net::UnixStream::pair().expect("socketpair");
         assert!(
             peer_is_same_user(&ours),
@@ -4283,11 +4290,197 @@ mod tests {
         );
     }
 
+    /// Issue #976 AC1, the Windows arm's positive control: a real named-pipe exchange between two
+    /// ends of THIS process authenticates, and the SID the impersonation resolves is our own.
+    ///
+    /// The socket-pair shape the Unix sibling uses has no analogue — a pipe peer has to actually
+    /// connect — so this binds a listener at a temp path, opens a client through the production
+    /// `connect`, and accepts. That makes it a round trip over BOTH identity directions at once:
+    /// the client's `verify_server_owner` check of the SERVER's owner SID has to pass for
+    /// `connect` to return at all, and `peer_is_same_user` then checks the reverse.
+    ///
+    /// What it does NOT establish is what ADR-0037 § What this spike did NOT establish already
+    /// says of the spike, for the same reason: both ends are this one process, so a DIFFERENT
+    /// user's SID being reported as different is not measured here and cannot be without a second
+    /// account. That residual stays open on #976 rather than being papered over by a test that
+    /// looks like it covers it.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn peer_is_same_user_authenticates_a_same_user_pipe_peer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("daemon.sock");
+        let listener =
+            crate::control_transport::ControlListener::bind(&path).expect("bind the control pipe");
+
+        // The client open must go first: `accept` completes only once a client is attached.
+        let connect = crate::control_transport::connect(&path);
+        let (client, server) = tokio::join!(connect, listener.accept());
+        let _client = client.expect("the client verifies our own pipe's owner and connects");
+        let server = server.expect("accept");
+
+        assert!(
+            peer_is_same_user(&server),
+            "a pipe peer opened by this same process is the same local user"
+        );
+        assert_eq!(
+            peer_user_sid(&server),
+            crate::control_transport::our_user_sid().ok(),
+            "the impersonated peer SID must be this process's own user SID, not something else \
+             that merely compares equal"
+        );
+    }
+
+    /// Issue #976: the impersonation window CLOSES — the production regression test for the
+    /// negative control ADR-0037 records the #972 spike's `CHECK 0` canaries as.
+    ///
+    /// This is the highest-consequence property of the Windows arm and the one a passing
+    /// `peer_is_same_user` cannot report on. A `RevertToSelf` that returned TRUE while leaving the
+    /// token in place would leave this thread — and, on the daemon's `current_thread` runtime,
+    /// every task co-scheduled on it — running as the peer, while the authentication above still
+    /// answered correctly. `OpenThreadToken` failing `ERROR_NO_TOKEN` is what says the thread
+    /// carries no impersonation token; it is asserted BEFORE as well as after, so a green here
+    /// cannot come from a thread that was already dirty.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn the_impersonation_window_leaves_no_token_on_the_thread() {
+        use windows_sys::Win32::Foundation::{GetLastError, ERROR_NO_TOKEN, HANDLE};
+        use windows_sys::Win32::Security::TOKEN_QUERY;
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, OpenThreadToken};
+
+        fn thread_carries_an_impersonation_token() -> bool {
+            let mut token: HANDLE = std::ptr::null_mut();
+            // SAFETY: a pseudo-handle needing no cleanup, and a live local the kernel writes only
+            // on success.
+            let opened = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) };
+            if opened == 0 {
+                // SAFETY: reads the last-error slot set by the call above.
+                let code = unsafe { GetLastError() };
+                assert_eq!(
+                    code, ERROR_NO_TOKEN,
+                    "the canary must fail for the ONE documented reason, or it is not a canary"
+                );
+                return false;
+            }
+            // SAFETY: `token` is the handle `OpenThreadToken` just wrote, closed exactly once.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(token) };
+            true
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("daemon.sock");
+        let listener =
+            crate::control_transport::ControlListener::bind(&path).expect("bind the control pipe");
+        let connect = crate::control_transport::connect(&path);
+        let (client, server) = tokio::join!(connect, listener.accept());
+        let _client = client.expect("connect");
+        let server = server.expect("accept");
+
+        assert!(
+            !thread_carries_an_impersonation_token(),
+            "this thread must start clean, or the assertion after the window proves nothing"
+        );
+        let sid = peer_user_sid(&server);
+        assert!(sid.is_some(), "the peer SID resolves for a same-user peer");
+        assert!(
+            !thread_carries_an_impersonation_token(),
+            "the impersonation window must be closed by the time peer_user_sid returns"
+        );
+    }
+
+    /// Issue #976: ADR-0037's no-`.await`-between-impersonate-and-revert rule, mechanized.
+    ///
+    /// Impersonation mutates the CALLING THREAD's token, so a suspension point inside the window
+    /// lets tokio poll other tasks on that thread while it wears the client's token — and
+    /// `UnixControl::serve` spawns exactly such tasks. The ADR is explicit that the type system
+    /// does not catch this: `trait Control::serve` declares no `Send` bound, so a `!Send` guard
+    /// would compile. What enforces it is that the whole module is synchronous, and this is what
+    /// says so out loud — on EVERY target, which matters because no CI job compiles the Windows
+    /// arm until **#978** and a rule nothing checks is a rule that decays into a paragraph.
+    ///
+    /// A source scan, the same instrument `control_transport`'s option guard and `src/usage.rs`'s
+    /// egress sweep use for a claim the test target cannot reach, and it is exact here rather than
+    /// approximate: the module has no async surface at all, so ANY occurrence is a regression
+    /// rather than a shape to be parsed around. Comment-only lines are dropped first, or this
+    /// test's own prose would satisfy it.
+    #[test]
+    fn the_impersonation_window_contains_no_suspension_point() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("daemon")
+            .join("peer_auth.rs");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        let code: String = source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // The canary: a zero below must mean "no async surface", never "the scan broke".
+        assert!(
+            code.contains("fn peer_is_same_user"),
+            "source scan is broken: peer_auth.rs did not read back as the module it guards"
+        );
+        for needle in [".await", "async fn", "async move", "async {"] {
+            assert!(
+                !code.contains(needle),
+                "`{needle}` in peer_auth.rs: the impersonation window must contain no suspension \
+                 point (ADR-0037 § Consequences → Negative, issue #976)"
+            );
+        }
+    }
+
+    /// Issue #976: the pure decision over the identity type the WINDOWS arm hands it — exercised
+    /// on every target, which is the point of `is_same_user` being generic rather than cfg'd into
+    /// two copies. Until #978 compiles that arm, this is the only place its decision runs at all.
+    ///
+    /// The three branches are the uid test's three, in SID form. The equality is byte equality on
+    /// purpose: both operands come from `ConvertSidToStringSidW`, which renders one canonical
+    /// spelling per SID, so a case-insensitive comparison would only widen what counts as a match.
+    /// The fixtures below are two real-shaped account SIDs differing in their last RID — the same
+    /// one-digit-apart relationship the uid test's `owner + 1` has, and the case a comparison that
+    /// matched on a PREFIX would get wrong.
+    #[test]
+    fn is_same_user_denies_a_foreign_and_an_unreadable_sid() {
+        let ours = "S-1-5-21-3623811015-3361044348-30300820-1013".to_owned();
+
+        assert!(
+            is_same_user(Some(ours.clone()), ours.clone()),
+            "our own SID is the same local user"
+        );
+        assert!(
+            !is_same_user(
+                Some("S-1-5-21-3623811015-3361044348-30300820-1014".to_owned()),
+                ours.clone()
+            ),
+            "a different account in the same domain is not the same local user"
+        );
+        // A prefix of ours, which is what an account whose RID is a truncation would render as.
+        // Equality rejects it; a `starts_with` comparison would not.
+        assert!(
+            !is_same_user(
+                Some("S-1-5-21-3623811015-3361044348-30300820-101".to_owned()),
+                ours.clone()
+            ),
+            "a SID that merely shares a prefix is not the same local user"
+        );
+        // Unreadable identity (impersonation failed, the token had no user SID, the render
+        // failed) → fail closed, exactly as the uid arm's `None` does.
+        assert!(
+            !is_same_user(None, ours),
+            "an unreadable peer identity must fail closed"
+        );
+    }
+
+    #[cfg(unix)]
     #[test]
     fn is_same_user_denies_foreign_and_unreadable_credentials() {
         // Issue #196: the pure peer-auth decision, exercised on all three branches so a
         // silent auth-inverting refactor cannot ship green. Fixed uids (no syscall) —
         // the real credential-read path is covered by the socket tests around this one.
+        // Unix-gated since #976 only because it NAMES `libc::uid_t`; the decision it grades is
+        // target-neutral and `is_same_user_denies_a_foreign_and_an_unreadable_sid` above runs the
+        // same three branches over the identity type the Windows arm produces.
         let owner: libc::uid_t = 1_000;
         // Same user → authenticated.
         assert!(
@@ -4307,6 +4500,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn peer_euid_fails_closed_when_the_credential_read_errors() {
         use std::os::unix::io::AsRawFd;
@@ -4331,6 +4525,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn serve_control_rejects_a_foreign_uid_peer() {
         use std::os::unix::io::AsRawFd;

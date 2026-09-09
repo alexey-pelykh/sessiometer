@@ -134,18 +134,21 @@ use crate::usage_store::{append_sample, compact_and_roll, RetentionPolicy, Sampl
 // (the [`Daemon`] state machine) and its wiring.
 mod peer_auth;
 
-// Unix-only: the control server's call site is `#[cfg(unix)]` because the Windows peer identity
-// (ADR-0037 § Decision 3) is **#976**'s and not the transport port's (issue #1511). Re-exporting
-// it unconditionally would be an unused re-export on that target — a warning, and `-D warnings`
-// under the #978 job that will build it.
-#[cfg(unix)]
+// Unconditional since issue #976 landed the Windows peer identity (ADR-0037 § Decision 3): the
+// control server's call site takes the target-neutral `ControlStream` and no longer splits on
+// `cfg`, so this re-export is reached on every supported target.
 pub(crate) use peer_auth::peer_is_same_user;
-// `is_same_user` / `peer_euid` are exercised only by the in-module peer-auth tests
-// (production reaches them through `peer_is_same_user`); re-export test-scoped so
-// `mod tests`' `use super::*` resolves them unmodified while a non-test build sees no
-// unused re-export.
+// The pure decision and the per-target identity reads are exercised only by the in-module
+// peer-auth tests (production reaches them through `peer_is_same_user`); re-export test-scoped so
+// `mod tests`' `use super::*` resolves them unmodified while a non-test build sees no unused
+// re-export. `is_same_user` is target-neutral; the read beneath it is not, and each arm is
+// re-exported only where it exists.
 #[cfg(test)]
-pub(crate) use peer_auth::{is_same_user, peer_euid};
+pub(crate) use peer_auth::is_same_user;
+#[cfg(all(test, unix))]
+pub(crate) use peer_auth::peer_euid;
+#[cfg(all(test, windows))]
+pub(crate) use peer_auth::peer_user_sid;
 
 mod snapshot;
 
