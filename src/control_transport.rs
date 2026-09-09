@@ -792,34 +792,56 @@ mod windows_tests {
 /// clause each one is derived from, never as discharging it.
 ///
 /// Mutations were run against it rather than assumed, because a spelling guard's whole value is
-/// which edits it survives, and BOTH results below were found by an independent pass mutating
-/// what an earlier revision of this comment merely asserted. What goes red: deleting any pinned
-/// call; appending a SECOND `security_qos_flags` to the same builder chain, which compiles since
-/// the setter takes `&mut self` and is last-write-wins, and which an exact-spelling match alone
-/// does not catch — hence the by-NAME count; widening the level inside the one call, caught
-/// because the needle matches through its closing paren; and an unflagged client open in another
-/// module, or in this one below the guard's own header, which an earlier revision let through.
+/// which edits it survives, and every result below was found by an independent pass mutating what
+/// an earlier revision of this comment merely asserted. What goes red: deleting any pinned call;
+/// appending a SECOND `security_qos_flags` to the same builder chain, which compiles since the
+/// setter takes `&mut self` and is last-write-wins, and which an exact-spelling match alone does
+/// not catch — hence the by-NAME count; widening the level inside the one call, caught because
+/// the needle matches through its closing paren; an unflagged client open in another module, or
+/// in this one below the guard's own header, which an earlier revision let through; and moving
+/// the flags off the call into a trailing `//` or into a `/* */` block, two mutations that
+/// deleted the call, formatted clean, and left every count balanced until the marker assertion in
+/// [`transport_code`] closed them.
 ///
-/// What stays GREEN, stated because a guard that hides its blind spot is worse than none: making
-/// the flags CONDITIONAL. A source scan reads text, not control flow, so an open whose flags sit
-/// behind an `if` satisfies both counts while violating what AC5 asks. That is the shape of the
-/// gap #1514's round-trip closes and this cannot.
+/// What stays GREEN, stated because a guard that hides its blind spot is worse than none. Making
+/// the flags CONDITIONAL: a source scan reads text, not control flow, so an open whose flags sit
+/// behind an `if` satisfies both counts while violating what AC5 asks — the shape of the gap
+/// #1514's round-trip closes and this cannot. And spelling a needle inside a STRING LITERAL above
+/// this header, which the marker assertion does not reach and which inflates both sides the way
+/// the comment mutations did — the residue of counting text at all.
 #[cfg(test)]
 mod windows_option_source_guard {
-    /// This file's own source up to the start of this guard, comment-only lines dropped and
-    /// whitespace collapsed.
+    /// This file's own source up to the start of this guard, comment-only lines dropped, whitespace
+    /// collapsed, and the result asserted to carry no comment marker at all.
     ///
-    /// Three reductions, each load-bearing. Dropping comment-only lines is what keeps the counts
+    /// Four reductions, each load-bearing. Dropping comment-only lines is what keeps the counts
     /// honest: every option below is named several times in the prose above, so a scan of the raw
-    /// text would be satisfied by doc comments alone. The file carries no trailing comments, so
-    /// dropping whole lines is complete; should one ever appear carrying one of these names the
-    /// count inflates and this guard goes RED — an alarm that points here, never a silent pass.
-    /// Collapsing whitespace keeps it stable under `cargo fmt`: a call the formatter wraps across
-    /// lines still matches. And cutting the text at this guard's own module header is what stops
-    /// the needles below from counting THEMSELVES — a scan that matches its own literals stays
-    /// green with the code it guards deleted, which was measured, not supposed.
+    /// text would be satisfied by doc comments alone. Dropping whole lines is NOT complete on its
+    /// own, and an earlier revision of this comment claimed it was: a trailing `//`, or a `/* */`
+    /// block, leaves the spelling in text the reduction keeps, which inflates BOTH sides of every
+    /// count in lockstep and passes green with the call itself deleted — measured on this guard,
+    /// not supposed. The marker assertion below is what closes that, and it is also why the
+    /// counting can stay a substring scan instead of a Rust lexer: the region is required to hold
+    /// no comment for the scan to be wrong about. Collapsing whitespace keeps it stable under
+    /// `cargo fmt`: a call the formatter wraps across lines still matches. And cutting the text at
+    /// this guard's own module header is what stops the needles below from counting THEMSELVES — a
+    /// scan that matches its own literals stays green with the code it guards deleted, which was
+    /// measured too.
+    ///
+    /// The constraint that puts on the file is real and deliberate: above this header, a comment
+    /// goes on its own line. Moving it there is the repair the failure message asks for. Teaching
+    /// the reduction Rust's comment grammar is the alternative, and a lexer that mis-tracks a raw
+    /// string would be a silent pass of exactly the shape this replaces.
     fn transport_code() -> String {
-        split_at_guard().0
+        let code = split_at_guard().0;
+        for marker in ["//", "/*", "*/"] {
+            assert!(
+                !code.contains(marker),
+                "a `{marker}` survived the reduction: a comment above this guard's own header can \
+                 hold text these counts cannot tell from code — put it on its own line"
+            );
+        }
+        code
     }
 
     /// The reduced source split into (everything before this guard, everything from its header on).
