@@ -213,6 +213,16 @@ mod imp {
     /// `daemon status` and `daemon restart` share — wraps it in `DAEMON_STATUS_SOCKET_TIMEOUT`.
     /// `ControlSocketCache::query_status` is bounded that same way, by `use_account`'s
     /// `CONTROL_SOCKET_TIMEOUT`. One unbounded site is enough to need this budget.
+    ///
+    /// Its SIZE is set against those same bounded call sites, which the paragraph above
+    /// names without measuring: `DAEMON_STATUS_SOCKET_TIMEOUT`, `CONTROL_SOCKET_TIMEOUT` and
+    /// `CLIENT_NOTIFY_TIMEOUT` are each two seconds, so this budget is HALF of every outer
+    /// bound that exists. A saturated daemon can therefore spend half of a bounded caller's
+    /// whole allowance retrying before the exchange starts, leaving the other half for the
+    /// exchange itself. That split is a chosen ceiling, not a measured optimum: what a real
+    /// saturation costs is exactly what nobody has measured until #978 compiles and runs
+    /// this arm. Read it as the largest share of a caller's budget this retry may take, and
+    /// re-derive it if any of those three timeouts moves.
     const CLIENT_BUSY_BUDGET: Duration = Duration::from_secs(1);
 
     /// How long a CLIENT sleeps between `ERROR_PIPE_BUSY` retries.
