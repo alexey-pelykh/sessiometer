@@ -54,10 +54,14 @@
 //! The shape used instead — link the module that IS reachable, name the item beside it in a code
 //! span — is the one `crate::canary`'s `reconcile_on_start` reference already takes.
 //!
-//! NOT here: the peer's identity, which ADR-0037 assigns to **#976** and this item's Boundaries
-//! exclude (`crate::daemon::peer_auth` is the Unix half). The one identity-protecting piece that
-//! IS here is the client's SQOS flag pair, because it rides on the client's own open call and so
-//! is transport code — ADR-0037 § Consequences → Negative splits them the same way.
+//! NOT here: the peer's identity, which ADR-0037 assigns to **#976** and which landed there — in
+//! `crate::daemon::peer_auth`, now per-target rather than the Unix-only half this comment used to
+//! call it. Three identity-shaped pieces ARE here, each because it rides on a TRANSPORT call
+//! rather than on the peer: the client's SQOS flag pair, set on the client's own open; the
+//! client-side check of the SERVER's owner SID that #976 added beside it (`verify_server_owner`);
+//! and the process-token helpers that arm reads its own SID through, which live here so that
+//! exactly one site in the crate opens our own token. ADR-0037 § Consequences → Negative splits
+//! transport from peer the same way.
 //!
 //! The owner-only descriptor IS here as of **#1513**, and the module doc above records it with the
 //! other four decisions. It was the one part of ADR-0037 § Decision 2 that #1511 did not land — not
@@ -65,7 +69,10 @@
 //! `first_pipe_instance` and `reject_remote_clients`. What the DACL buys is bounded, and the bound
 //! is the ADR's own: it governs who may OPEN an instance we created, and says nothing about who may
 //! CREATE the name. There is no `0700` directory here to close that half, which is why the client
-//! open sets the SQOS pair above and why the client-side owner check remains **#976**'s.
+//! open sets the SQOS pair above and why **#976** landed the client-side owner check beside it.
+//! Neither is MEASURED, and saying so is the point: no CI job compiles this crate for Windows, so
+//! both are reasoned from the documented API contract rather than from a run — **#978** is the
+//! job that turns that around.
 
 // The control transport is per-target and neither arm below is portable beyond the targets
 // ADR-0029 and ADR-0037 declare. Fail at compile time naming the missing port, rather than

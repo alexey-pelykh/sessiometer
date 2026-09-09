@@ -402,13 +402,15 @@ fn open_lock_file(path: &Path, create: bool) -> std::io::Result<File> {
 /// Open (creating if needed) the lock file at `path` for the lock attempts below.
 ///
 /// The `0600` the Unix arm sets has NO analogue here and is deliberately not faked with one: a
-/// new file inherits the enclosing directory's ACL, and hardening the support DIRECTORY on this
-/// target belongs to the item that ports `crate::paths`, not to this one. So on Windows this
-/// file's reachability is whatever that directory grants — stated rather than papered over,
-/// because the same asymmetry that removed the `0700` directory from the control channel
-/// (ADR-0037 § Decision 2) shows up here, and the lock's own guarantee does not rest on it: the
-/// file carries no content, and a foreign user who can open it still cannot make our
-/// `LockFileEx` succeed while we hold it.
+/// new file inherits the enclosing directory's ACL, and the file-mode-to-ACL layer is **#974**'s,
+/// not this item's. So on Windows this file's reachability is whatever the support directory
+/// grants — stated rather than papered over, because it is the same asymmetry ADR-0037
+/// § Decision 2 records for the control channel, where the `0700` directory also has no analogue.
+///
+/// The lock's own guarantee does not rest on the mode either way: the file carries no content —
+/// it exists only to be locked — and a foreign user who can OPEN it still cannot make our
+/// `LockFileEx` succeed while we hold it, because a byte-range lock is contended per handle by
+/// the kernel rather than by anything the file's ACL says.
 #[cfg(windows)]
 fn open_lock_file(path: &Path, create: bool) -> std::io::Result<File> {
     if !create {
