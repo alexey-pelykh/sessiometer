@@ -754,17 +754,27 @@ mod windows_tests {
     }
 }
 
-/// The three pipe options this port is contractually required to set, pinned by SPELLING because
+/// The pipe options this port is contractually required to set, pinned by SPELLING because
 /// nothing in this repo can pin them by behaviour: no CI job compiles the Windows arm — #978 is
 /// the item that would — so deleting the `security_qos_flags` call builds, lints, tests and
-/// merges green on every gate that actually runs. Scanning the module's own source is this
-/// repo's existing answer for a claim its test target cannot reach (`src/witness.rs`'s
+/// merges green on every gate that actually runs. `first_pipe_instance`,
+/// `reject_remote_clients` and the explicit byte mode stand the same way. Scanning source text is
+/// this repo's existing answer for a claim its test target cannot reach (`src/witness.rs`'s
 /// forbidden-token sweep, `src/usage.rs`'s egress scan), and unlike the module it guards it runs
-/// on EVERY target, which is the whole point.
+/// on every target.
 ///
-/// What a green here means, exactly: the calls are WRITTEN. It is not evidence that Windows
-/// honours them, that they achieve what ADR-0037 says they achieve, or that the transport works
-/// at all — an executable round-trip is **#1514**'s, behind the #978 job.
+/// What a green here means, exactly, and the bound is not a formality: the calls are WRITTEN, at
+/// the arity and spelling asserted below. It is not evidence that Windows honours them, that they
+/// achieve what ADR-0037 says they achieve, or that the transport works at all — an executable
+/// round-trip is **#1514**'s, behind the #978 job. AC5 is a claim about what every open DOES;
+/// this is the weaker claim that every open is written to. Read the test names as naming the
+/// clause each one is derived from, never as discharging it.
+///
+/// Two mutations were run against it rather than assumed, because a spelling guard's whole value
+/// is which edits it survives. Deleting any pinned call goes red, and so does adding a second
+/// client open without the flags. Appending a SECOND `security_qos_flags` to the same builder
+/// chain — which compiles, since the setter takes `&mut self` and is last-write-wins — defeats an
+/// exact-spelling match on its own, and is why the flag test also counts the calls by NAME.
 #[cfg(test)]
 mod windows_option_source_guard {
     /// This file's own source up to the start of this guard, comment-only lines dropped and
@@ -778,23 +788,67 @@ mod windows_option_source_guard {
     /// Collapsing whitespace keeps it stable under `cargo fmt`: a call the formatter wraps across
     /// lines still matches. And cutting the text at this guard's own module header is what stops
     /// the needles below from counting THEMSELVES — a scan that matches its own literals stays
-    /// green with the code it guards deleted.
+    /// green with the code it guards deleted, which was measured, not supposed.
     fn transport_code() -> String {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        collapse(&read_source(&module_path()))
+            .split_once("mod windows_option_source_guard {")
+            .expect("source scan is broken: did not find this guard's own module header")
+            .0
+            .to_owned()
+    }
+
+    fn module_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")
-            .join("control_transport.rs");
-        let text = std::fs::read_to_string(&path)
-            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
-        let collapsed = text
-            .lines()
+            .join("control_transport.rs")
+    }
+
+    fn read_source(path: &std::path::Path) -> String {
+        std::fs::read_to_string(path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
+    }
+
+    /// Comment-only lines dropped, then whitespace collapsed — the reduction described above.
+    fn collapse(text: &str) -> String {
+        text.lines()
             .filter(|line| !line.trim_start().starts_with("//"))
             .flat_map(str::split_whitespace)
             .collect::<Vec<_>>()
-            .join(" ");
-        let (before_guard, _) = collapsed
-            .split_once("mod windows_option_source_guard {")
-            .expect("source scan is broken: did not find this guard's own module header");
-        before_guard.to_owned()
+            .join(" ")
+    }
+
+    /// Every `.rs` file under `src/` EXCEPT this one, reduced the same way.
+    ///
+    /// This is what makes the "no client open outside this module" test a statement about the
+    /// crate rather than about one file. Modelled on `src/usage.rs`'s walk, canary included.
+    fn other_sources() -> Vec<(std::path::PathBuf, String)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read_dir under src") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut paths = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut paths,
+        );
+        let this = module_path();
+        assert!(
+            paths.contains(&this),
+            "source scan is broken: the walk under src/ did not reach control_transport.rs itself"
+        );
+        paths
+            .into_iter()
+            .filter(|path| path != &this)
+            .map(|path| {
+                let text = collapse(&read_source(&path));
+                (path, text)
+            })
+            .collect()
     }
 
     /// `(client opens, server instance creations)` in the scanned text, with the canary that
@@ -809,13 +863,17 @@ mod windows_option_source_guard {
         (clients, servers)
     }
 
-    /// AC5, the only one of the three the issue states as an acceptance criterion: EVERY client
-    /// open sets both flags, so a server that wins the name race is handed an
-    /// identification-level token and cannot impersonate the CLI (ADR-0037 § Consequences →
-    /// Negative). Matched as the whole call rather than as the constants, because both names are
-    /// also `use`-imported at the top of the Windows arm and a bare constant search therefore
-    /// stays green over a deleted call. The pair is matched together because
-    /// `SECURITY_IDENTIFICATION` without `SECURITY_SQOS_PRESENT` is not requested at all.
+    /// AC5's flags, and the only one of these options the issue states as an acceptance criterion:
+    /// a client open that hands a squatting server an identification-level token, which it can
+    /// query and cannot act with (ADR-0037 § Consequences → Negative).
+    ///
+    /// Asserted twice on purpose, because one assertion each way is what the two mutations need.
+    /// The whole call is matched rather than the constants, since both names are also
+    /// `use`-imported at the top of the Windows arm and a bare constant search stays green over a
+    /// deleted call; matching through the closing paren is what makes a WIDENED level
+    /// (`| SECURITY_IMPERSONATION`) fail rather than match as a prefix. And the calls are counted
+    /// by NAME as well, because the setter is last-write-wins: a second one appended to the chain
+    /// silently overrides the first while leaving the exact-spelling count untouched.
     #[test]
     fn every_client_open_sets_the_ac5_security_qos_flags() {
         let code = transport_code();
@@ -825,6 +883,27 @@ mod windows_option_source_guard {
                 .count(),
             clients,
             "every client-side pipe open must set the AC5 flags (issue #1511 AC5)"
+        );
+        assert_eq!(
+            code.matches(".security_qos_flags(").count(),
+            clients,
+            "a second security_qos_flags call would override the first — one per client open"
+        );
+    }
+
+    /// AC5 says EVERY client-side open, so the count above is only half the claim: it would hold
+    /// while a second module opened a pipe with no flags at all. Every client today routes through
+    /// [`connect`], and this is what keeps that true.
+    #[test]
+    fn no_client_pipe_open_exists_outside_this_module() {
+        let offenders: Vec<_> = other_sources()
+            .into_iter()
+            .filter(|(_, text)| text.contains("ClientOptions::"))
+            .map(|(path, _)| path)
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "a client pipe open outside control_transport.rs is unguarded by AC5's flags: {offenders:?}"
         );
     }
 
@@ -841,10 +920,24 @@ mod windows_option_source_guard {
         );
     }
 
+    /// The third option ADR-0037 § Decision 2 mandates, and #1511's AC1 with it. Only its PRESENCE
+    /// is pinned: the call takes a variable, and "on the first instance only" is carried by that
+    /// argument, which no source scan can evaluate.
+    #[test]
+    fn instance_creation_passes_the_first_pipe_instance_flag() {
+        let code = transport_code();
+        let (_, servers) = builders(&code);
+        assert_eq!(
+            code.matches(".first_pipe_instance(").count(),
+            servers,
+            "the first-instance name reservation must be set per instance creation (AC1)"
+        );
+    }
+
     /// Byte mode on BOTH ends. Message mode would frame the wire, and leaving the wire format
-    /// alone is the constraint this whole port is built around (ADR-0037 § Decision). It is
-    /// tokio's default, which is exactly why the explicit call is worth pinning: the default is
-    /// tokio's to change, and the wire compatibility resting on it is ours.
+    /// alone is the constraint this whole port is built around (ADR-0037 § Decision). It is the
+    /// default in tokio AND on the raw Win32 API, which is exactly why the explicit call is worth
+    /// pinning: the default is tokio's to change, and the wire compatibility resting on it is ours.
     #[test]
     fn both_ends_pin_byte_mode_rather_than_inheriting_it() {
         let code = transport_code();
