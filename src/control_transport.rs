@@ -808,7 +808,8 @@ mod windows_tests {
 /// setter takes `&mut self` and is last-write-wins, and which an exact-spelling match alone does
 /// not catch — hence the by-NAME count; widening the level inside the one call, caught because
 /// the needle matches through its closing paren; an unflagged client open in another module, or
-/// in this one below the guard's own header, which an earlier revision let through; and moving
+/// in this one below the guard's own header, which an earlier revision let through — but only
+/// where the type is spelled plainly, the alias-shaped residue being #1519's; and moving
 /// the flags off the call into a trailing `//` or into a `/* */` block, two mutations that
 /// deleted the call, formatted clean, and left every count balanced until the marker assertion in
 /// [`transport_code`] closed them.
@@ -963,8 +964,7 @@ mod windows_option_source_guard {
     }
 
     /// AC5 says EVERY client-side open, so the arity above is only half the claim: it would hold
-    /// while a second open sat somewhere the counting never reaches. There are two such places and
-    /// this closes both, because an earlier revision closed only the first and claimed both.
+    /// while a second open sat somewhere the counting never reaches. This closes two such places.
     ///
     /// Another module is the obvious one. The other is THIS file BELOW the guard's own header,
     /// which the count cannot reach by construction — truncating there is what stops the needles
@@ -975,10 +975,18 @@ mod windows_option_source_guard {
     /// TWO needles, not one, and the second is why: `ClientOptions::` alone reads a PATH, so an
     /// ALIASED import — `use ...::ClientOptions as Co;` then `Co::new()` — contains no `::` after
     /// the type name and slipped through both halves. An independent review measured that, adding
-    /// exactly that pair to another module and watching every test here stay green. `ClientOptions
-    /// as` catches the rename at its import, which is the one place an alias must appear. The
-    /// blind spot this does NOT close is still the one the module doc declares: flags placed
-    /// behind a conditional. A source scan reads text, not control flow.
+    /// exactly that pair to another module and watching every test here stay green.
+    ///
+    /// Two places it still does NOT reach, both measured and both owned by **#1519**, because
+    /// enumerating "two such places" was only ever sound while the needles were spelling-blind
+    /// and the second needle is what proved they are not. A `type` alias renames without either
+    /// needle appearing — the type name is followed by `;`. And the region ABOVE this header,
+    /// which holds the production open, is matched by no needle at all: its only cover is
+    /// [`builders`], whose `ClientOptions::new()` carries the same weakness. An unflagged aliased
+    /// open placed there leaves all five of these tests green.
+    ///
+    /// The blind spot none of that closes is the one the module doc declares: flags placed behind
+    /// a conditional. A source scan reads text, not control flow.
     #[test]
     fn no_client_pipe_open_exists_outside_the_guarded_region() {
         const NEEDLES: [&str; 2] = ["ClientOptions::", "ClientOptions as"];
