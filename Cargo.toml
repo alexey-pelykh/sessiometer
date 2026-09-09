@@ -68,22 +68,32 @@ zeroize = "1.9.0"
 # the password-database home resolution. MIT OR Apache-2.0; 0.11.0 verified current on
 # crates.io 2026-07-22 (updated 2025-10-28, MSRV 1.87 — exactly this crate's).
 etcetera = "0.11.0"
-# The two Win32 constants the control transport needs (src/control_transport.rs, issue #1511):
-# `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` on every client pipe open (ADR-0037 records
-# the pair as NOT optional, and `SECURITY_IDENTIFICATION` alone is not even requested without
-# its companion), and `ERROR_PIPE_BUSY` — the documented retry signal, matched on the raw OS
-# code rather than on an `io::ErrorKind` mapping nothing here pins. Spelled from the crate that
-# generates them rather than hand-copied as magic numbers: they are a vendor-published ABI, the
-# same argument `toml_writer` carries for TOML escaping.
+# The Win32 surface the control transport needs (src/control_transport.rs, issues #1511 and
+# #1513). Two constants: `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` on every client pipe
+# open (ADR-0037 records the pair as NOT optional, and `SECURITY_IDENTIFICATION` alone is not even
+# requested without its companion), and `ERROR_PIPE_BUSY` — the documented retry signal, matched on
+# the raw OS code rather than on an `io::ErrorKind` mapping nothing here pins. Plus, since #1513,
+# the calls that build every server instance's owner-only security descriptor: this process's own
+# token user SID (`Win32_System_Threading`'s `OpenProcessToken` + `Win32_Security`'s
+# `GetTokenInformation`), its SDDL rendering and the descriptor built from it
+# (`Win32_Security_Authorization`), and the `SECURITY_ATTRIBUTES` that carries the result into
+# `CreateNamedPipeW`. Spelled from the crate that generates them rather than hand-copied as magic
+# numbers: they are a vendor-published ABI, the same argument `toml_writer` carries for TOML
+# escaping.
 #
 # ZERO new crates enter the graph: `windows-sys` 0.61.2 is ALREADY in Cargo.lock, pulled by both
 # `tokio` and `etcetera` on this target, so this adds a direct edge to a package that is already
-# compiled and the minimal-dependency posture holds. Target-gated like `etcetera`, so nothing
-# changes for the macOS or Linux build graphs. MIT OR Apache-2.0 — both on `deny.toml`'s
-# allow-list.
+# compiled and the minimal-dependency posture holds. FEATURES are not recorded in `Cargo.lock`
+# either, so widening this list resolves no new package and leaves the lockfile byte-identical —
+# `deny`'s advisory/source/licence gates see exactly the graph they saw before. Target-gated like
+# `etcetera`, so nothing changes for the macOS or Linux build graphs. MIT OR Apache-2.0 — both on
+# `deny.toml`'s allow-list.
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
 ] }
 
 [dev-dependencies]

@@ -15,10 +15,15 @@
 //! about the Unix behaviour changes — it is relocated, not rewritten.
 //!
 //! Windows is a NAMED PIPE (ADR-0037 § Decision 1), driven through
-//! `tokio::net::windows::named_pipe`. Four things about that arm are decisions rather
-//! than mechanics. The first three are recorded in the ADR and cite it; the fourth is decided
+//! `tokio::net::windows::named_pipe`. Five things about that arm are decisions rather
+//! than mechanics. The first four are recorded in the ADR and cite it; the fifth is decided
 //! HERE, and says so:
 //!
+//! - **Every INSTANCE is created owner-only** — `create_with_security_attributes_raw` with a
+//!   descriptor built from `D:P(A;;GA;;;<our user SID>)`, the analogue of the Unix `0600` chmod
+//!   (ADR-0037 § Decision 2, issue #1513). The SID comes from THIS PROCESS's own token, and the
+//!   path is fail-closed: a descriptor that cannot be built is an error, never a fall back to the
+//!   pipe namespace's default. `create_instance` carries the mechanism.
 //! - **One client per INSTANCE.** There is no listening socket that accepts repeatedly. The
 //!   server creates a new instance per accept and only the FIRST carries `first_pipe_instance`
 //!   (ADR-0037 § Consequences → Negative). `ControlListener::accept` is where that structural
@@ -54,11 +59,13 @@
 //! IS here is the client's SQOS flag pair, because it rides on the client's own open call and so
 //! is transport code — ADR-0037 § Consequences → Negative splits them the same way.
 //!
-//! ALSO not here, and on a different footing: the pipe's owner-only security descriptor. That one
-//! is not a residual anybody was assigned — ADR-0037 § Decision 2 mandates it in the same sentence
-//! as `first_pipe_instance` and `reject_remote_clients`, and this port implements those two and
-//! not it. It is tracked at **#1513**; until that lands an instance carries the pipe namespace's
-//! DEFAULT descriptor, and the `0600` socket's guarantee has no Windows counterpart.
+//! The owner-only descriptor IS here as of **#1513**, and the module doc above records it with the
+//! other four decisions. It was the one part of ADR-0037 § Decision 2 that #1511 did not land — not
+//! a residual anybody was assigned, since the ADR mandates it in the same sentence as
+//! `first_pipe_instance` and `reject_remote_clients`. What the DACL buys is bounded, and the bound
+//! is the ADR's own: it governs who may OPEN an instance we created, and says nothing about who may
+//! CREATE the name. There is no `0700` directory here to close that half, which is why the client
+//! open sets the SQOS pair above and why the client-side owner check remains **#976**'s.
 
 // The control transport is per-target and neither arm below is portable beyond the targets
 // ADR-0029 and ADR-0037 declare. Fail at compile time naming the missing port, rather than
@@ -69,6 +76,36 @@ compile_error!(
     "the daemon control channel needs a per-target byte transport; only Unix (a `0600` \
      Unix-domain socket) and Windows (a named pipe) are ported — see ADR-0029 and ADR-0037"
 );
+
+/// The SDDL for the control pipe's owner-only DACL, granting `sid` everything and nobody else
+/// anything (ADR-0037 § Decision 2, issue #1513 AC1).
+///
+/// Three characters carry the whole guarantee. `D:` opens the DACL. **`P` makes it PROTECTED**, so
+/// nothing is inherited from the pipe namespace's defaults — without it the descriptor would be a
+/// FLOOR the namespace could widen, not the ceiling AC1 asks for. `GA` is `GENERIC_ALL`, and the
+/// single `(A;;GA;;;<sid>)` ACE is the only one: an allow with no flags, no object GUIDs, and one
+/// trustee. The empty fields between the semicolons are the ACE flags, the object type and the
+/// inherited-object type, none of which apply to a pipe.
+///
+/// TARGET-NEUTRAL on purpose, and it is the only piece of the descriptor path that can be. The
+/// grammar is pure text while everything around it — reading the token, converting the string,
+/// handing the result to `CreateNamedPipeW` — is a syscall that exists on one target. Lifting it
+/// out means the DACL's SHAPE is asserted by an ordinary unit test on every target this crate
+/// builds for, rather than resting on the source scan at the foot of this file, which can only see
+/// that a call is written (see [`windows_option_source_guard`]). It is the same split the spike
+/// could not make: there, the SDDL was a `format!` inline in the one function that used it.
+///
+/// `sid` is expected to be the SDDL string form of a user SID (`S-1-5-21-…`), as
+/// `ConvertSidToStringSidW` renders it. Nothing here validates that — `S-1-5-21-…` is not a grammar
+/// this function can check without reimplementing the SID parser, and the caller does not obtain
+/// the string from anywhere it could be wrong: it comes from this process's own token, via the
+/// converter Windows ships for exactly this rendering. A malformed one is rejected by
+/// `ConvertStringSecurityDescriptorToSecurityDescriptorW`, which is a fail-closed error rather than
+/// a widened DACL.
+#[cfg(any(windows, test))]
+fn owner_only_sddl(sid: &str) -> String {
+    format!("D:P(A;;GA;;;{sid})")
+}
 
 #[cfg(unix)]
 mod imp {
@@ -172,7 +209,7 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use std::cell::RefCell;
-    use std::ffi::OsString;
+    use std::ffi::{c_void, OsString};
     use std::io;
     use std::path::Path;
     use std::time::Duration;
@@ -180,8 +217,18 @@ mod imp {
     use tokio::net::windows::named_pipe::{
         ClientOptions, NamedPipeClient, NamedPipeServer, PipeMode, ServerOptions,
     };
-    use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, LocalFree, ERROR_PIPE_BUSY, HANDLE,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+        SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenUser, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+    };
     use windows_sys::Win32::Storage::FileSystem::{SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     /// The SERVER side of one accepted control connection: a connected pipe INSTANCE.
     pub(crate) type ControlStream = NamedPipeServer;
@@ -299,6 +346,26 @@ mod imp {
 
     /// Create one server instance of the pipe called `name`.
     ///
+    /// The THIRD option ADR-0037 § Decision 2 mandates is the security descriptor, and it is why
+    /// this goes through `create_with_security_attributes_raw` rather than the plain `create`
+    /// (issue #1513). The descriptor is built HERE, per instance, from
+    /// [`owner_only_sddl`](super::owner_only_sddl) over [`our_user_sid`] — so AC1's "every
+    /// instance, the first and every replacement" is structural: there is one creation path and it
+    /// has no branch that reaches `create`. **Fail-closed** (AC2): a descriptor that cannot be
+    /// built returns `Err` and no instance is created. There is deliberately no fall back to the
+    /// namespace default, which is what the `0600` chmod's analogue must never silently become.
+    ///
+    /// Resolved PER CREATE rather than once at [`ControlListener::bind`], which is a choice with a
+    /// cost. The cost is a handful of syscalls on every accept — `OpenProcessToken`, two
+    /// `GetTokenInformation`s, two converts and their frees — on a path that runs once per client
+    /// connection, not per byte, and that is already creating a kernel object. What it buys is the
+    /// tightest possible scope for the `unsafe`: the descriptor is allocated and freed inside this
+    /// one function, so no raw pointer is stored in [`ControlListener`], nothing has to be freed in
+    /// a `Drop`, and the struct stays `Send`-agnostic. It also keeps the shape the #972 spike
+    /// MEASURED, which is the only executable evidence this path has until #978 exists. A process's
+    /// primary token user cannot change under it, so caching would be sound — it is simply not
+    /// worth the surface here.
+    ///
     /// `first` is the `first_pipe_instance` flag, and it may be set on the FIRST instance only:
     /// a second create that also sets it against a held name is denied `ERROR_ACCESS_DENIED`,
     /// which is precisely the kernel-enforced name reservation ADR-0037 § Decision 2 measured
@@ -315,21 +382,200 @@ mod imp {
     /// default as well (`PIPE_TYPE_BYTE` and `PIPE_READMODE_BYTE` are both `0`; `PIPE_TYPE_MESSAGE`
     /// is the opt-in). Byte mode is written out because it is what keeps the newline framing
     /// meaning what it means (ADR-0037 § Decision 5), and because the default is tokio's to change.
-    ///
-    /// NOT set here: the owner-only security descriptor
-    /// (`create_with_security_attributes_raw` with `D:P(A;;GA;;;<our user SID>)`, the analogue of
-    /// the Unix `0600` chmod). ADR-0037 § Decision 2 mandates it in the same sentence as the two
-    /// flags above, so it is a gap in that decision rather than a boundary this port respects —
-    /// it belongs to no residual the ADR assigns and is tracked at **#1513**. Until it lands the
-    /// instance carries the pipe namespace's DEFAULT descriptor, which is one reason the whole
-    /// Windows tier lands together behind the #978 CI job and nothing ships from this item
-    /// alone.
     fn create_instance(name: &OsString, first: bool) -> io::Result<NamedPipeServer> {
-        ServerOptions::new()
+        let sddl = super::owner_only_sddl(&our_user_sid()?);
+        let descriptor = security_descriptor_from_sddl(&sddl).map_err(|code| {
+            io::Error::other(format!(
+                "ConvertStringSecurityDescriptorToSecurityDescriptorW({sddl}) failed: \
+                 GetLastError={code}"
+            ))
+        })?;
+        let mut attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            // The control endpoint is never inherited by a child process. The Unix socket is not
+            // either — it is opened by the daemon and every child it spawns is a `curl` that has
+            // no business with it.
+            bInheritHandle: 0,
+        };
+
+        let mut options = ServerOptions::new();
+        options
             .first_pipe_instance(first)
             .reject_remote_clients(true)
-            .pipe_mode(PipeMode::Byte)
-            .create(name)
+            .pipe_mode(PipeMode::Byte);
+        // SAFETY: `attributes` is a live, correctly-sized `SECURITY_ATTRIBUTES` on this stack
+        // frame, and it outlives the call — which is all `CreateNamedPipeW` requires, because the
+        // descriptor is COPIED into the kernel object. Its `lpSecurityDescriptor` came from
+        // `ConvertStringSecurityDescriptorToSecurityDescriptorW`, which returned TRUE and which
+        // documents its out-parameter as a valid self-relative descriptor on success — the check
+        // above tests that BOOL, not the pointer.
+        let created = unsafe {
+            options.create_with_security_attributes_raw(
+                name,
+                (&mut attributes as *mut SECURITY_ATTRIBUTES).cast::<c_void>(),
+            )
+        };
+        // SAFETY: `descriptor` is exactly the pointer that call returned and has not been freed.
+        // Freed unconditionally, on the error path too: the kernel object holds its own copy from
+        // here on, so this cannot dangle it, and a `?` before this line would leak on every failed
+        // create — which, at the ceiling, is a retry loop.
+        unsafe { LocalFree(descriptor) };
+        created
+    }
+
+    /// THIS PROCESS's own user SID, in the SDDL string form `ConvertSidToStringSidW` renders
+    /// (`S-1-5-21-…`) — the trustee of the owner-only DACL above (issue #1513 AC2).
+    ///
+    /// Read from the process token, never hard-coded and never configurable: a SID that came from
+    /// anywhere else would be a DACL naming somebody the daemon merely BELIEVES it is. FAIL CLOSED
+    /// at every stage — each of the four calls that can fail returns `Err`, and the caller creates
+    /// no instance — mirroring `peer_euid`'s `None`-on-error contract on the Unix side: a value no
+    /// caller can mistake for an identity.
+    ///
+    /// This is the daemon's OWN identity, which is a different question from the PEER's. Resolving
+    /// the caller's SID by impersonation (`ImpersonateNamedPipeClient` → `OpenThreadToken` → …) is
+    /// ADR-0037 § Decision 3 and belongs to **#976**; when it lands it will want this same read to
+    /// compare against, and lifting this function's visibility is that item's to do.
+    fn our_user_sid() -> io::Result<String> {
+        let mut token: HANDLE = std::ptr::null_mut();
+        // SAFETY: `GetCurrentProcess` returns a pseudo-handle needing no cleanup; `token` is a
+        // live local the kernel writes only on success.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            // SAFETY: reads the last-error slot set by the call above.
+            let code = unsafe { GetLastError() };
+            return Err(io::Error::other(format!(
+                "OpenProcessToken failed: GetLastError={code}"
+            )));
+        }
+        let result = token_user_sid(token);
+        // SAFETY: `token` is the handle `OpenProcessToken` just wrote and has not been closed.
+        unsafe { CloseHandle(token) };
+        result
+    }
+
+    /// `GetTokenInformation(TokenUser)` on `token`, rendered as an SDDL SID string.
+    ///
+    /// The buffer is a `Vec<u64>`, not a `Vec<u8>`, and that is load-bearing rather than fussy: the
+    /// kernel writes a `TOKEN_USER` here, whose `Sid` member is a pointer, so reading it out of a
+    /// 1-byte-aligned allocation is undefined behaviour on a technicality that happens to work. A
+    /// `u64` element type makes the allocation 8-byte aligned, which is at least
+    /// `align_of::<TOKEN_USER>()`.
+    fn token_user_sid(token: HANDLE) -> io::Result<String> {
+        let mut needed: u32 = 0;
+        // First call sizes the buffer; it is EXPECTED to fail with `ERROR_INSUFFICIENT_BUFFER`, so
+        // its return value is deliberately ignored and only `needed` is read.
+        // SAFETY: a null buffer with length 0 is the documented sizing form; `needed` is a live
+        // local.
+        unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+        if needed == 0 {
+            // SAFETY: reads the last-error slot set by the sizing call above.
+            let code = unsafe { GetLastError() };
+            return Err(io::Error::other(format!(
+                "GetTokenInformation(TokenUser, sizing) failed: GetLastError={code}"
+            )));
+        }
+
+        let words = (needed as usize)
+            .div_ceil(std::mem::size_of::<u64>())
+            .max(1);
+        let mut buffer = vec![0u64; words];
+        // SAFETY: the buffer is `words * 8 >= needed` bytes of live, 8-byte-aligned, initialised
+        // memory. The length passed is `needed`, which UNDER-reports the allocation by up to seven
+        // bytes — the safe direction, since the kernel is told it has less room than it does. Rust
+        // evaluates call arguments left to right, so the by-value 4th argument copies `needed`
+        // BEFORE the `&mut needed` 5th exists; the out-write lands after and is never read again.
+        // Written only on success.
+        let ok = unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                buffer.as_mut_ptr().cast::<c_void>(),
+                needed,
+                &mut needed,
+            )
+        };
+        if ok == 0 {
+            // SAFETY: reads the last-error slot set by the call above.
+            let code = unsafe { GetLastError() };
+            return Err(io::Error::other(format!(
+                "GetTokenInformation(TokenUser) failed: GetLastError={code}"
+            )));
+        }
+
+        // SAFETY: on success the kernel wrote a `TOKEN_USER` at the start of `buffer`, which is
+        // correctly aligned for it (see the doc comment) and large enough (`needed` bytes). The
+        // `Sid` it carries points INTO that same buffer, so it stays valid while `buffer` is alive
+        // — which it is for the whole of `sid_to_string` below.
+        let sid = unsafe { (*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        if sid.is_null() {
+            return Err(io::Error::other(
+                "TOKEN_USER.User.Sid was null: the process token carries no user SID",
+            ));
+        }
+        sid_to_string(sid).map_err(|code| {
+            io::Error::other(format!(
+                "ConvertSidToStringSidW failed: GetLastError={code}"
+            ))
+        })
+    }
+
+    /// `ConvertSidToStringSidW`, with the `LocalFree` the API requires of its caller.
+    fn sid_to_string(sid: *mut c_void) -> Result<String, u32> {
+        let mut wide: *mut u16 = std::ptr::null_mut();
+        // SAFETY: `sid` is a non-null pointer to a valid SID inside a live buffer (checked by the
+        // caller); `wide` is a live local the API writes only on success.
+        if unsafe { ConvertSidToStringSidW(sid, &mut wide) } == 0 {
+            // SAFETY: reads the last-error slot set by the call above.
+            return Err(unsafe { GetLastError() });
+        }
+        // SAFETY: on success `wide` is a valid NUL-terminated UTF-16 string allocated with
+        // `LocalAlloc`.
+        let string = unsafe { wide_to_string(wide) };
+        // SAFETY: `wide` is exactly the `LocalAlloc`-ed pointer the call returned, freed once.
+        unsafe { LocalFree(wide.cast::<c_void>()) };
+        Ok(string)
+    }
+
+    /// A self-relative security descriptor built from an SDDL string. The returned pointer is
+    /// `LocalAlloc`-ed and the CALLER owns it — `CreateNamedPipeW` copies it, so freeing it right
+    /// after the create is correct and is what [`create_instance`] does.
+    fn security_descriptor_from_sddl(sddl: &str) -> Result<*mut c_void, u32> {
+        let wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut descriptor: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `wide` is a live, NUL-terminated UTF-16 buffer that outlives the call;
+        // `descriptor` is a live local the API writes only on success; a null size out-parameter is
+        // documented as "do not report the size".
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            // SAFETY: reads the last-error slot set by the call above.
+            return Err(unsafe { GetLastError() });
+        }
+        Ok(descriptor)
+    }
+
+    /// A NUL-terminated UTF-16 Win32 string as a Rust `String`.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be non-null and point at a NUL-terminated UTF-16 sequence that stays valid for
+    /// the duration of the call.
+    unsafe fn wide_to_string(ptr: *const u16) -> String {
+        let mut len = 0usize;
+        // SAFETY: the caller guarantees a NUL terminator, so this walk stops inside the allocation.
+        while unsafe { *ptr.add(len) } != 0 {
+            len += 1;
+        }
+        // SAFETY: `ptr[..len]` is exactly the sequence walked above, all within the caller's
+        // allocation.
+        String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(ptr, len) })
     }
 
     /// Holds the listening instance OUT of [`ControlListener::idle`] for the duration of one
