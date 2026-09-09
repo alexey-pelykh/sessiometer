@@ -69,13 +69,19 @@ const MAX_INSTANCES: usize = 4;
 
 /// The whole proof is time-boxed so a wedged runner fails the job instead of hanging it.
 ///
-/// It must be LONGER than the sum of every per-check bound below, and at 20s it was not: four
-/// `RECOVERY_ATTEMPTS` passes plus five `FRAME_TIMEOUT` waits plus CHECK 9's poll sum past 40s at
-/// the constants below, so a slow-but-not-wedged composite tripped this instead, and the message
-/// it prints names no check. That made the outer box compete with the inner ones rather than
-/// back them: whichever fires first is the one that gets to diagnose, and only the inner ones can.
-/// An earlier revision justified 20s as "shorter than `proof.rs`'s because nothing here spawns a
-/// child process" — a true statement about cost that is not the constraint that sets this value.
+/// It must be LONGER than the sum of every per-check bound in this file, and at 20s it was not:
+/// the [`FRAME_TIMEOUT`] waits alone exceed that, before the [`RECOVERY_ATTEMPTS`] polls. A
+/// slow-but-not-wedged composite therefore tripped this box instead of an inner one, and the
+/// message it prints names no check — so the outer box competed with the inner ones rather than
+/// backing them, and only the inner ones can diagnose.
+///
+/// No arithmetic is written out here, deliberately. Two revisions of this comment carried a sum
+/// and BOTH were wrong — the first justified 20s as "shorter than `proof.rs`'s because nothing
+/// here spawns a child process", a true statement about cost that is not the constraint; the
+/// second miscounted the waits it was adding up, in both directions at once, while reaching a
+/// conclusion that happened to hold. A tally beside the constants it tallies goes stale the next
+/// time one moves, and it is not what makes this value safe. What makes it safe is the RELATION:
+/// re-derive it if you change a bound, rather than trusting a number written here.
 const PROOF_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// How long to wait for a frame the server has already pushed. Generous: it bounds a failure,
@@ -376,9 +382,9 @@ async fn proof() -> Checked<()> {
             "CHECK 3: the first client could not open the pipe: {err}"
         ))
     })?;
-    let mut served_first = loop_
-        .accept()
+    let mut served_first = tokio::time::timeout(FRAME_TIMEOUT, loop_.accept())
         .await
+        .map_err(|_| fail("CHECK 3: the first client was never accepted"))?
         .map_err(|err| fail(format!("CHECK 3: the accept loop failed: {err}")))?;
     // ASSERTED, not merely printed. Interpolating `listening()` into a PASS line makes the check
     // unfalsifiable: a refill that was denied prints "PASS — … the loop refilled (0 listening…)"
@@ -465,9 +471,9 @@ async fn proof() -> Checked<()> {
                 subscribers.len()
             ))
         })?;
-        let server = loop_
-            .accept()
+        let server = tokio::time::timeout(FRAME_TIMEOUT, loop_.accept())
             .await
+            .map_err(|_| fail(format!("CHECK 5: client {nth} was never accepted")))?
             .map_err(|err| fail(format!("CHECK 5: accepting client {nth} failed: {err}")))?;
         subscribers.push(client);
         served.push(server);
@@ -805,8 +811,10 @@ async fn proof() -> Checked<()> {
 
     println!(
         "{TAG} ANSWER (ADR-0037, #1511 AC3): the accept loop keeps exactly ONE listening instance \
-         outstanding, plus one per live connection — so a `watch` subscriber occupies one for its \
-         whole lifetime. At the ceiling the refill is denied ERROR_PIPE_BUSY, nothing listens, and \
+         outstanding — a STRUCTURAL fact, carried by the `Option<NamedPipeServer>` this loop and \
+         production both hold, corroborated by every check here and measurable by none of them \
+         (see `listening()`) — plus one per live connection, so a `watch` subscriber occupies one \
+         for its whole lifetime. At the ceiling the refill is denied ERROR_PIPE_BUSY, nothing listens, and \
          an arriving client is told BUSY rather than NOT-FOUND — but only while an instance still \
          exists (CHECK 9): the refill is a single attempt, so a refused refill plus the end of the \
          exchange it served reaches zero instances, and there a live daemon reads first as \
