@@ -102,6 +102,9 @@ pub(crate) fn run() -> ExitCode {
 
     match args.next().as_deref() {
         None => runtime.block_on(server_main()),
+        // The issue-#1511 accept-loop / `watch` proof — a separate measurement in the same
+        // package, printing its own block under its own tag (`crate::accept_loop`).
+        Some("watch") => runtime.block_on(crate::accept_loop::watch_main()),
         Some("client") => match args.next() {
             Some(name) => runtime.block_on(client_main(&name)),
             None => {
@@ -110,7 +113,7 @@ pub(crate) fn run() -> ExitCode {
             }
         },
         Some(other) => {
-            eprintln!("[spike-972] FATAL: unknown mode {other:?}; expected no argument (server) or `client <pipe-name>`.");
+            eprintln!("[spike-972] FATAL: unknown mode {other:?}; expected no argument (server), `watch`, or `client <pipe-name>`.");
             ExitCode::from(1)
         }
     }
@@ -496,6 +499,15 @@ async fn client_exchange(pipe_name: &str) -> Result<(), String> {
     // A named pipe with no free instance answers ERROR_PIPE_BUSY rather than blocking, so the
     // idiomatic client is a retry loop. Unix `connect(2)` on a bound socket has no equivalent — a
     // difference the real port inherits, noted in ADR-0037.
+    //
+    // This open does NOT set `security_qos_flags` explicitly, and it is the only client open in
+    // the tree that does not — `accept_loop.rs` and `src/control_transport.rs` both do. It
+    // INHERITS tokio's default, which is that same flag pair, so what this proof measured is
+    // still an identification-level open. Left inherited on purpose: ADR-0037 records the
+    // reliance as a bound of THIS measurement, and changing it now would quietly alter the run
+    // whose output the ADR quotes. Do not copy the omission — #1511's AC5 requires the flags to
+    // be set explicitly, for the reason the ADR gives: a future port off tokio must not lose
+    // them silently.
     let client = loop {
         match ClientOptions::new().open(pipe_name) {
             Ok(client) => break client,

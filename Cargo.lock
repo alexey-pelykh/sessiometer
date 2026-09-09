@@ -418,6 +418,7 @@ dependencies = [
  "toml",
  "toml_writer",
  "unicode-width",
+ "windows-sys",
  "zeroize",
 ]
 

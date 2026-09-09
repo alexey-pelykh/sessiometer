@@ -1279,9 +1279,11 @@ mod tests {
     // `/usr/bin/curl` (`CURL`). It links no in-process HTTP/TLS client and opens
     // no raw TCP or UDP socket, so it *cannot* originate a connection except by
     // that one subprocess — which only ever targets `USAGE_URL`. (The daemon's
-    // control socket is a local Unix-domain socket that never leaves the machine;
-    // the external `claude` CLI the daemon drives for refresh/login makes its own
-    // calls under the user's own credential — that is not Sessiometer's egress.)
+    // control channel is local on both targets and never leaves the machine: a
+    // Unix-domain socket on Unix, and since #1511 a named pipe on Windows, created
+    // with `reject_remote_clients` so it is unreachable over SMB. The external
+    // `claude` CLI the daemon drives for refresh/login makes its own calls under
+    // the user's own credential — that is not Sessiometer's egress.)
 
     /// Read a repo-root-relative file, anchored at `CARGO_MANIFEST_DIR` so the
     /// scan is tied to the crate under test regardless of the test CWD.
@@ -1333,7 +1335,8 @@ mod tests {
     fn no_in_process_http_tls_or_telemetry_client_is_linked() {
         // Without an HTTP/TLS client crate the process cannot originate an
         // in-process HTTP(S) request; without a telemetry/analytics/crash SDK it
-        // cannot beacon to one. The Unix-domain daemon socket needs none of these,
+        // cannot beacon to one. The daemon's local control channel needs none of
+        // these on either target — a Unix-domain socket, or a named pipe on Windows,
         // so the dependency graph stays empty of them — the network surface analogue
         // of `scripts/check-no-security-framework.sh` and the CONTRIBUTING.md
         // transport rule ("No TLS / HTTP client ... the one network call rides the
@@ -1409,11 +1412,14 @@ mod tests {
     #[test]
     fn no_raw_tcp_or_udp_socket_primitive_is_used() {
         // tokio's `net` feature is on for the daemon's LOCAL IPC — but that IPC is a
-        // Unix-domain socket (UnixStream / UnixListener), which never leaves the
-        // machine. A raw TCP or UDP socket WOULD be outbound egress that bypasses
-        // the curl seam, so guard the primitives by name; the Unix-socket types do
-        // not match. Tokens are assembled from fragments so this guard never matches
-        // its own source (usage.rs is itself scanned).
+        // Unix-domain socket (UnixStream / UnixListener) on Unix and a NAMED PIPE on
+        // Windows since #1511, and neither ever leaves the machine. Every pipe
+        // instance sets `reject_remote_clients`, so the Windows half is local-only
+        // by construction rather than by convention. A raw TCP or UDP socket WOULD
+        // be outbound egress that bypasses the curl seam, so guard the primitives
+        // by name; neither the Unix-socket types nor the named-pipe types match.
+        // Tokens are assembled from fragments so this guard never matches its own
+        // source (usage.rs is itself scanned).
         let forbidden: [String; 4] = [
             concat!("Tcp", "Stream").to_string(),
             concat!("Tcp", "Listener").to_string(),
