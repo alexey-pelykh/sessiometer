@@ -25,6 +25,14 @@ the enforcing job, exactly as **#964** is on the Linux side. The port this decis
 is a *proof*, in `spikes/windows-control-transport/`, which is deliberately outside the root build
 graph and is run by the non-required `spike-972-windows-transport` workflow.
 
+**Amended** — 2026-09-09, on **#1511**. The decision is unchanged; the record gained the output of
+a SECOND proof. #1511 added an accept-loop / `watch` mode to the same spike package, and its
+measured block now sits beside the #972 one in § What was measured, and where. That is § Lifecycle's
+own requirement rather than a courtesy: it disposes of the spike directory and says this ADR is
+what survives it, *"which is why the measured output above is quoted here in full rather than
+linked to a CI run that expires"*. The second proof's output had been quoted only in an issue
+comment linking a run — precisely the shape that sentence rejects.
+
 ## Context
 
 ### What the control channel is today
@@ -188,6 +196,48 @@ handshake the client would write its request immediately and whether bytes were 
 would differ per run and go unobserved, which for a question phrased around *the last message read
 from the pipe* answers only one branch. The synchronisation deliberately rides stdio and never the
 pipe, or it would be the very traffic it exists to exclude.
+
+### The second proof: the accept loop and `watch` (#1511)
+
+Added by **#1511**, in the same throwaway package, as `cargo run -- watch` — a second mode rather
+than more checks in the first, so the #972 block above keeps being *"the whole of what the program
+printed"*. It answers that item's AC3: how many pipe instances the accept loop keeps outstanding,
+and what happens when they are exhausted. Quoted here for the reason § Lifecycle gives — this
+record outlives the directory that produced it.
+
+The `host pid` and the pipe name it appears in vary per run, as do the three timing figures
+(CHECK 7's recovery interval, CHECK 9's busy window, and CHECK 4's implicit ordering). Everything
+else — every `CHECK` verdict, the `MEASUREMENT` line, and the ANSWER — is invariant. Read a timing
+figure's ORDER OF MAGNITUDE and never its digits: each resolves no finer than one poll pass of the
+proof's own cadence, which the CHECK 7 line states.
+
+```text
+[spike-1511] host pid           : 7512
+[spike-1511] pipe name          : \\.\pipe\sessiometer-spike-1511-7512
+[spike-1511] max_instances      : 4 (production sets none — tokio's PIPE_UNLIMITED_INSTANCES, under which Windows bounds instances by system resources)
+[spike-1511] CHECK 1  bind       : PASS — first instance created with first_pipe_instance (1 listening, 0 connected)
+[spike-1511] CHECK 2  squat      : PASS — a second first_pipe_instance create is denied (ERROR_ACCESS_DENIED = 5)
+[spike-1511] CHECK 3  subscribe  : PASS — client 1 connected and is HELD OPEN (the `watch` shape); the loop refilled (1 listening, 1 connected)
+[spike-1511] CHECK 4  stream     : PASS — 3 newline-delimited JSON frames were all pushed to the held subscriber BEFORE any was read, so the subscriber had them BUFFERED, and each arrived intact over the one connection (order holds by byte-mode construction, not by this measurement)
+[spike-1511] CHECK 5  concurrent : PASS — 4 subscribers are connected AT ONCE, each holding its own instance; a one-instance server would have refused every one after the first
+[spike-1511] MEASUREMENT outstanding instances: 4 connected + 0 listening = 4 of max_instances=4
+[spike-1511] CHECK 6a exhaustion : PASS — with all 4 instances connected, creating the replacement is denied ERROR_PIPE_BUSY and NOTHING is listening
+[spike-1511] CHECK 6b client busy: PASS — an arriving client gets ERROR_PIPE_BUSY (= 231), the documented RETRY signal — NOT ERROR_FILE_NOT_FOUND (= 2). True of THIS state — every instance connected, all of them still open. CHECK 9 measures the state it does not cover
+[spike-1511] CHECK 7  recovery   : PASS — one subscriber left and a new client connected 0.180s later; no intervention, no restart. Reported on the PASS and not only on the failure, because the FINDING is that the figure is non-zero at all: reclaim is not synchronous with the client's disconnect, so a single refill attempt can still be refused. The figure itself resolves no finer than one poll pass (25ms + 50ms), so read its order of magnitude and not its digits — it measures this proof's cadence as much as the kernel's
+[spike-1511] CHECK 8  cancel-safe: PASS — an accept dropped mid-connect left its listening instance alive and the name held; the next client connected on the SAME instance
+[spike-1511] CHECK 9  name gone  : PASS — the last instance dropped, and a client then got ERROR_PIPE_BUSY first and then ERROR_FILE_NOT_FOUND (= 2) within 0.063s. So the BUSY-not-NOT-FOUND guarantee holds only while an instance EXISTS, and the name is then free for another process to take. At zero instances a running daemon reads first as SATURATED and then as ABSENT.
+[spike-1511] ANSWER (ADR-0037, #1511 AC3): the accept loop keeps exactly ONE listening instance outstanding — a STRUCTURAL fact, carried by the `Option<NamedPipeServer>` this loop and production both hold, corroborated by every check here and measurable by none of them (see `listening()`) — plus one per live connection, so a `watch` subscriber occupies one for its whole lifetime. At the ceiling the refill is denied ERROR_PIPE_BUSY, nothing listens, and an arriving client is told BUSY rather than NOT-FOUND — but only while an instance still exists (CHECK 9): the refill is a single attempt, so a refused refill plus the end of the exchange it served reaches zero instances, and there a live daemon reads first as saturated and then, once teardown completes, as ABSENT. When any connection ends the loop refills and service resumes unattended — but NOT necessarily on the very next accept, since the instance is not reclaimed synchronously with the client's disconnect. That is what production's `wait_for_instance` retry cadence is for, and CHECK 7 prints how long it actually took on this run.
+[spike-1511] VERDICT: PASS — every gated check succeeded.
+```
+
+Two bounds on that block, both stated in the proof's own source and repeated here because this
+record is what survives it. **`max_instances` is pinned to make a ceiling reachable in a CI run**;
+production sets none and takes tokio's `PIPE_UNLIMITED_INSTANCES`, a sentinel under which Windows
+bounds instances by system resources — so what generalizes is the BEHAVIOUR at a refused create,
+not the number, and not the assumption that production's configuration refuses with the same error
+code. Nothing measures that. **The loop it exercises is a TRANSCRIPTION.** The spike sits outside
+the root build graph, so it cannot `use` `src/control_transport.rs`; `AcceptLoop` mirrors it, and
+nothing compares the two. If they drift, the block above measures a loop the daemon does not run.
 
 ## Decision
 
