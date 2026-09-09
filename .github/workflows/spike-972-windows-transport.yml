@@ -119,18 +119,23 @@ jobs:
       # exhausted — and it gates its own checks, so this step's pass/fail IS that answer. Kept a
       # separate STEP because ADR-0037 quotes the proof above and calls that output "the whole of
       # what the program printed"; appending to it would falsify the sentence on every later run.
-      # It runs even if the proof above FAILED (`always()`): the two measure different properties,
-      # and a #972 regression should not hide a #1511 answer. The job still fails if either does.
+      # It runs even if the proof above FAILED (`success() || failure()`): the two measure
+      # different properties, and a #972 regression should not hide a #1511 answer. The job still
+      # fails if either does. NOT `always()`, which additionally runs the step on a CANCELLED
+      # run — routine here, because the concurrency group above sets `cancel-in-progress` on
+      # every ref but `main`, so a second push supersedes the first. A cancelled run has no
+      # answer to record, and this is a Windows runner.
       - name: Run the accept-loop / watch proof (issue #1511)
-        if: always()
+        if: success() || failure()
         run: |
           set -o pipefail
           cargo run --locked -- watch 2>&1 | tee watch-proof-output.txt
       # The log IS the evidence ADR-0037 quotes, so lift it where a reader lands first rather than
-      # leaving it several clicks deep. `always()`, because a FAILING proof's output is the more
-      # informative of the two and is exactly what gets read.
+      # leaving it several clicks deep. `success() || failure()`, because a FAILING proof's
+      # output is the more informative of the two and is exactly what gets read — and not
+      # `always()`, for the reason the step above gives: a cancelled run has nothing to publish.
       - name: Publish the proof's output to the job summary
-        if: always()
+        if: success() || failure()
         run: |
           {
             echo '### issue-#972 Windows control-transport proof'
