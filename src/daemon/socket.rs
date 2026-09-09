@@ -285,39 +285,34 @@ impl Control for UnixControl {
             Ok(stream) => {
                 // Authenticate the peer as the SAME local user (issue #64): a
                 // state-affecting command (`manual-swapped`, `swap` #167) is honored
-                // only from our own uid. On macOS / Linux the socket is already
+                // only from our own identity. On macOS / Linux the socket is already
                 // `0600` in a `0700` dir, so this is defense-in-depth; on Windows it
-                // is the only layer there is, and an earlier revision of this comment
-                // credited the arm with a directory it does not have. NEITHER half of
-                // the Unix pair has an analogue: the mode does not exist (`paths.rs`,
-                // `control_socket`), and ADR-0037 § Consequences says outright that the
-                // `0700` DIRECTORY has none either — "the pipe namespace has no
-                // directory to protect". What stands in for the mode is the pipe's own
-                // owner-only security descriptor, which #1513 landed: every instance
-                // carries `D:P(A;;GA;;;<our user SID>)`, so who may OPEN the name is
-                // now bounded to this daemon's own user. That is why the stub below
-                // fails CLOSED — and why the reads it does not gate (`status`, `watch`,
-                // `stats`, `config-get`) are, on Windows only, answered to any
-                // same-user process that reaches the pipe, where on Unix reaching it was
-                // itself the gate. The state-affecting receive path must be
-                // authenticated, never trust-by-reachability. Peer creds are read from
-                // the real fd here; `serve_control` takes the verdict as a plain bool so
-                // it stays testable over an in-memory duplex.
-                #[cfg(unix)]
+                // is the layer that carries the most weight, and an earlier revision of
+                // this comment credited the arm with a directory it does not have.
+                // NEITHER half of the Unix pair has an analogue: the mode does not
+                // exist (`paths.rs`, `control_socket`), and ADR-0037 § Consequences says
+                // outright that the `0700` DIRECTORY has none either — "the pipe
+                // namespace has no directory to protect". What stands in for the mode is
+                // the pipe's own owner-only security descriptor, which #1513 landed:
+                // every instance carries `D:P(A;;GA;;;<our user SID>)`, so who may OPEN
+                // the name is bounded to this daemon's own user. What stands in for the
+                // directory is on the CLIENT side and cannot help here — #976's check of
+                // the SERVER's owner SID, which protects the CLI from a squatter rather
+                // than the daemon from a caller.
+                //
+                // Since #976 there is ONE call on every target. `peer_is_same_user` takes
+                // the target-neutral `ControlStream` and reads whichever identity that
+                // target has — `getpeereid` / `SO_PEERCRED` over the socket fd, or the
+                // impersonated user SID off the pipe (ADR-0037 § Decision 3) — and every
+                // arm fails CLOSED, so an unreadable identity denies rather than passes.
+                // It replaces the `false` constant #1511 left here, under which no
+                // Windows peer was ever authenticated. The reads this gate does NOT
+                // cover (`status`, `watch`, `stats`, `config-get`) are non-secret and
+                // answered to anyone who reaches the endpoint on either target; the
+                // state-affecting receive path is authenticated rather than trusted by
+                // reachability. `serve_control` takes the verdict as a plain bool so it
+                // stays testable over an in-memory duplex.
                 let peer_authenticated = peer_is_same_user(&stream);
-                // The Windows peer identity — `ImpersonateNamedPipeClient` → `OpenThreadToken`
-                // → `GetTokenInformation(TokenUser)` → `ConvertSidToStringSidW` → `RevertToSelf`,
-                // compared against our own process token's user SID — is ADR-0037 § Decision 3,
-                // and it belongs to **#976**, not to the transport port (#1511) whose Boundaries
-                // exclude it. Until #976 lands this is the FAIL-CLOSED constant, which is the
-                // same direction `peer_euid`'s `None` already fails in: no Windows peer is ever
-                // authenticated, so every state-affecting command (`manual-swapped`,
-                // `roster-reload`, `restored`, `shutdown`, `swap`, `capture`, `config-set`) is
-                // refused with `{"error":"unauthorized"}` and only the non-secret reads answer.
-                // Explicit and safe rather than silent and wrong — and unreachable in a shipped
-                // binary either way, since no CI job builds this target until #978 exists.
-                #[cfg(windows)]
-                let peer_authenticated = false;
                 // Best-effort: a malformed or disconnected client must never crash
                 // the daemon — drop the exchange (the reply carries nothing secret).
                 match serve_control(stream, snapshot, peer_authenticated).await {

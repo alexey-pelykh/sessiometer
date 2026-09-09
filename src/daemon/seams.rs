@@ -316,96 +316,250 @@ impl KeepWarm for RealKeepWarmEngine {
     }
 }
 
-/// A held single-instance lock: a kernel advisory `flock(LOCK_EX|LOCK_NB)` on the
-/// native-local `daemon.lock`. The file is held open for the process lifetime —
-/// the kernel releases the lock on death (or on drop), so there is no stale-PID
-/// reaping. A second `run` cannot acquire it and gets [`Error::AlreadyRunning`]
-/// (process exit `3`).
+/// A held single-instance lock on the native-local `daemon.lock`: a kernel advisory
+/// `flock(LOCK_EX|LOCK_NB)` on Unix, a `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK |
+/// LOCKFILE_FAIL_IMMEDIATELY)` byte-range lock on Windows (issue #976). The file is held open
+/// for the process lifetime — the kernel releases the lock on death (or on drop) on BOTH
+/// targets, so there is no stale-PID reaping. A second `run` cannot acquire it and gets
+/// [`Error::AlreadyRunning`] (process exit `3`).
+///
+/// # Why a FILE lock on Windows and not a named mutex (issue #976 AC3)
+///
+/// The issue names both candidates and requires the choice to be made against the
+/// ANY-PROVENANCE requirement: [`InstanceLock::is_held`] is mirrored by the menu-bar's
+/// `DaemonLockProbe`, which must detect a daemon started by any means — launchd, manual,
+/// app-managed — and a lock that only detects self-started daemons is a regression in kind even
+/// though the menu-bar is macOS-only.
+///
+/// **A named mutex fails that requirement on its namespace alone.** Windows kernel object names
+/// are per-SESSION unless prefixed: an unprefixed (or `Local\`) name resolves inside the caller's
+/// session, so a daemon started in a service context and a CLI started from an interactive shell
+/// would create two different mutexes and each would report the other absent. `Global\` fixes the
+/// namespace and introduces a worse problem: creating a global object needs
+/// `SeCreateGlobalPrivilege`, which services and administrators hold by default and a standard
+/// interactive user does not — so the very user this per-user daemon exists for could fail to
+/// take its own lock. A byte-range lock has no namespace at all: the lock file is reached by
+/// PATH, which is already per-user and already the same path both ends compute.
+///
+/// **Three further reasons, each independent of that one.** A mutex is invisible to anything that
+/// checks the lock FILE, which is what the issue says outright and what the file-based
+/// `is_held` probe reads. An abandoned mutex reports `WAIT_ABANDONED`, an extra state with no
+/// `flock` analogue and no meaning here, where a byte-range lock simply becomes free. And
+/// `File::try_lock` — stable since 1.89 and the planned replacement for the raw `flock` FFI once
+/// MSRV reaches it (#257) — is implemented over `LockFileEx` on Windows, so this choice puts both
+/// arms on one future convergence point instead of stranding the Windows arm off it.
+///
+/// **What the file lock does NOT carry over.** `flock` is ADVISORY; a Windows byte-range lock is
+/// MANDATORY, so a third-party reader of `daemon.lock` is refused rather than ignored. Nothing in
+/// this crate reads the file's CONTENT — it is zero bytes and exists only to be locked — so the
+/// difference has no consumer here. It is recorded because it is a real semantic difference and
+/// the next reader should not have to rediscover it.
+///
+/// UNMEASURED on Windows, like every other line of that arm: no CI job compiles this target
+/// (**#978**). The reasoning above is from the documented API contract, not from a run.
 pub(crate) struct InstanceLock {
     // Held open purely to keep the lock; dropping it (or the process dying)
     // releases it.
     _file: File,
 }
 
-impl InstanceLock {
-    /// Acquire the lock at `path`, creating the file `0600` if needed.
-    /// [`Error::AlreadyRunning`] if another instance already holds it.
-    pub(crate) fn acquire(path: &Path) -> Result<Self> {
-        use std::os::unix::fs::OpenOptionsExt;
-        use std::os::unix::io::AsRawFd;
+/// What one non-blocking exclusive-lock attempt did — the three-way outcome both targets narrow
+/// to, so the state machine [`InstanceLock`] runs on top of it is target-neutral and its
+/// fail-closed shape is readable in one place (issue #976).
+///
+/// The same split [`super::peer_auth::is_same_user`] makes for peer identity: the per-target
+/// syscall yields a value, and the DECISION over that value is written once.
+enum LockAttempt {
+    /// The lock is now held on the passed handle, and is released when it closes.
+    Acquired,
+    /// Another open file description holds it — a live daemon.
+    Contended,
+    /// The lock could not be attempted or failed for any other reason.
+    Failed(std::io::Error),
+}
 
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(path)?;
-        // Raw `flock` FFI, kept un-wrapped by ADR-0004: kept raw rather than
-        // adding a `rustix` production dependency; the std wheel
-        // (`File::try_lock`, stable 1.89) is the planned replacement once MSRV
-        // reaches 1.89 (see #257).
-        // SAFETY: `flock` takes a valid open fd (owned by `file`, which outlives
-        // the call) and the two flag constants; it has no other preconditions.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc == 0 {
-            return Ok(Self { _file: file });
-        }
-        let err = std::io::Error::last_os_error();
-        // EWOULDBLOCK (== EAGAIN) means another instance holds the lock; anything
-        // else is a genuine I/O failure.
-        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
-            Err(Error::AlreadyRunning)
-        } else {
-            Err(Error::Io(err))
+/// Open (creating if needed) the lock file at `path` for the lock attempts below.
+///
+/// `0600` from the start, so the file is never briefly world-readable. It carries no content —
+/// it exists only to be locked — but a predictable per-user path under the support dir should
+/// not be a file anybody else can open either.
+#[cfg(unix)]
+fn open_lock_file(path: &Path, create: bool) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if !create {
+        return OpenOptions::new().read(true).open(path);
+    }
+    OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+}
+
+/// Open (creating if needed) the lock file at `path` for the lock attempts below.
+///
+/// The `0600` the Unix arm sets has NO analogue here and is deliberately not faked with one: a
+/// new file inherits the enclosing directory's ACL, and hardening the support DIRECTORY on this
+/// target belongs to the item that ports `crate::paths`, not to this one. So on Windows this
+/// file's reachability is whatever that directory grants — stated rather than papered over,
+/// because the same asymmetry that removed the `0700` directory from the control channel
+/// (ADR-0037 § Decision 2) shows up here, and the lock's own guarantee does not rest on it: the
+/// file carries no content, and a foreign user who can open it still cannot make our
+/// `LockFileEx` succeed while we hold it.
+#[cfg(windows)]
+fn open_lock_file(path: &Path, create: bool) -> std::io::Result<File> {
+    if !create {
+        return OpenOptions::new().read(true).open(path);
+    }
+    OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+}
+
+/// One non-blocking exclusive `flock(LOCK_EX|LOCK_NB)` on `file`.
+#[cfg(unix)]
+fn try_lock_exclusive(file: &File) -> LockAttempt {
+    use std::os::unix::io::AsRawFd;
+
+    // Raw `flock` FFI, kept un-wrapped by ADR-0004: kept raw rather than
+    // adding a `rustix` production dependency; the std wheel
+    // (`File::try_lock`, stable 1.89) is the planned replacement once MSRV
+    // reaches 1.89 (see #257).
+    // SAFETY: `flock` takes a valid open fd (owned by `file`, which outlives
+    // the call) and the two flag constants; it has no other preconditions.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return LockAttempt::Acquired;
+    }
+    let err = std::io::Error::last_os_error();
+    // EWOULDBLOCK (== EAGAIN) means another instance holds the lock; anything
+    // else is a genuine I/O failure.
+    if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        LockAttempt::Contended
+    } else {
+        LockAttempt::Failed(err)
+    }
+}
+
+/// One non-blocking exclusive `LockFileEx` over the first byte of `file` (issue #976).
+///
+/// `LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY` is the direct analogue of
+/// `LOCK_EX | LOCK_NB`: exclusive, and returning at once rather than blocking. Contention is
+/// `ERROR_LOCK_VIOLATION`, which is this arm's `EWOULDBLOCK`.
+///
+/// **One byte at offset zero**, and the range is arbitrary only in the sense that any range would
+/// do provided BOTH the acquire and the probe use the same one — which is why there is one
+/// function rather than two. Windows documents locking a range beyond the current end-of-file as
+/// legal, so the file staying empty is not a problem.
+///
+/// **Locks conflict between HANDLES, not between processes**, which is the property both callers
+/// depend on and the one a reader coming from `flock` should confirm rather than assume. A second
+/// `LockFileEx` against a separately-opened handle is refused even inside the same process — so
+/// the second-`acquire` refusal and the separate-open `is_held` probe both behave as their Unix
+/// counterparts do over distinct open file descriptions. (A DUPLICATED handle shares its locks;
+/// nothing here duplicates one.)
+#[cfg(windows)]
+fn try_lock_exclusive(file: &File) -> LockAttempt {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, HANDLE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    // The offset the lock starts at, carried in the OVERLAPPED rather than as an argument. Zeroed
+    // whole: `hEvent` must be null for a synchronous handle, and every other member is reserved.
+    // SAFETY: `OVERLAPPED` is a plain `#[repr(C)]` struct of integers and pointers, for which the
+    // all-zero bit pattern is valid (a null `hEvent` is exactly what this call wants).
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    // SAFETY: `LockFileEx` takes a valid open handle (owned by `file`, which outlives the call),
+    // the two flag constants, a reserved zero, the two halves of a 1-byte length, and a live
+    // `OVERLAPPED` on this stack frame which also outlives the call. The handle is synchronous
+    // (Rust's `File` opens without `FILE_FLAG_OVERLAPPED`), so the call completes before it
+    // returns and the structure is not retained.
+    let ok = unsafe {
+        LockFileEx(
+            file.as_raw_handle() as HANDLE,
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &mut overlapped,
+        )
+    };
+    if ok != 0 {
+        return LockAttempt::Acquired;
+    }
+    let err = std::io::Error::last_os_error();
+    // ERROR_LOCK_VIOLATION is what LOCKFILE_FAIL_IMMEDIATELY reports for a range another handle
+    // already holds — another instance is alive. Anything else is a genuine I/O failure.
+    if err.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+        LockAttempt::Contended
+    } else {
+        LockAttempt::Failed(err)
+    }
+}
+
+impl InstanceLock {
+    /// Acquire the lock at `path`, creating the file if needed (`0600` on Unix; see
+    /// [`open_lock_file`] for why Windows has no analogue). [`Error::AlreadyRunning`] if another
+    /// instance already holds it.
+    pub(crate) fn acquire(path: &Path) -> Result<Self> {
+        let file = open_lock_file(path, true)?;
+        match try_lock_exclusive(&file) {
+            LockAttempt::Acquired => Ok(Self { _file: file }),
+            LockAttempt::Contended => Err(Error::AlreadyRunning),
+            LockAttempt::Failed(err) => Err(Error::Io(err)),
         }
     }
 
     /// Probe whether the single-instance lock at `path` is currently held by a LIVE daemon,
     /// WITHOUT disturbing it (issue #396) — the lock-fallback half of the `daemon status`
-    /// liveness projection (socket-primary, lock-fallback). A non-blocking
-    /// `flock(LOCK_EX|LOCK_NB)` over a fresh read-only open (a separate open file description,
-    /// so it contends with the daemon's held lock exactly as a second `run` would):
-    /// - `EWOULDBLOCK` ⇒ another process holds it — a daemon is alive even if its control
+    /// liveness projection (socket-primary, lock-fallback). A non-blocking exclusive lock over a
+    /// fresh read-only open (a separate open file description / handle, so it contends with the
+    /// daemon's held lock exactly as a second `run` would):
+    /// - contention ⇒ another process holds it — a daemon is alive even if its control
     ///   socket is not answering yet (the honest startup / wedged case; NOT "not running").
     /// - a successful acquire ⇒ no live holder; the lock is released the instant `file` drops
     ///   at the end of this scope — nothing is started, stopped, or signalled.
     /// - an absent lock file ⇒ the daemon has never created it ⇒ not running.
     ///
+    /// ANY-PROVENANCE by construction, on every target (issue #976 AC3): it asks the KERNEL who
+    /// holds a lock on a path, so it answers about a daemon started by any means — launchd, a
+    /// Windows service, a shell, the menu-bar app — and never only about one this code started.
+    /// That is the property that ruled a named mutex out on Windows; see [`InstanceLock`].
+    ///
     /// Read-only by construction (the `daemon status` AC: no process is started/stopped/
-    /// signalled). Kept beside [`Self::acquire`] so the raw `flock` FFI stays localized
-    /// (ADR-0004).
+    /// signalled). Kept beside [`Self::acquire`] so the raw locking FFI stays localized
+    /// (ADR-0004) and so both ends lock the same range.
     ///
     /// Note the one inherent tradeoff: probing a FREE lock necessarily acquires it for the
-    /// ~microseconds until `file` drops — `flock` has no test-without-acquire mode, so this
-    /// acquire-then-release is the canonical liveness-probe shape. It is benign here because
-    /// the caller runs this ONLY as the socket-primary fallback (a real startup already holds
-    /// the lock, so the probe fails to acquire and never contends); the sole residual race is
-    /// a `run` whose own `acquire` lands in that microsecond window and self-refuses (exit 3),
-    /// which is vanishingly unlikely and self-correcting on retry.
+    /// ~microseconds until `file` drops — neither `flock` nor `LockFileEx` has a
+    /// test-without-acquire mode, so this acquire-then-release is the canonical liveness-probe
+    /// shape. It is benign here because the caller runs this ONLY as the socket-primary fallback
+    /// (a real startup already holds the lock, so the probe fails to acquire and never contends);
+    /// the sole residual race is a `run` whose own `acquire` lands in that microsecond window and
+    /// self-refuses (exit 3), which is vanishingly unlikely and self-correcting on retry.
     pub(crate) fn is_held(path: &Path) -> Result<bool> {
-        use std::os::unix::io::AsRawFd;
-
-        let file = match OpenOptions::new().read(true).open(path) {
+        let file = match open_lock_file(path, false) {
             Ok(file) => file,
             // No lock file at all ⇒ the daemon has never created it ⇒ not held.
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(err) => return Err(Error::Io(err)),
         };
-        // SAFETY: as in `acquire` — a valid open fd (owned by `file`, which outlives the
-        // call) plus the two flag constants; `flock` has no other preconditions.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc == 0 {
+        match try_lock_exclusive(&file) {
             // Acquired ⇒ no live holder; `file` drops at the end of this scope, releasing the
             // lock at once.
-            return Ok(false);
-        }
-        let err = std::io::Error::last_os_error();
-        // EWOULDBLOCK (== EAGAIN): another instance holds the lock — a live daemon.
-        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
-            Ok(true)
-        } else {
-            Err(Error::Io(err))
+            LockAttempt::Acquired => Ok(false),
+            // Another instance holds the lock — a live daemon.
+            LockAttempt::Contended => Ok(true),
+            LockAttempt::Failed(err) => Err(Error::Io(err)),
         }
     }
 }
@@ -414,6 +568,12 @@ impl InstanceLock {
 mod tests {
     use super::*;
 
+    // Unix-only because the scenario IS a symlink re-point: `std::os::windows::fs::symlink_file`
+    // needs either Developer Mode or `SeCreateSymbolicLinkPrivilege`, so the same test on Windows
+    // would fail for a reason that has nothing to do with what it asserts. The BEHAVIOUR it pins —
+    // resolve per cycle, never freeze at construction — is target-neutral and lives in
+    // `RealKeepWarmEngine::resolve_binary`; only the fixture is not (issue #976).
+    #[cfg(unix)]
     #[tokio::test]
     async fn real_keep_warm_engine_resolves_the_binary_per_cycle_not_frozen_at_construction() {
         // Issue #375, the #282 keep-warm engine's half of the fix (sibling to `refresh_tick`'s
@@ -445,10 +605,21 @@ mod tests {
 
     // --- single-instance lock ----------------------------------------------
 
+    /// The single-instance guarantee itself, and issue #976's AC2 on every target that compiles.
+    ///
+    /// TARGET-NEUTRAL since #976, where it was Unix-only because of the mode assertion it used to
+    /// carry (now `the_lock_file_is_owner_only_on_unix` below). The claim — a second acquisition
+    /// while the first is held is REFUSED, and the refusal is `AlreadyRunning` rather than a
+    /// generic I/O error — is the same on `flock` and on `LockFileEx`, and running it everywhere
+    /// is what makes the shared state machine in `InstanceLock` more than an assertion about one
+    /// arm. AC2 asks for this "verified by a test on the Windows CI job"; that job is **#978** and
+    /// does not exist yet, so what this commit can deliver is the test, committed and unskipped,
+    /// which grades the Windows arm the moment the job turns on.
+    ///
+    /// The two acquisitions are separate OPENS in one process, which is what both mechanisms
+    /// contend on: `flock` locks the open file description, and `LockFileEx` locks per handle.
     #[test]
     fn instance_lock_blocks_a_second_acquisition_then_frees_on_drop() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("daemon.lock");
 
@@ -459,20 +630,40 @@ mod tests {
             InstanceLock::acquire(&path),
             Err(Error::AlreadyRunning)
         ));
-        // The lock file is 0600.
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
         // Dropping the holder releases the lock (kernel-released on close).
         drop(lock);
         let _reacquired =
             InstanceLock::acquire(&path).expect("the lock is free after the first is dropped");
     }
 
+    /// The lock file's mode, split out of the test above by issue #976 because it is the one part
+    /// of it that does NOT generalize: `0600` has no Windows analogue and `open_lock_file`'s
+    /// Windows arm says so rather than faking one.
+    #[cfg(unix)]
+    #[test]
+    fn the_lock_file_is_owner_only_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.lock");
+        let _lock = InstanceLock::acquire(&path).expect("acquire creates the lock file");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
     #[test]
     fn instance_lock_is_held_probe_reports_absent_held_and_freed() {
         // Issue #396: the read-only lock-fallback probe behind `daemon status`. It must never
-        // disturb a live holder (non-blocking flock over a separate open), and it distinguishes
-        // three states: absent lock file, held-by-a-live-daemon, and present-but-free.
+        // disturb a live holder (a non-blocking exclusive lock over a SEPARATE open — `flock` on
+        // Unix, `LockFileEx` on Windows), and it distinguishes three states: absent lock file,
+        // held-by-a-live-daemon, and present-but-free.
+        //
+        // Issue #976 AC3 (any-provenance) is what the separate open buys: the probe asks the
+        // KERNEL who holds a lock on this PATH, so it answers about a holder started by any means
+        // rather than about one this code started. That is what a named mutex could not do, and
+        // this test is the executable half of it — the half it cannot reach is a holder in another
+        // PROCESS, which needs a second binary; neither lock primitive distinguishes the caller,
+        // so the separate open is the same contention a second process presents.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("daemon.lock");
 

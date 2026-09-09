@@ -79,7 +79,12 @@ etcetera = "0.11.0"
 # (`Win32_Security_Authorization`), and the `SECURITY_ATTRIBUTES` that carries the result into
 # `CreateNamedPipeW`. Spelled from the crate that generates them rather than hand-copied as magic
 # numbers: they are a vendor-published ABI, the same argument `toml_writer` carries for TOML
-# escaping.
+# escaping. Plus, since #976, the identity and single-instance-lock surface ADR-0037 assigns to
+# that item: `Win32_System_Pipes`' `ImpersonateNamedPipeClient` with `Win32_System_Threading`'s
+# `OpenThreadToken` and `Win32_Security`'s `RevertToSelf` for the peer's user SID,
+# `Win32_Security_Authorization`'s `GetSecurityInfo` for the client-side check of the SERVER's
+# owner SID, and `Win32_Storage_FileSystem`'s `LockFileEx` over `Win32_System_IO`'s `OVERLAPPED`
+# for the single-instance lock.
 #
 # ZERO new crates enter the graph: `windows-sys` 0.61.2 is ALREADY in Cargo.lock, pulled by both
 # `tokio` and `etcetera` on this target, so this adds a direct edge to a package that is already
@@ -93,6 +98,8 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
 
