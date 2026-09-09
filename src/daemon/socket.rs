@@ -285,8 +285,11 @@ impl Control for UnixControl {
             Ok(stream) => {
                 // Authenticate the peer as the SAME local user (issue #64): a
                 // state-affecting command (`manual-swapped`, `swap` #167) is honored
-                // only from our own uid. The socket is already `0600` in a `0700`
-                // dir, so this is defense-in-depth — but the state-affecting receive
+                // only from our own uid. On macOS / Linux the socket is already
+                // `0600` in a `0700` dir, so this is defense-in-depth; on Windows
+                // there is no mode and the equivalent descriptor is #1513's, so the
+                // Windows arm has this and the directory only — which is why the
+                // stub below fails CLOSED. The state-affecting receive
                 // path must be authenticated, never trust-by-reachability. Peer creds
                 // are read from the real fd here; `serve_control` takes the verdict as
                 // a plain bool so it stays testable over an in-memory duplex.

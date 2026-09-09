@@ -1132,6 +1132,12 @@ async fn query_next_swap(socket: &Path) -> Result<StatusResponse> {
             .map_err(|err| {
                 match err.kind() {
                     // No socket file, or a stale one with no listener → no live daemon.
+                    // On Windows that inference is not sound: the accept loop's refill is
+                    // a single attempt, so a live daemon can reach zero instances, stop
+                    // holding the pipe name, and answer `ERROR_FILE_NOT_FOUND` — this arm
+                    // then falls back to standalone against a daemon that is running.
+                    // Tracked at #1515; nothing here distinguishes the two yet, and the
+                    // path is unreachable until #978 compiles this target.
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
                         Error::UseNextRequiresDaemon
                     }

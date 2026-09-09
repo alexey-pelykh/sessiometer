@@ -1335,7 +1335,8 @@ mod tests {
     fn no_in_process_http_tls_or_telemetry_client_is_linked() {
         // Without an HTTP/TLS client crate the process cannot originate an
         // in-process HTTP(S) request; without a telemetry/analytics/crash SDK it
-        // cannot beacon to one. The Unix-domain daemon socket needs none of these,
+        // cannot beacon to one. The daemon's local control channel needs none of
+        // these on either target — a Unix-domain socket, or a named pipe on Windows,
         // so the dependency graph stays empty of them — the network surface analogue
         // of `scripts/check-no-security-framework.sh` and the CONTRIBUTING.md
         // transport rule ("No TLS / HTTP client ... the one network call rides the

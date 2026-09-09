@@ -1277,8 +1277,8 @@ This is an architectural guarantee, not just a policy:
   [transport rule](CONTRIBUTING.md#system-clis-not-client-crates-the-transport-rule));
   the one usage `GET` rides the system `/usr/bin/curl` at an absolute path. With
   no in-process HTTP/TLS stack and no raw TCP/UDP socket — the daemon's control
-  socket is a local Unix-domain socket that never leaves the machine — the process
-  has no way to open a second connection.
+  channel is local on every target, a Unix-domain socket on macOS / Linux and a
+  named pipe on Windows — the process has no way to open a second connection.
 - **A test enforces it.** The no-other-egress invariant is a capability guard in
   the test suite ([`src/usage.rs`](src/usage.rs), run by `cargo test` in CI): it
   fails the build if an HTTP/TLS/telemetry crate ever enters the dependency graph,

@@ -570,11 +570,17 @@ pub(crate) fn daemon_lock() -> Result<PathBuf> {
     Ok(support_dir()?.join("daemon.lock"))
 }
 
-/// The control socket: `<support_dir>/daemon.sock` (`0600`).
+/// The control endpoint: `<support_dir>/daemon.sock`.
 ///
-/// The newline-delimited-JSON Unix-domain control channel a running daemon
-/// serves `status` on (issue #7). Native-local (via [`support_dir`]) and a Unix
-/// domain socket — never a TCP port.
+/// The newline-delimited-JSON control channel a running daemon serves `status` on
+/// (issue #7). Native-local via [`support_dir`], and never a TCP port on any target.
+///
+/// This function is NOT cfg-gated and both arms call it, so read the path as the
+/// endpoint's IDENTITY rather than its kind. On Unix it is the socket itself, created
+/// `0600`. On Windows since #1511 it names nothing on disk: `control_transport` digests
+/// it into a pipe name under `\\.\pipe\`, so neither the file nor the mode exists —
+/// which is why the owner-only descriptor that would stand in for the `0600` is tracked
+/// separately at #1513 rather than implied here.
 pub(crate) fn control_socket() -> Result<PathBuf> {
     Ok(support_dir()?.join("daemon.sock"))
 }

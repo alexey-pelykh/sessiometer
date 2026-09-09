@@ -1776,8 +1776,9 @@ fn bind_control_socket(path: &Path) -> Result<UnixControl> {
 
 /// Show the active account, every account's usage, and the next swap candidate (#88).
 ///
-/// The **live** counterpart to the offline `list` (#17): a control-socket CLIENT.
-/// Connect to the running daemon's `0600` socket, ask for `status`, and pretty-
+/// The **live** counterpart to the offline `list` (#17): a control-channel CLIENT.
+/// Connect to the running daemon's endpoint — the `0600` socket on macOS / Linux, the
+/// named pipe on Windows (#1511) — ask for `status`, and pretty-
 /// print the reply. The socket exists only while `run` is live, so a failed
 /// connect is the friendly [`Error::DaemonNotRunning`] (exit non-zero), never a
 /// raw connection error — the live analog of `list`'s empty-state friendliness.
