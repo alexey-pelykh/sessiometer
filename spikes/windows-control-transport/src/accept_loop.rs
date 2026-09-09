@@ -27,6 +27,15 @@
 //! provenance rather than approximated, exactly as `MAX_CONTROL_LINE_BYTES` is in `proof.rs`. If
 //! the two ever disagree this proof is measuring a loop the daemon does not run.
 //!
+//! **Nothing enforces that, and a reader should not assume otherwise.** No test, lint or CI job
+//! compares this file against `src/control_transport.rs`; the correspondence is checked by hand
+//! at review time and is a standing premise of every figure below — the #1511 record states the
+//! same bound. Three divergences are deliberate and are declared where they occur: the pinned
+//! [`MAX_INSTANCES`] above, the refill arm here recording `refill_was_busy` for CHECK 6a, and
+//! `bind`'s signature. The client here also omits production's busy budget, which is inert for a
+//! proof that opens one client at a time. No gate is added because both this package and its
+//! workflow are throwaway (ADR-0037 § Lifecycle) — a gate would be built and deleted with them.
+//!
 //! **`max_instances` is lowered to make a ceiling exist at all.** Production never calls
 //! `max_instances`, so it takes tokio's default of `PIPE_UNLIMITED_INSTANCES` — a SENTINEL, not
 //! a count: under it Windows bounds instances by the availability of system resources, and 255 is
@@ -58,9 +67,16 @@ use windows_sys::Win32::Storage::FileSystem::{SECURITY_IDENTIFICATION, SECURITY_
 /// create below passes it.
 const MAX_INSTANCES: usize = 4;
 
-/// The whole proof is time-boxed so a wedged runner fails the job instead of hanging it. Shorter
-/// than `proof.rs`'s budget because nothing here spawns a child process.
-const PROOF_TIMEOUT: Duration = Duration::from_secs(20);
+/// The whole proof is time-boxed so a wedged runner fails the job instead of hanging it.
+///
+/// It must be LONGER than the sum of every per-check bound below, and at 20s it was not: four
+/// `RECOVERY_ATTEMPTS` passes plus five `FRAME_TIMEOUT` waits plus CHECK 9's poll sum past 40s at
+/// the constants below, so a slow-but-not-wedged composite tripped this instead, and the message
+/// it prints names no check. That made the outer box compete with the inner ones rather than
+/// back them: whichever fires first is the one that gets to diagnose, and only the inner ones can.
+/// An earlier revision justified 20s as "shorter than `proof.rs`'s because nothing here spawns a
+/// child process" — a true statement about cost that is not the constraint that sets this value.
+const PROOF_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// How long to wait for a frame the server has already pushed. Generous: it bounds a failure,
 /// it does not pace a success.
@@ -262,6 +278,13 @@ impl AcceptLoop {
 
     /// Instances this loop is holding open: the listening one, if any, plus whatever the caller
     /// still holds. The caller supplies its own count because the loop hands connections away.
+    ///
+    /// Read what this can and cannot witness. `idle` is an `Option`, so the range is `{0, 1}` and
+    /// every `listening() == 1` assertion in this file is a two-state test — it can catch the
+    /// instance being GONE and can never catch a second one, because the type forbids one. The
+    /// ANSWER's "exactly ONE listening instance" is therefore established by production's own
+    /// `Option<NamedPipeServer>` (mirrored here) and only CORROBORATED by these runs. A count that
+    /// could exceed one would need a different field, in production first.
     fn listening(&self) -> usize {
         usize::from(self.idle.borrow().is_some())
     }
@@ -449,6 +472,18 @@ async fn proof() -> Checked<()> {
         subscribers.push(client);
         served.push(server);
     }
+    // The PASS below interpolates its own subject, so without this the claim degrades with
+    // `MAX_INSTANCES`: at 1 it would print "1 subscribers are connected AT ONCE ... a one-instance
+    // server would have refused every one after the first", which is vacuous and reads as a
+    // finding. The module doc invites tuning that constant, so gate the discriminating half.
+    if subscribers.len() < 2 {
+        return Err(fail(format!(
+            "CHECK 5: concurrency is not demonstrated by {} subscriber(s) — MAX_INSTANCES is {}, \
+             and this check needs at least 2 to say anything a one-instance server could not",
+            subscribers.len(),
+            MAX_INSTANCES
+        )));
+    }
     println!(
         "{TAG} CHECK 5  concurrent : PASS — {} subscribers are connected AT ONCE, each holding its \
          own instance; a one-instance server would have refused every one after the first",
@@ -557,9 +592,14 @@ async fn proof() -> Checked<()> {
     println!(
         "{TAG} CHECK 7  recovery   : PASS — one subscriber left and a new client connected \
          {:.3}s later; no intervention, no restart. Reported on the PASS and not only on the \
-         failure, because the number is the finding: reclaim is not synchronous with the \
-         client's disconnect, so a single refill attempt can still be refused",
-        started.elapsed().as_secs_f64()
+         failure, because the FINDING is that the figure is non-zero at all: reclaim is not \
+         synchronous with the client's disconnect, so a single refill attempt can still be \
+         refused. The figure itself resolves no finer than one poll pass ({:?} + {:?}), so read \
+         its order of magnitude and not its digits — it measures this proof's cadence as much as \
+         the kernel's",
+        started.elapsed().as_secs_f64(),
+        ACCEPT_POLL,
+        INSTANCE_RETRY_INTERVAL
     );
     subscribers.push(recovered);
     served.push(served_recovered);
