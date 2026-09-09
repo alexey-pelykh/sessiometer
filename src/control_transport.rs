@@ -303,8 +303,10 @@ mod imp {
     /// unwinding panic would then leave the endpoint with nothing listening.
     struct PendingAccept<'a> {
         idle: &'a RefCell<Option<NamedPipeServer>>,
-        /// The instance being connected. `None` once the caller has claimed it (a completed accept)
-        /// or deliberately discarded it (a failed `connect`), which makes [`Drop`] a no-op.
+        /// The instance being connected, and whatever [`ControlListener::accept`] leaves here is
+        /// what [`Drop`] parks back in `idle`. `None` once the caller has claimed it (a completed
+        /// accept), or where a failed `connect` deliberately discarded it — which is one of the
+        /// three ways that failure resolves, not the only one.
         server: Option<NamedPipeServer>,
     }
 
@@ -330,9 +332,10 @@ mod imp {
     /// instance through the one await that would otherwise need it.
     pub(crate) struct ControlListener {
         name: OsString,
-        /// The created-but-not-yet-connected instance. `None` only in the window after an
-        /// instance was handed out and its replacement could not yet be created (no instance was
-        /// available); the next [`ControlListener::accept`] waits for one.
+        /// The created-but-not-yet-connected instance. `None` in two windows: after an instance
+        /// was handed out and its replacement was refused, and after a `connect` failed and its
+        /// replacement was refused as busy. The next [`ControlListener::accept`] waits for one —
+        /// for as long as the refusal keeps being `ERROR_PIPE_BUSY`; any other error surfaces.
         idle: RefCell<Option<NamedPipeServer>>,
     }
 
@@ -412,15 +415,22 @@ mod imp {
         ///   waits (see [`ControlListener::wait_for_instance`]) until a subscriber disconnects.
         ///   Nothing is
         ///   dropped and no client is refused outright; service resumes on its own.
-        /// - **At least one instance exists at all times**, so the NAME is never released while
-        ///   the daemon is up. A released name is worse than a busy one: a client would see
-        ///   `ERROR_FILE_NOT_FOUND` and report "no daemon", any local process could then take
-        ///   the name, and the recovery path creates with `first_pipe_instance(false)`, so the
-        ///   kernel-enforced reservation would not come back. Two places have to honour it, and
-        ///   the second is the one that is easy to miss: the replacement is created BEFORE the
-        ///   connected instance is handed out, AND a `connect` that FAILS must not drop its
-        ///   instance until a replacement exists — at that point `idle` has already been emptied,
-        ///   so with no live connection that instance is the only one the process holds.
+        /// - **The NAME is held whenever an instance exists, and one normally does** — but
+        ///   NOT unconditionally, and an earlier revision of this list claimed otherwise. A
+        ///   released name is the worst outcome available here: a client sees
+        ///   `ERROR_FILE_NOT_FOUND` and reports "no daemon" against a running daemon, and any
+        ///   local process may then take the name. Two places therefore hold it deliberately —
+        ///   the replacement is created BEFORE the connected instance is handed out, and a
+        ///   `connect` that FAILS does not drop its instance until a replacement exists, since
+        ///   `idle` is already empty by then.
+        ///
+        ///   The hole both of those leave open is the REFILL, which is a single attempt on
+        ///   purpose (below). If it is refused, `idle` is empty and the handed-out instance is
+        ///   the only handle the process holds; when that exchange ends and the stream drops,
+        ///   the count reaches zero and the name goes with it. Serving the client now rather
+        ///   than stalling it behind a saturated pipe is worth that window, but the window is
+        ///   real: under the default `PIPE_UNLIMITED_INSTANCES` it takes resource exhaustion to
+        ///   reach, and NOTHING here measures it. Do not restate the guarantee as absolute.
         ///
         /// CANCEL-SAFE, and the structure below is what buys it. The run loop's idle `select!`
         /// drops this future whenever another arm wins, which on a busy daemon is most ticks. The
@@ -464,11 +474,19 @@ mod imp {
                     // Busy means some OTHER instance is alive, so the name does not depend on
                     // this one: discard it, exactly as before.
                     Err(create_err) if is_pipe_busy(&create_err) => pending.server = None,
-                    // Anything else says nothing about whether another instance exists. Keep the
-                    // failed one listening rather than gamble the name on it. This is the one
-                    // branch that can spin, and it is the trade taken deliberately: a spin is
-                    // observable and recoverable, a released name is neither.
-                    Err(_) => {}
+                    // Anything else says nothing about whether another instance exists. Keep
+                    // the failed one listening rather than gamble the name on it — and PACE the
+                    // failure, because nothing else will. `UnixControl::serve` maps a failed
+                    // accept to `ControlYield::Signal(None)` and the run loop re-arms `serve`
+                    // the moment it resolves, with no suspension point anywhere in between: a
+                    // non-`WouldBlock` `connect` error returns on the first poll and
+                    // `create_instance` is synchronous, so without this sleep the arm is a hot
+                    // loop on the daemon's single thread, not a retry. Even paced it is a POOR
+                    // outcome, and it should be read as one: nothing logs or counts it today, so
+                    // it is invisible until #978 makes the path executable. It is chosen only
+                    // against the alternative of releasing the name, which is silent too and
+                    // additionally lets another process take it.
+                    Err(_) => tokio::time::sleep(INSTANCE_RETRY_INTERVAL).await,
                 }
                 return Err(err);
             }

@@ -1491,9 +1491,11 @@ async fn run(verbosity: Verbosity, managed: bool) -> Result<()> {
     // one.
     emit_best_effort(&mut log, &daemon_build_event(std::env::current_exe()));
 
-    // Bind the 0600 control socket (status queries; issue #15: handles +
-    // percentages only). The lock above guarantees no live daemon owns a stale
-    // socket, so a leftover one is safe to remove and rebind.
+    // Bind the control endpoint (status queries; issue #15: handles + percentages
+    // only). What that is per target is `crate::control_transport`'s to decide — a
+    // 0600 Unix-domain socket, or a named pipe on Windows (#1511, ADR-0037). The
+    // lock above guarantees no live daemon owns a stale one, which is what makes the
+    // Unix arm's remove-and-rebind safe; the Windows arm has nothing to remove.
     let socket_path = paths::control_socket()?;
     let control = bind_control_socket(&socket_path)?;
 
