@@ -449,7 +449,8 @@ async fn proof() -> Checked<()> {
             println!(
                 "{TAG} CHECK 6b client busy: PASS — an arriving client gets ERROR_PIPE_BUSY \
                  (= {ERROR_PIPE_BUSY}), the documented RETRY signal — NOT ERROR_FILE_NOT_FOUND \
-                 (= {ERROR_FILE_NOT_FOUND}), so a saturated daemon is never read as an absent one"
+                 (= {ERROR_FILE_NOT_FOUND}). True of THIS state — every instance connected, \
+                 all of them still open. CHECK 9 measures the state it does not cover"
             );
         }
         Err(err) => {
