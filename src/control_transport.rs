@@ -643,11 +643,22 @@ mod unix_tests {
     /// umask, NOT the `0o666` seeded below. The seed stays conspicuous so an implementation that
     /// did inherit would be distinguishable from that one, but the umask case is the assertion's
     /// teeth.
+    ///
+    /// The seed is a REAL leftover socket rather than a regular file standing in for one. Nothing
+    /// in `bind` discriminates — `remove_file` unlinks either — so the branch would be reached
+    /// the same way. It is a socket because the test says it is: a seed that does not match the
+    /// name is how a test quietly stops describing the scenario it is kept for. Dropping a
+    /// `UnixListener` does NOT unlink its path, which is the whole reason `bind` needs the
+    /// `remove_file` this test exercises, so binding and dropping leaves exactly the artifact an
+    /// unclean exit leaves behind.
     #[tokio::test]
     async fn bind_replaces_a_leftover_socket_and_still_chmods_it() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("daemon.sock");
-        std::fs::write(&path, b"leftover").expect("seed a stale socket path");
+        drop(
+            std::os::unix::net::UnixListener::bind(&path)
+                .expect("seed a real leftover socket at the control path"),
+        );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
             .expect("make the leftover deliberately too permissive");
         let listener = ControlListener::bind(&path).expect("bind over the leftover");
@@ -695,5 +706,108 @@ mod windows_tests {
         // Well inside the 256-character limit, and the digest is fixed-width regardless of how
         // long the support-dir path is.
         assert_eq!(rendered.len(), r"\\.\pipe\sessiometer-control-".len() + 32);
+    }
+}
+
+/// The three pipe options this port is contractually required to set, pinned by SPELLING because
+/// nothing in this repo can pin them by behaviour: no CI job compiles the Windows arm — #978 is
+/// the item that would — so deleting the `security_qos_flags` call builds, lints, tests and
+/// merges green on every gate that actually runs. Scanning the module's own source is this
+/// repo's existing answer for a claim its test target cannot reach (`src/witness.rs`'s
+/// forbidden-token sweep, `src/usage.rs`'s egress scan), and unlike the module it guards it runs
+/// on EVERY target, which is the whole point.
+///
+/// What a green here means, exactly: the calls are WRITTEN. It is not evidence that Windows
+/// honours them, that they achieve what ADR-0037 says they achieve, or that the transport works
+/// at all — an executable round-trip is **#1514**'s, behind the #978 job.
+#[cfg(test)]
+mod windows_option_source_guard {
+    /// This file's own source up to the start of this guard, comment-only lines dropped and
+    /// whitespace collapsed.
+    ///
+    /// Three reductions, each load-bearing. Dropping comment-only lines is what keeps the counts
+    /// honest: every option below is named several times in the prose above, so a scan of the raw
+    /// text would be satisfied by doc comments alone. The file carries no trailing comments, so
+    /// dropping whole lines is complete; should one ever appear carrying one of these names the
+    /// count inflates and this guard goes RED — an alarm that points here, never a silent pass.
+    /// Collapsing whitespace keeps it stable under `cargo fmt`: a call the formatter wraps across
+    /// lines still matches. And cutting the text at this guard's own module header is what stops
+    /// the needles below from counting THEMSELVES — a scan that matches its own literals stays
+    /// green with the code it guards deleted.
+    fn transport_code() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("control_transport.rs");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+        let collapsed = text
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(str::split_whitespace)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let (before_guard, _) = collapsed
+            .split_once("mod windows_option_source_guard {")
+            .expect("source scan is broken: did not find this guard's own module header");
+        before_guard.to_owned()
+    }
+
+    /// `(client opens, server instance creations)` in the scanned text, with the canary that
+    /// makes a zero read as "the scan broke" rather than "the calls are gone".
+    fn builders(code: &str) -> (usize, usize) {
+        let clients = code.matches("ClientOptions::new()").count();
+        let servers = code.matches("ServerOptions::new()").count();
+        assert!(
+            clients > 0 && servers > 0,
+            "source scan is broken: found no pipe option builders in src/control_transport.rs"
+        );
+        (clients, servers)
+    }
+
+    /// AC5, the only one of the three the issue states as an acceptance criterion: EVERY client
+    /// open sets both flags, so a server that wins the name race is handed an
+    /// identification-level token and cannot impersonate the CLI (ADR-0037 § Consequences →
+    /// Negative). Matched as the whole call rather than as the constants, because both names are
+    /// also `use`-imported at the top of the Windows arm and a bare constant search therefore
+    /// stays green over a deleted call. The pair is matched together because
+    /// `SECURITY_IDENTIFICATION` without `SECURITY_SQOS_PRESENT` is not requested at all.
+    #[test]
+    fn every_client_open_sets_the_ac5_security_qos_flags() {
+        let code = transport_code();
+        let (clients, _) = builders(&code);
+        assert_eq!(
+            code.matches(".security_qos_flags(SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION)")
+                .count(),
+            clients,
+            "every client-side pipe open must set the AC5 flags (issue #1511 AC5)"
+        );
+    }
+
+    /// ADR-0037 § Decision 2 mandates this in the same breath as the flags: the pipe namespace is
+    /// machine-global, so an instance created without it is reachable over SMB from another host.
+    #[test]
+    fn every_server_instance_rejects_remote_clients() {
+        let code = transport_code();
+        let (_, servers) = builders(&code);
+        assert_eq!(
+            code.matches(".reject_remote_clients(true)").count(),
+            servers,
+            "every pipe instance must reject remote clients (ADR-0037 § Decision)"
+        );
+    }
+
+    /// Byte mode on BOTH ends. Message mode would frame the wire, and leaving the wire format
+    /// alone is the constraint this whole port is built around (ADR-0037 § Decision). It is
+    /// tokio's default, which is exactly why the explicit call is worth pinning: the default is
+    /// tokio's to change, and the wire compatibility resting on it is ours.
+    #[test]
+    fn both_ends_pin_byte_mode_rather_than_inheriting_it() {
+        let code = transport_code();
+        let (clients, servers) = builders(&code);
+        assert_eq!(
+            code.matches(".pipe_mode(PipeMode::Byte)").count(),
+            clients + servers,
+            "both the client open and the server instance must pin byte mode"
+        );
     }
 }
