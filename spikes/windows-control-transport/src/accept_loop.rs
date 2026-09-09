@@ -183,7 +183,16 @@ impl AcceptLoop {
                 Err(err) if is_code(&err, ERROR_PIPE_BUSY) => {
                     tokio::time::sleep(INSTANCE_RETRY_INTERVAL).await;
                 }
-                Err(err) => return Err(err),
+                // Paced before it is surfaced, exactly as production paces it: under the default
+                // `PIPE_UNLIMITED_INSTANCES` an exhausted create is at least as likely to report
+                // something other than `ERROR_PIPE_BUSY`, and returning that un-paced turns the
+                // caller's retry into a hot loop rather than a retry. Transcribed for the same
+                // reason as the arm above — a mirror that diverges measures a loop the daemon
+                // does not run.
+                Err(err) => {
+                    tokio::time::sleep(INSTANCE_RETRY_INTERVAL).await;
+                    return Err(err);
+                }
             }
         }
     }
@@ -196,8 +205,13 @@ impl AcceptLoop {
     /// - the listening instance is carried through `connect().await` by [`PendingAccept`], whose
     ///   `Drop` restores it, so a dropped accept future leaves it listening rather than closing it
     ///   (CHECK 8 measures this);
-    /// - the replacement is created BEFORE the connected instance is returned, so at least one
-    ///   instance always exists and the name is never released.
+    /// - the replacement is created BEFORE the connected instance is returned, so the handover
+    ///   itself never leaves the name unheld. That is NOT the absolute guarantee an earlier
+    ///   revision of this list claimed: the refill is a SINGLE attempt (`accept` below), so a
+    ///   refused one leaves the loop holding nothing but the instance it just handed out, and
+    ///   the name goes when that one does. Production carries the same retraction in its
+    ///   instance-accounting doc, and CHECK 9 is what measures the name's release once the count
+    ///   reaches zero. Do not restate it as absolute.
     async fn accept(&self) -> io::Result<NamedPipeServer> {
         if self.idle.borrow().is_none() {
             let created = self.wait_for_instance().await?;

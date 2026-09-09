@@ -509,10 +509,13 @@ mod imp {
                 .take()
                 .expect("the connected instance is claimed exactly once");
 
-            // Replace it before handing the connected one out, so the name is never unheld. A
-            // single attempt: at the ceiling this leaves `idle` empty and the NEXT accept waits,
-            // which serves this client now instead of stalling it behind a saturated pipe. Any
-            // other error is likewise deferred to that accept, which surfaces it.
+            // Replace it before handing the connected one out, so the HANDOVER never leaves the
+            // name unheld. That is narrower than the name always being held, and the doc above
+            // says why: a single attempt on purpose, so a refused one leaves `idle` empty and the
+            // handed-out instance is the only handle left. At the ceiling that leaves the NEXT
+            // accept waiting, which serves this client now instead of stalling it behind a
+            // saturated pipe. Any other error is likewise deferred to that accept, which
+            // surfaces it.
             if let Ok(next) = create_instance(&self.name, false) {
                 *self.idle.borrow_mut() = Some(next);
             }
@@ -613,8 +616,13 @@ mod unix_tests {
 
     /// `bind` is documented as safe to run over a leftover socket, which is what makes the
     /// single-instance lock sufficient on its own. Exercised here because the branch is otherwise
-    /// dead in every test: the daemon only reaches it after an unclean exit. The leftover is
-    /// seeded world-writable so that inheriting its mode would be visible rather than incidental.
+    /// dead in every test: the daemon only reaches it after an unclean exit. What the seed buys
+    /// is the BRANCH, not the mode: `bind` unlinks the leftover and creates a fresh socket, so
+    /// none of the old file survives to be inherited. Deleting the `chmod` was measured against
+    /// this test rather than assumed — the mode comes back `0o755`, derived from the process
+    /// umask, NOT the `0o666` seeded below. The seed stays conspicuous so an implementation that
+    /// did inherit would be distinguishable from that one, but the umask case is the assertion's
+    /// teeth.
     #[tokio::test]
     async fn bind_replaces_a_leftover_socket_and_still_chmods_it() {
         let dir = tempfile::tempdir().expect("tempdir");
