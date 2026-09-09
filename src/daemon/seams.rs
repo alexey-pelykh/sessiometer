@@ -498,35 +498,6 @@ fn try_lock_exclusive(file: &File) -> LockAttempt {
 /// the second-`acquire` refusal and the separate-open `is_held` probe both behave as their Unix
 /// counterparts do over distinct open file descriptions. (A DUPLICATED handle shares its locks;
 /// nothing here duplicates one.)
-/// Release the exclusive lock [`try_lock_exclusive`] took, before the handle is closed.
-///
-/// A no-op on Unix, and deliberately: `flock` releases at close with no documented latency caveat,
-/// so an explicit `LOCK_UN` would buy nothing and would add a syscall to every drop. On Windows it
-/// is `UnlockFileEx` over the same one-byte range, which is what that API's own Remarks recommend
-/// — see [`InstanceLock`] for the sentence and for the case this still cannot reach.
-///
-/// Best-effort by construction: it runs on a drop path and on a probe that has already decided its
-/// answer, so there is no caller left to return a failure to. A failure leaves exactly the state
-/// the close would have left anyway.
-#[cfg(unix)]
-fn unlock_exclusive(_file: &File) {}
-
-#[cfg(windows)]
-fn unlock_exclusive(file: &File) {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
-    use windows_sys::Win32::System::IO::OVERLAPPED;
-
-    // SAFETY: the same contract `try_lock_exclusive` documents for the matching lock call — a
-    // zeroed `OVERLAPPED` carrying offset 0 with a null `hEvent`, a live handle owned by `file`,
-    // and the one-byte length that call took. The result is discarded on purpose (see above).
-    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
-    unsafe {
-        UnlockFileEx(file.as_raw_handle() as HANDLE, 0, 1, 0, &mut overlapped);
-    }
-}
-
 #[cfg(windows)]
 fn try_lock_exclusive(file: &File) -> LockAttempt {
     use std::os::windows::io::AsRawHandle;
@@ -566,6 +537,35 @@ fn try_lock_exclusive(file: &File) -> LockAttempt {
         LockAttempt::Contended
     } else {
         LockAttempt::Failed(err)
+    }
+}
+
+/// Release the exclusive lock [`try_lock_exclusive`] took, before the handle is closed.
+///
+/// A no-op on Unix, and deliberately: `flock` releases at close with no documented latency caveat,
+/// so an explicit `LOCK_UN` would buy nothing and would add a syscall to every drop. On Windows it
+/// is `UnlockFileEx` over the same one-byte range, which is what that API's own Remarks recommend
+/// — see [`InstanceLock`] for the sentence and for the case this still cannot reach.
+///
+/// Best-effort by construction: it runs on a drop path and on a probe that has already decided its
+/// answer, so there is no caller left to return a failure to. A failure leaves exactly the state
+/// the close would have left anyway.
+#[cfg(unix)]
+fn unlock_exclusive(_file: &File) {}
+
+#[cfg(windows)]
+fn unlock_exclusive(file: &File) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    // SAFETY: the same contract `try_lock_exclusive` documents for the matching lock call — a
+    // zeroed `OVERLAPPED` carrying offset 0 with a null `hEvent`, a live handle owned by `file`,
+    // and the one-byte length that call took. The result is discarded on purpose (see above).
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    unsafe {
+        UnlockFileEx(file.as_raw_handle() as HANDLE, 0, 1, 0, &mut overlapped);
     }
 }
 

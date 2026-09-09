@@ -51,14 +51,31 @@
 //! too, and then presents that account's SID here. **So a peer running as A can authenticate as B**
 //! — something a distinct uid cannot do on Unix at any privilege short of root.
 //!
-//! Two things bound it without dissolving it. The privilege is NOT universal: service accounts and
-//! Administrators hold it by default, a standard interactive user does not. And holding it is not
-//! sufficient — the attacker must first get B to authenticate to something it controls, which is
-//! the precondition the whole documented family of such attacks turns on. The residual is
-//! therefore "a service-account-class principal on the same machine", not "any local user". That
-//! is still strictly more than Unix concedes, it is not closed by anything in this crate, and no
-//! transport choice available on this platform closes it — ADR-0037 § Alternatives records that
-//! the pipe's impersonated SID was already the strongest identity on offer here.
+//! There are TWO routes to that borrowed token, and an earlier revision of this paragraph named
+//! only the first, which understated the residual. `ImpersonateNamedPipeClient`'s own Remarks
+//! enumerate the conditions under which an impersonation is allowed at all, and two of them
+//! matter here:
+//!
+//! 1. **`SeImpersonatePrivilege`** — held by default by service accounts and Administrators, NOT
+//!    by a standard interactive user. On this route the attacker must additionally get B to
+//!    authenticate to something it controls, which is the precondition the whole documented family
+//!    of such attacks turns on.
+//! 2. **A token created "using explicit credentials through `LogonUser` or `LsaLogonUser`"** —
+//!    which requires **no privilege at all**. A standard local user who possesses B's credentials
+//!    can log B on, impersonate that token, and open the pipe.
+//!
+//! So the residual is NOT bounded to "a service-account-class principal". Route 2 admits any local
+//! account that holds B's credentials, and route 1 admits a privileged one that does not. What
+//! bounds it is that both routes require the attacker to already hold or already obtain B's
+//! authentication — a heavily compromised position on any platform.
+//!
+//! The asymmetry with Unix survives that steel-manning, and is what AC1 is for. `getpeereid`
+//! reports the peer PROCESS's own credentials; there is no primitive by which a process borrows
+//! another uid for the duration of one connection. An attacker holding B's password on Unix must
+//! make a real uid transition, which local policy can deny; on Windows the equivalent is an API
+//! call the documentation lists as permitted without privilege. Nothing in this crate closes it,
+//! and no transport choice available on this platform closes it either — ADR-0037 § Alternatives
+//! records that the pipe's impersonated SID was already the strongest identity on offer here.
 //!
 //! **Unchanged — the TOCTOU property.** Like the Unix uid, the impersonated SID describes the
 //! connection's own security context, not a live process looked up after the fact. That is the

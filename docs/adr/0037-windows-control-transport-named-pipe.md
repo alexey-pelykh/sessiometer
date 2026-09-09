@@ -448,12 +448,19 @@ technical impossibility.
   held by default by service accounts and Administrators, NOT by a standard interactive user — can
   impersonate a token it has acquired for another account, pass the owner-only DACL (the open's own
   access check uses the impersonated token), and present that account's SID. So a peer running as
-  one account can authenticate as another, which a distinct uid cannot do on Unix short of root.
-  The precondition bounds it — the attacker must first get the target to authenticate to something
-  it controls — so the residual is a service-account-class principal on the same machine rather
-  than any local user. It is recorded rather than absorbed because #976's own Constraints demand
-  that of a weaker guarantee, and § Alternatives already establishes that no transport available on
-  this platform offers a stronger identity to trade for it.
+  one account can authenticate as another, which a distinct uid cannot do on Unix at all: there is
+  no primitive by which a process borrows another uid for the duration of one connection.
+  `ImpersonateNamedPipeClient`'s Remarks enumerate when an impersonation is permitted, and TWO of
+  those conditions reach here. The privilege above is one, and on that route the attacker must
+  additionally get the target to authenticate to something it controls. The other is a token
+  created *"using explicit credentials through `LogonUser` or `LsaLogonUser`"*, which requires **no
+  privilege at all** — so a standard local account holding the target's credentials can take this
+  route too. The residual is therefore NOT bounded to a service-account-class principal; what
+  bounds it is that either route needs the attacker to already hold or obtain the target's
+  authentication. On Unix that same attacker must still make a real uid transition, which local
+  policy can deny. Recorded rather than absorbed because #976's own Constraints demand that of a
+  weaker guarantee, and § Alternatives already establishes that no transport available on this
+  platform offers a stronger identity to trade for it.
 - **The name is squattable in a way the socket path is not.** The `0700` support dir means a
   foreign user cannot create our socket path at all, so `getpeereid` only ever had to answer the
   forward direction. The pipe namespace has no directory to protect, so first-creator-wins — the
