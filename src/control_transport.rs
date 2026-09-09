@@ -1481,6 +1481,32 @@ mod windows_option_source_guard {
         );
     }
 
+    /// The CLIENT-side owner check, pinned to the same arity for the same reason as the flags above.
+    ///
+    /// `verify_server_owner` is the other half of the squat defence ADR-0037 § What this spike did
+    /// NOT establish assigns to **#976**, and deleting its call is a fail-OPEN edit that changes no
+    /// other spelling in this file: the open still succeeds, the client is still handed out, and
+    /// every compiler, test and CI job on every target stays green — the same argument the
+    /// null-descriptor pin above already makes in those words, applied to the one new call this
+    /// item added. Nothing else can catch it, because no job compiles this arm (**#978**).
+    ///
+    /// The whole call including the `?` is matched, not the bare name: a `let _ = ` binding would
+    /// discard the refusal while leaving the name in place, and the definition and its doc-link
+    /// mentions are other occurrences of that name. Counted against the client opens rather than
+    /// asserted `> 0`, so a SECOND open added without the check fails here rather than riding on
+    /// the first one's match.
+    #[test]
+    fn every_client_open_verifies_the_server_owner() {
+        let code = transport_code();
+        let (clients, _) = builders(&code);
+        assert_eq!(
+            code.matches("verify_server_owner(&client)?").count(),
+            clients,
+            "every client-side pipe open must verify the server's owner SID before handing the \
+             client out (ADR-0037 § What this spike did NOT establish, issue #976)"
+        );
+    }
+
     /// AC5 says EVERY client-side open, so the arity above is only half the claim: it would hold
     /// while a second open sat somewhere the counting never reaches. This closes two such places.
     ///
