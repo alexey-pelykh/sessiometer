@@ -1118,9 +1118,11 @@ mod imp {
     /// a moment and `NotFound` after — a running daemon reported as absent, with the whole busy
     /// budget potentially spent watching it change. Two earlier revisions of this comment shipped
     /// a hand-written list of the affected callers and each called itself the whole set; both were
-    /// short. So derive it instead — `git grep 'control_transport::connect'` outside this module
-    /// is every client, and the partition below is that grep's output at this commit, not a list
-    /// maintained beside it.
+    /// short. So derive it instead — `git grep 'control_transport::connect'` outside this module,
+    /// minus this crate's own tests, is every client, and the partition below is that grep's
+    /// output at this commit rather than a list maintained beside it. The test exclusion is not a
+    /// hedge: #976 added three such call sites to `crate::daemon::snapshot_build`, and a recipe
+    /// that no longer reproduces its own list is the exact weakness this paragraph replaced.
     ///
     /// Callers that KEY on the kind, mapping `NotFound | ConnectionRefused` to a friendly "no
     /// daemon" answer: `cli::query_status`, `cli::request_shutdown`, `use_account::query_next_swap`.

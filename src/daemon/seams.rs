@@ -540,19 +540,31 @@ fn try_lock_exclusive(file: &File) -> LockAttempt {
     }
 }
 
-/// Release the exclusive lock [`try_lock_exclusive`] took, before the handle is closed.
+/// Release the exclusive lock [`try_lock_exclusive`] took — a NO-OP here, and deliberately.
 ///
-/// A no-op on Unix, and deliberately: `flock` releases at close with no documented latency caveat,
-/// so an explicit `LOCK_UN` would buy nothing and would add a syscall to every drop. On Windows it
-/// is `UnlockFileEx` over the same one-byte range, which is what that API's own Remarks recommend
-/// — see [`InstanceLock`] for the sentence and for the case this still cannot reach.
-///
-/// Best-effort by construction: it runs on a drop path and on a probe that has already decided its
-/// answer, so there is no caller left to return a failure to. A failure leaves exactly the state
-/// the close would have left anyway.
+/// `flock` releases at close with no documented latency caveat, so an explicit `LOCK_UN` would buy
+/// nothing and would add a syscall to every drop. The Windows arm below is where this function
+/// does something; both are called from the same two places, so the shape is target-neutral even
+/// though only one target needs it.
 #[cfg(unix)]
 fn unlock_exclusive(_file: &File) {}
 
+/// Release the exclusive lock [`try_lock_exclusive`] took, before the handle is closed.
+///
+/// `UnlockFileEx` over the SAME one-byte range that call locked — the two must agree, which is why
+/// they are read as a pair rather than each choosing a range. Doing this at all is what
+/// `LockFileEx`'s own Remarks recommend; see [`InstanceLock`] for the sentence, for why the
+/// ordinary drop is inside its caveat and not only a crash, and for the case this still cannot
+/// reach.
+///
+/// Best-effort by construction: it runs on a drop path and on a probe that has already decided its
+/// answer, so there is no caller left to return a failure to, and a failure leaves exactly the
+/// state the close would have left anyway. That is why the result is discarded below.
+///
+/// Documented per ARM rather than once above the pair, because a single block would attach to the
+/// Unix no-op and leave this arm — the one with the API contract in it — undocumented on the only
+/// target that compiles it. `cargo doc` cannot catch that: the links resolve either way, and no
+/// job renders this target (**#978**).
 #[cfg(windows)]
 fn unlock_exclusive(file: &File) {
     use std::os::windows::io::AsRawHandle;
@@ -562,7 +574,8 @@ fn unlock_exclusive(file: &File) {
 
     // SAFETY: the same contract `try_lock_exclusive` documents for the matching lock call — a
     // zeroed `OVERLAPPED` carrying offset 0 with a null `hEvent`, a live handle owned by `file`,
-    // and the one-byte length that call took. The result is discarded on purpose (see above).
+    // and the one-byte length that call took. The result is discarded on purpose; this function's
+    // own doc comment above says why.
     let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
     unsafe {
         UnlockFileEx(file.as_raw_handle() as HANDLE, 0, 1, 0, &mut overlapped);
