@@ -8,9 +8,10 @@
 //! Rust with no OS surface. This module is the whole of the per-target seam under it: how a
 //! listening endpoint is created, how one connection is accepted, and how a client opens one.
 //!
-//! Unix (macOS, Linux) keeps the `0600` Unix-domain socket verbatim: the aliases below
-//! ARE `tokio::net::UnixStream` / `UnixListener`, and `ControlListener::bind` is the
-//! remove→bind→chmod dance moved here unchanged from `cli::bind_control_socket`. Nothing
+//! Unix (macOS, Linux) keeps the `0600` Unix-domain socket verbatim: `ControlStream` IS
+//! `tokio::net::UnixStream`, `ControlListener` is a thin newtype over `tokio::net::UnixListener`
+//! whose `accept` drops the peer address the daemon never read, and `ControlListener::bind` is
+//! the remove→bind→chmod dance moved here unchanged from `cli::bind_control_socket`. Nothing
 //! about the Unix behaviour changes — it is relocated, not rewritten.
 //!
 //! Windows is a NAMED PIPE (ADR-0037 § Decision 1), driven through
@@ -374,8 +375,10 @@ mod imp {
         /// reports busy or reports something else is UNMEASURED — the #972 spike pinned a small
         /// `max_instances` so that a ceiling was reachable inside a CI run, which is not this
         /// configuration. A non-busy error surfaces, and `UnixControl::serve` turns a failed
-        /// accept into an event the run loop re-arms immediately, so that path spins where this
-        /// one waits. #978 is where it first becomes observable.
+        /// accept into an event the run loop re-arms immediately — so it is PACED before it is
+        /// surfaced, which is the only thing between it and a hot loop on the daemon's single
+        /// thread. It is still a failure nothing logs or counts; #978 is where it first becomes
+        /// observable at all.
         ///
         /// It WAITS rather than erroring because the run loop treats a resolved `serve` as an
         /// event: returning `Err` at the ceiling would resolve the select arm immediately and
@@ -389,7 +392,18 @@ mod imp {
                     Err(err) if is_pipe_busy(&err) => {
                         tokio::time::sleep(INSTANCE_RETRY_INTERVAL).await;
                     }
-                    Err(err) => return Err(err),
+                    // Paced for the same reason the failed-`connect` arm below is, and this one
+                    // is MORE likely to be reached: under the default `PIPE_UNLIMITED_INSTANCES`
+                    // an exhausted create is at least as likely to report something other than
+                    // `ERROR_PIPE_BUSY`, which lands here. Surfacing it un-paced is a hot loop
+                    // rather than a retry — `create_instance` is synchronous, so nothing in
+                    // `accept` suspends before the `?`, and the run loop's `select!` is `biased`
+                    // with `serve` ahead of the timer, so a `serve` that resolves immediately
+                    // starves every other arm and every spawned task on the one thread.
+                    Err(err) => {
+                        tokio::time::sleep(INSTANCE_RETRY_INTERVAL).await;
+                        return Err(err);
+                    }
                 }
             }
         }
@@ -529,9 +543,16 @@ mod imp {
     /// different in kind — the daemon IS up and holds the name, it just has no free instance
     /// this instant — so it is retried here rather than surfaced as a failure, bounded by
     /// [`CLIENT_BUSY_BUDGET`]. If the budget runs out the busy error is returned as-is: it is
-    /// NOT `NotFound`, so a caller keying on `NotFound` cannot mistake a saturated daemon for an
-    /// absent one — and [`is_saturated`] is how the one caller that discards the kind entirely
-    /// tells them apart.
+    /// NOT `NotFound`, and [`is_saturated`] is what a caller that discards the kind can key on
+    /// instead.
+    ///
+    /// That is NOT a clean dichotomy, and `ControlListener::accept`'s accounting says why: a
+    /// daemon whose instances reach zero stops holding the name, and a client then gets busy for
+    /// a moment and `NotFound` after — a running daemon reported as absent, with the whole busy
+    /// budget potentially spent watching it change. THREE callers discard the kind
+    /// (`crate::poke`, `use_account`'s cache, and `socket::request_swap`); only the last takes
+    /// the guard, because only it can double-write on a wrong answer. The other two degrade into
+    /// an extra live poll and a quieter message.
     pub(crate) async fn connect(path: &Path) -> io::Result<ControlClient> {
         let name = windows_pipe_name(path);
         let deadline = tokio::time::Instant::now() + CLIENT_BUSY_BUDGET;
@@ -566,6 +587,54 @@ mod imp {
 // caller infers it, so naming it here would be an unused import under `-D warnings`. Its
 // definition inside each arm is what documents the client/server type split.
 pub(crate) use imp::{cleanup, connect, is_saturated, ControlListener, ControlStream};
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::ControlListener;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// The `0600` mode is the WHOLE of the Unix control channel's access control — nothing checks
+    /// the peer before the bytes are read — and until this test nothing anywhere asserted it. The
+    /// relocation in #1511 moved the `chmod` between files; had it dropped the call, every gate in
+    /// the repo would still have gone green, and "relocated, not rewritten" would have rested on
+    /// reading the two versions side by side.
+    #[tokio::test]
+    async fn bind_leaves_the_socket_owner_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("daemon.sock");
+        let listener = ControlListener::bind(&path).expect("bind");
+        assert_eq!(
+            mode_of(&path),
+            0o600,
+            "the control socket must be owner-only"
+        );
+        drop(listener);
+    }
+
+    /// `bind` is documented as safe to run over a leftover socket, which is what makes the
+    /// single-instance lock sufficient on its own. Exercised here because the branch is otherwise
+    /// dead in every test: the daemon only reaches it after an unclean exit. The leftover is
+    /// seeded world-writable so that inheriting its mode would be visible rather than incidental.
+    #[tokio::test]
+    async fn bind_replaces_a_leftover_socket_and_still_chmods_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("daemon.sock");
+        std::fs::write(&path, b"leftover").expect("seed a stale socket path");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+            .expect("make the leftover deliberately too permissive");
+        let listener = ControlListener::bind(&path).expect("bind over the leftover");
+        assert_eq!(
+            mode_of(&path),
+            0o600,
+            "a leftover must not carry its mode over"
+        );
+        drop(listener);
+    }
+
+    fn mode_of(path: &std::path::Path) -> u32 {
+        std::fs::metadata(path).expect("stat").permissions().mode() & 0o777
+    }
+}
 
 #[cfg(all(test, windows))]
 mod windows_tests {

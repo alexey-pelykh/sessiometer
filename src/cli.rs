@@ -2181,7 +2181,9 @@ async fn daemon_restart() -> Result<()> {
 /// unexpected line) surfaces as an I/O error carrying the reply, never a false success.
 ///
 /// The request carries NO credential and NO payload — a pure stop signal, gated same-user on the
-/// daemon side ([`crate::daemon::peer_is_same_user`]). Time-boxed by [`DAEMON_SHUTDOWN_TIMEOUT`] —
+/// daemon side (`crate::daemon`'s `peer_is_same_user`, `#[cfg(unix)]` since #1511 — a code
+/// span rather than a link, because the item does not exist on Windows and the link would fail
+/// the doc gate there). Time-boxed by [`DAEMON_SHUTDOWN_TIMEOUT`] —
 /// generous, because a busy daemon serves the socket only between ticks — so a wedged daemon that
 /// binds the socket but never answers cannot hang `daemon stop` forever.
 async fn request_shutdown(path: &Path) -> Result<()> {
