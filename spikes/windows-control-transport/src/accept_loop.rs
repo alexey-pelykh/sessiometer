@@ -50,11 +50,12 @@ use tokio::net::windows::named_pipe::{
 use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY};
 use windows_sys::Win32::Storage::FileSystem::{SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT};
 
-/// The instance ceiling this proof pins so exhaustion is reachable in a bounded run.
+/// The instance ceiling this proof pins so that a ceiling exists at all.
 ///
-/// Production (`src/control_transport.rs`) sets none, which is tokio's
-/// `PIPE_UNLIMITED_INSTANCES` — the OS maximum, 255. All instances of one pipe must agree on
-/// this value, so every create below passes it.
+/// Production (`src/control_transport.rs`) sets none, so it takes tokio's default of
+/// `PIPE_UNLIMITED_INSTANCES` — a SENTINEL rather than a count, under which Windows bounds
+/// instances by system resources. All instances of one pipe must agree on this value, so every
+/// create below passes it.
 const MAX_INSTANCES: usize = 4;
 
 /// The whole proof is time-boxed so a wedged runner fails the job instead of hanging it. Shorter
@@ -131,7 +132,8 @@ fn open_client(name: &OsString) -> io::Result<NamedPipeClient> {
 /// Holds the listening instance OUT of [`AcceptLoop::idle`] for one `connect().await` and puts it
 /// BACK if that await is cancelled — the transcription of `PendingAccept` in
 /// `src/control_transport.rs`. A guard rather than a borrow held across the await, because that
-/// pattern is `clippy::await_holding_refcell_ref` and both crates deny it.
+/// pattern is `clippy::await_holding_refcell_ref`, which is warn-by-default and so an error
+/// under the `-D warnings` both crates are linted with.
 struct PendingAccept<'a> {
     idle: &'a RefCell<Option<NamedPipeServer>>,
     server: Option<NamedPipeServer>,
@@ -212,7 +214,17 @@ impl AcceptLoop {
             .connect()
             .await
         {
-            pending.server = None;
+            // Mirrors the three-arm failed-connect path in `src/control_transport.rs`: replace
+            // before releasing, discard outright only when the refusal is itself evidence that
+            // another instance is alive, and otherwise keep the failed one listening and pace
+            // the failure. Transcribed even though no check here drives a failed `connect` —
+            // a mirror that diverges is measuring a loop the daemon does not run, whether or
+            // not a check happens to reach the divergence.
+            match create_instance(&self.name, false) {
+                Ok(next) => pending.server = Some(next),
+                Err(create_err) if is_code(&create_err, ERROR_PIPE_BUSY) => pending.server = None,
+                Err(_) => tokio::time::sleep(INSTANCE_RETRY_INTERVAL).await,
+            }
             return Err(err);
         }
         let connected = pending.server.take().expect("claimed exactly once");
@@ -264,7 +276,8 @@ async fn proof() -> Checked<()> {
     println!("{TAG} host pid           : {pid}");
     println!("{TAG} pipe name          : {}", name.to_string_lossy());
     println!(
-        "{TAG} max_instances      : {MAX_INSTANCES} (production sets none — the OS maximum, 255)"
+        "{TAG} max_instances      : {MAX_INSTANCES} (production sets none — tokio's \
+         PIPE_UNLIMITED_INSTANCES, under which Windows bounds instances by system resources)"
     );
 
     let loop_ = AcceptLoop::bind(name.clone()).map_err(|err| {
@@ -467,13 +480,13 @@ async fn proof() -> Checked<()> {
                 // that expiry is also what returns a newly created instance to `idle`, where the
                 // next `open_client` can reach it.
                 let _ = tokio::time::timeout(ACCEPT_POLL, loop_.accept()).await;
-                // Then WAIT. This is load-bearing, not padding, and its absence is what the FIRST
-                // Windows run of this proof measured: every earlier check passed and CHECK 7
-                // reported that no client could connect. When the create is denied, `accept`
-                // returns its error on its first poll, `timeout` therefore never registers a
-                // sleep, and the whole loop ran to its limit inside one microsecond window — a
-                // budget that read as a second and was in fact zero. Production does not have
-                // this loop at all: `wait_for_instance` waits INSIDE the accept.
+                // Then WAIT, because the pass above can be cut short before it has waited for
+                // anything: `accept` now retries inside `wait_for_instance`, and ACCEPT_POLL is
+                // shorter than one retry interval, so a timed-out pass may have done nothing but
+                // sleep. The FIRST Windows run of this proof is why the wait is here at all —
+                // back then `accept` surfaced a denied create on its first poll, `timeout`
+                // registered no sleep, and all 40 passes elapsed inside one microsecond window,
+                // a budget that read as a second and was in fact zero.
                 tokio::time::sleep(INSTANCE_RETRY_INTERVAL).await;
             }
             Err(err) => {
@@ -516,20 +529,24 @@ async fn proof() -> Checked<()> {
     // closed its listening instance, a daemon with no other instance would release the NAME —
     // and a client would then see ERROR_FILE_NOT_FOUND and report "no daemon".
     //
-    // Free every instance first, so the loop is back to exactly one listening and the name is
-    // held by that instance ALONE. Then cancel an accept against it and require a client to
-    // still connect.
-    subscribers.clear();
-    served.clear();
+    // Get back to exactly one listening instance, and get there WITHOUT passing through zero.
+    // Clearing everything at once is the obvious way and it is wrong: at this point the refill
+    // after CHECK 7's accept was denied, so nothing is listening, and dropping all the
+    // connections leaves the process holding no handles at all — which RELEASES the name. Every
+    // assertion below would then be measuring a pipe this proof re-created a moment later, not
+    // the one it has been holding, and the release itself would go unnoticed. So free ONE pair,
+    // let the loop refill against the instances still open, and only then drop the rest.
+    drop(subscribers.pop());
+    drop(served.pop());
     let started = tokio::time::Instant::now();
     for _ in 0..RECOVERY_ATTEMPTS {
         if loop_.listening() == 1 {
             break;
         }
         // Same two-part pass as CHECK 7's retry, and for the same reason: drive one accept so a
-        // create is attempted and its instance parked in `idle`, then WAIT, because a denied
-        // create makes `accept` return on its first poll and the loop would otherwise spend its
-        // whole budget in no time at all.
+        // create is attempted and its instance parked in `idle`, then WAIT, since ACCEPT_POLL is
+        // shorter than one internal retry interval and a cut-short pass may have created
+        // nothing.
         let _ = tokio::time::timeout(ACCEPT_POLL, loop_.accept()).await;
         tokio::time::sleep(INSTANCE_RETRY_INTERVAL).await;
     }
@@ -540,6 +557,29 @@ async fn proof() -> Checked<()> {
             started.elapsed().as_secs_f64(),
             loop_.listening()
         )));
+    }
+    // Now the remaining connections can go: the listening instance keeps the name held.
+    subscribers.clear();
+    served.clear();
+    if open_client(&name).is_err() {
+        return Err(fail(
+            "CHECK 8: the name did not survive draining the connections down to the single \
+             listening instance — so the drain passed through zero handles after all",
+        ));
+    }
+    // That probe connected, which consumed the listening instance. Put the loop back to one
+    // listening before the cancellation test, the same way.
+    for _ in 0..RECOVERY_ATTEMPTS {
+        if loop_.listening() == 1 {
+            break;
+        }
+        let _ = tokio::time::timeout(ACCEPT_POLL, loop_.accept()).await;
+        tokio::time::sleep(INSTANCE_RETRY_INTERVAL).await;
+    }
+    if loop_.listening() != 1 {
+        return Err(fail(
+            "CHECK 8: could not get back to one listening instance after the name-survival probe",
+        ));
     }
     // One listening instance, no client: `accept` cannot resolve, so the timeout DROPS the
     // future mid-`connect()` — the exact cancellation the idle select performs.
@@ -576,11 +616,55 @@ async fn proof() -> Checked<()> {
          instance alive and the name held; the next client connected on the SAME instance"
     );
 
+    // The failure mode the accounting is WRITTEN against, measured rather than reasoned. Every
+    // guarantee above is conditional on the process holding at least one instance; production's
+    // refill is a single attempt, so a refused refill plus the end of the exchange it served can
+    // take that count to zero. What happens then is the whole reason the refill order and the
+    // failed-connect path are shaped the way they are, and until this check it was asserted by
+    // three comments and measured by nothing.
+    //
+    // Driven here by taking the listening instance out of the loop and dropping it, which is the
+    // same terminal state by a shorter road. LAST, because it is destructive: the name does not
+    // come back without a fresh create.
+    let last = loop_.idle.borrow_mut().take();
+    if last.is_none() {
+        return Err(fail(
+            "CHECK 9: expected a listening instance to drop; the loop had none",
+        ));
+    }
+    drop(last);
+    match open_client(&name) {
+        Ok(_) => {
+            return Err(fail(
+                "CHECK 9: the pipe still accepted a client with no instance open — the name \
+                 outlives its instances, and the accounting above is written on the assumption \
+                 that it does not",
+            ))
+        }
+        Err(err) if is_code(&err, ERROR_FILE_NOT_FOUND) => {
+            println!(
+                "{TAG} CHECK 9  name gone  : PASS — with the last instance dropped a client gets \
+                 ERROR_FILE_NOT_FOUND (= {ERROR_FILE_NOT_FOUND}), NOT ERROR_PIPE_BUSY \
+                 (= {ERROR_PIPE_BUSY}). So the BUSY-not-NOT-FOUND guarantee holds only while an \
+                 instance exists: reach zero and a live daemon reads as an absent one, and the \
+                 name is free for another process to take"
+            );
+        }
+        Err(err) => {
+            return Err(fail(format!(
+                "CHECK 9: expected ERROR_FILE_NOT_FOUND with no instance open, got {err}"
+            )))
+        }
+    }
+
     println!(
         "{TAG} ANSWER (ADR-0037, #1511 AC3): the accept loop keeps exactly ONE listening instance \
          outstanding, plus one per live connection — so a `watch` subscriber occupies one for its \
          whole lifetime. At the ceiling the refill is denied ERROR_PIPE_BUSY, nothing listens, and \
-         an arriving client is told BUSY rather than NOT-FOUND; when any connection ends the loop \
+         an arriving client is told BUSY rather than NOT-FOUND — but only while an instance still \
+         exists (CHECK 9): the refill is a single attempt, so a refused refill plus the end of the \
+         exchange it served reaches zero instances, and there a live daemon reads as an absent \
+         one. When any connection ends the loop \
          refills and service resumes unattended — but NOT necessarily on the very next accept, \
          since the instance is not reclaimed synchronously with the client's disconnect. That is \
          what production's `wait_for_instance` retry cadence is for, and CHECK 7 prints how long \
