@@ -24,13 +24,21 @@
 #   sufficient for the issue's AC2 ("a minimal Windows proof accepts a connection, round-trips one
 #   framed message, and resolves the peer's identity"). Only an executed run answers that.
 #
-# READ THE VERDICT OFF THE EXIT CODE. The proof gates its own checks and returns non-zero if any
-# fails (spikes/windows-control-transport/src/proof.rs), so this job's own pass/fail IS the finding
-# rather than a log someone has to interpret. The two MEASUREMENT lines are reports rather than
-# gates — ADR-0037 quotes the SIDs they print — and each property they report is gated beside them
-# (CHECK 6, CHECK 5). On the spike's FIRST run the pre-read one was deliberately un-gated, because
-# its outcome was the open question; ADR-0037 § Decision 4 now records the answer, and a recorded
-# decision no check enforces is one a later run can regress in silence.
+# READ THE VERDICT OFF THE EXIT CODE. BOTH proofs gate their own checks and return non-zero when
+# one fails (spikes/windows-control-transport/src/proof.rs and .../src/accept_loop.rs), and each
+# runs as its own step, so this job's pass/fail IS the finding rather than a log someone has to
+# interpret. The second step runs even when the first FAILED, so a #972 regression cannot hide a
+# #1511 answer; the job is red if either is.
+#
+# WHAT IS REPORTED RATHER THAN GATED, and it is not the same list in the two modes. In the #972
+# proof: the two MEASUREMENT lines, because ADR-0037 quotes the SIDs they print — each property
+# they report is gated beside them (CHECK 6, CHECK 5). In the #1511 proof: the MEASUREMENT line
+# counting outstanding instances; the elapsed figures CHECK 7 and CHECK 9 print, where the check
+# gates that the transition HAPPENED inside its attempt budget and never how long it took; and the
+# closing ANSWER line, which synthesises what CHECK 3 and CHECK 5-9 gate rather than adding a claim
+# of its own. On the spike's FIRST run the pre-read impersonation was deliberately un-gated,
+# because its outcome was the open question; ADR-0037 § Decision 4 now records the answer, and a
+# recorded decision no check enforces is one a later run can regress in silence.
 #
 # LIFECYCLE: delete this file together with spikes/windows-control-transport/ once ADR-0037 is
 # accepted and the dependent Windows items no longer need the proof re-runnable.
