@@ -646,29 +646,61 @@ async fn proof() -> Checked<()> {
         ));
     }
     drop(last);
-    match open_client(&name) {
-        Ok(_) => {
-            return Err(fail(
-                "CHECK 9: the pipe still accepted a client with no instance open — the name \
-                 outlives its instances, and the accounting above is written on the assumption \
-                 that it does not",
-            ))
-        }
-        Err(err) if is_code(&err, ERROR_FILE_NOT_FOUND) => {
-            println!(
-                "{TAG} CHECK 9  name gone  : PASS — with the last instance dropped a client gets \
-                 ERROR_FILE_NOT_FOUND (= {ERROR_FILE_NOT_FOUND}), NOT ERROR_PIPE_BUSY \
-                 (= {ERROR_PIPE_BUSY}). So the BUSY-not-NOT-FOUND guarantee holds only while an \
-                 instance exists: reach zero and a live daemon reads as an absent one, and the \
-                 name is free for another process to take"
-            );
-        }
-        Err(err) => {
-            return Err(fail(format!(
-                "CHECK 9: expected ERROR_FILE_NOT_FOUND with no instance open, got {err}"
-            )))
+
+    // The name does not disappear the instant the handle does, and finding that out is the point
+    // of polling rather than asserting. The FIRST run of this check demanded ERROR_FILE_NOT_FOUND
+    // immediately and got ERROR_PIPE_BUSY: teardown is asynchronous, the same way reclaim is
+    // (CHECK 7), so for a while the name still resolves with nothing behind it. Both readings are
+    // wrong about a daemon that is up; they are wrong in different directions, and a client
+    // retrying BUSY — which production's `connect` does, on a budget — can watch one turn into
+    // the other underneath it.
+    let started = tokio::time::Instant::now();
+    let mut saw_busy = false;
+    let mut gone = false;
+    for _ in 0..RECOVERY_ATTEMPTS {
+        match open_client(&name) {
+            Ok(_) => {
+                return Err(fail(
+                    "CHECK 9: the pipe still accepted a client with no instance open — the name \
+                     outlives its instances, and the accounting above is written on the \
+                     assumption that it does not",
+                ))
+            }
+            Err(err) if is_code(&err, ERROR_PIPE_BUSY) => {
+                saw_busy = true;
+                tokio::time::sleep(INSTANCE_RETRY_INTERVAL).await;
+            }
+            Err(err) if is_code(&err, ERROR_FILE_NOT_FOUND) => {
+                gone = true;
+                break;
+            }
+            Err(err) => {
+                return Err(fail(format!(
+                    "CHECK 9: expected busy-then-not-found with no instance open, got {err}"
+                )))
+            }
         }
     }
+    if !gone {
+        return Err(fail(format!(
+            "CHECK 9: the name never stopped resolving after its last instance was dropped \
+             ({RECOVERY_ATTEMPTS} passes over {:.3}s)",
+            started.elapsed().as_secs_f64()
+        )));
+    }
+    println!(
+        "{TAG} CHECK 9  name gone  : PASS — the last instance dropped, and a client then got \
+         {} for {:.3}s before the name stopped resolving at all with ERROR_FILE_NOT_FOUND \
+         (= {ERROR_FILE_NOT_FOUND}). So the BUSY-not-NOT-FOUND guarantee holds only while an \
+         instance EXISTS. At zero, a running daemon reads first as saturated and then as absent, \
+         and the name is free for another process to take",
+        if saw_busy {
+            "ERROR_PIPE_BUSY first"
+        } else {
+            "no busy window"
+        },
+        started.elapsed().as_secs_f64()
+    );
 
     println!(
         "{TAG} ANSWER (ADR-0037, #1511 AC3): the accept loop keeps exactly ONE listening instance \
@@ -676,8 +708,8 @@ async fn proof() -> Checked<()> {
          whole lifetime. At the ceiling the refill is denied ERROR_PIPE_BUSY, nothing listens, and \
          an arriving client is told BUSY rather than NOT-FOUND — but only while an instance still \
          exists (CHECK 9): the refill is a single attempt, so a refused refill plus the end of the \
-         exchange it served reaches zero instances, and there a live daemon reads as an absent \
-         one. When any connection ends the loop \
+         exchange it served reaches zero instances, and there a live daemon reads first as \
+         saturated and then, once teardown completes, as ABSENT. When any connection ends the loop \
          refills and service resumes unattended — but NOT necessarily on the very next accept, \
          since the instance is not reclaimed synchronously with the client's disconnect. That is \
          what production's `wait_for_instance` retry cadence is for, and CHECK 7 prints how long \
