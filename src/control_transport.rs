@@ -608,17 +608,34 @@ mod imp {
     /// That is NOT a clean dichotomy, and `ControlListener::accept`'s accounting says why: a
     /// daemon whose instances reach zero stops holding the name, and a client then gets busy for
     /// a moment and `NotFound` after — a running daemon reported as absent, with the whole busy
-    /// budget potentially spent watching it change. Every caller that discards the kind inherits
-    /// that ambiguity: `crate::poke`, `use_account`'s cache, `use_account`'s manual-hold notifier
-    /// (`ControlSocketNotifier::notify`), `socket::notify_restored`, and `socket::request_swap`.
-    /// An earlier revision of this comment named the first, second and last and called that the
-    /// whole set. Only `request_swap` takes [`is_saturated`], because only it can double-write on
-    /// a wrong answer; the cache and `poke` degrade into an extra live poll and a quieter message.
-    /// The two notifiers are the ones to read carefully: both print "is the daemon running?"
-    /// (`use_account.rs`'s manual-hold path and `capture.rs`'s restore path), which on Windows can
-    /// now be printed about a daemon that is running — a saturated one past the budget, or one in
-    /// the zero-instance window. Both are best-effort notifications whose authoritative write has
-    /// already landed, so the message misleads without changing an outcome.
+    /// budget potentially spent watching it change. Two earlier revisions of this comment shipped
+    /// a hand-written list of the affected callers and each called itself the whole set; both were
+    /// short. So derive it instead — `git grep 'control_transport::connect'` outside this module
+    /// is every client, and the partition below is that grep's output at this commit, not a list
+    /// maintained beside it.
+    ///
+    /// Callers that KEY on the kind, mapping `NotFound | ConnectionRefused` to a friendly "no
+    /// daemon" answer: `cli::query_status`, `cli::request_shutdown`, `use_account::query_next_swap`.
+    /// Keying does not make them immune — it is what makes them WRONG in the zero-instance window,
+    /// where a live daemon is reported as absent (#1515 owns the `use` fallback that produces).
+    ///
+    /// Callers that DISCARD it: `crate::poke` and `use_account`'s status cache, which degrade into
+    /// an extra live poll; `socket::request_swap`, the one caller that takes [`is_saturated`],
+    /// because it is the one that can double-write on a wrong answer; and the three best-effort
+    /// notifiers — `ControlSocketNotifier::notify`, `socket::notify_restored` and
+    /// `socket::notify_roster_reload` — which print "is the daemon running?" (`use_account.rs`
+    /// once, `capture.rs` twice), a question that on Windows can now be asked about a daemon that
+    /// IS running: a saturated one past the budget, or one in the zero-instance window.
+    ///
+    /// `notify_roster_reload` is the one to read carefully, and an earlier revision of this
+    /// comment did not name it at all and then asserted of the ones it did name that the message
+    /// "misleads without changing an outcome". That is false here. `src/capture.rs` classifies
+    /// anything that is not `TimedOut` as `RosterReloadReason::NotifyFailed` and emits it to the
+    /// event log, so a Windows saturation writes a DURABLE record. The code is the right one — a
+    /// saturated daemon genuinely was not told, unlike the start-up timeout that arm carves out
+    /// precisely because the daemon adopts it anyway — but the question printed beside it has the
+    /// wrong answer. Tracked at **#1517**; no arm is added here, because none of these three can
+    /// double-write and the paths are unreachable until #978 compiles this target.
     pub(crate) async fn connect(path: &Path) -> io::Result<ControlClient> {
         let name = windows_pipe_name(path);
         let deadline = tokio::time::Instant::now() + CLIENT_BUSY_BUDGET;
@@ -770,11 +787,19 @@ mod windows_tests {
 /// this is the weaker claim that every open is written to. Read the test names as naming the
 /// clause each one is derived from, never as discharging it.
 ///
-/// Two mutations were run against it rather than assumed, because a spelling guard's whole value
-/// is which edits it survives. Deleting any pinned call goes red, and so does adding a second
-/// client open without the flags. Appending a SECOND `security_qos_flags` to the same builder
-/// chain — which compiles, since the setter takes `&mut self` and is last-write-wins — defeats an
-/// exact-spelling match on its own, and is why the flag test also counts the calls by NAME.
+/// Mutations were run against it rather than assumed, because a spelling guard's whole value is
+/// which edits it survives, and BOTH results below were found by an independent pass mutating
+/// what an earlier revision of this comment merely asserted. What goes red: deleting any pinned
+/// call; appending a SECOND `security_qos_flags` to the same builder chain, which compiles since
+/// the setter takes `&mut self` and is last-write-wins, and which an exact-spelling match alone
+/// does not catch — hence the by-NAME count; widening the level inside the one call, caught
+/// because the needle matches through its closing paren; and an unflagged client open in another
+/// module, or in this one below the guard's own header, which an earlier revision let through.
+///
+/// What stays GREEN, stated because a guard that hides its blind spot is worse than none: making
+/// the flags CONDITIONAL. A source scan reads text, not control flow, so an open whose flags sit
+/// behind an `if` satisfies both counts while violating what AC5 asks. That is the shape of the
+/// gap #1514's round-trip closes and this cannot.
 #[cfg(test)]
 mod windows_option_source_guard {
     /// This file's own source up to the start of this guard, comment-only lines dropped and
@@ -790,11 +815,21 @@ mod windows_option_source_guard {
     /// the needles below from counting THEMSELVES — a scan that matches its own literals stays
     /// green with the code it guards deleted, which was measured, not supposed.
     fn transport_code() -> String {
-        collapse(&read_source(&module_path()))
+        split_at_guard().0
+    }
+
+    /// The reduced source split into (everything before this guard, everything from its header on).
+    ///
+    /// The tail is not discarded: it is a region of the same file, and a client open placed in it
+    /// is exactly as unguarded as one in another module. Counting there is what the guard's own
+    /// literals make impossible, so the tail is checked by a different question — see
+    /// [`no_client_pipe_open_exists_outside_the_guarded_region`].
+    fn split_at_guard() -> (String, String) {
+        let reduced = collapse(&read_source(&module_path()));
+        let (before, after) = reduced
             .split_once("mod windows_option_source_guard {")
-            .expect("source scan is broken: did not find this guard's own module header")
-            .0
-            .to_owned()
+            .expect("source scan is broken: did not find this guard's own module header");
+        (before.to_owned(), after.to_owned())
     }
 
     fn module_path() -> std::path::PathBuf {
@@ -875,7 +910,7 @@ mod windows_option_source_guard {
     /// by NAME as well, because the setter is last-write-wins: a second one appended to the chain
     /// silently overrides the first while leaving the exact-spelling count untouched.
     #[test]
-    fn every_client_open_sets_the_ac5_security_qos_flags() {
+    fn the_ac5_flags_are_written_once_per_client_open() {
         let code = transport_code();
         let (clients, _) = builders(&code);
         assert_eq!(
@@ -891,11 +926,17 @@ mod windows_option_source_guard {
         );
     }
 
-    /// AC5 says EVERY client-side open, so the count above is only half the claim: it would hold
-    /// while a second module opened a pipe with no flags at all. Every client today routes through
-    /// [`connect`], and this is what keeps that true.
+    /// AC5 says EVERY client-side open, so the arity above is only half the claim: it would hold
+    /// while a second open sat somewhere the counting never reaches. There are two such places and
+    /// this closes both, because an earlier revision closed only the first and claimed both.
+    ///
+    /// Another module is the obvious one. The other is THIS file BELOW the guard's own header,
+    /// which the count cannot reach by construction — truncating there is what stops the needles
+    /// matching themselves. So the tail is checked by a different question that its own literals
+    /// cannot fake: every `ClientOptions::` down there must be immediately preceded by a quote,
+    /// which is true of a needle and false of a call.
     #[test]
-    fn no_client_pipe_open_exists_outside_this_module() {
+    fn no_client_pipe_open_exists_outside_the_guarded_region() {
         let offenders: Vec<_> = other_sources()
             .into_iter()
             .filter(|(_, text)| text.contains("ClientOptions::"))
@@ -904,6 +945,13 @@ mod windows_option_source_guard {
         assert!(
             offenders.is_empty(),
             "a client pipe open outside control_transport.rs is unguarded by AC5's flags: {offenders:?}"
+        );
+
+        let tail = split_at_guard().1;
+        assert_eq!(
+            tail.matches("ClientOptions::").count(),
+            tail.matches("\"ClientOptions::").count(),
+            "a client pipe open below this guard's own header is outside every count above"
         );
     }
 
