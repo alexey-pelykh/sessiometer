@@ -1409,11 +1409,14 @@ mod tests {
     #[test]
     fn no_raw_tcp_or_udp_socket_primitive_is_used() {
         // tokio's `net` feature is on for the daemon's LOCAL IPC — but that IPC is a
-        // Unix-domain socket (UnixStream / UnixListener), which never leaves the
-        // machine. A raw TCP or UDP socket WOULD be outbound egress that bypasses
-        // the curl seam, so guard the primitives by name; the Unix-socket types do
-        // not match. Tokens are assembled from fragments so this guard never matches
-        // its own source (usage.rs is itself scanned).
+        // Unix-domain socket (UnixStream / UnixListener) on Unix and a NAMED PIPE on
+        // Windows since #1511, and neither ever leaves the machine. Every pipe
+        // instance sets `reject_remote_clients`, so the Windows half is local-only
+        // by construction rather than by convention. A raw TCP or UDP socket WOULD
+        // be outbound egress that bypasses the curl seam, so guard the primitives
+        // by name; neither the Unix-socket types nor the named-pipe types match.
+        // Tokens are assembled from fragments so this guard never matches its own
+        // source (usage.rs is itself scanned).
         let forbidden: [String; 4] = [
             concat!("Tcp", "Stream").to_string(),
             concat!("Tcp", "Listener").to_string(),

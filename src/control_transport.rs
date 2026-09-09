@@ -255,8 +255,21 @@ mod imp {
     /// keeps the whole name well inside the 256-character limit.
     ///
     /// Windows paths are case-insensitive while this digest is not, so two spellings of one path
-    /// would hash apart. That is inert here because both ends resolve the path through the same
-    /// function rather than accepting one from the operator.
+    /// hash apart — and that is NOT inert, though an earlier revision of this comment said it
+    /// was, on the grounds that both ends resolve the path through the same function. They do;
+    /// the function does not return the same STRING in every context. `src/paths.rs` records that
+    /// the Windows resolver is env-first and that "the never-overridable invariant is NOT yet
+    /// delivered on that target", so a daemon started in a service context and a CLI started in
+    /// an interactive shell can hold two spellings Windows opens as one directory. Case is not
+    /// even the only axis: a trailing separator, an 8.3 short name and a UNC-versus-drive
+    /// spelling all diverge with no case difference at all.
+    ///
+    /// Unix does not have this because the socket path IS the rendezvous and the KERNEL
+    /// dereferences it; digesting the path moves resolution into this function and removes that
+    /// absorption. The failure it produces is a CLI reporting "no daemon" against a live one
+    /// while `daemon.lock` — reached by path, under that same directory — still resolves. Tracked
+    /// at **#1516**; nothing here normalizes the spelling yet, and this comment is not a claim
+    /// that it does.
     pub(crate) fn windows_pipe_name(path: &Path) -> OsString {
         use std::os::windows::ffi::OsStrExt;
 
