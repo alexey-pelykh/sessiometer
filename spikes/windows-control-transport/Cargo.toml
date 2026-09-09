@@ -27,12 +27,16 @@ serde_json = "1.0.150"
 # feature set for the control path. `rt` only — the daemon is `current_thread` (ADR-0001).
 tokio = { version = "1.52.3", features = ["rt", "time", "io-util", "net", "process"] }
 # ALREADY in the root crate's Windows lockfile (tokio and `etcetera` both pull it), so the proof
-# introduces no crate the real port would not already have. Used for the peer-identity syscalls
-# and the pipe's security descriptor.
+# introduces no crate the real port would not already have. Used for the peer-identity syscalls,
+# the pipe's security descriptor, and the client-open SQOS flags the #1511 accept-loop proof sets.
+# Every module this crate imports from is listed: `Win32_Storage_FileSystem` carries
+# `SECURITY_SQOS_PRESENT`/`SECURITY_IDENTIFICATION` and was resolving only through another
+# feature's transitive enablement, which is not something to depend on.
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
     "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
