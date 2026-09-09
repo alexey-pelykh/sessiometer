@@ -418,9 +418,15 @@ async fn proof() -> Checked<()> {
             )));
         }
     }
+    // The BUFFERING is what this check establishes and what the write-all-then-read-all shape
+    // bought. Order is not co-equal evidence: a byte-mode pipe preserves it by construction and
+    // this proof writes the frames itself, so the ordering assertion above cannot fail on any
+    // run. It is kept as a cheap invariant, and named as one, rather than quoted as a finding.
     println!(
-        "{TAG} CHECK 4  stream     : PASS — 3 newline-delimited JSON frames pushed to the held \
-         subscriber BEFORE any was read, then read back IN ORDER over one connection"
+        "{TAG} CHECK 4  stream     : PASS — 3 newline-delimited JSON frames were all pushed to \
+         the held subscriber BEFORE any was read, so the subscriber had them BUFFERED, and each \
+         arrived intact over the one connection (order holds by byte-mode construction, not by \
+         this measurement)"
     );
     subscribers.push(reader.into_inner());
     served.push(served_first);
@@ -728,22 +734,30 @@ async fn proof() -> Checked<()> {
     // claim is therefore written from what THIS run observed: narrating a busy-then-absent
     // sequence on a run that never saw the busy half would be a PASS asserting what it failed to
     // measure, which is exactly what the rule above CHECK 3 forbids.
+    // The code annotation rides INSIDE each branch rather than after the placeholder: appended
+    // unconditionally it trails whichever phrase the branch chose, and in the no-busy branch that
+    // put "(= 2)" four words downstream of the name it annotates.
     let (observed, conclusion) = if saw_busy {
         (
-            "ERROR_PIPE_BUSY first and then ERROR_FILE_NOT_FOUND",
+            format!(
+                "ERROR_PIPE_BUSY first and then ERROR_FILE_NOT_FOUND (= {ERROR_FILE_NOT_FOUND})"
+            ),
             "At zero instances a running daemon reads first as SATURATED and then as ABSENT.",
         )
     } else {
         (
-            "ERROR_FILE_NOT_FOUND on its first poll, with no busy window observed",
+            format!(
+                "ERROR_FILE_NOT_FOUND (= {ERROR_FILE_NOT_FOUND}) on its first poll, with no \
+                 busy window observed"
+            ),
             "This run measured only the transition to ABSENT — the busy half did not occur here, \
              so nothing rests on it.",
         )
     };
     println!(
         "{TAG} CHECK 9  name gone  : PASS — the last instance dropped, and a client then got {} \
-         (= {ERROR_FILE_NOT_FOUND}) within {:.3}s. So the BUSY-not-NOT-FOUND guarantee holds only \
-         while an instance EXISTS, and the name is then free for another process to take. {}",
+         within {:.3}s. So the BUSY-not-NOT-FOUND guarantee holds only while an instance EXISTS, \
+         and the name is then free for another process to take. {}",
         observed,
         started.elapsed().as_secs_f64(),
         conclusion
