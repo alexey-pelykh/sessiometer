@@ -92,8 +92,16 @@ compile_error!(
 /// handing the result to `CreateNamedPipeW` — is a syscall that exists on one target. Lifting it
 /// out means the DACL's SHAPE is asserted by an ordinary unit test on every target this crate
 /// builds for, rather than resting on the source scan at the foot of this file, which can only see
-/// that a call is written (see [`windows_option_source_guard`]). It is the same split the spike
-/// could not make: there, the SDDL was a `format!` inline in the one function that used it.
+/// that a call is written (`windows_option_source_guard`). It is the same split the spike could not
+/// make: there, the SDDL was a `format!` inline in the one function that used it.
+///
+/// A code span rather than an intra-doc link, for the reason this module's own header gives about
+/// the per-target `imp` items: this item is `cfg(any(windows, test))` and the guard is `cfg(test)`,
+/// so on a NON-TEST WINDOWS build the link's target does not exist while the link does — and
+/// `RUSTDOCFLAGS="-D warnings"` turns an unresolved intra-doc link into a failed build. It is
+/// invisible on macOS and Linux, where neither cfg holds and the comment is never processed, so
+/// nothing that runs today would have caught it; an independent verify reproduced the error by
+/// flipping the cfg to `any(unix, test)` and running the repo's own `doc` gate.
 ///
 /// `sid` is expected to be the SDDL string form of a user SID (`S-1-5-21-…`), as
 /// `ConvertSidToStringSidW` renders it. Nothing here validates that — `S-1-5-21-…` is not a grammar
@@ -218,7 +226,7 @@ mod imp {
         ClientOptions, NamedPipeClient, NamedPipeServer, PipeMode, ServerOptions,
     };
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, LocalFree, ERROR_PIPE_BUSY, HANDLE,
+        CloseHandle, GetLastError, LocalFree, ERROR_INVALID_SECURITY_DESCR, ERROR_PIPE_BUSY, HANDLE,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
@@ -346,7 +354,8 @@ mod imp {
 
     /// Create one server instance of the pipe called `name`.
     ///
-    /// The THIRD option ADR-0037 § Decision 2 mandates is the security descriptor, and it is why
+    /// The security descriptor ADR-0037 § Decision 2 mandates — the FIRST of the three things that
+    /// sentence names, ahead of `first_pipe_instance` and `reject_remote_clients` — is why
     /// this goes through `create_with_security_attributes_raw` rather than the plain `create`
     /// (issue #1513). The descriptor is built HERE, per instance, from
     /// [`owner_only_sddl`](super::owner_only_sddl) over [`our_user_sid`] — so AC1's "every
@@ -468,17 +477,23 @@ mod imp {
         // SAFETY: a null buffer with length 0 is the documented sizing form; `needed` is a live
         // local.
         unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
-        if needed == 0 {
+        // Checked against the size of what the kernel says it will WRITE, not merely against zero.
+        // The struct is read back out of this buffer below, so a `needed` under `size_of::<TOKEN_USER>()`
+        // would allocate less than the deref reads — out of bounds, which the zero check alone does
+        // not exclude. Only reachable if `GetTokenInformation` violates its documented contract, and
+        // this function already declines to trust it in the other direction; declining in the
+        // direction that is UB costs one comparison.
+        if (needed as usize) < std::mem::size_of::<TOKEN_USER>() {
             // SAFETY: reads the last-error slot set by the sizing call above.
             let code = unsafe { GetLastError() };
             return Err(io::Error::other(format!(
-                "GetTokenInformation(TokenUser, sizing) failed: GetLastError={code}"
+                "GetTokenInformation(TokenUser, sizing) reported {needed} bytes, below the {} a \
+                 TOKEN_USER occupies: GetLastError={code}",
+                std::mem::size_of::<TOKEN_USER>()
             )));
         }
 
-        let words = (needed as usize)
-            .div_ceil(std::mem::size_of::<u64>())
-            .max(1);
+        let words = (needed as usize).div_ceil(std::mem::size_of::<u64>());
         let mut buffer = vec![0u64; words];
         // SAFETY: the buffer is `words * 8 >= needed` bytes of live, 8-byte-aligned, initialised
         // memory. The length passed is `needed`, which UNDER-reports the allocation by up to seven
@@ -540,6 +555,16 @@ mod imp {
     /// A self-relative security descriptor built from an SDDL string. The returned pointer is
     /// `LocalAlloc`-ed and the CALLER owns it — `CreateNamedPipeW` copies it, so freeing it right
     /// after the create is correct and is what [`create_instance`] does.
+    ///
+    /// The NULL check after a TRUE return is the one place this path could fail OPEN rather than
+    /// closed, and it is checked rather than reasoned about. A null `lpSecurityDescriptor` inside a
+    /// non-null `SECURITY_ATTRIBUTES` is not an error to `CreateNamedPipeW` — it MEANS "default
+    /// security", and the pipe namespace's default grants full control to LocalSystem,
+    /// administrators and the creator owner, plus READ to Everyone and the anonymous account. So
+    /// the one return value the API documents as impossible is also the only one that would silently
+    /// undo AC1 while every gate in this file stayed green. `token_user_sid` already declines to
+    /// trust an out-parameter the same way (`TOKEN_USER.User.Sid`); this is that arm's sibling, and
+    /// an independent verify measured its absence as a surviving mutation before it existed.
     fn security_descriptor_from_sddl(sddl: &str) -> Result<*mut c_void, u32> {
         let wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
         let mut descriptor: *mut c_void = std::ptr::null_mut();
@@ -557,6 +582,11 @@ mod imp {
         if ok == 0 {
             // SAFETY: reads the last-error slot set by the call above.
             return Err(unsafe { GetLastError() });
+        }
+        if descriptor.is_null() {
+            // TRUE with a null out-parameter is a contract violation, so there is no meaningful
+            // `GetLastError` to report — `ERROR_INVALID_SECURITY_DESCR` names the condition.
+            return Err(ERROR_INVALID_SECURITY_DESCR);
         }
         Ok(descriptor)
     }
@@ -1035,7 +1065,9 @@ mod windows_tests {
 /// nothing in this repo can pin them by behaviour: no CI job compiles the Windows arm — #978 is
 /// the item that would — so deleting the `security_qos_flags` call builds, lints, tests and
 /// merges green on every gate that actually runs. `first_pipe_instance`,
-/// `reject_remote_clients` and the explicit byte mode stand the same way. Scanning source text is
+/// `reject_remote_clients`, the explicit byte mode and — since #1513 — the
+/// `create_with_security_attributes_raw` call that carries the owner-only descriptor all stand the
+/// same way. Scanning source text is
 /// this repo's existing answer for a claim its test target cannot reach (`src/witness.rs`'s
 /// forbidden-token sweep, `src/usage.rs`'s egress scan), and unlike the module it guards it runs
 /// on every target.
@@ -1067,18 +1099,39 @@ mod windows_tests {
 /// this header, which the marker assertion does not reach and which inflates both sides the way
 /// the comment mutations did — the residue of counting text at all.
 ///
-/// #1513's descriptor assertions were mutation-tested the same way, eight edits run against them
-/// rather than reasoned about. Four are caught HERE, by counting: replacing
-/// `create_with_security_attributes_raw` with the plain `create`; hard-coding the trustee at the
-/// call site; and — via the `S-1-` sweep, which is what generalises past the call spelling —
-/// baking a constant SID inside `owner_only_sddl` itself or appending a second ACE naming one.
-/// Four more are caught by [`owner_only_dacl_tests`] BEHAVIOURALLY, which is the point of lifting
-/// the SDDL out of the Windows arm: dropping the `P` that makes the DACL protected, narrowing `GA`
-/// to `GR`, flipping the ALLOW to a DENY, and adding an inheritance flag — none of which a count of
-/// call sites can see, since every one of them leaves the call arity untouched.
+/// #1513's descriptor assertions were mutation-tested the same way. Caught HERE, by counting:
+/// replacing `create_with_security_attributes_raw` with the plain `create`; hard-coding the trustee
+/// at the call site; wrapping the SDDL binding in a `format!` or a `.replace` that appends a second
+/// ACE or strips the `P`; a second `ServerOptions` path, plain or aliased, in another module; and —
+/// via the `S-1-` sweep — baking a numeric SID inside `owner_only_sddl` itself. Caught by
+/// [`owner_only_dacl_tests`] BEHAVIOURALLY, which is the point of lifting the SDDL out of the
+/// Windows arm: dropping the `P` that makes the DACL protected, narrowing `GA` to `GR`, flipping the
+/// ALLOW to a DENY, and adding an inheritance flag — none of which a count of call sites can see,
+/// since every one of them leaves the call arity untouched.
 ///
-/// One mutation was run against the HARNESS rather than the guard, and it is the reason the list
-/// above is worth reading: deleting `.reject_remote_clients(true)` must go red, and an early
+/// Five of those catches exist BECAUSE an independent verify and a reviewer measured them
+/// surviving an earlier revision, which listed only catches and named no survivor — a guard that
+/// reports a perfect score is reporting on itself. Named, because they are the shapes a reader
+/// should expect to recur: a conditional attributes ARGUMENT (`if first { attrs } else { null }`),
+/// which is AC1's own named failure; a null `lpSecurityDescriptor` assigned into the struct; a
+/// wrapper around the SDDL binding that appends an ACE or strips the `P`; an ENV-CONFIGURED
+/// trustee, which AC2 forbids beside a hard-coded one and which no SID sweep can see; and an SDDL
+/// two-letter ALIAS (`WD` Everyone, `SY` LocalSystem, `BA` Administrators), the idiomatic spelling
+/// rather than a trick, invisible to a sweep keyed on the numeric form. Each is now pinned as one
+/// exact expression, because none of them is a count a scan can balance.
+///
+/// What stays GREEN, and it is the same residue the AC5 half above declares. A conditional placed
+/// anywhere the pins do not name: a source scan reads text, never control flow, and the pins close
+/// the two links this code actually has rather than the class. A SID assembled rather than written
+/// (`concat!`, or a `const` imported from another module), which no literal sweep can see. And
+/// every question of whether Windows HONOURS any of it — that a foreign user is refused, that a
+/// REPLACEMENT instance carries the DACL at all — which nothing in this repo can ask until #978
+/// compiles this arm and #1514 reads the descriptor back off a live instance. These tests pin the
+/// DACL this port ASKS FOR; the ADR's own bound on the spike ("Reasoned, not measured") is the
+/// bound on them too.
+///
+/// One mutation was run against the HARNESS rather than the guard, and it is the reason the lists
+/// above are worth reading: deleting `.reject_remote_clients(true)` must go red, and an early
 /// version of the mutation runner reported it GREEN. The runner was parsing `cargo test --quiet`
 /// output, which prints dots rather than per-test verdicts, so it saw no failure line and called
 /// every mutation survived. Any future pass over these guards should re-run that known-red edit
@@ -1246,7 +1299,9 @@ mod windows_option_source_guard {
     /// needle appearing — the type name is followed by `;`. And the region ABOVE this header,
     /// which holds the production open, is matched by no needle at all: its only cover is
     /// [`builders`], whose `ClientOptions::new()` carries the same weakness. An unflagged aliased
-    /// open placed there leaves all five of these tests green.
+    /// open placed there leaves every test in this module green. No count: the module has gained
+    /// tests twice since that sentence was first written, and a cardinal in a blind-spot disclosure
+    /// understates the blind spot the moment it goes stale.
     ///
     /// The blind spot none of that closes is the one the module doc declares: flags placed behind
     /// a conditional. A source scan reads text, not control flow.
@@ -1288,7 +1343,11 @@ mod windows_option_source_guard {
         );
     }
 
-    /// The third option ADR-0037 § Decision 2 mandates, and #1511's AC1 with it. Only its PRESENCE
+    /// The SECOND of the three things ADR-0037 § Decision 2's sentence names, and #1511's AC1 with
+    /// it. The ordinal is the ADR's own order — descriptor, `first_pipe_instance`,
+    /// `reject_remote_clients` — rather than the order these tests happen to sit in; an earlier
+    /// revision called this one "the third", which collided with #1513 calling the descriptor the
+    /// third and left a reader no way to tell which citation to trust. Only its PRESENCE
     /// is pinned: the call takes a variable, and "on the first instance only" is carried by that
     /// argument, which no source scan can evaluate.
     #[test]
@@ -1329,7 +1388,7 @@ mod windows_option_source_guard {
     /// `.create(` cannot match `.create_with_security_attributes_raw(` — the needle requires the
     /// paren immediately after `create` — so the two assertions do not shadow each other.
     #[test]
-    fn every_server_instance_is_created_with_an_explicit_security_descriptor() {
+    fn every_server_instance_is_written_with_an_explicit_security_descriptor() {
         let code = transport_code();
         let (_, servers) = builders(&code);
         assert_eq!(
@@ -1341,8 +1400,34 @@ mod windows_option_source_guard {
         assert_eq!(
             code.matches(".create(").count(),
             0,
-            "a plain `.create(` leaves the instance carrying the pipe namespace's DEFAULT \
-             descriptor; the fail-closed path has no such fall back (issue #1513 AC1/AC2)"
+            "no `.create(` may appear above this guard's header. On a pipe builder it is the plain \
+             create, which leaves the instance carrying the namespace's DEFAULT descriptor and is \
+             the fall back the fail-closed path must not have (issue #1513 AC1/AC2). This count \
+             cannot tell that from an unrelated `create` — a `File::create` in the test modules \
+             above would fail here too; move such a call below this header"
+        );
+        // The two links between the descriptor and the kernel, each pinned as a whole expression.
+        // Counting the CALL leaves both open, and both were measured surviving before these
+        // existed: assigning a null `lpSecurityDescriptor` into the struct hands `CreateNamedPipeW`
+        // the namespace default while the call spelling is untouched, and making the attributes
+        // ARGUMENT conditional (`if first { attrs } else { null }`) protects the first instance
+        // only — AC1's own named failure, the guarantee holding until the second client. Neither is
+        // a count a scan can balance; each is one exact expression, so they are pinned as such.
+        assert_eq!(
+            code.matches("lpSecurityDescriptor: descriptor,").count(),
+            servers,
+            "the descriptor built above must be the one the SECURITY_ATTRIBUTES carries \
+             (issue #1513 AC1)"
+        );
+        assert_eq!(
+            code.matches(
+                "options.create_with_security_attributes_raw( name, \
+                 (&mut attributes as *mut SECURITY_ATTRIBUTES).cast::<c_void>(), )"
+            )
+            .count(),
+            servers,
+            "the attributes must reach the create UNCONDITIONALLY — a branch here protects the \
+             first instance only (issue #1513 AC1)"
         );
     }
 
@@ -1356,10 +1441,16 @@ mod windows_option_source_guard {
     ///
     /// Same two needles for the same reason the client test gives: `ServerOptions::` alone reads a
     /// PATH, so an ALIASED import (`use …::ServerOptions as So;` then `So::new()`) contains no
-    /// `::` after the type name and would slip through. The blind spots are that test's too, and
-    /// **#1519** owns them: a `type` alias renames without either needle appearing, and the region
+    /// `::` after the type name and would slip through. The blind spots are that test's too, in the
+    /// same two shapes: a `type` alias renames without either needle appearing, and the region
     /// ABOVE this header — which holds the production create — is covered only by [`builders`],
     /// whose `ServerOptions::new()` carries the same weakness.
+    ///
+    /// **#1519 does NOT own them**, and an earlier revision of this comment said it did. That issue
+    /// is scoped to the AC5 CLIENT-open guard by its own title and body; this sweep did not exist
+    /// when it was filed, so attributing these holes to it would have left them with no owner —
+    /// which is the very move #1513's own issue body objects to, one issue number over. They are
+    /// recorded here and on #1513 instead, until an item claims them.
     #[test]
     fn no_server_pipe_instance_is_created_outside_the_guarded_region() {
         const NEEDLES: [&str; 2] = ["ServerOptions::", "ServerOptions as"];
@@ -1400,23 +1491,71 @@ mod windows_option_source_guard {
     /// their fixtures are SID literals, and in the scanned region they would trip this test while
     /// asserting the very thing it protects.
     #[test]
-    fn the_dacl_trustee_is_read_from_the_process_token_and_never_hard_coded() {
+    fn the_dacl_trustee_is_written_as_the_process_token_read_and_never_a_literal() {
         let code = transport_code();
         let (_, servers) = builders(&code);
+        // The WHOLE STATEMENT, not just the call inside it. A substring scan is satisfied by any
+        // expression that CONTAINS its needle, so pinning `owner_only_sddl(&our_user_sid()?)`
+        // alone stayed green under `format!("{}(A;;GA;;;WD)", owner_only_sddl(&our_user_sid()?))`
+        // and under a trailing `.replace("D:P", "D:")` — a second ACE and an unprotected DACL
+        // respectively, both measured surviving. Binding the statement end to end is what makes
+        // the value that reaches `SECURITY_ATTRIBUTES` the value `owner_only_dacl_tests` grades.
         assert_eq!(
-            code.matches("owner_only_sddl(&our_user_sid()?)").count(),
+            code.matches("let sddl = super::owner_only_sddl(&our_user_sid()?);")
+                .count(),
             servers,
-            "the DACL's trustee must be this process's own token user (issue #1513 AC2)"
+            "the DACL's trustee must be this process's own token user, and the SDDL must reach \
+             the descriptor unwrapped (issue #1513 AC1/AC2)"
         );
         assert_eq!(
             code.matches("OpenProcessToken(GetCurrentProcess()").count(),
             1,
             "the token read must be of THIS process, once (issue #1513 AC2)"
         );
+        // Both spellings a trustee can take. The numeric form is the one `ConvertSidToStringSidW`
+        // renders; the two-letter ALIASES are what SDDL itself accepts, and they are the idiomatic
+        // way to name a well-known account rather than an evasion — `D:P(A;;GA;;;WD)` is a real
+        // string a real author would write. An earlier revision swept for the numeric form only
+        // and claimed no well-known account escaped it, which was false of every account it named.
+        for needle in [
+            "S-1-", ";WD)", ";SY)", ";BA)", ";AU)", ";WD;", ";SY;", ";BA;", ";AU;",
+        ] {
+            assert!(
+                !code.contains(needle),
+                "`{needle}` names a trustee literally; AC2 requires the process's own token read \
+                 (issue #1513 AC2)"
+            );
+        }
+        // The function those assertions are about must still be INSIDE the scanned region. It is
+        // the one place a baked SID would not appear at any call site, and its unit tests live
+        // below this header precisely because their fixtures are the literals swept for above —
+        // so an edit that moved the function down there with them would switch this whole test off
+        // silently.
         assert!(
-            !code.contains("S-1-"),
-            "a SID literal in the transport is a hard-coded trustee — AC2 requires the process's \
-             own token (issue #1513 AC2)"
+            code.contains("fn owner_only_sddl"),
+            "owner_only_sddl moved out of the scanned region: the sweeps above no longer see the \
+             one function that builds the DACL"
+        );
+        // AC2 forbids a CONFIGURED trustee in the same breath as a hard-coded one, and the sweeps
+        // above see only the hard-coded half — a SID arriving from the environment never appears
+        // in the source at all, which was measured surviving them. The transport reads no
+        // environment for any purpose, so the absence is exact rather than a heuristic: the two
+        // `env!("CARGO_MANIFEST_DIR")` uses in this file are both BELOW this guard's header, in
+        // the scan machinery, and so are outside this region by construction.
+        assert!(
+            !code.contains("env::var"),
+            "the transport reads no environment; a configured trustee is what AC2 forbids beside \
+             a hard-coded one (issue #1513 AC2)"
+        );
+        // The fail-closed arm itself. `ConvertStringSecurityDescriptorToSecurityDescriptorW`
+        // returning TRUE with a null out-parameter would mean "default security" to
+        // `CreateNamedPipeW` — the one value that silently undoes AC1 — so deleting the check is a
+        // fail-OPEN edit that changes no other spelling here.
+        assert_eq!(
+            code.matches("if descriptor.is_null()").count(),
+            1,
+            "the descriptor's null check is AC2's fail-closed arm at the conversion boundary \
+             (issue #1513 AC2)"
         );
     }
 }
@@ -1443,17 +1582,20 @@ mod owner_only_dacl_tests {
     /// confused for a value the code could legitimately hold.
     const SID: &str = "S-1-5-21-3623811015-3361044348-30300820-1013";
 
-    /// AC1, clause by clause. The first assertion pins the exact bytes; each one after it names the
-    /// clause of ADR-0037 § Decision 2 that byte string is there to satisfy, so a failure says
-    /// WHICH guarantee moved instead of printing two strings and leaving the reader to diff them.
+    /// AC1, clause by clause. Each assertion names the clause of ADR-0037 § Decision 2 it is there
+    /// to satisfy, so a failure says WHICH guarantee moved instead of printing two strings and
+    /// leaving the reader to diff them.
+    ///
+    /// The exact-bytes assertion is LAST, and the order is the whole point. An earlier revision put
+    /// it first, which made every clause assertion below it unreachable: exact string equality
+    /// strictly subsumes them, so all four of the mutations this test is kept for — dropping `P`,
+    /// narrowing `GA`, flipping to DENY, adding an inheritance flag — panicked on the equality and
+    /// printed the two strings the design above says it avoids. Running the clauses first means the
+    /// failure names the guarantee; the equality then still catches what no clause covers, which is
+    /// a careless re-baseline of the literal itself.
     #[test]
     fn the_dacl_is_protected_allows_generic_all_and_names_exactly_one_trustee() {
         let sddl = owner_only_sddl(SID);
-
-        assert_eq!(
-            sddl, "D:P(A;;GA;;;S-1-5-21-3623811015-3361044348-30300820-1013)",
-            "the owner-only DACL's exact form (ADR-0037 § Decision 2)"
-        );
 
         // `P` is the whole of the "nothing is inherited" guarantee. Without it the descriptor is a
         // FLOOR the pipe namespace's defaults can widen, not the ceiling AC1 asks for — and the
@@ -1499,6 +1641,13 @@ mod owner_only_dacl_tests {
             "the object-type fields do not apply to a pipe: {ace}"
         );
         assert_eq!(fields[5], SID, "the trustee must be the SID given: {ace}");
+
+        // Last, per the ordering argument above: what the clauses do not cover is the literal
+        // itself being re-baselined to match a changed implementation.
+        assert_eq!(
+            sddl, "D:P(A;;GA;;;S-1-5-21-3623811015-3361044348-30300820-1013)",
+            "the owner-only DACL's exact form (ADR-0037 § Decision 2)"
+        );
     }
 
     /// The trustee VARIES with the argument. A `format!` that dropped its interpolation — or a

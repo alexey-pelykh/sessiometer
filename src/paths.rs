@@ -578,9 +578,9 @@ pub(crate) fn daemon_lock() -> Result<PathBuf> {
 /// This function is NOT cfg-gated and both arms call it, so read the path as the
 /// endpoint's IDENTITY rather than its kind. On Unix it is the socket itself, created
 /// `0600`. On Windows since #1511 it names nothing on disk: `control_transport` digests
-/// it into a pipe name under `\\.\pipe\`, so neither the file nor the mode exists —
-/// which is why the owner-only descriptor that would stand in for the `0600` is tracked
-/// separately at #1513 rather than implied here.
+/// it into a pipe name under `\\.\pipe\`, so neither the file nor the mode exists — the
+/// owner-only descriptor that stands in for the `0600` is applied there, per instance, and
+/// is not implied by this path (#1513).
 pub(crate) fn control_socket() -> Result<PathBuf> {
     Ok(support_dir()?.join("daemon.sock"))
 }
