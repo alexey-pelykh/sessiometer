@@ -561,14 +561,27 @@ async fn proof() -> Checked<()> {
     // Now the remaining connections can go: the listening instance keeps the name held.
     subscribers.clear();
     served.clear();
-    if open_client(&name).is_err() {
-        return Err(fail(
+    let probe = open_client(&name).map_err(|err| {
+        fail(format!(
             "CHECK 8: the name did not survive draining the connections down to the single \
-             listening instance — so the drain passed through zero handles after all",
-        ));
-    }
-    // That probe connected, which consumed the listening instance. Put the loop back to one
-    // listening before the cancellation test, the same way.
+             listening instance — so the drain passed through zero handles after all: {err}"
+        ))
+    })?;
+    // The probe ATTACHED to the listening instance, so it has to be accepted and closed rather
+    // than merely dropped. An un-accepted client leaves that instance already connected, and the
+    // cancellation below would then resolve on its first poll against a client that was never
+    // supposed to be there — which is a green CHECK 8 that tested nothing, and is exactly what
+    // the first run of this probe produced.
+    let probe_served = tokio::time::timeout(FRAME_TIMEOUT, loop_.accept())
+        .await
+        .map_err(|_| fail("CHECK 8: the name-survival probe was never accepted"))?
+        .map_err(|err| {
+            fail(format!(
+                "CHECK 8: accepting the name-survival probe failed: {err}"
+            ))
+        })?;
+    drop(probe);
+    drop(probe_served);
     for _ in 0..RECOVERY_ATTEMPTS {
         if loop_.listening() == 1 {
             break;
