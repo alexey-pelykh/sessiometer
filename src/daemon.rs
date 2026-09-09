@@ -54,9 +54,11 @@
 //!   for the process lifetime; a second `run` exits `3`.
 //! - **Reconcile-on-start** ([`Daemon::reconcile_on_start`]) — heal a crash /
 //!   third-writer `oauthAccount`↔canonical mismatch before the first poll.
-//! - **Control socket** ([`UnixControl`]) — a `0600` Unix-domain socket serving
-//!   newline-delimited JSON `status`, carrying handles + percentages only, never a
-//!   token (issue #15).
+//! - **Control channel** ([`UnixControl`]) — serves newline-delimited JSON `status`,
+//!   carrying handles + percentages only, never a token (issue #15). The endpoint is
+//!   per-target since #1511: a `0600` Unix-domain socket on Unix, a named pipe on
+//!   Windows. The type keeps its name because it is the production [`Control`] seam,
+//!   not because the transport is a Unix socket everywhere.
 //! - **Graceful shutdown** ([`Shutdown`]) — SIGINT / SIGTERM is observed only
 //!   *between* ticks, so an in-flight swap always runs to completion (#6 is
 //!   no-half-swap): complete-or-abort, never a torn swap.

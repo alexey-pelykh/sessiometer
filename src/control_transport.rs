@@ -24,10 +24,13 @@
 //!   (ADR-0037 § Consequences → Negative). `ControlListener::accept` is where that structural
 //!   difference lives; its own docs carry the instance accounting.
 //! - **The framing survives unchanged.** The pipe stays in BYTE mode
-//!   (`PipeMode::Byte`) — set explicitly rather than inherited from tokio's default, the same
-//!   argument ADR-0037 § Decision 2 applies to `reject_remote_clients`: a future port off tokio
-//!   must not silently lose it. Message mode would impose datagram boundaries the newline
-//!   framing does not need.
+//!   (`PipeMode::Byte`) — set explicitly rather than inherited. This is NOT the
+//!   `reject_remote_clients` argument ADR-0037 § Decision 2 makes, though an earlier revision of
+//!   this comment borrowed it: byte mode is the raw Win32 DEFAULT too (`PIPE_TYPE_BYTE` and
+//!   `PIPE_READMODE_BYTE` are both `0`; `PIPE_TYPE_MESSAGE` is what is opt-in), so a port off
+//!   tokio could not silently lose it. It is written out because the default is TOKIO's to change
+//!   and the wire compatibility resting on it is ours. Message mode would impose datagram
+//!   boundaries the newline framing does not need.
 //! - **Every CLIENT open sets `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION`**
 //!   (`connect`), so a server that wins the pipe-name race cannot impersonate the CLI. The
 //!   pipe namespace has no `0700` directory to protect the name, so first-creator-wins cuts
@@ -291,12 +294,17 @@ mod imp {
     /// which is precisely the kernel-enforced name reservation ADR-0037 § Decision 2 measured
     /// (spike CHECK 2). Every later instance therefore omits it.
     ///
-    /// Two options are set EXPLICITLY although both are already tokio's default, for the reason
-    /// ADR-0037 § Decision 2 gives about `reject_remote_clients`: on the raw Win32 API they are
-    /// opt-in, so a future port that stops going through tokio must not silently lose them.
-    /// `reject_remote_clients` keeps the control channel off the network — the same posture
-    /// `CONTRIBUTING.md`'s transport rule and ADR-0011 hold everywhere else — and `PipeMode::Byte`
-    /// is what keeps the newline framing meaning what it means (ADR-0037 § Decision 5).
+    /// Two options are set EXPLICITLY although both are already tokio's default, and they are set
+    /// for DIFFERENT reasons — an earlier revision of this comment gave them one reason, which was
+    /// true of only the first. `reject_remote_clients` keeps the control channel off the network,
+    /// the same posture `CONTRIBUTING.md`'s transport rule and ADR-0011 hold everywhere else, and
+    /// it is spelled out for the reason ADR-0037 § Decision 2 gives about it in particular: on the
+    /// raw Win32 API it is opt-in (`PIPE_REJECT_REMOTE_CLIENTS` is `8`,
+    /// `PIPE_ACCEPT_REMOTE_CLIENTS` is `0`), so a port that stops going through tokio would
+    /// silently lose it. That argument does NOT extend to `PipeMode::Byte`, which is the raw Win32
+    /// default as well (`PIPE_TYPE_BYTE` and `PIPE_READMODE_BYTE` are both `0`; `PIPE_TYPE_MESSAGE`
+    /// is the opt-in). Byte mode is written out because it is what keeps the newline framing
+    /// meaning what it means (ADR-0037 § Decision 5), and because the default is tokio's to change.
     ///
     /// NOT set here: the owner-only security descriptor
     /// (`create_with_security_attributes_raw` with `D:P(A;;GA;;;<our user SID>)`, the analogue of
@@ -387,9 +395,9 @@ mod imp {
         /// did: this code never calls `ServerOptions::max_instances`, so it takes tokio's default
         /// of `PIPE_UNLIMITED_INSTANCES`, which is a SENTINEL rather than a count — Windows
         /// documents the number of instances under it as limited only by the availability of
-        /// system resources. 255 is the value of that sentinel and is the one number
-        /// `max_instances` refuses outright (`assert!(instances < 255)`, so 254 is the largest
-        /// ceiling that can be set at all).
+        /// system resources. 255 is the value of that sentinel, and it is the SMALLEST value
+        /// `max_instances` refuses — `assert!(instances < 255)` on a `usize` refuses it and
+        /// everything above it, leaving 254 as the largest ceiling that can be set at all.
         ///
         /// The retry predicate is correspondingly narrower than "at capacity": it keys on
         /// `ERROR_PIPE_BUSY` and surfaces everything else. Whether exhausting system resources
@@ -413,10 +421,12 @@ mod imp {
                     Err(err) if is_pipe_busy(&err) => {
                         tokio::time::sleep(INSTANCE_RETRY_INTERVAL).await;
                     }
-                    // Paced for the same reason the failed-`connect` arm below is, and this one
-                    // is MORE likely to be reached: under the default `PIPE_UNLIMITED_INSTANCES`
-                    // an exhausted create is at least as likely to report something other than
-                    // `ERROR_PIPE_BUSY`, which lands here. Surfacing it un-paced is a hot loop
+                    // Paced for the same reason the failed-`connect` arm below is. How OFTEN it
+                    // is reached is not stated here, and an earlier revision of this comment did
+                    // state it — as a comparative against the busy arm, on the question
+                    // [`ControlListener::wait_for_instance`] fifteen lines up declares UNMEASURED:
+                    // what an exhausted create reports under the default `PIPE_UNLIMITED_INSTANCES`
+                    // is exactly what nobody here has measured. Surfacing it un-paced is a hot loop
                     // rather than a retry — `create_instance` is synchronous, so nothing in
                     // `accept` suspends before the `?`, and the run loop's `select!` is `biased`
                     // with `serve` ahead of the timer, so a `serve` that resolves immediately
@@ -478,9 +488,14 @@ mod imp {
         /// listening instance is therefore carried through `connect().await` by [`PendingAccept`],
         /// whose `Drop` puts it back — so a cancelled accept leaves the endpoint exactly as it
         /// found it. Simply closing it would release the pipe NAME, and a client would then read
-        /// "no daemon" out of `ERROR_FILE_NOT_FOUND`. Cancellation AFTER `connect()` resolved is
-        /// harmless too: the client stays attached and the next `accept` re-awaits `connect()` on
-        /// the same instance, which returns immediately for an already-connected pipe.
+        /// "no daemon" out of `ERROR_FILE_NOT_FOUND`. There is no second window to reason about:
+        /// once `connect()` resolves, nothing between it and the `Ok` suspends — the `take`, the
+        /// single refill attempt and the return are all synchronous — so a cancellation cannot
+        /// land there. An earlier revision of this comment claimed one could and dismissed it on
+        /// the premise that re-awaiting `connect()` returns immediately for an already-connected
+        /// pipe. That premise does not hold either: mio maps both `ERROR_PIPE_CONNECTED` and
+        /// `ERROR_NO_DATA` to success, so a re-await can resolve `Ok` on an instance whose peer
+        /// has already gone, and nothing here calls `DisconnectNamedPipe` to reset one.
         pub(crate) async fn accept(&self) -> io::Result<ControlStream> {
             // Make sure something is listening. The `Ref` temporary in the condition is dropped
             // before the block runs, so nothing is held across the await inside it.
@@ -563,10 +578,20 @@ mod imp {
     /// process that creates `\\.\pipe\sessiometer-control-…` first can stand a server in front of
     /// the CLI. These flags cap what such a server may do with the token it impersonates at
     /// IDENTIFICATION — query it, never act as us. It is a binary the port either sets or does
-    /// not, and nothing enforces it; `SECURITY_IDENTIFICATION` alone is not even requested
-    /// without `SECURITY_SQOS_PRESENT`, so BOTH are named here rather than relying on tokio's
-    /// default — which today happens to be exactly this pair, and which `security_qos_flags`
-    /// would silently replace if a caller ever passed something narrower.
+    /// not, and nothing enforces it. Both are named here rather than left to tokio's default,
+    /// which today is exactly this pair (`ClientOptions::new`) — but the default is tokio's to
+    /// change, and naming them makes the impersonation level this module's decision.
+    ///
+    /// Two things about that call are worth stating precisely, because an earlier revision of
+    /// this comment got the direction of the hazard backwards. `SECURITY_SQOS_PRESENT` cannot be
+    /// lost through `security_qos_flags` at all: tokio ORs it in unconditionally
+    /// (`self.security_qos_flags = flags | SECURITY_SQOS_PRESENT`), so the presence bit is not
+    /// what the explicit call buys. What it pins is the LEVEL, and the dangerous direction there
+    /// is WIDER, not narrower — `SECURITY_IMPERSONATION` or `SECURITY_DELEGATION` would let a
+    /// squatting server act as us, which is the whole exposure. `SECURITY_ANONYMOUS` is `0` and
+    /// fails closed. The setter is last-write-wins, so a second call appended to this chain would
+    /// override this one silently; the source guard at the foot of this file counts the calls
+    /// against the opens for that reason, and cannot do better than counting.
     ///
     /// The CLIENT-side check of the SERVER's owner SID — the other half of that squat defence —
     /// is **#976**'s and is not here.
@@ -583,10 +608,17 @@ mod imp {
     /// That is NOT a clean dichotomy, and `ControlListener::accept`'s accounting says why: a
     /// daemon whose instances reach zero stops holding the name, and a client then gets busy for
     /// a moment and `NotFound` after — a running daemon reported as absent, with the whole busy
-    /// budget potentially spent watching it change. THREE callers discard the kind
-    /// (`crate::poke`, `use_account`'s cache, and `socket::request_swap`); only the last takes
-    /// the guard, because only it can double-write on a wrong answer. The other two degrade into
-    /// an extra live poll and a quieter message.
+    /// budget potentially spent watching it change. Every caller that discards the kind inherits
+    /// that ambiguity: `crate::poke`, `use_account`'s cache, `use_account`'s manual-hold notifier
+    /// (`ControlSocketNotifier::notify`), `socket::notify_restored`, and `socket::request_swap`.
+    /// An earlier revision of this comment named the first, second and last and called that the
+    /// whole set. Only `request_swap` takes [`is_saturated`], because only it can double-write on
+    /// a wrong answer; the cache and `poke` degrade into an extra live poll and a quieter message.
+    /// The two notifiers are the ones to read carefully: both print "is the daemon running?"
+    /// (`use_account.rs`'s manual-hold path and `capture.rs`'s restore path), which on Windows can
+    /// now be printed about a daemon that is running — a saturated one past the budget, or one in
+    /// the zero-instance window. Both are best-effort notifications whose authoritative write has
+    /// already landed, so the message misleads without changing an outcome.
     pub(crate) async fn connect(path: &Path) -> io::Result<ControlClient> {
         let name = windows_pipe_name(path);
         let deadline = tokio::time::Instant::now() + CLIENT_BUSY_BUDGET;

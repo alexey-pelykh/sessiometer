@@ -1279,9 +1279,11 @@ mod tests {
     // `/usr/bin/curl` (`CURL`). It links no in-process HTTP/TLS client and opens
     // no raw TCP or UDP socket, so it *cannot* originate a connection except by
     // that one subprocess — which only ever targets `USAGE_URL`. (The daemon's
-    // control socket is a local Unix-domain socket that never leaves the machine;
-    // the external `claude` CLI the daemon drives for refresh/login makes its own
-    // calls under the user's own credential — that is not Sessiometer's egress.)
+    // control channel is local on both targets and never leaves the machine: a
+    // Unix-domain socket on Unix, and since #1511 a named pipe on Windows, created
+    // with `reject_remote_clients` so it is unreachable over SMB. The external
+    // `claude` CLI the daemon drives for refresh/login makes its own calls under
+    // the user's own credential — that is not Sessiometer's egress.)
 
     /// Read a repo-root-relative file, anchored at `CARGO_MANIFEST_DIR` so the
     /// scan is tied to the crate under test regardless of the test CWD.
