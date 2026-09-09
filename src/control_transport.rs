@@ -16,7 +16,8 @@
 //!
 //! Windows is a NAMED PIPE (ADR-0037 § Decision 1), driven through
 //! `tokio::net::windows::named_pipe`. Four things about that arm are decisions rather
-//! than mechanics, each recorded in the ADR:
+//! than mechanics. The first three are recorded in the ADR and cite it; the fourth is decided
+//! HERE, and says so:
 //!
 //! - **One client per INSTANCE.** There is no listening socket that accepts repeatedly. The
 //!   server creates a new instance per accept and only the FIRST carries `first_pipe_instance`
@@ -33,7 +34,10 @@
 //!   both ways; ADR-0037 records this flag pair as NOT optional, and warns that
 //!   `SECURITY_IDENTIFICATION` without `SECURITY_SQOS_PRESENT` is not requested at all.
 //! - **The name is derived from the control-socket path**, so the two ends cannot drift
-//!   (`windows_pipe_name`, in the Windows arm below).
+//!   (`windows_pipe_name`, in the Windows arm below). NOT an ADR decision: ADR-0037 only ever
+//!   writes the name elided (`\\.\pipe\sessiometer-...`) and fixes no derivation, so the
+//!   digest, its truncation and the prefix are chosen in this module and carry their rationale
+//!   there rather than a `§` citation.
 //!
 //! The item names above are code spans rather than intra-doc links on purpose. Each lives in a
 //! private per-target `imp` module, which is not in this module's link scope, and
@@ -199,10 +203,12 @@ mod imp {
     /// documented signal to retry, not an error (ADR-0037 § Consequences → Negative). In the
     /// accept loop below the window is a single `create` call wide, so this budget exists for
     /// the pathological saturated case rather than the normal one. BOUNDED here rather than left
-    /// to the caller because not every client bounds itself: `cli::query_status` and `poke`'s
-    /// best-effort read wrap no timeout of their own around the exchange.
-    /// `ControlSocketCache::query_status` reads as a third and is not one — `use_account` wraps
-    /// it in `CONTROL_SOCKET_TIMEOUT` at the call site.
+    /// to the caller because not every client bounds itself — and boundedness is a property of
+    /// the CALL SITE, not of the function. `poke`'s best-effort read wraps no timeout of its own,
+    /// and `cli::query_status` wraps none at the `daemon status` path, though its other caller
+    /// `probe_socket_responsive` does wrap it in `DAEMON_STATUS_SOCKET_TIMEOUT`.
+    /// `ControlSocketCache::query_status` is bounded that same way, by `use_account`'s
+    /// `CONTROL_SOCKET_TIMEOUT`. One unbounded site is enough to need this budget.
     const CLIENT_BUSY_BUDGET: Duration = Duration::from_secs(1);
 
     /// How long a CLIENT sleeps between `ERROR_PIPE_BUSY` retries.
@@ -399,7 +405,8 @@ mod imp {
                     // rather than a retry — `create_instance` is synchronous, so nothing in
                     // `accept` suspends before the `?`, and the run loop's `select!` is `biased`
                     // with `serve` ahead of the timer, so a `serve` that resolves immediately
-                    // starves every other arm and every spawned task on the one thread.
+                    // starves every arm BELOW it and every spawned task on the one thread.
+                    // `shutdown.requested()` is polled ABOVE `serve` and so is not starved.
                     Err(err) => {
                         tokio::time::sleep(INSTANCE_RETRY_INTERVAL).await;
                         return Err(err);
@@ -428,7 +435,12 @@ mod imp {
         ///   also gets `ERROR_PIPE_BUSY` — which [`connect`] retries — and the next `accept`
         ///   waits (see [`ControlListener::wait_for_instance`]) until a subscriber disconnects.
         ///   Nothing is
-        ///   dropped and no client is refused outright; service resumes on its own.
+        ///   dropped and no client is refused outright; service resumes on its own. That is the
+        ///   BUSY outcome, and the only one this bullet describes: under
+        ///   `PIPE_UNLIMITED_INSTANCES` whether exhaustion reports busy AT ALL is unmeasured,
+        ///   and a non-busy refusal does NOT resume unattended —
+        ///   [`ControlListener::wait_for_instance`] paces it and SURFACES it, and the failed
+        ///   accept becomes an event the run loop re-arms.
         /// - **The NAME is held whenever an instance exists, and one normally does** — but
         ///   NOT unconditionally, and an earlier revision of this list claimed otherwise. A
         ///   released name is the worst outcome available here: a client sees
@@ -475,22 +487,26 @@ mod imp {
                 .connect()
                 .await
             {
-                // Discarding this instance is the right move — re-awaiting a `connect` that just
-                // failed is an error that spins rather than recovers, because the run loop
-                // re-arms `serve` as soon as it resolves. But `idle` was emptied above, so with
-                // no live connection this instance is the ONLY one the process holds, and
-                // dropping it first would release the NAME (see the accounting on this method).
-                // So replace before releasing, and let the failure decide how:
+                // Not re-awaiting this `connect` is the right move — re-awaiting one that just
+                // failed spins rather than recovers, because the run loop re-arms `serve` as soon
+                // as it resolves. But `idle` was emptied above, so with no live connection this
+                // instance is the ONLY one the process holds, and dropping it would release the
+                // NAME (see the accounting on this method). So try to REPLACE it, and keep it
+                // when the replacement cannot be made:
                 match create_instance(&self.name, false) {
                     // A fresh instance is listening. Assigning it here drops the failed one, and
                     // the guard parks the replacement in `idle` — the name is held throughout.
                     Ok(next) => pending.server = Some(next),
-                    // Busy means some OTHER instance is alive, so the name does not depend on
-                    // this one: discard it, exactly as before.
-                    Err(create_err) if is_pipe_busy(&create_err) => pending.server = None,
-                    // Anything else says nothing about whether another instance exists. Keep
-                    // the failed one listening rather than gamble the name on it — and PACE the
-                    // failure, because nothing else will. `UnixControl::serve` maps a failed
+                    // NO failed create says another instance exists — `ERROR_PIPE_BUSY` included,
+                    // and an earlier revision of this arm discarded the instance on the premise
+                    // that it did. Busy carries that meaning only under a PINNED `max_instances`,
+                    // which production never sets: it takes tokio's default
+                    // `PIPE_UNLIMITED_INSTANCES`, under which whether exhaustion even REPORTS
+                    // busy is unmeasured — [`ControlListener::wait_for_instance`] records this,
+                    // and reading busy as "some other instance is alive" here contradicted it.
+                    // So keep the failed one listening rather than gamble the name on an
+                    // inference this module elsewhere declines to make — and PACE the failure,
+                    // because nothing else will. `UnixControl::serve` maps a failed
                     // accept to `ControlYield::Signal(None)` and the run loop re-arms `serve`
                     // the moment it resolves, with no suspension point anywhere in between: a
                     // non-`WouldBlock` `connect` error returns on the first poll and

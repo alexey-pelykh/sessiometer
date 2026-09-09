@@ -228,15 +228,18 @@ impl AcceptLoop {
             .connect()
             .await
         {
-            // Mirrors the three-arm failed-connect path in `src/control_transport.rs`: replace
-            // before releasing, discard outright only when the refusal is itself evidence that
-            // another instance is alive, and otherwise keep the failed one listening and pace
-            // the failure. Transcribed even though no check here drives a failed `connect` —
-            // a mirror that diverges is measuring a loop the daemon does not run, whether or
-            // not a check happens to reach the divergence.
+            // Mirrors the two-arm failed-connect path in `src/control_transport.rs`: replace the
+            // instance when a replacement can be made, and otherwise keep the failed one
+            // listening and pace the failure. Production treats `ERROR_PIPE_BUSY` like any other
+            // failed create — under its default `PIPE_UNLIMITED_INSTANCES` a busy refusal is NOT
+            // evidence that another instance is alive — and this mirror follows it there even
+            // though THIS proof pins `MAX_INSTANCES`, which is exactly the configuration that
+            // would make the discarding arm safe. Mirroring the daemon's reasoning matters more
+            // than exploiting a ceiling the daemon does not set. Transcribed even though no check
+            // here drives a failed `connect` — a mirror that diverges is measuring a loop the
+            // daemon does not run, whether or not a check happens to reach the divergence.
             match create_instance(&self.name, false) {
                 Ok(next) => pending.server = Some(next),
-                Err(create_err) if is_code(&create_err, ERROR_PIPE_BUSY) => pending.server = None,
                 Err(_) => tokio::time::sleep(INSTANCE_RETRY_INTERVAL).await,
             }
             return Err(err);
