@@ -302,10 +302,19 @@ async fn proof() -> Checked<()> {
             "CHECK 1: the first instance could not be created: {err}"
         ))
     })?;
+    // ASSERTED, not merely printed, for the reason CHECK 3 states below: interpolating
+    // `listening()` into a PASS line makes the check unfalsifiable. It cannot invert today —
+    // `AcceptLoop::bind` returns `Ok` only with the instance present — but a bind that stopped
+    // parking its first instance would then print "PASS (0 listening)" and go green.
+    if loop_.listening() != 1 {
+        return Err(fail(format!(
+            "CHECK 1: bind returned Ok with {} listening instances, expected 1",
+            loop_.listening()
+        )));
+    }
     println!(
         "{TAG} CHECK 1  bind       : PASS — first instance created with first_pipe_instance \
-         ({} listening, 0 connected)",
-        loop_.listening()
+         (1 listening, 0 connected)"
     );
 
     // The #972 reservation still holds at a pinned max_instances — worth re-gating here rather
@@ -365,6 +374,12 @@ async fn proof() -> Checked<()> {
     // Push several frames down the held connection and read them back in order: the `watch`
     // stream's own shape, which the #972 proof's single request/reply exchange never exercised.
     // Same framing as the daemon: one newline-terminated JSON object per frame, flushed.
+    //
+    // ALL of them are written BEFORE any is read, and that ordering is the check rather than an
+    // implementation detail. Writing frame n, reading it, then writing n+1 keeps exactly one
+    // frame in flight, which is three request/reply exchanges wearing a stream's clothes: no
+    // reordering could occur, so the "IN ORDER" claim below would hold vacuously. A real `watch`
+    // subscriber can have several frames buffered ahead of it, and this is what puts them there.
     let mut reader = tokio::io::BufReader::new(subscriber);
     for nth in 1..=3u32 {
         let frame = format!("{{\"frame\":{nth}}}\n");
@@ -376,6 +391,8 @@ async fn proof() -> Checked<()> {
             .flush()
             .await
             .map_err(|err| fail(format!("CHECK 4: flushing frame {nth} failed: {err}")))?;
+    }
+    for nth in 1..=3u32 {
         let mut line = String::new();
         match tokio::time::timeout(FRAME_TIMEOUT, reader.read_line(&mut line)).await {
             Ok(Ok(0)) => return Err(fail(format!("CHECK 4: EOF instead of frame {nth}"))),
@@ -403,7 +420,7 @@ async fn proof() -> Checked<()> {
     }
     println!(
         "{TAG} CHECK 4  stream     : PASS — 3 newline-delimited JSON frames pushed to the held \
-         subscriber and read back IN ORDER over one connection"
+         subscriber BEFORE any was read, then read back IN ORDER over one connection"
     );
     subscribers.push(reader.into_inner());
     served.push(served_first);
@@ -706,18 +723,30 @@ async fn proof() -> Checked<()> {
             started.elapsed().as_secs_f64()
         )));
     }
+    // `gone` is what this check GATES; the busy window is reported, because teardown being
+    // asynchronous is a property of the runner rather than of the accounting. The concluding
+    // claim is therefore written from what THIS run observed: narrating a busy-then-absent
+    // sequence on a run that never saw the busy half would be a PASS asserting what it failed to
+    // measure, which is exactly what the rule above CHECK 3 forbids.
+    let (observed, conclusion) = if saw_busy {
+        (
+            "ERROR_PIPE_BUSY first and then ERROR_FILE_NOT_FOUND",
+            "At zero instances a running daemon reads first as SATURATED and then as ABSENT.",
+        )
+    } else {
+        (
+            "ERROR_FILE_NOT_FOUND on its first poll, with no busy window observed",
+            "This run measured only the transition to ABSENT — the busy half did not occur here, \
+             so nothing rests on it.",
+        )
+    };
     println!(
-        "{TAG} CHECK 9  name gone  : PASS — the last instance dropped, and a client then got \
-         {} for {:.3}s before the name stopped resolving at all with ERROR_FILE_NOT_FOUND \
-         (= {ERROR_FILE_NOT_FOUND}). So the BUSY-not-NOT-FOUND guarantee holds only while an \
-         instance EXISTS. At zero, a running daemon reads first as saturated and then as absent, \
-         and the name is free for another process to take",
-        if saw_busy {
-            "ERROR_PIPE_BUSY first"
-        } else {
-            "no busy window"
-        },
-        started.elapsed().as_secs_f64()
+        "{TAG} CHECK 9  name gone  : PASS — the last instance dropped, and a client then got {} \
+         (= {ERROR_FILE_NOT_FOUND}) within {:.3}s. So the BUSY-not-NOT-FOUND guarantee holds only \
+         while an instance EXISTS, and the name is then free for another process to take. {}",
+        observed,
+        started.elapsed().as_secs_f64(),
+        conclusion
     );
 
     println!(

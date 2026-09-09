@@ -102,8 +102,17 @@ jobs:
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: Build
         run: cargo build --locked --verbose
+      # `set -o pipefail` is STATED rather than inherited, on both proof steps. GitHub's
+      # `shell: bash` does supply it (`bash --noprofile --norc -eo pipefail`), so this changes
+      # nothing today — but the whole verdict contract above rests on the proof's exit code
+      # surviving the pipe into `tee`, and this same file records the `defaults` block silently
+      # losing `shell: bash` once already. `.github/workflows/ci.yml` writes it explicitly before
+      # its one `| tee` for the same reason. An inherited flag that a defaults edit can drop is
+      # not something a gate should depend on implicitly.
       - name: Run the proof
-        run: cargo run --locked 2>&1 | tee proof-output.txt
+        run: |
+          set -o pipefail
+          cargo run --locked 2>&1 | tee proof-output.txt
       # The issue-#1511 accept-loop / `watch` measurement, a SECOND mode of the same binary. It
       # answers the residual ADR-0037 § What this spike did NOT establish assigns to the transport
       # port — how many instances the accept loop keeps outstanding and what happens when they are
@@ -114,7 +123,9 @@ jobs:
       # and a #972 regression should not hide a #1511 answer. The job still fails if either does.
       - name: Run the accept-loop / watch proof (issue #1511)
         if: always()
-        run: cargo run --locked -- watch 2>&1 | tee watch-proof-output.txt
+        run: |
+          set -o pipefail
+          cargo run --locked -- watch 2>&1 | tee watch-proof-output.txt
       # The log IS the evidence ADR-0037 quotes, so lift it where a reader lands first rather than
       # leaving it several clicks deep. `always()`, because a FAILING proof's output is the more
       # informative of the two and is exactly what gets read.
