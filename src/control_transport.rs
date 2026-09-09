@@ -981,15 +981,30 @@ mod imp {
     /// pipe that IS answering under the wrong owner is the opposite of absent — reporting it as
     /// "no daemon" would tell the operator to start a daemon while a hostile one held the name.
     ///
-    /// That choice is HALF-EFFECTIVE and the shortfall is a residual rather than a fix. Other
-    /// callers of [`connect`] collapse every error kind before the kind can matter — a
-    /// `Err(_) => Ok(None)` arm in `crate::daemon::socket`, an `.ok()?` in `crate::poke`, and a
-    /// cache-miss mapping in `crate::use_account` that maps EVERY error identically. On those
-    /// paths the refusal above IS read as "no daemon", which is the outcome the kind was chosen to
-    /// prevent, and the operator gets no signal at all. It is benign today rather than dangerous:
-    /// a squatter holding the name means `first_pipe_instance(true)` already denied the real
-    /// daemon its bind, so there is no live daemon those paths could have reached. Widening them
-    /// is a change to callers this item does not own, so it is named here rather than made.
+    /// That choice is HALF-EFFECTIVE, and the shortfall is a residual rather than a fix. Only
+    /// three of [`connect`]'s callers key on the kind at all; the rest DISCARD it, so on those the
+    /// refusal above is read as "no daemon" — the outcome the kind was chosen to prevent. **Do not
+    /// re-list them here.** [`connect`]'s own doc below already partitions every caller by what it
+    /// does with the kind, derives that partition from a grep rather than maintaining it by hand,
+    /// and records that two earlier hand-written lists were each short. This is a third place that
+    /// would go stale the same way, so it points there instead — and an earlier revision of THIS
+    /// comment did ship such a list, and was short by half.
+    ///
+    /// What that partition means for a refusal HERE is worse than for the zero-instance window it
+    /// was written about, because the two harms it names both apply. `socket::request_swap`
+    /// discards the kind and takes [`is_saturated`], which is `is_pipe_busy` only — so a refusal
+    /// reaches its "no daemon reachable" arm and the caller falls through to the STANDALONE swap
+    /// path: a write, not a refusal. The swap lock still serialises it, so it is not a torn or
+    /// double write; what it bypasses is the daemon's own adjudication. **#1515** owns that
+    /// fallback. The three best-effort notifiers instead print "is the daemon running?" — a wrong
+    /// signal rather than no signal, and `crate::capture` writes one of them into a durable event.
+    ///
+    /// The squat case those harms would otherwise be about cannot arise: a squatter holding the
+    /// name means `first_pipe_instance(true)` already denied the real daemon its bind, so there is
+    /// no live daemon to have been misreported. The cases that DO reach a live daemon are the
+    /// mixed-elevation false refusal named below and any failure inside this function or the two
+    /// SID reads it calls — which fail closed BY DESIGN, and whose closure is what those callers
+    /// then misread. Widening them is a change to callers this item does not own.
     ///
     /// One FALSE-REFUSAL case the two-value widening does NOT cover, for the same reason it covers
     /// the first: both accepted values come from THIS process's token. Under MIXED elevation — an

@@ -360,24 +360,39 @@ impl KeepWarm for RealKeepWarmEngine {
 /// recorded because it is a real semantic difference and the next reader should not have to
 /// rediscover it.
 ///
-/// RELEASE ON ABRUPT DEATH IS NOT PROMPT ON WINDOWS, where `flock`'s is. `LockFileEx`'s own
-/// documented Remarks say the time the system takes to unlock a lock held by a terminated process
-/// "depends upon available system resources", and recommend a process unlock explicitly before it
-/// terminates. A graceful exit is fine — dropping the `File` closes the handle and releases the
-/// range — but after a kill or a crash there is an indeterminate window in which
-/// [`InstanceLock::is_held`] can still answer `true` and a restart can still take
-/// [`Error::AlreadyRunning`]. That is a startup-latency and operator-confusion hazard, not a
-/// correctness one: the lock cannot be held by two live daemons either way, and the conclusion
-/// above still holds, since a stale LOCK clears itself where a stale PID FILE would not. An
-/// explicit `UnlockFileEx` in `Drop` would not help the case that has the hazard — the process is
-/// already gone — so this is named rather than fixed.
+/// RELEASE IS NOT PROMISED TO BE PROMPT ON WINDOWS, where `flock`'s is, and the caveat covers more
+/// than a crash. `LockFileEx`'s documented Remarks put both paths in ONE clause — a process that
+/// "terminates with a portion of a file locked **or closes a file that has outstanding locks**" —
+/// say the time the system takes to unlock them "depends upon available system resources", and
+/// recommend that a process explicitly unlock what it locked. So the ORDINARY drop is inside the
+/// caveat too, not only the crash, which is why the recommendation is TAKEN here rather than
+/// dismissed: [`unlock_exclusive`] runs before the handle closes, on `Drop` and on the probe in
+/// [`InstanceLock::is_held`]. Both paths matter to this crate. `is_held` acquires and releases in
+/// one breath, and the AC2 test drops a lock and immediately re-acquires it — the two places an
+/// unpromised release latency would bite first, and both are on the target the test is committed
+/// to grade.
+///
+/// What the explicit unlock CANNOT reach is a kill or a crash: the process is gone before any
+/// `Drop` runs, so an indeterminate window remains in which [`InstanceLock::is_held`] answers
+/// `true` and a restart takes [`Error::AlreadyRunning`]. That is a startup-latency and
+/// operator-confusion hazard rather than a correctness one — the lock still cannot be held by two
+/// live daemons — and the no-reaping conclusion above still holds, because a stale LOCK clears
+/// itself eventually where a stale PID FILE never would. It is named rather than fixed because
+/// nothing in this process can fix it, and it is UNMEASURED like the rest of this arm.
 ///
 /// UNMEASURED on Windows, like every other line of that arm: no CI job compiles this target
 /// (**#978**). The reasoning above is from the documented API contract, not from a run.
 pub(crate) struct InstanceLock {
-    // Held open purely to keep the lock; dropping it (or the process dying)
-    // releases it.
-    _file: File,
+    // Held open purely to keep the lock. Dropping it releases the lock — explicitly first, via the
+    // `Drop` below, then implicitly as the handle closes; the process dying releases it too, but
+    // only on the operating system's own schedule (see the doc above).
+    file: File,
+}
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        unlock_exclusive(&self.file);
+    }
 }
 
 /// What one non-blocking exclusive-lock attempt did — the three-way outcome both targets narrow
@@ -483,6 +498,35 @@ fn try_lock_exclusive(file: &File) -> LockAttempt {
 /// the second-`acquire` refusal and the separate-open `is_held` probe both behave as their Unix
 /// counterparts do over distinct open file descriptions. (A DUPLICATED handle shares its locks;
 /// nothing here duplicates one.)
+/// Release the exclusive lock [`try_lock_exclusive`] took, before the handle is closed.
+///
+/// A no-op on Unix, and deliberately: `flock` releases at close with no documented latency caveat,
+/// so an explicit `LOCK_UN` would buy nothing and would add a syscall to every drop. On Windows it
+/// is `UnlockFileEx` over the same one-byte range, which is what that API's own Remarks recommend
+/// — see [`InstanceLock`] for the sentence and for the case this still cannot reach.
+///
+/// Best-effort by construction: it runs on a drop path and on a probe that has already decided its
+/// answer, so there is no caller left to return a failure to. A failure leaves exactly the state
+/// the close would have left anyway.
+#[cfg(unix)]
+fn unlock_exclusive(_file: &File) {}
+
+#[cfg(windows)]
+fn unlock_exclusive(file: &File) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    // SAFETY: the same contract `try_lock_exclusive` documents for the matching lock call — a
+    // zeroed `OVERLAPPED` carrying offset 0 with a null `hEvent`, a live handle owned by `file`,
+    // and the one-byte length that call took. The result is discarded on purpose (see above).
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    unsafe {
+        UnlockFileEx(file.as_raw_handle() as HANDLE, 0, 1, 0, &mut overlapped);
+    }
+}
+
 #[cfg(windows)]
 fn try_lock_exclusive(file: &File) -> LockAttempt {
     use std::os::windows::io::AsRawHandle;
@@ -532,7 +576,7 @@ impl InstanceLock {
     pub(crate) fn acquire(path: &Path) -> Result<Self> {
         let file = open_lock_file(path, true)?;
         match try_lock_exclusive(&file) {
-            LockAttempt::Acquired => Ok(Self { _file: file }),
+            LockAttempt::Acquired => Ok(Self { file }),
             LockAttempt::Contended => Err(Error::AlreadyRunning),
             LockAttempt::Failed(err) => Err(Error::Io(err)),
         }
@@ -573,9 +617,14 @@ impl InstanceLock {
             Err(err) => return Err(Error::Io(err)),
         };
         match try_lock_exclusive(&file) {
-            // Acquired ⇒ no live holder; `file` drops at the end of this scope, releasing the
-            // lock at once.
-            LockAttempt::Acquired => Ok(false),
+            // Acquired ⇒ no live holder. Unlock EXPLICITLY before `file` drops: closing a handle
+            // with an outstanding lock is inside the same "depends upon available system
+            // resources" caveat as termination on Windows, and this probe is the one path that
+            // takes a lock only to hand it straight back (`InstanceLock`'s own doc).
+            LockAttempt::Acquired => {
+                unlock_exclusive(&file);
+                Ok(false)
+            }
             // Another instance holds the lock — a live daemon.
             LockAttempt::Contended => Ok(true),
             LockAttempt::Failed(err) => Err(Error::Io(err)),

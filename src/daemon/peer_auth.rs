@@ -32,13 +32,33 @@
 //! crosses a machine boundary, so the practical difference is small; the direction is not in
 //! doubt (ADR-0037 § Consequences → Positive).
 //!
-//! **Weaker — the peer has a say.** `getpeereid` and `SO_PEERCRED` read a uid the KERNEL captured
-//! at `connect(2)` time. It is a property of the CONNECTION, and the peer cannot influence what
-//! is reported. A named-pipe client, by contrast, chooses the impersonation level on its own open:
-//! a client that opens with `SECURITY_ANONYMOUS` hands the server an anonymous token, whose user
+//! **Weaker — the peer has a say, on TWO axes, and only one of them is harmless.** `getpeereid`
+//! and `SO_PEERCRED` read a uid the KERNEL captured at `connect(2)` time. It is a property of the
+//! CONNECTION and of the peer PROCESS, and the peer cannot influence what is reported.
+//!
+//! *The impersonation LEVEL* is the harmless axis. A named-pipe client chooses it on its own open:
+//! a client that opens with `SECURITY_ANONYMOUS` hands the server an anonymous token whose user
 //! SID is not ours. Under the fail-closed comparison below that can only make a client DENY
-//! ITSELF — there is no level at which a peer can make itself look like a DIFFERENT account — so
-//! it is an asymmetry rather than an escalation path (ADR-0037 § Consequences → Negative).
+//! ITSELF — no level makes a peer look like a DIFFERENT account — so on this axis it is an
+//! asymmetry rather than an escalation path (ADR-0037 § Consequences → Negative).
+//!
+//! *The TOKEN ITSELF* is the axis that is genuinely weaker, and #976's Constraints require it be
+//! surfaced rather than quietly accepted. What `ImpersonateNamedPipeClient` yields is the client
+//! THREAD's effective token at open — not, as on Unix, a credential the kernel took from the peer
+//! process and that no API can substitute. A principal holding `SeImpersonatePrivilege` can
+//! impersonate a token it has ACQUIRED for another account and open the pipe under it. That token
+//! passes #1513's owner-only DACL, because `CreateFile`'s access check uses the impersonated token
+//! too, and then presents that account's SID here. **So a peer running as A can authenticate as B**
+//! — something a distinct uid cannot do on Unix at any privilege short of root.
+//!
+//! Two things bound it without dissolving it. The privilege is NOT universal: service accounts and
+//! Administrators hold it by default, a standard interactive user does not. And holding it is not
+//! sufficient — the attacker must first get B to authenticate to something it controls, which is
+//! the precondition the whole documented family of such attacks turns on. The residual is
+//! therefore "a service-account-class principal on the same machine", not "any local user". That
+//! is still strictly more than Unix concedes, it is not closed by anything in this crate, and no
+//! transport choice available on this platform closes it — ADR-0037 § Alternatives records that
+//! the pipe's impersonated SID was already the strongest identity on offer here.
 //!
 //! **Unchanged — the TOCTOU property.** Like the Unix uid, the impersonated SID describes the
 //! connection's own security context, not a live process looked up after the fact. That is the
@@ -51,7 +71,9 @@
 //! not have; `peer_user_sid` is where it is contained, and its own docs carry the rules.
 //!
 //! **Net.** The gate's question — "is this peer the same local user?" — is answered at least as
-//! precisely on Windows as on Unix, and every failure mode of the Windows read denies. What the
+//! precisely on Windows as on Unix for every peer that cannot borrow a token, and every failure
+//! mode of the Windows read denies; the token axis above is where "at least as precisely" stops
+//! being true, and it is recorded rather than absorbed. What the
 //! Windows arm does NOT reproduce is the Unix REACHABILITY layer around the gate: `0600` on the
 //! socket in a `0700` directory means a foreign user cannot reach the endpoint at all, whereas
 //! the pipe namespace has no directory (ADR-0037 § Decision 2). The owner-only descriptor #1513

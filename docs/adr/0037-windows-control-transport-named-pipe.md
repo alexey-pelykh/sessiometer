@@ -441,20 +441,35 @@ technical impossibility.
   proof's client opens the pipe with tokio's defaults and never requests a different impersonation
   level, so this paragraph is an argument from the fail-closed comparison and from the API contract,
   not a reading taken off a run.
+- **The client also controls WHICH TOKEN it presents, and that half IS weaker.** Added on **#976**,
+  because the bullet above bounds the LEVEL parameter and an earlier revision concluded from it for
+  the whole axis. What the server impersonates is the client THREAD's effective token, not a
+  credential the kernel took from the peer process. A principal holding `SeImpersonatePrivilege` —
+  held by default by service accounts and Administrators, NOT by a standard interactive user — can
+  impersonate a token it has acquired for another account, pass the owner-only DACL (the open's own
+  access check uses the impersonated token), and present that account's SID. So a peer running as
+  one account can authenticate as another, which a distinct uid cannot do on Unix short of root.
+  The precondition bounds it — the attacker must first get the target to authenticate to something
+  it controls — so the residual is a service-account-class principal on the same machine rather
+  than any local user. It is recorded rather than absorbed because #976's own Constraints demand
+  that of a weaker guarantee, and § Alternatives already establishes that no transport available on
+  this platform offers a stronger identity to trade for it.
 - **The name is squattable in a way the socket path is not.** The `0700` support dir means a
   foreign user cannot create our socket path at all, so `getpeereid` only ever had to answer the
   forward direction. The pipe namespace has no directory to protect, so first-creator-wins — the
   property CHECK 2 measured in our favour — cuts the other way too: a foreign local process that
   creates `\\.\pipe\sessiometer-...` first either denies the daemon its own name or stands a server
-  in front of the CLI. **#976** therefore owes a **client-side check of the server's
-  owner SID**, and **#1511** **must open** with
+  in front of the CLI. **#976** therefore owed a **client-side check of the server's
+  owner SID** and landed it, and **#1511** **had to open** with
   `SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION` so a rogue
-  server cannot impersonate the CLI even if it wins the race — the flag pair rides on the client's
-  own open call, so it is transport code even though identity is what it protects. Neither is
-  optional, and neither is
-  work the Unix side ever had to do. § What this spike did NOT establish restates this pair in the
-  same words on purpose — that is the section an implementer skims for what is owed, so the two
-  must not drift apart in strength.
+  server cannot impersonate the CLI even if it wins the race, and did — the flag pair rides on the
+  client's own open call, so it is transport code even though identity is what it protects. Neither
+  was optional, and neither is
+  work the Unix side ever had to do. Both have since MERGED and neither is MEASURED; the residual
+  bullet in § What this spike did NOT establish carries that state in full and is the copy to read.
+  This paragraph is updated in the same pass on purpose: it restates that pair in the same words,
+  it is the section an implementer skims for what is owed, and the two must not drift apart in
+  strength — which an amendment touching only one of them is exactly how they would.
 - **`paths::control_socket()` gains a per-target shape**, and with it every caller that reasons
   about the socket as a *file*. The CLI's friendly `Error::DaemonNotRunning` currently keys on a
   failed connect to a filesystem path; on Windows the not-running case is `ERROR_FILE_NOT_FOUND`
@@ -532,10 +547,13 @@ onto their owners is tracker work this record does not perform, and merging this
   one message on one connection. The long-lived `watch` subscription (#165), which hands the
   connection to a spawned task and streams frames indefinitely, is untested here — and it is where
   one-client-per-instance (§ Negative) bites hardest, since a subscriber occupies an instance for
-  its whole lifetime. **#1511 owes a `watch`-shaped proof before that subscription is
-  ported**, answering how many instances the accept loop keeps outstanding — the accept loop is
-  the transport port's work, not #976's, for the same Boundaries reason as § Negative above. This
-  record does not settle it and no measurement here bears on it.
+  its whole lifetime. **#1511 owed a `watch`-shaped proof before that subscription was ported and
+  DELIVERED it** — that second proof is what the 2026-09-09 amendment on #1511 records, quoted in
+  § The second proof: the accept loop and `watch` (#1511), answering how many instances the accept
+  loop keeps outstanding. The bullet is kept rather than deleted because the sentence above it is
+  still true of THIS spike, which round-trips one message on one connection; only the ownership
+  clause is updated, and it is updated here because the amendment that discharged it left this
+  copy behind. Not #976's either way, for the same Boundaries reason as § Negative above.
 - **Nothing is enforced, and this one is #978's, not #976's.** No CI job compiles the crate for
   Windows; **#978** — *ci: add a Windows job that builds and tests (not just checks)* — is the
   enforcing job, the Windows half of the guard **#964** provides on Linux. The
