@@ -1066,6 +1066,23 @@ mod windows_tests {
 /// #1514's round-trip closes and this cannot. And spelling a needle inside a STRING LITERAL above
 /// this header, which the marker assertion does not reach and which inflates both sides the way
 /// the comment mutations did — the residue of counting text at all.
+///
+/// #1513's descriptor assertions were mutation-tested the same way, eight edits run against them
+/// rather than reasoned about. Four are caught HERE, by counting: replacing
+/// `create_with_security_attributes_raw` with the plain `create`; hard-coding the trustee at the
+/// call site; and — via the `S-1-` sweep, which is what generalises past the call spelling —
+/// baking a constant SID inside `owner_only_sddl` itself or appending a second ACE naming one.
+/// Four more are caught by [`owner_only_dacl_tests`] BEHAVIOURALLY, which is the point of lifting
+/// the SDDL out of the Windows arm: dropping the `P` that makes the DACL protected, narrowing `GA`
+/// to `GR`, flipping the ALLOW to a DENY, and adding an inheritance flag — none of which a count of
+/// call sites can see, since every one of them leaves the call arity untouched.
+///
+/// One mutation was run against the HARNESS rather than the guard, and it is the reason the list
+/// above is worth reading: deleting `.reject_remote_clients(true)` must go red, and an early
+/// version of the mutation runner reported it GREEN. The runner was parsing `cargo test --quiet`
+/// output, which prints dots rather than per-test verdicts, so it saw no failure line and called
+/// every mutation survived. Any future pass over these guards should re-run that known-red edit
+/// first: a mutation harness that cannot fail is indistinguishable from a guard that cannot fail.
 #[cfg(test)]
 mod windows_option_source_guard {
     /// This file's own source up to the start of this guard, comment-only lines dropped, whitespace
@@ -1297,6 +1314,206 @@ mod windows_option_source_guard {
             code.matches(".pipe_mode(PipeMode::Byte)").count(),
             clients + servers,
             "both the client open and the server instance must pin byte mode"
+        );
+    }
+
+    /// AC1's ARITY half: every server instance is created through the descriptor-carrying call.
+    /// Pinned two ways, and the second is the load-bearing one — a count alone stays green while a
+    /// SECOND creation path sits beside the guarded one, so the plain `create` is separately
+    /// required to be absent. Its absence is what makes "the first instance and every replacement"
+    /// structural rather than a property of whichever branch happened to run: there is one creation
+    /// path and it has no arm that reaches a default descriptor. That absence is also AC2's
+    /// fail-closed half, since the only fall back a descriptor failure could take is the very call
+    /// this forbids.
+    ///
+    /// `.create(` cannot match `.create_with_security_attributes_raw(` — the needle requires the
+    /// paren immediately after `create` — so the two assertions do not shadow each other.
+    #[test]
+    fn every_server_instance_is_created_with_an_explicit_security_descriptor() {
+        let code = transport_code();
+        let (_, servers) = builders(&code);
+        assert_eq!(
+            code.matches(".create_with_security_attributes_raw(")
+                .count(),
+            servers,
+            "every pipe instance must be created with an owner-only descriptor (issue #1513 AC1)"
+        );
+        assert_eq!(
+            code.matches(".create(").count(),
+            0,
+            "a plain `.create(` leaves the instance carrying the pipe namespace's DEFAULT \
+             descriptor; the fail-closed path has no such fall back (issue #1513 AC1/AC2)"
+        );
+    }
+
+    /// AC1 says EVERY instance the daemon creates, so the arity above is only half the claim — it
+    /// holds while a second `ServerOptions` sits in a module this file's counting never reaches.
+    /// The client-side sibling ([`no_client_pipe_open_exists_outside_the_guarded_region`]) has
+    /// swept for that since #1511; the server side was not swept, and until #1513 nothing needed
+    /// it, because an unguarded instance merely lacked flags that were themselves unenforced.
+    /// With a security descriptor on the line, an instance created elsewhere is one carrying the
+    /// namespace default.
+    ///
+    /// Same two needles for the same reason the client test gives: `ServerOptions::` alone reads a
+    /// PATH, so an ALIASED import (`use …::ServerOptions as So;` then `So::new()`) contains no
+    /// `::` after the type name and would slip through. The blind spots are that test's too, and
+    /// **#1519** owns them: a `type` alias renames without either needle appearing, and the region
+    /// ABOVE this header — which holds the production create — is covered only by [`builders`],
+    /// whose `ServerOptions::new()` carries the same weakness.
+    #[test]
+    fn no_server_pipe_instance_is_created_outside_the_guarded_region() {
+        const NEEDLES: [&str; 2] = ["ServerOptions::", "ServerOptions as"];
+
+        let offenders: Vec<_> = other_sources()
+            .into_iter()
+            .filter(|(_, text)| NEEDLES.iter().any(|needle| text.contains(needle)))
+            .map(|(path, _)| path)
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "a pipe instance created outside control_transport.rs carries the namespace's default \
+             descriptor, not the owner-only DACL (issue #1513 AC1): {offenders:?}"
+        );
+
+        let tail = split_at_guard().1;
+        for needle in NEEDLES {
+            assert_eq!(
+                tail.matches(needle).count(),
+                tail.matches(&format!("\"{needle}")).count(),
+                "a pipe instance created below this guard's own header is outside every count \
+                 above (needle: {needle})"
+            );
+        }
+    }
+
+    /// AC2's PROVENANCE half: the DACL's trustee is read from THIS PROCESS's own token, and is not
+    /// a constant sitting in the source.
+    ///
+    /// The absence assertion is the one that generalises. Pinning the call spelling catches the
+    /// trustee being swapped for a literal AT THIS CALL SITE; sweeping the whole region for a SID
+    /// literal catches it being introduced anywhere else in the transport, including inside
+    /// [`super::owner_only_sddl`] itself. `S-1-` is the universal prefix of every SID's string
+    /// form, so no well-known account (`S-1-5-18` LocalSystem, `S-1-1-0` Everyone, `S-1-5-32-544`
+    /// Administrators) escapes it.
+    ///
+    /// It is why the DACL's own unit tests live BELOW this guard's header rather than above it:
+    /// their fixtures are SID literals, and in the scanned region they would trip this test while
+    /// asserting the very thing it protects.
+    #[test]
+    fn the_dacl_trustee_is_read_from_the_process_token_and_never_hard_coded() {
+        let code = transport_code();
+        let (_, servers) = builders(&code);
+        assert_eq!(
+            code.matches("owner_only_sddl(&our_user_sid()?)").count(),
+            servers,
+            "the DACL's trustee must be this process's own token user (issue #1513 AC2)"
+        );
+        assert_eq!(
+            code.matches("OpenProcessToken(GetCurrentProcess()").count(),
+            1,
+            "the token read must be of THIS process, once (issue #1513 AC2)"
+        );
+        assert!(
+            !code.contains("S-1-"),
+            "a SID literal in the transport is a hard-coded trustee — AC2 requires the process's \
+             own token (issue #1513 AC2)"
+        );
+    }
+}
+
+/// The owner-only DACL's SHAPE, asserted behaviourally on EVERY target rather than by the source
+/// scan above — which can see only that a call is written, and is blind to what the string it
+/// builds says.
+///
+/// This is what lifting [`super::owner_only_sddl`] out of the Windows arm buys, and it is the one
+/// piece of #1513 that a macOS or Linux `cargo test` can actually execute. The rest of the path is
+/// syscalls: whether Windows HONOURS this descriptor is neither asserted here nor assertable
+/// anywhere in this repo until **#978** compiles and runs the arm, and **#1514** exercises it. Read
+/// these tests as pinning the DACL this port ASKS FOR, never as evidence of what it gets.
+///
+/// Placed BELOW `windows_option_source_guard` on purpose: the SID fixtures are exactly the literals
+/// that guard's hard-coded-trustee sweep forbids, and its scanned region ends at its own module
+/// header. Above it, these tests would fail the test that protects them.
+#[cfg(test)]
+mod owner_only_dacl_tests {
+    use super::owner_only_sddl;
+
+    /// A realistic domain-user SID — the shape `ConvertSidToStringSidW` renders for the account a
+    /// daemon actually runs as, rather than a well-known constant, so the fixture cannot be
+    /// confused for a value the code could legitimately hold.
+    const SID: &str = "S-1-5-21-3623811015-3361044348-30300820-1013";
+
+    /// AC1, clause by clause. The first assertion pins the exact bytes; each one after it names the
+    /// clause of ADR-0037 § Decision 2 that byte string is there to satisfy, so a failure says
+    /// WHICH guarantee moved instead of printing two strings and leaving the reader to diff them.
+    #[test]
+    fn the_dacl_is_protected_allows_generic_all_and_names_exactly_one_trustee() {
+        let sddl = owner_only_sddl(SID);
+
+        assert_eq!(
+            sddl, "D:P(A;;GA;;;S-1-5-21-3623811015-3361044348-30300820-1013)",
+            "the owner-only DACL's exact form (ADR-0037 § Decision 2)"
+        );
+
+        // `P` is the whole of the "nothing is inherited" guarantee. Without it the descriptor is a
+        // FLOOR the pipe namespace's defaults can widen, not the ceiling AC1 asks for — and the
+        // string still parses, so nothing else here would notice.
+        assert!(
+            sddl.starts_with("D:P("),
+            "the DACL must be PROTECTED, or the namespace default is inherited: {sddl}"
+        );
+        // "exactly one SID and nothing to anyone else" is a statement about ACE COUNT, which no
+        // assertion on the ACE's contents can make.
+        assert_eq!(
+            sddl.matches('(').count(),
+            1,
+            "the DACL must carry exactly one ACE: {sddl}"
+        );
+        assert!(sddl.ends_with(')'), "the ACE must be closed: {sddl}");
+
+        let ace = sddl
+            .strip_prefix("D:P(")
+            .and_then(|rest| rest.strip_suffix(')'))
+            .expect("the two assertions above establish both delimiters");
+        let fields: Vec<&str> = ace.split(';').collect();
+        assert_eq!(
+            fields.len(),
+            6,
+            "an SDDL ACE has six semicolon-separated fields: {ace}"
+        );
+        assert_eq!(
+            fields[0], "A",
+            "the ACE must be an ALLOW, not a DENY: {ace}"
+        );
+        assert_eq!(
+            fields[1], "",
+            "no ACE flags apply to a pipe — inheritance flags especially: {ace}"
+        );
+        assert_eq!(
+            fields[2], "GA",
+            "the right granted must be GENERIC_ALL: {ace}"
+        );
+        assert_eq!(
+            (fields[3], fields[4]),
+            ("", ""),
+            "the object-type fields do not apply to a pipe: {ace}"
+        );
+        assert_eq!(fields[5], SID, "the trustee must be the SID given: {ace}");
+    }
+
+    /// The trustee VARIES with the argument. A `format!` that dropped its interpolation — or a
+    /// well-known SID baked in beside it — would satisfy every structural assertion above while
+    /// naming an account this process is not.
+    #[test]
+    fn the_trustee_is_the_sid_it_is_given_rather_than_a_constant() {
+        assert_ne!(
+            owner_only_sddl("S-1-5-18"),
+            owner_only_sddl("S-1-5-19"),
+            "two different SIDs must produce two different DACLs"
+        );
+        assert!(
+            owner_only_sddl("S-1-5-18").ends_with(";S-1-5-18)"),
+            "the trustee field must be the argument"
         );
     }
 }
