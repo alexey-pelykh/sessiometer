@@ -969,13 +969,23 @@ mod windows_option_source_guard {
     /// Another module is the obvious one. The other is THIS file BELOW the guard's own header,
     /// which the count cannot reach by construction — truncating there is what stops the needles
     /// matching themselves. So the tail is checked by a different question that its own literals
-    /// cannot fake: every `ClientOptions::` down there must be immediately preceded by a quote,
-    /// which is true of a needle and false of a call.
+    /// cannot fake: every needle down there must be immediately preceded by a quote, which is true
+    /// of a needle and false of a call.
+    ///
+    /// TWO needles, not one, and the second is why: `ClientOptions::` alone reads a PATH, so an
+    /// ALIASED import — `use ...::ClientOptions as Co;` then `Co::new()` — contains no `::` after
+    /// the type name and slipped through both halves. An independent review measured that, adding
+    /// exactly that pair to another module and watching every test here stay green. `ClientOptions
+    /// as` catches the rename at its import, which is the one place an alias must appear. The
+    /// blind spot this does NOT close is still the one the module doc declares: flags placed
+    /// behind a conditional. A source scan reads text, not control flow.
     #[test]
     fn no_client_pipe_open_exists_outside_the_guarded_region() {
+        const NEEDLES: [&str; 2] = ["ClientOptions::", "ClientOptions as"];
+
         let offenders: Vec<_> = other_sources()
             .into_iter()
-            .filter(|(_, text)| text.contains("ClientOptions::"))
+            .filter(|(_, text)| NEEDLES.iter().any(|needle| text.contains(needle)))
             .map(|(path, _)| path)
             .collect();
         assert!(
@@ -984,11 +994,14 @@ mod windows_option_source_guard {
         );
 
         let tail = split_at_guard().1;
-        assert_eq!(
-            tail.matches("ClientOptions::").count(),
-            tail.matches("\"ClientOptions::").count(),
-            "a client pipe open below this guard's own header is outside every count above"
-        );
+        for needle in NEEDLES {
+            assert_eq!(
+                tail.matches(needle).count(),
+                tail.matches(&format!("\"{needle}")).count(),
+                "a client pipe open below this guard's own header is outside every count above \
+                 (needle: {needle})"
+            );
+        }
     }
 
     /// ADR-0037 § Decision 2 mandates this in the same breath as the flags: the pipe namespace is
