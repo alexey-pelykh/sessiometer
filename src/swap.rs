@@ -999,16 +999,16 @@ impl SwapLock {
     /// the current-thread runtime keeps cooperating while it waits — the daemon
     /// stays responsive, and `use` stays interruptible.
     pub(crate) async fn acquire(path: &Path, max_wait: Duration) -> Result<Self> {
-        use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::io::AsRawFd;
 
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(path)?;
+        let file = crate::file_policy::open_owner_only(
+            OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false),
+            path,
+        )?;
         let deadline = Instant::now() + max_wait;
         loop {
             // Raw `flock` FFI, kept un-wrapped by ADR-0004: kept raw rather than

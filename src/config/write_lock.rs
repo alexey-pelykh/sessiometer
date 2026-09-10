@@ -83,7 +83,6 @@
 //! records why `capture` and `login` cannot simply be widened: their reads straddle a
 //! multi-minute interactive spawn.
 
-use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -156,13 +155,14 @@ impl ConfigWriteLock {
     /// `std::fs` on a `current_thread` runtime. Yielding here buys an interruptible, non-spinning
     /// wait — not a daemon that keeps working through it.
     pub(crate) async fn acquire(path: &Path, max_wait: Duration) -> Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(path)?;
+        let file = crate::file_policy::open_owner_only(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false),
+            path,
+        )?;
         let deadline = Instant::now() + max_wait;
         loop {
             // Raw `flock` FFI, kept un-wrapped by ADR-0004: kept raw rather than adding a

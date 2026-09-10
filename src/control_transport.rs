@@ -158,8 +158,6 @@ mod imp {
         /// same order, same fail-on-`remove_file`-error branch. The relocation is what lets the
         /// caller stay target-neutral.
         pub(crate) fn bind(path: &Path) -> io::Result<Self> {
-            use std::os::unix::fs::PermissionsExt;
-
             // A leftover socket file makes `bind` fail with EADDRINUSE; the lock we hold
             // means it cannot belong to a running daemon, so remove it. A genuinely
             // absent file is not an error.
@@ -169,7 +167,11 @@ mod imp {
                 Err(err) => return Err(err),
             }
             let inner = tokio::net::UnixListener::bind(path)?;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+            // The same owner-only policy every other private file in this crate carries, through
+            // the one module that owns it (issue #974) rather than through a second spelling of
+            // `0600` here. On this target it IS `0600`; the socket's Windows counterpart is the
+            // pipe's own DACL below, which is built from the same intent.
+            crate::file_policy::owner_only_file(path)?;
             Ok(Self { inner })
         }
 

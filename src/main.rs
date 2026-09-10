@@ -30,6 +30,11 @@ mod cross_surface;
 mod daemon;
 mod duration;
 mod error;
+/// The owner-only file-permission policy (issue #974), stated once and implemented per target:
+/// `0600` / `0700` mode bits on Unix, an explicit PROTECTED DACL on Windows. Every private file
+/// and directory this crate writes goes through it, so the security property is one decision
+/// rather than one per call site.
+mod file_policy;
 /// The FRAMING guard's shared vocabulary (issues #160, #542, #918, #1123, #1139) — the central
 /// banned-token and banned-phrase lists, the single scanner all five audiences share, and the
 /// per-audience exemption sets that let `--help`, the operator advisories and `Error::CliUsage`'s

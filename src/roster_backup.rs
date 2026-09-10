@@ -83,14 +83,13 @@
 
 use std::cmp::Reverse;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::file_policy;
 use crate::paths;
-use crate::paths::FILE_MODE;
 
 /// How many previous configs the ring retains. Small on purpose (design D-3): the value is
 /// surviving one bad write, not keeping history.
@@ -209,16 +208,18 @@ impl Retention {
 /// ring at all — so the guard adds no new way for a first run, or a run over a damaged file, to
 /// fail.
 ///
-/// The mode of the written entry is READ BACK rather than assumed. `write_private_file` creates
-/// it `0600`, but only on a filesystem that honours POSIX modes; a ring directory that is a
-/// symlink to an exFAT volume or a sync-provider shim is an operator affordance nothing here
+/// The permissions of the written entry are READ BACK rather than assumed. `write_private_file`
+/// creates it owner-only, but only on a filesystem that honours the policy; a ring directory that
+/// is a symlink to an exFAT volume or a sync-provider shim is an operator affordance nothing here
 /// forbids, and AC-5's "BUT NOT by retaining a backup readable by another user" is a property of
 /// what is on disk, not of the writer that was used. A wider entry is removed and the write
 /// aborts.
 ///
-/// The comparison is against [`paths::FILE_MODE`] itself — the constant AC-5 names — and not a
-/// second copy of `0600` spelled here, so the two cannot drift apart. That is why this module
-/// widened it to `pub(crate)`.
+/// The read-back goes through [`file_policy::owner_only_deviation`] rather than spelling a mode
+/// here, so this module and the writer cannot drift apart and the check means the same thing on
+/// both targets: the mode bits on Unix, an explicit PROTECTED DACL on Windows (issue #974). Before
+/// #974 the comparison was against `paths::FILE_MODE`, which existed as `pub(crate)` for this one
+/// caller; the constant now lives with the mechanism.
 pub(crate) fn retain_if_qualifying(config_path: &Path) -> Result<Option<Retention>> {
     let Some(contents) = qualifying_contents(config_path) else {
         return Ok(None);
@@ -227,14 +228,13 @@ pub(crate) fn retain_if_qualifying(config_path: &Path) -> Result<Option<Retentio
     paths::ensure_private_dir(&dir)?;
     let target = dir.join(file_name(representable(stamp_for(&dir))?));
     paths::write_private_file(&target, contents.as_bytes())?;
-    let mode = fs::metadata(&target)?.permissions().mode() & 0o777;
-    if mode != FILE_MODE {
+    if let Some(deviation) = file_policy::owner_only_deviation(&target)? {
         // Not a retention at all: it is a disclosure wearing a retention's name.
         let _ = fs::remove_file(&target);
         return Err(Error::Io(std::io::Error::other(format!(
-            "refusing this roster write: its backup landed at mode {mode:o} because {} does \
-             not preserve {FILE_MODE:o}; move the config directory to a filesystem that honours \
-             POSIX modes, or the roster cannot be replaced without widening a copy of it",
+            "refusing this roster write: its backup landed at {deviation} because {} does not \
+             preserve owner-only permissions; move the config directory to a filesystem that \
+             honours them, or the roster cannot be replaced without widening a copy of it",
             dir.display()
         ))));
     }
@@ -417,6 +417,7 @@ fn sweep_abandoned_temps(dir: &Path, newest: (u64, u32)) {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     use tempfile::TempDir;
@@ -592,6 +593,10 @@ mod tests {
 
     /// The mode is read off the filesystem, never inferred from the writer used. A `0644`
     /// backup of a `0600` file is a disclosure the original deliberately prevented.
+    // Unix-only: it asserts the mode bits `file_policy` writes on this target. The
+    // cross-platform property — that every retained entry is owner-only — is what
+    // `retain_if_qualifying` itself now refuses to complete without (issue #974).
+    #[cfg(unix)]
     #[tokio::test]
     async fn every_retained_file_carries_the_config_file_mode() {
         let (_dir, path) = scratch();
@@ -821,9 +826,9 @@ mod tests {
              while leaving a torn entry reachable:\n{body}"
         );
         assert!(
-            body.contains("permissions().mode()") && body.contains("FILE_MODE"),
-            "the written entry's mode must be read back and compared against FILE_MODE, not \
-             inferred from the writer that was used:\n{body}"
+            body.contains("file_policy::owner_only_deviation(&target)"),
+            "the written entry's permissions must be read BACK off the file and graded against \
+             the owner-only policy, not inferred from the writer that was used:\n{body}"
         );
     }
 
@@ -841,7 +846,7 @@ mod tests {
             .0;
         assert!(!body.contains("paths::write_private_file("));
         assert!(body.contains("fs::write("));
-        assert!(!(body.contains("permissions().mode()") && body.contains("FILE_MODE")));
+        assert!(!body.contains("file_policy::owner_only_deviation(&target)"));
     }
 
     /// A stamp too wide to be read back is refused rather than written. Without this the entry
