@@ -372,16 +372,16 @@ impl StoreLock {
     /// the first try with no sleep; a genuine contender waits [`STORE_LOCK_RETRY`]
     /// between tries. `EINTR` (a signal during the wait) retries immediately.
     fn acquire(path: &Path, max_wait: Duration) -> Result<Self> {
-        use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::io::AsRawFd;
 
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(path)?;
+        let file = crate::file_policy::open_owner_only(
+            OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .truncate(false),
+            path,
+        )?;
         let deadline = Instant::now() + max_wait;
         loop {
             // Raw `flock` FFI, kept un-wrapped by ADR-0004: kept raw rather than
@@ -844,6 +844,7 @@ fn serialize_err() -> Error {
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -894,7 +895,9 @@ mod tests {
         assert_eq!(lines.len(), 2, "one line per sample");
         assert!(text.ends_with('\n'), "each record is newline-terminated");
         assert_eq!(read_samples(&samples_path).unwrap().len(), 2);
-        // The raw file is 0600 (created through the private-file path).
+        // The raw file is 0600 (created through the private-file path). Only this ASSERTION is
+        // Unix-gated, not the test around it (issue #974): everything above is target-neutral.
+        #[cfg(unix)]
         assert_eq!(
             fs::metadata(&samples_path).unwrap().permissions().mode() & 0o777,
             0o600
@@ -1011,6 +1014,10 @@ mod tests {
         assert!(reads.load(Ordering::Relaxed) > 0, "reader never ran");
     }
 
+    // Unix-only: it asserts the mode bits `crate::file_policy` writes on this target. The
+    // property is cross-platform; the Windows arm of it — an explicit, PROTECTED DACL — is
+    // asserted by that module's own `#[cfg(windows)]` tests (issue #974 AC3/AC4).
+    #[cfg(unix)]
     #[test]
     fn rollup_rewrite_preserves_an_operator_set_mode() {
         // First write creates it 0600; a rewrite fchmod-preserves the current mode

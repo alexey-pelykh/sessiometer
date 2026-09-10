@@ -419,9 +419,17 @@ fn passthrough_environment() -> Vec<(String, String)> {
 /// `set_permissions` after the write pins the mode even on the overwrite path,
 /// where `OpenOptions::mode` (create-only) would not.
 fn write_plist(path: &Path, contents: &str) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
     std::fs::write(path, contents)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))?;
+    // `#[cfg(unix)]` rather than routed through `crate::file_policy`, which owns the OWNER-ONLY
+    // policy and deliberately does not grow a second one (issue #974). `0644` here is not that
+    // policy — it is launchd's convention for a plist, and launchd is a macOS concept with no
+    // Windows analogue at all, so a Windows arm would be a no-op wearing a policy's name. The
+    // gate sits where the fact lives: the mode and the platform are one decision.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))?;
+    }
     Ok(())
 }
 
