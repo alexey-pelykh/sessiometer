@@ -38,10 +38,27 @@
 //!   `std::fs::OpenOptions` — `std::os::windows::fs::OpenOptionsExt` exposes `access_mode`,
 //!   `share_mode`, `custom_flags`, `attributes` and `security_qos_flags`, and no
 //!   `security_attributes`, so a `SECURITY_ATTRIBUTES` cannot reach `CreateFileW` through it.
-//!   [`open_owner_only`](crate::file_policy::open_owner_only) therefore creates and then tightens. What covers the gap between the two
-//!   is the PARENT: every such file is created inside a directory this same module has already
-//!   made explicitly owner-only, so the transient inherits from a DACL we control rather than
-//!   from the profile's.
+//!   [`open_owner_only`](crate::file_policy::open_owner_only) therefore creates and then tightens. What covers the gap for MOST callers
+//!   is the PARENT: a file created inside a directory this same module has already made
+//!   explicitly owner-only has its transient inherit from a DACL we control rather than from the
+//!   profile's. **That argument is bounded, and the bound is where the callers put their staging
+//!   file.** `paths::write_private_file` stages `<path>.tmp` in `path`'s OWN directory and neither
+//!   creates nor tightens it, so where `path` comes from outside this crate's tree the transient
+//!   inherits whatever that directory grants: `cli::write_export` takes the directory from the
+//!   operator (`sessiometer export <PATH> --plaintext` writes decrypted secrets wherever they
+//!   point it), and `paths::write_preserving_mode` stages `~/.claude.json.tmp` in the profile
+//!   root. Windows evaluates a DACL at OPEN time and stamps the granted mask into the handle, so
+//!   a later `SetNamedSecurityInfoW` does not revoke access a live handle already has, and
+//!   `<path>.tmp` is predictable from the operator's own argument. Closing it needs an atomic
+//!   owner-only create, which `src/control_transport.rs`'s `SECURITY_ATTRIBUTES` construction for
+//!   `CreateNamedPipeW` already has the parts for — **#1528** carries it.
+//! - **A filesystem that cannot hold the policy DEGRADES on Unix and fails CLOSED on Windows.**
+//!   `set_permissions` against a mount that ignores mode bits succeeds and the file simply lands
+//!   wider, so only `src/roster_backup.rs`'s read-back refuses. `SetNamedSecurityInfoW` against
+//!   FAT/exFAT — a USB volume, some sync-provider shims — returns an error instead, so
+//!   [`owner_only_file`](crate::file_policy::owner_only_file) fails and EVERY private write under
+//!   such a directory fails with it. Failing closed is the right direction for a security policy;
+//!   it is recorded because it is a different operator experience, not because it is wrong.
 //! - **Unix applies a creation mode only when it creates; Windows applies the DACL either way.**
 //!   `open(2)` ignores `mode` for an existing file, and [`open_owner_only`](crate::file_policy::open_owner_only) keeps that. On Windows
 //!   there is no way to ask "only if you created it", so an existing file is tightened too. The
@@ -267,6 +284,50 @@ fn owner_only_sddl(sid: &str, inheritance: Inheritance) -> String {
     format!("D:P(A;{flags};FA;;;SY)(A;{flags};FA;;;BA)(A;{flags};FA;;;{sid})")
 }
 
+/// The two-letter SDDL alias `ConvertSecurityDescriptorToStringSecurityDescriptorW` may render
+/// `sid` as, or `None` if it renders no alias for it.
+///
+/// The read-back path compares two renderings produced by DIFFERENT calls.
+/// `ConvertSecurityDescriptorToStringSecurityDescriptorW` substitutes a two-letter alias for a
+/// well-known SID; `ConvertSidToStringSidW` — the call behind [`owner_only_deviation`]'s notion of
+/// "us" — is documented always to produce the `S-1-…` form and never an alias. So a DACL this
+/// module wrote correctly reads back with an ALIASED trustee where the account is a well-known
+/// one, matches neither our `S-1-…` string nor the hard-coded floor, and
+/// `src/roster_backup.rs` refuses a roster write over a formatting difference. That is the same
+/// hazard [`owner_only_deviation`] already records for the rights MASK, one field over: it stopped
+/// at the mask, and the trustee is rendered by the same call.
+///
+/// The fix is to accept the alias only for a SID that IS the aliased account, which is what this
+/// maps. It can never widen the policy: an alias is admitted only when our own SID string is the
+/// one it stands for, so a wrong entry here fails closed exactly as today.
+///
+/// **Deliberately narrow, and the residue is named rather than papered over.** The two mapped are
+/// the domain-relative user RIDs — `LA` (the built-in Administrator, RID 500) and `LG` (Guest,
+/// RID 501) — the only aliases a process token's USER SID can carry that the floor does not
+/// already hard-code (`SY` is `S-1-5-18`, `BA` is `S-1-5-32-544`, and the elevated-owner case
+/// resolves to that group). An alias outside this set would still read back as a stranger; nothing
+/// here has run on Windows, so the rendering is REASONED from the documented API contract and
+/// has been observed nowhere: **#1530** is the item that observes it and settles the set, and a
+/// green `#[cfg(windows)]` run under an ordinary account will not settle it (an ordinary
+/// account's SID carries no alias, so such a run passes either way).
+///
+/// Target-neutral, like the SDDL builder and the predicate it feeds: it is a suffix match on a
+/// string, so it is graded by ordinary unit tests on macOS and Linux today.
+#[cfg(any(windows, test))]
+fn sddl_alias_for(sid: &str) -> Option<&'static str> {
+    // A domain- or machine-relative account SID: `S-1-5-21-<48 bits of authority>-<RID>`. Matching
+    // the prefix as well as the RID keeps `S-1-5-32-500`-shaped strings — a different authority —
+    // out of it.
+    if !sid.starts_with("S-1-5-21-") {
+        return None;
+    }
+    match sid.rsplit_once('-') {
+        Some((_, "500")) => Some("LA"),
+        Some((_, "501")) => Some("LG"),
+        _ => None,
+    }
+}
+
 /// The first way `dacl` — a DACL rendered in SDDL — falls short of the owner-only policy, or
 /// `None` if it does not.
 ///
@@ -276,6 +337,11 @@ fn owner_only_sddl(sid: &str, inheritance: Inheritance) -> String {
 /// group" policy names the group rather than the creator, creates objects owned by
 /// `BUILTIN\Administrators` while its token user is still the account. `src/control_transport.rs`
 /// accepts either for the same reason.
+///
+/// Each entry is matched BOTH as itself and as the two-letter alias the renderer may substitute
+/// for it ([`sddl_alias_for`]) — the two sides of this comparison come from different calls with
+/// different alias policies, and that helper's docs carry the mechanism and what it does not
+/// cover. Callers pass the `S-1-…` form and nothing else.
 ///
 /// Deliberately NOT a check of the rights mask — see [`owner_only_deviation`] for why a production
 /// refusal path must not turn on how a mask was rendered.
@@ -317,7 +383,12 @@ fn owner_only_dacl_defect(dacl: &str, owners: &[&str]) -> Option<String> {
             ));
         }
         let trustee = fields[5];
-        if !(trustee == "SY" || trustee == "BA" || owners.contains(&trustee)) {
+        // Matched as written AND as the alias the renderer may have substituted — see
+        // [`sddl_alias_for`]. `SY` / `BA` are the floor's own aliases, which is how the renderer
+        // spells the two SIDs this module writes there.
+        let is_ours =
+            owners.contains(&trustee) || owners.iter().any(|o| sddl_alias_for(o) == Some(trustee));
+        if !(trustee == "SY" || trustee == "BA" || is_ours) {
             return Some(format!(
                 "ACE {seen} names {trustee}, who is neither the owner nor the \
                  SYSTEM/Administrators floor: {dacl:?}"
@@ -826,6 +897,68 @@ mod tests {
         // stranger, so the widening is the caller's to grant rather than the predicate's to
         // assume.
         assert!(owner_only_dacl_defect(&sddl, &ours()).is_some());
+    }
+
+    #[test]
+    fn an_aliased_owner_ace_is_admitted_only_for_the_account_it_aliases() {
+        // The read-back's two sides come from different calls:
+        // `ConvertSecurityDescriptorToStringSecurityDescriptorW` substitutes a two-letter alias
+        // for a well-known SID, while `ConvertSidToStringSidW` — how this crate learns its own
+        // SIDs — never does. Under the built-in Administrator account, a DACL this module wrote
+        // correctly therefore reads back with `LA` in the owner ACE, and before this was handled
+        // `src/roster_backup.rs` refused a real roster write over the rendering.
+        let admin = "S-1-5-21-1004336348-1177238915-682003330-500";
+        let guest = "S-1-5-21-1004336348-1177238915-682003330-501";
+        for (sid, alias) in [(admin, "LA"), (guest, "LG")] {
+            let aliased = format!("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{alias})");
+            assert_eq!(
+                owner_only_dacl_defect(&aliased, &[sid]),
+                None,
+                "{alias} is how the renderer spells {sid}"
+            );
+            // The unaliased rendering of the same account keeps working — the acceptance is
+            // additive, not a substitution.
+            let plain = owner_only_sddl(sid, Inheritance::No);
+            assert_eq!(owner_only_dacl_defect(&plain, &[sid]), None);
+        }
+        // And it never widens: an alias is admitted only when OUR OWN SID is the one it stands
+        // for. Offered any other SID, `LA` is the stranger it would have been all along.
+        let aliased = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;LA)";
+        assert!(
+            owner_only_dacl_defect(aliased, &ours()).is_some(),
+            "LA must stay a stranger to an account it does not alias"
+        );
+        assert!(owner_only_dacl_defect(aliased, &[guest]).is_some());
+    }
+
+    #[test]
+    fn only_the_two_domain_relative_user_rids_carry_an_alias() {
+        // Narrow by design, and the boundary is what the test pins: a wrong entry here could
+        // never widen the policy (the alias is matched against our own SID), but a MISSING one is
+        // the false-refusal above, so the mapped set is stated rather than assumed.
+        assert_eq!(
+            sddl_alias_for("S-1-5-21-1004336348-1177238915-682003330-500"),
+            Some("LA")
+        );
+        assert_eq!(
+            sddl_alias_for("S-1-5-21-1004336348-1177238915-682003330-501"),
+            Some("LG")
+        );
+        for other in [
+            SID,
+            // The floor's own SIDs: already hard-coded in the predicate, never routed here.
+            "S-1-5-18",
+            "S-1-5-32-544",
+            // A different authority that merely ENDS in an aliased RID.
+            "S-1-5-32-500",
+            "S-1-5-21-1-2-3-1002",
+            // Degenerate shapes must not panic or match.
+            "",
+            "S-1-5-21-",
+            "LA",
+        ] {
+            assert_eq!(sddl_alias_for(other), None, "{other:?}");
+        }
     }
 
     #[test]

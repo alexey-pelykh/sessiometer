@@ -232,9 +232,11 @@ pub(crate) fn retain_if_qualifying(config_path: &Path) -> Result<Option<Retentio
         // Not a retention at all: it is a disclosure wearing a retention's name.
         let _ = fs::remove_file(&target);
         return Err(Error::Io(std::io::Error::other(format!(
-            "refusing this roster write: its backup landed at {deviation} because {} does not \
-             preserve owner-only permissions; move the config directory to a filesystem that \
-             honours them, or the roster cannot be replaced without widening a copy of it",
+            "refusing this roster write: the backup just written under {} did not read back as \
+             owner-only ({deviation}); the roster cannot be replaced without leaving a copy of it \
+             wider than the original. A filesystem that does not carry the policy — an exFAT \
+             volume or a sync-provider shim under the config directory — is the usual cause; \
+             moving the config directory to one that does is the usual fix",
             dir.display()
         ))));
     }

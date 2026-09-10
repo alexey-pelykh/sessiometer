@@ -101,18 +101,28 @@ A directory's ACEs are marked inheritable (`OICI`) so anything created inside st
 That is defence in depth, not the guarantee: every file this crate creates in such a directory
 is given its **own** explicit DACL, which replaces the inherited ACEs outright.
 
-### 3. Two per-target differences are recorded, not hidden
+### 3. Three per-target differences are recorded, not hidden
 
 - **Creation is atomic on Unix and is not on Windows.** `OpenOptionsExt::mode` hands the mode to
   `open(2)`. Windows has no equivalent hook on `std::fs::OpenOptions`:
   `std::os::windows::fs::OpenOptionsExt` exposes `access_mode`, `share_mode`, `custom_flags`,
   `attributes` and `security_qos_flags`, and no `security_attributes`, so a `SECURITY_ATTRIBUTES`
   cannot reach `CreateFileW` through it. `open_owner_only` therefore creates and then tightens,
-  and what covers the window is the PARENT: every such file is created inside a directory this
-  same module has already made explicitly owner-only.
+  and what covers the window **for the callers that stage inside this crate's own tree** is the
+  PARENT: such a file is created inside a directory this same module has already made explicitly
+  owner-only. Two callers stage elsewhere and are outside that argument —
+  `paths::write_private_file` puts `<path>.tmp` in `path`'s own directory, which
+  `cli::write_export` takes from the operator, and `paths::write_preserving_mode` puts
+  `~/.claude.json.tmp` in the profile root. **#1528** carries that work.
 - **Unix applies a creation mode only when it creates; Windows applies the DACL either way.**
   There is no "only if you created it" on that path, so an existing file is tightened too. The
   divergence narrows access rather than widening it.
+- **A filesystem that cannot hold the policy degrades on Unix and fails CLOSED on Windows.**
+  `set_permissions` against a mount that ignores mode bits succeeds and the file lands wider, so
+  only `roster_backup`'s read-back refuses. `SetNamedSecurityInfoW` against FAT/exFAT returns an
+  error instead, so `owner_only_file` fails and every private write under such a directory fails
+  with it. Fail-closed is the right direction for a security policy; it is recorded because it is
+  a different operator experience, not because it is wrong.
 
 ### 4. `0644` is not this policy
 
@@ -159,17 +169,28 @@ they saw before. #974's "do not add a dependency to get this" holds with nothing
   it by spelling a mode.
 - The DACL's SHAPE is asserted by ordinary unit tests on macOS and Linux, because the SDDL
   builder and the read-back predicate are target-neutral text. Only the syscalls are gated.
-- Unix behaviour is byte for byte what it was: the same modes at the same moments, and the
-  existing Unix permission tests assert it with their bodies untouched.
+- Unix behaviour is the same modes at the same moments, and the existing Unix permission tests
+  assert it with their bodies untouched. One mechanism did change beneath that: in
+  `write_preserving_mode` the source's policy was applied with `file.set_permissions` — `fchmod`
+  on the held fd — and `copy_policy(path, &tmp)` applies it BY PATH. The resulting mode and the
+  moment are identical and the writer is same-user throughout, so no privilege boundary moves;
+  it is recorded because "byte for byte" would otherwise cover a fd-exact operation becoming a
+  path-resolved one.
 
 ### Negative / trade-offs
 
 - **Nothing here has run.** Every Windows claim is a type-checked hypothesis until #978. The
   committed `#[cfg(windows)]` tests are what will grade it.
-- **A create-then-tighten window exists on Windows** and does not on Unix (§ Decision 3). It is
-  covered by the parent directory's own explicit DACL, which is a layered argument rather than
-  an atomic one. Closing it needs a `SECURITY_ATTRIBUTES` on `CreateFileW`, which std does not
-  expose today.
+- **A create-then-tighten window exists on Windows** and does not on Unix (§ Decision 3). For the
+  callers that stage inside this crate's own tree it is covered by the parent directory's own
+  explicit DACL — a layered argument rather than an atomic one — and for `write_export` and
+  `write_preserving_mode` it is not covered at all, since neither stages in a directory this
+  module made. Closing it needs a `SECURITY_ATTRIBUTES` on `CreateFileW`, which **std** does not
+  expose — but this crate is already past std on that API: `src/control_transport.rs` builds one
+  from an SDDL string for `CreateNamedPipeW`, so the remaining work is a direct `CreateFileW` plus
+  `File::from_raw_handle`, on ADR-0004's incidental-FFI precedent. **#1528** carries it, and the
+  sentence is worded this way because a future reader would otherwise take "std does not expose
+  it" as the reason not to try.
 - **`owner_is_current_user_nofollow` is `lstat`-exact on Unix and is not on Windows.**
   `GetNamedSecurityInfoW` resolves reparse points and there is no named no-follow form; the
   handle-based one would need `CreateFileW(FILE_FLAG_OPEN_REPARSE_POINT)`, which is not ported.
@@ -189,4 +210,6 @@ they saw before. #974's "do not add a dependency to get this" holds with nothing
 - Test-only permission manipulation — the `0500` directory freezes in the canary and drift
   fixtures — is `cfg`-gated rather than ported, per #974 § Boundaries. Those fixtures assert a
   POSIX DAC behaviour with no Windows analogue: a read-only directory there does not stop a file
-  being created inside it. The Windows equivalents of those scenarios are unwritten.
+  being created inside it. The Windows equivalents of those scenarios are unwritten; **#1529**
+  owns writing them, or recording per fixture why no equivalent exists. #978 is scoped to RUNNING
+  the tests that are already committed and does not cover these.

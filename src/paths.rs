@@ -1423,9 +1423,9 @@ pub(crate) fn write_preserving_mode(path: &Path, contents: &[u8]) -> Result<()> 
         let mut file =
             file_policy::open_owner_only(OpenOptions::new().create_new(true).write(true), &tmp)?;
         file.write_all(contents)?;
-        // The source's policy is copied on just before the rename, and reading it HERE rather
-        // than before the open also surfaces an absent `path` as an error instead of fabricating
-        // one at the owner-only default.
+        // The source's policy, copied on just before the rename. An absent `path` was already
+        // refused by the `fs::metadata` above — BEFORE anything was staged, so no `<path>.tmp` is
+        // left behind — rather than here.
         file_policy::copy_policy(path, &tmp)?;
         // Durable (data + the copied policy) before the rename, so a crash can't
         // leave a truncated file in place of the old one.
