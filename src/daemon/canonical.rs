@@ -1468,12 +1468,14 @@ mod tests {
     /// a temp-file + rename in the SAME directory — cannot land, pinning a stale
     /// display for the drift fixtures. Restore with [`thaw_dir`] before the
     /// tempdir drops.
+    #[cfg(unix)]
     fn freeze_dir(dir: &std::path::Path) {
         let mut perms = std::fs::metadata(dir).unwrap().permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o500);
         std::fs::set_permissions(dir, perms).unwrap();
     }
 
+    #[cfg(unix)]
     fn thaw_dir(dir: &std::path::Path) {
         let mut perms = std::fs::metadata(dir).unwrap().permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o700);
@@ -1503,6 +1505,11 @@ mod tests {
         (dir, daemon)
     }
 
+    // Unix-only: the fixture FREEZES a directory read-only (`0o500`) so a rename cannot land,
+    // which is a POSIX DAC behaviour with no Windows analogue — a read-only directory there does
+    // not stop a file being created inside it. #974 § Boundaries keeps test-only permission
+    // manipulation out of the owner-only abstraction; the fixture is gated, not ported.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_drifted_canary_refuses_the_swap_with_zero_writes_and_one_edge_event() {
         // Issue #714 AC: identity mismatch (the resolved canonical byte-matches
@@ -1569,6 +1576,11 @@ mod tests {
             .matches(&cred(b"B-token")));
     }
 
+    // Unix-only: the fixture FREEZES a directory read-only (`0o500`) so a rename cannot land,
+    // which is a POSIX DAC behaviour with no Windows analogue — a read-only directory there does
+    // not stop a file being created inside it. #974 § Boundaries keeps test-only permission
+    // manipulation out of the owner-only abstraction; the fixture is gated, not ported.
+    #[cfg(unix)]
     #[tokio::test]
     async fn an_overridden_drift_swaps_anyway_and_logs_overridden_true() {
         // Issue #714 AC: the documented operator override (`canary_drift_override`)
@@ -1819,6 +1831,11 @@ mod tests {
             .matches(&cred(b"B-token")));
     }
 
+    // Unix-only: the fixture FREEZES a directory read-only (`0o500`) so a rename cannot land,
+    // which is a POSIX DAC behaviour with no Windows analogue — a read-only directory there does
+    // not stop a file being created inside it. #974 § Boundaries keeps test-only permission
+    // manipulation out of the owner-only abstraction; the fixture is gated, not ported.
+    #[cfg(unix)]
     #[tokio::test]
     async fn refresh_canary_closes_the_drift_bracket_when_entering_the_unparseable_refusal() {
         // Issue #738 regression guard. The `canary_drift` / `canary_cleared` pair is a durable
@@ -2011,6 +2028,11 @@ mod tests {
         assert_eq!(outcome.snapshot.canary, Some(CanaryStatus::Ok));
     }
 
+    // Unix-only: the fixture FREEZES a directory read-only (`0o500`) so a rename cannot land,
+    // which is a POSIX DAC behaviour with no Windows analogue — a read-only directory there does
+    // not stop a file being created inside it. #974 § Boundaries keeps test-only permission
+    // manipulation out of the owner-only abstraction; the fixture is gated, not ported.
+    #[cfg(unix)]
     #[tokio::test]
     async fn refresh_canary_holds_state_and_edges_through_drift_and_clear() {
         // The boot-path entry (issue #714): `refresh_canary` concludes a verdict,

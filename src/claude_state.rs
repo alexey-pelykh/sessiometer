@@ -387,6 +387,10 @@ mod tests {
         assert!(v["projects"].is_object());
     }
 
+    // Unix-only: it asserts the mode bits `crate::file_policy` writes on this target. The
+    // property is cross-platform; the Windows arm of it — an explicit, PROTECTED DACL — is
+    // asserted by that module's own `#[cfg(windows)]` tests (issue #974 AC3/AC4).
+    #[cfg(unix)]
     #[test]
     fn write_oauth_account_preserves_the_files_existing_mode() {
         use std::os::unix::fs::PermissionsExt;

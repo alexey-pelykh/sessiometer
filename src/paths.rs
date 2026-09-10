@@ -2878,10 +2878,15 @@ mod tests {
     /// `-l -c /usr/bin/env` arguments and instead runs `body`. That substitution is
     /// what makes the spawn tests hermetic — the harvested bytes are whatever `body`
     /// prints, rather than whatever environment the test runner happens to carry.
-    #[cfg(unix)]
     fn fake_shell(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        // The executable bit is Unix's, and gating it here rather than gating the helper keeps
+        // every caller compiling on both targets — which is where they already were. The spawn
+        // tests below drive a POSIX login shell and so are meaningless on Windows whatever this
+        // line does; that is #973's ledger, and #974 deliberately does not move it (issue #974
+        // § Boundaries: test-only permission manipulation is a separate concern).
+        #[cfg(unix)]
         fs::set_permissions(&path, Permissions::from_mode(0o755)).unwrap();
         path
     }

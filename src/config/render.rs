@@ -1783,6 +1783,7 @@ label = \"work\"
     /// AC #3 + #4 end-to-end: a config written the way `capture` will write it
     /// (rendered → `write_private_file`) is read back identically by the daemon's
     /// `load`, and the on-disk file is `0600`.
+    #[cfg(unix)]
     #[test]
     fn written_config_round_trips_through_disk_at_0600() {
         use std::os::unix::fs::PermissionsExt;

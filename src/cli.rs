@@ -11872,6 +11872,10 @@ spare  22222222-2222\n\
 
     /// The file target is written atomically at mode 0600, replacing any prior file
     /// and leaving no temp residue — so a reader sees the old file or the new one.
+    // Unix-only: it asserts the mode bits `crate::file_policy` writes on this target. The
+    // property is cross-platform; the Windows arm of it — an explicit, PROTECTED DACL — is
+    // asserted by that module's own `#[cfg(windows)]` tests (issue #974 AC3/AC4).
+    #[cfg(unix)]
     #[test]
     fn export_to_file_is_private_atomic_and_replaces() {
         use std::os::unix::fs::PermissionsExt;
@@ -15451,8 +15455,6 @@ impl Nested {
     /// notice printed one line earlier claims. The ring assertion below is what fails.
     #[tokio::test]
     async fn restoring_installs_the_entry_and_rings_the_config_it_displaced() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         let roster = |accounts: usize| {
@@ -15495,11 +15497,19 @@ impl Nested {
         );
         // Read the ACTUAL mode rather than trusting the writer: a copy-based restore would carry
         // the source's mode, and `write_private_file` is what guarantees this one.
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600,
-            "the restored config is written at the config file mode"
-        );
+        //
+        // Only this ASSERTION is Unix-gated, not the test around it (issue #974): everything
+        // above is target-neutral and worth running on both, and the Windows form of the same
+        // guarantee is asserted in `crate::file_policy`.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "the restored config is written at the config file mode"
+            );
+        }
     }
 
     /// A restore that cannot proceed leaves the live roster exactly as it was — the refusal is a

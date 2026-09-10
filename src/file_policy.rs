@@ -38,12 +38,12 @@
 //!   `std::fs::OpenOptions` — `std::os::windows::fs::OpenOptionsExt` exposes `access_mode`,
 //!   `share_mode`, `custom_flags`, `attributes` and `security_qos_flags`, and no
 //!   `security_attributes`, so a `SECURITY_ATTRIBUTES` cannot reach `CreateFileW` through it.
-//!   [`open_owner_only`] therefore creates and then tightens. What covers the gap between the two
+//!   [`open_owner_only`](crate::file_policy::open_owner_only) therefore creates and then tightens. What covers the gap between the two
 //!   is the PARENT: every such file is created inside a directory this same module has already
 //!   made explicitly owner-only, so the transient inherits from a DACL we control rather than
 //!   from the profile's.
 //! - **Unix applies a creation mode only when it creates; Windows applies the DACL either way.**
-//!   `open(2)` ignores `mode` for an existing file, and [`open_owner_only`] keeps that. On Windows
+//!   `open(2)` ignores `mode` for an existing file, and [`open_owner_only`](crate::file_policy::open_owner_only) keeps that. On Windows
 //!   there is no way to ask "only if you created it", so an existing file is tightened too. The
 //!   divergence narrows access rather than widening it, and every caller in this crate wants
 //!   owner-only whichever way it got there.
@@ -56,7 +56,7 @@
 //! # What this module is NOT
 //!
 //! It is not a general permission library. It expresses the one policy this crate has — owner-only
-//! — plus the "preserve what is already there" case ([`copy_policy`]) that the swap engine needs
+//! — plus the "preserve what is already there" case ([`copy_policy`](crate::file_policy::copy_policy)) that the swap engine needs
 //! for a file it co-writes but does not own. The LaunchAgent plist's deliberately world-readable
 //! `0644` is not here: launchd is a macOS concept, so `src/service.rs` keeps that mode inline
 //! under its own `#[cfg(unix)]`, where a reader can see that the policy and the platform are one
@@ -670,5 +670,437 @@ mod windows_impl {
         // SAFETY: `ptr[..len]` is exactly the sequence walked above, all within the caller's
         // allocation.
         String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A user SID of the shape `ConvertSidToStringSidW` renders. Not a real account — it is a
+    /// fixture for the pure string machinery, which never resolves it.
+    const SID: &str = "S-1-5-21-1004336348-1177238915-682003330-1001";
+
+    /// Every SID string this process may call its own, for the predicate's `owners` argument.
+    fn ours() -> [&'static str; 1] {
+        [SID]
+    }
+
+    // --- The SDDL this module writes (issue #974 AC1, AC2) -------------------
+    //
+    // Target-neutral: the grammar is pure text, so the DACL's SHAPE is graded on macOS and Linux
+    // rather than waiting on a Windows job that does not exist yet. `src/control_transport.rs`
+    // makes the same split for the pipe's descriptor and records why.
+
+    #[test]
+    fn the_file_dacl_is_protected_and_names_exactly_the_floor_plus_the_owner() {
+        let sddl = owner_only_sddl(SID, Inheritance::No);
+        assert_eq!(
+            sddl,
+            format!("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{SID})"),
+            "the file DACL is three allow ACEs and the P flag; anything else is a different policy"
+        );
+        // `P` is the whole item. Without it these ACEs are a FLOOR the parent directory can
+        // widen, which is precisely the inherited-only state the #40 recon found.
+        assert!(
+            sddl.starts_with("D:P"),
+            "an unprotected DACL still inherits from its parent: {sddl}"
+        );
+        // No inheritance flags on a FILE: an ACE that propagates from a leaf object is
+        // meaningless, and writing one would make the file and directory forms indistinguishable.
+        assert!(
+            !sddl.contains("OICI"),
+            "a file's ACEs must not be inheritable: {sddl}"
+        );
+    }
+
+    #[test]
+    fn the_directory_dacl_differs_from_the_file_one_only_in_inheritance() {
+        let file = owner_only_sddl(SID, Inheritance::No);
+        let dir = owner_only_sddl(SID, Inheritance::Yes);
+        assert_ne!(file, dir, "the two forms must not collapse into one");
+        assert_eq!(
+            dir.replace("OICI", ""),
+            file,
+            "inheritance is the ONLY axis on which the directory form may differ — same P flag, \
+             same three trustees, same rights"
+        );
+        assert_eq!(
+            dir.matches("OICI").count(),
+            3,
+            "every ACE inherits, or a child gets a partial policy: {dir}"
+        );
+    }
+
+    #[test]
+    fn the_trustee_is_the_sid_it_is_given_rather_than_a_constant() {
+        // The provenance half of AC2, asserted behaviourally: a builder that ignored its argument
+        // and baked a SID would return the same string for two different callers.
+        let other = "S-1-5-21-9999999999-9999999999-9999999999-1002";
+        assert_ne!(
+            owner_only_sddl(SID, Inheritance::No),
+            owner_only_sddl(other, Inheritance::No)
+        );
+        assert!(owner_only_sddl(other, Inheritance::No).contains(other));
+    }
+
+    #[test]
+    fn the_floor_is_exactly_localsystem_and_the_administrators_group() {
+        let sddl = owner_only_sddl(SID, Inheritance::No);
+        // The two the #40 recon measured as unavoidable, in the two-letter aliases SDDL itself
+        // uses. Their ABSENCE would be a policy this crate has no business inventing; anything
+        // ELSE present would be the exposure AC2 forbids.
+        assert!(sddl.contains("(A;;FA;;;SY)"), "LocalSystem: {sddl}");
+        assert!(sddl.contains("(A;;FA;;;BA)"), "Administrators: {sddl}");
+        for stranger in [";WD)", ";AU)", ";BU)", ";WD;", ";AU;", ";BU;"] {
+            assert!(
+                !sddl.contains(stranger),
+                "`{stranger}` names Everyone, Authenticated Users or Users — the accounts the \
+                 recon found ABSENT and which this policy must not add: {sddl}"
+            );
+        }
+    }
+
+    // --- The read-back predicate (issue #974 AC3's core) ---------------------
+
+    #[test]
+    fn what_this_module_writes_passes_its_own_read_back() {
+        // The writer and the reader are two independent statements of one policy, and nothing
+        // else in this file makes them agree. Without this, a DACL could be written correctly and
+        // graded as a deviation on every read — a production refusal path that refuses everything.
+        for inheritance in [Inheritance::No, Inheritance::Yes] {
+            let sddl = owner_only_sddl(SID, inheritance);
+            assert_eq!(
+                owner_only_dacl_defect(&sddl, &ours()),
+                None,
+                "{sddl} is what this module writes and must not read back as a deviation"
+            );
+        }
+    }
+
+    #[test]
+    fn an_inherited_ace_is_rejected_however_correct_its_trustees_are() {
+        // AC3 in one assertion. This DACL grants EXACTLY the accounts the policy allows and
+        // nobody else — an "the owner can read it, and only the owner" check passes it — and it
+        // is still the wrong answer, because the ACEs are the PARENT's. That distinction is the
+        // whole of #974's Windows half.
+        let inherited = format!("D:PAI(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;FA;;;{SID})");
+        let defect = owner_only_dacl_defect(&inherited, &ours())
+            .expect("an inherited DACL is not this policy, however permissive it looks");
+        assert!(
+            defect.contains("INHERITED"),
+            "the report must say WHICH property failed: {defect}"
+        );
+    }
+
+    #[test]
+    fn an_unprotected_dacl_is_rejected() {
+        // No `P`: the three ACEs below are a floor the parent can widen at any time, which is
+        // exactly the state the item exists to leave behind.
+        let unprotected = format!("D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{SID})");
+        let defect =
+            owner_only_dacl_defect(&unprotected, &ours()).expect("an unprotected DACL is a floor");
+        assert!(defect.contains("PROTECTED"), "{defect}");
+    }
+
+    #[test]
+    fn a_stranger_in_the_dacl_is_rejected() {
+        for stranger in ["WD", "AU", "BU", "S-1-5-21-1-2-3-1002"] {
+            let widened = format!("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{SID})(A;;FA;;;{stranger})");
+            let defect = owner_only_dacl_defect(&widened, &ours())
+                .unwrap_or_else(|| panic!("{stranger} must not be admitted: {widened}"));
+            assert!(defect.contains(stranger), "{defect}");
+        }
+    }
+
+    #[test]
+    fn the_elevated_administrators_owner_case_is_admitted() {
+        // ADR-0037 § Consequences: a process holding a full Administrators token, on a machine
+        // whose default-owner policy names the group, creates objects owned by
+        // `BUILTIN\Administrators` while its token user is still the account. Both SIDs are read
+        // off THIS process's own token, so admitting either never widens to somebody else.
+        let owner_sid = "S-1-5-32-544";
+        let sddl = owner_only_sddl(owner_sid, Inheritance::No);
+        assert_eq!(owner_only_dacl_defect(&sddl, &[SID, owner_sid]), None);
+        // …and only because it was offered: the same DACL against the user SID alone is a
+        // stranger, so the widening is the caller's to grant rather than the predicate's to
+        // assume.
+        assert!(owner_only_dacl_defect(&sddl, &ours()).is_some());
+    }
+
+    #[test]
+    fn a_dacl_that_is_missing_absent_or_unparseable_is_a_defect_not_a_pass() {
+        // Three failure-open shapes. `NO_ACCESS_CONTROL` and an absent DACL both mean "everyone,
+        // full control" to Windows; an ACE this predicate cannot parse is a rendering it has no
+        // business grading as clean.
+        for hopeless in [
+            "",
+            "O:BAG:BA",
+            "D:NO_ACCESS_CONTROL",
+            "D:P(A;;FA;;;SY",
+            "D:P(A;;FA)",
+        ] {
+            assert!(
+                owner_only_dacl_defect(hopeless, &ours()).is_some(),
+                "{hopeless:?} must not read back as the owner-only policy"
+            );
+        }
+        // An empty PROTECTED DACL denies everyone, us included. Not a widening, but not the
+        // policy either, and a caller deserves to hear it here rather than at an access denial.
+        assert!(owner_only_dacl_defect("D:P", &ours()).is_some());
+    }
+
+    // --- The Unix mechanism (issue #974 AC4) ---------------------------------
+
+    #[cfg(unix)]
+    mod unix {
+        use super::*;
+
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode_of(path: &Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        #[test]
+        fn open_owner_only_creates_at_0600() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("f");
+            let _file =
+                open_owner_only(OpenOptions::new().create(true).write(true), &path).unwrap();
+            assert_eq!(mode_of(&path), FILE_MODE);
+        }
+
+        #[test]
+        fn open_owner_only_leaves_an_existing_file_alone() {
+            // `open(2)` applies a creation mode only when it creates. Pinned because the Windows
+            // arm deliberately CANNOT keep that promise — see the module docs — and a reader
+            // comparing the two needs the Unix half to be a stated property rather than a habit.
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("f");
+            std::fs::write(&path, b"x").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let _file = open_owner_only(OpenOptions::new().write(true), &path).unwrap();
+            assert_eq!(mode_of(&path), 0o644);
+        }
+
+        #[test]
+        fn owner_only_file_and_dir_are_0600_and_0700() {
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("f");
+            std::fs::write(&file, b"x").unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o666)).unwrap();
+            owner_only_file(&file).unwrap();
+            assert_eq!(mode_of(&file), FILE_MODE);
+
+            let nested = dir.path().join("d");
+            std::fs::create_dir(&nested).unwrap();
+            std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o777)).unwrap();
+            owner_only_dir(&nested).unwrap();
+            assert_eq!(mode_of(&nested), DIR_MODE);
+        }
+
+        #[test]
+        fn copy_policy_carries_the_source_mode_including_the_high_bits() {
+            let dir = tempfile::tempdir().unwrap();
+            let from = dir.path().join("from");
+            let to = dir.path().join("to");
+            std::fs::write(&from, b"a").unwrap();
+            std::fs::write(&to, b"b").unwrap();
+            // `1644` — the sticky bit alongside an ordinary mode, so a `& 0o777` mask anywhere in
+            // the copy path shows up as a lost bit rather than passing unnoticed.
+            std::fs::set_permissions(&from, std::fs::Permissions::from_mode(0o1644)).unwrap();
+            copy_policy(&from, &to).unwrap();
+            assert_eq!(
+                std::fs::metadata(&to).unwrap().permissions().mode() & 0o7777,
+                0o1644
+            );
+        }
+
+        #[test]
+        fn owner_only_deviation_reports_the_mode_it_found() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("f");
+            std::fs::write(&path, b"x").unwrap();
+
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let deviation = owner_only_deviation(&path).unwrap().expect("0644 is wider");
+            assert!(deviation.contains("644"), "{deviation}");
+
+            owner_only_file(&path).unwrap();
+            assert_eq!(owner_only_deviation(&path).unwrap(), None);
+        }
+
+        #[test]
+        fn ownership_is_read_through_the_link_and_around_it() {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("target");
+            std::fs::write(&target, b"x").unwrap();
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+
+            // Both answer "yes" here — this test host owns both the link and its target — so what
+            // it pins is that the two functions ASK about different objects, which is what makes
+            // the no-follow one worth having at all.
+            assert!(owner_is_current_user(&link).unwrap());
+            assert!(owner_is_current_user_nofollow(&link).unwrap());
+            let broken = dir.path().join("broken");
+            std::os::unix::fs::symlink(dir.path().join("gone"), &broken).unwrap();
+            assert!(
+                owner_is_current_user(&broken).is_err(),
+                "the following form stats the TARGET, which is absent"
+            );
+            assert!(
+                owner_is_current_user_nofollow(&broken).unwrap(),
+                "the no-follow form lstats the LINK, which exists and is ours"
+            );
+        }
+    }
+
+    // --- The Windows mechanism (issue #974 AC3) ------------------------------
+    //
+    // COMMITTED but never RUN: no CI job compiles this crate for Windows, so these are what
+    // execute the moment **#978** lands, and AC3's execution half is deferred to it. They are
+    // written against the documented API contract, not against an observation.
+
+    #[cfg(windows)]
+    mod windows {
+        use super::*;
+
+        use crate::control_transport::our_user_sid;
+
+        #[test]
+        fn owner_only_file_writes_an_explicit_dacl_rather_than_an_inherited_one() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("private");
+            std::fs::write(&path, b"secret").expect("write");
+
+            // Recorded, never asserted on: what a fresh file in the runner's temp inherits is the
+            // environment's business, and a test that pinned it would be measuring the runner
+            // rather than this module. It rides in the failure message below because it is the
+            // first thing a reader of a red run wants.
+            let before = windows_impl::rendered_dacl(&path).expect("read the DACL before");
+
+            owner_only_file(&path).expect("write the owner-only DACL");
+            let after = windows_impl::rendered_dacl(&path).expect("read the DACL back");
+
+            // AC3, and the reason it says "asserting only that the owner can read it does not
+            // satisfy this": every assertion here is about the DACL's OWN shape.
+            assert!(
+                after.starts_with("D:P"),
+                "the DACL must be PROTECTED, or it is a floor the profile directory can widen \
+                 (before={before:?}, after={after:?})"
+            );
+            for ace in after.split('(').skip(1) {
+                let flags = ace.split(';').nth(1).unwrap_or("");
+                assert!(
+                    !flags.contains("ID"),
+                    "an INHERITED ACE survived: this DACL is still the parent's \
+                     (before={before:?}, after={after:?})"
+                );
+            }
+            // The read really came off this file, rather than from anything canned: our own token
+            // user is in it.
+            let sid = our_user_sid().expect("our token user");
+            assert!(
+                after.contains(&sid),
+                "the trustee must be this process's own token user (after={after:?})"
+            );
+            // …and the whole predicate agrees, which is what `roster_backup` will act on.
+            assert_eq!(
+                owner_only_deviation(&path).expect("grade it"),
+                None,
+                "before={before:?}, after={after:?}"
+            );
+        }
+
+        #[test]
+        fn owner_only_dir_writes_an_inheritable_explicit_dacl() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("private");
+            std::fs::create_dir(&path).expect("create_dir");
+
+            owner_only_dir(&path).expect("write the owner-only DACL");
+            let rendered = windows_impl::rendered_dacl(&path).expect("read the DACL back");
+
+            assert!(rendered.starts_with("D:P"), "{rendered}");
+            let aces: Vec<&str> = rendered.split('(').skip(1).collect();
+            assert!(!aces.is_empty(), "{rendered}");
+            for ace in aces {
+                let flags = ace.split(';').nth(1).unwrap_or("");
+                assert!(
+                    !flags.contains("ID"),
+                    "an INHERITED ACE survived: {rendered}"
+                );
+                assert!(
+                    flags.contains("OI") && flags.contains("CI"),
+                    "a directory's ACEs must reach its children, or a file created inside starts \
+                     at the profile's defaults: {rendered}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_file_created_inside_an_owner_only_dir_still_gets_its_own_explicit_dacl() {
+            // The layering the module docs claim: the directory covers the window between
+            // `CreateFileW` and the DACL write, and the file's OWN explicit DACL is what replaces
+            // the inherited ACEs afterwards. Both halves, in the order production runs them.
+            let dir = tempfile::tempdir().expect("tempdir");
+            let nested = dir.path().join("private");
+            std::fs::create_dir(&nested).expect("create_dir");
+            owner_only_dir(&nested).expect("tighten the directory first");
+
+            let path = nested.join("state");
+            let _file = open_owner_only(OpenOptions::new().create(true).write(true), &path)
+                .expect("open owner-only");
+
+            let rendered = windows_impl::rendered_dacl(&path).expect("read the DACL back");
+            assert!(
+                rendered.starts_with("D:P"),
+                "inheriting the right ACEs is not the same as carrying them: {rendered}"
+            );
+            for ace in rendered.split('(').skip(1) {
+                let flags = ace.split(';').nth(1).unwrap_or("");
+                assert!(
+                    !flags.contains("ID"),
+                    "an INHERITED ACE survived: {rendered}"
+                );
+            }
+        }
+
+        #[test]
+        fn copy_policy_reproduces_an_unprotected_source_as_unprotected() {
+            // `write_preserving_mode` co-writes a file owned by Claude Code. Turning ITS
+            // inherited DACL into a protected one would freeze the user's file against a profile
+            // change they may want — a narrowing, but still not the policy they had.
+            let dir = tempfile::tempdir().expect("tempdir");
+            let from = dir.path().join("theirs");
+            let to = dir.path().join("staging");
+            std::fs::write(&from, b"a").expect("write");
+            std::fs::write(&to, b"b").expect("write");
+            // The staging file starts PROTECTED, so a `copy_policy` that silently left the
+            // protection flag alone would pass without this.
+            owner_only_file(&to).expect("protect the staging file first");
+
+            let source = windows_impl::rendered_dacl(&from).expect("read the source DACL");
+            copy_policy(&from, &to).expect("copy the policy");
+            let copied = windows_impl::rendered_dacl(&to).expect("read the copy back");
+
+            assert_eq!(
+                copied.starts_with("D:P"),
+                source.starts_with("D:P"),
+                "protection must be copied, not invented or dropped (source={source:?}, \
+                 copied={copied:?})"
+            );
+        }
+
+        #[test]
+        fn a_file_we_just_created_is_owned_by_us() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("ours");
+            std::fs::write(&path, b"x").expect("write");
+            assert!(owner_is_current_user(&path).expect("read the owner"));
+            assert!(owner_is_current_user_nofollow(&path).expect("read the owner"));
+        }
     }
 }

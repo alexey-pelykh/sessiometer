@@ -288,6 +288,10 @@ mod tests {
 
     /// The lock file is created `0600`: it sits beside a `0600` config in a `0700` directory, and
     /// a world-writable lock would let any local user wedge every config write on the machine.
+    // Unix-only: it asserts the mode bits `crate::file_policy` writes on this target. The
+    // property is cross-platform; the Windows arm of it — an explicit, PROTECTED DACL — is
+    // asserted by that module's own `#[cfg(windows)]` tests (issue #974 AC3/AC4).
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_lock_file_is_created_private() {
         use std::os::unix::fs::PermissionsExt;

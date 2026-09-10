@@ -478,7 +478,7 @@ mod imp {
     /// THIS process's own token, so widening to two never admits an identity that is not ours;
     /// what it removes is a false REFUSAL of a live daemon in that configuration, which nothing
     /// in this repo can measure until **#978** compiles this arm.
-    fn our_owner_sid() -> io::Result<String> {
+    pub(crate) fn our_owner_sid() -> io::Result<String> {
         with_process_token(token_owner_sid)
     }
 
@@ -1197,8 +1197,14 @@ pub(crate) use imp::{cleanup, connect, is_saturated, ControlListener, ControlStr
 // the trustee of every instance's DACL, so access granted and access authenticated cannot drift —
 // and `token_user_sid` is the class read that module applies to the token `OpenThreadToken` yields
 // inside its impersonation window. Target-gated so the Unix build sees no unused re-export.
+//
+// `our_owner_sid` joined them in #974: `crate::file_policy` asks whether a FILE is ours, and that
+// is the same two-sided question `verify_server_owner` below already answers about a pipe — an
+// object created by an elevated Administrators token can be owned by the group while our token
+// user is still the account. Widened rather than duplicated, so one module keeps saying who this
+// process is.
 #[cfg(windows)]
-pub(crate) use imp::{our_user_sid, token_user_sid};
+pub(crate) use imp::{our_owner_sid, our_user_sid, token_user_sid};
 
 #[cfg(all(test, unix))]
 mod unix_tests {

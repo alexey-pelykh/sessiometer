@@ -1828,14 +1828,24 @@ mod tests {
     /// A minimal `~/.claude.json` displaying `uuid`, at mode `mode`, plus unrelated
     /// fields the co-write must preserve. Returns the tempdir guard and the path.
     fn claude_json(uuid: &str, mode: u32) -> (tempfile::TempDir, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(".claude.json");
         let body = format!(
             r#"{{"numStartups":7,"oauthAccount":{{"accountUuid":"{uuid}","emailAddress":"{uuid}@x.com"}},"projects":{{"/a":1}}}}"#
         );
         std::fs::write(&path, body).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        // The seed mode is Unix's, and gating it HERE rather than gating the helper keeps its
+        // twenty-odd callers compiling on both targets — none of which reads a mode back. What
+        // the co-write's preserve-what-was-there guarantee is worth is asserted where the
+        // mechanism lives: `crate::paths` for the mode bits, `crate::file_policy` for the DACL
+        // (issue #974 § Boundaries).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
         (dir, path)
     }
 

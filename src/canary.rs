@@ -670,6 +670,11 @@ mod tests {
         assert_eq!(outcome, CanaryOutcome::Ok);
     }
 
+    // Unix-only: the fixture FREEZES a directory read-only (`0o500`) so a rename cannot land,
+    // which is a POSIX DAC behaviour with no Windows analogue — a read-only directory there does
+    // not stop a file being created inside it. #974 § Boundaries keeps test-only permission
+    // manipulation out of the owner-only abstraction; the fixture is gated, not ported.
+    #[cfg(unix)]
     #[tokio::test]
     async fn drift_when_the_canonical_matches_a_different_accounts_stash() {
         // Identity mismatch (issue #714 AC): CC's own state says A is active,
@@ -802,6 +807,11 @@ mod tests {
         assert_eq!(outcome, CanaryOutcome::Ok);
     }
 
+    // Unix-only: the fixture FREEZES a directory read-only (`0o500`) so a rename cannot land,
+    // which is a POSIX DAC behaviour with no Windows analogue — a read-only directory there does
+    // not stop a file being created inside it. #974 § Boundaries keeps test-only permission
+    // manipulation out of the owner-only abstraction; the fixture is gated, not ported.
+    #[cfg(unix)]
     #[tokio::test]
     async fn drift_fires_even_when_the_displayed_accounts_stash_is_absent() {
         // A's stash is absent (captured elsewhere / corrupt) — no positive

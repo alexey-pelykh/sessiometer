@@ -8426,6 +8426,10 @@ pub(crate) mod tests {
         assert!(crate::redaction::meter::unauthored_emails(&logged, &[]).is_empty());
     }
 
+    // Unix-only: it asserts the mode bits `crate::file_policy` writes on this target. The
+    // property is cross-platform; the Windows arm of it — an explicit, PROTECTED DACL — is
+    // asserted by that module's own `#[cfg(windows)]` tests (issue #974 AC3/AC4).
+    #[cfg(unix)]
     #[test]
     fn the_log_file_is_created_private() {
         use std::os::unix::fs::PermissionsExt;
