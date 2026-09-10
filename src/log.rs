@@ -999,8 +999,10 @@ enum Flow {
 /// The identity of the file an offset refers to, so a REPLACEMENT can be told from an append.
 ///
 /// `(dev, ino)` and not `ino` alone: an inode number is only unique within a device, and the log
-/// directory is not guaranteed to stay on one. Unix-only, matching the crate's existing posture —
-/// `src/paths.rs` already imports `std::os::unix::fs::MetadataExt` at module level, ungated.
+/// directory is not guaranteed to stay on one. Unix-only, and the `MetadataExt` import below is
+/// still UNGATED — which issue #973 removed as a precedent rather than endorsed: `src/paths.rs`
+/// used to carry the same shape at module level and now gates it, so this is a remaining Windows
+/// error site awaiting its own port, not the crate's settled posture.
 #[derive(Debug, PartialEq, Clone, Copy)]
 struct FileIdentity {
     dev: u64,

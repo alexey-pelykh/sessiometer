@@ -22,9 +22,12 @@
 //! `%LOCALAPPDATA%` when set, the `SHGetKnownFolderPath` Known-Folder API as
 //! its fallback; pinning it to the API alone (the analog of this `getpwuid`
 //! discipline) remains a requirement on the Windows-enablement work and is NOT
-//! delivered. That branch does now COMPILE (issue #973) and carries committed
-//! `#[cfg(windows)]` tests, but no CI job runs them until #978 exists, so its
-//! behavior is asserted rather than observed.
+//! delivered. That branch does now TYPE-CHECK (issue #973) and carries committed
+//! `#[cfg(windows)]` tests — but nothing has ever RUN them, and #978's Windows CI
+//! job alone will not change that: this module still carries the `mode` /
+//! `from_mode` / `uid` ownership cluster (#974), which does not resolve on that
+//! target, so the crate does not yet BUILD there and no test binary is produced.
+//! Every Windows claim here is a type-checked hypothesis, not an observation.
 //!
 //! That same password-database discipline extends past *locations* to the user's
 //! login shell (issue #783): under launchd the daemon inherits a bare
@@ -162,6 +165,14 @@ fn home_dir() -> Result<PathBuf> {
 /// fallback the #711 tests exist to guarantee. That module is the macOS `/usr/bin/security`
 /// client and does not build on Windows for a dozen other reasons already; its port owns
 /// the decision, and this makes the missing piece visible at the call site.
+///
+/// Deliberately NOT a `#[cfg(not(unix))] compile_error!`, though that is the mechanism the
+/// cited precedent uses and it would name the gap instead of leaving a bare "cannot find
+/// function". The shapes differ: `peer_auth`'s guard fires for targets with NO port at all,
+/// a condition that cannot expire. This one's condition can — the moment the keychain port
+/// gates its module or stops calling this, a `compile_error!` here would be a permanent
+/// false blocker on a Windows build that had actually become correct, and nothing would tell
+/// it so. The note below carries the same warning without outliving what it warns about.
 #[cfg(unix)]
 pub(crate) fn username() -> Result<OsString> {
     let uid = current_uid();
@@ -190,6 +201,17 @@ pub(crate) fn username() -> Result<OsString> {
         Ok(OsString::from_vec(bytes))
     }
 }
+
+// TO WHOEVER PORTS `crate::keychain` TO WINDOWS, since the error you will see there is a
+// bare "cannot find function `username` in module `paths`" and says none of this:
+//
+// [`username`] above has no Windows arm ON PURPOSE (issue #973). Do NOT resolve that error by
+// adding one that returns `Err` — its caller (`IsolatedKeychainItem::new`) discards the error
+// with `.ok()` and substitutes the literal `claude-code-user`, so an `Err` arm would silently
+// seed a credential under the FALLBACK acct instead of surfacing the missing port. Do NOT
+// resolve it with `%USERNAME%` either: the whole point of reading the passwd database is that
+// the environment may be spoofed (issue #711). Gate the caller, or port the identity read
+// properly.
 
 /// The current user's login shell from the password database
 /// (`getpwuid(getuid())->pw_shell`), resolved exactly like [`home_dir`] and
@@ -481,12 +503,15 @@ fn windows_logs_dir_from(local_app_data: &Path) -> PathBuf {
 /// NOT delivered here; issue #973's Boundaries validate this policy rather than
 /// rewrite it.
 ///
-/// **Compiles since #973; still unexecuted.** `windows_local_app_data_resolves_the_local_root_never_the_roaming_one`
-/// and `the_live_windows_accessors_route_through_the_local_app_data_root` are
-/// committed against this branch and run the moment #978's Windows job turns
-/// on. Until then its correctness is a type-checked hypothesis, not a measured
-/// result — which is the whole reason #973 refused to read the pre-existing
-/// shape of this code as evidence about it.
+/// **Type-checks since #973; still unexecuted, and not by #978 alone.**
+/// `windows_local_app_data_resolves_the_local_root_never_the_roaming_one` and
+/// `the_live_windows_accessors_route_through_the_local_app_data_root` are
+/// committed against this branch, but they run only once the crate BUILDS on
+/// Windows — which needs this module's `mode` / `from_mode` / `uid` cluster
+/// (#974) ported as well as #978's CI job to exist. Until both, correctness
+/// here is a type-checked hypothesis rather than a measured result, which is
+/// the whole reason #973 refused to read the pre-existing shape of this code as
+/// evidence about it.
 #[cfg(windows)]
 fn windows_local_app_data() -> Result<PathBuf> {
     use etcetera::base_strategy::{BaseStrategy, Windows};
@@ -1019,40 +1044,6 @@ pub(crate) fn build_login_shell_env_command(shell: &Path) -> Command {
 /// An absent `PATH=` line and a present-but-EMPTY one are both errors. An empty `PATH`
 /// is not a usable answer, and returning it as success would present a failed harvest
 /// as a successful one.
-/// A harvested `PATH=` value's raw bytes as an `OsString` — per-target, because the two
-/// platforms disagree about what a path's bytes ARE and the wrong answer here is SILENT.
-///
-/// On Unix `OsStringExt::from_vec` is the byte-exact inverse of `OsStrExt::as_bytes`, so a
-/// `PATH` entry that is not valid UTF-8 survives verbatim — the property
-/// `a_non_utf8_path_entry_survives_verbatim` pins, and the reason this is not simply a
-/// `String` parse. Windows `OsStr` is UTF-16 and has no byte constructor at all; the
-/// substitution that LOOKS equivalent, `String::from_utf8_lossy`, would rewrite such an
-/// entry into replacement characters and then resolve `claude` against a directory that
-/// does not exist. So the Windows arm is lossless-or-refuse: `from_utf8` succeeds exactly
-/// when nothing is lost, and anything else is reported as an unharvested `PATH` rather
-/// than silently corrupted (issue #973).
-///
-/// Unreachable on Windows today — [`login_shell`]'s arm there yields no shell to harvest
-/// from — so this exists to make the family COMPILE, and is written to fail loudly if that
-/// ever changes.
-#[cfg(unix)]
-fn os_string_from_env_bytes(_shell: &Path, value: &[u8]) -> Result<OsString> {
-    Ok(OsString::from_vec(value.to_vec()))
-}
-
-/// See the `#[cfg(unix)]` sibling for the contract; this is the lossless-or-refuse arm.
-#[cfg(windows)]
-fn os_string_from_env_bytes(shell: &Path, value: &[u8]) -> Result<OsString> {
-    match std::str::from_utf8(value) {
-        Ok(text) => Ok(OsString::from(text)),
-        Err(_) => Err(Error::LoginShellPathUnharvested {
-            shell: shell.to_path_buf(),
-            reason: "it reported a PATH that is not valid UTF-8, which this target cannot \
-                     represent without loss",
-        }),
-    }
-}
-
 fn path_from_env_output(shell: &Path, output: &[u8]) -> Result<OsString> {
     for line in output.split(|byte| *byte == b'\n') {
         if let Some(value) = line.strip_prefix(b"PATH=") {
@@ -1069,6 +1060,45 @@ fn path_from_env_output(shell: &Path, output: &[u8]) -> Result<OsString> {
         shell: shell.to_path_buf(),
         reason: "its environment contained no PATH= line",
     })
+}
+
+/// A harvested `PATH=` value's raw bytes as an `OsString` — the Unix arm (issue #973).
+///
+/// `OsStringExt::from_vec` is the byte-exact inverse of `OsStrExt::as_bytes`, so a `PATH`
+/// entry that is not valid UTF-8 survives verbatim. That is the property
+/// `a_non_utf8_path_entry_survives_verbatim` pins, and the reason [`path_from_env_output`]
+/// is not simply a `String` parse.
+///
+/// Per-target because the two platforms disagree about what a path's bytes ARE, and because
+/// the wrong answer here is SILENT rather than loud — see the `#[cfg(windows)]` sibling,
+/// which cannot share this implementation and must not fake it.
+#[cfg(unix)]
+fn os_string_from_env_bytes(_shell: &Path, value: &[u8]) -> Result<OsString> {
+    Ok(OsString::from_vec(value.to_vec()))
+}
+
+/// A harvested `PATH=` value's raw bytes as an `OsString` — the Windows arm (issue #973),
+/// which is lossless-or-refuse.
+///
+/// Windows `OsStr` is UTF-16 and has no byte constructor at all, so there is no counterpart
+/// to the Unix arm's byte-exact `from_vec`. The substitution that LOOKS equivalent,
+/// `String::from_utf8_lossy`, would rewrite a non-UTF-8 entry into replacement characters
+/// and then resolve `claude` against a directory that does not exist — a silent corruption
+/// where a refusal is correct. So `from_utf8` succeeds exactly when nothing is lost, and
+/// anything else is reported as an UNHARVESTED `PATH` rather than a corrupted one.
+///
+/// Unreachable today: [`login_shell`]'s Windows arm yields no shell to harvest from. This
+/// exists so the family COMPILES there, and is written to fail loudly if that changes.
+#[cfg(windows)]
+fn os_string_from_env_bytes(shell: &Path, value: &[u8]) -> Result<OsString> {
+    match std::str::from_utf8(value) {
+        Ok(text) => Ok(OsString::from(text)),
+        Err(_) => Err(Error::LoginShellPathUnharvested {
+            shell: shell.to_path_buf(),
+            reason: "it reported a PATH that is not valid UTF-8, which this target cannot \
+                     represent without loss",
+        }),
+    }
 }
 
 /// Harvest the user-level `PATH` by running the current user's login shell (issue #783).
@@ -1582,11 +1612,15 @@ mod tests {
     // Compiling is the first half of the evidence; these are the second — AC2 is explicit
     // that "a branch that compiles but is never executed does not satisfy this".
     //
-    // They are committed and `#[cfg(windows)]`, so they run the moment the Windows CI job
-    // (#978) turns on, exactly as `crate::daemon::snapshot_build`'s #976 pair does. Until
-    // then NOTHING in this repo executes them, and that is stated rather than implied: the
-    // suite above covers the PURE derivations on every host, and these cover the live
-    // accessors that select them, which only the target itself can exercise.
+    // They are committed and `#[cfg(windows)]`, in the same posture as
+    // `crate::daemon::snapshot_build`'s #976 pair. Be precise about when they actually run,
+    // because it is NOT simply "when #978 turns on": a test binary has to be produced first,
+    // and this module still carries the `mode` / `from_mode` / `uid` ownership cluster
+    // (#974) that does not resolve on Windows. So the preconditions are #978's CI job AND
+    // that cluster's port. Until both, NOTHING in this repo executes them, and that is
+    // stated rather than implied: the suite above covers the PURE derivations on every host,
+    // and these cover the live accessors that select them, which only the target itself can
+    // exercise.
 
     /// AC2, the branch every other Windows branch depends on: `windows_local_app_data`
     /// resolves, and resolves to the LOCAL app-data root rather than the Roaming profile.
@@ -1675,19 +1709,31 @@ mod tests {
             Windows::new().expect("strategy").home_dir(),
             "the arm must read etcetera's user-profile ladder, not invent its own"
         );
-        assert_eq!(
-            claude_json().expect("claude_json must resolve on Windows"),
-            home.join(".claude.json"),
-            "Claude Code's per-user state file hangs off the resolved profile"
+        // Anchored independently rather than against `home.join(".claude.json")`, which would
+        // be tautological — `claude_json` IS that expression, so it passes however broken the
+        // arm above is. These two have teeth: the file is a direct child of the profile named
+        // `.claude.json`, and it is NOT under the app-data root, which is where a mis-wiring
+        // to `support_dir`/`config_dir` (a DIFFERENT etcetera accessor) would put it.
+        let claude_json = claude_json().expect("claude_json must resolve on Windows");
+        assert_eq!(claude_json.parent(), Some(home.as_path()));
+        assert_eq!(claude_json.file_name().unwrap(), OsStr::new(".claude.json"));
+        assert!(
+            !claude_json
+                .starts_with(windows_local_app_data().expect("the app-data root must resolve")),
+            "Claude Code's own state file belongs to the user profile, never to our app-data \
+             tree: {claude_json:?}"
         );
     }
 
     /// AC2 for the other arm #973 added: there is no login shell to harvest on Windows, and
     /// the tier-3 ladder degrades through the path its own contract already defines.
     ///
-    /// Both halves are asserted because only the second is the behaviour that matters: an
-    /// `Err` from `login_shell` is worth nothing if `harvest_login_shell_path` were to
-    /// translate it into something the resolver treats differently.
+    /// Both halves are asserted, but be exact about what the second one can and cannot
+    /// catch. `tier3_path` matches `Err(_)` — it is VARIANT-INSENSITIVE — so this cannot
+    /// discriminate one error variant from another, and a mutant returning a different
+    /// variant would fail here while behaving identically in production. What it does
+    /// discriminate is `Ok`-vs-`Err`, which is the case that matters: an `Ok` would send the
+    /// harvest off to spawn something on a target that has nothing to spawn.
     #[cfg(windows)]
     #[tokio::test]
     async fn windows_has_no_login_shell_to_harvest() {
@@ -2575,10 +2621,19 @@ mod tests {
 
     // -- Cross-platform (T19) ------------------------------------------------
 
-    /// T19 (per issue #797's premise correction): the resolver must gain NO platform
+    /// T19 (per issue #797's premise correction): the resolver must gain no per-OS POLICY
     /// conditional. There is no Linux CI to catch one — `test` and `msrv` are both
     /// `runs-on: macos-latest` — so the guard is a source assertion rather than a build.
     /// No Linux claim is made or implied by this test.
+    ///
+    /// **What it asserts is `target_os`, and that is narrower than "no platform conditional"
+    /// — deliberately, restated here because #973 put a `cfg(unix)`/`cfg(windows)` pair
+    /// inside this very window and the earlier wording read as forbidding it.** The two are
+    /// different kinds. A `target_os` arm makes the resolver BEHAVE differently per platform,
+    /// which is what #784 AC9 forbids. The pair at [`os_string_from_env_bytes`] does not: it
+    /// is a byte-REPRESENTATION seam for a type whose encoding genuinely differs (Unix
+    /// `OsStr` is bytes, Windows `OsStr` is UTF-16), and both arms carry the same contract.
+    /// Widening this predicate to `cfg(` would fail on that seam, so it stays as it is.
     #[test]
     fn t19_the_resolver_introduces_no_platform_conditional() {
         let source = include_str!("paths.rs");
@@ -3232,6 +3287,12 @@ mod tests {
     /// shell exist on disk, where the sibling only demands `is_absolute()`. A minimal Linux
     /// container image naming an absent `/usr/sbin/nologin` would pass the sibling and fail
     /// here. A future porter (#26 / #29) re-verifies it against the target's passwd database.
+    // Unix-only since #973. Its "documented, not `cfg`-gated" note above was written when
+    // every supported target HAD a passwd database and the only variance was which entry it
+    // held. Windows has none: `login_shell` returns `LoginShellUnresolved` there
+    // unconditionally, so the `unwrap()` below would PANIC on the very job #978 adds — a
+    // committed red rather than a coverage gap.
+    #[cfg(unix)]
     #[test]
     fn the_login_shell_comes_from_the_password_database() {
         let shell = login_shell().unwrap();
@@ -3257,6 +3318,11 @@ mod tests {
     /// observe which `Duration` the entry point passed. The bound is pinned separately —
     /// structurally by `harvest_bound_stays_far_below_the_refresh_cycle_bound`, and
     /// behaviorally by `a_hanging_shell_is_cut_off_by_the_bound`.
+    // Unix-only since #973, for a different reason than the panic above: on Windows BOTH
+    // sides of the equivalence short-circuit to `Err(LoginShellUnresolved)` and the match
+    // lands in the empty arm, so it would pass while asserting nothing. A vacuous green is
+    // worse than an absent test — `windows_has_no_login_shell_to_harvest` covers that target.
+    #[cfg(unix)]
     #[tokio::test]
     async fn the_entry_point_draws_its_shell_from_the_password_database() {
         let via_entry_point = harvest_login_shell_path().await;

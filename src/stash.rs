@@ -328,6 +328,12 @@ fn write_item_command_line(
         !payload.contains(&b'\n'),
         "interactive command line is newline-delimited"
     );
+    // Resolved BEFORE `line` exists, and that ordering is load-bearing rather than stylistic:
+    // `line` is a bare `Vec` until the `Zeroizing::new` at the end, so an early `?` taken
+    // AFTER the payload had been pushed would drop the escaped secret without wiping it —
+    // falsifying this module's own "the only heap copy of the escaped secret is `Zeroizing`"
+    // invariant. Every fallible step therefore happens while the buffer is still empty.
+    let keychain = keychain_path_bytes(keychain)?;
     let mut line = Vec::new();
     line.extend_from_slice(b"add-generic-password -U -s ");
     push_quoted(&mut line, service.as_bytes());
@@ -336,7 +342,7 @@ fn write_item_command_line(
     line.extend_from_slice(b" -w ");
     push_quoted(&mut line, payload);
     line.push(b' ');
-    push_quoted(&mut line, keychain_path_bytes(keychain)?);
+    push_quoted(&mut line, keychain);
     line.push(b'\n');
     Ok(Zeroizing::new(line))
 }
@@ -500,6 +506,39 @@ mod tests {
             kc.display()
         );
         assert_eq!(&line[..], expected.as_bytes());
+    }
+
+    /// The Windows arm of [`keychain_path_bytes`] is lossless-or-refuses (issue #973).
+    ///
+    /// Committed and `#[cfg(windows)]`, so it runs once that target builds — the same posture
+    /// as `crate::paths`' Windows tests, and for the same reason: the arm is type-checked
+    /// today and executed by nothing. The REFUSAL half is the half worth testing. A
+    /// `to_string_lossy` substitution passes any UTF-8-only assertion while silently pinning
+    /// a keychain that does not exist, and this is what fails against it.
+    #[cfg(windows)]
+    #[test]
+    fn the_windows_keychain_path_seam_is_lossless_or_refuses() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let ok = Path::new(r"C:\Users\x\login.keychain-db");
+        assert_eq!(
+            keychain_path_bytes(ok).unwrap(),
+            br"C:\Users\x\login.keychain-db",
+            "a representable path passes through byte-for-byte"
+        );
+
+        // A lone high surrogate: representable in an `OsString`, not in a `String`.
+        let unrepresentable = PathBuf::from(OsString::from_wide(
+            &r"C:\Users\x\"
+                .encode_utf16()
+                .chain(std::iter::once(0xD800))
+                .collect::<Vec<u16>>(),
+        ));
+        assert!(
+            keychain_path_bytes(&unrepresentable).is_err(),
+            "a path this target cannot encode without loss must be REFUSED, never rewritten \
+             into replacement characters that name a different keychain"
+        );
     }
 
     #[test]
