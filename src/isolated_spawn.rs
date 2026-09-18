@@ -51,9 +51,15 @@ const SPAWN_TIMEOUT: Duration = Duration::from_secs(40);
 /// Env vars **unset** on every isolated spawn so the child `claude` acts on the ISOLATED item
 /// and nothing else — the security-critical scrub (issue #102 step 4). Each entry is a
 /// credential source or a config-dir override that, if inherited, would defeat the isolation:
-///   - `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` — an ambient bearer in the daemon's env:
-///     CC would authenticate with it instead of reading the seeded item, so the refresh would
-///     silently no-op.
+///   - `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` — an ambient
+///     bearer in the daemon's env: CC would authenticate with it instead of reading the seeded
+///     item, so the refresh would silently no-op. These are ALL THREE env-sourced links of the
+///     bearer chain `build/version-compat.md` § "auth-source precedence" records — every one of
+///     them resolved ABOVE `firstParty-keychain`, which is the only reason membership here is
+///     decided by that chain rather than by name shape. `ANTHROPIC_AUTH_TOKEN` was absent until
+///     it was measured missing: it appeared exactly once in the repo, inside that chain, so
+///     nothing recorded whether its omission was judged or overlooked.
+///     `every_ambient_bearer_above_the_keychain_is_scrubbed_by_name` now pins the three by name.
 ///   - `CLAUDE_SECURESTORAGE_CONFIG_DIR` — takes PRECEDENCE over `CLAUDE_CONFIG_DIR` in CC's
 ///     keychain service-name derivation (#100, [`crate::keychain`]), so an inherited one would
 ///     mis-target the read away from the item we seeded.
@@ -132,6 +138,7 @@ const SPAWN_TIMEOUT: Duration = Duration::from_secs(40);
 pub(crate) const SPAWN_ENV_REMOVE: &[&str] = &[
     "CLAUDE_CODE_OAUTH_TOKEN",
     "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
     "CLAUDE_SECURESTORAGE_CONFIG_DIR",
     "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
     "CLAUDE_CODE_OAUTH_SCOPES",
@@ -576,6 +583,67 @@ mod tests {
         }
     }
 
+    /// Every env-sourced bearer CC resolves ABOVE the first-party keychain item is scrubbed, named
+    /// LITERALLY. This is the isolation property `the_oauth_refresh_triple_is_scrubbed_by_name`
+    /// does NOT cover: that test guards the issue #1009 triple plus its own immediate neighbours,
+    /// which is a different subject from the bearer CHAIN.
+    ///
+    /// The chain is recorded in `build/version-compat.md` § "auth-source precedence", read out of
+    /// the shipping CC binary:
+    ///
+    /// ```text
+    /// ANTHROPIC_API_KEY > ANTHROPIC_AUTH_TOKEN > CLAUDE_CODE_OAUTH_TOKEN > CCR-file >
+    /// apiKeyHelper > profile > firstParty-keychain
+    /// ```
+    ///
+    /// Three of its links are plain env vars and every one of them outranks the keychain, so an
+    /// inherited one makes the child authenticate with IT instead of reading the seeded isolated
+    /// item — the silent no-op refresh [`SPAWN_ENV_REMOVE`]'s own doc comment names as the reason
+    /// the scrub exists. `ANTHROPIC_AUTH_TOKEN` was the link the list missed: before this test it
+    /// appeared exactly ONCE in the repo — inside that chain — and in no scrub, no test and no ADR,
+    /// so nothing recorded whether its absence was judged or merely overlooked.
+    ///
+    /// Spelled out rather than derived from [`SPAWN_ENV_REMOVE`] for the reason
+    /// `the_oauth_refresh_triple_is_scrubbed_by_name` already records: an expectation taken from
+    /// the thing under test cannot detect that thing being wrong.
+    #[test]
+    fn every_ambient_bearer_above_the_keychain_is_scrubbed_by_name() {
+        // The env-sourced links of CC's bearer chain, highest precedence first. Deliberately NOT
+        // `SPAWN_ENV_REMOVE`: dropping any of these from that list must fail here, by name.
+        const AMBIENT_BEARERS: &[&str] = &[
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+        ];
+
+        // The same three seams the neighbouring scrub tests cover — every place this crate
+        // constructs a child environment through the scrub.
+        let seams = [
+            ("the refresh spawn", scrubbed_vars(&SpawnPlan::refresh())),
+            (
+                "the login spawn",
+                scrubbed_vars(&SpawnPlan::login(SPAWN_TIMEOUT)),
+            ),
+            (
+                "the login-shell PATH harvest",
+                scrubbed_vars_of(&crate::paths::build_login_shell_env_command(Path::new(
+                    "/bin/zsh",
+                ))),
+            ),
+        ];
+
+        for (seam, scrubbed) in seams {
+            for var in AMBIENT_BEARERS {
+                assert!(
+                    scrubbed.contains(&OsString::from(*var)),
+                    "{seam} does not remove {var}, which CC resolves ABOVE the first-party \
+                     keychain item — an inherited {var} would authenticate the child instead of \
+                     the seeded isolated credential, silently no-opping the refresh"
+                );
+            }
+        }
+    }
+
     /// AC2 (issue #131): the refresh path's built command is the pre-#131 inline spawn — same
     /// argv, same env set, all stdio nulled. Guards the behavior-preserving contract of the
     /// extraction.
@@ -618,6 +686,9 @@ mod tests {
             ("DISABLE_BUG_COMMAND", Some("1")),
             ("CLAUDE_CODE_OAUTH_TOKEN", None),
             ("ANTHROPIC_API_KEY", None),
+            // The third env-sourced link of CC's bearer chain, absent from the list until it was
+            // measured missing (`every_ambient_bearer_above_the_keychain_is_scrubbed_by_name`).
+            ("ANTHROPIC_AUTH_TOKEN", None),
             ("CLAUDE_SECURESTORAGE_CONFIG_DIR", None),
             // The issue #1009 / R-13 refresh triple.
             ("CLAUDE_CODE_OAUTH_REFRESH_TOKEN", None),
