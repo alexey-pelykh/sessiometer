@@ -130,6 +130,8 @@ enum Command {
     Remove { target: Option<String> },
     /// `poke [<account>]` — refresh a parked account's credential once.
     Poke { target: Option<String> },
+    /// Refresh one account's usage through the running daemon.
+    Poll { target: String },
     /// `stats [<account>...] [--period …] [--since …] [--json] [--no-color] [--ascii]`.
     Stats(crate::stats::StatsArgs),
     /// `reliability [--json]` — the OFFLINE reliability-SLO readout over the event log (#455).
@@ -242,6 +244,7 @@ enum HelpTopic {
     Enable,
     Remove,
     Poke,
+    Poll,
     Stats,
     Reliability,
     Log,
@@ -267,6 +270,7 @@ impl HelpTopic {
             HelpTopic::Enable => "sessiometer enable --help",
             HelpTopic::Remove => "sessiometer remove --help",
             HelpTopic::Poke => "sessiometer poke --help",
+            HelpTopic::Poll => "sessiometer poll --help",
             HelpTopic::Stats => "sessiometer stats --help",
             HelpTopic::Reliability => "sessiometer reliability --help",
             HelpTopic::Log => "sessiometer log --help",
@@ -294,6 +298,7 @@ impl HelpTopic {
             HelpTopic::Enable => ENABLE_USAGE,
             HelpTopic::Remove => REMOVE_USAGE,
             HelpTopic::Poke => POKE_USAGE,
+            HelpTopic::Poll => POLL_USAGE,
             HelpTopic::Stats => STATS_USAGE,
             HelpTopic::Reliability => RELIABILITY_USAGE,
             HelpTopic::Log => LOG_USAGE,
@@ -841,6 +846,31 @@ fn parse_subcommand(name: &OsStr, parser: &mut lexopt::Parser) -> Result<Command
             target,
         }),
         "poke" => parse_positional(parser, HelpTopic::Poke, |target| Command::Poke { target }),
+        "poll" => {
+            let mut target = None;
+            while let Some(arg) = parser.next()? {
+                match arg {
+                    Short('h') | Long("help") => return Ok(Command::Help(HelpTopic::Poll)),
+                    Value(value) if target.is_none() => {
+                        target = Some(value.to_string_lossy().into_owned())
+                    }
+                    Value(_) => {
+                        return Err(Error::CliUsage {
+                            message: "poll takes one account".to_owned(),
+                            usage_hint: HelpTopic::Poll.hint(),
+                        })
+                    }
+                    other => return Err(unexpected(other, HelpTopic::Poll)),
+                }
+            }
+            target
+                .filter(|t| !t.is_empty())
+                .map(|target| Command::Poll { target })
+                .ok_or_else(|| Error::CliUsage {
+                    message: "poll requires an account".to_owned(),
+                    usage_hint: HelpTopic::Poll.hint(),
+                })
+        }
         "stats" => parse_stats(parser),
         "reliability" => parse_reliability(parser),
         "log" => parse_log(parser),
@@ -909,6 +939,21 @@ async fn execute(command: Command) -> Result<()> {
         Command::SetEnabled { target, enabled } => set_enabled(target, enabled).await,
         Command::Remove { target } => remove_account(target).await,
         Command::Poke { target } => crate::poke::poke(target).await,
+        Command::Poll { target } => {
+            let ack = request_poll(&paths::control_socket()?, &target).await?;
+            match ack {
+                crate::daemon::PollAck::Polled { label } => {
+                    println!("polled {label}");
+                    Ok(())
+                }
+                crate::daemon::PollAck::Rejected { reason } => {
+                    Err(Error::Io(std::io::Error::other(format!(
+                        "poll rejected: {}",
+                        serde_json::to_string(&reason).map_err(std::io::Error::other)?
+                    ))))
+                }
+            }
+        }
         Command::Stats(args) => crate::stats::run(args).await,
         Command::Reliability(args) => crate::reliability::run(args),
         Command::Log(args) => crate::log::run(args),
@@ -973,6 +1018,7 @@ COMMANDS:
     enable <account>     Return a parked account to the rotation
     remove <account>     Delete an account: drop it from the rotation and erase its stash
     poke [<account>]     Run Claude Code once in an isolated config dir so it refreshes a parked account's credential (all near-expiry if omitted)
+    poll <account>       Re-check one account's usage now through the running daemon
     stats [<account>...] [--period day|week|month|lifetime] [--since <when>] [--json]  Show usage over a period, offline (reads the sample store directly)
     reliability [--json]  Swap-out overshoot SLO readout, offline (reads the event log): swap-out session_pct P50/P95/P100 vs targets, time-blind, false-preempt proxy, 429 counts
     log [--since <duration>] [--event <name>] [--channel <c>] [--json] [-f|--follow]  Show the daemon's own log lines, offline (reads the log files directly) — the raw-lines counterpart to reliability; --follow keeps printing new lines as they arrive; --channel picks event (default), diag or all
@@ -1213,6 +1259,17 @@ USAGE:
 
     <account>   the account to delete (its label or account-uuid)
     -h, --help  print this help
+";
+
+const POLL_USAGE: &str = "sessiometer poll — re-check one account's usage now
+
+USAGE:
+    sessiometer poll <account>
+
+ACCOUNT is a roster label or account UUID. Requires a running daemon with poll support.
+Clears quota slow-polling; provider rate-limit backoff remains in force.
+The daemon applies its normal account rotation policy to the fresh reading.
+This polls usage; use poke to refresh a parked credential.
 ";
 
 const POKE_USAGE: &str = "sessiometer poke — run Claude Code once in an isolated config dir to refresh a parked account's credential
@@ -1884,6 +1941,46 @@ async fn query_status(path: &Path) -> Result<String> {
     let mut line = String::new();
     buffered.read_line(&mut line).await?;
     Ok(line.trim_end().to_owned())
+}
+
+/// Wait for the daemon's poll result; a socket write alone is not a completed poll.
+async fn request_poll(path: &Path, target: &str) -> Result<crate::daemon::PollAck> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+    let exchange = async {
+        let stream = match control_transport::connect(path).await {
+            Ok(stream) => stream,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                return Err(Error::DaemonNotRunning)
+            }
+            Err(err) => return Err(Error::Io(err)),
+        };
+        let mut buffered = tokio::io::BufReader::new(stream);
+        let request = serde_json::to_vec(&serde_json::json!({ "cmd": "poll", "target": target }))
+            .map_err(std::io::Error::other)?;
+        buffered.write_all(&request).await?;
+        buffered.write_all(b"\n").await?;
+        buffered.flush().await?;
+        let mut line = String::new();
+        (&mut buffered).take(8 * 1024).read_line(&mut line).await?;
+        serde_json::from_str(&line).map_err(|_| {
+            Error::Io(std::io::Error::other(
+                "daemon returned no poll result; upgrade the daemon if poll is unsupported",
+            ))
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(180), exchange)
+        .await
+        .map_err(|_| {
+            Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "poll command timed out",
+            ))
+        })?
 }
 
 /// A minimal probe over a status reply that reads ONLY the frozen contract version (issue #164),
@@ -13126,6 +13223,14 @@ spare  22222222-2222\n\
     }
 
     #[test]
+    fn poll_is_a_required_single_account_command_in_help() {
+        assert!(parse_argv(&["poll", "spare"]).is_ok());
+        assert!(parse_argv(&["poll"]).is_err());
+        assert!(parse_argv(&["poll", "spare", "extra"]).is_err());
+        assert!(ROOT_USAGE.contains("poll <account>"));
+    }
+
+    #[test]
     fn no_args_and_top_level_help_flags_map_to_the_root_overview() {
         // No args, `-h`, and `--help` at the top level all print the root usage (exit 0),
         // as the prior dispatch did for the first two.
@@ -13372,6 +13477,7 @@ spare  22222222-2222\n\
         HelpTopic::Enable,
         HelpTopic::Remove,
         HelpTopic::Poke,
+        HelpTopic::Poll,
         HelpTopic::Stats,
         HelpTopic::Reliability,
         HelpTopic::Log,
@@ -13398,6 +13504,7 @@ spare  22222222-2222\n\
             HelpTopic::Enable => "ENABLE_USAGE",
             HelpTopic::Remove => "REMOVE_USAGE",
             HelpTopic::Poke => "POKE_USAGE",
+            HelpTopic::Poll => "POLL_USAGE",
             HelpTopic::Stats => "STATS_USAGE",
             HelpTopic::Reliability => "RELIABILITY_USAGE",
             HelpTopic::Log => "LOG_USAGE",
@@ -13637,8 +13744,8 @@ spare  22222222-2222\n\
         // both sides above could agree at zero if the source scan silently matched nothing.
         assert_eq!(
             declared.len(),
-            19,
-            "expected 19 help constants; the count moved — wire the new verb in, then update this"
+            20,
+            "expected 20 help constants; the count moved — wire the new verb in, then update this"
         );
     }
 
@@ -13653,7 +13760,7 @@ spare  22222222-2222\n\
     #[test]
     fn every_help_surface_carries_no_banned_framing_but_the_guard_bites_on_injection() {
         let surfaces = help_surfaces();
-        assert_eq!(surfaces.len(), 19, "the scan must cover every help topic");
+        assert_eq!(surfaces.len(), 20, "the scan must cover every help topic");
 
         // PASSES on the real, shipped help — all of it, not a sample.
         for (name, help) in &surfaces {
@@ -14326,7 +14433,7 @@ spare  22222222-2222\n\
         ("parse_run", NotRendered, "argv: `run`'s flags"),
         ("parse_stats", NotRendered, "argv: `stats`' flags"),
         ("parse_status", NotRendered, "argv: `status`'s flags"),
-        ("parse_subcommand", NotRendered, "argv: the eighteen verb names, matched against input"),
+        ("parse_subcommand", Scanned, "argv tokens plus poll's missing/extra-account errors, reached by usage_error_surfaces"),
         ("cross_surface_id", NotRendered, "the eight cross-surface fault identifiers (issue #768) — a machine contract"),
         ("query_status", NotRendered, "the `{\"cmd\":\"status\"}` control frame"),
         ("should_colorize", NotRendered, "the three colour environment keys"),
@@ -14366,6 +14473,8 @@ spare  22222222-2222\n\
         ("render_daemon_status", Unscanned, "`daemon status`'s three verdicts"),
         ("management_suffix", Unscanned, "the managed / unmanaged suffix both daemon verbs append"),
         ("request_shutdown", Unscanned, "two control frames, plus two failure sentences carried inside an `Error::Io` — the construction-site residual issue #1152 records"),
+        ("request_poll", Unscanned, "poll control frame and two Error::Io failure sentences, like request_shutdown"),
+        ("execute", Unscanned, "poll's result confirmation and redacted rejection carried inside an Error::Io"),
         ("render_snapshot_age", Unscanned, "the snapshot-age line"),
         ("render_next_swap", Unscanned, "the next-swap footer and its four reasons"),
         ("out_of_capacity_phrase", Unscanned, "the blocked-fleet phrase both footers share"),
@@ -14427,21 +14536,21 @@ spare  22222222-2222\n\
         // catches a second same-named function, since the register keys on the name alone.
         assert_eq!(
             spelled.len(),
-            79,
-            "expected 79 functions spelling an inline word-bearing literal; the count moved — \
+            81,
+            "expected 81 functions spelling an inline word-bearing literal; the count moved — \
              disposition the new one, then update this"
         );
         assert_eq!(
             literals.len(),
-            288,
-            "expected 288 inline word-bearing literals; the count moved — check whether the \
+            301,
+            "expected 301 inline word-bearing literals; the count moved — check whether the \
              function that gained one is still dispositioned correctly, then update this"
         );
 
         // Per-arm cardinality, so the DEBT is pinned rather than merely listed: a surface moved
         // into `Unscanned` without anyone deciding to would otherwise land silently among 44
         // entries that already say so. Shrinking this number is the progress issue #1167 tracks.
-        for (arm, expected) in [(Scanned, 11), (NotRendered, 24), (Unscanned, 44)] {
+        for (arm, expected) in [(Scanned, 12), (NotRendered, 23), (Unscanned, 46)] {
             let actual = INLINE_PROSE_REGISTER
                 .iter()
                 .filter(|(_, disposition, _)| *disposition == arm)
@@ -14798,6 +14907,8 @@ impl Nested {
             ("disable --zzz", vec!["disable", "--zzz"]),
             ("enable --zzz", vec!["enable", "--zzz"]),
             ("remove --zzz", vec!["remove", "--zzz"]),
+            ("poll", vec!["poll"]),
+            ("poll zzz zzz", vec!["poll", "zzz", "zzz"]),
             // A value-bearing flag left dangling (`required_value`).
             ("stats --period", vec!["stats", "--period"]),
             // The three unknown-sub-action arms.
@@ -14858,8 +14969,8 @@ impl Nested {
             .filter(|line| line.contains("CliUsage {"))
             .count();
         assert_eq!(
-            sites, 9,
-            "expected 9 `CliUsage` construction sites in src/cli.rs's non-test code; the count \
+            sites, 11,
+            "expected 11 `CliUsage` construction sites in src/cli.rs's non-test code; the count \
              moved — add an argv case to `usage_error_surfaces` covering the new site, then \
              update this"
         );
@@ -14870,7 +14981,7 @@ impl Nested {
         // What this pins is that the scanned subject has not silently shrunk.
         assert_eq!(
             usage_error_surfaces().len(),
-            15,
+            17,
             "the scanned argv cases changed count — a scan over a shrunken subject passes \
              identically, so this is pinned rather than trusted"
         );

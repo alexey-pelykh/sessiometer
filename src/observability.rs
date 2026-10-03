@@ -1928,6 +1928,9 @@ pub(crate) enum Event {
     /// with no prior slow-poll stays silent, mirroring [`Event::UsageBackoffCleared`].
     /// `account` is the account UUID — never the operator `label` (issue #15).
     ExhaustedSlowPollCleared { account: String },
+
+    /// An operator-requested usage poll, distinct from credential-refresh `poke`.
+    ForcedPoll { account: String, success: bool },
     /// The ACTIVE account entered the near-limit poll-coverage fast-poll (issue #540): its reading —
     /// or the #539 velocity projection — reached the near-limit band, so the daemon ENGAGED the
     /// near-limit cap on its poll sub-interval, which becomes
@@ -3008,6 +3011,9 @@ impl Event {
             }
             Event::ExhaustedSlowPollCleared { account } => {
                 format!("ts={ts} event=exhausted_slow_poll_cleared acct={account}")
+            }
+            Event::ForcedPoll { account, success } => {
+                format!("ts={ts} event=forced_poll acct={account} success={success}")
             }
             Event::NearLimitPollCoverage {
                 account,
@@ -6661,6 +6667,7 @@ pub(crate) mod tests {
             Event::UsageBackoffCleared { .. } => "UsageBackoffCleared",
             Event::ExhaustedSlowPoll { .. } => "ExhaustedSlowPoll",
             Event::ExhaustedSlowPollCleared { .. } => "ExhaustedSlowPollCleared",
+            Event::ForcedPoll { .. } => "ForcedPoll",
             Event::NearLimitPollCoverage { .. } => "NearLimitPollCoverage",
             Event::UsageVelocity { .. } => "UsageVelocity",
             Event::BlindWindow { .. } => "BlindWindow",
@@ -6856,6 +6863,14 @@ pub(crate) mod tests {
             },
             Event::ExhaustedSlowPollCleared {
                 account: "work".to_owned(),
+            },
+            Event::ForcedPoll {
+                account: "work".to_owned(),
+                success: true,
+            },
+            Event::ForcedPoll {
+                account: "work".to_owned(),
+                success: false,
             },
             Event::NearLimitPollCoverage {
                 account: "work".to_owned(),

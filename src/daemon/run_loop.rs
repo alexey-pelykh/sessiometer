@@ -150,6 +150,7 @@ enum Idle {
     /// Answered INLINE here (not spawned), exactly like `swap` / `capture`, because the reconcile
     /// touches the `!Send` daemon seams (ADR-0001).
     ConfigSetRequested(ControlStream, Box<ConfigSetCommand>),
+    PollRequested(ControlStream, PollCommand),
     /// The external-login watch (#140) saw the canonical credential change out-of-band
     /// during the idle (a manual `claude /login`) — re-tick NOW, off the usage-poll cadence,
     /// so the next `tick`'s `reconcile_canonical_change` re-stashes / re-resolves / surfaces
@@ -344,6 +345,7 @@ where
                     // answered inline in `serve_control`, so only an authenticated, well-formed
                     // request reaches here.
                     ControlYield::Swap(stream, command) => break Idle::SwapRequested(stream, command),
+                    ControlYield::Poll(stream, command) => break Idle::PollRequested(stream, command),
                     // A `capture` (#359) breaks the idle to perform the capture (moving the open
                     // stream + parsed request out of the handoff) where `&mut daemon` is available,
                     // write the redacted ack, then re-tick. Like `swap`, the auth rejection was
@@ -644,8 +646,12 @@ where
         login_watch,
     };
 
+    let mut pending_outcome = None;
     loop {
-        let outcome = daemon.tick().await;
+        let outcome = match pending_outcome.take() {
+            Some(outcome) => outcome,
+            None => daemon.tick().await,
+        };
         report_tick_outcome(&outcome, log, diag);
         // The wait this tick requested — the locked-keychain back-off (#13) overrides the
         // normal interval; the rate-limit / transient back-off is per-account now (#293) and
@@ -681,6 +687,14 @@ where
 
         match idle {
             Idle::Shutdown => return Ok(()),
+            Idle::PollRequested(stream, command) => {
+                let (ack, outcome) = daemon.perform_socket_poll(&command).await;
+                // Consume this outcome on the next iteration, so publishing the new snapshot
+                // does not also issue an unrelated second poll before serving status.
+                pending_outcome = outcome;
+                let _ = tokio::time::timeout(SWAP_ACK_WRITE_TIMEOUT, write_poll_ack(stream, &ack))
+                    .await;
+            }
             // Adopt the manual `use` swap (#64) — arm the cooldown so the next tick holds on
             // the operator's choice, and re-resolve active from the canonical — then, if the
             // newly-active account carries the terminal 🔴 `Dead` verdict (a forced `use` onto

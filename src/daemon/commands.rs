@@ -72,6 +72,58 @@ where
         self.state.last_swap = Some(LastSwap { at });
     }
 
+    /// Force one usage observation, retaining provider backoff and normal daemon policy.
+    pub(super) async fn perform_socket_poll(
+        &mut self,
+        command: &PollCommand,
+    ) -> (PollAck, Option<TickOutcome>) {
+        let reject = |reason| (PollAck::Rejected { reason }, None);
+        let i = match crate::use_account::resolve_target(&self.roster, &command.target) {
+            Ok(i) => i,
+            Err(Error::UseTargetAmbiguous { .. }) => return reject(PollRejection::AmbiguousTarget),
+            Err(_) => return reject(PollRejection::UnknownTarget),
+        };
+        if self.state.accounts[i].health.quarantined {
+            return reject(PollRejection::Quarantined);
+        }
+        // Quota resets can be changed manually; a provider throttle is still authoritative.
+        if self.account_backing_off(i) {
+            return reject(PollRejection::BackingOff);
+        }
+        let cleared = self.state.accounts[i]
+            .health
+            .exhausted_poll_until
+            .take()
+            .is_some();
+        let mut outcome = self.tick_with_poll_target(Some(i)).await;
+        let polled = self.state.accounts[i].last_polled_tick == Some(self.state.ticks);
+        let success = polled && self.state.accounts[i].last_reading.is_some();
+        let account = self.roster[i].account_uuid.clone();
+        if cleared {
+            outcome.events.insert(
+                0,
+                Event::ExhaustedSlowPollCleared {
+                    account: account.clone(),
+                },
+            );
+        }
+        outcome.events.push(Event::ForcedPoll { account, success });
+        let ack = if success {
+            PollAck::Polled {
+                label: self.roster[i].label.clone(),
+            }
+        } else {
+            PollAck::Rejected {
+                reason: if matches!(outcome.action, TickAction::KeychainLocked) {
+                    PollRejection::KeychainLocked
+                } else {
+                    PollRejection::Failed
+                },
+            }
+        };
+        (ack, Some(outcome))
+    }
+
     /// Perform a socket `swap` command (issue #167) against the daemon's live state, returning the
     /// redacted [`SwapAck`] plus any durable [`Event`] to log — WITHOUT touching the socket, so the
     /// re-validation + write are unit-testable apart from the ack I/O (the run loop writes the ack
@@ -3695,6 +3747,7 @@ mod tests {
         Option<BlindAnchor>,
         Option<ObservationGapAnchor>,
         bool,
+        Option<u64>,
     ) {
         let AccountRuntime {
             health,
@@ -3706,6 +3759,7 @@ mod tests {
             blind_anchor,
             observation_gap,
             polled_once,
+            last_polled_tick,
         } = account;
         (
             (
@@ -3721,6 +3775,7 @@ mod tests {
             *blind_anchor,
             *observation_gap,
             *polled_once,
+            *last_polled_tick,
         )
     }
 
@@ -3805,6 +3860,7 @@ mod tests {
                 was_active: i.is_multiple_of(2),
             });
             account.polled_once = i.is_multiple_of(2);
+            account.last_polled_tick = Some(i as u64 + 1);
         };
 
         // The expected fingerprint per uuid, captured once from a freshly-seeded daemon.

@@ -3488,6 +3488,7 @@ mod tests {
             .await
             .unwrap()
         {
+            ServeOutcome::Poll(..) => panic!("a watch command must not route to a poll handoff"),
             ServeOutcome::Watch(_stream) => {}
             ServeOutcome::OneShot(_) => {
                 panic!("a watch command must route to a stream, not a one-shot reply")
