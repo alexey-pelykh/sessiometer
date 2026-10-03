@@ -247,6 +247,7 @@ async fn idle_until_next_tick<P, C, S, K, Sh, Ctl, R, LW>(
     seams: &mut IdleSeams<'_, Sh, Ctl, R, LW>,
     snapshot: &StatusSnapshot,
     next_wait: Option<Duration>,
+    deadline: &std::cell::Cell<Option<Instant>>,
 ) -> (Idle, Vec<String>, Vec<RefreshObservation>, Vec<SweepHealth>)
 where
     P: RosterPoller,
@@ -303,7 +304,7 @@ where
     // The wait future borrows `&mut daemon`, so it is scoped to this block and dropped before the
     // returned tuple is built — leaving `&mut daemon` free for the caller's post-idle mutation.
     let idle = {
-        let wait = daemon.wait_after_tick(next_wait);
+        let wait = daemon.wait_after_tick(next_wait, deadline);
         tokio::pin!(wait);
         // Issue #280: `recovery_pending` prompts the tick to become due within the idle floor (not
         // the full refresh cadence) while a quarantined account the sweep can restore is present —
@@ -647,31 +648,46 @@ where
     };
 
     let mut pending_outcome = None;
+    let mut pending_idle = None;
+    let idle_deadline = std::cell::Cell::new(None);
     loop {
-        let outcome = match pending_outcome.take() {
-            Some(outcome) => outcome,
-            None => daemon.tick().await,
-        };
-        report_tick_outcome(&outcome, log, diag);
-        // The wait this tick requested — the locked-keychain back-off (#13) overrides the
-        // normal interval; the rate-limit / transient back-off is per-account now (#293) and
-        // never sets this. Captured before the snapshot is moved. The snapshot is what the
-        // control socket answers from until the next poll.
-        let next_wait = outcome.next_wait;
-        let snapshot = outcome.snapshot;
+        let (snapshot, next_wait) = if let Some(idle) = pending_idle.take() {
+            idle
+        } else {
+            idle_deadline.set(None);
+            let outcome = match pending_outcome.take() {
+                Some(outcome) => outcome,
+                None => daemon.tick().await,
+            };
+            report_tick_outcome(&outcome, log, diag);
+            // The wait this tick requested — the locked-keychain back-off (#13) overrides the
+            // normal interval; the rate-limit / transient back-off is per-account now (#293) and
+            // never sets this. Captured before the snapshot is moved. The snapshot is what the
+            // control socket answers from until the next poll.
+            let next_wait = outcome.next_wait;
+            let snapshot = outcome.snapshot;
 
-        // Push this cycle's snapshot to any live `watch` subscribers (issue #165), off the
-        // one-shot `status` path — a no-op for a control seam without a subscriber channel (every
-        // hermetic test seam). Whole snapshots, so a subscriber that missed an intermediate value
-        // still converges on the latest. Every state-changing idle exit re-ticks, so publishing
-        // once per tick here catches manual swaps / roster reloads / restores / external logins too.
-        seams.control.publish(&snapshot);
+            // Push this cycle's snapshot to any live `watch` subscribers (issue #165), off the
+            // one-shot `status` path — a no-op for a control seam without a subscriber channel (every
+            // hermetic test seam). Whole snapshots, so a subscriber that missed an intermediate value
+            // still converges on the latest. Every state-changing idle exit re-ticks, so publishing
+            // once per tick here catches manual swaps / roster reloads / restores / external logins too.
+            seams.control.publish(&snapshot);
+            (snapshot, next_wait)
+        };
 
         // Idle until the next tick, collecting the sweep's deferred restores + observations + the
         // per-sweep systemic-refresh classifications (#378) to apply once the idle's `&mut daemon`
         // borrow has dropped.
-        let (idle, refresh_restored, refresh_observations, sweep_healths) =
-            idle_until_next_tick(daemon, log, &mut seams, &snapshot, next_wait).await;
+        let (idle, refresh_restored, refresh_observations, sweep_healths) = idle_until_next_tick(
+            daemon,
+            log,
+            &mut seams,
+            &snapshot,
+            next_wait,
+            &idle_deadline,
+        )
+        .await;
 
         // Apply the deferred mutations + log this cycle's edges, then surface any newly-confirmed
         // unrecoverable death (#261) to the operator from here — the async context `notify_macos`
@@ -691,7 +707,12 @@ where
                 let (ack, outcome) = daemon.perform_socket_poll(&command).await;
                 // Consume this outcome on the next iteration, so publishing the new snapshot
                 // does not also issue an unrelated second poll before serving status.
-                pending_outcome = outcome;
+                if outcome.is_some() {
+                    pending_outcome = outcome;
+                } else {
+                    // A refusal did not tick; resume this snapshot's original idle deadline.
+                    pending_idle = Some((snapshot, next_wait));
+                }
                 let _ = tokio::time::timeout(SWAP_ACK_WRITE_TIMEOUT, write_poll_ack(stream, &ack))
                     .await;
             }
