@@ -29,6 +29,7 @@ use toml_writer::{ToTomlValue, TomlStringBuilder};
 
 use crate::error::{Error, Result};
 use crate::paths;
+pub(crate) use crate::plaintext_fallback::PlaintextFallbackMode;
 use crate::timing::{Jitter, Strategy};
 use crate::usage_store::RetentionPolicy;
 
@@ -879,6 +880,15 @@ pub(crate) struct CredentialConfig {
     ///
     /// Governs GROUPING only. Like the horizon beside it, it never feeds a swap or poll decision.
     pub(crate) expiry_cohort_window_secs: u64,
+    /// What a canonical write does about Claude Code's plaintext credential fallback
+    /// (`<config dir>/.credentials.json`) when it finds one (issue #1540); **default**
+    /// [`PlaintextFallbackMode::Remove`].
+    ///
+    /// Unlike the two keys above this one ACTS: while that file exists, Claude Code's running
+    /// sessions stop noticing keychain swaps, so the default deletes it after every successful
+    /// canonical write. `touch` keeps the file but re-stamps it so live sessions re-read storage;
+    /// `off` leaves it alone. See [`crate::plaintext_fallback`].
+    pub(crate) plaintext_fallback: PlaintextFallbackMode,
 }
 
 impl Default for CredentialConfig {
@@ -886,6 +896,7 @@ impl Default for CredentialConfig {
         Self {
             expiry_horizon_secs: DEFAULT_CREDENTIAL_EXPIRY_HORIZON_SECS,
             expiry_cohort_window_secs: DEFAULT_CREDENTIAL_EXPIRY_COHORT_WINDOW_SECS,
+            plaintext_fallback: PlaintextFallbackMode::default(),
         }
     }
 }
@@ -1685,6 +1696,8 @@ struct RawCredential {
     expiry_horizon_secs: i64,
     #[serde(default = "default_credential_expiry_cohort_window_secs")]
     expiry_cohort_window_secs: i64,
+    #[serde(default = "default_credential_plaintext_fallback")]
+    plaintext_fallback: String,
 }
 
 impl Default for RawCredential {
@@ -1692,6 +1705,7 @@ impl Default for RawCredential {
         Self {
             expiry_horizon_secs: default_credential_expiry_horizon_secs(),
             expiry_cohort_window_secs: default_credential_expiry_cohort_window_secs(),
+            plaintext_fallback: default_credential_plaintext_fallback(),
         }
     }
 }
@@ -1702,6 +1716,10 @@ fn default_credential_expiry_horizon_secs() -> i64 {
 
 fn default_credential_expiry_cohort_window_secs() -> i64 {
     DEFAULT_CREDENTIAL_EXPIRY_COHORT_WINDOW_SECS as i64
+}
+
+fn default_credential_plaintext_fallback() -> String {
+    PlaintextFallbackMode::default().as_str().to_owned()
 }
 
 /// Permissive deserialization of the optional `[stats]` table (issue #161): every key
