@@ -49,6 +49,7 @@ mod migration;
 mod observability;
 mod paths;
 mod percentile;
+mod plaintext_fallback;
 mod poke;
 mod redaction;
 mod refresh;
