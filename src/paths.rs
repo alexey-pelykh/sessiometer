@@ -750,6 +750,14 @@ pub(crate) fn usage_rollup() -> Result<PathBuf> {
     Ok(support_dir()?.join("usage-rollup.json"))
 }
 
+/// Claude Code's DEFAULT config directory: `~/.claude` — where it keeps its plaintext
+/// credential fallback when neither `CLAUDE_SECURESTORAGE_CONFIG_DIR` nor `CLAUDE_CONFIG_DIR`
+/// relocates it (issue #1540; the env precedence lives in
+/// [`crate::plaintext_fallback::fallback_path_from`]). From the password database, never `$HOME`.
+pub(crate) fn claude_config_dir() -> Result<PathBuf> {
+    Ok(home_dir()?.join(".claude"))
+}
+
 /// Claude Code's per-user state file: `~/.claude.json`.
 ///
 /// Holds the active account's `oauthAccount` identity block, which `capture`

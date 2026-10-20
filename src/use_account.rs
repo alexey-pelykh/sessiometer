@@ -81,6 +81,7 @@ use crate::error::{Error, Result};
 use crate::keychain::{CredentialStore, RealCredentialStore};
 use crate::observability::{self, Event, EventLog, SwapReason};
 use crate::paths;
+use crate::plaintext_fallback::FallbackSettlingStore;
 use crate::stash::{AccountStash, RealAccountStash};
 use crate::swap;
 
@@ -1069,7 +1070,11 @@ pub(crate) async fn use_account(query: Option<String>, force: bool, next: bool) 
         Seams {
             cache: &cache,
             poller: &RealRosterPoller::new(),
-            store: &RealCredentialStore::new(),
+            // Issue #1540: settle Claude Code's stale plaintext fallback after the swap's write.
+            store: &FallbackSettlingStore::for_host(
+                RealCredentialStore::new(),
+                config.credential.plaintext_fallback,
+            ),
             stash: &RealAccountStash::new(),
             claude_json: &claude_json,
             lock_path: &lock_path,

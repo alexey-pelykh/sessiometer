@@ -1079,12 +1079,15 @@ Settings for `sessiometer login`, the interactive re-auth verb.
 
 ### `[credential]`
 
-How far ahead the daemon looks at each account's **refresh-token deadline** when
-classifying it for the [`EXPIRY` column](#the-refresh-token-deadline-expiry).
+Two things about the credentials sessiometer manages: how far ahead the daemon looks at each
+account's **refresh-token deadline** when classifying it for the
+[`EXPIRY` column](#the-refresh-token-deadline-expiry), and what a credential write does to
+**Claude Code's plaintext fallback file**.
 
 | Key | Meaning | Range | Default |
 |-----|---------|-------|---------|
 | `expiry_horizon_secs` | Seconds of lookahead over `refreshTokenExpiresAt`. A deadline falling inside this window classifies as *within* the horizon (bracketed, `[6d21h]`, and tinted yellow); one further out classifies as *beyond* it (bare, and dimmed). | `86_400..=7_776_000` (one day to ninety days) | `604800` (seven days) |
+| `plaintext_fallback` | What to do with Claude Code's `.credentials.json` after each write of the canonical credential (macOS only; see [below](#claude-codes-plaintext-fallback)). | `remove`, `touch`, `off` | `remove` |
 
 This bounds the **lookahead only** — it is emphatically not an assumed refresh-token
 lifetime. The daemon always reads the deadline from the credential and never infers one
@@ -1099,6 +1102,32 @@ poll decision — expiry is surfaced, not acted upon. It is also independent of
 [`[refresh]`](#refreshing-parked-credentials-automatically), and keeps classifying whether
 or not that periodic refresh is enabled — an account with refresh off is if anything more
 exposed to a quiet lapse.
+
+#### Claude Code's plaintext fallback
+
+On macOS, Claude Code keeps its login in the keychain, and writes a plaintext copy to
+`.credentials.json` in its config directory (`~/.claude`, or `CLAUDE_CONFIG_DIR`) only when a
+keychain write fails. Once that file exists, a running session watches **the file** for
+credential changes and stops looking at the keychain, so every swap sessiometer makes lands
+where that session never looks: it keeps sending whichever login the file last held — often a
+`/login` from long ago — until it is restarted.
+
+After each write of the canonical credential (an automatic or manual swap, `use` adopting an
+account, a keep-warm promotion, or an activating `login`), sessiometer settles that file:
+
+- **`remove`** (default) deletes it. The keychain item sessiometer just wrote is the real
+  credential; the file is a stale copy whose remaining effects are hiding swaps and bringing
+  back an old login. Claude Code recreates it only if a later keychain write fails again.
+- **`touch`** keeps the file and bumps its modification time, so every live session re-reads
+  its credential storage — keychain first — on its next request. The swap is seen, but the
+  stale copy stays, and it is used again if the keychain read ever fails.
+- **`off`** leaves it alone.
+
+Each outcome is recorded in the event log as `event=plaintext_fallback action=…`
+(`removed`, `touched`, `ignored` for `off`, `refused` for anything that is not a regular file,
+`failed` for an I/O error); nothing is logged when there is no file. It never fails the write
+that triggered it. On Linux the file *is* Claude Code's credential store, so this setting does
+nothing there. The daemon reads it once at start-up, so a change needs a daemon restart.
 
 ### Other blocks
 

@@ -869,6 +869,39 @@ impl CaptureEventOutcome {
     }
 }
 
+/// What happened to Claude Code's plaintext credential fallback (`<config dir>/.credentials.json`)
+/// after a canonical write (issue #1540) — the `action=` of the [`Event::PlaintextFallback`] line.
+/// Only a file that was PRESENT produces one: an absent file is the normal state and is silent. A
+/// bare classification — the file's path and contents never reach the log (#15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlaintextFallbackAction {
+    /// The file was deleted (`plaintext_fallback = "remove"`).
+    Removed,
+    /// The file's mtime was bumped, its contents untouched (`plaintext_fallback = "touch"`).
+    Touched,
+    /// The file was left alone (`plaintext_fallback = "off"`). Logged so a present file — which
+    /// hides every swap from live sessions — is never silent.
+    Ignored,
+    /// The path holds something other than a regular file (a symlink, a directory), so it was
+    /// left alone whatever the mode: removing or re-stamping it could reach something else.
+    Refused,
+    /// The file was present but the remove / re-stamp failed (e.g. a permission error).
+    Failed,
+}
+
+impl PlaintextFallbackAction {
+    /// The `action=` token for the [`Event::PlaintextFallback`] log line.
+    fn as_str(self) -> &'static str {
+        match self {
+            PlaintextFallbackAction::Removed => "removed",
+            PlaintextFallbackAction::Touched => "touched",
+            PlaintextFallbackAction::Ignored => "ignored",
+            PlaintextFallbackAction::Refused => "refused",
+            PlaintextFallbackAction::Failed => "failed",
+        }
+    }
+}
+
 /// Whether an `export` carried credential material or only the roster/config — the `mode=` of the
 /// redacted [`Event::Export`] (issue #150). A bare classification (never a handle, token, or
 /// email): the SAME #15 discipline as the other outcome enums here. Maps from the `export` verb's
@@ -1829,6 +1862,12 @@ pub(crate) enum Event {
         account: Option<String>,
         outcome: CaptureEventOutcome,
     },
+    /// A canonical write found Claude Code's plaintext credential fallback present and acted on it
+    /// per `[credential].plaintext_fallback` (issue #1540). Emitted once per canonical write that
+    /// finds the file, so it rides alongside the swap / adopt / keep-warm line that caused it.
+    /// Fleet-global — no `account` field: the file is not any one account's. `action` is a bare
+    /// tag; the path and the file's contents are never logged (#15).
+    PlaintextFallback { action: PlaintextFallbackAction },
     /// The usage-stats store compacted and rolled aged raw samples down into its hourly/daily
     /// aggregates (issue #161). Edge-ish: emitted only when a pass actually folds something
     /// (`raw_lines > 0`), so a no-op maintenance pass is silent. `rolled_through` is the roll
@@ -2913,6 +2952,12 @@ impl Event {
                     }
                     None => format!("ts={ts} event=capture outcome={outcome}"),
                 }
+            }
+            Event::PlaintextFallback { action } => {
+                format!(
+                    "ts={ts} event=plaintext_fallback action={}",
+                    action.as_str()
+                )
             }
             Event::UsageRollup {
                 rolled_through,
@@ -4567,6 +4612,25 @@ pub(crate) mod tests {
 
         let no_handle = Event::CanonicalRestored { account: None }.to_log_line(at_epoch(0));
         assert_eq!(no_handle, format!("{TS0} event=canonical_restored"));
+    }
+
+    #[test]
+    fn plaintext_fallback_renders_each_action_as_a_bare_tag() {
+        // Issue #1540: one line per canonical write that found the fallback file present. No
+        // account and no path — the file is fleet-global and its location is not the log's to carry.
+        for (action, token) in [
+            (PlaintextFallbackAction::Removed, "removed"),
+            (PlaintextFallbackAction::Touched, "touched"),
+            (PlaintextFallbackAction::Ignored, "ignored"),
+            (PlaintextFallbackAction::Refused, "refused"),
+            (PlaintextFallbackAction::Failed, "failed"),
+        ] {
+            let line = Event::PlaintextFallback { action }.to_log_line(at_epoch(0));
+            assert_eq!(
+                line,
+                format!("{TS0} event=plaintext_fallback action={token}")
+            );
+        }
     }
 
     #[test]
@@ -6652,6 +6716,7 @@ pub(crate) mod tests {
             Event::CredentialHealth { .. } => "CredentialHealth",
             Event::Login { .. } => "Login",
             Event::Capture { .. } => "Capture",
+            Event::PlaintextFallback { .. } => "PlaintextFallback",
             Event::UsageRollup { .. } => "UsageRollup",
             Event::UsageGap { .. } => "UsageGap",
             Event::UncapturedLogin { .. } => "UncapturedLogin",
@@ -6816,6 +6881,9 @@ pub(crate) mod tests {
             Event::Capture {
                 account: Some("work".to_owned()),
                 outcome: CaptureEventOutcome::Captured,
+            },
+            Event::PlaintextFallback {
+                action: PlaintextFallbackAction::Removed,
             },
             Event::UsageRollup {
                 rolled_through: 1_782_777_600,
