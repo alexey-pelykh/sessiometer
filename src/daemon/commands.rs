@@ -1886,6 +1886,11 @@ mod tests {
         assert!(daemon.state.last_swap.is_none(), "a no-op arms no cooldown");
     }
 
+    // Unix-only: the fixture FREEZES a directory read-only (`0o500`) so a rename cannot land,
+    // which is a POSIX DAC behaviour with no Windows analogue — a read-only directory there does
+    // not stop a file being created inside it. #974 § Boundaries keeps test-only permission
+    // manipulation out of the owner-only abstraction; the fixture is gated, not ported.
+    #[cfg(unix)]
     #[tokio::test]
     async fn perform_socket_swap_carries_the_canary_drift_alarm_on_a_refused_swap() {
         // Issue #714 on the daemon-routed path: a drifted canary refuses the socket swap with the

@@ -6971,12 +6971,18 @@ mod tests {
     /// Freeze / thaw the `~/.claude.json` directory (0o500 ⇄ 0o700) so the
     /// canary's best-effort display heal — a temp-file + rename in that same
     /// directory — cannot land, pinning the stale display the drift fixtures need.
+    #[cfg(unix)]
     fn set_dir_mode(dir: &Path, mode: u32) {
         let mut perms = std::fs::metadata(dir).unwrap().permissions();
         std::os::unix::fs::PermissionsExt::set_mode(&mut perms, mode);
         std::fs::set_permissions(dir, perms).unwrap();
     }
 
+    // Unix-only: the fixture FREEZES a directory read-only (`0o500`) so a rename cannot land,
+    // which is a POSIX DAC behaviour with no Windows analogue — a read-only directory there does
+    // not stop a file being created inside it. #974 § Boundaries keeps test-only permission
+    // manipulation out of the owner-only abstraction; the fixture is gated, not ported.
+    #[cfg(unix)]
     #[tokio::test]
     async fn use_refuses_a_drifted_canary_even_with_force() {
         // Issue #714 AC on the daemon-DOWN path: the canonical byte-matches
@@ -7027,6 +7033,11 @@ mod tests {
         assert!(!log.contains("event=swap"), "no swap was written: {log}");
     }
 
+    // Unix-only: the fixture FREEZES a directory read-only (`0o500`) so a rename cannot land,
+    // which is a POSIX DAC behaviour with no Windows analogue — a read-only directory there does
+    // not stop a file being created inside it. #974 § Boundaries keeps test-only permission
+    // manipulation out of the owner-only abstraction; the fixture is gated, not ported.
+    #[cfg(unix)]
     #[tokio::test]
     async fn use_with_the_override_swaps_through_a_drift_and_logs_it() {
         // Issue #714 AC: `canary_drift_override = true` lets the standalone `use`

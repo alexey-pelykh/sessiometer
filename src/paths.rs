@@ -24,10 +24,11 @@
 //! discipline) remains a requirement on the Windows-enablement work and is NOT
 //! delivered. That branch does now TYPE-CHECK (issue #973) and carries committed
 //! `#[cfg(windows)]` tests — but nothing has ever RUN them, and #978's Windows CI
-//! job alone will not change that: this module still carries the `mode` /
-//! `from_mode` / `uid` ownership cluster (#974), which does not resolve on that
-//! target, so the crate does not yet BUILD there and no test binary is produced.
-//! Every Windows claim here is a type-checked hypothesis, not an observation.
+//! job is what changes that. The `mode` / `from_mode` / `uid` ownership cluster
+//! this module used to carry is gone (issue #974): the permission mechanics now
+//! live behind [`crate::file_policy`], which states the owner-only policy once and
+//! implements it per target. Every Windows claim here is still a type-checked
+//! hypothesis, not an observation.
 //!
 //! That same password-database discipline extends past *locations* to the user's
 //! login shell (issue #783): under launchd the daemon inherits a bare
@@ -36,23 +37,26 @@
 //! `pw_shell`, never from `$SHELL`, for the same reason the home directory is never
 //! read from `$HOME`.
 //!
-//! Directories are created `0700` and files `0600`, and every directory we
-//! create is asserted to be owned by the current uid before use.
+//! Directories are created `0700` and files `0600` — on Windows, the explicit
+//! owner-only DACL that means the same thing — and every directory we create is
+//! asserted to be owned by the current user before use. The mechanism for all
+//! three is [`crate::file_policy`]; this module states the intent and never the
+//! mode bits.
 
 #[cfg(unix)]
 use std::ffi::CStr;
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File, OpenOptions, Permissions};
+use std::fs::{self, File, OpenOptions};
 use std::future::Future;
 use std::io::{ErrorKind, Write};
-// Both `std::os::unix` imports are `cfg`-gated: an ungated one is a hard error on every
-// non-Unix target, and this module carried two of them while ALSO carrying the four
+// The one remaining `std::os::unix` import is `cfg`-gated: an ungated one is a hard error on
+// every non-Unix target, and this module carried two of them while ALSO carrying the four
 // `#[cfg(windows)]` branches below — which is how the file with Windows support became the
-// largest Windows error site in the crate (issue #973 AC1).
+// largest Windows error site in the crate (issue #973 AC1). The permission traits that used to
+// sit beside it (`MetadataExt`, `OpenOptionsExt`, `PermissionsExt`) are gone with the mode
+// mechanics themselves, into `crate::file_policy` (issue #974).
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
-#[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -61,19 +65,21 @@ use tokio::process::Command;
 use tokio::sync::Mutex;
 
 use crate::error::{Error, Result};
+use crate::file_policy;
 use crate::isolated_spawn::SPAWN_ENV_REMOVE;
 
-/// `0700` — owner `rwx`, nothing for group/other.
-const DIR_MODE: u32 = 0o700;
-/// `0600` — owner `rw`, nothing for group/other.
-pub(crate) const FILE_MODE: u32 = 0o600;
 /// Application name segment used in every derived path.
 const APP: &str = "sessiometer";
 
 /// The current real user id (`getuid(2)`).
 ///
 /// Exposed `pub(crate)` for the launchd domain target `gui/<uid>` the background
-/// service installer builds (issue #166); every other caller is in-module.
+/// service installer builds (issue #166), and for the Unix arm of
+/// [`crate::file_policy`]'s ownership check; every other caller is in-module, in the
+/// `getpwuid` ladder below. Unix-only by nature, so it is one of the two things in
+/// this module that still do not resolve on Windows — the other being `libc` itself
+/// — and the launchd domain target it feeds is a macOS concept with no analogue
+/// there. That belongs to the service port, not to the permissions layer (#974).
 pub(crate) fn current_uid() -> u32 {
     // SAFETY: `getuid` cannot fail and has no preconditions.
     unsafe { libc::getuid() }
@@ -370,14 +376,18 @@ pub(crate) fn create_isolated_dir(path: &Path) -> Result<()> {
     // never follows a symlink (a TOCTOU-planted link at this point fails the create
     // or is caught by the post-create lstat below).
     fs::create_dir(path)?;
-    fs::set_permissions(path, Permissions::from_mode(DIR_MODE))?;
+    file_policy::owner_only_dir(path)?;
     let meta = fs::symlink_metadata(path)?;
     if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
         return Err(Error::UnsafeIsolatedDir {
             path: path.to_path_buf(),
         });
     }
-    if meta.uid() != current_uid() {
+    // `lstat`-exact on Unix, so a link planted at this path is judged by ITS OWN owner rather
+    // than by its target's — the same discipline as the check just above, and the reason this
+    // asks by path a second time instead of reading `meta`, whose Windows sibling carries no
+    // owner at all. See `file_policy` for the one axis on which the two targets differ here.
+    if !file_policy::owner_is_current_user_nofollow(path)? {
         return Err(Error::ForeignOwnership(path.to_path_buf()));
     }
     Ok(())
@@ -1312,22 +1322,21 @@ where
 /// mode and re-checks ownership.
 pub(crate) fn ensure_private_dir(path: &Path) -> Result<()> {
     fs::create_dir_all(path)?;
-    fs::set_permissions(path, Permissions::from_mode(DIR_MODE))?;
-    if fs::metadata(path)?.uid() != current_uid() {
+    file_policy::owner_only_dir(path)?;
+    if !file_policy::owner_is_current_user(path)? {
         return Err(Error::ForeignOwnership(path.to_path_buf()));
     }
     Ok(())
 }
 
-/// Open (creating if needed, then append) `path` with `0600` permissions. The
-/// mode is applied only when the file is created; an existing file keeps its
-/// permissions (standard Unix `open` semantics).
+/// Open (creating if needed, then append) `path` owner-only.
+///
+/// On Unix the mode is applied only when the file is created; an existing file keeps its
+/// permissions (standard `open(2)` semantics). Windows has no create-only hook for a security
+/// descriptor on `std::fs::OpenOptions`, so there an existing file is tightened too — a
+/// narrowing, never a widening. [`crate::file_policy`] carries both halves of that difference.
 pub(crate) fn create_private_file(path: &Path) -> Result<File> {
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(FILE_MODE)
-        .open(path)?;
+    let file = file_policy::open_owner_only(OpenOptions::new().create(true).append(true), path)?;
     Ok(file)
 }
 
@@ -1368,11 +1377,8 @@ pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
     // remove it best-effort so we always start from a fresh `0600` file.
     let _ = fs::remove_file(&tmp);
     {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(FILE_MODE)
-            .open(&tmp)?;
+        let mut file =
+            file_policy::open_owner_only(OpenOptions::new().create_new(true).write(true), &tmp)?;
         file.write_all(contents)?;
         // Durable before the rename, so a crash can't leave an empty config in
         // place of the old one.
@@ -1383,23 +1389,25 @@ pub(crate) fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
 }
 
 /// Atomically (over)write an **existing** `path` with `contents`, preserving its
-/// current permission mode rather than forcing `0600`.
+/// current permission policy rather than forcing owner-only.
 ///
 /// Same atomic shape as [`write_private_file`] — a same-directory `<path>.tmp`,
 /// `fsync`, then `rename` over `path`, so a concurrent reader never observes a
 /// half-written file — but for a file whose permission policy is **not ours to
 /// set**. The swap engine (#6) co-writes the `oauthAccount` block into
-/// `~/.claude.json`, a file owned by Claude Code; the existing file's mode is
+/// `~/.claude.json`, a file owned by Claude Code; the existing file's policy is
 /// copied onto the replacement so the co-write never widens (nor narrows) the
-/// user's chosen permissions. `path` must already exist — its mode is the very
-/// thing being preserved, so an absent file is an error, never a silent create at
-/// our default mode. Wired into the swap loop in #7 (via [`crate::claude_state`]).
+/// user's chosen permissions — the mode bits on Unix, the DACL on Windows, which
+/// [`crate::file_policy::copy_policy`] documents. `path` must already exist — its
+/// policy is the very thing being preserved, so an absent file is an error, never
+/// a silent create at our default. Wired into the swap loop in #7 (via
+/// [`crate::claude_state`]).
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn write_preserving_mode(path: &Path, contents: &[u8]) -> Result<()> {
-    // The existing file's permission bits (including any setuid/setgid/sticky),
-    // copied verbatim onto the replacement. Reading metadata first also surfaces
-    // an absent file here rather than fabricating one at `FILE_MODE`.
-    let mode = fs::metadata(path)?.permissions().mode() & 0o7777;
+    // Stat the source BEFORE staging anything. Its policy is copied onto the replacement below,
+    // just before the rename; this call is what surfaces an absent `path` here — with no staging
+    // file left behind — rather than fabricating one at the owner-only default.
+    fs::metadata(path)?;
 
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
@@ -1409,17 +1417,17 @@ pub(crate) fn write_preserving_mode(path: &Path, contents: &[u8]) -> Result<()> 
     // it best-effort so we always start from a fresh file.
     let _ = fs::remove_file(&tmp);
     {
-        // Created `0600` so the temp is never *more* permissive than the file it
-        // replaces while it is being written; the source mode is copied on just
-        // before the rename.
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(FILE_MODE)
-            .open(&tmp)?;
+        // Created owner-only so the temp is never *more* permissive than the file
+        // it replaces while it is being written; the source's own policy is copied
+        // on just before the rename.
+        let mut file =
+            file_policy::open_owner_only(OpenOptions::new().create_new(true).write(true), &tmp)?;
         file.write_all(contents)?;
-        file.set_permissions(Permissions::from_mode(mode))?;
-        // Durable (data + the copied mode) before the rename, so a crash can't
+        // The source's policy, copied on just before the rename. An absent `path` was already
+        // refused by the `fs::metadata` above — BEFORE anything was staged, so no `<path>.tmp` is
+        // left behind — rather than here.
+        file_policy::copy_policy(path, &tmp)?;
+        // Durable (data + the copied policy) before the rename, so a crash can't
         // leave a truncated file in place of the old one.
         file.sync_all()?;
     }
@@ -1433,7 +1441,18 @@ mod tests {
 
     use std::collections::BTreeSet;
     use std::ffi::OsStr;
+    // The Unix permission surface the `#[cfg(unix)]` tests below assert against. It sits HERE
+    // rather than at the top of the module because production code no longer touches a mode bit
+    // at all: `crate::file_policy` owns the mechanism, and these tests are what pin the Unix half
+    // of it at this module's own call sites (issue #974).
+    #[cfg(unix)]
+    use std::fs::Permissions;
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[cfg(unix)]
+    use crate::file_policy::{DIR_MODE, FILE_MODE};
 
     #[test]
     fn apple_config_prefers_xdg_when_set() {
@@ -1975,6 +1994,10 @@ mod tests {
         assert_ne!(dir, isolated_refresh_dir("login").unwrap());
     }
 
+    // Unix-only: it asserts the mode bits `file_policy` writes on this target. The property
+    // itself is cross-platform and the Windows arm of it — an explicit, PROTECTED DACL — is
+    // asserted by `crate::file_policy`'s own `#[cfg(windows)]` tests (issue #974 AC3/AC4).
+    #[cfg(unix)]
     #[test]
     fn create_isolated_dir_makes_a_fresh_0700_owned_directory() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2030,6 +2053,10 @@ mod tests {
         assert!(target.exists());
     }
 
+    // Unix-only: it asserts the mode bits `file_policy` writes on this target. The property
+    // itself is cross-platform and the Windows arm of it — an explicit, PROTECTED DACL — is
+    // asserted by `crate::file_policy`'s own `#[cfg(windows)]` tests (issue #974 AC3/AC4).
+    #[cfg(unix)]
     #[test]
     fn ensure_private_dir_sets_0700_and_owner() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2041,6 +2068,10 @@ mod tests {
         assert_eq!(meta.uid(), current_uid());
     }
 
+    // Unix-only: it asserts the mode bits `file_policy` writes on this target. The property
+    // itself is cross-platform and the Windows arm of it — an explicit, PROTECTED DACL — is
+    // asserted by `crate::file_policy`'s own `#[cfg(windows)]` tests (issue #974 AC3/AC4).
+    #[cfg(unix)]
     #[test]
     fn create_private_file_is_0600() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2051,6 +2082,10 @@ mod tests {
         assert_eq!(meta.permissions().mode() & 0o777, FILE_MODE);
     }
 
+    // Unix-only: it asserts the mode bits `file_policy` writes on this target. The property
+    // itself is cross-platform and the Windows arm of it — an explicit, PROTECTED DACL — is
+    // asserted by `crate::file_policy`'s own `#[cfg(windows)]` tests (issue #974 AC3/AC4).
+    #[cfg(unix)]
     #[test]
     fn write_private_file_writes_contents_0600() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2064,6 +2099,10 @@ mod tests {
         assert!(!tmp.path().join("config.toml.tmp").exists());
     }
 
+    // Unix-only: it asserts the mode bits `file_policy` writes on this target. The property
+    // itself is cross-platform and the Windows arm of it — an explicit, PROTECTED DACL — is
+    // asserted by `crate::file_policy`'s own `#[cfg(windows)]` tests (issue #974 AC3/AC4).
+    #[cfg(unix)]
     #[test]
     fn write_private_file_overwrites_and_stays_0600() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2080,6 +2119,10 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"second");
     }
 
+    // Unix-only: it asserts the mode bits `file_policy` writes on this target. The property
+    // itself is cross-platform and the Windows arm of it — an explicit, PROTECTED DACL — is
+    // asserted by `crate::file_policy`'s own `#[cfg(windows)]` tests (issue #974 AC3/AC4).
+    #[cfg(unix)]
     #[test]
     fn write_preserving_mode_keeps_an_existing_non_0600_mode() {
         // The co-write target (~/.claude.json) is Claude Code's; a non-0600 mode
@@ -2103,6 +2146,10 @@ mod tests {
         assert!(!tmp.path().join("state.json.tmp").exists());
     }
 
+    // Unix-only: it asserts the mode bits `file_policy` writes on this target. The property
+    // itself is cross-platform and the Windows arm of it — an explicit, PROTECTED DACL — is
+    // asserted by `crate::file_policy`'s own `#[cfg(windows)]` tests (issue #974 AC3/AC4).
+    #[cfg(unix)]
     #[test]
     fn write_preserving_mode_keeps_a_0600_mode_too() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2834,6 +2881,12 @@ mod tests {
     fn fake_shell(dir: &Path, name: &str, body: &str) -> PathBuf {
         let path = dir.join(name);
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        // The executable bit is Unix's, and gating it here rather than gating the helper keeps
+        // every caller compiling on both targets — which is where they already were. The spawn
+        // tests below drive a POSIX login shell and so are meaningless on Windows whatever this
+        // line does; that is #973's ledger, and #974 deliberately does not move it (issue #974
+        // § Boundaries: test-only permission manipulation is a separate concern).
+        #[cfg(unix)]
         fs::set_permissions(&path, Permissions::from_mode(0o755)).unwrap();
         path
     }
