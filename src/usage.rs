@@ -450,9 +450,19 @@ fn parse_usage(body: &str) -> Result<UsageReport> {
     let (session, session_resets_at, session_severity) =
         dimension(&root, "five_hour", &["session", "five_hour"])
             .ok_or_else(|| Error::UsageParse("no session (five_hour) dimension".into()))?;
-    let (weekly, weekly_resets_at, weekly_severity) =
+    let (mut weekly, mut weekly_resets_at, mut weekly_severity) =
         dimension(&root, "seven_day", &["weekly_all", "seven_day", "weekly"])
             .ok_or_else(|| Error::UsageParse("no weekly (seven_day) dimension".into()))?;
+
+    // A per-model `weekly_scoped` cap above the all-models window is the binding
+    // constraint — take it over the top-level `seven_day` reading.
+    if let Some((fraction, resets_at, severity)) = max_active_weekly_scoped(&root) {
+        if fraction > weekly {
+            weekly = fraction;
+            weekly_resets_at = resets_at;
+            weekly_severity = severity;
+        }
+    }
 
     Ok(UsageReport {
         session,
@@ -507,6 +517,40 @@ fn dimension(
         }
     }
     fallback
+}
+
+/// The highest `(fraction, resets_at, severity)` among `limits[]` entries with
+/// `kind == "weekly_scoped"` that are active (`is_active` true or absent; an
+/// explicit `false` is skipped — unlike [`dimension`]'s inactive fallback, a
+/// scoped cap the API has switched off must never outvote the all-models
+/// window). A scoped per-model weekly cap is the BINDING constraint when it is
+/// higher than the all-models window: `weekly_all` aggregates every model, so a
+/// Fable-heavy account can sit at 44 % overall while its Fable cap is already at
+/// 74 %, and it is the 74 % that exhausts the account. `None` when no active
+/// scoped entry carries a readable fraction.
+fn max_active_weekly_scoped(root: &Value) -> Option<(f64, Option<String>, Option<String>)> {
+    let limits = root.get("limits").and_then(Value::as_array)?;
+    let mut max: Option<(f64, Option<String>, Option<String>)> = None;
+    for entry in limits {
+        let kind = entry.get("kind").and_then(Value::as_str);
+        if kind != Some("weekly_scoped") {
+            continue;
+        }
+        let active = entry
+            .get("is_active")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if !active {
+            continue;
+        }
+        let Some(fraction) = fraction_of(entry) else {
+            continue;
+        };
+        if max.as_ref().is_none_or(|(best, _, _)| fraction > *best) {
+            max = Some((fraction, resets_at_of(entry), severity_of(entry)));
+        }
+    }
+    max
 }
 
 /// Read a usage fraction in `[0.0, 1.0]` from an object: a `utilization`
@@ -806,6 +850,96 @@ mod tests {
             (report.weekly - 0.15).abs() < 1e-9,
             "weekly fraction was {}",
             report.weekly
+        );
+    }
+
+    #[test]
+    fn weekly_scoped_higher_than_weekly_all_wins() {
+        // Regression fixture: the live payload shape carries BOTH a top-level
+        // `seven_day` window (44 %) and an active `limits[]` entry of kind
+        // `weekly_scoped` for one model (Fable, 74 %). The scoped per-model cap
+        // is the binding constraint — it is what exhausts the account — so it
+        // outvotes the lower all-models window, resets_at included.
+        let body = r#"{
+            "five_hour": { "utilization": 0.0, "resets_at": null },
+            "seven_day": { "utilization": 44.0, "resets_at": "2026-09-24T16:00:00.485164+00:00" },
+            "limits": [
+                { "kind": "session", "group": "session", "percent": 0, "severity": "normal",
+                  "resets_at": null, "scope": null, "is_active": false },
+                { "kind": "weekly_all", "group": "weekly", "percent": 44, "severity": "normal",
+                  "resets_at": "2026-09-24T16:00:00.485164+00:00", "scope": null, "is_active": false },
+                { "kind": "weekly_scoped", "group": "weekly", "percent": 74, "severity": "normal",
+                  "resets_at": "2026-09-24T16:00:00.485335+00:00",
+                  "scope": { "model": { "id": null, "display_name": "Fable" }, "surface": null },
+                  "is_active": true }
+            ]
+        }"#;
+        let report = parse_usage(body).unwrap();
+        assert!((report.weekly - 0.74).abs() < 1e-9);
+        assert_eq!(
+            report.weekly_resets_at.as_deref(),
+            Some("2026-09-24T16:00:00.485335+00:00")
+        );
+        assert!((report.session - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn weekly_scoped_lower_than_weekly_all_is_ignored() {
+        // A scoped cap BELOW the all-models window is not the binding constraint;
+        // the weekly triple stays the `seven_day` reading.
+        let body = r#"{
+            "five_hour": { "utilization": 0.0, "resets_at": null },
+            "seven_day": { "utilization": 44.0, "resets_at": "2026-09-24T16:00:00.485164+00:00" },
+            "limits": [
+                { "kind": "weekly_scoped", "group": "weekly", "percent": 10, "severity": "normal",
+                  "resets_at": "2026-09-24T16:00:00.485335+00:00",
+                  "scope": { "model": { "id": null, "display_name": "Fable" }, "surface": null },
+                  "is_active": true }
+            ]
+        }"#;
+        let report = parse_usage(body).unwrap();
+        assert!((report.weekly - 0.44).abs() < 1e-9);
+        assert_eq!(
+            report.weekly_resets_at.as_deref(),
+            Some("2026-09-24T16:00:00.485164+00:00")
+        );
+    }
+
+    #[test]
+    fn inactive_weekly_scoped_is_ignored() {
+        // `is_active: false` on a scoped entry means the API has switched that
+        // cap off — it must never outvote the all-models window, even at 90 %.
+        let body = r#"{
+            "five_hour": { "utilization": 0.0, "resets_at": null },
+            "seven_day": { "utilization": 44.0, "resets_at": "2026-09-24T16:00:00.485164+00:00" },
+            "limits": [
+                { "kind": "weekly_scoped", "group": "weekly", "percent": 90, "severity": "normal",
+                  "resets_at": "2026-09-24T16:00:00.485335+00:00",
+                  "scope": { "model": { "id": null, "display_name": "Fable" }, "surface": null },
+                  "is_active": false }
+            ]
+        }"#;
+        let report = parse_usage(body).unwrap();
+        assert!((report.weekly - 0.44).abs() < 1e-9);
+        assert_eq!(
+            report.weekly_resets_at.as_deref(),
+            Some("2026-09-24T16:00:00.485164+00:00")
+        );
+    }
+
+    #[test]
+    fn no_limits_array_still_parses() {
+        // Regression guard: a payload with only the top-level windows and no
+        // `limits` key parses exactly as before the weekly_scoped scan.
+        let body = r#"{
+            "five_hour": { "utilization": 0.0, "resets_at": null },
+            "seven_day": { "utilization": 44.0, "resets_at": "2026-09-24T16:00:00.485164+00:00" }
+        }"#;
+        let report = parse_usage(body).unwrap();
+        assert!((report.weekly - 0.44).abs() < 1e-9);
+        assert_eq!(
+            report.weekly_resets_at.as_deref(),
+            Some("2026-09-24T16:00:00.485164+00:00")
         );
     }
 
