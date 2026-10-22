@@ -2886,9 +2886,10 @@ mod tests {
         // `cli::apply_remove` is the sixth site and is deliberately ABSENT: it resolves and then
         // removes, never reading an identity field, so the field scan cannot see it. That is not
         // a hole — it is why this register alone is not the whole gate, and why
-        // [`resolve_target_has_exactly_the_five_known_call_sites`] pins the compliant set from
+        // [`resolve_target_has_exactly_the_six_known_call_sites`] pins the compliant set from
         // the other side.
         ("perform_socket_swap", ViaSharedResolver, "the daemon's control-socket swap — reads the resolved from/to labels for the event"),
+        ("perform_socket_poll", ViaSharedResolver, "the daemon's control-socket usage poll — reads the resolved account's handle for the result and event"),
         ("poke_named", ViaSharedResolver, "`poke <label>` — reads the resolved account's label for its report line"),
         ("run_use", ViaSharedResolver, "`use <label>` — reads the resolved target's label for the swap confirmation"),
         // --- matched by an identifier the SYSTEM supplied, never an operator handle -------------
@@ -3135,7 +3136,7 @@ mod tests {
         ("snapshot", NotHandleResolution, "the wire snapshot's per-account `label` field and its active handle"),
         ("status_response", NotHandleResolution, "the `status` reply's per-account `label` field"),
         ("stored_expires_at", NotHandleResolution, "forwards an already-chosen account's stash into `refresh::stored_expires_at` (`poke` and the refresh tick each have one)"),
-        ("tick", NotHandleResolution, "the tick's own events' account handles"),
+        ("tick_with_poll_target", NotHandleResolution, "the tick's own events' account handles; its optional index was resolved by perform_socket_poll"),
         ("validate", NotHandleResolution, "config validation — enforces uuid uniqueness and label non-emptiness, and is where a duplicated LABEL is warned about (R-6) rather than resolved"),
         ("velocity_swap", NotHandleResolution, "the velocity-swap event's from / to handles"),
         ("view", NotHandleResolution, "projects an account into the settings `AccountView`"),
@@ -3495,7 +3496,7 @@ mod tests {
         // it. That is what the crate-wide totals above could never be.
         for (arm, expected) in [
             (SharedResolver, 1),
-            (ViaSharedResolver, 4),
+            (ViaSharedResolver, 5),
             (NotHandleResolution, 92),
         ] {
             let actual = HANDLE_READ_REGISTER
@@ -4046,7 +4047,7 @@ mod tests {
     /// (`use`, `poke`, the daemon's control-socket swap, `enable`, `disable`, `remove`) reach the
     /// resolver through FIVE call sites, because `enable` and `disable` share `apply_enabled`.
     #[test]
-    fn resolve_target_has_exactly_the_five_known_call_sites() {
+    fn resolve_target_has_exactly_the_six_known_call_sites() {
         let mut callers: Vec<String> = crate_sources()
             .iter()
             .flat_map(|(_, text)| handle_reads(&non_test_region(text)).resolver_callers)
@@ -4058,11 +4059,12 @@ mod tests {
             [
                 "apply_enabled",
                 "apply_remove",
+                "perform_socket_poll",
                 "perform_socket_swap",
                 "poke_named",
                 "run_use",
             ],
-            "the five label-resolving call sites; a new one is a new verb that must also be \
+            "the six label-resolving call sites; a new one is a new verb that must also be \
              dispositioned in HANDLE_READ_REGISTER, and a MISSING one is a site that stopped \
              sharing the resolver"
         );

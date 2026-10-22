@@ -178,9 +178,10 @@ mod socket;
 
 pub(crate) use socket::{
     notify_restored, notify_roster_reload, request_swap, write_capture_ack, write_config_set_ack,
-    write_swap_ack, CaptureAck, CaptureCommand, CaptureRejection, ConfigSetAck, ConfigSetCommand,
-    ConfigSetEffect, ConfigSetRejection, Control, ControlSignal, ControlYield, ReloadIntent,
-    SwapAck, SwapCommand, SwapRejection, UnixControl, SWAP_ACK_WRITE_TIMEOUT,
+    write_poll_ack, write_swap_ack, CaptureAck, CaptureCommand, CaptureRejection, ConfigSetAck,
+    ConfigSetCommand, ConfigSetEffect, ConfigSetRejection, Control, ControlSignal, ControlYield,
+    PollAck, PollCommand, PollRejection, ReloadIntent, SwapAck, SwapCommand, SwapRejection,
+    UnixControl, SWAP_ACK_WRITE_TIMEOUT,
 };
 // `serve_control` / `control_reply` / `MAX_CONTROL_LINE_BYTES` are exercised only by the
 // in-module socket tests (production reaches them through `UnixControl::serve`); `serve_watch` /
@@ -1363,6 +1364,9 @@ struct AccountRuntime {
     /// Whether this account has been polled at least once this run (issue #80). Drives the warm-up
     /// latch [`warmed_up`](DecisionState::warmed_up).
     polled_once: bool,
+    /// Tick of the most recent poll attempt, so a forced request cannot acknowledge an old reading
+    /// when this tick stopped before polling. This stamp does not affect scheduled poll order.
+    last_polled_tick: Option<u64>,
 }
 
 /// Per-account decision helpers (issue #669, the final step of the #637 `daemon.rs`
@@ -2553,6 +2557,11 @@ where
     /// Run one poll iteration: resolve the active account, poll every roster
     /// account, then decide and (if warranted) swap.
     pub(crate) async fn tick(&mut self) -> TickOutcome {
+        self.tick_with_poll_target(None).await
+    }
+
+    /// An explicit target takes one tick without consuming the scheduled account's turn.
+    async fn tick_with_poll_target(&mut self, forced: Option<usize>) -> TickOutcome {
         self.state.ticks += 1;
         let at = self.clock.now();
         // Issue #1452: the active designation this tick STARTED on, captured before anything can
@@ -2691,7 +2700,11 @@ where
         // disabled / quarantined active is still polled (swap-AWAY trigger, dead-active
         // re-probe), never a disabled / quarantined non-active. A locked keychain is
         // handled at top-of-tick, not here (see `locked_tick`).
-        let poll_idx = self.next_poll_index(active);
+        if forced.is_some() && self.state.poll_schedule.is_empty() {
+            // Warm-up must still observe every rotation account even before a scheduled turn.
+            self.state.poll_schedule = self.build_poll_schedule(active);
+        }
+        let poll_idx = forced.or_else(|| self.next_poll_index(active));
         // The per-account rate-limit / transient back-off this tick imposed (issue #293,
         // the per-account revision of #76): the widened wait the account polled this tick
         // earned by a `429` / `5xx`, plus the raw server `Retry-After` source label (issue
@@ -2714,9 +2727,10 @@ where
         // re-polling it every `poll_secs` wastes a request. Same skip mechanics as the back-off
         // (slot consumed, readings carried, no usage request); the ACTIVE account is
         // exempt inside `exhausted_slow_polling` so its swap-away trigger stays observable.
-        if let Some(i) = poll_idx
-            .filter(|&i| !self.account_backing_off(i) && !self.exhausted_slow_polling(i, active))
-        {
+        if let Some(i) = poll_idx.filter(|&i| {
+            !self.account_backing_off(i)
+                && (forced == Some(i) || !self.exhausted_slow_polling(i, active))
+        }) {
             let polled = self.poller.poll(&self.roster[i], active == Some(i)).await;
             // Record ONE usage sample for this poll (issue #156): piggyback the
             // reading just fetched (no extra usage-API call), recording nothing on a
@@ -3256,6 +3270,7 @@ where
     /// [`decide_action`](Self::decide_action)).
     fn note_polled(&mut self, i: usize) {
         self.state.accounts[i].polled_once = true;
+        self.state.accounts[i].last_polled_tick = Some(self.state.ticks);
         if !self.state.warmed_up
             && self
                 .state
@@ -5649,8 +5664,9 @@ where
 
     /// Sleep until the next single-account poll is due — a freshly drawn, jittered
     /// sub-interval (issues #38, #80) handed to the [`Clock`] seam.
-    pub(crate) async fn wait_for_next_poll(&mut self) {
+    pub(crate) async fn wait_for_next_poll(&mut self, deadline: &std::cell::Cell<Option<Instant>>) {
         let interval = self.next_subinterval();
+        deadline.set(Some(self.clock.now() + interval));
         self.clock.tick(interval).await;
     }
 
@@ -5660,10 +5676,23 @@ where
     /// back-off no longer rides this wait (issue #293): it is per-account, applied by
     /// skipping the throttled account inside `tick`. Behind the [`Clock`] seam, so tests
     /// drive both paths deterministically.
-    pub(crate) async fn wait_after_tick(&mut self, next_wait: Option<Duration>) {
+    pub(crate) async fn wait_after_tick(
+        &mut self,
+        next_wait: Option<Duration>,
+        deadline: &std::cell::Cell<Option<Instant>>,
+    ) {
+        if let Some(at) = deadline.get() {
+            self.clock
+                .tick(at.saturating_duration_since(self.clock.now()))
+                .await;
+            return;
+        }
         match next_wait {
-            Some(backoff) => self.clock.tick(backoff).await,
-            None => self.wait_for_next_poll().await,
+            Some(backoff) => {
+                deadline.set(Some(self.clock.now() + backoff));
+                self.clock.tick(backoff).await;
+            }
+            None => self.wait_for_next_poll(deadline).await,
         }
     }
 
@@ -12748,6 +12777,155 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_forced_poll_after_unlock_does_not_finish_warmup_early() {
+        let (_dir, mut daemon) = two_account_rate_limit_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.99, 0.10)
+                .ok("u-B", 0.10, 0.10),
+        )
+        .await;
+        daemon.store.set_locked(true);
+        assert_eq!(daemon.tick().await.action, TickAction::KeychainLocked);
+        assert!(daemon.state.poll_schedule.is_empty());
+        daemon.store.set_locked(false);
+        let (ack, outcome) = daemon
+            .perform_socket_poll(&PollCommand {
+                target: "u-A".to_owned(),
+            })
+            .await;
+        assert!(matches!(ack, PollAck::Polled { .. }));
+        assert!(
+            !daemon.state.warmed_up,
+            "an unobserved viable peer still blocks warm-up"
+        );
+        assert!(!matches!(
+            outcome.unwrap().action,
+            TickAction::NoViableTarget
+        ));
+        assert_eq!(
+            daemon.state.poll_pos, 0,
+            "forced observation does not consume a scheduled turn"
+        );
+        next_peer_tick(&mut daemon).await;
+        assert!(daemon.state.warmed_up);
+    }
+
+    #[tokio::test]
+    async fn a_forced_poll_clears_the_slow_window_and_resumes_normal_cadence() {
+        let now = wall_clock_now_secs();
+        let (_dir, mut daemon) =
+            two_account_rate_limit_daemon(FakeRosterPoller::new().ok("u-A", 0.10, 0.10).ok_resets(
+                "u-B",
+                0.10,
+                0.99,
+                now + 999_999,
+            ))
+            .await;
+        next_peer_tick(&mut daemon).await;
+        assert!(daemon.state.accounts[1]
+            .health
+            .exhausted_poll_until
+            .is_some());
+        daemon.poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10);
+        let (ack, outcome) = daemon
+            .perform_socket_poll(&socket::PollCommand {
+                target: "spare".to_owned(),
+            })
+            .await;
+        assert_eq!(
+            ack,
+            socket::PollAck::Polled {
+                label: "spare".to_owned()
+            }
+        );
+        let outcome = outcome.unwrap();
+        assert!(peer_polled(&outcome, "spare"));
+        assert!(!peer_polled(&outcome, "active"));
+        assert_eq!(daemon.state.accounts[1].health.exhausted_poll_until, None);
+        assert!(peer_polled(&next_peer_tick(&mut daemon).await, "spare"));
+    }
+
+    #[tokio::test]
+    async fn forced_poll_refuses_unknown_ambiguous_quarantined_and_backing_off_accounts() {
+        let (_dir, mut daemon) = two_account_rate_limit_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .rate_limited("u-B", Some(Duration::from_secs(300))),
+        )
+        .await;
+        next_peer_tick(&mut daemon).await;
+        for (target, reason) in [
+            ("missing", PollRejection::UnknownTarget),
+            ("spare", PollRejection::BackingOff),
+        ] {
+            let ticks = daemon.state.ticks;
+            let (ack, outcome) = daemon
+                .perform_socket_poll(&PollCommand {
+                    target: target.to_owned(),
+                })
+                .await;
+            assert_eq!(ack, PollAck::Rejected { reason });
+            assert!(outcome.is_none());
+            assert_eq!(daemon.state.ticks, ticks);
+        }
+        daemon.state.accounts[1].health.quarantined = true;
+        let (ack, _) = daemon
+            .perform_socket_poll(&PollCommand {
+                target: "spare".to_owned(),
+            })
+            .await;
+        assert_eq!(
+            ack,
+            PollAck::Rejected {
+                reason: PollRejection::Quarantined
+            }
+        );
+        daemon.roster[1].label = daemon.roster[0].label.clone();
+        let (ack, _) = daemon
+            .perform_socket_poll(&PollCommand {
+                target: daemon.roster[0].label.clone(),
+            })
+            .await;
+        assert_eq!(
+            ack,
+            PollAck::Rejected {
+                reason: PollRejection::AmbiguousTarget
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_forced_poll_reports_failure_and_preserves_provider_backoff() {
+        let (_dir, mut daemon) = two_account_rate_limit_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .ok("u-B", 0.10, 0.99),
+        )
+        .await;
+        next_peer_tick(&mut daemon).await;
+        daemon.poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .rate_limited("u-B", None);
+        let (ack, outcome) = daemon
+            .perform_socket_poll(&PollCommand {
+                target: "u-B".to_owned(),
+            })
+            .await;
+        assert_eq!(
+            ack,
+            PollAck::Rejected {
+                reason: PollRejection::Failed
+            }
+        );
+        assert!(outcome.unwrap().events.iter().any(|event| matches!(event,
+            Event::ForcedPoll { account, success: false } if account == "u-B")));
+        assert!(daemon.account_backing_off(1));
+        assert_eq!(daemon.state.accounts[1].health.exhausted_poll_until, None);
+    }
+
+    #[tokio::test]
     async fn the_active_account_is_never_slow_polled_even_when_exhausted() {
         // AC: the ACTIVE account is NEVER slow-polled, even weekly-exhausted — its swap-away
         // trigger must stay observable at full cadence (the #453 active-vs-peer asymmetry).
@@ -17127,7 +17305,7 @@ mod tests {
 
         // AC-5 — and the only thing it wrote on that account is its own anchor.
         //
-        // Destructured rather than spot-checked, so the coverage cannot silently narrow: a TENTH
+        // Destructured rather than spot-checked, so the coverage cannot silently narrow: a new
         // per-account signal fails to compile here until someone decides whether the instrument is
         // allowed to move it. The same discipline `fingerprint` uses for the issue #668 re-key
         // property, applied to the field AC-5 is actually about.
@@ -17141,6 +17319,7 @@ mod tests {
             blind_anchor,
             observation_gap,
             polled_once,
+            last_polled_tick,
         } = &daemon.state.accounts[1];
         assert!(observation_gap.is_some(), "its own anchor moved");
         assert_eq!(last_reading, &before.last_reading);
@@ -17150,6 +17329,7 @@ mod tests {
         assert_eq!(session_high_water, &before.session_high_water);
         assert_eq!(parked_landing, &before.parked_landing);
         assert_eq!(polled_once, &before.polled_once);
+        assert_eq!(last_polled_tick, &before.last_polled_tick);
         // `assert!` rather than `assert_eq!`: `AccountHealth` deliberately derives no `Debug`, and
         // this test is not a reason to give a credential-adjacent record a formatter.
         assert!(
@@ -17990,6 +18170,59 @@ mod tests {
     }
 
     // --- run loop ----------------------------------------------------------
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rejected_poll_does_not_advance_the_run_loop_schedule() {
+        struct RejectThenShutdown {
+            stream: RefCell<Option<tokio::net::UnixStream>>,
+        }
+        impl Control for RejectThenShutdown {
+            async fn serve(&self, _snapshot: &StatusSnapshot) -> ControlYield {
+                if let Some(stream) = self.stream.borrow_mut().take() {
+                    ControlYield::Poll(
+                        stream,
+                        PollCommand {
+                            target: "missing".to_owned(),
+                        },
+                    )
+                } else {
+                    ControlYield::Signal(Some(ControlSignal::ShutdownRequested))
+                }
+            }
+        }
+        let (_dir, mut daemon) = two_account_rate_limit_daemon(
+            FakeRosterPoller::new()
+                .ok("u-A", 0.10, 0.10)
+                .ok("u-B", 0.10, 0.10),
+        )
+        .await;
+        let (_client, server) = tokio::net::UnixStream::pair().unwrap();
+        let control = RejectThenShutdown {
+            stream: RefCell::new(Some(server)),
+        };
+        let logdir = tempfile::tempdir().unwrap();
+        let mut log = EventLog::at(&logdir.path().join("events.log")).unwrap();
+        let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
+        run_loop(
+            &mut daemon,
+            &mut log,
+            &mut diag,
+            &mut FakeShutdown::after(100),
+            &control,
+            &mut NoopRefreshTicker,
+            &mut NoopExternalLoginWatch,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            daemon.poller.requests(),
+            1,
+            "only the initial scheduled poll runs"
+        );
+        assert_eq!(daemon.state.ticks, 1);
+        assert_eq!(daemon.state.poll_pos, 1);
+    }
 
     #[tokio::test]
     async fn run_loop_ticks_deterministically_and_stops_on_shutdown() {
