@@ -424,9 +424,10 @@ const MIN_VELOCITY_SAMPLES: u32 = 2;
 /// exactly as the projection extends further beyond the validated envelope — whereas a fixed additive
 /// margin would just re-lower the anchor band, the level-vs-level move issue #584 shows cannot work.
 ///
-/// Biased HIGH by the swap-timing asymmetry (issue #484): a too-HIGH factor only over-reports DEGRADED
-/// (a scary status line — this arm is REPORT-ONLY, it fires no swap), while a too-LOW one under-reports
-/// and lets the burn stay invisible — the exact #584 failure.
+/// Biased HIGH by the swap-timing asymmetry (issue #484): a too-HIGH factor over-reports DEGRADED
+/// and, since the 2026-09-26 ADR-0017 amendment armed the arm for [`blind_swap`](Daemon::blind_swap),
+/// can fire an early swap — still the cheap side of the asymmetry for an unattended fleet — while a
+/// too-LOW one under-reports and lets the burn stay invisible — the exact #584 failure.
 ///
 /// INTERIM / REVERSIBLE, ratification-pending (issue #584 acceptance criteria / issue #583): promotion
 /// reads the #583-uncensored blind-episode distribution — which now records the never-recovering and
@@ -482,15 +483,22 @@ fn blind_gate_armed(blind_secs: u64, anchor_session: f64) -> bool {
 /// too). This is the exact 2026-07-17 episode issue #584 was filed about (anchor 0.29 climbing
 /// 2.7–4.14 %/min, blind past the interim T, burning while `status` said "auto-protection OK").
 ///
-/// REPORT-ONLY: it does NOT arm a swap. A too-high report only prints a scary status line, but ACTING on
-/// a deliberately-inflated projection off a stale anchor could thrash a good target — a higher-confidence
-/// decision than an honest status line needs (ADR-0017, issue #584). As a disjunct it can only move
-/// `status` OK→DEGRADED, never the reverse, so it strictly strengthens the one-sided
-/// never-"OK"-while-unprotected invariant.
+/// Report AND swap arm: it still disjoins into the `auto_protection_degraded` projection (as a
+/// disjunct it can only move `status` OK→DEGRADED, never the reverse, so it strictly strengthens
+/// the one-sided never-"OK"-while-unprotected invariant) AND, since the 2026-09-26 amendment of
+/// ADR-0017, it ARMS [`blind_swap`](Daemon::blind_swap) as the third arm. Acting on a
+/// deliberately-inflated projection off a stale anchor can thrash a good target, but the
+/// 2026-09-26 episode — a 0.58 anchor under the 0.60 band, no `Retry-After`, a 34-min blind burn
+/// to exhaustion at ~1.1 %/min — showed a level-only gate cannot cover a below-band anchor that is
+/// nonetheless racing to the ceiling, and #484's fire-early-is-cheaper asymmetry prices a wrong
+/// swap below an unswapped exhaustion on a fleet running unattended. The bias-HIGH inflation is
+/// reused deliberately: the swap arm wants the same conservative bound the report arm does.
 ///
 /// Fires only when ALL hold, so a single spike never trips it:
-/// - blind past the interim [`BLIND_GATE_SECS`] (strict `>`, the SAME floor the anchor + server arms
-///   share — below it the blindness is presumed calm / self-resolving), AND
+/// - blind past the interim [`BLIND_GATE_SECS`] (strict `>` — below it the blindness is presumed
+///   calm / self-resolving; as a swap arm this floor sits UNDER the outer
+///   `session_blind_swap_secs` gate in [`blind_swap`](Daemon::blind_swap), so it can only further
+///   delay a firing, never advance one), AND
 /// - a retained [`VelocityEma`] exists and is SUSTAINED (`>= MIN_VELOCITY_SAMPLES` blended intervals — a
 ///   single-interval spike has already decayed, the #539 invariant), AND
 /// - `anchor + rate × BLIND_VELOCITY_RATE_INFLATION × blind_secs >= session_ceiling` — the anchor,
@@ -2863,9 +2871,9 @@ where
                         session_at_recovery: to_pct(fresh.session),
                         near_limit: anchor.session >= self.session_ceiling_base,
                         // Issue #634: the retained #539 velocity in force through the window, so the
-                        // REPORT-ONLY blind velocity-projection arm
-                        // ([`blind_velocity_projected_armed`], #584/#600) — which fires no swap and
-                        // so emits no event of its own — is reconstructable offline from this line.
+                        // blind velocity-projection arm
+                        // ([`blind_velocity_projected_armed`], #584/#600) — which emits no event of
+                        // its own — is reconstructable offline from this line.
                         // Genuinely the PRE-BLIND rate: the velocity fold above is gated on a
                         // previous live reading (`accounts[i].last_reading`), which is exactly what this
                         // branch requires to be `None`, so the recovery poll cannot have blended
@@ -4826,10 +4834,12 @@ where
     /// anchor (`last_good`, #450), NEVER the missing reading, and swaps only when ALL hold:
     ///
     /// - blind past the config `session_blind_swap_secs` (strict `>`), AND
-    /// - EITHER the anchor — plausibility-corrected to its window high-water mark (issue #619), so a
-    ///   stale-low pre-blind reading cannot disarm the gate — sat at/over the config
-    ///   `session_blind_risk_band` (the ratified #452 arm) OR a nonzero server `Retry-After` is
-    ///   still holding the account off its usage poll (the #582 arm, below), AND
+    /// - AT LEAST ONE of: the anchor — plausibility-corrected to its window high-water mark (issue
+    ///   #619), so a stale-low pre-blind reading cannot disarm the gate — sat at/over the config
+    ///   `session_blind_risk_band` (the ratified #452 arm); a nonzero server `Retry-After` still
+    ///   holding the account off its usage poll (the #582 arm, below); OR the retained velocity
+    ///   EMA projecting the plausible anchor across `session_ceiling_base` inside the blind window
+    ///   (the #584 arm, below — report-only until the 2026-09-26 ADR-0017 amendment armed it), AND
     /// - a viable target exists — a peer under `target_max_session_usage` (ADR-0013), chosen via
     ///   [`selection::pick_target_with_reason`] with the BASE (un-jittered) triggers, exactly as
     ///   [`note_blind_gate_eligibility`](Self::note_blind_gate_eligibility)'s premise SLI (#482)
@@ -4861,7 +4871,21 @@ where
     /// arithmetic; it reads the retained directive
     /// ([`server_retry_after_holding`]) purely as a decision
     /// input, and reuses `reason=blind_preempt` + the `session_blind_swap_secs` bound (so the
-    /// documented kill-switch still disables BOTH arms, and no new tunable is introduced).
+    /// documented kill-switch still disables every arm, and no new tunable is introduced).
+    ///
+    /// # The velocity-projection arm (issue #584, armed 2026-09-26)
+    ///
+    /// [`blind_velocity_projected_armed`] — the predicate behind the `auto_protection_degraded`
+    /// `status` projection — is the third arm. A level-only gate cannot cover a below-band anchor
+    /// racing to the ceiling: on 2026-09-26 the active went blind with a retained anchor of 0.58
+    /// (under the 0.60 band) and no `Retry-After`, then burned to exhaustion in 34 min at
+    /// ~1.1 %/min while 83 ticks skipped — the anchor arm could not see the climb and no directive
+    /// existed. The retained, SUSTAINED velocity EMA projects the same plausible anchor the anchor
+    /// arm uses across `session_ceiling_base` over the blind window at the bias-HIGH
+    /// [`BLIND_VELOCITY_RATE_INFLATION`] bound; reaching it arms the swap exactly like the anchor
+    /// arm, so a velocity-armed swap is NOT subject to the #582 circuit-breaker below. Its own
+    /// [`BLIND_GATE_SECS`] floor sits under the outer config gate, and `session_blind_swap_secs`
+    /// remains the kill-switch for all three arms.
     ///
     /// # The circuit-breaker (issue #582)
     ///
@@ -4869,8 +4893,9 @@ where
     /// `RA:3600` within minutes of TAKING the slot, while peers never got one. An unbounded
     /// swap-away therefore WALKS the throttle around the roster, so this arm is bounded twice —
     /// and both bounds apply ONLY when it is firing on its own authority (a server directive with
-    /// the anchor BELOW the band). A swap the ratified #452 arm would have fired anyway is left
-    /// exactly as it was; the breaker can only ever make the newer, more speculative arm yield:
+    /// NEITHER the anchor NOR the velocity arm armed). A swap the ratified #452 arm or the #584
+    /// velocity arm would have fired anyway is left exactly as it was; the breaker can only ever
+    /// make the newer, more speculative arm yield:
     ///
     /// - **Never spend the LAST viable target.** This swap acts on a directive, not on observed
     ///   near-limit usage, so it must yield the final target to a CONFIRMED-exhaustion swap rather
@@ -4921,25 +4946,42 @@ where
         // lower bound, never a synthesized number); the stored anchor + every measurement/display
         // surface keep the raw value (see `swap::plausible_anchor_session`).
         let blind_elapsed = at.saturating_duration_since(anchor.at).as_secs();
-        let anchor_armed = swap::plausible_anchor_session(
+        let plausible_anchor_session = swap::plausible_anchor_session(
             self.state.accounts[active_idx].session_high_water,
             anchor.session,
-        ) >= self.session_blind_risk_band;
+        );
+        let anchor_armed = plausible_anchor_session >= self.session_blind_risk_band;
         // Issue #582: the server-directed arm. A nonzero `Retry-After` STILL holding the active
         // account off its poll arms the gate on its OWN, wherever the anchor sat — below the band
         // that blindness is otherwise unreachable by every swap path (see the doc comment). Shares
         // condition 1 (`session_blind_swap_secs`), so the kill-switch disables both arms.
         let retry_after = server_retry_after_holding(&self.state.accounts[active_idx].health, at);
+        // The #584 velocity-projection arm, PROMOTED from report-only to a third swap arm
+        // (ADR-0017, amended 2026-09-26): a below-band anchor is not safe when the retained
+        // velocity EMA projects the blind account across `session_ceiling_base` inside the blind
+        // window — the 2026-09-26 episode (anchor 0.58 under the 0.60 band, no Retry-After, a
+        // 34-min burn to exhaustion) sat below every level-only arm. Decides on the SAME
+        // plausibility-corrected `gate_session` the anchor arm and the `status` projection use,
+        // and additionally floors on the interim [`BLIND_GATE_SECS`] (the arm's own calm floor —
+        // it can never fire earlier than that even if the config bound is set lower), while the
+        // `session_blind_swap_secs` kill-switch still disables it along with the other arms.
+        let velocity_armed = blind_velocity_projected_armed(
+            blind_elapsed,
+            plausible_anchor_session,
+            self.state.accounts[active_idx].session_velocity,
+            self.session_ceiling_base,
+        );
         if !(blind_elapsed > self.session_blind_swap_secs
-            && (anchor_armed || retry_after.is_some()))
+            && (anchor_armed || retry_after.is_some() || velocity_armed))
         {
             return TickAction::SkippedActiveUnavailable;
         }
         // The #582 circuit-breaker's subject: the server-directed arm firing on its OWN authority —
-        // a directive with the anchor BELOW the band. When the anchor IS armed the ratified #452
-        // swap fires regardless of the directive, so bounding it there would regress a ratified AC;
-        // `None` here leaves that path byte-for-byte unchanged.
-        let speculative = retry_after.filter(|_| !anchor_armed);
+        // a directive with no other arm armed. When the anchor OR the velocity arm is armed the
+        // swap is evidence of near-limit usage in its own right (a ratified #452 swap or a #584
+        // projection to the ceiling), not a speculative read of a directive, so it is NOT subject
+        // to the walk/reserve breakers; `None` here leaves those paths byte-for-byte unchanged.
+        let speculative = retry_after.filter(|_| !anchor_armed && !velocity_armed);
         // #80 warm-up: until the staggered loop has polled every rotation account once, the
         // carried readings are partial — a viable-target verdict off them could be spurious, so
         // hold (skip) until the first cycle completes. Mirrors the reactive path + the SLI guard.
@@ -5052,8 +5094,9 @@ where
                     session_pct: last_known_session_pct,
                     // The blind-preempt arm's projection ingredients ride its own
                     // `blind_window` line (issue #634), not the swap line — this swap fires on the
-                    // stale anchor, and the retained velocity is carried where the report-only arm
-                    // that consumes it lives. So the swap line itself carries no projection.
+                    // stale anchor, and the retained velocity is carried where the blind
+                    // velocity-projection arm that consumes it lives. So the swap line itself
+                    // carries no projection.
                     projection: None,
                 });
                 // Retain the swap for `status` to NARRATE (issue #479): `record_swap` above cleared any
@@ -5177,10 +5220,11 @@ where
     }
 
     /// The #539 velocity ingredients account `i`'s blind window should carry (issue #634), or `None`
-    /// when the REPORT-ONLY blind velocity-projection arm ([`blind_velocity_projected_armed`],
+    /// when the blind velocity-projection arm ([`blind_velocity_projected_armed`],
     /// issues #584/#600) could not have armed on this account at all.
     ///
-    /// That arm decides but emits nothing — it moves `status` to DEGRADED and fires no swap — so its
+    /// That arm emits nothing of its own — it moves `status` to DEGRADED and, since the 2026-09-26
+    /// arming, can drive a `blind_preempt` swap whose line carries no projection — so its
     /// inputs left no trace and the report was unfalsifiable after the fact. This supplies the one
     /// missing ingredient (the anchor and the window are already on [`Event::BlindWindow`]), letting
     /// an offline reader recompute `anchor + rate × inflation × blind_secs` and check it against the
@@ -5189,8 +5233,8 @@ where
     /// high-water mark is carried alongside it ([`Self::blind_anchor_high_water`],
     /// `session_high_water_pct`, issue #670), letting the recompute apply the SAME correction and
     /// reproduce the arm exactly rather than under-computing off the stale-low base. The recomputation
-    /// is deliberate: the arm is report-only and not in every running binary, so logging the ingredient
-    /// must NOT require the live arm to be active.
+    /// is deliberate: the arm logs no projection of its own and is not in every running binary, so
+    /// logging the ingredient must NOT require the live arm to be active.
     ///
     /// Gated on the SAME sustained-EMA precondition the arm applies (a retained EMA with
     /// `>= MIN_VELOCITY_SAMPLES` blended intervals), so absent tokens mean "this arm could not have
@@ -9234,7 +9278,7 @@ mod tests {
     async fn blind_window_carries_the_retained_velocity_when_the_account_climbed_before_going_blind(
     ) {
         // Issue #634: the load-bearing finding — the #539 EMA retained at the blind-window emit is
-        // the PRE-BLIND one, so the report-only blind velocity-projection arm (#584/#600) is
+        // the PRE-BLIND one, so the blind velocity-projection arm (#584/#600) is
         // reconstructable offline. Drive two climbing intervals to SUSTAIN the EMA (samples ≥ 2),
         // then blind the account and recover it: the velocity fold is gated on a live previous
         // reading — exactly what a blind window clears — so the recovery poll cannot overwrite the
@@ -9360,7 +9404,7 @@ mod tests {
 
     #[tokio::test]
     async fn blind_velocity_ingredients_gate_on_a_sustained_ema() {
-        // Issue #634: the ingredient is published only when the report-only arm could actually have
+        // Issue #634: the ingredient is published only when the velocity-projection arm could actually have
         // armed — a retained EMA that is SUSTAINED (>= MIN_VELOCITY_SAMPLES). No EMA and a
         // single-interval spike both yield `None`, so absent tokens on a `blind_window` line mean
         // "the arm could not have armed here", never "unknown". When present the fraction-domain rate
@@ -10365,6 +10409,118 @@ mod tests {
             Some(0),
             "u-A unchanged — genuinely below the band"
         );
+    }
+
+    // --- #584 velocity-projection arm as a swap arm (ADR-0017, amended 2026-09-26) ------------
+
+    /// A blind daemon on the deciding tick (the `blind_daemon_with_seeded_anchor` fixture: anchor
+    /// and mark both `anchor_session`, one second past the interim gate bound) PLUS a retained
+    /// `session_velocity` EMA on the blind active — the third arm's ingredient. `samples` is the
+    /// caller's knob: `MIN_VELOCITY_SAMPLES` for a SUSTAINED EMA, `1` for a single-interval spike.
+    async fn blind_daemon_with_velocity(
+        anchor_session: f64,
+        rate: f64,
+        samples: u32,
+    ) -> FakeDaemon {
+        let mut daemon = blind_daemon_with_seeded_anchor(anchor_session, anchor_session).await;
+        daemon.state.accounts[0].session_velocity = Some(VelocityEma { rate, samples });
+        daemon
+    }
+
+    #[tokio::test]
+    async fn blind_swap_fires_on_a_velocity_projection_below_the_band() {
+        // The 2026-09-26 episode, replayed: a below-band anchor (0.40 < the 0.60 band — the anchor
+        // arm cannot fire), NO server `Retry-After` (the #582 arm is silent), but a retained,
+        // SUSTAINED velocity EMA whose bias-HIGH projection crosses the 0.95 base ceiling inside
+        // the blind window: 0.40 + 0.002 × 1.75 × 301 ≈ 1.45 ≥ 0.95. The velocity arm is the third
+        // disjunct, so the tick swaps.
+        let mut daemon = blind_daemon_with_velocity(0.40, 0.002, MIN_VELOCITY_SAMPLES).await;
+        let swapped = daemon.tick().await;
+        assert!(
+            matches!(
+                swapped.action,
+                TickAction::PreemptivelySwapped { from: 0, .. }
+            ),
+            "the velocity-projection arm fires the preemptive swap below the risk band: {:?}",
+            swapped.action,
+        );
+        assert_ne!(
+            daemon.state.active,
+            Some(0),
+            "the active moved off the blind u-A"
+        );
+        assert!(
+            swapped.events.iter().any(|e| matches!(
+                e,
+                Event::Swap {
+                    reason: SwapReason::BlindPreempt,
+                    ..
+                }
+            )),
+            "the swap logs reason=blind_preempt like the other arms: {:?}",
+            swapped.events,
+        );
+        assert!(
+            daemon.state.last_blind_preempt_swap.is_some(),
+            "the preemptive swap is retained for `status` to narrate (#479)",
+        );
+    }
+
+    #[tokio::test]
+    async fn blind_swap_velocity_arm_does_not_fire_on_a_projection_below_the_ceiling() {
+        // Negative: a SUSTAINED but SLOW retained EMA — 0.40 + 0.0002 × 1.75 × 301 ≈ 0.51, well
+        // under the 0.95 base ceiling — leaves all three arms disarmed, so the historical skip
+        // stands exactly as `blind_swap_below_the_risk_band_does_not_fire` pins for no velocity.
+        let mut daemon = blind_daemon_with_velocity(0.40, 0.0002, MIN_VELOCITY_SAMPLES).await;
+        let out = daemon.tick().await;
+        assert!(
+            matches!(out.action, TickAction::SkippedActiveUnavailable),
+            "a projection that never reaches the ceiling does not arm the gate: {:?}",
+            out.action,
+        );
+        assert!(
+            !out.events.iter().any(|e| matches!(
+                e,
+                Event::Swap {
+                    reason: SwapReason::BlindPreempt,
+                    ..
+                }
+            )),
+            "no blind_preempt swap fired: {:?}",
+            out.events,
+        );
+        assert_eq!(daemon.state.active, Some(0), "u-A unchanged");
+    }
+
+    #[tokio::test]
+    async fn blind_swap_velocity_arm_needs_a_sustained_ema() {
+        // The arm's own `MIN_VELOCITY_SAMPLES` gate: the SAME firing projection off a
+        // single-interval EMA (`samples: 1` — the spike that has already decayed, the #539
+        // invariant) does not arm the swap. Deliberately the firing rate from the positive test.
+        let mut daemon = blind_daemon_with_velocity(0.40, 0.002, 1).await;
+        let out = daemon.tick().await;
+        assert!(
+            matches!(out.action, TickAction::SkippedActiveUnavailable),
+            "an unsustained EMA never arms the velocity arm: {:?}",
+            out.action,
+        );
+        assert_eq!(daemon.state.active, Some(0), "u-A unchanged");
+    }
+
+    #[tokio::test]
+    async fn blind_swap_velocity_arm_is_disabled_by_the_kill_switch() {
+        // `session_blind_swap_secs` is the kill-switch for the WHOLE path (ADR-0017): parked back
+        // at its 24 h ceiling it disables the velocity arm along with the anchor + server arms,
+        // even with the firing projection in place.
+        let mut daemon = blind_daemon_with_velocity(0.40, 0.002, MIN_VELOCITY_SAMPLES).await;
+        daemon.session_blind_swap_secs = 86_400;
+        let out = daemon.tick().await;
+        assert!(
+            matches!(out.action, TickAction::SkippedActiveUnavailable),
+            "the config kill-switch disables the velocity arm too: {:?}",
+            out.action,
+        );
+        assert_eq!(daemon.state.active, Some(0), "u-A unchanged");
     }
 
     // --- #582 server-`Retry-After` swap-away + circuit-breaker (ADR-0017) ---------------------

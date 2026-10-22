@@ -466,18 +466,19 @@ impl CredentialReadSource {
 ///   tracks the swap the gate actually fires rather than a stale-low pre-blind reading;
 /// - the #582 SERVER-directed arm (`server_retry_after_hold` AND blind past the interim
 ///   [`BLIND_GATE_SECS`]), fronting the #582 swap-away; and
-/// - the #584 VELOCITY-projection arm ([`blind_velocity_projected_armed`]) — the first arm mirroring NO
-///   decision: it reports a BELOW-band anchor whose retained #539 velocity, projected over the blind
-///   window, could PLAUSIBLY reach the trigger (a burn the anchor arm cannot see, because the frozen
-///   anchor sits below the band). The daemon fires no swap on it (report-only, ADR-0017 / issue #584), so
-///   this arm makes `status` HONEST about a blind account it cannot protect rather than protecting it.
+/// - the #584 VELOCITY-projection arm ([`blind_velocity_projected_armed`]) — reporting a BELOW-band
+///   anchor whose retained #539 velocity, projected over the blind window, could PLAUSIBLY reach the
+///   trigger (a burn the anchor arm cannot see, because the frozen anchor sits below the band).
+///   Report-only at introduction (ADR-0017 / issue #584); since the 2026-09-26 ADR-0017 amendment it
+///   also arms [`Daemon::blind_swap`], so this projection now mirrors a real swap DECISION like the
+///   other two arms.
 ///
 /// The invariant the arms serve is ONE-SIDED — `status` must never claim "auto-protection OK" while the
 /// daemon has actually stopped protecting the account. #582's episode was a below-band account blind
 /// behind a `Retry-After: 3600`, burning, while `status` said OK; #584 is its velocity twin — a
 /// below-band account burning fast with NO directive at all. Each arm is a disjunct, so adding one can
-/// only move OK→DEGRADED, never the reverse: the first two mirror a swap DECISION, the velocity arm is
-/// pure honesty with no swap behind it.
+/// only move OK→DEGRADED, never the reverse: all three now mirror a swap DECISION (the velocity arm
+/// joined the swap gate on 2026-09-26).
 ///
 /// `server_retry_after_hold` is [`server_retry_after_holding`]`.is_some()` for THIS account — the
 /// same shared predicate `blind_swap` decides on, so the report and the decision cannot drift. The
@@ -728,7 +729,8 @@ mod tests {
     fn blind_active_view_velocity_arm_degrades_a_fast_below_band_blind_account() {
         // Issue #584: the false-"OK" bug. A BELOW-band anchor (the anchor arm can never fire on it) that
         // was climbing fast when it went blind can burn to the trigger UNSEEN inside the blind window; the
-        // velocity-projection arm reports it DEGRADED even though no swap acts on it (report-only).
+        // velocity-projection arm reports it DEGRADED — and, since the 2026-09-26 arming, this same
+        // projection also arms the swap gate (see `blind_swap_fires_on_a_velocity_projection_below_the_band`).
         let base = Instant::now();
         let trigger = 0.95;
         // The 2026-07-17 incident shape: anchor 0.29, well below the 0.60 band, no server hold, climbing.

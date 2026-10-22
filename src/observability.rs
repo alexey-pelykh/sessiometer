@@ -987,12 +987,12 @@ pub(crate) struct SwapProjection {
 }
 
 /// The retained #539 velocity signal in force during a blind window (issue #634) — the ingredient
-/// that makes the report-only blind velocity-projection arm reconstructable offline, carried on
+/// that makes the blind velocity-projection arm reconstructable offline, carried on
 /// [`Event::BlindWindow`] as optional trailing tokens.
 ///
 /// The blind arm ([`crate::daemon`]'s `blind_velocity_projected_armed`, issues #584/#600) reports a
 /// blind account whose stale anchor, carried forward at its retained EMA rate, plausibly reaches the
-/// ceiling before the daemon sees it again. It fires no swap and emits no event of its own, so its
+/// ceiling before the daemon sees it again. It emits no event of its own, so its
 /// inputs were invisible. `rate` is the missing one — the anchor (`session_pct`) and the window
 /// (`duration_secs`) are already on the line.
 ///
@@ -2039,7 +2039,7 @@ pub(crate) enum Event {
         session_at_recovery: u8,
         near_limit: bool,
         /// The retained #539 velocity signal in force through this blind window (issue #634), or
-        /// `None` when no SUSTAINED EMA was retained — in which case the report-only blind
+        /// `None` when no SUSTAINED EMA was retained — in which case the blind
         /// velocity-projection arm could not have armed here at all.
         ///
         /// Rendered as additive trailing tokens, so a window with no retained velocity leaves the
@@ -3070,8 +3070,8 @@ impl Event {
                 // the usage-family lines.
                 //
                 // Issue #634: the retained #539 velocity in force through the window trails as
-                // additive optional tokens, so the report-only blind velocity-projection arm
-                // (#584/#600) — which fires no swap and emits no event of its own — becomes
+                // additive optional tokens, so the blind velocity-projection arm
+                // (#584/#600) — which emits no event of its own — becomes
                 // reconstructable offline from THIS line:
                 // `projected = anchor + rate × inflation × duration_secs` (anchor = `session_pct`,
                 // raised by the #670 mark token below when present), armed iff it reaches
@@ -9166,7 +9166,7 @@ outcome=failed\n",
     #[test]
     fn blind_window_line_appends_the_retained_velocity_ingredients() {
         // Issue #634: the retained #539 velocity in force through the window trails the line, so the
-        // REPORT-ONLY blind velocity-projection arm (#584/#600) — which fires no swap and emits no
+        // blind velocity-projection arm (#584/#600) — which emits no
         // event of its own — is reconstructable OFFLINE from this one line. Here a 29 % anchor was
         // blind for 8 min (480 s) at 0.05 %/s, inflated 1.75× against the 95 % base ceiling:
         // `projected = 29 + 0.05 × 1.75 × 480 = 71 %` — below the ceiling, so the arm would NOT have
