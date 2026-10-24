@@ -1296,3 +1296,602 @@ load-bearing, and here, where it is re-walked: a doc comment is not re-verified 
 is the whole reason both exist. Keep the two in step.
 
 CC-independent (Apple `/usr/bin/security`) · macOS 26.5.2 / 25F84 · sessiometer #769.
+
+---
+
+# Issue #1020 side probe — seeded argv `/exit` exits before login (patched wrapper); no resume-hint switch found (spike)
+
+The operator proposed ending the isolated interactive login without typing `/exit`, by passing it on
+the command line: `claude '/exit'`. Their reading was that an unauthenticated Claude Code would *"go
+through login first and then once done execute exit"*. The same ask was the fourth part of the
+2026-08-04 scope brief (`docs/briefs/2026-08-04-scope-gui-cli-capability-parity.md`), which set it
+aside as moot under `auth login`. The operator also asked whether the `Resume this session with:`
+lines the child prints on exit can be switched off. This entry records what Claude Code **2.1.294**
+does with both, run through the operator's byte-patched wrapper (see Environment). It is a side
+probe for #1020, not #1020's acceptance record. That record is the real-login walk the issue's
+acceptance criteria name.
+
+**Terms.** A *profile* is the configuration Claude Code starts with: the operator's default
+`~/.claude`, or an isolated `CLAUDE_CONFIG_DIR`, either empty or *seeded*. The *seed* is the
+`.claude.json` that `onboarding_seed` (`src/login.rs`) writes into the isolated directory. It holds
+`hasCompletedOnboarding`, `theme` and `hasTrustDialogAccepted` at the top level, and a per-project
+`hasTrustDialogAccepted` for the working directory. The shell block below writes the same content;
+its key order differs from `onboarding_seed`'s output, which `serde_json` sorts. A *positional* is a
+command-line argument that is not an option, here the root command's `[prompt]`. The measured *arms*
+are the six rows lettered A to F of the results table. The two `B, re-run` rows repeat arm B, and
+the two *canaries* are control runs. The *draft reviews* are the two automated reviews of earlier
+drafts of this entry; each re-ran arm B. The instruments were: the *2026-10-21 rig*, a `pty.fork()`
+program described under Provenance, which ran the arms and canaries; the two *re-run rigs*, one per
+draft review; and the *earlier scratch rig* of 2026-09-09 and 2026-10-21, which produced the two
+withdrawn readings. One more arm, the *operator-driven unseeded arm* proposed below, was not
+measured. Each claim below names its evidence kind. *Measured*: a run or a probe whose result this
+entry quotes, with who ran it and its date; reading a file on the operator's machine counts as a
+probe. *Code reading*: a quoted excerpt of the stock binary, or a reading labelled as not quoted.
+*Reported*: an operator report, with its date. *Source reading*: this repository's own code or
+documents, earlier entries of this ledger included. *Review record*: an automated review's own
+record of what it ran, not committed. *Inference*: a reading the entry draws from the records or
+code named beside it; it is not itself measured.
+
+Legend: ✅ measured at 2.1.294, through the operator's patched wrapper · ⚠️ open or partial.
+
+**Verdict.** On the seeded profile that sessiometer's login child starts in today, argv `/exit` is
+no route to *log in, then exit*. The positional runs as a slash command. The process exits 0 in
+under 2 s (1.0 s, 1.9 s and 1.5 s in the three seeded runs) and offers no login. The status line
+reads `Not logged in · Run /login`. The operator's own run of `claude '/exit'` by hand on a seeded
+profile also exited without offering a login (*reported*, 2026-10-22). The three measured runs went
+through the patched wrapper. The hand run did too, inferred from the launcher reading under
+Environment. The stock binary was not run. A second positional did not run in the arms that passed
+one: `claude '/login' '/exit'` opened the login dialog, and `/exit` had not run 25 s later, with the
+dialog unanswered. Whether it would run after a completed login was not measured, and the parser
+trace is incomplete. Without the seed, onboarding comes first. The one unseeded run had nobody at
+the keyboard and waited at the theme picker. So whether onboarding still runs its own login, as `#
+#130` recorded at 2.1.197, and whether `/exit` runs after it, is **unmeasured**. For the resume
+hint, no switch was found. The one option that sets the guard the hint checks is
+`--no-session-persistence`. By the code quoted below, which was not run, the start-up code refuses
+that option in an interactive session. Also by the code, two environment variables turn transcript
+saving off: `CLAUDE_CODE_SKIP_PROMPT_HISTORY` set to a non-empty value, and an inherited
+`CLAUDE_CODE_CHILD_SESSION` marker under conditions given below. By the code, the local `--resume`
+hint cannot print without a transcript, while the `--cloud` form for cloud sessions has no such
+guard. Neither variable was run. Whether the hint prints when the seeded `/exit` exits is
+unmeasured: the two re-runs that left a transcript captured neither the farewell their transcripts
+record nor the hint, and the records do not say why.
+
+**What is settled.** On the seeded profile, through the patched wrapper, argv `/exit` exits without
+a login: the three measured runs of `claude '/exit'` there and the operator's run by hand agree.
+#1020's move to `auth login --claudeai` (ADR-0032) stays the planned route for removing the typed
+`/exit`.
+
+**What is not.** Each open item names the section that holds it and the run that would close it.
+
+- That `auth login --claudeai` exits by itself once its OAuth completes. #1020's body states it,
+  and the 2026-08-04 brief says it exits on its own. ADR-0032's Decision assumes it when it says the
+  change removes the operator's manual `/exit`, and its Consequences repeat that. The solution
+  design states it in § 5.3 (`docs/design/gui-cli-capability-parity-solution-design.md`). The PRD
+  (`docs/requirements/gui-cli-capability-parity.md`) says in § 1.3 that the command runs to
+  completion. Its § 7 assumption registry does not list the self-exit: the registry's A-1, which the
+  PRD calls "the one residual empirical claim from the spike", concerns where `auth login` writes
+  the credential. No walk has measured the self-exit: the ADR-0032 walk stopped at its 20 s timeout
+  without completing an OAuth. #1020's real-login walk would close it (Downstream).
+- Whether an unseeded `claude '/exit'`, with an operator answering onboarding, logs them in and
+  then exits. The operator-driven unseeded arm would close it (the onboarding Finding; Downstream).
+- Whether a second positional runs once a login completes. An arm-D re-run in which an operator
+  completes the login would close it (the second-positional Finding).
+- Whether the hint prints when the seeded `/exit` exits. The two re-runs' captures hold neither the
+  farewell their transcripts record nor the hint, and why is not established, so they say nothing
+  about it. The shell block run by an operator in a plain terminal, watching for a farewell and then
+  for the hint, would close it (the resume-hint Finding).
+- Whether the patch in the operator's wrapper touches any path the arms exercised. Also whether
+  `BROWSER`, `DISABLE_AUTOUPDATER`, or the `DISABLE_TELEMETRY`, `DISABLE_ERROR_REPORTING` and
+  `DISABLE_BUG_COMMAND` that the production login child also sets (`src/isolated_spawn.rs`), change
+  arm B. Arm B run on the stock binary with the production child's environment would close both
+  (Environment; the seeded-exit Finding).
+- What `CLAUDE_CODE_SKIP_PROMPT_HISTORY` or the inherited marker does to a real login child, and
+  whether a notice or the hint stays in the terminal's scrollback after exit. One operator-run
+  `sessiometer login` per case would close them; #1542 tracks them (the resume-hint Finding).
+
+## Environment
+
+| Field | Value |
+|---|---|
+| Claude Code version | `2.1.294` (`BUILD_TIME 2026-10-08T02:40:59Z`, `GIT_SHA 8f033c6ebe3d82a87f502e199307f38f5d55ccca`), above the crate's advertised supported range |
+| Supported range | unchanged. This entry does not widen `CC_SUPPORTED_MAX`, and does not re-verify H3 or the #100 keychain-service derivation at 2.1.294; widening stays with #1306 |
+| macOS | `27.0.1` / `26A434` |
+| Runs | 2026-10-21, arms A to F and both canaries, by the author; one re-run of arm B in each draft review: the first on 2026-10-22 (UTC), by the review that ran from 2026-10-22 into 2026-10-23 (UTC); the second on 2026-10-23 (UTC) |
+| `claude` that ran the arms | a byte-patched wrapper first on `PATH`, as `# Issue #101` above also records for the operator's `claude`. *Measured*: the author read the launcher file on 2026-10-23 (UTC). It is a bash launcher that sets `DISABLE_AUTOUPDATER=1` and runs a patched copy of the stock binary. Its modification time, 2026-10-08, predates the runs. So the arms and canaries ran the patched copy. The live probes `# Issue #101` records used the stock binary directly; these arms did not |
+| Binary decoded | the stock `~/.local/share/claude/versions/2.1.294` (*code reading*). Each fragment quoted below, between elisions, was counted byte-exactly in both files. It occurs once in the stock binary, and once at the same offset in the wrapper's patched copy. That comparison covers only the quoted fragments. Whether the patch touches the other paths the arms exercised was not checked: onboarding and the theme picker, the status line and the `Not logged in` replies, and the login dialog. So the behavioural results stand for stock 2.1.294 only as far as the patch leaves those paths unchanged |
+
+## Results at a glance
+
+Verdict lines are quoted as each rig printed them; the first re-run rig puts a space before the `s`.
+`TIMEOUT: still running at N.Ns, killed` means the child had not exited when the deadline passed.
+"Never echoed" means the string did not appear on the captured screen before then. *Not recorded*
+means the run's surviving record does not say. For each re-run, that record holds the raw
+pseudo-terminal output and the transcript; the first also describes the final screen. The rigs' own
+status-line detectors read false in both records, because cursor-positioning codes split the words;
+the Screen cells read the raw bytes.
+
+| Arm | Argv | Profile | Verdict line | Screen at the end | Transcript and hint |
+|---|---|---|---|---|---|
+| canary + | `claude --version` | default `~/.claude` | `EXITED code=0 at 0.1s` | the version string | no session |
+| canary − | `claude` | isolated, seeded, unauthenticated | `TIMEOUT: still running at 12.2s, killed` | the REPL prompt | not recorded |
+| A | `claude '/exit'` | default `~/.claude`, logged in | `EXITED code=0 at 2.3s` | not recorded | not recorded |
+| B | `claude '/exit'` | isolated, seeded, unauthenticated | `EXITED code=0 at 1.0s` | `❯ /exit`; status line `Not logged in · Run /login` | not recorded |
+| B, re-run 1 | `claude '/exit'` | isolated, seeded, unauthenticated | `EXITED code=0 at 1.9 s` | `❯ /exit`, a spinner verb, the empty input box and the footer with `Not logged in · Run /login`; no farewell | a transcript written, ending `Goodbye!`; the captured raw output holds neither that farewell nor a `Resume this session` line, and the records do not say why |
+| B, re-run 2 | `claude '/exit'` | isolated, seeded, unauthenticated | `EXITED code=0 at 1.5s` | `❯ /exit`, a spinner verb, the empty input box and the footer with `Not logged in · Run /login`; no farewell | a transcript written, ending `Catch you later!`; the captured raw output holds neither that farewell nor a `Resume this session` line, and the records do not say why |
+| C | `claude '/exit'` | isolated, empty (no `.claude.json`) | `TIMEOUT: still running at 20.2s, killed` | the first-run theme picker, unanswered | not recorded |
+| D | `claude '/login' '/exit'` | isolated, seeded, unauthenticated | `TIMEOUT: still running at 25.1s, killed` | `❯ /login` and the "Select login method" dialog; `/exit` never echoed | not recorded |
+| E | `claude 'ZZPROMPT' '/exit'` | isolated, seeded, unauthenticated | `TIMEOUT: still running at 25.1s, killed` | `ZZPROMPT` answered `Not logged in · Please run /login`; `/exit` never echoed | not recorded |
+| F | `claude 'ZZPROMPT /exit'`, one argument | isolated, seeded, unauthenticated | `TIMEOUT: still running at 20.2s, killed` | the whole string submitted as one prompt and answered `Not logged in · Please run /login` | not recorded |
+
+## Finding — on the seeded profile, argv `/exit` exits before any login ✅
+
+*Measured* (arms B, C, E and F, and the re-runs of arm B). With `hasCompletedOnboarding:true`
+seeded, Claude Code opens the REPL showing `Not logged in · Run /login` and waits for someone to
+type it. A prompt does not change that: in arms E and F the prompt is answered
+`Not logged in · Please run /login`, and no login flow opens. So on this profile `claude '/exit'`
+exits in under 2 s having logged nobody in (arm B and its two re-runs). The seed is what skips the
+first-run screens; arm C, without it, stopped at the theme picker. `onboarding_seed`
+(`src/login.rs`) exists because first-start onboarding's own login made the operator log in twice
+(*source reading*: `# #130` above, propagated to #132).
+
+*Measured* (the re-runs' transcripts) and *code reading*. The exit is the interactive `exit`
+command, not a silent shutdown. Each re-run of arm B left the session's transcript,
+`<sessionId>.jsonl`, in the isolated directory's `projects/`. Its last two records are the command,
+shown here by its `<command-name>` tag (the record also carries `<command-message>` and
+`<command-args>`), and its output. From the first re-run:
+
+```text
+<command-name>/exit</command-name>
+<local-command-stdout>Goodbye!</local-command-stdout>
+```
+
+The second re-run's output record reads `<local-command-stdout>Catch you later!</local-command-stdout>`.
+Both strings sit in the module that exports the exit flow as its `call`. The minified names in this
+excerpt and the later ones are specific to this build; Provenance says how to find each quoted site
+on another build. At 2.1.294, the module's farewell array, its farewell function and its exported
+call, in full:
+
+```js
+var ee=["Goodbye!","See ya!","Bye!","Catch you later!"];function L(){return S$(ee)??"Goodbye!"}async function Ne(d,o){if(Lt())return d(),mQ(),null;let p=Jc()!==null,s=HNo(),t=p||s.length>0?(m)=>e(VOt,{showWorktree:p,backgroundItems:s,messages:o.messages,isMidTurn:o.isMidTurn,getMessages:o.getMessages,getIsResponseStreaming:o.getIsResponseStreaming,onDone:d,onCancel:()=>d(),onBeforeExit:m}):null;if(DW()){let{queued:m}=await Foe({lightweight:!0},o.storageV5).catch(()=>({queued:[],expired:[]})),f=m.filter((h)=>h.source_session_id===K());if(f.length>0)return e(x,{sessionDrafts:f,messages:[...o.messages],renderExitFlow:t,onExit:()=>{d(L()),ape(EO(o),{responseStreaming:Hge(o)},o.storageV5)}})}if(t)return t();return d(L()),await ape(EO(o),{responseStreaming:Hge(o)},o.storageV5),null}export{Ne as call};
+```
+
+The farewell function draws one of the four strings through a sampler (`S$`, a random pick by a
+reading of code not quoted here); the `"Goodbye!"` after `??` is a fallback a non-empty array never
+reaches. The call has four paths, checked in this order. When `Lt()` (not decoded) holds, it
+returns through `d()` with no farewell. When `DW()` (not decoded) holds and session drafts are
+queued for this session, it returns a drafts dialog, whose exit draws the farewell through
+`d(L())`. With a worktree or background items, it returns an exit-flow dialog. That dialog's exit
+callback draws a farewell from a second copy of the same four strings (`Ie(Kt??Eat())`, by a
+reading of code not quoted here). Otherwise it takes the final path. So a farewell record does not
+show which path ran. That the re-runs took the final path is an inference from their conditions: a
+fresh isolated profile with no worktree, no background items and no drafts. How the argv reaches
+the REPL's submit handler was not traced; the finding rests on the exits and the transcripts, not on
+that path.
+
+Operator-reproducible without any rig: the shell block below runs arm B. Run it from a plain
+terminal: a shell inside Claude Code carries `CLAUDE_CODE_CHILD_SESSION`, and any `CLAUDE*` or
+`ANTHROPIC*` variable can change what is measured. The block removes no variable, and it runs
+whatever `claude` the shell resolves, alias or function included. Every measured arm, by contrast,
+ran with every `CLAUDE*` and `ANTHROPIC*` variable removed and `BROWSER=/usr/bin/true`, through the
+wrapper described under Environment. So before running it, check that
+`awk 'BEGIN { for (k in ENVIRON) if (k ~ /^(CLAUDE|ANTHROPIC)/) print k }'` prints nothing. That
+check prints variable names only, never their values; a `grep` over `env` would print the value
+beside each name. Check too that `type claude` names the program you mean. The block
+sets no `BROWSER`. Whether `BROWSER`, `DISABLE_AUTOUPDATER` or the patched binary changes arm B was
+not measured.
+
+The block deletes and recreates `.tmp/seeded-unauth` under the current directory, so run it from a
+scratch directory. It writes the physical working directory into JSON unescaped. A path holding a
+double quote, a backslash or a control character gives invalid JSON, or valid JSON under a different
+key; either way the trust entry does not match.
+
+```sh
+D="$PWD/.tmp/seeded-unauth"; rm -rf "${D:?}"; mkdir -p "${D:?}"
+cat > "${D:?}/.claude.json" <<EOF
+{"hasCompletedOnboarding":true,"theme":"dark","hasTrustDialogAccepted":true,"projects":{"$(pwd -P)":{"hasTrustDialogAccepted":true}}}
+EOF
+time CLAUDE_CONFIG_DIR="${D:?}" claude '/exit'; echo "exit=$?"
+command -v claude; readlink -f "$(command -v claude)"; CLAUDE_CONFIG_DIR="${D:?}" claude --version
+```
+
+Expect the timed line to exit within a few seconds and print `exit=0`. The transcript records a
+farewell such as `Goodbye!`; whether it, or a `Resume this session with:` line, shows on the screen
+was captured in no arm or re-run, and the resume-hint Finding holds that as open, so note what you
+see. A run still waiting after a few seconds has not reproduced arm B: interrupt it with Ctrl-C
+rather than answer its prompts, and check the seed. The last line records which `claude` the shell
+resolved, the file that name resolves to, and the version that `claude` reports, under the same
+isolated directory. It runs after the arm, so that it cannot touch the seed first. It cannot tell a
+stock binary from a wrapper's patched copy: behind this operator's wrapper it prints the launcher's
+path, by the launcher reading under Environment, and only the launcher names the patched copy.
+
+`${D:?}` is a guard. *Measured* by the author on 2026-10-23 against a stub `claude`, with `D` unset
+and again with `D` empty, in `-c` strings under `env -i` (bash with `--noprofile --norc`; `zsh -f`
+with a dummy `HOME`): neither shell ran the stub. Bash stopped at the guard. Zsh printed the guard's
+message, then a time line and `exit=1`, and ran the next command. The guard catches only an unset or
+empty `D`. So if you run one line of the block on its own, run it in the shell and directory where
+the block's first line set `D`.
+
+The guard matters because an empty `CLAUDE_CONFIG_DIR` is not isolation. *Code reading* of the two
+functions below. The global config file resolves under `CLAUDE_CONFIG_DIR` when that variable is
+non-empty, and otherwise under the directory `Ot()` returns, which is not decoded here. The keychain
+service name ends either in a suffix, a hyphen and the first eight hex digits of a SHA-256, or in
+nothing. `CLAUDE_SECURESTORAGE_CONFIG_DIR` decides whenever it is defined: a non-empty value is
+hashed, and an empty value gives no suffix. When it is undefined, a non-empty `CLAUDE_CONFIG_DIR`
+gives a suffix, hashed from what `we()` returns (not decoded here), and an empty or unset one gives
+none. For the credential item the caller passes `-credentials` as `e`, and `cn().OAUTH_FILE_SUFFIX`
+is empty in the production configuration, by a reading of code not quoted here. So with no suffix
+the name is `Claude Code-credentials`, the operator's default item:
+
+```js
+function UEr(){let t=`.claude${jK()}.json`;return i(process.env.CLAUDE_CONFIG_DIR||Ot(),t)}
+```
+
+```js
+function FF(e=""){let n=process.env.CLAUDE_SECURESTORAGE_CONFIG_DIR,t=n!==void 0?!n:!process.env.CLAUDE_CONFIG_DIR,r=n!==void 0?n.normalize("NFC"):we(),c=t?"":`-${i("sha256").update(r).digest("hex").substring(0,8)}`;return`Claude Code${cn().OAUTH_FILE_SUFFIX}${e}${c}`}
+```
+
+*Review record*: the first draft review ran an earlier draft's unguarded last line with `D` empty,
+by accident, and Claude Code used the real `~/.claude.json` and the real account. Provenance has
+that record.
+
+## Finding — without the seed, onboarding comes first, and the operator-driven arm is unmeasured ⚠️
+
+*Measured* (arm C) and *source reading* (`# #130` above, at 2.1.197). Arm C ran on an empty config
+directory with nobody at the keyboard. It stopped at the first-run theme picker and was still there
+at the 20.2 s deadline, so the positional never got its turn. What follows the picker was not
+measured at 2.1.294. `# #130` recorded, at 2.1.197, that a fresh profile's onboarding ran its own
+login and then ran the positional. There the positional was `/login`, which is what made the double
+login. If 2.1.294 keeps that order, an unseeded `claude '/exit'` would walk an operator through
+onboarding, log them in once, and then exit. That is the operator's original reading. Measuring it
+needs an operator to answer onboarding's prompts and complete a real login, so it was not run here.
+Dropping the seed would also bring back the theme picker and the per-folder trust prompt. `# #130`
+recorded that prompt at 2.1.197, recorded that trust is scoped to the working directory, and
+recommended seeding the per-project `hasTrustDialogAccepted` entry; it did not measure that entry
+suppressing the prompt. No recorded run shows it doing so at any version. The seed sets both the
+top-level key and the per-project entry, no arm varied either, and what arm B measured is only that
+no trust prompt blocked its exit.
+
+## Finding — a second positional did not run in arms D and E, so `/login /exit` did not chain there ⚠️
+
+*Measured* (arms D to F). In arm D, `/login` opens the "Select login method" dialog. `/exit` had
+not been echoed by the 25.1 s deadline, with the dialog unanswered. Arm E separates the second
+positional from the dialog: `ZZPROMPT` runs and is answered on auth, and `/exit` had not been echoed
+by 25.1 s either. Arm F folds both into one argument, which is submitted as a single prompt rather
+than dispatched as `/exit`. All three ran on the seeded profile with no login completed.
+
+*Code reading.* The parser is consistent with the second positional being dropped, and the trace is
+incomplete. The root command's declaration takes one positional, and it is not variadic:
+`.argument("[prompt]","Your prompt",String)`. Whether any other declaration adds one was not
+searched. The bundled commander allows excess arguments (`_allowExcessArguments=!0`). Its action
+wrapper hands the action the declared positionals, then the options (or, when
+`_storeOptionsAsProperties` is set, the command itself), then the command object:
+
+```js
+action(t){let e=(i)=>{let n=this.registeredArguments.length,s=i.slice(0,n);if(this._storeOptionsAsProperties)s[n]=this;else s[n]=this.opts();return s.push(this),t.apply(this,s)}
+```
+
+Whether the root action reads the remaining positionals off that command object was not traced. A
+reading in which the second positional is held until a login or a model turn completes fits arms D
+and E, and was not excluded: arm D completed no turn, and arm E's only completed turn was a local
+`Not logged in` reply. So the records show that `/exit` did not run within 25 s before a login.
+That it would not run after one is inferred, not measured. No second-positional shape (arms D to F)
+was seen to *log in, then exit*. The open measurements are the operator-driven unseeded arm (the
+onboarding Finding) and an arm-D re-run in which an operator completes the login.
+
+## Finding — no switch for the resume hint was found; whether it prints on the seeded `/exit` is unmeasured: the two re-runs' captures hold neither the farewell their transcripts record nor the hint ⚠️
+
+*Code reading.* The hint comes from `printResumeHint`. At 2.1.294, in full, with the template
+literals' own line breaks kept:
+
+```js
+printResumeHint(){if(this.resumeHintPrinted)return;if(process.stdout.isTTY&&fp())try{let e=Fn()?mr():null,n=e?.sessionId!==void 0&&!e.viewerOnly?UIe(Kd(e.sessionId)):null;if(n!==null){_A(1,ge.dim(`
+Resume this session with:
+claude --cloud ${n}
+`)),this.resumeHintPrinted=!0;return}}catch{}if(process.stdout.isTTY&&fp()&&!Hx())try{let e=K();if(!gEn(e))return;let n=cm(e),r;if(n)r=`"${n.replaceAll("\\","\\\\").replaceAll('"',"\\\"")}"`;else r=e;let s=this.resumeHintOmitsWorktree?void 0:Fms(),g=s?`--worktree ${s} `:"";_A(1,ge.dim(`
+Resume this session with:
+claude ${g}--resume ${r}
+`)),this.resumeHintPrinted=!0}catch{}}
+```
+
+The first `try` prints a `--cloud` form for a cloud session and checks no transcript file. The
+local hint's command is `claude --resume <session>`, with `--worktree <name>` added in a worktree,
+and it names no `CLAUDE_CONFIG_DIR`. It passes five guards:
+
+1. `this.resumeHintPrinted` is unset, so the hint was neither printed already nor suppressed.
+2. Stdout is a TTY.
+3. The interactive-mode guard, `fp()`, holds. It reads a launch option:
+
+   ```js
+   function fp(){return n().host.launchOptions.isInteractive()}
+   ```
+
+4. The persistence flag, `Hx()`, is false. It reads a launch option too, which `dvo` sets:
+
+   ```js
+   function dvo(e){n().host.launchOptions.replaceSessionPersistenceDisabled(e)}function Hx(){return n().host.launchOptions.sessionPersistenceDisabled()}
+   ```
+
+   *Measured* by the author on 2026-10-24 by searching the stock binary: the method name
+   `replaceSessionPersistenceDisabled` occurs three times, once outside the JavaScript text, once as
+   the method's definition, and once as the call inside the setter function the excerpt shows. That
+   setter function is called once, as `dvo(!0)`, by the start-up code that handles
+   `--no-session-persistence`; the stock binary's three other `dvo(` sites are the setter's own
+   definition, the definition of a second function of the same minified name elsewhere in the
+   bundle, and that function's one call. That option describes itself as print-only. The start-up
+   code refuses it, with the error below, in an interactive session: before the setter runs, it
+   tests a value that it then passes on as `isNonInteractiveSession`. So the option is no switch for
+   an interactive login child. Whether the error prints in an interactive session was not tested.
+
+   ```js
+   .option("--no-session-persistence","Disable session persistence - sessions will not be saved to disk and cannot be resumed (only works with --print)")
+   ```
+
+   ```js
+   if(o.sessionPersistence===!1){if(!Y)return sn("Error: --no-session-persistence can only be used with --print mode.");dvo(!0)}gi({sdkUrl:He,isNonInteractiveSession:Y});
+   ```
+
+5. The transcript-file guard, `gEn(e)`, finds the session's transcript file:
+
+   ```js
+   function gEn(e){let n=Nj(),r=uc(n,`${e}.jsonl`),s=se();try{return s.statSync(r),!0}catch{return!1}}
+   ```
+
+**Two runs that left a transcript show no farewell and no `Resume this session` line in their
+captured output.** *Measured* (the re-runs of arm B, by the draft reviews; their records, the rig
+code included, re-read by the author on 2026-10-24). Both wrote `<sessionId>.jsonl`, and the last
+record of each holds the farewell (`Goodbye!`, `Catch you later!`). Each rig polled for the child's
+exit while it read the pseudo-terminal, by its code: the first left its read loop only once it had
+seen both end-of-file and the exit, then drained for up to a second; the second left it at the exit
+and then read on until end-of-file or a 0.2 s silence. The first rig recorded end-of-file and the
+reap at the same instant, 1.9 s in, and no kill. The first transcript's farewell record,
+23:23:23.54Z, precedes that end-of-file: the rig's report is dated 23:23:22Z and the arm started
+after it, so end-of-file came at 23:23:23.91Z or later. The second transcript's farewell record,
+00:55:06.44Z, precedes the 1.5 s exit its rig recorded after a start logged at 00:55:05Z; that rig
+did not record the end-of-file instant. Neither captured raw output, 2,846 and 2,842 bytes, holds
+any of the four farewell strings or a `Resume this session` line, with or without cursor-positioning
+codes between the letters; after the echoed `/exit`, both end with a spinner verb, the empty input
+box and the REPL footer, whose status line reads `Not logged in · Run /login` and whose last line
+reads `◐ medium · /effort`. So the transcript records a farewell that the captured terminal output
+does not hold, and the records do not say why. *Inference:* two readings fit, neither measured. In
+one, the farewell and anything after it were written to the terminal and lost when the child closed
+it; in the other, the farewell was never written to the terminal on this exit path, since the exit
+call quoted in the seeded-exit Finding hands it to a callback, `d`, that is not decoded. Because the
+records do not say which reading holds, the captures are no evidence about the hint: in the first
+reading the hint would be lost with the farewell; in the second its absence would mean that a guard
+failed, that the hint's own write was lost the same way, or that this exit path reached none of the
+hint's call sites, none of which the re-runs instrumented. Whether the hint printed in those two
+runs is therefore unmeasured. *Reported:* the operator's real `sessiometer login` run, which
+completed a login and ended with a typed `/exit`, did print the hint. That report is from
+2026-09-09, from a plain terminal. It reached the author as a pasted terminal transcript, is
+recorded nowhere in the repository, and its Claude Code version was not recorded. It is the only
+observation of the hint either way, and one unversioned run does not settle what a plain-terminal
+login does at 2.1.294.
+
+**No switch was found.** *Code reading.* Searches of the stock binary for `RESUME_HINT`,
+`hideResumeHint`, `noResumeHint`, `resume_hint` and `resume-hint` find nothing. The only shutdown
+option found that sets the first guard is `suppressResumeHint`:
+`r?.suppressResumeHint)this.resumeHintPrinted=!0`. By a reading of code not quoted here, the calls
+that pass it are:
+
+- the `claude agents` paths and the fleet-view relaunch;
+- the `refuse` handler that records `helper_failed`, which sits beside a settings `policyHelpers`
+  predicate, and whose call path was not traced;
+- the `cli_resume` path;
+- a fatal-error shutdown;
+- the two exits taken once a conversation has moved to a background session;
+- the backgrounded-conversation return;
+- `job_stop_self`.
+
+Each passes the constant `true`, except the backgrounded-conversation return, whose value is
+computed from the spawn's `resumeHintRequested` (origin not traced). Reaching a call does depend on
+the command line: the `claude agents` paths on that subcommand, and the `cli_resume` path on
+`--resume` given without a value and with several other options absent. By this reading, none of
+them is a user-facing switch for an ordinary interactive exit.
+
+**Two environment variables turn transcript saving off.** *Code reading.* The reason function,
+`hEn()`, names the reason saving is off, and `function Na(){return hEn()!==null}` reads it; the
+transcript writer's use of that predicate is a code reading not quoted here. The branches of the
+reason function at 2.1.294:
+
+```js
+function hEn(){if(_As()==="test"&&!a.TEST_ENABLE_SESSION_PERSISTENCE)return"test_env";if(Hx())return"explicit_disable";if(a.CLAUDE_CODE_SKIP_PROMPT_HISTORY)return"skip_prompt_history";if(sKe())return"nested_marker";return null}
+```
+
+This build defines `function _As(){return"production"}`, so the first branch never fires, and the
+second is the persistence flag above. That leaves `CLAUDE_CODE_SKIP_PROMPT_HISTORY`, and an
+inherited `CLAUDE_CODE_CHILD_SESSION` marker, which the marker predicate `sKe()` reads, with the
+team predicate `yc()`:
+
+```js
+function sKe(){if(a.CLAUDE_CODE_FORCE_SESSION_PERSISTENCE)return!1;if(!(a.CLAUDE_CODE_CHILD_SESSION&&fp()&&!yc()))return!1;return!n().isChildSessionMarkerAmbientInTmux()}
+```
+
+```js
+function yc(){if(hA())return!0;let{dynamicTeamContext:t}=n();return!!(t?.agentId&&t?.teamName)}
+```
+
+So `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE` overrides the marker. The marker counts only in an
+interactive session that is neither in a dynamic team context nor in the state the team predicate's
+first branch (`hA()`, not decoded) names. And a marker that the ambient probe judges ambient does
+not count; that probe's rule is not decoded, and its name is the only ground for reading it as
+tmux. With saving off there is no `<sessionId>.jsonl`, so by the transcript-file guard the local
+hint cannot print. That is a reading of the code; neither variable was run. Instead of a line at
+exit, each shows a notice while the session runs. The notice is registered under
+`var fUe="persistence-suppressed"` at priority `"high"`, by a reading of code quoted only in part:
+`Wg(fUe,"high",k==="skip_prompt_history"||k==="nested_marker"?k:null,yUe)`. Joined, the two text
+nodes of each notice read:
+
+> Transcript saving is off — CLAUDE_CODE_SKIP_PROMPT_HISTORY is set · --resume will not find this session; if unintended, unset it and restart
+
+> Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker · restart with CLAUDE_CODE_FORCE_SESSION_PERSISTENCE=1 to keep future transcripts
+
+**For sessiometer, two things follow.** *Source reading* (`src/isolated_spawn.rs`, `src/login.rs`,
+#103, #133) and *code reading*. First, the hint names no `CLAUDE_CONFIG_DIR`, while the transcript
+it points at sits in the isolated directory. `IsolatedSession` teardown removes that directory,
+best-effort, when sessiometer returns, panics, times out, is cancelled or takes SIGINT
+(`src/isolated_spawn.rs`). After a crash, the orphan reaper (#103, extended to login in #133)
+removes it later. So when the hint prints, it points at a transcript sessiometer deletes. Second,
+the marker reaches the login child. Claude Code sets it for the processes it starts:
+
+```js
+function dGe(e){let n={CLAUDECODE:"1",CLAUDE_CODE_SESSION_ID:e.sessionId,CLAUDE_CODE_CHILD_SESSION:"1",…
+```
+
+`SPAWN_ENV_REMOVE` (`src/isolated_spawn.rs`) does not remove it, and `sessiometer login` refuses to
+start unless its stdout is a terminal (`require_tty`, `src/login.rs`).
+
+*Measured* (a probe by the author on 2026-10-23, in the Bash tool of the Claude Code session that
+wrote this entry; that session's process command line, read with `ps` on 2026-10-23, names the
+wrapper's patched copy of 2.1.294): `printenv CLAUDE_CODE_CHILD_SESSION` there printed `1` with
+`TMUX` unset, and `[ -t 1 ]` was false. So the Bash tool itself cannot run `sessiometer login`; the
+marker case is a terminal that inherited the marker from a Claude Code process.
+
+*Code reading, not run:* in that case, if the marker predicate quoted above holds for the child, it
+saves no transcript and shows the second notice. From a plain terminal the child would save a
+transcript; that too is inferred from the code, and no login child was run here. The one reported
+login printed the hint. The two re-runs of arm B left a transcript, and their captures hold neither
+the farewell nor the hint, for the reasons left open above, so they say nothing about the hint. The
+plain-terminal login and the inherited-marker login are both tracked in #1542, with the candidate of
+setting `CLAUDE_CODE_SKIP_PROMPT_HISTORY` on the login child.
+
+*Unmeasured:* whether a notice, or the hint, stays in the terminal's scrollback after the child
+exits.
+
+## What would falsify this
+
+- On the seeded profile the shell block builds, argv `/exit` offers a login before it exits, or
+  stops exiting.
+- On an empty isolated `CLAUDE_CONFIG_DIR`, a run dispatches the positional before onboarding. Or
+  onboarding at 2.1.294 no longer runs its own login, which would retire the operator-driven arm
+  rather than falsify a claim here.
+- On the seeded profile, an arm-D or arm-E re-run left unanswered echoes `/exit` within 25 s. On the
+  code side, the root command takes a second positional (a variadic `[prompt...]`), the action
+  wrapper passes excess positionals as parameters, or the root action reads them off the command
+  object. An arm-D re-run in which an operator completes the login and `/exit` then runs would
+  instead close the open item; it writes a credential, which the Downstream bullet on runs that
+  complete a login covers.
+- `CLAUDE_CONFIG_DIR="${D:?}" claude --no-session-persistence` starts an interactive session instead
+  of printing the error quoted above; or the stock binary holds `replaceSessionPersistenceDisabled`
+  more than three times, or a second call of the function that wraps it (at 2.1.294 `dvo(` has four
+  sites: two definitions, one call of the other `dvo`, and `dvo(!0)`).
+- The searches above find a hint switch; a `suppressResumeHint` argument is taken from an
+  environment variable, a setting or a flag; or the reason function gains a branch.
+- On a freshly rebuilt seeded profile, after re-running the block up to its `EOF` line,
+  `CLAUDE_CODE_SKIP_PROMPT_HISTORY=1 CLAUDE_CONFIG_DIR="${D:?}" claude '/exit'` writes a
+  `<sessionId>.jsonl` under `${D}/projects/`.
+- On a freshly rebuilt seeded profile, from a plain terminal outside tmux and with
+  `CLAUDE_CODE_FORCE_SESSION_PERSISTENCE` unset,
+  `CLAUDE_CODE_CHILD_SESSION=1 CLAUDE_CONFIG_DIR="${D:?}" claude '/exit'` writes a
+  `<sessionId>.jsonl` under `${D}/projects/`. The team predicate's undecoded first branch could
+  also produce that, so such a run would narrow the reading rather than settle it.
+- In sessiometer's source, `SPAWN_ENV_REMOVE` gains `CLAUDE_CODE_CHILD_SESSION`, or
+  `IsolatedSession` teardown stops removing the isolated directory. Either changes what #1542
+  tracks.
+- Re-run the searches on any version bump that touches the login path, by the method under
+  Provenance rather than by minified names.
+
+## Downstream
+
+- **#1020 stays the route** for removing the typed `/exit`; its body records it as blocked by
+  #1009. Three lines for its real-login walk are proposed on that issue: whether
+  `auth login --claudeai` exits by itself once its OAuth completes; whether
+  `Resume this session with:` prints under it; and, if it does not exit by itself, the
+  operator-driven unseeded arm below.
+- **The operator-driven unseeded arm is the open measurement for argv `/exit`.** An operator runs
+  `claude '/exit'` on an empty isolated config directory, answers onboarding, completes a real
+  login if onboarding offers one, and records whether the process then exits. It matters only if
+  #1020's route does not exit by itself.
+- **Runs that complete a login**, the operator-driven arm and the arm-D re-run among the
+  falsifiers, write a real OAuth credential to the login keychain. By the keychain-service function
+  quoted in the seeded-exit Finding (*code reading*), the item is the operator's default one when
+  `CLAUDE_SECURESTORAGE_CONFIG_DIR` is defined and empty, or undefined while `CLAUDE_CONFIG_DIR` is
+  empty or unset. So start such a run only after the shell block's check lists no `CLAUDE*` or
+  `ANTHROPIC*` variable, with `D` set as the block's first line sets it and passed as
+  `CLAUDE_CONFIG_DIR="${D:?}"`; for the unseeded arm, skip the block's seed. The item's name is then
+  `Claude Code-credentials-` followed by the first eight hex digits of
+  `printf %s "$D" | shasum -a 256`, for an ASCII path. That is the derivation `# Issue #100`
+  recorded at 2.1.181, and this entry does not decode the hashed value at 2.1.294. So after the
+  run, confirm the name: `security find-generic-password -s '<name>'` must find the item. Remove it
+  with `security delete-generic-password -s '<name>'`, check that the same `find` then reports that
+  it could not be found, and delete `D`. If the computed name finds nothing, delete nothing, and
+  compare `security dump-keychain | grep 'Claude Code'` with a listing taken before the run.
+- **#1542** tracks the sessiometer side: the hint, whose command names no `CLAUDE_CONFIG_DIR` and
+  points at a transcript that sessiometer deletes; the inherited marker; and the candidate of
+  setting `CLAUDE_CODE_SKIP_PROMPT_HISTORY` on the login child. `--no-session-persistence` is not
+  an alternative there, being refused in an interactive session by the code quoted above.
+- **#1546** tracks the records this entry does not change. ADR-0032, the solution design, the PRD
+  and the 2026-08-04 brief state the self-exit as settled, and the `onboarding_seed` doc comment in
+  `src/login.rs` states the trust entry's effect more strongly than any record shows. Whether and
+  when they name these as unproven is the owner's decision there.
+- **#1306, which tracks widening the supported range:** every measured arm and re-run here ran
+  2.1.294 through the patched wrapper, and every binary reading is of the stock 2.1.294; both are
+  above the advertised range. Two observations this entry relies on carry no recorded Claude Code
+  version: the 2026-09-09 operator report that the hint prints, and the operator's 2026-10-22 run
+  by hand. The withdrawn 2026-09-09 scratch-rig reading, cited under Provenance and relied on for
+  nothing, has none either. The `# #130` reading cited here was taken at 2.1.197, inside the range,
+  and the `src/` claims are source readings with no Claude Code version.
+
+## Provenance
+
+- Arms A to F and both canaries ran on 2026-10-21, run by the author through the 2026-10-21 rig, a
+  `pty.fork()` program. Each arm and each canary inherited the environment minus every `CLAUDE*`
+  and `ANTHROPIC*` variable, with `BROWSER=/usr/bin/true`. Arm A and `canary +` ran on the
+  operator's real, logged-in default `~/.claude`; arm A passed only `/exit`. Every other run used a
+  fresh isolated `CLAUDE_CONFIG_DIR`. Arm C's was left empty, and the rest were seeded with the
+  seed `onboarding_seed` builds. *Measured* by the author's re-reading of the rig's code on
+  2026-10-23 (the rig is not committed): the rig starts `claude` through `pty.fork()` and `execv`,
+  and itself runs no `security` command, reads or writes no credential, and starts no login or
+  OAuth. What arm A's and `canary +`'s Claude Code processes read or wrote in `~/.claude`,
+  `~/.claude.json` and the keychain, and what they fetched from the account, was not checked.
+- The 2026-10-21 rig waits on the child with a non-blocking `waitpid`. At pseudo-terminal
+  end-of-file it keeps reaping for up to 10 s, so an exit is not reported as a timeout. The positive
+  canary shows the rig can see an exit, and the negative canary shows it can see a child that does
+  not exit.
+- The operator's run by hand (2026-10-22, an earlier draft of the shell block, from a plain
+  terminal) is an operator report; its output was not captured.
+- The operator's 2026-09-09 report that the hint printed is a pasted terminal transcript given to
+  the author; it is recorded nowhere in the repository.
+- Two earlier readings from the earlier scratch rig, uncommitted, are withdrawn. On 2026-09-09 it
+  read a sole-positional `claude '/exit'` as never exiting. It did not record its Claude Code
+  version (a static reading the same day was at 2.1.263), and which profile it ran on is not
+  recorded in anything that survives. On 2026-10-21 it read the same argv at 2.1.294 as dispatched
+  and hanging on a spinner. Its profile was past onboarding, since the reading says the positional
+  was dispatched. That rig stopped reading at pseudo-terminal end-of-file without reaping the
+  child, so an exited child looked alive. Its canary checked the output text rather than the exit
+  status, so it passed anyway. Neither reading carries weight either way: the rig could not tell a
+  child that had exited from one still waiting. Arms A to C are the measurements that replace them.
+- The two re-runs of arm B were made by the draft reviews: the first re-run on 2026-10-22 (UTC), by
+  the review that ran from 2026-10-22 into 2026-10-23 (UTC), and the second on 2026-10-23 (UTC).
+  Each used its own re-run rig that reaps the same way, the same seed and environment policy, an
+  isolated directory, and `claude` through the wrapper described under Environment.
+- The incident behind the shell block's guard. On 2026-10-23 (UTC) a defective test harness in the
+  first draft review ran an earlier draft's unguarded last line, `time CLAUDE_CONFIG_DIR="$D" claude
+  '/exit'`, twice, in bash and in zsh, with `D` empty, stdin `/dev/null` and stdout a pipe. By that
+  review's own record, which is not committed, Claude Code used the real `~/.claude.json` and the
+  real account. It answered that `/exit` was not available in that environment, cost nothing, and
+  ran no model turn and no login flow; the keychain credential item's modification time predates the
+  runs. It also synced account skills, plugins and a model catalog into the harness's scratch
+  directory, and wrote a backup of the real global config there. The same record compares the real
+  global config with that backup afterwards: only `cachedGrowthBookFeaturesAt` and `skillUsage`
+  differed, and the record notes that other Claude Code processes also write that file. The author
+  did not check the file separately. How the writes reached the scratch directory was not traced.
+  One reading that fits is that an empty `CLAUDE_CONFIG_DIR` resolves the config directory's
+  sub-paths relative to the working directory, while the global config resolves under `Ot()`'s
+  directory, as the excerpt in the seeded-exit Finding shows; the backup landed in a `backups/`
+  directory under the harness's working directory. That reading is a hypothesis. The scratch copy
+  was deleted after review. The run was a separate test, not an arm, and it was not isolated.
+- None of the instruments Terms names, and none of the screens and transcripts they captured, is
+  committed. What a reader can re-run is the shell block (arm B) and the static binary readings.
+- Static readings decode the stock binary. Excerpts are verbatim except where `…` marks an elision,
+  and the two notices are their text nodes joined, with the binary's escaped em dash and middle dot
+  rendered. Every short identifier in an excerpt (`L`, `S$`, `gEn`, `Ot`, `we` and the like) is a
+  minified name, specific to this build and renamed by others. At 2.1.294 each fenced excerpt,
+  split at its elisions, occurs once in the stock binary, so a re-check at this version finds each
+  site by searching for its excerpt. On another build, search instead for an excerpt's string
+  literals, property names and option text, such as `printResumeHint`, `suppressResumeHint`,
+  `persistence-suppressed`, `sessionPersistenceDisabled`, `isChildSessionMarkerAmbientInTmux`,
+  `CLAUDE_CODE_SKIP_PROMPT_HISTORY`, `can only be used with --print mode`, `registeredArguments`
+  and `Catch you later!`. Expect more than one match for some, and take the one whose surrounding
+  code has the excerpt's shape.
+
+CC 2.1.294 · macOS 27.0.1 / 26A434 · sessiometer #1020.
