@@ -869,11 +869,12 @@ impl Config {
         // Issue #1540: what a canonical write does to Claude Code's stale plaintext fallback.
         out.push_str(
             "# Claude Code's plaintext fallback (`.credentials.json` in its config dir, macOS\n\
-             # only — on Linux that file IS the store and is left alone). Claude Code writes it\n\
+             # only — elsewhere that file IS the store and is left alone). Claude Code writes it\n\
              # when a keychain write fails, then lets it SHADOW the keychain: a live session\n\
              # whose fallback exists never notices a swap. After each credential write:\n\
-             # remove (delete it) | touch (keep it, bump its mtime so live sessions re-read\n\
-             # storage once) | off (leave it; the event log still records it is there).\n",
+             # touch (keep it, bump its mtime so live sessions re-read storage once; the\n\
+             # default) | remove (delete it; the file can hold a login newer than the\n\
+             # keychain's) | off (leave it; the event log still records it is there).\n",
         );
         out.push_str(&format!(
             "plaintext_fallback = {}\n",
@@ -1099,8 +1100,8 @@ mod tests {
     }
 
     /// Issue #1540: every `plaintext_fallback` mode survives render → parse, so a `capture` (which
-    /// rewrites the whole file) can never quietly flip an operator's `off` back to the default
-    /// `remove` — the one direction that would start deleting a file they chose to keep.
+    /// rewrites the whole file) can never quietly flip an operator's explicit `remove` or `off`
+    /// back to the default `touch`.
     #[test]
     fn plaintext_fallback_round_trips_render_then_parse() {
         for token in PlaintextFallbackMode::TOKENS {
@@ -1137,7 +1138,7 @@ mod tests {
         };
 
         let defaulted = entry("");
-        assert_eq!(defaulted.value, "\"remove\"");
+        assert_eq!(defaulted.value, "\"touch\"");
         assert_eq!(defaulted.origin, Origin::Default);
 
         let from_file = entry("[credential]\nplaintext_fallback = \"off\"\n");

@@ -882,12 +882,13 @@ pub(crate) struct CredentialConfig {
     pub(crate) expiry_cohort_window_secs: u64,
     /// What a canonical write does about Claude Code's plaintext credential fallback
     /// (`<config dir>/.credentials.json`) when it finds one (issue #1540); **default**
-    /// [`PlaintextFallbackMode::Remove`].
+    /// [`PlaintextFallbackMode::Touch`].
     ///
     /// Unlike the two keys above this one ACTS: while that file exists, Claude Code's running
-    /// sessions stop noticing keychain swaps, so the default deletes it after every successful
-    /// canonical write. `touch` keeps the file but re-stamps it so live sessions re-read storage;
-    /// `off` leaves it alone. See [`crate::plaintext_fallback`].
+    /// sessions stop noticing keychain swaps, so the default re-stamps it after every successful
+    /// canonical write, which makes live sessions re-read storage (keychain first) once. `remove`
+    /// deletes it instead — opt-in, because for one window the file can be the only working copy
+    /// of a login (ADR-0039 § Context); `off` leaves it alone. See [`crate::plaintext_fallback`].
     pub(crate) plaintext_fallback: PlaintextFallbackMode,
 }
 

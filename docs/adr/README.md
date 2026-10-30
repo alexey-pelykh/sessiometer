@@ -51,7 +51,7 @@ issue threads is consolidated here in a stable, discoverable place.
 | [0036](0036-prior-configuration-witness.md) | An absent `config.toml` is a first run only when no prior-configuration witness survives | Accepted |
 | [0037](0037-windows-control-transport-named-pipe.md) | The Windows daemon control transport is a named pipe; peer identity is the caller's user SID | Accepted (amended 2026-09-09 by #1511 — a second proof's measured output — and again 2026-09-09 by #976, which landed the peer-identity read, the single-instance lock and the client-side owner-SID check; decision in force, the cross-user, foreign-account and standard-user measurements stay open on #976 and the enforcing CI job is #978) |
 | [0038](0038-owner-only-file-policy-one-abstraction.md) | The owner-only file policy is one abstraction, not forty `cfg` gates; on Windows it is an explicit protected DACL | Accepted (decision in force; the Windows arm is unmeasured until the enforcing CI job #978) |
-| [0038](0038-settle-claude-code-plaintext-fallback-after-canonical-writes.md) | Every canonical write settles Claude Code's plaintext fallback; the default deletes it | Accepted |
+| [0039](0039-settle-claude-code-plaintext-fallback-after-canonical-writes.md) | Every canonical write settles Claude Code's plaintext fallback; the default re-stamps it | Accepted |
 
 ## Conventions
 

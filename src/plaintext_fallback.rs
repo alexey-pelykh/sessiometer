@@ -8,7 +8,10 @@
 //! (`build/version-compat.md`, the AC-6 finding): it reads the `Claude Code-credentials` item and
 //! falls back to the file only when the keychain returns nothing, and it writes the file only when
 //! a keychain write fails non-transiently. On macOS the file is therefore the leftover of a failed
-//! write, never the live credential while the keychain item exists.
+//! write. It is usually stale — but between that failed save and sessiometer's next swap it can
+//! hold a login NEWER than the keychain's, and with refresh-token rotation (ADR-0007) the only
+//! working one for the account about to be swapped away from (ADR-0039 § Context). Nothing on
+//! disk tells the two apart without reading the file, which this module never does.
 //!
 //! A leftover is not harmless. Claude Code's per-request "did the credentials change?" check is
 //! file-FIRST (observed on 2.1.285): while the file exists it compares only the file's mtime and
@@ -17,14 +20,15 @@
 //! removed (the ADR-0018 scrub), sessions fall back to the file's stale login.
 //!
 //! [`settle`] acts on the file per [`PlaintextFallbackMode`] without ever reading it: it stats,
-//! removes, or re-stamps the path, nothing more.
+//! re-stamps, or removes the path, nothing more. The default re-stamps (ADR-0039 Decision 3): that
+//! is what makes live sessions re-read storage, and it deletes nothing.
 //!
 //! macOS only. On Linux the same file IS the canonical store (#26), so the host wiring resolves no
 //! path there and nothing in this module runs.
 
 use std::ffi::OsStr;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -40,12 +44,14 @@ pub(crate) const FALLBACK_FILE_NAME: &str = ".credentials.json";
 /// `[credential].plaintext_fallback` setting (issue #1540).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum PlaintextFallbackMode {
-    /// Delete the file. The keychain item sessiometer just wrote is authoritative; the file is a
-    /// stale fallback whose only remaining effects are hiding swaps and resurrecting an old login.
-    #[default]
+    /// Delete the file. Opt-in: the keychain item sessiometer just wrote is then the only copy
+    /// and nothing can resurrect an old login from the file — but the file is not always stale
+    /// (see the module docs), so this can cost the outgoing account a fresh `login`.
     Remove,
     /// Leave the contents alone and bump the mtime, so live sessions re-read storage
-    /// (keychain-first) on their next request. The file — and its stale login — stays.
+    /// (keychain-first) on their next request. The file — and whatever login it holds — stays.
+    /// The default (ADR-0039 Decision 3): it fixes the hidden swap and deletes nothing.
+    #[default]
     Touch,
     /// Do nothing beyond logging that the file is present.
     Off,
@@ -135,7 +141,9 @@ pub(crate) fn settle(
             fs::remove_file(path).map(|()| PlaintextFallbackAction::Removed)
         }
         // Opened read-only: re-stamping needs only ownership, and nothing is ever written to it.
-        PlaintextFallbackMode::Touch => fs::File::open(path)
+        // Without following: a link swapped in between the `symlink_metadata` above and this
+        // open is refused by the kernel rather than re-stamped through.
+        PlaintextFallbackMode::Touch => open_without_following(path)
             .and_then(|file| file.set_modified(now))
             .map(|()| PlaintextFallbackAction::Touched),
     };
@@ -147,13 +155,30 @@ pub(crate) fn settle(
     }
 }
 
+/// Open `path` read-only without following a symlink at its final component.
+///
+/// On Unix that is `O_NOFOLLOW`, which makes `open(2)` fail with `ELOOP` on a link instead of
+/// opening its target. Elsewhere it is a plain open: the wrapper resolves no path off macOS
+/// (`fallback_applies_on`), so this never runs there.
+fn open_without_following(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
 /// Where a [`FallbackSettlingStore`] records its [`Event::PlaintextFallback`] lines.
 enum LogTarget {
     /// The native event log (`~/Library/Logs/sessiometer/sessiometer.log`), opened per line in
     /// append mode, so it interleaves safely with the daemon's and the CLI's own handle.
     Native,
-    /// An explicit log file — the hermetic test path.
-    #[cfg(test)]
+    /// An explicit log file — the hermetic test path. Gated like the test module that is its
+    /// only user, so a non-Unix test build sees no dead variant.
+    #[cfg(all(test, unix))]
     At(PathBuf),
 }
 
@@ -192,7 +217,7 @@ impl<C> FallbackSettlingStore<C> {
     }
 
     /// Wrap `inner` against an explicit fallback `path` and event `log` (tests only).
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn at(inner: C, mode: PlaintextFallbackMode, path: Option<PathBuf>, log: PathBuf) -> Self {
         Self {
             inner,
@@ -210,7 +235,7 @@ impl<C> FallbackSettlingStore<C> {
         };
         let log = match &self.log {
             LogTarget::Native => EventLog::open(),
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             LogTarget::At(path) => EventLog::at(path),
         };
         if let Ok(mut log) = log {
@@ -219,11 +244,22 @@ impl<C> FallbackSettlingStore<C> {
     }
 }
 
+/// Whether the settlement applies on the operating system `std` names `os`
+/// (`std::env::consts::OS` spelling): macOS, where the file is Claude Code's FALLBACK behind the
+/// keychain, and nowhere else — on Linux (#26) and Windows the same path IS Claude Code's
+/// credential store, and acting on it would re-stamp or delete the live login. A pure function
+/// of the name, so the gate is testable on the one target CI builds; a `cfg!` here would be
+/// correct and untestable.
+fn fallback_applies_on(os: &str) -> bool {
+    os == "macos"
+}
+
 /// The fallback paired with this process's canonical item: macOS only (see
 /// [`FallbackSettlingStore::for_host`]), resolved from the same environment the keychain service
-/// name is. `cfg!` rather than `#[cfg]` keeps the resolution compiled — and linted — everywhere.
+/// name is. A runtime test rather than `#[cfg]` keeps the resolution compiled — and linted —
+/// everywhere.
 fn host_fallback_path() -> Option<PathBuf> {
-    if !cfg!(target_os = "macos") {
+    if !fallback_applies_on(std::env::consts::OS) {
         return None;
     }
     let default_dir = paths::claude_config_dir().ok()?;
@@ -357,6 +393,23 @@ mod tests {
         );
     }
 
+    // --- the platform gate ---------------------------------------------------------------------
+
+    #[test]
+    fn the_settlement_applies_on_macos_and_nowhere_else() {
+        // CI builds macOS only, so a `#[cfg(not(target_os = "macos"))]` test would never run;
+        // the gate is a function of the OS name precisely so every arm runs here.
+        assert!(fallback_applies_on("macos"));
+        for other in ["linux", "windows", "freebsd", "android", "ios", ""] {
+            assert!(!fallback_applies_on(other), "{other:?}");
+        }
+        // The name the host wiring passes is the one `std` spells for this target.
+        assert_eq!(
+            fallback_applies_on(std::env::consts::OS),
+            cfg!(target_os = "macos")
+        );
+    }
+
     // --- settle ------------------------------------------------------------------------------
 
     const ALL_MODES: [PlaintextFallbackMode; 3] = [
@@ -411,6 +464,39 @@ mod tests {
         );
         assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), later());
         assert_eq!(fs::read(&path).unwrap(), b"{\"claudeAiOauth\":{}}");
+    }
+
+    #[test]
+    fn the_default_mode_re_stamps_and_deletes_nothing() {
+        // ADR-0039 Decision 3. The file is not always stale: right after a failed Claude Code
+        // keychain save it can hold a login newer than the keychain's, possibly the only working
+        // one for the account being swapped away from. The default must leave it intact.
+        assert_eq!(
+            PlaintextFallbackMode::default(),
+            PlaintextFallbackMode::Touch
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let body = b"{\"claudeAiOauth\":{\"refreshToken\":\"newer-than-the-keychain\"}}";
+        let (path, _) = present_file(dir.path(), body);
+        assert_eq!(
+            settle(PlaintextFallbackMode::default(), &path, later()),
+            Some(PlaintextFallbackAction::Touched)
+        );
+        assert_eq!(fs::read(&path).unwrap(), body);
+    }
+
+    #[test]
+    fn the_re_stamp_open_refuses_a_link_on_its_own() {
+        // `settle` stats first and refuses a link it sees; this is the second line of defence,
+        // for a link swapped in between that stat and the open.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere.json");
+        fs::write(&target, b"keep me").unwrap();
+        let link = dir.path().join(FALLBACK_FILE_NAME);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = open_without_following(&link).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{err:?}");
+        assert!(open_without_following(&target).is_ok());
     }
 
     #[test]
@@ -644,17 +730,21 @@ mod tests {
 
     // --- wiring: the production writers of the canonical item ------------------------------
 
-    /// Everything above `source`'s `#[cfg(test)] mod …` block. A lone `#[cfg(test)]` ITEM earlier
-    /// in the file (use_account.rs carries one on an import) does not end the region; only the
-    /// attribute on a module does.
+    /// Everything above `source`'s test module — `#[cfg(test)]` or `#[cfg(all(test, …))]` on the
+    /// line before a `mod …{` or `pub(crate) mod …{`. A lone `#[cfg(test)]` ITEM earlier in the
+    /// file (use_account.rs carries one on an import) does not end the region; only the attribute
+    /// on a module does.
     fn non_test_region(source: &str) -> String {
         let lines: Vec<&str> = source.lines().collect();
+        let opens_test_module =
+            |line: &str| line.starts_with("#[cfg(test)]") || line.starts_with("#[cfg(all(test");
+        let is_module = |line: &str| {
+            let line = line.trim_end();
+            (line.starts_with("mod ") || line.starts_with("pub(crate) mod ")) && line.ends_with('{')
+        };
         let end = (0..lines.len())
             .find(|&i| {
-                lines[i].starts_with("#[cfg(test)]")
-                    && lines
-                        .get(i + 1)
-                        .is_some_and(|n| n.starts_with("mod ") && n.trim_end().ends_with('{'))
+                opens_test_module(lines[i]) && lines.get(i + 1).is_some_and(|n| is_module(n))
             })
             .unwrap_or(lines.len());
         lines[..end].join("\n")
@@ -731,5 +821,160 @@ mod tests {
                 "{file}: the mode must come from `[credential].plaintext_fallback`, got `{args}`"
             );
         }
+    }
+
+    /// Every `.rs` file under `src/`, walked rather than listed, so a file added later is seen.
+    fn source_files() -> Vec<PathBuf> {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        files.sort();
+        assert!(
+            files.len() > 50,
+            "the walk found {} files — wrong root?",
+            files.len()
+        );
+        files
+    }
+
+    /// The `fn` whose body holds `lines[index]`: the nearest `fn` header at or above it, at any
+    /// indent, with its visibility and `async` stepped over.
+    fn enclosing_fn(lines: &[&str], index: usize) -> String {
+        lines[..=index]
+            .iter()
+            .rev()
+            .find_map(|line| {
+                let rest = line.trim_start();
+                let rest = rest.strip_prefix("pub(crate) ").unwrap_or(rest);
+                let rest = rest.strip_prefix("pub ").unwrap_or(rest);
+                let rest = rest.strip_prefix("async ").unwrap_or(rest);
+                let name = rest.strip_prefix("fn ")?;
+                let end = name
+                    .find(|c: char| !c.is_alphanumeric() && c != '_')
+                    .unwrap_or(name.len());
+                Some(name[..end].to_owned())
+            })
+            .unwrap_or_default()
+    }
+
+    /// Issue #1540, the sweep the three-site gate above cannot do: EVERY non-test
+    /// `RealCredentialStore::new()` in the crate is either wrapped in the settling store or
+    /// registered here as read-only, with the reason. A writer built on a bare store at a site
+    /// the gate above does not anchor — a fourth construction site, or one of the read-only sites
+    /// below growing a `write` — passes that gate and every behavioural test, and silently brings
+    /// back the swap a live session never sees. Keyed by file and enclosing `fn`, so a new bare
+    /// construction must be classified here before it lands, and a registered site that moves or
+    /// disappears fails rather than leaving a stale row.
+    #[test]
+    fn every_bare_store_construction_is_wrapped_or_registered_read_only() {
+        // (file, enclosing fn, why no settlement is owed)
+        const READ_ONLY: &[(&str, &str, &str)] = &[
+            (
+                "src/capture.rs",
+                "capture",
+                "`capture_locked` reads the canonical item to stash it; the activating write is \
+                 `run_login_locked`, wrapped at its own site",
+            ),
+            (
+                "src/cli.rs",
+                "run",
+                "the #140 external-login watch polls the canonical item and never writes it",
+            ),
+            (
+                "src/cli.rs",
+                "import",
+                "`resolve_active_uuid_for_import` reads the item to resolve the active account",
+            ),
+            (
+                "src/daemon/seams.rs",
+                "poll",
+                "the active account's usage poll reads the bearer through the item",
+            ),
+            (
+                "src/login.rs",
+                "login_account",
+                "`run_login` hashes the shared item to detect a rogue write into it; the \
+                 activating write happens in `capture::reconcile_login`, wrapped there",
+            ),
+            (
+                "src/poke.rs",
+                "poke",
+                "token-first active resolution reads the item and byte-matches the stashes",
+            ),
+        ];
+        const BARE: &str = "RealCredentialStore::new()";
+        const WRAP: &str = "FallbackSettlingStore::for_host(";
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut wrapped = 0usize;
+        let mut unclassified = Vec::new();
+        let mut matched = vec![0usize; READ_ONLY.len()];
+        for file in source_files() {
+            let rel = file
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let source = fs::read_to_string(&file).unwrap();
+            let region = non_test_region(&source);
+            let lines: Vec<&str> = region.lines().collect();
+            for (index, line) in lines.iter().enumerate() {
+                let Some(at) = line.find(BARE) else { continue };
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                // Wrapped: `for_host(` earlier on the same line, or ending the nearest preceding
+                // non-comment line — the shape rustfmt gives the multi-line call.
+                let previous = lines[..index]
+                    .iter()
+                    .rev()
+                    .map(|l| l.trim())
+                    .find(|l| !l.is_empty() && !l.starts_with("//"))
+                    .unwrap_or("");
+                if line[..at].contains(WRAP) || previous.ends_with(WRAP) {
+                    wrapped += 1;
+                    continue;
+                }
+                let func = enclosing_fn(&lines, index);
+                match READ_ONLY
+                    .iter()
+                    .position(|(f, name, _)| *f == rel && *name == func)
+                {
+                    Some(row) => matched[row] += 1,
+                    None => unclassified.push(format!("{rel}: fn {func}: `{}`", line.trim())),
+                }
+            }
+        }
+        assert!(
+            unclassified.is_empty(),
+            "bare `{BARE}` neither wrapped in `{WRAP}` nor registered as read-only — if the site \
+             only reads, add a row with the reason; if it writes, wrap it:\n{}",
+            unclassified.join("\n")
+        );
+        for ((file, func, _), count) in READ_ONLY.iter().zip(&matched) {
+            assert_eq!(
+                *count, 1,
+                "read-only registry row {file}: fn {func} matched {count} bare constructions, \
+                 expected exactly one (zero: the site moved or was wrapped — drop the row; two: \
+                 the second site needs its own row)"
+            );
+        }
+        assert_eq!(
+            wrapped, 3,
+            "three wrapped construction sites are expected (the daemon, `use`, and the \
+             activating `login`); the gate above pins which three"
+        );
     }
 }

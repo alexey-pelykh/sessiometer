@@ -448,7 +448,8 @@ impl Config {
         )?;
         // The plaintext-fallback mode (issue #1540) is validated against its fixed vocabulary, like
         // `migration.conflict_policy`, so a typo fails at load rather than silently falling back to
-        // the default — which, for an operator who wrote `of`, would be the deleting mode.
+        // the default: an operator who wrote `remov` would otherwise get `touch` and never learn
+        // why the file is still there.
         let plaintext_fallback = PlaintextFallbackMode::from_token(&c.plaintext_fallback)
             .ok_or_else(|| {
                 Error::ConfigInvalid(format!(
@@ -1595,7 +1596,7 @@ mod tests {
                 // opt-out contract: naming one key in `[credential]` must not silently reset its
                 // sibling.
                 expiry_cohort_window_secs: DEFAULT_CREDENTIAL_EXPIRY_COHORT_WINDOW_SECS,
-                plaintext_fallback: PlaintextFallbackMode::Remove,
+                plaintext_fallback: PlaintextFallbackMode::Touch,
             }
         );
         assert_eq!(
@@ -1616,7 +1617,7 @@ mod tests {
             CredentialConfig {
                 expiry_horizon_secs: DEFAULT_CREDENTIAL_EXPIRY_HORIZON_SECS,
                 expiry_cohort_window_secs: 3_600,
-                plaintext_fallback: PlaintextFallbackMode::Remove,
+                plaintext_fallback: PlaintextFallbackMode::Touch,
             }
         );
         assert_eq!(
@@ -1705,16 +1706,16 @@ mod tests {
     // --- [credential].plaintext_fallback (issue #1540) ----------------------
 
     #[test]
-    fn plaintext_fallback_defaults_to_remove_when_absent() {
+    fn plaintext_fallback_defaults_to_touch_when_absent() {
         let config = Config::parse(VALID).unwrap();
         assert_eq!(
             config.credential.plaintext_fallback,
-            PlaintextFallbackMode::Remove
+            PlaintextFallbackMode::Touch
         );
         let toml = format!("{VALID}\n[credential]\nexpiry_horizon_secs = 1209600\n");
         assert_eq!(
             Config::parse(&toml).unwrap().credential.plaintext_fallback,
-            PlaintextFallbackMode::Remove
+            PlaintextFallbackMode::Touch
         );
     }
 

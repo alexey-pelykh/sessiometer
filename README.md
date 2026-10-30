@@ -1087,7 +1087,7 @@ account's **refresh-token deadline** when classifying it for the
 | Key | Meaning | Range | Default |
 |-----|---------|-------|---------|
 | `expiry_horizon_secs` | Seconds of lookahead over `refreshTokenExpiresAt`. A deadline falling inside this window classifies as *within* the horizon (bracketed, `[6d21h]`, and tinted yellow); one further out classifies as *beyond* it (bare, and dimmed). | `86_400..=7_776_000` (one day to ninety days) | `604800` (seven days) |
-| `plaintext_fallback` | What to do with Claude Code's `.credentials.json` after each write of the canonical credential (macOS only; see [below](#claude-codes-plaintext-fallback)). | `remove`, `touch`, `off` | `remove` |
+| `plaintext_fallback` | What to do with Claude Code's `.credentials.json` after each write of the canonical credential (macOS only; see [below](#claude-codes-plaintext-fallback)). | `remove`, `touch`, `off` | `touch` |
 
 This bounds the **lookahead only** — it is emphatically not an assumed refresh-token
 lifetime. The daemon always reads the deadline from the credential and never infers one
@@ -1106,28 +1106,39 @@ exposed to a quiet lapse.
 #### Claude Code's plaintext fallback
 
 On macOS, Claude Code keeps its login in the keychain, and writes a plaintext copy to
-`.credentials.json` in its config directory (`~/.claude`, or `CLAUDE_CONFIG_DIR`) only when a
-keychain write fails. Once that file exists, a running session watches **the file** for
-credential changes and stops looking at the keychain, so every swap sessiometer makes lands
-where that session never looks: it keeps sending whichever login the file last held — often a
-`/login` from long ago — until it is restarted.
+`.credentials.json` in its config directory only when a keychain write fails. sessiometer
+resolves that directory exactly as it resolves the keychain item's service name:
+`CLAUDE_SECURESTORAGE_CONFIG_DIR` when it is defined, an empty value meaning `~/.claude`;
+otherwise a non-empty `CLAUDE_CONFIG_DIR`; otherwise `~/.claude`. Nothing is settled when that
+directory is relative (Claude Code resolves it against its own working directory, which
+sessiometer cannot know) or non-ASCII (the keychain side refuses those too). Once the file
+exists, a running session watches **the file** for credential changes and stops looking at the
+keychain, so every swap sessiometer makes lands where that session never looks: it keeps using
+the login it already holds in memory — the account you swapped away from — until that token
+fails or the session restarts.
 
 After each write of the canonical credential (an automatic or manual swap, `use` adopting an
 account, a keep-warm promotion, or an activating `login`), sessiometer settles that file:
 
-- **`remove`** (default) deletes it. The keychain item sessiometer just wrote is the real
-  credential; the file is a stale copy whose remaining effects are hiding swaps and bringing
-  back an old login. Claude Code recreates it only if a later keychain write fails again.
-- **`touch`** keeps the file and bumps its modification time, so every live session re-reads
-  its credential storage — keychain first — on its next request. The swap is seen, but the
-  stale copy stays, and it is used again if the keychain read ever fails.
+- **`touch`** (default) keeps the file and bumps its modification time, so every live session
+  re-reads its credential storage — keychain first — on its next request, and the swap is seen.
+  That is what the decode of Claude Code's change check predicts: removing the file was measured
+  live, re-stamping it was not (`build/version-compat.md` § Issue #1540). The file stays, and
+  Claude Code reads it again if the keychain item is ever missing.
+- **`remove`** deletes it. The keychain item sessiometer just wrote is then the only copy, and
+  nothing can bring back an old login from the file. It is not the default because the file is
+  not always stale: Claude Code writes it when a keychain save *fails*, so right after that it can
+  hold a login *newer* than the keychain's — and since refresh tokens rotate, possibly the only
+  working one for the account you are swapping away from. Choose it if you would rather have that
+  account need a fresh `login` than keep a plaintext copy on disk. Claude Code recreates the file
+  only if a later keychain write fails again.
 - **`off`** leaves it alone.
 
 Each outcome is recorded in the event log as `event=plaintext_fallback action=…`
 (`removed`, `touched`, `ignored` for `off`, `refused` for anything that is not a regular file,
 `failed` for an I/O error); nothing is logged when there is no file. It never fails the write
-that triggered it. On Linux the file *is* Claude Code's credential store, so this setting does
-nothing there. The daemon reads it once at start-up, so a change needs a daemon restart.
+that triggered it. Outside macOS the file *is* Claude Code's credential store, so this setting
+does nothing there. The daemon reads it once at start-up, so a change needs a daemon restart.
 
 ### Other blocks
 
@@ -1279,7 +1290,9 @@ There are no releases yet, so this is a floor on **builds**, not on versions —
 time a rendered config key is added, so it is not a fixed number to memorize. As of 2026-08-09 it
 sits at commit `81bd4f2` (`[credential].expiry_cohort_window_secs`). Do not reach for the commit
 that added a whole *section*: `[credential]` arrived 14 commits earlier in `6fe3457`, and a build
-pinned there still refuses a current artifact over the later key.
+pinned there still refuses a current artifact over the later key. It has moved again since:
+`[credential].plaintext_fallback` (#1540) is rendered the same way, and issue #1589 restates the
+floor at the commit that landed it.
 
 **So the rule to follow is the one that cannot go stale: import on a build at least as new as the
 one that wrote the artifact.** The two ways of breaking it read differently, which is worth

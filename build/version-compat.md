@@ -1950,24 +1950,38 @@ Two consequences beyond the hidden swap:
   lands over an *empty* keychain; after sessiometer's write refills the item, CC's later saves find
   it non-empty and leave the file in place indefinitely.
 
-## Finding — removing or touching the file is picked up without a restart ✅
+## Finding — removing the file is picked up without a restart ✅
 
 Moving the file aside made every running session follow the canonical item on its next request
-(the last row above). The decode predicts the same from a bumped mtime alone, which is the `touch`
-mode; that arm was **not** exercised live.
+(the last row above).
+
+## Finding — a bumped mtime alone is predicted to be picked up the same way; unmeasured ⚠️
+
+The decode predicts the same from a bumped mtime alone, which is the `touch` mode — the default
+(ADR-0039 Decision 3). That arm was **not** exercised live: the prediction rests on the change
+check comparing the file's mtime (or its `dev:ino:size:mtimeNs` version) and nothing else. A
+measured `touched` line followed by the running sessions moving to the target, scored as the table
+above scores the removal, would promote this to ✅.
 
 ## What would falsify this
 
 - **The check consulting the keychain while the file exists.** The settling would then be
   unnecessary, but harmless.
 - **CC writing the file on a *successful* keychain save.** `remove` would then fight CC on every
-  save; the `event=plaintext_fallback action=removed` count would show it, at one line per swap.
+  save, and `touch` would re-stamp a file CC had just written; the `event=plaintext_fallback`
+  count would show either, at one line per swap.
+- **The file holding a login *newer* than the keychain item.** A falsifier of the premise that
+  the file is always stale, not of the mechanism, and the reason `remove` is not the default:
+  CC writes the file when a keychain save *fails*, so right after that it is newer than the item,
+  and refresh-token rotation (ADR-0007) can already have retired the keychain's copy of the
+  outgoing account's token. Under `touch` nothing is lost. A measurement that CC's failed-save
+  write never carries a rotated token would make `remove` safe as the default; none was taken.
 - **The file's directory resolving differently from the service suffix.** The settling would then
   address a file no session reads; `host_fallback_path` in `src/plaintext_fallback.rs` mirrors the
   precedence, and `keychain::canonical_service_from` is its sibling.
 
 Load-bearing at `FallbackSettlingStore` in `src/plaintext_fallback.rs`, which settles the file after
-every canonical write, per `[credential].plaintext_fallback` (ADR-0038). Re-walk on the same trigger
+every canonical write, per `[credential].plaintext_fallback` (ADR-0039). Re-walk on the same trigger
 as the range: a CC release whose storage or change-check code moved.
 
 CC 2.1.285 · macOS 26.6.2 / 25G83 · sessiometer #1540.
