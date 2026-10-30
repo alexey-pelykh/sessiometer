@@ -8,8 +8,9 @@
 //! where **Claude Code performs its own credential refresh** against an isolated
 //! keychain item; the command then reads the refreshed credential back, re-stashes it,
 //! and tears the isolated dir + item down. `poke` is the trigger — Claude Code does the
-//! refresh. The live `Claude Code-credentials` item the active session reads is never
-//! touched.
+//! refresh. The refresh cycle never rewrites the active credential. Before selecting
+//! parked accounts, macOS file mode may recover a completed interactive login using
+//! the shared copy-before-delete import; Keychain mode and Linux remain unchanged.
 //!
 //! Two modes:
 //!   - `poke <account>` — one cycle for the named account (resolved by label OR
@@ -74,11 +75,11 @@ use crate::active;
 use crate::config::{Account, Config};
 use crate::daemon::{AccountStatusLine, StatusResponse};
 use crate::error::{Error, Result};
-use crate::keychain::{CredentialStore, RealCredentialStore};
+use crate::keychain::CredentialStore;
 use crate::observability::CredentialHealth;
 use crate::paths;
 use crate::refresh::{self, RefreshOutcome, RefreshReport};
-use crate::stash::{AccountStash, RealAccountStash};
+use crate::stash::AccountStash;
 use crate::use_account::resolve_target;
 
 /// How close to its `expiresAt` a parked account's stored token must be for the
@@ -109,7 +110,8 @@ trait PokeEngine {
 /// `claude` binary, wired straight into the #102 engine entry points
 /// ([`refresh::stored_expires_at`], [`refresh::refresh_account`]).
 struct RealPokeEngine {
-    stash: RealAccountStash,
+    stash: crate::storage::AccountStore,
+    storage: crate::storage::Storage,
     claude_binary: PathBuf,
 }
 
@@ -122,8 +124,9 @@ impl PokeEngine for RealPokeEngine {
         refresh::refresh_account(
             &self.stash,
             &account.stash(),
-            &account.account_uuid,
+            account.id(),
             self.claude_binary.clone(),
+            &self.storage,
         )
         .await
     }
@@ -177,18 +180,31 @@ pub(crate) async fn poke(target: Option<String>) -> Result<()> {
     // ensure it (0700) before the engine touches it (mirrors `use`).
     paths::ensure_private_dir(&paths::support_dir()?)?;
 
+    // Recover a file-mode login BEFORE resolving the active account. Otherwise the
+    // source guard refuses this first read and the isolated refresh is never reached.
     // Resolve WHICH account is active TOKEN-FIRST (issue #207/#250): read the canonical
-    // keychain credential and byte-match it against the stashes, `~/.claude.json`'s
-    // clobberable `oauthAccount` a DISPLAY-only fallback. One `RealAccountStash` is reused
+    // credential and byte-match it against the stashes, `~/.claude.json`'s
+    // clobberable `oauthAccount` a DISPLAY-only fallback. One selected account stash is reused
     // — borrowed here for resolution, then moved into the engine — so this adds only a
     // `CredentialStore` read over the pre-#250 display-only path.
-    let store = RealCredentialStore::new();
-    let stash = RealAccountStash::new();
-    let active_uuid =
-        resolve_active_uuid(&config.roster, &store, &stash, &paths::claude_json()?).await?;
+    let storage = crate::storage::Storage::from_config(&config.storage)?;
+    let store = storage.canonical()?;
+    let stash = storage.stash()?;
+    let config_path = paths::config_file()?;
+    let lock_path = paths::swap_lock()?;
+    let active_uuid = prepare_poke(
+        &config.roster,
+        target.as_deref(),
+        &store,
+        &stash,
+        storage.state_file(),
+        storage.recover_file_login(&config.roster, &config_path, &lock_path),
+    )
+    .await?;
     let engine = RealPokeEngine {
         stash,
         claude_binary: paths::claude_binary().await?,
+        storage,
     };
     // The daemon's current per-account verdict (#163), read best-effort BEFORE the
     // cycle so a refreshed-but-still-quarantined account is reported honestly rather
@@ -209,6 +225,31 @@ pub(crate) async fn poke(target: Option<String>) -> Result<()> {
         &notifier,
     )
     .await
+}
+
+/// Validate the requested handle, complete any file-mode recovery, then resolve the
+/// active account from the resulting canonical credential. The recovery future is
+/// lazy, so an invalid target cannot trigger an import. Keeping this ordering in a
+/// small injectable preflight lets tests prove that a failed recovery stops poke
+/// and that a recovered active account is still excluded from isolated refresh.
+async fn prepare_poke<C, S, F>(
+    roster: &[Account],
+    target: Option<&str>,
+    store: &C,
+    stash: &S,
+    claude_json: &Path,
+    recovery: F,
+) -> Result<Option<String>>
+where
+    C: CredentialStore,
+    S: AccountStash,
+    F: std::future::Future<Output = Result<Option<usize>>>,
+{
+    if let Some(query) = target {
+        resolve_target(roster, query)?;
+    }
+    recovery.await?;
+    resolve_active_uuid(roster, store, stash, claude_json).await
 }
 
 /// The active account's uuid (the one logged in to Claude Code), or `None` when no
@@ -262,7 +303,7 @@ async fn resolve_active_uuid<C: CredentialStore, S: AccountStash>(
         // cleared, leaving the account genuinely logged out ⇒ `None` ⇒ poke all).
         None => active::resolve_via_display(roster, claude_json),
     };
-    Ok(active.map(|idx| roster[idx].account_uuid.clone()))
+    Ok(active.map(|idx| roster[idx].id().to_owned()))
 }
 
 /// Run the requested `poke` mode over the injected `engine`: named (one account) or
@@ -292,7 +333,7 @@ async fn run_poke<E: PokeEngine, N: RestoreNotifier>(
 /// modes gate on (named-mode refuses it, all-mode skips it). `active_uuid` is `None`
 /// when no account is active, in which case nothing is active.
 fn is_active(account: &Account, active_uuid: Option<&str>) -> bool {
-    Some(account.account_uuid.as_str()) == active_uuid
+    Some(account.id()) == active_uuid
 }
 
 /// `poke <account>`: resolve the named account, refuse if it is active, run one cycle,
@@ -504,7 +545,7 @@ async fn resolve_restore<N: RestoreNotifier>(
     notifier: &N,
 ) -> Restore {
     if should_restore(report, verdict) {
-        return match notifier.send_restored(&account.account_uuid).await {
+        return match notifier.send_restored(account.id()).await {
             // Delivery is RECEIPT, so which of the two it licenses is the daemon's fork, read
             // off the same verdict that gated the send (issue #1347).
             Ok(()) if verdict == DaemonVerdict::QuarantinedDead => Restore::Reprobing,
@@ -883,7 +924,7 @@ mod tests {
 
     fn acct(label: &str, uuid: &str) -> Account {
         Account {
-            account_uuid: uuid.to_owned(),
+            key: crate::config::AccountKey::ClaudeUuid(uuid.to_owned()),
             label: label.to_owned(),
             enabled: true,
         }
@@ -906,6 +947,7 @@ mod tests {
         quarantined: bool,
     ) -> AccountStatusLine {
         AccountStatusLine {
+            usage_unavailable: false,
             label: label.to_owned(),
             active: false,
             enabled: true,
@@ -987,14 +1029,12 @@ mod tests {
 
     impl PokeEngine for FakePokeEngine {
         async fn stored_expires_at(&self, account: &Account) -> Option<i64> {
-            self.expiries.get(&account.account_uuid).copied().flatten()
+            self.expiries.get(account.id()).copied().flatten()
         }
 
         async fn refresh(&self, account: &Account) -> Result<RefreshReport> {
-            self.refreshed
-                .borrow_mut()
-                .push(account.account_uuid.clone());
-            match self.results.get(&account.account_uuid) {
+            self.refreshed.borrow_mut().push(account.id().to_owned());
+            match self.results.get(account.id()) {
                 Some(FakeRefresh::Report(r)) => Ok(*r),
                 Some(FakeRefresh::HardError) => Err(Error::SwapLockBusy),
                 None => Ok(report(RefreshOutcome::NoChange, false)),
@@ -2018,11 +2058,13 @@ mod tests {
     fn stashed(token: &[u8], uuid: &str) -> StashedAccount {
         StashedAccount {
             credential: cred(token),
-            oauth_account: OauthAccount::from_object_bytes(
-                format!(r#"{{"accountUuid":"{uuid}","emailAddress":"{uuid}@example.com"}}"#)
-                    .as_bytes(),
-            )
-            .unwrap(),
+            oauth_account: Some(
+                OauthAccount::from_object_bytes(
+                    format!(r#"{{"accountUuid":"{uuid}","emailAddress":"{uuid}@example.com"}}"#)
+                        .as_bytes(),
+                )
+                .unwrap(),
+            ),
         }
     }
 
@@ -2049,6 +2091,198 @@ mod tests {
 
     fn roster_ab() -> Vec<Account> {
         vec![acct("work", "u-A"), acct("spare", "u-B")]
+    }
+
+    struct PreflightStore {
+        inner: FakeCredentialStore,
+        shadowed: std::cell::Cell<bool>,
+        reads: std::cell::Cell<usize>,
+    }
+
+    impl PreflightStore {
+        async fn new(shadowed: bool) -> Self {
+            Self {
+                inner: store_holding(b"A-token").await,
+                shadowed: std::cell::Cell::new(shadowed),
+                reads: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl CredentialStore for PreflightStore {
+        async fn read(&self) -> Result<Credential> {
+            self.reads.set(self.reads.get() + 1);
+            if self.shadowed.get() {
+                return Err(Error::CredentialSourceConflict);
+            }
+            self.inner.read().await
+        }
+
+        async fn write(&self, credential: &Credential) -> Result<()> {
+            self.inner.write(credential).await
+        }
+    }
+
+    #[tokio::test]
+    async fn preflight_recovers_before_reading_and_sweep_skips_the_recovered_active() {
+        let roster = roster_ab();
+        let stash = stash_ab().await;
+        let store = PreflightStore::new(true).await;
+        // A stale display must not make the recovered, token-matched A look parked.
+        let (_dir, json) = write_claude_json(r#"{"oauthAccount":{"accountUuid":"u-B"}}"#);
+        let active = prepare_poke(&roster, None, &store, &stash, &json, async {
+            assert_eq!(store.reads.get(), 0, "recovery must precede canonical read");
+            stash
+                .write("Sessiometer/u-A", &stashed(b"A-fresh", "u-A"))
+                .await?;
+            store.write(&cred(b"A-fresh")).await?;
+            store.shadowed.set(false);
+            Ok(Some(0))
+        })
+        .await
+        .unwrap();
+        assert_eq!(store.reads.get(), 1);
+        assert_eq!(active.as_deref(), Some("u-A"));
+        let engine = FakePokeEngine::new()
+            .with_expiry("u-A", Some(0))
+            .with_expiry("u-B", Some(0));
+        run_poke(
+            &roster,
+            None,
+            active.as_deref(),
+            1_000,
+            &engine,
+            None,
+            &FakeRestoreNotifier::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(engine.refreshed(), vec!["u-B"]);
+    }
+
+    #[tokio::test]
+    async fn preflight_recovery_does_not_allow_poking_the_named_active_account() {
+        let roster = roster_ab();
+        let stash = stash_ab().await;
+        let store = PreflightStore::new(true).await;
+        let (_dir, json) = write_claude_json(r#"{"oauthAccount":{"accountUuid":"u-A"}}"#);
+        let active = prepare_poke(&roster, Some("work"), &store, &stash, &json, async {
+            store.shadowed.set(false);
+            Ok(Some(0))
+        })
+        .await
+        .unwrap();
+        let engine = FakePokeEngine::new();
+        let result = run_poke(
+            &roster,
+            Some("work"),
+            active.as_deref(),
+            1_000,
+            &engine,
+            None,
+            &FakeRestoreNotifier::new(),
+        )
+        .await;
+        assert!(matches!(result, Err(Error::PokeTargetActive { .. })));
+        assert!(engine.refreshed().is_empty());
+    }
+
+    #[tokio::test]
+    async fn preflight_failed_recovery_stops_before_canonical_read_or_refresh() {
+        let roster = roster_ab();
+        let stash = stash_ab().await;
+        let store = PreflightStore::new(true).await;
+        let (_dir, json) = write_claude_json(r#"{"oauthAccount":{"accountUuid":"u-A"}}"#);
+        let engine = FakePokeEngine::new().with_expiry("u-B", Some(0));
+        let result = async {
+            let active = prepare_poke(&roster, None, &store, &stash, &json, async {
+                Err(Error::CredentialSourceConflict)
+            })
+            .await?;
+            run_poke(
+                &roster,
+                None,
+                active.as_deref(),
+                1_000,
+                &engine,
+                None,
+                &FakeRestoreNotifier::new(),
+            )
+            .await
+        }
+        .await;
+        assert!(matches!(result, Err(Error::CredentialSourceConflict)));
+        assert_eq!(store.reads.get(), 0);
+        assert!(store.shadowed.get());
+        assert!(engine.refreshed().is_empty());
+    }
+
+    #[tokio::test]
+    async fn preflight_invalid_or_ambiguous_target_never_polls_recovery() {
+        for ambiguous in [false, true] {
+            let mut roster = roster_ab();
+            let target = if ambiguous {
+                roster[1].label = roster[0].label.clone();
+                "work"
+            } else {
+                "unknown"
+            };
+            let stash = stash_ab().await;
+            let store = PreflightStore::new(true).await;
+            let (_dir, json) = write_claude_json(r#"{"oauthAccount":{"accountUuid":"u-A"}}"#);
+            let recovered = std::cell::Cell::new(false);
+            let result = prepare_poke(&roster, Some(target), &store, &stash, &json, async {
+                recovered.set(true);
+                Ok(None)
+            })
+            .await;
+            assert!(result.is_err());
+            assert!(!recovered.get());
+            assert_eq!(store.reads.get(), 0);
+            assert!(store.shadowed.get());
+        }
+    }
+
+    #[tokio::test]
+    async fn preflight_noop_recovery_keeps_normal_active_resolution() {
+        let roster = roster_ab();
+        let stash = stash_ab().await;
+        let store = PreflightStore::new(false).await;
+        let (_dir, json) = write_claude_json(r#"{"oauthAccount":{"accountUuid":"u-B"}}"#);
+        let active = prepare_poke(&roster, None, &store, &stash, &json, async { Ok(None) })
+            .await
+            .unwrap();
+        assert_eq!(active.as_deref(), Some("u-A"));
+        assert_eq!(store.reads.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn preflight_remaining_shadow_still_refuses_active_resolution() {
+        let roster = roster_ab();
+        let stash = stash_ab().await;
+        let store = PreflightStore::new(true).await;
+        let (_dir, json) = write_claude_json(r#"{"oauthAccount":{"accountUuid":"u-A"}}"#);
+        let result = prepare_poke(&roster, None, &store, &stash, &json, async { Ok(None) }).await;
+        assert!(matches!(result, Err(Error::CredentialSourceConflict)));
+        assert_eq!(store.reads.get(), 1);
+    }
+
+    #[test]
+    fn public_poke_wires_recovery_before_constructing_the_refresh_engine() {
+        // The regression was missing PUBLIC wiring, while the importer tests
+        // passed. Pin that call site as well as exercising the preflight above.
+        let body = include_str!("poke.rs")
+            .split_once("pub(crate) async fn poke(")
+            .unwrap()
+            .1
+            .split_once("/// Validate the requested handle")
+            .unwrap()
+            .0;
+        let preflight = body.find("let active_uuid = prepare_poke(").unwrap();
+        let recovery = body.find("storage.recover_file_login(").unwrap();
+        let engine = body.find("let engine = RealPokeEngine").unwrap();
+        assert!(preflight < recovery && recovery < engine);
+        assert!(body[recovery..engine].contains(".await?"));
     }
 
     #[tokio::test]

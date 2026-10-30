@@ -68,12 +68,16 @@ struct TunablesView: Decodable, Equatable {
 /// mutable label), its current `label`, and its `enabled` flag. NO credential — the roster holds none
 /// (issue #15). All three fields required.
 struct AccountView: Decodable, Equatable {
+    /// Distinguishes local roster keys from actual provider UUIDs. The legacy
+    /// accountUuid field remains the stable label-edit key for compatibility.
+    var localId: String? = nil
     let accountUuid: String
     let label: String
     let enabled: Bool
 
     private enum CodingKeys: String, CodingKey {
         case accountUuid = "account_uuid"
+        case localId = "local_id"
         case label
         case enabled
     }

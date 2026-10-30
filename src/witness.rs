@@ -88,7 +88,9 @@ pub(crate) enum WitnessSources {
     /// The two durable sources on a machine this process can read.
     Observable {
         /// The keychain file to enumerate for `Sessiometer/…` items.
-        keychain: PathBuf,
+        keychain: Option<PathBuf>,
+        /// File-stash metadata also witnesses a lost config, irrespective of selected backend.
+        file_accounts: Option<PathBuf>,
         /// Files whose NON-EMPTINESS is the second witness. A list rather than two fields
         /// because the rule is "any of these", and a list cannot grow a third source
         /// without the loop already handling it.
@@ -111,7 +113,12 @@ impl WitnessSources {
     /// The real machine: the login keychain plus both usage-store files.
     pub(crate) fn real() -> Result<Self> {
         Ok(Self::Observable {
-            keychain: paths::login_keychain()?,
+            keychain: if cfg!(target_os = "macos") {
+                Some(paths::login_keychain()?)
+            } else {
+                None
+            },
+            file_accounts: Some(paths::support_dir()?.join("file-accounts")),
             usage_store: vec![paths::usage_samples()?, paths::usage_rollup()?],
         })
     }
@@ -120,7 +127,8 @@ impl WitnessSources {
     #[cfg(test)]
     pub(crate) fn pinned(keychain: PathBuf, usage_store: Vec<PathBuf>) -> Self {
         Self::Observable {
-            keychain,
+            keychain: Some(keychain),
+            file_accounts: None,
             usage_store,
         }
     }
@@ -161,6 +169,7 @@ impl WitnessSources {
     pub(crate) async fn observe(&self) -> PriorConfiguration {
         let Self::Observable {
             keychain,
+            file_accounts,
             usage_store,
         } = self
         else {
@@ -169,7 +178,19 @@ impl WitnessSources {
         if usage_store.iter().any(|path| is_non_empty(path)) {
             return PriorConfiguration::Present;
         }
-        resolve_probe(crate::keychain::any_stash_item_present(keychain).await)
+        #[cfg(unix)]
+        if let Some(root) = file_accounts {
+            if resolve_probe(
+                crate::file_storage::FileAccountStash::new(root.clone()).any_record_present(),
+            ) == PriorConfiguration::Present
+            {
+                return PriorConfiguration::Present;
+            }
+        }
+        match keychain {
+            Some(path) => resolve_probe(crate::keychain::any_stash_item_present(path).await),
+            None => PriorConfiguration::Absent,
+        }
     }
 }
 
@@ -283,6 +304,31 @@ pub(crate) async fn admit_append_only(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_stash_metadata_refuses_first_run_without_reading_credentials() {
+        let root = tempfile::tempdir().unwrap();
+        crate::file_policy::owner_only_dir(root.path()).unwrap();
+        let accounts = root.path().join("file-accounts");
+        let sources = WitnessSources::Observable {
+            keychain: None,
+            file_accounts: Some(accounts.clone()),
+            usage_store: Vec::new(),
+        };
+        assert_eq!(sources.observe().await, PriorConfiguration::Absent);
+        std::fs::create_dir(&accounts).unwrap();
+        crate::file_policy::owner_only_dir(&accounts).unwrap();
+        // Even malformed data is evidence: the witness must not parse the secret.
+        std::fs::write(accounts.join("record.json"), b"not credential JSON").unwrap();
+        assert!(matches!(
+            admit_append_only(&sources, false).await,
+            Err(Error::PriorConfigurationWithoutConfig)
+        ));
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&accounts, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(sources.observe().await, PriorConfiguration::Present);
+    }
 
     // --- the rule (issue #1440, design D-1) ------------------------------------------
 
@@ -402,7 +448,9 @@ mod tests {
         // the prefix constant does not capture, which would leave the witness hunting a
         // family nothing creates: a probe that can only ever answer `Absent`.
         let account = crate::config::Account {
-            account_uuid: "11111111-1111-1111-1111-111111111111".to_owned(),
+            key: crate::config::AccountKey::ClaudeUuid(
+                "11111111-1111-1111-1111-111111111111".to_owned(),
+            ),
             label: "any".to_owned(),
             enabled: true,
         };
@@ -445,6 +493,7 @@ mod tests {
         // that merely skipped the check would report that as an unrelated panic.
         let WitnessSources::Observable {
             keychain,
+            file_accounts,
             usage_store,
         } = &sources
         else {
@@ -452,8 +501,12 @@ mod tests {
         };
         assert_eq!(
             keychain,
-            &paths::login_keychain().unwrap(),
+            &if cfg!(target_os = "macos") { Some(paths::login_keychain().unwrap()) } else { None },
             "the witness reads a different keychain than `stash` writes to, so it cannot see a stash"
+        );
+        assert_eq!(
+            file_accounts.as_ref(),
+            Some(&paths::support_dir().unwrap().join("file-accounts"))
         );
         assert_eq!(
             usage_store,

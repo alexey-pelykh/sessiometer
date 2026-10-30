@@ -298,6 +298,12 @@ where
     // `&mut daemon` mid-idle. The daemon's own writes (a swap) commit the watch, so this baseline
     // already reflects them and they are never mis-seen as external.
     let canonical_baseline = daemon.canonical_baseline();
+    let storage = daemon.storage.clone();
+    let config_path = daemon.config_path.clone();
+    let storage_ready = || match (&storage, &config_path) {
+        (Some(storage), Some(path)) => storage.require_config_path(path).is_ok(),
+        _ => true,
+    };
 
     // The wait future borrows `&mut daemon`, so it is scoped to this block and dropped before the
     // returned tuple is built — leaving `&mut daemon` free for the caller's post-idle mutation.
@@ -386,7 +392,9 @@ where
                 // the prompt fires at most once per idle period — the coupling that keeps this off
                 // the sub-poll retry storm ADR-0007 rejected. Re-created each iteration like the
                 // #260 wait; the same anchored idle floor keeps the recovery path un-starvable too.
-                () = refresh.until_due(recovery_pending && !recovery_prompted) => {
+                () = refresh.until_due(recovery_pending && !recovery_prompted), if storage_ready() => {
+                    // A config edit during the idle wait must not start an old-backend sweep.
+                    if !storage_ready() { break Idle::Elapsed; }
                     tokio::select! {
                         biased;
                         _ = shutdown.requested() => break Idle::Shutdown,
@@ -429,18 +437,20 @@ where
                 // borrowed by `wait`) and compares against the pre-idle committed baseline;
                 // a difference is an out-of-band write since the last tick → break to
                 // re-tick, so `tick`'s `reconcile_canonical_change` does the authoritative
-                // re-stash / re-resolve / surface. Fail-safe: an unreadable / locked /
-                // absent probe (`None`), or a byte-identical read, or no baseline yet,
-                // detects nothing and keeps idling — the loop never stalls. `wait` is pinned
+                // re-stash / re-resolve / surface. A file-source conflict also wakes
+                // recovery, even without a baseline. Other read errors, unchanged
+                // bytes, or no baseline keep idling. `wait` is pinned
                 // OUTSIDE this loop, so a probe does not reset the poll cadence.
                 () = login_watch.until_due() => {
-                    if let Some(current) = login_watch.read_canonical().await {
-                        if canonical_baseline
+                    match login_watch.read_canonical().await {
+                        Err(Error::CredentialSourceConflict) => break Idle::ExternalLoginDetected,
+                        Ok(current) if canonical_baseline
                             .as_ref()
-                            .is_some_and(|base| !base.matches(&current))
+                            .is_some_and(|base| !base.matches(&current)) =>
                         {
                             break Idle::ExternalLoginDetected;
                         }
+                        _ => {}
                     }
                 }
                 _ = &mut wait => break Idle::Elapsed,

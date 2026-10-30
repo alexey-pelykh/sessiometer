@@ -50,6 +50,8 @@ toml_writer = { version = "1.1.1", default-features = false, features = ["alloc"
 # posture is preserved (~nil dependency-count impact) while operator-provided account
 # labels with wide/emoji glyphs stop misaligning the `status` / `stats` tables.
 unicode-width = "0.2.2"
+# Match Claude profile-path and Keychain-namespace NFC normalization.
+unicode-normalization = "0.1.24"
 zeroize = "1.9.0"
 
 [target.'cfg(windows)'.dependencies]

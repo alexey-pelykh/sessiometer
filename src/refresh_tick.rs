@@ -55,7 +55,8 @@ use crate::error::{Error, Result};
 use crate::observability::{Event, RefreshEventOutcome, RefreshEventReason};
 use crate::paths;
 use crate::refresh::{self, RefreshErrorReason, RefreshOutcome, RefreshReport};
-use crate::stash::RealAccountStash;
+use crate::stash::AccountStash;
+use crate::storage::{AccountStore, Storage};
 
 /// Floor on the base spacing the per-account refresh error back-off widens from (issue #408). The
 /// base is the sweep's own idle floor (`idle_after_secs`) — the interval a recovery-prompted failing
@@ -217,7 +218,8 @@ impl ResolvedBinaryObserver {
 /// was invisible until a manual restart — and a frozen path that stopped working failed EVERY
 /// cycle (the periodic sweep #105 AND the #162 poll-refresh, which share this one engine).
 pub(crate) struct RealRefreshEngine {
-    stash: RealAccountStash,
+    stash: AccountStore,
+    storage: Storage,
     claude_bin: Option<PathBuf>,
     /// The edge-trigger for the resolved-binary log line (issue #786), sited HERE because this
     /// is where resolution happens. Per-engine, not process-wide: `cli` builds one engine for the
@@ -227,9 +229,10 @@ pub(crate) struct RealRefreshEngine {
 }
 
 impl RealRefreshEngine {
-    pub(crate) fn new(stash: RealAccountStash, claude_bin: Option<PathBuf>) -> Self {
+    pub(crate) fn new(stash: AccountStore, storage: Storage, claude_bin: Option<PathBuf>) -> Self {
         Self {
             stash,
+            storage,
             claude_bin,
             binary_observer: ResolvedBinaryObserver::default(),
         }
@@ -268,14 +271,18 @@ impl RefreshEngine for RealRefreshEngine {
     }
 
     async fn refresh(&self, account: &Account) -> Result<RefreshReport> {
+        if refresh::non_refreshable(self.stash.read(&account.stash()).await?.credential.expose()) {
+            return Ok(RefreshReport::no_change());
+        }
         // Resolve per cycle at the spawn site (issue #375), not from a frozen field — the `?` is
         // the non-fatal path `run_sweep` (and the #162 poll) already handle fail-safe.
         let claude_binary = self.resolve_binary().await?;
         refresh::refresh_account(
             &self.stash,
             &account.stash(),
-            &account.account_uuid,
+            account.id(),
             claude_binary,
+            &self.storage,
         )
         .await
     }
@@ -417,7 +424,7 @@ impl<E, K> RefreshTick<E, K> {
 fn account_listed_in(allowlist: &[String], account: &Account) -> bool {
     allowlist
         .iter()
-        .any(|entry| entry == &account.label || entry == &account.account_uuid)
+        .any(|entry| entry == &account.label || entry == account.id())
 }
 
 /// The most accounts a single sweep can ever have excluded from it — the ACTIVE account, plus at
@@ -529,7 +536,7 @@ impl<E: RefreshEngine, K: Clock> RefreshTick<E, K> {
         let mut backoff_updates: Vec<(usize, Option<RefreshBackoff>)> = Vec::new();
         for (i, account) in self.roster.iter().enumerate() {
             // Parked only: the daemon excludes the active account + imminent swap target.
-            if excluded.iter().any(|uuid| uuid == &account.account_uuid) {
+            if excluded.iter().any(|uuid| uuid == account.id()) {
                 continue;
             }
             // Allowlist (empty = all parked accounts).
@@ -548,7 +555,7 @@ impl<E: RefreshEngine, K: Clock> RefreshTick<E, K> {
                     continue;
                 }
             }
-            let is_quarantined = quarantined.iter().any(|uuid| uuid == &account.account_uuid);
+            let is_quarantined = quarantined.iter().any(|uuid| uuid == account.id());
             // The stored expiry BEFORE the cycle: the event's `expires_before` AND the
             // near-expiry input — read once here and reused for the event.
             let before_ms = self.engine.stored_expires_at(account).await;
@@ -560,7 +567,7 @@ impl<E: RefreshEngine, K: Clock> RefreshTick<E, K> {
             // so a healthy, far-from-expiry account surfaces its expiry clock to the rollup.
             if !is_quarantined && !is_near_expiry(before_ms, now_ms, horizon_ms) {
                 outcome.observations.push(RefreshObservation {
-                    account_uuid: account.account_uuid.clone(),
+                    account_uuid: account.id().to_owned(),
                     expires_at_ms: before_ms,
                     refresh: None,
                 });
@@ -613,7 +620,7 @@ impl<E: RefreshEngine, K: Clock> RefreshTick<E, K> {
                     matches!(r.outcome, RefreshOutcome::Refreshed { .. }) && r.re_stashed
                 })
             {
-                outcome.restored.push(account.account_uuid.clone());
+                outcome.restored.push(account.id().to_owned());
             }
             // Fold the per-account back-off ledger (issue #408). An `Error` advances the streak and
             // arms a widening window (surfaced as `backoff_secs=` on the event); ANY other outcome
@@ -646,7 +653,7 @@ impl<E: RefreshEngine, K: Clock> RefreshTick<E, K> {
                 Some(report) => (
                     refresh_event(&account.label, before_ms, &report, backoff_secs),
                     RefreshObservation {
-                        account_uuid: account.account_uuid.clone(),
+                        account_uuid: account.id().to_owned(),
                         // The post-cycle stored expiry (the event's `expires_after`): a
                         // re-stashed refresh slid it forward; every other terminal state
                         // left the stash — and so the expiry — unchanged.
@@ -664,7 +671,7 @@ impl<E: RefreshEngine, K: Clock> RefreshTick<E, K> {
                 None => (
                     error_refresh_event(&account.label, before_ms, error_reason, backoff_secs),
                     RefreshObservation {
-                        account_uuid: account.account_uuid.clone(),
+                        account_uuid: account.id().to_owned(),
                         expires_at_ms: before_ms,
                         refresh: Some(RefreshDelta {
                             outcome: RefreshEventOutcome::Error,
@@ -704,8 +711,8 @@ impl<E: RefreshEngine, K: Clock> RefreshTicker for RefreshTick<E, K> {
         // ~1/min spawn storm.
         let allowlist = !self.config.accounts.is_empty();
         self.roster.iter().any(|account| {
-            quarantined.iter().any(|uuid| uuid == &account.account_uuid)
-                && !excluded.iter().any(|uuid| uuid == &account.account_uuid)
+            quarantined.iter().any(|uuid| uuid == account.id())
+                && !excluded.iter().any(|uuid| uuid == account.id())
                 && (!allowlist || self.account_listed(account))
         })
     }
@@ -932,7 +939,7 @@ mod tests {
 
     fn acct(label: &str, uuid: &str) -> Account {
         Account {
-            account_uuid: uuid.to_owned(),
+            key: crate::config::AccountKey::ClaudeUuid(uuid.to_owned()),
             label: label.to_owned(),
             enabled: true,
         }
@@ -1081,15 +1088,11 @@ mod tests {
 
     impl RefreshEngine for FakeEngine {
         async fn stored_expires_at(&self, account: &Account) -> Option<i64> {
-            self.expiry_reads
-                .borrow_mut()
-                .push(account.account_uuid.clone());
-            self.expiries.get(&account.account_uuid).copied().flatten()
+            self.expiry_reads.borrow_mut().push(account.id().to_owned());
+            self.expiries.get(account.id()).copied().flatten()
         }
         async fn refresh(&self, account: &Account) -> Result<RefreshReport> {
-            self.refreshed
-                .borrow_mut()
-                .push(account.account_uuid.clone());
+            self.refreshed.borrow_mut().push(account.id().to_owned());
             // Model the real engine's per-cycle resolution (issue #786) when one is scripted:
             // observe the outcome, then short-circuit on failure exactly as
             // `RealRefreshEngine::refresh`'s `?` does. Engines with no script resolve nothing and
@@ -1109,10 +1112,10 @@ mod tests {
             let scripted = self
                 .scripts
                 .borrow_mut()
-                .get_mut(&account.account_uuid)
+                .get_mut(account.id())
                 .filter(|s| !s.is_empty())
                 .map(|s| s.remove(0));
-            let fake = scripted.or_else(|| self.results.get(&account.account_uuid).copied());
+            let fake = scripted.or_else(|| self.results.get(account.id()).copied());
             match fake {
                 Some(FakeRefresh::Report(r)) => Ok(r),
                 Some(FakeRefresh::HardError) => Err(crate::error::Error::SwapLockBusy),
@@ -1283,7 +1286,8 @@ mod tests {
         std::os::unix::fs::symlink(&version_a, &link).unwrap();
 
         // Built ONCE — exactly as the daemon builds it once at startup.
-        let engine = RealRefreshEngine::new(RealAccountStash::new(), Some(link.clone()));
+        let storage = Storage::from_config(&Default::default()).unwrap();
+        let engine = RealRefreshEngine::new(storage.stash().unwrap(), storage, Some(link.clone()));
 
         // Cycle 1: link → A (exists) → Ok. The resolver returns the SYMLINK path UNCANONICALIZED
         // (AC4 / issue constraint [C1]: a wrapper symlink is spawned as-is, never resolved to its

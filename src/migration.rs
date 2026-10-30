@@ -91,10 +91,10 @@ use crate::error::{Error, Result};
 const MAGIC: &str = "sessiometer-migration";
 
 /// Current container format version. Gates the *structure* of the artifact:
-/// [`MigrationArtifact::from_bytes`] rejects any other value up front. Bump only for
+/// [`MigrationArtifact::from_bytes`] also accepts the frozen v1 format. Bump only for
 /// a structural change old readers cannot understand — parameter changes travel in
 /// the header instead (see the module docs on forward compatibility).
-const FORMAT_VERSION: u16 = 1;
+const FORMAT_VERSION: u16 = 2;
 
 /// A whole migration artifact: the stable magic, the structured header, and the
 /// body (plaintext payload or opaque ciphertext).
@@ -361,7 +361,7 @@ impl MigrationArtifact {
             return Err(Error::MigrationBadMagic);
         }
         if let Some(version) = preamble.header.and_then(|h| h.format_version) {
-            if version != FORMAT_VERSION {
+            if !(1..=FORMAT_VERSION).contains(&version) {
                 return Err(Error::MigrationUnsupportedVersion {
                     found: version,
                     supported: FORMAT_VERSION,
@@ -1866,13 +1866,9 @@ mod tests {
                 "the {label} fixture's on-disk format_version drifted from the pin"
             );
         }
-        // ...and the pin tracks the CURRENT code version, so a `FORMAT_VERSION` bump
-        // cannot land without refreshing the fixtures + this constant together.
-        assert_eq!(
-            EXPECTED_FIXTURE_VERSION, FORMAT_VERSION,
-            "FORMAT_VERSION was bumped: re-emit the golden fixtures (run the ignored \
-             emit_v1_golden_fixtures) and update EXPECTED_FIXTURE_VERSION to match"
-        );
+        // Keep v1 immutable: new readers must continue decrypting existing backups.
+        assert_eq!(EXPECTED_FIXTURE_VERSION, 1);
+        assert_eq!(FORMAT_VERSION, 2);
     }
 
     #[test]

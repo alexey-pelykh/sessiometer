@@ -291,7 +291,7 @@ where
         let changed = before != Some(deadline);
         if changed || record_unchanged {
             events.push(Event::CredentialExpiryObserved {
-                account: self.roster[idx].account_uuid.clone(),
+                account: self.roster[idx].id().to_owned(),
                 provenance,
                 before,
                 after: deadline,
@@ -339,7 +339,7 @@ where
                 if *signaled != Some(state) {
                     *signaled = Some(state);
                     events.push(Event::CredentialExpiryHorizon {
-                        account: self.roster[idx].account_uuid.clone(),
+                        account: self.roster[idx].id().to_owned(),
                         state,
                         expires_at: deadline,
                         horizon_secs,
@@ -421,6 +421,7 @@ where
             .map(|(i, account)| {
                 let health = &self.state.accounts[i].health;
                 AccountReading {
+                    usage_unavailable: health.usage_unavailable,
                     label: account.label.clone(),
                     active: active == Some(i),
                     enabled: account.enabled,

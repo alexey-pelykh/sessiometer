@@ -635,6 +635,8 @@ struct AccountExpiry: Decodable, Equatable, Sendable {
 /// daemon that omits them still decodes. The `auth` property is the wire key; the Rust field
 /// it mirrors is named `health`.
 struct AccountStatusLine: Decodable, Equatable {
+    /// Explicitly unmonitored credential; manual use remains available.
+    var usageUnavailable = false
     /// The operator-chosen handle — never the email (issue #15).
     let label: String
     let active: Bool
@@ -678,6 +680,7 @@ struct AccountStatusLine: Decodable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case label
+        case usageUnavailable = "usage_unavailable"
         case active
         case enabled
         case quarantined
@@ -697,6 +700,7 @@ struct AccountStatusLine: Decodable, Equatable {
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         label = try c.decode(String.self, forKey: .label)
+        usageUnavailable = try c.decodeIfPresent(Bool.self, forKey: .usageUnavailable) ?? false
         active = try c.decode(Bool.self, forKey: .active)
         enabled = try c.decode(Bool.self, forKey: .enabled)
         quarantined = try c.decode(Bool.self, forKey: .quarantined)

@@ -343,7 +343,7 @@ const MIGRATION_CONFLICT_POLICIES: [&str; 2] = ["skip", "overwrite"];
 /// shared constant so the prefix has a single definition (issue #70).
 pub(crate) const STASH_PREFIX: &str = "Sessiometer/";
 
-/// One captured account in the roster. Keyed by `account_uuid` alone.
+/// One roster entry, keyed by a real Claude UUID or an explicitly local ID.
 ///
 /// The fields beyond the uniqueness key are read by the write path
 /// ([`Config::render`], for `capture` #4) and by `list` / `status` (#17 / #9);
@@ -351,15 +351,15 @@ pub(crate) const STASH_PREFIX: &str = "Sessiometer/";
 /// persisted here ahead of those consumers.
 ///
 /// The keychain stash name is NOT stored: it is definitionally
-/// `Sessiometer/<account_uuid>` (issue #70), so [`Account::stash`] derives it
-/// from `account_uuid` rather than carrying a duplicate, separately-persisted
+/// `Sessiometer/<id>` (issue #70), so [`Account::stash`] derives it
+/// from the stable key rather than carrying a duplicate, separately-persisted
 /// copy that could drift out of sync.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) struct Account {
-    /// Stable per-account identifier (the Claude `account_uuid`); the sole roster
+    /// Stable per-account identifier (Claude UUID or local ID); the sole roster
     /// key, and the basis for the derived [`stash`](Account::stash) name.
-    pub(crate) account_uuid: String,
+    pub(crate) key: AccountKey,
     /// Human-readable label shown by `list` / `status`, and the operator-facing
     /// HANDLE written **verbatim** into the daemon's durable event log — e.g. the
     /// `event=swap` line's `from=` / `to=` (see [`crate::observability`], the sole
@@ -381,14 +381,42 @@ pub(crate) struct Account {
 }
 
 impl Account {
+    /// Stable roster/storage key, not necessarily a Claude account UUID.
+    pub(crate) fn id(&self) -> &str {
+        match &self.key {
+            AccountKey::ClaudeUuid(id) | AccountKey::LocalId(id) => id,
+        }
+    }
+
+    /// A local token entry must never be used as a Claude identity fallback.
+    pub(crate) fn claude_uuid(&self) -> Option<&str> {
+        match &self.key {
+            AccountKey::ClaudeUuid(uuid) => Some(uuid),
+            AccountKey::LocalId(_) => None,
+        }
+    }
+
     /// The keychain service name the captured credential lives under,
-    /// `Sessiometer/<account_uuid>`. Derived, never stored (issue #70): the stash
-    /// is definitionally a function of `account_uuid`, so the roster keeps one
+    /// `Sessiometer/<id>`. Derived, never stored (issue #70): the stash
+    /// is definitionally a function of the stable key, so the roster keeps one
     /// source of truth and `config.toml` no longer carries a redundant
     /// `stash = …` line. See [`crate::stash`] for the stash layout itself.
     pub(crate) fn stash(&self) -> String {
-        format!("{STASH_PREFIX}{}", self.account_uuid)
+        format!("{STASH_PREFIX}{}", self.id())
     }
+}
+
+/// The source of an entry's identifier. Existing Claude UUIDs retain their stash
+/// names; token-only entries use a separate, generated local namespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AccountKey {
+    ClaudeUuid(String),
+    LocalId(String),
+}
+
+pub(crate) fn is_local_account_id(id: &str) -> bool {
+    id.strip_prefix("local-")
+        .is_some_and(|suffix| suffix.len() == 32 && suffix.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
 /// The daemon tunables, validated into their typed ranges.
@@ -1056,9 +1084,70 @@ pub(crate) struct PeakRunwayAdvisory {
     pub(crate) window_secs: u64,
 }
 
+/// The storage location, not a different OAuth credential kind.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum StorageBackend {
+    Keychain,
+    File,
+}
+
+impl StorageBackend {
+    /// Pure helper so all platform policies can be tested on one host.
+    fn default_for_os(os: &str) -> Self {
+        if os == "macos" {
+            Self::Keychain
+        } else {
+            Self::File
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Keychain => "keychain",
+            Self::File => "file",
+        }
+    }
+}
+
+impl Default for StorageBackend {
+    fn default() -> Self {
+        Self::default_for_os(std::env::consts::OS)
+    }
+}
+
+/// Non-secret, restart-required settings. Profile paths are optional for both backends.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct StorageConfig {
+    pub(crate) backend: StorageBackend,
+    pub(crate) claude_config_dir: Option<PathBuf>,
+}
+
+impl StorageConfig {
+    pub(crate) fn validate(&self) -> Result<()> {
+        self.validate_for_os(std::env::consts::OS)
+    }
+
+    fn validate_for_os(&self, os: &str) -> Result<()> {
+        match (os, self.backend) {
+            ("macos", _) | ("linux", StorageBackend::File) => Ok(()),
+            (_, StorageBackend::Keychain) => Err(Error::ConfigInvalid(
+                "Keychain storage is supported only on macOS; select file storage".into(),
+            )),
+            (_, StorageBackend::File) => Err(Error::ConfigInvalid(
+                "the file adapter currently supports macOS and Linux; Windows is not enabled"
+                    .into(),
+            )),
+        }
+    }
+}
+
 /// The validated configuration: the captured roster plus tunables.
 #[derive(Debug, Clone)]
 pub(crate) struct Config {
+    /// Local credential backend and Claude profile; changes require a daemon restart.
+    pub(crate) storage: StorageConfig,
     /// Captured accounts (unique `account_uuid`; no fixed upper bound —
     /// #35, and possibly empty — the daemon's "at least one" precondition is
     /// [`Config::require_roster`], not a parse-time rule, so `capture` can load a
@@ -1388,7 +1477,11 @@ impl From<&Tunables> for TunablesView {
 /// none (issue #15).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct AccountView {
+    /// Legacy wire name for the roster key; never used as Claude identity.
     pub(crate) account_uuid: String,
+    /// Present only for a locally identified, token-only entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) local_id: Option<String>,
     pub(crate) label: String,
     pub(crate) enabled: bool,
 }
@@ -1399,6 +1492,8 @@ pub(crate) struct AccountView {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
+    #[serde(default)]
+    storage: StorageConfig,
     #[serde(default)]
     account: Vec<RawAccount>,
     #[serde(default)]
@@ -1420,7 +1515,10 @@ struct RawConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawAccount {
-    account_uuid: String,
+    #[serde(default)]
+    account_uuid: Option<String>,
+    #[serde(default)]
+    local_id: Option<String>,
     /// Legacy back-compat (issue #70): pre-#70 `config.toml` files persisted a
     /// `stash = "Sessiometer/<account_uuid>"` line. The stash is now derived
     /// ([`Account::stash`]) and never re-written, but the key is still ACCEPTED
@@ -1435,6 +1533,15 @@ struct RawAccount {
     /// omits the key and must stay fully enabled (backward-compatible default).
     #[serde(default = "default_account_enabled")]
     enabled: bool,
+}
+
+impl RawAccount {
+    fn id(&self) -> &str {
+        self.account_uuid
+            .as_deref()
+            .or(self.local_id.as_deref())
+            .unwrap_or("")
+    }
 }
 
 /// The backward-compatible default for [`RawAccount::enabled`] (issue #36): an
@@ -1946,5 +2053,76 @@ mod tests {
         assert_eq!(cost.memory_kib, 131_072);
         assert_eq!(cost.iterations, 5);
         assert_eq!(cost.parallelism, 1, "the lane count is fixed at production");
+    }
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::*;
+
+    #[test]
+    fn platform_defaults_are_choices_not_fallback_chains() {
+        assert_eq!(
+            StorageBackend::default_for_os("macos"),
+            StorageBackend::Keychain
+        );
+        assert_eq!(
+            StorageBackend::default_for_os("linux"),
+            StorageBackend::File
+        );
+        assert_eq!(
+            StorageBackend::default_for_os("windows"),
+            StorageBackend::File
+        );
+    }
+
+    #[test]
+    fn absent_settings_select_the_native_default_without_requiring_a_profile() {
+        let config: StorageConfig = toml::from_str("").unwrap();
+        assert_eq!(config.backend, StorageBackend::default());
+        assert!(config.claude_config_dir.is_none());
+        assert_eq!(
+            config.validate().is_ok(),
+            cfg!(any(target_os = "macos", target_os = "linux"))
+        );
+    }
+
+    #[test]
+    fn unknown_backend_and_unknown_fields_are_rejected() {
+        assert!(toml::from_str::<StorageConfig>("backend = 'other'").is_err());
+        assert!(toml::from_str::<StorageConfig>("unexpected = true").is_err());
+    }
+
+    #[test]
+    fn file_profiles_may_be_absent_empty_relative_or_unicode() {
+        for profile in [None, Some(""), Some("../profile"), Some("/profile-café")] {
+            let config = StorageConfig {
+                backend: StorageBackend::File,
+                claude_config_dir: profile.map(PathBuf::from),
+            };
+            config.validate_for_os("macos").unwrap();
+            config.validate_for_os("linux").unwrap();
+        }
+    }
+
+    #[test]
+    fn keychain_override_is_allowed_on_macos_but_keychain_is_rejected_elsewhere() {
+        let config = StorageConfig {
+            backend: StorageBackend::Keychain,
+            claude_config_dir: Some(PathBuf::from("/profile")),
+        };
+        config.validate_for_os("macos").unwrap();
+        assert!(config.validate_for_os("linux").is_err());
+        assert!(config.validate_for_os("windows").is_err());
+    }
+
+    #[test]
+    fn windows_default_does_not_claim_an_implemented_windows_adapter() {
+        let config = StorageConfig {
+            backend: StorageBackend::File,
+            claude_config_dir: None,
+        };
+        assert!(config.validate_for_os("windows").is_err());
+        assert!(config.validate_for_os("freebsd").is_err());
     }
 }

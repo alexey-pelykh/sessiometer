@@ -364,6 +364,8 @@ pub(crate) enum CanaryStatus {
 /// One account's latest reading.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AccountReading {
+    /// Deliberately unmonitored: manual selection only, not a failed usage poll.
+    pub(crate) usage_unavailable: bool,
     pub(crate) label: String,
     pub(crate) active: bool,
     /// Whether the account is in the rotation (issue #36) — surfaced so `status`
@@ -535,9 +537,10 @@ pub(crate) struct SchemaVersion {
 /// pre-#1070 app must update the app, which is the same lockstep every wire change here already
 /// assumes. The reverse direction is clean: a 1.14 client reading a ≤1.13 daemon decodes the
 /// always-present key as `Some(_)`.
+/// Version 1.15 adds optional `usage_unavailable` for deliberately unmonitored credentials.
 pub(crate) const STATUS_SCHEMA_VERSION: SchemaVersion = SchemaVersion {
     major: 1,
-    minor: 14,
+    minor: 15,
 };
 
 /// The control socket's `status` reply PAYLOAD — handles + percentages + the forward-looking
@@ -735,6 +738,9 @@ pub(crate) struct VersionedStatus {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct AccountStatusLine {
+    /// Additive capability flag, omitted for ordinary OAuth and by older daemons.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) usage_unavailable: bool,
     /// The operator-chosen handle (label) — never the email (issue #15).
     pub(crate) label: String,
     pub(crate) active: bool,
@@ -1004,6 +1010,7 @@ pub(crate) fn status_response(snapshot: &StatusSnapshot) -> StatusResponse {
                 access_expires_at: account.access_expires_at,
                 refresh_health: account.refresh_health,
                 health: Some(account.health),
+                usage_unavailable: account.usage_unavailable,
                 // The bounded-blindness projection (issue #479), already resolved daemon-side in
                 // `Daemon::snapshot`; copied straight to the wire. `None` for every non-active or
                 // non-blind account, so `skip_serializing_if` omits it there.

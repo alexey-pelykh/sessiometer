@@ -44,6 +44,7 @@ jobs:
           filters: |
             rust:
               - 'src/**'
+              - 'tests/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'deny.toml'
@@ -226,6 +227,31 @@ jobs:
         run: cargo build --verbose
       - name: Test
         run: cargo test --verbose
+
+  linux:
+    name: linux (${{ matrix.rust }})
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [stable, msrv]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: ${{ matrix.rust == 'msrv' && env.RUST_MSRV || env.RUST_STABLE }}
+          components: clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+      - name: Build
+        run: cargo build --locked --verbose
+      - name: Test
+        run: cargo test --locked --verbose
+      - name: Clippy
+        if: matrix.rust == 'stable'
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
   deny:
     name: deny
@@ -605,7 +631,7 @@ jobs:
     # gate step is `continue-on-error`, so the job's conclusion is always success and it cannot block a
     # merge while it is soft-landing (issue #754). Promoting it to a real gate is a change in THAT job,
     # not here.
-    needs: [changes, test, msrv, deny, swift, formula, panel-goldens, ci-ok-needs-complete, gate-change-ack, doc-gates]
+    needs: [changes, test, msrv, linux, deny, swift, formula, panel-goldens, ci-ok-needs-complete, gate-change-ack, doc-gates]
     runs-on: ubuntu-latest
     steps:
       # `needs.*.result` auto-covers every job in `needs:` above — and the `ci-ok-needs-complete`

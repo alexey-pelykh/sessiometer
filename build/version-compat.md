@@ -341,21 +341,19 @@ So `service = "Claude Code-credentials" + suffix`, where:
 Pinned as `keychain::tests` assertions, so the Rust derivation is proven byte-for-byte against CC,
 not merely self-consistent.
 
-## NFC — hash raw bytes, refuse non-ASCII (no Unicode-normalizer dependency)
+## NFC — normalize before hashing
 
-CC hashes the **NFC** form. For an ASCII config-dir path NFC is the identity, so hashing the raw
-bytes is byte-exact — and the crate hand-rolls its primitives (`sha256`, hex) to keep the dependency
-graph minimal, so pulling a Unicode-normalizer crate for the rare non-ASCII tail is disproportionate.
-A non-ASCII value could differ between its NFC form and its raw bytes, so rather than silently
-address the **wrong** keychain item, resolution **refuses** with `Error::NonAsciiConfigDir`. The value
-is read as bytes (`OsStrExt`), never `to_string_lossy` — a lossy decode would hash different bytes
-than CC sees.
+The file-storage implementation replaces the original ASCII-only restriction with Unicode NFC
+normalization. Both credential-directory resolution and Keychain service suffixes follow Claude's
+normalization, while ordinary identity-file fallback retains the original override spelling.
+Invalid UTF-8 is refused rather than lossily decoded. The namespace uses the original override,
+not its absolute filesystem path; explicit default-directory selection still has a suffix.
 
 ## Verification
 
 `canonical_service_from` is pure (the env read lives in `canonical_service`), so every arm — default,
 empty, suffixed (`/abs/path`, `/opt/cc`), `CLAUDE_SECURESTORAGE_CONFIG_DIR` precedence, defined-empty,
-non-ASCII refusal — is unit-tested without mutating process env. The `security`-CLI round-trip test
+NFC-equivalent Unicode spelling — is unit-tested without mutating process env. The `security`-CLI round-trip test
 (`keychain::tests::real_cli`) still passes against the bare base name (its `for_keychain` store pins
 the base, hermetic against ambient `CLAUDE_CONFIG_DIR`).
 
@@ -1895,3 +1893,27 @@ exits.
   code has the excerpt's shape.
 
 CC 2.1.294 · macOS 27.0.1 / 26A434 · sessiometer #1020.
+
+
+## 2026-10-30 — macOS file-mode owned-helper output handoff
+
+The implementation now normalizes an owned login/refresh helper's isolated Keychain output into its credential file after the child finishes, then resumes the existing file readback/classification/persistence protocol. This does not change Claude's backend selection, seed Keychain in file mode, or import/delete live-profile credentials. Linux has no Keychain output adapter.
+
+The scoped implementation and complete regression tests are recorded in the [file-storage design](../docs/design/file-credential-storage-solution-design.md). Validation results are recorded there; this entry is **not a new real-Claude compatibility measurement**. No installed Claude version is admitted by a version number or a fake-backed test. Real owned macOS login and refresh acceptance remains pending, independently of native Linux and build/test portability. Historical observations above remain unchanged.
+
+
+## 2026-10-30 — macOS file-mode live-profile re-login import
+
+The implemented recovery extends file mode to import an already-captured account from the
+configured profile's login-Keychain item during startup/reconciliation or before a manual
+swap or manual refresh. It saves the account entry and active credential file before a checked,
+specific-item delete. Normal reads/status, Keychain mode, Linux, and owned-helper cleanup are unchanged.
+
+This implementation record is not a real-Claude compatibility measurement. A reread before deletion is
+not atomic with a live Claude writer. Real interactive re-login and in-flight A → B → A
+acceptance remain pending; no historical observations or compatibility ranges are expanded.
+
+The manual-refresh entry point now runs this recovery before its active-account read. Its
+earlier omission caused a source-conflict error before any isolated helper could start, even
+in the rebuilt implementation. The fix preserves active-account exclusion and reuses the
+same backend/platform gate and swap lock; no real-Claude compatibility claim is added.

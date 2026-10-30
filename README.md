@@ -1,6 +1,6 @@
 # sessiometer
 
-Manage multiple Claude Code accounts on macOS. `sessiometer` polls each
+Manage multiple Claude Code accounts with macOS Keychain or file storage. `sessiometer` polls each
 account's usage quota and swaps the active credential out-of-band before an
 account is exhausted, so a long session keeps running by rotating across
 accounts.
@@ -22,9 +22,111 @@ including the Terms of Service that govern the accounts you configure with
 `sessiometer`. Review those terms and make sure your own use of those
 accounts is permitted under them.
 
+## Credential storage
+
+macOS defaults to Keychain; Linux defaults to files. To opt into file storage on macOS,
+add this local section to your configuration:
+
+```/dev/null/sessiometer-config.toml#L1-3
+[storage]
+backend = "file"
+claude_config_dir = "/absolute/path/to/your/claude-profile"
+```
+
+The profile is optional for **both** backends. Explicit configuration takes precedence over
+CLAUDE_CONFIG_DIR, then the native home default is used. Start Claude with the same profile.
+Relative, empty, and Unicode paths follow the inspected Claude path semantics; paths are not
+shell-expanded or resolved through filesystem canonicalization. An existing legacy state file
+in the profile takes precedence; otherwise the default identity remains in the home directory.
+
+The active credential is the complete Claude credential document in the selected profile.
+Saved accounts are private records in the native-local support directory, **not** the syncable
+config directory; see the [file stash implementation](src/file_storage.rs#L456). Files are owner-only (0600), new directories
+0700; existing safe profile directories keep their permissions. A valid first write may create
+only the missing profile leaf, whose safe parent must already exist. Swaps reuse the existing
+lock and ordering, publish an atomic replacement, and advance its millisecond modification time.
+Claude picks up the new file between requests, not midway through an already-created request.
+
+**Restart the daemon after changing storage settings.** Selection does not migrate, merge,
+or delete either credential store. Capture accounts into the selected store, or deliberately
+transfer them with encrypted export/import; exports omit machine-local storage settings and
+imports preserve the destination's selection.
+
+**macOS file-mode helpers:** active credentials and saved accounts remain file-backed.
+An owned login or refresh helper may temporarily save its result to its isolated Keychain item.
+After the child finishes, Sessiometer validates and atomically copies that complete credential
+into the isolated file, removes the temporary item, and resumes its existing file-based protocol.
+This also covers manual refresh and keep-warm; no new setting or launcher is needed.
+Keychain-mode helpers are unchanged, and Linux helpers use files directly.
+
+**macOS file-mode re-login:** when an interactive login creates a matching Keychain item,
+Sessiometer can import it for an already-captured account. Startup, daemon reconciliation,
+manual swaps, and manual refresh preflight save the complete credential in the account entry
+and active file before removing the specifically resolved item. Reads/status never perform this migration. Unknown
+accounts, unreadable/ambiguous sources, failed saves, and remaining shadows still refuse it.
+The source is rechecked before deletion, but a running Claude does not share Sessiometer's
+lock: this is not an atomic transaction with Claude. Keychain mode and Linux are unchanged.
+Manual refresh recovers before identifying the active account, then still refreshes only
+parked accounts; a recovered active account is never included in the refresh sweep.
+
+Environment/descriptor auth and other Claude authentication overrides can bypass stored
+credentials: start Claude without them and unset
+[CLAUDE_SECURESTORAGE_CONFIG_DIR](src/storage.rs)
+in file mode. This helper handoff does not alter an independently running Claude's persistence.
+Real macOS helper and live-profile import acceptance remains pending; fake-backed tests and native
+build checks do not establish compatibility with an installed Claude binary.
+
+The file backend does not add profile scope to an inference-only setup-token; its usage is
+retrieved through inference-response headers instead of the profile-scoped usage API.
+
+### Token-only setup-token accounts
+
+You can register a setup-token without borrowing the identity of the currently logged-in account.
+Put only the raw token in an owned regular file with mode 0600, in a directory other users cannot
+modify. Register it explicitly, then select it when you are ready:
+
+```/dev/null/token-only-example.sh#L1-2
+sessiometer capture account-c --token-file "$HOME/private/setup-token"
+sessiometer use account-c
+```
+
+Registration writes only the selected account stash and roster; it does not change the active
+Claude profile. The roster uses a random, stable local ID, not an invented Claude account UUID.
+On selection, Sessiometer writes the complete credential document and removes only the saved
+OAuth account identity from Claude's state. Selecting a normal OAuth account restores its saved
+identity. Other profile settings, onboarding state and device ID remain untouched.
+
+**Enabled inference-only accounts are monitored automatically**, whether active or parked.
+No additional usage setting is needed: credential scopes select the method. Profile-scoped
+accounts use the usage API; inference-only accounts use small, real inference requests.
+Successful probes supply five-hour and weekly utilization, plus reset times when reported,
+to the existing meters and automatic rotation. These calls **consume provider usage**.
+The existing scheduler remains in control: active-account interleaving and
+near-limit polling can run more frequently than the configured base interval. There is no
+five-minute cache. Standalone manual viability checks and explicitly enabled online canaries use
+the same policy; merely viewing daemon status sends no extra request. Profile-scoped accounts
+continue using the usage endpoint. HTTP failures do not trigger a paid fallback, and HTTP 429
+retains the existing backoff behavior even when it carries quota headers.
+
+This monitoring method is not a provider-policy endorsement; see the dated exception in
+[ADR-0017](docs/adr/0017-bounded-blindness-preemptive-swap-not-header-observation.md).
+No account is renewed without a refresh token. Token lifetime
+is not inferred from the token string; missing expiry stays unknown. Existing environment or
+descriptor-based authentication overrides must still be removed from the Claude process you
+want to switch. Token-only registration works with either selected backend; it does not add
+Windows support or bypass macOS Keychain precedence.
+
+A successful credential write followed by a failed identity update is reported as an **identity
+update pending**, not a zero-write failure. Until reconciliation succeeds, Claude may still use
+the preceding account's identity metadata. Adoption occurs between client requests/cache reloads,
+not atomically inside an already-running request.
+
+Implementation and test scope are documented in the
+[file-storage design](docs/design/file-credential-storage-solution-design.md).
+
 ## Prerequisites
 
-- **macOS**, using the **login keychain**.
+- **macOS** with the login Keychain (default), or experimental file storage on macOS/Linux. Windows credential storage is not enabled.
 - A Claude Code credential already present in the login keychain — the
   generic-password item whose service is `Claude Code-credentials` (created when
   you sign in to Claude Code). `sessiometer` reads and rewrites this item in
@@ -1263,27 +1365,29 @@ stops and states this floor instead (issue #1053,
 ## Privacy: no telemetry
 
 `sessiometer` phones home for nothing. It sends **no** analytics, usage
-telemetry, crash reports, update pings, or beacons of any kind. The **only**
-outbound network request it makes is the read-only per-account usage poll the
-swap logic runs — `GET https://api.anthropic.com/api/oauth/usage`, under your own
-account's bearer token — so the daemon can tell when an account is near its quota
-and swap before exhaustion. Nothing else leaves the machine during normal
-operation (start, poll, swap, idle).
+telemetry, crash reports, update pings, or beacons of any kind. Its usage transport
+normally makes a read-only per-account GET to Anthropic's OAuth usage endpoint,
+under your own account's bearer token, so the daemon can swap before exhaustion.
+The scope-selected inference-usage probe instead sends a fixed, minimal POST
+to Anthropic's Messages endpoint for inference-only credentials. That request
+**consumes provider usage**; it sends no conversation, project content, or account
+UUID. It is never a fallback for a failed GET. Model output is discarded and only
+the status, retry delay, and quota headers are read.
 
 This is an architectural guarantee, not just a policy:
 
 - **No HTTP or TLS client is linked.** `sessiometer` pulls in no `reqwest` /
   `hyper` / `rustls` / `native-tls` (the
   [transport rule](CONTRIBUTING.md#system-clis-not-client-crates-the-transport-rule));
-  the one usage `GET` rides the system `/usr/bin/curl` at an absolute path. With
-  no in-process HTTP/TLS stack and no raw TCP/UDP socket — the daemon's control
-  channel is local on every target, a Unix-domain socket on macOS / Linux and a
-  named pipe on Windows — the process has no way to open a second connection.
+  both usage methods ride the system curl at an absolute path. Each request selects
+  one of two fixed Anthropic endpoints, with ambient curl configuration disabled
+  and no automatic redirect or retry. The daemon's control channel is a local
+  Unix-domain socket on macOS / Linux; Windows is unsupported on this branch.
 - **A test enforces it.** The no-other-egress invariant is a capability guard in
   the test suite ([`src/usage.rs`](src/usage.rs), run by `cargo test` in CI): it
   fails the build if an HTTP/TLS/telemetry crate ever enters the dependency graph,
   if a raw TCP/UDP socket appears, or if any network binary other than the
-  sanctioned usage-endpoint `curl` is referenced — so a future change cannot
+  sanctioned usage-transport curl is referenced — so a future change cannot
   silently open a telemetry channel.
 
 `sessiometer` also *drives* the official Claude Code CLI (`claude`) to refresh a
@@ -1295,11 +1399,11 @@ you.
 ## What it stores
 
 `sessiometer` takes custody of Claude Code credentials, so it is worth knowing
-exactly what it keeps and where. Everything lives under your own user account — in
-the **login keychain** and under `~/Library` — and nothing leaves the machine
-(the only outbound traffic is the read-only usage poll; the one file that can carry
-credentials off-machine is an [`export`](#exporting-state-offline) artifact you
-create explicitly).
+exactly what it keeps and where. State lives under your own user account, using
+the selected Keychain or file backend. Credentials are used for the usage requests
+and Claude-assisted operations described above, not sent to a telemetry service.
+An [export](#exporting-state-offline) artifact can carry credentials off-machine
+when you explicitly create and transfer it.
 
 ### In the login keychain
 

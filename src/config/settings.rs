@@ -69,7 +69,11 @@ impl Config {
                 .roster
                 .iter()
                 .map(|account| AccountView {
-                    account_uuid: account.account_uuid.clone(),
+                    account_uuid: account.id().to_owned(),
+                    local_id: account
+                        .claude_uuid()
+                        .is_none()
+                        .then(|| account.id().to_owned()),
                     label: account.label.clone(),
                     enabled: account.enabled,
                 })
@@ -160,7 +164,7 @@ fn overlay_labels(accounts: &mut [RawAccount], labels: &BTreeMap<String, String>
     for (account_uuid, new_label) in labels {
         let account = accounts
             .iter_mut()
-            .find(|account| &account.account_uuid == account_uuid)
+            .find(|account| account.id() == account_uuid)
             .ok_or_else(|| Error::AccountUuidNotFound {
                 account_uuid: account_uuid.clone(),
             })?;
@@ -216,7 +220,7 @@ mod tests {
         let renamed = after
             .roster
             .iter()
-            .find(|a| a.account_uuid == "11111111-1111-1111-1111-111111111111")
+            .find(|a| a.id() == "11111111-1111-1111-1111-111111111111")
             .unwrap();
         assert_eq!(renamed.label, "day-job");
     }

@@ -17,7 +17,6 @@ use lexopt::Arg::{Long, Short, Value};
 
 use unicode_width::UnicodeWidthStr;
 
-use crate::claude_state::OauthAccount;
 use crate::config::{Account, Config, ConflictPolicy, Origin, OriginReport};
 use crate::control_transport::{self, ControlListener};
 use crate::daemon::{
@@ -28,7 +27,7 @@ use crate::daemon::{
     STATUS_SCHEMA_VERSION,
 };
 use crate::error::{Error, Result};
-use crate::keychain::{Credential, CredentialStore, RealCredentialStore};
+use crate::keychain::{Credential, CredentialStore};
 use crate::migration::{ManagedAccount, MigrationArtifact, Passphrase, Payload, PLAINTEXT_WARNING};
 use crate::observability::{
     daemon_build_event, CredentialHealth, Diagnostic, DiagnosticLog, Event, EventLog,
@@ -39,7 +38,7 @@ use crate::refresh;
 use crate::refresh_tick::{self, RealRefreshEngine, RefreshTick};
 use crate::service::AgentSupervision;
 use crate::sha256::sha256_hex;
-use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
+use crate::stash::{AccountStash, StashedAccount};
 use crate::swap::{SwapLock, SWAP_LOCK_MAX_WAIT};
 use crate::systemic_refresh;
 
@@ -80,6 +79,11 @@ impl From<lexopt::Error> for Error {
 enum Command {
     /// `capture [<label>]` — stash the active account into the rotation.
     Capture { label: Option<String> },
+    /// Explicit token-only registration; argv carries only a private file path.
+    CaptureToken {
+        label: Option<String>,
+        token_file: PathBuf,
+    },
     /// `login [<label>]` — `claude /login` in isolation, then land it in the rotation.
     Login { label: Option<String> },
     /// `run [-v|--verbose] [--managed]` — the foreground poll+swap daemon. `--managed`
@@ -350,6 +354,32 @@ fn parse_positional(
         }
     }
     Ok(build(positional))
+}
+
+/// Capture keeps its positional behavior; token-only import is explicit, never
+/// inferred from an unreadable identity file.
+fn parse_capture(parser: &mut lexopt::Parser) -> Result<Command> {
+    let mut label = None;
+    let mut token_file = None;
+    while let Some(arg) = parser.next()? {
+        match arg {
+            Short('h') | Long("help") => return Ok(Command::Help(HelpTopic::Capture)),
+            Long("token-file") if token_file.is_none() => {
+                token_file = Some(PathBuf::from(required_value(
+                    parser,
+                    "token-file",
+                    HelpTopic::Capture,
+                )?));
+            }
+            Value(value) if label.is_none() => label = Some(value.to_string_lossy().into_owned()),
+            Value(_) => {}
+            other => return Err(unexpected(other, HelpTopic::Capture)),
+        }
+    }
+    Ok(match token_file {
+        Some(token_file) => Command::CaptureToken { label, token_file },
+        None => Command::Capture { label },
+    })
 }
 
 /// Parse `list` — no positional, no flags but `-h`/`--help`. A stray positional is ignored
@@ -818,9 +848,7 @@ where
 /// unrecognized name is `UnknownCommand` — unchanged from the prior dispatch.
 fn parse_subcommand(name: &OsStr, parser: &mut lexopt::Parser) -> Result<Command> {
     match name.to_string_lossy().as_ref() {
-        "capture" => parse_positional(parser, HelpTopic::Capture, |label| Command::Capture {
-            label,
-        }),
+        "capture" => parse_capture(parser),
         "login" => parse_positional(parser, HelpTopic::Login, |label| Command::Login { label }),
         "run" => parse_run(parser),
         "service" => parse_service(parser),
@@ -869,6 +897,9 @@ fn version_line() -> String {
 async fn execute(command: Command) -> Result<()> {
     match command {
         Command::Capture { label } => crate::capture::capture(label).await,
+        Command::CaptureToken { label, token_file } => {
+            crate::capture::capture_token(label, &token_file).await
+        }
         Command::Login { label } => crate::capture::login(label).await,
         Command::Run { verbose, managed } => {
             let verbosity = if verbose {
@@ -996,13 +1027,18 @@ sessiometer works with.
 const CAPTURE_USAGE: &str = "sessiometer capture — stash the active account into the rotation
 
 USAGE:
-    sessiometer capture [<label>]
+    sessiometer capture [<label>] [--token-file <path>]
 
     <label>     a name for the captured account. Omit it at a terminal and capture
                 offers the account's email as an editable, pre-filled default —
                 press Enter to accept it, or type a shorter handle (e.g. `work`).
                 Omit it when piped/scripted and the label auto-derives from the
                 account-uuid (no prompt, and never the email unconfirmed).
+    --token-file <path>
+                register a setup-token without identity (private 0600 file, raw
+                token only). Does not change the active Claude profile. Usage is
+                monitored automatically through small inference requests that
+                consume provider usage. No automatic renewal.
     -h, --help  print this help
 ";
 
@@ -1504,15 +1540,17 @@ async fn run(verbosity: Verbosity, managed: bool) -> Result<()> {
     // account stash, the real clock, and `~/.claude.json` for display reconcile.
     // Wire the single-writer swap lock (#64) so the daemon's own swaps serialize
     // against a concurrent manual `use` swap on the same native-local `swap.lock`.
+    let storage = crate::storage::Storage::from_config(&config.storage)?;
     let mut daemon = Daemon::new(
         config.roster.clone(),
-        RealRosterPoller::new(),
-        RealCredentialStore::new(),
-        RealAccountStash::new(),
+        RealRosterPoller::new(storage.canonical()?, storage.stash()?),
+        storage.canonical()?,
+        storage.stash()?,
         RealClock::new(),
-        paths::claude_json()?,
+        storage.state_file().to_path_buf(),
         &config.tunables,
     )
+    .with_storage(storage.clone())
     .with_swap_lock(paths::swap_lock()?)
     // Re-read this on a runtime roster-reload (#139): a `capture` / `login` / `remove`
     // notifies the daemon over the control socket, which then reconciles the in-memory
@@ -1619,14 +1657,14 @@ async fn run(verbosity: Verbosity, managed: bool) -> Result<()> {
     let roster_uuids: Vec<String> = config
         .roster
         .iter()
-        .map(|account| account.account_uuid.clone())
+        .map(|account| account.id().to_owned())
         .collect();
-    refresh::reap_orphans(&roster_uuids).await;
+    refresh::reap_orphans(&roster_uuids, &storage).await;
     // …and the login isolation root (issue #133): a crashed `claude /login` (SIGKILL / power-loss —
     // no RAII teardown) can strand a credential-bearing isolated item + dir under `<support>/login`.
     // Folded in beside the roster reap under the same single-instance lock (no login is in flight),
     // scan-based (the fixed login dir is not roster-keyed). Best-effort — never blocks daemon start.
-    refresh::reap_login_orphan().await;
+    refresh::reap_login_orphan(&storage).await;
 
     // The periodic isolated-refresh tick (issue #105): opt-in, driven from `run_loop`'s idle
     // path off the poll→usage→swap seam. Wired whenever `[refresh]` is enabled — the spawn
@@ -1656,7 +1694,8 @@ async fn run(verbosity: Verbosity, managed: bool) -> Result<()> {
     // the single-threaded tick, so a refresh can never race a promotion into a torn canonical
     // (ADR-0015). The `[refresh].enabled` toggle now gates ONLY the PROACTIVE maintenance below.
     daemon = daemon.with_refresh_engine(Box::new(RealRefreshEngine::new(
-        RealAccountStash::new(),
+        storage.stash()?,
+        storage.clone(),
         config.refresh.claude_bin.clone(),
     )));
     if refresh_enabled {
@@ -1679,7 +1718,10 @@ async fn run(verbosity: Verbosity, managed: bool) -> Result<()> {
         // the scrub it guards against to `continue`-recoverable.
         daemon = daemon
             .with_keep_warm_engine(
-                Box::new(RealKeepWarmEngine::new(config.refresh.claude_bin.clone())),
+                Box::new(RealKeepWarmEngine::new(
+                    config.refresh.claude_bin.clone(),
+                    storage.clone(),
+                )),
                 config.refresh.cadence(),
             )
             .with_proactive_keep_warm(config.refresh.proactive_keep_warm);
@@ -1691,7 +1733,11 @@ async fn run(verbosity: Verbosity, managed: bool) -> Result<()> {
         // `claude` per cycle, so the tick is no longer gated on a successful startup resolution —
         // that gate is exactly what froze a stale path and blocked self-healing.
         refresh_enabled,
-        RealRefreshEngine::new(RealAccountStash::new(), config.refresh.claude_bin.clone()),
+        RealRefreshEngine::new(
+            storage.stash()?,
+            storage.clone(),
+            config.refresh.claude_bin.clone(),
+        ),
         RealClock::new(),
     );
     // The STARTUP PREFLIGHT (issue #787): probe the refresh mechanism's PRECONDITION exactly once,
@@ -1734,11 +1780,11 @@ async fn run(verbosity: Verbosity, managed: bool) -> Result<()> {
     }
 
     // The external-login watch (issue #140): a short-cadence LOCAL probe of the canonical item
-    // over its OWN `RealCredentialStore`, driven from `run_loop`'s idle path, so a manual
+    // over its OWN selected canonical store, driven from `run_loop`'s idle path, so a manual
     // `claude /login` on the active account is reflected within `EXTERNAL_LOGIN_WATCH_SECS`
     // instead of up to a full `poll_secs`. Always-on (no feature gate — a cheap local read); its
     // own store leaves the daemon's untouched by the idle borrow.
-    let mut login_watch = ExternalLoginWatcher::new(RealCredentialStore::new());
+    let mut login_watch = ExternalLoginWatcher::new(storage.canonical()?);
 
     let result = run_loop(
         &mut daemon,
@@ -3926,8 +3972,15 @@ const DEGRADED_CUE: &str = "degraded — run 'sessiometer poke'";
 /// rollup) falls back to the legacy comma-joined tags, so an old daemon's `status` is unchanged
 /// rather than mis-reading a defaulted glyph over a dead account.
 fn health_cell(account: &AccountStatusLine) -> String {
+    let availability = if account.usage_unavailable {
+        " usage unavailable (manual)"
+    } else {
+        ""
+    };
     let Some(health) = account.health else {
-        return legacy_health_tags(account);
+        let mut cell = legacy_health_tags(account);
+        cell.push_str(availability);
+        return cell;
     };
     let mut cell = health_glyph(health).to_owned();
     // The actionable cue an operator needs, keyed off the honest verdict (issue #427): a PROVEN
@@ -3959,6 +4012,7 @@ fn health_cell(account: &AccountStatusLine) -> String {
     if !account.enabled {
         cell.push_str(" disabled");
     }
+    cell.push_str(availability);
     cell
 }
 
@@ -4794,11 +4848,17 @@ fn now_epoch() -> i64 {
 /// timestamp-derived duration and a bare refresh-outcome token, so it can never print a
 /// token or email (issue #15 redaction).
 async fn list() -> Result<()> {
-    let roster = resolve_roster(Config::load())?;
+    let loaded = Config::load();
+    let settings = loaded
+        .as_ref()
+        .map(|c| c.storage.clone())
+        .unwrap_or_default();
+    let roster = resolve_roster(loaded)?;
+    let storage = crate::storage::Storage::from_config(&settings)?;
     // The static auth subset (issue #120): a credential-STORE + event-log read, both
     // daemon-independent (no `run`, no `/usage`). Gathered AFTER the roster resolves so
     // the empty / malformed-config exits below never touch the keychain.
-    let auth = gather_auth_subset(&roster).await;
+    let auth = gather_auth_subset(&roster, &storage.stash()?).await;
     print!("{}", render_roster(&roster, &auth, now_epoch()));
     Ok(())
 }
@@ -4872,7 +4932,8 @@ fn export_encryption(
 /// through the #147 no-argv input paths and never logged.
 async fn export(path: Option<PathBuf>, no_secrets: bool, encryption: Encryption) -> Result<()> {
     let config = Config::load()?;
-    let stash = RealAccountStash::new();
+    let storage = crate::storage::Storage::from_config(&config.storage)?;
+    let stash = storage.stash()?;
     let payload = gather_payload(&config, &stash, no_secrets).await?;
 
     // The redacted-event dimensions (issue #150), captured before `encryption` is consumed by
@@ -4947,7 +5008,7 @@ async fn gather_payload(
     stash: &impl AccountStash,
     no_secrets: bool,
 ) -> Result<Payload> {
-    let config_toml = config.render();
+    let config_toml = config.render_portable();
     let accounts = if no_secrets {
         Vec::new()
     } else {
@@ -4955,9 +5016,9 @@ async fn gather_payload(
         for account in &config.roster {
             let stashed = stash.read(&account.stash()).await?;
             accounts.push(ManagedAccount::new(
-                account.account_uuid.clone(),
+                account.id().to_owned(),
                 stashed.credential.expose().to_vec(),
-                stashed.oauth_account.raw_json().to_vec(),
+                stashed.identity_bytes().to_vec(),
             ));
         }
         accounts
@@ -5045,7 +5106,12 @@ async fn import(path: PathBuf, overwrite: bool, passphrase: PassphraseSource) ->
     // behaviour unchanged). Resolved from `local` before it is moved into `apply_import`.
     let overwrite = resolve_import_overwrite(overwrite, local.as_ref());
 
-    let stash = RealAccountStash::new();
+    let target_storage = local
+        .as_ref()
+        .map(|c| c.storage.clone())
+        .unwrap_or_default();
+    let storage = crate::storage::Storage::from_config(&target_storage)?;
+    let stash = storage.stash()?;
 
     // Which roster account is this machine currently logged into (issue #1001)? Resolved
     // BEFORE `apply_import`, because "active" is a PRE-import fact: the import is about to
@@ -5056,9 +5122,9 @@ async fn import(path: PathBuf, overwrite: bool, passphrase: PassphraseSource) ->
         Some(config) => {
             resolve_active_uuid_for_import(
                 &config.roster,
-                &RealCredentialStore::new(),
+                &storage.canonical()?,
                 &stash,
-                &paths::claude_json()?,
+                storage.state_file(),
             )
             .await
         }
@@ -5188,7 +5254,7 @@ async fn resolve_active_uuid_for_import<C: CredentialStore, S: AccountStash>(
         }
         Err(_) => crate::active::resolve_via_display(roster, claude_json),
     }?;
-    Some(roster[index].account_uuid.clone())
+    Some(roster[index].id().to_owned())
 }
 
 /// Tally the per-account import outcomes into `(imported, skipped, overwritten, failed)` — the four
@@ -5273,8 +5339,12 @@ async fn apply_import<S: AccountStash>(
     // The roster + tunables the artifact carries, held to the same invariants as any
     // on-disk config (unique non-empty account_uuid, tunable ranges) — with the SHAPE
     // failure re-badged to name the import version floor (issue #1053).
-    let incoming =
-        Config::from_toml_str(payload.config_toml()).map_err(name_the_import_version_floor)?;
+    let target_storage = local
+        .as_ref()
+        .map(|config| config.storage.clone())
+        .unwrap_or_default();
+    let incoming = Config::from_portable_toml_str(payload.config_toml(), &target_storage)
+        .map_err(name_the_import_version_floor)?;
 
     // Base config: preserve the LOCAL config when present — its tunables / refresh / login / stats
     // / migration blocks and existing roster are authoritative (the per-account merge below only
@@ -5318,7 +5388,7 @@ async fn apply_import<S: AccountStash>(
         let existing = result
             .roster
             .iter()
-            .position(|account| account.account_uuid == incoming_account.account_uuid);
+            .position(|account| account.id() == incoming_account.id());
 
         // Conflict policy: an account already on the target is SKIPPED — left
         // byte-for-byte untouched (its stash AND roster entry) — unless `overwrite`.
@@ -5334,7 +5404,7 @@ async fn apply_import<S: AccountStash>(
         // A config-only account (no secret) writes nothing and lands as a roster entry
         // only → "needs re-login".
         let mut staged = false;
-        if let Some(managed) = secrets.get(incoming_account.account_uuid.as_str()) {
+        if let Some(managed) = secrets.get(incoming_account.id()) {
             if write_and_verify(stash, &incoming_account.stash(), managed)
                 .await
                 .is_err()
@@ -5361,7 +5431,7 @@ async fn apply_import<S: AccountStash>(
         // deliberately: a SKIPPED account (conflict policy left it byte-for-byte untouched)
         // and a config-only account (no secret in the artifact) both wrote nothing, so there
         // is nothing pending adoption and the notice would be a false alarm.
-        if staged && active_uuid == Some(incoming_account.account_uuid.as_str()) {
+        if staged && active_uuid == Some(incoming_account.id()) {
             outcome = outcome.staged_not_adopted();
         }
         outcomes.push(outcome);
@@ -5443,15 +5513,15 @@ async fn write_and_verify<S: AccountStash>(
 ) -> Result<()> {
     let account = StashedAccount {
         credential: Credential::new(managed.credential().to_vec()),
-        oauth_account: OauthAccount::from_object_bytes(managed.oauth_account())?,
+        oauth_account: crate::stash::decode_identity(managed.oauth_account())?,
     };
+    crate::stash::validate_identity(service, account.oauth_account.as_ref())?;
     stash.write(service, &account).await?;
 
     let readback = stash.read(service).await?;
     let credential_ok =
         sha256_hex(account.credential.expose()) == sha256_hex(readback.credential.expose());
-    let oauth_ok = sha256_hex(account.oauth_account.raw_json())
-        == sha256_hex(readback.oauth_account.raw_json());
+    let oauth_ok = sha256_hex(account.identity_bytes()) == sha256_hex(readback.identity_bytes());
     if credential_ok && oauth_ok {
         Ok(())
     } else {
@@ -5728,18 +5798,17 @@ pub(crate) struct AuthSubset {
 /// outcome per handle ([`crate::observability::last_refresh_outcomes`]). No daemon, no
 /// `/usage`, no live refresh. Best-effort: an unreadable stash or log degrades that
 /// field to `None`, so `list` stays a non-failing read-only view.
-async fn gather_auth_subset(roster: &[Account]) -> Vec<AuthSubset> {
+async fn gather_auth_subset<S: AccountStash>(roster: &[Account], stash: &S) -> Vec<AuthSubset> {
     // One log read for the whole roster (last outcome per handle) — not one read per
     // account. An unresolvable log path degrades straight to an empty map (→ no refresh
     // tags), rather than reading a sentinel empty path.
     let last_refresh = crate::observability::log_path()
         .map(|path| crate::observability::last_refresh_outcomes(&path))
         .unwrap_or_default();
-    let stash = RealAccountStash::new();
     let mut subsets = Vec::with_capacity(roster.len());
     for account in roster {
         subsets.push(AuthSubset {
-            expires_at_ms: refresh::stored_expires_at(&stash, &account.stash()).await,
+            expires_at_ms: refresh::stored_expires_at(stash, &account.stash()).await,
             last_refresh: last_refresh.get(&account.label).copied(),
         });
     }
@@ -5791,12 +5860,18 @@ pub(crate) fn render_roster(roster: &[Account], auth: &[AuthSubset], now_secs: i
         // A parked account is marked inline (issue #36); an enabled one adds
         // nothing.
         let state = if account.enabled { "" } else { " · disabled" };
+        let identity = if account.claude_uuid().is_none() {
+            " · token only (no identity)"
+        } else {
+            ""
+        };
         let tags = auth_tags(auth, now_secs);
         out.push_str(&format!(
-            "{}  {}{}{}\n",
+            "{}  {}{}{}{}\n",
             pad_end(&account.label, width),
-            account.account_uuid,
+            account.id(),
             state,
+            identity,
             tags,
         ));
     }
@@ -5978,6 +6053,7 @@ fn flip_confirmation(outcome: FlipOutcome, label: &str, enabled: bool) -> String
 async fn remove_account(query: Option<String>) -> Result<()> {
     let query = query.ok_or(Error::RotationLabelRequired { verb: "remove" })?;
     let mut config = Config::load()?;
+    let storage = crate::storage::Storage::from_config(&config.storage)?;
     let removed = apply_remove(&mut config.roster, &query)?;
     // Config FIRST (see the doc): persist the roster without the entry before the
     // destructive stash delete, so any failure past here orphans a harmless stash
@@ -5985,7 +6061,11 @@ async fn remove_account(query: Option<String>) -> Result<()> {
     config.save().await?;
     // Then delete the now-unreferenced stash — both halves, idempotent. The
     // service name is derived from the removed account's uuid (issue #70).
-    RealAccountStash::new().delete(&removed.stash()).await?;
+    paths::ensure_private_dir(&paths::support_dir()?)?;
+    let lock_path = paths::swap_lock()?;
+    let guard = SwapLock::acquire(&lock_path, SWAP_LOCK_MAX_WAIT).await?;
+    storage.stash()?.delete(&removed.stash()).await?;
+    drop(guard);
     // Tell a running daemon to drop the removed account from its live rotation now
     // (#139) — best-effort, so it never swaps to an account whose stash is gone.
     // MUTATING (#1442, R-4): the canonical shrink. Removing the LAST account is a legitimate
@@ -6396,7 +6476,7 @@ mod tests {
 
     fn acct(label: &str, uuid: &str) -> Account {
         Account {
-            account_uuid: uuid.to_owned(),
+            key: crate::config::AccountKey::ClaudeUuid(uuid.to_owned()),
             label: label.to_owned(),
             enabled: true,
         }
@@ -6443,6 +6523,7 @@ mod tests {
             login: crate::config::LoginConfig::default(),
             stats: crate::config::StatsConfig::default(),
             migration: crate::config::MigrationConfig::default(),
+            storage: crate::config::StorageConfig::default(),
             credential: crate::config::CredentialConfig::default(),
         }
     }
@@ -8841,7 +8922,7 @@ spare  22222222-2222\n\
         // The load-bearing assertion of this whole issue: nothing was removed, so
         // `remove_account` never reaches the stash delete. Previously `u1` went, irreversibly.
         assert_eq!(roster.len(), 3, "an ambiguous resolve removes nothing");
-        assert_eq!(roster[0].account_uuid, "u1");
+        assert_eq!(roster[0].id(), "u1");
     }
 
     #[test]
@@ -8860,10 +8941,11 @@ spare  22222222-2222\n\
         assert!(!roster[1].enabled);
 
         let removed = apply_remove(&mut roster, "u1").expect("the uuid resolves for remove too");
-        assert_eq!(removed.account_uuid, "u1");
+        assert_eq!(removed.id(), "u1");
         assert_eq!(roster.len(), 1);
         assert_eq!(
-            roster[0].account_uuid, "u2",
+            roster[0].id(),
+            "u2",
             "the OTHER bearer survives — the operator picked one and got it"
         );
     }
@@ -9243,6 +9325,7 @@ spare  22222222-2222\n\
         weekly: Option<u8>,
     ) -> AccountStatusLine {
         AccountStatusLine {
+            usage_unavailable: false,
             label: label.to_owned(),
             active,
             session_pct: session,
@@ -9321,6 +9404,7 @@ spare  22222222-2222\n\
         weekly_resets_at: Option<i64>,
     ) -> AccountStatusLine {
         AccountStatusLine {
+            usage_unavailable: false,
             label: label.to_owned(),
             active: false,
             session_pct: session,
@@ -11697,10 +11781,12 @@ spare  22222222-2222\n\
     fn export_stashed(token: &[u8], uuid: &str, email: &str) -> crate::stash::StashedAccount {
         crate::stash::StashedAccount {
             credential: crate::keychain::Credential::new(token.to_vec()),
-            oauth_account: crate::claude_state::OauthAccount::from_object_bytes(
-                format!(r#"{{"accountUuid":"{uuid}","emailAddress":"{email}"}}"#).as_bytes(),
-            )
-            .expect("valid oauthAccount object"),
+            oauth_account: Some(
+                crate::claude_state::OauthAccount::from_object_bytes(
+                    format!(r#"{{"accountUuid":"{uuid}","emailAddress":"{email}"}}"#).as_bytes(),
+                )
+                .expect("valid oauthAccount object"),
+            ),
         }
     }
 
@@ -11749,17 +11835,17 @@ spare  22222222-2222\n\
         let sa = export_stashed(TOKEN_A, UUID_A, EMAIL_A);
         let sb = export_stashed(TOKEN_B, UUID_B, EMAIL_B);
         let expected = Payload::new(
-            config.render(),
+            config.render_portable(),
             vec![
                 ManagedAccount::new(
                     UUID_A.to_owned(),
                     sa.credential.expose().to_vec(),
-                    sa.oauth_account.raw_json().to_vec(),
+                    sa.identity_bytes().to_vec(),
                 ),
                 ManagedAccount::new(
                     UUID_B.to_owned(),
                     sb.credential.expose().to_vec(),
-                    sb.oauth_account.raw_json().to_vec(),
+                    sb.identity_bytes().to_vec(),
                 ),
             ],
         );
@@ -11821,7 +11907,7 @@ spare  22222222-2222\n\
         let payload = gather_payload(&config, &stash, true).await.unwrap();
 
         // Config-only: identical to a payload with an EMPTY account set.
-        assert!(payload == Payload::new(config.render(), Vec::new()));
+        assert!(payload == Payload::new(config.render_portable(), Vec::new()));
 
         // Serialize it (plaintext container) and assert the credential material is
         // wholly absent — neither raw token, nor hex token, nor email, for either
@@ -11848,6 +11934,38 @@ spare  22222222-2222\n\
             contains_bytes(&bytes, UUID_A.as_bytes()),
             "the roster itself is still exported"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn portable_import_into_file_storage_preserves_target_settings_and_secret_bytes() {
+        let (source, source_stash) = export_config_and_stash().await;
+        let payload = gather_payload(&source, &source_stash, false).await.unwrap();
+        assert!(!payload.config_toml().contains("[storage]"));
+        let root = tempfile::tempdir().unwrap();
+        let destination = crate::file_storage::FileAccountStash::new(root.path().join("accounts"));
+        let mut target = config_with(Vec::new());
+        target.storage.backend = crate::config::StorageBackend::File;
+        target.storage.claude_config_dir = Some(root.path().join("target-profile"));
+        let expected_settings = target.storage.clone();
+        let lock = root.path().join("swap.lock");
+        let (imported, _) = apply_import(
+            Some((&lock, Duration::from_secs(1))),
+            &payload,
+            Some(target),
+            None,
+            &destination,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(imported.storage, expected_settings);
+        for account in &source.roster {
+            let before = source_stash.read(&account.stash()).await.unwrap();
+            let after = destination.read(&account.stash()).await.unwrap();
+            assert!(after.credential.matches(&before.credential));
+            assert_eq!(after.identity_bytes(), before.identity_bytes());
+        }
     }
 
     /// A `--plaintext` export round-trips structurally and — by design — carries the
@@ -11947,7 +12065,7 @@ spare  22222222-2222\n\
                 ManagedAccount::new(
                     (*uuid).to_owned(),
                     stashed.credential.expose().to_vec(),
-                    stashed.oauth_account.raw_json().to_vec(),
+                    stashed.identity_bytes().to_vec(),
                 )
             })
             .collect();
@@ -11983,8 +12101,12 @@ spare  22222222-2222\n\
         async fn read(&self, _service: &str) -> Result<StashedAccount> {
             Ok(StashedAccount {
                 credential: Credential::new(b"NOT-WHAT-WAS-WRITTEN".to_vec()),
-                oauth_account: OauthAccount::from_object_bytes(br#"{"accountUuid":"other"}"#)
+                oauth_account: Some(
+                    crate::claude_state::OauthAccount::from_object_bytes(
+                        br#"{"accountUuid":"other"}"#,
+                    )
                     .unwrap(),
+                ),
             })
         }
         async fn delete(&self, _service: &str) -> Result<()> {
@@ -12035,8 +12157,8 @@ spare  22222222-2222\n\
                 "credential restored byte-for-byte"
             );
             assert_eq!(
-                back.oauth_account.raw_json(),
-                export_stashed(token, uuid, email).oauth_account.raw_json(),
+                back.identity_bytes(),
+                export_stashed(token, uuid, email).identity_bytes(),
                 "oauthAccount restored byte-for-byte"
             );
         }
@@ -14331,6 +14453,7 @@ spare  22222222-2222\n\
         ("parse_stats", NotRendered, "argv: `stats`' flags"),
         ("parse_status", NotRendered, "argv: `status`'s flags"),
         ("parse_subcommand", NotRendered, "argv: the eighteen verb names, matched against input"),
+        ("parse_capture", NotRendered, "argv: capture's explicit token-file flag and help; the value is a path, never a bearer"),
         ("cross_surface_id", NotRendered, "the eight cross-surface fault identifiers (issue #768) — a machine contract"),
         ("query_status", NotRendered, "the `{\"cmd\":\"status\"}` control frame"),
         ("should_colorize", NotRendered, "the three colour environment keys"),
@@ -14431,21 +14554,21 @@ spare  22222222-2222\n\
         // catches a second same-named function, since the register keys on the name alone.
         assert_eq!(
             spelled.len(),
-            79,
-            "expected 79 functions spelling an inline word-bearing literal; the count moved — \
+            80,
+            "expected 80 functions spelling an inline word-bearing literal; the count moved — \
              disposition the new one, then update this"
         );
         assert_eq!(
             literals.len(),
-            288,
-            "expected 288 inline word-bearing literals; the count moved — check whether the \
+            293,
+            "expected 293 inline word-bearing literals; the count moved — check whether the \
              function that gained one is still dispositioned correctly, then update this"
         );
 
         // Per-arm cardinality, so the DEBT is pinned rather than merely listed: a surface moved
         // into `Unscanned` without anyone deciding to would otherwise land silently among 44
         // entries that already say so. Shrinking this number is the progress issue #1167 tracks.
-        for (arm, expected) in [(Scanned, 11), (NotRendered, 24), (Unscanned, 44)] {
+        for (arm, expected) in [(Scanned, 11), (NotRendered, 25), (Unscanned, 44)] {
             let actual = INLINE_PROSE_REGISTER
                 .iter()
                 .filter(|(_, disposition, _)| *disposition == arm)
@@ -16794,6 +16917,7 @@ impl Nested {
         /// vary fields that helper fixes (`active`, `enabled`, `quarantined`, `health`).
         fn quiet(label: &str) -> AccountStatusLine {
             AccountStatusLine {
+                usage_unavailable: false,
                 label: label.to_owned(),
                 active: false,
                 enabled: true,
@@ -18599,5 +18723,87 @@ impl Nested {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod token_only_tests {
+    use super::*;
+    use crate::daemon::SwapAck;
+
+    #[test]
+    fn token_file_capture_parser_is_explicit_and_path_only() {
+        assert_eq!(
+            parse(["capture", "account-c", "--token-file", "/tmp/token"]).unwrap(),
+            Command::CaptureToken {
+                label: Some("account-c".into()),
+                token_file: PathBuf::from("/tmp/token")
+            }
+        );
+        assert!(parse(["capture", "--token-file"]).is_err());
+        assert_eq!(
+            parse(["capture", "account-b"]).unwrap(),
+            Command::Capture {
+                label: Some("account-b".into())
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn token_only_export_import_preserves_local_key_and_explicit_absence() {
+        let id = "local-0123456789abcdef0123456789abcdef";
+        let config = Config::from_toml_str(&format!(
+            "[[account]]\nlocal_id='{id}'\nlabel='account-c'\n"
+        ))
+        .unwrap();
+        let stash = crate::stash::FakeAccountStash::empty();
+        let expected = Credential::new(br#"{"claudeAiOauth":{"accessToken":"dummy","refreshToken":null,"expiresAt":null,"scopes":["user:inference"]}}"#.to_vec());
+        stash
+            .write(
+                &config.roster[0].stash(),
+                &StashedAccount {
+                    credential: expected.clone(),
+                    oauth_account: None,
+                },
+            )
+            .await
+            .unwrap();
+        let payload = gather_payload(&config, &stash, false).await.unwrap();
+        let artifact = MigrationArtifact::plaintext(payload);
+        let decoded = MigrationArtifact::from_bytes(&artifact.to_bytes())
+            .unwrap()
+            .into_plaintext_payload()
+            .unwrap();
+        let target = crate::stash::FakeAccountStash::empty();
+        let (restored, outcomes) = apply_import(None, &decoded, None, None, &target, false)
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(restored.roster, config.roster);
+        let saved = target.read(&restored.roster[0].stash()).await.unwrap();
+        assert!(saved.oauth_account.is_none());
+        assert!(saved.credential.matches(&expected));
+    }
+
+    #[test]
+    fn token_only_status_is_additive_and_partial_swap_ack_is_not_a_rejection() {
+        let old = r#"{"label":"c","active":true,"enabled":true,"quarantined":false,"session_pct":null,"weekly_pct":null}"#;
+        let mut account: AccountStatusLine = serde_json::from_str(old).unwrap();
+        assert!(!account.usage_unavailable);
+        account.usage_unavailable = true;
+        assert!(health_cell(&account).contains("usage unavailable"));
+        let encoded = serde_json::to_string(&account).unwrap();
+        assert!(encoded.contains("\"usage_unavailable\":true"));
+        let ack: SwapAck = serde_json::from_str(
+            r#"{"result":"accepted","from":"b","to":"c","identity_pending":true}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            ack,
+            SwapAck::Accepted {
+                identity_pending: true,
+                ..
+            }
+        ));
     }
 }

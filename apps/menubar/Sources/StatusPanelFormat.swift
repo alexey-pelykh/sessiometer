@@ -814,6 +814,7 @@ enum StatusPanelFormat {
     static func swapDoneText(_ success: SwapSuccess) -> String {
         switch success {
         case .swapped(let from, let to): return "Switched \(from) → \(to)"
+        case .identityPending(let to): return "Credentials switched to \(to); identity update pending"
         case .alreadyActive(let to):     return "\(to) is already active"
         }
     }
@@ -1480,8 +1481,11 @@ enum StatusPanelFormat {
     /// (needs-refresh) account needs, softened to `recovering` while healing (#109), plus a trailing
     /// `disabled` — or `nil` when there is no cue. For the modern (`auth != nil`) path where the view
     /// renders the glyph as its own element; the legacy (`auth == nil`) path uses `legacyHealthTags`.
-    static func authCue(auth: CredentialHealth?, recovering: Bool, enabled: Bool) -> String? {
+    static func authCue(auth: CredentialHealth?, recovering: Bool, enabled: Bool, usageUnavailable: Bool = false) -> String? {
         var parts: [String] = []
+        if usageUnavailable {
+            parts.append("usage unavailable · manual")
+        }
         if let auth, let cue = authActionCue(auth: auth, recovering: recovering) {
             parts.append(cue)
         }
@@ -2183,10 +2187,12 @@ enum StatusPanelFormat {
         nextSwap: NextSwap? = nil,
         now: Int64 = 0,
         expiry: AccountExpiry? = nil,
-        showsExpiry: Bool = false
+        showsExpiry: Bool = false,
+        usageUnavailable: Bool = false
     ) -> String {
         var parts: [String] = [label]
         if isActive { parts.append("active") }
+        if usageUnavailable { parts.append("usage unavailable; manual selection only") }
         parts.append(authSpoken(auth: auth, recovering: recovering, enabled: enabled, quarantined: quarantined))
         if let blind = blind {
             // Blind active row (#485): speak the SEMANTIC held state the row shows — blind duration,

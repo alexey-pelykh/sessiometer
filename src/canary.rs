@@ -1,14 +1,16 @@
 // Copyright (c) 2026 Oleksii PELYKH
 // SPDX-License-Identifier: MIT
 
-//! Behavioral canary (issue #714) — asserts the reverse-engineered #100 keychain
-//! derivation still points at the credential Claude Code is actually using,
+//! Behavioral canary (issue #714) — probes the selected credential source and checks
+//! its identity against the captured roster. Keychain selection uses #100 derivation;
+//! file selection verifies file safety and, on macOS, absence of a shadowing item,
 //! converting "CC silently changed where/how it stores its credential" from an
 //! operational-failure-later into a loud, immediate signal at boot / pre-swap.
 //!
 //! ## The two layers (and the residual third)
 //!
-//! **Layer 1 — service resolution (uniqueness).** A FRESH enumeration pass
+//! **Layer 1 — source resolution.** File storage performs a fresh authority/safe-read probe.
+//! Keychain storage performs a FRESH enumeration pass
 //! ([`CredentialStore::probe_resolution`]): zero items under the derived service →
 //! [`CanaryOutcome::NotFound`] (a service-name derivation change, or a scrubbed
 //! keychain), more than one → [`CanaryOutcome::Ambiguous`]. Zero is already
@@ -278,11 +280,8 @@ pub(crate) async fn reconcile_display<S: AccountStash>(
             continue;
         }
         // The canonical belongs to this account; ensure the display agrees.
-        let displayed = claude_state::read_oauth_account_from(claude_json)
-            .ok()
-            .map(|o| o.account_uuid().to_owned());
-        if displayed.as_deref() != Some(stashed.oauth_account.account_uuid()) {
-            claude_state::write_oauth_account(claude_json, &stashed.oauth_account)?;
+        if !claude_state::identity_matches(claude_json, stashed.oauth_account.as_ref())? {
+            claude_state::set_oauth_account(claude_json, stashed.oauth_account.as_ref())?;
         }
         return Ok(());
     }
@@ -337,6 +336,25 @@ where
     // mismatch it then presents, which is exactly the decided posture when the
     // display CANNOT be brought to agree).
     let _ = reconcile_display(roster, stash, claude_json, &canonical).await;
+
+    // A registered token-only credential is complete without a displayed UUID.
+    // This is not an exemption for an unknown or malformed canonical credential.
+    for account in roster
+        .iter()
+        .filter(|account| account.claude_uuid().is_none())
+    {
+        if let Ok(stashed) = stash.read(&account.stash()).await {
+            if stashed.oauth_account.is_none() && stashed.credential.matches(&canonical) {
+                return if claude_state::identity_matches(claude_json, None)? {
+                    Ok(CanaryOutcome::Ok)
+                } else {
+                    Err(Error::ConfigInvalid(
+                        "token-only credential still has a Claude identity".into(),
+                    ))
+                };
+            }
+        }
+    }
 
     // Layer 2 — the offline stash-token cross-check (decided oracle, option C).
     let Some(displayed) = active::resolve_via_display(roster, claude_json) else {
@@ -522,6 +540,9 @@ where
     match poller.poll(account, true).await {
         Ok(_) => Liveness::Live,
         Err(Error::UsageUnauthorized) => Liveness::Rejected,
+        // Capability check skipped HTTP entirely; even strict mode cannot
+        // require a usage result this credential is explicitly unable to obtain.
+        Err(Error::UsageUnavailable) => Liveness::Uninformative,
         // Everything else is an absence of evidence, NOT evidence of absence: transient
         // transport failures, throttling, a 5xx, a missing scope, an unparseable body, a
         // locked keychain. Collapsed to one verdict on purpose — the swap decision below
@@ -580,7 +601,7 @@ mod tests {
 
     fn acct(label: &str, uuid: &str) -> Account {
         Account {
-            account_uuid: uuid.to_owned(),
+            key: crate::config::AccountKey::ClaudeUuid(uuid.to_owned()),
             label: label.to_owned(),
             enabled: true,
         }
@@ -603,15 +624,50 @@ mod tests {
     fn stashed(token: &[u8], uuid: &str) -> StashedAccount {
         StashedAccount {
             credential: cred(token),
-            oauth_account: OauthAccount::from_object_bytes(
-                format!(r#"{{"accountUuid":"{uuid}","emailAddress":"{uuid}@example.com"}}"#)
-                    .as_bytes(),
-            )
-            .unwrap(),
+            oauth_account: Some(
+                OauthAccount::from_object_bytes(
+                    format!(r#"{{"accountUuid":"{uuid}","emailAddress":"{uuid}@example.com"}}"#)
+                        .as_bytes(),
+                )
+                .unwrap(),
+            ),
         }
     }
 
     /// A two-account roster: `work` (`u-A`) and `spare` (`u-B`).
+
+    #[tokio::test]
+    async fn token_only_reconcile_and_canary_remove_stale_identity_without_inventing_one() {
+        let id = "local-0123456789abcdef0123456789abcdef";
+        let roster = vec![Account {
+            key: crate::config::AccountKey::LocalId(id.into()),
+            label: "c".into(),
+            enabled: true,
+        }];
+        let stash = FakeAccountStash::empty();
+        stash
+            .write(
+                &roster[0].stash(),
+                &StashedAccount {
+                    credential: cred(b"C-token"),
+                    oauth_account: None,
+                },
+            )
+            .await
+            .unwrap();
+        let store = store_holding(b"C-token").await;
+        let (_dir, json) = claude_json_for("u-B");
+        assert_eq!(
+            run(&store, &stash, &roster, &json).await.unwrap(),
+            CanaryOutcome::Ok
+        );
+        assert!(claude_state::identity_matches(&json, None).unwrap());
+        assert!(active::resolve_via_display(&roster, &json).is_none());
+        assert_eq!(
+            run(&store, &stash, &roster, &json).await.unwrap(),
+            CanaryOutcome::Ok
+        );
+    }
     fn roster_ab() -> Vec<Account> {
         vec![acct("work", "u-A"), acct("spare", "u-B")]
     }

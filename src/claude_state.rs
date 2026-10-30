@@ -3,11 +3,11 @@
 
 //! Claude Code's per-user state file, `~/.claude.json`.
 //!
-//! Holds the active account's `oauthAccount` identity block — the second half of
-//! an account's credential. The first half is the keychain token (see
-//! [`crate::keychain`]); issue #16/R1 established that an account is *both* parts,
-//! so [`capture`](crate::capture) records this block alongside the token and the
-//! swap engine (#6) restores both when rotating an account in.
+//! Holds the active account's optional `oauthAccount` identity block, separate
+//! from the canonical bearer. Ordinary [`capture`](crate::capture) still requires
+//! both parts. Explicit token-only registration records intentional absence;
+//! the swap engine restores OR clears identity accordingly. Claude can use this
+//! block in request metadata as well as its UI: it is not merely cosmetic.
 //!
 //! Only the `oauthAccount` object is read; the rest of the (large) file is
 //! ignored. The object is preserved as its canonical JSON bytes so it can be
@@ -152,7 +152,7 @@ pub(crate) fn read_oauth_account_from(path: &Path) -> Result<OauthAccount> {
 /// Co-write `oauth` into `~/.claude.json` as its `oauthAccount`, preserving every
 /// other field and the file's existing permission mode.
 ///
-/// The swap engine's honest-display co-write (#6): a field-preserving
+/// The identified-account identity co-write (#6): a field-preserving
 /// read-modify-write. The whole file is parsed into a `serde_json::Value`, **only**
 /// the `oauthAccount` key is replaced (or inserted, if absent), and the result is
 /// written back atomically through [`paths::write_preserving_mode`] (same-directory
@@ -166,9 +166,18 @@ pub(crate) fn read_oauth_account_from(path: &Path) -> Result<OauthAccount> {
 /// (issue #15 redaction). Wired into the swap loop in #7.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn write_oauth_account(path: &Path, oauth: &OauthAccount) -> Result<()> {
+    set_oauth_account(path, Some(oauth))
+}
+
+/// Apply the incoming entry's identity, including explicit absence. Preserve
+/// every unrelated Claude setting and use the existing atomic/mode-preserving write.
+pub(crate) fn set_oauth_account(path: &Path, oauth: Option<&OauthAccount>) -> Result<()> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == ErrorKind::NotFound => {
+            if oauth.is_none() {
+                return Ok(());
+            }
             return Err(Error::ClaudeStateNotFound {
                 path: path.to_path_buf(),
             });
@@ -182,14 +191,43 @@ pub(crate) fn write_oauth_account(path: &Path, oauth: &OauthAccount) -> Result<(
     // `oauth.raw_json()` is the canonical bytes of an already-validated object, so
     // this parse cannot fail; `insert` replaces an existing `oauthAccount` or adds
     // it, leaving every sibling key untouched.
-    let value: Value =
-        serde_json::from_slice(oauth.raw_json()).expect("oauthAccount raw JSON is always valid");
-    obj.insert("oauthAccount".to_owned(), value);
+    match oauth {
+        Some(oauth) => {
+            let value: Value =
+                serde_json::from_slice(oauth.raw_json()).expect("validated identity JSON");
+            if obj.get("oauthAccount") == Some(&value) {
+                return Ok(());
+            }
+            obj.insert("oauthAccount".to_owned(), value);
+        }
+        None => {
+            if obj.remove("oauthAccount").is_none() {
+                return Ok(());
+            }
+        }
+    }
     // Re-serialize the whole mutated document; serializing a parsed `Value` cannot
     // fail. Field order may be normalized — semantically irrelevant for JSON, and
     // the AC requires preserving fields, not their order.
     let serialized = serde_json::to_vec(&root).expect("serializing a parsed JSON value");
     paths::write_preserving_mode(path, &serialized)
+}
+
+/// An unreadable/malformed file is not proof of absent identity. For identified
+/// entries compare UUIDs, preserving Claude's independently updated profile fields.
+pub(crate) fn identity_matches(path: &Path, expected: Option<&OauthAccount>) -> Result<bool> {
+    if let Some(expected) = expected {
+        return Ok(read_oauth_account_from(path)
+            .is_ok_and(|actual| actual.account_uuid() == expected.account_uuid()));
+    }
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(Error::Io(error)),
+    };
+    let root: Value = serde_json::from_slice(&bytes).map_err(parse_error)?;
+    let object = root.as_object().ok_or(Error::OauthAccountMissing)?;
+    Ok(!object.contains_key("oauthAccount"))
 }
 
 /// Extract a required string field, mapping absence (or a non-string value) to
@@ -215,6 +253,42 @@ fn parse_error(err: serde_json::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_only_clear_preserves_other_state_and_is_idempotent() {
+        let (_dir, path) = write_temp(
+            r#"{"oauthAccount":{"accountUuid":"B"},"hasCompletedOnboarding":true,"userID":"device","projects":{"x":1}}"#,
+        );
+        set_oauth_account(&path, None).unwrap();
+        let first = std::fs::read(&path).unwrap();
+        let state: Value = serde_json::from_slice(&first).unwrap();
+        assert!(state.get("oauthAccount").is_none());
+        assert_eq!(state["userID"], "device");
+        assert_eq!(state["hasCompletedOnboarding"], true);
+        assert_eq!(state["projects"]["x"], 1);
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        set_oauth_account(&path, None).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), first);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            modified
+        );
+        assert!(identity_matches(&path, None).unwrap());
+        let identity = OauthAccount::from_object_bytes(br#"{"accountUuid":"B"}"#).unwrap();
+        set_oauth_account(&path, Some(&identity)).unwrap();
+        assert!(identity_matches(&path, Some(&identity)).unwrap());
+    }
+
+    #[test]
+    fn token_only_missing_state_is_absent_but_malformed_state_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        set_oauth_account(&path, None).unwrap();
+        assert!(!path.exists());
+        std::fs::write(&path, b"not json").unwrap();
+        assert!(set_oauth_account(&path, None).is_err());
+        assert!(identity_matches(&path, None).is_err());
+    }
 
     /// A representative `~/.claude.json` fragment: the `oauthAccount` object plus
     /// unrelated top-level keys that must be ignored.

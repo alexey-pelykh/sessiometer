@@ -225,7 +225,7 @@ pub(crate) enum Error {
 
     /// No `Claude Code-credentials` item is present in the keychain — an account
     /// must be captured before it can be read or swapped.
-    #[error("no Claude Code credential found in the keychain (capture an account first)")]
+    #[error("no Claude Code credential found in the selected storage (capture an account first)")]
     CredentialNotFound,
 
     /// More than one `Claude Code-credentials` item is present, so the active
@@ -247,19 +247,14 @@ pub(crate) enum Error {
     #[error("keychain {op} via `security` failed (exit status {code})")]
     Keychain { op: &'static str, code: i32 },
 
-    /// `CLAUDE_CONFIG_DIR` (or `CLAUDE_SECURESTORAGE_CONFIG_DIR`) holds a non-ASCII
-    /// value, which sessiometer cannot map to Claude Code's keychain service name.
-    /// CC hashes the **NFC-normalized** config-dir path; for an ASCII path NFC is
-    /// the identity, so the raw bytes hash byte-identically and no Unicode-normalizer
-    /// dependency is pulled in (issue #100). A non-ASCII path could differ between
-    /// its NFC form and its raw bytes, so rather than compute a suffix that may
-    /// silently address the **wrong** keychain item, resolution refuses. The
-    /// offending value is a filesystem path and is deliberately NOT echoed.
-    #[error(
-        "CLAUDE_CONFIG_DIR (or CLAUDE_SECURESTORAGE_CONFIG_DIR) contains non-ASCII characters, \
-         which sessiometer cannot map to Claude Code's keychain service name"
-    )]
-    NonAsciiConfigDir,
+    #[error("credential file storage: {reason}")]
+    CredentialFile { reason: &'static str },
+
+    #[error("file credentials are shadowed by a profile-specific Keychain item")]
+    CredentialSourceConflict,
+
+    #[error("storage settings changed; restart the daemon before changing credentials")]
+    StorageRestartRequired,
 
     /// No `config.toml` exists yet at the expected path. Carries the path (a
     /// filesystem location, never a secret) so the message can name it.
@@ -548,6 +543,11 @@ pub(crate) enum Error {
          (re-capture this account with an interactive login)"
     )]
     UsageScopeMissing,
+
+    /// No supported usage method matches the declared scopes. No HTTP request
+    /// was attempted; this is a local capability decision, not an HTTP failure.
+    #[error("usage unavailable for this credential — manual selection only")]
+    UsageUnavailable,
 
     /// The poll returned `200` but the body could not be parsed into both quota
     /// dimensions. The wrapped message is a structural hint (a field/shape name)
@@ -2329,7 +2329,7 @@ pub(crate) mod tests {
         // message below can say which one this is rather than leaving the reader to guess.
         assert_eq!(
             prose.len(),
-            91,
+            94,
             "the `#[error(...)]` count moved, and a variant having been ADDED OR REMOVED is the \
              EXPECTED cause: `error_prose_of`'s self-consistency check ran first and found that \
              every `#[error(` in the source started an attribute it parsed, which rules out the \

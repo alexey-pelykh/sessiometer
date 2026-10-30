@@ -3,7 +3,7 @@
 
 //! Per-account usage polling.
 //!
-//! Reads one account's quota from the Claude usage endpoint, read-only:
+//! Normally reads one account's quota from the Claude usage endpoint, read-only:
 //!
 //! ```text
 //! GET https://api.anthropic.com/api/oauth/usage
@@ -11,7 +11,11 @@
 //! anthropic-beta: oauth-2025-04-20
 //! ```
 //!
-//! and projects the response into a [`Usage`] reading (both windows) for the swap
+//! Inference-only credentials automatically issue one minimal Messages
+//! request and project its quota headers into the same reading. Those probes consume
+//! provider usage; they are never an implicit fallback after an HTTP failure.
+//!
+//! Each method projects its response into a [`Usage`] reading (both windows) for the swap
 //! decision. The bearer is the `accessToken` inside the stored
 //! `Claude Code-credentials` blob — read through the existing [`CredentialStore`]
 //! seam ([`crate::keychain`]); the poller never re-reads or re-mints a token.
@@ -37,7 +41,8 @@
 //!   - **Unauthorized** (`401`) → [`Error::UsageUnauthorized`]; the consecutive
 //!     count feeds the re-stash trigger (below).
 //!   - **ScopeFailed** (`403`) → [`Error::UsageScopeMissing`], surfaced
-//!     **distinctly** from 401 — the hallmark of a non-interactive setup token.
+//!     **distinctly** from 401 on the usage API. An inference-probe 403 is instead
+//!     [`Error::UsageRejected`], not a claim about the profile scope.
 //!
 //! ## 401 streak → dead-credential detection (issue #42)
 //!
@@ -60,7 +65,7 @@ use tokio::process::Command;
 use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
-use crate::keychain::CredentialStore;
+use crate::keychain::{Credential, CredentialStore};
 
 /// Absolute path to the system `curl`. Absolute (not `$PATH`-resolved) so a
 /// hijacked `PATH` cannot substitute a different binary for this network call —
@@ -69,6 +74,17 @@ const CURL: &str = "/usr/bin/curl";
 
 /// The read-only per-account usage endpoint.
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
+
+/// Inference endpoint for credentials with inference scope but no profile scope.
+const INFERENCE_URL: &str = "https://api.anthropic.com/v1/messages";
+/// The quota-header probe follows the Claude Code request convention.
+const PROBE_USER_AGENT: &str = "claude-code/2.1.0";
+/// A real inference request: consumes usage even though the output is discarded.
+const PROBE_BODY: &str = concat!(
+    r#"{"model":"claude-haiku-4-5-20251001","#,
+    r#""max_tokens":1,"messages":["#,
+    r#"{"role":"user","content":"hi"}]}"#,
+);
 
 /// The OAuth beta opt-in header the usage endpoint requires.
 const BETA_HEADER: &str = "anthropic-beta: oauth-2025-04-20";
@@ -188,16 +204,57 @@ impl UsageReport {
     }
 }
 
-/// Seam: reads one account's usage quota as a [`PolledReading`] — the swap-decision
-/// [`Usage`] plus the sample-only `severity`, from a SINGLE usage-API call (issue
-/// #156). The only impl ([`RealUsageSource`]) polls the API; it is exercised in tests
-/// through its [`UsageTransport`] seam (a fake transport returns scripted responses),
-/// not a separate fake source.
+/// One request method selected from credential scopes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UsageMethod {
+    /// Read quota JSON without issuing inference.
+    UsageApi,
+    /// Issue one minimal inference request and read its quota headers.
+    InferenceProbe,
+}
+
+/// Scope metadata chooses the request, independently of identity and refreshability.
+/// Unknown metadata retains the legacy usage API; an HTTP failure never selects a
+/// different method. Inference scope without profile scope selects the probe directly.
+pub(crate) fn method_for_credential(credential: &Credential) -> Result<UsageMethod> {
+    #[derive(serde::Deserialize)]
+    struct Scopes<'a> {
+        #[serde(rename = "claudeAiOauth", borrow)]
+        oauth: OauthScopes<'a>,
+    }
+    #[derive(serde::Deserialize)]
+    struct OauthScopes<'a> {
+        scopes: Vec<std::borrow::Cow<'a, str>>,
+    }
+
+    let Ok(metadata) = serde_json::from_slice::<Scopes<'_>>(credential.expose()) else {
+        return Ok(UsageMethod::UsageApi);
+    };
+    if metadata
+        .oauth
+        .scopes
+        .iter()
+        .any(|scope| scope == "user:profile")
+    {
+        return Ok(UsageMethod::UsageApi);
+    }
+    if metadata
+        .oauth
+        .scopes
+        .iter()
+        .any(|scope| scope == "user:inference")
+    {
+        return Ok(UsageMethod::InferenceProbe);
+    }
+    Err(Error::UsageUnavailable)
+}
+
+/// Seam returning the same normalized reading for either retrieval method.
 pub(crate) trait UsageSource {
     async fn usage(&self) -> Result<PolledReading>;
 }
 
-/// Seam: performs the raw usage HTTP GET and reports the `(status, body)`. The
+/// Seam: performs one raw usage HTTP exchange and reports its method and metadata. The
 /// real impl ([`CurlTransport`]) reads the token and shells out to `curl`; a
 /// test impl returns scripted responses, so the classification / parsing / 401
 /// logic in [`RealUsageSource`] is exercised without a network.
@@ -208,6 +265,7 @@ pub(crate) trait UsageTransport {
 /// One HTTP exchange's result. `status == 0` is the sentinel for "no HTTP
 /// response" (curl could not reach the endpoint), classified as Transient.
 pub(crate) struct HttpResponse {
+    method: UsageMethod,
     status: u16,
     body: String,
     /// The server-advised `Retry-After` (delta-seconds form) when the response
@@ -216,6 +274,28 @@ pub(crate) struct HttpResponse {
     /// (issue #76). Only a `4xx`/`5xx` carrying it is meaningful; on a `2xx` it is
     /// simply ignored.
     retry_after: Option<Duration>,
+    quota_headers: QuotaHeaders,
+}
+
+/// Only the four quota headers are retained; arbitrary response headers are not logged.
+#[derive(Default)]
+struct QuotaHeaders {
+    session_utilization: String,
+    weekly_utilization: String,
+    session_reset: String,
+    weekly_reset: String,
+}
+
+impl HttpResponse {
+    fn unreachable(method: UsageMethod) -> Self {
+        Self {
+            method,
+            status: 0,
+            body: String::new(),
+            retry_after: None,
+            quota_headers: QuotaHeaders::default(),
+        }
+    }
 }
 
 /// Real usage poller: classify the HTTP outcome and parse a success. Generic over
@@ -244,14 +324,23 @@ where
             // The one fetch+classify success path: parse ONCE and keep both the
             // decision `Usage` and the sample-only `severity` (issue #156), so the
             // daemon's sample piggybacks this poll with no extra API call.
-            UsageStatus::Success => {
-                let report = parse_usage(&response.body)?;
-                Ok(PolledReading {
-                    usage: report.to_usage(),
-                    severity: report.severity(),
-                })
-            }
-            UsageStatus::ScopeMissing => Err(Error::UsageScopeMissing),
+            UsageStatus::Success => match response.method {
+                UsageMethod::UsageApi => {
+                    let report = parse_usage(&response.body)?;
+                    Ok(PolledReading {
+                        usage: report.to_usage(),
+                        severity: report.severity(),
+                    })
+                }
+                UsageMethod::InferenceProbe => Ok(PolledReading {
+                    usage: parse_probe_headers(&response.quota_headers)?,
+                    severity: None,
+                }),
+            },
+            UsageStatus::ScopeMissing => match response.method {
+                UsageMethod::UsageApi => Err(Error::UsageScopeMissing),
+                UsageMethod::InferenceProbe => Err(Error::UsageRejected { status }),
+            },
             UsageStatus::RateLimited => Err(Error::UsageRateLimited {
                 status,
                 retry_after: response.retry_after,
@@ -265,8 +354,8 @@ where
     }
 }
 
-/// Real transport: read the bearer from the stored credential and `curl` the
-/// usage endpoint. Generic over [`CredentialStore`] so the token source can be
+/// Real transport: read the bearer and perform the selected usage request.
+/// Generic over [`CredentialStore`] so the token source can be
 /// the canonical active item (now) or a per-account stash adapter (#6 / #7).
 pub(crate) struct CurlTransport<C> {
     store: C,
@@ -282,16 +371,19 @@ impl<C: CredentialStore> UsageTransport for CurlTransport<C> {
     async fn fetch(&self) -> Result<HttpResponse> {
         let credential = self.store.read().await?;
         let token = access_token_from_blob(credential.expose())?;
+        let method = method_for_credential(&credential)?;
         // The token-bearing config rides stdin (never argv) and is zeroized on
-        // drop. argv is only `curl --config -`.
-        let config = curl_config(&token);
+        // drop. Ambient curl configuration cannot add requests, retries or redirects.
+        let config = curl_config(&token, method)?;
 
         let mut child = Command::new(CURL)
+            .arg("--disable")
             .arg("--config")
             .arg("-")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            .kill_on_drop(true)
             .spawn()?;
         {
             let mut stdin = child.stdin.take().expect("stdin was piped");
@@ -306,13 +398,9 @@ impl<C: CredentialStore> UsageTransport for CurlTransport<C> {
         // sentinel → classified Transient. (A failure to *spawn* curl is a true
         // I/O error and propagated via `?` above.)
         if !output.status.success() {
-            return Ok(HttpResponse {
-                status: 0,
-                body: String::new(),
-                retry_after: None,
-            });
+            return Ok(HttpResponse::unreachable(method));
         }
-        Ok(parse_curl_output(&output.stdout))
+        Ok(parse_curl_output(&output.stdout, method))
     }
 }
 
@@ -362,17 +450,24 @@ fn access_token_from_blob(blob: &[u8]) -> Result<Zeroizing<String>> {
     Ok(Zeroizing::new(token.to_owned()))
 }
 
-/// Build the `curl --config -` body fed on stdin. Keeps the bearer out of argv;
-/// `write-out` appends `\n<status>\n<retry-after>` after the body so the caller
-/// can recover the HTTP status and the `Retry-After` response header (empty when
-/// absent — `%header{}` requires curl ≥ 7.84, present on every supported macOS;
-/// an unparseable value just degrades to `None`, issue #76). The token is an
-/// opaque `sk-ant-…` string (no `"`/newline), so it needs no escaping inside the
-/// quoted `header` value. Zeroized on drop.
-fn curl_config(token: &str) -> Zeroizing<String> {
-    let mut config = String::new();
+/// Build the secret-bearing stdin configuration, with no ambient curl config or
+/// automatic retries. The fixed metadata trailer uses the same `%header{}` facility
+/// as the existing Retry-After capture (curl >= 7.84). Probe bodies are discarded.
+fn curl_config(token: &str, method: UsageMethod) -> Result<Zeroizing<String>> {
+    if token.is_empty()
+        || token
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '"' | '\\'))
+    {
+        return Err(Error::UsageTokenUnreadable);
+    }
+    let url = match method {
+        UsageMethod::UsageApi => USAGE_URL,
+        UsageMethod::InferenceProbe => INFERENCE_URL,
+    };
+    let mut config = Zeroizing::new(String::new());
     config.push_str("url = \"");
-    config.push_str(USAGE_URL);
+    config.push_str(url);
     config.push_str("\"\n");
     config.push_str("header = \"Authorization: Bearer ");
     config.push_str(token);
@@ -381,46 +476,79 @@ fn curl_config(token: &str) -> Zeroizing<String> {
     config.push_str(BETA_HEADER);
     config.push_str("\"\n");
     config.push_str("header = \"Accept: application/json\"\n");
+    if method == UsageMethod::InferenceProbe {
+        config.push_str("request = \"POST\"\n");
+        config.push_str("header = \"anthropic-version: 2023-06-01\"\n");
+        config.push_str("header = \"Content-Type: application/json\"\n");
+        config.push_str("header = \"User-Agent: ");
+        config.push_str(PROBE_USER_AGENT);
+        config.push_str("\"\n");
+        let escaped = PROBE_BODY.replace('\\', "\\\\").replace('"', "\\\"");
+        config.push_str("data = \"");
+        config.push_str(&escaped);
+        config.push_str("\"\n");
+        config.push_str("output = \"/dev/null\"\n");
+    }
     // Quiet progress, but still print transport errors (to stderr, never stdout).
     config.push_str("silent\n");
     config.push_str("show-error\n");
     config.push_str(&format!("max-time = {POLL_TIMEOUT_SECS}\n"));
-    // Body, then a newline and the numeric status, then a newline and the
-    // `Retry-After` header value (empty when absent), on stdout.
-    config.push_str("write-out = \"\\n%{http_code}\\n%header{retry-after}\"\n");
-    Zeroizing::new(config)
+    config.push_str(concat!(
+        "write-out = \"\\n%{http_code}\\n%header{retry-after}",
+        "\\n%header{anthropic-ratelimit-unified-5h-utilization}",
+        "\\n%header{anthropic-ratelimit-unified-7d-utilization}",
+        "\\n%header{anthropic-ratelimit-unified-5h-reset}",
+        "\\n%header{anthropic-ratelimit-unified-7d-reset}\"\n",
+    ));
+    Ok(config)
 }
 
-/// Split `curl`'s stdout (`<body>\n<status>\n<retry-after>`, per the `write-out`
-/// above) into a [`HttpResponse`]. The two metadata lines are peeled from the END,
-/// so a multi-line body is preserved. Tolerant: the `Retry-After` line is empty
-/// (→ `None`) on most responses; an unparseable trailing code becomes `0` (→
-/// Transient); a no-body output is just the metadata.
-fn parse_curl_output(stdout: &[u8]) -> HttpResponse {
+/// Peel six metadata lines from the end, preserving multiline JSON bodies. Empty
+/// headers stay empty; an incomplete trailer is a transport failure, never a reading.
+fn parse_curl_output(stdout: &[u8], method: UsageMethod) -> HttpResponse {
     let text = String::from_utf8_lossy(stdout);
-    // Peel the last line (the `Retry-After` value, empty when the header was
-    // absent), then the new-last line (the status); everything before is the body.
-    let Some((rest, retry_after_line)) = text.rsplit_once('\n') else {
-        // No newline at all — degenerate; treat the whole output as the code.
-        return HttpResponse {
-            status: text.trim().parse().unwrap_or(0),
-            body: String::new(),
-            retry_after: None,
-        };
-    };
-    let retry_after = parse_retry_after(retry_after_line);
-    match rest.rsplit_once('\n') {
-        Some((body, code)) => HttpResponse {
-            status: code.trim().parse().unwrap_or(0),
-            body: body.to_owned(),
-            retry_after,
-        },
-        None => HttpResponse {
-            status: rest.trim().parse().unwrap_or(0),
-            body: String::new(),
-            retry_after,
+    let parts: Vec<&str> = text.rsplitn(7, '\n').collect();
+    if parts.len() != 7 {
+        return HttpResponse::unreachable(method);
+    }
+    HttpResponse {
+        method,
+        status: parts[5].trim().parse().unwrap_or(0),
+        body: parts[6].to_owned(),
+        retry_after: parse_retry_after(parts[4]),
+        quota_headers: QuotaHeaders {
+            session_utilization: parts[3].to_owned(),
+            weekly_utilization: parts[2].to_owned(),
+            session_reset: parts[1].to_owned(),
+            weekly_reset: parts[0].to_owned(),
         },
     }
+}
+
+/// Header utilization is already a fraction, unlike the usage API's percentages.
+fn header_fraction(raw: &str, window: &'static str) -> Result<f64> {
+    let value = raw
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| {
+            Error::UsageParse(format!("missing or invalid {window} utilization header"))
+        })?;
+    Ok(value.clamp(0.0, 1.0))
+}
+
+fn header_reset(raw: &str) -> Option<i64> {
+    raw.trim().parse::<i64>().ok().filter(|value| *value > 0)
+}
+
+fn parse_probe_headers(headers: &QuotaHeaders) -> Result<Usage> {
+    Ok(Usage {
+        session: header_fraction(&headers.session_utilization, "five-hour")?,
+        weekly: header_fraction(&headers.weekly_utilization, "weekly")?,
+        session_resets_at: header_reset(&headers.session_reset),
+        weekly_resets_at: header_reset(&headers.weekly_reset),
+    })
 }
 
 /// Parse a `Retry-After` header value into a back-off floor. Only the
@@ -670,6 +798,66 @@ fn days_in_month(year: i64, month: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unsupported_scopes_are_unavailable_without_spawning_curl() {
+        use crate::keychain::{Credential, FakeCredentialStore};
+        let store = FakeCredentialStore::empty();
+        store
+            .write(&Credential::new(
+                br#"{"claudeAiOauth":{"accessToken":"dummy-token","scopes":["unknown:scope"]}}"#
+                    .to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            CurlTransport::new(store).fetch().await,
+            Err(Error::UsageUnavailable)
+        ));
+    }
+
+    #[test]
+    fn method_selection_uses_scopes_without_a_runtime_toggle() {
+        for (scopes, expected) in [
+            ("[]", None),
+            (r#"["user:inference"]"#, Some(UsageMethod::InferenceProbe)),
+            (
+                r#"["user:profile","user:inference"]"#,
+                Some(UsageMethod::UsageApi),
+            ),
+            (r#"["user:profile"]"#, Some(UsageMethod::UsageApi)),
+            (r#"["unknown:scope"]"#, None),
+            (
+                r#"["user\u003ainference"]"#,
+                Some(UsageMethod::InferenceProbe),
+            ),
+            ("null", Some(UsageMethod::UsageApi)),
+            ("42", Some(UsageMethod::UsageApi)),
+        ] {
+            for refresh in ["null", r#""refresh-present""#] {
+                let blob = format!(
+                    r#"{{"claudeAiOauth":{{"accessToken":"dummy","scopes":{scopes},"refreshToken":{refresh},"expiresAt":null}}}}"#
+                );
+                let credential = Credential::new(blob.into_bytes());
+                let result = method_for_credential(&credential);
+                match expected {
+                    Some(method) => assert_eq!(result.unwrap(), method),
+                    None => assert!(matches!(result, Err(Error::UsageUnavailable))),
+                }
+            }
+        }
+        for blob in [
+            br#"{"claudeAiOauth":{"accessToken":"dummy"}}"#.as_slice(),
+            br#"{"accessToken":"dummy"}"#.as_slice(),
+            b"not json".as_slice(),
+        ] {
+            let credential = Credential::new(blob.to_vec());
+            assert_eq!(
+                method_for_credential(&credential).unwrap(),
+                UsageMethod::UsageApi
+            );
+        }
+    }
     use std::collections::VecDeque;
 
     // --- classify_status (pure, the taxonomy) ---
@@ -1066,21 +1254,119 @@ mod tests {
 
     #[test]
     fn curl_config_carries_the_url_headers_and_writeout() {
-        let config = curl_config("sk-ant-oat-TESTTOKEN");
+        let config = curl_config("sk-ant-oat-TESTTOKEN", UsageMethod::UsageApi).unwrap();
         assert!(config.contains(&format!("url = \"{USAGE_URL}\"")));
         assert!(config.contains("header = \"Authorization: Bearer sk-ant-oat-TESTTOKEN\""));
         assert!(config.contains(&format!("header = \"{BETA_HEADER}\"")));
-        assert!(config.contains("write-out = \"\\n%{http_code}\\n%header{retry-after}\""));
+        assert!(config.contains("write-out = \"\\n%{http_code}\\n%header{retry-after}"));
         assert!(config.contains(&format!("max-time = {POLL_TIMEOUT_SECS}")));
+        assert!(!config.contains("request ="));
+        assert!(!config.contains("data ="));
+        assert!(!config.contains("output ="));
+        assert!(!config.contains(INFERENCE_URL));
     }
 
     // --- parse_curl_output (pure) ---
 
     #[test]
+    fn probe_request_is_one_fixed_minimal_inference_with_no_identity() {
+        let config = curl_config("sk-ant-oat-TESTTOKEN", UsageMethod::InferenceProbe).unwrap();
+        assert!(config.contains(&format!("url = \"{INFERENCE_URL}\"")));
+        assert!(config.contains("request = \"POST\""));
+        assert!(config.contains("header = \"anthropic-version: 2023-06-01\""));
+        assert!(config.contains(&format!("header = \"User-Agent: {PROBE_USER_AGENT}\"")));
+        assert!(config.contains("header = \"Authorization: Bearer sk-ant-oat-TESTTOKEN\""));
+        assert!(config.contains("output = \"/dev/null\""));
+        assert!(!config.contains(USAGE_URL));
+        assert!(!config.contains("retry ="));
+        assert!(!config.contains("location"));
+        let body: Value = serde_json::from_str(PROBE_BODY).unwrap();
+        assert_eq!(body["max_tokens"], 1);
+        assert_eq!(
+            body["messages"],
+            serde_json::json!([{"role":"user","content":"hi"}])
+        );
+        assert_eq!(body.as_object().unwrap().len(), 3);
+        assert!(body.get("metadata").is_none());
+        assert!(body.get("account_uuid").is_none());
+        assert_eq!(
+            config
+                .lines()
+                .filter(|line| line.starts_with("url ="))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn both_request_methods_reject_curl_config_injection_without_echoing_the_token() {
+        for method in [UsageMethod::UsageApi, UsageMethod::InferenceProbe] {
+            for token in [
+                "",
+                "secret\nurl = bad",
+                "secret\rheader: bad",
+                "secret\"",
+                "secret\\",
+                "secret\0",
+            ] {
+                let error = curl_config(token, method).unwrap_err();
+                assert!(matches!(error, Error::UsageTokenUnreadable));
+                assert!(!error.to_string().contains("secret"));
+            }
+        }
+    }
+
+    #[test]
+    fn probe_trailer_preserves_fractions_and_epoch_resets() {
+        let response = parse_curl_output(
+            b"\n200\n\n0.42\n0.17\n1900000000\n1900500000",
+            UsageMethod::InferenceProbe,
+        );
+        assert_eq!(response.status, 200);
+        assert_eq!(response.method, UsageMethod::InferenceProbe);
+        assert!(response.body.is_empty());
+        let usage = parse_probe_headers(&response.quota_headers).unwrap();
+        assert_eq!(usage.session, 0.42);
+        assert_eq!(usage.weekly, 0.17);
+        assert_eq!(usage.session_resets_at, Some(1_900_000_000));
+        assert_eq!(usage.weekly_resets_at, Some(1_900_500_000));
+    }
+
+    #[test]
+    fn probe_usage_requires_both_finite_dimensions_but_resets_are_optional() {
+        for raw in ["", "not-a-number", "NaN", "inf", "-inf"] {
+            for (session, weekly) in [(raw, "0.17"), ("0.42", raw)] {
+                let headers = QuotaHeaders {
+                    session_utilization: session.into(),
+                    weekly_utilization: weekly.into(),
+                    ..QuotaHeaders::default()
+                };
+                assert!(matches!(
+                    parse_probe_headers(&headers),
+                    Err(Error::UsageParse(_))
+                ));
+            }
+        }
+        for reset in ["", "invalid", "0", "-1", "99999999999999999999999999"] {
+            let headers = QuotaHeaders {
+                session_utilization: "1.7".into(),
+                weekly_utilization: "-0.2".into(),
+                session_reset: reset.into(),
+                weekly_reset: reset.into(),
+            };
+            let usage = parse_probe_headers(&headers).unwrap();
+            assert_eq!(usage.session, 1.0);
+            assert_eq!(usage.weekly, 0.0);
+            assert_eq!(usage.session_resets_at, None);
+            assert_eq!(usage.weekly_resets_at, None);
+        }
+    }
+
+    #[test]
     fn parse_curl_output_splits_body_status_and_empty_retry_after() {
-        // write-out shape: <body>\n<status>\n<retry-after> — the trailing
-        // retry-after line is empty on a normal response.
-        let resp = parse_curl_output(b"{\"limits\":[]}\n200\n");
+        // Six write-out metadata lines follow the body. Retry-After and the
+        // four quota headers may all be empty on a normal usage-API response.
+        let resp = parse_curl_output(b"{\"limits\":[]}\n200\n\n\n\n\n", UsageMethod::UsageApi);
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, "{\"limits\":[]}");
         assert_eq!(resp.retry_after, None);
@@ -1088,9 +1374,9 @@ mod tests {
 
     #[test]
     fn parse_curl_output_handles_a_multiline_body() {
-        // The two metadata lines are peeled from the end, so newlines inside the
+        // The six metadata lines are peeled from the end, so newlines inside the
         // body survive.
-        let resp = parse_curl_output(b"{\n  \"a\": 1\n}\n403\n");
+        let resp = parse_curl_output(b"{\n  \"a\": 1\n}\n403\n\n\n\n\n", UsageMethod::UsageApi);
         assert_eq!(resp.status, 403);
         assert_eq!(resp.body, "{\n  \"a\": 1\n}");
         assert_eq!(resp.retry_after, None);
@@ -1099,7 +1385,7 @@ mod tests {
     #[test]
     fn parse_curl_output_captures_a_numeric_retry_after() {
         // A 429 with `Retry-After: 30` and an empty body.
-        let resp = parse_curl_output(b"\n429\n30");
+        let resp = parse_curl_output(b"\n429\n30\n\n\n\n", UsageMethod::UsageApi);
         assert_eq!(resp.status, 429);
         assert_eq!(resp.body, "");
         assert_eq!(resp.retry_after, Some(Duration::from_secs(30)));
@@ -1109,7 +1395,10 @@ mod tests {
     fn parse_curl_output_ignores_an_http_date_retry_after() {
         // The HTTP-date form is not honoured (delta-seconds only) → None, leaving
         // exponential back-off to govern the wait.
-        let resp = parse_curl_output(b"\n503\nWed, 21 Oct 2015 07:28:00 GMT");
+        let resp = parse_curl_output(
+            b"\n503\nWed, 21 Oct 2015 07:28:00 GMT\n\n\n\n",
+            UsageMethod::UsageApi,
+        );
         assert_eq!(resp.status, 503);
         assert_eq!(resp.retry_after, None);
     }
@@ -1117,9 +1406,12 @@ mod tests {
     #[test]
     fn parse_curl_output_tolerates_a_missing_or_unparseable_status() {
         // No newline at all + non-numeric → status 0 (→ Transient).
-        assert_eq!(parse_curl_output(b"garbage").status, 0);
+        assert_eq!(
+            parse_curl_output(b"garbage", UsageMethod::UsageApi).status,
+            0
+        );
         // A lone newline → empty status + empty retry-after → status 0.
-        assert_eq!(parse_curl_output(b"\n").status, 0);
+        assert_eq!(parse_curl_output(b"\n", UsageMethod::UsageApi).status, 0);
     }
 
     #[test]
@@ -1150,18 +1442,22 @@ mod tests {
 
         fn ok(status: u16, body: &str) -> Result<HttpResponse> {
             Ok(HttpResponse {
+                method: UsageMethod::UsageApi,
                 status,
                 body: body.to_owned(),
                 retry_after: None,
+                quota_headers: QuotaHeaders::default(),
             })
         }
 
         /// A bodyless response carrying a `Retry-After`, for the throttled paths.
         fn ok_retry_after(status: u16, retry_after: Option<Duration>) -> Result<HttpResponse> {
             Ok(HttpResponse {
+                method: UsageMethod::UsageApi,
                 status,
                 body: String::new(),
                 retry_after,
+                quota_headers: QuotaHeaders::default(),
             })
         }
     }
@@ -1177,6 +1473,72 @@ mod tests {
 
     fn source(responses: Vec<Result<HttpResponse>>) -> RealUsageSource<FakeUsageTransport> {
         RealUsageSource::new(FakeUsageTransport::new(responses))
+    }
+
+    fn probe_response(status: u16) -> Result<HttpResponse> {
+        Ok(HttpResponse {
+            method: UsageMethod::InferenceProbe,
+            status,
+            body: "ignored model output or error body".into(),
+            retry_after: Some(Duration::from_secs(37)),
+            quota_headers: QuotaHeaders {
+                session_utilization: "0.42".into(),
+                weekly_utilization: "0.17".into(),
+                session_reset: "1900000000".into(),
+                weekly_reset: "1900500000".into(),
+            },
+        })
+    }
+
+    #[tokio::test]
+    async fn a_probe_success_returns_the_existing_reading_without_invented_severity() {
+        let reading = source(vec![probe_response(200)]).usage().await.unwrap();
+        assert_eq!(reading.usage.session, 0.42);
+        assert_eq!(reading.usage.weekly, 0.17);
+        assert_eq!(reading.usage.session_resets_at, Some(1_900_000_000));
+        assert_eq!(reading.usage.weekly_resets_at, Some(1_900_500_000));
+        assert_eq!(reading.severity, None);
+    }
+
+    #[tokio::test]
+    async fn usage_api_failures_never_fall_back_to_inference() {
+        for status in [0, 400, 401, 403, 429, 500, 503] {
+            let src = source(vec![
+                FakeUsageTransport::ok(status, "{}"),
+                probe_response(200),
+            ]);
+            assert!(src.usage().await.is_err());
+            assert_eq!(src.transport.responses.borrow().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_failures_do_not_consume_headers_as_success_or_make_a_fallback_request() {
+        for status in [0, 401, 403, 429, 500, 503] {
+            let src = source(vec![probe_response(status), probe_response(200)]);
+            let error = src.usage().await.unwrap_err();
+            match status {
+                401 => assert!(matches!(error, Error::UsageUnauthorized)),
+                403 => assert!(matches!(error, Error::UsageRejected { status: 403 })),
+                429 => assert!(
+                    matches!(error, Error::UsageRateLimited { status: 429, retry_after: Some(delay) } if delay == Duration::from_secs(37))
+                ),
+                _ => assert!(
+                    matches!(error, Error::UsageTransient { status: observed, retry_after: Some(delay) } if observed == status && delay == Duration::from_secs(37))
+                ),
+            }
+            assert_eq!(src.transport.responses.borrow().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_success_without_headers_is_not_zero_usage() {
+        let mut response = probe_response(200).unwrap();
+        response.quota_headers = QuotaHeaders::default();
+        assert!(matches!(
+            source(vec![Ok(response)]).usage().await,
+            Err(Error::UsageParse(_))
+        ));
     }
 
     #[tokio::test]
@@ -1265,9 +1627,9 @@ mod tests {
     // --- no-telemetry / no-other-egress privacy invariant (issue #271) ---
     //
     // Sessiometer phones home for nothing: no analytics, usage telemetry, crash
-    // reporting, update pings, or beacons. The ONLY outbound network egress it
-    // originates is the documented per-account usage GET the swap logic polls
-    // (`USAGE_URL`). These are *capability* guards — deliberately stronger than a
+    // reporting, update pings, or beacons. Its usage transport makes the normal
+    // usage GET or the scope-selected minimal inference probe at fixed URLs.
+    // These are *capability* guards — deliberately stronger than a
     // behavioural "we observed no egress on this run" check: the same discipline
     // as `scripts/check-no-security-framework.sh`, guarding what the binary CAN
     // do so a refactor cannot silently open a second egress. Because the guarantee
@@ -1278,7 +1640,7 @@ mod tests {
     // The tool reaches the network through exactly one mechanism: spawning
     // `/usr/bin/curl` (`CURL`). It links no in-process HTTP/TLS client and opens
     // no raw TCP or UDP socket, so it *cannot* originate a connection except by
-    // that one subprocess — which only ever targets `USAGE_URL`. (The daemon's
+    // that one subprocess — targeting `USAGE_URL` or `INFERENCE_URL`. (The daemon's
     // control channel is local on both targets and never leaves the machine: a
     // Unix-domain socket on Unix, and since #1511 a named pipe on Windows, created
     // with `reject_remote_clients` so it is unreachable over SMB. The external
@@ -1313,22 +1675,22 @@ mod tests {
     }
 
     #[test]
-    fn the_sole_egress_endpoint_is_the_documented_usage_url() {
-        // The one allowed destination, and the absolute (PATH-proof) binary that
-        // reaches it. A change here is a deliberate change to the privacy contract
-        // — keep it in step with the README no-telemetry statement.
+    fn egress_endpoints_are_fixed_and_each_method_configures_exactly_one_request() {
         assert_eq!(USAGE_URL, "https://api.anthropic.com/api/oauth/usage");
+        assert_eq!(INFERENCE_URL, "https://api.anthropic.com/v1/messages");
         assert_eq!(CURL, "/usr/bin/curl");
-
-        // The request we actually build points nowhere else: its only `url = ` line
-        // is the documented endpoint.
-        let config = curl_config("sk-ant-oat-TESTTOKEN");
-        let url_lines: Vec<&str> = config
-            .lines()
-            .filter(|line| line.trim_start().starts_with("url = "))
-            .collect();
-        assert_eq!(url_lines.len(), 1, "exactly one request URL is configured");
-        assert_eq!(url_lines[0], format!("url = \"{USAGE_URL}\"").as_str());
+        for (method, url) in [
+            (UsageMethod::UsageApi, USAGE_URL),
+            (UsageMethod::InferenceProbe, INFERENCE_URL),
+        ] {
+            let config = curl_config("sk-ant-oat-TESTTOKEN", method).unwrap();
+            let url_lines: Vec<&str> = config
+                .lines()
+                .filter(|line| line.trim_start().starts_with("url = "))
+                .collect();
+            assert_eq!(url_lines.len(), 1, "exactly one request URL is configured");
+            assert_eq!(url_lines[0], format!("url = \"{url}\"").as_str());
+        }
     }
 
     #[test]
@@ -1405,7 +1767,7 @@ mod tests {
             present.is_empty(),
             "forbidden network/telemetry crate(s) entered the dependency graph: {present:?}. \
              Sessiometer must reach the network only by spawning /usr/bin/curl for the usage \
-             endpoint — no in-process HTTP/TLS client, no telemetry SDK (issue #271)."
+             methods — no in-process HTTP/TLS client, no telemetry SDK (issue #271)."
         );
     }
 

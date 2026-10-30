@@ -104,6 +104,14 @@ where
         &mut self,
         command: &SwapCommand,
     ) -> (SwapAck, Vec<Event>) {
+        if self.require_storage_selection().is_err() {
+            return (
+                SwapAck::Rejected {
+                    reason: SwapRejection::Failed,
+                },
+                Vec::new(),
+            );
+        }
         // 1. Resolve the target handle (label OR uuid) against the CURRENT roster — the daemon's
         //    OWN resolution, never a client-provided index; it never guesses (issue #17).
         let target_idx = match crate::use_account::resolve_target(&self.roster, &command.target) {
@@ -126,6 +134,22 @@ where
                 )
             }
         };
+
+        // Reconciliation can preserve a login even if the requested swap is
+        // later refused by policy. It is separate from the swap's commit.
+        let mut events = Vec::new();
+        if let Err(error) = self.recover_file_login_before_swap(&mut events).await {
+            let _ = writeln!(
+                std::io::stderr(),
+                "sessiometer: file login recovery failed: {error}"
+            );
+            return (
+                SwapAck::Rejected {
+                    reason: classify_swap_failure(&error),
+                },
+                events,
+            );
+        }
 
         // 2. Re-validate viability from the daemon's LIVE state (health + last readings + the
         //    un-jittered weekly rotation line + the in-memory last-swap), never a client hint. The
@@ -164,9 +188,9 @@ where
                 SwapAck::AlreadyActive {
                     to: self.roster[target_idx].label.clone(),
                 },
-                Vec::new(),
+                events,
             ),
-            SwapVerdict::Reject(reason) => (SwapAck::Rejected { reason }, Vec::new()),
+            SwapVerdict::Reject(reason) => (SwapAck::Rejected { reason }, events),
             // The verdict returns `Swap` only when an active account exists (it rejects
             // `NoActiveAccount` otherwise); re-match defensively rather than `expect` on the
             // long-running daemon path.
@@ -175,7 +199,7 @@ where
                     SwapAck::Rejected {
                         reason: SwapRejection::NoActiveAccount,
                     },
-                    Vec::new(),
+                    events,
                 ),
                 Some(active_idx) => {
                     let outgoing = self.roster[active_idx].stash();
@@ -192,12 +216,11 @@ where
                     // otherwise the escape out of a strict refusal would exist only while the
                     // daemon is DOWN, which is the opposite of when an operator needs it. It
                     // bypasses that layer ONLY: Layers 1–2 still fail closed under `--force`.
-                    let mut events = Vec::new();
                     match self
                         .locked_swap(&outgoing, &incoming, command.force, &mut events)
                         .await
                     {
-                        Ok(_report) => {
+                        Ok(report) => {
                             let prev_active = self.state.active;
                             // Mirror the auto-swap tail: cache active, arm the cooldown, prime the
                             // canonical watch (so this write is not re-detected as out-of-band #13).
@@ -225,7 +248,14 @@ where
                                 // Manual / forced swap: operator-driven, not a projection (#634).
                                 projection: None,
                             });
-                            (SwapAck::Accepted { from, to }, events)
+                            (
+                                SwapAck::Accepted {
+                                    from,
+                                    to,
+                                    identity_pending: !report.oauth_cowritten,
+                                },
+                                events,
+                            )
                         }
                         Err(err) => (
                             SwapAck::Rejected {
@@ -289,11 +319,19 @@ where
         };
         // Load the existing roster to plan against (absent → a first capture, malformed → a failure)
         // — read BEFORE the lock, exactly like the standalone `capture`'s `load_existing`.
-        let existing = match Config::load_path(&config_path) {
-            Ok(config) => Some(config),
-            Err(Error::ConfigNotFound { .. }) => None,
-            Err(err) => return self.capture_failure(command, classify_capture_failure(&err)),
-        };
+        let existing =
+            match Config::load_path(&config_path) {
+                Ok(config) => {
+                    if self.storage.as_ref().is_some_and(|storage| {
+                        storage.require_same_settings(&config.storage).is_err()
+                    }) {
+                        return self.capture_failure(command, CaptureRejection::Failed);
+                    }
+                    Some(config)
+                }
+                Err(Error::ConfigNotFound { .. }) => None,
+                Err(err) => return self.capture_failure(command, classify_capture_failure(&err)),
+            };
         // #1441 (design D-1 / D-5, R-2): the arm directly above turns an absent `config.toml` into
         // `None`, and `capture_locked` can then only APPEND — so resolving that ambiguity to "first
         // run" writes a one-account roster over a live six-account one. That is the incident, and
@@ -513,6 +551,16 @@ where
                     return ConfigSetAck::Rejected { reason, detail };
                 }
             };
+        if self
+            .storage
+            .as_ref()
+            .is_some_and(|storage| storage.require_same_settings(&config.storage).is_err())
+        {
+            return ConfigSetAck::Rejected {
+                reason: ConfigSetRejection::ConfigUnreadable,
+                detail: None,
+            };
+        }
         // A no-op edit (the submitted values already equal the current ones) writes nothing.
         if !change.tunables_changed && !change.labels_changed {
             return ConfigSetAck::Applied {
@@ -676,7 +724,12 @@ where
                 reason: Some(RosterReloadReason::ReloadDisabled),
             };
         };
-        match Config::load_path(&path) {
+        match Config::load_path(&path).and_then(|config| {
+            if let Some(storage) = &self.storage {
+                storage.require_same_settings(&config.storage)?;
+            }
+            Ok(config)
+        }) {
             Ok(config) => {
                 // Read before `reconcile_roster` takes the roster by value.
                 let incoming = Some(config.roster.len());
@@ -794,7 +847,7 @@ where
             .state
             .active
             .and_then(|i| self.roster.get(i))
-            .map(|account| account.account_uuid.clone());
+            .map(|account| account.id().to_owned());
 
         // Re-key each account's carried decision state by uuid: preserve it for an
         // account that persists, default it for a newly-onboarded one. (Rosters are a
@@ -810,24 +863,17 @@ where
         // bounds), and a ninth signal is re-keyed here for free.
         let accounts = new_roster
             .iter()
-            .map(|account| {
-                match self
-                    .roster
-                    .iter()
-                    .position(|old| old.account_uuid == account.account_uuid)
-                {
+            .map(
+                |account| match self.roster.iter().position(|old| old.id() == account.id()) {
                     Some(old_idx) => self.state.accounts[old_idx].clone(),
                     None => AccountRuntime::default(),
-                }
-            })
+                },
+            )
             .collect();
 
         // Re-resolve active by uuid: kept (its new index) if it persists, else `None`.
-        let active = active_uuid.and_then(|uuid| {
-            new_roster
-                .iter()
-                .position(|account| account.account_uuid == uuid)
-        });
+        let active =
+            active_uuid.and_then(|uuid| new_roster.iter().position(|account| account.id() == uuid));
 
         // Commit the reconciled roster + its per-account runtime state together, so no tick ever
         // observes a roster/state length mismatch.
@@ -897,6 +943,72 @@ mod tests {
     use crate::observability::{RefreshEventOutcome, Verbosity};
 
     use std::rc::Rc;
+
+    #[tokio::test]
+    async fn storage_change_refuses_reload_socket_mutations_and_autonomous_tick() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.toml");
+        write_roster_config(&path, &[("u-A", "work")]);
+        let config = Config::load_path(&path).unwrap();
+        let storage = crate::storage::Storage::from_config(&config.storage).unwrap();
+        let mut daemon = reconcile_daemon(config.roster)
+            .with_config_path(path.clone())
+            .with_storage(storage);
+        assert!(matches!(
+            daemon.adopt_roster_reload(ReloadIntent::AppendOnly).await,
+            Event::RosterReload {
+                outcome: RosterReloadOutcome::Adopted,
+                ..
+            }
+        ));
+        let mut edited = Config::load_path(&path).unwrap();
+        edited.storage.claude_config_dir = Some(root.path().join("different-profile"));
+        std::fs::write(&path, edited.render()).unwrap();
+        assert!(matches!(
+            daemon.require_storage_selection(),
+            Err(Error::StorageRestartRequired)
+        ));
+        assert!(matches!(
+            daemon.adopt_roster_reload(ReloadIntent::Mutating).await,
+            Event::RosterReload {
+                outcome: RosterReloadOutcome::Failed,
+                ..
+            }
+        ));
+        assert!(matches!(
+            daemon
+                .perform_socket_swap(&SwapCommand {
+                    target: "work".into(),
+                    force: true
+                })
+                .await
+                .0,
+            SwapAck::Rejected {
+                reason: SwapRejection::Failed
+            }
+        ));
+        assert!(matches!(
+            daemon
+                .perform_socket_capture(&CaptureCommand { label: None })
+                .await
+                .0,
+            CaptureAck::Rejected {
+                reason: CaptureRejection::Failed
+            }
+        ));
+        assert_eq!(daemon.tick().await.action, TickAction::SwapFailed);
+        // The restart guard must not mask the existing lost-config refusal.
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            daemon
+                .perform_socket_capture(&CaptureCommand { label: None })
+                .await
+                .0,
+            CaptureAck::Rejected {
+                reason: CaptureRejection::PriorConfiguration
+            }
+        ));
+    }
 
     // --- manual-hold: adopt a manual `use` swap (issue #64) ----------------
 
@@ -1368,6 +1480,7 @@ mod tests {
         assert_eq!(
             ack,
             SwapAck::Accepted {
+                identity_pending: false,
                 from: "work".to_owned(),
                 to: "spare".to_owned(),
             }
@@ -1478,6 +1591,7 @@ mod tests {
         assert_eq!(
             accepted,
             SwapAck::Accepted {
+                identity_pending: false,
                 from: "work".to_owned(),
                 to: "spare".to_owned(),
             }
@@ -2044,12 +2158,12 @@ mod tests {
         // The on-disk `config.toml` grew the SAME row — persisted, so a restart keeps it.
         let on_disk = Config::load_path(&config_path).unwrap();
         assert_eq!(on_disk.roster.len(), 2);
-        assert_eq!(on_disk.roster[1].account_uuid, "u-A");
+        assert_eq!(on_disk.roster[1].id(), "u-A");
         assert_eq!(on_disk.roster[1].label, "work");
         // Both credential halves are stashed together under u-A's uuid-derived service.
         let stashed = daemon.stash.read("Sessiometer/u-A").await.unwrap();
         assert_eq!(stashed.credential.expose(), b"A-token");
-        assert_eq!(stashed.oauth_account.account_uuid(), "u-A");
+        assert_eq!(stashed.require_identity().unwrap().account_uuid(), "u-A");
         // Canonical-READ-ONLY: the keychain still holds A's token and `~/.claude.json` still shows
         // u-A — capture rewrote NEITHER (it is not a swap).
         assert!(daemon
@@ -2470,7 +2584,7 @@ mod tests {
         assert_eq!(roster_uuids(&daemon), vec!["u-A"]);
         let on_disk = Config::load_path(&config_path).unwrap();
         assert_eq!(on_disk.roster.len(), 1);
-        assert_eq!(on_disk.roster[0].account_uuid, "u-A");
+        assert_eq!(on_disk.roster[0].id(), "u-A");
         assert!(daemon.stash.contains("Sessiometer/u-A"));
     }
 
@@ -2795,7 +2909,7 @@ mod tests {
         assert_eq!(daemon.roster[0].label, "day-job");
         // …and it is persisted (a restart keeps it), keyed by the immutable uuid.
         let on_disk = Config::load_path(&config_path).unwrap();
-        assert_eq!(on_disk.roster[0].account_uuid, "u-A");
+        assert_eq!(on_disk.roster[0].id(), "u-A");
         assert_eq!(on_disk.roster[0].label, "day-job");
     }
 
@@ -3820,7 +3934,7 @@ mod tests {
             }
             daemon.state.accounts.iter().map(fingerprint).collect()
         };
-        let uuid_of = |account: &Account| account.account_uuid.clone();
+        let uuid_of = |account: &Account| account.id().to_owned();
         let onboard = account("u-NEW", "onboarded");
 
         let mut reshapes = 0;
@@ -5516,7 +5630,7 @@ mod tests {
             "the re-tick the watch triggered re-stashed A with the freshly-logged-in token"
         );
         assert_eq!(
-            a.oauth_account.account_uuid(),
+            a.require_identity().unwrap().account_uuid(),
             "u-A",
             "the identity half is preserved through the re-stash"
         );
@@ -5652,11 +5766,100 @@ mod tests {
         );
     }
 
+    struct OnceSourceConflict {
+        fired: std::cell::Cell<bool>,
+    }
+
+    impl ExternalLoginWatch for OnceSourceConflict {
+        async fn until_due(&mut self) {
+            if self.fired.replace(true) {
+                std::future::pending::<()>().await;
+            }
+        }
+
+        async fn read_canonical(&mut self) -> Result<Credential> {
+            Err(Error::CredentialSourceConflict)
+        }
+    }
+
     #[tokio::test]
-    async fn external_login_watcher_reads_the_canonical_and_fails_open() {
+    async fn live_import_conflict_watch_wakes_the_existing_daemon_loop() {
+        let roster = vec![account("u-A", "work"), account("u-B", "spare")];
+        let store = store_holding(b"A-token").await;
+        let stash = stash_with(&[
+            ("Sessiometer/u-A", b"A-token", "u-A"),
+            ("Sessiometer/u-B", b"B-token", "u-B"),
+        ])
+        .await;
+        let (_dir, json) = claude_json("u-A");
+        let poller = FakeRosterPoller::new()
+            .ok("u-A", 0.10, 0.10)
+            .ok("u-B", 0.10, 0.10);
+        let mut daemon = Daemon::new(
+            roster,
+            poller,
+            store,
+            stash,
+            FakeClock::frozen(),
+            json,
+            &tunables(95, 80, 0),
+        );
+        let logdir = tempfile::tempdir().unwrap();
+        let mut log = EventLog::at(&logdir.path().join("sessiometer.log")).unwrap();
+        let mut shutdown = FakeShutdown::after(3);
+        let mut watch = OnceSourceConflict {
+            fired: std::cell::Cell::new(false),
+        };
+        let mut diag = DiagnosticLog::new(std::io::sink(), Verbosity::Quiet);
+        run_loop(
+            &mut daemon,
+            &mut log,
+            &mut diag,
+            &mut shutdown,
+            &NoControl,
+            &mut NoopRefreshTicker,
+            &mut watch,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            daemon.state.ticks, 2,
+            "conflict must trigger an immediate re-tick"
+        );
+        assert!(
+            daemon
+                .store
+                .read()
+                .await
+                .unwrap()
+                .matches(&cred(b"A-token")),
+            "the watcher must not mutate credentials"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_import_production_watcher_preserves_the_conflict_signal() {
+        struct Shadowed;
+        impl CredentialStore for Shadowed {
+            async fn read(&self) -> Result<Credential> {
+                Err(Error::CredentialSourceConflict)
+            }
+            async fn write(&self, _: &Credential) -> Result<()> {
+                panic!("the watcher cannot write credentials");
+            }
+        }
+        let mut watcher = ExternalLoginWatcher::new(Shadowed);
+        assert!(matches!(
+            watcher.read_canonical().await,
+            Err(Error::CredentialSourceConflict)
+        ));
+    }
+
+    #[tokio::test]
+    async fn external_login_watcher_preserves_read_errors_for_the_idle_policy() {
         // Issue #140: the PRODUCTION watcher's `read_canonical` returns the current canonical
-        // over its own store, and FAILS OPEN to `None` on a locked or absent read — so a probe
-        // that cannot read simply detects nothing, never an error that could break the loop.
+        // over its own store, preserving errors for the idle loop to classify.
+        // A source conflict wakes recovery; other failures remain non-fatal.
         let readable = FakeCredentialStore::empty();
         readable.write(&cred(b"A-token")).await.unwrap();
         let mut w = ExternalLoginWatcher::new(readable);
@@ -5666,20 +5869,20 @@ mod tests {
             "a readable canonical is returned"
         );
 
-        // A LOCKED keychain read is swallowed to `None`, not surfaced as an error.
+        // A locked source is distinguishable from a file-source conflict.
         let locked = FakeCredentialStore::empty();
         locked.set_locked(true);
         let mut w = ExternalLoginWatcher::new(locked);
         assert!(
-            w.read_canonical().await.is_none(),
-            "a locked read fails open to None"
+            matches!(w.read_canonical().await, Err(Error::KeychainLocked { .. })),
+            "the idle loop can distinguish a lock from a source conflict"
         );
 
-        // An ABSENT canonical (no item yet) likewise fails open to `None` — never an error.
+        // Any unreadable source remains an error; only a conflict wakes recovery.
         let mut w = ExternalLoginWatcher::new(FakeCredentialStore::empty());
         assert!(
-            w.read_canonical().await.is_none(),
-            "an absent canonical fails open to None"
+            w.read_canonical().await.is_err(),
+            "an unreadable source remains an error; the idle loop ignores it"
         );
     }
 

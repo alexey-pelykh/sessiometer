@@ -106,9 +106,7 @@ use crate::config::{
 // it is imported test-scoped inside `mod tests`, not at module scope.)
 pub(crate) use crate::contract::{Clock, RealClock, RefreshObservation, RefreshTicker};
 use crate::error::{Error, Result};
-use crate::keychain::{
-    CanonicalChange, CanonicalWatch, Credential, CredentialStore, RealCredentialStore,
-};
+use crate::keychain::{CanonicalChange, CanonicalWatch, Credential, CredentialStore};
 use crate::landing;
 use crate::observability::{
     BackoffClass, BlindVelocity, CanonicalLiveness, CaptureEventOutcome, CredentialHealth,
@@ -118,7 +116,7 @@ use crate::observability::{
 };
 use crate::refresh::{CredentialClocks, RefreshOutcome, RefreshReport};
 use crate::refresh_tick::{refresh_event_outcome, RealRefreshEngine, RefreshEngine};
-use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
+use crate::stash::{AccountStash, StashedAccount};
 use crate::stats::{FleetRunway, FleetRunwayState, FLEET_RUNWAY_PLAUSIBLE_MAX_SECS};
 use crate::swap::{self, SwapDecision, SwapLock, SWAP_LOCK_MAX_WAIT};
 use crate::systemic_refresh::{PreflightHealth, SweepHealth, SystemicRefreshHealth};
@@ -1036,6 +1034,8 @@ struct LandingOvershootRecord {
 // hand-maintained list of comparisons silently narrows the moment one is.
 #[derive(Default, Clone, PartialEq)]
 pub(crate) struct AccountHealth {
+    /// Explicit scope metadata excludes usage polling, not proof of token death.
+    usage_unavailable: bool,
     /// Consecutive non-scope 401s on this account's stored token. Incremented on a
     /// 401, reset to 0 on ANY non-401 outcome (success, 403, transient, locked). The
     /// `consecutive=` field of a `monitor_401` event while still healthy; reaching
@@ -1899,6 +1899,8 @@ pub(crate) struct Daemon<P, C, S, K> {
     /// [`with_config_path`](Self::with_config_path); when `None`, an inbound
     /// `roster-reload` signal is a logged best-effort no-op (there is nothing to read).
     config_path: Option<PathBuf>,
+    /// Pinned production selection; hermetic fake engines do not need real storage.
+    storage: Option<crate::storage::Storage>,
     /// Where [`perform_socket_capture`](Self::perform_socket_capture) reads the
     /// prior-configuration witness (issue #1441, design D-1) — the daemon's half of the same
     /// seam the CLI verbs pass inline. Consulted ONLY when `config.toml` is absent, so the
@@ -2113,6 +2115,7 @@ where
             // No runtime roster-reload by default (issue #139); production opts in via
             // `with_config_path`. A hermetic test drives `reconcile_roster` directly.
             config_path: None,
+            storage: None,
             // No witness sources by default (issue #1441); production opts in via
             // `with_witness_sources`. Unwired means "cannot observe", which resolves
             // `Present` and REFUSES a capture into an absent config — fail-closed, never a
@@ -2195,6 +2198,19 @@ where
     pub(crate) fn with_systemic_failure_n(mut self, n: u32) -> Self {
         self.systemic_failure_n = n;
         self
+    }
+
+    /// Pin production storage independently of later config/roster reloads.
+    pub(crate) fn with_storage(mut self, storage: crate::storage::Storage) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    fn require_storage_selection(&self) -> Result<()> {
+        if let (Some(storage), Some(path)) = (&self.storage, &self.config_path) {
+            storage.require_config_path(path)?;
+        }
+        Ok(())
     }
 
     /// Wire the `config.toml` path re-read on a runtime roster-reload (issue #139):
@@ -2553,6 +2569,25 @@ where
     /// Run one poll iteration: resolve the active account, poll every roster
     /// account, then decide and (if warranted) swap.
     pub(crate) async fn tick(&mut self) -> TickOutcome {
+        let ready = match self.require_storage_selection() {
+            Ok(()) => self.recover_file_login().await.map(|_| ()),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = ready {
+            eprintln!("sessiometer: credential operations suspended: {error}");
+            let readings = vec![None; self.roster.len()];
+            return TickOutcome {
+                action: TickAction::SwapFailed,
+                events: Vec::new(),
+                diagnostics: vec![Diagnostic::Tick {
+                    decision: TickAction::SwapFailed.decision_class(),
+                    backoff_secs: None,
+                    retry_after_secs: None,
+                }],
+                snapshot: self.snapshot(self.state.active, &readings, wall_clock_now_secs()),
+                next_wait: Some(Duration::from_secs(5)),
+            };
+        }
         self.state.ticks += 1;
         let at = self.clock.now();
         // Issue #1452: the active designation this tick STARTED on, captured before anything can
@@ -2718,258 +2753,291 @@ where
             .filter(|&i| !self.account_backing_off(i) && !self.exhausted_slow_polling(i, active))
         {
             let polled = self.poller.poll(&self.roster[i], active == Some(i)).await;
-            // Record ONE usage sample for this poll (issue #156): piggyback the
-            // reading just fetched (no extra usage-API call), recording nothing on a
-            // gap and swallowing any store error. The store path is INJECTED (issue #315):
-            // `None` in the hermetic-test default, so ticking a `FakeDaemon` writes nothing —
-            // off the swap-decision path, so a sampling failure never perturbs the loop below.
-            record_usage_sample(
-                self.usage_samples_path.as_deref(),
-                &self.roster[i].label,
-                &polled,
-                wall_clock_now_secs(),
-            );
-            // Usage-stats store maintenance (issue #161): a cadence-gated `compact_and_roll`
-            // (emitting a redacted `usage_rollup` when a pass folds aged samples) plus a
-            // rate-limited redacted `usage_gap` on a no-reading poll. Inert unless `with_stats`
-            // wired the retention policy; off the swap-decision path, so a store failure is
-            // swallowed and never perturbs the loop below.
-            self.maintain_stats_store(i, polled.is_err(), wall_clock_now_secs(), &mut events);
-            // Project to the lean `Usage` the decision path consumes; the sample-only
-            // `severity` does not travel past here.
-            let mut result = polled.map(|reading| reading.usage);
-            // Issue #162: a usage 401 is USUALLY a merely-expired access token, not a dead
-            // credential. Before it counts toward the #42 death streak, attempt ONE isolated
-            // refresh (the #102 engine) + a single re-poll — but only on the FIRST 401 of a
-            // streak episode and never for an already-quarantined account (see
-            // `should_refresh_retry`), so a persistently-401 account triggers at most one
-            // refresh per episode (no `claude -p` storm). A re-poll that CLEARS keeps the
-            // account healthy (the false-death this fixes); a 401 that SURVIVES a fresh token
-            // — or a refresh that reports the token DEAD — is the genuine dead signal and
-            // flows on to `note_poll_outcome` unchanged. The seam is inert (unset) unless
-            // `with_refresh_engine` wired it, so every other path behaves exactly as before.
-            if self.should_refresh_retry(i, &result) {
-                result = self.refresh_retry(i, &mut events).await;
-                // Issue #880: the daemon just refreshed THIS account's credential, so arm the
-                // `my_refresh` provenance latch before the deadline read at the end of this same
-                // poll observes the result. Armed HERE rather than inside `refresh_retry` because
-                // that helper takes `&self` (it emits into `events` without mutating carried
-                // state); armed unconditionally on a firing, including a refresh that reported
-                // `Dead` or could not run at all — the SERVER may have moved the deadline even
-                // where the local outcome was a failure, and mis-attributing that to an external
-                // write is the one direction that would corrupt the issue #877 answer.
-                self.note_own_credential_refresh(i);
-            } else if self.should_keep_warm_retry(i, &result) {
-                // Issue #282 REACTIVE backstop: the ACTIVE account's first usage-401. The #162
-                // path above EXCLUDES the active account (it writes the stash, #253); this mints
-                // and PROMOTES to the canonical a live session reads, then re-polls through it —
-                // reviving an expired-but-refreshable active token in place BEFORE the 401 counts
-                // toward the #42 death streak. Mutually exclusive with `should_refresh_retry` on
-                // `i` (active vs parked), so a 401 takes exactly one refresh path. A truly-dead
-                // credential (empty RT / a `Dead` mint) still returns the 401 → the streak
-                // advances to the emergency swap (invariant 4).
-                result = self
-                    .keep_warm_retry(i, canonical.as_ref(), &mut events)
+            if matches!(polled, Err(Error::UsageUnavailable)) {
+                // Capability changes invalidate quota/recovery state. No failed
+                // poll, gap, death streak, refresh retry or fabricated sample.
+                let runtime = &mut self.state.accounts[i];
+                runtime.health.usage_unavailable = true;
+                runtime.health.consec_401 = 0;
+                runtime.health.recovery_successes = 0;
+                runtime.last_reading = None;
+                runtime.last_reading_at = None;
+                runtime.session_velocity = None;
+                runtime.session_high_water = None;
+                runtime.parked_landing = None;
+                runtime.blind_anchor = None;
+                runtime.observation_gap = None;
+                // Scope absence is not proof of health or recovery. Keep any
+                // independently observed refresh evidence and credential clocks.
+                if active == Some(i) {
+                    self.state.last_good = None;
+                }
+                self.note_polled(i);
+            } else {
+                self.state.accounts[i].health.usage_unavailable = false;
+                // Record ONE usage sample for this poll (issue #156): piggyback the
+                // reading just fetched (no extra usage-API call), recording nothing on a
+                // gap and swallowing any store error. The store path is INJECTED (issue #315):
+                // `None` in the hermetic-test default, so ticking a `FakeDaemon` writes nothing —
+                // off the swap-decision path, so a sampling failure never perturbs the loop below.
+                record_usage_sample(
+                    self.usage_samples_path.as_deref(),
+                    &self.roster[i].label,
+                    &polled,
+                    wall_clock_now_secs(),
+                );
+                // Usage-stats store maintenance (issue #161): a cadence-gated `compact_and_roll`
+                // (emitting a redacted `usage_rollup` when a pass folds aged samples) plus a
+                // rate-limited redacted `usage_gap` on a no-reading poll. Inert unless `with_stats`
+                // wired the retention policy; off the swap-decision path, so a store failure is
+                // swallowed and never perturbs the loop below.
+                self.maintain_stats_store(i, polled.is_err(), wall_clock_now_secs(), &mut events);
+                // Project to the lean `Usage` the decision path consumes; the sample-only
+                // `severity` does not travel past here.
+                let mut result = polled.map(|reading| reading.usage);
+                // Issue #162: a usage 401 is USUALLY a merely-expired access token, not a dead
+                // credential. Before it counts toward the #42 death streak, attempt ONE isolated
+                // refresh (the #102 engine) + a single re-poll — but only on the FIRST 401 of a
+                // streak episode and never for an already-quarantined account (see
+                // `should_refresh_retry`), so a persistently-401 account triggers at most one
+                // refresh per episode (no `claude -p` storm). A re-poll that CLEARS keeps the
+                // account healthy (the false-death this fixes); a 401 that SURVIVES a fresh token
+                // — or a refresh that reports the token DEAD — is the genuine dead signal and
+                // flows on to `note_poll_outcome` unchanged. The seam is inert (unset) unless
+                // `with_refresh_engine` wired it, so every other path behaves exactly as before.
+                let wants_refresh = self.should_refresh_retry(i, &result);
+                let wants_keep_warm = self.should_keep_warm_retry(i, &result);
+                let may_retry = (wants_refresh || wants_keep_warm)
+                    && self
+                        .poll_credential_allows_refresh_retry(i, canonical.as_ref())
+                        .await;
+                if may_retry && wants_refresh {
+                    result = self.refresh_retry(i, &mut events).await;
+                    // Issue #880: the daemon just refreshed THIS account's credential, so arm the
+                    // `my_refresh` provenance latch before the deadline read at the end of this same
+                    // poll observes the result. Armed HERE rather than inside `refresh_retry` because
+                    // that helper takes `&self` (it emits into `events` without mutating carried
+                    // state); armed unconditionally on a firing, including a refresh that reported
+                    // `Dead` or could not run at all — the SERVER may have moved the deadline even
+                    // where the local outcome was a failure, and mis-attributing that to an external
+                    // write is the one direction that would corrupt the issue #877 answer.
+                    self.note_own_credential_refresh(i);
+                } else if may_retry && wants_keep_warm {
+                    // Issue #282 REACTIVE backstop: the ACTIVE account's first usage-401. The #162
+                    // path above EXCLUDES the active account (it writes the stash, #253); this mints
+                    // and PROMOTES to the canonical a live session reads, then re-polls through it —
+                    // reviving an expired-but-refreshable active token in place BEFORE the 401 counts
+                    // toward the #42 death streak. Mutually exclusive with `should_refresh_retry` on
+                    // `i` (active vs parked), so a 401 takes exactly one refresh path. A truly-dead
+                    // credential (empty RT / a `Dead` mint) still returns the 401 → the streak
+                    // advances to the emergency swap (invariant 4).
+                    result = self
+                        .keep_warm_retry(i, canonical.as_ref(), &mut events)
+                        .await;
+                }
+                self.note_poll_outcome(i, &result, &mut events);
+                diagnostics.push(Diagnostic::Poll {
+                    account: self.roster[i].label.clone(),
+                    outcome: diag_poll_class(&result),
+                });
+                // Fold the outcome into account `i`'s OWN back-off (issue #293): a `429` / `5xx`
+                // advances its per-account streak and arms its back-off window; any other
+                // outcome clears both. The ACTIVE account self-caps its back-off tighter and
+                // hard-floors `Retry-After` (issue #453), so pass whether `i` is the active
+                // account. The returned widened wait rides the diagnostic tick line; the durable
+                // back-off ENTER / EXIT events (issue #399) ride `events`.
+                this_tick_backoff =
+                    self.note_account_backoff(i, active == Some(i), &result, &mut events);
+                // A single monotonic read for this poll, shared by the velocity interval (#449), the
+                // blind-window close (#449), and the `last_good` anchor refresh (#450) so all three
+                // reason against the SAME instant.
+                let now = self.clock.now();
+                // Durable per-account usage VELOCITY (issue #399), normalized to %/min (issue #449): the
+                // signed percent delta between this reading and the account's previous one, carried with
+                // the `elapsed_secs` interval so the durable log expresses a TIME rate (the gated #451
+                // spike / #368 measurement). Both readings AND the prior timestamp must be present — the
+                // account's FIRST reading, or a reading after a throttle / failure (which clears the slot
+                // + its timestamp below), has nothing to diff — the interval must be positive, and the
+                // account must have measurably MOVED (a non-zero rounded delta in either dimension),
+                // mirroring `usage_rollup`'s no-op silence so a flat idle account stays quiet.
+                if let (Some(prev), Ok(next), Some(prev_at)) = (
+                    self.state.accounts[i].last_reading.as_ref(),
+                    result.as_ref(),
+                    self.state.accounts[i].last_reading_at,
+                ) {
+                    let (session_delta_pct, weekly_delta_pct) = usage_velocity(prev, next);
+                    let elapsed_secs = now.saturating_duration_since(prev_at).as_secs();
+                    // Copy the readings out (issues #539 / #614) — `Usage` is `Copy`, so this ends the
+                    // `prev`/`next` borrows and frees `self` for the `&mut self` EMA update below.
+                    let (prev_usage, next_usage) = (*prev, *next);
+                    let (prev_session, next_session) = (prev_usage.session, next_usage.session);
+                    if (session_delta_pct != 0 || weekly_delta_pct != 0) && elapsed_secs > 0 {
+                        events.push(Event::UsageVelocity {
+                            account: self.roster[i].id().to_owned(),
+                            session_delta_pct,
+                            weekly_delta_pct,
+                            elapsed_secs,
+                        });
+                    }
+                    // Issue #539: fold THIS interval into the account's session-velocity EMA (the
+                    // projective trigger's signal), from the SAME `(prev, next, elapsed)` the durable
+                    // velocity event uses. Folded on EVERY interval, including a flat/zero one (which
+                    // correctly decays the EMA toward "not climbing"), unlike the event above whose
+                    // non-zero-delta gate keeps the log quiet for an idle account.
+                    //
+                    // Issue #614: UNLESS either endpoint is an implausibly LOW reading — one below the
+                    // high-water mark of the very window it claims to be in, which usage's within-window
+                    // monotonicity makes impossible (a stale / cache-lagged response). Such an interval
+                    // is not a measurement of anything, so it is SKIPPED entirely rather than folded:
+                    // folding the drop would reset the EMA (`next < prev`) and falsely declare the
+                    // climbing trend stale, while folding the RECOVERY interval off the stale-low `prev`
+                    // would blend a spuriously steep rate. Skipping leaves the retained EMA untouched —
+                    // the last real intervals still describe the account's climb. The mark itself is
+                    // folded further below, AFTER this, so the comparison is against evidence gathered
+                    // strictly BEFORE this reading (`next` cannot mask its own implausibility).
+                    let high_water = self.state.accounts[i].session_high_water;
+                    let stale_low_interval = swap::is_stale_low(high_water, &prev_usage)
+                        || swap::is_stale_low(high_water, &next_usage);
+                    if !stale_low_interval {
+                        self.note_session_velocity(i, prev_session, next_session, elapsed_secs);
+                    }
+                }
+                // Durable BLIND-WINDOW close on the ACTIVE account (issue #449, umbrella #363 Path B):
+                // the active had gone blind (a `429` / `5xx` cleared `accounts[active].last_reading` so
+                // `swap::decide` had no reading to act on) and this poll reads it live again. Measured
+                // from the retained pre-blind anchor (`last_good`, #450) — read HERE, before the refresh
+                // below, so it is still the OLD anchor — so `duration_secs` is the `blind_elapsed` #452
+                // keys off (and the "anchor_age" the #482 recovery SLI names), and `near_limit` tags
+                // whether the anchor sat at/over the session trigger (the risk band). `session_at_recovery`
+                // is this poll's FRESH session pct (issue #482): paired with the stale anchor
+                // (`session_pct`) + its age (`duration_secs`) it reconciles a hypothetical stale-anchor
+                // preemptive swap as necessary (still climbing) vs wasted (already reset). The
+                // `accounts[i].last_reading.is_none()` was-blind check plus `last_good.is_some()` excludes a
+                // first-ever poll (a `None` slot that was never blind); `active == Some(i)` scopes it to
+                // the active account the anchor belongs to. Edge-triggered: the None→live transition fires
+                // exactly once per blind episode.
+                if active == Some(i)
+                    && result.is_ok()
+                    && self.state.accounts[i].last_reading.is_none()
+                {
+                    if let (Some(anchor), Ok(fresh)) = (self.state.last_good, result.as_ref()) {
+                        events.push(Event::BlindWindow {
+                            account: self.roster[i].id().to_owned(),
+                            duration_secs: now.saturating_duration_since(anchor.at).as_secs(),
+                            session_pct: to_pct(anchor.session),
+                            session_at_recovery: to_pct(fresh.session),
+                            near_limit: anchor.session >= self.session_ceiling_base,
+                            // Issue #634: the retained #539 velocity in force through the window, so the
+                            // REPORT-ONLY blind velocity-projection arm
+                            // ([`blind_velocity_projected_armed`], #584/#600) — which fires no swap and
+                            // so emits no event of its own — is reconstructable offline from this line.
+                            // Genuinely the PRE-BLIND rate: the velocity fold above is gated on a
+                            // previous live reading (`accounts[i].last_reading`), which is exactly what this
+                            // branch requires to be `None`, so the recovery poll cannot have blended
+                            // into the EMA before this read. Same SUSTAINED gate the arm itself applies
+                            // — an unwarmed EMA could not have armed it, so no ingredient is logged for
+                            // a projection that could not have happened.
+                            velocity: self.blind_velocity_ingredients(i),
+                            // Issue #670: the frozen per-window high-water mark, present only when it
+                            // raises the stale-low anchor (`swap::plausible_anchor_session`). `session_pct`
+                            // above stays the RAW measurement; this is the one-sided FLOOR it is raised to
+                            // by the #632-corrected arm, so an offline reader reproduces `gate_session`
+                            // instead of projecting off the stale-low base. Read HERE, before the
+                            // high-water fold below — a blind episode has no successful active poll, so the
+                            // mark is still frozen at the last live poll, exactly as the decision sites see
+                            // it. Omitted when no correction applies, leaving the line unchanged.
+                            session_high_water_pct: self.blind_anchor_high_water(i, anchor.session),
+                        });
+                    }
+                }
+                // The UNCENSORED blind-episode pair (issue #583): `blind_enter` on this account's
+                // live→blind edge, `blind_exit` on its blind→live one, off a PER-ACCOUNT anchor. Both
+                // tails the `blind_window` close above cannot reach — an episode that never recovers, and
+                // one the daemon swaps away from — are recorded here instead, so #484's promotion bar
+                // reads a distribution that is not censored at exactly its tail. Runs AFTER the
+                // `blind_window` block (whose recovery-edge semantics stay untouched) and BEFORE the slot
+                // assignment below (it anchors off the PRE-poll reading + its timestamp).
+                self.note_blind_episode(i, active, &result, now, &mut events);
+                // Issue #613: check this poll against any ARMED landing watch on account `i` — a parked
+                // account whose live reading crosses the SLO ceiling within its post-swap window is a LOCAL
+                // landing overshoot, surfaced through `status`. Runs on the FRESH `result` (before the slot
+                // below is overwritten), off the SAME `(i, active, now)` the blind-episode arm uses.
+                self.note_landing_overshoot(i, active, &result, now);
+                // Issue #614: fold a LIVE reading into this account's per-window session high-water mark
+                // — the plausibility baseline the swap arms measure a suspect low reading against. Only a
+                // successful poll updates it: a `429` / `5xx` is blindness, not evidence the window
+                // rolled, so a failed poll must leave the mark standing. `fold` releases the mark on its
+                // own when `session_resets_at` moves to a new window, so it never pins across windows.
+                if let Ok(fresh) = result.as_ref() {
+                    self.state.accounts[i].session_high_water = swap::SessionHighWater::fold(
+                        self.state.accounts[i].session_high_water,
+                        fresh,
+                    );
+                }
+                self.state.accounts[i].last_reading = result.ok();
+                // Track WHEN this reading was observed, beside it on the same `AccountRuntime` (issue
+                // #449): `now` on a live reading, cleared on a failed poll — so the velocity interval
+                // above spans only two real consecutive readings (never a gap).
+                self.state.accounts[i].last_reading_at =
+                    self.state.accounts[i].last_reading.as_ref().map(|_| now);
+                // Fold this poll into the account's out-of-rotation slow-poll window (issue #537):
+                // arm/refresh it on a NON-active peer read exhausted (skip its poll until its
+                // server-side window resets), or clear it when the account reads viable again / is
+                // the active account. Reads the reading just stored above; `now` is the shared
+                // monotonic instant (the window deadline), `wall_clock_now_secs()` the wall epoch
+                // (the `resets_at` delta). Off the swap-decision path — a pure widening of THIS
+                // account's own poll cadence, like the per-account back-off (`note_account_backoff`).
+                self.note_exhausted_poll(i, active, now, wall_clock_now_secs(), &mut events);
+                // Issue #450: retain the ACTIVE account's last-good reading as a pre-blind
+                // anchor, SEPARATE from `last_reading` (which the assignment above clears to
+                // `None` on a `429` / `5xx`, so the reactive `swap::decide` path is unchanged).
+                // Refreshed on every successful active poll and carried untouched across a
+                // throttle / failure, so the bounded-blindness preemptive swap (#452) can reason
+                // about how near the band the active account was when it went blind. Reset to
+                // `None` on swap-away (`record_swap` / `adopt_manual_swap` / the reconcile paths),
+                // so the anchor always belongs to the current active account.
+                if active == Some(i) {
+                    if let Some(reading) = self.state.accounts[i].last_reading {
+                        self.state.last_good = Some(LastGood {
+                            session: reading.session,
+                            weekly: reading.weekly,
+                            at: now,
+                        });
+                    }
+                }
+                // Populate the DISPLAY expiry clock (issue #141) from the SAME credential this
+                // poll used — kept DISTINCT from the refresh-sourced `access_expires_at` the
+                // rollup reads, so `status --json` surfaces the access-token expiry with
+                // `[refresh]` off without firing a false-🟠 Stale for an idle lapsed token (the
+                // rollup's positive-liveness consumption of this clock lands under #137).
+                // Issue #878: the SAME read also yields the REFRESH token's own fixed deadline, which
+                // feeds the orthogonal expiry modifier (never `credential_health`) — one credential
+                // read, two clocks, no extra `security` subprocess per cycle.
+                // Issue #907: that read also reports WHICH credential item it came out of — the
+                // canonical for the active account, this account's own stash otherwise. Carried into
+                // the fold below so a delta measured across a switch between the two is marked as
+                // such rather than inferred to be an external write.
+                let (clocks, clocks_source) = self
+                    .read_poll_clocks(&self.roster[i], active == Some(i))
                     .await;
+                self.state.accounts[i].health.poll_expires_at = clocks.access_expires_at;
+                self.state.accounts[i].health.refresh_token_expires_at =
+                    clocks.refresh_token_expires_at;
+                // Issue #880: fold that same reading into the DURABLE record — the provenance-tagged
+                // deadline observation and the horizon-entry edge. Runs on the reading just stored
+                // above, and AFTER any `refresh_retry` earlier in this poll armed the `my_refresh`
+                // latch, so a deadline the daemon's own refresh moved is attributed to it rather than
+                // inferred to be an external write. Reads the wall epoch (an event-emission path, off
+                // the deterministic `Clock`), like the fleet-runway warn below.
+                self.note_polled_expiry(
+                    i,
+                    clocks.refresh_token_expires_at,
+                    clocks_source,
+                    wall_clock_now_secs(),
+                    &mut events,
+                );
+                self.note_polled(i);
             }
-            self.note_poll_outcome(i, &result, &mut events);
-            diagnostics.push(Diagnostic::Poll {
-                account: self.roster[i].label.clone(),
-                outcome: diag_poll_class(&result),
-            });
-            // Fold the outcome into account `i`'s OWN back-off (issue #293): a `429` / `5xx`
-            // advances its per-account streak and arms its back-off window; any other
-            // outcome clears both. The ACTIVE account self-caps its back-off tighter and
-            // hard-floors `Retry-After` (issue #453), so pass whether `i` is the active
-            // account. The returned widened wait rides the diagnostic tick line; the durable
-            // back-off ENTER / EXIT events (issue #399) ride `events`.
-            this_tick_backoff =
-                self.note_account_backoff(i, active == Some(i), &result, &mut events);
-            // A single monotonic read for this poll, shared by the velocity interval (#449), the
-            // blind-window close (#449), and the `last_good` anchor refresh (#450) so all three
-            // reason against the SAME instant.
-            let now = self.clock.now();
-            // Durable per-account usage VELOCITY (issue #399), normalized to %/min (issue #449): the
-            // signed percent delta between this reading and the account's previous one, carried with
-            // the `elapsed_secs` interval so the durable log expresses a TIME rate (the gated #451
-            // spike / #368 measurement). Both readings AND the prior timestamp must be present — the
-            // account's FIRST reading, or a reading after a throttle / failure (which clears the slot
-            // + its timestamp below), has nothing to diff — the interval must be positive, and the
-            // account must have measurably MOVED (a non-zero rounded delta in either dimension),
-            // mirroring `usage_rollup`'s no-op silence so a flat idle account stays quiet.
-            if let (Some(prev), Ok(next), Some(prev_at)) = (
-                self.state.accounts[i].last_reading.as_ref(),
-                result.as_ref(),
-                self.state.accounts[i].last_reading_at,
-            ) {
-                let (session_delta_pct, weekly_delta_pct) = usage_velocity(prev, next);
-                let elapsed_secs = now.saturating_duration_since(prev_at).as_secs();
-                // Copy the readings out (issues #539 / #614) — `Usage` is `Copy`, so this ends the
-                // `prev`/`next` borrows and frees `self` for the `&mut self` EMA update below.
-                let (prev_usage, next_usage) = (*prev, *next);
-                let (prev_session, next_session) = (prev_usage.session, next_usage.session);
-                if (session_delta_pct != 0 || weekly_delta_pct != 0) && elapsed_secs > 0 {
-                    events.push(Event::UsageVelocity {
-                        account: self.roster[i].account_uuid.clone(),
-                        session_delta_pct,
-                        weekly_delta_pct,
-                        elapsed_secs,
-                    });
-                }
-                // Issue #539: fold THIS interval into the account's session-velocity EMA (the
-                // projective trigger's signal), from the SAME `(prev, next, elapsed)` the durable
-                // velocity event uses. Folded on EVERY interval, including a flat/zero one (which
-                // correctly decays the EMA toward "not climbing"), unlike the event above whose
-                // non-zero-delta gate keeps the log quiet for an idle account.
-                //
-                // Issue #614: UNLESS either endpoint is an implausibly LOW reading — one below the
-                // high-water mark of the very window it claims to be in, which usage's within-window
-                // monotonicity makes impossible (a stale / cache-lagged response). Such an interval
-                // is not a measurement of anything, so it is SKIPPED entirely rather than folded:
-                // folding the drop would reset the EMA (`next < prev`) and falsely declare the
-                // climbing trend stale, while folding the RECOVERY interval off the stale-low `prev`
-                // would blend a spuriously steep rate. Skipping leaves the retained EMA untouched —
-                // the last real intervals still describe the account's climb. The mark itself is
-                // folded further below, AFTER this, so the comparison is against evidence gathered
-                // strictly BEFORE this reading (`next` cannot mask its own implausibility).
-                let high_water = self.state.accounts[i].session_high_water;
-                let stale_low_interval = swap::is_stale_low(high_water, &prev_usage)
-                    || swap::is_stale_low(high_water, &next_usage);
-                if !stale_low_interval {
-                    self.note_session_velocity(i, prev_session, next_session, elapsed_secs);
-                }
-            }
-            // Durable BLIND-WINDOW close on the ACTIVE account (issue #449, umbrella #363 Path B):
-            // the active had gone blind (a `429` / `5xx` cleared `accounts[active].last_reading` so
-            // `swap::decide` had no reading to act on) and this poll reads it live again. Measured
-            // from the retained pre-blind anchor (`last_good`, #450) — read HERE, before the refresh
-            // below, so it is still the OLD anchor — so `duration_secs` is the `blind_elapsed` #452
-            // keys off (and the "anchor_age" the #482 recovery SLI names), and `near_limit` tags
-            // whether the anchor sat at/over the session trigger (the risk band). `session_at_recovery`
-            // is this poll's FRESH session pct (issue #482): paired with the stale anchor
-            // (`session_pct`) + its age (`duration_secs`) it reconciles a hypothetical stale-anchor
-            // preemptive swap as necessary (still climbing) vs wasted (already reset). The
-            // `accounts[i].last_reading.is_none()` was-blind check plus `last_good.is_some()` excludes a
-            // first-ever poll (a `None` slot that was never blind); `active == Some(i)` scopes it to
-            // the active account the anchor belongs to. Edge-triggered: the None→live transition fires
-            // exactly once per blind episode.
-            if active == Some(i) && result.is_ok() && self.state.accounts[i].last_reading.is_none()
-            {
-                if let (Some(anchor), Ok(fresh)) = (self.state.last_good, result.as_ref()) {
-                    events.push(Event::BlindWindow {
-                        account: self.roster[i].account_uuid.clone(),
-                        duration_secs: now.saturating_duration_since(anchor.at).as_secs(),
-                        session_pct: to_pct(anchor.session),
-                        session_at_recovery: to_pct(fresh.session),
-                        near_limit: anchor.session >= self.session_ceiling_base,
-                        // Issue #634: the retained #539 velocity in force through the window, so the
-                        // REPORT-ONLY blind velocity-projection arm
-                        // ([`blind_velocity_projected_armed`], #584/#600) — which fires no swap and
-                        // so emits no event of its own — is reconstructable offline from this line.
-                        // Genuinely the PRE-BLIND rate: the velocity fold above is gated on a
-                        // previous live reading (`accounts[i].last_reading`), which is exactly what this
-                        // branch requires to be `None`, so the recovery poll cannot have blended
-                        // into the EMA before this read. Same SUSTAINED gate the arm itself applies
-                        // — an unwarmed EMA could not have armed it, so no ingredient is logged for
-                        // a projection that could not have happened.
-                        velocity: self.blind_velocity_ingredients(i),
-                        // Issue #670: the frozen per-window high-water mark, present only when it
-                        // raises the stale-low anchor (`swap::plausible_anchor_session`). `session_pct`
-                        // above stays the RAW measurement; this is the one-sided FLOOR it is raised to
-                        // by the #632-corrected arm, so an offline reader reproduces `gate_session`
-                        // instead of projecting off the stale-low base. Read HERE, before the
-                        // high-water fold below — a blind episode has no successful active poll, so the
-                        // mark is still frozen at the last live poll, exactly as the decision sites see
-                        // it. Omitted when no correction applies, leaving the line unchanged.
-                        session_high_water_pct: self.blind_anchor_high_water(i, anchor.session),
-                    });
-                }
-            }
-            // The UNCENSORED blind-episode pair (issue #583): `blind_enter` on this account's
-            // live→blind edge, `blind_exit` on its blind→live one, off a PER-ACCOUNT anchor. Both
-            // tails the `blind_window` close above cannot reach — an episode that never recovers, and
-            // one the daemon swaps away from — are recorded here instead, so #484's promotion bar
-            // reads a distribution that is not censored at exactly its tail. Runs AFTER the
-            // `blind_window` block (whose recovery-edge semantics stay untouched) and BEFORE the slot
-            // assignment below (it anchors off the PRE-poll reading + its timestamp).
-            self.note_blind_episode(i, active, &result, now, &mut events);
-            // Issue #613: check this poll against any ARMED landing watch on account `i` — a parked
-            // account whose live reading crosses the SLO ceiling within its post-swap window is a LOCAL
-            // landing overshoot, surfaced through `status`. Runs on the FRESH `result` (before the slot
-            // below is overwritten), off the SAME `(i, active, now)` the blind-episode arm uses.
-            self.note_landing_overshoot(i, active, &result, now);
-            // Issue #614: fold a LIVE reading into this account's per-window session high-water mark
-            // — the plausibility baseline the swap arms measure a suspect low reading against. Only a
-            // successful poll updates it: a `429` / `5xx` is blindness, not evidence the window
-            // rolled, so a failed poll must leave the mark standing. `fold` releases the mark on its
-            // own when `session_resets_at` moves to a new window, so it never pins across windows.
-            if let Ok(fresh) = result.as_ref() {
-                self.state.accounts[i].session_high_water =
-                    swap::SessionHighWater::fold(self.state.accounts[i].session_high_water, fresh);
-            }
-            self.state.accounts[i].last_reading = result.ok();
-            // Track WHEN this reading was observed, beside it on the same `AccountRuntime` (issue
-            // #449): `now` on a live reading, cleared on a failed poll — so the velocity interval
-            // above spans only two real consecutive readings (never a gap).
-            self.state.accounts[i].last_reading_at =
-                self.state.accounts[i].last_reading.as_ref().map(|_| now);
-            // Fold this poll into the account's out-of-rotation slow-poll window (issue #537):
-            // arm/refresh it on a NON-active peer read exhausted (skip its poll until its
-            // server-side window resets), or clear it when the account reads viable again / is
-            // the active account. Reads the reading just stored above; `now` is the shared
-            // monotonic instant (the window deadline), `wall_clock_now_secs()` the wall epoch
-            // (the `resets_at` delta). Off the swap-decision path — a pure widening of THIS
-            // account's own poll cadence, like the per-account back-off (`note_account_backoff`).
-            self.note_exhausted_poll(i, active, now, wall_clock_now_secs(), &mut events);
-            // Issue #450: retain the ACTIVE account's last-good reading as a pre-blind
-            // anchor, SEPARATE from `last_reading` (which the assignment above clears to
-            // `None` on a `429` / `5xx`, so the reactive `swap::decide` path is unchanged).
-            // Refreshed on every successful active poll and carried untouched across a
-            // throttle / failure, so the bounded-blindness preemptive swap (#452) can reason
-            // about how near the band the active account was when it went blind. Reset to
-            // `None` on swap-away (`record_swap` / `adopt_manual_swap` / the reconcile paths),
-            // so the anchor always belongs to the current active account.
-            if active == Some(i) {
-                if let Some(reading) = self.state.accounts[i].last_reading {
-                    self.state.last_good = Some(LastGood {
-                        session: reading.session,
-                        weekly: reading.weekly,
-                        at: now,
-                    });
-                }
-            }
-            // Populate the DISPLAY expiry clock (issue #141) from the SAME credential this
-            // poll used — kept DISTINCT from the refresh-sourced `access_expires_at` the
-            // rollup reads, so `status --json` surfaces the access-token expiry with
-            // `[refresh]` off without firing a false-🟠 Stale for an idle lapsed token (the
-            // rollup's positive-liveness consumption of this clock lands under #137).
-            // Issue #878: the SAME read also yields the REFRESH token's own fixed deadline, which
-            // feeds the orthogonal expiry modifier (never `credential_health`) — one credential
-            // read, two clocks, no extra `security` subprocess per cycle.
-            // Issue #907: that read also reports WHICH credential item it came out of — the
-            // canonical for the active account, this account's own stash otherwise. Carried into
-            // the fold below so a delta measured across a switch between the two is marked as
-            // such rather than inferred to be an external write.
-            let (clocks, clocks_source) = self
-                .read_poll_clocks(&self.roster[i], active == Some(i))
-                .await;
-            self.state.accounts[i].health.poll_expires_at = clocks.access_expires_at;
-            self.state.accounts[i].health.refresh_token_expires_at =
-                clocks.refresh_token_expires_at;
-            // Issue #880: fold that same reading into the DURABLE record — the provenance-tagged
-            // deadline observation and the horizon-entry edge. Runs on the reading just stored
-            // above, and AFTER any `refresh_retry` earlier in this poll armed the `my_refresh`
-            // latch, so a deadline the daemon's own refresh moved is attributed to it rather than
-            // inferred to be an external write. Reads the wall epoch (an event-emission path, off
-            // the deterministic `Clock`), like the fleet-runway warn below.
-            self.note_polled_expiry(
-                i,
-                clocks.refresh_token_expires_at,
-                clocks_source,
-                wall_clock_now_secs(),
-                &mut events,
-            );
-            self.note_polled(i);
         }
 
         // Issue #1453: the never-looked-at instrument. The property that matters is not that this
@@ -3076,7 +3144,7 @@ where
         if near_limit_engaged && !self.state.near_limit_fast_poll {
             if let Some(active_idx) = self.state.active {
                 events.push(Event::NearLimitPollCoverage {
-                    account: self.roster[active_idx].account_uuid.clone(),
+                    account: self.roster[active_idx].id().to_owned(),
                     // Issue #1487: the sub-interval the scheduler APPLIES, not the bare cap this
                     // carried through 2026-09-06. Computed side-effect-free from the configured
                     // base — see `near_limit_applied_sub_interval_secs` for why it must not call
@@ -3402,7 +3470,7 @@ where
                     near_limit,
                 });
                 events.push(Event::BlindEnter {
-                    account: self.roster[i].account_uuid.clone(),
+                    account: self.roster[i].id().to_owned(),
                     session_pct: to_pct(prev.session),
                     weekly_pct: to_pct(prev.weekly),
                     was_active,
@@ -3413,7 +3481,7 @@ where
             // fresh reading in BOTH windows (the burn the log line derives), and the swap-away tag.
             (Some(anchor), Ok(fresh)) => {
                 events.push(Event::BlindExit {
-                    account: self.roster[i].account_uuid.clone(),
+                    account: self.roster[i].id().to_owned(),
                     duration_secs: now.saturating_duration_since(anchor.at).as_secs(),
                     session_pct: to_pct(anchor.session),
                     session_at_recovery: to_pct(fresh.session),
@@ -3449,7 +3517,7 @@ where
     /// exists to avoid, and it would buy a correction smaller than the jitter on the interval.
     fn note_active_designation(&mut self, active: Option<usize>) {
         let Some(i) = active else { return };
-        let uuid = self.roster[i].account_uuid.as_str();
+        let uuid = self.roster[i].id();
         if self
             .state
             .active_designation
@@ -3634,7 +3702,7 @@ where
             self.state
                 .active_designation
                 .as_ref()
-                .filter(|d| d.account_uuid == self.roster[i].account_uuid)
+                .filter(|d| d.account_uuid == self.roster[i].id())
                 .map(|d| d.at)
         });
         for i in 0..self.roster.len() {
@@ -3647,6 +3715,9 @@ where
             // failure discarded, retained by `note_blind_episode` for the same reason, so the two
             // together are failure-proof. `None` beats nothing (`Option`'s own ordering), so this
             // is the later of whichever is present.
+            if self.state.accounts[i].health.usage_unavailable {
+                continue;
+            }
             let observed_at = self.state.accounts[i]
                 .last_reading_at
                 .max(self.state.accounts[i].blind_anchor.map(|a| a.at));
@@ -3664,7 +3735,7 @@ where
                         continue; // the same reading the anchor was taken from — no new observation
                     }
                     events.push(Event::ObservationGapExit {
-                        account: self.roster[i].account_uuid.clone(),
+                        account: self.roster[i].id().to_owned(),
                         elapsed_secs: observed_at.saturating_duration_since(anchor.at).as_secs(),
                         was_active: anchor.was_active,
                         // The tail a naive first-sight reading would over-count: the episode opened
@@ -3727,7 +3798,7 @@ where
                         was_active: true,
                     });
                     events.push(Event::ObservationGapEnter {
-                        account: self.roster[i].account_uuid.clone(),
+                        account: self.roster[i].id().to_owned(),
                         elapsed_secs: elapsed.as_secs(),
                         threshold_secs: threshold.as_secs(),
                         was_active: true,
@@ -3833,7 +3904,7 @@ where
         )
         .is_some();
         events.push(Event::BlindGateEligible {
-            account: self.roster[active_idx].account_uuid.clone(),
+            account: self.roster[active_idx].id().to_owned(),
             viable_target,
             blind_secs: blind_elapsed.as_secs(),
             session_pct: to_pct(anchor.session),
@@ -4120,6 +4191,9 @@ where
         let Some(active_idx) = active else {
             return TickAction::SkippedActiveUnknown;
         };
+        if self.state.accounts[active_idx].health.usage_unavailable {
+            return TickAction::Held;
+        }
         // The active account's credential is DEAD (quarantined, #42) — distinct from
         // a transient skip below. Two sub-cases, by whether it polled this cycle:
         if self.state.accounts[active_idx].health.quarantined {
@@ -4622,6 +4696,7 @@ where
                 verdict: liveness.as_str(),
             });
         }
+        self.require_storage_selection()?;
         swap::swap_locked(
             self.swap_lock_path
                 .as_deref()
@@ -4644,6 +4719,7 @@ where
     /// ZERO writes ("locked ≠ gone"), and the incoming stash is read before any mutation. With no
     /// lock configured (hermetic tests) it runs unlocked — no second in-process writer to serialize.
     async fn locked_adopt(&self, incoming: &str) -> Result<swap::SwapReport> {
+        self.require_storage_selection()?;
         swap::adopt_target_locked(
             self.swap_lock_path
                 .as_deref()
@@ -4974,7 +5050,7 @@ where
             if swaps >= RETRY_AFTER_WALK_MAX {
                 if !self.state.signaled_retry_after_walk {
                     events.push(Event::RetryAfterWalk {
-                        account: self.roster[active_idx].account_uuid.clone(),
+                        account: self.roster[active_idx].id().to_owned(),
                         swaps,
                         window_secs: RETRY_AFTER_WALK_WINDOW.as_secs(),
                         retry_after_secs: ra.as_secs(),
@@ -5020,7 +5096,7 @@ where
             if matches!(target_reason, NextSwapReason::OnlyCandidate) {
                 if !self.state.signaled_retry_after_reserve {
                     events.push(Event::BlindPreemptReserveHold {
-                        account: self.roster[active_idx].account_uuid.clone(),
+                        account: self.roster[active_idx].id().to_owned(),
                         retry_after_secs: ra.as_secs(),
                         blind_secs: blind_elapsed,
                     });
@@ -5681,6 +5757,23 @@ where
             .is_some_and(|until| self.clock.now() < until)
     }
 
+    /// A known token-only credential must not enter a refresh/no-change/re-poll
+    /// cycle or acquire refresh provenance for an operation that never happened.
+    async fn poll_credential_allows_refresh_retry(
+        &self,
+        i: usize,
+        canonical: Option<&Credential>,
+    ) -> bool {
+        if self.state.active == Some(i) {
+            return canonical
+                .is_some_and(|credential| !crate::refresh::non_refreshable(credential.expose()));
+        }
+        match self.stash.read(&self.roster[i].stash()).await {
+            Ok(stashed) => !crate::refresh::non_refreshable(stashed.credential.expose()),
+            Err(_) => false,
+        }
+    }
+
     /// Whether the Layer-3 online liveness probe (issue #736) should put a request on the
     /// wire before swapping AWAY from account `i` — and if not, which of the three silences
     /// it is. Each [`ProbeGate`] variant carries its own WHY; this is where the daemon's
@@ -5774,7 +5867,7 @@ where
         // The account UUID is the durable identity for the #399 events (never the free-form,
         // PII-capable `label`, #15). Cloned up front so the borrow does not tangle with the
         // `&mut self.state.accounts[i].health` below.
-        let account_uuid = self.roster[i].account_uuid.clone();
+        let account_uuid = self.roster[i].id().to_owned();
         let Some(signal) = backoff_signal(result) else {
             let health = &mut self.state.accounts[i].health;
             // Edge-triggered EXIT (issue #399): a non-throttling poll (success / 401 / 403) that
@@ -5926,7 +6019,7 @@ where
         let out_of_rotation = active != Some(i)
             && (reading.weekly >= self.weekly_rotation_line()
                 || reading.session >= self.session_ceiling_base);
-        let account_uuid = self.roster[i].account_uuid.clone();
+        let account_uuid = self.roster[i].id().to_owned();
         if out_of_rotation {
             let window = exhausted_poll_window(
                 &reading,
@@ -6285,6 +6378,7 @@ mod tests {
     /// 401 / keychain-lock / 403 event paths and the 401 streak become testable.
     #[derive(Clone, Copy)]
     pub(super) enum Scripted {
+        UsageUnavailable,
         Ok(Usage),
         Transient,
         /// A `429` rate-limit carrying an optional server-advised `Retry-After`
@@ -6410,7 +6504,7 @@ mod tests {
             // `401` / `429` / transient still went out, and it is requests — not successful
             // readings — that `ADR-0012` Decision 3 bounds.
             self.requests.set(self.requests.get() + 1);
-            match self.readings.get(&account.account_uuid) {
+            match self.readings.get(account.id()) {
                 // The scripted decision reading, wrapped as a PolledReading with no
                 // severity (the collector's severity path is unit-tested directly).
                 Some(Scripted::Ok(usage)) => Ok(PolledReading {
@@ -6420,6 +6514,7 @@ mod tests {
                 Some(Scripted::Unauthorized) => Err(Error::UsageUnauthorized),
                 Some(Scripted::Locked) => Err(Error::KeychainLocked { op: "read" }),
                 Some(Scripted::ScopeMissing) => Err(Error::UsageScopeMissing),
+                Some(Scripted::UsageUnavailable) => Err(Error::UsageUnavailable),
                 Some(Scripted::RateLimited(retry_after)) => Err(Error::UsageRateLimited {
                     status: 429,
                     retry_after: *retry_after,
@@ -6519,8 +6614,8 @@ mod tests {
         async fn until_due(&mut self) {
             std::future::pending::<()>().await;
         }
-        async fn read_canonical(&mut self) -> Option<Credential> {
-            None
+        async fn read_canonical(&mut self) -> Result<Credential> {
+            Err(Error::CredentialNotFound)
         }
     }
 
@@ -6576,8 +6671,8 @@ mod tests {
                 self.store.write(&cred(&self.fresh)).await.unwrap();
             }
         }
-        async fn read_canonical(&mut self) -> Option<Credential> {
-            self.store.read().await.ok()
+        async fn read_canonical(&mut self) -> Result<Credential> {
+            self.store.read().await
         }
     }
 
@@ -6608,9 +6703,9 @@ mod tests {
                 std::future::pending::<()>().await;
             }
         }
-        async fn read_canonical(&mut self) -> Option<Credential> {
+        async fn read_canonical(&mut self) -> Result<Credential> {
             self.probed.set(true);
-            self.result.clone()
+            self.result.clone().ok_or(Error::CredentialNotFound)
         }
     }
 
@@ -6879,7 +6974,7 @@ mod tests {
 
     pub(super) fn account(uuid: &str, label: &str) -> Account {
         Account {
-            account_uuid: uuid.to_owned(),
+            key: crate::config::AccountKey::ClaudeUuid(uuid.to_owned()),
             label: label.to_owned(),
             enabled: true,
         }
@@ -6991,7 +7086,7 @@ mod tests {
     pub(super) fn stashed(token: &[u8], uuid: &str) -> StashedAccount {
         StashedAccount {
             credential: cred(token),
-            oauth_account: oauth(uuid),
+            oauth_account: Some(oauth(uuid)),
         }
     }
 
@@ -7152,11 +7247,7 @@ mod tests {
     }
 
     pub(super) fn roster_uuids(daemon: &FakeDaemon) -> Vec<String> {
-        daemon
-            .roster
-            .iter()
-            .map(|a| a.account_uuid.clone())
-            .collect()
+        daemon.roster.iter().map(|a| a.id().to_owned()).collect()
     }
 
     /// A two-account daemon (`work` active, `spare` spare) with both tokens stashed
@@ -7164,6 +7255,108 @@ mod tests {
     /// tests below. `monitor_401_n` = 3, `monitor_recovery_m` = 2 (the test defaults).
     pub(super) async fn lifecycle_daemon() -> FakeDaemon {
         lifecycle_daemon_with(FakeRosterPoller::new(), tunables(95, 80, 0)).await
+    }
+
+    #[tokio::test]
+    async fn unsupported_usage_is_not_a_blind_episode_or_an_automatic_target() {
+        let mut poller = FakeRosterPoller::new().ok("u-B", 0.1, 0.1);
+        poller
+            .readings
+            .insert("u-A".into(), Scripted::UsageUnavailable);
+        let mut daemon = lifecycle_daemon_with(poller, tunables(95, 80, 0)).await;
+        let outcome = warmed_tick(&mut daemon).await;
+        assert_eq!(outcome.action, TickAction::Held);
+        assert!(daemon.state.accounts[0].health.usage_unavailable);
+        assert!(!daemon.state.accounts[0].health.quarantined);
+        assert!(daemon.state.accounts[0].last_reading.is_none());
+        assert!(daemon.state.accounts[0].blind_anchor.is_none());
+        assert!(daemon.state.accounts[0].observation_gap.is_none());
+        assert!(daemon.state.last_good.is_none());
+        let snapshot = daemon.snapshot(Some(0), &daemon.decision_readings(Some(0)), 0);
+        assert!(snapshot.accounts[0].usage_unavailable);
+        assert_eq!(snapshot.accounts[0].health, CredentialHealth::Unknown);
+        assert!(snapshot.accounts[0].blind_active.is_none());
+        daemon.state.accounts[0].health.consecutive_refresh_failures = 2;
+        for _ in 0..4 {
+            daemon.tick().await;
+        }
+        assert_eq!(
+            daemon.state.accounts[0].health.consecutive_refresh_failures,
+            2
+        );
+        // A monitored active account cannot automatically select the unmonitored peer.
+        let mut poller = FakeRosterPoller::new().ok("u-A", 0.99, 0.1);
+        poller
+            .readings
+            .insert("u-B".into(), Scripted::UsageUnavailable);
+        let mut daemon = lifecycle_daemon_with(poller, tunables(95, 80, 0)).await;
+        warmed_tick(&mut daemon).await;
+        assert_eq!(daemon.state.active, Some(0));
+        assert!(daemon.state.accounts[1].last_reading.is_none());
+    }
+
+    #[tokio::test]
+    async fn monitored_local_account_uses_existing_rotation_without_identity_or_expiry() {
+        let local_id = "local-0123456789abcdef0123456789abcdef";
+        let mut poller = FakeRosterPoller::new().ok("u-A", 0.99, 0.1);
+        poller
+            .readings
+            .insert(local_id.into(), Scripted::UsageUnavailable);
+        let mut daemon = lifecycle_daemon_with(poller, tunables(95, 80, 0)).await;
+        daemon.roster[1].key = crate::config::AccountKey::LocalId(local_id.into());
+        let token_only = cred(br#"{"claudeAiOauth":{"accessToken":"dummy-inference","refreshToken":null,"expiresAt":null,"scopes":["user:inference"]}}"#);
+        daemon
+            .stash
+            .write(
+                &daemon.roster[1].stash(),
+                &StashedAccount {
+                    credential: token_only.clone(),
+                    oauth_account: None,
+                },
+            )
+            .await
+            .unwrap();
+        warmed_tick(&mut daemon).await;
+        assert_eq!(daemon.state.active, Some(0));
+        assert!(daemon.state.accounts[1].health.usage_unavailable);
+
+        // The transport's successful header projection is just an ordinary reading
+        // at this seam. No token-kind branch or identity lookup is needed to rotate.
+        let usage = Usage {
+            session: 0.12,
+            weekly: 0.23,
+            session_resets_at: Some(1_900_000_000),
+            weekly_resets_at: Some(1_900_500_000),
+        };
+        daemon
+            .poller
+            .readings
+            .insert(local_id.into(), Scripted::Ok(usage));
+        for _ in 0..5 {
+            daemon.tick().await;
+            if daemon.state.active == Some(1) {
+                break;
+            }
+        }
+        assert_eq!(daemon.state.active, Some(1));
+        assert!(!daemon.state.accounts[1].health.usage_unavailable);
+        assert_eq!(daemon.state.accounts[1].last_reading, Some(usage));
+        assert_eq!(daemon.state.accounts[1].health.poll_expires_at, None);
+        assert_eq!(
+            daemon.store.read().await.unwrap().expose(),
+            token_only.expose()
+        );
+        assert!(matches!(
+            crate::claude_state::read_oauth_account_from(&daemon.claude_json),
+            Err(Error::OauthAccountMissing)
+        ));
+        assert!(daemon
+            .stash
+            .read(&daemon.roster[1].stash())
+            .await
+            .unwrap()
+            .oauth_account
+            .is_none());
     }
 
     /// Like [`lifecycle_daemon`] but with a caller-chosen poller + tunables, for the
@@ -7217,7 +7410,7 @@ mod tests {
 
     impl RosterPoller for SeamPoller {
         async fn poll(&self, account: &Account, _active: bool) -> Result<PolledReading> {
-            match self.outcomes.borrow().get(&account.account_uuid) {
+            match self.outcomes.borrow().get(account.id()) {
                 Some(Scripted::Ok(usage)) => Ok(PolledReading {
                     usage: *usage,
                     severity: None,
@@ -7287,7 +7480,7 @@ mod tests {
                 if let Some(usage) = self.revive_to {
                     self.outcomes
                         .borrow_mut()
-                        .insert(account.account_uuid.clone(), Scripted::Ok(usage));
+                        .insert(account.id().to_owned(), Scripted::Ok(usage));
                 }
                 // A fresh credential to promote ONLY on a real refresh; every other outcome
                 // hands back `None` and the daemon leaves the canonical item untouched.
@@ -15084,7 +15277,7 @@ mod tests {
         let a = daemon.stash.read("Sessiometer/u-A").await.unwrap();
         assert_eq!(a.credential.expose(), b"A-reauthed-token");
         // The identity half is preserved, and A is still the resolved active account.
-        assert_eq!(a.oauth_account.account_uuid(), "u-A");
+        assert_eq!(a.require_identity().unwrap().account_uuid(), "u-A");
         assert_eq!(daemon.state.active, Some(0));
 
         // Tick 3: no further change → the committed baseline means no repeat re-stash.
@@ -15146,7 +15339,7 @@ mod tests {
         );
         let b = daemon.stash.read("Sessiometer/u-B").await.unwrap();
         assert_eq!(b.credential.expose(), b"B-reauthed");
-        assert_eq!(b.oauth_account.account_uuid(), "u-B");
+        assert_eq!(b.require_identity().unwrap().account_uuid(), "u-B");
         assert_eq!(daemon.state.active, Some(1));
     }
 
@@ -18118,6 +18311,7 @@ mod tests {
         assert_eq!(
             ack,
             SwapAck::Accepted {
+                identity_pending: false,
                 from: "work".to_owned(),
                 to: "spare".to_owned(),
             }
@@ -18443,7 +18637,7 @@ mod tests {
     fn meter_stashed(blob: &[u8], uuid: &str, email: &str) -> StashedAccount {
         StashedAccount {
             credential: cred(blob),
-            oauth_account: meter_oauth(uuid, email),
+            oauth_account: Some(meter_oauth(uuid, email)),
         }
     }
 
@@ -18620,7 +18814,9 @@ mod tests {
                 op: "write",
                 code: 1,
             },
-            Error::NonAsciiConfigDir,
+            Error::CredentialSourceConflict,
+            Error::CredentialFile { reason: "test" },
+            Error::StorageRestartRequired,
             Error::ConfigNotFound {
                 path: PathBuf::from("/home/op/.config/sessiometer/config.toml"),
             },
@@ -18677,6 +18873,7 @@ mod tests {
             Error::UsageRejected { status: 400 },
             Error::UsageUnauthorized,
             Error::UsageScopeMissing,
+            Error::UsageUnavailable,
             Error::UsageParse("no session (five_hour) dimension".to_owned()),
             Error::AlreadyRunning,
             Error::DaemonNotRunning,
@@ -19123,6 +19320,7 @@ mod tests {
         // this stays non-vacuous while proving the new channel leaks nothing in either shape.
         corpus.push_str(
             &serde_json::to_string(&SwapAck::Accepted {
+                identity_pending: false,
                 from: A.1.to_owned(),
                 to: B.1.to_owned(),
             })

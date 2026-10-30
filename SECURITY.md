@@ -1,6 +1,6 @@
 # Security Policy
 
-`sessiometer` takes custody of Claude Code credentials on macOS, so credential
+`sessiometer` takes custody of Claude Code credentials on macOS and Linux, so credential
 safety is a first-class concern. This document covers how to report a
 vulnerability and the security posture the tool is built to.
 
@@ -13,7 +13,7 @@ Include, as far as you can:
 
 - what the issue is and the impact you see — for example credential disclosure, a
   weakened keychain ACL, or a secret reaching `argv` / a log line;
-- the version (`sessiometer --version`) and your macOS and Claude Code versions;
+- the version (`sessiometer --version`) and your OS and Claude Code versions;
 - steps to reproduce; and
 - any proof-of-concept.
 
@@ -60,8 +60,11 @@ The credential-safety properties `sessiometer` is designed around:
   Argon2id + XChaCha20-Poly1305, and the passphrase is never taken from `argv`.
   `--plaintext` is an explicit opt-out that prints a warning and writes usable
   credentials in the clear.
-- **Minimal, audited dependencies.** The single outbound call is a read-only usage
-  `GET` via `curl` (no HTTP-client crate), and the supply-chain gates
+- **Minimal, audited dependencies.** Usage traffic uses system curl, with no HTTP-client
+  crate. Credential scopes select a read-only usage GET or, for inference-only tokens,
+  a minimal Messages POST that consumes provider usage. Only quota metadata is
+  retained from that probe, not model output. Both endpoints are fixed, ambient curl
+  configuration is disabled, and request failures never cause a paid fallback. The supply-chain gates
   `cargo deny check advisories sources licenses` run in CI.
 
 For where credentials and state actually live on your machine, see
@@ -69,7 +72,27 @@ For where credentials and state actually live on your machine, see
 
 ## Scope and known limitations
 
-- `sessiometer` is **macOS-only** and operates on the login keychain.
+- macOS defaults to Keychain; file storage is available on macOS/Linux. Windows is unsupported.
+- File credentials and saved accounts are plaintext protected by owner-only file permissions,
+  not Keychain encryption. Put them on a trusted local filesystem; same-user hostile races
+  and directory-entry persistence after power loss are not claimed security boundaries.
+- Ordinary file reads/writes retain the metadata-only Keychain shadow guard. Only explicit
+  macOS file-mode reconciliation imports a matching live-profile item: preserve the known
+  account's stash and active file before deleting the resolved service/account/login-Keychain
+  item. Unknown accounts and unreadable/ambiguous sources are not auto-adopted. Other Keychain
+  search-list items remain guarded; this does not change Keychain-mode storage.
+- Live imports have no RAII deletion or rollback of fresh saved credentials. A failure after
+  either file write may leave that write committed; deletion failures retain the source.
+  The pre-delete reread is not an atomic compare-and-delete with a running Claude. The swap
+  lock serializes Sessiometer writers only, and Claude can recreate the item after recovery.
+- An owned macOS login/refresh helper may save output to its isolated Keychain item.
+  After the child finishes, Sessiometer validates and atomically writes those complete bytes
+  to the isolated file before deleting that item and performing normal checked file readback.
+  This helper path never touches live-profile credentials; live import is the separate,
+  explicitly selected file-mode operation above. Neither path deletes unrelated profiles.
+- Existing best-effort session cleanup applies after failures, including failed handoffs.
+  Copy-before-delete ordering does not add durable failed-refresh recovery or a transaction
+  across Keychain and the final account store. Real macOS helper acceptance remains pending.
 - It manages credentials for accounts **you own**; you are responsible for
   complying with each provider's Terms of Service.
 - `--plaintext` export intentionally writes unencrypted credentials — treat and

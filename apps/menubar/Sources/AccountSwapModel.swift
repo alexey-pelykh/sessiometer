@@ -71,6 +71,7 @@ enum SwapFailure: Equatable {
 enum SwapSuccess: Equatable {
     /// The active credential was rerouted OFF `from` ONTO `to`.
     case swapped(from: String, to: String)
+    case identityPending(to: String)
     /// A no-op success: `to` was ALREADY the active account, so nothing was written.
     case alreadyActive(to: String)
 }
@@ -148,6 +149,8 @@ final class AccountSwapModel: ObservableObject {
                 switch try SwapAck.decode(line) {
                 case .accepted(let from, let to):
                     settle(.swapped(from: from, to: to))
+                case .identityPending(_, let to):
+                    settle(.identityPending(to: to))
                 case .alreadyActive(let to):
                     settle(.alreadyActive(to: to))
                 case .rejected(let reason):

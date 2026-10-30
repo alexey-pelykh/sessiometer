@@ -17,6 +17,18 @@
 use super::*;
 
 impl Config {
+    pub(crate) fn from_portable_toml_str(
+        text: &str,
+        target_storage: &StorageConfig,
+    ) -> Result<Self> {
+        let mut raw: RawConfig =
+            toml::from_str(text).map_err(|err| Error::ConfigParse(err.to_string()))?;
+        // Replace machine-local settings BEFORE validation: a macOS artifact's
+        // Keychain setting must not fail Linux validation or choose the destination.
+        raw.storage = target_storage.clone();
+        Self::validate(raw)
+    }
+
     /// Load and validate `config.toml` from its standard path.
     ///
     /// Returns [`Error::ConfigNotFound`] if the file is absent (the daemon has
@@ -575,7 +587,7 @@ mod tests {
         // What `export` actually writes into an artifact: a current build's own render.
         let current = Config::parse(VALID)
             .expect("the baseline config parses")
-            .render();
+            .render_portable();
         assert!(
             current.contains("[credential]"),
             "render must emit [credential] or this test witnesses nothing: {current}"
@@ -666,6 +678,37 @@ mod tests {
         assert!(
             rejected.to_string().contains("expiry_cohort_window_secs"),
             "the rejection must name the key that moved the floor past the block: {rejected}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod portable_storage_tests {
+    use super::*;
+
+    #[test]
+    fn imported_machine_storage_is_replaced_before_platform_validation() {
+        let target = StorageConfig {
+            backend: StorageBackend::File,
+            claude_config_dir: Some("/target-profile".into()),
+        };
+        let imported = Config::from_portable_toml_str(
+            "[storage]\nbackend = 'keychain'\nclaude_config_dir = '/source-profile'\n",
+            &target,
+        )
+        .unwrap();
+        assert_eq!(imported.storage, target);
+    }
+
+    #[test]
+    fn old_artifact_without_storage_uses_target_settings() {
+        let target = StorageConfig {
+            backend: StorageBackend::File,
+            claude_config_dir: Some("".into()),
+        };
+        assert_eq!(
+            Config::from_portable_toml_str("", &target).unwrap().storage,
+            target
         );
     }
 }

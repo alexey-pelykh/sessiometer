@@ -235,7 +235,7 @@ where
     pub(super) fn refresh_exclusions(&self) -> Vec<String> {
         let mut excluded = Vec::new();
         if let Some(active) = self.state.active {
-            excluded.push(self.roster[active].account_uuid.clone());
+            excluded.push(self.roster[active].id().to_owned());
             // The imminent swap target from the latest carried readings — the same selection
             // `next_swap` surfaces (enhanced #612 axes, same per-daemon seed). A BEST-EFFORT
             // prediction, never a guarantee: this runs on POST-tick state, so any input that moves
@@ -256,7 +256,7 @@ where
                 self.weekly_rotation_line(),
                 self.selection_tiebreak(),
             ) {
-                excluded.push(self.roster[target].account_uuid.clone());
+                excluded.push(self.roster[target].id().to_owned());
             }
         }
         excluded
@@ -277,7 +277,7 @@ where
             .iter()
             .enumerate()
             .filter(|(i, _)| self.state.accounts[*i].health.quarantined)
-            .map(|(_, account)| account.account_uuid.clone())
+            .map(|(_, account)| account.id().to_owned())
             .collect()
     }
 
@@ -288,7 +288,7 @@ where
     /// unknown. Pairs the health flip with its event in the daemon, exactly as the #42 poll
     /// and #107 re-login recovery paths do; the tick only signals which accounts recovered.
     pub(super) fn apply_refresh_restore(&mut self, uuid: &str) -> Option<Event> {
-        let idx = self.roster.iter().position(|a| a.account_uuid == uuid)?;
+        let idx = self.roster.iter().position(|a| a.id() == uuid)?;
         if !self.state.accounts[idx].health.quarantined {
             return None;
         }
@@ -322,7 +322,7 @@ where
     /// the events to log; the edge-triggered `CredentialHealth` transition rides the run loop's
     /// immediate re-tick.
     pub(super) async fn reconcile_restored(&mut self, uuid: &str) -> Vec<Event> {
-        let Some(idx) = self.roster.iter().position(|a| a.account_uuid == uuid) else {
+        let Some(idx) = self.roster.iter().position(|a| a.id() == uuid) else {
             // Unknown uuid: an idempotent no-op (the daemon no longer holds it), mirroring
             // `apply_refresh_restore`.
             return Vec::new();
@@ -434,7 +434,7 @@ where
         // STAYS quarantined (out of rotation, honest 🔴); every other outcome un-quarantines — a live
         // one to 🟢, an inconclusive `Error` to 🟡 (the #275 un-quarantine guarantee).
         if !matches!(outcome, RefreshEventOutcome::Dead) {
-            let uuid = self.roster[idx].account_uuid.clone();
+            let uuid = self.roster[idx].id().to_owned();
             if let Some(event) = self.apply_refresh_restore(&uuid) {
                 events.push(event);
             }
@@ -528,7 +528,7 @@ where
         let idx = self
             .roster
             .iter()
-            .position(|a| a.account_uuid == observation.account_uuid)?;
+            .position(|a| a.id() == observation.account_uuid)?;
         // ms → s at the boundary; the rollup/wire are uniform epoch seconds. The expiry clock
         // updates on EVERY observation (refreshed or read-only).
         self.state.accounts[idx].health.access_expires_at =
@@ -646,6 +646,37 @@ mod tests {
     use crate::keychain::FakeCredentialStore;
     use crate::observability::{RefreshEventOutcome, Verbosity};
     use crate::stash::FakeAccountStash;
+
+    #[tokio::test]
+    async fn token_only_parked_401_does_not_attempt_refresh_or_claim_refresh_provenance() {
+        let (mut daemon, _outcomes, calls) = seam_daemon(
+            Scripted::Unauthorized,
+            RefreshOutcome::NoChange,
+            None,
+            false,
+            3,
+        )
+        .await;
+        let service = daemon.roster[1].stash();
+        let mut stashed = daemon.stash.read(&service).await.unwrap();
+        stashed.credential = cred(br#"{"claudeAiOauth":{"accessToken":"dummy-inference","refreshToken":null,"expiresAt":null,"scopes":["user:inference"]}}"#);
+        daemon.stash.write(&service, &stashed).await.unwrap();
+        for _ in 0..4 {
+            let outcome = daemon.tick().await;
+            assert!(!outcome
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::PollRefresh { .. })));
+        }
+        assert_eq!(calls.get(), 0);
+        assert!(daemon.state.accounts[1].health.consec_401 > 0);
+        assert_eq!(daemon.state.accounts[1].health.poll_expires_at, None);
+        assert!(
+            !daemon.state.accounts[1]
+                .health
+                .own_refresh_since_expiry_observation
+        );
+    }
 
     use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
@@ -1380,7 +1411,7 @@ mod tests {
                 if let Some(usage) = self.revive_to {
                     self.outcomes
                         .borrow_mut()
-                        .insert(account.account_uuid.clone(), Scripted::Ok(usage));
+                        .insert(account.id().to_owned(), Scripted::Ok(usage));
                 }
                 Ok(RefreshReport {
                     outcome: self.outcome,

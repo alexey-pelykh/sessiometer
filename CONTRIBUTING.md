@@ -18,53 +18,38 @@ omission is intentional, not an oversight.
 **macOS-only** — a SwiftUI/AppKit application with no Linux counterpart. **Windows is not
 supported**; it stays tracked behind its own recon (#27).
 
-**Linux support is decided and landed, and still not gated.** The two macOS-only syscall
-sites are ported (#963), so the crate builds, links, tests and lints for a Linux target. The
-CI job that would enforce that is #964, and it does not exist yet. Until it is green, **every
-job that runs `cargo build` / `test` / `clippy` / `doc` still uses a `macos-latest` runner** — the
-`ubuntu-latest` jobs (`changes`, `deny`, `ci-ok-needs-complete`, `doc-gates`,
-`gate-change-ack`, `ci-ok`) are gates and routers, and none of them compiles the crate.
+The Linux job now compiles, links, and tests the production file adapters on stable and MSRV,
+and runs strict Clippy on stable. It participates in the required aggregate gate. A local macOS
+pass is not a Linux result: check the actual native job before claiming portability. A type-check
+alone cannot catch unresolved platform symbols at link time.
 
-Three things follow, and all three matter when you write or review a change:
+Keep platform-specific tests explicit: real Apple Keychain and property-list tests require macOS;
+portable file-storage, lock, profile-resolution and engine tests run on both targets. The
+optional real-Claude swap probe is a dummy-only loopback test under macOS OS confinement.
+It lives in [test support](tests/support/) and is
+included only in test builds, not the runtime. Invoke it explicitly with the installed Claude
+binary using SESSIOMETER_TEST_CLAUDE_BIN and the ignored test selector; never substitute real
+credentials or retry unconfined. The ordinary suite still tests the mock's header assertions.
 
-- **A green CI run still says nothing about portability.** Introduce a macOS-only call and
-  every gate passes — the port landing changed nothing about that, because no job compiles
-  for Linux. The two sites #963 ported are the worked example:
-  [`src/daemon/peer_auth.rs`](src/daemon/peer_auth.rs) called `libc::getpeereid` with no
-  `cfg(target_os)` gate (`getpeereid(3)` is not in glibc), and
-  [`src/contract.rs`](src/contract.rs) declared three Mach clock symbols in an `extern "C"`
-  block. Both now carry per-target arms; a third such site would ship just as invisibly.
-- **`cargo check` cannot verify a Linux build.** An `extern` block resolves at **link**, not
-  at type-check, so `check` compiled the Mach block clean for a Linux target and it failed
-  only when something linked. Pre-port, a Linux `cargo check --all-targets` reported exactly
-  **1** error — the `getpeereid` site — and stayed blind to the other. Back any claim about
-  the Linux build with `cargo build` or `cargo test`, never `check`. This has already cost
-  two verifications: issue #797 and ADR-0029's superseded text were both checked this way,
-  and both named only one of the two sites.
-- **Do not write an acceptance criterion asserting that the Linux build works — not until
-  #964 lands.** Nothing in CI verifies it, so the claim cannot fail, which is worse than not
-  making it. That the port is green today was measured by hand, in a container, and recorded
-  on #963 — evidence for one commit, not a standing gate. Where a test carries a platform
-  assumption (a live `/bin/sh -l` spawn, an absolute passwd entry, a spawn of
-  `/usr/bin/security` or `/usr/bin/plutil`), always say so in a comment beside it — then
-  gate it on `target_os` only if it actually fails on the other target. The two cases have
-  different exemplars, and citing the wrong one is how this gets misread: the
-  real-`security` tests in [`src/witness.rs`](src/witness.rs) and the `plutil` test in
-  [`src/service.rs`](src/service.rs) **are** gated, because the binary under test has no
-  Linux referent at all; the live login-shell harvest test in
-  [`src/paths.rs`](src/paths.rs) is deliberately **not**, because #963 measured it passing
-  there — a gate would cost real coverage on a target where it works. Its two
-  passwd-reading neighbours in that same file are a third case again: also ungated, but on
-  a *deferral* rather than a measurement — they read the host's live passwd entry, which a
-  minimal container image need not populate, and a porter (#26 / #29) re-decides them. Do
-  not read the harvest test's result across to those two.
-
-The credential mechanism follows its own sequence: recon (#40, Linux half answered), then
-the backend-neutral credential-store seam (#25) and the per-OS mechanisms (#26 Linux, #27
-Windows, #28 at-rest hygiene), with packaging and distribution beyond CI in #29. The full
-record — what was measured, what reversed the earlier macOS-only decision, and what stays
-out of scope — is in
-[ADR-0029](docs/adr/0029-linux-is-a-supported-build-target.md), under umbrella #961.
+macOS defaults to Keychain and Linux to files; explicit Keychain is rejected off macOS.
+In macOS file mode, owned login/refresh helpers normalize any isolated Keychain output into
+the isolated credential file after the child completes, then continue the existing protocol.
+Linux has no Keychain output reader and retains file-only cleanup. Keep the handoff tests in
+[file storage](src/file_storage.rs), the
+[factory tests](src/storage.rs), and the
+[login integration tests](src/login.rs) hermetic;
+they use the existing isolated-item trait with fake credentials, not a real login Keychain.
+Native build tests and fake-backed handoffs do not establish real-client login/refresh parity.
+Real owned macOS helper acceptance is pending and must be recorded separately.
+Live-profile file-mode import is a separate operation. Keep its tests fake-backed too:
+cover both copies before deletion, failed saves/deletes, changed sources, identity attribution,
+token-only accounts, A → B → A, watcher wakeup, and Keychain/Linux no-op gates. Reads/status
+remain non-mutating. Manual refresh preflight must recover before resolving the active account;
+test that recovery errors stop the operation, invalid targets never start recovery, and the
+recovered active account remains excluded. Pin the public entry-point wiring as well as the
+injected preflight behavior. Native live-Claude acceptance must separately cover interactive re-login;
+the existing swap lock does not serialize Claude and the reread/delete pair is not atomic.
+Packaging, distribution and Windows enablement remain separate work.
 
 ## The minimal-dependency line
 
@@ -121,7 +106,10 @@ supply-chain surface:
 
 The rule of thumb: **hand-roll a small, well-specified primitive rather than pull a
 crate for it — but do not hand-roll something a maintained crate does more
-correctly.** `unicode-width` (below) is that second clause in practice.
+correctly.** Unicode display width and NFC normalization are that second clause in practice.
+The new unicode-normalization dependency matches Claude profile paths and Keychain namespaces;
+ASCII-only rejection is no longer the policy. File adapters reuse existing engine traits and
+locking rather than introducing a second swap/refresh algorithm.
 
 ## System CLIs, not client crates (the transport rule)
 
@@ -136,7 +124,11 @@ absolute path, with secrets fed on stdin, over a client crate**:
   rationale is [ADR-0002](docs/adr/0002-keychain-via-security-cli-zero-ffi.md).
 - **The usage poll** rides [`/usr/bin/curl`](src/usage.rs) — **not** an HTTP client
   crate such as `reqwest`. `curl` is always present on macOS, so no TLS/HTTP stack
-  enters the dependency graph for a single read-only `GET`.
+  enters the dependency graph. Profile-scoped tokens use a read-only GET. Inference-scoped
+  tokens without profile scope automatically use one minimal Messages POST, consuming provider
+  usage and reading quota headers. Both destinations are
+  fixed in [the usage transport](src/usage.rs);
+  ambient curl configuration is disabled and HTTP failures never trigger a method fallback.
 
 Two disciplines both calls share, and any new external call should follow:
 

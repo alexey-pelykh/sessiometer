@@ -78,10 +78,10 @@ use crate::daemon::{
     SwapAck, SwapRejection,
 };
 use crate::error::{Error, Result};
-use crate::keychain::{CredentialStore, RealCredentialStore};
+use crate::keychain::CredentialStore;
 use crate::observability::{self, Event, EventLog, SwapReason};
 use crate::paths;
-use crate::stash::{AccountStash, RealAccountStash};
+use crate::stash::AccountStash;
 use crate::swap;
 
 /// How long either control-socket exchange `use` makes — the cached-reading query
@@ -414,6 +414,9 @@ async fn poll_viability<P: RosterPoller>(
         // one-shot `use`-command probe, not the daemon's sampling poll loop).
         Ok(reading) if reading.usage.weekly >= weekly_ceiling => Ok(Viability::WeeklyExhausted),
         Ok(_) => Ok(Viability::Viable),
+        // Intentionally unmonitored: manual selection is allowed, without
+        // pretending we verified quota or inference liveness.
+        Err(Error::UsageUnavailable) => Ok(Viability::Viable),
         // A dead stored token: the daemon-independent "quarantined / needs re-login"
         // signal (#42). 401 (rejected) and 403 (missing usage scope) both mean the
         // stored credential cannot authenticate.
@@ -486,7 +489,7 @@ pub(crate) fn resolve_target(roster: &[Account], query: &str) -> Result<usize> {
     let matches: Vec<usize> = roster
         .iter()
         .enumerate()
-        .filter(|(_, account)| account.label == query || account.account_uuid == query)
+        .filter(|(_, account)| account.label == query || account.id() == query)
         .map(|(i, _)| i)
         .collect();
     match matches.as_slice() {
@@ -1009,7 +1012,8 @@ pub(crate) async fn use_account(query: Option<String>, force: bool, next: bool) 
     // step, and it is best-effort.
     paths::ensure_private_dir(&paths::support_dir()?)?;
 
-    let claude_json = paths::claude_json()?;
+    let storage = crate::storage::Storage::from_config(&config.storage)?;
+    let claude_json = storage.state_file().to_path_buf();
     let lock_path = paths::swap_lock()?;
     // All three control-socket clients (the cached-reading query #75, the manual-hold
     // notify #64, and the `--next` resolution #960) speak to the same daemon socket;
@@ -1054,6 +1058,13 @@ pub(crate) async fn use_account(query: Option<String>, force: bool, next: bool) 
         None => {}
     }
 
+    // Daemon-down only: a reachable daemon remains the sole credential writer.
+    // Resolve the requested handle before a recovery can mutate stored data.
+    resolve_target(&config.roster, &query)?;
+    storage
+        .recover_file_login(&config.roster, &paths::config_file()?, &lock_path)
+        .await?;
+
     let cache = ControlSocketCache {
         socket: control_socket.clone(),
     };
@@ -1068,9 +1079,9 @@ pub(crate) async fn use_account(query: Option<String>, force: bool, next: bool) 
         in_cooldown,
         Seams {
             cache: &cache,
-            poller: &RealRosterPoller::new(),
-            store: &RealCredentialStore::new(),
-            stash: &RealAccountStash::new(),
+            poller: &RealRosterPoller::new(storage.canonical()?, storage.stash()?),
+            store: &storage.canonical()?,
+            stash: &storage.stash()?,
             claude_json: &claude_json,
             lock_path: &lock_path,
             notifier: &notifier,
@@ -1259,7 +1270,14 @@ fn ack_falls_back_to_standalone(ack: &SwapAck) -> bool {
 /// the standalone adopt recovery — but the arm is retained (and directly tested) for completeness.
 fn report_swap_ack(ack: SwapAck, query: &str) -> Result<()> {
     match ack {
-        SwapAck::Accepted { from, to } => {
+        SwapAck::Accepted {
+            from,
+            to,
+            identity_pending,
+        } => {
+            if identity_pending {
+                eprintln!("sessiometer: {}", swap::IDENTITY_PENDING_WARNING);
+            }
             println!("{}", swap_confirmation(&from, &to));
             Ok(())
         }
@@ -1437,13 +1455,11 @@ mod tests {
             // `ControlSocketCache`-over-a-real-socket tests pin the lookup's semantics,
             // per site.
             assert!(
-                roster
-                    .iter()
-                    .any(|bearer| bearer.account_uuid == account.account_uuid),
+                roster.iter().any(|bearer| bearer.id() == account.id()),
                 "the cache was handed a roster with no bearer for `{}` ({}): the caller \
                  threaded a roster the target is not in",
                 account.label,
-                account.account_uuid,
+                account.id(),
             );
             self.calls.set(self.calls.get() + 1);
             self.verdict
@@ -1488,7 +1504,7 @@ mod tests {
 
     fn acct(label: &str, uuid: &str) -> Account {
         Account {
-            account_uuid: uuid.to_owned(),
+            key: crate::config::AccountKey::ClaudeUuid(uuid.to_owned()),
             label: label.to_owned(),
             enabled: true,
         }
@@ -1508,7 +1524,7 @@ mod tests {
     fn stashed(token: &[u8], uuid: &str) -> StashedAccount {
         StashedAccount {
             credential: cred(token),
-            oauth_account: oauth(uuid),
+            oauth_account: Some(oauth(uuid)),
         }
     }
 
@@ -1522,6 +1538,7 @@ mod tests {
             login: crate::config::LoginConfig::default(),
             stats: crate::config::StatsConfig::default(),
             migration: crate::config::MigrationConfig::default(),
+            storage: crate::config::StorageConfig::default(),
             credential: crate::config::CredentialConfig::default(),
         }
     }
@@ -2418,10 +2435,17 @@ mod tests {
         while src.get(k).is_some_and(|c| c.is_whitespace()) {
             k += 1;
         }
-        if name == "stash" {
+        if matches!(name.as_str(), "stash" | "id" | "claude_uuid") {
+            // AccountKey moved the stable string behind explicit accessors. Keep
+            // scanning those reads rather than silently losing the UUID sites.
+            let field = if name == "stash" {
+                name
+            } else {
+                "account_uuid".to_owned()
+            };
             // Past the `()`, so the span ENDS where the comparison would begin.
             return (src.get(k) == Some(&'(') && src.get(k + 1) == Some(&')'))
-                .then(|| (name, k + 2));
+                .then(|| (field, k + 2));
         }
         if name != "label" && name != "account_uuid" {
             return None;
@@ -2462,14 +2486,19 @@ mod tests {
     /// part of the read, so the arm says where the read begins rather than leaving that to the
     /// caller.
     fn path_stash_call_at(src: &[char], at: usize) -> Option<(usize, usize)> {
-        const NAME: &str = "stash";
         // Preceded by `::`, which is what separates a path call both from the `.stash()` the arm
         // above owns and from the `fn stash` declaration itself.
         if at < 2 || src[at - 1] != ':' || src[at - 2] != ':' {
             return None;
         }
-        let end = at + NAME.chars().count();
-        if src.get(at..end)?.iter().collect::<String>() != NAME {
+        let end = at
+            + src
+                .get(at..)?
+                .iter()
+                .take_while(|c| c.is_ascii_alphanumeric() || **c == '_')
+                .count();
+        let name: String = src.get(at..end)?.iter().collect();
+        if !matches!(name.as_str(), "stash" | "id" | "claude_uuid") {
             return None;
         }
         // An identifier token is maximal: `stash_name` and `stashed` are other names. A MODULE
@@ -2880,13 +2909,16 @@ mod tests {
     /// commit anywhere in `src/`, so it reported the collision it was for and a hundred things
     /// it was not.
     const HANDLE_READ_REGISTER: &[(&str, HandleRead, &str)] = &[
+        ("capture_token", NotHandleResolution, "prints the newly registered label, never resolves an operator handle"),
+        ("parse_capture", NotHandleResolution, "forwards the operator's optional label into an explicit capture command"),
+        ("id", NotHandleResolution, "raw configuration key accessor; exactly-one validation selects UUID versus local ID"),
         // --- the shared resolver, and the sites that read a handle after routing through it ----
         ("resolve_target", SharedResolver, "the one resolver: label OR account-uuid, refusing on zero and on many (#17, OQ-1)"),
         ("apply_enabled", ViaSharedResolver, "`enable` / `disable` — reads the resolved account's label for the confirmation"),
         // `cli::apply_remove` is the sixth site and is deliberately ABSENT: it resolves and then
         // removes, never reading an identity field, so the field scan cannot see it. That is not
         // a hole — it is why this register alone is not the whole gate, and why
-        // [`resolve_target_has_exactly_the_five_known_call_sites`] pins the compliant set from
+        // [`resolve_target_has_exactly_the_seven_known_call_sites`] pins the compliant set from
         // the other side.
         ("perform_socket_swap", ViaSharedResolver, "the daemon's control-socket swap — reads the resolved from/to labels for the event"),
         ("poke_named", ViaSharedResolver, "`poke <label>` — reads the resolved account's label for its report line"),
@@ -2928,7 +2960,7 @@ mod tests {
         ("apply_refresh_restore", NotHandleResolution, "matches a restore outcome's account-uuid back to its roster index, plus the handle its `CredentialRestored` carries"),
         ("is_active", NotHandleResolution, "compares an account's uuid to the ACTIVE uuid `active.rs` read from the credential"),
         ("overlay_labels", NotHandleResolution, "applies the settings overlay to the account bearing that uuid, and ASSIGNS a label rather than matching one"),
-        ("plan_capture", NotHandleResolution, "matches the freshly captured OAuth account's uuid; the label is the name being ASSIGNED to it"),
+        ("plan_account", NotHandleResolution, "matches the freshly captured OAuth account's uuid; the label is the name being ASSIGNED to it"),
         ("reconcile_restored", NotHandleResolution, "matches a restored credential's uuid back to its roster index"),
         ("reconcile_roster", NotHandleResolution, "re-indexes the roster across a config reload, by uuid"),
         ("recovery_pending", NotHandleResolution, "membership of an account's uuid in the quarantined / excluded uuid sets"),
@@ -3110,6 +3142,7 @@ mod tests {
         ("note_refresh_outcome", NotHandleResolution, "the refresh-outcome event's account handle"),
         ("poke_all", NotHandleResolution, "`poke` with no target — sweeps the WHOLE roster, so it resolves nothing"),
         ("poll", NotHandleResolution, "derives the polled account's stash as the service name the stash-backed credential store reads; the account is the parameter"),
+        ("poll_credential_allows_refresh_retry", NotHandleResolution, "reads an already-selected poll account's stash to check refreshability; the index is chosen by the scheduler, not an operator handle"),
         ("read_poll_clocks", NotHandleResolution, "derives an already-chosen account's stash to read that account's stored credential clocks"),
         ("reconcile_canonical_change", NotHandleResolution, "the canonical-change events' account handles"),
         ("reconcile_display", NotHandleResolution, "sweeps the WHOLE roster reading each account's stash, and selects on the stashed CREDENTIAL's bytes rather than on the stash name"),
@@ -3119,18 +3152,19 @@ mod tests {
         ("refresh_quarantined", NotHandleResolution, "collects the quarantined accounts' uuids"),
         ("refresh_retry", NotHandleResolution, "the refresh-retry event's account handle"),
         ("remove_account", NotHandleResolution, "prints the REMOVED account's label; `apply_remove` did the resolving"),
-        ("render", NotHandleResolution, "emits `account_uuid` / `label` back into `config.toml`"),
+        ("render_with_storage", NotHandleResolution, "emits `account_uuid` / `label` back into `config.toml`"),
         ("render_access_token_expiry", NotHandleResolution, "widths and cells for the `-v` access-token table"),
         ("render_roster", NotHandleResolution, "`list`'s label column widths, cells and uuid column"),
         ("reprobe_dead_parked_credential", NotHandleResolution, "the dead-parked reprobe event's account handle"),
         ("resolve", NotHandleResolution, "the `use` gate — compares the already-resolved target's stash with the OUTGOING account's own, for the AlreadyActive short-circuit, and derives the target's stash for the swap"),
+        ("import_keychain", NotHandleResolution, "resolves a live profile credential to a roster account before preserving it; not an operator-handle lookup"),
         ("resolve_account_for", NotHandleResolution, "token-first active resolution — reads every roster account's stash to find which one holds the CANONICAL credential; the credential is the input, not the operator"),
         ("resolve_active_uuid", NotHandleResolution, "reads the uuid at the ACTIVE index — the index is the input"),
         ("resolve_active_uuid_for_import", NotHandleResolution, "reads the uuid at the ACTIVE index for the import's adoption check"),
         ("resolve_restore", NotHandleResolution, "hands an already-chosen account's uuid to the restore notifier"),
         ("roster_handles", NotHandleResolution, "collects every label for `stats`"),
         ("run", NotHandleResolution, "collects roster uuids for the isolated-refresh orphan reap (`cli`), and reads every roster account's stash for the canary's stash cross-check (`canary`) — see MULTI_SITE_READERS"),
-        ("run_capture", NotHandleResolution, "reads the just-captured account's label for its report; found by STASH name"),
+        ("run_registration", NotHandleResolution, "reads the just-captured account's label for its report; found by STASH name"),
         ("run_login", NotHandleResolution, "reads the just-logged-in account's label for its report; found by STASH name"),
         ("snapshot", NotHandleResolution, "the wire snapshot's per-account `label` field and its active handle"),
         ("status_response", NotHandleResolution, "the `status` reply's per-account `label` field"),
@@ -3177,6 +3211,12 @@ mod tests {
         // refusal rather than a winner.
         ("account_uuid", NotHandleResolution, "`&self.account_uuid` on the OAuth state record and on the migration artifact, not on a roster account"),
         ("cached_viability_for", NotHandleResolution, "matches BOTH the daemon's wire line (`AccountStatusLine.label`) and the roster (`Account.label`) since issue #1201 — but it COUNTS bearers on each side and refuses on either being non-unique, exactly as `poke`'s `daemon_verdict` does. Counting is not resolving"),
+        ("recover_file_login", NotHandleResolution, "Storage::stash selects the file backend for an explicit macOS login import; not an Account lookup"),
+        ("export", NotHandleResolution, "`Storage::stash()` selects the configured backend; not an Account identity lookup or operator-handle resolution"),
+        ("import", NotHandleResolution, "`Storage::stash()` selects the configured backend; not an Account identity lookup or operator-handle resolution"),
+        ("list", NotHandleResolution, "`Storage::stash()` selects the configured backend; not an Account identity lookup or operator-handle resolution"),
+        ("poke", NotHandleResolution, "`Storage::stash()` selects the configured backend; not an Account identity lookup or operator-handle resolution"),
+        ("use_account", NotHandleResolution, "`Storage::stash()` is not an Account identity read; target preflight delegates to `resolve_target`, covered by the seven-caller audit"),
         ("capture", NotHandleResolution, "`CaptureReport.label`"),
         ("capture_failure", NotHandleResolution, "`CaptureCommand.label` — the name being ASSIGNED to a new account"),
         ("execute", NotHandleResolution, "`Command::Capture { label }` / `Command::Login { label }` — a MATCH ARM binding the operator's CLI positional out of the parsed command and handing it to `capture` / `login`, which ASSIGN it to a new account. Nothing is matched against the roster here"),
@@ -3271,6 +3311,7 @@ mod tests {
     /// a constant prefix, moved neither question. It was closed in [`identity_field_at`] rather
     /// than recorded here, and the next derived-identity spelling belongs there too.
     const COMPARING_READERS: &[(&str, &str)] = &[
+        ("validate", "compares key PRESENCE booleans to require exactly one UUID/local ID; no handle lookup or account selection"),
         // --- the resolver ----------------------------------------------------------------------
         ("resolve_target", "IS the resolver — the one place an operator-supplied string is compared against a roster handle and a match SELECTED, and it counts every match rather than taking the first (#17, OQ-1)"),
         // --- compared against an account-UUID ----------------------------------------------------
@@ -3284,7 +3325,7 @@ mod tests {
         ("apply_refresh_restore", "matches a restore outcome's account-uuid back to its roster index"),
         ("is_active", "compares an account's uuid to the ACTIVE uuid `active.rs` read from the credential"),
         ("overlay_labels", "finds the account bearing a settings-overlay uuid and ASSIGNS it a label — the uuid is the config's, and the label is the output rather than the query"),
-        ("plan_capture", "matches the freshly captured OAuth account's uuid; the label is the name being ASSIGNED to it"),
+        ("plan_account", "matches the stable roster key and refuses any duplicate label for a new local entry; no first-match label selection"),
         ("reconcile_restored", "matches a restored credential's uuid back to its roster index"),
         ("reconcile_roster", "re-indexes the roster across a config reload, by uuid"),
         ("recovery_pending", "membership of an account's uuid in the quarantined / excluded uuid sets"),
@@ -3314,7 +3355,7 @@ mod tests {
         // in order to see a shape that has never shipped.
         ("locked_swap", "`account.stash() == outgoing` re-finds the OUTGOING account's roster index — and `outgoing` is `self.roster[active_idx].stash()` at every caller, a stash this daemon derived from its own roster"),
         ("resolve", "the `use` gate's AlreadyActive short-circuit — the TARGET's stash against `active_stash`, which `run_use` derived from the OUTGOING account instead: `active::resolve_account_for` reads each roster account's stash and keeps the one whose stashed credential matches the canonical, falling back to the displayed `accountUuid` (`resolve_via_display`). Both sides are roster accounts' own derived names"),
-        ("run_capture", "`roster.iter().find(|a| a.stash() == stash_name)` re-finds the account just captured, and `stash_name` is what `plan_capture` returned for the OAuth capture's server-assigned uuid — matched or pushed one statement earlier"),
+        ("run_registration", "`roster.iter().find(|a| a.stash() == stash_name)` re-finds the account just captured, and `stash_name` is what `plan_capture` returned for the OAuth capture's server-assigned uuid — matched or pushed one statement earlier"),
         ("run_login", "the same shape and the same provenance as `run_capture` above, on the login path"),
     ];
 
@@ -3496,7 +3537,7 @@ mod tests {
         for (arm, expected) in [
             (SharedResolver, 1),
             (ViaSharedResolver, 4),
-            (NotHandleResolution, 92),
+            (NotHandleResolution, 103),
         ] {
             let actual = HANDLE_READ_REGISTER
                 .iter()
@@ -4044,9 +4085,10 @@ mod tests {
     /// `cli::apply_remove` proves the two populations differ: it resolves and removes without
     /// ever reading an identity field, so no field scan can see it. Six operator-facing verbs
     /// (`use`, `poke`, the daemon's control-socket swap, `enable`, `disable`, `remove`) reach the
-    /// resolver through FIVE call sites, because `enable` and `disable` share `apply_enabled`.
+    /// resolver through seven call sites: `enable` and `disable` share `apply_enabled`, and
+    /// standalone `use` and `poke` also validate their handles before file-mode recovery.
     #[test]
-    fn resolve_target_has_exactly_the_five_known_call_sites() {
+    fn resolve_target_has_exactly_the_seven_known_call_sites() {
         let mut callers: Vec<String> = crate_sources()
             .iter()
             .flat_map(|(_, text)| handle_reads(&non_test_region(text)).resolver_callers)
@@ -4060,11 +4102,12 @@ mod tests {
                 "apply_remove",
                 "perform_socket_swap",
                 "poke_named",
+                "prepare_poke",
                 "run_use",
+                "use_account",
             ],
-            "the five label-resolving call sites; a new one is a new verb that must also be \
-             dispositioned in HANDLE_READ_REGISTER, and a MISSING one is a site that stopped \
-             sharing the resolver"
+            "the seven shared-resolver call sites, including use/poke preflight; a new caller \
+             requires review, and a MISSING one stopped sharing the resolver"
         );
     }
 
@@ -4511,7 +4554,7 @@ mod tests {
         let capture = std::fs::read_to_string("src/capture.rs")
             .expect("`src/capture.rs` is one of the files this gate scans");
         let comparing = functions_comparing_a_handle(&capture);
-        for live in ["run_capture", "run_login"] {
+        for live in ["run_registration", "run_login"] {
             assert!(
                 comparing.iter().any(|name| name == live),
                 "`{live}` compares a derived stash name in `src/capture.rs` and the scan must see \
@@ -5345,11 +5388,9 @@ mod tests {
             .collect();
         assert_eq!(
             methods,
-            ["stash"],
-            "`impl Account` declares exactly one method, and `identity_field_at` admits exactly \
-             that one by name. A new method that DERIVES from `label` or `account_uuid` is a \
-             second invisible spelling of a handle read (issue #1358); one that does not is a \
-             one-line widening of this list"
+            ["id", "claude_uuid", "stash"],
+            "Account's identity accessors must be enumerated in both dotted and path-call \
+             scanners; adding an accessor without scanning it would hide handle reads"
         );
     }
 
@@ -5438,6 +5479,7 @@ mod tests {
         weekly_pct: Option<u8>,
     ) -> AccountStatusLine {
         AccountStatusLine {
+            usage_unavailable: false,
             label: label.to_owned(),
             active: false,
             enabled: true,
@@ -6287,6 +6329,7 @@ mod tests {
             assert_eq!(request["force"], true);
             // Reply with a redacted completed-swap ack (two labels, no secret).
             let ack = serde_json::to_string(&SwapAck::Accepted {
+                identity_pending: false,
                 from: "work".to_owned(),
                 to: "spare".to_owned(),
             })
@@ -6301,6 +6344,7 @@ mod tests {
         assert_eq!(
             ack.unwrap(),
             Some(SwapAck::Accepted {
+                identity_pending: false,
                 from: "work".to_owned(),
                 to: "spare".to_owned(),
             }),
@@ -6314,6 +6358,7 @@ mod tests {
         // already happened daemon-side, so `use` exits 0 (the same outcome the standalone path gives).
         assert!(report_swap_ack(
             SwapAck::Accepted {
+                identity_pending: false,
                 from: "work".to_owned(),
                 to: "spare".to_owned(),
             },
@@ -6535,6 +6580,7 @@ mod tests {
         // Completed / already-active acks are authoritative — never fall back.
         for ack in [
             SwapAck::Accepted {
+                identity_pending: false,
                 from: "work".to_owned(),
                 to: "spare".to_owned(),
             },
@@ -7323,7 +7369,7 @@ mod tests {
             b"A-token",
             "work's stash must be untouched"
         );
-        assert_eq!(a.oauth_account.account_uuid(), "u-A");
+        assert_eq!(a.require_identity().unwrap().account_uuid(), "u-A");
     }
 
     #[tokio::test]

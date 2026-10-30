@@ -72,28 +72,39 @@ pub(crate) trait RosterPoller {
 /// that drives dead-credential detection lives in the daemon's per-account health
 /// state (issue #42), not in this per-poll source.
 pub(crate) struct RealRosterPoller {
-    stash: RealAccountStash,
+    store: crate::storage::CanonicalStore,
+    stash: crate::storage::AccountStore,
 }
 
 impl RealRosterPoller {
-    pub(crate) fn new() -> Self {
-        Self {
-            stash: RealAccountStash::new(),
-        }
+    pub(crate) fn new(
+        store: crate::storage::CanonicalStore,
+        stash: crate::storage::AccountStore,
+    ) -> Self {
+        Self { store, stash }
+    }
+}
+
+/// Borrow a backend without constructing another Keychain instance.
+struct BorrowedCredentialStore<'a, C>(&'a C);
+
+impl<C: CredentialStore> CredentialStore for BorrowedCredentialStore<'_, C> {
+    async fn read(&self) -> Result<Credential> {
+        self.0.read().await
+    }
+
+    async fn write(&self, _credential: &Credential) -> Result<()> {
+        Err(Error::Unimplemented("usage credential source is read-only"))
     }
 }
 
 impl RosterPoller for RealRosterPoller {
     async fn poll(&self, account: &Account, active: bool) -> Result<PolledReading> {
         if active {
-            // The active account's token refreshes in place, so the canonical
-            // item is the freshest bearer — poll through it.
-            RealUsageSource::new(CurlTransport::new(RealCredentialStore::new()))
+            RealUsageSource::new(CurlTransport::new(BorrowedCredentialStore(&self.store)))
                 .usage()
                 .await
         } else {
-            // A non-active account is polled with its stashed token — the seam #5
-            // anticipated: `CurlTransport` is generic over `CredentialStore`.
             RealUsageSource::new(CurlTransport::new(StashCredentialStore {
                 stash: &self.stash,
                 service: account.stash(),
@@ -156,17 +167,16 @@ pub(crate) trait ExternalLoginWatch {
     /// resolve when disabled, so it never wins the idle select. Re-armable: the run loop awaits
     /// it afresh each idle iteration.
     async fn until_due(&mut self);
-    /// Read the canonical credential item via the watch's OWN store. `None` on ANY
-    /// unreadable / locked / absent read — a probe that cannot read simply detects nothing and
-    /// the run loop keeps idling (fail-safe: detection never stalls or crashes the loop).
-    async fn read_canonical(&mut self) -> Option<Credential>;
+    /// Read without mutating. Preserve the source-conflict error so the idle
+    /// loop can wake file-mode recovery; other errors still leave it idling.
+    async fn read_canonical(&mut self) -> Result<Credential>;
 }
 
 /// Production external-login watch (issue #140): a short-cadence LOCAL probe of the canonical
-/// item over a [`RealCredentialStore`]. Always-on — the probe is a cheap local keychain read
+/// item over a [`crate::storage::CanonicalStore`]. Always-on — the probe is a cheap local keychain read
 /// with no network / rate-limit cost and a strictly better active-account re-auth latency, so
 /// there is no feature gate; a hermetic test that must NOT probe wires the inert no-op watch
-/// instead. Its own store is a second [`RealCredentialStore`] (stateless, resolves the same
+/// instead. Its own store is a second [`crate::storage::CanonicalStore`] (stateless, resolves the same
 /// canonical item as the daemon's) so the idle `wait`'s `&mut Daemon` borrow is untouched.
 pub(crate) struct ExternalLoginWatcher<C> {
     store: C,
@@ -183,12 +193,8 @@ impl<C: CredentialStore> ExternalLoginWatch for ExternalLoginWatcher<C> {
         tokio::time::sleep(Duration::from_secs(EXTERNAL_LOGIN_WATCH_SECS)).await;
     }
 
-    async fn read_canonical(&mut self) -> Option<Credential> {
-        // Best-effort: a locked / not-found / transient keychain read yields `None`, so the run
-        // loop detects nothing this probe and keeps idling — a detection failure must never
-        // break the poll/swap loop (mirrors #156's fail-open collector, #162's fail-safe
-        // refresh).
-        self.store.read().await.ok()
+    async fn read_canonical(&mut self) -> Result<Credential> {
+        self.store.read().await
     }
 }
 
@@ -273,11 +279,15 @@ pub(crate) type KeepWarmMint = (RefreshReport, Option<Credential>);
 /// isolated dir + keychain are derived per-call from the account uuid.
 pub(crate) struct RealKeepWarmEngine {
     claude_bin: Option<PathBuf>,
+    storage: crate::storage::Storage,
 }
 
 impl RealKeepWarmEngine {
-    pub(crate) fn new(claude_bin: Option<PathBuf>) -> Self {
-        Self { claude_bin }
+    pub(crate) fn new(claude_bin: Option<PathBuf>, storage: crate::storage::Storage) -> Self {
+        Self {
+            claude_bin,
+            storage,
+        }
     }
 
     /// Resolve the `claude` binary to spawn THIS keep-warm cycle (issue #375) via the shared
@@ -308,10 +318,14 @@ impl KeepWarm for RealKeepWarmEngine {
         // shell), and `&'a self` is already captured, so awaiting it here is free of any bridge.
         // Still per-cycle (issue #375), and a resolution failure is still carried as the `Err`
         // the daemon handles fail-safe (canonical left untouched).
-        let uuid = account.account_uuid.clone();
+        let uuid = account.id().to_owned();
         Box::pin(async move {
+            if crate::refresh::non_refreshable(canonical.expose()) {
+                return Ok((RefreshReport::no_change(), None));
+            }
             let binary = self.resolve_binary().await?;
-            crate::refresh::keep_warm_account(canonical.expose(), &uuid, binary).await
+            crate::refresh::keep_warm_account(canonical.expose(), &uuid, binary, &self.storage)
+                .await
         })
     }
 }
@@ -668,7 +682,10 @@ mod tests {
         let link = tmp.path().join("claude");
         std::os::unix::fs::symlink(&installed, &link).unwrap();
 
-        let engine = RealKeepWarmEngine::new(Some(link.clone()));
+        let engine = RealKeepWarmEngine::new(
+            Some(link.clone()),
+            crate::storage::Storage::from_config(&Default::default()).unwrap(),
+        );
 
         // Cycle 1: link → installed (exists) → Ok, returning the symlink path UNCANONICALIZED
         // (issue constraint [C1]: a wrapper symlink is spawned as-is, never resolved to its target).
