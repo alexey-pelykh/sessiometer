@@ -1895,3 +1895,93 @@ exits.
   code has the excerpt's shape.
 
 CC 2.1.294 · macOS 27.0.1 / 26A434 · sessiometer #1020.
+
+---
+
+# Issue #1540 — a plaintext fallback file hides keychain swaps from live sessions
+
+Recorded on CC `2.1.285`, which is **outside** the verified range above and does **not** widen it:
+this entry characterizes one mechanism a field report surfaced, and re-verifies none of the
+findings the range records beyond the AC-6 storage shape it builds on.
+
+## Symptom, measured in the field
+
+Running sessions stopped following swaps. `status` named the swapped-to account, the canonical
+keychain item held its token, and the live sessions kept billing the outgoing account until their
+in-memory token failed; new sessions were unaffected. Scored per swap by which account's usage moved
+in the following hour (`usage-samples.jsonl` against `event=swap`):
+
+| When | What the usage did |
+|---|---|
+| 2026-10-08 → 10-09, nine swaps | target climbs within ~2 min; outgoing account freezes |
+| 2026-10-12 13:08 local | `~/.claude/.credentials.json` appears (0600; keychain item still present) |
+| 2026-10-20, three swaps | outgoing account keeps climbing to its cap; target sits at 0% for up to ~6 h |
+| 2026-10-20 ~19:55Z | file moved aside by hand; the **same running processes** move to the target on their next requests |
+
+One binary throughout, and no `ANTHROPIC_*` / `CLAUDE_*` variable in any session's environment.
+
+## Finding — the per-request change check is file-first ✅
+
+Static decode of the `2.1.285` binary, paraphrased below (its minified names are unstable across
+versions, so none is load-bearing). Storage is still AC-6's keychain-primary,
+plaintext-fallback combinator, with the same delete-on-save-over-an-EMPTY-primary arm. What AC-6 did
+not record is the check a live session runs before reusing its cached token:
+
+```js
+// before each request: has the credential changed under us?
+//   <config dir>/.credentials.json EXISTS → compare its mtime (or a dev:ino:size:mtimeNs
+//                                           version) against the last one seen; on change, clear
+//                                           the token memos AND the 30 s keychain cache
+//   ABSENT                                → re-read the keychain access token; on change, same
+```
+
+So while the file exists, a keychain-only write — which is every swap sessiometer makes — changes
+nothing the check looks at, and no live session notices it. The file's directory resolves with the
+same precedence as the keychain service-name suffix (`CLAUDE_SECURESTORAGE_CONFIG_DIR` when defined,
+an empty value meaning `~/.claude`; else `CLAUDE_CONFIG_DIR`; else `~/.claude`), so the file always
+pairs with the item sessiometer writes.
+
+Two consequences beyond the hidden swap:
+
+- **A stale login comes back on a scrub.** With the keychain item gone (ADR-0018), reads fall back
+  to the file instead of "Not logged in" — and the file found here held an access token that had
+  expired a week before.
+- **Nothing removes it once the keychain is refilled.** CC deletes the file only when its own save
+  lands over an *empty* keychain; after sessiometer's write refills the item, CC's later saves find
+  it non-empty and leave the file in place indefinitely.
+
+## Finding — removing the file is picked up without a restart ✅
+
+Moving the file aside made every running session follow the canonical item on its next request
+(the last row above).
+
+## Finding — a bumped mtime alone is predicted to be picked up the same way; unmeasured ⚠️
+
+The decode predicts the same from a bumped mtime alone, which is the `touch` mode — the default
+(ADR-0039 Decision 3). That arm was **not** exercised live: the prediction rests on the change
+check comparing the file's mtime (or its `dev:ino:size:mtimeNs` version) and nothing else. A
+measured `touched` line followed by the running sessions moving to the target, scored as the table
+above scores the removal, would promote this to ✅.
+
+## What would falsify this
+
+- **The check consulting the keychain while the file exists.** The settling would then be
+  unnecessary, but harmless.
+- **CC writing the file on a *successful* keychain save.** `remove` would then fight CC on every
+  save, and `touch` would re-stamp a file CC had just written; the `event=plaintext_fallback`
+  count would show either, at one line per swap.
+- **The file holding a login *newer* than the keychain item.** A falsifier of the premise that
+  the file is always stale, not of the mechanism, and the reason `remove` is not the default:
+  CC writes the file when a keychain save *fails*, so right after that it is newer than the item,
+  and refresh-token rotation (ADR-0007) can already have retired the keychain's copy of the
+  outgoing account's token. Under `touch` nothing is lost. A measurement that CC's failed-save
+  write never carries a rotated token would make `remove` safe as the default; none was taken.
+- **The file's directory resolving differently from the service suffix.** The settling would then
+  address a file no session reads; `host_fallback_path` in `src/plaintext_fallback.rs` mirrors the
+  precedence, and `keychain::canonical_service_from` is its sibling.
+
+Load-bearing at `FallbackSettlingStore` in `src/plaintext_fallback.rs`, which settles the file after
+every canonical write, per `[credential].plaintext_fallback` (ADR-0039). Re-walk on the same trigger
+as the range: a CC release whose storage or change-check code moved.
+
+CC 2.1.285 · macOS 26.6.2 / 25G83 · sessiometer #1540.

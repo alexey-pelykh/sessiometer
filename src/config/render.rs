@@ -309,6 +309,11 @@ impl Config {
                     cr.expiry_cohort_window_secs.to_string(),
                     present("credential", "expiry_cohort_window_secs"),
                 ),
+                entry(
+                    "plaintext_fallback",
+                    basic_string(cr.plaintext_fallback.as_str()),
+                    present("credential", "plaintext_fallback"),
+                ),
             ],
         };
 
@@ -861,6 +866,20 @@ impl Config {
             "expiry_cohort_window_secs = {}\n",
             cr.expiry_cohort_window_secs
         ));
+        // Issue #1540: what a canonical write does to Claude Code's stale plaintext fallback.
+        out.push_str(
+            "# Claude Code's plaintext fallback (`.credentials.json` in its config dir, macOS\n\
+             # only — elsewhere that file IS the store and is left alone). Claude Code writes it\n\
+             # when a keychain write fails, then lets it SHADOW the keychain: a live session\n\
+             # whose fallback exists never notices a swap. After each credential write:\n\
+             # touch (keep it, bump its mtime so live sessions re-read storage once; the\n\
+             # default) | remove (delete it; the file can hold a login newer than the\n\
+             # keychain's) | off (leave it; the event log still records it is there).\n",
+        );
+        out.push_str(&format!(
+            "plaintext_fallback = {}\n",
+            basic_string(cr.plaintext_fallback.as_str())
+        ));
 
         for account in &self.roster {
             out.push_str("\n[[account]]\n");
@@ -1078,6 +1097,53 @@ mod tests {
             Config::parse(&text).unwrap().credential,
             CredentialConfig::default()
         );
+    }
+
+    /// Issue #1540: every `plaintext_fallback` mode survives render → parse, so a `capture` (which
+    /// rewrites the whole file) can never quietly flip an operator's explicit `remove` or `off`
+    /// back to the default `touch`.
+    #[test]
+    fn plaintext_fallback_round_trips_render_then_parse() {
+        for token in PlaintextFallbackMode::TOKENS {
+            let toml = format!("{VALID}\n[credential]\nplaintext_fallback = \"{token}\"\n");
+            let original = Config::parse(&toml).unwrap();
+            let text = original.render();
+            assert!(
+                text.contains(&format!("\nplaintext_fallback = \"{token}\"\n")),
+                "render must write the mode: {text}"
+            );
+            assert_eq!(
+                Config::parse(&text).unwrap().credential,
+                original.credential
+            );
+        }
+    }
+
+    /// Issue #1540: `config show --origin` reports the key with its quoted token and its origin.
+    #[test]
+    fn plaintext_fallback_reports_its_value_and_origin() {
+        let entry = |text: &str| {
+            let config = Config::from_toml_str(text).expect("valid config");
+            let table: toml::Table = toml::from_str(text).expect("valid TOML");
+            config
+                .origin_report(&table)
+                .sections
+                .into_iter()
+                .find(|s| s.header == "[credential]")
+                .unwrap()
+                .entries
+                .into_iter()
+                .find(|e| e.key == "plaintext_fallback")
+                .expect("plaintext_fallback is reported")
+        };
+
+        let defaulted = entry("");
+        assert_eq!(defaulted.value, "\"touch\"");
+        assert_eq!(defaulted.origin, Origin::Default);
+
+        let from_file = entry("[credential]\nplaintext_fallback = \"off\"\n");
+        assert_eq!(from_file.value, "\"off\"");
+        assert_eq!(from_file.origin, Origin::FromFile);
     }
 
     #[test]

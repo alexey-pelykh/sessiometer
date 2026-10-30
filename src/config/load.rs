@@ -668,4 +668,48 @@ mod tests {
             "the rejection must name the key that moved the floor past the block: {rejected}"
         );
     }
+
+    /// **The floor has moved again, and the constant has not** (issue #1540). `plaintext_fallback`
+    /// is rendered unconditionally inside `[credential]`, so a build pinned at `81bd4f2` — the
+    /// commit `migration::CONFIG_BLOCK_VERSION_FLOOR` names — refuses a current artifact exactly
+    /// as a build at `6fe3457` refuses one over `expiry_cohort_window_secs`. The constant names a
+    /// commit, and the one that added this key exists only once the change squash-merges, so the
+    /// bump is issue #1589 — the sequencing #1053 used for `81bd4f2`. Until it lands this is the
+    /// witness that the gap is real; after it lands it is this rejection class's record, as the
+    /// sibling above is for `expiry_cohort_window_secs`.
+    #[test]
+    fn a_build_at_the_current_floor_commit_still_rejects_a_current_render() {
+        /// `RawCredential` exactly as it stood at `81bd4f2`: two fields, `deny_unknown_fields`.
+        /// Hand-written, like its two siblings, so it cannot track the drift it witnesses.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct CredentialAtTheNamedFloor {
+            #[serde(default)]
+            expiry_horizon_secs: i64,
+            #[serde(default)]
+            expiry_cohort_window_secs: i64,
+        }
+
+        let current = Config::parse(VALID)
+            .expect("the baseline config parses")
+            .render();
+        let mut table: toml::Table = toml::from_str(&current).expect("a render is valid TOML");
+        let credential = table
+            .remove("credential")
+            .expect("render must emit [credential] or this test witnesses nothing");
+
+        let rejected = match credential.try_into::<CredentialAtTheNamedFloor>() {
+            Err(err) => err,
+            Ok(_) => panic!(
+                "a parser at 81bd4f2 must REJECT a current [credential] block — if this passes, \
+                 `plaintext_fallback` is no longer rendered unconditionally and issue #1589 is \
+                 moot"
+            ),
+        };
+        assert!(
+            rejected.to_string().contains("plaintext_fallback"),
+            "the rejection must name the key that moved the floor past 81bd4f2: {rejected}"
+        );
+    }
 }

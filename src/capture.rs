@@ -62,6 +62,7 @@ use crate::observability::{
     Event, EventLog, LoginEventOutcome, RosterReloadOutcome, RosterReloadReason,
 };
 use crate::paths;
+use crate::plaintext_fallback::FallbackSettlingStore;
 use crate::stash::{AccountStash, RealAccountStash, StashedAccount};
 use crate::swap::{SwapLock, SWAP_LOCK_MAX_WAIT};
 use std::io::{BufRead, IsTerminal, Write};
@@ -997,7 +998,15 @@ pub(crate) async fn reconcile_login(
     let report = run_login_locked(
         Some((&swap_lock, SWAP_LOCK_MAX_WAIT)),
         HarvestedLogin { captured, activate },
-        &RealCredentialStore::new(),
+        // Issue #1540: an activating login writes the canonical item, so it settles Claude
+        // Code's stale plaintext fallback too. No config yet (a first login) is the default mode.
+        &FallbackSettlingStore::for_host(
+            RealCredentialStore::new(),
+            existing
+                .as_ref()
+                .map(|c| c.credential.plaintext_fallback)
+                .unwrap_or_default(),
+        ),
         &RealAccountStash::new(),
         existing,
         label.as_deref(),

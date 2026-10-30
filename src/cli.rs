@@ -35,6 +35,7 @@ use crate::observability::{
     ExpiryHorizon, ExportMode, RefreshEventOutcomeKind, Verbosity,
 };
 use crate::paths;
+use crate::plaintext_fallback::FallbackSettlingStore;
 use crate::refresh;
 use crate::refresh_tick::{self, RealRefreshEngine, RefreshTick};
 use crate::service::AgentSupervision;
@@ -1507,7 +1508,13 @@ async fn run(verbosity: Verbosity, managed: bool) -> Result<()> {
     let mut daemon = Daemon::new(
         config.roster.clone(),
         RealRosterPoller::new(),
-        RealCredentialStore::new(),
+        // Issue #1540: every canonical write the daemon makes (auto-swap, keep-warm promotion)
+        // settles Claude Code's stale plaintext fallback, or live sessions never see the swap.
+        // Read once at startup, like the tunables — a `[credential]` edit takes a restart.
+        FallbackSettlingStore::for_host(
+            RealCredentialStore::new(),
+            config.credential.plaintext_fallback,
+        ),
         RealAccountStash::new(),
         RealClock::new(),
         paths::claude_json()?,

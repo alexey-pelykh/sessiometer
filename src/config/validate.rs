@@ -446,9 +446,22 @@ impl Config {
             60,
             604_800,
         )?;
+        // The plaintext-fallback mode (issue #1540) is validated against its fixed vocabulary, like
+        // `migration.conflict_policy`, so a typo fails at load rather than silently falling back to
+        // the default: an operator who wrote `remov` would otherwise get `touch` and never learn
+        // why the file is still there.
+        let plaintext_fallback = PlaintextFallbackMode::from_token(&c.plaintext_fallback)
+            .ok_or_else(|| {
+                Error::ConfigInvalid(format!(
+                    "credential.plaintext_fallback must be one of {:?}, got {:?}",
+                    PlaintextFallbackMode::TOKENS,
+                    c.plaintext_fallback
+                ))
+            })?;
         let credential = CredentialConfig {
             expiry_horizon_secs: c.expiry_horizon_secs as u64,
             expiry_cohort_window_secs: c.expiry_cohort_window_secs as u64,
+            plaintext_fallback,
         };
 
         Ok(Config {
@@ -1583,6 +1596,7 @@ mod tests {
                 // opt-out contract: naming one key in `[credential]` must not silently reset its
                 // sibling.
                 expiry_cohort_window_secs: DEFAULT_CREDENTIAL_EXPIRY_COHORT_WINDOW_SECS,
+                plaintext_fallback: PlaintextFallbackMode::Touch,
             }
         );
         assert_eq!(
@@ -1603,6 +1617,7 @@ mod tests {
             CredentialConfig {
                 expiry_horizon_secs: DEFAULT_CREDENTIAL_EXPIRY_HORIZON_SECS,
                 expiry_cohort_window_secs: 3_600,
+                plaintext_fallback: PlaintextFallbackMode::Touch,
             }
         );
         assert_eq!(
@@ -1685,6 +1700,55 @@ mod tests {
             let config = Config::parse(&toml)
                 .unwrap_or_else(|e| panic!("expiry_horizon_secs = {edge} is a valid edge: {e:?}"));
             assert_eq!(config.credential.expiry_horizon_secs, edge);
+        }
+    }
+
+    // --- [credential].plaintext_fallback (issue #1540) ----------------------
+
+    #[test]
+    fn plaintext_fallback_defaults_to_touch_when_absent() {
+        let config = Config::parse(VALID).unwrap();
+        assert_eq!(
+            config.credential.plaintext_fallback,
+            PlaintextFallbackMode::Touch
+        );
+        let toml = format!("{VALID}\n[credential]\nexpiry_horizon_secs = 1209600\n");
+        assert_eq!(
+            Config::parse(&toml).unwrap().credential.plaintext_fallback,
+            PlaintextFallbackMode::Touch
+        );
+    }
+
+    #[test]
+    fn parses_every_plaintext_fallback_mode_without_disturbing_its_siblings() {
+        for (token, mode) in [
+            ("remove", PlaintextFallbackMode::Remove),
+            ("touch", PlaintextFallbackMode::Touch),
+            ("off", PlaintextFallbackMode::Off),
+        ] {
+            let toml = format!("{VALID}\n[credential]\nplaintext_fallback = \"{token}\"\n");
+            let config = Config::parse(&toml).unwrap_or_else(|e| panic!("{token}: {e:?}"));
+            assert_eq!(
+                config.credential,
+                CredentialConfig {
+                    plaintext_fallback: mode,
+                    ..CredentialConfig::default()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_plaintext_fallback_mode_is_rejected_naming_the_key_and_the_choices() {
+        for bad in ["\"delete\"", "\"Remove\"", "\"\""] {
+            let toml = format!("{VALID}\n[credential]\nplaintext_fallback = {bad}\n");
+            let err = Config::parse(&toml).unwrap_err();
+            assert!(
+                matches!(&err, Error::ConfigInvalid(msg)
+                    if msg.contains("credential.plaintext_fallback")
+                        && ["remove", "touch", "off"].iter().all(|t| msg.contains(t))),
+                "expected a credential.plaintext_fallback vocabulary error for {bad}, got {err:?}"
+            );
         }
     }
 

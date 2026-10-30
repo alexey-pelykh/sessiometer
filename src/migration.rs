@@ -570,6 +570,13 @@ pub(crate) const PLAINTEXT_WARNING: &str =
 /// from source before the floor commit, and every future release sits at or above it.
 /// Already-built binaries cannot be patched, which is why this constant makes the *next*
 /// occurrence legible rather than claiming to repair one already in the field.
+///
+/// **Known stale since issue #1540 (#1541)**: `[credential].plaintext_fallback` is rendered
+/// unconditionally too, so the floor has moved past `81bd4f2` and the text below has not — the
+/// constant names a commit, and the one that added that key exists only once that change has a
+/// `main` SHA. Issue #1589 moves it; until then
+/// `a_build_at_the_current_floor_commit_still_rejects_a_current_render` (`src/config/load.rs`)
+/// witnesses the gap.
 pub(crate) const CONFIG_BLOCK_VERSION_FLOOR: &str =
     "import version floor: an artifact carries the config as TEXT, and the importing build \
      refuses any config key it does not know, at any nesting level — so an artifact is only as \
