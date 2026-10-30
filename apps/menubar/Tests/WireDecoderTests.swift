@@ -10,12 +10,27 @@ import XCTest
 
 final class WireDecoderTests: XCTestCase {
 
+    func testUsageUnavailableIsAdditiveAndProjectsIntoTheRow() throws {
+        let old = #"{"label":"C","active":true,"enabled":true,"quarantined":false,"session_pct":null,"weekly_pct":null,"auth":"unknown"}"#
+        let decoder = JSONDecoder()
+        let before = try decoder.decode(AccountStatusLine.self, from: Data(old.utf8))
+        XCTAssertFalse(before.usageUnavailable)
+        let current = old.dropLast() + #", "usage_unavailable":true}"#
+        let account = try decoder.decode(AccountStatusLine.self, from: Data(current.utf8))
+        XCTAssertTrue(account.usageUnavailable)
+        XCTAssertNil(account.sessionPct)
+        XCTAssertEqual(account.auth, .unknown)
+        XCTAssertEqual(StatusPanelFormat.authCue(auth: account.auth, recovering: false,
+                                               enabled: true, usageUnavailable: true),
+                       "usage unavailable · manual")
+    }
+
     // AC: "Decodes real `snapshot` … frames."
     func testDecodesRealSnapshotFrame() throws {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotBasic) else {
             return XCTFail("expected a snapshot frame")
         }
-        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 14))
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 15))
         XCTAssertEqual(v.generatedAt, 42)
         XCTAssertTrue(v.isSchemaSupported)
         XCTAssertNil(v.nextSwap, "next_swap null decodes to nil")
@@ -46,8 +61,8 @@ final class WireDecoderTests: XCTestCase {
     // AC: "Decodes real … `heartbeat` frames." + heartbeat carries the freshness envelope.
     func testDecodesRealHeartbeatFrame() throws {
         let frame = try parseWatchFrame(Fixtures.heartbeatBasic)
-        XCTAssertEqual(frame, .heartbeat(generatedAt: 42, schemaVersion: SchemaVersion(major: 1, minor: 14)))
-        XCTAssertEqual(frame.schemaVersion, SchemaVersion(major: 1, minor: 14))
+        XCTAssertEqual(frame, .heartbeat(generatedAt: 42, schemaVersion: SchemaVersion(major: 1, minor: 15)))
+        XCTAssertEqual(frame.schemaVersion, SchemaVersion(major: 1, minor: 15))
         XCTAssertTrue(WireContract.isSupported(try XCTUnwrap(frame.schemaVersion)))
     }
 
@@ -195,7 +210,7 @@ final class WireDecoderTests: XCTestCase {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotBlindActiveDegraded) else {
             return XCTFail("expected a snapshot frame")
         }
-        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 14))
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 15))
         let work = v.accounts[0]
         XCTAssertTrue(work.active)
         XCTAssertNil(work.sessionPct)
@@ -222,7 +237,7 @@ final class WireDecoderTests: XCTestCase {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotCanonicalScrubExhausted) else {
             return XCTFail("expected a snapshot frame")
         }
-        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 14))
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 15))
         XCTAssertEqual(v.canonicalScrub, .exhausted)
         // The rest of the frame still decodes normally alongside the added rollup.
         XCTAssertEqual(v.accounts.count, 1)
@@ -250,7 +265,7 @@ final class WireDecoderTests: XCTestCase {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotKeychainLocked) else {
             return XCTFail("expected a snapshot frame")
         }
-        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 14))
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 15))
         XCTAssertTrue(v.keychainLocked)
         // The flag is independent of `canonical_scrub` (a locked keychain can't be read to know
         // scrubbed-ness), and the rest of the frame still decodes normally alongside it.
@@ -268,7 +283,7 @@ final class WireDecoderTests: XCTestCase {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotSystemicRefreshFailure) else {
             return XCTFail("expected a snapshot frame")
         }
-        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 14))
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 15))
         XCTAssertEqual(v.systemicRefreshFailure, 3)
         XCTAssertEqual(v.systemicRefreshSource, .sweep, "#813: the episode's opening bracket")
         // Independent of the vault pair — the mechanism can be down while the shared item is fine.
@@ -286,7 +301,7 @@ final class WireDecoderTests: XCTestCase {
         guard case .snapshot(let pre) = try parseWatchFrame(Fixtures.snapshotSystemicRefreshPreflight) else {
             return XCTFail("expected a snapshot frame")
         }
-        XCTAssertEqual(pre.schemaVersion, SchemaVersion(major: 1, minor: 14))
+        XCTAssertEqual(pre.schemaVersion, SchemaVersion(major: 1, minor: 15))
         XCTAssertEqual(pre.systemicRefreshSource, .preflight)
         XCTAssertEqual(pre.systemicRefreshFailure, 1, "the seeded floor, not a sweep count")
 
@@ -360,7 +375,7 @@ final class WireDecoderTests: XCTestCase {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotCanaryDriftRefusing) else {
             return XCTFail("expected a snapshot frame")
         }
-        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 14))
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 15))
         XCTAssertEqual(v.canary, .drift(displayed: "work", matched: "personal", overridden: false))
         // Independent of its sibling faults — the identity can drift while the vault reads fine.
         XCTAssertNil(v.canonicalScrub)
@@ -400,7 +415,7 @@ final class WireDecoderTests: XCTestCase {
             try parseWatchFrame(Fixtures.snapshotCanaryRefusedUnparseableCanonical) else {
             return XCTFail("expected a snapshot frame")
         }
-        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 14))
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 15))
         XCTAssertEqual(v.canary, .refusedUnparseableCanonical)
         // Independent of its sibling faults — an unrecognized canonical can sit under a vault that
         // reads fine and a roster that is entirely healthy.
@@ -473,7 +488,7 @@ final class WireDecoderTests: XCTestCase {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotExpiryModifier) else {
             return XCTFail("the #882 expiry modifier must not cost us the frame")
         }
-        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 14))
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 15))
         XCTAssertTrue(v.isSchemaSupported, "an additive minor stays supported — major gates, minor does not")
         XCTAssertEqual(v.accounts.count, 2, "the roster survives the unknown per-account key")
 
@@ -534,7 +549,7 @@ final class WireDecoderTests: XCTestCase {
         guard case .snapshot(let v) = try parseWatchFrame(Fixtures.snapshotExpiryCohort) else {
             return XCTFail("the #879 cohort keys must not cost us the frame")
         }
-        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 14))
+        XCTAssertEqual(v.schemaVersion, SchemaVersion(major: 1, minor: 15))
         XCTAssertTrue(v.isSchemaSupported, "an additive minor stays supported")
         XCTAssertEqual(v.accounts.count, 3, "the roster survives an unknown ROOT-level key")
 

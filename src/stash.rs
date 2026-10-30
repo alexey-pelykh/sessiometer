@@ -62,14 +62,59 @@ const ACCT_CREDENTIAL: &str = "credential";
 /// The `acct` attribute under which the `oauthAccount` JSON is stored.
 const ACCT_OAUTH: &str = "oauthAccount";
 
-/// Both halves of a captured account, as stashed under one `Sessiometer/<account_uuid>`
+/// A complete credential and its explicit optional identity, under `Sessiometer/<id>`.
 /// service. `Clone` so the in-memory test fake can hand back copies.
 #[derive(Clone)]
 pub(crate) struct StashedAccount {
     /// The raw `Claude Code-credentials` blob (the bearer token).
     pub(crate) credential: Credential,
-    /// The account's `~/.claude.json` `oauthAccount` identity block.
-    pub(crate) oauth_account: OauthAccount,
+    /// The account's `oauthAccount` block, or intentional absence for a local entry.
+    pub(crate) oauth_account: Option<OauthAccount>,
+}
+
+impl StashedAccount {
+    /// Explicit JSON null is different from a missing/corrupt identity item.
+    pub(crate) fn identity_bytes(&self) -> &[u8] {
+        match &self.oauth_account {
+            Some(identity) => identity.raw_json(),
+            None => b"null",
+        }
+    }
+
+    /// Login/capture paths require a genuine identity; token-only import does not.
+    pub(crate) fn require_identity(&self) -> Result<&OauthAccount> {
+        self.oauth_account
+            .as_ref()
+            .ok_or(Error::OauthAccountMissing)
+    }
+}
+
+pub(crate) fn decode_identity(bytes: &[u8]) -> Result<Option<OauthAccount>> {
+    if bytes == b"null" {
+        Ok(None)
+    } else {
+        OauthAccount::from_object_bytes(bytes).map(Some)
+    }
+}
+
+/// Validate both halves before using or persisting them. Local IDs are never
+/// smuggled into an OAuth identity; null under an identified key is corruption.
+pub(crate) fn validate_identity(service: &str, identity: Option<&OauthAccount>) -> Result<()> {
+    let id = service
+        .strip_prefix(crate::config::STASH_PREFIX)
+        .ok_or_else(|| Error::StashIncomplete {
+            service: service.to_owned(),
+        })?;
+    let valid = match identity {
+        Some(identity) => !id.starts_with("local-") && id == identity.account_uuid(),
+        None => crate::config::is_local_account_id(id),
+    };
+    if !valid {
+        return Err(Error::StashIncomplete {
+            service: service.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Reads/writes a per-account stash. The real impl drives the macOS `security`
@@ -204,6 +249,7 @@ impl RealAccountStash {
 
 impl AccountStash for RealAccountStash {
     async fn write(&self, service: &str, account: &StashedAccount) -> Result<()> {
+        validate_identity(service, account.oauth_account.as_ref())?;
         let keychain = self.keychain_path()?;
         // Credential first, then identity. The roster entry is written by
         // `capture` only after this returns, so a crash mid-write never leaves a
@@ -225,7 +271,7 @@ impl AccountStash for RealAccountStash {
             service,
             ACCT_OAUTH,
             &keychain,
-            crate::hex::encode(account.oauth_account.raw_json()).as_bytes(),
+            crate::hex::encode(account.identity_bytes()).as_bytes(),
         )
         .await?;
         Ok(())
@@ -241,7 +287,8 @@ impl AccountStash for RealAccountStash {
         let oauth_bytes = crate::hex::decode(&oauth_hex).ok_or_else(|| Error::StashIncomplete {
             service: service.to_owned(),
         })?;
-        let oauth_account = OauthAccount::from_object_bytes(&oauth_bytes)?;
+        let oauth_account = decode_identity(&oauth_bytes)?;
+        validate_identity(service, oauth_account.as_ref())?;
         Ok(StashedAccount {
             credential,
             oauth_account,
@@ -475,6 +522,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn token_only_identity_is_explicit_null_not_a_missing_or_corrupt_record() {
+        let local = "Sessiometer/local-0123456789abcdef0123456789abcdef";
+        assert!(decode_identity(b"null").unwrap().is_none());
+        for broken in [b"".as_slice(), b"{}", b"not json"] {
+            assert!(decode_identity(broken).is_err());
+        }
+        assert!(validate_identity(local, None).is_ok());
+        assert!(validate_identity("Sessiometer/u-B", None).is_err());
+        let identity = OauthAccount::from_object_bytes(br#"{"accountUuid":"u-B"}"#).unwrap();
+        assert!(validate_identity(local, Some(&identity)).is_err());
+        assert!(validate_identity("Sessiometer/u-B", Some(&identity)).is_ok());
+        assert!(validate_identity("Sessiometer/u-A", Some(&identity)).is_err());
+    }
+
+    #[test]
     fn push_quoted_wraps_and_escapes_only_backslash_and_quote() {
         let mut out = Vec::new();
         push_quoted(&mut out, b"plain");
@@ -611,7 +673,9 @@ mod tests {
         let stash = FakeAccountStash::empty();
         let account = StashedAccount {
             credential: Credential::new(b"raw-token".to_vec()),
-            oauth_account: OauthAccount::from_object_bytes(br#"{"accountUuid":"u-1"}"#).unwrap(),
+            oauth_account: Some(
+                OauthAccount::from_object_bytes(br#"{"accountUuid":"u-1"}"#).unwrap(),
+            ),
         };
         stash
             .write("Sessiometer/11111111-1111-1111-1111-111111111111", &account)
@@ -624,7 +688,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got.credential.expose(), b"raw-token");
-        assert_eq!(got.oauth_account.account_uuid(), "u-1");
+        assert_eq!(got.require_identity().unwrap().account_uuid(), "u-1");
 
         assert!(matches!(
             stash
@@ -640,7 +704,9 @@ mod tests {
         let service = "Sessiometer/11111111-1111-1111-1111-111111111111";
         let account = StashedAccount {
             credential: Credential::new(b"raw-token".to_vec()),
-            oauth_account: OauthAccount::from_object_bytes(br#"{"accountUuid":"u-1"}"#).unwrap(),
+            oauth_account: Some(
+                OauthAccount::from_object_bytes(br#"{"accountUuid":"u-1"}"#).unwrap(),
+            ),
         };
         stash.write(service, &account).await.unwrap();
         assert!(stash.contains(service));
@@ -706,19 +772,21 @@ mod tests {
                  \"displayName\":\"Cafe\u{301} \u{41e}\u{43b}\u{435}\u{43a}\u{441}i\u{439}\"}";
             let account = StashedAccount {
                 credential: Credential::new(blob.to_vec()),
-                oauth_account: OauthAccount::from_object_bytes(oauth_json.as_bytes()).unwrap(),
+                oauth_account: Some(
+                    OauthAccount::from_object_bytes(oauth_json.as_bytes()).unwrap(),
+                ),
             };
-            let oauth_raw = account.oauth_account.raw_json().to_vec();
+            let oauth_raw = account.identity_bytes().to_vec();
             stash.write(service, &account).await.expect("write stash");
 
             let got = stash.read(service).await.expect("read stash");
             assert_eq!(got.credential.expose(), blob);
             assert_eq!(
-                got.oauth_account.account_uuid(),
+                got.require_identity().unwrap().account_uuid(),
                 "11111111-1111-1111-1111-111111111111"
             );
             // The non-ASCII identity block survives byte-exact (what #6 restores).
-            assert_eq!(got.oauth_account.raw_json(), oauth_raw.as_slice());
+            assert_eq!(got.identity_bytes(), oauth_raw.as_slice());
 
             // Re-stash a fresh credential under the same service: `-U` updates in
             // place (idempotent refresh), and a single read still resolves it —
@@ -757,10 +825,12 @@ mod tests {
             let service = "Sessiometer/33333333-3333-3333-3333-333333333333";
             let account = StashedAccount {
                 credential: Credential::new(b"raw-token".to_vec()),
-                oauth_account: OauthAccount::from_object_bytes(
-                    br#"{"accountUuid":"33333333-3333-3333-3333-333333333333"}"#,
-                )
-                .unwrap(),
+                oauth_account: Some(
+                    OauthAccount::from_object_bytes(
+                        br#"{"accountUuid":"33333333-3333-3333-3333-333333333333"}"#,
+                    )
+                    .unwrap(),
+                ),
             };
             stash.write(service, &account).await.expect("write stash");
             stash.read(service).await.expect("stash present");
@@ -790,10 +860,12 @@ mod tests {
             let blob = br#"{"accessToken":"a b \" c \\ d","x":"$y `z` ;|&"}"#;
             let account = StashedAccount {
                 credential: Credential::new(blob.to_vec()),
-                oauth_account: OauthAccount::from_object_bytes(
-                    br#"{"accountUuid":"22222222-2222-2222-2222-222222222222"}"#,
-                )
-                .unwrap(),
+                oauth_account: Some(
+                    OauthAccount::from_object_bytes(
+                        br#"{"accountUuid":"22222222-2222-2222-2222-222222222222"}"#,
+                    )
+                    .unwrap(),
+                ),
             };
             stash.write(service, &account).await.expect("write stash");
             let got = stash.read(service).await.expect("read stash");

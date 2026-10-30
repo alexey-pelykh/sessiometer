@@ -86,7 +86,7 @@ use std::time::Duration;
 use crate::claude_state::read_oauth_account_from;
 use crate::error::{Error, Result};
 use crate::isolated_spawn::{ClaudeLogin, IsolatedSession, SpawnClaudeLogin};
-use crate::keychain::{CredentialStore, IsolatedKeychain, RealCredentialStore};
+use crate::keychain::{CredentialStore, IsolatedKeychain};
 use crate::paths;
 use crate::sha256::sha256_hex;
 use crate::stash::StashedAccount;
@@ -122,7 +122,10 @@ impl LoginCapture {
     /// a log; the email + token never leave the harvested [`StashedAccount`].
     pub(crate) fn account_uuid(&self) -> Option<&str> {
         match self {
-            LoginCapture::Captured(stashed) => Some(stashed.oauth_account.account_uuid()),
+            LoginCapture::Captured(stashed) => stashed
+                .oauth_account
+                .as_ref()
+                .map(|identity| identity.account_uuid()),
             LoginCapture::Incomplete => None,
         }
     }
@@ -260,7 +263,7 @@ where
     // The harvest — handed to the stash/roster write path (#134). Never printed here.
     Ok(LoginCapture::Captured(StashedAccount {
         credential,
-        oauth_account,
+        oauth_account: Some(oauth_account),
     }))
 }
 
@@ -324,6 +327,7 @@ where
 pub(crate) async fn login_account(
     config_bin: Option<&Path>,
     timeout: Duration,
+    storage: &crate::storage::Storage,
 ) -> Result<LoginCapture> {
     // Fail fast on a non-terminal stdout (AC1) BEFORE resolving the binary or touching the
     // keychain, so the clear TTY error is never preempted by an unrelated one. The engine core
@@ -335,12 +339,12 @@ pub(crate) async fn login_account(
     // `create_isolated_dir` below already clears a stale DIR, but not the orphaned keychain ITEM;
     // this sweeps both, so a fresh login never runs beside a leftover credential-bearing orphan.
     // Best-effort — never blocks the login.
-    crate::refresh::reap_login_orphan().await;
+    crate::refresh::reap_login_orphan(storage).await;
 
     let iso_dir = paths::isolated_login_dir()?;
+    let keychain = storage.isolated(&iso_dir)?;
     let binary = paths::claude_binary_with_override(config_bin).await?;
-    let shared_store = RealCredentialStore::new();
-    let keychain = crate::keychain::IsolatedKeychainItem::new(iso_dir.as_os_str())?;
+    let shared_store = storage.canonical()?;
     let login = SpawnClaudeLogin::new(binary);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let seed = onboarding_seed(&cwd);
@@ -616,7 +620,10 @@ mod tests {
         // The harvested credential is the fresh isolated blob, byte-exact…
         assert_eq!(stashed.credential.expose(), blob.as_slice());
         // …and the identity's uuid is derived from the isolated .claude.json's oauthAccount.
-        assert_eq!(stashed.oauth_account.account_uuid(), "u-fresh");
+        assert_eq!(
+            stashed.require_identity().unwrap().account_uuid(),
+            "u-fresh"
+        );
         // AC5: the shared item is byte-for-byte unchanged across the capture.
         assert_eq!(
             shared.snapshot().as_deref(),
@@ -776,5 +783,76 @@ mod tests {
     #[test]
     fn the_production_entry_stays_reachable() {
         let _entry = login_account;
+    }
+
+    #[cfg(unix)]
+    struct FileLoginAuthority(Rc<RefCell<Option<Vec<u8>>>>);
+
+    #[cfg(unix)]
+    impl crate::file_storage::FileAuthority for FileLoginAuthority {
+        async fn verify(&self) -> Result<()> {
+            if self.0.borrow().is_some() {
+                Err(Error::CredentialSourceConflict)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_login_handoff_keeps_existing_identity_baseline_and_cleanup_protocol() {
+        for complete in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let iso_dir = tmp.path().join("login");
+            let shared = FakeSharedStore::seeded(b"unchanged-live-profile");
+            let keychain = FakeIsolatedKeychain::empty();
+            let item = keychain.item.clone();
+            let blob = fresh_blob("DUMMY-FILE-LOGIN");
+            let login = FakeLogin {
+                isolated_item: item.clone(),
+                shared: shared.clone(),
+                behavior: if complete {
+                    LoginBehavior::Complete {
+                        fresh_blob: blob.clone(),
+                        oauth_object: oauth_object("u-file-login", "test@example.invalid"),
+                    }
+                } else {
+                    LoginBehavior::Incomplete
+                },
+            };
+            let isolated = crate::file_storage::FileIsolatedStore::new(
+                iso_dir.clone(),
+                FileLoginAuthority(item.clone()),
+                Some(keychain),
+            );
+            let result = login_capture(
+                &shared,
+                isolated,
+                &login,
+                iso_dir.clone(),
+                &onboarding_seed(tmp.path()),
+                DEFAULT_LOGIN_TIMEOUT,
+                true,
+            )
+            .await
+            .unwrap();
+            if complete {
+                let captured = result.into_captured().expect("completed login");
+                assert_eq!(captured.credential.expose(), blob.as_slice());
+                assert_eq!(
+                    captured.require_identity().unwrap().account_uuid(),
+                    "u-file-login"
+                );
+            } else {
+                assert!(matches!(result, LoginCapture::Incomplete));
+            }
+            assert_eq!(
+                shared.snapshot().as_deref(),
+                Some(b"unchanged-live-profile".as_slice())
+            );
+            assert!(item.borrow().is_none());
+            assert!(!iso_dir.exists());
+        }
     }
 }

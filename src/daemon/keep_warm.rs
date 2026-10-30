@@ -141,6 +141,9 @@ where
         let (Some(i), Some(canonical)) = (active, canonical) else {
             return;
         };
+        if crate::refresh::non_refreshable(canonical.expose()) {
+            return;
+        }
         // A quarantined active account is a dead credential the #42 streak / emergency swap owns —
         // never re-warmed every tick (invariant 4; mirrors `should_keep_warm_retry`'s guard).
         if self.state.accounts[i].health.quarantined {
@@ -151,7 +154,7 @@ where
         let Some(expires_at_ms) = crate::refresh::expires_at(canonical.expose()) else {
             return;
         };
-        let stagger = keep_warm_stagger_secs(&self.roster[i].account_uuid, self.keep_warm_cadence);
+        let stagger = keep_warm_stagger_secs(self.roster[i].id(), self.keep_warm_cadence);
         let horizon_ms = i64::try_from(self.keep_warm_cadence.as_secs().saturating_add(stagger))
             .unwrap_or(i64::MAX)
             .saturating_mul(1000);
@@ -277,6 +280,7 @@ where
             Some(path) => Some(SwapLock::acquire(path, SWAP_LOCK_MAX_WAIT).await?),
             None => None,
         };
+        self.require_storage_selection()?;
         // Re-read UNDER THE LOCK and confirm account `i` is still active before overwriting — the
         // mint ran unlocked, so a swap may have raced it. A changed / unreadable canonical aborts
         // with zero writes rather than clobber a concurrent swap.
@@ -315,6 +319,23 @@ mod tests {
     use crate::daemon::tests::*;
 
     use crate::observability::RefreshEventOutcome;
+
+    #[tokio::test]
+    async fn token_only_active_401_does_not_attempt_keep_warm() {
+        let canonical = cred(br#"{"claudeAiOauth":{"accessToken":"dummy-inference","refreshToken":null,"expiresAt":null,"scopes":["user:inference"]}}"#);
+        let (mut daemon, _outcomes, calls) = keep_warm_daemon(
+            Scripted::Unauthorized,
+            RefreshOutcome::NoChange,
+            None,
+            None,
+            canonical,
+        )
+        .await;
+        daemon.tick().await;
+        assert_eq!(calls.get(), 0);
+        assert_eq!(daemon.state.accounts[0].health.consec_401, 1);
+        assert_eq!(daemon.state.accounts[0].health.poll_expires_at, None);
+    }
 
     // --- #282 in-place ACTIVE-account keep-warm (the FOURTH refresh mechanism) ----
     //
@@ -1304,6 +1325,7 @@ mod tests {
 
         // The canonical now holds spare's token — an out-of-band manual swap the daemon
         // detects on its own. Reconcile re-stashes spare and drops work's frozen probe.
+        daemon.store.write(&cred(b"B-token")).await.unwrap();
         daemon
             .reconcile_canonical_change(&cred(b"B-token"), &mut events)
             .await;

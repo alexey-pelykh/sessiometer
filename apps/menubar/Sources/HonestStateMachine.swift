@@ -359,6 +359,7 @@ struct PresentationState: Equatable, Sendable {
 /// happens HERE, not in the view. A lean D2 projection: identity, the swap-relevant flags, and usage;
 /// the deeper refresh-health internals (rotation, access-expiry) belong to #169's rich health map.
 struct AccountRow: Identifiable, Equatable, Sendable {
+    let usageUnavailable: Bool
     /// The redacted operator handle doubles as the SwiftUI list identity (issue #15 — never an email).
     var id: String { label }
     let label: String
@@ -407,7 +408,9 @@ struct AccountRow: Identifiable, Equatable, Sendable {
          weeklyExhausted: Bool,
          isNextSwapTarget: Bool,
          blindActive: BlindActive?,
-         expiry: AccountExpiry? = nil) {
+         expiry: AccountExpiry? = nil,
+         usageUnavailable: Bool = false) {
+        self.usageUnavailable = usageUnavailable
         self.label = label
         self.isActive = isActive
         self.isEnabled = isEnabled
@@ -444,7 +447,8 @@ struct AccountRow: Identifiable, Equatable, Sendable {
                 weeklyExhausted: account.weeklyExhausted,
                 isNextSwapTarget: account.label == targetLabel,
                 blindActive: account.blindActive,
-                expiry: account.expiry)
+                expiry: account.expiry,
+                usageUnavailable: account.usageUnavailable)
         }
     }
 }

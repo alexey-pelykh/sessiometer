@@ -61,6 +61,8 @@
 //!     fed to `security -i` on **stdin** (not argv) so the blob is never visible in
 //!     this process's command line (issue #39; `build/version-compat.md`).
 
+use unicode_normalization::UnicodeNormalization;
+
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
@@ -88,24 +90,23 @@ const SECURITY: &str = "/usr/bin/security";
 /// name is resolved by [`canonical_service_from`].
 const SERVICE_BASE: &str = "Claude Code-credentials";
 
-/// Derive the keychain service suffix for a non-default config-dir `value`,
-/// replicating Claude Code 2.1.181's `-${sha256(value)[..8]}` (its `n1()`).
-///
-/// CC hashes the value **NFC-normalized**. For an ASCII value NFC is the identity,
-/// so the raw bytes hash byte-identically and no Unicode-normalizer dependency is
-/// pulled in (the crate hand-rolls its primitives to keep the dependency graph
-/// minimal — see [`crate::sha256`]). A non-ASCII value could differ between its NFC
-/// form and its raw bytes, so it is **refused** ([`Error::NonAsciiConfigDir`]) rather
-/// than risk computing a suffix that silently addresses the wrong keychain item. The
-/// value is read as bytes (`OsStrExt`), never `to_string_lossy` — a lossy decode
-/// would hash different bytes than CC sees.
+/// Claude hashes the NFC-normalized override spelling, not its resolved path.
 fn service_suffix(value: &OsStr) -> Result<String> {
-    let bytes = value.as_bytes();
-    if !bytes.is_ascii() {
-        return Err(Error::NonAsciiConfigDir);
-    }
-    // CC: `createHash("sha256").update(value).digest("hex").substring(0,8)`.
-    Ok(format!("-{}", &sha256_hex(bytes)[..8]))
+    let text = value.to_str().ok_or_else(|| {
+        Error::ConfigInvalid("Claude profile namespace must be valid UTF-8".into())
+    })?;
+    let normalized: String = text.nfc().collect();
+    Ok(format!("-{}", &sha256_hex(normalized.as_bytes())[..8]))
+}
+
+/// Preserve the existing legacy Keychain override precedence; inputs are pinned
+/// by the storage composition rather than re-read from each collaborator's env.
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn service_for_selection(
+    securestorage: Option<&OsStr>,
+    config_dir: Option<&OsStr>,
+) -> Result<String> {
+    canonical_service_from(securestorage, config_dir)
 }
 
 /// Resolve the canonical keychain service name from the two config-dir env values,
@@ -473,6 +474,15 @@ pub(crate) trait CredentialStore {
     }
 }
 
+/// A live source imported by the macOS file backend. Unlike an isolated helper,
+/// this has no Drop cleanup: failures must leave the source available for retry.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+pub(crate) trait FileImportSource: CredentialStore {
+    /// Recheck the source before deleting precisely the item that was read.
+    /// This is best-effort race detection, NOT an atomic compare-and-delete.
+    async fn delete_if_matches(&self, expected: &Credential) -> Result<()>;
+}
+
 /// Real keychain-backed store, driving `/usr/bin/security`.
 pub(crate) struct RealCredentialStore {
     /// Keychain to operate on. `None` is production (the login keychain via
@@ -483,22 +493,22 @@ pub(crate) struct RealCredentialStore {
     /// The resolved `acct`, read back from the item once and pinned for all
     /// later calls (issue #2 "resolve once at start").
     acct: OnceLock<OsString>,
-    /// The resolved canonical service name, computed once from the environment
-    /// (issue #100) and pinned for every read/poll, swap-write, and resolve. Lazy +
-    /// cached like [`acct`](Self::acct), but resolution is a pure synchronous env
-    /// read (no keychain round-trip): its only failure is a non-ASCII config dir
-    /// ([`Error::NonAsciiConfigDir`]), so it surfaces at first keychain use rather
-    /// than forcing a fallible `new()` on every construction site.
+    /// The canonical namespace pinned by the storage factory (issue #100). Every
+    /// read, poll, write and fresh resolution addresses that same selection.
+    /// The throwaway-Keychain test constructor pins its own bare namespace.
     service: OnceLock<String>,
 }
 
 impl RealCredentialStore {
-    /// Production store, operating on the login keychain.
-    pub(crate) fn new() -> Self {
+    /// Production login-Keychain store with an already-resolved service name.
+    /// Production callers pin the namespace through the selected storage factory.
+    pub(crate) fn for_service(service_name: String) -> Self {
+        let service = OnceLock::new();
+        let _ = service.set(service_name);
         Self {
             keychain: None,
             acct: OnceLock::new(),
-            service: OnceLock::new(),
+            service,
         }
     }
 
@@ -539,7 +549,7 @@ impl RealCredentialStore {
     /// The resolved canonical service name, computed once from the environment and
     /// cached (issue #100). Mirrors [`acct`](Self::acct) (lazy + cached) but the
     /// computation is a pure synchronous env read, so this stays sync and its only
-    /// error is a non-ASCII config dir. Returns a borrow — the resolved name is short
+    /// error is an invalid UTF-8 config dir. Returns a borrow — the resolved name is short
     /// and consumed within each `security`-arg builder.
     fn service(&self) -> Result<&str> {
         if let Some(service) = self.service.get() {
@@ -970,6 +980,38 @@ impl CredentialStore for RealCredentialStore {
         // probe asserts the uniqueness rule still holds NOW; addressing stays with
         // the pinned caches (see the trait docs for why a divergence is safe).
         self.resolve().await.map(drop)
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl FileImportSource for RealCredentialStore {
+    async fn delete_if_matches(&self, expected: &Credential) -> Result<()> {
+        // Re-enumerate: never delete through a newly ambiguous service.
+        self.probe_resolution().await?;
+        if !self.read().await?.matches(expected) {
+            return Err(Error::CredentialSourceConflict);
+        }
+        let acct = self.acct().await?;
+        let keychain = self.keychain_path()?;
+        let output = Command::new(SECURITY)
+            .args([
+                OsStr::new("delete-generic-password"),
+                OsStr::new("-s"),
+                OsStr::new(self.service()?),
+                OsStr::new("-a"),
+                acct.as_os_str(),
+                keychain.as_os_str(),
+            ])
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await?;
+        let code = output.status.code().unwrap_or(-1);
+        if output.status.success() || code == 44 {
+            Ok(())
+        } else {
+            Err(keychain_error("file import delete", code))
+        }
     }
 }
 
@@ -1550,22 +1592,6 @@ mod tests {
     }
 
     #[test]
-    fn a_non_ascii_config_dir_is_refused_rather_than_mis_hashed() {
-        // We hash raw bytes (no Unicode-normalizer dependency); CC hashes the NFC
-        // form. For a non-ASCII value the two could differ, so we refuse rather than
-        // silently address the wrong keychain item.
-        assert!(matches!(
-            canonical_service_from(None, Some(OsStr::new("/Users/café/.claude"))),
-            Err(Error::NonAsciiConfigDir)
-        ));
-        // The precedence path refuses on a non-ASCII securestorage value too.
-        assert!(matches!(
-            canonical_service_from(Some(OsStr::new("/naïve")), None),
-            Err(Error::NonAsciiConfigDir)
-        ));
-    }
-
-    #[test]
     fn service_for_config_dir_reuses_the_100_derivation_for_the_isolated_engine() {
         // The isolated-refresh engine (#102) addresses a `claude`'s isolated config
         // dir by the SAME #100 suffix — never re-derived. It is exactly
@@ -1579,11 +1605,6 @@ mod tests {
             service_for_config_dir(OsStr::new("/opt/cc")).unwrap(),
             canonical_service_from(None, Some(OsStr::new("/opt/cc"))).unwrap()
         );
-        // A non-ASCII isolated dir is refused, not mis-hashed — same guard as #100.
-        assert!(matches!(
-            service_for_config_dir(OsStr::new("/Users/café/refresh")),
-            Err(Error::NonAsciiConfigDir)
-        ));
     }
 
     // --- item `acct` derivation (issue #711) --------------------------------
@@ -2711,5 +2732,64 @@ class: "genp"
 
             delete(&kc);
         }
+    }
+}
+
+#[cfg(test)]
+mod selected_profile_tests {
+    use super::*;
+
+    #[test]
+    fn namespace_hash_normalizes_unicode_without_resolving_the_path() {
+        assert_eq!(
+            service_suffix(OsStr::new("/café")).unwrap(),
+            service_suffix(OsStr::new("/cafe\u{301}")).unwrap()
+        );
+        assert_ne!(
+            service_suffix(OsStr::new("relative")).unwrap(),
+            service_suffix(OsStr::new("/relative")).unwrap()
+        );
+        assert_ne!(
+            service_suffix(OsStr::new("/profile/")).unwrap(),
+            service_suffix(OsStr::new("/profile")).unwrap()
+        );
+    }
+
+    #[test]
+    fn bare_service_and_legacy_override_precedence_are_preserved() {
+        assert_eq!(service_for_selection(None, None).unwrap(), SERVICE_BASE);
+        assert_eq!(
+            service_for_selection(None, Some(OsStr::new(""))).unwrap(),
+            SERVICE_BASE
+        );
+        assert_eq!(
+            service_for_selection(Some(OsStr::new("")), Some(OsStr::new("/profile"))).unwrap(),
+            SERVICE_BASE
+        );
+        assert_eq!(
+            service_for_selection(Some(OsStr::new("/legacy")), Some(OsStr::new("/profile")))
+                .unwrap(),
+            service_for_config_dir(OsStr::new("/legacy")).unwrap()
+        );
+    }
+
+    #[test]
+    fn pinned_store_does_not_rederive_its_service_from_environment() {
+        let store = RealCredentialStore::for_service("test-only-service".into());
+        assert_eq!(
+            store.service.get().map(String::as_str),
+            Some("test-only-service")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn namespace_rejects_non_utf8_instead_of_hashing_replacement_characters() {
+        use std::os::unix::ffi::OsStringExt;
+        let invalid = OsString::from_vec(vec![0xff]);
+        assert!(matches!(
+            service_suffix(&invalid),
+            Err(Error::ConfigInvalid(_))
+        ));
     }
 }

@@ -20,7 +20,28 @@ use super::*;
 
 use crate::stats::FLEET_RUNWAY_PLAUSIBLE_MAX_SECS;
 
+fn render_storage(storage: &StorageConfig) -> String {
+    let mut output = format!(
+        "\n[storage]\nbackend = {}\n",
+        basic_string(storage.backend.as_str()),
+    );
+    if let Some(profile) = &storage.claude_config_dir {
+        output.push_str("claude_config_dir = ");
+        output.push_str(&basic_string(&profile.to_string_lossy()));
+        output.push('\n');
+    }
+    output
+}
+
 impl Config {
+    pub(crate) fn render(&self) -> String {
+        self.render_with_storage(true)
+    }
+
+    pub(crate) fn render_portable(&self) -> String {
+        self.render_with_storage(false)
+    }
+
     /// Build the origin report from the effective config (`self`) and the raw TOML
     /// `table` (the presence source). Mirrors [`render`](Config::render)'s field walk —
     /// same sections, same order, same value formatting — but emits `(key, value,
@@ -41,6 +62,23 @@ impl Config {
         };
         let entry =
             |key: &'static str, value: String, origin: Origin| OriginEntry { key, value, origin };
+
+        let mut storage = OriginSection {
+            header: "[storage]",
+            present: table.contains_key("storage"),
+            entries: vec![entry(
+                "backend",
+                basic_string(self.storage.backend.as_str()),
+                present("storage", "backend"),
+            )],
+        };
+        if let Some(profile) = &self.storage.claude_config_dir {
+            storage.entries.push(entry(
+                "claude_config_dir",
+                basic_string(&profile.to_string_lossy()),
+                present("storage", "claude_config_dir"),
+            ));
+        }
 
         let t = &self.tunables;
         let tunables = OriginSection {
@@ -314,7 +352,7 @@ impl Config {
 
         OriginReport {
             sections: vec![
-                tunables, jitter, refresh, login, stats, migration, credential,
+                storage, tunables, jitter, refresh, login, stats, migration, credential,
             ],
             roster_count: self.roster.len(),
             // The roster is the `[[account]]` array-of-tables (RawConfig's `account`).
@@ -412,7 +450,7 @@ impl Config {
     ///
     /// `pub(crate)` so the `export` verb (issue #148) can serialize the canonical
     /// config text into a migration artifact ([`crate::migration::Payload`]).
-    pub(crate) fn render(&self) -> String {
+    fn render_with_storage(&self, include_storage: bool) -> String {
         let t = &self.tunables;
         let mut out = String::new();
         out.push_str("# sessiometer configuration.\n");
@@ -428,6 +466,10 @@ impl Config {
              # signal. Velocity-spike detection reads the account-global usage and reduces —\n\
              # does not remove — this exposure. Prefer one roster per machine.\n\n",
         );
+
+        if include_storage {
+            out.push_str(&render_storage(&self.storage));
+        }
 
         out.push_str("[tunables]\n");
         out.push_str(
@@ -604,8 +646,9 @@ impl Config {
         ));
         out.push_str(
             "# Keychain-identity canary ONLINE liveness probe (issue #736), the canary's only\n\
-             # networked layer and therefore opt-in. When true, one bounded /oauth/usage GET\n\
+             # networked layer and therefore opt-in. When true, one bounded usage request\n\
              # runs on the resolved canonical immediately before the swap's credential write,\n\
+             # using its scope-selected method (inference-only tokens consume provider usage),\n\
              # asking only whether that bearer still authenticates. LIVENESS, not identity:\n\
              # the endpoint names no account, so a pass never says WHOSE session it is. It\n\
              # narrows — does not close — the Layer-3 same-account silent-relocation residual,\n\
@@ -864,10 +907,12 @@ impl Config {
 
         for account in &self.roster {
             out.push_str("\n[[account]]\n");
-            out.push_str(&format!(
-                "account_uuid = {}\n",
-                basic_string(&account.account_uuid)
-            ));
+            let key = if account.claude_uuid().is_some() {
+                "account_uuid"
+            } else {
+                "local_id"
+            };
+            out.push_str(&format!("{key} = {}\n", basic_string(account.id())));
             // No `stash` line: it is derived from `account_uuid` on load
             // ([`Account::stash`]), never persisted (issue #70).
             out.push_str(&format!("label = {}\n", basic_string(&account.label)));
@@ -1304,7 +1349,11 @@ mod tests {
         let table: toml::Table = toml::from_str(text).expect("valid TOML");
         let report = config.origin_report(&table);
 
-        let tunables = &report.sections[0];
+        let tunables = report
+            .sections
+            .iter()
+            .find(|s| s.header == "[tunables]")
+            .unwrap();
         assert_eq!(tunables.header, "[tunables]");
         assert!(tunables.present, "[tunables] is present");
         let by_key = |k: &str| {
@@ -1881,5 +1930,43 @@ label = \"work\"
         };
         let reparsed = Config::parse(&config.render()).unwrap();
         assert_eq!(reparsed.migration, config.migration);
+    }
+}
+
+#[cfg(test)]
+mod storage_render_tests {
+    use super::*;
+    use crate::config::StorageBackend;
+
+    #[derive(serde::Deserialize)]
+    struct StorageOnly {
+        storage: StorageConfig,
+    }
+
+    #[test]
+    fn saving_records_the_effective_backend_even_when_it_is_default() {
+        let settings = StorageConfig::default();
+        let text = render_storage(&settings);
+        assert!(text.contains("backend = "));
+        let parsed: StorageOnly = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.storage, settings);
+    }
+
+    #[test]
+    fn profiles_round_trip_without_shell_expansion_or_loss_of_empty_values() {
+        for value in [
+            "",
+            "../profile",
+            "/café",
+            "/profile with spaces",
+            "~/literal-$HOME",
+        ] {
+            let settings = StorageConfig {
+                backend: StorageBackend::File,
+                claude_config_dir: Some(value.into()),
+            };
+            let parsed: StorageOnly = toml::from_str(&render_storage(&settings)).unwrap();
+            assert_eq!(parsed.storage, settings);
+        }
     }
 }

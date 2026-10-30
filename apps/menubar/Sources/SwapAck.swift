@@ -25,6 +25,8 @@ enum SwapAck: Equatable {
     /// The swap COMMITTED: the active credential was rerouted OFF `from` ONTO `to` — both non-secret
     /// roster labels.
     case accepted(from: String, to: String)
+    /// Credentials committed, but clearing/writing identity needs reconciliation.
+    case identityPending(from: String, to: String)
     /// A no-op success: `to` was ALREADY the active account, so nothing was written. Label only.
     case alreadyActive(to: String)
     /// The daemon REFUSED with a redacted machine reason — ZERO writes happened.
@@ -95,6 +97,9 @@ extension SwapAck {
                 guard let body = try? decoder.decode(AcceptedBody.self, from: data) else {
                     throw DecodeError.unrecognized("malformed 'accepted' ack (missing from/to)")
                 }
+                if body.identity_pending == true {
+                    return .identityPending(from: body.from, to: body.to)
+                }
                 return .accepted(from: body.from, to: body.to)
             case "already_active":
                 guard let body = try? decoder.decode(AlreadyActiveBody.self, from: data) else {
@@ -133,6 +138,7 @@ private struct AckProbe: Decodable {
 private struct AcceptedBody: Decodable {
     let from: String
     let to: String
+    let identity_pending: Bool?
 }
 
 /// `{"result":"already_active","to":"<label>"}` — label only.

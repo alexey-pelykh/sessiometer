@@ -35,6 +35,11 @@ mod error;
 /// and directory this crate writes goes through it, so the security property is one decision
 /// rather than one per call site.
 mod file_policy;
+mod file_storage;
+// The loopback mock is test-only; production source forbids raw network sockets.
+#[cfg(all(test, target_os = "macos"))]
+#[path = "../tests/support/file_storage_probe.rs"]
+mod file_storage_probe;
 /// The FRAMING guard's shared vocabulary (issues #160, #542, #918, #1123, #1139) — the central
 /// banned-token and banned-phrase lists, the single scanner all five audiences share, and the
 /// per-audience exemption sets that let `--help`, the operator advisories and `Error::CliUsage`'s
@@ -68,6 +73,7 @@ mod service;
 mod sha256;
 mod stash;
 mod stats;
+mod storage;
 mod swap;
 mod systemic_refresh;
 mod timing;

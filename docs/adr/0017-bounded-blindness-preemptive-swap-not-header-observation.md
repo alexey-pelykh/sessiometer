@@ -11,6 +11,23 @@ decision_makers: [Oleksii PELYKH (maintainer)]
 
 ## Status
 
+**Experimental exception — revised 2026-10-30, file-storage feature branch.** The decision
+below remains unchanged for profile-scoped credentials. Inference-based quota retrieval is
+selected automatically for a credential whose scopes include inference but exclude profile access. This
+is an alternative primary usage method for that credential, not a fallback for usage-endpoint
+throttling or another HTTP failure. Profile-scoped and legacy credentials retain the usage
+endpoint. Monitoring inference-only accounts consumes real provider usage, uses the existing scheduling and backoff
+rules, and applies to manual viability checks and enabled online canaries as well. Successful
+responses must report both quota dimensions; HTTP 429 remains a rate-limit error even if it
+carries headers. No identity, token renewal, proxy, or background observer is introduced.
+
+The separate runtime opt-in introduced on 2026-10-29 was removed: registering an enabled account
+is sufficient for its normal usage monitoring. This does not establish provider
+permission or invalidate the account-policy concerns recorded below. Request acceptance and
+header availability for a real setup-token are separate live acceptance checks, not facts
+established by mocked tests. Implementation lives in
+[the usage module](../../src/usage.rs).
+
 **Accepted** — 2026-07-11. Records the **#452** decision to swap the active
 account away **preemptively on bounded blindness** — spending the *swap* lever when
 fresh near-limit active usage is provably unavailable — and, importantly, to

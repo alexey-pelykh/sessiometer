@@ -50,6 +50,53 @@ where
     S: AccountStash,
     K: Clock,
 {
+    /// Explicit mutation boundary for live file-mode imports. Hermetic daemons
+    /// have no Storage selection; production must supply both existing paths.
+    pub(super) async fn recover_file_login(&self) -> Result<Option<usize>> {
+        let Some(storage) = &self.storage else {
+            return Ok(None);
+        };
+        if !cfg!(target_os = "macos")
+            || storage.settings().backend != crate::config::StorageBackend::File
+        {
+            return Ok(None);
+        }
+        let config_path = self.config_path.as_deref().ok_or(Error::CredentialFile {
+            reason: "file login recovery requires a config path",
+        })?;
+        let lock_path = self
+            .swap_lock_path
+            .as_deref()
+            .ok_or(Error::CredentialFile {
+                reason: "file login recovery requires the swap lock",
+            })?;
+        storage
+            .recover_file_login(&self.roster, config_path, lock_path)
+            .await
+    }
+
+    /// Bring an imported login into the daemon's existing account/health state
+    /// before a socket swap evaluates its policy gates. No network requests.
+    pub(super) async fn recover_file_login_before_swap(
+        &mut self,
+        events: &mut Vec<Event>,
+    ) -> Result<()> {
+        if self.recover_file_login().await?.is_none() {
+            return Ok(());
+        }
+        let previous = self.state.active;
+        let current = self.store.read().await?;
+        self.reconcile_canonical_change(&current, events).await;
+        let next = self.resolve_account_for(&current).await;
+        self.deactivate_recovery_probe(previous, next);
+        self.state.active = next;
+        if next != previous {
+            self.state.last_good = None;
+            self.invalidate_poll_schedule();
+        }
+        Ok(())
+    }
+
     /// Reconcile `~/.claude.json` to the canonical credential on startup.
     ///
     /// Heals the post-swap crash window: a swap writes the incoming token to the
@@ -74,6 +121,8 @@ where
     /// identity cross-check, so a lagging self-co-write can never false-positive
     /// as drift — one core, two wirings.
     pub(crate) async fn reconcile_on_start(&self) -> Result<()> {
+        self.require_storage_selection()?;
+        self.recover_file_login().await?;
         let canonical = self.store.read().await?;
         crate::canary::reconcile_display(&self.roster, &self.stash, &self.claude_json, &canonical)
             .await
@@ -399,26 +448,44 @@ where
     /// usable identity is available or the stash write fails — the caller then
     /// leaves the change to re-fire rather than committing the baseline.
     pub(super) async fn restash_account(&self, idx: usize, canonical: &Credential) -> bool {
+        let _guard = match self.swap_lock_path.as_deref() {
+            Some(path) => match SwapLock::acquire(path, SWAP_LOCK_MAX_WAIT).await {
+                Ok(guard) => Some(guard),
+                Err(_) => return false,
+            },
+            None => None, // Hermetic tests; production always wires the lock.
+        };
+        if self.require_storage_selection().is_err() {
+            return false;
+        }
+        let current = match self.store.read().await {
+            Ok(current) if current.matches(canonical) => current,
+            _ => return false,
+        };
+        if self.resolve_account_for(&current).await != Some(idx) {
+            return false;
+        }
         let account = &self.roster[idx];
-        // Prefer the identity already stashed for this account: it is authoritative
-        // and does not depend on the best-effort display file.
         let oauth_account = if let Ok(existing) = self.stash.read(&account.stash()).await {
             existing.oauth_account
         } else if let Ok(displayed) = claude_state::read_oauth_account_from(&self.claude_json) {
-            // No existing stash: fall back to the displayed identity, but only if it
-            // is THIS account's — never staple a different account's identity on.
-            if account.account_uuid != displayed.account_uuid() {
+            if account.claude_uuid() != Some(displayed.account_uuid()) {
                 return false;
             }
-            displayed
+            Some(displayed)
         } else {
             return false;
         };
-        let refreshed = StashedAccount {
-            credential: canonical.clone(),
-            oauth_account,
-        };
-        self.stash.write(&account.stash(), &refreshed).await.is_ok()
+        self.stash
+            .write(
+                &account.stash(),
+                &StashedAccount {
+                    credential: current,
+                    oauth_account,
+                },
+            )
+            .await
+            .is_ok()
     }
 
     /// Autonomously recover a SCRUBBED / empty shared canonical (issue #467) — the ADR-0018
@@ -2668,6 +2735,11 @@ mod tests {
         // reaches no re-stash — hence no line yet.
         let mut events = Vec::new();
         daemon
+            .store
+            .write(&rt_blob("rt-1", deadline_ms))
+            .await
+            .unwrap();
+        daemon
             .reconcile_canonical_change(&rt_blob("rt-1", deadline_ms), &mut events)
             .await;
         assert!(
@@ -2696,6 +2768,11 @@ mod tests {
         // A DIFFERENT refresh token under the same deadline: a new grant that did NOT move the
         // deadline — the issue #877 third row, end to end through the real reconcile path.
         daemon
+            .store
+            .write(&rt_blob("rt-2", deadline_ms))
+            .await
+            .unwrap();
+        daemon
             .reconcile_canonical_change(&rt_blob("rt-2", deadline_ms), &mut events)
             .await;
         assert_eq!(
@@ -2714,6 +2791,11 @@ mod tests {
         // changed, so the watch fires — but the grant is byte-identical, which RULES OUT a re-login.
         events.clear();
         daemon
+            .store
+            .write(&rt_blob("rt-2", deadline_ms + 86_400_000))
+            .await
+            .unwrap();
+        daemon
             .reconcile_canonical_change(&rt_blob("rt-2", deadline_ms + 86_400_000), &mut events)
             .await;
         assert_eq!(
@@ -2729,6 +2811,28 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn reconciliation_never_restashes_a_snapshot_replaced_before_its_lock() {
+        let daemon = lifecycle_daemon().await;
+        let snapshot = daemon.store.read().await.unwrap();
+        let before = daemon.stash.read("Sessiometer/u-A").await.unwrap();
+        daemon.store.write(&cred(b"B-token")).await.unwrap();
+        assert!(!daemon.restash_account(0, &snapshot).await);
+        assert!(daemon
+            .stash
+            .read("Sessiometer/u-A")
+            .await
+            .unwrap()
+            .credential
+            .matches(&before.credential));
+        assert!(daemon
+            .store
+            .read()
+            .await
+            .unwrap()
+            .matches(&cred(b"B-token")));
+    }
+
     /// Issue #880: a canonical the daemon cannot read a refresh token OUT of records the deadline with
     /// `grant_replaced` OMITTED — never `Some(false)`, which would assert the grant was unchanged on the
     /// strength of a failed parse. The absent-not-guessed rule the whole record is built on.
@@ -2738,6 +2842,11 @@ mod tests {
         let deadline_ms = 1_785_499_802_819;
 
         let mut events = Vec::new();
+        daemon
+            .store
+            .write(&rt_blob("rt-1", deadline_ms))
+            .await
+            .unwrap();
         daemon
             .reconcile_canonical_change(&rt_blob("rt-1", deadline_ms), &mut events)
             .await;
@@ -2751,6 +2860,7 @@ mod tests {
             )
             .as_bytes(),
         );
+        daemon.store.write(&no_rt).await.unwrap();
         daemon.reconcile_canonical_change(&no_rt, &mut events).await;
         let observed = expiry_observations(&events);
         assert_eq!(
@@ -2783,6 +2893,11 @@ mod tests {
 
         let mut events = Vec::new();
         daemon
+            .store
+            .write(&rt_blob("rt-1", deadline_ms))
+            .await
+            .unwrap();
+        daemon
             .reconcile_canonical_change(&rt_blob("rt-1", deadline_ms), &mut events)
             .await;
         events.clear();
@@ -2801,6 +2916,7 @@ mod tests {
 
         // CC clears the refresh token in place, leaving the deadline behind. The blob changed, so the
         // watch fires and the deadline is still recorded — but the grant question has no answer.
+        daemon.store.write(&rt_blob("", deadline_ms)).await.unwrap();
         daemon
             .reconcile_canonical_change(&rt_blob("", deadline_ms), &mut events)
             .await;

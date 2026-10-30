@@ -140,7 +140,7 @@ fn home_dir() -> Result<PathBuf> {
 /// new and not this arm's doing: both already compile on Linux, where they are equally
 /// meaningless, and both live behind modules (`crate::service`, `crate::keychain`) that
 /// no non-Apple target can build. Giving this function a Windows arm keeps the three
-/// currently-clean consumers of [`claude_json`] compiling; gating it away instead would
+/// currently-clean consumers of [`home_dir`] compiling; gating it away instead would
 /// break them for no gain.
 #[cfg(windows)]
 fn home_dir() -> Result<PathBuf> {
@@ -755,6 +755,7 @@ pub(crate) fn usage_rollup() -> Result<PathBuf> {
 /// Holds the active account's `oauthAccount` identity block, which `capture`
 /// (issue #4) records alongside the keychain credential. Resolved from the
 /// password database like every other path here — never from `$HOME`.
+#[cfg(windows)]
 pub(crate) fn claude_json() -> Result<PathBuf> {
     Ok(home_dir()?.join(".claude.json"))
 }
@@ -1433,6 +1434,11 @@ pub(crate) fn write_preserving_mode(path: &Path, contents: &[u8]) -> Result<()> 
     }
     fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// Native user home used when no Claude profile override is selected.
+pub(crate) fn claude_home_dir() -> Result<PathBuf> {
+    home_dir()
 }
 
 #[cfg(test)]

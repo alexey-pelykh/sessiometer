@@ -69,7 +69,7 @@ pub(crate) fn resolve_via_display(roster: &[Account], claude_json: &Path) -> Opt
     let oauth = claude_state::read_oauth_account_from(claude_json).ok()?;
     roster
         .iter()
-        .position(|account| account.account_uuid == oauth.account_uuid())
+        .position(|account| account.claude_uuid() == Some(oauth.account_uuid()))
 }
 
 #[cfg(test)]
@@ -80,7 +80,7 @@ mod tests {
 
     fn acct(label: &str, uuid: &str) -> Account {
         Account {
-            account_uuid: uuid.to_owned(),
+            key: crate::config::AccountKey::ClaudeUuid(uuid.to_owned()),
             label: label.to_owned(),
             enabled: true,
         }
@@ -93,11 +93,13 @@ mod tests {
     fn stashed(token: &[u8], uuid: &str) -> StashedAccount {
         StashedAccount {
             credential: cred(token),
-            oauth_account: OauthAccount::from_object_bytes(
-                format!(r#"{{"accountUuid":"{uuid}","emailAddress":"{uuid}@example.com"}}"#)
-                    .as_bytes(),
-            )
-            .unwrap(),
+            oauth_account: Some(
+                OauthAccount::from_object_bytes(
+                    format!(r#"{{"accountUuid":"{uuid}","emailAddress":"{uuid}@example.com"}}"#)
+                        .as_bytes(),
+                )
+                .unwrap(),
+            ),
         }
     }
 

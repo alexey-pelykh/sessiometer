@@ -651,7 +651,8 @@ struct AccountRowView: View {
                     .accessibilityHidden(true)
                 if let cue = StatusPanelFormat.authCue(auth: auth,
                                                        recovering: row.isRecovering,
-                                                       enabled: row.isEnabled) {
+                                                       enabled: row.isEnabled,
+                                                       usageUnavailable: row.usageUnavailable) {
                     Text(cue)
                         .font(.panel(style: .caption1, scale: scale))
                         .foregroundStyle(cueColor(for: auth))
@@ -705,7 +706,8 @@ struct AccountRowView: View {
             nextSwap: nextSwap,
             now: now,
             expiry: row.expiry,
-            showsExpiry: showsExpiry)
+            showsExpiry: showsExpiry,
+            usageUnavailable: row.usageUnavailable)
     }
 }
 

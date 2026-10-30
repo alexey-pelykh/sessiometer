@@ -22,6 +22,8 @@ impl Config {
     /// `Config`. Each rejection names the offending field; the cross-field rule
     /// (`target_max_session_usage <= session_ceiling`) gets its own distinct error.
     pub(super) fn validate(raw: RawConfig) -> Result<Self> {
+        raw.storage.validate()?;
+        let storage = raw.storage;
         let t = raw.tunables;
 
         range("session_ceiling", t.session_ceiling, 50, 99)?;
@@ -294,7 +296,13 @@ impl Config {
         let mut uuids = HashSet::new();
         let mut roster = Vec::with_capacity(raw.account.len());
         for account in raw.account {
-            if account.account_uuid.trim().is_empty() {
+            if account.account_uuid.is_some() == account.local_id.is_some() {
+                return Err(Error::ConfigInvalid(
+                    "account requires exactly one of account_uuid or local_id".into(),
+                ));
+            }
+            let id = account.id();
+            if id.trim().is_empty() {
                 return Err(Error::ConfigInvalid(
                     "account_uuid must not be empty".into(),
                 ));
@@ -306,20 +314,34 @@ impl Config {
             // hostile value regardless of ordering — a duplicate is by definition a string
             // already seen, so the entry that introduced it was shape-checked on an earlier
             // pass through this same loop.
-            if let Some(rule) = account_uuid_violation(&account.account_uuid) {
+            if let Some(rule) = account_uuid_violation(id) {
                 return Err(Error::ConfigInvalid(format!("account_uuid {rule}")));
             }
             if account.label.trim().is_empty() {
                 return Err(Error::ConfigInvalid("label must not be empty".into()));
             }
-            if !uuids.insert(account.account_uuid.clone()) {
+            if account.local_id.is_some() && !is_local_account_id(id) {
+                return Err(Error::ConfigInvalid(
+                    "local_id must be local- followed by 32 hexadecimal characters".into(),
+                ));
+            }
+            if account.account_uuid.is_some() && id.starts_with("local-") {
+                return Err(Error::ConfigInvalid(
+                    "the local- namespace is reserved for local_id".into(),
+                ));
+            }
+            if !uuids.insert(id.to_owned()) {
                 return Err(Error::ConfigInvalid(format!(
                     "duplicate account_uuid: {}",
-                    account.account_uuid
+                    id
                 )));
             }
             roster.push(Account {
-                account_uuid: account.account_uuid,
+                key: match (account.account_uuid, account.local_id) {
+                    (Some(uuid), None) => AccountKey::ClaudeUuid(uuid),
+                    (None, Some(id)) => AccountKey::LocalId(id),
+                    _ => unreachable!("validated exactly one identifier"),
+                },
                 label: account.label,
                 enabled: account.enabled,
             });
@@ -452,6 +474,7 @@ impl Config {
         };
 
         Ok(Config {
+            storage,
             roster,
             tunables,
             refresh,
@@ -609,6 +632,26 @@ fn non_negative(field: &str, param: &str, value: f64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_ids_and_claude_uuids_are_exclusive_and_roundtrip() {
+        let local = "local-0123456789abcdef0123456789abcdef";
+        let text = format!("[[account]]\naccount_uuid='B'\nlabel='b'\n[[account]]\nlocal_id='{local}'\nlabel='c'\n");
+        let config = Config::from_toml_str(&text).unwrap();
+        assert_eq!(config.roster[0].claude_uuid(), Some("B"));
+        assert_eq!(config.roster[1].id(), local);
+        assert_eq!(config.roster[1].claude_uuid(), None);
+        let reread = Config::from_toml_str(&config.render()).unwrap();
+        assert_eq!(reread.roster, config.roster);
+        for keys in [
+            "",
+            "local_id='bad'",
+            "account_uuid='B'\nlocal_id='local-0123456789abcdef0123456789abcdef'",
+            "account_uuid='local-0123456789abcdef0123456789abcdef'",
+        ] {
+            assert!(Config::from_toml_str(&format!("[[account]]\nlabel='c'\n{keys}\n")).is_err());
+        }
+    }
     use crate::config::test_support::*;
 
     #[test]

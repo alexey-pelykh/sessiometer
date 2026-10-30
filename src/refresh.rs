@@ -236,7 +236,8 @@ pub(crate) enum RefreshOutcome {
     /// removes the state from the type rather than merely leaving it unprinted, so no
     /// downstream emitter can reintroduce it at the formatting layer.
     Refreshed { rotated: bool },
-    /// CC returned the seeded token unchanged — no refresh happened. Not re-stashed.
+    /// No refresh happened: CC returned the seed unchanged, or this valid bearer
+    /// has no refresh token and was never spawned. Not re-stashed.
     NoChange,
     /// CC cleared the refresh token in place (`refreshToken == ""`) — it is dead and
     /// needs an operator re-login. NOT re-stashed; surfaced (issue #102 step 7).
@@ -307,6 +308,14 @@ pub(crate) struct RefreshReport {
 }
 
 impl RefreshReport {
+    /// A credential without a refresh token cannot be renewed. No spawn or write.
+    pub(crate) fn no_change() -> Self {
+        Self {
+            outcome: RefreshOutcome::NoChange,
+            expires_at_delta_secs: None,
+            re_stashed: false,
+        }
+    }
     /// A [`Malformed`](RefreshErrorReason::Malformed) `Error` outcome with no telemetry and no
     /// re-stash — used when the stored / canonical blob could not even be back-dated (STEP 3
     /// [`backdate`] returned `None`), so the cycle bailed before any spawn with nothing
@@ -376,6 +385,22 @@ pub(crate) fn refresh_token(blob: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
     let value: Value = serde_json::from_slice(blob).ok()?;
     let rt = value.get("claudeAiOauth")?.get("refreshToken")?.as_str()?;
     Some(Zeroizing::new(rt.as_bytes().to_vec()))
+}
+
+/// Absent/null refresh token on an otherwise valid OAuth bearer. An EMPTY
+/// refresh token is deliberately excluded: it is Claude's revocation signal.
+pub(crate) fn non_refreshable(blob: &[u8]) -> bool {
+    let Ok(value) = serde_json::from_slice::<Value>(blob) else {
+        return false;
+    };
+    let Some(oauth) = value.get("claudeAiOauth") else {
+        return false;
+    };
+    oauth
+        .get("accessToken")
+        .and_then(Value::as_str)
+        .is_some_and(|token| !token.is_empty())
+        && oauth.get("refreshToken").is_none_or(Value::is_null)
 }
 
 /// Whether `blob` is a well-formed Claude Code credential (issue #730) — the OFFLINE
@@ -655,6 +680,9 @@ where
         let _lock = acquire_swap_lock(lock).await?;
         stash.read(stash_service).await?
     };
+    if non_refreshable(snapshot.credential.expose()) {
+        return Ok(RefreshReport::no_change());
+    }
 
     // STEP 3 (prep): back-date the stored credential's expiry to force CC's on-demand
     // refresh. Done BEFORE the STEP 2 dir creation (the out-of-order labels are
@@ -702,9 +730,13 @@ pub(crate) async fn refresh_account<S: AccountStash>(
     stash_service: &str,
     account_uuid: &str,
     claude_binary: PathBuf,
+    storage: &crate::storage::Storage,
 ) -> Result<RefreshReport> {
+    if non_refreshable(stash.read(stash_service).await?.credential.expose()) {
+        return Ok(RefreshReport::no_change());
+    }
     let iso_dir = paths::isolated_refresh_dir(account_uuid)?;
-    let keychain = crate::keychain::IsolatedKeychainItem::new(iso_dir.as_os_str())?;
+    let keychain = storage.isolated(&iso_dir)?;
     let spawner = SpawnClaude::new(claude_binary);
     let lock = paths::swap_lock()?;
     refresh_cycle(
@@ -755,6 +787,9 @@ where
     K: IsolatedKeychain,
     R: ClaudeRefresh,
 {
+    if non_refreshable(canonical) {
+        return Ok((RefreshReport::no_change(), None));
+    }
     // Back-date a COPY of the canonical credential's expiry so CC's 5-minute pre-expiry
     // predicate is unconditionally true — the same forcing trick the parked cycle uses,
     // applied to an isolated COPY so the live canonical item is never touched by the mint.
@@ -801,9 +836,13 @@ pub(crate) async fn keep_warm_account(
     canonical: &[u8],
     account_uuid: &str,
     claude_binary: PathBuf,
+    storage: &crate::storage::Storage,
 ) -> Result<(RefreshReport, Option<Credential>)> {
+    if non_refreshable(canonical) {
+        return Ok((RefreshReport::no_change(), None));
+    }
     let iso_dir = paths::isolated_refresh_dir(account_uuid)?;
-    let keychain = crate::keychain::IsolatedKeychainItem::new(iso_dir.as_os_str())?;
+    let keychain = storage.isolated(&iso_dir)?;
     let spawner = SpawnClaude::new(claude_binary);
     keep_warm_cycle(canonical, keychain, &spawner, iso_dir, now_ms()).await
 }
@@ -818,6 +857,9 @@ pub(crate) async fn keep_warm_account(
 /// the one timestamp, and dropped here.
 pub(crate) async fn stored_expires_at<S: AccountStash>(stash: &S, service: &str) -> Option<i64> {
     let snapshot = stash.read(service).await.ok()?;
+    if non_refreshable(snapshot.credential.expose()) {
+        return None;
+    }
     expires_at(snapshot.credential.expose())
 }
 
@@ -901,9 +943,9 @@ pub(crate) async fn stored_credential_clocks<S: AccountStash>(
 /// Best-effort, like teardown: a per-account failure (a momentarily-locked keychain, an
 /// FS error) is logged and the sweep moves on — a reap failure must never block the
 /// daemon from starting, and the orphan is retried on the next start.
-pub(crate) async fn reap_orphans(account_uuids: &[String]) {
+pub(crate) async fn reap_orphans(account_uuids: &[String], storage: &crate::storage::Storage) {
     for account_uuid in account_uuids {
-        if let Err(err) = reap_orphan(account_uuid).await {
+        if let Err(err) = reap_orphan(account_uuid, storage).await {
             eprintln!(
                 "sessiometer: isolated-refresh orphan reap skipped for {account_uuid}: {err}"
             );
@@ -919,8 +961,13 @@ pub(crate) async fn reap_orphans(account_uuids: &[String]) {
 /// Addressed by SERVICE, never by `(service, acct)`: the item was seeded by a process
 /// that has since died, so the `acct` it was seeded under is not this process's to
 /// re-derive (issue #769 — see [`IsolatedServiceReaper`]).
-async fn reap_orphan(account_uuid: &str) -> Result<()> {
+async fn reap_orphan(account_uuid: &str, storage: &crate::storage::Storage) -> Result<()> {
     let iso_dir = paths::isolated_refresh_dir(account_uuid)?;
+    if storage.settings().backend == crate::config::StorageBackend::File
+        && !cfg!(target_os = "macos")
+    {
+        return remove_dir_if_present(&iso_dir);
+    }
     let reaper = crate::keychain::IsolatedService::new(iso_dir.as_os_str())?;
     reap_isolated(&reaper, &iso_dir).await.map(drop)
 }
@@ -982,8 +1029,8 @@ const LOGIN_REAP_RETRY_WAIT: Duration = Duration::from_millis(100);
 /// Best-effort with retry (a per-start failure is logged and retried on the next daemon / `login`
 /// start), and the common clean-start case is silent. Run at daemon start (in `cli`, beside
 /// [`reap_orphans`]) and at `login` start (in [`crate::login`]).
-pub(crate) async fn reap_login_orphan() {
-    if let Err(err) = reap_login_orphan_inner().await {
+pub(crate) async fn reap_login_orphan(storage: &crate::storage::Storage) {
+    if let Err(err) = reap_login_orphan_inner(storage).await {
         eprintln!("sessiometer: isolated-login orphan reap skipped: {err}");
     }
 }
@@ -991,8 +1038,13 @@ pub(crate) async fn reap_login_orphan() {
 /// The fallible body of [`reap_login_orphan`], separated so the thin wrapper owns the single
 /// failure log site (mirrors [`reap_orphans`] → [`reap_orphan`]). Derives the login service exactly
 /// as the engine does, so the swept items are the artifacts a crashed login left.
-async fn reap_login_orphan_inner() -> Result<()> {
+async fn reap_login_orphan_inner(storage: &crate::storage::Storage) -> Result<()> {
     let iso_dir = paths::isolated_login_dir()?;
+    if storage.settings().backend == crate::config::StorageBackend::File
+        && !cfg!(target_os = "macos")
+    {
+        return remove_dir_if_present(&iso_dir);
+    }
     // A PRESENT login dir means a crashed login stranded a root (a graceful teardown / clean
     // shutdown removed it). Captured PRE-reap because the reap itself removes the dir, and used
     // ONLY to keep the common clean-start case silent — the reap is attempted regardless (hence a
@@ -1214,7 +1266,7 @@ mod tests {
                 STASH,
                 &StashedAccount {
                     credential: Credential::new(stored_blob.to_vec()),
-                    oauth_account: oauth(uuid),
+                    oauth_account: Some(oauth(uuid)),
                 },
             )
             .await
@@ -1475,6 +1527,29 @@ mod tests {
     // --- the engine, end to end (hermetic, fakes) --------------------------------
 
     #[tokio::test]
+    async fn token_only_refresh_is_a_noop_without_an_isolated_item_or_spawn() {
+        let original =
+            br#"{"claudeAiOauth":{"accessToken":"dummy","refreshToken":null,"expiresAt":null}}"#;
+        assert!(non_refreshable(original));
+        assert!(!non_refreshable(&blob(NOW_MS, "")));
+        assert!(!non_refreshable(b"not-json"));
+        let stash = seeded_stash(original, "u-1").await;
+        let keychain = FakeIsolatedKeychain::empty();
+        let item = keychain.item.clone();
+        let spawner = FakeSpawn::new(item.clone(), CcBehavior::SpawnFails);
+        let report = run_cycle(&stash, keychain, &spawner).await.unwrap();
+        assert_eq!(report.outcome, RefreshOutcome::NoChange);
+        assert!(!report.re_stashed);
+        assert!(item.borrow().is_none());
+        assert!(stash
+            .read(STASH)
+            .await
+            .unwrap()
+            .credential
+            .matches(&Credential::new(original.to_vec())));
+    }
+
+    #[tokio::test]
     async fn a_successful_refresh_re_stashes_the_fresh_token_and_preserves_identity() {
         let original = blob(NOW_MS + 300_000, "sk-ant-ort-ORIG");
         let stash = seeded_stash(&original, "u-1").await;
@@ -1500,7 +1575,7 @@ mod tests {
                 .as_slice(),
             b"sk-ant-ort-ROTATED"
         );
-        assert_eq!(restashed.oauth_account.account_uuid(), "u-1");
+        assert_eq!(restashed.require_identity().unwrap().account_uuid(), "u-1");
     }
 
     #[tokio::test]
@@ -1612,7 +1687,7 @@ mod tests {
                                 NOW_MS + 1_000_000,
                                 "sk-ant-ort-CONCURRENT",
                             )),
-                            oauth_account: oauth("u-1"),
+                            oauth_account: Some(oauth("u-1")),
                         },
                     )
                     .await

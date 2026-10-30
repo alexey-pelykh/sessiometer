@@ -21,6 +21,13 @@ import XCTest
 
 final class AccountSwapTests: XCTestCase {
 
+    func testCommittedCredentialsWithPendingIdentityAreNotACleanSuccessOrRejection() throws {
+        XCTAssertEqual(try SwapAck.decode(#"{"result":"accepted","from":"B","to":"C","identity_pending":true}"#),
+                       .identityPending(from: "B", to: "C"))
+        XCTAssertEqual(StatusPanelFormat.swapDoneText(.identityPending(to: "C")),
+                       "Credentials switched to C; identity update pending")
+    }
+
     // MARK: - SwapCommand: the wire request
 
     // AC (one command, both paths): the clicked/displayed target rides the wire verbatim, as the `swap`

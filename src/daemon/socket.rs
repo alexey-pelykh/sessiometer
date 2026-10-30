@@ -478,7 +478,13 @@ pub(crate) struct SwapCommand {
 pub(crate) enum SwapAck {
     /// The swap COMMITTED: the active credential was rerouted OFF `from` ONTO `to` (both
     /// non-secret labels). The daemon's own single-writer swap already did the write.
-    Accepted { from: String, to: String },
+    Accepted {
+        from: String,
+        to: String,
+        /// Credential commit succeeded but the identity co-write/clear did not.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        identity_pending: bool,
+    },
     /// A no-op success: `to` was ALREADY the active account, so nothing was written (the
     /// non-`force` already-active case, mirroring the standalone `use` no-op). Label only.
     AlreadyActive { to: String },

@@ -10,12 +10,15 @@ those differently.
 
 A Rust daemon + CLI at `src/`, and a SwiftUI macOS menu-bar app at `apps/menubar/` that talks to the
 daemon over a local AF_UNIX socket. **The CLI and daemon target macOS and Linux; the menu-bar app is
-macOS-only and Windows is unsupported** (`CONTRIBUTING.md`, ADR-0029). Linux is **landed but not
-gated**: the two macOS-only syscall sites are ported (#963), so the crate builds, links, tests and
-lints there — measured by hand in a container and recorded on #963, which is evidence for one
-commit and not a standing gate. Until the enforcing job (#964) exists **no CI job compiles for
-Linux or Windows, so a green run still says nothing about portability**, and nothing stops the
-next macOS-only call from silently regressing it.
+macOS-only and Windows is unsupported** (`CONTRIBUTING.md`, ADR-0029). The file-storage branch adds a Linux stable/MSRV build-and-test job to CI and includes it in
+the required aggregate. macOS local results are not Linux results; verify the native job before
+claiming portability. Windows credential storage remains disabled. macOS file-mode helpers
+normalize their owned Keychain output into the isolated file after the child completes;
+Linux helpers use files directly. Real-Claude owned-helper handoff acceptance remains pending
+and is separate from build/test portability and fake-backed tests. Live-profile import is a
+separate macOS/file-only reconciliation: preserve the known account and active file before
+specific-item deletion. Do not put deletion in reads/status, helper Drop cleanup, or Keychain
+mode. The source reread does not make deletion atomic with Claude. No new runtime opt-in.
 
 The two halves version their wire contracts independently and are gated by different CI jobs. Most
 mistakes below come from applying one half's rule to the other.
@@ -57,7 +60,7 @@ three filters, so editing it re-runs every one of them.
 
 **`msrv` and `deny` share one trigger, and it is much wider than dependency work.** Both are
 `if: needs.changes.outputs.rust == 'true'`, and so is `test`, whose commands are the five above. The
-`rust` filter is `src/**`, `Cargo.toml`, `Cargo.lock`, `deny.toml`, `build/fixtures/**`,
+`rust` filter is `src/**`, `tests/**`, `Cargo.toml`, `Cargo.lock`, `deny.toml`, `build/fixtures/**`,
 `scripts/**`, `.cargo/**`, `build.rs`, `**/build.rs`, `rust-toolchain.toml`, `rust-toolchain`,
 `rustfmt.toml`, `clippy.toml`, `.github/workflows/ci.yml`, and `src/**` is the entry that gets
 missed. **An ordinary source edit owes both jobs**: any change under `src/**` puts the PR in this

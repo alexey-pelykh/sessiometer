@@ -750,7 +750,7 @@ pub(crate) fn plausible_anchor_session(mark: Option<SessionHighWater>, anchor_se
 }
 
 /// The result of a completed [`swap`]. The token reroute (the swap proper)
-/// succeeded; these two fields report the best-effort, display-only follow-ups so
+/// succeeded; these two fields report the identity/verification follow-ups so
 /// the caller (#7) can log or act without re-reading the keychain itself.
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -762,11 +762,14 @@ pub(crate) struct SwapReport {
     /// next cycle. The token reroute itself already succeeded — this is a
     /// display / diagnostic signal, not a swap failure.
     pub(crate) canonical_confirmed: bool,
-    /// Whether the `~/.claude.json` `oauthAccount` co-write succeeded. `false` is
-    /// tolerated (best-effort display correctness): a missed co-write self-heals
-    /// on the next reconcile, since the keychain blob is the authoritative bearer.
+    /// Whether setting OR clearing `oauthAccount` succeeded. A false value is a
+    /// committed credential switch with an identity update still pending, not a
+    /// clean switch or a zero-write failure. Reconciliation retries the identity.
     pub(crate) oauth_cowritten: bool,
 }
+
+/// Secret-free warning shared by the engine and the daemon-routed CLI client.
+pub(crate) const IDENTITY_PENDING_WARNING: &str = "credential switched, but Claude identity update is pending; outgoing identity metadata may still be used until reconciliation succeeds";
 
 /// Run one out-of-band swap, rotating the active credential from the outgoing
 /// account to the incoming account. Both are addressed by their `Sessiometer/<account_uuid>`
@@ -851,7 +854,10 @@ where
     // 4. Co-write the incoming account's `oauthAccount` into `~/.claude.json`
     //    (best-effort display correctness — a failure is tolerated and self-heals).
     let oauth_cowritten =
-        claude_state::write_oauth_account(claude_json, &incoming.oauth_account).is_ok();
+        claude_state::set_oauth_account(claude_json, incoming.oauth_account.as_ref()).is_ok();
+    if !oauth_cowritten {
+        eprintln!("sessiometer: {IDENTITY_PENDING_WARNING}");
+    }
 
     // 5. Post-swap re-read to confirm the canonical item still holds the token we
     //    wrote (re-read each cycle, never cache). A read failure or a third-writer
@@ -939,7 +945,10 @@ where
     // 4. Co-write the incoming account's `oauthAccount` into `~/.claude.json`
     //    (best-effort display correctness — a failure is tolerated and self-heals).
     let oauth_cowritten =
-        claude_state::write_oauth_account(claude_json, &incoming.oauth_account).is_ok();
+        claude_state::set_oauth_account(claude_json, incoming.oauth_account.as_ref()).is_ok();
+    if !oauth_cowritten {
+        eprintln!("sessiometer: {IDENTITY_PENDING_WARNING}");
+    }
 
     // 5. Post-write re-read to confirm the canonical still holds the token we wrote
     //    (re-read each cycle, never cache). A read failure or a third-writer change
@@ -1804,6 +1813,81 @@ mod tests {
 
     // --- the swap engine (#6) ---
 
+    #[tokio::test]
+    async fn token_only_b_to_c_to_b_clears_then_restores_identity() {
+        let store = store_holding(b"B-token").await;
+        let stash = FakeAccountStash::empty();
+        let local = "Sessiometer/local-0123456789abcdef0123456789abcdef";
+        stash
+            .write(ACCT_B, &stashed(b"B-token", "u-B"))
+            .await
+            .unwrap();
+        stash
+            .write(
+                local,
+                &StashedAccount {
+                    credential: cred(b"C-token"),
+                    oauth_account: None,
+                },
+            )
+            .await
+            .unwrap();
+        let (_dir, state) = claude_json("u-B", 0o600);
+        let report = swap(&store, &stash, ACCT_B, local, &state).await.unwrap();
+        assert!(report.oauth_cowritten && report.canonical_confirmed);
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+        assert!(value.get("oauthAccount").is_none());
+        assert_eq!(value["numStartups"], 7);
+        assert_eq!(value["projects"]["/a"], 1);
+        // An external writer changes C's credential; swapping away must preserve
+        // C's intentional absence, never borrow B's former identity.
+        store.write(&cred(b"C-new-token")).await.unwrap();
+        let report = swap(&store, &stash, local, ACCT_B, &state).await.unwrap();
+        assert!(report.oauth_cowritten && report.canonical_confirmed);
+        assert_eq!(displayed_uuid(&state), "u-B");
+        let c = stash.read(local).await.unwrap();
+        assert!(c.oauth_account.is_none());
+        assert!(c.credential.matches(&cred(b"C-new-token")));
+        assert_eq!(
+            stash
+                .read(ACCT_B)
+                .await
+                .unwrap()
+                .require_identity()
+                .unwrap()
+                .account_uuid(),
+            "u-B"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_only_failed_identity_clear_is_a_committed_partial_swap() {
+        let store = store_holding(b"B-token").await;
+        let stash = FakeAccountStash::empty();
+        let local = "Sessiometer/local-0123456789abcdef0123456789abcdef";
+        stash
+            .write(ACCT_B, &stashed(b"B-token", "u-B"))
+            .await
+            .unwrap();
+        stash
+            .write(
+                local,
+                &StashedAccount {
+                    credential: cred(b"C-token"),
+                    oauth_account: None,
+                },
+            )
+            .await
+            .unwrap();
+        let (_dir, state) = claude_json("u-B", 0o600);
+        std::fs::write(&state, b"malformed").unwrap();
+        let report = swap(&store, &stash, ACCT_B, local, &state).await.unwrap();
+        assert!(report.canonical_confirmed);
+        assert!(!report.oauth_cowritten);
+        assert!(store.read().await.unwrap().matches(&cred(b"C-token")));
+    }
+
     const ACCT_A: &str = "Sessiometer/u-A";
     const ACCT_B: &str = "Sessiometer/u-B";
 
@@ -1821,7 +1905,7 @@ mod tests {
     fn stashed(token: &[u8], uuid: &str) -> StashedAccount {
         StashedAccount {
             credential: cred(token),
-            oauth_account: oauth(uuid),
+            oauth_account: Some(oauth(uuid)),
         }
     }
 
@@ -1904,8 +1988,8 @@ mod tests {
         // A was re-stashed with its FRESH canonical token, not the stale stashed one…
         assert_eq!(a.credential.expose(), b"A-refreshed");
         // …and its display-only `oauthAccount` was PRESERVED, not fabricated/changed.
-        assert_eq!(a.oauth_account.account_uuid(), "u-A");
-        assert_eq!(a.oauth_account.raw_json(), oauth("u-A").raw_json());
+        assert_eq!(a.require_identity().unwrap().account_uuid(), "u-A");
+        assert_eq!(a.identity_bytes(), oauth("u-A").raw_json());
         // The incoming write happened (after the re-stash): canonical is B's token.
         assert!(store.read().await.unwrap().matches(&cred(b"B-token")));
     }
@@ -2201,7 +2285,7 @@ mod tests {
             b"A-token",
             "A's stash must be untouched"
         );
-        assert_eq!(a.oauth_account.account_uuid(), "u-A");
+        assert_eq!(a.require_identity().unwrap().account_uuid(), "u-A");
         // AC3: ZERO writes — the canonical item and B's stash are both untouched.
         assert!(
             store.read().await.unwrap().matches(&cred(b"B-token")),
@@ -2245,7 +2329,7 @@ mod tests {
             b"A-token",
             "A's stash must be untouched"
         );
-        assert_eq!(a.oauth_account.account_uuid(), "u-A");
+        assert_eq!(a.require_identity().unwrap().account_uuid(), "u-A");
     }
 
     #[tokio::test]
