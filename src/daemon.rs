@@ -19823,6 +19823,42 @@ mod tests {
         assert_eq!(samples[0].ts, 200);
     }
 
+    /// GAP HONESTY (issue #1613): a reading whose session window was absent from the
+    /// reply is served to the swap decision, but it must NOT be stored — its
+    /// `session: 0.0` is a lift, not a measurement, and a stored zero would read as a
+    /// real idle session. The flagged call writes no line; an unflagged reading
+    /// through the same store writes exactly one.
+    #[test]
+    fn collector_records_nothing_for_a_reading_whose_session_window_was_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let samples_path = dir.path().join("usage-samples.jsonl");
+        let reading_with = |session_window_absent: bool| {
+            Ok(PolledReading {
+                usage: Usage {
+                    session: 0.0,
+                    weekly: 0.90,
+                    weekly_resets_at: Some(1_700_600_000),
+                    session_resets_at: None,
+                },
+                severity: Some("critical".to_owned()),
+                session_window_absent,
+            })
+        };
+
+        append_sample_for_poll(&samples_path, "work", &reading_with(true), 100);
+        assert!(
+            crate::usage_store::read_samples(&samples_path)
+                .unwrap()
+                .is_empty(),
+            "a flagged reading writes no sample"
+        );
+
+        append_sample_for_poll(&samples_path, "work", &reading_with(false), 200);
+        let samples = crate::usage_store::read_samples(&samples_path).unwrap();
+        assert_eq!(samples.len(), 1, "an unflagged reading writes exactly one");
+        assert_eq!(samples[0].ts, 200, "and it is the unflagged call's");
+    }
+
     /// FAIL-OPEN: a store-write error is swallowed — the collector returns normally
     /// (the poll/swap loop continues, the daemon stays up) and leaves no file. Here
     /// the parent directory does not exist, so the append cannot open its file.

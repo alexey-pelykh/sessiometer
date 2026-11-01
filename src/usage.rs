@@ -892,6 +892,56 @@ mod tests {
     }
 
     #[test]
+    fn a_weekly_only_reply_is_served_with_its_session_read_as_idle_until_the_lift() {
+        // Issue #1613: the captured reply of an account that has no session window
+        // at all (`five_hour` is `null`) beside a present `seven_day` window and
+        // `limits[]` weekly entries. It parses to `Ok`, the absent session read as
+        // idle (`0.0`, no reset, no severity) and flagged so the sample store can
+        // skip it.
+        let body = r#"{"five_hour":null,"seven_day":{"utilization":90.0,"resets_at":"2026-11-06T22:59:59.916061+00:00","limit_dollars":null,"used_dollars":null,"remaining_dollars":null,"locked_reason":null},"limits":[{"kind":"weekly_all","group":"weekly","percent":90,"severity":"critical","resets_at":"2026-11-06T22:59:59.916061+00:00","scope":null,"is_active":true},{"kind":"weekly_scoped","group":"weekly","percent":12,"severity":"normal","resets_at":"2026-11-06T22:59:59.916182+00:00","scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"is_active":false}]}"#;
+        let report = parse_usage(body).expect("a weekly-only reply must parse");
+        assert_eq!(report.session, 0.0);
+        assert_eq!(report.session_resets_at, None);
+        assert_eq!(report.session_severity, None);
+        assert!((report.weekly - 0.90).abs() < 1e-9);
+        assert_eq!(
+            report.weekly_resets_at.as_deref(),
+            Some("2026-11-06T22:59:59.916061+00:00")
+        );
+        assert!(
+            report.session_absent,
+            "the absent session window must be flagged"
+        );
+    }
+
+    #[test]
+    fn a_two_window_reply_is_not_flagged_as_missing_its_session() {
+        // Issue #1613 regression guard: a reply carrying both windows parses as it
+        // always did and does not set the absent-session flag.
+        let body = r#"{
+            "limits": [
+                {"kind": "session", "percent": 42, "resets_at": "2026-06-26T18:00:00Z", "is_active": true},
+                {"kind": "weekly_all", "percent": 88, "severity": "critical", "resets_at": "2026-06-30T00:00:00Z", "is_active": true}
+            ]
+        }"#;
+        let report = parse_usage(body).unwrap();
+        assert!((report.session - 0.42).abs() < 1e-9);
+        assert!((report.weekly - 0.88).abs() < 1e-9);
+        assert!(
+            !report.session_absent,
+            "a two-window reply carries its session window"
+        );
+    }
+
+    #[test]
+    fn a_reply_with_neither_window_is_a_parse_error() {
+        // Issue #1613 regression guard: only a missing SESSION window is lifted to
+        // idle. A reply with no usable window at all stays a hard parse error.
+        let body = r#"{"five_hour":null,"seven_day":null,"limits":[]}"#;
+        assert!(matches!(parse_usage(body), Err(Error::UsageParse(_))));
+    }
+
+    #[test]
     fn non_json_body_is_a_parse_error() {
         assert!(matches!(parse_usage("not json"), Err(Error::UsageParse(_))));
     }
