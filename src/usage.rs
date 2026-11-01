@@ -1276,6 +1276,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_present_idle_session_window_through_the_poll_path_is_not_flagged() {
+        // Issue #1613 AC-9: the flag records that the session LOOKUP found no
+        // window, not that the session fraction is zero. A parked account's
+        // session window can be present with a zero fraction and no reset stamp
+        // (the warm-up design's row C-1); it is a real idle reading, so the poll
+        // path must not flag it as a missing window.
+        let idle_session = r#"{"five_hour":{"utilization":0.0,"resets_at":null},"seven_day":{"utilization":40.0,"resets_at":"2026-11-06T22:59:59.916061+00:00"}}"#;
+        let src = source(vec![FakeUsageTransport::ok(200, idle_session)]);
+        let reading = src
+            .usage()
+            .await
+            .expect("a two-window reply with an idle session is served through the poll path");
+        assert!(
+            !reading.session_window_absent,
+            "a present idle session window must not be flagged as absent"
+        );
+        assert!((reading.usage.session - 0.0).abs() < 1e-9);
+    }
+
+    #[tokio::test]
     async fn a_200_with_an_unparseable_body_is_a_parse_error() {
         let src = source(vec![FakeUsageTransport::ok(200, "{}")]);
         assert!(matches!(src.usage().await, Err(Error::UsageParse(_))));
