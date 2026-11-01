@@ -1242,6 +1242,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_weekly_only_reply_through_the_poll_path_carries_the_absent_session_flag() {
+        // Issue #1613 AC-8: the flag must survive the poll path. The `parse_usage`
+        // oracles above never reach the `PolledReading` that `RealUsageSource::usage`
+        // builds, so a fix that parses correctly yet leaves the flag `false` where
+        // that reading is built would pass all of them and store a fabricated
+        // `session: 0.0` sample for a weekly-only account.
+        //
+        // A captured weekly-only reply (`five_hour` null, no session limit).
+        let weekly_only = r#"{"five_hour":null,"seven_day":{"utilization":90.0,"resets_at":"2026-11-06T22:59:59.916061+00:00","limit_dollars":null,"used_dollars":null,"remaining_dollars":null,"locked_reason":null},"limits":[{"kind":"weekly_all","group":"weekly","percent":90,"severity":"critical","resets_at":"2026-11-06T22:59:59.916061+00:00","scope":null,"is_active":true},{"kind":"weekly_scoped","group":"weekly","percent":12,"severity":"normal","resets_at":"2026-11-06T22:59:59.916182+00:00","scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"is_active":false}]}"#;
+        let src = source(vec![FakeUsageTransport::ok(200, weekly_only)]);
+        let reading = src
+            .usage()
+            .await
+            .expect("a weekly-only reply is served through the poll path, not rejected");
+        assert!(
+            reading.session_window_absent,
+            "the poll path must carry the absent-session flag onto the reading"
+        );
+
+        // The same seam with both windows present leaves the flag clear.
+        let two_window =
+            r#"{"limits":[{"kind":"session","percent":30},{"kind":"weekly_all","percent":70}]}"#;
+        let src = source(vec![FakeUsageTransport::ok(200, two_window)]);
+        let reading = src
+            .usage()
+            .await
+            .expect("a two-window reply is served through the poll path");
+        assert!(
+            !reading.session_window_absent,
+            "a two-window reply must not be flagged as missing its session window"
+        );
+    }
+
+    #[tokio::test]
     async fn a_200_with_an_unparseable_body_is_a_parse_error() {
         let src = source(vec![FakeUsageTransport::ok(200, "{}")]);
         assert!(matches!(src.usage().await, Err(Error::UsageParse(_))));
