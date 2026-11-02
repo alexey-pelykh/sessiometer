@@ -20,7 +20,8 @@ blindness bites.
 
 Like ADR-0009 and ADR-0012, this ADR records a **shipped** behaviour change, now
 enforced in `src/daemon.rs` (**#452**), with constants `T=300s` / `risk_band=60%`
-confirmed on two weeks of real telemetry — the **#451** premise-confirmation spike
+(**but see Amended 2026-11-02 (#1593)**: for an active with no session window there is no session
+reading to apply them to) confirmed on two weeks of real telemetry — the **#451** premise-confirmation spike
 validated the premise and the interim `T`, and **#484** ratified the conservative
 60% band (the "fire-early-is-cheaper" asymmetry for unattended runs) over the
 interim 65%. It **supersedes nothing**: it *affirms* [ADR-0012](0012-active-reobservation-via-schedule-interleave.md)
@@ -103,6 +104,57 @@ reading, outcome-identical to doing nothing, and would invert #453's ratified ab
 (the server is within spec — RFC 9110 §10.2.3 scopes `Retry-After` to 503/3xx as "ought to
 wait," RFC 6585 §4 lets a `429` carry it). The core **#452** decision and its constants are
 unchanged.
+
+**Amended 2026-11-02 (#1593) — the retained anchor's session window may not exist: for an active
+with no session window, "never fires on a `None`" covers a `None` that is structural rather than a
+failed poll, and the constants `T=300s` / `risk_band=60%` have no session reading to apply to.**
+Since 2026-10-30 Anthropic removes the five-hour session window from verified Ultra accounts, so
+such an account's usage reply carries `"five_hour": null` beside a present weekly window; Pro and
+Max accounts keep their session window, so a fleet holds both shapes at once (the dated sources are
+replicated in `docs/requirements/optional-quota-windows.md` § 2.2). This ADR's gate arms on the
+retained pre-blind anchor's **session** fraction against `risk_band` — `blind_gate_armed` over
+`BLIND_GATE_SECS` and `BLIND_GATE_RISK_BAND` (`src/daemon.rs`) — and every passage above assumes
+that fraction exists for every active. That premise is falsified on the wire; the decision stands
+and its premise is rewritten.
+
+**The decision in force, under open decision D3.** An anchor whose session window does not apply is
+such a `None`. Under **D3** `blind-gate-weekly-only-active`
+(`docs/requirements/optional-quota-windows.md` § 8) — the pipeline's default, pipeline-recommended,
+ratification-pending, not an operator ruling — the gate reads false for such an active, because
+there is nothing on the session axis to protect, and `status` claims no auto-protection on its
+strength rather than reporting `auto-protection OK` over an account it cannot protect. A `None` is
+therefore of two kinds: a failed poll, which this ADR always covered, and a window the account does
+not have, which it did not. Whether a weekly anchor should arm the swap against a weekly band — a
+new constant, a further amendment to this ADR and a swap that fires on the slower-moving axis — is
+the arming half of the same question, left open as **OAD-2** `blind-gate-weekly-only-active` in
+`docs/design/optional-quota-windows-solution-design.md` § 12 (§ Open architecture decision stubs),
+the operator's to decide and outside #1590. The core **#452** decision, its constants, the
+header-observation rejection and the **#582** `Retry-After` arm (which keys on no session anchor)
+are unchanged; the **#584** velocity report arm projects the same session anchor, so for such an
+active it has nothing to project and reads false by the same rule.
+
+**What the code does at this amendment's merge, and where the decision lands.** The tree does not
+yet behave this way. The hot-fix #1613 (on `main` since 2026-11-02) serves a weekly-only reply with
+the session fraction read as `0.0` and no session reset stamp, so the retained anchor of such an
+active carries an idle session rather than an absent one; the gate reads false there by accident of
+that `0.0` sitting under the band, not by this rule, and `status` shows the account as an idle one.
+The parser item #1596 replaces that read with `None`, the reading-model item #1597 lifts `LastGood`
+and `BlindAnchor` to carry "does not apply", and the decision-arms item #1602 has `blind_gate_armed`
+and the #584 arm's `blind_velocity_projected_armed` take the optional fraction and read false on
+`None` (the design's AD-5 and § 5 B-3 row 7) — all under umbrella #1590. This record lands before
+them deliberately: requirement `REQ-REC-C-001` (`docs/requirements/optional-quota-windows.md`
+§ 10.10, pipeline-authored and ratification-pending) asks that no commit reverse a pinned behaviour
+without its record. This record decides none of those arms; it records the premise they implement
+against.
+
+**Provenance.** The operator's direction of 2026-11-01, quoted verbatim in
+`docs/requirements/optional-quota-windows.md` § 2.1: "we need to make the parser more robust and
+flexible, maybe eventually they will make some account w/o weekly limits e.g." — each quota window
+independently optional, a weekly-less account the explicit future case; the request that opened the
+work, from the same day, is quoted beside it. The wording above is the solution design's draft
+(`docs/design/optional-quota-windows-solution-design.md` § 5 B-10), pipeline-authored and
+ratification-pending under umbrella #1590; the operator has reworded nothing and ratified no
+sentence here.
 
 ## Context
 
@@ -188,7 +240,8 @@ The path honours the **#369** cautions on a reactive fast-path:
 
 - **Never fires on a `None`/missing reading.** It keys off the retained `last_good`
   anchor (**#450**) — *not* the `429`, *not* `last_readings` — so a
-  genuinely-unknown account produces no spurious swap.
+  genuinely-unknown account produces no spurious swap. **But see Amended 2026-11-02 (#1593)**: a
+  `None` may also be structural — an active whose session window does not apply.
 - **Not `emergency_swap`.** A separate *availability* path: it does not raise the
   target gate to infinity, does not bypass cooldown, and preserves the
   dead-vs-exhausted model (**#42**).

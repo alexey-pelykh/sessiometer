@@ -17,6 +17,51 @@ Supersedes nothing: ADR-0023's session decision is unchanged, and this ADR amend
 § Related note that `#41 weekly_trigger` is "the *genuinely* separate second knob… untouched"
 — it is no longer untouched, though it remains genuinely separate.
 
+**Amended 2026-11-02 (#1593) — the anti-thrash invariant holds "on every dimension the account has",
+not "on BOTH dimensions": a dimension the account lacks is neither released nor acquired on.** Since
+2026-10-30 Anthropic removes the five-hour session window from verified Ultra accounts, so such an
+account's usage reply carries `"five_hour": null` beside a present weekly window; Pro and Max
+accounts keep their session window, so a fleet holds both shapes at once (the dated sources are
+replicated in `docs/requirements/optional-quota-windows.md` § 2.2). § Decision quotes
+`pick_target`'s invariant as "the acquire predicate is at least as strict as the negation of the
+release predicate on BOTH dimensions" — the doc comment above `pick_target`
+(`src/daemon/selection.rs`) states the same — and "BOTH" presumes every account has a session
+window. That premise is falsified on the wire; the decision stands and its premise is rewritten.
+
+**The decision in force.** The invariant holds on every dimension the account has. A dimension the
+account lacks is neither released nor acquired on: `swap::decide` does not fire on it and
+`pick_target` neither admits nor excludes on it, so no ping-pong can run on an axis that does not
+exist. Everything this record decided on the weekly line is unchanged — the single
+`weekly_effective_ceiling` used by both predicates, the `[ceiling − margin, ceiling)` argument, the
+two liveness exemptions, the downward-only jitter and the independently calibrated
+`WEEKLY_TAIL_MARGIN` — because the account class the wire shows keeps its weekly window, so every
+weekly predicate here still applies to it. The symmetric case, an account with no weekly window (the
+operator's explicit future case), is never weekly-blocked, never `weekly_exhausted`, and `use`
+returns `Viable` for it — the design's AD-4b, author-chosen and surfaced for ratification, with no
+observable instance today. "The dimensions stay independent (#41)" gains a corollary: a dimension
+may be absent, and absence is independent per dimension too.
+
+**What the code does at this amendment's merge, and where the decision lands.** The tree does not
+yet behave this way. The hot-fix #1613 (on `main` since 2026-11-02) serves a weekly-only reply with
+the session fraction read as `0.0`, so `pick_target`'s session gates admit such an account and
+`swap::decide` never releases on its session — the outcome the invariant wants, reached through a
+fabricated idle reading this record does not endorse. The parser item #1596 replaces that read with
+`None`, the reading-model item #1597 lifts `Usage`, and the decision-arms item #1602 rewrites the
+two predicates per axis — `is_none_or` on the acquire side, `is_some_and` on the release side, the
+design's § 5 B-3 rows 1 and 3, which is this invariant stated per dimension — all under umbrella
+#1590. This record lands before them deliberately: requirement `REQ-REC-C-001`
+(`docs/requirements/optional-quota-windows.md` § 10.10, pipeline-authored and ratification-pending)
+asks that no commit reverse a pinned behaviour without its record.
+
+**Provenance.** The operator's direction of 2026-11-01, quoted verbatim in
+`docs/requirements/optional-quota-windows.md` § 2.1: "we need to make the parser more robust and
+flexible, maybe eventually they will make some account w/o weekly limits e.g." — each quota window
+independently optional, a weekly-less account the explicit future case; the request that opened the
+work, from the same day, is quoted beside it. The wording above is the solution design's draft
+(`docs/design/optional-quota-windows-solution-design.md` § 5 B-10), pipeline-authored and
+ratification-pending under umbrella #1590; the operator has reworded nothing and ratified no
+sentence here.
+
 ## Context
 
 **The weekly dimension had the blind spot the session dimension lost in #597.** ADR-0023 gave
@@ -47,7 +92,8 @@ ceiling 98 the weekly fire point is **97**.
 
 **One weekly line, used by BOTH the release and acquire predicates.** This is load-bearing, not
 incidental. `pick_target`'s anti-thrash invariant is that *"the acquire predicate is at least as
-strict as the negation of the release predicate on BOTH dimensions"*. Lowering only the release
+strict as the negation of the release predicate on BOTH dimensions"* (**but see Amended 2026-11-02 (#1593)**:
+on every dimension the account has). Lowering only the release
 side would open a `[ceiling − margin, ceiling)` band in which an account is simultaneously
 fire-eligible and target-eligible — swap onto it and it re-trips `swap::decide`'s weekly
 dimension on the very next tick, a ping-pong bounded only by cooldown. The **session** dimension

@@ -17,6 +17,51 @@ dimension?* The answer is **no**, and the reason is a measurement rather than a 
 why it is recorded here instead of as a note on the spec. Companion to **ADR-0019** (the widened
 cadence that creates the blind spot in the first place).
 
+**Amended 2026-11-02 (#1593) — a structurally absent session window is excluded from the session
+census: it is not an unobserved reading, and the census is over the accounts that have the window.**
+Since 2026-10-30 Anthropic removes the five-hour session window from verified Ultra accounts, so
+such an account's usage reply carries `"five_hour": null` beside a present weekly window; Pro and
+Max accounts keep their session window, so a fleet holds both shapes at once (the dated sources are
+replicated in `docs/requirements/optional-quota-windows.md` § 2.2). This record's census reasons
+over readings that carry a session fraction, and "The census reports what it observed and refuses to
+interpolate across what it did not" presumes every rostered account has a session window to observe.
+That premise is falsified on the wire; the decision stands and its premise is rewritten.
+
+**The decision in force, under open decision D5 — this record takes the default.** Open decision
+**D5** `census-excludes-absent-window` (`docs/requirements/optional-quota-windows.md` § 8) has two
+options. The default, which this paragraph records: a structurally absent session window is excluded
+from the session census — it is not an unobserved reading, and the census is over the accounts that
+have the window. The alternative, which this paragraph does not record: "While any account on the
+roster has no session window, the session census reports UNKNOWN." The default is
+pipeline-recommended, ratification-pending; the operator has not ruled on D5, and a ruling for the
+alternative replaces this paragraph's sentence with that one. `high_windows` (`src/usage_stats.rs`)
+and its asymmetry are unchanged either way: a high reading is still anchored to its
+`session_resets_at`, a low reading is still not, no low reading is anchored, and a reading with no
+session window is simply not a reading on this axis — it anchors nothing and it covers nothing.
+UNKNOWN keeps its meaning: an account that has the window and was not observed still empties the
+intersection, exactly as the weekly-drained corpus above does, and unobserved is not the same as no
+window. The weekly figures of such an account are untouched; only the session axis excludes it.
+
+**What the code does at this amendment's merge, and where the decision lands.** The tree does not
+yet behave this way. The hot-fix #1613 (on `main` since 2026-11-02) records no usage sample for a
+weekly-only reading, so such an account contributes nothing to any census for the interim — a gap,
+never a stored zero, which `stats` reads as a missed poll. The store item #1598 writes the sample
+with `"session":null`, and the `stats` readers item #1600 excludes it from every session figure, the
+all-high census and the landings while keeping it in the weekly ones and in the capacity-hold census
+— both under umbrella #1590, in one pull request. This record lands before them deliberately:
+requirement `REQ-REC-C-001` (`docs/requirements/optional-quota-windows.md` § 10.10,
+pipeline-authored and ratification-pending) asks that no commit reverse a pinned behaviour without
+its record.
+
+**Provenance.** The operator's direction of 2026-11-01, quoted verbatim in
+`docs/requirements/optional-quota-windows.md` § 2.1: "we need to make the parser more robust and
+flexible, maybe eventually they will make some account w/o weekly limits e.g." — each quota window
+independently optional, a weekly-less account the explicit future case; the request that opened the
+work, from the same day, is quoted beside it. The wording above is the solution design's draft
+(`docs/design/optional-quota-windows-solution-design.md` § 5 B-10), pipeline-authored and
+ratification-pending under umbrella #1590; the operator has reworded nothing and ratified no
+sentence here.
+
 ## Context
 
 The all-accounts-high census intersects every rostered account's validity window. Issue #1030
@@ -54,7 +99,8 @@ Both halves were tested. The blocker turns out not to be the binding one.
 **The weekly-saturated / session-low class stays UNKNOWN. Rotation state is not carried into the
 census, and no low reading is anchored.** The asymmetry in `high_windows` is unchanged.
 
-The census reports what it observed and refuses to interpolate across what it did not. On a
+The census reports what it observed and refuses to interpolate across what it did not (**but see
+Amended 2026-11-02 (#1593)**: a structurally absent session window is not an unobserved reading). On a
 weekly-drained roster it therefore reports UNKNOWN, and
 `on_the_replay_corpus_the_utilisation_census_is_unknown_because_the_drain_was_weekly`
 (`src/usage_stats.rs`) is the standing record of why, with the falsifier below asserted against the
