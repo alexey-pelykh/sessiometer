@@ -235,7 +235,7 @@ Scenario: every schema:1 site under apps/menubar moves to 2 or is recorded as de
         `:745`, `:922`; `PanelStatsModel.swift:203` (`statsPreviewFixtureJSON`)
    When this item lands
    Then `statsBasic` is the regenerated golden; `statsConfigUnreadable` is that plus the `config_unreadable`
-        key, its doc's derivation kept; the four `StatsTests` assertions read `2`, the `:134` message reworded
+        key, its doc's derivation kept; the three `StatsTests` assertions and the `:745` input literal read `2`, the `:134` message reworded
         ("an additive field, so no bump of its own — the version is 2 for the omittable keys")
     And `statsPreviewFixtureJSON` reads `"schema":2` with its three accounts unchanged
     And both greps return nothing, or only sites the pull request body lists as deliberately pinned with a reason

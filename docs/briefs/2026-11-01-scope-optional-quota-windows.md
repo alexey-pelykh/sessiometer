@@ -112,14 +112,14 @@ Counting rule: each item's latest verdict in the Stage 4 ledger, with READY-PEND
 ## Artifacts Produced
 
 **Assertion**: 5/5 declared artifacts verified, 0 amended-absent, 0 repaired
-**Disposition**: 0 tracked, 11 committed here, 0 ignored, 0 undeterminable, 0 filed — of 11 artifacts (`T+C+G+D` partitions `S`; `F` counts filings and overlaps `G` and `D`)
+**Disposition**: 0 tracked, 11 committed here, 0 ignored, 0 undeterminable, 0 filed — of 11 artifacts (tracked + committed here + ignored + undeterminable partition the 11 artifacts; filed counts filings, which overlap ignored and undeterminable)
 
 - **PRD** — `docs/requirements/optional-quota-windows.md` [committed here]
 - **Solution design** — `docs/design/optional-quota-windows-solution-design.md` [committed here]
 - **Design brief** — `docs/briefs/2026-11-01-design-optional-quota-windows.md` [committed here]
 - **Feature files** — 7 at `docs/specs/` [committed here], one per deterministic-output item, named `<slug>.feature.md`: `parser-optional-quota-windows` (#1596), `reading-model-optional-window` (#1597), `sample-store-session-null` (#1598), `status-wire-no-window-key` (#1599), `stats-readers-no-session-window` (#1600), `stats-wire-no-session-window` (#1601), `decision-arms-absent-window` (#1602). The remaining items record their formulation escapes in their own bodies: pre-authored graders, pure text, operator-run measurement, or waiting.
-- **Scope brief** — `docs/briefs/2026-11-01-scope-optional-quota-windows.md` [committed here] — in the subject per Step 1.7 point 1, so it carries a marker like any other durable artifact
-- **Work items** — 16 in GitHub (`alexey-pelykh/sessiometer`), under umbrella #1590 — no marker: items have no in-repo path, so they are outside Step 1.7's subject
+- **Scope brief** — `docs/briefs/2026-11-01-scope-optional-quota-windows.md` [committed here] — in the subject of `/scope`'s Step 1.7 point 1 (the tracking-disposition step, which gives each durable artifact a bracketed marker such as [committed here]), so it carries a marker like any other durable artifact
+- **Work items** — 16 in GitHub (`alexey-pelykh/sessiometer`), under umbrella #1590 — no marker: items have no in-repo path, so they are outside the subject of `/scope`'s Step 1.7
 - _No `user-stories` document_ — requirements are EARS + OOUX; story-shaped work is tracked items typed `story`.
 
 ## Next Steps

@@ -2,7 +2,7 @@
 
 Issue #1600 · PRD REQ-STS-B-001 / REQ-STS-C-001 / REQ-RDG-C-001 (§ 10.8, § 10.3; D5 and D8 in § 8, D12 in design § 14; § 11.3, § 11.4; MET-T-003 in § 4) · design § 5 B-8 (first bullet), § 4.2, § 4.4, § 4.5, § 11 Cap-5, § 12 AD-4 / AD-13 / AD-17 / OAD-3, § 14 R-D4
 
-Example Mapping: 🟦 5 rules · 🟩 23 examples · 🟥 0 open
+Example Mapping: 🟦 5 rules · 🟩 17 examples · 🟥 0 open
 
 > Since 2026-10-30 a verified Ultra account's usage reply carries `"five_hour":null` beside a present
 > weekly window. Once the parser (#1596), the reading model (#1597) and the sample store (#1598)

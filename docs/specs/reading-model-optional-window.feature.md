@@ -236,7 +236,7 @@ Scenario: the three production files this item touches carry no numeric-default 
     # exclude, name — and never a numeric default.
 
 Scenario: a Some(0.0) wrapper stands only for a measured idle window
-  # Tier B — pending: review of the diff (design § 14 R-D4: a test "fixed" by `Some(0.0)` asserts nothing about the absent state); `git grep -nE 'Some\(0\.0\)' -- src` prints 10 lines at fd8640b, none a usage-window fraction (a comment, glyph and sparkline inputs, two rates, a spend), so the signal is the lines this item's own commit adds — `git show -U0 --format= <commit found by its `(issue #1597)` subject> -- src | grep -E '^\+.*Some\(0\.0\)'` — each listed in the pull request body with the reading it means; no executor-uneditable grader exists for a test literal's intent · covers AC-8
+  # Tier B — pending: review of the diff (design § 14 R-D4: a test "fixed" by `Some(0.0)` asserts nothing about the absent state); `git grep -nE 'Some\(0\.0\)' -- src` prints 10 lines at fd8640b, none a usage-window fraction (a comment, glyph and sparkline inputs, three rates, a spend), so the signal is the lines this item's own commit adds — `git show -U0 --format= <commit found by its `(issue #1597)` subject> -- src | grep -E '^\+.*Some\(0\.0\)'` — each listed in the pull request body with the reading it means; no executor-uneditable grader exists for a test literal's intent · covers AC-8
   Given a test literal that constructed a present reading — `Usage { session: 0.5, .. }`, or
         `LastGood { session: 0.70, .. }` as at `src/daemon/records.rs:581`
    When it is adapted to the lifted type

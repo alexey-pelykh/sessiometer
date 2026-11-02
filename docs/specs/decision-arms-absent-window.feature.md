@@ -1,6 +1,6 @@
 # Feature: every decision arm names its move on an absent quota window — skip, pass, exclude or name, never a numeric default
 
-Issue #1602 · PRD REQ-RDG-C-001 / REQ-ARM-B-001 … REQ-ARM-B-012 / REQ-ARM-C-001 / REQ-ARM-Q-001 (§ 10.3; D3, D4, D7, D10 in § 8; § 11.1) · design § 5 B-3, § 4.2, § 4.4, § 4.5, § 5 B-6t, § 11 Cap-2 / Cap-10 / MET-R-001, § 12 AD-4 / AD-4b / AD-5 / AD-6 / AD-8 / AD-14 / AD-15 / AD-16 / OAD-2, § 14 R-D4 / R-D5
+Issue #1602 · PRD REQ-RDG-C-001 / REQ-ARM-B-001 … REQ-ARM-B-012 / REQ-ARM-C-001 / REQ-ARM-Q-001 (§ 10.3; D3, D4, D7, D10 in § 8; § 11.1) · design § 5 B-3, § 4.2, § 4.4, § 4.5, § 5 B-6t, § 11 Cap-2 / Cap-10 (MET-R-001: § 5 B-3 row 12, § 12 AD-16), § 12 AD-4 / AD-4b / AD-5 / AD-6 / AD-8 / AD-14 / AD-15 / AD-16 / OAD-2, § 14 R-D4 / R-D5
 
 Example Mapping: 🟦 5 rules · 🟩 30 examples · 🟥 0 open
 
