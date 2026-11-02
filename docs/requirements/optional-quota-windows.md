@@ -1,0 +1,928 @@
+---
+title: Optional Quota Windows — Serving an Account Whose Usage Reply Carries No Session Window
+scope: optional-quota-windows
+created: 2026-11-01
+status: draft
+dor_status: failed
+profile: full
+source: investigation report "how should sessiometer support accounts whose /oauth/usage reply now carries five_hour: null", run via /investigate at HEAD a232a39 (2026-11-01T08:19:36Z), and the /scope seed the orchestrator wrote from it the same day — both are machine-local scratch under .tmp/ and are not committed, so every value this document rests on is replicated in-band (§ 2.2, § 2.4, § 10)
+parent-requirements: private HQ, strategy/prd-0.1.0.md — REQ-USG-B-001 "Per-account usage poll, both dimensions" (its both-dimensions premise is now false on the wire) and REQ-PCY-B-002 "Transient-failure resilience — never swap on missing data" (still stands); not dereferenceable from a clone, both quoted in-band in § 2.4
+appetite: a hot-fix (tranche 0, #1613) as soon as possible; tranche 1 at the human effort-day budget the coverage gate sized; tranche 2 a small batch; one unsized item that waits on D0 — tranche 0 and tranche 1's budget set by the maintainer on 2026-11-01, the rest pipeline-proposed, ratification-pending (§ 3.1)
+formulation: {technical-architecture: complete, ux-ia: pending, testing-architecture: complete}
+features:
+  parser-serves-null-session-window: {stage: design, tracks: {technical-architecture: complete, testing-architecture: complete}}
+  parser-every-window-optional: {stage: design, tracks: {technical-architecture: complete, testing-architecture: complete}}
+  model-option-lift-and-decision-arms: {stage: design, tracks: {technical-architecture: complete, testing-architecture: complete}}
+  fixtures-null-session-and-weekly-scoped: {stage: design, tracks: {testing-architecture: complete}}
+  oracles-a-d-landed-red-first: {stage: design, tracks: {testing-architecture: complete}}
+  status-wire-no-window-key: {stage: design, tracks: {technical-architecture: complete, ux-ia: pending, testing-architecture: complete}}
+  sample-store-session-null: {stage: design, tracks: {technical-architecture: complete, testing-architecture: complete}}
+  stats-wire-no-session-representation: {stage: design, tracks: {technical-architecture: complete, ux-ia: pending, testing-architecture: complete}}
+  warmup-design-c1-reads-the-fraction: {stage: design, tracks: {technical-architecture: complete}}
+  spec-move-recorded: {stage: design, tracks: {technical-architecture: complete}}
+  render-no-window-cells: {stage: blocked, tracks: {ux-ia: pending, testing-architecture: pending}}
+  deploy-and-verify-on-the-fleet: {stage: design, tracks: {technical-architecture: complete, testing-architecture: complete}}
+artifacts:
+  design-doc: docs/design/optional-quota-windows-solution-design.md
+  design-brief: docs/briefs/2026-11-01-design-optional-quota-windows.md
+---
+
+# PRD — Optional Quota Windows
+
+**Version**: 1.4
+**Created**: 2026-11-01
+**Last Updated**: 2026-11-02
+**Status**: Draft — `dor_status: failed` (check 6; see § 17)
+**Sources**: the investigation report and the scope seed named in the frontmatter `source`; the
+operator's two verbatim messages of 2026-11-01 (§ 2.1); the tree at `fd8640b` (`origin/main`, 2026-10-30), against which every code claim below was re-verified on 2026-11-01
+
+> **Provenance.** Authored by an AI pipeline (`/scope` Stage 1, headless) from a `/investigate` forensic report and the scope seed derived from it. **The operator-authored text in this run is the two messages quoted verbatim in § 2.1, plus three maintainer answers of 2026-11-01 quoted verbatim in § 3.1 (notes 1 and 4), which set the appetite and the sequencing and ratify no requirement.** Everything else — the problem framing, the appetite of tranche 2 and of S11, the twelve-component scope, every requirement, every acceptance criterion, every measure and every success metric — is **pipeline-authored and ratification-pending**, and is labelled so where it appears. Ten decisions only the operator can make (D0–D9) plus one the pipeline identified (D10) are held **open** in § 8; no requirement below assumes an answer to any of them. Every `src/…:NNN` citation was re-verified against `fd8640b`; where the report's line numbers (taken at `a232a39`) differed, this document carries the corrected line and § 14 lists the correction. The TL;DR (§ 1) and the benefit hypothesis (§ 2.5) are the operator's to write and are left visibly owed.
+
+## 0. What this PRD owns, and what it deliberately does not
+
+The wire changed under the daemon: on 2026-10-30 Anthropic began removing the five-hour session window from verified Ultra accounts, per account and automatically, leaving the weekly window in place. The daemon's usage parser treats both windows as mandatory, so it rejects the whole reply of such an account and reports it as having no reading at all. On the operator's machine 15 of 17 accounts were in that state when the investigation ran, and the daemon reported the fleet out of capacity. This PRD owns making every quota window independently optional — on the wire, in the model, at every decision arm, on the status wire, in the sample store, in the offline verbs, in the design records — and getting the fix onto the crippled machine.
+
+**Twelve components, in two tranches plus one that waits, behind a tranche-0 hot-fix that is not one of the twelve** (slugs are the seed's; each is a feature anchor in § 10):
+
+| Tranche | Components | Why this grouping |
+|---|---|---|
+| 0 — hot-fix | none of the twelve: #1613, outside the design blocks and not a PRD feature | The maintainer's known path to a working daemon now. On 2026-11-01 the maintainer answered the appetite question with a demand for a known hot-fix path (verbatim in § 3.1, note 1). The hot-fix serves a weekly-only reply instead of rejecting it, stores no sample for it, and is deployed to the operator's machine before it merges. Tranche 1 supersedes it (§ 3.3). |
+| 1 — urgent | S1 `parser-serves-null-session-window`, S2 `parser-every-window-optional`, S3 `model-option-lift-and-decision-arms`, S4 `fixtures-null-session-and-weekly-scoped`, S5 `oracles-a-d-landed-red-first`, S7 `sample-store-session-null`, S8's reader half (`stats-wire-no-session-representation`: the five sample readers, #1600, in #1598's pull request), S10 `spec-move-recorded`, S12 `deploy-and-verify-on-the-fleet` (its live deploy, #1604; its runbook text, #1603, is in tranche 2) | The operator's message 1 says "urgently". S1–S5 are the fix. S7, S8's reader half and S10 are in this tranche for different reasons. S8's reader half is here by compile necessity: #1598's `Option` lift of the sample fields forces the five readers to move in the same pull request (§ 3.1, note 2). S10 is there by construction: the repo's own advisory is that a spec move is recorded before the test that pins the old behaviour moves, and that test moves in this tranche. S7 is there by choice (§ 3.2, A-7): the compiler forces the sample writer to decide what it writes for an absent window the moment the model changes, the compile unit decides it by keeping #1613's sample skip, and S7's `null` line lands in the pull request right after the compile unit, before the deploy. S12's live deploy (#1604) is how the proper fix reaches the running bundle; #1604 follows #1603's text where it has merged and the runbook's current text otherwise. |
+| 2 — follows | S6 `status-wire-no-window-key`, S8's wire half (`stats-wire-no-session-representation`, #1601; D8 may move it to tranche 1), S9 `warmup-design-c1-reads-the-fraction`, and S12's runbook text (#1603, Should, landing after the tranche-1 deploy) | Wire and offline-verb representation of the new state, plus one unbuilt design amendment. Separable from tranche 1 under D10 (§ 8). The runbook text moves here from tranche 1 by the maintainer's answer of 2026-11-01 (§ 3.1, note 4); the tranche-2 deploy is #1608. |
+| waits | S11 `render-no-window-cells` | Blocked on D0: the panel's own register forbids building against an unclassified state. |
+
+**Not owned here** — each has a stated reason in § 3.3: the `usage_gap` event's missing cause (C2); blind peers polled at full cadence (C3); PR #1537's `weekly_scoped` binding-cap defect (C6/D9); the `PolledReading.severity` provenance gap (C7); ADR-0013's wrong test path (C9); the `active-account-observation-continuity` R-8 violation (C10); reading `/api/oauth/profile`; any keep-warm or `reliability` rule change; any platform-specific work; and the amendment of the private HQ's REQ-USG-B-001, which is owed by the operator.
+
+## 1. TL;DR
+
+> **Owed by the operator.** This section is the operator's to author. The pipeline does not write it; a recommended wording was returned to the operator with this document.
+
+## 2. Problem Statement
+
+> **Pipeline-framed, pending the operator's validation.** Framed at Phase 1 from the operator's message 1 (§ 2.1) and the investigation's findings; the framing challenge is recorded in § 2.3.
+
+**Why this matters.** The daemon exists to rotate the active account onto whichever one has headroom. Since 2026-10-30 it cannot see most of the fleet: an account whose usage reply carries no session window is parsed as "no reading", dropped from target selection, never sampled, and rendered `n/a` on every surface — although its credential is healthy and the reply was HTTP 200. The daemon's forward-looking verdict for the whole roster is "no viable target, cause weekly": **out of capacity, while 15 accounts with unknown weekly headroom sit unread.**
+
+**Who has the problem.** The operator, on the one machine this daemon serves. The operator and the maintainer named in this document are one person, the repository's owner: "operator" where that person runs or reads the daemon, "maintainer" where that person decides for the repository (the design register, the budget, a ruling). The two accounts that still parse are at 97 % and 100 % of their weekly windows, so the operator's local work is "crippled" in the operator's own word.
+
+**Current state, and the workaround signal.** There is no workaround inside the product: `status` shows `n/a`; `sessiometer use <account>` without `--force` aborts for these accounts because the viability probe propagates the parse error; `--force` bypasses the gate blind. The operator's only lever is manual account juggling outside the daemon. Claude Code itself tolerates the reply shape and simply skips the null window in its own `/usage` view, so the operator sees the window gone in one tool and the account "unreadable" in the other.
+
+**Evidence.** § 2.2, replicated in-band: the captured reply, the status snapshot, the sample-store timeline, the parser's rejection path at the cited lines, and the three primary Anthropic sources.
+
+**Why now, and the cost of doing nothing.** The lift is per account and automatic ("starting today with most existing subscribers"), so the share of blind accounts only grows; the fleet's 15 dark accounts went dark one at a time over 23 h 20 min between 2026-10-30 23:16Z and 2026-10-31 22:36Z. Every poll of a dark account is a full-cadence usage request that yields nothing. Doing nothing leaves the daemon unable to rotate for as long as the operator holds Ultra accounts — which, by the primary sources, is the steady state, not a transition.
+
+### 2.1 The operator's words — the only operator-authored input, verbatim
+
+1. 2026-11-01, first message of the session: "Claude dropped 5h limits on SOME accounts and claude obivouslty updated for that, so we need to: - update claude (via better claude) + update better-claude - /investigate and /scope how to support this in sessionmeter urgently, since now even locally the accounts without 5h limits are crippled"
+2. 2026-11-01, mid-session, while the investigation was being prepared: "we need to make the parser more robust and flexible, maybe eventually they will make some account w/o weekly limits e.g."
+
+Message 1 ratifies the **class** of work (support, in sessiometer, accounts whose usage reply carries no five-hour window — urgently). Message 2 ratifies the **shape** of the parser (each quota window independently optional, a weekly-less account being the explicit future case). Nothing else in this document is operator-authored, except the three maintainer answers of 2026-11-01 quoted in § 3.1 (notes 1 and 4), which decide the appetite and the sequencing and ratify no requirement.
+
+### 2.2 Evidence, replicated in-band
+
+**The captured reply.** `GET https://api.anthropic.com/api/oauth/usage`, header `anthropic-beta: oauth-2025-04-20`, HTTP 200, 2 192 bytes, captured 2026-11-01T07:20:52Z for the account that was active at the time. The quota fields, verbatim (the reply's identity fields are deliberately not reproduced anywhere in this repository):
+
+```json
+"five_hour":null
+"seven_day":{"utilization":90.0,"resets_at":"2026-11-06T22:59:59.916061+00:00","limit_dollars":null,"used_dollars":null,"remaining_dollars":null,"locked_reason":null}
+"limits":[{"kind":"weekly_all","group":"weekly","percent":90,"severity":"critical","resets_at":"2026-11-06T22:59:59.916061+00:00","scope":null,"is_active":true},{"kind":"weekly_scoped","group":"weekly","percent":12,"severity":"normal","resets_at":"2026-11-06T22:59:59.916182+00:00","scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"is_active":false}]
+```
+
+25 of the reply's 32 top-level keys are JSON `null`, among them `seven_day_oauth_apps`, `seven_day_opus`, `seven_day_sonnet`, `seven_day_cowork`, `seven_day_omelette` and 17 unknown-named fields. `limits[]` carries no entry whose `kind` is `session` or `five_hour`; every entry is `group: "weekly"`. The `weekly_scoped` kind is new to this tree: no fixture or test under `src/` carries it.
+
+**What the tree does with it, verified at `fd8640b`.** `parse_usage` (`src/usage.rs:503-537`) looks the session window up first — `dimension(&root, "five_hour", &["session", "five_hour"])` at `src/usage.rs:507` — and turns a miss into `Error::UsageParse("no session (five_hour) dimension")` before the weekly lookup at `src/usage.rs:508` (`dimension(&root, "seven_day", …)`) runs. The weekly window parses on its own — `0.90`, reset `2026-11-06T22:59:59.916061+00:00` — and is lost only because the session lookup returns early. The parser's contract is the reason it rejects rather than fills (`src/usage.rs:473-474`): "A window that cannot be found is a hard [`Error::UsageParse`] (never a fabricated `0`): the loop must skip, not swap, on missing data" — `UsageParse` is the only outcome the contract allows for a missing window. `dimension` (`src/usage.rs:548-582`) reads the top-level object first (`fraction_of` at `src/usage.rs:553-557`) and then scans `limits[]`, skipping any entry whose `kind` is not in the window's alias list (`is_some_and` … `continue` at `src/usage.rs:563-566`) — so `weekly_scoped` and the 25 null keys are already tolerated; the single defect is that each window is mandatory. The rule is symmetric: `seven_day: null` with an empty `limits[]` fails with "no weekly (seven_day) dimension".
+
+Downstream: `classify_poll` maps any parse `Err` to `PollOutcome::Transient` (`src/daemon/classify.rs:55-62`), so the credential is read as live-but-unreadable; no sample is written, because `append_sample_for_poll` returns on an `Err` reading under the store's gap-honesty rule (`src/daemon.rs:695-726`); `status` renders `n/a` for a `None` percentage (`pct` at `src/cli.rs:4595-4598`, `reset_cell` at `src/cli.rs:4365-4368`); the wire carries `session_pct: null, weekly_pct: null` because both map from the same absent `account.usage` (`src/daemon/snapshot.rs:999-1002`, `to_pct`); selection drops the account before any filter runs (`filter_map` at `src/daemon/selection.rs:246`); `all_exhausted_relief` (`src/daemon.rs:6297-6341`) sees the 15 unread accounts as nothing to relieve and promises only the soonest weekly reset among the two readable spares, both at or over the weekly line for selection (`spare_relief` at `src/daemon.rs:6241`; the snapshot's `resets_at 1793725200` below is that spare's), falling to its `(None, None)` default — `SwapReason::Weekly` with nothing to promise (`src/daemon.rs:6339`) — only when no readable blocked spare remains; and `next_swap` reads `no_viable_target` because `AwaitingData` is reserved for the case where **every** live other account is unpolled (`src/daemon.rs:5666-5679`). The `use` verb is blocked too: `poll_viability` propagates the `Err` (`src/use_account.rs:407-424`) and the gate falls back to that live poll whenever the daemon cache has no usable reading (`cached_viability` … `poll_viability` at `src/use_account.rs:451-462`).
+
+**The status snapshot** (`status --json`, schema `1.14` = `STATUS_SCHEMA_VERSION` at `src/daemon/snapshot.rs:538-541`; `generated_at 1793517534` = 2026-11-01T07:18:54Z): 17 rows, 15 of them `session_pct: null, weekly_pct: null, session_resets_at: null, weekly_resets_at: null, weekly_exhausted: false, auth: "healthy", refresh_health.last_ok: true`; the two rows with readings show `0%`/`97%`/`4d10h` and `0%`/`100%`/`2d9h`; `next_swap = {"state": "no_viable_target", "cause": "weekly", "resets_at": 1793725200}` (= 2026-11-03T17:00:00Z). The 97 % account is **not** weekly-exhausted against `DEFAULT_WEEKLY_CEILING = 98` (`src/config.rs:166`); the report retracted the evidence pack's "both weekly-exhausted" claim and this document does not inherit it.
+
+**The sample store** (`usage-samples.jsonl`, keys `ts, provider, acct, session, weekly, weekly_resets_at`): 15 accounts stopped sampling between 2026-10-30 23:16Z and 2026-10-31 22:36Z; the two still-sampling accounts sample every ~66 min. A sample is written only after a successful parse, so the gap is the parser's, not the poll loop's.
+
+**What the client does with the same bytes.** Claude Code 2.1.294 and 2.1.316 declare both windows independently optional in their usage-cache schema (`five_hour:e.nullish(),seven_day:e.nullish()`) and skip a null window in the `/usage` renderer (`if(!l||l.utilization===null)continue;`); the 2.1.312 changelog line, verbatim: "- Changed usage limit messages to call the 5-hour window the "5-hour limit" instead of the "session limit"". No client release between 2.1.294 and 2.1.316 announced a wire change — the client tolerated this shape before 2026-10-30. A behavioural reference, not a visual one.
+
+**Primary Anthropic sources** (retrieved by the investigation 2026-11-01; dated records, quoted so this document stands alone): the @claudeai post of 2026-10-30T17:29:07Z — "We're also removing the 5-hour limit for verified Ultra accounts, starting today with most existing subscribers. Newer accounts keep a temporary limit until they're verified … Weekly limits remain unchanged." and "Max 20x → Ultra / Max 5x → Max"; the Help Center article "What is the Ultra plan?" (`dateModified` 2026-10-30T17:11:53Z) — "Verified Ultra accounts don't have a five-hour limit. If your account isn't verified yet, a temporary limit applies." and "we automatically verify Ultra accounts using factors like your account and payment history … If you don't see a Current session bar, your account is verified."; the Help Center article "Use Claude Code with your Pro, Max, or Ultra plan" (`dateModified` 2026-10-30T19:29:25Z) — "Pro and Max plans have a five-hour session limit and a weekly limit. Ultra plans have a weekly limit, and verified Ultra accounts don't have a five-hour session limit." Three consequences bind the requirements: the state is **per account**; a fleet holds **both shapes at once** and will keep doing so (Pro and Max keep both windows); and no API signal or reverse transition is documented, so **the usage reply is the only observable**.
+
+**The plan name is not the signal.** The profile endpoint names the plan (`plan_display_name = 'Ultra'`, `rate_limit_tier = 'default_claude_max_20x'`) and carries no field saying whether the session window is lifted; the lift arrives per account over about a day of background verification. Reading it would open a second egress endpoint, moving the privacy oracle `the_sole_egress_endpoint_is_the_documented_usage_url` (`src/usage.rs:1593-1608`, which pins `USAGE_URL`), behind #737's unrelated identity gate. It is excluded (§ 3.3).
+
+### 2.3 Problem framing — what was challenged
+
+| Challenge | Outcome |
+|---|---|
+| **Observation vs interpretation.** The observation is 15 `n/a` rows and `no_viable_target`; the operator's interpretation is "Claude dropped 5h limits on SOME accounts". | Confirmed by the captured reply (`five_hour: null`) and three primary sources. The interpretation stands. |
+| **Symptom or cause?** The blind fleet is the symptom. The proximate cause is the mandatory-both-windows rule — the two `dimension` lookups at `src/usage.rs:507-508`. The deeper cause is that the model cannot express "this window does not apply" — `Usage` at `src/usage.rs:87-116` carries `session: f64` and `weekly: f64` — so any parser-only patch must invent a value. | The PRD treats the deeper cause: the model gains the state, the parser reports it, every consumer states what it does with it. |
+| **Prevention vs solution.** Anthropic's change cannot be prevented. Recurrence can: the operator's message 2 names the next shape (no weekly window). | Every window is optional, not only the session one (S2). |
+| **Constraint or solution?** Message 2 is solution-shaped ("make the parser more robust and flexible"). | Read as the constraint behind it: a reply that lacks any one window still yields the windows it carries, and the model says which window is absent. |
+| **Implicit constraints questioned.** (a) "Keep `Usage.session: f64` and add a flag" — rejected: the flag must be consulted at all 93 production reads or the fabricated value stands (§ 2.4). (b) "Fabricate `session = 0.0`" — rejected: byte-identical to an idle window the tree already holds, and written permanently to the store (§ 6, R2–R3). (c) "Reuse `session_pct: null`" — rejected: the wire defines it as "poll failed" (§ 8, R5). (d) "Ask the profile endpoint" — rejected (§ 2.2). | The `Option` lift is the smallest change that lets the compiler enumerate every consumer; the others are explicit exclusions in § 3.3. Exclusion (b) has one maintainer-decided exception, tranche 0 (#1613), also recorded in § 3.3. |
+| **Is this a should-we-build question?** No — message 1 decides it. A PRD, not a PR-FAQ or a pitch, is the right artifact: many surfaces must align on one model change, and an agent will implement it from the statements. | Phase 0 gate passed; recorded as pipeline-decided. |
+
+### 2.4 The records this falsifies, and the figures the argument rests on
+
+**The private HQ's requirement, quoted** (`strategy/prd-0.1.0.md:290`, not reachable from a clone): "REQ-USG-B-001: Per-account usage poll, both dimensions — For each captured account, when a poll cycle runs, the system shall … query `GET https://api.anthropic.com/api/oauth/usage` … returning the session% (`five_hour.utilization` / `limits[kind=session].percent`), the account% (`seven_day.utilization` / `limits[kind=weekly_all].percent`), and `resets_at`." Confidence recorded there: VALIDATED. **Its both-dimensions premise is now false for verified Ultra accounts.** The HQ records no decision about an absent window and no mention of the Ultra plan (grep of `strategy/*.md`, `research/`, `inbox/` on 2026-11-01 at HQ `440c912`). Its amendment is the operator's and is owed (§ 7).
+
+**The HQ rule that still stands, quoted** (`strategy/prd-0.1.0.md:808`): "REQ-PCY-B-002: Transient-failure resilience — never swap on missing data — When a usage poll fails transiently (5xx / network), the system shall skip that poll cycle, log it, and retry next interval; the system shall never perform a swap on missing usage data." Confidence recorded there: ASSUMED. The `None` representation preserves it: an absent window is never a number anything swaps on.
+
+**In-repo records that assume two windows** (all verified at `fd8640b`): ADR-0013 ("Sound because **both** windows hard-reset", `docs/adr/0013-session-floor-default-on-reserve-emergency-exempt.md:134`); ADR-0017 (the blind gate keys on the retained session anchor, `T=300s` / `risk_band=60%` at `docs/adr/0017-bounded-blindness-preemptive-swap-not-header-observation.md:22`, and "Never fires on a `None`/missing reading" at `:189`); ADR-0025 ("at least as strict as the negation of the release predicate on BOTH dimensions", `docs/adr/0025-weekly-trigger-ceiling-semantics.md:48-50`); ADR-0033 ("The census reports what it observed and refuses to interpolate across what it did not", `docs/adr/0033-weekly-saturated-session-low-stays-unknown.md:54-58`); and the parser doc comment at `src/usage.rs:473-474` (`UsageParse`). S10 amends each (§ 10.10).
+
+**Consumer counts the argument rests on** (the report's, at `a232a39`; the parse path, model, wire, Swift mirror and fixtures are byte-identical at `fd8640b`): 93 lexical production reads of a `.session` fraction across 13 files (31 `src/daemon.rs`, 22 `src/stats.rs`, 10 `src/swap.rs`, 8 `src/usage_store.rs`, 7 `src/usage_stats.rs`, 4 `src/daemon/records.rs`, 3 `src/daemon/snapshot.rs`, 2 `src/reliability.rs`, 2 `src/daemon/selection.rs`, 1 each `src/usage.rs`, `src/daemon/classify.rs`, `src/config/validate.rs`, `src/cli.rs`); the compiler, on a scratch copy with `Usage.session` lifted to `Option<f64>`, reports 33 production type errors in 6 files plus 125 in tests, and for `Usage.weekly` 17 in 9 files plus 120 in tests (lower bounds: one error per inference chain); `Usage {` literals sit almost entirely in test modules: two are in production code (`to_usage` at `src/usage.rs:191-192`, `plausible_session` at `src/swap.rs:705`); list them all with `git grep -n -E '(^|[^A-Za-z_])Usage \{' -- src`.
+
+**Fixture-lockstep counts** (re-counted at `fd8640b`): 27 lines at `"minor":14` in `apps/menubar/Tests/Fixtures.swift`; 14 sites across both spellings in `apps/menubar/Tests/WireDecoderTests.swift`; one `"minor":15` "future daemon" frame at `apps/menubar/Tests/WireDecoderTests.swift:325` that stops being future on the bump; five wire goldens `build/fixtures/wire-heartbeat-basic.json`, `wire-snapshot-basic.json`, `wire-snapshot-canonical-scrub.json`, `wire-snapshot-expiry.json`, `wire-snapshot-next-swap.json`; 31 CLI render goldens under `build/fixtures/cli-renders/`, 9 of which carry `n/a`; 98 Session meters in `apps/menubar/design/menubar-preview.html` and no row without one.
+
+**Tree values an implementer would otherwise invent** (pinned by no source; stated so nobody guesses): `DEFAULT_SESSION_CEILING = 95` (`src/config.rs:152`); `DEFAULT_WEEKLY_CEILING = 98` (`src/config.rs:166`), whose effective line at defaults the report derives as `0.97`; the operator's session floor `target_max_session_usage = 80` (the operator's `config.toml`, per the report; not readable here); `BLIND_GATE_SECS = 300` (`src/daemon.rs:370`); `BLIND_GATE_RISK_BAND = 0.60` (`src/daemon.rs:401`).
+
+### 2.5 Benefit hypothesis
+
+> **Owed by the operator.** Not written by the pipeline; a recommended wording was returned with this document.
+
+## 3. Boundaries
+
+### 3.1 Appetite — tranche 0 and tranche 1's budget set by the maintainer; tranche 2 and S11 pipeline-proposed, ratification-pending
+
+| Tranche | Size | Justification | Circuit breaker | Uncertainty |
+|---|---|---|---|---|
+| 0 — hot-fix (#1613; not one of the twelve) | **As soon as possible**; deployed to the operator's machine before it merges (maintainer, 2026-11-01; note 1) | The maintainer's known path to a working daemon now. A weekly-only reply is served with session `0.0` and no session stamp or severity, and no sample is stored for it, so the weekly reading returns without waiting for the `Option` lift. The accepted costs and the narrowing that bounds them are in § 3.3. | **Tranche 1 supersedes it**: #1596 removes the weekly-only branch and both flags, and #1598 replaces the sample skip with a `"session":null` line. Invalidated if tranche 1 merges and deploys first. | The same single capture as tranche 1 (A-1): the reply shape of the other 14 dark accounts is inferred, not captured. |
+| 1 (S1–S5, S7, S10, S12's live deploy #1604, and S8's reader half) | **Budget: the human effort-day estimate the coverage gate sized, about 34.5 human effort-days**, no longer one calendar week (maintainer, 2026-11-01; note 1) | The proper fix that retires tranche 0's accepted costs; the solution shape is proven (a scratch prototype of the `Option` lift passes Oracles A–D, `9 passed; 0 failed`); the compiler enumerates the consumers. | **Extend with justification** — one further small batch. "Ship what is done" does not apply: S1–S3 are one compile unit. The fabricating shortcut (`session = 0.0`) is **never** tranche 1's fallback; its one sanctioned use is tranche 0 (#1613), by the maintainer's decision (§ 3.3). | Low on the parser and model; moderate on the decision arms (three open defaults, D3/D4/D7). |
+| 2 (S6, S8, S9, and S12's runbook text #1603) | **Small batch**, 1–2 weeks | Wire and offline-verb representation plus a design amendment; independent of each other. The runbook text joins from tranche 1 (note 4); the tranche-2 deploy is #1608. | **Ship what is done** — the three are independent. | Moderate: S6 sits in the 1.15 minor queue (§ 7); S8's representation is D8. |
+| waits (S11) | **Not sized** until D0 is answered | The register rule forbids building against an unclassified state (§ 10.11). | — | High until classified. |
+
+**Notes on the table (added 2026-11-01 after the Stage 3.7 coverage gate; notes 1 and 4 written the same day from the maintainer's answers).** (1) *Tranche 1's budget, and the hot-fix path.* The gate sized tranche 1 by its human effort-day ladder at about 34.5 days and read the earlier one-calendar-week target as an overflow (finding B1). The maintainer was asked whether tranche 1 could stay "merged and deployed within one calendar week" at that sizing, and answered on 2026-11-01, verbatim: "Bigger budget, but we need a known path to have a hot-fix for the issue as rugiht now sessiometer is unsuable". Two decisions follow. Tranche 1's budget is re-set to the human effort-day estimate the gate sized, no longer one calendar week, so finding B1 no longer stands. A hot-fix path is added as tranche 0 (#1613). The maintainer then added, verbatim: "The hotfix must happen ASAP and local daemon rebuilt-restarted so that you can continue working". Tranche 0 is therefore deployed to the operator's machine before it merges. Its mechanism, its accepted costs and its retirement are in § 3.3. Measured context, not the budget: of the last 25 merged pull requests (2026-09-03 to 2026-10-30), the median merged 1.2 hours after it opened, 19 within 6 hours and 21 within 24 hours. The critical path of tranche 1 runs in sequence: the oracles (#1591), the fixture pins (#1592), the compile unit (#1596 + #1597 + #1602), the sample store with the readers it forces (#1598 with #1600, one pull request), then the deploy (#1604). (2) *S8's reader half rides tranche 1.* #1598's `Option` lift of the sample fields forces the five sample readers to move in the same pull request, so #1600 is tranche 1 by compile necessity; S8's wire half (#1601) stays tranche 2 unless D8 / OAD-3 moves it. (3) *Tranche 2 by the same ladder.* #1595, #1599 and #1601 size at about 13 human effort-days, above the one-to-two-week appetite; its breaker, ship what is done, applies because the three are independent of each other. (4) *S12 splits across two tranches.* The maintainer was asked whether the runbook text item (#1603) must gate the tranche-1 deploy (#1604) and answered on 2026-11-01, verbatim: "Yes, after deploy (Recommended)". #1603 therefore moves from Must in tranche 1 to Should in tranche 2 and lands after the deploy. #1604 follows #1603's text where it has merged and the runbook's current text otherwise. The tranche-2 sizing in note 3 covers the three items named there and does not include #1603.
+
+What not acting costs: every poll cycle the daemon cannot rotate; the window closes a little more each day as more accounts are verified. Without tranche 0 the fleet stays blind until tranche 1 deploys, and the maintainer's own word for the daemon in that state is "unsuable". Without tranche 1, tranche 0's accepted costs stand (§ 3.3): a `0%` session on the status wire and the panel, session tokens of `0` in the event log, and no stored usage sample for a weekly-only account.
+
+### 3.2 In scope, and the separability the urgency demands
+
+The twelve components of § 0. **S1–S5 are separable from the wire, stats, design and render work**, with two couplings the tree imposes, stated so nobody discovers them at the compiler:
+
+1. **The sample writer must decide on day one.** `append_sample_for_poll` passes `reading.usage.session` into `Sample::new` (`src/daemon.rs:718-754`). Once the model carries an absent window the writer must write `null`, write a number, or write no line. Writing a number is forbidden (§ 3.3); writing no line loses the weekly reading of a healthy poll and contradicts the gap-honesty rule, which reserves "nothing" for a failed poll. So S7 — the `null` write, the tolerant reader, compaction retention and the tier-fold guard — is in tranche 1. Tranche 0 (#1613) takes the third option as a stated interim: it writes no line for a weekly-only reading. The compile unit keeps that interim, re-keyed on a `None` fraction for either window, so it compiles without S7; S7 lands in the next pull request (#1598, with #1600) and replaces the skip with the `null` line (§ 3.3). The re-keyed interim never runs on the operator's machine, because tranche 1's deploy (#1604) waits on S7. Pipeline-decided by elimination, ratification-pending (§ 12 A-7).
+2. **The wire must carry something on day one.** `session_pct` maps from the same reading (`src/daemon/snapshot.rs:999-1002`). Whether tranche 1 may ship a documented **transitional** wire state (`session_pct: null` beside a present `weekly_pct`, under `1.14`, no new key) with S6 following in tranche 2, or whether S6 is part of tranche 1, is **D10** (§ 8) — open, with the pipeline's recommendation stated there.
+
+### 3.3 Out of scope — with the reason each is excluded
+
+**Deferred — not yet, with what reopens each** (sibling issues filed while scoping are each Related to #1590 and none is a child; they are marked below, and the rest are candidates the operator may add):
+
+| Item | Why deferred | What reopens it |
+|---|---|---|
+| C2 — the `usage_gap` event names no cause (a parse failure and a 5xx gap read alike) | Observability finding outside this goal | Filed as #1609 while scoping; the next log forensics that needs the cause |
+| C3 — blind peers are never slow-polled, so rejected accounts draw full-cadence requests | Polling finding outside this goal; bears on #1309's 429 question | Filed as #1612 while scoping, narrower than C3 as worded here: #1612 slow-polls a peer whose polls keep ending in a 403, another rejected 4xx, an unparseable body or an unreadable token, because peers blind from a 429 or 5xx already back off. What reopens it: a 429 attributable to blind-peer cadence |
+| C7 — `PolledReading.severity` is `None` for every top-level-shape reply, because `dimension` reads the top-level object (no `severity`) before `limits[]` (`src/usage.rs:553-557`, `fraction_of`) | Latent, pre-existing, outside this goal; Oracle A pins today's `None` deliberately so the two defects are not conflated | Filed as #1606 while scoping (read a window's severity from its `limits[]` entry when the top-level window object has none) |
+| C9 — ADR-0013 `:142` cites `emergency_swap_escapes_a_dead_active_ignoring_the_floor` at the wrong path (it lives in `src/daemon/keep_warm.rs:1159`) | Trivial docs fix, separate | Filed as #1607 while scoping (ADR-0013's drifted code pointers) |
+| C10 — `active-account-observation-continuity` R-8 (`docs/requirements/active-account-observation-continuity.md:267`) is violated at HEAD by this very symptom; its design records it UNCOVERED and unfiled (`docs/design/active-account-observation-continuity-solution-design.md:402`) | A standing gap in a neighbouring PRD; this fix removes today's instance without filing the general item | Filed as #1611 while scoping (keep a viable peer visible to swap-target selection when its usage poll fails — the `active-account-observation-continuity` R-8 gap) |
+| C6 / D9 — PR #1537's claim that an active `weekly_scoped` cap can be the binding weekly limit | A second, independent defect in the same `dimension` lookup with an open PR; D9's default leaves it with #1537, and this parser rework does not absorb it (§ 8) | A D9 ruling for its other arm ("the parser rework absorbs it"), or #1537 closing without landing its claim |
+| The parser gives the same `None` for a window the reply does not carry and for one it carries in a shape it cannot read (a renamed `utilization`, a string where a number belongs, a `limits[]` entry without `percent`); the hot-fix (#1613) and #1596 both serve that `None` as "no such window" | A decision for the maintainer, raised after #1613's mechanism was designed; #1596 keeps `dimension` unchanged so the decision is not pre-empted | Filed as #1614 while scoping, with the two answers and their costs; the maintainer's ruling |
+| The weekly-anchor blind arm (should a weekly anchor arm ADR-0017's preemptive swap for a weekly-only active?) | An ADR-0017 amendment question, not this fix (D3) | The operator opens the amendment |
+| Amending REQ-USG-B-001 in the private HQ | Not reachable from a clone; owed by the operator (§ 7) | The operator edits the HQ |
+
+**Explicitly not building — never, with why**:
+
+| Item | Why never |
+|---|---|
+| Fabricating `session = 0.0` (or `session = weekly`) for an absent window | Lies on every measurement surface and writes an irreversible `"session":0.0` to the store; byte-identical to an idle window the tree already holds (the API omits `session_resets_at` on most zero-session readings, `src/swap.rs:595-597`); `session = weekly` would exclude a weekly-only spare at the viability floor and fire swaps attributed `reason=Session` (`SwapReason` at `src/daemon.rs:4588-4592`) **Never for tranches 1 and 2; one exception, tranche 0 (#1613), below the table.** |
+| A flag beside an unchanged `Usage.session: f64` | Must be consulted at all 93 production reads or the fabricated value stands where it is not **Never for tranches 1 and 2; one exception, tranche 0 (#1613), below the table.** |
+| Reusing `session_pct: null` to mean "no session window" | The wire defines `null` as "the last poll for this account failed (never a fabricated `0`)" (`session_pct` at `src/daemon/snapshot.rs:758-763`); the Swift decoder documents the same (`sessionPct` at `apps/menubar/Sources/WireModel.swift:648`); nine CLI goldens pin the `n/a` rendering. See D10 for the transitional state, which is documented as transitional, never redefined |
+| Reading `/api/oauth/profile` | Carries no per-account window signal; opens a second egress endpoint, moving the oracle `the_sole_egress_endpoint_is_the_documented_usage_url` at `src/usage.rs:1593-1608`; gated by #737 |
+| A keep-warm rule change | Keep-warm's non-test code reads no quota-session value (`should_keep_warm_retry` at `src/daemon/keep_warm.rs:44` keys on `Unauthorized` only); the fix restores a correct liveness class by itself |
+| A `reliability` rule change | A weekly-only account produces no `reason=session` swaps; `session_blocked` reads false (`src/usage_stats.rs:1055-1057`); `compute_landing` treats an absent reading as unmeasured (`src/reliability.rs:2138`) |
+| Platform-specific work (#26, #27, the credential stores) | The parse path, classifier, selection and store carry no target-specific code; the change is platform-neutral (Linux stays un-gated in CI) |
+| A `log --json` schema change | The `log` wire carries the line's own tokens, so an omitted token reshapes nothing (`reliability --json` does move, 13 → 14: its blind-window census gains a disclosed no-session-window bucket so the #484 exact partition holds — #1602 Specification § 3) |
+
+**The single exception to the first two rows: tranche 0 (#1613).** Both rows stay never for tranches 1 and 2. For tranche 0 alone, the maintainer decided on 2026-11-01 that a hot-fix path exists (§ 3.1, note 1, which quotes the decision verbatim). The mechanism below is the scoping pipeline's design under that decision, ratification-pending: the maintainer ordered a hot-fix, not this mechanism or each of its costs.
+
+*What the hot-fix does.* In `parse_usage`, a reply whose session window is absent and whose weekly window is present returns `Ok` with `session: 0.0`, no session reset stamp, no session severity, and a private flag `UsageReport.session_absent = true`. A reply with both windows absent returns `Err(UsageParse)` as today, and so does a reply with the weekly window alone absent. `PolledReading` gains `pub(crate) session_window_absent: bool`, set from the report. `append_sample_for_poll` returns early on it, so no sample line is written for such a reading: a gap, never a stored zero. The flag is consulted only there. The doc comment of `parse_usage` states the exception.
+
+*The narrowing.* The first row's irreversible harm is a `"session":0.0` line in the store. The hot-fix writes no sample, so nothing irreversible reaches the store. The flag is consulted only by the sample writer, and #1596 and #1598 remove it. Every other read sees the `0.0`, which is costs (a) and (b) below. One wider narrowing was weighed and rejected: consulting the flag at the status wire and the event emitters as well, so that costs (a) and (b) would not arise. Each added consultation is one more read site audited by hand on the urgent path — the flag-beside-`f64` cost the second never-row names — while the store is the only sink where the fabrication is irreversible; consulting the flag at the sample writer alone bounds the irreversible harm at the smallest diff, and the `Option` lift of tranche 1, not a wider hot-fix, is what reaches every read site. ADR-0033 is not breached: it governs the stats census, and the hot-fix stores no sample, so the census never sees its `0.0`.
+
+*Costs, ratification-pending with the mechanism; tranche 1 retires (a)–(d), and (e) stands until #1614 is ruled.* (a) The status and watch wire and the panel show `0%` session for a weekly-only account. (b) Event-log lines that carry a session token (swap, `usage_velocity` and blind events) read `0`, so `reliability` over the hot-fix window reads them as idle sessions. (c) No usage sample is stored for such an account while it serves; `stats` shows a gap, never a zero, and a gap reads as a missed poll. (d) The usage-gap tracker counts such a poll as a reading, because `maintain_stats_store` keys on `polled.is_err()`: the account's gap streak clears and no `usage_gap` event is logged, although the store holds no sample for it. (e) A session window the reply carries but the parser cannot read is served as no window, like an absent one (#1614).
+
+*Retirement.* #1596 removes the weekly-only branch and both flags. #1598 replaces the sample skip with a `"session":null` line. #1591 names #1613 where its RED proof reads differently.
+
+*Oracles.* #1591's oracles stay `#[ignore]`d, so CI stays green. Against the hot-fix, Oracle A passes (#1591 states that the fabricating mutant passes A), Oracle B fails on its session-window assertion (`Some(0.0)`) instead of on the parse error, Oracle C stays green, and Oracle D still fails on the weekly parse error.
+
+*Deployment and validity.* Tranche 0 is deployed to the operator's machine before it merges. It is invalidated if tranche 1 merges and deploys first.
+
+## 4. Success Criteria
+
+> **Pipeline-derived candidates, pending ratification.** Derived at Phase 6 from the objects and calls to action in § 9 and the operator's stated outcome ("the accounts without 5h limits are crippled"). Each is a candidate the operator may strike or reword.
+
+**Serves**: the daemon can see, sample, select and rotate onto every enabled account whose credential is healthy, whatever quota windows its plan carries.
+
+**North-star candidate** — `MET-NSM-001 FleetReadingCoverage`: the share of enabled, healthy-credential accounts whose latest `status --json` row carries a served reading (`weekly_pct` non-null) — the one SCALE this tag carries here, in MET-T-001 and in REQ-DEP-Q-001. Value test: doubling it means the daemon can see twice as much of the fleet. Baseline 2 of 17 (2026-11-01T07:18:54Z).
+
+### Leading indicators (within two weeks of deployment)
+
+| ID | Metric (Planguage) | Type |
+|---|---|---|
+| MET-T-001 | TAG `FleetReadingCoverage` · SCALE enabled accounts with `weekly_pct` non-null over enabled accounts with `auth: "healthy"`, from `status --json` · METER one `status --json` read per poll cycle for three cycles after the relaunch that ends the runbook's procedure (quit the app and `sessiometer daemon stop`, rebuild, launch the rebuilt app) · PAST 2/17 · GOAL 17/17 by the second cycle · FAIL any healthy-credential account still `n/a` after three cycles · NOTE first met at the tranche-0 deploy; after the tranche-1 deploy the same measure is a no-regression check (PAST then 17/17), reported as counts, never as account labels | Leading |
+| MET-T-002 | TAG `SamplingResumption` · SCALE count of the 15 dark accounts with at least one new line in `usage-samples.jsonl` after the restart that deploys tranche 1 · METER `jq` over the store, keyed on `acct` and `ts` · PAST 0 · GOAL 15 within two poll cycles · FAIL any of the 15 with no line after three cycles · NOTE what tranche 1's deploy newly turns on: after the tranche-0 restart the count stays 0 by design, because the hot-fix stores no sample for a weekly-only reading (§ 3.3), and that 0 is not a FAIL; reported as a count, never as account labels | Leading |
+| MET-T-004 | TAG `CapacityVerdictHonesty` · SCALE `next_swap.state` while at least one enabled spare has a served reading with weekly headroom (its weekly fraction below the weekly line, REQ-ARM-B-001's sense) and a session window that either does not apply or is below its own line · METER `status --json` after the first full cycle · PAST `no_viable_target` with 15 unread accounts · GOAL not `no_viable_target` while such a spare exists; `no_viable_target` with `cause: weekly` naming a real blocked spare and its reset counts as met only while every enabled spare has a served reading and each is at or above the weekly line (none unread) · FAIL `no_viable_target` while an unread spare exists, or while a spare with weekly headroom and no applicable session window exists · NOTE first met at the tranche-0 deploy; a no-regression check at tranche 1's | Leading |
+
+### Lagging indicators
+
+| Window | ID | Metric | Type |
+|---|---|---|---|
+| 30 days | MET-R-001 | TAG `WeeklyOnlySelected` · SCALE count of swaps whose target is an account with no session window, over the UTC days on which (i) at least one swap fired, (ii) such an account had weekly headroom that day — a `usage-samples.jsonl` line dated that day with `"session":null` and `weekly` below the weekly line (REQ-ARM-B-001's sense) — and (iii) no two-window spare with weekly headroom carried an earlier `weekly_resets_at` at the swap's instant (REQ-ARM-B-012 ranks on that axis) · METER the event log's `event=swap` lines (`to=` names the target) joined to the store's `acct` through the roster (the log names an account two ways until #1616 lands), reported as counts · GOAL > 0 over the window · FAIL 0 while at least one day met (i)–(iii) (a selection defect; reopen D7/D3) · NOTE a window with no such day is unmeasured, not a FAIL: no swap at all, or every swap's soonest-weekly-reset winner being a two-window account, is correct selection under REQ-ARM-B-001 and REQ-ARM-B-012 | Lagging |
+| 60 days | MET-R-003 | TAG `GapStreaksOnHealthyAccounts` · SCALE `usage_gap` streaks per day on accounts with `auth: "healthy"` · METER streak starts per UTC day: distinct (`acct`, `since`) pairs of `usage_gap` lines, dated by `since`, counted when the account's last `credential_health` line before the streak's first `usage_gap` line reads `state=healthy` · PAST median 247 per day, range 165–339, over 2026-10-16..10-29 (measured from the operator's event log on 2026-11-01 and re-measured the same day with the meter printed below this table, which reproduced it; for comparison 80 on 10-30 and 18 on 10-31 — a streak that does not end adds no new start, so this count falls while accounts stay dark, and the days after 10-29 are no baseline; cause not attributable until C2) · GOAL 14-day median at or below 247, **and** on each of those days every enabled account whose last `credential_health` line that day reads `state=healthy` has at least one `usage-samples.jsonl` line dated that day, because a dark fleet starts no new streaks and must not pass · FAIL 14-day median above 247, or any day with such an account and no sample line | Lagging |
+
+**MET-R-003's meter, as run** (re-measured 2026-11-01 against the operator's event log; it reproduced the baseline's median, range and both later days). It prints counts only, never an account value:
+
+```python
+import re, sys, statistics, collections, datetime, pathlib
+log = pathlib.Path(sys.argv[1]).expanduser()       # ~/Library/Logs/sessiometer/sessiometer.log
+lo, hi = sys.argv[2], sys.argv[3]                  # inclusive UTC dates, e.g. 2026-10-16 2026-10-29
+kv = re.compile(r'(\w+)=(\S+)')
+last_state, seen, per_day = {}, set(), collections.Counter()
+for raw in log.open('rb'):
+    line = raw.decode('utf-8', 'replace')
+    if ' event=credential_health ' in line:
+        f = dict(kv.findall(line)); last_state[f.get('account')] = f.get('state')
+    elif ' event=usage_gap ' in line:
+        f = dict(kv.findall(line)); key = (f.get('acct'), f.get('since'))
+        if key in seen: continue
+        seen.add(key)
+        if last_state.get(f.get('acct')) == 'healthy': per_day[f['since'][:10]] += 1
+d0, d1 = datetime.date.fromisoformat(lo), datetime.date.fromisoformat(hi)
+counts = [per_day.get((d0 + datetime.timedelta(n)).isoformat(), 0) for n in range((d1 - d0).days + 1)]
+print('median', statistics.median(counts), 'min', min(counts), 'max', max(counts))
+```
+
+The `usage_gap` line's `acct` and the `credential_health` line's `account` carry the same identifier (every account seen in the first is seen in the second), which is what makes the join sound.
+
+### Implementation criteria (quality gates, not success indicators)
+
+Moved here on 2026-11-01 after the Stage 3.7 coverage gate: each grades the implementation — a test, a store invariant, a fixture sweep — rather than the operator's outcome. The decision gates below still cite them by ID.
+
+| Window | ID | Metric (Planguage) |
+|---|---|---|
+| before merge, then two weeks | MET-T-003 | TAG `NoFabricatedWindowValue` · SCALE count of surfaces (status table, status/watch wire, panel, sample line, `stats --json`, event log) on which an absent window appears as a number, the documented D8 interim on `stats --json` excepted until #1601 lands (under D8's "follow" arm #1600 keeps a zero session block on that wire and documents it: #1600 AC-7, test T8), and the tranche-0 hot-fix's `0%` and `0` displays excepted until tranche 1 deploys (§ 3.3) · METER Oracle B plus one test per surface (§ 10) · PAST n/a (no such reading exists today) · GOAL 0 · FAIL any |
+| before merge | MET-A-001 | TAG `OraclesRedThenGreen` · SCALE the four oracles' verdicts against `origin/main` and the fix branch · METER `cargo test` on each, filtered to the four tests, never `--include-ignored` · GOAL A, B and D RED on `origin/main`; C as D1 decides — green there under D1 (a), because today's tree already rejects a windowless body, with its RED proven against the mutant that fabricates both windows (#1591) — then GREEN×4 on the fix branch · FAIL A, B or D green on `origin/main`, or C green against that mutant |
+| 30 days | MET-R-002 | TAG `SampleStoreContinuity` · SCALE lines carrying `"session":null` lost between write and the next compaction · METER line count before/after each `compact_and_roll`, scoped to the shipped binary · GOAL 0 · CONSTRAINT loss caused by an older daemon's compaction run against the store is the D6 residual, recorded separately |
+| 90 days | MET-R-004 | TAG `WireLockstepHeld` · SCALE count of current-minor Swift fixture lines, goldens and the panel-golden drift line left stale after the S6 bump · METER the `swift` job plus an **armed** `panel-goldens` run (`TEST_RUNNER_SESSIOMETER_PANEL_GOLDEN_GATE=1`) · GOAL 0 stale · FAIL any |
+
+### Decision gates
+
+| Gate | Metric | Threshold | Decision |
+|---|---|---|---|
+| After the tranche-0 deploy: the first poll cycle. After tranche 1's deploy: three cycles, each one full roster sweep (about `2·poll_secs`), reading MET-T-001 as a no-regression check, MET-T-002 and MET-T-004 | MET-T-001; after tranche 1's deploy also MET-T-002 and MET-T-004 | 17/17; after tranche 1's deploy also each of the 15 dark accounts sampling, and an honest `next_swap`, each by its GOAL | Continue only when the deploy took (its `exe_mtime` check) and every listed metric meets its GOAL. A metric meets its GOAL only as its GOAL is worded: MET-T-001 and MET-T-002 by the second cycle; MET-T-004 as its GOAL words it, with `no_viable_target` met only under `cause: weekly` while every enabled spare has a served reading and each is at or above the weekly line — none unread (REQ-DEP-B-002). A metric that first meets its GOAL at the third cycle is recorded `late`: it is not met, and it takes its failure route below. *(Rule ratification-pending: decided by the orchestrator on 2026-11-02; amending the GOALs to admit late readings was rejected.)* Otherwise the deploy stands, with no rollback, and tranche 2 waits until a re-run of each failed metric meets its GOAL. Coverage below threshold: capture the quota fields of one still-dark account (never its identity) and compare against Oracle A's shape — a second shape is a new fixture, not a rollback. Sampling or capacity verdict below its GOAL: file a fix item under #1590. |
+| Two weeks | MET-T-003, MET-A-001 | 0 fabricated values (the documented D8 interim on `stats --json` excepted until #1601 lands); oracles green | Continue to tranche 2. A fabricated value anywhere reopens S3. |
+| 30 days | MET-R-001 | > 0 when headroom existed | Keep D7's default. 0 reopens D7 and D3. |
+| 90 days | MET-R-004 | 0 stale | Close S6. |
+
+## 5. Proposed Solution
+
+At sketch altitude; the mechanism is Stage 2's. Five operator scenarios the requirements in § 10 must make true:
+
+1. **The fleet recovers.** The operator quits the app, stops the daemon, rebuilds the bundle and launches the rebuilt app per the existing runbook, first with the tranche-0 hot-fix and then with tranche 1. At the hot-fix, within two poll cycles every healthy-credential account shows its weekly percentage and reset and `next_swap` names a real target or a real weekly hold; the session cell of a weekly-only account reads `0%` and no sample is stored for it (§ 3.3). At tranche 1, those weekly readings hold, the sample store resumes for all 15, and the session cell of a no-window account shows whatever D0 decides — and until D0 is decided, the failed-poll token, documented as transitional (D10), replacing the hot-fix's `0%`.
+2. **A mixed fleet rotates.** Ultra accounts with no session window and Pro/Max accounts with both compete on the same soonest-weekly-reset axis. A weekly-only spare passes both session gates by construction and is excluded only by its weekly value. A weekly-only **active** swaps away only on its weekly trigger; no swap is ever recorded with `reason=Session` for it.
+3. **A window reappears.** A not-yet-verified Ultra account carries a temporary session window, then loses it; a downgrade could bring one back. Every consumer re-derives per poll: the high-water mark, the velocity EMA and the pre-blind anchor stop acting as current readings when the window vanishes, and the next `Some` reading seeds a fresh window. No new durable per-account state.
+4. **A weekly-only account goes blind while active.** The ADR-0017 session gate has nothing to protect and reads false; `status` does not claim auto-protection on its strength. Whether a weekly anchor should arm a swap is an ADR-0017 amendment for the operator (D3), outside this fix.
+5. **The operator reads the record.** A sample line for a no-window account carries `"session":null` — the key written, never omitted — beside its weekly reading; readers tolerate it, compaction keeps it, the hour tier folds it without a `-∞`; `stats` does not render a zero session series as a reading (D8 decides whether its wire says so in tranche 1 or 2); `reliability` needs no rule change.
+
+Underneath: the parser reports `None` for a window it cannot find instead of erroring (the pipeline's recommended mechanism is `Option<f64>` on `UsageReport`, `Usage`, `LastGood` and `BlindAnchor` — `Copy` kept on the last three; `UsageReport` is `Clone` and never `Copy`, holding four `Option<String>`s — so the compiler enumerates every consumer); four pre-authored oracles land `#[ignore]`d and RED first; the records that say "both dimensions" are amended to "every dimension the account has"; the status wire gains one omittable per-account key under the next free `STATUS_SCHEMA_VERSION` minor with the Swift fixtures in lockstep; `#1232`'s unbuilt warm-up design reads the session **fraction's** absence, never the reset stamp's.
+
+## 6. Risks and Mitigations
+
+| # | Severity | Risk | Mitigation in this PRD |
+|---|---|---|---|
+| R1 | HIGH | **Open-PR and schema-minor contention.** PR #1537 (open since 2026-09-18, `CHANGES_REQUESTED` 2026-10-22) rewrites the weekly half of `parse_usage` (the `dimension` lookups at `src/usage.rs:507-508`) and adds `max_active_weekly_scoped`; PR #1588 (`CONFLICTING`) also moves `STATUS_SCHEMA_VERSION` 1.14 → 1.15 and touches `src/usage.rs`, `src/swap.rs`, `src/daemon.rs`, `src/daemon/snapshot.rs`, `WireModel.swift`, `Fixtures.swift` and all five goldens; PR #1538 edits the blind-swap seam in `src/daemon.rs` and ADR-0017; #1457, #1586 and #1587 also claim minor 15. | REQ-STL-C-001 binds S6 to the recorded queue rule ("whichever lands second takes the next minor"); § 7 names the coordination; D9 leaves #1537's defect with #1537. |
+| R2 | HIGH | **An invented session value** acted on by selection (`session_ceiling` … `is_none_or` at `src/daemon/selection.rs:252-253`), the trigger (`SwapDecision` at `src/swap.rs:129-134`) and the blind gate (`blind_gate_armed` at `src/daemon.rs:470-472`). | REQ-RPL-C-001, REQ-RDG-C-001 (no defaulting at any read site), Oracle B. |
+| R3 | HIGH | **An invented value written to disk**, breaking gap honesty (`append_sample_for_poll`, `src/daemon.rs:695-726`) and ADR-0033's "refuses to interpolate", landing a no-window account permanently in the weekly-saturated / session-low class. | REQ-SMP-B-001 writes `null`; MET-T-003. |
+| R4 | HIGH | **Silent data loss on the sample-line change.** `Sample.session` has no `serde(default)` while its optional siblings carry `skip_serializing_if` (`src/usage_store.rs:146-156`, `session_resets_at`); `read_samples` skips an unparseable record (`from_slice` at `src/usage_store.rs:457-465`); compaction rewrites the file from what it read (`read_samples` … `write_samples` at `src/usage_store.rs:535-544`). A daemon build that still requires `session` — any pre-#1598 bundle, the 2026-09-05 one and the #1613 hot-fix alike — erases session-less lines without a word when it compacts; an older `stats` or `reliability` only reads, and deletes nothing. | REQ-SMP-B-002; REQ-DEP-C-001 (no pre-#1598 build runs as the daemon against the store after its first `null` line, checked by ancestry before any rebuild); the rollup fence #1598 builds, which stalls an older daemon's compaction before it rewrites; D6, settled by council on 2026-11-02, records the residual. |
+| R5 | MEDIUM | **`session_pct: null` already has a meaning** (§ 3.3). | REQ-STL-I-001 adds a distinct key; D10 bounds the transitional state. |
+| R6 | MEDIUM | **The work crosses three of the four independent wires plus the versionless sample line.** `status`/`watch` (Swift mirror, 5 goldens, 27 + 14 + 1 fixture sites); `stats` (`JSON_SCHEMA_VERSION = 1` at `src/stats.rs:80`) whose Swift `StatsWire` has a non-optional `let session: StatsDim` (`apps/menubar/Sources/WireModel.swift:1010`); `reliability` (`JSON_SCHEMA_VERSION = 13` at `src/reliability.rs:264`) moves 13 → 14 in the compile unit's pull request for its census's no-session-window bucket (§ 3.3, § 15.3); `log` (`JSON_SCHEMA_VERSION = 2` at `src/log.rs:159-167`) untouched. | § 15.6 names each wire's disposition; D8 scopes the `stats` change. |
+| R7 | MEDIUM | **The scope's outer edge is partly inference.** Message 2 asks for a flexible parser with a weekly-less example; the reach into every consumer is the dispatching session's reading. | Every requirement carries `[AI-inferred-expansion]` unless it traces to a message; § 17 lists what is unratified. |
+| R8 | MEDIUM | **The state flips per account.** The stale-reading guard keys on `session_resets_at` (`src/swap.rs:651-665`); the warm-up design's C-1 reads `session_resets_at == None` as "clock stopped" (`docs/design/session-warmup-on-reset-solution-design.md:57`). | REQ-ARM-B-011 (per-poll re-derivation), REQ-REC-B-001 (S9). |
+| R9 | MEDIUM | **Deployment lag.** `cargo build` replaces nothing that runs; the running daemon is the bundle built 2026-09-05; the Developer ID identity named by `IDENTITY` at `apps/menubar/scripts/release-macos.sh:10` was not verified present (a `security` probe is forbidden to this run). | S12 reuses the existing runbook; MET-T-001 is the proof of deployment. |
+| R10 | LOW | **A second reply shape among the 14 uncaptured dark accounts** (an absent key instead of `null`; a `limits[]` entry of kind `session` with `is_active: false`; a null `percent`). One reply was captured; the other 14 are inferred from timing. | D2 pins null-vs-absent with a test; the first decision gate captures a still-dark account's quota fields. |
+| R11 | LOW | **Tests "fixed" by `Some(0.0)` wrappers**, so the 125 + 120 test sites assert nothing about the absent state. | REQ-RDG-C-001's per-arm `None` test; MET-T-003. |
+| R12 | LOW | Security and privacy: the usage reply alone carries the signal; no new egress; the fixture carries quota fields only. | § 15.1. |
+| R13 | none | Performance: one `serde_json::Value` walk per poll, unchanged. | § 15.4. |
+
+## 7. Dependencies
+
+| Ref | Title or seam | Relation |
+|---|---|---|
+| #1232 | (feat) daemon: opt-in session warm-up when a parked account's window has ended | S9 amends its PRD and design; its C-1 predicate opposes this PRD's reading of `session_resets_at == None` |
+| #1580 | (test) usage-store: pre-author the sample-carries-the-account-uuid oracle for #1562, RED before any fix | Its planned exact-key-set oracle `["account_uuid","acct","provider","session","ts","weekly"]` is satisfied by writing `"session":null` and RED if the key is omitted; `Sample` (`src/usage_store.rs:135-166`) carries no `account_uuid` field at `fd8640b`, so that oracle has not landed |
+| #1586 | (fix) status: blind active row shows n/a for weekly % and resets, not ~{last known} | 1.15 queue; blind-row rendering neighbour of S6/S11 |
+| #1587 | (feat) status: say when auto-protection will fire, not just "auto-protection OK" | 1.15 queue; D3's "do not claim auto-protection" touches the same readout |
+| #1457 | a 1.15 minor claimant (per the report's R1) | 1.15 queue |
+| #848 | stats: the capacity-holds cause split has no stated assignment rule | `session_blocked` reads false for a weekly-only account; no rule change |
+| #737 | canary: online /api/oauth/profile identity fetch — gated | The profile endpoint stays gated and unused |
+| #1309 | the 429 / polling-cadence question | C3 bears on it; out of scope here |
+| #726, #791, #1490 | capacity spike, weekly-anchor placement, fleet-sizing advisory | Neighbours; unaffected |
+| #1533 | (fix) daemon: a re-login of the already-active account clears last_good, disarming the blind-swap gate | `LastGood` (`src/daemon/records.rs:194-198`) changes shape under S3 |
+| #1613 | (fix) usage: hot-fix — serve a weekly-only usage reply instead of rejecting it, storing no sample for it, until #1596 lands | Tranche 0, a child of #1590 and outside the twelve design blocks; the maintainer's known path (§ 3.1 note 1, § 3.3); retired by #1596 and #1598; invalidated if tranche 1 merges and deploys first |
+| #1603, #1604, #1608 | the runbook text; the tranche-1 live deploy; the tranche-2 deploy | S12's split (§ 3.1 note 4): #1603 is in tranche 2 and lands after the tranche-1 deploy; #1604 stays in tranche 1 and follows #1603's text where it has merged; #1608 is the tranche-2 deploy |
+| #1609, #1612, #1606, #1607, #1611 | C2, C3, C7, C9 and C10 of § 3.3 | Filed while scoping; Related to #1590, none a child |
+| #1614, #1615, #1616 | a window the reply lacks versus one it carries but cannot read (§ 3.3); the `Tunables.poll_secs` doc comment's sweep cadence; one identifier per account on every event-log line | Filed while scoping; Related to #1590, none a child |
+| #1605, #1610, #1524 | the `Option<Window>` refactor; a per-axis sample count in the rollup tiers; the ADR README's Immutability bullet | Named so the record is complete. #1610 was absorbed into #1598 by the D6/D13 council ruling of 2026-11-02 (its `samples: Option<u32>` per present tier statistic ships in #1598's pull request, tranche 1); this PRD assigns neither of the other two to a tranche. #1593 relates to #1524 and does not wait on it: it follows the repository's existing in-place amendment practice, and a ruling against that practice would invalidate #1593 rather than delay it |
+| PR #1537, PR #1588, PR #1538 | parser weekly half; wire minor 1.15; blind-swap seam | Coordinate; never re-scope their work (R1) |
+| `docs/runbooks/replacing-the-running-daemon.md` | the deployment procedure (quit the app and `sessiometer daemon stop`; bundle rebuild with `release-macos.sh --sign-only`; launch the rebuilt app, which re-registers the agent; the confirm-what-is-serving step — `sessiometer daemon restart`, which runs `launchctl kickstart -k`, is the runbook's shortcut that does not re-register, never the deploy step) | S12 reuses it; the seed's "a runbook step under `docs/runbooks/`" is already delivered |
+| Private HQ `strategy/prd-0.1.0.md` REQ-USG-B-001 | "both dimensions" | Amendment owed by the operator, with the two messages of § 2.1 as provenance |
+| `CLAUDE.md` § Schema versions are four independent wires | "Additive means no bump" holds only where the new key is omittable via `skip_serializing_if` (`CLAUDE.md` § Schema versions are four independent wires); that an existing key changing meaning is a bump is this PRD's own reading, not `CLAUDE.md`'s | Binds S6 and D10 |
+
+## 8. Open Questions — decisions only the operator can make
+
+Each stays **open** except D6, settled by council on 2026-11-02 at the maintainer's delegation (its row records the ruling; the design's D13 was settled the same day). Where the investigation recorded a default, it is the pipeline's recommendation, ratification-pending. No requirement in § 10 assumes an answer; a requirement that depends on one says so by name.
+
+| ID | Decision | Options and what each costs | Pipeline recommendation | Owner |
+|---|---|---|---|---|
+| **D0** `render-no-window-classification` — the investigation's named blocker | Classify the no-session-window account row in `apps/menubar/design/README.md`'s register (the rule at `apps/menubar/design/README.md:1289-1291`: "an unclassified silence is not authority to invent. Classify it … before building against it") and name the CLI `status` SESSION%/RESET token for the same state | (i) **decided to be nothing**: the Session meter shows the expiry line's `—` OBSERVED-ABSENCE token, which the mock already says "is deliberately NOT `n/a`" (`apps/menubar/design/menubar-preview.html:1123-1126`) — cheapest, one register entry, a new panel fixture and a `Panel-Goldens-Rebaselined:` trailer; (ii) **as authored**: a mock frame for a weekly-only row — costs a mock edit plus the same gates; (iii) **genuinely open** — S11 stays parked and the transitional token stands. The CLI token follows the same classification; a token other than `n/a` costs `emit_cli_render_goldens` plus `CLI-Goldens-Rebaselined:` | None — the register rule forbids the pipeline inventing one | maintainer |
+| **D1** `parser-neither-window-decided` | A 200 reply with no applicable window at all | (a) hard `UsageParse` error as today — keeps "never swap on missing data", maps a 200 reply to `Transient`; (b) `Ok` with both windows absent — classifies `Live`, passes every viability filter, never swaps away, no dimension to name in a hold. No observable instance exists (Ultra keeps the weekly window) | (a); Oracle C pins the choice | operator |
+| **D2** `parser-null-versus-absent-key` | `"five_hour":null` versus an absent `five_hour` key | identical treatment (both fall through to the `limits[]` scan today, `fraction_of` at `src/usage.rs:553-557`) costs one test; different treatment costs a second fixture and a documented reason | identical; one test pins it | operator |
+| **D3** `blind-gate-weekly-only-active` | A weekly-only active blind for more than `BLIND_GATE_SECS` | default: the ADR-0017 gate reads false (nothing on the session axis to protect) and `status` does not claim auto-protection on its strength; arming on a weekly anchor is an ADR-0017 amendment outside this fix | the default | operator |
+| **D4** `near-limit-fast-poll-weekly-only` | The near-limit fast-poll band (`near_limit_fast_poll_engaged` at `src/daemon.rs:5826`; the floor read at `src/daemon.rs:5799-5804`, `plausible_active_usage`) for a weekly-only active | not applicable (the band is session-only), stated; or a weekly band, a new behaviour | not applicable, stated not accidental | operator |
+| **D5** `census-excludes-absent-window` | ADR-0033's session census over a roster with a weekly-only account | exclude a structurally absent window from the session census (one ADR-0033 amendment sentence); or hold the census UNKNOWN whenever such an account is present | exclude; the sentence lands with S10 | operator |
+| **D6** `store-readers-version-skew` | Which binaries count as supported readers of a store carrying `"session":null` | write `null`, every window key always written; the hazard is an older **daemon** run against the store (its compaction skips such lines and erases them; an older `stats` or `reliability` only reads and deletes nothing); the alternatives — a versioned sample line, a number plus an "absent" marker, a new sample-file name — each fail the same older compactor or split the store | **Settled by council, 2026-11-02** (three panels at the maintainer's delegation; the record is a comment on #1598): write `null`, amended with a rollup fence #1598 builds (`usage-rollup.json` becomes `{"format":2,"rollup":{…}}`, which a pre-#1598 build fails to read, so its compaction returns before it rewrites the raw file) and with the corrected deployment rule of REQ-DEP-C-001 | settled (council, at the maintainer's delegation) |
+| **D7** `mixed-fleet-tie-break` | On a soonest-weekly-reset tie, an absent session-velocity EMA | reads `0.0`, "the safest (lowest-velocity) landing" (`velocity_rate` at `src/daemon/selection.rs:135-143`), so a weekly-only spare is preferred over a climbing Max/Pro peer; or a neutral treatment that needs a new rule | `0.0`, stated for ratification; MET-R-001 watches it | operator |
+| **D8** `stats-wire-rides-first-or-follows` | Whether the `stats` representation of "no session window" (an optional `DimWire` at `src/stats.rs:2799-2803` or a sibling marker → a `stats` `JSON_SCHEMA_VERSION` bump, the Swift `StatsWire` mirror and `build/fixtures/wire-stats-basic.json`; or exclusion from the session figures) rides in tranche 1 or follows | rides first: tranche 1 grows by a wire change; follows: until it lands, `stats` renders a zero session series for a no-window account as a reading, which REQ-STS-B-001 forbids — so "follows" means accepting that interim defect knowingly | ride the **minimal half** first (do not render a zero series as a reading), decide the wire shape at Stage 2 | operator |
+| **D9** `weekly-scoped-binding-cap` | PR #1537's claim that an active `weekly_scoped` cap can be the binding weekly limit | the parser rework absorbs it (R1 contention grows); or #1537 carries it (default) | #1537 carries it (C6) | operator |
+| **D10** `urgent-tranche-wire-interim` — pipeline-identified | Whether tranche 1 may ship before S6 with a documented **transitional** wire state: `session_pct: null` beside a present `weekly_pct` and `weekly_resets_at`, under `STATUS_SCHEMA_VERSION 1.14`, no new key, the `session_pct` doc comment amended to name the transitional meaning | ship transitional: tranche 1 does not wait for the 1.15 queue; the CLI and the 1.14 app render the session cell exactly as they do for a failed poll (`n/a`), replacing the tranche-0 hot-fix's `0%` while the weekly figures stay, and the Swift app decodes without edit (`decodeIfPresent` at `apps/menubar/Sources/WireModel.swift:704`); cost: for those days a healthy no-window account reads like a failed session poll on the session cell, which the mock's own rule calls a misreport; **or** S6 in tranche 1: no misreport, at the price of the 1.15 queue, 27 + 14 + 1 fixture edits and five goldens on the urgent path | ship transitional, with S6 landing in tranche 2 and the amendment to the `session_pct` doc comment reverting with it | operator |
+
+## 9. Object Model
+
+### 9.1 Objects
+
+| Object | Identity | Description (the operator's mental model) | Lifecycle |
+|---|---|---|---|
+| **UsageReply** | one HTTP 200 body per poll of one account | what Anthropic says about the account's quota right now | received → parsed (served, or rejected) → discarded |
+| **QuotaWindow** | (account, kind ∈ {session, weekly}) | one quota meter the account's plan carries — or does not | applies (fraction, reset, severity) ↔ does-not-apply; re-derived every poll |
+| **Reading** | one per successful poll per account (`Usage` / `PolledReading`) | the two windows the daemon decides on, plus sample-only fields | fresh → stale (no newer poll) → cleared on a failed poll; the active account's last good reading is retained as `LastGood` |
+| **DecisionArm** | one per rule that reads a Reading: selection, swap triggers, velocity projection, all-exhausted relief, blind gate, near-limit band, `use` gate, keep-warm, warm-up (unbuilt) | what the daemon does with a reading | evaluated per tick |
+| **StatusLine** | one per account per `status` reply or `watch` frame (`AccountStatusLine`, with its `BlindActive` block) | the row the operator and the panel read | emitted per request or heartbeat |
+| **Sample** | one line per successful poll (`usage-samples.jsonl`) | the durable record the offline verbs read | appended → retained → folded into hour/day tiers by compaction |
+| **StatsReport** | one `stats --json` document | the roster-wide and per-account figures | computed on demand from Samples |
+| **DesignRecord** | ADR-0013, 0017, 0025, 0033; the parser doc comment; the warm-up PRD and design; the HQ's REQ-USG-B-001 | the written premises the code implements | accepted → amended in place (original `date:` kept, `**Amended**` paragraph added, README index row updated) |
+| **Oracle** | Oracles A–D, one test each | the executor-uneditable judge of the parser's behaviour | authored → proven RED (A, B and D on `origin/main`; C against the fabricating mutant) → landed `#[ignore]`d → un-ignored by the fix |
+| **Fixture** | the captured quota fields; the `weekly_scoped` entry; a session-only body; a windowless body | the bodies the parser tests feed | added once; never re-baselined |
+| **Deployment** | the bundle serving on the operator's machine | the build that is actually running | launched (the 2026-09-05 build, then the #1613 emergency build) → quit and stopped → rebuilt → relaunched → verified |
+| **RenderCell** | the panel row's Session meter; the CLI SESSION%/RESET cells | where the operator sees the state | unclassified (today) → classified by D0 → rendered |
+
+### 9.2 Relationships
+
+| From | To | Type | Cardinality | Navigation |
+|---|---|---|---|---|
+| UsageReply | QuotaWindow | contains | 1 : 0..2 | reply → the windows it carries (always) |
+| Reading | QuotaWindow | contains | 1 : 2 (each applies or does not) | reading → session, weekly (always) |
+| Reading | UsageReply | references | 1 : 1 | reading → the body it was parsed from (debug only) |
+| DecisionArm | Reading | references | N : 1 | arm → the active or candidate reading (always) |
+| StatusLine | Reading | references | 1 : 0..1 | line → the latest reading, or none |
+| Sample | Reading | references | 1 : 1 | sample → the reading it recorded (by `ts`) |
+| StatsReport | Sample | contains | 1 : N | report → the samples it folded |
+| Oracle | Fixture | references | 1 : 1..2 | oracle → the body it feeds |
+| Oracle | UsageReply | references | 1 : 1 | oracle → the captured shape |
+| DesignRecord | DecisionArm | references | N : N | record → the arms it governs |
+| Deployment | Reading | contains | 1 : N | the running build → the readings it produces |
+| RenderCell | StatusLine | references | 1 : 1 | cell → the line it renders |
+
+### 9.3 CTA inventories
+
+Each object carries Create, View, Edit (re-derive) and Delete (or its reasoned absence), plus its domain verbs. Feature is the component slug; `—` marks an object-local action.
+
+**UsageReply** — Receive (poll loop; precondition: a healthy credential; outcome: a body) · **ParseReply** (S1, S2; precondition: a JSON body; outcome: a Reading with each window applies / does-not-apply, or `UsageParse` per D1) · View: none (never logged; privacy) · Edit: none (immutable) · Delete: discarded after parse.
+
+**QuotaWindow** — **ClassifyWindow** (S1, S2; from the top-level object or a `limits[]` entry of a known kind; outcome: applies with fraction/reset/severity, or does-not-apply) · **SkipUnknownKind** (S1; an entry of an unlisted kind is neither a failure nor a window) · View: via StatusLine · Edit: re-derived per poll · Delete: n/a (re-derived).
+
+**Reading** — **ProjectReading** (S3; `UsageReport` → `Usage`, each window carried as applies or not) · **RetainLastGood** (S3; the active account's last good reading) · **ClearOnFailedPoll** (—; `last_reading` cleared, `last_good` retained) · View: StatusLine, Sample · Delete: cleared.
+
+**DecisionArm** — **SelectTarget** (S3) · **DecideSwap** (S3) · **ProjectVelocity** (S3) · **RelieveAllExhausted** (S3) · **ArmBlindGate** (S3; D3) · **GateNearLimit** (S3; D4) · **ServeUseVerb** (S3) · **ClassifyLiveness** (S3; no code change) · **KeepWarm** (—; unchanged) · **WarmUp** (S9; unbuilt) · Create/Edit/Delete: n/a (rules, not records).
+
+**StatusLine** — **EmitStatusReply** (S6) · **EmitWatchSnapshot** (S6) · **EmitWatchHeartbeat** (S6) · **ProjectBlindActive** (S6; `BlindActive`) · View: CLI table, panel · Edit/Delete: n/a.
+
+**Sample** — **AppendSample** (S7) · **ReadSamples** (S7) · **CompactAndRoll** (S7) · **FoldIntoTiers** (S7) · View: `stats`, `reliability` · Delete: aged lines rolled into tiers.
+
+**StatsReport** — **ComputeDimStats** (S8) · **EmitStatsWire** (S8; D8) · **ComputeLanding** (—; unchanged) · View: `stats --json`, the panel's stats pane.
+
+**DesignRecord** — **AmendAdr** (S10; in place) · **RewriteParserDoc** (S10) · **AmendWarmupDesign** (S9) · **NoteHqAmendmentOwed** (S10) · View: `docs/adr/`, `docs/requirements/`, `docs/design/` · Delete: never (records are amended, not removed).
+
+**Oracle** — **AuthorOracle** (S5) · **ProveRed** (S5; A, B and D against `origin/main`, C against the fabricating mutant) · **LandIgnored** (S5) · **UnIgnore** (S1, S2; by the fix item) · Edit: never by the executor · Delete: never.
+
+**Fixture** — **AddNullSessionFixture** (S4) · **AddWeeklyScopedEntry** (S4) · **AddSessionOnlyBody** (S4; Oracle D) · **AddWindowlessBody** (S4; Oracle C) · View: `src/usage.rs` `mod tests` · Edit: never (a captured shape) · Delete: never.
+
+**Deployment** — **RebuildBundle** (S12) · **Relaunch** (S12; quit the app, `daemon stop`, launch the rebuilt app) · **VerifyFleetRecovery** (S12) · View: the runbook's confirm step · Delete: n/a.
+
+**RenderCell** — **ClassifyState** (S11; D0, maintainer) · **RenderPanelMeter** (S11) · **RenderCliCells** (S11) · **RebaselineGoldens** (S11) · Edit/Delete: per the goldens' own rules.
+
+### 9.4 Attribute priority (the four objects the operator reads)
+
+| Object | Attribute | Type | Priority | Display context |
+|---|---|---|---|---|
+| QuotaWindow | applicability | applies / does-not-apply | Primary | status table, panel meter, sample line, stats |
+| QuotaWindow | fraction | `[0.0, 1.0+]` or absent | Primary | status table, panel meter |
+| QuotaWindow | resets_at | epoch seconds or absent | Primary | status RESET cell, panel reset label |
+| QuotaWindow | severity | provider string or absent | Tertiary | sample line only (C7 limits its provenance) |
+| Reading | session, weekly | QuotaWindow × 2 | Primary | every decision arm |
+| Reading | observed_at | monotonic instant | Metadata | velocity, staleness |
+| StatusLine | session_pct, weekly_pct | `Option<u8>` | Primary | CLI, panel |
+| StatusLine | "no session window" marker | new omittable key (S6) | Primary | CLI, panel; decoded by `WireModel.swift` |
+| StatusLine | blind_active.last_known_session_pct | required `u8` today (`last_known_session_pct` at `src/daemon/snapshot.rs:167`; `lastKnownSessionPct: UInt8` at `apps/menubar/Sources/WireModel.swift:499`) → optional (S6) | Secondary | the `~N%` blind row |
+| Sample | session | `null` or fraction | Primary | the offline verbs |
+| Sample | weekly, weekly_resets_at | fraction, epoch | Primary | the offline verbs |
+
+### 9.5 Entity-Feature Matrix
+
+Cells count CTAs at the intersection; `—` is no interaction.
+
+| | S1 | S2 | S3 | S4 | S5 | S6 | S7 | S8 | S9 | S10 | S11 | S12 | Total |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| UsageReply | 1 | 1 | — | — | 1 | — | — | — | — | — | — | — | 3 |
+| QuotaWindow | 2 | 1 | — | — | — | — | — | — | — | — | — | — | 3 |
+| Reading | — | — | 2 | — | — | — | — | — | — | — | — | 1 | 3 |
+| DecisionArm | — | — | 8 | — | — | — | — | — | 1 | — | — | — | 9 |
+| StatusLine | — | — | — | — | — | 4 | — | — | — | — | 1 | — | 5 |
+| Sample | — | — | — | — | — | — | 4 | — | — | — | — | — | 4 |
+| StatsReport | — | — | — | — | — | — | — | 2 | — | — | — | — | 2 |
+| DesignRecord | — | — | — | — | — | — | — | — | 1 | 3 | — | — | 4 |
+| Oracle | 1 | 1 | — | — | 3 | — | — | — | — | — | — | — | 5 |
+| Fixture | — | — | — | 4 | 1 | — | — | — | — | — | — | — | 5 |
+| Deployment | — | — | — | — | — | — | — | — | — | — | — | 3 | 3 |
+| RenderCell | — | — | — | — | — | — | — | — | — | — | 4 | — | 4 |
+| **Total** | 4 | 3 | 10 | 4 | 5 | 4 | 4 | 2 | 2 | 3 | 5 | 4 | 50 |
+
+No cell is claimed by two features. The widest column is S3 (Reading and DecisionArm), which is where the open defaults D3, D4 and D7 sit; the sparsest objects (StatsReport, Deployment) are well-encapsulated.
+
+## 10. Requirements
+
+Every requirement is identified `REQ-`, the object's abbreviation, the layer letter (B behavioural, Q quality, C constraint, I interface) and a three-digit number — `REQ-RPL-B-001` is the first behavioural requirement on UsageReply, carries its EARS pattern, its origin tag (`[user-stated]` only where it traces to a message in § 2.1; `[AI-inferred-expansion]` otherwise), its confidence, and acceptance criteria with a BUT NOT. Each is **ratification-pending** (§ 17). Line citations are at `fd8640b`. The requirements bind tranches 1 and 2; tranche 0 (#1613) is outside them, and its one departure from REQ-RPL-C-001 and REQ-RDG-C-001 is recorded in § 3.3. Where an acceptance block carries only BUT NOT clauses, the EARS statement is the acceptance — its trigger or state is the Given and When, its "shall" clause the Then — and the BUT NOT names the fabrication or regression that fails it. A statement that joins more than one response grades each response on its own; where the responses are graded by different tests or at different deploys, they are lettered and the acceptance names the letter each clause grades.
+
+### 10.1 S1 `parser-serves-null-session-window` {#feature-parser-serves-null-session-window}
+
+**REQ-RPL-B-001 — a null session window is served, not rejected.** *Event-Driven.*
+When `parse_usage` receives a 200 reply whose `five_hour` is JSON `null` and whose `limits[]` carries no entry of kind `session` or `five_hour`, the daemon shall return a served reading in which the session window **does not apply** and the weekly window carries the reply's weekly fraction, reset and severity. Origin `[user-stated]` (message 1) + `[AI-inferred-expansion]` for the form. Confidence `[VALIDATED]` (live capture). Object UsageReply · CTA ParseReply.
+
+> **Given** the captured quota fields of § 2.2, verbatim (fixture-grade: `"five_hour":null`; the `seven_day` object with `"utilization":90.0` and `"resets_at":"2026-11-06T22:59:59.916061+00:00"`; the two-entry `limits[]` with `weekly_all` active at `percent 90` and `weekly_scoped` inactive at `percent 12`), **When** `parse_usage` runs, **Then** it returns `Ok`; the weekly fraction is `0.90 ± 1e-9`; `weekly_resets_at` is `"2026-11-06T22:59:59.916061+00:00"`; the weekly severity is `None` (the top-level object carries none — C7, pinned deliberately so the two defects are not conflated); the session window is marked not applicable. **BUT NOT** `Err(Error::UsageParse(_))`; **BUT NOT** a session fraction of `0.0` or any number; **BUT NOT** the weekly fraction read from the `weekly_scoped` entry (`0.12`); **BUT NOT** a `resets_at` for the session window.
+
+**REQ-QW-B-001 — unknown `limits[]` kinds stay inert.** *Ubiquitous.*
+A `limits[]` entry whose `kind` is in no window's alias list (`weekly_scoped` today; any future kind) shall neither fail the parse nor be read as the session or the weekly window. Origin `[AI-inferred-expansion]` (today's behaviour at `src/usage.rs:563-566`, `is_some_and`, unbound by any test). Confidence `[VALIDATED]` (the kind is on the live wire). Object QuotaWindow · CTA SkipUnknownKind.
+
+> **Given** the captured `limits[]` above, **When** each window is looked up, **Then** `weekly_all` is the weekly source and `weekly_scoped` is skipped. **BUT NOT** a parse error on an unlisted kind; **BUT NOT** `weekly_scoped` read as either window; **BUT NOT** a dependency on PR #1537's `max_active_weekly_scoped` semantics (D9).
+
+**REQ-RPL-C-001 — never a fabricated window value, kept and widened.** *Unwanted.*
+If a window is absent from a reply, then no surface — the decision path, the status table, the status/watch wire, the panel, the sample line, `stats`, the event log — shall show that window as `0` or as any fraction. Origin `[AI-inferred-expansion]`, carrying the existing contract at `src/usage.rs:473-474` (`UsageParse`) and `src/daemon/snapshot.rs:758-763` (`session_pct`). Confidence `[VALIDATED]`. Object UsageReply · CTA ParseReply.
+
+> Rule-oriented acceptance: Oracle B fails any build in which the captured reply yields a session fraction; the wire test `status_response_carries_handles_and_percentages_and_never_a_secret` (`src/daemon/snapshot_build.rs:642`) keeps its "never a fabricated `0`" assertion; one test per surface named in MET-T-003. **BUT NOT** a value that is `0` "by default" at any site.
+
+### 10.2 S2 `parser-every-window-optional` {#feature-parser-every-window-optional}
+
+**REQ-RPL-B-002 — an absent weekly window is served too.** *Event-Driven.*
+When `parse_usage` receives a 200 reply that carries a session window and neither a top-level `seven_day` fraction nor a `limits[]` entry of kind `weekly_all`, `seven_day` or `weekly`, the daemon shall return a served reading in which the weekly window does not apply and the session window carries the reply's values. Origin `[user-stated]` (message 2: "maybe eventually they will make some account w/o weekly limits"). Confidence `[ASSUMED]` (no such reply observed yet). Object UsageReply · CTA ParseReply.
+
+> **Given** the body `{"five_hour":{"utilization":42.0,"resets_at":null},"seven_day":null,"limits":[]}` (Oracle D), **When** `parse_usage` runs, **Then** it returns `Ok` with session `0.42` and the weekly window not applicable. **BUT NOT** `Err(UsageParse)`; **BUT NOT** weekly `0.0`.
+>
+> The committed test `a_missing_dimension_is_a_parse_error_not_a_fabricated_zero` (`src/usage.rs:959-965`) asserts the opposite for a session-only body and **moves** to assert this reading — after S10's record lands (REQ-REC-C-001).
+
+**REQ-RPL-B-003 — a reply with no applicable window takes D1's answer.** *Event-Driven.*
+When `parse_usage` receives a 200 reply in which neither window applies, the daemon shall produce the single outcome D1 records — (a) `Err(UsageParse)` as today, or (b) a served reading with both windows not applicable — and Oracle C shall pin it. Origin `[AI-inferred-expansion]`. Confidence `[SPECULATIVE]` (no observable instance). Object UsageReply · CTA ParseReply.
+
+> **Given** `{"five_hour":null,"seven_day":null,"limits":[]}`, **When** `parse_usage` runs, **Then** the outcome is D1's. **BUT NOT** a reading with any fraction `0.0`; **BUT NOT** two outcomes nobody decided. Under (a) the test `a_200_with_an_unparseable_body_is_a_parse_error` (`src/usage.rs:1472`) stands; under (b) it moves.
+
+**REQ-RPL-B-004 — `null` and an absent key take D2's answer.** *Event-Driven.*
+When two replies differ only in that one carries `"five_hour":null` and the other omits the `five_hour` key, both with no session kind in `limits[]`, the daemon shall produce the relation D2 records (identical by the pipeline's recommendation) and one test shall pin it. Origin `[AI-inferred-expansion]`. Confidence `[SPECULATIVE]`. Object UsageReply · CTA ParseReply.
+
+> **BUT NOT** an undocumented difference between the two; **BUT NOT** a test over only one of them.
+
+### 10.3 S3 `model-option-lift-and-decision-arms` {#feature-model-option-lift-and-decision-arms}
+
+**REQ-RDG-B-001 — the reading model expresses "does not apply" per window.** *Ubiquitous.*
+The daemon's reading model shall represent, for the session window and for the weekly window independently, the state "does not apply to this account", distinguishable from (i) a measured `0 %` and (ii) no reading at all (a failed poll, a blind account), at every consumer of a reading — the retained pre-blind anchor (`LastGood` at `src/daemon/records.rs:194-198`, `BlindAnchor` at `src/daemon/records.rs:222-226`) included. Origin `[user-stated]` (message 2) + `[AI-inferred-expansion]`. Confidence `[ASSUMED]`. Object Reading · CTA ProjectReading. The pipeline's recommended mechanism, not a requirement: `Option<f64>` on the session and weekly fields of `UsageReport` (`src/usage.rs:157-182`) and `Usage` (`src/usage.rs:87-116`), and on `LastGood` and `BlindAnchor` — `Copy` kept on `Usage`, `LastGood` and `BlindAnchor`; `UsageReport` is `Clone`, never `Copy` (four `Option<String>` fields) — projected by `to_usage` (`src/usage.rs:191-204`).
+
+> **Given** a served reading from the captured reply, **When** it is stored as the account's latest reading and, for the active account, as its last good reading, **Then** the session window reads as not applicable at every site that reads it. **BUT NOT** expressible for the session window only; **BUT NOT** a sentinel number.
+
+**REQ-RDG-C-001 — no read site defaults an absent window to a number.** *Unwanted.*
+If a production read site of a window fraction meets the absent state, then it shall treat that state by one of four named moves — skip, pass, exclude or name it — and shall not substitute a numeric default. Covers the 93 lexical reads of § 2.4, the event fields (`session_pct: u8` on `Swap` at `src/observability.rs:1359`; `session_delta_pct` at `src/observability.rs:2039`; `session_high_water_pct` at `src/observability.rs:2108`) and `reliability`'s offline parse of them. Origin `[AI-inferred-expansion]` (premortem P-1). Confidence `[ASSUMED]`. Object Reading · CTA ProjectReading.
+
+> Rule-oriented acceptance: each decision arm below carries one test over a reading whose session window does not apply; an event emitted for such an account carries no fabricated session percent (typed to express absence, or omitted), and `reliability` decodes the emitted shape. **BUT NOT** tests satisfied by wrapping the old value in `Some(0.0)`; **BUT NOT** an event-field change that moves `reliability`'s `JSON_SCHEMA_VERSION` without saying so (§ 15.6).
+
+**REQ-ARM-B-001 — a weekly-only spare is viable on its weekly headroom.** *State-Driven.*
+While an enabled, non-active account's session window does not apply and its weekly fraction is below the weekly line, selection shall include it in the viable set, ranked on the same soonest-weekly-reset axis as a two-window account (`weekly_resets_at` … `min_by` at `src/daemon/selection.rs:256-265`). Origin `[AI-inferred-expansion]`. Confidence `[ASSUMED]`. Object DecisionArm · CTA SelectTarget.
+
+> **Given** such an account at weekly `0.90`, **When** a target is picked, **Then** it is viable and ranked by its weekly reset. **BUT NOT** excluded by the session anti-thrash gate or the floor (`session_ceiling` … `is_none_or` at `src/daemon/selection.rs:252-253`); **BUT NOT** admitted because its session read as `0.0`; **BUT NOT** dropped as a missing reading (`filter_map` at `src/daemon/selection.rs:246`).
+
+**REQ-ARM-B-002 — a weekly-only spare is blocked on its weekly line like any other.** *State-Driven.*
+While such an account's weekly fraction is at or above the weekly line (`weekly_ceiling` at `src/daemon/selection.rs:247`), selection shall exclude it exactly as it excludes a two-window account at that value. Origin `[AI-inferred-expansion]`. Confidence `[ASSUMED]`. Object DecisionArm · CTA SelectTarget.
+
+> **Given** such an account at weekly `0.98` and a two-window peer at the same value, **When** a target is picked, **Then** both are excluded. **BUT NOT** a second weekly line for weekly-only accounts.
+
+**REQ-ARM-B-003 — only the weekly arm can swap a weekly-only active away.** *State-Driven.*
+While the active account's session window does not apply, the swap decision (`SwapDecision` at `src/swap.rs:129-134`), the velocity projection (`velocity_swap` at `src/daemon.rs:5465`; the projection at `src/daemon.rs:5502-5516`, `effective_ceiling`) and the exhaustion bookkeeping (`note_exhausted_poll` at `src/daemon.rs:6092-6115`, `out_of_rotation`) shall act on the weekly dimension alone. Origin `[AI-inferred-expansion]`. Confidence `[ASSUMED]`. Object DecisionArm · CTAs DecideSwap, ProjectVelocity.
+
+> **Given** a weekly-only active at weekly `0.99`, **When** the tick evaluates, **Then** a swap fires with reason weekly. **BUT NOT** a swap recorded with `reason=Session` (`SwapReason` at `src/daemon.rs:4588-4592`); **BUT NOT** a parked-landing watch armed for it (`ParkedLanding` at `src/daemon.rs:4610-4614`); **BUT NOT** a velocity projection over an absent session.
+
+**REQ-ARM-B-004 — no high-water mark without a window; a fresh mark when one appears.** *Event-Driven.*
+(a) When a reading whose session window does not apply is folded, `SessionHighWater` shall yield no mark; (b) when a later reading carries a session window, the mark shall seed from that window's first stamp as a fresh window. Origin `[AI-inferred-expansion]`. Confidence `[ASSUMED]` (today's `fold` already returns early without a stamp — `session_resets_at` at `src/swap.rs:651-665`, test `session_high_water_needs_a_window_stamp` at `src/swap.rs:1603`). Object DecisionArm · CTA DecideSwap.
+
+> (a) **BUT NOT** a mark carried across the disappearance of the window, and **BUT NOT** a stale-reading guard that fires because the fraction vanished; (b) **BUT NOT** the fresh mark seeded from a stamp older than the window that reappeared.
+
+**REQ-ARM-B-005 — a weekly-only blocked spare names a weekly hold.** *Event-Driven.*
+When no viable target exists and the soonest-returning blocked spare is an account whose session window does not apply, `all_exhausted_relief` (`src/daemon.rs:6297-6341`) shall return `cause: weekly`, `hold` = that spare, `resets_at` = its weekly reset. Origin `[AI-inferred-expansion]`. Confidence `[ASSUMED]`. Object DecisionArm · CTA RelieveAllExhausted.
+
+> **BUT NOT** `cause: session`; **BUT NOT** satisfied by the `(None, None)` default (`SwapReason::Weekly` at `src/daemon.rs:6339`), which names nothing — the existing relief tests bind two-window spares only.
+
+**REQ-ARM-B-006 — the daemon is not "out of capacity" while a weekly-only spare has weekly headroom.** *State-Driven.*
+While at least one enabled, non-active account whose credential is healthy has a served reading whose session window does not apply and whose weekly fraction is below the weekly line (weekly headroom, REQ-ARM-B-001's sense), `next_swap` shall not be `no_viable_target` and `status` shall not print "out of capacity". A two-window spare held on its session reserve still yields the legitimate `no_viable_target` with `cause: session` (`NoTargetCause` at `src/daemon/snapshot.rs:972-975`); this requirement does not reach it. Origin `[user-stated]` (message 1: "crippled") + `[AI-inferred-expansion]`. Confidence `[VALIDATED]` (symptom measured). Object DecisionArm · CTA RelieveAllExhausted.
+
+> **Given** a fleet in which one enabled spare's served reading has no session window and weekly `0.90`, and every other spare is weekly-blocked, **When** `status --json` is read, **Then** `next_swap.state` names that spare as the target. **BUT NOT** `no_viable_target` with `cause: weekly` or `cause: session` while that spare exists; **BUT NOT** `AwaitingData` while served readings exist (`src/daemon.rs:5666-5679`); **BUT NOT** the `cause: session` hold of a two-window spare on its session reserve read as a breach of this requirement.
+
+**REQ-ARM-B-007 — no auto-protection claim on a gate that cannot arm.** *State-Driven (D3).*
+While the active account is blind for more than `BLIND_GATE_SECS` and its retained anchor carries no session window, `status` shall not report auto-protection as OK (`auto_protection_degraded: false`), because the ADR-0017 session gate cannot arm on an anchor that has no session window (`blind_gate_armed` at `src/daemon.rs:470-472`; the `BlindActive` projection at `src/daemon/records.rs:501-519`, `auto_protection_degraded`). Whether a weekly anchor arms a swap is D3. Origin `[AI-inferred-expansion]`. Confidence `[SPECULATIVE]` for the arming half, `[ASSUMED]` for the surfacing half. Object DecisionArm · CTA ArmBlindGate.
+
+> **BUT NOT** `auto_protection_degraded: false` for such an anchor past the gate; **BUT NOT** a `BlindActive` block whose `last_known_session_pct` is fabricated; **BUT NOT** a swap fired on an absent anchor ("Never fires on a `None`/missing reading", ADR-0017 `:189`).
+
+**REQ-ARM-B-008 — the near-limit band's behaviour for a weekly-only active is stated.** *State-Driven (D4).*
+While the active account's session window does not apply, the near-limit fast-poll (`near_limit_fast_poll_engaged` at `src/daemon.rs:5826`) shall behave as D4 records — not applicable by the pipeline's recommendation — and a test shall pin it. Origin `[AI-inferred-expansion]`. Confidence `[SPECULATIVE]`. Object DecisionArm · CTA GateNearLimit.
+
+> **BUT NOT** an accident of a session-only predicate.
+
+**REQ-ARM-B-009 — `use` serves the weekly verdict.** *Event-Driven.*
+When the operator runs `sessiometer use <account>` without `--force` for an account whose session window does not apply, the viability gate shall return the weekly verdict from the served reading. Origin `[AI-inferred-expansion]`. Confidence `[ASSUMED]`. Object DecisionArm · CTA ServeUseVerb.
+
+> **BUT NOT** an abort on `UsageParse` (`poll_viability` at `src/use_account.rs:407-424`); **BUT NOT** a bypass of the weekly gate (`weekly_exhausted` at `src/daemon/commands.rs:146-148`).
+
+**REQ-ARM-B-010 — a served reply is a live poll.** *Event-Driven.*
+When the parse succeeds, the poll shall classify as live (`PollOutcome` at `src/daemon/classify.rs:55-62`, no edit), the account's gap and blind streaks shall end, and sampling shall resume. Origin `[AI-inferred-expansion]`. Confidence `[VALIDATED]` (the classifier already does this on `Ok`). Object DecisionArm · CTA ClassifyLiveness.
+
+> **BUT NOT** a cadence change (§ 15.4); **BUT NOT** a classifier edit.
+
+**REQ-ARM-B-011 — the state is re-derived every poll; nothing durable remembers it.** *Event-Driven.*
+(a) When a window disappears between two polls, every consumer shall stop treating the previous session values (high-water mark, velocity EMA, pre-blind anchor) as current; (b) when a window reappears, the next served reading shall be a fresh window with every session gate applying again. Origin `[AI-inferred-expansion]` (grounded in the primary sources: temporary windows, per-account lift). Confidence `[ASSUMED]`. Object DecisionArm · CTA DecideSwap.
+
+> (a) **BUT NOT** a previous session value acted on after its window vanished; (b) **BUT NOT** a cached per-account "weekly-only" flag that outlives the reading; both: **BUT NOT** a new field in the daemon's persisted state.
+
+**REQ-ARM-B-012 — a mixed fleet competes on one axis.** *Ubiquitous (D7).*
+The daemon shall rank weekly-only and two-window spares on the same soonest-weekly-reset axis, apply the session filters only to accounts whose session window applies, and treat an absent velocity EMA on a reset tie as D7 records (`0.0` by the pipeline's recommendation — `velocity_rate` at `src/daemon/selection.rs:135-143`). Origin `[AI-inferred-expansion]`. Confidence `[ASSUMED]`. Object DecisionArm · CTA SelectTarget.
+
+> **BUT NOT** a weekly-only spare preferred or penalised by a rule nobody ratified.
+
+**REQ-ARM-C-001 — keep-warm is unchanged.** *Ubiquitous.*
+The keep-warm schedule of an account whose session window does not apply shall equal that of a two-window account with the same credential state (`should_keep_warm_retry` at `src/daemon/keep_warm.rs:44` reads liveness only). Origin `[AI-inferred-expansion]`. Confidence `[ASSUMED]`. Object DecisionArm · CTA KeepWarm.
+
+> **Given** a weekly-only account and a two-window account in the same credential state, **When** the keep-warm schedule is computed, **Then** both get the same retry decision. **BUT NOT** a keep-warm arm that reads a window fraction; **BUT NOT** a schedule change for either account.
+
+**REQ-ARM-Q-001 — `ScheduleRateNeutrality`.** TAG `ScheduleRateNeutrality` · SCALE the poll schedule `build_poll_schedule` (`src/daemon.rs:3370`) computes: one `/usage` request per enabled account per sweep, the active interleaved before each peer, at `poll_secs` spacing · METER the committed interleave tests `the_poll_schedule_interleaves_the_active_before_each_peer_and_wraps`, `the_poll_schedule_interleaves_before_each_peer_and_handles_degenerate_rosters` and `the_interleave_re_observes_the_active_in_band_and_swaps_before_the_ceiling` (`src/daemon.rs` `mod tests`; the #80/#366 stagger locks) green before and after the change, plus `git diff origin/main -- src/daemon.rs` showing no hunk inside `build_poll_schedule` · PAST the schedule at `fd8640b` · GOAL the same schedule — delta 0 (the fix ends requests that yield nothing and changes no cadence; C3 is where cadence lives) · FAIL any hunk in the schedule, or any of the three tests red. Origin `[AI-inferred-expansion]` (report:R12; the #80/#366 stagger locks). Confidence `[ASSUMED]`.
+
+### 10.4 S4 `fixtures-null-session-and-weekly-scoped` {#feature-fixtures-null-session-and-weekly-scoped}
+
+**REQ-FIX-B-001 — the tree carries the shapes it lacks.** *Ubiquitous.*
+The parser tests in `src/usage.rs` shall carry, as inline `r#"…"#` bodies: the captured reply's quota fields of § 2.2 (no identity field); a body with the `five_hour` key absent (D2); the session-only body of Oracle D; the windowless body of Oracle C; and a `limits[]` entry of kind `weekly_scoped`. Every parse-test body present at `fd8640b` (the newest dated 2026-06-29, `five_hour` at `src/usage.rs:864`) shall stay green under the new shape. Origin `[AI-inferred-expansion]`. Confidence `[VALIDATED]` (feasibility F4). Object Fixture · CTAs AddNullSessionFixture, AddWeeklyScopedEntry, AddSessionOnlyBody, AddWindowlessBody.
+
+> **BUT NOT** the account's email, label, UUID or any of the reply's identity fields; **BUT NOT** a fixture re-baselined later (a captured shape is frozen).
+
+### 10.5 S5 `oracles-a-d-landed-red-first` {#feature-oracles-a-d-landed-red-first}
+
+**REQ-ORC-B-001 — four oracles land ignored and RED before any implementer is dispatched.** *Ubiquitous.*
+The scoping party shall land Oracles A–D as `#[ignore]`d tests in `src/usage.rs` `mod tests` in a first, separate item — A, B and D each proven RED against `origin/main`, and C proven RED against the mutant that fabricates both windows (under D1 (a) today's tree already satisfies C, as #1591 states) — with the un-ignore obligation recorded on the fix item; the executor shall not edit the oracles. Origin `[AI-inferred-expansion]` (this repo's rule: `ci-ok` cannot merge a failing test and `--admin` is impossible). Confidence `[VALIDATED]`. Object Oracle · CTAs AuthorOracle, ProveRed, LandIgnored.
+
+> **Oracle A** — `parse_usage(<captured quota fields>)` is `Ok`; weekly `0.90 ± 1e-9`; `weekly_resets_at` `"2026-11-06T22:59:59.916061+00:00"`; weekly severity `None`. RED at `fd8640b`: `Err("no session (five_hour) dimension")`. **Oracle B** — the same parse reports the session window as not applicable, never `0.0`, never any fraction. RED against the fabricating mutant (`session == 0.0`) — which is why A alone does not suffice. **Oracle C** — `{"five_hour":null,"seven_day":null,"limits":[]}` is not served as a reading with two fabricated windows; pins D1's choice. **Oracle D** — `{"five_hour":{"utilization":42.0,…},"seven_day":null,"limits":[]}` is served with weekly not applicable and session `0.42`. RED at `fd8640b` and against the mutant alike. Mutation evidence (scratch `cargo test --offline`): the `fd8640b` shape fails A; the mutant passes A and fails B; the proposed shape passes A–D (`9 passed; 0 failed`). The scratch proof is the feasibility axis's own and is **not** independent: the scoping party re-proves RED. **BUT NOT** oracles landed un-ignored (the branch cannot merge); **BUT NOT** `cargo test -- --include-ignored` in any form (it rewrites a frozen migration fixture). Against the tranche-0 hot-fix (#1613), which is the fabricating mutant deployed, the oracles stay `#[ignore]`d and CI stays green: A passes, B fails on its session-window assertion (`Some(0.0)`) instead of the parse error, C stays green and D still fails on the weekly parse error (§ 3.3); #1591 names #1613 where its RED proof reads differently.
+
+### 10.6 S6 `status-wire-no-window-key` {#feature-status-wire-no-window-key}
+
+**REQ-STL-I-001 — the wire says "no session window" with its own key.** *Ubiquitous.*
+The `status` reply and both `watch` frames (snapshot and heartbeat) shall carry, per account, an omittable key stating that the account's session window does not apply, so that a client can tell "no session window" from "no reading" by bytes, with `weekly_pct` and `weekly_resets_at` present on the same line; `session_pct` keeps its documented meaning. Direction outbound; frequency per request and per heartbeat; format JSON under `STATUS_SCHEMA_VERSION`. Origin `[AI-inferred-expansion]` (report Q3). Confidence `[ASSUMED]`. Object StatusLine · CTAs EmitStatusReply, EmitWatchSnapshot, EmitWatchHeartbeat. The key's name is Stage 2's.
+
+> **Given** one account whose session window does not apply and has a fresh reading, and one blind account, **When** `status --json` and the `watch` snapshot are produced, **Then** the two lines differ in bytes and the first carries its weekly fields. **BUT NOT** both lines carrying `"session_pct":null` with no other discriminator; **BUT NOT** a key emitted for an account whose session window applies (omittable means absent when inapplicable, after the omit-when-absent precedents `blind_active` at 1.4, the daemon-level `canonical_scrub` at 1.5 and `rotated` at 1.14, each behind `skip_serializing_if`, in the history the `STATUS_SCHEMA_VERSION` doc comment keeps at `src/daemon/snapshot.rs:538-541`).
+
+**REQ-STL-I-002 — a weekly-only blind active still has a blind row.** *State-Driven.*
+While a blind active account's retained anchor carries no session window, the `BlindActive` block shall still report `blind_secs` and `auto_protection_degraded`, with `last_known_session_pct` optional (the required-to-optional reshape has the 1.14 precedent documented at `src/daemon/snapshot.rs:528-541`, `STATUS_SCHEMA_VERSION`). Origin `[AI-inferred-expansion]`. Confidence `[ASSUMED]`. Object StatusLine · CTA ProjectBlindActive.
+
+> **BUT NOT** a fabricated `last_known_session_pct: 0`; **BUT NOT** a Swift decode that throws on the absent field (`lastKnownSessionPct` is a non-optional `UInt8` at `apps/menubar/Sources/WireModel.swift:499` today).
+
+**REQ-STL-C-001 — the bump and its lockstep.** *Constraint.*
+S6 shall take `STATUS_SCHEMA_VERSION` from `1.14` to the next free minor under the recorded queue rule ("whichever lands second takes the next minor" — #1457, #1586, #1587 and PR #1588 claim 15); shall regenerate the five wire goldens once with `cargo test -- --ignored emit_wire_golden_fixtures` (`emit_wire_golden_fixtures` at `src/daemon/snapshot_build.rs:3862`; the pin `the_committed_wire_goldens_still_match_the_daemon_encoders` at `src/daemon/snapshot_build.rs:3929`), never `--include-ignored`; shall add a **new** golden row carrying the key (every current golden row carries `session_pct: 60`, so a no-window row is a new fixture, not a re-baseline); and shall sweep the 27 `"minor":14` lines in `apps/menubar/Tests/Fixtures.swift`, the 14 sites across both spellings in `apps/menubar/Tests/WireDecoderTests.swift`, and the `"minor":15` frame at `apps/menubar/Tests/WireDecoderTests.swift:325`, leaving version-pinned compat fixtures alone and adding a pinned fixture at the outgoing minor where tolerance was proved there. Production `WireModel.swift` takes exactly the decode edits S6 forces — `lastKnownSessionPct` becomes `UInt8?` (REQ-STL-I-002: today a present `blind_active` block missing that field throws) and the new key is read with `decodeIfPresent … ?? []` — and no other; the support gate is major-only (`decodeIfPresent` at `apps/menubar/Sources/WireModel.swift:704`), and the render edit is S11's. Origin `[AI-inferred-expansion]`, carrying `CLAUDE.md` § If you touch X. Confidence `[VALIDATED]` (counts re-derived at `fd8640b`). Object StatusLine.
+
+> **BUT NOT** reusing a minor another PR already landed; **BUT NOT** a golden hand-edited.
+
+**REQ-STL-B-001 — the transitional state, if D10 permits it, is documented as transitional.** *Optional.*
+Where D10 permits tranche 1 to ship before S6, the daemon shall emit `session_pct: null` beside a present `weekly_pct` for a no-window account under `1.14`, and the `session_pct` doc comment at `src/daemon/snapshot.rs:758-763` shall name the transitional meaning and the item that retires it. Origin `[AI-inferred-expansion]`. Confidence `[SPECULATIVE]` (conditional on D10). Object StatusLine · CTA EmitStatusReply.
+
+> **BUT NOT** the contract redefined ("`null` if the last poll failed" stays the steady-state meaning); **BUT NOT** the transitional state outliving S6.
+
+**REQ-STL-Q-001 — `WireLockstep`.** TAG `WireLockstep` · SCALE count of fixture lines, goldens and decoder sites left at the outgoing minor after the S6 bump · METER `grep -c '"minor":14'` over `Fixtures.swift` (expected to print exactly the line count of the pinned fixture S6 adds at the outgoing minor, which is not stale), both spellings over `WireDecoderTests.swift`, the `swift` job's test cardinality, and an armed `panel-goldens` run · PAST 27 + 14 + 1 sites at 1.14 · GOAL 0 stale · FAIL any. Origin `[AI-inferred-expansion]` (report:feasibility F15–F17), carrying `CLAUDE.md` § Schema versions are four independent wires (the minor-bump lockstep). Confidence `[VALIDATED]`.
+
+### 10.7 S7 `sample-store-session-null` {#feature-sample-store-session-null}
+
+**REQ-SMP-B-001 — a weekly-only sample carries `"session":null`.** *Event-Driven.*
+When a poll of an account whose session window does not apply succeeds, the daemon shall append one line to `usage-samples.jsonl` carrying `"session":null` — the key written, never omitted — with `weekly` and `weekly_resets_at`. Origin `[AI-inferred-expansion]` (pipeline-decided by elimination, § 3.2). Confidence `[VALIDATED]` (the dark accounts stopped sampling; #1580's key-set oracle). Object Sample · CTA AppendSample.
+
+> **BUT NOT** `"session":0` or `0.0`; **BUT NOT** no line at all (the gap-honesty rule reserves "nothing" for a failed poll, `src/daemon.rs:695-726`, `append_sample_for_poll`); **BUT NOT** the `session` key omitted (#1580's exact-key-set oracle REDs on omission).
+
+**REQ-SMP-B-002 — every reader of the store copes.** *Ubiquitous.*
+The shipped binary shall decode a line carrying `"session":null` (`from_slice` at `src/usage_store.rs:457-465` today skips it), retain that line through `compact_and_roll` (`read_samples` … `write_samples` at `src/usage_store.rs:535-544`), and fold an hour that holds only session-less samples into a finite hour statistic over the readings that carried the axis, or none — `max_of` returns `-∞` on an empty slice (`src/usage_store.rs:807-809`, `NEG_INFINITY`; the fold at `src/usage_store.rs:669-680`, `HourStat`). Origin `[AI-inferred-expansion]`. Confidence `[VALIDATED]` (a scratch probe at HEAD showed a `"session":null` line dropped by `read_samples` and erased by one compaction pass). Object Sample · CTAs ReadSamples, CompactAndRoll, FoldIntoTiers.
+
+> **BUT NOT** a `-∞` or `NaN` written to the rollup (`serde_json` 1.0.150 does **not** refuse a non-finite `f64`: its `serialize_f64` writes `null`, so the compaction write succeeds and the next `read_rollup` (`src/usage_store.rs:475-486`) hard-errors with `UsageRollupMalformed`, stopping every later compaction and every `stats` run until the file is repaired by hand); **BUT NOT** a session statistic fabricated for such an hour.
+
+**REQ-SMP-C-001 — the pinning tests move with the shape.** *Constraint.*
+The canary loop that asserts `"session":null` fails to decode (`from_str` … `is_err` at `src/reliability.rs:7414-7423`, inside `the_sample_store_cannot_carry_a_non_finite_session_reading` at `src/reliability.rs:7386`) shall move its `null` arm to accept the line, and its encode arm — which serialises in-memory non-finite readings and asserts the result fails to decode — shall move to assert that a non-finite `Some` is refused at serialisation (otherwise `serde_json`'s `null` would read back as "no window"); `sample_round_trips_with_and_without_optionals` (`src/usage_store.rs:870`) shall gain the `null` case; the non-finite decode arms (`Infinity`, `NaN`, `1e400`) stay refused. Origin `[AI-inferred-expansion]`. Confidence `[VALIDATED]`. Object Sample.
+
+> **BUT NOT** `Infinity`/`NaN` accepted as a side effect; **BUT NOT** the canary deleted.
+
+**REQ-SMP-Q-001 — `SampleStoreContinuity`.** TAG `SampleStoreContinuity` · SCALE lines carrying `"session":null` lost between append and the next compaction, per 1 000 such lines, on the shipped binary · METER a round-trip test plus a compaction test over a store seeded with weekly-only lines; MET-R-002 in production · PAST 1 000 of 1 000 (every such line is dropped and erased at `fd8640b`) · GOAL 0 · FAIL any · CONSTRAINT loss by an older daemon's compaction is D6's residual, recorded in § 12, never counted as a pass. Origin `[AI-inferred-expansion]` (R4). Confidence `[VALIDATED]`.
+
+### 10.8 S8 `stats-wire-no-session-representation` {#feature-stats-wire-no-session-representation}
+
+**REQ-STS-B-001 — `stats` never renders a zero session series as a reading.** *State-Driven (D8).*
+While an account's samples carry no session reading, `stats` shall present no session mean, peak or p95 for it — not `0`, not any number; the figures are absent, omitted on the wire and the `—` sentinel in the table — and its session figures (the signal band, the session runway, `capacity_holds_session`, the post-swap landing) shall exclude that account while its weekly figures include it. The representation — an optional `DimWire` (`src/stats.rs:2799-2803`) or a sibling marker, each a `stats` `JSON_SCHEMA_VERSION` bump (`src/stats.rs:80`) with the Swift `StatsWire` mirror (`let session: StatsDim` at `apps/menubar/Sources/WireModel.swift:1010`) and `build/fixtures/wire-stats-basic.json` in lockstep; or exclusion without a wire change — is Stage 2's; whether it rides in tranche 1 is D8. Origin `[AI-inferred-expansion]`. Confidence `[ASSUMED]`. Object StatsReport · CTAs ComputeDimStats, EmitStatsWire.
+
+> **BUT NOT** the account counted as a session of `0` in ADR-0033's census (D5); **BUT NOT** a `JSON_SCHEMA_VERSION` bump riding in unannounced (§ 15.6).
+
+**REQ-STS-C-001 — `reliability` needs no rule change.** *Constraint.*
+A weekly-only account produces no `reason=session` swaps, `session_blocked` reads false (`src/usage_stats.rs:1055-1057`, `relief_of`), and `compute_landing` (`src/reliability.rs:2138`) treats an absent reading as unmeasured; S8 shall not change a `reliability` rule. Origin `[AI-inferred-expansion]`. Confidence `[ASSUMED]`. Object StatsReport · CTA ComputeLanding.
+
+> **Given** a weekly-only account's samples and swap records, **When** `reliability` runs, **Then** no `reason=session` swap is attributed to it, `relief_of` reads its session as not blocked, and `compute_landing` counts an absent reading as unmeasured. **BUT NOT** a rule, percentile or breach class edited; **BUT NOT** a `0 %` landing from an absent reading.
+
+### 10.9 S9 `warmup-design-c1-reads-the-fraction` {#feature-warmup-design-c1-reads-the-fraction}
+
+**REQ-REC-B-001 — the warm-up design distinguishes "no window" from "clock stopped".** *Ubiquitous.*
+`docs/requirements/session-warmup-on-reset.md` (§ 3 at `:95`, "`session_resets_at` (nullable = no window running)"; R-2 at `:122-124`) and `docs/design/session-warmup-on-reset-solution-design.md` (C-1 at `:45`; the predicate `session_resets_at == None … clock stopped` at `:57`; its own risk R-3 at `:90`, "`None` may not mean 'no window'") shall be amended so the stopped-clock predicate reads the session **fraction's** absence as "no window, nothing to warm" and never an absent reset stamp alone. No shipped code changes (#1232 is unbuilt). Origin `[AI-inferred-expansion]` (report Q2; contradiction 3). Confidence `[ASSUMED]`. Object DesignRecord · CTA AmendWarmupDesign.
+
+> **Given** a parked account whose session window does not apply, **When** the amended R-2 is read, **Then** it never matches. **BUT NOT** a warm-up cycle that spends weekly quota on such an account; **BUT NOT** an amendment that changes R-1's spike.
+
+### 10.10 S10 `spec-move-recorded` {#feature-spec-move-recorded}
+
+**REQ-REC-B-002 — the records read "every dimension the account has".** *Ubiquitous.*
+ADR-0013 (`:134`), ADR-0017 (`:22`, `:189`), ADR-0025 (`:48-50`) and ADR-0033 (`:54-58`, with D5's census sentence) shall each gain an in-place `**Amended 2026-…**` paragraph reading "both dimensions" as "every dimension the account has", keeping the original `date:` and updating the `docs/adr/README.md` index row, with the two messages of § 2.1 as provenance. Origin `[user-stated]` (message 2 is the spec move) + `[AI-inferred-expansion]` for the record form. Confidence `[VALIDATED]`. Object DesignRecord · CTA AmendAdr.
+
+> **BUT NOT** a new ADR superseding four; **BUT NOT** the original `date:` moved.
+
+**REQ-REC-B-003 — the parser's own contract is rewritten.** *Ubiquitous.*
+The doc comment at `src/usage.rs:473-474` (`UsageParse`) shall state that each window is independently optional, that an absent window is reported as not applicable and never as `0`, and what a reply with no window does (D1). Origin `[user-stated]` + `[AI-inferred-expansion]`. Confidence `[VALIDATED]`. Object DesignRecord · CTA RewriteParserDoc.
+
+> **Given** the rewritten comment, **When** `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items` builds and the `parse_usage` contract is read, **Then** it says each window is independently optional, an absent window is reported as not applicable and never as `0`, and a reply with no window takes D1's outcome. **BUT NOT** "A window that cannot be found is a hard `Error::UsageParse`" left standing; **BUT NOT** the rewrite landing after the pinned test moves (REQ-REC-C-001).
+
+**REQ-REC-B-004 — the HQ amendment is recorded as owed, not done.** *Ubiquitous.*
+The repository shall carry a prose note (this PRD's § 2.4 and § 7) that the private HQ's REQ-USG-B-001 "both dimensions" is to be amended by the operator, since the HQ is not reachable from a clone. Origin `[AI-inferred-expansion]`. Confidence `[VALIDATED]`. Object DesignRecord · CTA NoteHqAmendmentOwed.
+
+> **Given** a fresh clone, **When** § 2.4 and § 7 are read, **Then** they say the amendment is owed by the operator and quote the HQ text in-band. **BUT NOT** a path into the private HQ offered as a citation; **BUT NOT** the amendment recorded as done.
+
+**REQ-REC-C-001 — the record lands before the test moves.** *Constraint.*
+REQ-REC-B-002 and REQ-REC-B-003 shall land with or before the change that moves `a_missing_dimension_is_a_parse_error_not_a_fabricated_zero` (`src/usage.rs:959-965`), so that no commit reverses a pinned behaviour without its record (the report's advisory 8). Origin `[AI-inferred-expansion]`. Confidence `[VALIDATED]`. Object DesignRecord.
+
+> **Given** `main`'s history after tranche 1, **When** the commits are ordered, **Then** #1593's ADR amendments and the parser-doc rewrite are on `main` at or before the commit that moves the test. **BUT NOT** the test moved in a commit without its record; **BUT NOT** the record left to a later follow-up.
+
+### 10.11 S11 `render-no-window-cells` — waits on D0 {#feature-render-no-window-cells}
+
+**REQ-CEL-C-001 — nothing is built against the unclassified state.** *Constraint.*
+Until D0 is answered, no panel or CLI rendering of the no-session-window state shall be built (the register rule at `apps/menubar/design/README.md:1289-1291`); the transitional token (D10) stands. The constraint covers S11's cells — the panel row's Session meter and the CLI `status` table's SESSION% and RESET cells, the cells the register leaves unclassified. A surface's own pre-existing UNKNOWN sentinel is not a new rendering of the state: the `stats` table's `—` (a doc comment in `src/stats.rs` names it the UNKNOWN sentinel), which #1601 AC-6 prints in such an account's session-keyed cells, stays permitted (scoped 2026-11-01 after the Stage 3.7 coverage gate, ratification-pending). Origin `[AI-inferred-expansion]`. Confidence `[VALIDATED]`. Object RenderCell · CTA ClassifyState.
+
+> **Given** D0 unanswered, **When** the panel row and the CLI `status` table render a healthy no-window account, **Then** the Session meter and the SESSION%/RESET cells show the transitional `n/a` and nothing else, and the `stats` table's `—` stays. **BUT NOT** a token, glyph or register row invented for the state; **BUT NOT** a panel golden added for it.
+
+**REQ-CEL-B-001 — once classified, the cells render the state as classified.** *Event-Driven (D0).*
+When D0 records a classification, the panel row's Session meter (`UsageMeter(label: "Session", …)` at `apps/menubar/Sources/StatusPanelRoster.swift:443`; `sessionSeverity` at `apps/menubar/Sources/StatusPanelFormat.swift:1755`; `resetIn` at `apps/menubar/Sources/StatusPanelFormat.swift:903`) and the CLI SESSION%/RESET cells (`pct` at `src/cli.rs:4595-4598`, `reset_cell` at `src/cli.rs:4365-4368`) shall render the no-session-window state as classified — (i) the `—` OBSERVED-ABSENCE token, (ii) an authored mock frame, or (iii) left open — and shall owe an **armed** `panel-goldens` run plus a `Panel-Goldens-Rebaselined:` trailer for a new panel fixture, and `emit_cli_render_goldens` plus `CLI-Goldens-Rebaselined:` if the CLI cell renders other than `n/a`. Origin `[AI-inferred-expansion]`. Confidence `[SPECULATIVE]` (blocked). Object RenderCell · CTAs RenderPanelMeter, RenderCliCells, RebaselineGoldens.
+
+> **BUT NOT** `n/a` for a healthy no-window account once classified (the panel spends `n/a` on a failed poll); **BUT NOT** `0%`; **BUT NOT** a pending session reset shown for a window that does not exist; **BUT NOT** a token invented without the register entry.
+
+### 10.12 S12 `deploy-and-verify-on-the-fleet` {#feature-deploy-and-verify-on-the-fleet}
+
+> **Tranche split and hot-fix (2026-11-01).** S12 spans two tranches: the live deploy (#1604) stays in tranche 1, and the runbook text (#1603) moves to tranche 2 (Should), landing after the tranche-1 deploy; #1604 follows #1603's text where it has merged and the runbook's current text otherwise (§ 3.1, note 4). The tranche-0 hot-fix (#1613) is deployed to the operator's machine by the same runbook before it merges, and is not an S12 requirement. It writes no sample line, so no `"session":null` line precedes tranche 1's deploy, and REQ-DEP-C-001's ordering concerns tranche 1's deploy. REQ-DEP-B-002 is amended: its weekly clauses are first met at the tranche-0 deploy, and the clause that each dark account appends a sample line is what tranche 1's deploy newly turns on. The one text change in this section is in REQ-DEP-B-002: "the new bundle" now reads "the tranche-1 bundle". Every measure here is reported as counts or roster ordinals, never as account labels.
+
+**REQ-DEP-B-001 — the fix reaches the running bundle by the existing procedure.** *Event-Driven.*
+When tranche 1 merges, the operator shall deploy it per `docs/runbooks/replacing-the-running-daemon.md`, whose procedure is: quit the app and `sessiometer daemon stop`; rebuild the bundle with `apps/menubar/scripts/release-macos.sh --sign-only` (the identity named by `IDENTITY` at `apps/menubar/scripts/release-macos.sh:10`); launch the rebuilt app, which re-registers the agent; then the runbook's confirm-what-is-serving step. `sessiometer daemon restart` (`launchctl kickstart -k`) is the runbook's shortcut that does not re-register and is not the deploy step. The procedure exists because `cargo build` replaces nothing that runs: the serving bundle is whatever was last launched (the 2026-09-05 build when the scope began; the #1613 emergency build since 2026-11-01). Origin `[AI-inferred-expansion]`. Confidence `[VALIDATED]` (runbook present at `fd8640b`). Object Deployment · CTAs RebuildBundle, Relaunch.
+
+> **BUT NOT** a new runbook (the seed's "a runbook step under `docs/runbooks/`" is already delivered); **BUT NOT** a deploy the runbook's confirm step did not verify; **BUT NOT** `daemon restart` in place of the relaunch.
+
+**REQ-DEP-C-001 — no pre-#1598 daemon against a store that carries a `null` line.** *Constraint.*
+From a store's first `"session":null` line, no pre-#1598 build shall run as the daemon against that store, on any machine, by any path: relaunching a kept bundle (the #1613 hot-fix included), rebuilding the served bundle from a checkout that does not contain #1598, or `sessiometer service install` / `run` from an older build. Before any rebuild of the served bundle the operator shall check ancestry with `git merge-base --is-ancestor <#1598 squash commit> HEAD`. The erasing binary is an older daemon: `compact_and_roll` has one production caller, the daemon's store maintenance (`stats_events_for_poll` at `src/daemon.rs:839`; the `compact_and_roll` call at `src/daemon.rs:894`), and an older daemon skips such lines and rewrites the raw file without them. An older `sessiometer stats` or `reliability` deletes nothing: `stats` fails loudly on the fenced rollup and `reliability` silently leaves `null` lines out of its report. The rule holds per store, so per machine; with the rollup fence #1598 builds it is a backstop. The store files are never deleted or moved. Origin `[AI-inferred-expansion]` (R4), as corrected by the D6/D13 council ruling of 2026-11-02 (a comment on #1598). Confidence `[VALIDATED]`. Object Deployment.
+
+> **Given** a machine whose store carries a `"session":null` line, **When** the operator is about to launch or rebuild a daemon on it, **Then** the ancestry check passes and the bundle launched contains #1598; #1604 and #1608 record the check's output. **BUT NOT** an older `stats` or `reliability` named as the binary that erases; **BUT NOT** `usage-rollup.json` deleted or moved by hand to clear an older build's "malformed usage rollup" message, which the fence makes expected; **BUT NOT** a kept #1613 bundle relaunched after the first `null` line.
+
+**REQ-DEP-B-002 — the fleet is seen to recover.** *Event-Driven.*
+When the agent restarts on the tranche-1 bundle, within two poll cycles (a) every enabled account with `auth: "healthy"` shall show a weekly percentage and reset in `status`, (b) each of the 15 dark accounts shall have appended at least one line to `usage-samples.jsonl`, and (c) `next_swap` shall leave `no_viable_target` unless every enabled spare has a served reading and each is at or above the weekly line (none unread), in which case it names the soonest-returning spare and its weekly reset. Origin `[user-stated]` (message 1) + `[AI-inferred-expansion]`. Confidence `[VALIDATED]`. Object Deployment · CTA VerifyFleetRecovery.
+
+> **BUT NOT** declared recovered on `TEST SUCCEEDED` or a green CI run — the proof is the live `status --json` and the store (MET-T-001, MET-T-002, MET-T-004); **BUT NOT** a rollback on a second reply shape — that is a new fixture (§ 4 decision gates).
+>
+> *Measure note (2026-11-01).* Clauses (a) and (c) are already met at the tranche-0 deploy and stay here as a no-regression check at tranche 1. Clause (b) is what tranche 1 newly turns on, because the hot-fix stores no sample for a weekly-only reading. Report the result as a count or as roster ordinals, never as account labels.
+
+**REQ-DEP-Q-001 — `FleetReadingCoverage`.** TAG `FleetReadingCoverage` · SCALE enabled healthy-credential accounts with a served reading (`weekly_pct` non-null in `status --json`, the one SCALE of this tag) over all such accounts · METER `status --json` per poll cycle for three cycles after the relaunch · PAST 2/17 (2026-11-01T07:18:54Z) · GOAL 17/17 by the second cycle · FAIL any such account at `n/a` after the third cycle. Origin `[user-stated]` (message 1: the accounts without the window are crippled) + `[AI-inferred-expansion]` (the 17/17 goal and the three-cycle meter). Confidence `[VALIDATED]` (§ 2.2 status snapshot). Measure note (2026-11-01): first met at the tranche-0 deploy; after the tranche-1 deploy it is a no-regression check, reported as a count or as roster ordinals, never as account labels.
+
+## 11. State Matrices
+
+### 11.1 The per-account `status` row (CLI table and status/watch wire), session cell
+
+| State | Behaviour today (`fd8640b`) | Required | Req |
+|---|---|---|---|
+| Loading | first poll pending: `AwaitingData` only when every live other account is unpolled | unchanged | — |
+| Empty (first use) | no accounts: the table prints no rows | unchanged | — |
+| Empty (no results) | not applicable — the roster is not filtered | n/a, stated | — |
+| Populated | session % and reset shown (`0%  n/a` for an idle window whose stamp the API omits) | unchanged | — |
+| Error (network) | failed poll → `session_pct: null` → `n/a`; blind streak | unchanged — `null` keeps this meaning | REQ-STL-I-001 |
+| Error (auth) | quarantined / needs re-login (`UsageUnauthorized`) | unchanged | — |
+| Error (permission) | `UsageScopeMissing` (403) | unchanged | — |
+| **Partial — weekly present, session does not apply** | **does not exist**: the whole reply is rejected and the row reads `n/a`/`n/a` | the row carries weekly % and reset; the session cell shows the transitional `n/a` under D10, then the D0 token; the wire carries the new key | REQ-RPL-B-001, REQ-STL-I-001, REQ-STL-B-001, REQ-CEL-B-001 |
+| Stale | blind active: `~N%` from the retained anchor (`last_known_session_pct` at `src/cli.rs:3867`) | a weekly-only blind active shows its blind duration without a fabricated `~N%` | REQ-ARM-B-007, REQ-STL-I-002 |
+| Offline | daemon not running: the CLI reports it; the panel shows its daemon-fault banner | unchanged | — |
+
+### 11.2 The panel row's Session meter
+
+| State | Today | Required | Req |
+|---|---|---|---|
+| Loading / Empty / Populated / Error (network, auth, permission) / Stale / Offline | as the mock authors (98 rows, every one with a Session meter) | unchanged | — |
+| Empty (no results) | n/a — no filter | stated | — |
+| **Partial — no session window** | unauthored; the register calls it unclassified | rendered per D0 after classification; until then the transitional token (D10) | REQ-CEL-C-001, REQ-CEL-B-001 |
+
+### 11.3 The `stats --json` per-account session block
+
+| State | Today | Required | Req |
+|---|---|---|---|
+| Populated | mean / peak / p95 over the session series | unchanged | — |
+| Empty (no samples at all) | the account is absent from the figures | unchanged | — |
+| **Partial — samples present, every session `null`** | does not exist (no such sample can be written); on a tolerant reader a zero series would be rendered as a reading | not rendered as a reading; excluded from session figures, included in weekly ones; representation per Stage 2 and D8 | REQ-STS-B-001 |
+| Loading / Error / Stale / Offline | not applicable — an offline verb over a local file | stated | — |
+
+### 11.4 The sample line (not a view; its states for the readers)
+
+| Line | Today | Required | Req |
+|---|---|---|---|
+| `"session":0.42,"weekly":0.90,…` | read, retained, folded | unchanged | — |
+| `"session":null,"weekly":0.90,…` | **dropped** by `read_samples`, **erased** by compaction | read, retained, folded without a session statistic | REQ-SMP-B-001, REQ-SMP-B-002 |
+| `session` key absent | dropped and erased | read as `None` — serde treats a missing `Option` field as `None`, and design AD-10's `#[serde(default)]` makes that explicit; the key is always written, and #1580's exact-key-set oracle grades the writer, not the reader; ratification-pending (design AD-10; #1598 follows it) | REQ-SMP-B-001, REQ-SMP-B-002 |
+| `"session":"Infinity"` / `NaN` / `1e400` | rejected | still rejected | REQ-SMP-C-001 |
+
+## 12. Assumption Registry
+
+The register below carries the ten fields the progressive-elicitation register names, plus an ID. The thin-input detector stayed **silent** at Phase 1 (two rich sources, with paths, examples, a non-empty out-of-scope list and named alternatives), so no interview ran; the premortem ran and its items are the `P-` rows. `stage-of-origin` is `requirements` for every row.
+
+| ID | item | importance | evidence | verdict | signpost | hedge | owner | status | stage-of-origin | adr-stub-ref |
+|---|---|---|---|---|---|---|---|---|---|---|
+| A-1 | The other 14 dark accounts reply with the same shape as the captured one (`five_hour: null`, weekly in `seven_day` and `limits[weekly_all]`) | high — the whole urgent tranche is sized on one capture | moderate — 15 accounts went dark one at a time within 23 h 20 min of the announced lift; no second reply captured | test | any healthy-credential account still `n/a` two cycles after deploy | D2 pins null-vs-absent; the first decision gate captures a still-dark account's quota fields | operator (the probe reads the keychain; forbidden to this run) | open | requirements | — |
+| A-2 | The weekly window is unchanged by the lift and stays the binding limit for Ultra accounts | high | strong — three dated primary sources, 2026-10-30 | decide | a primary source announcing a weekly change | — | pipeline | resolved | requirements | — |
+| A-3 | A window can reappear on an account that lost it (downgrade, re-verification) | medium | weak — no source documents a reverse transition; temporary windows on unverified accounts are documented | decide | a reading whose session window returns | build per-poll re-derivation, no durable flag; REQ-ARM-B-011 holds either way | pipeline | resolved | requirements | — |
+| A-4 | The running bundle's parser is `fd8640b`'s parser | high — the fix must target what runs | strong — the only commit on the parse path since 2026-09-05 is comment-only (`381523b`) | decide | a bundle rebuilt from another branch | — | pipeline | resolved | requirements | — |
+| A-5 | The Developer ID signing identity named by `IDENTITY` is present on the operator's machine | medium — deployment lag (R9) | unverified — a `security` probe is forbidden to this run | surface | `release-macos.sh --sign-only` failing at signing | the runbook's prerequisites section already names the failure mode | operator | ratification-pending | requirements | — |
+| A-6 | `cargo-deny`, the MSRV toolchain, `xcodegen` and Xcode are present for the gates every code item owes | low | strong — the investigation measured them (stable 1.96.0, MSRV 1.87.0, Xcode 27.2) | decide | a gate failing to start | — | pipeline | resolved | requirements | — |
+| A-7 | **Pipeline-decided sequencing**: S7 (the `null` write, tolerant reader, compaction, tier-fold guard, canary move) is in tranche 1, in the pull request after the compile unit | high | strong — the compiler forces the writer's choice at `src/daemon.rs:718-754` (`append_sample_for_poll`) when the model changes; writing a number is forbidden, and writing no line is forbidden on a running daemon (§ 3.2); the compile unit's interim no-line skip never runs on one, because the deploy (#1604) waits on S7 | decide | — | — | pipeline, ratification-pending | ratification-pending | requirements | — |
+| A-8 | **Pipeline-decided sequencing**: S10's ADR and parser-doc amendments ride in tranche 1, before the pinned test moves | medium | strong — the report's advisory 8; docs cost no build time | decide | — | — | pipeline, ratification-pending | ratification-pending | requirements | — |
+| A-9 | The appetite of § 3.1 (tranche 0 as soon as possible; tranche 1 at the gate-sized human effort-day budget; tranche 2 a small batch; S11 unsized) | medium | moderate — the prototype's `9 passed`, the measured consumer counts; tranche 0 and tranche 1's budget are the maintainer's answers of 2026-11-01 | surface | tranche 1 not merged within its human effort-day budget | extend by one small batch; the fabricating shortcut is never tranche 1's fallback (tranche 0, #1613, is its one sanctioned use, § 3.3) | operator | partly resolved — tranche 0 and tranche 1's budget maintainer-set; ratification-pending for tranche 2 and S11 | requirements | — |
+| A-10 | The problem statement of § 2 as pipeline-framed | high | strong — captured reply, status snapshot, primary sources | surface | the operator's validation | — | operator | ratification-pending | requirements | — |
+| A-11 | The success-metric candidates of § 4 | medium | moderate — derived from the objects and the stated outcome | surface | the operator striking or rewording any | — | operator | ratification-pending | requirements | — |
+| P-1 | *It shipped and failed because* a consumer silently defaulted the absent window to a number at one site (an event field, a test wrapper), so the fabricated zero returned and poisoned `stats` and the census | high | moderate — 93 reads, every `Usage` literal, `u8` event fields | decide | a `0` session on any surface for a no-window account | per-arm `None` tests; routed to REQ-RDG-C-001, MET-T-003 | pipeline | resolved | requirements | — |
+| P-2 | *…because* the operator relaunched a pre-#1598 daemon (a kept bundle, the #1613 hot-fix included, or a rebuild from a checkout without #1598) against the new store and its compaction erased the weekly-only lines — an older `stats` or `reliability` only reads and deletes nothing | high | strong — measured at HEAD by the scratch probe; the actor corrected by the D6/D13 council of 2026-11-02 | decide | a missing stretch of lines after a compaction | no pre-#1598 daemon against the store, checked by ancestry before any rebuild; the rollup fence #1598 builds stalls an older daemon's compaction; routed to REQ-DEP-C-001 | pipeline / operator | resolved (D6 settled by council, 2026-11-02) | requirements | — |
+| P-3 | *…because* two PRs both landed `STATUS_SCHEMA_VERSION 1.15` with different shapes and the Swift app pinned one | high | strong — PR #1588 `CONFLICTING`, four other claimants | decide | a second `minor: 15` on `main` | coordinate before the bump; routed to REQ-STL-C-001 (queue rule) | pipeline | resolved | requirements | — |
+| P-4 | *…because* #1232 was built later from its unamended design and warmed every weekly-only account each cycle, spending weekly quota | high | strong — the design's own R-3 flags it | decide | a warm-up event against a no-window account | routed to REQ-REC-B-001 | pipeline | resolved | requirements | — |
+| P-5 | *…because* a weekly-only active went blind and `status` said "auto-protection OK" while nothing could arm | medium | strong — `blind_active_view` projects the session anchor | surface | — | REQ-ARM-B-007's surfacing half; routed to D3 | operator | ratification-pending | requirements | — |
+| P-6 | *…because* the window reappeared on a temporary-window account and a cached flag kept treating it as weekly-only | medium | moderate — primary sources document temporary windows | decide | — | no durable flag; routed to REQ-ARM-B-011 | pipeline | resolved | requirements | — |
+| P-7 | *…because* Oracle A passed but the 14 uncaptured accounts had a second shape (absent key; an inactive `session` entry; a `null` percent) | medium | weak — one capture | test | a still-dark account after deploy | the decision gate's capture; routed to A-1 | operator | open | requirements | — |
+| P-8 | *…because* the weekly fraction was read from `weekly_scoped` (12 %) instead of `weekly_all` (90 %) after the parser rework | high | strong — the entry is on the live wire | decide | — | routed to Oracle A's BUT NOT, REQ-QW-B-001 | pipeline | resolved | requirements | — |
+| P-9 | *…because* the fix merged but the serving bundle stayed the 2026-09-05 build for days | high | strong — `cargo build` deploys nothing | decide | `status` unchanged after merge | the runbook; routed to REQ-DEP-B-001, MET-T-001 | pipeline | resolved | requirements | — |
+| P-10 | *…because* `stats` rendered session mean/peak/p95 `0` for the weekly-only accounts and the operator read the fleet as session-idle | medium | strong — `dim_stats` is finite on an empty series and that zero is rendered | surface | a `0` session figure for a no-window account in `stats` | ride the minimal half first; routed to D8; REQ-STS-B-001 | operator | ratification-pending | requirements | — |
+| P-11 | *…because* the 125 + 120 test sites were "fixed" with `Some(0.0)` wrappers and no test exercised the absent state | medium | moderate | decide | — | per-arm `None` tests; routed to REQ-RDG-C-001 | pipeline | resolved | requirements | — |
+| P-12 | *…because* the compaction of the first hour of weekly-only samples wrote `-∞` as `null`, and every later `read_rollup` — so every later compaction and every `stats` run — failed with `UsageRollupMalformed` until the file was repaired by hand | medium | strong — `max_of` folds from `NEG_INFINITY`; `serde_json` 1.0.150 writes a non-finite `f64` as `null` (`serialize_f64`), and `read_rollup` (`src/usage_store.rs:475-486`) hard-errors on it | decide | a failing `compact_and_roll` after deploy | the tier-fold guard rides in tranche 1; routed to REQ-SMP-B-002 | pipeline | resolved | requirements | — |
+
+## 13. Feature Completeness
+
+Expected entities per feature are traced from § 9.2; "spec depth" is CTAs carrying a statement, a criterion and a BUT NOT over the feature's CTAs.
+
+| Feature | Requirement IDs | Object sections | Entity coverage | CTA coverage | Specification depth | Open questions | Verdict |
+|---|---|---|---|---|---|---|---|
+| S1 `parser-serves-null-session-window` | REQ-RPL-B-001, REQ-QW-B-001, REQ-RPL-C-001 | UsageReply, QuotaWindow, Oracle | 3/3 | 4/4 | 4/4 | 0 | **COMPLETE** |
+| S2 `parser-every-window-optional` | REQ-RPL-B-002, REQ-RPL-B-003, REQ-RPL-B-004 | UsageReply, QuotaWindow, Oracle | 3/3 | 3/3 | 3/3 | 2 (D1, D2) | **NEAR-COMPLETE** — both questions carry a recorded default and an oracle slot |
+| S3 `model-option-lift-and-decision-arms` | REQ-RDG-B-001, REQ-RDG-C-001, REQ-ARM-B-001…B-012, REQ-ARM-C-001, REQ-ARM-Q-001 | Reading, DecisionArm | 2/2 | 10/10 | 10/10 | 3 (D3, D4, D7) | **INCOMPLETE** — more than two open questions; each carries a recorded default, and none blocks the parser or the selection rule, but the arming half of D3 and the tie-break of D7 are behaviour the operator has not chosen |
+| S4 `fixtures-null-session-and-weekly-scoped` | REQ-FIX-B-001 | Fixture | 1/1 | 4/4 | 4/4 | 0 | **COMPLETE** |
+| S5 `oracles-a-d-landed-red-first` | REQ-ORC-B-001 | Oracle, Fixture, UsageReply | 3/3 | 5/5 | 5/5 | 0 | **COMPLETE** |
+| S6 `status-wire-no-window-key` | REQ-STL-I-001, REQ-STL-I-002, REQ-STL-C-001, REQ-STL-B-001, REQ-STL-Q-001 | StatusLine | 1/1 | 4/4 | 4/4 | 1 (D10) | **NEAR-COMPLETE** — the key's name and shape are Stage 2's |
+| S7 `sample-store-session-null` | REQ-SMP-B-001, REQ-SMP-B-002, REQ-SMP-C-001, REQ-SMP-Q-001 | Sample | 1/1 | 4/4 | 4/4 | 1 (D6) | **NEAR-COMPLETE** |
+| S8 `stats-wire-no-session-representation` | REQ-STS-B-001, REQ-STS-C-001 | StatsReport | 1/1 | 2/2 | 1/2 (the wire shape is undecided) | 1 (D8) | **NEAR-COMPLETE** — the representation is a design choice; the behaviour is specified |
+| S9 `warmup-design-c1-reads-the-fraction` | REQ-REC-B-001 | DesignRecord, DecisionArm | 2/2 | 2/2 | 2/2 | 0 | **COMPLETE** |
+| S10 `spec-move-recorded` | REQ-REC-B-002, REQ-REC-B-003, REQ-REC-B-004, REQ-REC-C-001 | DesignRecord | 1/1 | 3/3 | 3/3 | 1 (D5) | **NEAR-COMPLETE** — the HQ amendment is owed, outside the clone |
+| S11 `render-no-window-cells` | REQ-CEL-C-001, REQ-CEL-B-001 | RenderCell, StatusLine | 2/2 | 4/4 | 1/4 (only the gate is specifiable) | 1 (D0 — the blocker) | **INCOMPLETE** — waits on D0; the three classification options and the gates it will owe are named; nothing else can be written without inventing |
+| S12 `deploy-and-verify-on-the-fleet` | REQ-DEP-B-001, REQ-DEP-C-001, REQ-DEP-B-002, REQ-DEP-Q-001 | Deployment, Reading | 2/2 | 3/3 | 3/3 | 0 | **COMPLETE** |
+
+## 14. Source Traceability
+
+Source keys: `msg-1`, `msg-2` = the operator's messages (§ 2.1); `report:§X` = the investigation report (secondary, re-verified where it cites code); `seed:SN` = the scope seed's component N; `tree:path:lines` = verified at `fd8640b`; `hq:…` = the private HQ, quoted in § 2.4. The `report:` and `seed:` keys — and the "evidence pack", "run log" and "Stage 4 ledger" the planning set mentions — name the machine-local scratch the frontmatter `source` describes: not committed, not openable from a clone. They are provenance notes, never citations; every value they anchor is replicated in-band where it is used.
+
+| Req ID | Source | Object | CTA | Feature | Layer | Confidence |
+|---|---|---|---|---|---|---|
+| REQ-RPL-B-001 | msg-1; report:Findings Q1; seed:S1; tree:src/usage.rs | UsageReply | ParseReply | S1 | B | VALIDATED |
+| REQ-QW-B-001 | report:AC `parser-unknown-kind-ignored`; tree:src/usage.rs | QuotaWindow | SkipUnknownKind | S1 | B | VALIDATED |
+| REQ-RPL-C-001 | report:AC `parser-never-fabricate-zero`; tree:src/usage.rs; tree:src/daemon/snapshot.rs | UsageReply | ParseReply | S1 | C | VALIDATED |
+| REQ-RPL-B-002 | msg-2; report:Oracle D; seed:S2 | UsageReply | ParseReply | S2 | B | ASSUMED |
+| REQ-RPL-B-003 | report:AC `parser-neither-window-decided`; seed:D1 | UsageReply | ParseReply | S2 | B | SPECULATIVE |
+| REQ-RPL-B-004 | report:AC `parser-null-versus-absent-key`; seed:D2 | UsageReply | ParseReply | S2 | B | SPECULATIVE |
+| REQ-RDG-B-001 | msg-2; report:AC `model-window-not-applicable-either-window`; seed:S3 | Reading | ProjectReading | S3 | B | ASSUMED |
+| REQ-RDG-C-001 | premortem P-1, P-11; report:Forensics (event fields) | Reading | ProjectReading | S3 | C | ASSUMED |
+| REQ-ARM-B-001 | report:Q2 selection row; tree:src/daemon/selection.rs | DecisionArm | SelectTarget | S3 | B | ASSUMED |
+| REQ-ARM-B-002 | report:AC `selection-weekly-only-blocked-on-weekly` | DecisionArm | SelectTarget | S3 | B | ASSUMED |
+| REQ-ARM-B-003 | report:Q2 triggers row; tree:src/swap.rs; tree:src/daemon.rs | DecisionArm | DecideSwap, ProjectVelocity | S3 | B | ASSUMED |
+| REQ-ARM-B-004 | report:Q4; tree:src/swap.rs | DecisionArm | DecideSwap | S3 | B | ASSUMED |
+| REQ-ARM-B-005 | report:AC `hold-cause-weekly-for-weekly-only-spare`; tree:src/daemon.rs | DecisionArm | RelieveAllExhausted | S3 | B | ASSUMED |
+| REQ-ARM-B-006 | msg-1; report:AC `not-out-of-capacity-while-weekly-only-headroom` | DecisionArm | RelieveAllExhausted | S3 | B | VALIDATED |
+| REQ-ARM-B-007 | report:AC `blind-gate-weekly-only-active-surfaced`; seed:D3 | DecisionArm | ArmBlindGate | S3 | B | SPECULATIVE / ASSUMED |
+| REQ-ARM-B-008 | report:AC `near-limit-weekly-only-active-stated`; seed:D4 | DecisionArm | GateNearLimit | S3 | B | SPECULATIVE |
+| REQ-ARM-B-009 | report:Q2 `use` row; tree:src/use_account.rs | DecisionArm | ServeUseVerb | S3 | B | ASSUMED |
+| REQ-ARM-B-010 | report:Q2 cadence row; tree:src/daemon/classify.rs | DecisionArm | ClassifyLiveness | S3 | B | VALIDATED |
+| REQ-ARM-B-011 | report:Q4; primary sources (§ 2.2) | DecisionArm | DecideSwap | S3 | B | ASSUMED |
+| REQ-ARM-B-012 | report:Q5; seed:D7; tree:src/daemon/selection.rs | DecisionArm | SelectTarget | S3 | B | ASSUMED |
+| REQ-ARM-C-001 | report:AC `keep-warm-unchanged`; tree:src/daemon/keep_warm.rs | DecisionArm | KeepWarm | S3 | C | ASSUMED |
+| REQ-ARM-Q-001 | report:R12; the #80/#366 stagger locks | DecisionArm | ClassifyLiveness | S3 | Q | ASSUMED |
+| REQ-FIX-B-001 | report:Test Coverage; seed:S4; tree:src/usage.rs | Fixture | the four Add… CTAs | S4 | B | VALIDATED |
+| REQ-ORC-B-001 | report:Readiness Assessment ORACLE; seed:S5 | Oracle | AuthorOracle, ProveRed, LandIgnored | S5 | B | VALIDATED |
+| REQ-STL-I-001 | report:Q3; seed:S6 | StatusLine | the three Emit… CTAs | S6 | I | ASSUMED |
+| REQ-STL-I-002 | report:Q3 (`BlindActive`); tree:src/daemon/snapshot.rs | StatusLine | ProjectBlindActive | S6 | I | ASSUMED |
+| REQ-STL-C-001 | report:Q3 lockstep; CLAUDE.md § If you touch X; counts re-derived at fd8640b | StatusLine | — | S6 | C | VALIDATED |
+| REQ-STL-B-001 | pipeline-identified D10 | StatusLine | EmitStatusReply | S6 | B | SPECULATIVE |
+| REQ-STL-Q-001 | report:feasibility F15–F17 | StatusLine | — | S6 | Q | VALIDATED |
+| REQ-SMP-B-001 | report:Q2 store row; seed:S7; #1580's oracle | Sample | AppendSample | S7 | B | VALIDATED |
+| REQ-SMP-B-002 | report:R4; tree:src/usage_store.rs | Sample | ReadSamples, CompactAndRoll, FoldIntoTiers | S7 | B | VALIDATED |
+| REQ-SMP-C-001 | tree:src/reliability.rs; tree:src/usage_store.rs | Sample | — | S7 | C | VALIDATED |
+| REQ-SMP-Q-001 | report:R4 | Sample | — | S7 | Q | VALIDATED |
+| REQ-STS-B-001 | report:Q2 stats row; seed:S8; seed:D8 | StatsReport | ComputeDimStats, EmitStatsWire | S8 | B | ASSUMED |
+| REQ-STS-C-001 | report:Q2 stats row; tree:src/usage_stats.rs; tree:src/reliability.rs | StatsReport | ComputeLanding | S8 | C | ASSUMED |
+| REQ-REC-B-001 | report:Q2 warm-up row; seed:S9; tree:docs/requirements/session-warmup-on-reset.md | DesignRecord | AmendWarmupDesign | S9 | B | ASSUMED |
+| REQ-REC-B-002 | msg-2; report:AC contradictions 6–7; seed:S10; tree:docs/adr (four files) | DesignRecord | AmendAdr | S10 | B | VALIDATED |
+| REQ-REC-B-003 | msg-2; tree:src/usage.rs | DesignRecord | RewriteParserDoc | S10 | B | VALIDATED |
+| REQ-REC-B-004 | report:grounding F28; hq:REQ-USG-B-001 | DesignRecord | NoteHqAmendmentOwed | S10 | B | VALIDATED |
+| REQ-REC-C-001 | report:advisory 8 | DesignRecord | — | S10 | C | VALIDATED |
+| REQ-CEL-C-001 | report:Readiness Assessment blocker; tree:apps/menubar/design/README.md | RenderCell | ClassifyState | S11 | C | VALIDATED |
+| REQ-CEL-B-001 | report:AC `render-distinct-session-cell`; seed:S11; seed:D0 | RenderCell | RenderPanelMeter, RenderCliCells, RebaselineGoldens | S11 | B | SPECULATIVE |
+| REQ-DEP-B-001 | report:R9; seed:S12; tree:docs/runbooks/replacing-the-running-daemon.md | Deployment | RebuildBundle, Relaunch | S12 | B | VALIDATED |
+| REQ-DEP-C-001 | report:R4; seed:D6; premortem P-2; the D6/D13 council ruling of 2026-11-02 (comment on #1598) | Deployment | — | S12 | C | VALIDATED |
+| REQ-DEP-B-002 | msg-1; seed:S12 | Deployment | VerifyFleetRecovery | S12 | B | VALIDATED |
+| REQ-DEP-Q-001 | § 2.2 status snapshot | Deployment | VerifyFleetRecovery | S12 | Q | VALIDATED |
+
+**Corrections to the report and the seed, made against `fd8640b`** (the report's lines were taken at `a232a39`; the two trees differ by the #1540 hunks in `src/swap.rs`, `src/usage_store.rs`, `src/cli.rs` and `src/daemon/commands.rs`, by #1535's `src/isolated_spawn.rs`, and by small offsets elsewhere): selection's missing-reading drop is `filter_map` at `src/daemon/selection.rs:246` (the seed's S1 said `:245`, which is the `enabled[i]` filter); the relief default `SwapReason::Weekly` is at `src/daemon.rs:6339` (the report said `6151-6153`); the CLI `n/a` arms are `pct` at `src/cli.rs:4595-4598` and `reset_cell` at `src/cli.rs:4365-4368` (the report's `4584-4589` / `4356-4361` were HEAD-side lines); `poll_viability` is at `src/use_account.rs:407-424` and the gate's fallback at `src/use_account.rs:451-462` (+1); `DEFAULT_SESSION_CEILING` is at `src/config.rs:152` and `DEFAULT_WEEKLY_CEILING` at `src/config.rs:166` (+1); the `null` canary loop is at `src/reliability.rs:7414-7423` (the report said `7418-7425`); the event fields are `session_pct` at `src/observability.rs:1359`, `session_delta_pct` at `src/observability.rs:2039` and `session_high_water_pct` at `src/observability.rs:2108` (the report's `1326`, `2000`, `2069`); the report's evidence line "`git grep -c account_uuid` → 0 on both trees" is wrong as stated — `account_uuid` is a roster field present throughout this tree (`src/daemon.rs:6114` reads `self.roster[i].account_uuid`) — while its conclusion holds: `Sample` at `src/usage_store.rs:135-166` carries no `account_uuid`, so
+#1580's oracle has not landed; and the seed's S12 proposes "a runbook step under `docs/runbooks/`"
+that already exists as `docs/runbooks/replacing-the-running-daemon.md`. The pack's four retracted claims (the `parse_usage` locator "around line 412", the Claude Code schema fragment, "no primary Anthropic source", "sources differ on the trigger") and its "both weekly-exhausted" are not inherited.
+
+### 14b. Cross-Repository References
+
+| PRD Req | Implementation repo | Spec or item | Status |
+|---|---|---|---|
+| every requirement in § 10 | this repository | the umbrella #1590, its children #1591–#1604 and #1608, and the hot-fix #1613; the umbrella's work list maps each item to its building block | created 2026-11-01 |
+
+## 15. Cross-Cutting and Non-Functional Concerns
+
+**Category coverage sweep** (Phase 6; scope context: a local daemon plus a menu-bar app, "general application", so no preset N/A; risk markers present — the daemon operates against a third-party service and handles credentials — so the legal / safety / trust lane is evaluated, not skipped):
+
+| Category | Components | Status |
+|---|---|---|
+| Functional suitability | S1–S3, S7, S8 | Covered |
+| Performance efficiency | REQ-ARM-Q-001 (rate neutrality) | Covered |
+| Compatibility | S6 (wire lockstep), S7 (store readers, D6) | Covered |
+| Usability — accessibility | No new control, but spoken output changes on three surfaces: #1599 AC-5 (a percent-less blind block renders and speaks as the failed-poll row until classified); #1601 AC-5 with test W9 (the Stats-tab row's `accessibilityLabel` speaks only the weekly peak for a weekly-only account); #1594 (the three spoken strings, after D0 / D15) | Covered (reclassified 2026-11-01 after the Stage 3.7 coverage gate) |
+| Usability — i18n / l10n | N/A: the repo renders no localised strings; a `—` token is locale-neutral | N/A (justified) |
+| Reliability — observability | REQ-ARM-B-010 (gap/blind streaks end), REQ-RDG-C-001 (event fields); C2 deferred | Covered |
+| Reliability — recoverability | S7 (no line lost; compaction retains), REQ-DEP-C-001 | Covered |
+| Security — auth/authz | no change; the credential path is untouched | N/A (justified) |
+| Security — secrets / audit | REQ-FIX-B-001's BUT NOT (no identity field in a fixture); the sole-egress oracle stays green | Covered |
+| Maintainability | S5 (oracles), S10 (records), REQ-REC-C-001 | Covered |
+| Portability | platform-neutral change; Linux un-gated in CI (§ 15.5) | Covered |
+| Infrastructure scaffolding | N/A: extends an existing repo; no greenfield marker | N/A (justified) |
+| Cross-cutting concerns | REQ-RDG-C-001 (one rule across 93 sites) | Covered |
+| UX lifecycle flows | § 11 state matrices; S11 after D0 | Covered |
+| UX architecture | N/A: no new surface; the register classification (D0) is the only IA decision and is the maintainer's | N/A (justified) |
+| Operational features | S12 | Covered |
+| Data concerns | S7 (the sample line's shape and its readers) | Covered |
+| Compliance / legal / trust lane | § 15.2; the third-party-service marker: the daemon keeps reading the one documented usage endpoint and nothing else (the profile endpoint excluded); the credential marker: no credential, token or identity field is read, logged or committed by any item here | Covered at the size of the surface this scope touches |
+
+Verdict: PASS-WITH-FINDINGS. Three N/A rows — i18n / l10n, auth / authz and UX architecture — carry substantive reasons, but under the declared "general application" context they match no preset N/A pattern, so they await the maintainer's review; only infrastructure scaffolding matches one (an internal tool on existing infrastructure). Raised by the Stage 3.7 coverage gate on 2026-11-01, which also moved the accessibility row to Covered. Stakeholder perspectives checked (product owner — the operator's two messages; end user — the same person, § 5; developer — § 10, § 14; QA — Oracles A–D, MET-T-003, MET-A-001; operations — S12, § 15.5; security — § 15.1; support — n/a, single operator; data — S7, S8).
+
+### 15.1 Security
+
+The usage reply alone carries the signal; no new egress, no new credential read, no new scope. The sole-egress oracle `the_sole_egress_endpoint_is_the_documented_usage_url` (`src/usage.rs:1593-1608`) stays green by requirement (§ 3.3). The captured fixture carries quota fields only; the account's email, label and UUID never enter the tree (REQ-FIX-B-001). The store already permits operator-authored email labels (`src/usage_store.rs:135-166`, `Sample`); nothing here widens that.
+
+### 15.2 Compliance and Regulatory
+
+N/A — a single-operator local daemon with no regulated data; the only third-party terms in play are Anthropic's, and the daemon's read of its documented usage endpoint is unchanged in kind and in rate.
+
+### 15.3 Reliability and Observability
+
+A served reply ends the `usage_gap` and `blind_enter` streaks of the 15 accounts (REQ-ARM-B-010); the event log carries no fabricated session value for a no-window account (REQ-RDG-C-001). The `usage_gap` event's missing cause (C2) is deferred with its reopen trigger. `reliability` keeps every rule (REQ-STS-C-001); its own `JSON_SCHEMA_VERSION` (`src/reliability.rs:264`) moves 13 → 14 in the compile unit's pull request, named there, because its blind-window census gains the `n_without_session_window` bucket that keeps the #484 exact partition (§ 3.3; #1602 Specification § 3) — never moved silently.
+
+### 15.4 Performance and Scalability
+
+One `serde_json::Value` walk over a ~3 KB body per poll, unchanged; the `Option` lift adds no I/O, request or hot loop. REQ-ARM-Q-001 pins rate neutrality: the fix stops requests that yielded nothing from being wasted, and changes no cadence (C3 is where cadence lives).
+
+### 15.5 Operational
+
+Deployment is S12 by the existing runbook; REQ-DEP-C-001 orders it. The tranche-0 hot-fix deploys by the same runbook, from its branch, before it merges. Gates every code item owes (`CLAUDE.md` § Before you push): the five `test` steps, `msrv`, both `deny` checks (`src/**` puts every item in the `rust` filter), `swift` for anything under `apps/menubar/**` or `build/fixtures/**`, an **armed** `panel-goldens` run where the panel changes, and the `Panel-Goldens-Rebaselined:` / `CLI-Goldens-Rebaselined:` trailers where goldens move. The change is platform-neutral; Linux is landed but un-gated in CI, so no job proves it. The 1.15 minor queue and PRs #1537, #1588, #1538 are coordinated, never re-scoped (§ 7).
+
+### 15.6 Lifecycle
+
+The four wires are independent and each is named: `status`/`watch` takes a **minor** `STATUS_SCHEMA_VERSION` bump in S6 (the five goldens, the Swift fixtures, and the one production decode edit that makes `lastKnownSessionPct` optional, REQ-STL-C-001); `stats` moves its `JSON_SCHEMA_VERSION` only if S8's representation changes `AccountWire`'s shape, dragging the Swift `StatsWire` mirror and `wire-stats-basic.json` with it (D8); `reliability` moves 13 → 14 in the compile unit for its census bucket (§ 15.3); `log` is untouched. The sample line is versionless, so its change is governed by reader tolerance (S7) and deployment order (REQ-DEP-C-001). `FORMAT_VERSION` and the frozen migration fixtures are untouched. Four ADRs are amended in place (S10); no ADR is superseded.
+
+## 16. Change Log
+
+| Version | Date | Change | Rationale | Impact |
+|---|---|---|---|---|
+| 1.0 | 2026-11-01 | Created (`/scope` Stage 1, headless) | The wire removed the session window from verified Ultra accounts; 15 of 17 local accounts blind | Twelve components scoped; D0–D10 held open; `dor_status: failed` on check 6 |
+| 1.1 | 2026-11-01 | Stage 3.7 remediation: § 3.1 states tranche 1's week in calendar time under agent execution and notes that S8's reader half rides tranche 1; § 4 splits the implementation criteria (MET-T-003, MET-A-001, MET-R-002, MET-R-004) into their own tier, restates MET-R-003 with a measured baseline and a failing threshold, and excepts the documented D8 interim from the two-week gate; REQ-ARM-Q-001 and REQ-STL-Q-001 move under S3 and S6; four Planguage requirements gain Origin tags; REQ-CEL-C-001 is scoped to S11's cells; § 15's accessibility row becomes Covered and its verdict PASS-WITH-FINDINGS; § 2's `Usage {` construction count is deleted (it had counted an unrelated `CliUsage` and function signatures) | The scope's coverage gate (Stage 3.7) returned FAIL with findings against this document | The appetite restatement is pipeline-proposed and put to the operator; until ratified, the gate's appetite finding stands |
+| 1.2 | 2026-11-01 | Recorded the maintainer's three answers of 2026-11-01: tranche 1's budget is re-set to the human effort-day estimate the coverage gate sized, no longer one calendar week; a hot-fix, tranche 0 (#1613), is added, with its one exception to the two "never" rows in § 3.3; the runbook text (#1603) moves from tranche 1 to tranche 2 (Should) and lands after the deploy (#1604, which stays in tranche 1). Re-scoped to the split: MET-T-001, MET-T-002, MET-T-003, MET-T-004, the first decision gate, scenario 1, A-9, D10's wording, REQ-DEP-B-002 (one phrase of text) and the notes of REQ-DEP-B-002, REQ-DEP-Q-001 and REQ-ORC-B-001. Rows C2, C3, C7, C9 and C10 carry their filed issue numbers; § 7 gains the new references; the § 3.1 heading suffix changes | The maintainer's answers to questions put during scoping; the premise that the fleet stays blind until tranche 1 deploys no longer holds, because tranche 0 recovers the weekly reading | Finding B1 no longer stands; tranche 0 is invalidated if tranche 1 merges and deploys first; no requirement ID, risk, assumption or table row is added or renumbered, except the tranche-0 rows and the § 7 reference rows |
+| 1.3 | 2026-11-01 | Corrected MET-A-001 and REQ-ORC-B-001, which said all four oracles are RED on `origin/main` | Under D1 (a) Oracle C is green there, because today's tree already rejects a windowless body; #1591 proves its RED against the mutant that fabricates both windows | MET-A-001's goal and FAIL line and REQ-ORC-B-001's text now say A, B and D RED on `origin/main` and C RED against the mutant |
+| 1.4 | 2026-11-02 | Resolved the pre-merge review of the scope pull request. REQ-ARM-B-006 is restricted to a weekly-only spare with weekly headroom, and MET-T-004 and REQ-DEP-B-002's capacity clause are worded to the same test; REQ-DEP-C-001 is rewritten to the deployment rule the D6/D13 council ruling corrected (the erasing binary is an older daemon; the rollup fence; the ancestry check), and R4, P-2, D6, MET-R-002 and REQ-SMP-Q-001 name the same actor; the deploy step is the runbook's quit, stop, rebuild and relaunch, not `launchctl kickstart -k`; REQ-STL-C-001 and § 15.6 name the one production Swift decode edit; `reliability`'s 13 → 14 move is recorded in R6, § 15.3 and § 15.6; `Copy` is scoped to the three types that carry it; the omit-when-absent precedents are re-dated; S8's reader half is placed in tranche 1 in § 0; C6/D9 moves from never to deferred with its reopen trigger; cost (e) of the hot-fix outlives tranche 1 until #1614, and the hot-fix's narrowing is weighed against a wider one; `FleetReadingCoverage` carries one SCALE; MET-R-001 defines its headroom, join and unmeasured case; REQ-ARM-Q-001's meter is named; the § 4 take-2 rule of 2026-11-02 is recorded here; the three corrections of 2026-11-01 that were narrated inline (REQ-SMP-B-002's and P-12's mechanism, § 11.4's omitted-key row) are recorded here instead; acceptance is added to the requirements that carried none; operator and maintainer are defined as one person; S6 gains its `ux-ia` track | The review of pull request #1629 (2026-11-02) and the council ruling on #1598 the same day | No requirement ID is added or renumbered; D6 is recorded settled; every other decision stays open |
+
+## 17. Requirement Provenance and Definition-of-Ready Verdict
+
+| Set | Members | Status |
+|---|---|---|
+| Operator-ratified | The **class** of work (message 1) and the **shape** of the parser (message 2); from the maintainer's answers of 2026-11-01, tranche 1's budget, the tranche-0 hot-fix path and the placement of #1603 in tranche 2 | Ratified by the two messages of § 2.1 and the three answers quoted in § 3.1 (notes 1 and 4) — and nothing beyond them |
+| Pipeline-authored, ratification-pending | The problem framing (§ 2); the appetite of tranche 2 and of S11 (§ 3.1); the twelve-component selection and the assignment of components to tranches 1 and 2 (§ 0, § 3.2, A-7, A-8); every requirement REQ-… in § 10 in its specific form; every Planguage GOAL and FAIL; every success metric (§ 4); the recommended defaults on D1–D8 and D10 | **Pending** — none has been ratified one at a time; the operator was not present during this run |
+| Operator-owned, not written | TL;DR (§ 1), benefit hypothesis (§ 2.5) | Owed |
+| Maintainer-owned, open | D0 (the render classification); the HQ amendment of REQ-USG-B-001 | Open |
+
+| # | Check | Result |
+|---|---|---|
+| 1 | Validated problem statement | **PASS as a section, pending the operator's validation** — § 2 is non-empty, traces to the framing challenge in § 2.3, and names the current state, the affected user and why now; it is pipeline-framed and the operator has not validated it |
+| 2 | Explicit out-of-scope declarations | **PASS** — § 3 carries the appetite, a deferral table whose every row names what reopens it, and a never table whose every row names its reason |
+| 3 | Success and telemetry metrics | **PASS as a section, pending ratification** — § 4 carries leading and lagging indicators, an implementation-criteria tier for the metrics that grade the build rather than the outcome (split out on 2026-11-01 after the Stage 3.7 coverage gate), decision gates and a north-star candidate, each in Planguage form; all are pipeline-derived |
+| 4 | Cross-cutting and non-functional concerns | **PASS** — § 15, all six subsections with content or `N/A — rationale`, plus the category sweep |
+| 5 | Feature-completeness verdict | **PASS** — § 13 grades all twelve features in the fixed vocabulary; the two INCOMPLETE rows (S3, S11) carry their gaps |
+| 6 | Requirement provenance | **FAIL** — every requirement carries its origin tag, but every pipeline-authored requirement is unratified, and that is all of them; the two ratified items are the class and the shape, not any requirement's form |
+
+**Verdict: FAIL.** `dor_status: failed`. The failing check is the one the other five cannot substitute for: checks 1–5 grade each requirement's own properties and would pass a fabricated requirement that traces to the document that fabricated it. Nothing here is fabricated — every requirement traces to the operator's two messages, to the captured reply, or to a line of the tree — but tracing is not ratification. The remediation belongs to the requirements stage: the operator reads § 10 and ratifies, strikes or rewords each requirement, validates § 2, sizes § 3.1, answers or defers D0–D10, and this gate is re-run. Later stages proceed **provisionally** on this verdict, per the readiness rule that a `failed` beside a later stage marks that stage provisional rather than wrong; a consumer ordering its recommendations puts this remediation first.
